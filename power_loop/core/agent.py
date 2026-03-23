@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional
 
-from llm_client.interface import LLMRequest, LLMResponse
+from llm_client.interface import LLMRequest, LLMResponse, LLMService
 
 from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
@@ -93,7 +93,7 @@ def _sanitize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any
 
 async def agent_loop_async(
     *,
-    llm: Any,
+    llm: LLMService,
     config: AgentLoopConfig,
     tool_registry: ToolRegistry | None,
     messages: list[LoopMessage],

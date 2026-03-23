@@ -167,10 +167,7 @@ def test_real_agent_loop_smoke_print_only() -> None:
     llm_cfg = OpenAICompatibleChatConfig(
         base_url=creds["base_url"],
         api_key=creds["api_key"],
-        model=creds["model"],
-        timeout_s=120.0,
-        max_tokens=8000,
-        temperature=0.0,
+        model=creds["model"]
     )
     llm = OpenAICompatibleChatLLMService(llm_cfg)
 
@@ -183,7 +180,7 @@ def test_real_agent_loop_smoke_print_only() -> None:
         "请严格遵循：不要调用任何工具，直接用一句话回答用户问题。"
         "一句话必须简短明确。"
     )
-    agent_cfg = AgentLoopConfig(max_rounds=2, max_tokens=256, temperature=0.0, system_prompt=system_prompt)
+    agent_cfg = AgentLoopConfig(max_rounds=2, max_tokens=8000, temperature=0.0, system_prompt=system_prompt)
     loop = AgentLoop(llm=llm, config=agent_cfg, tool_registry=tool_registry, event_bus=event_bus, hooks=hooks)
 
     async def _run() -> Any:
