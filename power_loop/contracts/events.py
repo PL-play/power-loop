@@ -46,6 +46,21 @@ class AgentEventType(str, Enum):
 
 @dataclass
 class AgentEvent:
+    """Agent lifecycle event.
+    Common payload conventions (JSON-serializable dicts):
+    - ``STATUS_CHANGED``: always includes ``kind`` (discriminator). Known kinds:
+      ``auto_compact`` (phase, round_index, trigger, input_tokens, compact_threshold),
+      ``round_usage`` (time_iso, round_index, round_number, max_rounds, token fields),
+      ``hit_round_limit`` (max_rounds).
+   - ``USAGE_UPDATED``: ``usage`` includes both **completion_*** (single last LLM response) and
+      **session_*** (cumulative for this agent session); legacy keys ``input`` / ``total_in`` remain
+      aliases. ``session`` mirrors :class:`~power_loop.core.state.ContextManager` counters (with
+      legacy field names duplicated). Optional ``summary`` is human-readable; prefer structured keys.
+ 
+      and optional ``summary`` (human line; prefer ``usage`` / ``session`` for logic).
+    - ``TODO_UPDATED``: ``kind`` = ``todo_snapshot``, ``items``, ``counts``, ``rendered``;
+      ``text`` is kept as an alias of ``rendered`` for older subscribers.
+    """
     type: AgentEventType
     payload: Dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None

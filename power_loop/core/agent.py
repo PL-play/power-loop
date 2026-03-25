@@ -18,6 +18,35 @@ from power_loop.tools.registry import ToolRegistry
 
 RESULT_MAX_CHARS = 50000
 
+def _status_payload_auto_compact(*, round_index: int, ctx: ContextManager) -> dict[str, Any]:
+    return {
+        "kind": "auto_compact",
+        "phase": "started",
+        "round_index": round_index,
+        "trigger": "input_tokens_gt_threshold",
+        "input_tokens": ctx.last_input_tokens,
+        "compact_threshold": ctx.compact_threshold,
+    }
+def _status_payload_round_usage(*, round_index: int, max_rounds: int, usage: dict[str, Any]) -> dict[str, Any]:
+    def _g(*keys: str) -> Any:
+        for k in keys:
+            if k in usage and usage[k] is not None:
+                return usage[k]
+        return None
+    return {
+        "kind": "round_usage",
+        "time_iso": datetime.now().isoformat(timespec="seconds"),
+        "round_index": round_index,
+        "round_number": round_index + 1,
+        "max_rounds": max_rounds,
+        "prompt_tokens": _g("prompt_tokens", "input"),
+        "completion_tokens": _g("completion_tokens", "output"),
+        "cache_read_tokens": _g("cache_read_tokens", "cache_read"),
+        "reasoning_tokens": _g("reasoning_tokens", "reasoning"),
+    }
+def _status_payload_hit_round_limit(*, max_rounds: int) -> dict[str, Any]:
+    return {"kind": "hit_round_limit", "max_rounds": max_rounds}
+
 
 def _is_cancelled(stop_event: threading.Event | None) -> bool:
     return bool(stop_event is not None and stop_event.is_set())
@@ -209,7 +238,7 @@ async def agent_loop_async(
             bus.publish(
                 AgentEvent(
                     type=AgentEventType.STATUS_CHANGED,
-                    payload={"status": "auto-compact triggered, saving transcript..."},
+                    payload=_status_payload_auto_compact(round_index=round_idx, ctx=ctx),
                     session_id=session_id,
                     round_index=round_idx,
                 )
@@ -286,13 +315,14 @@ async def agent_loop_async(
         )
 
         usage = ctx.update_usage(response)
-        ts = datetime.now().strftime("%H:%M:%S")
         bus.publish(
             AgentEvent(
                 type=AgentEventType.STATUS_CHANGED,
-                payload={
-                    "status": f"[{ts}] round {round_idx+1}/{config.max_rounds} | in={usage['input']:,} out={usage['output']:,} | session={usage['total_in']:,}+{usage['total_out']:,}"
-                },
+                payload=_status_payload_round_usage(
+                    round_index=round_idx,
+                    max_rounds=int(config.max_rounds),
+                    usage=usage,
+                ),
                 session_id=session_id,
                 round_index=round_idx,
             )
@@ -300,7 +330,9 @@ async def agent_loop_async(
         bus.publish(
             AgentEvent(
                 type=AgentEventType.USAGE_UPDATED,
-                payload={"usage": usage, "summary": ctx.all_usage_summary()},
+                payload={
+                    "usage": usage,
+                },
                 session_id=session_id,
                 round_index=round_idx,
             )
@@ -494,7 +526,7 @@ async def agent_loop_async(
     bus.publish(
         AgentEvent(
             type=AgentEventType.STATUS_CHANGED,
-            payload={"status": f"hit_round_limit={config.max_rounds}"},
+            payload=_status_payload_hit_round_limit(max_rounds=int(config.max_rounds)),
             session_id=session_id,
         )
     )
@@ -512,7 +544,9 @@ async def agent_loop_async(
     bus.publish(
         AgentEvent(
             type=AgentEventType.USAGE_UPDATED,
-            payload={"usage": ctx.update_usage(final_resp), "summary": ctx.all_usage_summary()},
+            payload={
+                "usage": ctx.update_usage(final_resp),
+            },
             session_id=session_id,
         )
     )

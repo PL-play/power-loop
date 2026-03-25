@@ -47,13 +47,20 @@ class TodoManager:
 
         self.items = validated
         result = self.render()
+        done = sum(1 for t in self.items if t["status"] == "completed")
 
         # Publish todo state for any UI subscriber.
         session_id = get_session_id()
         get_event_bus().publish(
             AgentEvent(
                 type=AgentEventType.TODO_UPDATED,
-                payload={"text": result},
+                payload={
+                    "kind": "todo_snapshot",
+                    "items": [dict(x) for x in self.items],
+                    "counts": {"total": len(self.items), "completed": done},
+                    "rendered": result,
+                    "text": result,
+                },
                 session_id=session_id,
             )
         )
@@ -88,11 +95,10 @@ class ContextManager:
     recent_files: list[str] = field(default_factory=list)
     _file_counter: int = 0
 
+    #: 最近一次 ``update_usage`` 解析到的 prompt/input tokens（用于 auto-compact 阈值判断）
     last_input_tokens: int = 0
-    total_input_tokens: int = 0
-    total_output_tokens: int = 0
-    cache_read_tokens: int = 0
-    reasoning_tokens: int = 0
+    token_usage: dict[str, Any] = field(default_factory=dict)
+    #: 可选计数器，供测试/扩展使用；**不会**被 ``update_usage`` 自动递增
     api_calls: int = 0
 
     _compact_count: int = 0
@@ -125,8 +131,6 @@ class ContextManager:
         if getattr(response, "token_usage", None) is not None:
             tu = response.token_usage
             usage = tu.as_dict() if hasattr(tu, "as_dict") else None
-        elif getattr(response, "usage", None) is not None:
-            usage = response.usage
 
         def _pick(dct: dict, keys: list[str]) -> int:
             for key in keys:
@@ -139,6 +143,7 @@ class ContextManager:
         output_tokens = 0
         cache_read = 0
         reasoning = 0
+        total_tokens = 0
 
         if isinstance(usage, dict):
             input_tokens = _pick(usage, ["prompt_tokens", "input_tokens"])
@@ -154,38 +159,23 @@ class ContextManager:
                 ],
             )
             reasoning = _pick(usage, ["completion_reasoning_tokens", "reasoning_tokens"])
-        else:
-            input_tokens = int(getattr(usage, "input_tokens", 0) or getattr(usage, "prompt_tokens", 0) or 0)
-            output_tokens = int(getattr(usage, "output_tokens", 0) or getattr(usage, "completion_tokens", 0) or 0)
-            cache_read = int(getattr(usage, "cache_read_tokens", 0) or 0)
-            reasoning = int(getattr(usage, "reasoning_tokens", 0) or 0)
+            total_tokens = _pick(usage, ["total_tokens"])
 
-        self.last_input_tokens = input_tokens
-        self.total_input_tokens += input_tokens
-        self.total_output_tokens += output_tokens
-        self.cache_read_tokens += cache_read
-        self.reasoning_tokens += reasoning
-        self.api_calls += 1
-        return {
-            "input": self.last_input_tokens,
+        usage = {
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "cache_read_tokens": cache_read,
+            "reasoning_tokens": reasoning,
+            "total_tokens": total_tokens,
+            # 与常见 OpenAI usage 字段对齐的别名
+            "input": input_tokens,
             "output": output_tokens,
             "cache_read": cache_read,
             "reasoning": reasoning,
-            "total_in": self.total_input_tokens,
-            "total_out": self.total_output_tokens,
-            "total_reasoning": self.reasoning_tokens,
-            "calls": self.api_calls,
         }
-
-    def usage_summary(self) -> str:
-        return f"input={self.last_input_tokens:,} | session_in={self.total_input_tokens:,} | calls={self.api_calls}"
-
-    def all_usage_summary(self) -> str:
-        main_in = self.total_input_tokens
-        main_out = self.total_output_tokens
-        main_reason = self.reasoning_tokens
-        main_calls = self.api_calls
-        return f"IN={main_in:,} OUT={main_out:,} reason={main_reason:,} calls={main_calls}"
+        self.token_usage = usage
+        self.last_input_tokens = input_tokens
+        return usage
 
     def reset_usage(self) -> None:
         self.last_input_tokens = 0

@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict
 
+import pytest
 from dotenv import load_dotenv
 
 # ── LLM client ──────────────────────────────────────────────────────────
@@ -66,6 +67,37 @@ def _load_env() -> Dict[str, str]:
         sys.exit(0)
     return {"model": model, "base_url": base_url, "api_key": api_key}
 
+def _creds_or_skip() -> Dict[str, str]:
+    """Same rules as ``_load_env()`` but for pytest (skip instead of sys.exit)."""
+    root = Path(__file__).resolve().parents[1]
+    load_dotenv(root / ".env", override=False)
+    load_dotenv(root / ".env.example", override=False)
+    model = (os.getenv("OPENAI_COMPAT_MODEL") or "").strip()
+    base_url = (os.getenv("OPENAI_COMPAT_BASE_URL") or "").strip()
+    api_key = (os.getenv("OPENAI_COMPAT_API_KEY") or "").strip()
+    if not (model and base_url and api_key):
+        pytest.skip(
+            "Fill OPENAI_COMPAT_MODEL / OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_API_KEY in power-loop/.env "
+            "(or .env.example)."
+        )
+    if (os.getenv("POWER_LOOP_RUN_REAL_SMOKE") or "").strip().lower() not in ("1", "true", "yes", "y"):
+        pytest.skip("Set POWER_LOOP_RUN_REAL_SMOKE=1 to run real-LLM parts of this file.")
+    return {"model": model, "base_url": base_url, "api_key": api_key}
+
+def _configure_streaming_stdio() -> None:
+    """尽量降低 stdout/stderr 块缓冲，使 ``print(..., end='', flush=True)`` 能尽快出现在终端。
+    说明：pytest 默认会 *捕获* stdout，捕获模式下无论 flush 与否都要等用例结束才一次性展示。
+    对流式用例请配合 ``capsys.disabled()``（见 Part2/3 测试）或命令行 ``pytest -s``。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if reconf is None:
+            continue
+        try:
+            reconf(line_buffering=True)
+        except Exception:
+            # e.g. io.UnsupportedOperation on non-TTY / wrapped streams
+            pass
 
 def _make_llm(creds: Dict[str, str]) -> OpenAICompatibleChatLLMService:
     return OpenAICompatibleChatLLMService(
@@ -204,6 +236,26 @@ async def demo_streaming_agent(llm: OpenAICompatibleChatLLMService, model: str):
 
     bus.subscribe(AgentEventType.STREAM_DELTA, on_stream_delta)
 
+    # 流式打印 —— 订阅 STREAM_THINK_DELTA（推理/思考内容）
+    _current_think_round: int | None = None
+    _think_started = False
+    def on_stream_think(event: AgentEvent):
+        text = event.payload.get("text", "")
+        if not text:
+            return
+        rid = event.round_index
+        nonlocal _current_think_round, _think_started
+        # 新的一轮 think：前面加一个标记，避免和普通输出混在一起。
+        if rid != _current_think_round:
+            _current_think_round = rid
+            _think_started = True
+            print(f"\n[THINK r{rid}] ", end="", flush=True)
+        elif not _think_started:
+            _think_started = True
+            print("\n[THINK] ", end="", flush=True)
+        print(text, end="", flush=True)
+    bus.subscribe(AgentEventType.STREAM_THINK_DELTA, on_stream_think)
+
     # 工具调用日志
     def on_tool_start(event: AgentEvent):
         name = event.payload.get("name", "?")
@@ -224,8 +276,53 @@ async def demo_streaming_agent(llm: OpenAICompatibleChatLLMService, model: str):
     bus.subscribe(AgentEventType.TOOL_CALL_STARTED, on_tool_start)
     bus.subscribe(AgentEventType.TOOL_CALL_COMPLETED, on_tool_done)
 
-    # 状态变化
-    bus.subscribe(AgentEventType.STATUS_CHANGED, lambda e: print(f"\n--- {e.payload.get('status', '')} ---", flush=True))
+    # Session lifecycle markers
+    def on_session_started(e: AgentEvent) -> None:
+        print(
+            f"\n\n{'=' * 30} SESSION_STARTED session_id={e.session_id} {'=' * 30}\n",
+            flush=True,
+        )
+    def on_session_ended(e: AgentEvent) -> None:
+        reason = (e.payload or {}).get("reason", "")
+        print(
+            f"\n\n{'=' * 30} SESSION_ENDED session_id={e.session_id} reason={reason} {'=' * 30}\n",
+            flush=True,
+        )
+    bus.subscribe(AgentEventType.SESSION_STARTED, on_session_started)
+    bus.subscribe(AgentEventType.SESSION_ENDED, on_session_ended)
+    # Round lifecycle markers (clear separators between rounds)
+    def on_round_started(e: AgentEvent) -> None:
+        idx = e.round_index
+        print(f"\n\n{'-' * 26} ROUND_STARTED round_index={idx} {'-' * 26}\n", flush=True)
+    def on_round_completed(e: AgentEvent) -> None:
+        idx = e.round_index
+        payload = e.payload or {}
+        has_tools = payload.get("has_tools")
+        used_todo = payload.get("used_todo")
+        print(
+            f"\n\n{'-' * 26} ROUND_COMPLETED round_index={idx} has_tools={has_tools} used_todo={used_todo} {'-' * 26}\n",
+            flush=True,
+        )
+    bus.subscribe(AgentEventType.ROUND_STARTED, on_round_started)
+    bus.subscribe(AgentEventType.ROUND_COMPLETED, on_round_completed)
+
+    def _on_status(e: AgentEvent) -> None:
+        kind = e.payload.get("kind", "?")
+        print(f"\n--- STATUS_CHANGED kind={kind} payload={e.payload} ---", flush=True)
+    bus.subscribe(AgentEventType.STATUS_CHANGED, _on_status)
+
+     # Token 用量：USAGE_UPDATED 里同时有「单次 completion」与「本会话累计」
+    _prev_session_prompt_total: int | None = None
+    def on_usage_updated(e: AgentEvent) -> None:
+        nonlocal _prev_session_prompt_total
+        usage = e.payload.get("usage") or {}
+
+        print(
+            f"\n--- USAGE_UPDATED round_index={e.round_index!r} ---\n"
+            f"  {usage}\n",
+            flush=True,
+        )
+    bus.subscribe(AgentEventType.USAGE_UPDATED, on_usage_updated)
 
     # 使用 core 工具预设（bash, read_file, write_file, edit_file, glob, grep, ...）
     registry = create_default_tool_registry(preset="core")
@@ -448,3 +545,36 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# =====================================================================
+# pytest entry points (PyCharm / CI 用 ``pytest tests/test_real_streaming_subagent.py`` 才能收集到用例)
+# =====================================================================
+def test_part1_contextvars_isolation() -> None:
+    """无需真实 LLM；验证 contextvars session 隔离。"""
+    asyncio.run(demo_contextvars_isolation())
+
+def test_part2_streaming_agent_real_llm(capsys: pytest.CaptureFixture[str]) -> None:
+    creds = _creds_or_skip()
+    llm = _make_llm(creds)
+    async def _run() -> None:
+        try:
+            await demo_streaming_agent(llm, creds["model"])
+        finally:
+            await llm.close()
+    # pytest 默认捕获 stdout：流式 chunk 会攒到用例结束才显示；禁用捕获才能实时看到 token 流
+    with capsys.disabled():
+        _configure_streaming_stdio()
+        asyncio.run(_run())
+
+def test_part3_subagent_pattern_real_llm(capsys: pytest.CaptureFixture[str]) -> None:
+    creds = _creds_or_skip()
+    llm = _make_llm(creds)
+    async def _run() -> None:
+        try:
+            await demo_subagent_pattern(llm, creds["model"])
+        finally:
+            await llm.close()
+    with capsys.disabled():
+        _configure_streaming_stdio()
+        asyncio.run(_run())
