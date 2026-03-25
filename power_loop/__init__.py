@@ -2,9 +2,11 @@
 
 from power_loop.agent.loop import AgentLoop
 from power_loop.agent.system_prompt import (
+	BUILTIN_SECTIONS,
 	DEFAULT_AGENT_SYSTEM_PROMPT,
 	DEFAULT_EXPLORE_SUBAGENT_SYSTEM_PROMPT,
 	DEFAULT_SUBAGENT_SYSTEM_PROMPT,
+	SystemPromptBuilder,
 	SystemPromptContext,
 	build_agent_system_prompt,
 	build_explore_subagent_system_prompt,
@@ -20,7 +22,14 @@ from power_loop.contracts.hooks import HookContext, HookPoint
 from power_loop.contracts.messages import AgentMessage, MessageRole, ToolCall
 from power_loop.contracts.protocols import EventBusProtocol, HookManagerProtocol, ToolArgsValidator
 from power_loop.contracts.tools import ToolDefinition, validate_tool_args
-from power_loop.tools import ToolRegistry, create_default_tool_registry
+from power_loop.tools import ToolRegistry, build_registry, create_default_tool_registry
+from power_loop.tools.default_manifest import (
+	CORE_TOOL_NAMES,
+	EXPLORE_TOOL_NAMES,
+	FULL_TOOL_NAMES,
+	TOOL_PRESETS,
+	get_tool_definitions,
+)
 
 __all__ = [
 	"AgentLoop",
@@ -46,11 +55,19 @@ __all__ = [
 	"ToolDefinition",
 	"validate_tool_args",
 	"ToolRegistry",
+	"build_registry",
 	"create_default_tool_registry",
+	"get_tool_definitions",
+	"CORE_TOOL_NAMES",
+	"EXPLORE_TOOL_NAMES",
+	"FULL_TOOL_NAMES",
+	"TOOL_PRESETS",
+	"SystemPromptBuilder",
+	"SystemPromptContext",
+	"BUILTIN_SECTIONS",
 	"DEFAULT_AGENT_SYSTEM_PROMPT",
 	"DEFAULT_SUBAGENT_SYSTEM_PROMPT",
 	"DEFAULT_EXPLORE_SUBAGENT_SYSTEM_PROMPT",
-	"SystemPromptContext",
 	"build_agent_system_prompt",
 	"build_subagent_system_prompt",
 	"build_explore_subagent_system_prompt",

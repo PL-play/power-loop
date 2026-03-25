@@ -9,13 +9,7 @@ LoopMessage = Dict[str, Any]
 
 @dataclass
 class AgentLoopConfig:
-    """Config for Agent Loop v1.
-
-    v1 scope:
-    - pure round loop
-    - no tool execution
-    - no hooks/events
-    """
+    """Configuration for the agent loop."""
 
     system_prompt: str | None = None
     max_rounds: int = 24

@@ -40,6 +40,19 @@ class SkillLoader:
             meta = {}
         return meta, match.group(2).strip()
 
+    def get_descriptions(self) -> str:
+        if not self.skills:
+            return "(no skills available)"
+        lines = []
+        for name, skill in self.skills.items():
+            desc = skill["meta"].get("description", "No description")
+            tags = skill["meta"].get("tags", "")
+            line = f"  - {name}: {desc} (path: {skill['path']})"
+            if tags:
+                line += f" [{tags}]"
+            lines.append(line)
+        return "\n".join(lines)
+
     def get_content(self, name: str) -> str:
         skill = self.skills.get(name)
         if not skill:

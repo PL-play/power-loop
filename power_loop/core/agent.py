@@ -323,7 +323,11 @@ async def agent_loop_async(
         history.append(assistant_msg)
 
         if todo_snap:
-            history.pop()  # remove temporary todo snapshot injected into prompt
+            # Remove the todo snapshot that was injected before the LLM call.
+            # It sits right before the assistant message we just appended.
+            idx = len(history) - 2
+            if idx >= 0 and history[idx].get("content") == todo_snap:
+                history.pop(idx)
 
         if not tool_calls:
             # No tools -> round end & session end.
@@ -363,7 +367,7 @@ async def agent_loop_async(
             context=HookContext(values={"round_index": round_idx, "messages": history, "tool_calls": tool_calls}),
         )
 
-        used_todo = False  # kept for future parity with zero-code; no built-in todo tool here by default.
+        used_todo = False
         for tool_call in tool_calls:
             if _is_cancelled(stop_event):
                 await _finalize_session("cancelled", final_text=None)
@@ -407,6 +411,10 @@ async def agent_loop_async(
                 except Exception as exc:  # pragma: no cover
                     output = f"Error: {exc}"
                     failed = True
+
+            if tool_name == "todo":
+                used_todo = True
+                rounds_since_todo = 0
 
             if not isinstance(output, str):
                 output = json.dumps(output, ensure_ascii=False)
@@ -472,6 +480,9 @@ async def agent_loop_async(
             HookPoint.ROUND_END,
             context=HookContext(values={"round_index": round_idx, "messages": history, "has_tools": True, "used_todo": used_todo}),
         )
+
+        if not used_todo:
+            rounds_since_todo += 1
 
     # Hit max rounds -> force summary.
     history.append(

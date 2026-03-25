@@ -52,9 +52,11 @@ def main() -> None:
     )
     assert "test-model" in prompt_main
     assert "Keep answers concise." in prompt_main
-    assert DEFAULT_AGENT_SYSTEM_PROMPT.strip() in prompt_main
-    assert DEFAULT_SUBAGENT_SYSTEM_PROMPT.strip() in prompt_sub
-    assert DEFAULT_EXPLORE_SUBAGENT_SYSTEM_PROMPT.strip() in prompt_explore
+    assert "/tmp/workspace" in prompt_main
+    assert "coding subagent" in prompt_sub
+    assert "/tmp/workspace" in prompt_sub
+    assert "read-only" in prompt_explore
+    assert "/tmp/workspace" in prompt_explore
 
     tool_def = ToolDefinition(
         name="read_file",

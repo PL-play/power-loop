@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Dict, Sequence
+
 from power_loop.contracts.tools import ToolDefinition
 
 # Tool definitions copied from zero-code BASE_TOOLS entries for the default core tool set.
@@ -164,3 +166,79 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=(),
     ),
 ]
+
+# Indexed lookup for selective registration.
+DEFAULT_TOOL_DEFINITIONS_MAP: Dict[str, ToolDefinition] = {d.name: d for d in DEFAULT_TOOL_DEFINITIONS}
+
+# ---------------------------------------------------------------------------
+# Tool presets (matching zero-code's BASE_TOOLS / EXPLORE_TOOLS categories)
+# ---------------------------------------------------------------------------
+
+# Core coding tools — the minimal set for an agent that reads, writes, and runs code.
+CORE_TOOL_NAMES: tuple[str, ...] = (
+    "bash",
+    "read_file",
+    "write_file",
+    "edit_file",
+    "apply_patch",
+    "glob",
+    "grep",
+    "load_skill",
+)
+
+# Read-only / exploration tools — no file mutation.  Matches zero-code EXPLORE_TOOLS.
+EXPLORE_TOOL_NAMES: tuple[str, ...] = (
+    "bash",
+    "read_file",
+    "glob",
+    "grep",
+    "load_skill",
+)
+
+# Full set — everything including todo and background tasks.
+FULL_TOOL_NAMES: tuple[str, ...] = tuple(d.name for d in DEFAULT_TOOL_DEFINITIONS)
+
+TOOL_PRESETS: Dict[str, tuple[str, ...]] = {
+    "core": CORE_TOOL_NAMES,
+    "explore": EXPLORE_TOOL_NAMES,
+    "full": FULL_TOOL_NAMES,
+}
+
+
+def get_tool_definitions(
+    *,
+    preset: str | None = None,
+    include: Sequence[str] | None = None,
+    exclude: Sequence[str] | None = None,
+) -> list[ToolDefinition]:
+    """Return a filtered list of default tool definitions.
+
+    Priority: *include* > *preset* > all.
+    *exclude* is applied last regardless.
+
+    Args:
+        preset: One of "core", "explore", "full".
+        include: Explicit tool names to include (ignores preset).
+        exclude: Tool names to drop from the result.
+    """
+    if include is not None:
+        names = list(include)
+    elif preset is not None:
+        names_tuple = TOOL_PRESETS.get(preset)
+        if names_tuple is None:
+            raise ValueError(f"Unknown preset '{preset}'. Choose from: {', '.join(TOOL_PRESETS)}")
+        names = list(names_tuple)
+    else:
+        names = [d.name for d in DEFAULT_TOOL_DEFINITIONS]
+
+    if exclude:
+        exclude_set = set(exclude)
+        names = [n for n in names if n not in exclude_set]
+
+    result: list[ToolDefinition] = []
+    for name in names:
+        defn = DEFAULT_TOOL_DEFINITIONS_MAP.get(name)
+        if defn is None:
+            raise ValueError(f"Unknown default tool: '{name}'")
+        result.append(defn)
+    return result
