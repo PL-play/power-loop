@@ -141,6 +141,20 @@ async def agent_loop_async(
     rounds_since_todo = 0
     session_scope = "main"
 
+    async def _append_message(msg: LoopMessage, *, round_index: int | None = None) -> None:
+        """Append *msg* to history, firing MESSAGE_APPEND hook first."""
+        hook_ctx = await hooks.run_async(
+            HookPoint.MESSAGE_APPEND,
+            context=HookContext(values={
+                "message": msg,
+                "round_index": round_index,
+                "session_id": session_id,
+            }),
+        )
+        # Hook may replace the message (e.g. redact, enrich).
+        final_msg = hook_ctx.values.get("message", msg)
+        history.append(final_msg)
+
     # Session start hook
     session_start_ctx = {
         "scope": session_scope,
@@ -219,8 +233,9 @@ async def agent_loop_async(
         )
 
         if rounds_since_todo >= 5 and ctx.todo.has_in_progress:
-            history.append(
-                {"role": "user", "content": "<reminder>You have an in_progress todo. Update your todos.</reminder>"}
+            await _append_message(
+                {"role": "user", "content": "<reminder>You have an in_progress todo. Update your todos.</reminder>"},
+                round_index=round_idx,
             )
             bus.publish(
                 AgentEvent(
@@ -248,7 +263,7 @@ async def agent_loop_async(
 
         todo_snap = ctx.todo.snapshot_for_prompt()
         if todo_snap:
-            history.append({"role": "user", "content": todo_snap})
+            await _append_message({"role": "user", "content": todo_snap}, round_index=round_idx)
 
         # Stream lifecycle marker (best-effort; complete() might not stream).
         bus.publish(
@@ -352,7 +367,7 @@ async def agent_loop_async(
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
         if tool_calls:
             assistant_msg["tool_calls"] = _sanitize_tool_calls(tool_calls)
-        history.append(assistant_msg)
+        await _append_message(assistant_msg, round_index=round_idx)
 
         if todo_snap:
             # Remove the todo snapshot that was injected before the LLM call.
@@ -485,13 +500,14 @@ async def agent_loop_async(
                 )
             )
 
-            history.append(
+            await _append_message(
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
                     "name": tool_name,
                     "content": _truncate_result(output),
-                }
+                },
+                round_index=round_idx,
             )
 
         # Tools batch after hook
@@ -517,11 +533,11 @@ async def agent_loop_async(
             rounds_since_todo += 1
 
     # Hit max rounds -> force summary.
-    history.append(
+    await _append_message(
         {
             "role": "user",
             "content": f"You have reached the maximum of {config.max_rounds} rounds. Summarize what you accomplished and what remains.",
-        }
+        },
     )
     bus.publish(
         AgentEvent(

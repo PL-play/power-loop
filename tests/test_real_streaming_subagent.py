@@ -341,7 +341,30 @@ async def demo_streaming_agent(llm: OpenAICompatibleChatLLMService, model: str):
         max_tokens=4096,
         temperature=0.0,
     )
-    loop = AgentLoop(llm=llm, config=config, tool_registry=registry, event_bus=bus)
+
+    # ── MESSAGE_APPEND hook: 每条新消息写入 JSONL 文件 ──
+    jsonl_path = Path(__file__).resolve().parent / "message_log.jsonl"
+    # 清空上一次运行的残留
+    jsonl_path.write_text("", encoding="utf-8")
+
+    def on_message_append(ctx: HookContext) -> HookContext:
+        msg = ctx.values.get("message")
+        if msg is None:
+            return ctx
+        record = {
+            "session_id": ctx.values.get("session_id"),
+            "round_index": ctx.values.get("round_index"),
+            "message": msg,
+        }
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        print(f"\n  [jsonl] wrote {msg.get('role', '?')} message to {jsonl_path.name}", flush=True)
+        return ctx
+
+    hooks = AgentHooks()
+    hooks.register(HookPoint.MESSAGE_APPEND, on_message_append)
+
+    loop = AgentLoop(llm=llm, config=config, tool_registry=registry, event_bus=bus, hooks=hooks)
 
     task = (
         "请帮我查看当前目录下有哪些 Python 文件（用 glob），然后用 read_file 读取 power_loop/__init__.py 的前 20 行，"
@@ -354,6 +377,17 @@ async def demo_streaming_agent(llm: OpenAICompatibleChatLLMService, model: str):
     )
 
     print(f"\n\n--- Result: status={result.status}, rounds={result.rounds} ---")
+
+    # 验证 JSONL 文件确实写入了
+    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
+    print(f"  [jsonl] {len(lines)} messages logged to {jsonl_path}")
+    for i, line in enumerate(lines):
+        record = json.loads(line)
+        role = record["message"].get("role", "?")
+        content_preview = str(record["message"].get("content", ""))[:60]
+        print(f"    [{i}] round={record['round_index']} role={role} content={content_preview!r}")
+    assert len(lines) >= 2, f"Expected at least 2 messages in JSONL, got {len(lines)}"
+
     return result
 
 

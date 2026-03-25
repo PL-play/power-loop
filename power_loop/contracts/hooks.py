@@ -16,6 +16,7 @@ class HookPoint(str, Enum):
     TOOLS_BATCH_AFTER = "tools.batch.after"
     TOOL_BEFORE = "tool.before"
     TOOL_AFTER = "tool.after"
+    MESSAGE_APPEND = "message.append"
 
 
 @dataclass
