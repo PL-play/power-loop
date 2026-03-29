@@ -15,6 +15,8 @@ from power_loop.agent.system_prompt import (
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
+from power_loop.core.phase import PhaseContext, PhaseResult, phase
+from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.handlers import EventHandler, HookHandler, ToolHandler, ToolHandlerResult
@@ -43,7 +45,11 @@ __all__ = [
 	"AgentEventType",
 	"AgentEventBus",
 	"AgentHooks",
+	"AgentPipeline",
 	"AgentRunner",
+	"PhaseContext",
+	"PhaseResult",
+	"phase",
 	"HookContext",
 	"HookDirective",
 	"HookPoint",
