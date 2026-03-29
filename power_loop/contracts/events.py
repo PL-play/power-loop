@@ -42,6 +42,7 @@ class AgentEventType(str, Enum):
     SUBAGENT_TASK_START = "subagent_task_start"
     SUBAGENT_TEXT = "subagent_text"
     SUBAGENT_LIMIT = "subagent_limit"
+    SUBAGENT_COMPLETED = "subagent_completed"
 
 
 @dataclass

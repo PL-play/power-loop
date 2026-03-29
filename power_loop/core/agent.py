@@ -11,7 +11,7 @@ from llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.events import AgentEvent, AgentEventType
-from power_loop.contracts.hooks import HookContext, HookPoint
+from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
 from power_loop.core.agent_context import get_ctx, get_event_bus, get_hooks, get_session_id
 from power_loop.tools.registry import ToolRegistry
 
@@ -143,7 +143,7 @@ async def agent_loop_async(
 
     async def _append_message(msg: LoopMessage, *, round_index: int | None = None) -> None:
         """Append *msg* to history, firing MESSAGE_APPEND hook first."""
-        hook_ctx = await hooks.run_async(
+        hr = await hooks.run_async(
             HookPoint.MESSAGE_APPEND,
             context=HookContext(values={
                 "message": msg,
@@ -152,18 +152,18 @@ async def agent_loop_async(
             }),
         )
         # Hook may replace the message (e.g. redact, enrich).
-        final_msg = hook_ctx.values.get("message", msg)
+        final_msg = hr.context.values.get("message", msg)
         history.append(final_msg)
 
     # Session start hook
-    session_start_ctx = {
+    session_start_vals = {
         "scope": session_scope,
         "messages": history,
         "stop_event": stop_event,
     }
-    session_start_ctx = await hooks.run_async(HookPoint.SESSION_START, context=HookContext(values=session_start_ctx))
-    if isinstance(session_start_ctx.values.get("messages"), list):
-        history = session_start_ctx.values["messages"]  # type: ignore[assignment]
+    session_start_hr = await hooks.run_async(HookPoint.SESSION_START, context=HookContext(values=session_start_vals))
+    if isinstance(session_start_hr.context.values.get("messages"), list):
+        history = session_start_hr.context.values["messages"]  # type: ignore[assignment]
 
     bus.publish(
         AgentEvent(
@@ -186,7 +186,7 @@ async def agent_loop_async(
             )
         )
 
-    async def _run_llm_before(round_index: int) -> dict[str, Any]:
+    async def _run_llm_before(round_index: int) -> HookResult:
         llm_before_ctx: dict[str, Any] = {
             "round_index": round_index,
             "messages": history,
@@ -196,18 +196,15 @@ async def agent_loop_async(
             "max_tokens": config.max_tokens,
             "temperature": config.temperature,
         }
-        out = await hooks.run_async(HookPoint.LLM_BEFORE, context=HookContext(values=llm_before_ctx))
-        return out.values
+        return await hooks.run_async(HookPoint.LLM_BEFORE, context=HookContext(values=llm_before_ctx))
 
-    async def _run_llm_after(round_index: int, response: LLMResponse) -> LLMResponse:
+    async def _run_llm_after(round_index: int, response: LLMResponse) -> HookResult:
         llm_after_ctx: dict[str, Any] = {
             "round_index": round_index,
             "messages": history,
             "response": response,
         }
-        out = await hooks.run_async(HookPoint.LLM_AFTER, context=HookContext(values=llm_after_ctx))
-        new_resp = out.values.get("response")
-        return new_resp if isinstance(new_resp, LLMResponse) else response
+        return await hooks.run_async(HookPoint.LLM_AFTER, context=HookContext(values=llm_after_ctx))
 
     for round_idx in range(int(config.max_rounds)):
         if _is_cancelled(stop_event):
@@ -219,9 +216,17 @@ async def agent_loop_async(
             "messages": history,
             "stop_event": stop_event,
         }
-        out = await hooks.run_async(HookPoint.ROUND_START, context=HookContext(values=round_start_ctx))
-        if isinstance(out.values.get("messages"), list):
-            history = out.values["messages"]  # type: ignore[assignment]
+        round_start_hr = await hooks.run_async(HookPoint.ROUND_START, context=HookContext(values=round_start_ctx))
+        if isinstance(round_start_hr.context.values.get("messages"), list):
+            history = round_start_hr.context.values["messages"]  # type: ignore[assignment]
+
+        # ROUND_START directive: BREAK -> end loop, SKIP -> skip this round
+        if round_start_hr.directive == HookDirective.BREAK:
+            reason = round_start_hr.context.values.get("reason", "hook_break")
+            await _finalize_session(reason, final_text=None)
+            return AgentLoopResult(status="completed", final_text="", rounds=round_idx, messages=history)
+        if round_start_hr.directive == HookDirective.SKIP:
+            continue
 
         bus.publish(
             AgentEvent(
@@ -250,16 +255,36 @@ async def agent_loop_async(
         ctx.microcompact(history)
 
         if ctx.should_compact():
-            bus.publish(
-                AgentEvent(
-                    type=AgentEventType.STATUS_CHANGED,
-                    payload=_status_payload_auto_compact(round_index=round_idx, ctx=ctx),
-                    session_id=session_id,
-                    round_index=round_idx,
-                )
+            compact_before_hr = await hooks.run_async(
+                HookPoint.COMPACT_BEFORE,
+                context=HookContext(values={
+                    "round_index": round_idx,
+                    "messages": history,
+                    "input_tokens": ctx.last_input_tokens,
+                    "compact_threshold": ctx.compact_threshold,
+                }),
             )
-            history = await ctx.compact_async(llm, history)
-            ctx.reset_usage()
+            if compact_before_hr.directive != HookDirective.SKIP:
+                bus.publish(
+                    AgentEvent(
+                        type=AgentEventType.STATUS_CHANGED,
+                        payload=_status_payload_auto_compact(round_index=round_idx, ctx=ctx),
+                        session_id=session_id,
+                        round_index=round_idx,
+                    )
+                )
+                history_before_len = len(history)
+                history = await ctx.compact_async(llm, history)
+                ctx.reset_usage()
+                await hooks.run_async(
+                    HookPoint.COMPACT_AFTER,
+                    context=HookContext(values={
+                        "round_index": round_idx,
+                        "messages": history,
+                        "messages_before_count": history_before_len,
+                        "messages_after_count": len(history),
+                    }),
+                )
 
         todo_snap = ctx.todo.snapshot_for_prompt()
         if todo_snap:
@@ -302,21 +327,41 @@ async def agent_loop_async(
                 )
             )
 
-        llm_before = await _run_llm_before(round_idx)
-        response = await llm.complete(
-            LLMRequest(
-                messages=llm_before.get("messages", history),
-                system_prompt=llm_before.get("system_prompt", system_prompt),
-                tools=llm_before.get("tools", runtime_tools),
-                tool_choice=llm_before.get("tool_choice", "auto"),
-                max_tokens=int(llm_before.get("max_tokens", config.max_tokens) or config.max_tokens or 8000),
-                temperature=float(llm_before.get("temperature", config.temperature) or 0),
-            ),
-            on_chunk_delta_text=_on_delta,
-            on_chunk_think=_on_think,
-        )
+        llm_before_hr = await _run_llm_before(round_idx)
+        llm_vals = llm_before_hr.context.values
 
-        response = await _run_llm_after(round_idx, response)
+        # LLM_BEFORE directive: SHORT_CIRCUIT -> use values["response"] directly
+        if llm_before_hr.directive == HookDirective.SHORT_CIRCUIT:
+            response = llm_vals.get("response")
+            if not isinstance(response, LLMResponse):
+                raise ValueError("LLM_BEFORE hook returned SHORT_CIRCUIT but no valid 'response' in context values")
+        else:
+            response = await llm.complete(
+                LLMRequest(
+                    messages=llm_vals.get("messages", history),
+                    system_prompt=llm_vals.get("system_prompt", system_prompt),
+                    tools=llm_vals.get("tools", runtime_tools),
+                    tool_choice=llm_vals.get("tool_choice", "auto"),
+                    max_tokens=int(llm_vals.get("max_tokens", config.max_tokens) or config.max_tokens or 8000),
+                    temperature=float(llm_vals.get("temperature", config.temperature) or 0),
+                ),
+                on_chunk_delta_text=_on_delta,
+                on_chunk_think=_on_think,
+            )
+
+        llm_after_hr = await _run_llm_after(round_idx, response)
+        # LLM_AFTER may replace the response
+        new_resp = llm_after_hr.context.values.get("response")
+        if isinstance(new_resp, LLMResponse):
+            response = new_resp
+
+        # LLM_AFTER directive: BREAK -> end loop immediately with current text
+        if llm_after_hr.directive == HookDirective.BREAK:
+            final_text = (getattr(response, "raw_text", "") or getattr(response, "content_text", "") or "").strip()
+            assistant_msg_break: dict[str, Any] = {"role": "assistant", "content": final_text}
+            await _append_message(assistant_msg_break, round_index=round_idx)
+            await _finalize_session("hook_break", final_text=final_text)
+            return AgentLoopResult(status="completed", final_text=final_text, rounds=round_idx + 1, messages=history)
 
         # Stream completion marker
         bus.publish(
@@ -398,6 +443,33 @@ async def agent_loop_async(
                 messages=history,
             )
 
+        # ROUND_DECIDE hook: fires when tool_calls are present, before execution.
+        # Supports SKIP (skip tool execution, proceed to next round) and BREAK (end loop).
+        round_decide_hr = await hooks.run_async(
+            HookPoint.ROUND_DECIDE,
+            context=HookContext(values={
+                "round_index": round_idx,
+                "messages": history,
+                "tool_calls": tool_calls,
+                "assistant_text": assistant_text,
+            }),
+        )
+        if round_decide_hr.directive == HookDirective.BREAK:
+            await _finalize_session("hook_break", final_text=assistant_text)
+            return AgentLoopResult(status="completed", final_text=assistant_text, rounds=round_idx + 1, messages=history)
+        if round_decide_hr.directive == HookDirective.SKIP:
+            # Skip tool execution — still need to append tool results so the
+            # conversation stays valid for the next LLM call.
+            for tc in tool_calls:
+                cid = str(tc.get("id") or "")
+                tname = _tool_call_name(tc)
+                skip_output = str(round_decide_hr.context.values.get("tool_output", "[skipped by round_decide hook]"))
+                await _append_message(
+                    {"role": "tool", "tool_call_id": cid, "name": tname, "content": skip_output},
+                    round_index=round_idx,
+                )
+            continue
+
         if tool_registry is None:
             # Tool calls are present but no registry installed.
             return AgentLoopResult(
@@ -409,12 +481,16 @@ async def agent_loop_async(
             )
 
         # Tools batch before hook
-        await hooks.run_async(
+        batch_before_hr = await hooks.run_async(
             HookPoint.TOOLS_BATCH_BEFORE,
             context=HookContext(values={"round_index": round_idx, "messages": history, "tool_calls": tool_calls}),
         )
 
+        # TOOLS_BATCH_BEFORE directive: SKIP -> skip all tool execution this round
+        skip_tools_batch = batch_before_hr.directive == HookDirective.SKIP
+
         used_todo = False
+        break_after_tool = False
         for tool_call in tool_calls:
             if _is_cancelled(stop_event):
                 await _finalize_session("cancelled", final_text=None)
@@ -431,10 +507,19 @@ async def agent_loop_async(
                 "tool_name": tool_name,
                 "tool_args": tool_args,
             }
-            out = await hooks.run_async(HookPoint.TOOL_BEFORE, context=HookContext(values=tool_before_ctx))
-            tool_name = str(out.values.get("tool_name", tool_name))
-            if isinstance(out.values.get("tool_args"), Mapping):
-                tool_args = dict(out.values["tool_args"])
+            tool_before_hr = await hooks.run_async(HookPoint.TOOL_BEFORE, context=HookContext(values=tool_before_ctx))
+            tool_name = str(tool_before_hr.context.values.get("tool_name", tool_name))
+            if isinstance(tool_before_hr.context.values.get("tool_args"), Mapping):
+                tool_args = dict(tool_before_hr.context.values["tool_args"])
+
+            # TOOL_BEFORE directive: SKIP -> use values["tool_output"] or "[skipped]"
+            if tool_before_hr.directive == HookDirective.SKIP:
+                output = str(tool_before_hr.context.values.get("tool_output", "[skipped by hook]"))
+                await _append_message(
+                    {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": output},
+                    round_index=round_idx,
+                )
+                continue
 
             bus.publish(
                 AgentEvent(
@@ -444,6 +529,15 @@ async def agent_loop_async(
                     round_index=round_idx,
                 )
             )
+
+            # Skip actual execution when batch was skipped
+            if skip_tools_batch:
+                output = str(batch_before_hr.context.values.get("tool_output", "[skipped by batch hook]"))
+                await _append_message(
+                    {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": output},
+                    round_index=round_idx,
+                )
+                continue
 
             # Validate/execute tool
             validation_err = tool_registry.validate(tool_name, tool_args)
@@ -455,9 +549,33 @@ async def agent_loop_async(
             else:
                 try:
                     output = await tool_registry.invoke_async(tool_name, tool_args)
-                except Exception as exc:  # pragma: no cover
-                    output = f"Error: {exc}"
-                    failed = True
+                except Exception as exc:
+                    # TOOL_ERROR hook: lets user handle errors (replace output, retry, etc.)
+                    tool_error_hr = await hooks.run_async(
+                        HookPoint.TOOL_ERROR,
+                        context=HookContext(values={
+                            "round_index": round_idx,
+                            "tool_call": tool_call,
+                            "tool_name": tool_name,
+                            "tool_args": tool_args,
+                            "error": exc,
+                            "error_message": str(exc),
+                        }),
+                    )
+                    if tool_error_hr.directive == HookDirective.SKIP:
+                        # Use hook-provided output instead of error
+                        output = str(tool_error_hr.context.values.get("tool_output", f"Error: {exc}"))
+                        failed = False
+                    elif tool_error_hr.directive == HookDirective.SHORT_CIRCUIT:
+                        # Retry once
+                        try:
+                            output = await tool_registry.invoke_async(tool_name, tool_args)
+                        except Exception as retry_exc:
+                            output = f"Error (retry failed): {retry_exc}"
+                            failed = True
+                    else:
+                        output = f"Error: {exc}"
+                        failed = True
 
             if tool_name == "todo":
                 used_todo = True
@@ -468,7 +586,7 @@ async def agent_loop_async(
             output = str(output)
 
             # tool.after hook
-            await hooks.run_async(
+            tool_after_hr = await hooks.run_async(
                 HookPoint.TOOL_AFTER,
                 context=HookContext(
                     values={
@@ -477,9 +595,12 @@ async def agent_loop_async(
                         "tool_name": tool_name,
                         "tool_args": tool_args,
                         "tool_output": output,
+                        "failed": failed,
                     }
                 ),
             )
+            # TOOL_AFTER may replace tool_output
+            output = str(tool_after_hr.context.values.get("tool_output", output))
 
             if failed:
                 bus.publish(
@@ -509,6 +630,11 @@ async def agent_loop_async(
                 },
                 round_index=round_idx,
             )
+
+            # TOOL_AFTER directive: BREAK -> stop executing remaining tools
+            if tool_after_hr.directive == HookDirective.BREAK:
+                break_after_tool = True
+                break
 
         # Tools batch after hook
         await hooks.run_async(

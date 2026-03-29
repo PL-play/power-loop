@@ -18,7 +18,7 @@ from power_loop.core.hooks import AgentHooks
 from power_loop.core.runner import AgentRunner
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.handlers import EventHandler, HookHandler, ToolHandler, ToolHandlerResult
-from power_loop.contracts.hooks import HookContext, HookPoint
+from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
 from power_loop.contracts.messages import AgentMessage, MessageRole, ToolCall
 from power_loop.contracts.protocols import EventBusProtocol, HookManagerProtocol, ToolArgsValidator
 from power_loop.contracts.tools import ToolDefinition, validate_tool_args
@@ -30,6 +30,7 @@ from power_loop.tools.default_manifest import (
 	TOOL_PRESETS,
 	get_tool_definitions,
 )
+from power_loop.tools.spawn_agent import register_spawn_agent, SPAWN_AGENT_DEFINITION
 
 __all__ = [
 	"AgentLoop",
@@ -44,7 +45,9 @@ __all__ = [
 	"AgentHooks",
 	"AgentRunner",
 	"HookContext",
+	"HookDirective",
 	"HookPoint",
+	"HookResult",
 	"EventHandler",
 	"HookHandler",
 	"ToolHandler",
@@ -71,4 +74,6 @@ __all__ = [
 	"build_agent_system_prompt",
 	"build_subagent_system_prompt",
 	"build_explore_subagent_system_prompt",
+	"register_spawn_agent",
+	"SPAWN_AGENT_DEFINITION",
 ]
