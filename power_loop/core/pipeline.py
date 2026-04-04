@@ -1,8 +1,8 @@
 """AgentPipeline — the core agent loop refactored into discrete, hookable phases.
 
-Each phase is a small method decorated with ``@phase``, which injects
-before/after hooks, events, and directive handling automatically.
-The ``run()`` method is a minimal orchestrator (just the loops + directive checks).
+Phase methods (``prepare_round``, ``call_llm``, ``execute_tool``) are pure
+business logic with explicit parameters and return types.  All hook
+orchestration, directive checks, and event publishing live in ``run()``.
 
 The old ``agent_loop_async`` function is preserved in ``agent.py`` as a thin
 wrapper that delegates to ``AgentPipeline.run()``.
@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime
-from typing import Any, Dict, List, Mapping
+from typing import Any, Mapping
 
 from llm_client.interface import LLMRequest, LLMResponse, LLMService
 
@@ -22,7 +22,6 @@ from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
-from power_loop.core.phase import PhaseContext, PhaseResult, phase
 from power_loop.core.state import ContextManager
 from power_loop.tools.registry import ToolRegistry
 
@@ -206,23 +205,19 @@ class AgentPipeline:
         )
 
     # ══════════════════════════════════════════════════════════════
-    # Phase methods — each decorated with @phase for automatic
-    # hook injection, event publishing, and directive handling.
-    # The method body is ONLY business logic.
+    # Phase methods — pure business logic with explicit parameters.
+    # Hook orchestration is handled entirely by run().
     # ══════════════════════════════════════════════════════════════
 
-    @phase(before=HookPoint.ROUND_START)
-    async def prepare_round(self, ctx: PhaseContext) -> None:
+    async def prepare_round(self, round_index: int) -> None:
         """Prepare a new round: todo reminders, compaction."""
-        round_idx = ctx.values["round_index"]
-
         # Todo reminder
         if self.rounds_since_todo >= 5 and self.ctx.todo.has_in_progress:
             await self._append_message(
                 {"role": "user", "content": "<reminder>You have an in_progress todo. Update your todos.</reminder>"},
-                round_index=round_idx,
+                round_index=round_index,
             )
-            self._emit(AgentEventType.USER_NOTIFICATION, {"message": "update your todos"}, round_index=round_idx)
+            self._emit(AgentEventType.USER_NOTIFICATION, {"message": "update your todos"}, round_index=round_index)
             self.rounds_since_todo = 0
 
         # Microcompact
@@ -233,7 +228,7 @@ class AgentPipeline:
             compact_hr = await self.hooks.run_async(
                 HookPoint.COMPACT_BEFORE,
                 context=HookContext(values={
-                    "round_index": round_idx,
+                    "round_index": round_index,
                     "messages": self.history,
                     "input_tokens": self.ctx.last_input_tokens,
                     "compact_threshold": self.ctx.compact_threshold,
@@ -242,88 +237,84 @@ class AgentPipeline:
             if compact_hr.directive != HookDirective.SKIP:
                 self._emit(AgentEventType.STATUS_CHANGED, {
                     "kind": "auto_compact", "phase": "started",
-                    "round_index": round_idx,
+                    "round_index": round_index,
                     "trigger": "input_tokens_gt_threshold",
                     "input_tokens": self.ctx.last_input_tokens,
                     "compact_threshold": self.ctx.compact_threshold,
-                }, round_index=round_idx)
+                }, round_index=round_index)
                 before_len = len(self.history)
                 self.history = await self.ctx.compact_async(self.llm, self.history)
                 self.ctx.reset_usage()
                 await self.hooks.run_async(
                     HookPoint.COMPACT_AFTER,
                     context=HookContext(values={
-                        "round_index": round_idx,
+                        "round_index": round_index,
                         "messages": self.history,
                         "messages_before_count": before_len,
                         "messages_after_count": len(self.history),
                     }),
                 )
 
-    @phase(before=HookPoint.LLM_BEFORE, after=HookPoint.LLM_AFTER)
-    async def call_llm(self, ctx: PhaseContext) -> LLMResponse:
+    async def call_llm(
+        self,
+        round_index: int,
+        *,
+        messages: list[LoopMessage],
+        system_prompt: str,
+        tools: list[dict[str, Any]] | None,
+        max_tokens: int,
+        temperature: float,
+    ) -> LLMResponse:
         """Call the LLM and return its response."""
-        v = ctx.values
-        round_idx = ctx.round_index
-
-        # Stream callbacks
         def _on_delta(text: str) -> None:
             if text:
                 self._emit(AgentEventType.STREAM_DELTA,
                            {"stream_id": "main", "text": text, "is_think": False},
-                           round_index=round_idx, stream_id="main")
+                           round_index=round_index, stream_id="main")
 
         def _on_think(text: str) -> None:
             if text:
                 self._emit(AgentEventType.STREAM_THINK_DELTA,
                            {"stream_id": "main", "text": text, "is_think": True},
-                           round_index=round_idx, stream_id="main")
+                           round_index=round_index, stream_id="main")
 
         self._emit(AgentEventType.STREAM_STARTED, {"stream_id": "main"},
-                   round_index=round_idx, stream_id="main")
+                   round_index=round_index, stream_id="main")
 
         response = await self.llm.complete(
             LLMRequest(
-                messages=v.get("messages", self.history),
-                system_prompt=v.get("system_prompt", self.system_prompt),
-                tools=v.get("tools", self.runtime_tools),
-                tool_choice=v.get("tool_choice", "auto"),
-                max_tokens=int(v.get("max_tokens", self.config.max_tokens) or self.config.max_tokens or 8000),
-                temperature=float(v.get("temperature", self.config.temperature) or 0),
+                messages=messages,
+                system_prompt=system_prompt,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=max_tokens,
+                temperature=temperature,
             ),
             on_chunk_delta_text=_on_delta,
             on_chunk_think=_on_think,
         )
 
         self._emit(AgentEventType.STREAM_COMPLETED, {"stream_id": "main"},
-                   round_index=round_idx, stream_id="main")
+                   round_index=round_index, stream_id="main")
 
         return response
 
-    @phase(before=HookPoint.ROUND_DECIDE)
-    async def decide_tools(self, ctx: PhaseContext) -> list[dict[str, Any]]:
-        """Decide whether to execute tool calls. Returns the tool_calls list."""
-        return ctx.values.get("tool_calls", [])
+    async def execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> tuple[str, bool]:
+        """Execute a single tool and return ``(output_string, failed)``.
 
-    @phase(before=HookPoint.TOOL_BEFORE, after=HookPoint.TOOL_AFTER, error=HookPoint.TOOL_ERROR)
-    async def execute_tool(self, ctx: PhaseContext) -> str:
-        """Execute a single tool and return its output string."""
-        tool_name = ctx.values["tool_name"]
-        tool_args = ctx.values["tool_args"]
-
+        Raises on unexpected errors — the caller handles the TOOL_ERROR hook.
+        """
         validation_err = self.tool_registry.validate(tool_name, tool_args)
         if validation_err is not None:
-            ctx.values["failed"] = True
-            return validation_err
+            return (validation_err, True)
 
         result = await self.tool_registry.invoke_async(tool_name, tool_args)
-
         if not isinstance(result, str):
             result = json.dumps(result, ensure_ascii=False)
-        return str(result)
+        return (str(result), False)
 
     # ══════════════════════════════════════════════════════════════
-    # Main orchestrator — minimal loop + directive checks
+    # Main orchestrator — loop, hooks, directive checks, events
     # ══════════════════════════════════════════════════════════════
 
     async def run(self, messages: list[LoopMessage]) -> AgentLoopResult:
@@ -347,21 +338,27 @@ class AgentPipeline:
                 await self._finalize("cancelled")
                 return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx)
 
-            # ── Phase: prepare round ──
-            pr = await self.prepare_round(PhaseContext(
-                values={"round_index": round_idx, "messages": self.history, "stop_event": self.stop_event},
-                round_index=round_idx, session_id=self.session_id,
-            ))
-            if pr.should_break:
-                reason = pr.values.get("reason", "hook_break")
+            # ── Hook: ROUND_START ──
+            round_hr = await self.hooks.run_async(
+                HookPoint.ROUND_START,
+                context=HookContext(values={
+                    "round_index": round_idx, "messages": self.history,
+                    "stop_event": self.stop_event,
+                }),
+            )
+            if round_hr.directive == HookDirective.BREAK:
+                reason = round_hr.context.values.get("reason", "hook_break")
                 await self._finalize(reason)
                 return self._make_result("completed", rounds=round_idx)
-            if pr.should_skip:
+            if round_hr.directive == HookDirective.SKIP:
                 continue
 
-            # Update history if hook modified it
-            if isinstance(pr.values.get("messages"), list):
-                self.history = pr.values["messages"]
+            # Apply hook-modified messages
+            if isinstance(round_hr.context.values.get("messages"), list):
+                self.history = round_hr.context.values["messages"]
+
+            # ── Business logic: prepare round ──
+            await self.prepare_round(round_idx)
 
             self._emit(AgentEventType.ROUND_STARTED, {"round_index": round_idx}, round_index=round_idx)
 
@@ -370,37 +367,55 @@ class AgentPipeline:
             if todo_snap:
                 await self._append_message({"role": "user", "content": todo_snap}, round_index=round_idx)
 
-            # ── Phase: call LLM ──
-            llm_result = await self.call_llm(PhaseContext(
-                values={
+            # ── Hook: LLM_BEFORE ──
+            llm_before_hr = await self.hooks.run_async(
+                HookPoint.LLM_BEFORE,
+                context=HookContext(values={
                     "round_index": round_idx,
                     "messages": self.history,
                     "system_prompt": self.system_prompt,
                     "tools": self.runtime_tools,
-                    "tool_choice": "auto",
                     "max_tokens": self.config.max_tokens,
                     "temperature": self.config.temperature,
-                },
-                round_index=round_idx, session_id=self.session_id,
-            ))
+                }),
+            )
+            bv = llm_before_hr.context.values  # hook-modified values
 
-            if llm_result.is_short_circuit:
-                # before-hook provided a cached response
-                response = llm_result.values.get("output") or llm_result.output
+            if llm_before_hr.directive == HookDirective.SHORT_CIRCUIT:
+                response = bv.get("output")
                 if not isinstance(response, LLMResponse):
                     raise ValueError("LLM_BEFORE SHORT_CIRCUIT but no valid LLMResponse")
-            elif llm_result.should_break:
-                # LLM_AFTER said BREAK
-                text = ""
-                if isinstance(llm_result.output, LLMResponse):
-                    text = (getattr(llm_result.output, "raw_text", "") or "").strip()
-                await self._append_message({"role": "assistant", "content": text}, round_index=round_idx)
-                await self._finalize("hook_break", final_text=text)
-                return self._make_result("completed", final_text=text, rounds=round_idx + 1)
+            elif llm_before_hr.directive == HookDirective.BREAK:
+                await self._finalize("hook_break")
+                return self._make_result("completed", rounds=round_idx)
             else:
-                response = llm_result.output
-                # after hook may have replaced the response
-                after_resp = llm_result.values.get("output")
+                # ── Business logic: call LLM ──
+                response = await self.call_llm(
+                    round_idx,
+                    messages=bv.get("messages", self.history),
+                    system_prompt=bv.get("system_prompt", self.system_prompt),
+                    tools=bv.get("tools", self.runtime_tools),
+                    max_tokens=int(bv.get("max_tokens", self.config.max_tokens)
+                                   or self.config.max_tokens or 8000),
+                    temperature=float(bv.get("temperature", self.config.temperature) or 0),
+                )
+
+                # ── Hook: LLM_AFTER ──
+                llm_after_hr = await self.hooks.run_async(
+                    HookPoint.LLM_AFTER,
+                    context=HookContext(values={
+                        "round_index": round_idx,
+                        "output": response,
+                        "messages": self.history,
+                    }),
+                )
+                if llm_after_hr.directive == HookDirective.BREAK:
+                    text = (getattr(response, "raw_text", "") or "").strip()
+                    await self._append_message({"role": "assistant", "content": text}, round_index=round_idx)
+                    await self._finalize("hook_break", final_text=text)
+                    return self._make_result("completed", final_text=text, rounds=round_idx + 1)
+                # After hook may replace the response
+                after_resp = llm_after_hr.context.values.get("output")
                 if isinstance(after_resp, LLMResponse):
                     response = after_resp
 
@@ -441,19 +456,19 @@ class AgentPipeline:
                 await self._finalize("completed", final_text=assistant_text)
                 return self._make_result("completed", final_text=assistant_text, rounds=round_idx + 1)
 
-            # ── Phase: decide tools ──
-            decide_result = await self.decide_tools(PhaseContext(
-                values={
+            # ── Hook: ROUND_DECIDE ──
+            decide_hr = await self.hooks.run_async(
+                HookPoint.ROUND_DECIDE,
+                context=HookContext(values={
                     "round_index": round_idx, "messages": self.history,
                     "tool_calls": tool_calls, "assistant_text": assistant_text,
-                },
-                round_index=round_idx, session_id=self.session_id,
-            ))
-            if decide_result.should_break:
+                }),
+            )
+            if decide_hr.directive == HookDirective.BREAK:
                 await self._finalize("hook_break", final_text=assistant_text)
                 return self._make_result("completed", final_text=assistant_text, rounds=round_idx + 1)
-            if decide_result.should_skip:
-                skip_output = str(decide_result.values.get("output", "[skipped by round_decide hook]"))
+            if decide_hr.directive == HookDirective.SKIP:
+                skip_output = str(decide_hr.context.values.get("output", "[skipped by round_decide hook]"))
                 for tc in tool_calls:
                     cid = str(tc.get("id") or "")
                     tname = _tool_call_name(tc)
@@ -467,14 +482,14 @@ class AgentPipeline:
                 return self._make_result("pending_tools", final_text=assistant_text,
                                          rounds=round_idx + 1, pending_tool_calls=tool_calls)
 
-            # ── Tools batch before ──
+            # ── Hook: TOOLS_BATCH_BEFORE ──
             batch_hr = await self.hooks.run_async(
                 HookPoint.TOOLS_BATCH_BEFORE,
                 context=HookContext(values={"round_index": round_idx, "messages": self.history, "tool_calls": tool_calls}),
             )
             skip_batch = batch_hr.directive == HookDirective.SKIP
 
-            # ── Phase: execute tools ──
+            # ── Execute tools ──
             used_todo = False
             for tool_call in tool_calls:
                 if _is_cancelled(self.stop_event):
@@ -485,7 +500,7 @@ class AgentPipeline:
                 tool_name = _tool_call_name(tool_call)
                 tool_args = _tool_call_args(tool_call)
 
-                # Batch skip: emit placeholder result
+                # Batch skip
                 if skip_batch:
                     skip_out = str(batch_hr.context.values.get("tool_output", "[skipped by batch hook]"))
                     await self._append_message(
@@ -494,23 +509,21 @@ class AgentPipeline:
                     )
                     continue
 
-                # Execute single tool via @phase
-                tool_result = await self.execute_tool(PhaseContext(
-                    values={
+                # ── Hook: TOOL_BEFORE ──
+                tool_before_hr = await self.hooks.run_async(
+                    HookPoint.TOOL_BEFORE,
+                    context=HookContext(values={
                         "round_index": round_idx, "tool_call": tool_call,
                         "tool_name": tool_name, "tool_args": tool_args,
-                    },
-                    round_index=round_idx, session_id=self.session_id,
-                ))
+                    }),
+                )
+                # Before-hook may modify name/args
+                tool_name = str(tool_before_hr.context.values.get("tool_name", tool_name))
+                if isinstance(tool_before_hr.context.values.get("tool_args"), Mapping):
+                    tool_args = dict(tool_before_hr.context.values["tool_args"])
 
-                # Before-hook may have modified name/args
-                tool_name = str(tool_result.values.get("tool_name", tool_name))
-                if isinstance(tool_result.values.get("tool_args"), Mapping):
-                    tool_args = dict(tool_result.values["tool_args"])
-
-                if tool_result.should_skip:
-                    # TOOL_BEFORE said skip
-                    output = str(tool_result.values.get("output", "[skipped by hook]"))
+                if tool_before_hr.directive == HookDirective.SKIP:
+                    output = str(tool_before_hr.context.values.get("output", "[skipped by hook]"))
                     await self._append_message(
                         {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": output},
                         round_index=round_idx,
@@ -521,11 +534,47 @@ class AgentPipeline:
                            {"name": tool_name, "tool_input": tool_args, "tool_call_id": call_id},
                            round_index=round_idx)
 
-                output = str(tool_result.output) if tool_result.output is not None else ""
-                # After hook may have replaced output
-                if "output" in tool_result.values and tool_result.values["output"] is not None:
-                    output = str(tool_result.values["output"])
-                failed = tool_result.values.get("failed", False)
+                # ── Business logic: execute tool ──
+                failed = False
+                try:
+                    output, failed = await self.execute_tool(tool_name, tool_args)
+                except Exception as exc:
+                    # ── Hook: TOOL_ERROR ──
+                    err_hr = await self.hooks.run_async(
+                        HookPoint.TOOL_ERROR,
+                        context=HookContext(values={
+                            "round_index": round_idx, "tool_call": tool_call,
+                            "tool_name": tool_name, "tool_args": tool_args,
+                            "error": exc, "error_message": str(exc),
+                        }),
+                    )
+                    if err_hr.directive == HookDirective.SKIP:
+                        output = str(err_hr.context.values.get("output", f"Error: {exc}"))
+                    elif err_hr.directive == HookDirective.SHORT_CIRCUIT:
+                        # Retry once
+                        try:
+                            output, failed = await self.execute_tool(tool_name, tool_args)
+                        except Exception as retry_exc:
+                            output = f"Error (retry failed): {retry_exc}"
+                            failed = True
+                    else:
+                        output = f"Error: {exc}"
+                        failed = True
+
+                # ── Hook: TOOL_AFTER ──
+                tool_after_hr = await self.hooks.run_async(
+                    HookPoint.TOOL_AFTER,
+                    context=HookContext(values={
+                        "round_index": round_idx, "tool_call": tool_call,
+                        "tool_name": tool_name, "tool_args": tool_args,
+                        "output": output, "failed": failed,
+                    }),
+                )
+                # After hook may replace output
+                after_output = tool_after_hr.context.values.get("output")
+                if after_output is not None:
+                    output = str(after_output)
+                failed = tool_after_hr.context.values.get("failed", failed)
 
                 if tool_name == "todo":
                     used_todo = True
@@ -546,10 +595,10 @@ class AgentPipeline:
                 )
 
                 # TOOL_AFTER BREAK → stop remaining tools
-                if tool_result.should_break:
+                if tool_after_hr.directive == HookDirective.BREAK:
                     break
 
-            # ── Tools batch after ──
+            # ── Hook: TOOLS_BATCH_AFTER ──
             await self.hooks.run_async(
                 HookPoint.TOOLS_BATCH_AFTER,
                 context=HookContext(values={"round_index": round_idx, "messages": self.history, "used_todo": used_todo}),

@@ -52,7 +52,6 @@ from power_loop import (
     create_default_tool_registry,
     register_spawn_agent,
 )
-from power_loop.contracts.messages import MessageRole
 
 
 # =====================================================================
@@ -453,7 +452,7 @@ async def _async_level4_spawn_agent_delegation(creds: Dict[str, str]) -> None:
                 "You are a project coordinator. "
                 "Check project structure briefly, then summarize."
             ),
-            max_rounds=2,
+            max_rounds=5,
             max_tokens=1024,
             temperature=0.0,
         )
@@ -558,7 +557,7 @@ async def _async_level5_advanced_workflow(creds: Dict[str, str]) -> None:
 
         def on_message_append(ctx: HookContext) -> HookContext:
             msg = ctx.values.get("message")
-            if msg and msg.get("role") == MessageRole.ASSISTANT:
+            if msg and msg.get("role") == "assistant":
                 workflow_state["steps"].append({
                     "type": "assistant_message",
                     "timestamp": datetime.now().isoformat(),
