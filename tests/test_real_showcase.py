@@ -47,6 +47,13 @@ from power_loop import (
     HookDirective,
     HookPoint,
     HookResult,
+    LlmAfterCtx,
+    LlmBeforeCtx,
+    MessageAppendCtx,
+    RoundStartCtx,
+    SessionEndCtx,
+    SessionStartCtx,
+    ToolBeforeCtx,
     SystemPromptBuilder,
     SystemPromptContext,
     ToolDefinition,
@@ -341,48 +348,41 @@ async def level_4_hooks(llm: OpenAICompatibleChatLLMService):
 
     # ── Hook 1: Security policy (TOOL_BEFORE → SKIP) ──
     # Block any tool call that contains "rm", "delete", or "drop"
-    def security_policy(ctx: HookContext) -> HookResult:
-        tool_name = ctx.values.get("tool_name", "")
-        tool_args = ctx.values.get("tool_args", {})
-        args_str = json.dumps(tool_args, ensure_ascii=False)
+    def security_policy(ctx: ToolBeforeCtx) -> None:
+        args_str = json.dumps(ctx.tool_args, ensure_ascii=False)
 
         dangerous_keywords = ["rm ", "rm -", "delete", "drop ", "rmdir", "unlink"]
         for kw in dangerous_keywords:
             if kw in args_str.lower():
-                blocked_tools.append(f"{tool_name}({args_str[:60]})")
-                ctx.values["output"] = f"BLOCKED by security policy: '{kw}' detected in arguments."
-                print(f"\n  [SECURITY] BLOCKED: {tool_name} with '{kw}'", flush=True)
-                return HookResult(context=ctx, directive=HookDirective.SKIP)
-
-        return HookResult(context=ctx, directive=HookDirective.CONTINUE)
+                blocked_tools.append(f"{ctx.tool_name}({args_str[:60]})")
+                ctx.output = f"BLOCKED by security policy: '{kw}' detected in arguments."
+                print(f"\n  [SECURITY] BLOCKED: {ctx.tool_name} with '{kw}'", flush=True)
+                ctx.directive = HookDirective.SKIP
+                return
 
     hooks.register(HookPoint.TOOL_BEFORE, security_policy, order=0)
 
     # ── Hook 2: Audit log (MESSAGE_APPEND) ──
     # Record every message with timestamp
-    def audit_hook(ctx: HookContext) -> HookContext:
-        msg = ctx.values.get("message")
+    def audit_hook(ctx: MessageAppendCtx) -> None:
+        msg = ctx.message
         if msg:
             audit_log.append({
                 "time": datetime.now().isoformat(timespec="seconds"),
-                "round": ctx.values.get("round_index"),
+                "round": ctx.round_index,
                 "role": msg.get("role", "?"),
                 "content_preview": str(msg.get("content", ""))[:80],
                 "has_tool_calls": bool(msg.get("tool_calls")),
             })
-        return ctx
 
     hooks.register(HookPoint.MESSAGE_APPEND, audit_hook)
 
     # ── Hook 3: Session lifecycle logging ──
-    def on_session_start(ctx: HookContext) -> HookContext:
-        print(f"  [HOOK] Session starting, messages={len(ctx.values.get('messages', []))}", flush=True)
-        return ctx
+    def on_session_start(ctx: SessionStartCtx) -> None:
+        print(f"  [HOOK] Session starting, messages={len(ctx.messages)}", flush=True)
 
-    def on_session_end(ctx: HookContext) -> HookContext:
-        reason = ctx.values.get("reason", "?")
-        print(f"  [HOOK] Session ending, reason={reason}", flush=True)
-        return ctx
+    def on_session_end(ctx: SessionEndCtx) -> None:
+        print(f"  [HOOK] Session ending, reason={ctx.reason}", flush=True)
 
     hooks.register(HookPoint.SESSION_START, on_session_start)
     hooks.register(HookPoint.SESSION_END, on_session_end)
@@ -487,57 +487,50 @@ async def level_5_combo(llm: OpenAICompatibleChatLLMService):
     tool_call_timestamps: List[float] = []
 
     # ── Hook 1: Round progress tracker (order=0, runs first) ──
-    def round_tracker(ctx: HookContext) -> HookContext:
-        round_idx = ctx.values.get("round_index", 0)
-        print(f"\n  [Round {round_idx + 1}] starting...", flush=True)
-        telemetry["rounds"].append({"index": round_idx, "start_time": time.time()})
-        return ctx
+    def round_tracker(ctx: RoundStartCtx) -> None:
+        print(f"\n  [Round {ctx.round_index + 1}] starting...", flush=True)
+        telemetry["rounds"].append({"index": ctx.round_index, "start_time": time.time()})
 
     hooks.register(HookPoint.ROUND_START, round_tracker, order=0)
 
     # ── Hook 2: Token budget guard (order=1, runs after tracker) ──
-    def budget_guard(ctx: HookContext) -> HookResult:
+    def budget_guard(ctx: RoundStartCtx) -> None:
         if telemetry["total_prompt_tokens"] > TOKEN_BUDGET:
             print(f"\n  [BUDGET] Token budget exceeded: {telemetry['total_prompt_tokens']} > {TOKEN_BUDGET}", flush=True)
-            ctx.values["reason"] = "token_budget_exceeded"
+            ctx.reason = "token_budget_exceeded"
             telemetry["budget_break"] = True
-            return HookResult(context=ctx, directive=HookDirective.BREAK)
-        return HookResult(context=ctx, directive=HookDirective.CONTINUE)
+            ctx.directive = HookDirective.BREAK
 
     hooks.register(HookPoint.ROUND_START, budget_guard, order=1)
 
     # ── Hook 3: Tool rate limiter (TOOL_BEFORE) ──
-    def rate_limiter(ctx: HookContext) -> HookResult:
+    def rate_limiter(ctx: ToolBeforeCtx) -> None:
         now = time.time()
         tool_call_timestamps.append(now)
 
-        # Count calls in last 10 seconds
         recent = [t for t in tool_call_timestamps if now - t < 10]
-        tool_name = ctx.values.get("tool_name", "?")
-        telemetry["tool_calls"].append({"name": tool_name, "time": now})
+        telemetry["tool_calls"].append({"name": ctx.tool_name, "time": now})
 
         if len(recent) > 10:
             print(f"\n  [RATE LIMIT] Too many tool calls ({len(recent)} in 10s), injecting warning", flush=True)
-            ctx.values["output"] = (
+            ctx.output = (
                 "Rate limit: too many tool calls in quick succession. "
                 "Please slow down and batch your operations."
             )
-            return HookResult(context=ctx, directive=HookDirective.SKIP)
+            ctx.directive = HookDirective.SKIP
+            return
 
-        print(f"\n  [rate] tool={tool_name}, recent_calls={len(recent)}/10", flush=True)
-        return HookResult(context=ctx, directive=HookDirective.CONTINUE)
+        print(f"\n  [rate] tool={ctx.tool_name}, recent_calls={len(recent)}/10", flush=True)
 
     hooks.register(HookPoint.TOOL_BEFORE, rate_limiter, order=0)
 
     # ── Hook 4: Response length monitor (LLM_AFTER) ──
     from llm_client.interface import LLMResponse
-    def response_monitor(ctx: HookContext) -> HookContext:
-        output = ctx.values.get("output")
-        if isinstance(output, LLMResponse):
-            text = output.raw_text or ""
+    def response_monitor(ctx: LlmAfterCtx) -> None:
+        if isinstance(ctx.output, LLMResponse):
+            text = ctx.output.raw_text or ""
             if len(text) > 2000:
                 print(f"\n  [MONITOR] Long response: {len(text)} chars", flush=True)
-        return ctx
 
     hooks.register(HookPoint.LLM_AFTER, response_monitor)
 
@@ -701,12 +694,11 @@ async def level_6_spawn_agent(llm: OpenAICompatibleChatLLMService, model: str):
 
     tool_activity: List[Dict[str, Any]] = []
 
-    def tool_logger(ctx: HookContext) -> HookContext:
+    def tool_logger(ctx: ToolBeforeCtx) -> None:
         tool_activity.append({
-            "tool": ctx.values.get("tool_name"),
+            "tool": ctx.tool_name,
             "time": datetime.now().isoformat(timespec="seconds"),
         })
-        return ctx
 
     hooks.register(HookPoint.TOOL_BEFORE, tool_logger)
 
@@ -783,34 +775,28 @@ async def bonus_short_circuit_cache(llm: OpenAICompatibleChatLLMService):
     cache_hits = 0
 
     # ── LLM_AFTER: store response in cache ──
-    def cache_store(ctx: HookContext) -> HookContext:
-        messages = ctx.values.get("messages", [])
-        output = ctx.values.get("output")
-        if messages and isinstance(output, LLMResponse):
-            # Use last user message as cache key
-            last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    def cache_store(ctx: LlmAfterCtx) -> None:
+        if ctx.messages and isinstance(ctx.output, LLMResponse):
+            last_user = next((m for m in reversed(ctx.messages) if m.get("role") == "user"), None)
             if last_user:
                 key = str(last_user.get("content", ""))[:200]
-                cache[key] = output
+                cache[key] = ctx.output
                 print(f"\n  [cache] Stored response for: {key[:50]}...", flush=True)
-        return ctx
 
     hooks.register(HookPoint.LLM_AFTER, cache_store)
 
     # ── LLM_BEFORE: check cache and SHORT_CIRCUIT if hit ──
-    def cache_check(ctx: HookContext) -> HookResult:
+    def cache_check(ctx: LlmBeforeCtx) -> None:
         nonlocal cache_hits
-        messages = ctx.values.get("messages", [])
-        if messages:
-            last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+        if ctx.messages:
+            last_user = next((m for m in reversed(ctx.messages) if m.get("role") == "user"), None)
             if last_user:
                 key = str(last_user.get("content", ""))[:200]
                 if key in cache:
                     cache_hits += 1
                     print(f"\n  [cache] HIT! Returning cached response (hit #{cache_hits})", flush=True)
-                    ctx.values["output"] = cache[key]
-                    return HookResult(context=ctx, directive=HookDirective.SHORT_CIRCUIT)
-        return HookResult(context=ctx, directive=HookDirective.CONTINUE)
+                    ctx.output = cache[key]
+                    ctx.directive = HookDirective.SHORT_CIRCUIT
 
     hooks.register(HookPoint.LLM_BEFORE, cache_check)
 
