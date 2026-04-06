@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Protocol
 
 from power_loop.contracts.events import AgentEvent
-from power_loop.contracts.hooks import HookContext
+from power_loop.contracts.hook_contexts import BaseHookCtx
+from power_loop.contracts.hooks import HookContext, HookDirective
 
 
 class EventHandler(Protocol):
@@ -13,7 +14,15 @@ class EventHandler(Protocol):
 
 
 class HookHandler(Protocol):
-    def __call__(self, context: HookContext) -> HookContext | Dict[str, Any] | Awaitable[HookContext | Dict[str, Any]]:
+    """Hook handler callable.
+
+    The recommended (typed) signature receives a ``BaseHookCtx`` subclass,
+    mutates it in-place, and optionally returns ``HookDirective`` or ``None``.
+
+    Legacy handlers that accept ``HookContext`` are still supported.
+    """
+
+    def __call__(self, ctx: BaseHookCtx) -> HookDirective | None | Awaitable[HookDirective | None]:
         ...
 
 

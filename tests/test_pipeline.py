@@ -9,6 +9,12 @@ from llm_client.interface import LLMResponse, LLMService, LLMTokenUsage
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
+from power_loop.contracts.hook_contexts import (
+    LlmBeforeCtx,
+    MessageAppendCtx,
+    RoundStartCtx,
+    ToolBeforeCtx,
+)
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.phase import PhaseContext, PhaseResult, phase
@@ -162,9 +168,9 @@ def test_round_start_break():
     """ROUND_START BREAK at round 0 should prevent any LLM call."""
     hooks = AgentHooks()
 
-    def budget_guard(ctx: HookContext) -> HookResult:
-        ctx.values["reason"] = "budget_exceeded"
-        return HookResult(context=ctx, directive=HookDirective.BREAK)
+    def budget_guard(ctx: RoundStartCtx) -> None:
+        ctx.reason = "budget_exceeded"
+        ctx.directive = HookDirective.BREAK
 
     hooks.register(HookPoint.ROUND_START, budget_guard)
 
@@ -197,14 +203,13 @@ def test_round_start_break():
 def test_llm_before_short_circuit():
     hooks = AgentHooks()
 
-    def cache_hook(ctx: HookContext) -> HookResult:
-        # Always return a cached response
-        ctx.values["output"] = LLMResponse(
+    def cache_hook(ctx: LlmBeforeCtx) -> None:
+        ctx.output = LLMResponse(
             raw_text="cached!",
             content_text="cached!",
             token_usage=LLMTokenUsage(prompt_tokens=0, completion_tokens=0),
         )
-        return HookResult(context=ctx, directive=HookDirective.SHORT_CIRCUIT)
+        ctx.directive = HookDirective.SHORT_CIRCUIT
 
     hooks.register(HookPoint.LLM_BEFORE, cache_hook)
 
@@ -248,11 +253,10 @@ def test_tool_before_skip():
 
     hooks = AgentHooks()
 
-    def block_dangerous(ctx: HookContext) -> HookResult:
-        if ctx.values.get("tool_name") == "dangerous":
-            ctx.values["output"] = "[blocked by policy]"
-            return HookResult(context=ctx, directive=HookDirective.SKIP)
-        return HookResult(context=ctx)
+    def block_dangerous(ctx: ToolBeforeCtx) -> None:
+        if ctx.tool_name == "dangerous":
+            ctx.output = "[blocked by policy]"
+            ctx.directive = HookDirective.SKIP
 
     hooks.register(HookPoint.TOOL_BEFORE, block_dangerous)
 
@@ -298,13 +302,12 @@ def test_tool_before_skip():
 def test_message_append_hook():
     hooks = AgentHooks()
 
-    def redactor(ctx: HookContext) -> HookContext:
-        msg = ctx.values.get("message", {})
+    def redactor(ctx: MessageAppendCtx) -> None:
+        msg = ctx.message
         if msg.get("role") == "assistant":
             msg = dict(msg)
             msg["content"] = msg.get("content", "").replace("secret", "***")
-            ctx.values["message"] = msg
-        return ctx
+            ctx.message = msg
 
     hooks.register(HookPoint.MESSAGE_APPEND, redactor)
 

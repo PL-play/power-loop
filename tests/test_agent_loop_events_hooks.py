@@ -9,6 +9,19 @@ from llm_client.interface import LLMResponse
 from power_loop.agent.loop import AgentLoop
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.contracts.hooks import HookContext, HookPoint
+from power_loop.contracts.hook_contexts import (
+    BaseHookCtx,
+    LlmAfterCtx,
+    LlmBeforeCtx,
+    RoundEndCtx,
+    RoundStartCtx,
+    SessionEndCtx,
+    SessionStartCtx,
+    ToolAfterCtx,
+    ToolBeforeCtx,
+    ToolsBatchAfterCtx,
+    ToolsBatchBeforeCtx,
+)
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.contracts.events import AgentEventType
@@ -77,21 +90,18 @@ def test_events_and_hooks_for_tool_execution() -> None:
     tool_after: list[tuple[str, str]] = []
 
     def _mk(name: str):
-        def _handler(ctx: HookContext) -> HookContext:
+        def _handler(ctx: BaseHookCtx) -> None:
             hook_calls.append(name)
-            return ctx
 
         return _handler
 
-    def _tool_before(ctx: HookContext) -> HookContext:
+    def _tool_before(ctx: ToolBeforeCtx) -> None:
         hook_calls.append("tool.before")
-        tool_before.append(dict(ctx.values.get("tool_args") or {}))
-        return ctx
+        tool_before.append(dict(ctx.tool_args))
 
-    def _tool_after(ctx: HookContext) -> HookContext:
+    def _tool_after(ctx: ToolAfterCtx) -> None:
         hook_calls.append("tool.after")
-        tool_after.append((str(ctx.values.get("tool_name")), str(ctx.values.get("tool_output"))))
-        return ctx
+        tool_after.append((ctx.tool_name, ctx.output))
 
     hooks.register(HookPoint.SESSION_START, _mk("session.start"))
     hooks.register(HookPoint.ROUND_START, _mk("round.start"))

@@ -4,7 +4,8 @@ from typing import Any, Awaitable, Protocol
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.handlers import EventHandler, HookHandler
-from power_loop.contracts.hooks import HookContext, HookPoint
+from power_loop.contracts.hook_contexts import BaseHookCtx
+from power_loop.contracts.hooks import HookContext, HookPoint, HookResult
 
 
 class EventBusProtocol(Protocol):
@@ -28,10 +29,16 @@ class HookManagerProtocol(Protocol):
     def clear(self, hook_point: HookPoint | str | None = None) -> None:
         ...
 
-    def run(self, hook_point: HookPoint | str, context: HookContext) -> HookContext:
+    def run(self, hook_point: HookPoint | str, context: HookContext) -> HookResult:
         ...
 
-    async def run_async(self, hook_point: HookPoint | str, context: HookContext) -> HookContext:
+    async def run_async(self, hook_point: HookPoint | str, context: HookContext) -> HookResult:
+        ...
+
+    def run_typed(self, hook_point: HookPoint | str, ctx: BaseHookCtx) -> None:
+        ...
+
+    async def run_typed_async(self, hook_point: HookPoint | str, ctx: BaseHookCtx) -> None:
         ...
 
 

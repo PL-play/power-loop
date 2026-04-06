@@ -21,6 +21,24 @@ from power_loop.core.runner import AgentRunner
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.handlers import EventHandler, HookHandler, ToolHandler, ToolHandlerResult
 from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
+from power_loop.contracts.hook_contexts import (
+	BaseHookCtx,
+	CompactAfterCtx,
+	CompactBeforeCtx,
+	LlmAfterCtx,
+	LlmBeforeCtx,
+	MessageAppendCtx,
+	RoundDecideCtx,
+	RoundEndCtx,
+	RoundStartCtx,
+	SessionEndCtx,
+	SessionStartCtx,
+	ToolAfterCtx,
+	ToolBeforeCtx,
+	ToolErrorCtx,
+	ToolsBatchAfterCtx,
+	ToolsBatchBeforeCtx,
+)
 from power_loop.contracts.messages import AgentMessage, MessageRole, ToolCall
 from power_loop.contracts.protocols import EventBusProtocol, HookManagerProtocol, ToolArgsValidator
 from power_loop.contracts.tools import ToolDefinition, validate_tool_args
@@ -54,6 +72,22 @@ __all__ = [
 	"HookDirective",
 	"HookPoint",
 	"HookResult",
+	"BaseHookCtx",
+	"CompactAfterCtx",
+	"CompactBeforeCtx",
+	"LlmAfterCtx",
+	"LlmBeforeCtx",
+	"MessageAppendCtx",
+	"RoundDecideCtx",
+	"RoundEndCtx",
+	"RoundStartCtx",
+	"SessionEndCtx",
+	"SessionStartCtx",
+	"ToolAfterCtx",
+	"ToolBeforeCtx",
+	"ToolErrorCtx",
+	"ToolsBatchAfterCtx",
+	"ToolsBatchBeforeCtx",
 	"EventHandler",
 	"HookHandler",
 	"ToolHandler",
