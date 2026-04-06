@@ -47,6 +47,9 @@ from power_loop import (
     HookContext,
     HookPoint,
     HookDirective,
+    MessageAppendCtx,
+    ToolAfterCtx,
+    ToolBeforeCtx,
     ToolDefinition,
     ToolRegistry,
     create_default_tool_registry,
@@ -213,7 +216,7 @@ async def _async_level2_multiturn_with_tools(creds: Dict[str, str]) -> None:
                 "2. Read __init__.py to understand exports\n"
                 "3. Summarize the project structure"
             ),
-            max_rounds=5,
+            max_rounds=15,
             max_tokens=2048,
             temperature=0.0,
         )
@@ -325,29 +328,24 @@ async def _async_level3_custom_tools_with_hooks(creds: Dict[str, str]) -> None:
             "hook_calls": 0,
         }
 
-        def on_message_append(ctx: HookContext) -> HookContext:
+        def on_message_append(ctx: MessageAppendCtx) -> None:
             state["messages_count"] += 1
-            msg = ctx.values.get("message")
+            msg = ctx.message
             if msg:
                 role = msg.get("role", "?")
                 content_len = len(str(msg.get("content", "")))
                 print(f"  [Hook:MESSAGE_APPEND] #{state['messages_count']} role={role} len={content_len}")
-            return ctx
 
-        def on_tool_start(ctx: HookContext) -> HookContext:
+        def on_tool_start(ctx: ToolBeforeCtx) -> None:
             state["hook_calls"] += 1
-            tool_name = ctx.values.get("tool_name")
-            tool_input = ctx.values.get("tool_input")
-            print(f"  [Hook:TOOL_CALL_START] {tool_name} with input: {tool_input}")
+            print(f"  [Hook:TOOL_CALL_START] {ctx.tool_name} with input: {ctx.tool_args}")
             state["tool_inputs_log"].append({
-                "tool": tool_name,
-                "input": tool_input,
+                "tool": ctx.tool_name,
+                "input": ctx.tool_args,
             })
-            return ctx
 
-        def on_tool_complete(ctx: HookContext) -> HookContext:
+        def on_tool_complete(ctx: ToolAfterCtx) -> None:
             state["hook_calls"] += 1
-            return ctx
 
         hooks.register(HookPoint.MESSAGE_APPEND, on_message_append)
         hooks.register(HookPoint.TOOL_BEFORE, on_tool_start)
@@ -555,22 +553,19 @@ async def _async_level5_advanced_workflow(creds: Dict[str, str]) -> None:
         bus = AgentEventBus(suppress_subscriber_errors=True)
         hooks = AgentHooks()
 
-        def on_message_append(ctx: HookContext) -> HookContext:
-            msg = ctx.values.get("message")
+        def on_message_append(ctx: MessageAppendCtx) -> None:
+            msg = ctx.message
             if msg and msg.get("role") == "assistant":
                 workflow_state["steps"].append({
                     "type": "assistant_message",
                     "timestamp": datetime.now().isoformat(),
                 })
-            return ctx
 
-        def on_tool_call_start(ctx: HookContext) -> HookContext:
-            tool_name = ctx.values.get("tool_name")
-            if tool_name not in workflow_state["tool_calls"]:
-                workflow_state["tool_calls"][tool_name] = 0
-            workflow_state["tool_calls"][tool_name] += 1
-            print(f"  [Decision Point] Using tool: {tool_name}")
-            return ctx
+        def on_tool_call_start(ctx: ToolBeforeCtx) -> None:
+            if ctx.tool_name not in workflow_state["tool_calls"]:
+                workflow_state["tool_calls"][ctx.tool_name] = 0
+            workflow_state["tool_calls"][ctx.tool_name] += 1
+            print(f"  [Decision Point] Using tool: {ctx.tool_name}")
 
         hooks.register(HookPoint.MESSAGE_APPEND, on_message_append)
         hooks.register(HookPoint.TOOL_BEFORE, on_tool_call_start)

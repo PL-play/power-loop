@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Protocol
+from typing import Any, Awaitable, Callable, Dict, List, Protocol, Union
 
-from power_loop.contracts.events import AgentEventType
+from power_loop.contracts.hook_contexts import BaseHookCtx
 from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
-from power_loop.contracts.handlers import HookHandler
 
 
-class _HookHandlerResult(Protocol):
-    def __await__(self) -> Any: ...
+HookHandlerFn = Callable[..., Any]
+"""A hook handler callable.
 
+For **typed** hooks (the recommended style) the signature is::
 
-HookHandlerFn = Callable[
-    [HookContext],
-    HookContext | HookResult | Dict[str, Any] | Awaitable[HookContext | HookResult | Dict[str, Any]],
-]
+    def handler(ctx: SomeHookCtx) -> None | HookDirective
+
+Handlers mutate *ctx* in-place and optionally return a ``HookDirective``.
+
+Legacy handlers that receive ``HookContext`` and return
+``HookContext | HookResult | dict | None`` are still supported via
+:meth:`AgentHooks.run` / :meth:`AgentHooks.run_async`.
+"""
 
 
 @dataclass
@@ -27,16 +31,15 @@ class _HookEntry:
 class AgentHooks:
     """Hook manager with ordered sync/async handlers.
 
-    Handlers may return:
-      - ``HookContext`` — replaces the current context, directive stays CONTINUE.
-      - ``HookResult`` — replaces both context and directive.
-      - ``dict`` — shorthand, assigned to ``context.values``.
-      - ``None`` — no change.
+    **Typed API** (recommended — all pipeline hook points use this):
 
-    Once any handler sets a non-CONTINUE directive the pipeline **keeps running**
-    (later handlers can observe or override) but the final ``HookResult.directive``
-    will be the *last* non-CONTINUE directive set.  This lets an "audit" handler
-    after a "skip" handler override the skip if needed.
+    Handlers receive a strongly-typed ``*Ctx`` dataclass, mutate it in place,
+    and optionally return ``HookDirective`` or set ``ctx.directive``.
+
+    **Legacy API** (still supported for unit-test ergonomics):
+
+    Handlers receive ``HookContext`` and may return ``HookContext``,
+    ``HookResult``, ``dict``, or ``None``.
     """
 
     def __init__(self) -> None:
@@ -53,12 +56,13 @@ class AgentHooks:
             return
         self._handlers.pop(str(hook_point), None)
 
+    # ── Legacy dict-based API ──
+
     @staticmethod
     def _apply(context: HookContext, directive: HookDirective, result: Any) -> tuple[HookContext, HookDirective]:
         if result is None:
             return context, directive
         if isinstance(result, HookResult):
-            # HookResult always carries an explicit directive choice.
             return result.context, result.directive
         if isinstance(result, HookContext):
             return result, directive
@@ -84,6 +88,34 @@ class AgentHooks:
                 result = await result  # type: ignore[assignment]
             context, directive = self._apply(context, directive, result)
         return HookResult(context=context, directive=directive)
+
+    # ── Typed context API (all pipeline hooks use this path) ──
+
+    @staticmethod
+    def _apply_typed(ctx: BaseHookCtx, result: Any) -> None:
+        """Apply handler return value to the typed context."""
+        if result is None:
+            return
+        if isinstance(result, HookDirective):
+            ctx.directive = result
+            return
+        if isinstance(result, HookResult):
+            ctx.directive = result.directive
+            return
+
+    def run_typed(self, hook_point: HookPoint | str, ctx: BaseHookCtx) -> None:
+        """Run handlers with a typed context.  Handlers mutate *ctx* in place."""
+        for entry in self._handlers.get(str(hook_point), []):
+            result = entry.handler(ctx)
+            self._apply_typed(ctx, result)
+
+    async def run_typed_async(self, hook_point: HookPoint | str, ctx: BaseHookCtx) -> None:
+        """Async version of :meth:`run_typed`."""
+        for entry in self._handlers.get(str(hook_point), []):
+            result = entry.handler(ctx)
+            if hasattr(result, "__await__"):
+                result = await result  # type: ignore[assignment]
+            self._apply_typed(ctx, result)
 
 
 DEFAULT_HOOKS = AgentHooks()
