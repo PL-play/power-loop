@@ -24,6 +24,7 @@ from contextvars import ContextVar
 from typing import Any, Dict, Mapping
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
+from power_loop.contracts.event_payloads import SubagentLimitPayload, SubagentTaskStartPayload, SubagentTextPayload
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_event_bus, get_session_id
 
@@ -126,10 +127,12 @@ async def run_spawn_agent(
 
         sub_bus.subscribe(None, _bubble)  # global subscriber
 
-    # Notify parent about sub-agent start
     parent_bus.publish(AgentEvent(
         type=AgentEventType.SUBAGENT_TASK_START,
-        payload={"task": task[:500], "preset": preset, "sub_session_id": sub_session_id, "depth": current_depth + 1},
+        data=SubagentTaskStartPayload(
+            task=task[:500], preset=preset,
+            sub_session_id=sub_session_id, depth=current_depth + 1,
+        ),
         session_id=parent_session,
     ))
 
@@ -170,22 +173,21 @@ async def run_spawn_agent(
     finally:
         _spawn_depth.set(current_depth)
 
-    # Notify parent about completion
     parent_bus.publish(AgentEvent(
         type=AgentEventType.SUBAGENT_TEXT,
-        payload={
-            "sub_session_id": sub_session_id,
-            "status": result.status,
-            "rounds": result.rounds,
-            "final_text": (result.final_text or "")[:2000],
-        },
+        data=SubagentTextPayload(
+            sub_session_id=sub_session_id,
+            status=result.status,
+            rounds=result.rounds,
+            final_text=(result.final_text or "")[:2000],
+        ),
         session_id=parent_session,
     ))
 
     if result.status == "hit_round_limit":
         parent_bus.publish(AgentEvent(
             type=AgentEventType.SUBAGENT_LIMIT,
-            payload={"sub_session_id": sub_session_id, "max_rounds": config.max_rounds},
+            data=SubagentLimitPayload(sub_session_id=sub_session_id, max_rounds=config.max_rounds),
             session_id=parent_session,
         ))
 

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict
+from typing import Any, Dict, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from power_loop.contracts.event_payloads import BaseEventPayload
 
 
 class AgentEventType(str, Enum):
@@ -47,24 +50,28 @@ class AgentEventType(str, Enum):
 
 @dataclass
 class AgentEvent:
-    """Agent lifecycle event.
-    Common payload conventions (JSON-serializable dicts):
-    - ``STATUS_CHANGED``: always includes ``kind`` (discriminator). Known kinds:
-      ``auto_compact`` (phase, round_index, trigger, input_tokens, compact_threshold),
-      ``round_usage`` (time_iso, round_index, round_number, max_rounds, token fields),
-      ``hit_round_limit`` (max_rounds).
-   - ``USAGE_UPDATED``: ``usage`` includes both **completion_*** (single last LLM response) and
-      **session_*** (cumulative for this agent session); legacy keys ``input`` / ``total_in`` remain
-      aliases. ``session`` mirrors :class:`~power_loop.core.state.ContextManager` counters (with
-      legacy field names duplicated). Optional ``summary`` is human-readable; prefer structured keys.
- 
-      and optional ``summary`` (human line; prefer ``usage`` / ``session`` for logic).
-    - ``TODO_UPDATED``: ``kind`` = ``todo_snapshot``, ``items``, ``counts``, ``rendered``;
-      ``text`` is kept as an alias of ``rendered`` for older subscribers.
+    """Agent lifecycle event with typed payload.
+
+    The ``data`` field holds a strongly-typed payload dataclass (e.g.
+    ``StreamDeltaPayload``, ``ToolCallStartedPayload``).  Subscribers can
+    access fields directly with IDE auto-completion::
+
+        def on_delta(event: AgentEvent) -> None:
+            delta: StreamDeltaPayload = event.data
+            print(delta.text)
+
+    The legacy ``payload`` dict is auto-generated from ``data.to_dict()``
+    for backward compatibility.  If ``data`` is not set, ``payload`` dict
+    is used directly (legacy path).
     """
     type: AgentEventType
     payload: Dict[str, Any] = field(default_factory=dict)
+    data: BaseEventPayload | None = field(default=None, repr=False)
     session_id: str | None = None
     round_index: int | None = None
     stream_id: str | None = None
     source: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.data is not None and not self.payload:
+            self.payload = self.data.to_dict()

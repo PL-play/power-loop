@@ -19,6 +19,25 @@ from llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.events import AgentEvent, AgentEventType
+from power_loop.contracts.event_payloads import (
+    AutoCompactStatusPayload,
+    BaseEventPayload,
+    HitRoundLimitStatusPayload,
+    RoundCompletedPayload,
+    RoundStartedPayload,
+    RoundToolsPresentPayload,
+    RoundUsageStatusPayload,
+    SessionEndedPayload,
+    SessionStartedPayload,
+    StreamCompletedPayload,
+    StreamDeltaPayload,
+    StreamStartedPayload,
+    ToolCallCompletedPayload,
+    ToolCallFailedPayload,
+    ToolCallStartedPayload,
+    UsageUpdatedPayload,
+    UserNotificationPayload,
+)
 from power_loop.contracts.hook_contexts import (
     CompactAfterCtx,
     CompactBeforeCtx,
@@ -116,23 +135,22 @@ def _is_cancelled(stop_event: threading.Event | None) -> bool:
     return bool(stop_event is not None and stop_event.is_set())
 
 
-def _status_payload_round_usage(*, round_index: int, max_rounds: int, usage: dict[str, Any]) -> dict[str, Any]:
-    def _g(*keys: str) -> Any:
+def _round_usage_payload(*, round_index: int, max_rounds: int, usage: dict[str, Any]) -> RoundUsageStatusPayload:
+    def _g(*keys: str) -> int | None:
         for k in keys:
             if k in usage and usage[k] is not None:
-                return usage[k]
+                return int(usage[k])
         return None
-    return {
-        "kind": "round_usage",
-        "time_iso": datetime.now().isoformat(timespec="seconds"),
-        "round_index": round_index,
-        "round_number": round_index + 1,
-        "max_rounds": max_rounds,
-        "prompt_tokens": _g("prompt_tokens", "input"),
-        "completion_tokens": _g("completion_tokens", "output"),
-        "cache_read_tokens": _g("cache_read_tokens", "cache_read"),
-        "reasoning_tokens": _g("reasoning_tokens", "reasoning"),
-    }
+    return RoundUsageStatusPayload(
+        time_iso=datetime.now().isoformat(timespec="seconds"),
+        round_index=round_index,
+        round_number=round_index + 1,
+        max_rounds=max_rounds,
+        prompt_tokens=_g("prompt_tokens", "input"),
+        completion_tokens=_g("completion_tokens", "output"),
+        cache_read_tokens=_g("cache_read_tokens", "cache_read"),
+        reasoning_tokens=_g("reasoning_tokens", "reasoning"),
+    )
 
 
 # ── AgentPipeline ──
@@ -175,11 +193,11 @@ class AgentPipeline:
 
     # ── Helper: emit event ──
 
-    def _emit(self, event_type: AgentEventType, payload: dict[str, Any] | None = None,
+    def _emit(self, event_type: AgentEventType, data: BaseEventPayload,
               *, round_index: int | None = None, stream_id: str | None = None) -> None:
         self.bus.publish(AgentEvent(
             type=event_type,
-            payload=payload or {},
+            data=data,
             session_id=self.session_id,
             round_index=round_index,
             stream_id=stream_id,
@@ -204,7 +222,7 @@ class AgentPipeline:
             messages=self.history, final_text=final_text,
         )
         await self.hooks.run_typed_async(HookPoint.SESSION_END, ctx)
-        self._emit(AgentEventType.SESSION_ENDED, {"reason": reason})
+        self._emit(AgentEventType.SESSION_ENDED, SessionEndedPayload(reason=reason))
 
     def _make_result(self, status: str, *, final_text: str = "", rounds: int = 0,
                      pending_tool_calls: list | None = None) -> AgentLoopResult:
@@ -229,7 +247,7 @@ class AgentPipeline:
                 {"role": "user", "content": "<reminder>You have an in_progress todo. Update your todos.</reminder>"},
                 round_index=round_index,
             )
-            self._emit(AgentEventType.USER_NOTIFICATION, {"message": "update your todos"}, round_index=round_index)
+            self._emit(AgentEventType.USER_NOTIFICATION, UserNotificationPayload(message="update your todos"), round_index=round_index)
             self.rounds_since_todo = 0
 
         # Microcompact
@@ -245,13 +263,13 @@ class AgentPipeline:
             )
             await self.hooks.run_typed_async(HookPoint.COMPACT_BEFORE, compact_before)
             if compact_before.directive != HookDirective.SKIP:
-                self._emit(AgentEventType.STATUS_CHANGED, {
-                    "kind": "auto_compact", "phase": "started",
-                    "round_index": round_index,
-                    "trigger": "input_tokens_gt_threshold",
-                    "input_tokens": self.ctx.last_input_tokens,
-                    "compact_threshold": self.ctx.compact_threshold,
-                }, round_index=round_index)
+                self._emit(AgentEventType.STATUS_CHANGED, AutoCompactStatusPayload(
+                    phase="started",
+                    round_index=round_index,
+                    trigger="input_tokens_gt_threshold",
+                    input_tokens=self.ctx.last_input_tokens,
+                    compact_threshold=self.ctx.compact_threshold,
+                ), round_index=round_index)
                 before_len = len(self.history)
                 self.history = await self.ctx.compact_async(self.llm, self.history)
                 self.ctx.reset_usage()
@@ -277,16 +295,16 @@ class AgentPipeline:
         def _on_delta(text: str) -> None:
             if text:
                 self._emit(AgentEventType.STREAM_DELTA,
-                           {"stream_id": "main", "text": text, "is_think": False},
+                           StreamDeltaPayload(text=text, is_think=False),
                            round_index=round_index, stream_id="main")
 
         def _on_think(text: str) -> None:
             if text:
                 self._emit(AgentEventType.STREAM_THINK_DELTA,
-                           {"stream_id": "main", "text": text, "is_think": True},
+                           StreamDeltaPayload(text=text, is_think=True),
                            round_index=round_index, stream_id="main")
 
-        self._emit(AgentEventType.STREAM_STARTED, {"stream_id": "main"},
+        self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
                    round_index=round_index, stream_id="main")
 
         response = await self.llm.complete(
@@ -302,7 +320,7 @@ class AgentPipeline:
             on_chunk_think=_on_think,
         )
 
-        self._emit(AgentEventType.STREAM_COMPLETED, {"stream_id": "main"},
+        self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
                    round_index=round_index, stream_id="main")
 
         return response
@@ -336,7 +354,7 @@ class AgentPipeline:
         await self.hooks.run_typed_async(HookPoint.SESSION_START, session_ctx)
         if isinstance(session_ctx.messages, list):
             self.history = session_ctx.messages
-        self._emit(AgentEventType.SESSION_STARTED, {"scope": "main"})
+        self._emit(AgentEventType.SESSION_STARTED, SessionStartedPayload(scope="main"))
 
         # ── Round loop ──
         for round_idx in range(int(self.config.max_rounds)):
@@ -363,7 +381,7 @@ class AgentPipeline:
             # ── Business logic: prepare round ──
             await self.prepare_round(round_idx)
 
-            self._emit(AgentEventType.ROUND_STARTED, {"round_index": round_idx}, round_index=round_idx)
+            self._emit(AgentEventType.ROUND_STARTED, RoundStartedPayload(round_index=round_idx), round_index=round_idx)
 
             # Todo snapshot injection
             todo_snap = self.ctx.todo.snapshot_for_prompt()
@@ -417,14 +435,14 @@ class AgentPipeline:
 
             # ── Post-LLM processing ──
             usage = self.ctx.update_usage(response)
-            self._emit(AgentEventType.STATUS_CHANGED, _status_payload_round_usage(
+            self._emit(AgentEventType.STATUS_CHANGED, _round_usage_payload(
                 round_index=round_idx, max_rounds=int(self.config.max_rounds), usage=usage,
             ), round_index=round_idx)
-            self._emit(AgentEventType.USAGE_UPDATED, {"usage": usage}, round_index=round_idx)
+            self._emit(AgentEventType.USAGE_UPDATED, UsageUpdatedPayload(usage=usage), round_index=round_idx)
 
             assistant_text = (getattr(response, "raw_text", "") or getattr(response, "content_text", "") or "").strip()
             tool_calls = response.get_tool_calls()
-            self._emit(AgentEventType.ROUND_TOOLS_PRESENT, {"has_tools": bool(tool_calls)}, round_index=round_idx)
+            self._emit(AgentEventType.ROUND_TOOLS_PRESENT, RoundToolsPresentPayload(has_tools=bool(tool_calls)), round_index=round_idx)
 
             # Append assistant message
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
@@ -441,7 +459,7 @@ class AgentPipeline:
             # ── No tools → completed ──
             if not tool_calls:
                 self._emit(AgentEventType.ROUND_COMPLETED,
-                           {"round_index": round_idx, "has_tools": False}, round_index=round_idx)
+                           RoundCompletedPayload(round_index=round_idx, has_tools=False), round_index=round_idx)
                 round_end = RoundEndCtx(
                     round_index=round_idx, messages=self.history,
                     has_tools=False, response_text=assistant_text,
@@ -520,7 +538,7 @@ class AgentPipeline:
                     continue
 
                 self._emit(AgentEventType.TOOL_CALL_STARTED,
-                           {"name": tool_name, "tool_input": tool_args, "tool_call_id": call_id},
+                           ToolCallStartedPayload(name=tool_name, tool_input=tool_args, tool_call_id=call_id),
                            round_index=round_idx)
 
                 # ── Business logic: execute tool ──
@@ -569,11 +587,11 @@ class AgentPipeline:
 
                 if failed:
                     self._emit(AgentEventType.TOOL_CALL_FAILED,
-                               {"name": tool_name, "output": output, "tool_input": tool_args, "tool_call_id": call_id},
+                               ToolCallFailedPayload(name=tool_name, output=output, tool_input=tool_args, tool_call_id=call_id),
                                round_index=round_idx)
 
                 self._emit(AgentEventType.TOOL_CALL_COMPLETED,
-                           {"name": tool_name, "output": output, "tool_input": tool_args, "tool_call_id": call_id},
+                           ToolCallCompletedPayload(name=tool_name, output=output, tool_input=tool_args, tool_call_id=call_id),
                            round_index=round_idx)
 
                 await self._append_message(
@@ -594,7 +612,7 @@ class AgentPipeline:
             await self.hooks.run_typed_async(HookPoint.TOOLS_BATCH_AFTER, batch_after_ctx)
 
             self._emit(AgentEventType.ROUND_COMPLETED,
-                       {"round_index": round_idx, "has_tools": True, "used_todo": used_todo},
+                       RoundCompletedPayload(round_index=round_idx, has_tools=True, used_todo=used_todo),
                        round_index=round_idx)
             round_end = RoundEndCtx(
                 round_index=round_idx,
@@ -613,7 +631,7 @@ class AgentPipeline:
             "content": f"You have reached the maximum of {self.config.max_rounds} rounds. "
                        f"Summarize what you accomplished and what remains.",
         })
-        self._emit(AgentEventType.STATUS_CHANGED, {"kind": "hit_round_limit", "max_rounds": int(self.config.max_rounds)})
+        self._emit(AgentEventType.STATUS_CHANGED, HitRoundLimitStatusPayload(max_rounds=int(self.config.max_rounds)))
 
         final_resp = await self.llm.complete(LLMRequest(
             messages=self.history,
@@ -624,7 +642,7 @@ class AgentPipeline:
             temperature=float(self.config.temperature or 0),
         ))
         final_text = (getattr(final_resp, "raw_text", "") or getattr(final_resp, "content_text", "") or "").strip()
-        self._emit(AgentEventType.USAGE_UPDATED, {"usage": self.ctx.update_usage(final_resp)})
+        self._emit(AgentEventType.USAGE_UPDATED, UsageUpdatedPayload(usage=self.ctx.update_usage(final_resp)))
         await self._finalize("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}")
         return self._make_result("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",
                                  rounds=int(self.config.max_rounds))

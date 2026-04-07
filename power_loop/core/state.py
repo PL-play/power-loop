@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from power_loop.core.agent_context import get_event_bus, get_session_id
 from power_loop.contracts.events import AgentEvent, AgentEventType
+from power_loop.contracts.event_payloads import TodoUpdatedPayload
 from power_loop.runtime.env import AGENT_DIR, SKILLS_DIR, WORKSPACE_DIR, safe_path
 from power_loop.runtime.skills import SKILL_LOADER
 from llm_client.interface import LLMRequest, LLMResponse
@@ -54,13 +55,12 @@ class TodoManager:
         get_event_bus().publish(
             AgentEvent(
                 type=AgentEventType.TODO_UPDATED,
-                payload={
-                    "kind": "todo_snapshot",
-                    "items": [dict(x) for x in self.items],
-                    "counts": {"total": len(self.items), "completed": done},
-                    "rendered": result,
-                    "text": result,
-                },
+                data=TodoUpdatedPayload(
+                    items=[dict(x) for x in self.items],
+                    counts={"total": len(self.items), "completed": done},
+                    rendered=result,
+                    text=result,
+                ),
                 session_id=session_id,
             )
         )
