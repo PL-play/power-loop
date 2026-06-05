@@ -244,7 +244,8 @@ class AgentPipeline:
     # ══════════════════════════════════════════════════════════════
 
     async def prepare_round(self, round_index: int) -> None:
-        """Prepare a new round: todo reminders, compaction."""
+        """Prepare a new round: todo reminders, then run the pluggable
+        compactor if one is configured on the loop config."""
         # Todo reminder
         if self.rounds_since_todo >= 5 and self.ctx.todo.has_in_progress:
             await self._append_message(
@@ -254,36 +255,71 @@ class AgentPipeline:
             self._emit(AgentEventType.USER_NOTIFICATION, UserNotificationPayload(message="update your todos"), round_index=round_index)
             self.rounds_since_todo = 0
 
-        # Microcompact
+        # Microcompact (legacy: dump large tool outputs to disk and replace
+        # with a short pointer — orthogonal to LLM-based compaction).
         self.ctx.microcompact(self.history)
 
-        # Auto-compact (with its own hooks, handled inline since it's conditional)
-        if self.ctx.should_compact():
-            compact_before = CompactBeforeCtx(
+        compactor = self.config.compactor
+        if compactor is None:
+            return
+
+        compact_before = CompactBeforeCtx(
+            round_index=round_index,
+            messages=self.history,
+            input_tokens=self.ctx.last_input_tokens,
+            compact_threshold=int(self.config.max_tokens or 0),
+        )
+        await self.hooks.run_typed_async(HookPoint.COMPACT_BEFORE, compact_before)
+        if compact_before.directive == HookDirective.SKIP:
+            return
+
+        plan = await compactor.maybe_compact(
+            self.history,
+            llm=self.llm,
+            max_tokens=int(self.config.max_tokens or 0),
+            round_index=round_index,
+        )
+        if plan is None:
+            return
+
+        self._emit(
+            AgentEventType.STATUS_CHANGED,
+            AutoCompactStatusPayload(
+                phase="started",
                 round_index=round_index,
-                messages=self.history,
-                input_tokens=self.ctx.last_input_tokens,
-                compact_threshold=self.ctx.compact_threshold,
-            )
-            await self.hooks.run_typed_async(HookPoint.COMPACT_BEFORE, compact_before)
-            if compact_before.directive != HookDirective.SKIP:
-                self._emit(AgentEventType.STATUS_CHANGED, AutoCompactStatusPayload(
-                    phase="started",
-                    round_index=round_index,
-                    trigger="input_tokens_gt_threshold",
-                    input_tokens=self.ctx.last_input_tokens,
-                    compact_threshold=self.ctx.compact_threshold,
-                ), round_index=round_index)
-                before_len = len(self.history)
-                self.history = await self.ctx.compact_async(self.llm, self.history)
-                self.ctx.reset_usage()
-                compact_after = CompactAfterCtx(
-                    round_index=round_index,
-                    messages=self.history,
-                    messages_before_count=before_len,
-                    messages_after_count=len(self.history),
-                )
-                await self.hooks.run_typed_async(HookPoint.COMPACT_AFTER, compact_after)
+                trigger="compactor_plan_emitted",
+                input_tokens=plan.before_tokens,
+                compact_threshold=int(self.config.max_tokens or 0),
+            ),
+            round_index=round_index,
+        )
+
+        # Apply plan IN-MEMORY first, then persist via the sink.
+        note_msg = {"role": "system", "name": "compact_note", "content": plan.summary_text}
+        before_len = len(self.history)
+        self.history = (
+            self.history[: plan.fold_start_idx]
+            + [note_msg]
+            + self.history[plan.fold_end_idx + 1 :]
+        )
+        # Persist (no-op for NullSink).
+        self.sink.on_compaction(
+            fold_start_idx=plan.fold_start_idx,
+            fold_end_idx=plan.fold_end_idx,
+            summary_text=plan.summary_text,
+            before_tokens=plan.before_tokens,
+            after_tokens=plan.after_tokens,
+            round_index=round_index,
+        )
+        self.ctx.reset_usage()
+
+        compact_after = CompactAfterCtx(
+            round_index=round_index,
+            messages=self.history,
+            messages_before_count=before_len,
+            messages_after_count=len(self.history),
+        )
+        await self.hooks.run_typed_async(HookPoint.COMPACT_AFTER, compact_after)
 
     async def call_llm(
         self,

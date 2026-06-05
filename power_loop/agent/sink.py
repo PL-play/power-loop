@@ -32,6 +32,16 @@ class MessageSink(Protocol):
     def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None: ...
+    def on_compaction(
+        self,
+        *,
+        fold_start_idx: int,
+        fold_end_idx: int,
+        summary_text: str,
+        before_tokens: int,
+        after_tokens: int,
+        round_index: int,
+    ) -> None: ...
     def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None
     ) -> None: ...
@@ -44,6 +54,16 @@ class NullSink:
     def on_message_appended(self, message: LoopMessage, *, round_index: int | None) -> None: ...
     def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
+    ) -> None: ...
+    def on_compaction(
+        self,
+        *,
+        fold_start_idx: int,
+        fold_end_idx: int,
+        summary_text: str,
+        before_tokens: int,
+        after_tokens: int,
+        round_index: int,
     ) -> None: ...
     def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None
@@ -67,6 +87,15 @@ class SQLiteSink:
         self.session_id = session_id
         self._unresolved: set[str] = set()
         self._assistant_seq: int | None = None
+        # Ordered seqs mirroring the pipeline's in-memory history. Initialized
+        # by StatefulAgentLoop from the loaded active messages; appended to as
+        # the pipeline emits new messages.
+        self._history_seqs: list[int] = []
+
+    def init_history_seqs(self, seqs: list[int]) -> None:
+        """Called by :class:`StatefulAgentLoop` with the seqs of the loaded
+        active messages, in the same order they sit in pipeline.history."""
+        self._history_seqs = list(seqs)
 
     # ── messages ───────────────────────────────────────────────
 
@@ -79,7 +108,7 @@ class SQLiteSink:
         role = message.get("role")
         if role == "tool":
             tool_call_id = str(message.get("tool_call_id") or "")
-            self.store.append_message(
+            seq = self.store.append_message(
                 self.session_id,
                 role="tool",
                 content=_as_text(message.get("content")),
@@ -87,6 +116,7 @@ class SQLiteSink:
                 name=message.get("name"),
                 round_index=round_index,
             )
+            self._history_seqs.append(seq)
             # Auto-resolve pending: when the matching tool message lands,
             # drop it from the unresolved set and clear pending once empty.
             if tool_call_id and tool_call_id in self._unresolved:
@@ -113,17 +143,19 @@ class SQLiteSink:
                 tool_calls=list(tool_calls) if tool_calls else None,
                 round_index=round_index,
             )
+            self._history_seqs.append(seq)
             if tool_calls:
                 self._assistant_seq = seq
             return
         # user / system / anything else
-        self.store.append_message(
+        seq = self.store.append_message(
             self.session_id,
             role=str(role or "user"),
             content=_as_text(message.get("content")),
             name=message.get("name"),
             round_index=round_index,
         )
+        self._history_seqs.append(seq)
 
     # ── pending state machine ──────────────────────────────────
 
@@ -141,6 +173,43 @@ class SQLiteSink:
                 "tool_call_ids": ids,
                 "tool_calls": list(tool_calls),
             },
+        )
+
+    def on_compaction(
+        self,
+        *,
+        fold_start_idx: int,
+        fold_end_idx: int,
+        summary_text: str,
+        before_tokens: int,
+        after_tokens: int,
+        round_index: int,
+    ) -> None:
+        """Persist a compaction: mark messages [fold_start_idx, fold_end_idx]
+        in the in-memory history as ``compacted_out`` in the store, append the
+        ``compact_note`` row, and rewrite ``_history_seqs`` to mirror the
+        post-compaction in-memory history (so future appends keep the index
+        invariant).
+        """
+        if not (0 <= fold_start_idx <= fold_end_idx < len(self._history_seqs)):
+            return  # defensive: out-of-range indices → no-op
+        from_seq = self._history_seqs[fold_start_idx]
+        to_seq = self._history_seqs[fold_end_idx]
+        _, note_seq = self.store.record_compaction(
+            self.session_id,
+            from_seq=from_seq,
+            to_seq=to_seq,
+            note_content=summary_text,
+            before_tokens=before_tokens,
+            after_tokens=after_tokens,
+            round_index=round_index,
+        )
+        # In the in-memory history the cut range is replaced by ONE note
+        # message; mirror that here.
+        self._history_seqs = (
+            self._history_seqs[:fold_start_idx]
+            + [note_seq]
+            + self._history_seqs[fold_end_idx + 1 :]
         )
 
     def on_round_ended(

@@ -306,7 +306,11 @@ class StatefulAgentLoop:
         sink: SQLiteSink | None = None,
     ) -> StatefulResult:
         sink = sink if sink is not None else SQLiteSink(self.store, sid)
-        history = [_row_to_loop_message(r) for r in self.store.load_active_messages(sid)]
+        active_rows = self.store.load_active_messages(sid)
+        history = [_row_to_loop_message(r) for r in active_rows]
+        # Mirror loaded seqs into the sink so the compactor can translate
+        # in-memory indices back to store rows when it folds messages.
+        sink.init_history_seqs([r.seq for r in active_rows])
 
         async with self._runner.session_async(session_id=sid):
             loop_token = set_current_loop(self)
