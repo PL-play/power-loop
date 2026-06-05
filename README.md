@@ -1,323 +1,484 @@
 # power-loop
 
-> 一个可嵌入的 **Agent 执行内核**：LLM 抽象 + 多轮消息循环 + 工具调用 + 生命周期 Hook + 事件总线 + 子代理。
-> 目标：让上层服务（例如 DeepTalk 的 `agent` 服务）只写「编排 / 业务壳」，不重复写 LLM 适配、tool 调用解析、循环控制和观测。
+> **可嵌入的、有状态的 Agent 执行内核。** 调用方只管「给一段最新输入 + session_id」，
+> power-loop 自治管理：LLM 多轮循环、工具调用、上下文压缩、子代理、消息持久化（SQLite）、
+> 悬挂态恢复。
 >
-> 状态：**开发中（v0.1）**。本 README 与代码同步迭代；新增能力先落代码与测试，再回流到这里。
-> 最后更新：2026-06-04。
+> Python ≥ 3.10 · MIT · OpenAI 兼容 + Anthropic 双家底 · 零强依赖（SQLite 用 stdlib）
+
+```python
+from power_loop import StatefulAgentLoop, AgentLoopConfig
+
+loop = StatefulAgentLoop(
+    llm=my_llm,
+    db_path="./sessions.db",
+    config=AgentLoopConfig(system_prompt="You are helpful.", max_rounds=8),
+)
+r1 = await loop.send("hello")                            # 自动新建 session
+r2 = await loop.send("more please", session_id=r1.session_id)  # 续话
+loop.close_session(r1.session_id)                        # 物理删除
+```
+
+---
+
+## 目录
+
+- [1. 它是什么 / 不是什么](#1-它是什么--不是什么)
+- [2. 安装](#2-安装)
+- [3. Quickstart](#3-quickstart)
+- [4. 核心概念](#4-核心概念)
+- [5. API 参考](#5-api-参考)
+- [6. Examples](#6-examples)
+- [7. 配置（环境变量）](#7-配置环境变量)
+- [8. 内部机制](#8-内部机制)
+- [9. 测试](#9-测试)
+- [10. Roadmap & Changelog](#10-roadmap--changelog)
 
 ---
 
 ## 1. 它是什么 / 不是什么
 
 **是**：
-- 一个 Python 库（非服务），可被任意后端 / CLI / 测试用例 `import` 调用。
-- OpenAI 兼容（含国内同协议厂商）与 Anthropic 双家底的 LLM 客户端集合。
-- 一套带 hook 与事件的「消息 → LLM → 工具 → 回合」主循环，可单回合或多回合。
-- 一个可动态注册工具的 `ToolRegistry`，自带一组开箱即用的本地工具（read / write / edit / bash / spawn_agent…）。
+- 一个 Python 库（非服务），可被任意后端 / CLI / 测试 `import` 使用。
+- **唯一公开入口** `StatefulAgentLoop`：有状态、`send/resume/abort_pending/close_session` 四个动词。
+- 持久化层 `SessionStore`：SQLite，5 张表，承诺消息顺序、悬挂态、压缩审计的所有不变量。
+- 工具循环 + 生命周期 Hook + 事件总线 + 子代理（命令式 + 声明式 `AgentSpec`）。
+- 上下文压缩：可插拔 `Compactor` 协议，自带 `DefaultCompactor` 默认开启。
 
 **不是**：
-- 不是 IM / 业务服务。**不感知**会话、用户、Kafka、HTTP；这些应在调用方（DeepTalk `agent` 服务等）里实现。
-- 不是大而全的 Agent Framework；不内置 RAG、向量库、Planner 等高层抽象。
-- 不绑死任何模型厂商：`base_url` / `api_key` / `model` 全部从配置传入。
-
-### 实现亮点 / 卖点
-
-> 状态标记：✅ 已实现 · 🚧 计划中（ROADMAP 标号） · 📐 设计已锁
-
-| # | 能力 | 状态 | 一句话价值 |
-|---|---|---|---|
-| 1 | **可编程控制流**：15 个 HookPoint × 4 个 Directive（`CONTINUE/SKIP/BREAK/SHORT_CIRCUIT`） | ✅ | 不改主循环就能实现安全策略、缓存短路、提前终止、注入 mock 结果 |
-| 2 | **观测/控制双通道**：`AgentEventBus`（只读旁路）+ `AgentHooks`（可改控制流） | ✅ | 指标、审计、typing 推送走 event；安全门、降级走 hook，二者不互相污染 |
-| 3 | **contextvars 会话隔离**：`hooks / event_bus / session_id` 通过 contextvars 注入 | ✅ | 一个进程并发跑多会话不串台；子代理自动继承独立子 session |
-| 4 | **声明式 + 命令式两种子代理**：`spawn_agent` 工具（命令式）+ `AgentSpec` JSON（声明式，主 Agent 可自描述生成） | ✅ + 🚧M1.8 | dynamic workflow 不需要 DAG 框架：主 Agent 自己决定何时分裂、用什么工具子集、什么人格 |
-| 5 | **OpenAI 兼容 + Anthropic 双家底**：单一 `LLMRequest` 抽象，`base_url / api_key / model` 全走 env | ✅ | 切厂商不改业务代码；DashScope、MiniMax、Kimi、DeepSeek 直连 |
-| 6 | **工具调用 = 一等公民**：动态 `ToolRegistry` + JSON Schema 必填校验 + sync/async handler 自动适配 + OpenAI tool schema 一键导出 | ✅ | 业务工具随注册随用；无需为 async handler 手写 event loop hack |
-| 7 | **运行时工具注册**（meta-tool `register_tool`）：主 Agent 临时声明脚本/命令为新工具，默认沙箱 + 默认关闭 | 🚧M2.6 | 把"主 Agent 自己长出新能力"做成受控、可审计的一等机制，不是 `eval` 后门 |
-| 8 | **上下文压缩**（M1.7a） | 📐已锁设计 | 详见下方"压缩策略"；解决长会话 `context_length_exceeded` 这个**运行时正确性问题** |
-| 9 | **统一重试 / 超时 / 取消** + 软降级 | 🚧M1.1 | LLM 抖动不让 Agent 卡死；用户撤回 @ 时能真正取消正在跑的循环 |
-| 10 | **结构化输出**：`response_format=json_schema` + JSON 修复 + Schema 校验 | 🚧M1.3 | 卡片 / 表单 / 报告类输出由 LLM 直出可解析对象，不靠 prompt 哄 |
-| 11 | **可序列化的会话快照**：`SessionSnapshot.save/load`，支持断点续跑 / 调试回放 | 🚧M1.7b | 长任务可中断恢复；事故现场可一比一重放 |
-| 12 | **记忆分层**：4 层清晰拆分（回合上下文 / 会话工作记忆 / 跨会话连续 / 长期事实），库提供 `MemoryProvider` 协议 + 生命周期接线，**业务方 30 行实现长期记忆** | 🚧M1.9 | 库不绑存储栈（不押注 vector DB / RAG 框架），业务方任选 SQLite / Redis / PG / Chroma 接入；examples 给 3 个开箱即用参考实现 |
-
-#### 压缩策略（M1.7a 设计已锁）
-
-参考 Anthropic 官方 [Compaction](https://platform.claude.com/docs/en/build-with-claude/compaction)、Claude Code auto-compact、LangChain `ConversationSummaryBufferMemory`，落到 vendor-neutral 的客户端实现：
-
-- **抽象**：`Compactor` 协议 + `DefaultCompactor`，**默认开启**（`AgentLoopConfig.compactor=DefaultCompactor()`，传 `None` 才关）。
-- **触发**：每回合 `round.start` 之前；`estimate_tokens(messages) ≥ max_tokens × 0.75`（或 env `CONTEXT_COMPACT_THRESHOLD` 绝对值）。**幂等**：同一回合最多压缩 1 次。
-- **保留区**（核心不变量）：
-  1. 所有 `role=system` 消息（含先前 `compact_note`）；
-  2. 工具定义（不在 messages 里，天然不动）；
-  3. 末尾 `keep_last_n` 条**完整 exchange**——`assistant(tool_calls)` 必须与对应 `tool(tool_call_id=…)` **作为原子对**保留，绝不被切开；
-  4. 任何悬挂未完结的 tool_call。
-- **摘要**：可压缩中段 → 一次额外 LLM 调用（默认主 LLM，可注入更便宜的 `summary_llm`）→ 输出包在 `<summary>…</summary>` 中，prompt 显式禁止调用工具（避开 Anthropic 文档警告的失败模式）。
-- **注入**：替换为一条 `{role: "system", name: "compact_note", content, _meta: {compacted_at_round, original_count, original_tokens, summary_tokens}}`，位置在 system 之后、保留尾巴之前——**保持顺序稳定，prompt cache 友好**。
-- **多轮累积**：默认 Option A（旧 `compact_note` 视为 system 不再压缩）；超过 `max_compact_notes=5` 时切换 Option B（合并最旧 2 条 notes 为 1 条）。
-- **失败软降级**：压缩 LLM 失败（含 retry 用尽）→ `compact.failed` 事件 → **用未压缩 history 跑该回合**；若主 LLM 因此 `context_length_exceeded` → 升级 `loop.degraded` 终止；连续 3 次失败 → 本 session 永久禁用 compactor + warning。
-- **可换**：业务方可注入自定义 `Compactor` 实现（选择性压缩、外部摘要服务、本地小模型摘要等），或通过 `compact.before` hook 一票否决/替换。
-
-> 与"裁剪"（M1.2 `trim_history`）的关系：裁剪是无成本纯删，压缩是有成本但保留语义；二者正交，业务可任选。
+- 不是 IM / 业务服务。不感知会话、用户、Kafka、HTTP；这些放在调用方。
+- 不是大而全的 Agent Framework。没有内置 RAG / 向量库 / Planner / DAG。
+- 不绑死任何模型厂商：`base_url` / `api_key` / `model` 都通过配置传入。
 
 ---
 
-## 2. 目录结构
-
-```
-power-loop/
-├── llm_client/                # LLM 适配层（独立顶级包）
-│   ├── interface.py           # LLMRequest / LLMResponse / LLMService 抽象
-│   ├── llm_factory.py         # 多 provider 工厂（OpenAI 兼容 + Anthropic）
-│   ├── llm_tooling.py         # OpenAI tool-call 协议解析 / 规整
-│   ├── multimodal.py          # 多模态内容拼装（图片等）
-│   ├── capabilities.py        # 模型能力探测（多模态 / 工具 / 流式…）
-│   ├── web_search.py          # 内置 web search 工具的 LLM 侧接线
-│   └── qwen_image.py          # 通义千问图像专用通道
-│
-├── power_loop/                # Agent 执行内核
-│   ├── agent/
-│   │   ├── loop.py            # AgentLoop 外观类（run / run_sync）
-│   │   ├── types.py           # AgentLoopConfig / AgentLoopResult / LoopMessage
-│   │   └── system_prompt.py   # 默认 system prompt 模板
-│   ├── core/
-│   │   ├── pipeline.py        # 主循环（按 phase 拆分 + hook/event 编排）
-│   │   ├── agent.py           # 旧入口 agent_loop_async（薄包装）
-│   │   ├── runner.py          # 会话生命周期与上下文注入
-│   │   ├── agent_context.py   # contextvars：hooks / event_bus / session_id
-│   │   ├── state.py           # ContextManager（消息累积、token 估算等）
-│   │   ├── phase.py           # 单回合的 phase 步骤拆分
-│   │   ├── hooks.py           # AgentHooks：有序 sync/async hook 管理
-│   │   └── events.py          # AgentEventBus：事件订阅 / 发布
-│   ├── contracts/             # 类型契约（dataclass / pydantic）
-│   │   ├── hooks.py           # HookPoint / HookDirective / HookContext
-│   │   ├── hook_contexts.py   # 每个 hook 点的 typed Ctx
-│   │   ├── events.py          # AgentEvent / AgentEventType
-│   │   ├── event_payloads.py  # 每类事件 payload
-│   │   ├── tools.py           # ToolDefinition / 校验
-│   │   ├── messages.py        # LoopMessage 协议
-│   │   ├── handlers.py        # handler 协议
-│   │   └── protocols.py       # 公共 Protocol
-│   ├── tools/
-│   │   ├── registry.py        # ToolRegistry（动态 register / invoke / OpenAI schema 导出）
-│   │   ├── default_manifest.py# 默认工具的 ToolDefinition 集合
-│   │   ├── default_tools.py   # 默认工具实现：bash/read/write/edit/grep/glob/patch…
-│   │   └── spawn_agent.py     # 子代理 spawn 工具
-│   └── runtime/
-│       ├── env.py             # WORKSPACE / AGENT_DIR / 路径白名单
-│       └── skills.py          # SKILL.md 加载（frontmatter + body）
-└── tests/                     # smoke + 真实/伪 LLM 测试用例
-```
-
-> `llm_client` 当前是 **顶级包**，独立于 `power_loop`，可单独 import 用作"只调 LLM"的薄客户端。
-
----
-
-## 3. 安装
+## 2. 安装
 
 ```bash
-cd power-loop
-pip install -e ".[dev]"      # 含 pytest / pytest-asyncio
+pip install -e .                  # 开发安装
+pip install -e ".[dev]"           # 含 pytest / ruff / mypy
 ```
 
-依赖（见 `pyproject.toml`）：`anthropic`、`openai`、`socksio`、`python-dotenv`、`pyyaml`、`rich`、`pypdf`。
-Python ≥ 3.10。
+依赖（见 `pyproject.toml`）：`openai`、`anthropic`、`socksio`、`python-dotenv`、`pyyaml`、`rich`、`pypdf`。**SQLite 用 Python 标准库**，零新增。
 
 ---
 
-## 4. 配置（环境变量）
+## 3. Quickstart
 
-LLM 凭证与端点 **不入代码 / 不入配置文件**，统一走环境变量（推荐配合 `.env` + `python-dotenv`）：
-
-| 变量 | 说明 |
-|------|------|
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | OpenAI 兼容厂商凭证与默认模型 |
-| `ANTHROPIC_API_KEY` | Anthropic 凭证（如需） |
-| `POWER_LOOP_WORKSPACE` | 默认工作目录（默认工具的相对路径以此为根） |
-| `POWER_LOOP_SKILLS_DIR` | SKILL.md 目录（默认 `<agent_dir>/.skills`） |
-
-> 多 provider 的具体 key 名见 `llm_client/llm_factory.py`；新增厂商时在工厂里扩，不要在业务代码里写死。
-
----
-
-## 5. 最小用法
-
-### 5.1 仅用 LLM 客户端（不进 agent loop）
+### 3.1 单次回复（最小用法）
 
 ```python
-from llm_client.llm_factory import create_llm_service
-from llm_client.interface import LLMRequest
+import asyncio
+from power_loop import StatefulAgentLoop, AgentLoopConfig
 
-llm = create_llm_service(provider="openai")  # 或 "anthropic"
-resp = llm.complete_sync(LLMRequest(
-    messages=[{"role": "user", "content": "你好"}],
-    system_prompt="你是一个简洁的助手。",
-    temperature=0.0,
-))
-print(resp.text)
+async def main():
+    loop = StatefulAgentLoop(
+        llm=my_llm,                       # 见 §7 构造 LLM
+        db_path="./sessions.db",
+        config=AgentLoopConfig(
+            system_prompt="Reply briefly.",
+            max_rounds=1,
+            compactor=None,               # 短对话不需要压缩
+        ),
+    )
+    result = await loop.send("Say hi.")
+    print(result.session_id, result.final_text)
+
+asyncio.run(main())
 ```
 
-> 完整可运行版本见 [`examples/00_minimal.py`](examples/00_minimal.py)（真实 DashScope）。
-> `tests/real/test_examples.py::test_example_00_minimal_runs` 把它作为活文档锁定——
-> 若 example 跑挂，要么 example 该更新，要么有 Public API 回归。
+完整版：[`examples/00_minimal.py`](examples/00_minimal.py)
 
-### 5.2 运行一个完整 Agent Loop（含工具）
+### 3.2 多轮对话
 
 ```python
-from llm_client.llm_factory import create_llm_service
-from power_loop.agent.loop import AgentLoop
-from power_loop.agent.types import AgentLoopConfig
-from power_loop.tools.registry import build_registry
-from power_loop.tools.default_manifest import DEFAULT_TOOL_DEFINITIONS
-from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+r1 = await loop.send("My favorite color is teal.")
+r2 = await loop.send(
+    "What did I just say?",
+    session_id=r1.session_id,    # ← 续话
+)
+# r2.final_text 会引用 "teal"
+```
 
-llm = create_llm_service(provider="openai")
-tools = build_registry(DEFAULT_TOOL_DEFINITIONS, DEFAULT_TOOL_HANDLERS)
+### 3.3 工具调用
 
-loop = AgentLoop(
-    llm=llm,
-    config=AgentLoopConfig(
-        system_prompt="你是一个能调用工具的工程师助手。",
-        max_rounds=8,
-        temperature=0.0,
-        max_tokens=4000,
+```python
+from power_loop import ToolDefinition, ToolRegistry
+
+registry = ToolRegistry()
+registry.register(
+    ToolDefinition(
+        name="lookup_dish",
+        description="Return the local dish for a city.",
+        input_schema={"type": "object", "properties": {"city": {"type": "string"}},
+                       "required": ["city"]},
+        required_params=("city",),
     ),
-    tool_registry=tools,
+    lambda **kw: "ceviche" if kw["city"].lower() == "lima" else "?",
 )
 
-result = loop.run_sync(messages=[
-    {"role": "user", "content": "读取 README.md 的前 20 行并总结。"},
-])
-print(result.status, result.rounds)
-print(result.final_text)
+loop = StatefulAgentLoop(llm=my_llm, db_path="./s.db",
+                         tool_registry=registry,
+                         config=AgentLoopConfig(max_rounds=4))
+result = await loop.send("What's Lima's signature dish?")
 ```
 
-### 5.3 不要工具的单回合「LLM 应答」
+完整版：[`examples/01_tool_use.py`](examples/01_tool_use.py)
+
+### 3.4 子代理
 
 ```python
-loop = AgentLoop(llm=llm, config=AgentLoopConfig(system_prompt=SYS, max_rounds=1))
-result = loop.run_sync(messages=conversation)   # 直接拿 final_text
+from power_loop import register_spawn_agent
+
+registry = ToolRegistry()
+register_spawn_agent(registry)        # 注入 spawn_agent + run_agent 两个 meta-tool
+
+loop = StatefulAgentLoop(llm=my_llm, db_path="./s.db",
+                         tool_registry=registry,
+                         config=AgentLoopConfig(max_rounds=5,
+                                                system_prompt="Delegate factual Qs."))
+result = await loop.send("Delegate this: capital of Japan?")
 ```
 
-> 这就是 DeepTalk `agent` 服务 MVP 的典型用法：业务侧把"系统人格 + 历史 + 当前任务"拼成 messages 传进来，
-> power-loop 走一次 LLM 调用就返回。
+完整版：[`examples/02_subagent.py`](examples/02_subagent.py)
 
 ---
 
-## 6. Hook & Event 模型
+## 4. 核心概念
 
-### 6.1 Hook 点（控制流）
+### Session
 
-`power_loop.contracts.hooks.HookPoint` 当前覆盖：
+一次 send/resume 循环跑在一个 **session** 上。session 是 `SessionStore` 里 sessions 表的一行，承载 system prompt、AgentLoopConfig 快照、metadata 与所有 messages。`send(user_input)` 不传 `session_id` 自动新建；传则续话。
 
-```
-session.start / session.end
-round.start   / round.end   / round.decide
-llm.before    / llm.after
-tools.batch.before / tools.batch.after
-tool.before   / tool.after  / tool.error
-compact.before / compact.after
-message.append
-```
+### SessionStore
 
-每个 hook 点接收 **typed Ctx**（`power_loop/contracts/hook_contexts.py` 定义对应 dataclass），可：
+power-loop 的**唯一**持久化入口（SQLite）。5 张表：
 
-- 原地修改 ctx 字段（如改写 messages、注入 tool_output、改 LLM 请求）；
-- 返回 `HookDirective`：`CONTINUE / SKIP / BREAK / SHORT_CIRCUIT`，组合语义见 `HookDirective` 的 docstring。
+| 表 | 作用 |
+|---|---|
+| `sessions` | 元数据 + 父子链接 + 生命周期 |
+| `messages` | 每条消息 + `state ∈ {active, compacted_out}` + seq |
+| `compactions` | 每次压缩的审计行（覆盖了哪些 seq → 哪个 note） |
+| `usage_rounds` | 每轮 token 用量 |
+| `session_state` | next_seq / round_index / pending |
 
-注册示例：
+并发：单连接 + `threading.RLock`；SQLite WAL 模式，允许多读者跨进程共享文件。
+
+### Sink
+
+`MessageSink` 是 pipeline 与持久化之间的协议。`StatefulAgentLoop` 默认装 `SQLiteSink`，把每条消息、压缩、usage 持久化到 store。NullSink 是测试用的 no-op。
+
+### Compactor
+
+可插拔的上下文压缩策略。`AgentLoopConfig.compactor` 默认为 `DefaultCompactor()`；传 `None` 关闭。
+
+**触发**：`estimate_tokens(history) ≥ max_tokens × trigger_ratio`（默认 0.75）；
+环境变量 `CONTEXT_COMPACT_THRESHOLD` 可设绝对值覆盖。
+
+**不变量**（DefaultCompactor 实现，自定义 Compactor 应遵守）：
+1. 保留所有 `role=system` 消息（含先前 `compact_note`）；
+2. 保留尾部 `keep_last_n` 个 user 段（默认 4）；
+3. **绝不切开 `assistant(tool_calls) ↔ tool(tool_call_id=…)` 原子对**；
+4. 摘要 LLM 抛错 → 返回 `None` → 主循环用未压缩 history 继续（软降级）。
+
+### Pending 状态机
+
+一轮工具调用的协议是：`assistant(tool_calls=[A,B])` → `tool(tool_call_id=A)` + `tool(tool_call_id=B)`。
+
+如果进程在 assistant 已落库、tool 还没全部落库时挂掉，session 处于**悬挂态**。下次 `send` 会抛 `SessionPendingError`。调用方两个选项：
+- `await loop.resume(sid)` — 把剩余 tool_calls 跑完，继续循环；
+- `loop.abort_pending(sid, reason="…")` — 给每个未完成 tool_call 写一条 `<aborted: reason>` tool 消息，恢复协议合法性，再 `send` 即可继续。
+
+### 子代理
+
+- `spawn_agent(task, ...)` — 命令式 meta-tool，LLM 用 kwargs 调用，自动包成 `AgentSpec`。
+- `run_agent(spec, input)` — 声明式 meta-tool，LLM 提交完整 spec（严格 schema，未知字段拒绝）。
+
+两者都走同一份内部实现 `run_agent_spec`，差异只在入口形态。子会话与父共享同一个 `SessionStore`，建立 `parent_session_id` / `spawn_tool_call_id` 链接，`spawn_depth ≤ 3` 强校验。
+
+**生命周期** `SubagentLifecycle`：
+- `EPHEMERAL`（默认）：子 session 完成时物理删除；非完成态（hit_round_limit / cancelled）保留供 debug；
+- `LINKED`：保留；父 `close_session(cascade=True)` 时随之级联删；
+- `DETACHED`：保留；父 close 时不影响（解链）。
+
+### Hooks & Events
+
+两条互不污染的通道：
+
+- **Hooks**（控制流）：15 个 `HookPoint`，每个 hook 返回 `HookDirective ∈ {CONTINUE/SKIP/BREAK/SHORT_CIRCUIT}`。改 LLM 请求、注入 mock 结果、安全门、提前终止都靠它。
+- **Events**（旁路只读）：`AgentEventBus` 发布 token usage / stream delta / tool call started / completed / 等。指标、审计、UI 推送都订阅它。
+
+---
+
+## 5. API 参考
+
+### `StatefulAgentLoop`
+
+唯一公开入口。一个实例可并发驱动多个 session（每 session 一把 `asyncio.Lock`）。
 
 ```python
-from power_loop.core.hooks import AgentHooks
-from power_loop.contracts.hooks import HookPoint, HookDirective
-
-hooks = AgentHooks()
-
-def on_llm_before(ctx):
-    ctx.request.temperature = 0.2   # 改写请求
-
-def on_tool_error(ctx):
-    ctx.tool_output = "（工具失败，已忽略）"
-    return HookDirective.SKIP
-
-hooks.register(HookPoint.LLM_BEFORE, on_llm_before)
-hooks.register(HookPoint.TOOL_ERROR, on_tool_error)
-
-loop = AgentLoop(llm=llm, config=cfg, tool_registry=tools, hooks=hooks)
+StatefulAgentLoop(
+    *,
+    llm: LLMService,
+    store: SessionStore | None = None,          # 传 None → 用 db_path 自建
+    db_path: str = "./power_loop_sessions.db",
+    config: AgentLoopConfig | None = None,
+    tool_registry: ToolRegistry | None = None,
+    hooks: AgentHooks | None = None,
+    event_bus: AgentEventBus | None = None,
+)
 ```
 
-### 6.2 Event Bus（观测 / 旁路）
+| 方法 | 说明 |
+|---|---|
+| `await send(user_input, session_id=None, *, metadata=None, stop_event=None) -> StatefulResult` | 主入口。无 `session_id` 自动新建；悬挂态 → `SessionPendingError`。 |
+| `send_sync(...)` | 同上的同步壳。 |
+| `await resume(session_id)` | 把悬挂的 tool_calls 跑完，继续循环。 |
+| `abort_pending(session_id, *, reason="aborted") -> int` | 给悬挂 tool_calls 写 `<aborted>` tool 消息，返回 abort 数量。 |
+| `close_session(session_id, *, cascade=True) -> int` | 物理删除 session（含 LINKED 子树）。 |
+| `close()` | 关 store（若 owned）。不删数据。 |
+| `get_messages(session_id, *, include_compacted=False) -> list[dict]` | 取当前 active history。 |
+| `get_pending(session_id) -> dict \| None` | 查悬挂态。 |
 
-`AgentEventBus` 发布只读事件（不改控制流），用于上报指标、推送"正在输入"、日志/审计等：
+### `StatefulResult`
 
-- `session.started / session.ended`
-- `round.started / round.completed`
-- `stream.started / stream.delta / stream.completed`
-- `tool_call.started / tool_call.completed / tool_call.failed`
-- `usage.updated`、`user.notification`、`auto_compact.status`、`hit_round_limit.status`…
+```python
+@dataclass
+class StatefulResult:
+    session_id: str
+    status: str                       # "completed" / "hit_round_limit" / "cancelled" / "pending_tools"
+    final_text: str = ""
+    rounds: int = 0
+    pending_tool_calls: list[dict] = []
+```
 
-Payload 类型见 `power_loop/contracts/event_payloads.py`。
+### `AgentLoopConfig`
+
+```python
+@dataclass
+class AgentLoopConfig:
+    system_prompt: str | None = None
+    max_rounds: int = 24
+    temperature: float | None = 0.0
+    max_tokens: int | None = 8000
+    compactor: Compactor | None = DefaultCompactor()   # 传 None 关闭压缩
+```
+
+### `SessionStore`
+
+```python
+SessionStore.open(path="./power_loop_sessions.db") -> SessionStore
+store.close()
+store.create_session(*, system_prompt=None, model=None, config=None,
+                     parent_session_id=None, spawn_tool_call_id=None,
+                     kind=SessionKind.ROOT,
+                     lifecycle=SubagentLifecycle.EPHEMERAL,
+                     metadata=None, session_id=None) -> str
+store.get_session(sid) -> SessionRow | None
+store.list_children(parent_sid) -> list[SessionRow]
+store.close_session(sid, *, cascade=True) -> int   # 物理删除，返回行数
+store.archive_session(sid)                          # 改 status，不删
+store.append_message(sid, *, role, content=None, tool_calls=None,
+                      tool_call_id=None, name=None, round_index=None,
+                      meta=None) -> int             # 返回新 seq
+store.load_active_messages(sid) -> list[MessageRow]
+store.load_all_messages(sid) -> list[MessageRow]    # 含 compacted_out
+store.record_compaction(sid, *, from_seq, to_seq, note_content,
+                         before_tokens, after_tokens, round_index) -> tuple[int, int]
+store.list_compactions(sid) -> list[CompactionRow]
+store.record_usage(sid, *, round_index, prompt_tokens,
+                    completion_tokens, total_tokens, model=None)
+store.get_state(sid) -> SessionStateRow | None
+store.set_pending(sid, pending: dict | None)
+```
+
+### 子代理：`AgentSpec` + 工具
+
+```python
+@dataclass(frozen=True)
+class AgentSpec:
+    name: str
+    system_prompt: str
+    tools: list[str] | None = None        # parent tool whitelist, None=inherit all
+    max_rounds: int = 8                    # 1..50
+    max_tokens: int = 4000
+    temperature: float = 0.0
+    model: str | None = None
+    lifecycle: str = "ephemeral"           # "ephemeral" / "linked" / "detached"
+    metadata: dict[str, Any] = {}
+# 工厂：AgentSpec.from_dict(d) / AgentSpec.from_json(s)
+# 严格 schema：未知字段 / 非法 lifecycle / max_rounds 越界 → AgentSpecError
+
+from power_loop import register_spawn_agent
+register_spawn_agent(registry, *, include_run_agent=True, overwrite=False)
+```
+
+直接 API（绕过 meta-tool）：
+
+```python
+from power_loop import run_agent_spec
+result = await run_agent_spec(spec, "user input", parent_loop=loop)
+# → {"session_id", "status", "final_text", "rounds", "depth"}
+```
+
+### Errors
+
+```python
+class PowerLoopError(Exception): ...
+class SessionNotFoundError(PowerLoopError):
+    session_id: str
+class SessionPendingError(PowerLoopError):
+    session_id: str
+    assistant_seq: int
+    pending_tool_calls: list[dict]
+```
+
+### Compactor
+
+```python
+@dataclass(frozen=True)
+class CompactionPlan:
+    fold_start_idx: int    # inclusive
+    fold_end_idx: int      # inclusive
+    summary_text: str
+    before_tokens: int
+    after_tokens: int
+
+class Compactor(Protocol):
+    async def maybe_compact(self, messages, *, llm, max_tokens, round_index) -> CompactionPlan | None: ...
+
+class DefaultCompactor:
+    def __init__(self, *, trigger_ratio=0.75, keep_last_n=4,
+                  summary_max_tokens=512, summary_llm=None, absolute_threshold=None): ...
+```
+
+自定义 compactor 实现上面的 Protocol 即可注入 `AgentLoopConfig.compactor=YourCompactor()`。
 
 ---
 
-## 7. 工具系统
+## 6. Examples
 
-- `ToolDefinition`（`contracts/tools.py`）：名字 / 描述 / JSON Schema / 必填参数；可直接 `to_openai_tool()` 喂给 LLM。
-- `ToolRegistry`：`register / unregister / invoke / invoke_async`，自带必填参数校验，兼容 dict / kwargs 两种 handler 签名。
-- 默认工具集（`default_tools.py` / `default_manifest.py`）：`run_bash` `run_read` `run_write` `run_edit` `run_grep` `run_glob` `apply_patch`…（含路径白名单与读后写检查）。
-- 子代理：`tools/spawn_agent.py` 提供 `spawn_agent` 工具，允许在工具调用里启一个子 AgentLoop 处理子任务。
+`examples/` 下每个文件可独立 `python examples/NN_*.py` 运行，并由 `tests/real/test_examples.py` 持续验证。
 
-> DeepTalk agent 服务用到的"业务能力"（如 `/summary`、`/deep`、生成卡片 JSON）应在 **调用方** 注册成工具或直接靠
-> `parse_json` 结构化输出实现；不要把业务工具塞进 `power_loop/tools/default_*`。
+| 文件 | 演示 |
+|---|---|
+| [`00_minimal.py`](examples/00_minimal.py) | 最小用法：`send → StatefulResult` |
+| [`01_tool_use.py`](examples/01_tool_use.py) | 自定义 `ToolDefinition` + 多轮工具调用 |
+| [`02_subagent.py`](examples/02_subagent.py) | `spawn_agent` meta-tool + EPHEMERAL 自动清理 |
+| [`03_compaction.py`](examples/03_compaction.py) | `DefaultCompactor` 自动折叠 + 持久化痕迹 |
 
 ---
 
-## 8. 测试
+## 7. 配置（环境变量）
+
+LLM 凭证与端点 **不入代码**，统一走环境变量（建议 `.env` + `python-dotenv`）：
+
+| 变量 | 说明 |
+|---|---|
+| `OPENAI_COMPAT_BASE_URL` | OpenAI 兼容端点（DashScope、MiniMax、Kimi、DeepSeek 等） |
+| `OPENAI_COMPAT_API_KEY` | API key |
+| `OPENAI_COMPAT_MODEL` | 默认模型名 |
+| `ANTHROPIC_API_KEY` | Anthropic 凭证（用 Anthropic 家底时） |
+| `CONTEXT_COMPACT_THRESHOLD` | 绝对 token 阈值（覆盖 `trigger_ratio`） |
+| `POWER_LOOP_WORKSPACE` | 默认工作目录（默认工具相对路径以此为根） |
+| `POWER_LOOP_SKILLS_DIR` | `SKILL.md` 目录 |
+
+构造 LLM 示例：
+
+```python
+from llm_client.interface import OpenAICompatibleChatConfig
+from llm_client.llm_factory import OpenAICompatibleChatLLMService
+import os
+
+cfg = OpenAICompatibleChatConfig(
+    base_url=os.environ["OPENAI_COMPAT_BASE_URL"],
+    api_key=os.environ["OPENAI_COMPAT_API_KEY"],
+    model=os.environ["OPENAI_COMPAT_MODEL"],
+    max_tokens=512, temperature=0.2,
+)
+llm = OpenAICompatibleChatLLMService(cfg)
+```
+
+---
+
+## 8. 内部机制
+
+### Pipeline 一回合
+
+```
+session.start
+  ↓
+for round in 0..max_rounds:
+  ├ round.start  →  sink.on_round_started
+  ├ prepare_round
+  │   ├ todo reminder（每 5 轮）
+  │   ├ microcompact（大 tool 输出溢盘到 .cache/）
+  │   └ compactor.maybe_compact → 命中则 sink.on_compaction → 持久化
+  ├ llm.before  →  LLM.complete  →  llm.after
+  ├ assistant 消息落 sink（带 tool_calls 时立即 set_pending）
+  ├ 若无 tool_calls → round.end → 返回 "completed"
+  ├ round.decide
+  ├ tools.batch.before
+  │   ├ tool.before  →  tool.invoke  →  tool.after / tool.error
+  │   └ tool 消息落 sink（同 tool_call_id 解 pending）
+  ├ tools.batch.after
+  └ round.end  →  sink.on_round_ended(usage=…)
+session.end
+```
+
+15 个 HookPoint：见 `power_loop/contracts/hooks.py`。
+
+### 消息持久化与 seq
+
+每条消息在 store 里有唯一 `(session_id, seq)`。`SQLiteSink` 在内存里维护一份 `_history_seqs` 与 pipeline.history 一一对应：
+- 加载老 session：`init_history_seqs([row.seq for row in active_rows])`
+- 新追加：`store.append_message` 返回 seq，追加到尾
+- 压缩：`on_compaction(fold_start_idx, fold_end_idx, …)` → 用索引转 seq → `store.record_compaction` → 重写 `_history_seqs`（折叠区间替换为 note 的 seq）
+
+### Pending 状态机
+
+```
+LLM 返回 tool_calls
+  ↓
+assistant 消息落库 → set_pending({assistant_seq, tool_call_ids, tool_calls})
+  ↓
+tool A 落库 → 自动从 _unresolved 移除 A → set_pending(剩余)
+  ↓ (process killed here)
+进程重启 → send() 检测 pending → SessionPendingError
+  ├ resume()         → 跑剩余 tool_calls，pending 清零，继续
+  └ abort_pending()  → 写 <aborted> tool 消息，pending 清零，下次 send 即可继续
+```
+
+---
+
+## 9. 测试
 
 ```bash
-cd power-loop
-pytest                                  # 全跑
-pytest tests/test_agent_loop_events_hooks.py
-pytest tests/smoke_agent_loop_v1.py
+# 全跑（含真实 LLM，要 .env 配 OPENAI_COMPAT_*）
+pytest
+
+# 只跑单元测试（不连真实 LLM）
+pytest -m "not real_llm"
+
+# 跳过真实 LLM
+pytest --no-real
 ```
 
-- `smoke_*` 用例：跑通主循环骨架。
-- `test_real_*` 用例：连真实 LLM 验证流式/工具调用/sub-agent；需要环境变量里有 key，否则跳过。
-
----
-
-## 9. DeepTalk 集成定位
-
-`agent` 服务对 power-loop 的预期分工（来自 `platform/docs/design/06-agent-orchestration.md`）：
-
-| 关注点 | 归属 |
+| 目录 | 内容 |
 |---|---|
-| Kafka 消费 `im.messages` / 触发判定（@、斜杠、卡片） | **agent 服务** |
-| `message_id` 幂等去重、防自激（`sender_type=agent` 过滤） | **agent 服务** |
-| 调 api 拉历史 / 调 api 受信内部接口写回 | **agent 服务** |
-| 双方授权门 / 能力开关 / 降级文案 | **agent 服务** |
-| 历史窗口拼装（含 A/B/Agent 身份标注） | **agent 服务**（power-loop 后续可提供 trim helper） |
-| 系统人格 + LLM 调用 + 工具循环 + 结构化输出 | **power-loop** |
-| `typing` 瞬时指示（通过事件总线 + 业务侧推送） | 协作：power-loop 出事件，agent 服务推 gateway |
+| `tests/unit/` | 纯控制流 / 契约测试，fake LLM |
+| `tests/integration/` | 多组件场景，fake LLM |
+| `tests/real/` | 跑真实 DashScope；缺 env 自动 skip |
+
+`tests/real/judge.py` 提供 **LLM-as-judge**：业务方在测试里调 `assert_passes(question, answer, rubric)`，
+内部 spawn 一个 power-loop 作 evaluator，按 rubric 返回 `{passed, reason}` JSON。
+专门解决 LLM 输出非确定性下的断言难题。
 
 ---
 
-## 10. Roadmap（边用边补）
+## 10. Roadmap & Changelog
 
-按当前对接需要优先级：
+- 详细路线：[`ROADMAP.md`](ROADMAP.md)
+- 版本记录：[`CHANGELOG.md`](CHANGELOG.md)
 
-1. **结构化卡片输出约定**：定义 DeepTalk 侧 card schema → 在 `llm_client` 提供 `response_format=json_schema` 便捷封装。
-2. **token 预算窗口工具**：`trim_history(messages, max_tokens, model)` 公共助手，避免每个调用方重复实现。
-3. **统一 LLM 重试 / 超时策略**：`LLMRetryPolicy`（指数退避 + 最大次数 + 整体超时），让业务侧降级更可靠。
-4. **事件命名稳定化**：固定一组对外暴露的事件名，方便 DeepTalk admin 后台采集。
-5. **README 中加入"事件 / Hook 完整一览表"**：随着 hook / event 增减保持同步。
-6. **provider 配置文档化**：把 `llm_factory` 支持的厂商与所需 env 列成对照表。
-7. **README 示例代码自动化校验**（doctest 或 smoke）。
-
----
-
-## 11. 变更与对接备注
-
-- 主入口稳定：`AgentLoop(llm, config, tool_registry, *, event_bus, hooks).run / run_sync`。
-- 旧入口 `power_loop.core.agent.agent_loop_async` 仍保留，作为 `AgentPipeline` 的薄包装。
-- 业务方不应直接 import `power_loop.core.pipeline` 内部；通过 `AgentLoop` 外观使用。
-- 新增 hook 点或事件类型，需同时更新 `contracts/hooks.py` 或 `contracts/events.py` + payload，并在本 README §6 补充。
+Issues / PRs welcome.

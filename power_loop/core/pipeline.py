@@ -266,8 +266,6 @@ class AgentPipeline:
         compact_before = CompactBeforeCtx(
             round_index=round_index,
             messages=self.history,
-            input_tokens=0,
-            compact_threshold=int(self.config.max_tokens or 0),
         )
         await self.hooks.run_typed_async(HookPoint.COMPACT_BEFORE, compact_before)
         if compact_before.directive == HookDirective.SKIP:
@@ -288,8 +286,8 @@ class AgentPipeline:
                 phase="started",
                 round_index=round_index,
                 trigger="compactor_plan_emitted",
-                input_tokens=plan.before_tokens,
-                compact_threshold=int(self.config.max_tokens or 0),
+                before_tokens=plan.before_tokens,
+                after_tokens=plan.after_tokens,
             ),
             round_index=round_index,
         )

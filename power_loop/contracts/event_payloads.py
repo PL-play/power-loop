@@ -124,8 +124,8 @@ class AutoCompactStatusPayload(StatusChangedPayload):
     phase: str = ""
     round_index: int = 0
     trigger: str = ""
-    input_tokens: int = 0
-    compact_threshold: int = 0
+    before_tokens: int = 0
+    after_tokens: int = 0
 
 
 @dataclass

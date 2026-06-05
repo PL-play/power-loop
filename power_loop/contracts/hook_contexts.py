@@ -223,8 +223,6 @@ class CompactBeforeCtx(BaseHookCtx):
     """
 
     messages: list[LoopMessage] = field(default_factory=list)
-    input_tokens: int = 0
-    compact_threshold: int = 0
 
 
 @dataclass
