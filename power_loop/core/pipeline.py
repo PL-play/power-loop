@@ -266,7 +266,7 @@ class AgentPipeline:
         compact_before = CompactBeforeCtx(
             round_index=round_index,
             messages=self.history,
-            input_tokens=self.ctx.last_input_tokens,
+            input_tokens=0,
             compact_threshold=int(self.config.max_tokens or 0),
         )
         await self.hooks.run_typed_async(HookPoint.COMPACT_BEFORE, compact_before)
@@ -311,8 +311,6 @@ class AgentPipeline:
             after_tokens=plan.after_tokens,
             round_index=round_index,
         )
-        self.ctx.reset_usage()
-
         compact_after = CompactAfterCtx(
             round_index=round_index,
             messages=self.history,

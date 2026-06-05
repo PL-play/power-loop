@@ -1,17 +1,15 @@
 from __future__ import annotations
 
-import json
 import os
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from llm_client.interface import LLMRequest, LLMResponse
+from llm_client.interface import LLMResponse
 from power_loop.contracts.event_payloads import TodoUpdatedPayload
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.core.agent_context import get_event_bus, get_session_id
-from power_loop.runtime.env import AGENT_DIR, SKILLS_DIR, WORKSPACE_DIR
+from power_loop.runtime.env import AGENT_DIR
 from power_loop.runtime.skills import SKILL_LOADER
 
 TOOL_MAX_LINES = 20
@@ -85,25 +83,28 @@ class TodoManager:
 
 @dataclass
 class ContextManager:
-    """Per-session agent context: usage tracking + optional compacting."""
+    """Per-session agent context: usage tracking + microcompact + todo state.
+
+    LLM-summary compaction lives in :mod:`power_loop.runtime.compact`
+    (configured via ``AgentLoopConfig.compactor``). This class only owns
+    the orthogonal "spill large tool outputs to disk" path and the
+    telemetry-friendly :meth:`update_usage` parser.
+    """
 
     role: str = "main"
     recent_files: list[str] = field(default_factory=list)
     _file_counter: int = 0
 
-    #: 最近一次 ``update_usage`` 解析到的 prompt/input tokens（用于 auto-compact 阈值判断）
-    last_input_tokens: int = 0
     token_usage: dict[str, Any] = field(default_factory=dict)
     #: 可选计数器，供测试/扩展使用；**不会**被 ``update_usage`` 自动递增
     api_calls: int = 0
 
-    _compact_count: int = 0
     subagent_records: list[dict[str, Any]] = field(default_factory=list)
 
     todo: TodoManager = field(default_factory=TodoManager)
 
-    # Compact config
-    compact_threshold: int = field(default_factory=lambda: int(os.getenv("CONTEXT_COMPACT_THRESHOLD", "50000")))
+    # Microcompact (large tool-output spill-to-disk) config — orthogonal to
+    # the LLM-summary Compactor in runtime/compact.py.
     micro_hot_tail: int = field(default_factory=lambda: int(os.getenv("CONTEXT_MICRO_HOT_TAIL", "10")))
     micro_size_limit: int = field(default_factory=lambda: int(os.getenv("CONTEXT_MICRO_SIZE_LIMIT", "1000")))
 
@@ -170,14 +171,7 @@ class ContextManager:
             "reasoning": reasoning,
         }
         self.token_usage = usage_out
-        self.last_input_tokens = input_tokens
         return usage_out
-
-    def reset_usage(self) -> None:
-        self.last_input_tokens = 0
-
-    def should_compact(self) -> bool:
-        return self.last_input_tokens > self.compact_threshold
 
     def microcompact(self, messages: list[dict[str, Any]]) -> None:
         # Keep hot tail tool outputs; summarize/cached replace for old tool outputs.
@@ -212,72 +206,3 @@ class ContextManager:
             cache_path.write_text(md, encoding="utf-8")
             replaced = f"[tool output saved to {cache_path.relative_to(AGENT_DIR)}, {tool_name}, {len(content)} chars]"
             msg["content"] = replaced
-
-    async def compact_async(
-        self,
-        llm: Any,
-        messages: list[dict[str, Any]],
-        *,
-        focus: str | None = None,
-    ) -> list[dict[str, Any]]:
-        self._compact_count += 1
-        transcript_path = self.cache_dir / f"transcript_{int(time.time())}.jsonl"
-        with open(transcript_path, "w", encoding="utf-8") as f:
-            for msg in messages:
-                f.write(json.dumps(msg, default=str, ensure_ascii=False) + "\n")
-
-        conversation_text = json.dumps(messages, default=str, ensure_ascii=False)[:80000]
-        focus_instruction = f"\nFocus especially on: {focus}\n" if focus else ""
-
-        compact_messages = [
-            {
-                "role": "user",
-                "content": (
-                    "Summarize this conversation for continuity. Include:\n"
-                    "1) What was accomplished\n"
-                    "2) Current state of the codebase and any in-progress work\n"
-                    "3) Key technical decisions made and why\n"
-                    "4) Open tasks and next steps\n"
-                    "5) Errors encountered and how they were resolved\n"
-                    "6) Files touched and why they matter — use workspace-relative paths\n"
-                    "7) IMPORTANT: Preserve all file paths mentioned. Note that workspace is "
-                    f"{WORKSPACE_DIR} and agent home is {AGENT_DIR}. "
-                    "All user project files are in workspace.\n"
-                    f"{focus_instruction}"
-                    "Be concise but preserve critical details needed to continue without re-asking.\n\n"
-                    + conversation_text
-                ),
-            }
-        ]
-
-        summary_response = await llm.complete(
-            LLMRequest(messages=compact_messages, max_tokens=8000, temperature=0)
-        )
-        summary = getattr(summary_response, "raw_text", "") or getattr(summary_response, "content_text", "")
-        summary = str(summary).strip()
-
-        todo_state = self.todo.render()
-        parts: list[str] = [
-            "This session is being continued from a previous conversation that ran out of context.",
-            f"Transcript saved to: {transcript_path.relative_to(AGENT_DIR)}",
-            "",
-            "<path_reminder>",
-            f"WORKSPACE (your working directory): {WORKSPACE_DIR}",
-            f"AGENT HOME (power-loop installation): {AGENT_DIR}",
-            f"SKILLS: {SKILLS_DIR}",
-            "All relative file paths resolve to WORKSPACE. Files you created earlier in this session are in WORKSPACE.",
-            "</path_reminder>",
-            "",
-            summary,
-        ]
-        if todo_state and todo_state != "No todos.":
-            parts.append(f"\n<current_todos>\n{todo_state}\n</current_todos>")
-        if self.recent_files:
-            parts.append(f"\nRecently accessed files (workspace-relative): {', '.join(self.recent_files)}")
-        parts.append("\nPlease continue from where we left off without asking the user any further questions.")
-
-        return [
-            {"role": "user", "content": "\n".join(parts)},
-            {"role": "assistant", "content": "Understood. I have the context from the summary and will continue the task."},
-        ]
-
