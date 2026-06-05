@@ -76,3 +76,13 @@ def test_example_05_pending_resume_runs() -> None:
     assert "hypertext" in final_text.lower().replace("-", "").replace(" ", ""), (
         f"post-abort send did not produce the expected answer: {final_text!r}"
     )
+
+
+def test_example_06_declarative_subagent_runs() -> None:
+    module = _load_example("06_declarative_subagent.py")
+    final_text = asyncio.run(module.main())
+    # The orchestrator delegates (17+25)*3 = 126; the answer should surface
+    # that number (subagent may include extra prose).
+    assert "126" in final_text, (
+        f"declarative subagent answer missing '126': {final_text!r}"
+    )

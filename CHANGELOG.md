@@ -8,6 +8,59 @@
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-05
+
+Stateful refactor. The library now revolves around `StatefulAgentLoop` and a SQLite-backed `SessionStore`; the stateless `AgentLoop` is removed. **Hard break — no compatibility shim.**
+
+### Added
+
+- **`StatefulAgentLoop`** — the only public entry point. `send(user_input, session_id=None)` / `send_sync` / `resume(sid)` / `abort_pending(sid)` / `close_session(sid, cascade=True)` / `close()` / `get_messages(sid)` / `get_pending(sid)`. Per-session `asyncio.Lock` so one instance can drive any number of sessions concurrently.
+- **`SessionStore`** (`power_loop.runtime.session_store`) — SQLite-backed, the **only** thing that writes to disk. Five tables: `sessions` / `messages` / `compactions` / `usage_rounds` / `session_state`. Single connection + `threading.RLock`; WAL + busy_timeout. Public API surface for sessions, messages, compactions, usage, lifecycle.
+- **`MessageSink`** Protocol + `NullSink` + `SQLiteSink` — pipeline persistence hook. SQLiteSink owns the in-memory `_history_seqs` list that mirrors `pipeline.history` so the compactor can translate fold indices back to store rows.
+- **Pending state machine** — `assistant(tool_calls)` falling-into-store immediately marks `session_state.pending`; each matching `tool` message clears it. Mid-tool crash leaves a recoverable state. Next `send` raises `SessionPendingError`; caller picks `resume()` (replay remaining tools) or `abort_pending(sid, reason=…)` (synthesize `<aborted>` tool messages).
+- **Subagent on top of `SessionStore`** — `spawn_agent` rewritten as a thin shell over the shared store. Children get their own row with `parent_session_id` / `spawn_tool_call_id` / `spawn_depth` (`MAX_SPAWN_DEPTH=3` enforced at insert time).
+- **`AgentSpec`** (`power_loop.runtime.spec`) — strict-schema declarative subagent: `name / system_prompt / tools / max_rounds / max_tokens / temperature / model / lifecycle / metadata`. Unknown fields → `AgentSpecError`. `from_dict` / `from_json` factories.
+- **`run_agent` meta-tool** — declarative companion to `spawn_agent`. The parent LLM submits a full `AgentSpec` JSON; the library validates and dispatches via `run_agent_spec`. Both meta-tools registered by a single `register_spawn_agent(registry)`.
+- **`SubagentLifecycle`** enum — `EPHEMERAL` (default, deleted on success, preserved on failure for debug) / `LINKED` (cascade-deleted with parent) / `DETACHED` (independent of parent's lifecycle).
+- **`Compactor`** Protocol + **`DefaultCompactor`** (`power_loop.runtime.compact`) — pluggable LLM-summary compaction. Trigger at `max_tokens × trigger_ratio` (default 0.75) or absolute `CONTEXT_COMPACT_THRESHOLD`. Preserves all `role=system`, last `keep_last_n` user-bounded exchanges, and the `assistant(tool_calls) ↔ tool` atomic pair. Soft-fails to `None` on summary errors so the loop degrades gracefully.
+- **`runtime/budget.py`** — `estimate_tokens(messages)` heuristic (≈4 chars/token, stdlib-only) used by the compactor's trigger logic.
+- **Error hierarchy** — `PowerLoopError` base + `SessionNotFoundError` + `SessionPendingError(session_id, assistant_seq, pending_tool_calls)`. Caller catches the base class to handle every library-raised exception.
+- **`_current_loop` contextvar** (`power_loop.core.agent_context`) — threads the active `StatefulAgentLoop` through tool invocations so meta-tools like `spawn_agent` find their parent without ambient state.
+- **Examples 00–05** — progressive tutorial: minimal send → multi-turn → tool calling → subagent → compaction → pending recovery. Each file introduces exactly one new concept. `examples/_helpers.py` shares `.env` loading + LLM construction.
+- **Real-LLM test suite** — `tests/real/test_real_stateful_loop.py` / `test_real_tool_use.py` / `test_real_subagent.py` / `test_real_pending_resume.py` / `test_real_compaction.py` / `test_examples.py` (6 examples). `tests/real/judge.py` provides an **LLM-as-judge** helper: tests assert `await assert_passes(question, answer, rubric)` and a separate power-loop evaluator returns `{passed, reason}` JSON, solving the LLM-non-determinism assertion problem.
+
+### Changed — Breaking
+
+- **Removed `AgentLoop` and `agent_loop_async`**. Replace `AgentLoop(llm, config).run(messages=…)` with `StatefulAgentLoop(llm=…, db_path=…, config=…).send(user_input, session_id=…)`. The stateless model is gone — callers no longer ship the full messages list per turn; power-loop loads history from the store.
+- **`AgentLoopConfig.compactor: Compactor | None = DefaultCompactor()`** — default-on. Pass `None` to disable.
+- **`CompactBeforeCtx`** loses `input_tokens` and `compact_threshold` — neither carried useful data after the runtime/compact.py rewrite. **`AutoCompactStatusPayload`** trades them for `before_tokens` / `after_tokens` (sourced from the `CompactionPlan`).
+- **`ContextManager`** loses `compact_async` / `should_compact` / `compact_threshold` / `last_input_tokens` / `_compact_count` / `reset_usage`. It now owns only `update_usage` (telemetry parsing), `microcompact` (large tool-output spill-to-disk), `recent_files`, and `TodoManager`. LLM-summary compaction has moved to `runtime/compact.py`.
+- **`power_loop.contracts.errors`** is now a real module (was unused).
+
+### Removed
+
+- `power_loop/agent/loop.py` — `AgentLoop` shell.
+- `power_loop/core/agent.py` — `agent_loop_async` entry point.
+- Six stale integration / real tests that depended on the removed API; replaced by the new `tests/real/test_real_*.py` suite + the 6 example-driven tests.
+
+### Migration
+
+| Before (0.1.x) | After (0.2.0) |
+|---|---|
+| `AgentLoop(llm, config).run(messages=[…])` | `StatefulAgentLoop(llm=…, db_path=…, config=…).send(user_input)` |
+| Caller manages `messages` list | Library loads from `SessionStore` by `session_id` |
+| No persistence | `db_path` (default `./power_loop_sessions.db`); `":memory:"` for tests |
+| No pending detection | Crash mid-tool → next `send` raises `SessionPendingError`; pick `resume()` or `abort_pending()` |
+| Compaction via `ContextManager.compact_async` | `AgentLoopConfig.compactor = DefaultCompactor()` (default-on); pluggable via `Compactor` protocol |
+| `spawn_agent` with private `AgentLoop` | `register_spawn_agent(registry)` + `run_agent` meta-tool; shared `SessionStore` with parent linking |
+| No declarative subagent | `AgentSpec` + `run_agent_spec(spec, input, parent_loop=…)` |
+
+### Documentation
+
+- README rewritten around `StatefulAgentLoop`. Sections: 1. what it is/isn't · 2. install · 3. quickstart (mirrors examples 00→05) · 4. core concepts (Session / SessionStore / Sink / Compactor / Pending / Subagent / Hooks vs Events) · 5. flat API reference · 6. examples table · 7. env-var config · 8. pipeline ASCII trace + persistence/seq notes + pending state machine · 9. tests (including the LLM-as-judge pattern) · 10. roadmap pointer.
+- `docs/hooks.md` — every `HookPoint` with its typed Ctx fields + accepted directives + typical use cases.
+- `docs/events.md` — every `AgentEventType` with its payload fields + when fired + typical subscriber.
+
 ### Added — M0 工程化基线（2026-06-05）
 - `power_loop.__version__ = "0.1.0"` 单一来源 + `STABLE_API` 元组声明稳定面（`AgentLoop / AgentLoopConfig / AgentLoopResult / AgentHooks / AgentEventBus / HookPoint / HookDirective / ToolRegistry / ToolDefinition`）。
 - `pyproject.toml` 补 license / classifiers / urls / dynamic version；新增 dev extras (`ruff` / `mypy`)；统一 `ruff` (line=120, E/F/I/UP/B) 与 `pytest` marker (`unit` / `integration` / `real_llm`)。

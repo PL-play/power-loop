@@ -244,8 +244,8 @@ power-loop 的**唯一**持久化入口（SQLite）。5 张表：
 
 两条互不污染的通道：
 
-- **Hooks**（控制流）：15 个 `HookPoint`，每个 hook 返回 `HookDirective ∈ {CONTINUE/SKIP/BREAK/SHORT_CIRCUIT}`。改 LLM 请求、注入 mock 结果、安全门、提前终止都靠它。
-- **Events**（旁路只读）：`AgentEventBus` 发布 token usage / stream delta / tool call started / completed / 等。指标、审计、UI 推送都订阅它。
+- **Hooks**（控制流）：15 个 `HookPoint`，每个 hook 返回 `HookDirective ∈ {CONTINUE/SKIP/BREAK/SHORT_CIRCUIT}`。改 LLM 请求、注入 mock 结果、安全门、提前终止都靠它。完整 hook 表与示例：[`docs/hooks.md`](docs/hooks.md)。
+- **Events**（旁路只读）：`AgentEventBus` 发布 token usage / stream delta / tool call started / completed / 等。指标、审计、UI 推送都订阅它。完整 event 表与示例：[`docs/events.md`](docs/events.md)。
 
 ---
 
@@ -409,6 +409,7 @@ class DefaultCompactor:
 | [`03_subagent.py`](examples/03_subagent.py) | `spawn_agent` meta-tool + EPHEMERAL 自动清理 |
 | [`04_compaction.py`](examples/04_compaction.py) | `DefaultCompactor` 自动折叠 + 查看 store 审计行 |
 | [`05_pending_resume.py`](examples/05_pending_resume.py) | `SessionPendingError` + `resume` / `abort_pending` |
+| [`06_declarative_subagent.py`](examples/06_declarative_subagent.py) | `AgentSpec` 严格 schema + `run_agent` meta-tool + 直接调 `run_agent_spec` |
 
 `examples/_helpers.py` 是共享的 `.env` 读取 + LLM 构造辅助，每个示例 `from _helpers import make_llm`，省掉 boilerplate。复制到自己项目时把那两行内联即可。
 
