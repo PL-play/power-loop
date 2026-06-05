@@ -1,0 +1,122 @@
+# 配置
+
+[English](../../en/user-guide/configuration.md) | [用户手册](../index.md)
+
+所有可调参数 —— `AgentLoopConfig`、环境变量、`LLMProviderConfig`。
+
+## AgentLoopConfig
+
+```python
+from power_loop import AgentLoopConfig
+
+config = AgentLoopConfig(
+    system_prompt="你是一个有帮助的助手。",
+    max_rounds=24,           # 每次 send() 的最大 LLM 调用次数
+    temperature=0.0,         # 0 = 确定性的
+    max_tokens=8000,         # 每次请求的 token 上限
+    compactor=DefaultCompactor(),  # 默认开启；None 关闭
+    retry_policy=None,       # None = 不重试（快速失败）
+    memory=None,             # None = 无跨会话记忆
+    memory_budget_tokens=1500,
+)
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `system_prompt` | `str \| None` | `None` | 每次 LLM 请求前添加的系统消息 |
+| `max_rounds` | `int` | `24` | 每次 `send()` 的最大 LLM + 工具轮数。1 = 单条回复，无工具 |
+| `temperature` | `float \| None` | `0.0` | LLM 温度 |
+| `max_tokens` | `int \| None` | `8000` | 每次请求的 token 上限 |
+| `compactor` | `Compactor \| None` | `DefaultCompactor()` | 上下文压缩；`None` 关闭 |
+| `retry_policy` | `LLMRetryPolicy \| None` | `None` | LLM 瞬时错误重试 |
+| `memory` | `MemoryProvider \| None` | `None` | 跨会话记忆 provider |
+| `memory_budget_tokens` | `int` | `1500` | 传给 `memory.recall()` 的 token 预算 |
+
+## 环境变量
+
+配置 LLM 凭证的推荐方式：
+
+```bash
+# 必填
+POWER_LOOP_BASE_URL=https://api.openai.com/v1
+POWER_LOOP_API_KEY=sk-…
+POWER_LOOP_MODEL=gpt-4o-mini
+
+# 可选
+POWER_LOOP_PROVIDER=openai          # 遥测标签
+POWER_LOOP_TIMEOUT_S=180            # HTTP 超时
+POWER_LOOP_MAX_TOKENS=8000          # 每次请求上限
+POWER_LOOP_TEMPERATURE=0.0
+POWER_LOOP_MAX_RETRIES=3
+```
+
+旧 `OPENAI_COMPAT_*` 名称仍支持作为回退。
+
+### 一行构建服务
+
+```python
+from power_loop import create_llm_service_from_env
+
+llm = create_llm_service_from_env()
+# 或自定义前缀
+llm = create_llm_service_from_env(prefix="MY_APP")
+```
+
+## LLMProviderConfig（编程式）
+
+```python
+from power_loop import LLMProviderConfig, create_llm_service_from_config
+
+cfg = LLMProviderConfig(
+    provider="dashscope",
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+    api_key="sk-…",
+    model="qwen-plus",
+    max_tokens=4096,
+    temperature=0.0,
+)
+llm = create_llm_service_from_config(cfg)
+```
+
+必填字段缺失 → 构造时 `ValueError`（不是等 `complete()` 时才报——提前暴露配置错误）。
+
+详见 [Providers](providers.md) 的各 provider 片段（OpenAI / DashScope / DeepSeek / 本地）。
+
+## 压缩器调优
+
+```python
+from power_loop.runtime.compact import DefaultCompactor
+
+compactor = DefaultCompactor(
+    trigger_ratio=0.75,       # token 超过 max_tokens 的 75% 时触发压缩
+    keep_last_n=4,            # 始终保留最后 4 轮对话
+    summary_max_tokens=512,   # 摘要 LLM 调用的最大 token 数
+)
+```
+
+或通过环境变量设置绝对阈值：`CONTEXT_COMPACT_THRESHOLD=6000`
+
+关闭压缩：`AgentLoopConfig(compactor=None)`。
+
+## 重试策略
+
+```python
+from power_loop import LLMRetryPolicy
+
+retry = LLMRetryPolicy(
+    max_attempts=3,           # 1 次初始 + 2 次重试
+    backoff_initial=0.5,      # 第二次尝试前等待秒数
+    backoff_max=8.0,          # 指数退避上限
+    total_timeout=60.0,       # 跨所有尝试的 wall-clock 超时
+    retry_on=(Exception,),    # 默认：所有 Exception 子类
+)
+
+config = AgentLoopConfig(retry_policy=retry, ...)
+```
+
+详见 [重试与取消](retry-cancel.md) 了解完整重试生命周期。
+
+## 下一步
+
+- [会话](sessions.md) — 理解会话生命周期
+- [工具](tools.md) — 给 Agent 能力
