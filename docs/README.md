@@ -19,7 +19,7 @@
 
 ## Project links
 
-- [GitHub Repository](https://github.com/deep-talk0/power-loop)
+- [GitHub Repository](https://github.com/PL-play/power-loop)
 - [Changelog](../CHANGELOG.md)
 - [Roadmap](../ROADMAP.md)
 - [Examples](../examples/)

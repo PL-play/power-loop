@@ -41,10 +41,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/deep-talk0/power-loop"
-Repository = "https://github.com/deep-talk0/power-loop"
-Changelog = "https://github.com/deep-talk0/power-loop/blob/main/CHANGELOG.md"
-Roadmap = "https://github.com/deep-talk0/power-loop/blob/main/ROADMAP.md"
+Homepage = "https://github.com/PL-play/power-loop"
+Repository = "https://github.com/PL-play/power-loop"
+Changelog = "https://github.com/PL-play/power-loop/blob/main/CHANGELOG.md"
+Roadmap = "https://github.com/PL-play/power-loop/blob/main/ROADMAP.md"
 
 [tool.setuptools]
 include-package-data = true

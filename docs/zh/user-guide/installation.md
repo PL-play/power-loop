@@ -15,10 +15,10 @@
 pip install power-loop
 
 # 从 GitHub 安装（开发版）
-pip install git+https://github.com/deep-talk0/power-loop.git
+pip install git+https://github.com/PL-play/power-loop.git
 
 # 可编辑安装（DeepTalk 风格多仓库）
-git clone https://github.com/deep-talk0/power-loop.git
+git clone https://github.com/PL-play/power-loop.git
 cd power-loop
 pip install -e .
 

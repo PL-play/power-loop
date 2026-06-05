@@ -15,10 +15,10 @@
 pip install power-loop
 
 # From GitHub (development)
-pip install git+https://github.com/deep-talk0/power-loop.git
+pip install git+https://github.com/PL-play/power-loop.git
 
 # Editable install (multi-repo setup like DeepTalk)
-git clone https://github.com/deep-talk0/power-loop.git
+git clone https://github.com/PL-play/power-loop.git
 cd power-loop
 pip install -e .
 

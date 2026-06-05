@@ -17,7 +17,7 @@ pip install power-loop
 For local development:
 
 ```bash
-git clone https://github.com/deep-talk0/power-loop.git
+git clone https://github.com/PL-play/power-loop.git
 cd power-loop
 pip install -e ".[dev]"
 ```
