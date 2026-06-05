@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 keywords = ["agent", "llm", "openai", "anthropic", "tool-use", "hooks"]
-authors = [{ name = "zhangran" }]
+authors = [{ name = "zhangran", email = "zhangran24@126.com" }]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",

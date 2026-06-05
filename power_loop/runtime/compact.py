@@ -5,7 +5,9 @@ Design contract (from ROADMAP §M1.7a / README §1):
 * Triggered every ``round.start`` when estimated tokens >=
   ``max_tokens × trigger_ratio`` (or absolute ``CONTEXT_COMPACT_THRESHOLD``
   env override). Idempotent within a round.
-* **Preserve** ``role=system`` messages (including prior ``compact_note``).
+* **Preserve** the first ``role=system`` message (the original system_prompt)
+	and ``memory_*`` messages. Old ``compact_note`` messages are foldable —
+	the new summary merges them so at most one compact_note ever exists.
 * **Preserve** the last ``keep_last_n`` exchanges. An exchange is a
   ``user / assistant(+optional tool_calls) / tool*`` triple — never split
   the atomic ``assistant(tool_calls)`` ↔ matching ``tool(tool_call_id=…)``
@@ -70,7 +72,7 @@ class DefaultCompactor:
         *,
         trigger_ratio: float = 0.75,
         keep_last_n: int = 4,
-        summary_max_tokens: int = 1024,
+        summary_max_tokens: int = 5000,
         summary_llm: Any | None = None,
         absolute_threshold: int | None = None,
     ) -> None:
@@ -88,10 +90,10 @@ class DefaultCompactor:
             everything but the last user turn"; the default 4 follows
             Anthropic's compaction guide.
         summary_max_tokens
-            Token cap for the summary LLM call. Rule of thumb:
-            ``summary_max_tokens ≈ max_tokens × 0.10–0.15``. 1024 is a
-            balanced default for typical ``max_tokens=8000`` setups; bump
-            it for very long sessions, lower it to cut summary cost.
+            Token cap for the summary LLM call. Since at most one compact_note
+            exists at any time (each compaction merges the old note into the
+            new one), this can be generous — 5000 is a good default for
+            preserving detailed context across many compaction rounds.
         summary_llm
             Optional cheaper LLM dedicated to the summary call. Defaults
             to the main loop's LLM.
@@ -156,30 +158,33 @@ class DefaultCompactor:
     ) -> tuple[int, int] | None:
         """Return the inclusive index range we can safely fold, or None.
 
-        Preserves all ``system`` messages at the front; preserves the tail
-        ``keep_last_n`` exchanges; never splits an
-        ``assistant(tool_calls) ↔ tool`` atomic pair.
+        Preserves the first ``system`` message (the original system_prompt)
+        and ``memory_*`` messages. Old ``compact_note`` messages are foldable
+        so at most one compact_note ever exists.
         """
         n = len(messages)
         if n == 0:
             return None
-        # Find end of leading system block.
+        # Find end of preserved system block: first system msg + memory_* msgs.
         sys_end = 0
-        while sys_end < n and messages[sys_end].get("role") == "system":
-            sys_end += 1
+        # Always preserve the first system message (the original system_prompt).
+        if sys_end < n and messages[sys_end].get("role") == "system":
+            sys_end = 1
+            # Preserve subsequent memory_* messages (they share system-region protection).
+            while sys_end < n and messages[sys_end].get("role") == "system":
+                name = messages[sys_end].get("name") or ""
+                if name.startswith("memory_"):
+                    sys_end += 1
+                else:
+                    break
         # Decide the tail boundary by counting exchanges from the end.
         tail_start = self._tail_start(messages, sys_end)
         if tail_start <= sys_end:
-            return None  # nothing in the middle
-        # Don't split a pending pair: if tail_start points at a `tool` whose
-        # `assistant(tool_calls)` is in the cut range, expand tail to include
-        # that assistant too.
+            return None
+        # Don't split a pending pair.
         tail_start = self._expand_back_to_atomic(messages, tail_start)
         if tail_start <= sys_end:
             return None
-        # And don't cut after the LAST element of an atomic pair without its
-        # head: if messages[tail_start - 1] is a tool message, walk back so
-        # the cut range ends on a non-tool boundary.
         end = tail_start - 1
         while end > sys_end and messages[end].get("role") == "tool":
             end -= 1
@@ -239,11 +244,12 @@ class DefaultCompactor:
         prompt = (
             "You are a conversation summarizer. Below is a slice of an "
             "agent's working transcript that needs to be compressed for "
-            "context-window economy. Produce a concise but faithful summary "
-            "that preserves: (1) decisions made, (2) facts established, "
-            "(3) errors and how they were handled, (4) any pending intent "
-            "the assistant was about to act on. Do NOT call tools. Wrap "
-            "your summary in <summary>…</summary>.\n\n"
+            "context-window economy. The slice may include prior compact_notes — "
+            "merge their content into your summary so there is at most ONE "
+            "compact note at any time. Preserve: (1) decisions made, "
+            "(2) facts established, (3) errors and how they were handled, "
+            "(4) any pending intent the assistant was about to act on. "
+            "Do NOT call tools. Wrap your summary in <summary>…</summary>.\n\n"
             "--- transcript slice ---\n"
             + _stringify_slice(slice_msgs)
         )

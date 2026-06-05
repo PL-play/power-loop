@@ -10,7 +10,7 @@ from power_loop.contracts.event_payloads import TodoUpdatedPayload
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.core.agent_context import get_event_bus, get_session_id
 from power_loop.runtime.env import AGENT_DIR
-from power_loop.runtime.skills import SKILL_LOADER
+from power_loop.runtime.skills import get_default_loader
 
 TOOL_MAX_LINES = 20
 
@@ -113,7 +113,7 @@ class ContextManager:
     def __post_init__(self) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         # Ensure skills loader reads from correct runtime env.
-        _ = SKILL_LOADER
+        _ = get_default_loader()
 
     def track_file(self, path: str) -> None:
         if not path:

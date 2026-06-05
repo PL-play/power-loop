@@ -18,7 +18,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
@@ -127,6 +127,12 @@ from power_loop.runtime.session_store import (
     SessionStatus,
     SessionStore,
     SubagentLifecycle,
+)
+from power_loop.runtime.skills import (
+    LOAD_SKILL_DEFINITION,
+    SkillLoader,
+    get_default_loader,
+    register_skill_tools,
 )
 from power_loop.runtime.spec import AgentSpec, AgentSpecError, run_agent_spec
 from power_loop.runtime.structured import (
@@ -310,6 +316,10 @@ __all__ = [
 	"register_spawn_agent",
 	"SPAWN_AGENT_DEFINITION",
 	"RUN_AGENT_DEFINITION",
+	"LOAD_SKILL_DEFINITION",
+	"SkillLoader",
+	"get_default_loader",
+	"register_skill_tools",
 	"AgentSpec",
 	"AgentSpecError",
 	"run_agent_spec",

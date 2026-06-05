@@ -29,6 +29,7 @@ class AgentLoopConfig:
     retry_policy: LLMRetryPolicy | None = None
     memory: MemoryProvider | None = None
     memory_budget_tokens: int = 1500
+    skills_dir: str | None = None
 
 
 @dataclass
