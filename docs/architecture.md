@@ -1,5 +1,7 @@
 # 架构总览
 
+[English](en/architecture.md) | [回到文档站](README.md)
+
 本文用图示和代码地标讲清楚 power-loop 的内部协作：`StatefulAgentLoop` /
 `AgentPipeline` / `MessageSink` / `SessionStore` / `Compactor` /
 Subagent 链路。
@@ -506,3 +508,91 @@ flowchart LR
 详细数据流和测试覆盖见 `tests/unit/test_session_store.py`、
 `tests/unit/test_stateful_loop.py`、`tests/unit/test_compact.py`、
 `tests/unit/test_subagent.py`。
+
+## 10. Retry 状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Attempting: LLM call starts
+    Attempting --> Success: LLM responds
+    Attempting --> Retryable: retry_on exception
+    Retryable --> Backoff: sleep(backoff)
+    Backoff --> Attempting: attempt < max_attempts
+    Backoff --> Cancelled: CancellationToken fires
+    Retryable --> Timeout: total_timeout exceeded
+    Retryable --> Exhausted: attempt == max_attempts
+    Cancelled --> [*]: status=cancelled
+    Timeout --> [*]: status=degraded
+    Exhausted --> [*]: status=degraded
+    Success --> [*]: status=completed
+```
+
+**关键路径**：
+- Attempting → Success：正常完成，`status="completed"`。
+- Retryable → Backoff → Attempting（循环）：指数退避，退避 sleep 是 cancel-aware 的。
+- Timeout / Exhausted → `status="degraded"`：LLM 降级，pipeline 返回合成 assistant 消息。
+- Cancelled → `status="cancelled"`：外部 token flip，退避 sleep 中立即响应。
+
+## 11. Memory 生命周期
+
+```mermaid
+flowchart TD
+    A[send user_input] --> B[session.start hook]
+    B --> C{memory configured?}
+    C -->|No| F[round loop]
+    C -->|Yes| D[memory.recall]
+    D --> E{recall raises?}
+    E -->|Yes| E1[emit MEMORY_FAILED]
+    E1 --> F
+    E -->|No| E2[tag_as_memory]
+    E2 --> E3[MEMORY_RECALLED hook]
+    E3 --> E4{hook SKIP?}
+    E4 -->|Yes| E5[emit MEMORY_RECALLED injected=0]
+    E5 --> F
+    E4 -->|No| E6[inject after leading system block]
+    E6 --> E7[emit MEMORY_RECALLED]
+    E7 --> F
+    F --> G[session.end]
+    G --> H{memory configured?}
+    H -->|Yes| I[memory.remember]
+    H -->|No| J[done]
+    I --> K{remember raises?}
+    K -->|Yes| K1[emit MEMORY_FAILED]
+    K1 --> J
+    K -->|No| J
+```
+
+**不变**：
+- recall 失败 → 返回 `[]` 视为无记忆，loop 继续，不报错。
+- 注入位置：所有 leading `role=system` 消息之后，对话历史之前——与 `compact_note` 同区，受压缩器保留。
+- remember 失败 → 不影响 `StatefulResult` 返回，仅发 `MEMORY_FAILED` 事件。
+- `MEMORY_RECALLED` hook 可以 SKIP 整批注入（双方授权 gate 等）。
+
+## 12. Hook 决策树
+
+```mermaid
+flowchart TD
+    Q["我想…"] --> A1[在 loop 开始前初始化]
+    Q --> A2[每轮开始前做检查]
+    Q --> A3[改 LLM 请求参数]
+    Q --> A4[限制/禁止工具执行]
+    Q --> A5[单个工具执行前拦截]
+    Q --> A6[工具结果后处理]
+    Q --> A7[LLM 返回后立即终止]
+    Q --> A8[跳过本轮压缩]
+    Q --> A9[每条消息落库前修改]
+    Q --> A10[内存召回后过滤]
+
+    A1 --> H1["session.start"]
+    A2 --> H2["round.start (BREAK 结束 / SKIP 跳过本轮)"]
+    A3 --> H3["llm.before (SHORT_CIRCUIT 跳过 LLM / BREAK 结束)"]
+    A4 --> H4["round.decide / tools.batch.before (SKIP 整批)"]
+    A5 --> H5["tool.before (SKIP + output 替代)"]
+    A6 --> H6["tool.after (修改 output) / tool.error (SKIP 吞错 / SHORT_CIRCUIT 重试)"]
+    A7 --> H7["llm.after (BREAK)"]
+    A8 --> H8["compact.before (SKIP)"]
+    A9 --> H9["message.append"]
+    A10 --> H10["memory.recalled (SKIP 丢弃整批)"]
+```
+
+**选择规则**：Hook 在热路径同步触发，handler 越短越好。耗时操作（调外部 API、写数据库）放进 event 订阅者做旁路处理。

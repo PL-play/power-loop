@@ -1,5 +1,7 @@
 # Hooks 完整参考
 
+[English](en/user-guide/hooks.md) | [回到文档站](README.md)
+
 Hook 是 power-loop 的**控制流**通道。和 [Events](events.md) 不同：
 event 只读、用于观测；hook 可以改 messages、改 LLM 请求、改工具输入输出，甚至
 让循环跳到下一轮或直接结束。

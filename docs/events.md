@@ -1,5 +1,7 @@
 # Events 完整参考
 
+[English](en/user-guide/events.md) | [回到文档站](README.md)
+
 Event 是 power-loop 的**旁路观测**通道。订阅者**只读**——event 不能改控制流。
 所有事件都流过同一个 `AgentEventBus`；订阅者错误不会污染主循环（默认
 `suppress_subscriber_errors=True`）。

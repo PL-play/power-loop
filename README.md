@@ -1,5 +1,7 @@
 # power-loop
 
+[English Documentation](docs/en/index.md) | [中文文档](docs/zh/index.md)
+
 > **可嵌入的、有状态的 Agent 执行内核。** 调用方只管「给一段最新输入 + session_id」，
 > power-loop 自治管理：LLM 多轮循环、工具调用、上下文压缩、子代理、消息持久化（SQLite）、
 > 悬挂态恢复。

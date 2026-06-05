@@ -1,5 +1,7 @@
 # Providers
 
+[English](en/user-guide/providers.md) | [回到文档站](README.md)
+
 power-loop speaks to LLMs through **one transport** today:
 `OpenAICompatibleChatLLMService`. Any provider that exposes an
 OpenAI-compatible `chat.completions` endpoint works — you only need
