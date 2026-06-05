@@ -60,48 +60,49 @@ API 稳定性：`power_loop/__init__.py` 暴露的为 **Public API**，破坏性
 
 每项 = **能力 + 单元测试 + 文档段落**。按列表顺序推进。
 
-### M1.1 LLM 重试 / 超时 / 取消（最关键）
+### M1.1 LLM 重试 / 超时 / 取消（最关键）✅ 2026-06-05
 
-- `power_loop/runtime/retry.py`：`LLMRetryPolicy(max_attempts, backoff_initial, backoff_max, total_timeout, retry_on=(RateLimitError, TimeoutError, …))`。
-- 接入 `AgentPipeline.call_llm`：失败按策略重试；整体超时 BREAK，结果 `status="degraded"`。
-- `stop_event` 升级为 `CancellationToken`，兼容 `asyncio.Event` / `threading.Event` / `Callable[[], bool]`；每个 await 边界检查。
-- 新事件：`llm.retry.attempted` / `llm.degraded` / `loop.cancelled`。
-- 测试：连续失败 / 超时 / 用户取消三条路径。
+- `power_loop/runtime/retry.py`：`LLMRetryPolicy(max_attempts, backoff_initial, backoff_max, total_timeout, retry_on)` + `with_retry(call, *, policy, token, on_retry=None)`。
+- 接入 `AgentPipeline.call_llm`：失败按策略重试；整体超时 / 重试耗尽 → pipeline 翻译成 `status="degraded"` 并 append 合成 assistant 消息。
+- `stop_event` 升级为 `CancellationToken`（`runtime/cancellation.py`），兼容 `asyncio.Event` / `threading.Event` / `Callable[[], bool]` / `None`；retry backoff sleep cancel-aware。
+- 新事件：`LLM_RETRY_ATTEMPTED` / `LLM_DEGRADED` / `LOOP_CANCELLED`（+ 对应 Payload）。新错误：`LLMTimeout` / `LLMRetryExhausted` / `CancellationRequested` / `CompactionFailed`。
+- 测试：`tests/unit/test_retry_cancel.py`（12 个）+ `tests/real/test_real_retry.py`（2 个真实 LLM）。example `12_retry_and_cancel.py` 演示三条路径。
 
-### M1.2 历史窗口工具 `trim_history`
+### M1.2 历史窗口工具 `trim_history` ✅ 2026-06-05
 
 - `power_loop/runtime/budget.py`：
-  - `estimate_tokens(messages, model)`（OpenAI 用 tiktoken，Anthropic 近似）；
-  - `trim_history(messages, max_tokens, model, *, keep_system=True, keep_last_n=2)` —— 仅裁剪，不摘要（摘要走 M1.7）。
+  - `trim_history(messages, max_tokens, *, keep_system=True, keep_last_n=2)` —— 纯裁剪（不摘要），保留 leading system + 最后 N exchanges + `assistant(tool_calls) ↔ tool` 原子对。
+  - `estimate_tokens` / `estimate_text_tokens` 从顶层导出。
 - 不进 pipeline 默认行为，作为业务侧 helper。
-- 测试：不同预算下的裁剪结果固定快照。
+- 测试：`tests/unit/test_budget.py`（9 个，覆盖不同预算下的裁剪结果固定快照）。
 
-### M1.3 结构化输出（卡片 JSON）
+### M1.3 结构化输出（卡片 JSON）✅ 2026-06-05
 
-- `LLMRequest.response_format: dict | None`（OpenAI `json_schema` / Anthropic tool-use 两种适配）。
+- `LLMRequest.response_format: dict | None` 已加；`_request_kwargs` 透传到 OpenAI 兼容 API。Anthropic tool-use 适配后置（DeepTalk MVP 单 provider）。
 - `power_loop/runtime/structured.py`：
-  - `StructuredOutputSpec(name, schema, examples=None)`；
-  - `parse_structured(response, schema) -> dict`，含 JSON 修复（提炼 pipeline 现有 `_tool_call_args` 的逻辑）。
-- 测试：fake LLM 返回带噪声 JSON；schema mismatch 时报错清晰。
+  - `StructuredOutputSpec(name, schema, strict=True, description, examples)` + `.to_openai_response_format()`。
+  - `parse_structured(output, *, schema=None)`：直接 → 围栏剥离 → 抓平衡 `{...}` → 修尾逗号；失败抛 `StructuredOutputError(reason, raw_text, detail)`，原因 `no_json` / `invalid_json` / `not_object` / `missing_required:<field>`。
+  - 本地仅校验 `type=="object"` + 顶层 `required`；深层校验留 provider strict mode。
+- 测试：`tests/unit/test_structured.py`（14 个）+ `tests/real/test_real_structured.py`（1 个真实 LLM）。example `14_structured_card.py` 三段（真实抽取 / 修复 / schema 缺字段）。
 
-### M1.4 Provider 配置统一
+### M1.4 Provider 配置统一 ✅ 2026-06-05
 
-- `power_loop/runtime/provider.py`：`LLMProviderConfig(provider, base_url, api_key, model, extra)`；
-  - `create_llm_service_from_env(prefix="POWER_LOOP")`；
-  - `create_llm_service_from_config(cfg)`。
-- 现 `llm_factory.py` 内部各厂商分支保留，外部只暴露这一层。
-- 文档：provider × env 变量对照表（写进 `docs/providers.md`）。
-- 测试：mock env，三家以上 provider 实例化通过。
+- `power_loop/runtime/provider.py`：`LLMProviderConfig` + `from_env(prefix, fallback_prefix, env=None)` + `to_openai_compatible()` + `create_llm_service_from_config()` / `create_llm_service_from_env()`。
+- `OPENAI_COMPAT_*` 作为 fallback 前缀，老 `.env` 无须改名即可工作；缺必填字段在构造时抛 `ValueError`（非首个 `complete()` 时）。
+- 文档：`docs/providers.md`（变量表 + OpenAI / DashScope / DeepSeek / 本地 OpenAI-compatible 4 个 snippet + 迁移指引）。
+- 测试：`tests/unit/test_provider.py`（11 个，覆盖必填守卫 / 前缀优先 / 回退 / 三家参数化 / 适配回环）。`provider` 字段当前仅是 informational tag，M3 引入第二条 transport 时升级为路由 key。
 
 ### M1.5 取消语义统一（与 M1.1 合并实现，单独验收）
 
 - 在 `tool.after` 触发取消，验证不会再启动下一回合；
 - 取消可由 hook 主动发起（`HookDirective.CANCEL` 或外部 token），二者等价。
 
-### M1.6 async tool handler 工效学
+### M1.6 async tool handler 工效学 ✅ 2026-06-05
 
-- `ToolRegistry.invoke` 自动检测 async handler 并走 `invoke_async`，去掉 `test_real_streaming_subagent.py` Part 3 的 `get_event_loop().is_running()` hack。
-- 测试：同名工具 sync / async 双版本。
+- `register()` 用 `inspect.iscoroutinefunction` 在登记时缓存 `is_async`，覆盖 `async def` 与 `async __call__` 两类 callable。
+- `invoke()`（sync）对 async handler 抛 `AsyncToolInSyncContext`，错误指向 `invoke_async`；`invoke_async()` 同时处理 sync + async，保留「sync handler 返回 awaitable」的回退路径。
+- 旧 `test_real_streaming_subagent.py` hack 在 stateful 重构时已随旧测试删除，本次 polish 让上游 API 工效学也补齐。
+- 测试：`tests/unit/test_tool_registry_async.py`（7 个）。
 
 ### M1.7a **上下文压缩**（must-have，默认 ON，影响运行时正确性）
 
@@ -135,9 +136,11 @@ API 稳定性：`power_loop/__init__.py` 暴露的为 **Public API**，破坏性
 - `AgentLoop.run(..., resume_from: SessionSnapshot | None = None)`。
 - 测试：跑 N 轮 → snapshot → 新实例 resume → 继续跑 → 结果一致。
 
-### M1.9 **MemoryProvider 协议 + 生命周期接线**（新增）
+### M1.9 **MemoryProvider 协议 + 生命周期接线**（新增）✅ 2026-06-05
 
 > 来源：长期记忆 / 跨会话连续性的分层落地。**库内零实现**，只提供协议、接线、参考示例。
+
+**实现状态**：协议 / Snapshot / pipeline 注入 / 软失败 / `MEMORY_RECALLED` hook / 两类事件全部落地；`tests/unit/test_memory.py`（6 个）+ `examples/13_memory_sqlite.py` 跨 session 演示通过。三个候选 example（09a-c）按 ROADMAP 标注「仅在 examples」原则只保留 SQLite 实现，HTTP API / vector 留给真正用上的人写。
 
 - **协议**（`power_loop/runtime/memory.py`）：
   ```python

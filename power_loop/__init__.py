@@ -35,6 +35,10 @@ from power_loop.agent.system_prompt import (
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult
 from power_loop.contracts.errors import (
+    CancellationRequested,
+    CompactionFailed,
+    LLMRetryExhausted,
+    LLMTimeout,
     PowerLoopError,
     SessionNotFoundError,
     SessionPendingError,
@@ -44,6 +48,11 @@ from power_loop.contracts.event_payloads import (
     AutoCompactStatusPayload,
     BaseEventPayload,
     HitRoundLimitStatusPayload,
+    LlmDegradedPayload,
+    LlmRetryAttemptedPayload,
+    LoopCancelledPayload,
+    MemoryFailedPayload,
+    MemoryRecalledPayload,
     RoundCompletedPayload,
     RoundStartedPayload,
     RoundToolsPresentPayload,
@@ -74,6 +83,7 @@ from power_loop.contracts.hook_contexts import (
     CompactBeforeCtx,
     LlmAfterCtx,
     LlmBeforeCtx,
+    MemoryRecalledCtx,
     MessageAppendCtx,
     RoundDecideCtx,
     RoundEndCtx,
@@ -95,6 +105,15 @@ from power_loop.core.hooks import AgentHooks
 from power_loop.core.phase import PhaseContext, PhaseResult, phase
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
+from power_loop.runtime.budget import estimate_text_tokens, estimate_tokens, trim_history
+from power_loop.runtime.cancellation import CancellationLike, CancellationToken
+from power_loop.runtime.memory import MemoryProvider, MemorySnapshot, tag_as_memory
+from power_loop.runtime.provider import (
+    LLMProviderConfig,
+    create_llm_service_from_config,
+    create_llm_service_from_env,
+)
+from power_loop.runtime.retry import LLMRetryPolicy, with_retry
 from power_loop.runtime.session_store import (
     DEFAULT_DB_PATH,
     MAX_SPAWN_DEPTH,
@@ -107,6 +126,11 @@ from power_loop.runtime.session_store import (
     SubagentLifecycle,
 )
 from power_loop.runtime.spec import AgentSpec, AgentSpecError, run_agent_spec
+from power_loop.runtime.structured import (
+    StructuredOutputError,
+    StructuredOutputSpec,
+    parse_structured,
+)
 from power_loop.tools import ToolRegistry, build_registry, create_default_tool_registry
 from power_loop.tools.default_manifest import (
     CORE_TOOL_NAMES,
@@ -115,6 +139,7 @@ from power_loop.tools.default_manifest import (
     TOOL_PRESETS,
     get_tool_definitions,
 )
+from power_loop.tools.registry import AsyncToolInSyncContext
 from power_loop.tools.spawn_agent import (
     RUN_AGENT_DEFINITION,
     SPAWN_AGENT_DEFINITION,
@@ -131,6 +156,11 @@ STABLE_API = (
     "PowerLoopError",
     "SessionPendingError",
     "SessionNotFoundError",
+    "LLMTimeout",
+    "LLMRetryExhausted",
+    "CancellationRequested",
+    "LLMRetryPolicy",
+    "CancellationToken",
     "AgentHooks",
     "AgentEventBus",
     "HookPoint",
@@ -158,6 +188,32 @@ __all__ = [
 	"PowerLoopError",
 	"SessionPendingError",
 	"SessionNotFoundError",
+	"LLMTimeout",
+	"LLMRetryExhausted",
+	"CancellationRequested",
+	"CompactionFailed",
+	"LLMRetryPolicy",
+	"with_retry",
+	"CancellationToken",
+	"CancellationLike",
+	"LlmRetryAttemptedPayload",
+	"LlmDegradedPayload",
+	"LoopCancelledPayload",
+	"MemoryProvider",
+	"MemorySnapshot",
+	"tag_as_memory",
+	"MemoryRecalledCtx",
+	"MemoryRecalledPayload",
+	"MemoryFailedPayload",
+	"StructuredOutputSpec",
+	"StructuredOutputError",
+	"parse_structured",
+	"estimate_tokens",
+	"estimate_text_tokens",
+	"trim_history",
+	"LLMProviderConfig",
+	"create_llm_service_from_config",
+	"create_llm_service_from_env",
 	"MessageSink",
 	"NullSink",
 	"SQLiteSink",
@@ -228,6 +284,7 @@ __all__ = [
 	"ToolDefinition",
 	"validate_tool_args",
 	"ToolRegistry",
+	"AsyncToolInSyncContext",
 	"build_registry",
 	"create_default_tool_registry",
 	"get_tool_definitions",

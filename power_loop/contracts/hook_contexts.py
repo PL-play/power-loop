@@ -246,3 +246,20 @@ class MessageAppendCtx(BaseHookCtx):
 
     message: dict[str, Any] = field(default_factory=dict)
     session_id: str | None = None
+
+
+# ── Memory (M1.9) ──
+
+
+@dataclass
+class MemoryRecalledCtx(BaseHookCtx):
+    """Context for :pyattr:`HookPoint.MEMORY_RECALLED`.
+
+    Fired after :meth:`MemoryProvider.recall` returns, before injection.
+    Handler may mutate ``recalled`` (filter, redact, reorder) or set
+    ``directive=SKIP`` to drop everything and inject nothing.
+    """
+
+    recalled: list[dict[str, Any]] = field(default_factory=list)
+    session_id: str | None = None
+    budget_tokens: int = 1500

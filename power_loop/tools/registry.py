@@ -10,10 +10,20 @@ from power_loop.contracts.tools import ToolDefinition, validate_tool_args
 ToolCallable = Callable[..., Any] | Callable[..., Awaitable[Any]]
 
 
+class AsyncToolInSyncContext(TypeError):
+    """Raised when ``ToolRegistry.invoke`` (sync) is called for a handler
+    that is a coroutine function. The caller should use ``invoke_async``
+    instead — silently returning the unawaited coroutine corrupts loop
+    state and is the single most common cause of "tool seemed to succeed
+    but did nothing" bugs.
+    """
+
+
 @dataclass(frozen=True)
 class RegisteredTool:
     definition: ToolDefinition
     handler: ToolCallable
+    is_async: bool = False
 
 
 class ToolRegistry:
@@ -31,7 +41,20 @@ class ToolRegistry:
     def register(self, definition: ToolDefinition, handler: ToolCallable, *, overwrite: bool = False) -> None:
         if not overwrite and definition.name in self._tools:
             raise ValueError(f"Tool already registered: {definition.name}")
-        self._tools[definition.name] = RegisteredTool(definition=definition, handler=handler)
+        # Detect async at register time so ``invoke()`` can raise a clear
+        # error without doing the call first. ``iscoroutinefunction``
+        # covers ``async def``; for callable objects whose ``__call__`` is
+        # async we additionally check that. Plain sync callables that
+        # *happen* to return awaitables are still handled at call time by
+        # ``invoke_async``.
+        is_async = inspect.iscoroutinefunction(handler)
+        if not is_async and not inspect.isfunction(handler) and callable(handler):
+            # Callable object whose ``__call__`` is async (e.g. dataclass
+            # with ``async def __call__``). Check that explicitly.
+            is_async = inspect.iscoroutinefunction(handler.__call__)
+        self._tools[definition.name] = RegisteredTool(
+            definition=definition, handler=handler, is_async=is_async,
+        )
 
     def unregister(self, name: str) -> None:
         self._tools.pop(name, None)
@@ -65,9 +88,17 @@ class ToolRegistry:
         return None
 
     def invoke(self, name: str, args: Mapping[str, Any]) -> Any:
+        """Sync invocation. Raises :class:`AsyncToolInSyncContext` if the
+        handler is an ``async def`` — use :meth:`invoke_async` for those.
+        """
         tool = self._tools.get(name)
         if tool is None:
             return f"Unknown tool: {name}"
+
+        if tool.is_async:
+            raise AsyncToolInSyncContext(
+                f"Tool {name!r} has an async handler; call invoke_async() instead."
+            )
 
         err = self.validate(name, args)
         if err:
@@ -80,7 +111,27 @@ class ToolRegistry:
             return tool.handler(dict(args))
 
     async def invoke_async(self, name: str, args: Mapping[str, Any]) -> Any:
-        result = self.invoke(name, args)
+        """Universal invocation entry. Handles both sync and async handlers.
+
+        For async handlers, calls them directly and awaits the coroutine.
+        For sync handlers, calls them and awaits if the return value happens
+        to be awaitable (handlers wrapping async libraries).
+        """
+        tool = self._tools.get(name)
+        if tool is None:
+            return f"Unknown tool: {name}"
+
+        err = self.validate(name, args)
+        if err:
+            return err
+
+        if tool.is_async:
+            return await tool.handler(**dict(args))
+
+        try:
+            result = tool.handler(**dict(args))
+        except TypeError:
+            result = tool.handler(dict(args))
         if inspect.isawaitable(result):
             return await result
         return result

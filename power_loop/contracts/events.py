@@ -18,6 +18,15 @@ class AgentEventType(str, Enum):
     ROUND_COMPLETED = "round_completed"
     ROUND_TOOLS_PRESENT = "round_tools_present"
 
+    # LLM retry / cancellation lifecycle
+    LLM_RETRY_ATTEMPTED = "llm_retry_attempted"
+    LLM_DEGRADED = "llm_degraded"
+    LOOP_CANCELLED = "loop_cancelled"
+
+    # Memory lifecycle (M1.9)
+    MEMORY_RECALLED = "memory_recalled"
+    MEMORY_FAILED = "memory_failed"
+
     # Streaming lifecycle
     STREAM_STARTED = "stream_started"
     STREAM_DELTA = "stream_delta"

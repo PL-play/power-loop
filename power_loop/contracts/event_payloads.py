@@ -34,6 +34,63 @@ class BaseEventPayload:
 
 
 @dataclass
+class LlmRetryAttemptedPayload(BaseEventPayload):
+    """Emitted after each *failed* LLM attempt that will be retried.
+
+    ``attempt`` is the 0-based index of the attempt that **just failed**;
+    ``next_sleep_seconds`` is what the policy will sleep before the next
+    attempt (capped by remaining deadline).
+    """
+    attempt: int = 0
+    max_attempts: int = 0
+    error_type: str = ""
+    error_message: str = ""
+    next_sleep_seconds: float = 0.0
+
+
+@dataclass
+class LlmDegradedPayload(BaseEventPayload):
+    """Emitted when the loop gives up on the LLM (retry exhausted or
+    total_timeout) and proceeds with status=``degraded``."""
+    reason: str = ""           # "retry_exhausted" | "timeout"
+    attempts: int = 0
+    error_type: str = ""
+    error_message: str = ""
+
+
+@dataclass
+class LoopCancelledPayload(BaseEventPayload):
+    """Emitted when the loop terminates because a CancellationToken fired."""
+    reason: str = "cancelled"
+    round_index: int | None = None
+
+
+@dataclass
+class MemoryRecalledPayload(BaseEventPayload):
+    """Emitted after a MemoryProvider.recall() call.
+
+    ``injected`` is the number actually placed into ``messages`` (after
+    the MEMORY_RECALLED hook had a chance to filter/skip). ``returned``
+    is what the provider gave us before hook filtering.
+    """
+    returned: int = 0
+    injected: int = 0
+    budget_tokens: int = 0
+
+
+@dataclass
+class MemoryFailedPayload(BaseEventPayload):
+    """Emitted when recall() or remember() raises.
+
+    The loop continues regardless — memory is best-effort. ``phase`` is
+    ``"recall"`` or ``"remember"`` so subscribers know which side broke.
+    """
+    phase: str = ""
+    error_type: str = ""
+    error_message: str = ""
+
+
+@dataclass
 class SessionStartedPayload(BaseEventPayload):
     scope: str = "main"
 

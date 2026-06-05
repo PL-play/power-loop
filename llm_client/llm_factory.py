@@ -492,6 +492,8 @@ class OpenAICompatibleChatLLMService(LLMService):
             out["tools"] = request.tools
         if request.tool_choice is not None:
             out["tool_choice"] = request.tool_choice
+        if request.response_format is not None:
+            out["response_format"] = request.response_format
         return out
 
     def _build_resume_request(self, request: LLMRequest, partial_text: str) -> LLMRequest:
@@ -510,6 +512,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             reason=request.reason,
             tools=request.tools,
             tool_choice=request.tool_choice,
+            response_format=request.response_format,
             extra=dict(request.extra or {}),
         )
 

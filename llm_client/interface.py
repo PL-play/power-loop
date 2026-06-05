@@ -58,6 +58,15 @@ class LLMRequest:
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
 
+    # Structured output (M1.3). OpenAI-compatible shape, e.g.::
+    #
+    #     {"type": "json_schema", "json_schema": {"name": ..., "schema": {...}, "strict": true}}
+    #
+    # Forwarded verbatim to the provider as the ``response_format`` parameter.
+    # Producing this dict from a pydantic-style spec is the caller's job
+    # (see ``power_loop.runtime.structured.StructuredOutputSpec``).
+    response_format: dict[str, Any] | None = None
+
     # Provider-specific passthrough
     extra: dict[str, Any] = field(default_factory=dict)
 

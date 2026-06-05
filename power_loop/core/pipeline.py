@@ -19,10 +19,20 @@ from llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.sink import MessageSink, NullSink
 from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
+from power_loop.contracts.errors import (
+    CancellationRequested,
+    LLMRetryExhausted,
+    LLMTimeout,
+)
 from power_loop.contracts.event_payloads import (
     AutoCompactStatusPayload,
     BaseEventPayload,
     HitRoundLimitStatusPayload,
+    LlmDegradedPayload,
+    LlmRetryAttemptedPayload,
+    LoopCancelledPayload,
+    MemoryFailedPayload,
+    MemoryRecalledPayload,
     RoundCompletedPayload,
     RoundStartedPayload,
     RoundToolsPresentPayload,
@@ -44,6 +54,7 @@ from power_loop.contracts.hook_contexts import (
     CompactBeforeCtx,
     LlmAfterCtx,
     LlmBeforeCtx,
+    MemoryRecalledCtx,
     MessageAppendCtx,
     RoundDecideCtx,
     RoundEndCtx,
@@ -60,6 +71,9 @@ from power_loop.contracts.hooks import HookDirective, HookPoint
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.state import ContextManager
+from power_loop.runtime.cancellation import CancellationLike, CancellationToken
+from power_loop.runtime.memory import MemorySnapshot, tag_as_memory
+from power_loop.runtime.retry import with_retry
 from power_loop.tools.registry import ToolRegistry
 
 RESULT_MAX_CHARS = 50000
@@ -132,8 +146,8 @@ def _sanitize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any
     return out
 
 
-def _is_cancelled(stop_event: threading.Event | None) -> bool:
-    return bool(stop_event is not None and stop_event.is_set())
+def _is_cancelled(token: CancellationToken | None) -> bool:
+    return bool(token is not None and token.is_cancelled())
 
 
 def _round_usage_payload(*, round_index: int, max_rounds: int, usage: dict[str, Any]) -> RoundUsageStatusPayload:
@@ -176,7 +190,7 @@ class AgentPipeline:
         bus: AgentEventBus,
         ctx: ContextManager,
         session_id: str | None = None,
-        stop_event: threading.Event | None = None,
+        stop_event: CancellationLike = None,
         sink: MessageSink | None = None,
     ) -> None:
         self.llm = llm
@@ -186,13 +200,17 @@ class AgentPipeline:
         self.bus = bus
         self.ctx = ctx
         self.session_id = session_id
-        self.stop_event = stop_event
+        # Normalise to CancellationToken once; pipeline only ever sees this shape.
+        self.cancel_token: CancellationToken = CancellationToken.from_any(stop_event)
+        # Legacy attribute kept for hook ctx fields (RoundStartCtx.stop_event etc.).
+        self.stop_event = stop_event if isinstance(stop_event, threading.Event) else None
         self.sink: MessageSink = sink if sink is not None else NullSink()
 
         self.system_prompt = (config.system_prompt or DEFAULT_AGENT_SYSTEM_PROMPT).strip()
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
         self.history: list[LoopMessage] = []
         self.rounds_since_todo = 0
+        self._completed_rounds = 0
 
     # ── Helper: emit event ──
 
@@ -220,16 +238,106 @@ class AgentPipeline:
 
     # ── Helper: finalize session ──
 
-    async def _finalize(self, reason: str, *, final_text: str | None = None) -> None:
+    async def _finalize(self, reason: str, *, final_text: str | None = None,
+                        rounds: int | None = None) -> None:
+        if rounds is not None:
+            self._completed_rounds = rounds
         ctx = SessionEndCtx(
             scope="main", reason=reason,
             messages=self.history, final_text=final_text,
         )
         await self.hooks.run_typed_async(HookPoint.SESSION_END, ctx)
         self._emit(AgentEventType.SESSION_ENDED, SessionEndedPayload(reason=reason))
+        await self._maybe_remember(reason=reason, final_text=final_text or "")
+
+    # ── Memory: recall at start, remember at end (M1.9) ──
+
+    async def _maybe_recall(self) -> None:
+        """Call ``config.memory.recall`` and inject results into ``self.history``.
+
+        Injection position: after any leading ``role=system`` messages
+        (which includes a ``compact_note`` if one is present). Recalled
+        messages are tagged ``role=system, name=memory_*`` so they share
+        the system region's compactor protection.
+
+        Soft-fails on any exception by emitting ``MEMORY_FAILED`` and
+        continuing with no injection.
+        """
+        provider = self.config.memory
+        if provider is None:
+            return
+        budget = int(self.config.memory_budget_tokens or 0)
+        try:
+            recalled = await provider.recall(
+                messages=self.history, session_id=self.session_id, budget_tokens=budget,
+            )
+        except Exception as exc:
+            self._emit(
+                AgentEventType.MEMORY_FAILED,
+                MemoryFailedPayload(
+                    phase="recall", error_type=type(exc).__name__,
+                    error_message=str(exc)[:500],
+                ),
+            )
+            return
+
+        recalled = list(recalled or [])
+        returned = len(recalled)
+        hook_ctx = MemoryRecalledCtx(
+            recalled=recalled, session_id=self.session_id, budget_tokens=budget,
+        )
+        await self.hooks.run_typed_async(HookPoint.MEMORY_RECALLED, hook_ctx)
+        if hook_ctx.directive == HookDirective.SKIP:
+            self._emit(
+                AgentEventType.MEMORY_RECALLED,
+                MemoryRecalledPayload(returned=returned, injected=0, budget_tokens=budget),
+            )
+            return
+
+        tagged = tag_as_memory(list(hook_ctx.recalled or []))
+        if not tagged:
+            self._emit(
+                AgentEventType.MEMORY_RECALLED,
+                MemoryRecalledPayload(returned=returned, injected=0, budget_tokens=budget),
+            )
+            return
+
+        insert_at = 0
+        n = len(self.history)
+        while insert_at < n and self.history[insert_at].get("role") == "system":
+            insert_at += 1
+        self.history[insert_at:insert_at] = tagged
+
+        self._emit(
+            AgentEventType.MEMORY_RECALLED,
+            MemoryRecalledPayload(returned=returned, injected=len(tagged), budget_tokens=budget),
+        )
+
+    async def _maybe_remember(self, *, reason: str, final_text: str) -> None:
+        provider = self.config.memory
+        if provider is None:
+            return
+        snapshot = MemorySnapshot(
+            session_id=self.session_id or "",
+            messages=list(self.history),
+            final_text=final_text,
+            rounds=self._completed_rounds,
+            status=reason,
+        )
+        try:
+            await provider.remember(snapshot=snapshot, session_id=self.session_id)
+        except Exception as exc:
+            self._emit(
+                AgentEventType.MEMORY_FAILED,
+                MemoryFailedPayload(
+                    phase="remember", error_type=type(exc).__name__,
+                    error_message=str(exc)[:500],
+                ),
+            )
 
     def _make_result(self, status: str, *, final_text: str = "", rounds: int = 0,
                      pending_tool_calls: list | None = None) -> AgentLoopResult:
+        self._completed_rounds = rounds  # for MemorySnapshot
         return AgentLoopResult(
             status=status,  # type: ignore[arg-type]
             final_text=final_text,
@@ -327,7 +435,13 @@ class AgentPipeline:
         max_tokens: int,
         temperature: float,
     ) -> LLMResponse:
-        """Call the LLM and return its response."""
+        """Call the LLM and return its response.
+
+        If ``config.retry_policy`` is set, transient failures retry under
+        :func:`with_retry`; exhaustion raises :class:`LLMRetryExhausted` /
+        :class:`LLMTimeout`, which :meth:`run` catches and degrades from.
+        Cancellation during retry sleep raises :class:`CancellationRequested`.
+        """
         def _on_delta(text: str) -> None:
             if text:
                 self._emit(AgentEventType.STREAM_DELTA,
@@ -340,21 +454,48 @@ class AgentPipeline:
                            StreamDeltaPayload(text=text, is_think=True),
                            round_index=round_index, stream_id="main")
 
-        self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
-                   round_index=round_index, stream_id="main")
-
-        response = await self.llm.complete(
-            LLMRequest(
-                messages=messages,
-                system_prompt=system_prompt,
-                tools=tools,
-                tool_choice="auto" if tools else None,  # DashScope rejects "auto" with no tools
-                max_tokens=max_tokens,
-                temperature=temperature,
-            ),
-            on_chunk_delta_text=_on_delta,
-            on_chunk_think=_on_think,
+        request = LLMRequest(
+            messages=messages,
+            system_prompt=system_prompt,
+            tools=tools,
+            tool_choice="auto" if tools else None,  # DashScope rejects "auto" with no tools
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
+
+        async def _do_call() -> LLMResponse:
+            # STREAM_STARTED is emitted **per attempt** so subscribers know
+            # a fresh stream is beginning; STREAM_COMPLETED only on success
+            # of the attempt that returns.
+            self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
+                       round_index=round_index, stream_id="main")
+            return await self.llm.complete(
+                request,
+                on_chunk_delta_text=_on_delta,
+                on_chunk_think=_on_think,
+            )
+
+        policy = self.config.retry_policy
+        if policy is None:
+            response = await _do_call()
+        else:
+            def _on_retry(attempt: int, exc: BaseException, sleep_s: float) -> None:
+                self._emit(
+                    AgentEventType.LLM_RETRY_ATTEMPTED,
+                    LlmRetryAttemptedPayload(
+                        attempt=attempt,
+                        max_attempts=policy.max_attempts,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc)[:500],
+                        next_sleep_seconds=sleep_s,
+                    ),
+                    round_index=round_index,
+                    stream_id="main",
+                )
+
+            response = await with_retry(
+                _do_call, policy=policy, token=self.cancel_token, on_retry=_on_retry,
+            )
 
         self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
                    round_index=round_index, stream_id="main")
@@ -394,9 +535,14 @@ class AgentPipeline:
             self.history = session_ctx.messages
         self._emit(AgentEventType.SESSION_STARTED, SessionStartedPayload(scope="main"))
 
+        # ── Memory recall (M1.9) ──
+        await self._maybe_recall()
+
         # ── Round loop ──
         for round_idx in range(int(self.config.max_rounds)):
-            if _is_cancelled(self.stop_event):
+            # Track for MemorySnapshot: how many round attempts we made.
+            self._completed_rounds = round_idx
+            if _is_cancelled(self.cancel_token):
                 await self._finalize("cancelled")
                 return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx)
 
@@ -446,15 +592,43 @@ class AgentPipeline:
                 await self._finalize("hook_break")
                 return self._make_result("completed", rounds=round_idx)
             else:
-                # ── Business logic: call LLM ──
-                response = await self.call_llm(
-                    round_idx,
-                    messages=llm_before.messages,
-                    system_prompt=llm_before.system_prompt,
-                    tools=llm_before.tools,
-                    max_tokens=llm_before.max_tokens,
-                    temperature=llm_before.temperature,
-                )
+                # ── Business logic: call LLM (with retry/timeout/cancel) ──
+                try:
+                    response = await self.call_llm(
+                        round_idx,
+                        messages=llm_before.messages,
+                        system_prompt=llm_before.system_prompt,
+                        tools=llm_before.tools,
+                        max_tokens=llm_before.max_tokens,
+                        temperature=llm_before.temperature,
+                    )
+                except CancellationRequested as exc:
+                    self._emit(
+                        AgentEventType.LOOP_CANCELLED,
+                        LoopCancelledPayload(reason=exc.reason, round_index=round_idx),
+                        round_index=round_idx,
+                    )
+                    await self._finalize("cancelled")
+                    return self._make_result(
+                        "cancelled", final_text=f"[cancelled: {exc.reason}]", rounds=round_idx,
+                    )
+                except (LLMRetryExhausted, LLMTimeout) as exc:
+                    reason = "timeout" if isinstance(exc, LLMTimeout) else "retry_exhausted"
+                    inner = getattr(exc, "last_error", exc)
+                    self._emit(
+                        AgentEventType.LLM_DEGRADED,
+                        LlmDegradedPayload(
+                            reason=reason,
+                            attempts=getattr(exc, "attempts", 0),
+                            error_type=type(inner).__name__,
+                            error_message=str(inner)[:500],
+                        ),
+                        round_index=round_idx,
+                    )
+                    msg = f"[degraded: LLM {reason} — {type(inner).__name__}: {str(inner)[:200]}]"
+                    await self._append_message({"role": "assistant", "content": msg}, round_index=round_idx)
+                    await self._finalize("degraded", final_text=msg, rounds=round_idx + 1)
+                    return self._make_result("degraded", final_text=msg, rounds=round_idx + 1)
 
                 # ── Hook: LLM_AFTER ──
                 llm_after = LlmAfterCtx(
@@ -466,7 +640,7 @@ class AgentPipeline:
                 if llm_after.directive == HookDirective.BREAK:
                     text = (getattr(response, "raw_text", "") or "").strip()
                     await self._append_message({"role": "assistant", "content": text}, round_index=round_idx)
-                    await self._finalize("hook_break", final_text=text)
+                    await self._finalize("hook_break", final_text=text, rounds=round_idx + 1)
                     return self._make_result("completed", final_text=text, rounds=round_idx + 1)
                 # After hook may replace the response
                 if isinstance(llm_after.output, LLMResponse):
@@ -515,7 +689,7 @@ class AgentPipeline:
                 )
                 await self.hooks.run_typed_async(HookPoint.ROUND_END, round_end)
                 self.sink.on_round_ended(round_idx, usage=usage)
-                await self._finalize("completed", final_text=assistant_text)
+                await self._finalize("completed", final_text=assistant_text, rounds=round_idx + 1)
                 return self._make_result("completed", final_text=assistant_text, rounds=round_idx + 1)
 
             # ── Hook: ROUND_DECIDE ──
@@ -525,7 +699,7 @@ class AgentPipeline:
             )
             await self.hooks.run_typed_async(HookPoint.ROUND_DECIDE, decide_ctx)
             if decide_ctx.directive == HookDirective.BREAK:
-                await self._finalize("hook_break", final_text=assistant_text)
+                await self._finalize("hook_break", final_text=assistant_text, rounds=round_idx + 1)
                 return self._make_result("completed", final_text=assistant_text, rounds=round_idx + 1)
             if decide_ctx.directive == HookDirective.SKIP:
                 for tc in tool_calls:
@@ -553,7 +727,7 @@ class AgentPipeline:
             # ── Execute tools ──
             used_todo = False
             for tool_call in tool_calls:
-                if _is_cancelled(self.stop_event):
+                if _is_cancelled(self.cancel_token):
                     await self._finalize("cancelled")
                     return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx + 1)
 
@@ -693,6 +867,7 @@ class AgentPipeline:
         ))
         final_text = (getattr(final_resp, "raw_text", "") or getattr(final_resp, "content_text", "") or "").strip()
         self._emit(AgentEventType.USAGE_UPDATED, UsageUpdatedPayload(usage=self.ctx.update_usage(final_resp)))
-        await self._finalize("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}")
+        await self._finalize("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",
+                             rounds=int(self.config.max_rounds))
         return self._make_result("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",
                                  rounds=int(self.config.max_rounds))

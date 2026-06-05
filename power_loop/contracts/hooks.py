@@ -21,6 +21,7 @@ class HookPoint(str, Enum):
     COMPACT_BEFORE = "compact.before"
     COMPACT_AFTER = "compact.after"
     MESSAGE_APPEND = "message.append"
+    MEMORY_RECALLED = "memory.recalled"
 
 
 class HookDirective(str, Enum):

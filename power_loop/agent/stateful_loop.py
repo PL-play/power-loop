@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,6 +37,7 @@ from power_loop.core.pipeline import (
 )
 from power_loop.core.runner import AgentRunner
 from power_loop.core.state import ContextManager
+from power_loop.runtime.cancellation import CancellationLike
 from power_loop.runtime.session_store import (
     DEFAULT_DB_PATH,
     MessageRow,
@@ -106,7 +106,7 @@ class StatefulAgentLoop:
         session_id: str | None = None,
         *,
         metadata: dict[str, Any] | None = None,
-        stop_event: threading.Event | None = None,
+        stop_event: CancellationLike = None,
     ) -> StatefulResult:
         """Append one user input to the session and run the loop.
 
@@ -129,7 +129,7 @@ class StatefulAgentLoop:
         session_id: str | None = None,
         *,
         metadata: dict[str, Any] | None = None,
-        stop_event: threading.Event | None = None,
+        stop_event: CancellationLike = None,
     ) -> StatefulResult:
         return asyncio.run(
             self.send(user_input, session_id, metadata=metadata, stop_event=stop_event)
@@ -139,7 +139,7 @@ class StatefulAgentLoop:
         self,
         session_id: str,
         *,
-        stop_event: threading.Event | None = None,
+        stop_event: CancellationLike = None,
     ) -> StatefulResult:
         """Finish executing pending tool_calls, then continue the loop.
 
@@ -302,7 +302,7 @@ class StatefulAgentLoop:
         self,
         sid: str,
         *,
-        stop_event: threading.Event | None,
+        stop_event: CancellationLike,
         sink: SQLiteSink | None = None,
     ) -> StatefulResult:
         sink = sink if sink is not None else SQLiteSink(self.store, sid)

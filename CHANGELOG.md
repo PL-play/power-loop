@@ -8,6 +8,113 @@
 
 ## [Unreleased]
 
+### Added — M1.1 LLM 重试 / 超时 / 取消（2026-06-05）
+
+- **`LLMRetryPolicy`**（`power_loop.runtime.retry`）—— 配置 `max_attempts` / `backoff_initial` / `backoff_max` / `total_timeout` / `retry_on`。指数退避（capped），跨所有 attempt 共享总超时；退避 sleep 是 cancel-aware 的（cancel 触发时不会傻等到底）。
+- **`with_retry(call, *, policy, token, on_retry=None)`** —— 库内通用 helper，pipeline 用它包 `await self.llm.complete(...)`。``CancellationRequested`` / ``asyncio.CancelledError`` 直接透传，不会被吞。
+- **`CancellationToken`**（`power_loop.runtime.cancellation`）—— 统一 cancel 形状：`from_any(...)` 接受 `asyncio.Event` / `threading.Event` / `Callable[[], bool]` / 已存在的 token / `None`。自带 owned 模式（`token.cancel(reason)`），供 hook `HookDirective.CANCEL`（M1.5）和外部 controller 使用。`is_cancelled()` 对用户 callable 抛出做容错（**绝不让 cancel 检查本身污染主循环控制流**）。
+- **`AgentLoopConfig.retry_policy: LLMRetryPolicy | None = None`** —— 默认 None（保持现有 fail-fast 行为）；显式赋值即开启。
+- **新事件**：
+  - `AgentEventType.LLM_RETRY_ATTEMPTED` + `LlmRetryAttemptedPayload(attempt, max_attempts, error_type, error_message, next_sleep_seconds)`
+  - `AgentEventType.LLM_DEGRADED` + `LlmDegradedPayload(reason, attempts, error_type, error_message)` —— `reason ∈ {"retry_exhausted", "timeout"}`
+  - `AgentEventType.LOOP_CANCELLED` + `LoopCancelledPayload(reason, round_index)`
+- **新错误**（`power_loop.contracts.errors`，全部 `PowerLoopError` 子类）：
+  - `LLMTimeout(elapsed, attempts, total_timeout)`
+  - `LLMRetryExhausted(attempts, last_error)`（`__cause__` 保留 last error）
+  - `CancellationRequested(reason)`
+  - `CompactionFailed`（M2.5 占位）
+- **`LoopStatus`** 新增 `"degraded"`。Pipeline 在 `call_llm` 抛 `LLMRetryExhausted` / `LLMTimeout` 时：append 一条合成的 `assistant` 消息（`[degraded: …]`），emit `LLM_DEGRADED`，`status="degraded"` 返回。`CancellationRequested` 翻译为 `status="cancelled"` + `LOOP_CANCELLED`。
+- **Pipeline 内部统一**：`stop_event` 仍接受任意 cancel-like 对象（API 向后兼容），但内部统一存为 `CancellationToken`；`StatefulAgentLoop.send / send_sync / resume` 的 `stop_event` 类型放宽为 `CancellationLike`。
+- **测试**：`tests/unit/test_retry_cancel.py`（12 个，覆盖 `with_retry` 直测 + token 各形态 + pipeline 端到端三条路径）；`tests/real/test_real_retry.py`（2 个真实 LLM 集成 —— 注入 transient 失败后真实 complete 通；全失败走 degraded 不打真实网络）。
+
+### Public API（M1.1 新增）
+
+`LLMRetryPolicy` / `with_retry` / `CancellationToken` / `CancellationLike` / `LLMTimeout` / `LLMRetryExhausted` / `CancellationRequested` / `CompactionFailed` / `LlmRetryAttemptedPayload` / `LlmDegradedPayload` / `LoopCancelledPayload` 全部从 `power_loop` 顶层导出；`AgentEventType.LLM_RETRY_ATTEMPTED` / `LLM_DEGRADED` / `LOOP_CANCELLED` 已加入枚举。
+
+### Added — M1.9 MemoryProvider 协议（2026-06-05）
+
+> 库内**零实现**：定义协议 + 接线 + 注入位置不变量。具体后端（SQLite / HTTP API / 向量库）一律留在调用方或 `examples/`。
+
+- **`MemoryProvider` Protocol**（`power_loop.runtime.memory`）—— 两个方法：
+  - `async recall(*, messages, session_id, budget_tokens=1500) -> list[dict]`
+  - `async remember(*, snapshot: MemorySnapshot, session_id) -> None`
+- **`MemorySnapshot`** dataclass —— `session_id / messages / final_text / rounds / status / metadata`，在 SESSION_END 时传给 `remember`。
+- **`tag_as_memory(messages)`** —— 工具函数，把任意 dict 列表规范化成 `role=system, name=memory_*`。Pipeline 在注入前自动调用，业务方不必关心。
+- **`AgentLoopConfig.memory: MemoryProvider | None = None`** + **`memory_budget_tokens: int = 1500`**。默认 None（保持原有行为）。
+- **注入位置不变量**：召回结果插在 ``self.history`` 的「最长 leading `role=system` 段」之后、对话历史之前。这与 `compact_note` 同区，受压缩器系统区保留保护。
+- **失败模型**（库强制不破坏主流程）：
+  - `recall` 抛 → 视为返回 `[]`，emit `MEMORY_FAILED(phase="recall")`，loop 照常跑。
+  - `remember` 抛 → emit `MEMORY_FAILED(phase="remember")`，`StatefulResult` 原样返回。
+- **新 hook**：`HookPoint.MEMORY_RECALLED` + `MemoryRecalledCtx(recalled, session_id, budget_tokens)`。业务可在注入前 redact / 去敏 / `directive=SKIP` 跳过整批注入（典型场景：双方授权 gate）。
+- **新事件**：`AgentEventType.MEMORY_RECALLED` + `MemoryRecalledPayload(returned, injected, budget_tokens)`；`AgentEventType.MEMORY_FAILED` + `MemoryFailedPayload(phase, error_type, error_message)`。
+- **Pipeline 内部**：`_finalize` 多了一个 `rounds` 形参，使 `MemorySnapshot.rounds` 正确反映已完成回合数；老调用点（cancelled 早出）保留默认行为。
+- **测试**：`tests/unit/test_memory.py`（6 个，覆盖注入位置 + tag 规范化 + recall 软失败 + remember 软失败 + 快照内容 + MEMORY_RECALLED SKIP）。
+- **example**：`examples/13_memory_sqlite.py` —— SQLite 事实 KV，跨 session 把「我叫阿岚 / 喜欢 37」记忆带回。
+
+### Public API（M1.9 新增）
+
+`MemoryProvider` / `MemorySnapshot` / `tag_as_memory` / `MemoryRecalledCtx` / `MemoryRecalledPayload` / `MemoryFailedPayload` 顶层导出；`HookPoint.MEMORY_RECALLED`、`AgentEventType.MEMORY_RECALLED` / `MEMORY_FAILED` 入枚举。
+
+### Added — M1.3 结构化输出（2026-06-05）
+
+- **`LLMRequest.response_format: dict[str, Any] | None = None`** —— OpenAI 兼容 `response_format` 字段；`llm_factory._request_kwargs` 与 `_build_resume_request` 透传。
+- **`StructuredOutputSpec(name, schema, strict=True, description=None, examples=...)`**（`power_loop.runtime.structured`）—— 声明式包装；`.to_openai_response_format()` 渲染成 `{"type":"json_schema","json_schema":{name, schema, strict, description}}`。
+- **`parse_structured(output, *, schema=None) -> dict`** —— 四级修复链：
+  1. 直接 `json.loads`
+  2. markdown ```json``` 围栏剥离
+  3. 抓出第一个**括号平衡**的 `{...}` 子串（跳过字符串里的引号）
+  4. 修补**尾逗号** `,]` / `,}`
+- **`StructuredOutputError(reason, raw_text, detail)`** —— 失败原因机器可读：`no_json` / `invalid_json` / `not_object` / `missing_required:<field>`，`raw_text` 截断到 1000 字符方便调试。
+- **本地 schema 校验有限**：仅强制 `type=="object"` 与顶层 `required` 字段存在。更深的 type / enum / pattern 留给 provider 在 strict mode 服务端校验，**避免本地实现与 provider 静默分歧**。
+- **测试**：`tests/unit/test_structured.py`（14 个）+ `tests/real/test_real_structured.py`（1 个真实 LLM —— card 抽取来回跑通）。
+- **example**：`examples/14_structured_card.py` —— 真实 LLM 抽取 → 修复带噪 JSON → schema 缺字段失败三段。
+
+### Public API（M1.3 新增）
+
+`StructuredOutputSpec` / `parse_structured` / `StructuredOutputError` 顶层导出。`LLMRequest.response_format` 已在 `llm_client` 层落地。
+
+### Added — M1.6 ToolRegistry async-handler 工效学（2026-06-05）
+
+- **`async def` 自动识别**：`ToolRegistry.register()` 用 `inspect.iscoroutinefunction` 在登记时缓存 `RegisteredTool.is_async`，覆盖普通 `async def` 与 `async __call__` callable 对象两种形态。
+- **`invoke()`（sync）对 async 处理器抛 `AsyncToolInSyncContext`**：取代之前「silently 返回未 await 的 coroutine」的隐式坑，错误信息明确指向 `invoke_async`。
+- **`invoke_async()` 是通用入口**：async handler 直接 `await tool.handler(...)`；sync handler 跑完后若返回 awaitable 仍会被自动 await（保留向后兼容）。
+- pipeline 早已用 `invoke_async`，业务侧无需改动；只有显式调 `invoke()` 把 async 当 sync 用的旧代码会立刻看到清晰报错。
+- ROADMAP 里提到的 `tests/real/test_real_streaming_subagent.py` 的 `get_event_loop().is_running()` hack 已在 stateful 重构时随旧测试一并删除，本次 polish 把上游 API 工效学也补齐。
+- **测试**：`tests/unit/test_tool_registry_async.py`（7 个）—— async 检测、callable 对象、sync-on-async 报错、双形态 invoke_async、sync-returning-awaitable 兼容。
+
+### Public API（M1.6 新增）
+
+`AsyncToolInSyncContext` 顶层导出。`ToolRegistry.invoke / invoke_async` 行为变更（前者更严格，对 async handler 抛清晰错；后者更优雅，省一次 `inspect.isawaitable`）—— 既有调 `invoke_async` 的代码完全不受影响。
+
+### Added — M1.4 LLMProviderConfig 统一（2026-06-05）
+
+- **`LLMProviderConfig`**（`power_loop.runtime.provider`）—— provider-agnostic 配置：`base_url` / `api_key` / `model` 必填，`provider` 标签（informational，今天只走 openai-compatible 一条 transport，预留 M3 多 transport 路由 key），加 `timeout_s` / `max_tokens` / `temperature` / `max_retries` 等默认值。
+- **`LLMProviderConfig.from_env(prefix="POWER_LOOP", fallback_prefix="OPENAI_COMPAT", env=None)`** —— 读 `POWER_LOOP_*` 环境变量，缺则回退 `OPENAI_COMPAT_*`，**老 `.env` 无须改字段**。`env` 形参用于测试（注入 dict）。
+- **`create_llm_service_from_config(cfg)` / `create_llm_service_from_env(*, prefix=…)`** —— 一行造服务；内部通过 `to_openai_compatible()` 适配现有 `OpenAICompatibleChatLLMService`。
+- **失败模式**：必填字段缺失 → 构造时 `ValueError`（不是首个 `complete()` 时），让配置错误在 pytest 阶段就暴露。
+- **docs/providers.md** —— 环境变量表 + 4 个 provider snippet（OpenAI / DashScope / DeepSeek / 本地 OpenAI-compatible）+ 老调用方式迁移指引。
+- **测试**：`tests/unit/test_provider.py`（11 个）—— 必填守卫 / 主前缀 / 回退前缀 / 主前缀优先 / 三家 provider 参数化建造 / `from_env` 一行入口 / `to_openai_compatible` 适配回环。
+
+### Public API（M1.4 新增）
+
+`LLMProviderConfig` / `create_llm_service_from_config` / `create_llm_service_from_env` 顶层导出。`OPENAI_COMPAT_*` 环境变量名继续可用，仅为回退；新代码请用 `POWER_LOOP_*`（或自定义 prefix）。
+
+### Added — M1.2 trim_history（2026-06-05）
+
+- **`trim_history(messages, max_tokens, *, keep_system=True, keep_last_n=2)`**（`power_loop.runtime.budget`）—— 纯裁剪 helper：保留 leading system + 最后 N 个 user-bounded 交换，从中间删消息直到落在 token 预算内。不调 LLM（不摘要），仅是业务侧调用前裁剪。
+- **不变量**：
+  1. 预算已够 → 返回原 list（不复制）。
+  2. `keep_system=True` → 所有 leading `role=system` 消息保留；`keep_last_n` 个 user-bounded 交换在尾部保留。
+  3. `assistant(tool_calls) ↔ tool(tool_call_id=...)` 对永不拆分 — 裁剪边界通过 tool_call_id 配对检测自动调整。
+  4. 当 system + tail 都放不下时，降级为 tail-only（丢 system）再按需从尾部裁剪。
+  5. 不修改输入（返回新 list）。
+- **测试**：`tests/unit/test_budget.py`（9 个）—— 已合预算 / 空 / 零预算 / 系统保留 / 去系统 / 工具对原子性 / 工具对在边界 / 仅 tail / 非突变。
+- `estimate_tokens` / `estimate_text_tokens` / `trim_history` 从 `power_loop` 顶层导出。
+
+### Public API（M1.2 新增）
+
+`trim_history` / `estimate_tokens` / `estimate_text_tokens` 顶层导出。
+
 ## [0.2.0] — 2026-06-05
 
 Stateful refactor. The library now revolves around `StatefulAgentLoop` and a SQLite-backed `SessionStore`; the stateless `AgentLoop` is removed. **Hard break — no compatibility shim.**

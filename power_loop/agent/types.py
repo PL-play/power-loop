@@ -5,8 +5,10 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from power_loop.runtime.compact import Compactor
+    from power_loop.runtime.memory import MemoryProvider
+    from power_loop.runtime.retry import LLMRetryPolicy
 
-LoopStatus = Literal["completed", "pending_tools", "cancelled", "hit_round_limit"]
+LoopStatus = Literal["completed", "pending_tools", "cancelled", "hit_round_limit", "degraded"]
 LoopMessage = dict[str, Any]
 
 
@@ -24,6 +26,9 @@ class AgentLoopConfig:
     temperature: float | None = 0.0
     max_tokens: int | None = 8000
     compactor: Compactor | None = field(default_factory=_default_compactor)
+    retry_policy: LLMRetryPolicy | None = None
+    memory: MemoryProvider | None = None
+    memory_budget_tokens: int = 1500
 
 
 @dataclass
