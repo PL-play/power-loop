@@ -65,82 +65,121 @@ pip install -e ".[dev]"           # 含 pytest / ruff / mypy
 
 ## 3. Quickstart
 
-### 3.1 单次回复（最小用法）
+本节按由浅入深的顺序排：每一步只引入一个新概念。每个代码片段都对应 `examples/`
+下一个可独立运行的文件。先按顺序读完，再回头看 §4 的核心概念会很顺。
+
+### 3.1 第一次发送（最小用法）
+
+最少的样板：构造 LLM → 构造 loop → `send`。
 
 ```python
 import asyncio
-from power_loop import StatefulAgentLoop, AgentLoopConfig
+from power_loop import StatefulAgentLoop
 
 async def main():
-    loop = StatefulAgentLoop(
-        llm=my_llm,                       # 见 §7 构造 LLM
-        db_path="./sessions.db",
-        config=AgentLoopConfig(
-            system_prompt="Reply briefly.",
-            max_rounds=1,
-            compactor=None,               # 短对话不需要压缩
-        ),
-    )
-    result = await loop.send("Say hi.")
-    print(result.session_id, result.final_text)
+    loop = StatefulAgentLoop(llm=my_llm, db_path=":memory:")
+    result = await loop.send("In one sentence: what is HTTP?")
+    print(result.final_text)
 
 asyncio.run(main())
 ```
 
-完整版：[`examples/00_minimal.py`](examples/00_minimal.py)
+要点：
+- `db_path=":memory:"` 是临时 store；生产换成文件路径就能跨进程保留。
+- 不传 `session_id` → 自动创建新 session。返回的 `result.session_id` 是后续续话的钥匙。
+- 没传 `AgentLoopConfig` 也行：全部用默认值（`max_rounds=24`、`DefaultCompactor()` 等）。
+
+→ 完整版：[`examples/00_minimal.py`](examples/00_minimal.py)
 
 ### 3.2 多轮对话
 
+唯一新东西：把上一轮返回的 `session_id` 传回去。
+
 ```python
 r1 = await loop.send("My favorite color is teal.")
-r2 = await loop.send(
-    "What did I just say?",
-    session_id=r1.session_id,    # ← 续话
-)
+r2 = await loop.send("What did I just say?", session_id=r1.session_id)
 # r2.final_text 会引用 "teal"
 ```
 
+power-loop 会自动从 store 加载历史，模型每轮看到的都是完整上下文。你不用维护
+"messages list"，只管最新的一句输入。
+
+→ 完整版：[`examples/01_multi_turn.py`](examples/01_multi_turn.py)
+
 ### 3.3 工具调用
 
+要让模型调用你的 Python 函数：写 `ToolDefinition` + handler，注册到 `ToolRegistry`，
+传给 loop。
+
 ```python
-from power_loop import ToolDefinition, ToolRegistry
+from power_loop import ToolDefinition, ToolRegistry, AgentLoopConfig
+
+def lookup_dish(**kwargs) -> str:
+    return {"lima": "ceviche", "tokyo": "sushi"}.get(kwargs["city"].lower(), "?")
 
 registry = ToolRegistry()
 registry.register(
     ToolDefinition(
         name="lookup_dish",
         description="Return the local dish for a city.",
-        input_schema={"type": "object", "properties": {"city": {"type": "string"}},
+        input_schema={"type": "object",
+                       "properties": {"city": {"type": "string"}},
                        "required": ["city"]},
         required_params=("city",),
     ),
-    lambda **kw: "ceviche" if kw["city"].lower() == "lima" else "?",
+    lookup_dish,
 )
 
-loop = StatefulAgentLoop(llm=my_llm, db_path="./s.db",
-                         tool_registry=registry,
-                         config=AgentLoopConfig(max_rounds=4))
+loop = StatefulAgentLoop(
+    llm=my_llm, db_path=":memory:", tool_registry=registry,
+    config=AgentLoopConfig(max_rounds=4),
+)
 result = await loop.send("What's Lima's signature dish?")
 ```
 
-完整版：[`examples/01_tool_use.py`](examples/01_tool_use.py)
+为什么 `max_rounds ≥ 2`：工具调用本质是两步——第 1 轮 LLM 决定调工具，第 2 轮看
+到工具结果给最终答案。`max_rounds=1` 跑不通工具。
+
+→ 完整版：[`examples/02_tool_use.py`](examples/02_tool_use.py)
 
 ### 3.4 子代理
+
+`register_spawn_agent(registry)` 一行注入两个 meta-tool：`spawn_agent`（命令式）
+和 `run_agent`（声明式 `AgentSpec`）。父 LLM 自主决定调用，子会话在同一个
+`SessionStore` 里独立跑完，把 `final_text` 当 tool 结果回灌给父。
 
 ```python
 from power_loop import register_spawn_agent
 
 registry = ToolRegistry()
-register_spawn_agent(registry)        # 注入 spawn_agent + run_agent 两个 meta-tool
-
-loop = StatefulAgentLoop(llm=my_llm, db_path="./s.db",
-                         tool_registry=registry,
-                         config=AgentLoopConfig(max_rounds=5,
-                                                system_prompt="Delegate factual Qs."))
+register_spawn_agent(registry)
+loop = StatefulAgentLoop(
+    llm=my_llm, db_path=":memory:", tool_registry=registry,
+    config=AgentLoopConfig(
+        system_prompt="Delegate factual Qs via spawn_agent.",
+        max_rounds=5,
+    ),
+)
 result = await loop.send("Delegate this: capital of Japan?")
 ```
 
-完整版：[`examples/02_subagent.py`](examples/02_subagent.py)
+→ 完整版：[`examples/03_subagent.py`](examples/03_subagent.py)
+
+### 3.5 上下文压缩
+
+历史变长后默认压缩自动触发：被折叠的消息在 store 里标 `compacted_out`，
+插入一条 `compact_note` 摘要替代。开关、阈值、保留条数都在 `DefaultCompactor`
+构造参数里。完整版演示了如何检查 `store.list_compactions(sid)` 看审计行。
+
+→ [`examples/04_compaction.py`](examples/04_compaction.py)
+
+### 3.6 悬挂态恢复
+
+如果进程在 `assistant(tool_calls)` 已落库、`tool` 消息还没全部落库时挂掉，session
+处于悬挂态。下次 `send` 会抛 `SessionPendingError`，由调用方选 `resume` 还是
+`abort_pending`。
+
+→ [`examples/05_pending_resume.py`](examples/05_pending_resume.py)
 
 ---
 
@@ -360,12 +399,18 @@ class DefaultCompactor:
 
 `examples/` 下每个文件可独立 `python examples/NN_*.py` 运行，并由 `tests/real/test_examples.py` 持续验证。
 
-| 文件 | 演示 |
+推荐按编号顺序读：每个文件只引入一个新概念。
+
+| 文件 | 你会学到 |
 |---|---|
-| [`00_minimal.py`](examples/00_minimal.py) | 最小用法：`send → StatefulResult` |
-| [`01_tool_use.py`](examples/01_tool_use.py) | 自定义 `ToolDefinition` + 多轮工具调用 |
-| [`02_subagent.py`](examples/02_subagent.py) | `spawn_agent` meta-tool + EPHEMERAL 自动清理 |
-| [`03_compaction.py`](examples/03_compaction.py) | `DefaultCompactor` 自动折叠 + 持久化痕迹 |
+| [`00_minimal.py`](examples/00_minimal.py) | 最小用法：`StatefulAgentLoop(llm=…).send(text)` |
+| [`01_multi_turn.py`](examples/01_multi_turn.py) | 用 `session_id` 续话 + `get_messages` / `close_session` |
+| [`02_tool_use.py`](examples/02_tool_use.py) | 自定义 `ToolDefinition` + 多轮工具调用 |
+| [`03_subagent.py`](examples/03_subagent.py) | `spawn_agent` meta-tool + EPHEMERAL 自动清理 |
+| [`04_compaction.py`](examples/04_compaction.py) | `DefaultCompactor` 自动折叠 + 查看 store 审计行 |
+| [`05_pending_resume.py`](examples/05_pending_resume.py) | `SessionPendingError` + `resume` / `abort_pending` |
+
+`examples/_helpers.py` 是共享的 `.env` 读取 + LLM 构造辅助，每个示例 `from _helpers import make_llm`，省掉 boilerplate。复制到自己项目时把那两行内联即可。
 
 ---
 
