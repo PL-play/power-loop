@@ -86,3 +86,24 @@ def test_example_06_declarative_subagent_runs() -> None:
     assert "126" in final_text, (
         f"declarative subagent answer missing '126': {final_text!r}"
     )
+
+
+def test_example_07_user_confirmation_runs() -> None:
+    """Always-deny confirm_fn: dangerous commands must NEVER execute;
+    safe whitelist commands may still execute; final answer must
+    acknowledge the denial (not silently retry)."""
+    module = _load_example("07_user_confirmation.py")
+    module.EXECUTED.clear()
+    final_text = asyncio.run(module.main())
+
+    executed = list(module.EXECUTED)
+    # 1. No dangerous command got through.
+    assert not any(
+        any(t in cmd for t in module.DANGEROUS_TOKENS) for cmd in executed
+    ), f"dangerous command leaked through: {executed!r}"
+
+    # 2. The model acknowledged the denial in the final reply.
+    low = final_text.lower()
+    assert any(kw in low for kw in ("deni", "not execute", "refused", "cannot")), (
+        f"reply does not acknowledge denial: {final_text!r}"
+    )

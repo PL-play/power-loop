@@ -325,13 +325,35 @@ loop = StatefulAgentLoop(llm=..., db_path="...", hooks=hooks, ...)
 ```python
 def block_destructive(ctx: ToolBeforeCtx) -> None:
     if ctx.tool_name == "bash":
-        cmd = ctx.tool_args.get("cmd", "")
+        cmd = ctx.tool_args.get("command", "")
         if any(bad in cmd for bad in ("rm -rf", "sudo", ":(){:|:&};:")):
             ctx.output = "[blocked: destructive]"
             ctx.directive = HookDirective.SKIP
 
 hooks.register(HookPoint.TOOL_BEFORE, block_destructive)
 ```
+
+### 用户交互中断（async confirm）
+
+`TOOL_BEFORE` 是 async 的，handler 里可以 `await` 任意 UI / WebSocket / CLI 输入，
+模型会**真的在等**——没有定时器，没有 polling。同意 → CONTINUE 放行；拒绝 →
+`SKIP + ctx.output`，pipeline 把 output 当成工具结果回灌给 LLM，pending 状态自
+动清零。
+
+```python
+async def ask_before_bash(ctx: ToolBeforeCtx) -> None:
+    if ctx.tool_name != "bash":
+        return
+    cmd = ctx.tool_args.get("command", "")
+    if not await your_confirm_ui(cmd):     # await 用户决定
+        ctx.output = f"[denied by user: {cmd!r}]"
+        ctx.directive = HookDirective.SKIP
+
+hooks.register(HookPoint.TOOL_BEFORE, ask_before_bash)
+```
+
+完整可运行版（含白名单 / always-deny 注入式回调 / CLI input 默认实现）：
+[`examples/07_user_confirmation.py`](../examples/07_user_confirmation.py)。
 
 ### 缓存短路
 

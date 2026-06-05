@@ -410,6 +410,7 @@ class DefaultCompactor:
 | [`04_compaction.py`](examples/04_compaction.py) | `DefaultCompactor` 自动折叠 + 查看 store 审计行 |
 | [`05_pending_resume.py`](examples/05_pending_resume.py) | `SessionPendingError` + `resume` / `abort_pending` |
 | [`06_declarative_subagent.py`](examples/06_declarative_subagent.py) | `AgentSpec` 严格 schema + `run_agent` meta-tool + 直接调 `run_agent_spec` |
+| [`07_user_confirmation.py`](examples/07_user_confirmation.py) | 用 async `TOOL_BEFORE` hook 实现「执行前问用户」中断 |
 
 `examples/_helpers.py` 是共享的 `.env` 读取 + LLM 构造辅助，每个示例 `from _helpers import make_llm`，省掉 boilerplate。复制到自己项目时把那两行内联即可。
 
