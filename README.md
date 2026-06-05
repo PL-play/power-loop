@@ -411,6 +411,9 @@ class DefaultCompactor:
 | [`05_pending_resume.py`](examples/05_pending_resume.py) | `SessionPendingError` + `resume` / `abort_pending` |
 | [`06_declarative_subagent.py`](examples/06_declarative_subagent.py) | `AgentSpec` 严格 schema + `run_agent` meta-tool + 直接调 `run_agent_spec` |
 | [`07_user_confirmation.py`](examples/07_user_confirmation.py) | 用 async `TOOL_BEFORE` hook 实现「执行前问用户」中断 |
+| [`08_streaming.py`](examples/08_streaming.py) | 订阅 `STREAM_DELTA` event 做打字机渲染 |
+| [`09_audit_log.py`](examples/09_audit_log.py) | `bus.subscribe(None, …)` 全量审计写 JSONL |
+| [`10_async_approval_queue.py`](examples/10_async_approval_queue.py) | 多并发 session + asyncio.Queue 审批 worker |
 
 `examples/_helpers.py` 是共享的 `.env` 读取 + LLM 构造辅助，每个示例 `from _helpers import make_llm`，省掉 boilerplate。复制到自己项目时把那两行内联即可。
 

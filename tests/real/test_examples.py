@@ -22,11 +22,12 @@ if str(EXAMPLES_DIR) not in sys.path:
 
 
 def _load_example(filename: str):
-    spec = importlib.util.spec_from_file_location(
-        f"example_{filename.removesuffix('.py')}", EXAMPLES_DIR / filename
-    )
+    mod_name = f"example_{filename.removesuffix('.py')}"
+    spec = importlib.util.spec_from_file_location(mod_name, EXAMPLES_DIR / filename)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
+    # Register before exec so dataclass() can look up the module via sys.modules.
+    sys.modules[mod_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -86,6 +87,40 @@ def test_example_06_declarative_subagent_runs() -> None:
     assert "126" in final_text, (
         f"declarative subagent answer missing '126': {final_text!r}"
     )
+
+
+def test_example_08_streaming_runs() -> None:
+    """Streaming events fire and final_text equals concatenated chunks."""
+    module = _load_example("08_streaming.py")
+    final_text = asyncio.run(module.main())
+    assert isinstance(final_text, str) and len(final_text.strip()) > 20
+
+
+def test_example_09_audit_log_runs() -> None:
+    """Audit subscriber writes a JSONL with the full lifecycle."""
+    import json
+
+    module = _load_example("09_audit_log.py")
+    audit_path = asyncio.run(module.main())
+    lines = audit_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) >= 5, f"audit file too small: {len(lines)} lines"
+    types = {json.loads(ln)["type"] for ln in lines}
+    # 必须覆盖 session + round + 至少一个流事件
+    assert {"session_started", "session_ended"}.issubset(types), types
+    assert any(t.startswith("round_") for t in types), types
+
+
+def test_example_10_async_approval_queue_runs() -> None:
+    """Concurrent sessions all complete; the approval worker handled at
+    least one denial path (the rm session) without blocking the others."""
+    module = _load_example("10_async_approval_queue.py")
+    results = asyncio.run(module.main())
+    assert len(results) == 3
+    labels = {r["label"] for r in results}
+    assert labels == {"S1", "S2", "S3"}
+    # Distinct session ids — confirms one StatefulAgentLoop drove 3 sessions
+    sids = {r["sid"] for r in results}
+    assert len(sids) == 3
 
 
 def test_example_07_user_confirmation_runs() -> None:

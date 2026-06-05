@@ -348,7 +348,7 @@ class AgentPipeline:
                 messages=messages,
                 system_prompt=system_prompt,
                 tools=tools,
-                tool_choice="auto",
+                tool_choice="auto" if tools else None,  # DashScope rejects "auto" with no tools
                 max_tokens=max_tokens,
                 temperature=temperature,
             ),
@@ -687,7 +687,7 @@ class AgentPipeline:
             messages=self.history,
             system_prompt=self.system_prompt,
             tools=self.runtime_tools,
-            tool_choice="auto",
+            tool_choice="auto" if self.runtime_tools else None,
             max_tokens=int(self.config.max_tokens or 8000),
             temperature=float(self.config.temperature or 0),
         ))

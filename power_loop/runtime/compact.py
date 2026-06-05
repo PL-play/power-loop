@@ -70,10 +70,36 @@ class DefaultCompactor:
         *,
         trigger_ratio: float = 0.75,
         keep_last_n: int = 4,
-        summary_max_tokens: int = 512,
+        summary_max_tokens: int = 1024,
         summary_llm: Any | None = None,
         absolute_threshold: int | None = None,
     ) -> None:
+        """
+        Parameters
+        ----------
+        trigger_ratio
+            Fire when ``estimate_tokens(history) ≥ max_tokens × trigger_ratio``.
+            Default 0.75 leaves headroom for the next round's prompt + reply.
+        keep_last_n
+            Preserve the last N **user-bounded exchanges** verbatim (not
+            summarized). This is the freshest context the model needs to
+            answer the next turn well; folding it hurts reply quality
+            dramatically. ``keep_last_n=1`` ≈ "aggressive — summarize
+            everything but the last user turn"; the default 4 follows
+            Anthropic's compaction guide.
+        summary_max_tokens
+            Token cap for the summary LLM call. Rule of thumb:
+            ``summary_max_tokens ≈ max_tokens × 0.10–0.15``. 1024 is a
+            balanced default for typical ``max_tokens=8000`` setups; bump
+            it for very long sessions, lower it to cut summary cost.
+        summary_llm
+            Optional cheaper LLM dedicated to the summary call. Defaults
+            to the main loop's LLM.
+        absolute_threshold
+            Absolute token count that overrides ``trigger_ratio`` when
+            non-None. Env ``CONTEXT_COMPACT_THRESHOLD`` always wins over
+            this if set.
+        """
         self.trigger_ratio = float(trigger_ratio)
         self.keep_last_n = int(keep_last_n)
         self.summary_max_tokens = int(summary_max_tokens)
