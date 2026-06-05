@@ -25,6 +25,11 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 12 | [`retry_and_cancel.py`](12_retry_and_cancel.py) | Retry policy + cancel | `LLMRetryPolicy`, `CancellationToken` |
 | 13 | [`memory_sqlite.py`](13_memory_sqlite.py) | Cross-session SQLite memory | `MemoryProvider`, `recall()` / `remember()` |
 | 14 | [`structured_card.py`](14_structured_card.py) | Structured JSON extraction | `StructuredOutputSpec`, `parse_structured()` |
+| 15 | [`skills_from_markdown.py`](15_skills_from_markdown.py) | SKILL.md → system prompt | Frontmatter parsing, domain knowledge injection |
+| 16 | [`custom_compactor.py`](16_custom_compactor.py) | Custom Compactor protocol | `Compactor` Protocol, `CompactionPlan` |
+| 17 | [`custom_memory_provider.py`](17_custom_memory_provider.py) | HTTP-backed MemoryProvider | `MemoryProvider` Protocol, HTTP API mock |
+| 18 | [`multi_provider.py`](18_multi_provider.py) | Multiple LLM providers | `LLMProviderConfig`, `create_llm_service_from_config()` |
+| 19 | [`full_chatbot.py`](19_full_chatbot.py) | **Flagship**: all features on | session + tools + hooks + events + memory + compaction |
 
 ## Running
 
@@ -43,4 +48,4 @@ python examples/00_hello_world.py
 
 ## Next
 
-After `14`, explore the [User Guide](../docs/en/user-guide/index.md) for deep-dive reference docs, or the [Tutorials](../docs/en/tutorials/index.md) for step-by-step project builds.
+After `19`, explore the [User Guide](../docs/en/user-guide/index.md) for deep-dive reference docs, or the [Tutorials](../docs/en/tutorials/index.md) for step-by-step project builds.

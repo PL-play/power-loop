@@ -32,14 +32,14 @@ def _load_example(filename: str):
     return module
 
 
-def test_example_00_minimal_runs() -> None:
-    module = _load_example("00_minimal.py")
+def test_example_00_hello_world_runs() -> None:
+    module = _load_example("00_hello_world.py")
     final_text = asyncio.run(module.main())
     assert isinstance(final_text, str) and final_text.strip()
 
 
-def test_example_01_multi_turn_runs() -> None:
-    module = _load_example("01_multi_turn.py")
+def test_example_01_multi_turn_chat_runs() -> None:
+    module = _load_example("01_multi_turn_chat.py")
     final_text = asyncio.run(module.main())
     # The fact established in turn 1 must surface in turn 2.
     assert "teal" in final_text.lower(), (
@@ -47,16 +47,16 @@ def test_example_01_multi_turn_runs() -> None:
     )
 
 
-def test_example_02_tool_use_runs() -> None:
-    module = _load_example("02_tool_use.py")
+def test_example_02_tool_calling_runs() -> None:
+    module = _load_example("02_tool_calling.py")
     final_text = asyncio.run(module.main())
     assert "pad thai" in final_text.lower(), (
         f"expected the answer to surface the tool result; got: {final_text!r}"
     )
 
 
-def test_example_03_subagent_runs() -> None:
-    module = _load_example("03_subagent.py")
+def test_example_03_subagent_delegation_runs() -> None:
+    module = _load_example("03_subagent_delegation.py")
     final_text = asyncio.run(module.main())
     assert "tokyo" in final_text.lower() or "东京" in final_text, (
         f"sub-agent answer did not surface 'Tokyo': {final_text!r}"
@@ -71,8 +71,8 @@ def test_example_04_compaction_runs() -> None:
     )
 
 
-def test_example_05_pending_resume_runs() -> None:
-    module = _load_example("05_pending_resume.py")
+def test_example_05_pending_recovery_runs() -> None:
+    module = _load_example("05_pending_recovery.py")
     final_text = asyncio.run(module.main())
     assert "hypertext" in final_text.lower().replace("-", "").replace(" ", ""), (
         f"post-abort send did not produce the expected answer: {final_text!r}"
@@ -110,10 +110,10 @@ def test_example_09_audit_log_runs() -> None:
     assert any(t.startswith("round_") for t in types), types
 
 
-def test_example_10_async_approval_queue_runs() -> None:
+def test_example_10_concurrent_sessions_runs() -> None:
     """Concurrent sessions all complete; the approval worker handled at
     least one denial path (the rm session) without blocking the others."""
-    module = _load_example("10_async_approval_queue.py")
+    module = _load_example("10_concurrent_sessions.py")
     results = asyncio.run(module.main())
     assert len(results) == 3
     labels = {r["label"] for r in results}
@@ -123,11 +123,11 @@ def test_example_10_async_approval_queue_runs() -> None:
     assert len(sids) == 3
 
 
-def test_example_07_user_confirmation_runs() -> None:
+def test_example_07_human_approval_runs() -> None:
     """Always-deny confirm_fn: dangerous commands must NEVER execute;
     safe whitelist commands may still execute; final answer must
     acknowledge the denial (not silently retry)."""
-    module = _load_example("07_user_confirmation.py")
+    module = _load_example("07_human_approval.py")
     module.EXECUTED.clear()
     final_text = asyncio.run(module.main())
 
