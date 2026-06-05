@@ -115,6 +115,26 @@
 
 `trim_history` / `estimate_tokens` / `estimate_text_tokens` 顶层导出。
 
+### Added — M2.5 错误体系收口（2026-06-05）
+
+- **`ToolNotFound(tool_name)`** —— `ToolRegistry.invoke / invoke_async` 找不到工具时 raise。
+- **`ToolValidationError(tool_name, message)`** —— 参数校验失败时 raise。
+- **`SpecValidationError(message, *, field=None)`** —— 新的规范验证错误；`AgentSpecError` 现继承于它（而它继承 `PowerLoopError`），旧代码 `except AgentSpecError` 继续有效，新代码 `except SpecValidationError` 或 `except PowerLoopError` 一把抓。
+- `ToolRegistry.invoke / invoke_async` 对 unknown tool 和 invalid args 现在 **raise 异常而非 return 字符串**；`invoke` 也 raise 而非 return 字符串作为错误。Pipeline 的 `execute_tool` 内部 catch 这两个异常并返回 `(str(exc), True)` 给 LLM 看到（保持向后兼容）。
+- **`ToolRegistry.validate` 保留为 internal legacy**（仍返回 `str | None`），管线仍用它做第一层检测，但新代码应直接 invoke + catch。
+- 所有 `__init__.py` 和 `__all__` 同步更新。
+
+### Added — M2.1 Public API 稳定性约定（2026-06-05）
+
+- **README §5** 新增 "Public API 稳定性约定" 节：**STABLE**（24 符号，跨 minor 保证兼容 + CHANGELOG 独立条目）、**PROVISIONAL**（顶层导入但 0.x 可调）、**INTERNAL**（无版本承诺）。与 `power_loop/STABLE_API` 元组同步。
+- Examples 表补齐 11–14（persistence / retry-cancel / memory-sqlite / structured-card）。
+- §7 环境变量节更新为 `POWER_LOOP_*` 优先 + `create_llm_service_from_env()` 一行法。
+
+### Added — M2.2 Hook/Event 全表文档（2026-06-05）
+
+- **`docs/hooks.md`** §3.9 新增 `memory.recalled` hook 点文档（Ctx 字段 / SKIP directive / 双方授权示例）。
+- **`docs/events.md`** 新增 §2.7 LLM retry/cancel lifecycle（`llm_retry_attempted` / `llm_degraded` / `loop_cancelled`）和 §2.8 Memory（`memory_recalled` / `memory_failed`），含完整 payload 字段表、触发时机、典型订阅者。
+
 ## [0.2.0] — 2026-06-05
 
 Stateful refactor. The library now revolves around `StatefulAgentLoop` and a SQLite-backed `SessionStore`; the stateless `AgentLoop` is removed. **Hard break — no compatibility shim.**

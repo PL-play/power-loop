@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from power_loop.contracts.errors import ToolNotFound, ToolValidationError
 from power_loop.contracts.tools import ToolDefinition, validate_tool_args
 
 ToolCallable = Callable[..., Any] | Callable[..., Awaitable[Any]]
@@ -72,58 +73,72 @@ class ToolRegistry:
         return [d.to_openai_tool() for d in self.definitions()]
 
     def validate(self, name: str, args: Mapping[str, Any]) -> str | None:
+        """Validate tool name and arguments. Returns an error string or ``None``.
+
+        This is a **legacy internal** method kept for the pipeline's
+        ``execute_tool``; new code should call ``_raise_if_invalid`` or
+        invoke directly and catch ``ToolNotFound`` / ``ToolValidationError``.
+        """
         tool = self._tools.get(name)
         if tool is None:
             return f"Unknown tool: {name}"
 
-        # Keep compatibility with zero-code required params behavior.
         err = validate_tool_args(name, args)
         if err:
             return err
 
-        # If a definition has explicit required_params, validate as well.
         missing = [p for p in tool.definition.required_params if p not in args]
         if missing:
             return f"Error: missing required parameter(s): {', '.join(missing)}"
         return None
 
+    def _raise_if_invalid(self, name: str, args: Mapping[str, Any]) -> None:
+        """Raise :class:`ToolNotFound` / :class:`ToolValidationError` if the
+        tool or its args are invalid."""
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ToolNotFound(name)
+
+        err = validate_tool_args(name, args)
+        if err:
+            raise ToolValidationError(name, err)
+
+        missing = [p for p in tool.definition.required_params if p not in args]
+        if missing:
+            raise ToolValidationError(
+                name, f"missing required parameter(s): {', '.join(missing)}",
+            )
+
     def invoke(self, name: str, args: Mapping[str, Any]) -> Any:
-        """Sync invocation. Raises :class:`AsyncToolInSyncContext` if the
-        handler is an ``async def`` — use :meth:`invoke_async` for those.
+        """Sync invocation. Raises :class:`ToolNotFound` if the tool is
+        not registered, :class:`ToolValidationError` if args fail validation,
+        and :class:`AsyncToolInSyncContext` if the handler is ``async def``.
         """
         tool = self._tools.get(name)
         if tool is None:
-            return f"Unknown tool: {name}"
+            raise ToolNotFound(name)
 
         if tool.is_async:
             raise AsyncToolInSyncContext(
                 f"Tool {name!r} has an async handler; call invoke_async() instead."
             )
 
-        err = self.validate(name, args)
-        if err:
-            return err
+        self._raise_if_invalid(name, args)
 
         try:
             return tool.handler(**dict(args))
         except TypeError:
-            # Backward compatibility for dict-arg handlers.
             return tool.handler(dict(args))
 
     async def invoke_async(self, name: str, args: Mapping[str, Any]) -> Any:
-        """Universal invocation entry. Handles both sync and async handlers.
-
-        For async handlers, calls them directly and awaits the coroutine.
-        For sync handlers, calls them and awaits if the return value happens
-        to be awaitable (handlers wrapping async libraries).
-        """
+        """Universal invocation entry. Raises :class:`ToolNotFound` if the
+        tool is not registered, :class:`ToolValidationError` if args fail
+        validation."""
         tool = self._tools.get(name)
         if tool is None:
-            return f"Unknown tool: {name}"
+            raise ToolNotFound(name)
 
-        err = self.validate(name, args)
-        if err:
-            return err
+        self._raise_if_invalid(name, args)
 
         if tool.is_async:
             return await tool.handler(**dict(args))

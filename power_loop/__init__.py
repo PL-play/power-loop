@@ -42,6 +42,9 @@ from power_loop.contracts.errors import (
     PowerLoopError,
     SessionNotFoundError,
     SessionPendingError,
+    SpecValidationError,
+    ToolNotFound,
+    ToolValidationError,
 )
 from power_loop.contracts.event_payloads import (
     AgentErrorPayload,
@@ -188,6 +191,9 @@ __all__ = [
 	"PowerLoopError",
 	"SessionPendingError",
 	"SessionNotFoundError",
+	"ToolNotFound",
+	"ToolValidationError",
+	"SpecValidationError",
 	"LLMTimeout",
 	"LLMRetryExhausted",
 	"CancellationRequested",

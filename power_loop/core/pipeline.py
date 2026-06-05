@@ -23,6 +23,8 @@ from power_loop.contracts.errors import (
     CancellationRequested,
     LLMRetryExhausted,
     LLMTimeout,
+    ToolNotFound,
+    ToolValidationError,
 )
 from power_loop.contracts.event_payloads import (
     AutoCompactStatusPayload,
@@ -505,15 +507,20 @@ class AgentPipeline:
     async def execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> tuple[str, bool]:
         """Execute a single tool and return ``(output_string, failed)``.
 
-        Raises on unexpected errors — the caller handles the TOOL_ERROR hook.
+        Catches :class:`ToolNotFound` / :class:`ToolValidationError` from
+        the registry and returns them as error strings (failed=True), making
+        them visible to the LLM so it can self-correct.
         """
         if self.tool_registry is None:
             return (f"Error: tool '{tool_name}' requested but no tool registry configured", True)
-        validation_err = self.tool_registry.validate(tool_name, tool_args)
-        if validation_err is not None:
-            return (validation_err, True)
+        try:
+            validation_err = self.tool_registry.validate(tool_name, tool_args)
+            if validation_err is not None:
+                return (validation_err, True)
 
-        result = await self.tool_registry.invoke_async(tool_name, tool_args)
+            result = await self.tool_registry.invoke_async(tool_name, tool_args)
+        except (ToolNotFound, ToolValidationError) as exc:
+            return (str(exc), True)
         if not isinstance(result, str):
             result = json.dumps(result, ensure_ascii=False)
         return (str(result), False)

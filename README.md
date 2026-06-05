@@ -393,6 +393,50 @@ class DefaultCompactor:
 
 自定义 compactor 实现上面的 Protocol 即可注入 `AgentLoopConfig.compactor=YourCompactor()`。
 
+### Public API 稳定性约定
+
+power-loop 采用 **三层分级**，与 `power_loop/__init__.py` 的 `STABLE_API` 元组同步：
+
+#### STABLE（跨 minor 保证向后兼容）
+
+破坏性变更必须升 minor 版本号（0.x → 0.x+1）+ CHANGELOG 独立条目。**业务方只应依赖这些符号。**
+
+| 符号 | 一句话 |
+|---|---|
+| `StatefulAgentLoop` | 主入口：`send()` / `resume()` / `abort_pending()` |
+| `StatefulResult` | `send()` 返回值：`session_id` / `status` / `final_text` / `rounds` |
+| `AgentLoopConfig` | 配置单：`system_prompt` / `max_rounds` / `compactor` / `retry_policy` / `memory` / … |
+| `AgentLoopResult` | Pipeline 内部返回值（`status` / `final_text` / `rounds` / `messages`） |
+| `SessionStore` | SQLite 持久化：`open(path)` / `create_session()` / `append_message()` / … |
+| `SubagentLifecycle` | Enum：`EPHEMERAL` / `LINKED` / `DETACHED` |
+| `PowerLoopError` | 所有异常的基类，`except PowerLoopError` 一把抓 |
+| `SessionNotFoundError` | `session_id` 不在 store 里 |
+| `SessionPendingError` | 上次崩溃留下未完成的 `tool_calls` |
+| `LLMTimeout` | LLM 调用（或一系列 retry）超 `total_timeout` |
+| `LLMRetryExhausted` | `max_attempts` 次重试仍未成功 |
+| `CancellationRequested` | `CancellationToken` 已 flip |
+| `ToolNotFound` | 调用了一个未注册的 tool 名字 |
+| `ToolValidationError` | tool args 未通过 schema / required 校验 |
+| `SpecValidationError` | `AgentSpec` 严格 schema 拒绝（`AgentSpecError` 的父类） |
+| `LLMRetryPolicy` | 重试策略：`max_attempts` / `backoff_*` / `total_timeout` / `retry_on` |
+| `CancellationToken` | 统一 cancel 形状：`from_any(ev)` / `cancel(reason)` |
+| `AgentHooks` | Hook 管理器：`register(pt, fn)` / `register_async(pt, async_fn)` |
+| `AgentEventBus` | 事件总线：`subscribe(type, fn)` / `publish(event)` |
+| `HookPoint` | Enum：`SESSION_START` … `MEMORY_RECALLED`（18 个） |
+| `HookDirective` | Enum：`CONTINUE` / `SKIP` / `BREAK` / `SHORT_CIRCUIT` |
+| `ToolRegistry` | 工具注册表：`register(def, handler)` / `invoke_async(name, args)` |
+| `ToolDefinition` | 工具声明：`name` / `description` / `input_schema` / `required_params` |
+
+#### PROVISIONAL（0.x 阶段可能调整）
+
+从 `power_loop` 顶层导入，但**不在 STABLE 列表中**。生产代码引用前确认版本号。
+
+例：`MessageSink` / `SQLiteSink` / `AgentSpec` / `run_agent_spec` / `MemoryProvider` / `MemorySnapshot` / `StructuredOutputSpec` / `parse_structured` / `trim_history` / `LLMProviderConfig` / 全部 `*Payload` / 全部 `*Ctx` 等。
+
+#### INTERNAL（无版本承诺）
+
+从 `power_loop.core.*` / `power_loop.runtime.*` 等子模块导入的符号视为 internal，可随时变更或删除。Pipeline / Runner / ContextManager 等都在这一层。
+
 ---
 
 ## 6. Examples
@@ -414,6 +458,10 @@ class DefaultCompactor:
 | [`08_streaming.py`](examples/08_streaming.py) | 订阅 `STREAM_DELTA` event 做打字机渲染 |
 | [`09_audit_log.py`](examples/09_audit_log.py) | `bus.subscribe(None, …)` 全量审计写 JSONL |
 | [`10_async_approval_queue.py`](examples/10_async_approval_queue.py) | 多并发 session + asyncio.Queue 审批 worker |
+| [`11_persistence.py`](examples/11_persistence.py) | `db_path` 跨进程恢复：子进程拿同一个 SQLite 文件续上 |
+| [`12_retry_and_cancel.py`](examples/12_retry_and_cancel.py) | `LLMRetryPolicy` + 注入失败 → 重试 / degraded / cancel 三条路径 |
+| [`13_memory_sqlite.py`](examples/13_memory_sqlite.py) | `MemoryProvider` 跨 session SQLite 事实记忆 |
+| [`14_structured_card.py`](examples/14_structured_card.py) | `StructuredOutputSpec` + `parse_structured` 抽取 JSON 卡片 |
 
 `examples/_helpers.py` 是共享的 `.env` 读取 + LLM 构造辅助，每个示例 `from _helpers import make_llm`，省掉 boilerplate。复制到自己项目时把那两行内联即可。
 
@@ -423,17 +471,25 @@ class DefaultCompactor:
 
 LLM 凭证与端点 **不入代码**，统一走环境变量（建议 `.env` + `python-dotenv`）：
 
+**推荐**（`POWER_LOOP_*`，M1.4 起）：
+
 | 变量 | 说明 |
 |---|---|
-| `OPENAI_COMPAT_BASE_URL` | OpenAI 兼容端点（DashScope、MiniMax、Kimi、DeepSeek 等） |
-| `OPENAI_COMPAT_API_KEY` | API key |
-| `OPENAI_COMPAT_MODEL` | 默认模型名 |
-| `ANTHROPIC_API_KEY` | Anthropic 凭证（用 Anthropic 家底时） |
-| `CONTEXT_COMPACT_THRESHOLD` | 绝对 token 阈值（覆盖 `trigger_ratio`） |
-| `POWER_LOOP_WORKSPACE` | 默认工作目录（默认工具相对路径以此为根） |
-| `POWER_LOOP_SKILLS_DIR` | `SKILL.md` 目录 |
+| `POWER_LOOP_BASE_URL` | OpenAI 兼容端点 |
+| `POWER_LOOP_API_KEY` | API key |
+| `POWER_LOOP_MODEL` | 默认模型名 |
+| `POWER_LOOP_PROVIDER` | 标签（openai / dashscope / deepseek / …） |
 
-构造 LLM 示例：
+向后兼容 `OPENAI_COMPAT_*`（旧 `.env` 不改名继续工作）。详见 [`docs/providers.md`](docs/providers.md)。
+
+构造 LLM 一行：
+
+```python
+from power_loop import create_llm_service_from_env
+llm = create_llm_service_from_env()  # 读 POWER_LOOP_*（回退到 OPENAI_COMPAT_*）
+```
+
+旧方式（仍可用）：
 
 ```python
 from llm_client.interface import OpenAICompatibleChatConfig

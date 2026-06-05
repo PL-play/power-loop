@@ -188,15 +188,22 @@ API 稳定性：`power_loop/__init__.py` 暴露的为 **Public API**，破坏性
 
 让外部敢用、敢长期依赖。
 
-### M2.1 Public API 表
+### M2.1 Public API 表 ✅ 2026-06-05
 
-- README 增节："Public API（稳定）vs Internal（可变）"。
-- 列出 v0.2.0 公开面，约定后续破坏性变更走 minor + CHANGELOG。
+- README §5 末尾增节："Public API 稳定性约定"，STABLE 24 符号全表（一句话功能描述）+ PROVISIONAL / INTERNAL 边界。
+- Examples 表补齐 11–14；§7 环境变量更新为 `POWER_LOOP_*` + `create_llm_service_from_env()`。
 
-### M2.2 Hook 点 / Event 全表
+### M2.2 Hook 点 / Event 全表 ✅ 2026-06-05
 
-- `docs/hooks.md`：每个 HookPoint 的 ctx 字段、可返回 directive、典型用途、示例片段。
-- `docs/events.md`：每类 AgentEvent 的 payload 字段、触发时机、订阅示例。
+- `docs/hooks.md` 补 §3.9 `memory.recalled` hook（Ctx 字段 / SKIP / 双方授权示例）。
+- `docs/events.md` 补 §2.7 LLM retry/cancel lifecycle（3 事件）+ §2.8 Memory（2 事件），含完整 payload 表、触发时机、典型订阅者。
+
+### M2.5 错误体系 ✅ 2026-06-05
+
+- 新增 `ToolNotFound(tool_name)` / `ToolValidationError(tool_name, message)` / `SpecValidationError(message, *, field=None)`，全部 `PowerLoopError` 子类。
+- `AgentSpecError` 改继承 `SpecValidationError`（不再直接从 `ValueError`）；旧 `except AgentSpecError` 继续有效。
+- `ToolRegistry.invoke / invoke_async` 对 unknown tool / invalid args 现在 raise；pipeline `execute_tool` 内部 catch 并返回 `(str(exc), True)` 使 LLM 可见。
+- `ToolRegistry.validate` 保留为 internal legacy 接口（仍返回 `str | None`）。
 
 ### M2.3 examples/ 充实
 
@@ -215,11 +222,6 @@ API 稳定性：`power_loop/__init__.py` 暴露的为 **Public API**，破坏性
 
 - `bench/loop_no_tools.py`：10 回合空工具循环 + fake LLM，记录基线数字进 CHANGELOG。
 - 非门禁；后续退化能看见即可。
-
-### M2.5 错误体系
-
-- 统一基类 `PowerLoopError`，子类：`ToolNotFound / ToolValidationError / LLMTimeout / LLMRetryExhausted / CancellationRequested / SpecValidationError / CompactionFailed`。
-- 业务侧 `except PowerLoopError` 即可一把抓。
 
 ### M2.6 **动态工具注册（meta-tool）**（新增）
 

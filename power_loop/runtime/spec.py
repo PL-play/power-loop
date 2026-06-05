@@ -23,6 +23,7 @@ from dataclasses import dataclass, field, fields
 from typing import Any
 
 from power_loop.agent.types import AgentLoopConfig
+from power_loop.contracts.errors import SpecValidationError
 from power_loop.runtime.session_store import MAX_SPAWN_DEPTH, SubagentLifecycle
 from power_loop.tools.registry import ToolRegistry
 
@@ -34,8 +35,15 @@ __all__ = [
 ]
 
 
-class AgentSpecError(ValueError):
-    """Raised when an :class:`AgentSpec` payload fails strict validation."""
+class AgentSpecError(SpecValidationError):
+    """Raised when an :class:`AgentSpec` payload fails strict validation.
+
+    Inherits from :class:`~power_loop.contracts.errors.SpecValidationError`
+    so ``except PowerLoopError`` catches it alongside all other library errors.
+    """
+    # Keep ValueError-compatible interface for callers that already do
+    # ``except ValueError`` or ``except AgentSpecError``.
+    pass
 
 
 @dataclass(frozen=True)

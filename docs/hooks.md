@@ -20,6 +20,7 @@ event 只读、用于观测；hook 可以改 messages、改 LLM 请求、改工�
   - [3.6 Tool（单个）](#36-tool单个)
   - [3.7 Compact](#37-compact)
   - [3.8 Message](#38-message)
+  - [3.9 Memory](#39-memory)
 - [4. 注册 hook](#4-注册-hook)
 - [5. 常见模式](#5-常见模式)
 
@@ -295,6 +296,31 @@ def block_dangerous(ctx: ToolBeforeCtx) -> None:
 - 写 audit log
 - 对 tool 输出做 PII 脱敏
 - 给消息加 `_meta` 字段供后续 hook 使用
+
+### 3.9 Memory
+
+#### `memory.recalled`
+
+`MemoryProvider.recall()` 返回之后、注入 history 之前触发。**M1.9 起可用。**
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `recalled` | `list[dict]` | 待注入的 memory 消息（可改：过滤 / 重排 / 去敏） |
+| `session_id` | `str \| None` | |
+| `budget_tokens` | `int` | recall 时传入的 token 预算 |
+
+**支持的 directive**：`SKIP`（丢弃整批 memory，不注入任何消息）。
+
+**典型用途**：双方授权 gate（"这个 session 应当看到记忆吗？"）；PII 去敏后再注入。
+
+```python
+def redact_memory(ctx: MemoryRecalledCtx) -> None:
+    if not user_has_consented(ctx.session_id):
+        ctx.directive = HookDirective.SKIP
+        return
+    for m in ctx.recalled:
+        m["content"] = redact_pii(m.get("content", ""))
+```
 
 ---
 

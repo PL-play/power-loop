@@ -109,3 +109,32 @@ class CompactionFailed(PowerLoopError):
     still emits ``compact.failed`` event and continues — this exception is
     only raised when the loop must be aborted because the un-compacted
     history blew the context window."""
+
+
+class ToolNotFound(PowerLoopError):
+    """Raised when a tool name is not registered in the :class:`ToolRegistry`."""
+
+    def __init__(self, tool_name: str) -> None:
+        self.tool_name = tool_name
+        super().__init__(f"tool not found: {tool_name}")
+
+
+class ToolValidationError(PowerLoopError):
+    """Raised when tool arguments fail schema / required-param validation."""
+
+    def __init__(self, tool_name: str, message: str) -> None:
+        self.tool_name = tool_name
+        self.message = message
+        super().__init__(f"tool {tool_name!r}: {message}")
+
+
+class SpecValidationError(PowerLoopError):
+    """Raised when an :class:`~power_loop.runtime.spec.AgentSpec` fails validation.
+
+    Replaces the previous ``AgentSpecError(ValueError)``. ``field`` is the
+    spec key that caused the failure (or ``None`` for a general error).
+    """
+
+    def __init__(self, message: str, *, field: str | None = None) -> None:
+        self.field = field
+        super().__init__(message)

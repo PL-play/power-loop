@@ -16,8 +16,10 @@ Event 是 power-loop 的**旁路观测**通道。订阅者**只读**——event 
   - [2.4 Tool lifecycle](#24-tool-lifecycle)
   - [2.5 Status / usage](#25-status--usage)
   - [2.6 Todo](#26-todo)
-  - [2.7 通知 / 日志 / 错误](#27-通知--日志--错误)
-  - [2.8 Subagent](#28-subagent)
+  - [2.7 LLM retry / cancel lifecycle](#27-llm-retry--cancel-lifecycle)
+  - [2.8 Memory](#28-memory)
+  - [2.9 通知 / 日志 / 错误](#29-通知--日志--错误)
+  - [2.10 Subagent](#210-subagent)
 - [3. 订阅 event](#3-订阅-event)
 - [4. 常见模式](#4-常见模式)
 
@@ -217,7 +219,85 @@ Payload — `TodoUpdatedPayload`：
 
 **典型订阅者**：UI 任务清单面板。
 
-### 2.7 通知 / 日志 / 错误
+### 2.7 LLM retry / cancel lifecycle
+
+> 当 `AgentLoopConfig.retry_policy` 启用时触发。**M1.1 起可用。**
+
+#### `llm_retry_attempted`
+
+每次 LLM 调用失败的**重试尝试**之后、退避 sleep 之前触发。
+
+Payload — `LlmRetryAttemptedPayload`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `attempt` | `int` | 刚失败的 attempt（0-based） |
+| `max_attempts` | `int` | 总 attempt 上限 |
+| `error_type` | `str` | 异常类名（如 `"RuntimeError"`） |
+| `error_message` | `str` | 异常消息（截断到 500 字符） |
+| `next_sleep_seconds` | `float` | 退避等待秒数 |
+
+**典型订阅者**：告警系统（"重试比例异常"）；UI 转圈 + 错误提示。
+
+#### `llm_degraded`
+
+重试耗尽或 total_timeout 超时，pipeline 降级返回合成 assistant 消息时触发。
+
+Payload — `LlmDegradedPayload`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `reason` | `str` | `"retry_exhausted"` / `"timeout"` |
+| `attempts` | `int` | 已尝试多少次 |
+| `error_type` | `str` | |
+| `error_message` | `str` | |
+
+**典型订阅者**：UI 显示降级提示；日志；告警。
+
+#### `loop_cancelled`
+
+外部 `CancellationToken` flip 导致 loop 终止时触发。
+
+Payload — `LoopCancelledPayload`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `reason` | `str` | cancel reason（如 `"user_pressed_stop"`） |
+| `round_index` | `int \| None` | 取消时所在轮次 |
+
+### 2.8 Memory
+
+> 当 `AgentLoopConfig.memory` 启用时触发。**M1.9 起可用。**
+
+#### `memory_recalled`
+
+`MemoryProvider.recall()` 返回、经过 `MEMORY_RECALLED` hook 之后、注入 history 之前触发。
+
+Payload — `MemoryRecalledPayload`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `returned` | `int` | recall 返回的消息数 |
+| `injected` | `int` | 实际注入到 history 的消息数（hook 过滤后） |
+| `budget_tokens` | `int` | recall 的 token 预算 |
+
+**典型订阅者**：审计——"这个 session 用了记忆吗"；debug——注入数 vs 返回数。
+
+#### `memory_failed`
+
+`recall()` 或 `remember()` 抛异常时触发。Loop 继续跑，记忆是 best-effort。
+
+Payload — `MemoryFailedPayload`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `phase` | `str` | `"recall"` / `"remember"` |
+| `error_type` | `str` | 异常类名 |
+| `error_message` | `str` | 异常消息（截断到 500 字符） |
+
+**典型订阅者**：告警；日志——"记忆后端 down 了但 Agent 还在跑"。
+
+### 2.9 通知 / 日志 / 错误
 
 #### `user_notification`
 
@@ -238,7 +318,7 @@ Payload — `AgentErrorPayload`：
 
 Payload — `SystemLogPayload`：`message: str` / `level: str`（`"info"` / `"warn"` / `"error"`）。
 
-### 2.8 Subagent
+### 2.10 Subagent
 
 #### `subagent_task_start`
 
