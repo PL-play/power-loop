@@ -27,6 +27,7 @@ from llm_client.interface import LLMService
 from power_loop.agent.sink import SQLiteSink
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import SessionNotFoundError, SessionPendingError
+from power_loop.core.agent_context import reset_current_loop, set_current_loop
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.pipeline import (
@@ -308,18 +309,22 @@ class StatefulAgentLoop:
         history = [_row_to_loop_message(r) for r in self.store.load_active_messages(sid)]
 
         async with self._runner.session_async(session_id=sid):
-            pipeline = AgentPipeline(
-                llm=self.llm,
-                config=self.config,
-                tool_registry=self.tool_registry,
-                hooks=self._runner.hooks,
-                bus=self._runner.event_bus,
-                ctx=ContextManager(role="main"),
-                session_id=sid,
-                stop_event=stop_event,
-                sink=sink,
-            )
-            result: AgentLoopResult = await pipeline.run(history)
+            loop_token = set_current_loop(self)
+            try:
+                pipeline = AgentPipeline(
+                    llm=self.llm,
+                    config=self.config,
+                    tool_registry=self.tool_registry,
+                    hooks=self._runner.hooks,
+                    bus=self._runner.event_bus,
+                    ctx=ContextManager(role="main"),
+                    session_id=sid,
+                    stop_event=stop_event,
+                    sink=sink,
+                )
+                result: AgentLoopResult = await pipeline.run(history)
+            finally:
+                reset_current_loop(loop_token)
         return StatefulResult(
             session_id=sid,
             status=result.status,

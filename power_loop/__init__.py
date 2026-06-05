@@ -20,7 +20,6 @@ Stability tiers
 
 __version__ = "0.1.0"
 
-from power_loop.agent.loop import AgentLoop  # deprecated: removed in PR-3
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
 from power_loop.agent.system_prompt import (
@@ -107,6 +106,7 @@ from power_loop.runtime.session_store import (
     SessionStore,
     SubagentLifecycle,
 )
+from power_loop.runtime.spec import AgentSpec, AgentSpecError, run_agent_spec
 from power_loop.tools import ToolRegistry, build_registry, create_default_tool_registry
 from power_loop.tools.default_manifest import (
     CORE_TOOL_NAMES,
@@ -115,7 +115,11 @@ from power_loop.tools.default_manifest import (
     TOOL_PRESETS,
     get_tool_definitions,
 )
-from power_loop.tools.spawn_agent import SPAWN_AGENT_DEFINITION, register_spawn_agent
+from power_loop.tools.spawn_agent import (
+    RUN_AGENT_DEFINITION,
+    SPAWN_AGENT_DEFINITION,
+    register_spawn_agent,
+)
 
 STABLE_API = (
     "StatefulAgentLoop",
@@ -140,7 +144,6 @@ __all__ = [
 	"STABLE_API",
 	"StatefulAgentLoop",
 	"StatefulResult",
-	"AgentLoop",
 	"AgentLoopConfig",
 	"AgentLoopResult",
 	"SessionStore",
@@ -243,4 +246,8 @@ __all__ = [
 	"build_explore_subagent_system_prompt",
 	"register_spawn_agent",
 	"SPAWN_AGENT_DEFINITION",
+	"RUN_AGENT_DEFINITION",
+	"AgentSpec",
+	"AgentSpecError",
+	"run_agent_spec",
 ]

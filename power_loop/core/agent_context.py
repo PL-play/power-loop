@@ -4,6 +4,7 @@ from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from power_loop.agent.stateful_loop import StatefulAgentLoop
     from power_loop.core.events import AgentEventBus
     from power_loop.core.hooks import AgentHooks
     from power_loop.core.state import ContextManager
@@ -13,6 +14,9 @@ _current_event_bus: ContextVar[AgentEventBus | None] = ContextVar("power_loop_ev
 _current_hooks: ContextVar[AgentHooks | None] = ContextVar("power_loop_hooks", default=None)
 _current_ctx: ContextVar[ContextManager | None] = ContextVar("power_loop_ctx", default=None)
 _current_session_id: ContextVar[str | None] = ContextVar("power_loop_session_id", default=None)
+_current_loop: ContextVar[StatefulAgentLoop | None] = ContextVar(
+    "power_loop_current_loop", default=None
+)
 
 
 def get_event_bus() -> AgentEventBus:
@@ -43,6 +47,18 @@ def get_ctx() -> ContextManager:
 
 def get_session_id() -> str | None:
     return _current_session_id.get()
+
+
+def get_current_loop() -> StatefulAgentLoop | None:
+    return _current_loop.get()
+
+
+def set_current_loop(loop: StatefulAgentLoop | None) -> Token:
+    return _current_loop.set(loop)
+
+
+def reset_current_loop(token: Token) -> None:
+    _current_loop.reset(token)
 
 
 def set_event_bus(bus: AgentEventBus | None) -> Token:

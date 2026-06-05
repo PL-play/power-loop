@@ -1,70 +1,63 @@
-"""spawn_agent tool — lets the LLM create sub-agents at runtime.
+"""spawn_agent + run_agent — meta-tools the LLM uses to delegate work.
 
-The parent agent calls ``spawn_agent(task=..., ...)`` as a regular tool.
-Internally a new :class:`AgentLoop` is created with an independent event bus
-and session, leveraging ``contextvars`` for full isolation.  The sub-agent
-runs to completion and its ``final_text`` is returned as the tool output.
+Two flavours of subagent invocation sit on the same plumbing
+(:func:`power_loop.runtime.spec.run_agent_spec`):
 
-Depth control
--------------
-A ``max_depth`` counter is threaded through the sub-agent's system prompt
-context. If the current depth exceeds the limit, the tool returns an error
-instead of spawning.
+* ``spawn_agent(task, preset=…)`` — *imperative*. Simple kwargs, the library
+  builds an :class:`AgentSpec` with sensible defaults for ``system_prompt`` and
+  the default tool preset. Designed for the common "go do this" case.
+* ``run_agent(spec_json, input)`` — *declarative*. The LLM provides a full
+  :class:`AgentSpec` JSON (custom system prompt, explicit tool whitelist,
+  max_rounds, etc). Designed for dynamic-workflow patterns where the parent
+  agent reasons about what a child should look like.
 
-Event bubbling
---------------
-Sub-agent events are optionally re-published on the parent event bus with
-``source="subagent:<session_id>"`` so the parent's subscribers can observe
-progress.
+Both tools require an active :class:`StatefulAgentLoop` context (set by
+:meth:`StatefulAgentLoop._run_loop`). Calling them outside one returns a
+clear error string.
 """
+
 from __future__ import annotations
 
-import uuid
-from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from power_loop.contracts.event_payloads import SubagentLimitPayload, SubagentTaskStartPayload, SubagentTextPayload
-from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.tools import ToolDefinition
-from power_loop.core.agent_context import get_event_bus, get_session_id
+from power_loop.core.agent_context import get_current_loop
+from power_loop.runtime.spec import AgentSpec, AgentSpecError, run_agent_spec
 
-if TYPE_CHECKING:
-    from power_loop.tools.registry import ToolRegistry
-
-# Tracks nesting depth per coroutine via contextvars.
-_spawn_depth: ContextVar[int] = ContextVar("power_loop_spawn_depth", default=0)
-
-DEFAULT_MAX_DEPTH = 3
 DEFAULT_MAX_ROUNDS = 20
 
 SPAWN_AGENT_DEFINITION = ToolDefinition(
     name="spawn_agent",
     description=(
-        "Spawn a sub-agent to handle a task independently. "
-        "The sub-agent has its own tool set and session. "
-        "Use this when a task can be delegated and worked on in isolation, "
-        "for example: research, code exploration, running tests, or generating code. "
-        "The sub-agent's final answer is returned as the tool result."
+        "Spawn a sub-agent to handle a delegated task in an isolated session. "
+        "The sub-agent inherits the parent's tool registry (filterable via "
+        "the 'tools' arg). Returns the sub-agent's final text."
     ),
     input_schema={
         "type": "object",
         "properties": {
             "task": {
                 "type": "string",
-                "description": "Clear description of the task for the sub-agent.",
+                "description": "The task description / instructions for the sub-agent.",
             },
-            "preset": {
+            "system_prompt": {
                 "type": "string",
-                "enum": ["core", "explore", "full"],
-                "description": "Tool preset for the sub-agent. Default: 'core'.",
+                "description": (
+                    "Optional system prompt override. Defaults to a generic "
+                    "task-completion prompt."
+                ),
+            },
+            "tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional whitelist of tool names from the parent registry. "
+                    "Omit to grant the sub-agent the full parent toolset."
+                ),
             },
             "max_rounds": {
                 "type": "integer",
-                "description": f"Maximum rounds for the sub-agent (default: {DEFAULT_MAX_ROUNDS}).",
-            },
-            "system_prompt_extra": {
-                "type": "string",
-                "description": "Additional instructions appended to the sub-agent's system prompt.",
+                "description": f"Maximum rounds (default {DEFAULT_MAX_ROUNDS}, clamp 1-50).",
             },
         },
         "required": ["task"],
@@ -72,170 +65,109 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(
     required_params=("task",),
 )
 
+RUN_AGENT_DEFINITION = ToolDefinition(
+    name="run_agent",
+    description=(
+        "Materialize a full AgentSpec JSON as a one-shot sub-agent. Use when "
+        "you want explicit control over name / system_prompt / tools / "
+        "max_rounds / max_tokens / temperature / lifecycle. Strict schema: "
+        "unknown fields are rejected."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "spec": {
+                "type": "object",
+                "description": "AgentSpec object (or JSON string).",
+            },
+            "input": {
+                "type": "string",
+                "description": "The initial user message sent to the sub-agent.",
+            },
+        },
+        "required": ["spec", "input"],
+    },
+    required_params=("spec", "input"),
+)
 
-async def run_spawn_agent(
-        task: str,
-        preset: str = "core",
-        max_rounds: int = DEFAULT_MAX_ROUNDS,
-        system_prompt_extra: str = "",
-        *,
-        # Injected by the factory (not from LLM args)
-        _llm: Any = None,
-        _max_depth: int = DEFAULT_MAX_DEPTH,
-        _bubble_events: bool = True,
-) -> str:
-    """Execute a sub-agent and return its final text.
 
-    This function is designed to be called inside an active agent loop.
-    It creates an independent :class:`AgentLoop` session.
-    """
-    # Depth guard
-    current_depth = _spawn_depth.get()
-    if current_depth >= _max_depth:
+# ── handlers ──────────────────────────────────────────────────────────────
+
+
+_DEFAULT_SUB_SYSTEM_PROMPT = (
+    "You are a delegated sub-agent. Complete the task the parent gave you, "
+    "be concise, and return your final answer in the last assistant message."
+)
+
+
+async def _handle_spawn_agent(**kwargs: Any) -> str:
+    loop = get_current_loop()
+    if loop is None:
         return (
-            f"Error: Sub-agent spawn rejected — max nesting depth ({_max_depth}) reached. "
-            "Summarize what you need and handle it directly."
+            "Error: spawn_agent must be invoked from inside an active "
+            "StatefulAgentLoop run."
         )
+    task = str(kwargs.get("task") or "").strip()
+    if not task:
+        return "Error: spawn_agent requires 'task'."
 
-    if _llm is None:
-        return "Error: spawn_agent is not configured — no LLM service available."
-
-    # Lazy imports to avoid circular dependencies
-    from power_loop.agent.loop import AgentLoop
-    from power_loop.agent.system_prompt import SystemPromptContext, build_subagent_system_prompt
-    from power_loop.agent.types import AgentLoopConfig
-    from power_loop.core.events import AgentEventBus
-    from power_loop.tools import create_default_tool_registry
-
-    parent_bus = get_event_bus()
-    parent_session = get_session_id()
-    sub_session_id = f"sub-{uuid.uuid4().hex[:8]}"
-
-    # Build sub-agent components
-    sub_bus = AgentEventBus(suppress_subscriber_errors=True)
-
-    # Event bubbling: re-publish sub-agent events on the parent bus
-    if _bubble_events and parent_bus is not None:
-        source_tag = f"subagent:{sub_session_id}"
-
-        def _bubble(event: AgentEvent) -> None:
-            parent_bus.publish(AgentEvent(
-                type=event.type,
-                payload={**event.payload, "source": source_tag},
-                session_id=parent_session,
-                round_index=event.round_index,
-                stream_id=event.stream_id,
-                source=source_tag,
-            ))
-
-        sub_bus.subscribe(None, _bubble)  # global subscriber
-
-    parent_bus.publish(AgentEvent(
-        type=AgentEventType.SUBAGENT_TASK_START,
-        data=SubagentTaskStartPayload(
-            task=task[:500], preset=preset,
-            sub_session_id=sub_session_id, depth=current_depth + 1,
-        ),
-        session_id=parent_session,
-    ))
-
-    # Build system prompt
-    from power_loop.runtime.env import WORKSPACE_DIR
-    prompt = build_subagent_system_prompt(
-        SystemPromptContext(model="subagent", workspace_dir=str(WORKSPACE_DIR)),
+    spec = AgentSpec(
+        name=str(kwargs.get("name") or "delegate"),
+        system_prompt=str(kwargs.get("system_prompt") or _DEFAULT_SUB_SYSTEM_PROMPT),
+        tools=kwargs.get("tools"),
+        max_rounds=int(kwargs.get("max_rounds") or DEFAULT_MAX_ROUNDS),
     )
-    if system_prompt_extra:
-        prompt += f"\n\n{system_prompt_extra}"
+    result = await run_agent_spec(spec, task, parent_loop=loop)
+    return _format_subagent_result(result)
 
-    # Build tool registry (exclude spawn_agent from sub-agent to prevent unbounded recursion
-    # unless depth allows it)
-    sub_registry = create_default_tool_registry(preset=preset)
-    if current_depth + 1 < _max_depth:
-        # Allow sub-agent to also spawn, but at incremented depth
-        sub_registry.register(
-            SPAWN_AGENT_DEFINITION,
-            _make_spawn_handler(_llm, max_depth=_max_depth, bubble_events=_bubble_events),
-            overwrite=True,
+
+async def _handle_run_agent(**kwargs: Any) -> str:
+    loop = get_current_loop()
+    if loop is None:
+        return (
+            "Error: run_agent must be invoked from inside an active "
+            "StatefulAgentLoop run."
         )
-
-    config = AgentLoopConfig(
-        system_prompt=prompt,
-        max_rounds=max(1, min(max_rounds, 50)),  # clamp
-        temperature=0.0,
-    )
-
-    loop = AgentLoop(llm=_llm, config=config, tool_registry=sub_registry, event_bus=sub_bus)
-
-    # Set increased depth for the sub-agent's coroutine
-    _spawn_depth.set(current_depth + 1)
+    spec_payload = kwargs.get("spec")
+    user_input = str(kwargs.get("input") or "")
+    if not user_input:
+        return "Error: run_agent requires 'input'."
     try:
-        result = await loop.run(
-            messages=[{"role": "user", "content": task}],
-            session_id=sub_session_id,
-        )
-    finally:
-        _spawn_depth.set(current_depth)
+        spec = AgentSpec.from_json(spec_payload) if not isinstance(spec_payload, AgentSpec) else spec_payload
+    except AgentSpecError as exc:
+        return f"Error: invalid AgentSpec — {exc}"
 
-    parent_bus.publish(AgentEvent(
-        type=AgentEventType.SUBAGENT_TEXT,
-        data=SubagentTextPayload(
-            sub_session_id=sub_session_id,
-            status=result.status,
-            rounds=result.rounds,
-            final_text=(result.final_text or "")[:2000],
-        ),
-        session_id=parent_session,
-    ))
-
-    if result.status == "hit_round_limit":
-        parent_bus.publish(AgentEvent(
-            type=AgentEventType.SUBAGENT_LIMIT,
-            data=SubagentLimitPayload(sub_session_id=sub_session_id, max_rounds=config.max_rounds),
-            session_id=parent_session,
-        ))
-
-    return result.final_text or "(sub-agent produced no output)"
+    result = await run_agent_spec(spec, user_input, parent_loop=loop)
+    return _format_subagent_result(result)
 
 
-def _make_spawn_handler(
-        llm: Any,
-        *,
-        max_depth: int = DEFAULT_MAX_DEPTH,
-        bubble_events: bool = True,
-) -> Any:
-    """Create a spawn_agent handler closure bound to the given LLM."""
-
-    async def handler(**kwargs: Any) -> str:
-        return await run_spawn_agent(
-            task=kwargs["task"],
-            preset=kwargs.get("preset", "core"),
-            max_rounds=kwargs.get("max_rounds", DEFAULT_MAX_ROUNDS),
-            system_prompt_extra=kwargs.get("system_prompt_extra", ""),
-            _llm=llm,
-            _max_depth=max_depth,
-            _bubble_events=bubble_events,
-        )
-
-    return handler
+def _format_subagent_result(result: dict[str, Any]) -> str:
+    text = result.get("final_text") or "(no output)"
+    status = result.get("status")
+    if status and status != "completed":
+        return f"[sub-agent status={status}]\n{text}"
+    return text
 
 
-def register_spawn_agent(
-        registry: ToolRegistry,
-        llm: Any,
-        *,
-        max_depth: int = DEFAULT_MAX_DEPTH,
-        bubble_events: bool = True,
-        overwrite: bool = False,
-) -> None:
-    """Convenience: register the spawn_agent tool on an existing registry.
+# ── registration helpers ──────────────────────────────────────────────────
+
+
+def register_spawn_agent(registry, *, include_run_agent: bool = True, overwrite: bool = False) -> None:
+    """Register the spawn_agent (and optionally run_agent) tools on ``registry``.
 
     Usage::
 
-        from power_loop.tools.spawn_agent import register_spawn_agent
-
-        registry = create_default_tool_registry(preset="core")
-        register_spawn_agent(registry, llm)
+        from power_loop import create_default_tool_registry, register_spawn_agent
+        registry = create_default_tool_registry()
+        register_spawn_agent(registry)
     """
+    registry.register(SPAWN_AGENT_DEFINITION, _handle_spawn_agent, overwrite=overwrite)
+    if include_run_agent:
+        registry.register(RUN_AGENT_DEFINITION, _handle_run_agent, overwrite=overwrite)
 
-    handler = _make_spawn_handler(llm, max_depth=max_depth, bubble_events=bubble_events)
-    registry.register(SPAWN_AGENT_DEFINITION, handler, overwrite=overwrite)
+
+__all__ = [
+    "SPAWN_AGENT_DEFINITION",
+    "RUN_AGENT_DEFINITION",
+    "register_spawn_agent",
+]
