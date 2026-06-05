@@ -449,6 +449,9 @@ llm = OpenAICompatibleChatLLMService(cfg)
 
 ## 8. 内部机制
 
+完整版（含 Mermaid 架构图、序列图、状态机）：[`docs/architecture.md`](docs/architecture.md)。
+本节是浓缩。
+
 ### Pipeline 一回合
 
 ```
