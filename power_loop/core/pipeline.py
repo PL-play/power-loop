@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any
 
 from llm_client.interface import LLMRequest, LLMResponse, LLMService
+from power_loop.agent.sink import MessageSink, NullSink
 from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.event_payloads import (
@@ -176,6 +177,7 @@ class AgentPipeline:
         ctx: ContextManager,
         session_id: str | None = None,
         stop_event: threading.Event | None = None,
+        sink: MessageSink | None = None,
     ) -> None:
         self.llm = llm
         self.config = config
@@ -185,6 +187,7 @@ class AgentPipeline:
         self.ctx = ctx
         self.session_id = session_id
         self.stop_event = stop_event
+        self.sink: MessageSink = sink if sink is not None else NullSink()
 
         self.system_prompt = (config.system_prompt or DEFAULT_AGENT_SYSTEM_PROMPT).strip()
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
@@ -213,6 +216,7 @@ class AgentPipeline:
         )
         await self.hooks.run_typed_async(HookPoint.MESSAGE_APPEND, ctx)
         self.history.append(ctx.message)
+        self.sink.on_message_appended(ctx.message, round_index=round_index)
 
     # ── Helper: finalize session ──
 
@@ -383,6 +387,7 @@ class AgentPipeline:
             # ── Business logic: prepare round ──
             await self.prepare_round(round_idx)
 
+            self.sink.on_round_started(round_idx)
             self._emit(AgentEventType.ROUND_STARTED, RoundStartedPayload(round_index=round_idx), round_index=round_idx)
 
             # Todo snapshot injection
@@ -448,9 +453,19 @@ class AgentPipeline:
 
             # Append assistant message
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
+            sanitized_tool_calls: list[dict[str, Any]] | None = None
             if tool_calls:
-                assistant_msg["tool_calls"] = _sanitize_tool_calls(tool_calls)
+                sanitized_tool_calls = _sanitize_tool_calls(tool_calls)
+                assistant_msg["tool_calls"] = sanitized_tool_calls
             await self._append_message(assistant_msg, round_index=round_idx)
+            # Mark pending IMMEDIATELY so a crash here leaves a recoverable state.
+            if sanitized_tool_calls:
+                assistant_seq = len(self.history)  # 1-based position in history
+                self.sink.on_assistant_tool_calls(
+                    assistant_seq=assistant_seq,
+                    tool_calls=sanitized_tool_calls,
+                    round_index=round_idx,
+                )
 
             # Remove todo snapshot
             if todo_snap:
@@ -467,6 +482,7 @@ class AgentPipeline:
                     has_tools=False, response_text=assistant_text,
                 )
                 await self.hooks.run_typed_async(HookPoint.ROUND_END, round_end)
+                self.sink.on_round_ended(round_idx, usage=usage)
                 await self._finalize("completed", final_text=assistant_text)
                 return self._make_result("completed", final_text=assistant_text, rounds=round_idx + 1)
 

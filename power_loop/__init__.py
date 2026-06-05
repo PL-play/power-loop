@@ -20,7 +20,9 @@ Stability tiers
 
 __version__ = "0.1.0"
 
-from power_loop.agent.loop import AgentLoop
+from power_loop.agent.loop import AgentLoop  # deprecated: removed in PR-3
+from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
+from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
 from power_loop.agent.system_prompt import (
     BUILTIN_SECTIONS,
     DEFAULT_AGENT_SYSTEM_PROMPT,
@@ -33,6 +35,11 @@ from power_loop.agent.system_prompt import (
     build_subagent_system_prompt,
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult
+from power_loop.contracts.errors import (
+    PowerLoopError,
+    SessionNotFoundError,
+    SessionPendingError,
+)
 from power_loop.contracts.event_payloads import (
     AgentErrorPayload,
     AutoCompactStatusPayload,
@@ -89,6 +96,17 @@ from power_loop.core.hooks import AgentHooks
 from power_loop.core.phase import PhaseContext, PhaseResult, phase
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
+from power_loop.runtime.session_store import (
+    DEFAULT_DB_PATH,
+    MAX_SPAWN_DEPTH,
+    MessageRow,
+    MessageState,
+    SessionKind,
+    SessionRow,
+    SessionStatus,
+    SessionStore,
+    SubagentLifecycle,
+)
 from power_loop.tools import ToolRegistry, build_registry, create_default_tool_registry
 from power_loop.tools.default_manifest import (
     CORE_TOOL_NAMES,
@@ -100,9 +118,15 @@ from power_loop.tools.default_manifest import (
 from power_loop.tools.spawn_agent import SPAWN_AGENT_DEFINITION, register_spawn_agent
 
 STABLE_API = (
-    "AgentLoop",
+    "StatefulAgentLoop",
+    "StatefulResult",
     "AgentLoopConfig",
     "AgentLoopResult",
+    "SessionStore",
+    "SubagentLifecycle",
+    "PowerLoopError",
+    "SessionPendingError",
+    "SessionNotFoundError",
     "AgentHooks",
     "AgentEventBus",
     "HookPoint",
@@ -114,9 +138,26 @@ STABLE_API = (
 __all__ = [
 	"__version__",
 	"STABLE_API",
+	"StatefulAgentLoop",
+	"StatefulResult",
 	"AgentLoop",
 	"AgentLoopConfig",
 	"AgentLoopResult",
+	"SessionStore",
+	"SessionRow",
+	"SessionStatus",
+	"SessionKind",
+	"SubagentLifecycle",
+	"MessageRow",
+	"MessageState",
+	"MAX_SPAWN_DEPTH",
+	"DEFAULT_DB_PATH",
+	"PowerLoopError",
+	"SessionPendingError",
+	"SessionNotFoundError",
+	"MessageSink",
+	"NullSink",
+	"SQLiteSink",
 	"AgentMessage",
 	"MessageRole",
 	"ToolCall",
