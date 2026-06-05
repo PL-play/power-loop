@@ -1,85 +1,119 @@
-"""power-loop public API."""
+"""power-loop public API.
+
+Stability tiers
+---------------
+
+**STABLE** — 跨 minor 版本保证向后兼容；破坏性变更必须升 minor 版本 + CHANGELOG。
+业务方（如 DeepTalk `agent` 服务）只应依赖这一层。
+
+    AgentLoop, AgentLoopConfig, AgentLoopResult,
+    AgentHooks, AgentEventBus,
+    HookPoint, HookDirective,
+    ToolRegistry, ToolDefinition,
+
+**PROVISIONAL** — 顶层有 re-export，但 0.x 阶段可能调整。生产代码引用前要确认。
+（其余在 ``__all__`` 中、不在上方 STABLE 列表中的所有符号。）
+
+**INTERNAL** — 不从顶层导出；直接 ``from power_loop.core.* import …`` 视为内部 API，
+无版本承诺，可随时变更或删除。
+"""
+
+__version__ = "0.1.0"
 
 from power_loop.agent.loop import AgentLoop
 from power_loop.agent.system_prompt import (
-	BUILTIN_SECTIONS,
-	DEFAULT_AGENT_SYSTEM_PROMPT,
-	DEFAULT_EXPLORE_SUBAGENT_SYSTEM_PROMPT,
-	DEFAULT_SUBAGENT_SYSTEM_PROMPT,
-	SystemPromptBuilder,
-	SystemPromptContext,
-	build_agent_system_prompt,
-	build_explore_subagent_system_prompt,
-	build_subagent_system_prompt,
+    BUILTIN_SECTIONS,
+    DEFAULT_AGENT_SYSTEM_PROMPT,
+    DEFAULT_EXPLORE_SUBAGENT_SYSTEM_PROMPT,
+    DEFAULT_SUBAGENT_SYSTEM_PROMPT,
+    SystemPromptBuilder,
+    SystemPromptContext,
+    build_agent_system_prompt,
+    build_explore_subagent_system_prompt,
+    build_subagent_system_prompt,
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult
+from power_loop.contracts.event_payloads import (
+    AgentErrorPayload,
+    AutoCompactStatusPayload,
+    BaseEventPayload,
+    HitRoundLimitStatusPayload,
+    RoundCompletedPayload,
+    RoundStartedPayload,
+    RoundToolsPresentPayload,
+    RoundUsageStatusPayload,
+    SessionEndedPayload,
+    SessionStartedPayload,
+    StatusChangedPayload,
+    StreamCompletedPayload,
+    StreamDeltaPayload,
+    StreamStartedPayload,
+    SubagentCompletedPayload,
+    SubagentLimitPayload,
+    SubagentTaskStartPayload,
+    SubagentTextPayload,
+    SystemLogPayload,
+    TodoUpdatedPayload,
+    ToolCallCompletedPayload,
+    ToolCallFailedPayload,
+    ToolCallStartedPayload,
+    UsageUpdatedPayload,
+    UserNotificationPayload,
+)
+from power_loop.contracts.events import AgentEvent, AgentEventType
+from power_loop.contracts.handlers import EventHandler, HookHandler, ToolHandler, ToolHandlerResult
+from power_loop.contracts.hook_contexts import (
+    BaseHookCtx,
+    CompactAfterCtx,
+    CompactBeforeCtx,
+    LlmAfterCtx,
+    LlmBeforeCtx,
+    MessageAppendCtx,
+    RoundDecideCtx,
+    RoundEndCtx,
+    RoundStartCtx,
+    SessionEndCtx,
+    SessionStartCtx,
+    ToolAfterCtx,
+    ToolBeforeCtx,
+    ToolErrorCtx,
+    ToolsBatchAfterCtx,
+    ToolsBatchBeforeCtx,
+)
+from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
+from power_loop.contracts.messages import AgentMessage, MessageRole, ToolCall
+from power_loop.contracts.protocols import EventBusProtocol, HookManagerProtocol, ToolArgsValidator
+from power_loop.contracts.tools import ToolDefinition, validate_tool_args
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.phase import PhaseContext, PhaseResult, phase
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
-from power_loop.contracts.events import AgentEvent, AgentEventType
-from power_loop.contracts.handlers import EventHandler, HookHandler, ToolHandler, ToolHandlerResult
-from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
-from power_loop.contracts.hook_contexts import (
-	BaseHookCtx,
-	CompactAfterCtx,
-	CompactBeforeCtx,
-	LlmAfterCtx,
-	LlmBeforeCtx,
-	MessageAppendCtx,
-	RoundDecideCtx,
-	RoundEndCtx,
-	RoundStartCtx,
-	SessionEndCtx,
-	SessionStartCtx,
-	ToolAfterCtx,
-	ToolBeforeCtx,
-	ToolErrorCtx,
-	ToolsBatchAfterCtx,
-	ToolsBatchBeforeCtx,
-)
-from power_loop.contracts.event_payloads import (
-	BaseEventPayload,
-	SessionStartedPayload,
-	SessionEndedPayload,
-	RoundStartedPayload,
-	RoundCompletedPayload,
-	RoundToolsPresentPayload,
-	StreamStartedPayload,
-	StreamDeltaPayload,
-	StreamCompletedPayload,
-	ToolCallStartedPayload,
-	ToolCallCompletedPayload,
-	ToolCallFailedPayload,
-	StatusChangedPayload,
-	AutoCompactStatusPayload,
-	RoundUsageStatusPayload,
-	HitRoundLimitStatusPayload,
-	UsageUpdatedPayload,
-	TodoUpdatedPayload,
-	UserNotificationPayload,
-	AgentErrorPayload,
-	SystemLogPayload,
-	SubagentTaskStartPayload,
-	SubagentTextPayload,
-	SubagentLimitPayload,
-	SubagentCompletedPayload,
-)
-from power_loop.contracts.messages import AgentMessage, MessageRole, ToolCall
-from power_loop.contracts.protocols import EventBusProtocol, HookManagerProtocol, ToolArgsValidator
-from power_loop.contracts.tools import ToolDefinition, validate_tool_args
 from power_loop.tools import ToolRegistry, build_registry, create_default_tool_registry
 from power_loop.tools.default_manifest import (
-	CORE_TOOL_NAMES,
-	EXPLORE_TOOL_NAMES,
-	FULL_TOOL_NAMES,
-	TOOL_PRESETS,
-	get_tool_definitions,
+    CORE_TOOL_NAMES,
+    EXPLORE_TOOL_NAMES,
+    FULL_TOOL_NAMES,
+    TOOL_PRESETS,
+    get_tool_definitions,
 )
-from power_loop.tools.spawn_agent import register_spawn_agent, SPAWN_AGENT_DEFINITION
+from power_loop.tools.spawn_agent import SPAWN_AGENT_DEFINITION, register_spawn_agent
+
+STABLE_API = (
+    "AgentLoop",
+    "AgentLoopConfig",
+    "AgentLoopResult",
+    "AgentHooks",
+    "AgentEventBus",
+    "HookPoint",
+    "HookDirective",
+    "ToolRegistry",
+    "ToolDefinition",
+)
 
 __all__ = [
+	"__version__",
+	"STABLE_API",
 	"AgentLoop",
 	"AgentLoopConfig",
 	"AgentLoopResult",

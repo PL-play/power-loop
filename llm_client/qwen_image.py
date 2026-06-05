@@ -3,18 +3,17 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
-import os
 import ssl
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 import certifi
-
 
 DEFAULT_DASHSCOPE_IMAGE_BASE_URL = "https://dashscope.aliyuncs.com/api/v1"
 DEFAULT_DASHSCOPE_IMAGE_OUTPUT_DIR = "outputs/generated-images"

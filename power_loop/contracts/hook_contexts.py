@@ -21,7 +21,6 @@ from power_loop.contracts.hooks import HookDirective
 
 if TYPE_CHECKING:
     from llm_client.interface import LLMResponse
-
     from power_loop.agent.types import LoopMessage
 
 

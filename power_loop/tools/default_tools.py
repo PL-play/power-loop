@@ -2,9 +2,7 @@ from __future__ import annotations
 
 # NOTE: This module intentionally copies tool implementations from zero-code/core/tools.py
 # with only import-path adjustments for power-loop package layout.
-
 import difflib
-import json
 import os
 import queue
 import re
@@ -160,6 +158,7 @@ class BashSession:
         if self._proc is None or self._proc.poll() is not None:
             self._start()
 
+        assert self._proc is not None and self._proc.stdin is not None
         full_cmd = f"{command}\\necho {SENTINEL} $?\\n"
         try:
             self._proc.stdin.write(full_cmd)
@@ -260,7 +259,7 @@ def _validate_bash_command_scope(command: str) -> str | None:
     return None
 
 
-def run_bash(command: str = None, restart: bool = False, timeout: int = 120) -> str:
+def run_bash(command: str | None = None, restart: bool = False, timeout: int = 120) -> str:
     if restart:
         return BASH.restart()
     if not command:
@@ -286,7 +285,7 @@ def _list_directory(dp: Path) -> str:
     return "\\n".join(lines)
 
 
-def run_read(path: str, offset: int = None, limit: int = None) -> str:
+def run_read(path: str, offset: int | None = None, limit: int | None = None) -> str:
     try:
         fp = safe_path(path)
         if fp.is_dir():
@@ -500,9 +499,9 @@ def _seek_context(lines: list[str], context_lines: list[str], start_from: int = 
 
 
 def _parse_patch(patch_text: str) -> list[dict[str, Any]]:
-    hunks = []
-    current_context = []
-    current_changes = []
+    hunks: list[dict[str, Any]] = []
+    current_context: list[str] = []
+    current_changes: list[tuple[str, str]] = []
 
     for raw_line in patch_text.split("\\n"):
         if raw_line.startswith("@@"):
@@ -628,7 +627,7 @@ def run_glob(pattern: str, path: str = ".") -> str:
         return f"Error: {e}"
 
 
-def run_grep(pattern: str, path: str = ".", include: str = None, max_results: int = 50) -> str:
+def run_grep(pattern: str, path: str = ".", include: str | None = None, max_results: int = 50) -> str:
     try:
         base = safe_path(path)
         cmd = ["rg", "--no-heading", "--line-number", "--max-count", str(max_results), pattern, str(base)]

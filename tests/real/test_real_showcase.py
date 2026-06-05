@@ -37,31 +37,28 @@ from llm_client.llm_factory import OpenAICompatibleChatLLMService
 
 # ── power-loop public API ──
 from power_loop import (
-    AgentLoop,
-    AgentLoopConfig,
     AgentEvent,
     AgentEventBus,
     AgentEventType,
     AgentHooks,
-    HookContext,
+    AgentLoop,
+    AgentLoopConfig,
     HookDirective,
     HookPoint,
-    HookResult,
     LlmAfterCtx,
     LlmBeforeCtx,
     MessageAppendCtx,
     RoundStartCtx,
     SessionEndCtx,
     SessionStartCtx,
-    ToolBeforeCtx,
     SystemPromptBuilder,
     SystemPromptContext,
+    ToolBeforeCtx,
     ToolDefinition,
     ToolRegistry,
     create_default_tool_registry,
     register_spawn_agent,
 )
-
 
 # =====================================================================
 # Helpers
@@ -203,7 +200,7 @@ async def level_2_events(llm: OpenAICompatibleChatLLMService):
 
     loop = AgentLoop(llm=llm, config=config, event_bus=bus)
 
-    result = await loop.run(
+    await loop.run(
         messages=[{"role": "user", "content": "Explain what a Python decorator is."}],
         session_id="level-2",
     )
@@ -606,7 +603,7 @@ async def level_5_combo(llm: OpenAICompatibleChatLLMService):
     )
 
     print(f"\n\n  Status: {result.status}, Rounds: {result.rounds}")
-    print(f"  Telemetry:")
+    print("  Telemetry:")
     print(f"    Rounds executed: {len(telemetry['rounds'])}")
     print(f"    Tool calls: {len(telemetry['tool_calls'])}")
     print(f"    Total prompt tokens: {telemetry['total_prompt_tokens']}")
@@ -741,7 +738,7 @@ async def level_6_spawn_agent(llm: OpenAICompatibleChatLLMService, model: str):
     )
 
     print(f"\n\n  Status: {result.status}, Rounds: {result.rounds}")
-    print(f"  Tool activity log:")
+    print("  Tool activity log:")
     for entry in tool_activity:
         print(f"    [{entry['time']}] {entry['tool']}")
 
@@ -768,7 +765,7 @@ async def bonus_short_circuit_cache(llm: OpenAICompatibleChatLLMService):
     """
     _sep("Bonus: SHORT_CIRCUIT cache — skip LLM on cache hit")
 
-    from llm_client.interface import LLMResponse, LLMTokenUsage
+    from llm_client.interface import LLMResponse
 
     hooks = AgentHooks()
     cache: Dict[str, LLMResponse] = {}

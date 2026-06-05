@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from collections.abc import Sequence
 
 from power_loop.contracts.tools import ToolDefinition
 
@@ -168,7 +168,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
 ]
 
 # Indexed lookup for selective registration.
-DEFAULT_TOOL_DEFINITIONS_MAP: Dict[str, ToolDefinition] = {d.name: d for d in DEFAULT_TOOL_DEFINITIONS}
+DEFAULT_TOOL_DEFINITIONS_MAP: dict[str, ToolDefinition] = {d.name: d for d in DEFAULT_TOOL_DEFINITIONS}
 
 # ---------------------------------------------------------------------------
 # Tool presets (matching zero-code's BASE_TOOLS / EXPLORE_TOOLS categories)
@@ -198,7 +198,7 @@ EXPLORE_TOOL_NAMES: tuple[str, ...] = (
 # Full set — everything including todo and background tasks.
 FULL_TOOL_NAMES: tuple[str, ...] = tuple(d.name for d in DEFAULT_TOOL_DEFINITIONS)
 
-TOOL_PRESETS: Dict[str, tuple[str, ...]] = {
+TOOL_PRESETS: dict[str, tuple[str, ...]] = {
     "core": CORE_TOOL_NAMES,
     "explore": EXPLORE_TOOL_NAMES,
     "full": FULL_TOOL_NAMES,

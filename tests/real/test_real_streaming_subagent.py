@@ -11,11 +11,11 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
-import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Dict
 
 import pytest
 from dotenv import load_dotenv
@@ -26,27 +26,24 @@ from llm_client.llm_factory import OpenAICompatibleChatLLMService
 
 # ── power-loop public API ───────────────────────────────────────────────
 from power_loop import (
-    AgentLoop,
-    AgentLoopConfig,
+    AgentEvent,
     AgentEventBus,
     AgentEventType,
-    AgentEvent,
     AgentHooks,
+    AgentLoop,
+    AgentLoopConfig,
     HookContext,
     HookPoint,
     SystemPromptBuilder,
     SystemPromptContext,
     ToolDefinition,
-    ToolRegistry,
     create_default_tool_registry,
 )
 from power_loop.core.agent_context import (
-    get_event_bus,
-    get_hooks,
     get_ctx,
+    get_event_bus,
     get_session_id,
 )
-
 
 # =====================================================================
 # helpers

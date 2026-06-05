@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
 from llm_client.interface import LLMRequest, LLMResponse, LLMService
-
 from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
-from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.event_payloads import (
     AutoCompactStatusPayload,
     BaseEventPayload,
@@ -38,6 +37,7 @@ from power_loop.contracts.event_payloads import (
     UsageUpdatedPayload,
     UserNotificationPayload,
 )
+from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hook_contexts import (
     CompactAfterCtx,
     CompactBeforeCtx,
@@ -330,6 +330,8 @@ class AgentPipeline:
 
         Raises on unexpected errors — the caller handles the TOOL_ERROR hook.
         """
+        if self.tool_registry is None:
+            return (f"Error: tool '{tool_name}' requested but no tool registry configured", True)
         validation_err = self.tool_registry.validate(tool_name, tool_args)
         if validation_err is not None:
             return (validation_err, True)

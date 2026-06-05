@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Awaitable, Protocol
+from collections.abc import Awaitable
+from typing import Any, Protocol
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.handlers import EventHandler, HookHandler

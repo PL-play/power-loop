@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from power_loop.contracts.event_payloads import BaseEventPayload
@@ -65,7 +65,7 @@ class AgentEvent:
     is used directly (legacy path).
     """
     type: AgentEventType
-    payload: Dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
     data: BaseEventPayload | None = field(default=None, repr=False)
     session_id: str | None = None
     round_index: int | None = None

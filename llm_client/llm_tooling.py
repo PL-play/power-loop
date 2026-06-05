@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Type, Union, get_args, get_origin, get_type_hints
+from typing import (
+    Any,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
-from .interface import LLMService, LLMRequest, LLMResponse, LLMMessage, LLMTool
+from .interface import LLMMessage, LLMRequest, LLMResponse, LLMService, LLMTool
 
 try:
     # Optional dependency (already used in other parts of this mono-repo).
@@ -15,10 +22,7 @@ except Exception:  # pragma: no cover
 
 
 
-ToolFn = Union[
-    Callable[[Dict[str, Any]], Any],
-    Callable[[Dict[str, Any]], Awaitable[Any]],
-]
+ToolFn = Callable[[dict[str, Any]], Any] | Callable[[dict[str, Any]], Awaitable[Any]]
 
 
 @dataclass(frozen=True)
@@ -29,9 +33,9 @@ class ToolSpec:
 
     name: str
     description: str
-    parameters: Dict[str, Any]
+    parameters: dict[str, Any]
     # Execution callback (optional). Many tools are "signals" (e.g., ResearchComplete) and don't need a function.
-    fn: Optional[ToolFn] = None
+    fn: ToolFn | None = None
     # Optional raw callable reference (best-effort). Useful for debugging/introspection.
     raw: Any = None
 
@@ -45,7 +49,7 @@ class ToolSpec:
             },
         }
 
-    def __call__(self, args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any:
+    def __call__(self, args: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         """
         Make ToolSpec callable for ergonomic manual execution:
         - tool({"a":1,"b":2})
@@ -53,14 +57,14 @@ class ToolSpec:
         """
         if self.fn is None:
             raise TypeError(f"ToolSpec '{self.name}' is not executable (fn is None)")
-        merged: Dict[str, Any] = {}
+        merged: dict[str, Any] = {}
         if args:
             merged.update(args)
         if kwargs:
             merged.update(kwargs)
         return self.fn(merged)
 
-    async def ainvoke(self, args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any:
+    async def ainvoke(self, args: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         """
         Async-friendly execution helper (mirrors LangChain's ainvoke ergonomics).
         """
@@ -69,7 +73,7 @@ class ToolSpec:
             return await v
         return v
 
-    def invoke(self, args: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any:
+    def invoke(self, args: dict[str, Any] | None = None, **kwargs: Any) -> Any:
         """
         Sync execution helper.
         """
@@ -77,23 +81,23 @@ class ToolSpec:
 
 
 class ToolRegistry:
-    def __init__(self, tools: Sequence[Any], *, existing_names: Optional[Sequence[str]] = None):
+    def __init__(self, tools: Sequence[Any], *, existing_names: Sequence[str] | None = None):
         """
         Registry with unique tool names.
         Accepts mixed inputs (ToolSpec / callable / BaseModel subclass).
         """
         existing = set(existing_names or [])
-        normalized: List[ToolSpec] = []
+        normalized: list[ToolSpec] = []
         for t in tools:
             spec = tool_spec_from(t)
             if spec.name in existing:
                 raise ValueError(f"duplicate tool name: {spec.name}")
             existing.add(spec.name)
             normalized.append(spec)
-        self._tools: Dict[str, ToolSpec] = {t.name: t for t in normalized}
+        self._tools: dict[str, ToolSpec] = {t.name: t for t in normalized}
 
     @property
-    def tools_by_name(self) -> Dict[str, ToolSpec]:
+    def tools_by_name(self) -> dict[str, ToolSpec]:
         return dict(self._tools)
 
     def register(self, tool: Any) -> None:
@@ -102,10 +106,10 @@ class ToolRegistry:
             raise ValueError(f"duplicate tool name: {spec.name}")
         self._tools[spec.name] = spec
 
-    def to_llm_tools(self) -> List[LLMTool]:
+    def to_llm_tools(self) -> list[LLMTool]:
         return [t.to_llm_tool() for t in self._tools.values()]
 
-    def get(self, name: str) -> Optional[ToolSpec]:
+    def get(self, name: str) -> ToolSpec | None:
         return self._tools.get(name)
 
     def require(self, name: str) -> ToolSpec:
@@ -155,7 +159,7 @@ class BoundLLMService:
         await self.llm.close()
 
 
-def _type_to_schema(tp: Any) -> Dict[str, Any]:
+def _type_to_schema(tp: Any) -> dict[str, Any]:
     """
     Best-effort mapping from Python type hints to JSON schema.
     Keep it intentionally small; callers can always pass `parameters=...` explicitly.
@@ -183,9 +187,9 @@ def _type_to_schema(tp: Any) -> Dict[str, Any]:
     if tp in (bool,):
         return {"type": "boolean"}
 
-    if origin in (list, List) and args:
+    if origin in (list, list) and args:
         return {"type": "array", "items": _type_to_schema(args[0])}
-    if origin in (dict, Dict):
+    if origin in (dict, dict):
         # keep open; providers typically accept object without deep constraints
         return {"type": "object"}
 
@@ -193,7 +197,7 @@ def _type_to_schema(tp: Any) -> Dict[str, Any]:
     return {"type": "string"}
 
 
-def schema_from_callable(fn: Any) -> Dict[str, Any]:
+def schema_from_callable(fn: Any) -> dict[str, Any]:
     """
     Build a JSON schema from a callable signature + type hints.
     """
@@ -207,8 +211,8 @@ def schema_from_callable(fn: Any) -> Dict[str, Any]:
         except Exception:
             hints = {}
 
-    properties: Dict[str, Any] = {}
-    required: List[str] = []
+    properties: dict[str, Any] = {}
+    required: list[str] = []
 
     for name, p in sig.parameters.items():
         if name in ("self", "cls"):
@@ -222,13 +226,13 @@ def schema_from_callable(fn: Any) -> Dict[str, Any]:
             # required unless explicitly Optional[...] (best-effort: treat as required anyway)
             required.append(name)
 
-    out: Dict[str, Any] = {"type": "object", "properties": properties}
+    out: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         out["required"] = required
     return out
 
 
-def _schema_from_langchain_like_tool(obj: Any) -> Dict[str, Any]:
+def _schema_from_langchain_like_tool(obj: Any) -> dict[str, Any]:
     """
     Best-effort schema extraction for LangChain tool objects
     (e.g., StructuredTool / BaseTool instances).
@@ -271,10 +275,10 @@ def _schema_from_langchain_like_tool(obj: Any) -> Dict[str, Any]:
 def tool_spec_from(
     obj: Any,
     *,
-    name: Optional[str] = None,
-    description: Optional[str] = None,
-    parameters: Optional[Dict[str, Any]] = None,
-    fn: Optional[ToolFn] = None,
+    name: str | None = None,
+    description: str | None = None,
+    parameters: dict[str, Any] | None = None,
+    fn: ToolFn | None = None,
 ) -> ToolSpec:
     """
     Convert a callable / ToolSpec / (optional) pydantic BaseModel into ToolSpec.
@@ -332,7 +336,7 @@ def tool_spec_from(
         merged_desc = "\n\n".join([s for s in [desc, doc] if s])
         params = parameters or schema_from_callable(target)
 
-        def _wrapped(args: Dict[str, Any]) -> Any:
+        def _wrapped(args: dict[str, Any]) -> Any:
             # Prefer kwargs call (common tool signature). Fallback to single-arg call for "dict tools".
             try:
                 return target(**(args or {}))
@@ -358,7 +362,7 @@ def tool_spec_from(
         merged_desc = "\n\n".join([s for s in [desc, doc] if s])
         params = parameters or _schema_from_langchain_like_tool(obj)
 
-        async def _invoke_langchain_tool(args: Dict[str, Any]) -> Any:
+        async def _invoke_langchain_tool(args: dict[str, Any]) -> Any:
             payload = args or {}
             ainvoke = getattr(obj, "ainvoke", None)
             if callable(ainvoke):
@@ -380,11 +384,11 @@ def tool_spec_from(
 
 
 def tool(
-    _fn: Optional[Callable[..., Any]] = None,
+    _fn: Callable[..., Any] | None = None,
     *,
-    name: Optional[str] = None,
-    description: Optional[str] = None,
-    parameters: Optional[Dict[str, Any]] = None,
+    name: str | None = None,
+    description: str | None = None,
+    parameters: dict[str, Any] | None = None,
 ) -> Any:
     """
     Decorator to define a tool quickly (LangChain-like), without LangChain dependency.
@@ -421,11 +425,11 @@ def bind_tools(
     normalize them, then bind onto the LLMService.
     """
     reg = ToolRegistry(tools)
-    normalized: List[ToolSpec] = list(reg.tools_by_name.values())
+    normalized: list[ToolSpec] = list(reg.tools_by_name.values())
     return BoundLLMService(llm=llm, tools=normalized, tool_choice=tool_choice)
 
 
-def _best_effort_json_loads(s: str) -> Optional[Dict[str, Any]]:
+def _best_effort_json_loads(s: str) -> dict[str, Any] | None:
     s = (s or "").strip()
     if not s:
         return None
@@ -441,7 +445,7 @@ def _best_effort_json_loads(s: str) -> Optional[Dict[str, Any]]:
 
 def extract_tool_calls(
     resp: LLMResponse,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """
     Normalize tool calls from `LLMResponse` into a simple, execution-friendly shape.
 
@@ -449,7 +453,7 @@ def extract_tool_calls(
     - [{"id": "...", "name": "...", "args": {...}, "args_raw": "..."}]
     This is intentionally similar to how `agent-psychology` prepares tool execution.
     """
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for tc in resp.get_tool_calls():
         if not isinstance(tc, dict):
             continue
@@ -494,9 +498,9 @@ def tool_message(
 
 def tool_messages_from_observations(
     *,
-    tool_calls: Sequence[Dict[str, Any]],
+    tool_calls: Sequence[dict[str, Any]],
     observations: Sequence[Any],
-) -> List[LLMMessage]:
+) -> list[LLMMessage]:
     """
     Build tool messages from executed observations.
 
@@ -505,13 +509,13 @@ def tool_messages_from_observations(
     - observations = await asyncio.gather(...)
     - messages += tool_messages_from_observations(tool_calls=tool_calls, observations=observations)
     """
-    msgs: List[LLMMessage] = []
-    for tc, obs in zip(tool_calls, observations):
+    msgs: list[LLMMessage] = []
+    for tc, obs in zip(tool_calls, observations, strict=False):
         msgs.append(tool_message(tool_call_id=str(tc.get("id") or ""), content=obs))
     return msgs
 
 
-def _coerce_scalar(expected_type: Optional[str], value: Any) -> Any:
+def _coerce_scalar(expected_type: str | None, value: Any) -> Any:
     if expected_type is None:
         return value
 
@@ -569,7 +573,7 @@ def _coerce_scalar(expected_type: Optional[str], value: Any) -> Any:
     return value
 
 
-def _expected_type_from_schema(schema: Any) -> Optional[str]:
+def _expected_type_from_schema(schema: Any) -> str | None:
     if not isinstance(schema, dict):
         return None
 
@@ -595,12 +599,12 @@ def _expected_type_from_schema(schema: Any) -> Optional[str]:
     return None
 
 
-def _coerce_args_by_schema(schema: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+def _coerce_args_by_schema(schema: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     properties = schema.get("properties")
     if not isinstance(properties, dict) or not isinstance(args, dict):
         return args
 
-    out: Dict[str, Any] = dict(args)
+    out: dict[str, Any] = dict(args)
     for key, prop_schema in properties.items():
         if key not in out:
             continue
@@ -627,7 +631,7 @@ def _coerce_args_by_schema(schema: Dict[str, Any], args: Dict[str, Any]) -> Dict
     return out
 
 
-async def execute_tool_safely(tool: ToolSpec, args: Dict[str, Any]) -> Any:
+async def execute_tool_safely(tool: ToolSpec, args: dict[str, Any]) -> Any:
     """
     Safely execute a tool with error handling.
     Mirrors the spirit of agent-psychology's execute_tool_safely, without LangChain dependency.

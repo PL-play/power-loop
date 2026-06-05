@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,8 @@ def _parse_optional_bool(value: Any) -> bool | None:
     return None
 
 
-def capability_overrides_from_env(env: Mapping[str, Any]) -> Dict[str, Any]:
-    overrides: Dict[str, Any] = {}
+def capability_overrides_from_env(env: Mapping[str, Any]) -> dict[str, Any]:
+    overrides: dict[str, Any] = {}
     for env_name, field_name in CAPABILITY_OVERRIDE_ENV_MAP.items():
         parsed = _parse_optional_bool(env.get(env_name))
         if parsed is not None:
@@ -59,7 +60,7 @@ def capability_overrides_from_env(env: Mapping[str, Any]) -> Dict[str, Any]:
     return overrides
 
 
-PROVIDER_DEFAULTS: dict[str, Dict[str, Any]] = {
+PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
     "openai": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
     "openai-compatible": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
     "deepseek": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
@@ -73,7 +74,7 @@ PROVIDER_DEFAULTS: dict[str, Dict[str, Any]] = {
 }
 
 
-MODEL_PATTERNS: list[tuple[re.Pattern[str], Dict[str, Any]]] = [
+MODEL_PATTERNS: list[tuple[re.Pattern[str], dict[str, Any]]] = [
     (re.compile(r"^(gpt-4o|gpt-4\.1|gpt-4\.5|o1|o3)", re.IGNORECASE), {
         "provider": "openai",
         "supports_image_input": True,
@@ -131,7 +132,7 @@ MODEL_PATTERNS: list[tuple[re.Pattern[str], Dict[str, Any]]] = [
 ]
 
 
-def resolve_model_capabilities(model: str, base_url: str, overrides: Dict[str, Any] | None = None) -> ModelCapabilities:
+def resolve_model_capabilities(model: str, base_url: str, overrides: dict[str, Any] | None = None) -> ModelCapabilities:
     normalized_model = (model or "").strip()
     provider = "openai-compatible"
     caps = _caps(provider=provider, model=normalized_model, **PROVIDER_DEFAULTS.get(provider, {}))

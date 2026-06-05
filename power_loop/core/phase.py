@@ -24,11 +24,12 @@ Usage::
 from __future__ import annotations
 
 import functools
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
-from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
+from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint
 
 
 @dataclass
@@ -38,7 +39,7 @@ class PhaseContext:
     Pipeline methods receive this; the ``@phase`` decorator populates it
     from the before-hook result and passes it to the method.
     """
-    values: Dict[str, Any] = field(default_factory=dict)
+    values: dict[str, Any] = field(default_factory=dict)
     round_index: int = 0
     session_id: str | None = None
 
@@ -52,7 +53,7 @@ class PhaseResult:
     """
     output: Any = None
     directive: HookDirective = HookDirective.CONTINUE
-    values: Dict[str, Any] = field(default_factory=dict)
+    values: dict[str, Any] = field(default_factory=dict)
 
     @property
     def should_break(self) -> bool:
@@ -112,7 +113,7 @@ def phase(
             hooks = self.hooks
             bus = self.bus
 
-            event_meta = {
+            event_meta: dict[str, Any] = {
                 "session_id": ctx.session_id,
                 "round_index": ctx.round_index,
             }

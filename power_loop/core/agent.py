@@ -7,12 +7,10 @@ delegating to the pipeline internally.
 from __future__ import annotations
 
 import threading
-from typing import Any
 
 from llm_client.interface import LLMService
-
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
-from power_loop.core.agent_context import get_ctx, get_event_bus, get_hooks, get_session_id
+from power_loop.core.agent_context import get_ctx, get_event_bus, get_hooks
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.tools.registry import ToolRegistry
 

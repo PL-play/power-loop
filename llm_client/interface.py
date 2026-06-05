@@ -1,9 +1,9 @@
-from typing import TypedDict, Literal, Any, Dict, List, Optional, AsyncIterator, Protocol, Callable
-
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from typing import Any, Literal, Protocol, TypedDict
 
 LLMRole = Literal["system", "user", "assistant", "tool"]
-LLMContent = str | List[Dict[str, Any]]
+LLMContent = str | list[dict[str, Any]]
 
 
 class LLMMessage(TypedDict, total=False):
@@ -19,7 +19,7 @@ class LLMMessage(TypedDict, total=False):
 class LLMToolFunction(TypedDict, total=False):
     name: str
     description: str
-    parameters: Dict[str, Any]
+    parameters: dict[str, Any]
 
 
 class LLMTool(TypedDict, total=False):
@@ -38,33 +38,34 @@ class LLMRequest:
     """
 
     # Message history. Rule: do NOT include a system message here; use `system_prompt`.
-    messages: List[LLMMessage | Dict]
-    system_prompt: Optional[str] = None
+    # Accepts any dict-shaped messages; the loop produces concrete dict[str, Any] sequences.
+    messages: list[dict[str, Any]]
+    system_prompt: str | None = None
 
     # Common generation params (optional; implementation may ignore some)
-    model: Optional[str] = None
-    temperature: Optional[float] = None
-    max_tokens: Optional[int] = None
+    model: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
 
     # Structured output helpers
     parse_json: bool = False
 
     # Reasoning switch for providers supporting `reason` flag.
     # Default enabled as requested; set to False to disable.
-    reason: Optional[bool] = True
+    reason: bool | None = True
 
     # Tool calling (OpenAI-compatible). Keep optional to avoid forcing every impl to support it.
-    tools: Optional[List[LLMTool | Dict]] = None
-    tool_choice: Optional[Any] = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any | None = None
 
     # Provider-specific passthrough
-    extra: Dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
 
-    def to_messages(self, capabilities: Any = None) -> List[Dict[str, Any]]:
+    def to_messages(self, capabilities: Any = None) -> list[dict[str, Any]]:
         """
         Normalize messages for OpenAI-compatible APIs.
         """
-        msgs: List[Dict[str, Any]] = []
+        msgs: list[dict[str, Any]] = []
         if self.system_prompt:
             msgs.append({"role": "system", "content": self.system_prompt})
 
@@ -86,12 +87,12 @@ class LLMRequest:
             cls,
             *,
             prompt: str,
-            system_prompt: Optional[str] = None,
-            model: Optional[str] = None,
-            temperature: Optional[float] = None,
-            max_tokens: Optional[int] = None,
+            system_prompt: str | None = None,
+            model: str | None = None,
+            temperature: float | None = None,
+            max_tokens: int | None = None,
             parse_json: bool = False,
-            reason: Optional[bool] = True,
+            reason: bool | None = True,
             **kwargs: Any,
     ) -> "LLMRequest":
         return cls(
@@ -108,32 +109,32 @@ class LLMRequest:
 
 @dataclass
 class LLMTokenUsage:
-    prompt_tokens: Optional[int] = None
-    completion_tokens: Optional[int] = None
-    total_tokens: Optional[int] = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
 
-    prompt_audio_tokens: Optional[int] = None
-    prompt_cached_tokens: Optional[int] = None
-    prompt_cache_miss_tokens: Optional[int] = None
-    prompt_text_tokens: Optional[int] = None
-    prompt_image_tokens: Optional[int] = None
+    prompt_audio_tokens: int | None = None
+    prompt_cached_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
+    prompt_text_tokens: int | None = None
+    prompt_image_tokens: int | None = None
 
-    completion_reasoning_tokens: Optional[int] = None
-    completion_audio_tokens: Optional[int] = None
-    completion_text_tokens: Optional[int] = None
-    completion_image_tokens: Optional[int] = None
+    completion_reasoning_tokens: int | None = None
+    completion_audio_tokens: int | None = None
+    completion_text_tokens: int | None = None
+    completion_image_tokens: int | None = None
 
-    accepted_prediction_tokens: Optional[int] = None
-    rejected_prediction_tokens: Optional[int] = None
+    accepted_prediction_tokens: int | None = None
+    rejected_prediction_tokens: int | None = None
 
-    cached_tokens: Optional[int] = None
-    cache_hit_tokens: Optional[int] = None
-    cache_miss_tokens: Optional[int] = None
-    reasoning_tokens: Optional[int] = None
-    accepted_tokens: Optional[int] = None
-    rejected_tokens: Optional[int] = None
+    cached_tokens: int | None = None
+    cache_hit_tokens: int | None = None
+    cache_miss_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    accepted_tokens: int | None = None
+    rejected_tokens: int | None = None
 
-    def as_dict(self) -> Dict[str, Optional[int]]:
+    def as_dict(self) -> dict[str, int | None]:
         return dict(self.__dict__)
 
     def to_log_str(self) -> str:
@@ -162,9 +163,9 @@ class LLMStreamChunk:
     # Aggregated tool calls (best-effort normalized), built by the LLMService streaming implementation.
     # Shape (OpenAI-compatible):
     # [{"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}]
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
     # Best-effort usage. Some providers only send usage in the final event.
-    token_usage: Optional[LLMTokenUsage] = None
+    token_usage: LLMTokenUsage | None = None
     raw_event: Any = None
     is_final: bool = False
 
@@ -186,21 +187,21 @@ class LLMResponse:
     raw_message: Any = None
     raw_completion: Any = None
 
-    raw_json_data: Dict[str, Any] = field(default_factory=dict)
-    raw_json_error: Optional[str] = None
+    raw_json_data: dict[str, Any] = field(default_factory=dict)
+    raw_json_error: str | None = None
 
     content_text: str = ""
     think: str = ""
-    json_data: Dict[str, Any] = field(default_factory=dict)
+    json_data: dict[str, Any] = field(default_factory=dict)
     token_usage: LLMTokenUsage = field(default_factory=LLMTokenUsage)
-    parse_error: Optional[str] = None
-    debug: Dict[str, Any] = field(default_factory=dict)
+    parse_error: str | None = None
+    debug: dict[str, Any] = field(default_factory=dict)
     # Best-effort extracted tool calls (if any). Providers may expose this on raw_message/raw_completion.
-    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
     # Raw streamed chunks captured when complete() is implemented via stream aggregation.
-    stream_chunks: List[LLMStreamChunk] = field(default_factory=list)
+    stream_chunks: list[LLMStreamChunk] = field(default_factory=list)
 
-    def get_tool_calls(self) -> List[Dict[str, Any]]:
+    def get_tool_calls(self) -> list[dict[str, Any]]:
         """
         Best-effort accessor for tool calls.
 
@@ -226,11 +227,11 @@ class LLMResponse:
             except Exception:
                 return obj
 
-        def _normalize_tool_calls(obj: Any) -> List[Dict[str, Any]]:
+        def _normalize_tool_calls(obj: Any) -> list[dict[str, Any]]:
             if not obj:
                 return []
             if isinstance(obj, list):
-                out: List[Dict[str, Any]] = []
+                out: list[dict[str, Any]] = []
                 for it in obj:
                     d = _as_dict(it)
                     if isinstance(d, dict):
@@ -239,7 +240,7 @@ class LLMResponse:
             d = _as_dict(obj)
             return [d] if isinstance(d, dict) else []
 
-        def _normalize_function_call(obj: Any) -> List[Dict[str, Any]]:
+        def _normalize_function_call(obj: Any) -> list[dict[str, Any]]:
             if not obj:
                 return []
             d = _as_dict(obj)
@@ -376,15 +377,15 @@ class LLMService(Protocol):
             self,
             request: "LLMRequest",
             *,
-            on_chunk_delta_text: Optional[Callable[[str], Any]] = None,
-            on_chunk_think: Optional[Callable[[str], Any]] = None,
-            on_stream_end: Optional[Callable[["LLMResponse"], Any]] = None,
+            on_chunk_delta_text: Callable[[str], Any] | None = None,
+            on_chunk_think: Callable[[str], Any] | None = None,
+            on_stream_end: Callable[["LLMResponse"], Any] | None = None,
     ) -> LLMResponse:
         """Preferred API (non-streaming). Can optional receive chunk hooks."""
         ...
 
-    async def stream(self, request: "LLMRequest") -> AsyncIterator["LLMStreamChunk"]:
-        """Preferred API (streaming)."""
+    def stream(self, request: "LLMRequest") -> AsyncIterator["LLMStreamChunk"]:
+        """Preferred API (streaming). Returns an async iterator directly (no await needed)."""
         ...
 
     async def close(self) -> None:
@@ -398,7 +399,7 @@ class LLMService(Protocol):
     async def predict(
             self,
             prompt: str,
-            system_prompt: Optional[str] = None,
+            system_prompt: str | None = None,
             **kwargs: Any,
     ) -> str:
         """
@@ -412,8 +413,8 @@ class LLMService(Protocol):
 
     async def chat(
             self,
-            messages: List[Dict[str, str]],
-            system_prompt: Optional[str] = None,
+            messages: list[dict[str, Any]],
+            system_prompt: str | None = None,
             **kwargs: Any,
     ) -> str:
         """
@@ -428,7 +429,7 @@ class LLMService(Protocol):
     async def predict_stream(
             self,
             prompt: str,
-            system_prompt: Optional[str] = None,
+            system_prompt: str | None = None,
             **kwargs: Any,
     ) -> AsyncIterator[str]:
         """
@@ -453,7 +454,7 @@ class OpenAICompatibleChatConfig:
     stream_resume_on_error: bool = False
     stream_max_restarts: int = 0
     stream_resume_instruction: str = "继续，从你上次中断的位置继续输出。不要重复已经输出的内容。"
-    capability_overrides: Dict[str, Any] = field(default_factory=dict)
+    capability_overrides: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_ready(self) -> bool:

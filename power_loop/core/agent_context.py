@@ -9,13 +9,13 @@ if TYPE_CHECKING:
     from power_loop.core.state import ContextManager
 
 
-_current_event_bus: ContextVar["AgentEventBus | None"] = ContextVar("power_loop_event_bus", default=None)
-_current_hooks: ContextVar["AgentHooks | None"] = ContextVar("power_loop_hooks", default=None)
-_current_ctx: ContextVar["ContextManager | None"] = ContextVar("power_loop_ctx", default=None)
+_current_event_bus: ContextVar[AgentEventBus | None] = ContextVar("power_loop_event_bus", default=None)
+_current_hooks: ContextVar[AgentHooks | None] = ContextVar("power_loop_hooks", default=None)
+_current_ctx: ContextVar[ContextManager | None] = ContextVar("power_loop_ctx", default=None)
 _current_session_id: ContextVar[str | None] = ContextVar("power_loop_session_id", default=None)
 
 
-def get_event_bus() -> "AgentEventBus":
+def get_event_bus() -> AgentEventBus:
     bus = _current_event_bus.get()
     # Local import to avoid import cycles
     from power_loop.core.events import DEFAULT_EVENT_BUS
@@ -23,14 +23,14 @@ def get_event_bus() -> "AgentEventBus":
     return DEFAULT_EVENT_BUS if bus is None else bus
 
 
-def get_hooks() -> "AgentHooks":
+def get_hooks() -> AgentHooks:
     hooks = _current_hooks.get()
     from power_loop.core.hooks import DEFAULT_HOOKS
 
     return DEFAULT_HOOKS if hooks is None else hooks
 
 
-def get_ctx() -> "ContextManager":
+def get_ctx() -> ContextManager:
     ctx = _current_ctx.get()
     if ctx is None:
         from power_loop.core.state import ContextManager
@@ -45,15 +45,15 @@ def get_session_id() -> str | None:
     return _current_session_id.get()
 
 
-def set_event_bus(bus: "AgentEventBus | None") -> Token:
+def set_event_bus(bus: AgentEventBus | None) -> Token:
     return _current_event_bus.set(bus)
 
 
-def set_hooks(hooks: "AgentHooks | None") -> Token:
+def set_hooks(hooks: AgentHooks | None) -> Token:
     return _current_hooks.set(hooks)
 
 
-def set_ctx(ctx: "ContextManager | None") -> Token:
+def set_ctx(ctx: ContextManager | None) -> Token:
     return _current_ctx.set(ctx)
 
 

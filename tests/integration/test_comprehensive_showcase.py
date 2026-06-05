@@ -38,15 +38,13 @@ from llm_client.llm_factory import OpenAICompatibleChatLLMService
 
 # ── power-loop public API ───────────────────────────────────────────────
 from power_loop import (
-    AgentLoop,
-    AgentLoopConfig,
+    AgentEvent,
     AgentEventBus,
     AgentEventType,
-    AgentEvent,
     AgentHooks,
-    HookContext,
+    AgentLoop,
+    AgentLoopConfig,
     HookPoint,
-    HookDirective,
     MessageAppendCtx,
     ToolAfterCtx,
     ToolBeforeCtx,
@@ -55,7 +53,6 @@ from power_loop import (
     create_default_tool_registry,
     register_spawn_agent,
 )
-
 
 # =====================================================================
 # Configuration & Helpers
@@ -199,7 +196,6 @@ async def _async_level2_multiturn_with_tools(creds: Dict[str, str]) -> None:
 
         def on_tool_call_completed(event: AgentEvent) -> None:
             metrics["tool_completions"] += 1
-            name = event.payload.get("name", "?")
             output = str(event.payload.get("output", ""))[:100]
             print(f"<<< [Result] {output}...\n", flush=True)
 
@@ -440,7 +436,7 @@ async def _async_level4_spawn_agent_delegation(creds: Dict[str, str]) -> None:
         def on_main_tool(event: AgentEvent) -> None:
             name = event.payload.get("name", "?")
             if name == "spawn_agent":
-                print(f"\n>>> [Spawn Subagent]", flush=True)
+                print("\n>>> [Spawn Subagent]", flush=True)
 
         main_bus.subscribe(AgentEventType.STREAM_DELTA, on_main_stream)
         main_bus.subscribe(AgentEventType.TOOL_CALL_STARTED, on_main_tool)
@@ -624,7 +620,7 @@ async def _async_level5_advanced_workflow(creds: Dict[str, str]) -> None:
             session_id="advanced-l5",
         )
 
-        print(f"\n\n" + "=" * 50)
+        print("\n\n" + "=" * 50)
         print("WORKFLOW SUMMARY")
         print("=" * 50)
         print(f"✓ Final Status: {result.status}")

@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 
 from llm_client.interface import OpenAICompatibleChatConfig
 from llm_client.llm_factory import OpenAICompatibleChatLLMService
-
 from power_loop.agent.loop import AgentLoop
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.contracts.events import AgentEventType

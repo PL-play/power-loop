@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Protocol, Union
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from power_loop.contracts.hook_contexts import BaseHookCtx
 from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
-
 
 HookHandlerFn = Callable[..., Any]
 """A hook handler callable.
@@ -43,7 +43,7 @@ class AgentHooks:
     """
 
     def __init__(self) -> None:
-        self._handlers: Dict[str, List[_HookEntry]] = {}
+        self._handlers: dict[str, list[_HookEntry]] = {}
 
     def register(self, hook_point: HookPoint | str, handler: HookHandlerFn, *, order: int = 0) -> None:
         key = str(hook_point)
@@ -85,7 +85,7 @@ class AgentHooks:
         for entry in self._handlers.get(key, []):
             result = entry.handler(context)
             if hasattr(result, "__await__"):
-                result = await result  # type: ignore[assignment]
+                result = await result
             context, directive = self._apply(context, directive, result)
         return HookResult(context=context, directive=directive)
 
@@ -114,7 +114,7 @@ class AgentHooks:
         for entry in self._handlers.get(str(hook_point), []):
             result = entry.handler(ctx)
             if hasattr(result, "__await__"):
-                result = await result  # type: ignore[assignment]
+                result = await result
             self._apply_typed(ctx, result)
 
 

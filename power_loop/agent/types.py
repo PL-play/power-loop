@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal
+from typing import Any, Literal
 
 LoopStatus = Literal["completed", "pending_tools", "cancelled", "hit_round_limit"]
-LoopMessage = Dict[str, Any]
+LoopMessage = dict[str, Any]
 
 
 @dataclass
@@ -22,5 +22,5 @@ class AgentLoopResult:
     status: LoopStatus
     final_text: str = ""
     rounds: int = 0
-    pending_tool_calls: List[Dict[str, Any]] = field(default_factory=list)
-    messages: List[LoopMessage] = field(default_factory=list)
+    pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    messages: list[LoopMessage] = field(default_factory=list)

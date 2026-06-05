@@ -4,14 +4,14 @@ import base64
 import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 from .capabilities import ModelCapabilities
 
 try:
     from pypdf import PdfReader
 except Exception:  # pragma: no cover
-    PdfReader = None  # type: ignore[assignment]
+    PdfReader = None  # type: ignore[assignment,misc]
 
 
 MAX_PDF_TEXT_CHARS = 24_000
@@ -29,7 +29,7 @@ class AttachmentRef:
 class PreparedAttachment:
     ref: AttachmentRef
     text_fallback: str = ""
-    rendered_parts: tuple[Dict[str, Any], ...] = ()
+    rendered_parts: tuple[dict[str, Any], ...] = ()
     strategy: str = "text"
 
 
@@ -38,7 +38,7 @@ def _guess_mime_type(path: Path) -> str:
     return mime_type or "application/octet-stream"
 
 
-def create_attachment_ref(path: str | Path) -> Dict[str, Any]:
+def create_attachment_ref(path: str | Path) -> dict[str, Any]:
     file_path = Path(path).expanduser().resolve()
     mime_type = _guess_mime_type(file_path)
     kind = "other"
@@ -61,7 +61,7 @@ def extract_text_from_content(content: Any) -> str:
     if not isinstance(content, list):
         return str(content or "")
 
-    parts: List[str] = []
+    parts: list[str] = []
     for block in content:
         if isinstance(block, str):
             parts.append(block)
@@ -98,7 +98,7 @@ def _extract_pdf_text(path: Path) -> str:
     except Exception:
         return ""
 
-    pages: List[str] = []
+    pages: list[str] = []
     for index, page in enumerate(reader.pages, start=1):
         text = ""
         try:
@@ -171,7 +171,7 @@ def _render_pdf_attachment(ref: AttachmentRef, path: Path, capabilities: ModelCa
     )
 
 
-def prepare_attachment(ref_payload: Dict[str, Any], capabilities: ModelCapabilities) -> PreparedAttachment:
+def prepare_attachment(ref_payload: dict[str, Any], capabilities: ModelCapabilities) -> PreparedAttachment:
     ref = AttachmentRef(
         path=str(ref_payload.get("path") or ""),
         filename=str(ref_payload.get("filename") or Path(str(ref_payload.get("path") or "attachment")).name),
@@ -198,8 +198,8 @@ def render_message_content(content: Any, role: str, capabilities: ModelCapabilit
     if not isinstance(content, list) or role != "user":
         return content
 
-    rendered: List[Dict[str, Any]] = []
-    debug_strategies: List[str] = []
+    rendered: list[dict[str, Any]] = []
+    debug_strategies: list[str] = []
     for block in content:
         if isinstance(block, str):
             rendered.append({"type": "text", "text": block})
@@ -230,7 +230,7 @@ def render_message_content(content: Any, role: str, capabilities: ModelCapabilit
         return "\n\n".join(text for text in text_parts if text).strip()
 
     if text_parts:
-        merged: List[Dict[str, Any]] = [{"type": "text", "text": "\n\n".join(text for text in text_parts if text).strip()}]
+        merged: list[dict[str, Any]] = [{"type": "text", "text": "\n\n".join(text for text in text_parts if text).strip()}]
         merged.extend(non_text_parts)
         return [part for part in merged if not (part.get("type") == "text" and not part.get("text"))]
 

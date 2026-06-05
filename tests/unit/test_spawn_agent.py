@@ -2,11 +2,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
-from unittest.mock import AsyncMock
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
-from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.runner import AgentRunner
@@ -19,7 +16,6 @@ from power_loop.tools.spawn_agent import (
     register_spawn_agent,
     run_spawn_agent,
 )
-
 
 # ---------------------------------------------------------------------------
 # 1. ToolDefinition is well-formed

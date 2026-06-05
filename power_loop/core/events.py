@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, DefaultDict, Dict, List
+from typing import Any
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
 
@@ -30,8 +31,8 @@ class AgentEventBus:
     """
 
     def __init__(self, *, suppress_subscriber_errors: bool = False) -> None:
-        self._handlers: DefaultDict[AgentEventType, List[_SubscribedHandler]] = defaultdict(list)
-        self._global_handlers: List[_SubscribedHandler] = []
+        self._handlers: defaultdict[AgentEventType, list[_SubscribedHandler]] = defaultdict(list)
+        self._global_handlers: list[_SubscribedHandler] = []
         self._counter = 0
         self._suppress_subscriber_errors = suppress_subscriber_errors
 
@@ -88,7 +89,7 @@ class AgentEventBus:
         Async subscriber handlers are scheduled on the running loop when available.
         """
 
-        handlers: List[_SubscribedHandler] = list(self._global_handlers)
+        handlers: list[_SubscribedHandler] = list(self._global_handlers)
         handlers.extend(self._handlers.get(event.type, []))
 
         try:
@@ -110,7 +111,7 @@ class AgentEventBus:
     async def publish_async(self, event: AgentEvent) -> None:
         """Publish asynchronously (awaits async subscribers)."""
 
-        handlers: List[_SubscribedHandler] = list(self._global_handlers)
+        handlers: list[_SubscribedHandler] = list(self._global_handlers)
         handlers.extend(self._handlers.get(event.type, []))
 
         for sub in handlers:

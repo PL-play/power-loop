@@ -12,9 +12,8 @@ Requirements:
 import argparse
 import json
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Any
+from typing import Any
 
 try:
     from duckduckgo_search import DDGS
@@ -49,8 +48,8 @@ class WebSearch:
         self,
         query: str,
         max_results: int = 10,
-        time_range: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        time_range: str | None = None,
+    ) -> list[dict[str, Any]]:
         """
         Perform a text/web search.
 
@@ -80,8 +79,8 @@ class WebSearch:
         self,
         query: str,
         max_results: int = 10,
-        time_range: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        time_range: str | None = None,
+    ) -> list[dict[str, Any]]:
         """
         Search for news articles.
 
@@ -111,11 +110,11 @@ class WebSearch:
         self,
         query: str,
         max_results: int = 10,
-        size: Optional[str] = None,
-        color: Optional[str] = None,
-        type_image: Optional[str] = None,
-        layout: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        size: str | None = None,
+        color: str | None = None,
+        type_image: str | None = None,
+        layout: str | None = None,
+    ) -> list[dict[str, Any]]:
         """
         Search for images.
 
@@ -152,9 +151,9 @@ class WebSearch:
         self,
         query: str,
         max_results: int = 10,
-        duration: Optional[str] = None,
-        resolution: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        duration: str | None = None,
+        resolution: str | None = None,
+    ) -> list[dict[str, Any]]:
         """
         Search for videos.
 
@@ -183,7 +182,7 @@ class WebSearch:
             return []
 
 
-def format_text_results(results: List[Dict[str, Any]], format_type: str = "text") -> str:
+def format_text_results(results: list[dict[str, Any]], format_type: str = "text") -> str:
     """
     Format search results for display.
 
@@ -230,7 +229,7 @@ def format_text_results(results: List[Dict[str, Any]], format_type: str = "text"
         return "\n".join(output)
 
 
-def format_news_results(results: List[Dict[str, Any]], format_type: str = "text") -> str:
+def format_news_results(results: list[dict[str, Any]], format_type: str = "text") -> str:
     """Format news search results."""
     if not results:
         return "No news results found."
@@ -281,7 +280,7 @@ def format_news_results(results: List[Dict[str, Any]], format_type: str = "text"
         return "\n".join(output)
 
 
-def format_image_results(results: List[Dict[str, Any]], format_type: str = "text") -> str:
+def format_image_results(results: list[dict[str, Any]], format_type: str = "text") -> str:
     """Format image search results."""
     if not results:
         return "No image results found."
@@ -329,7 +328,7 @@ def format_image_results(results: List[Dict[str, Any]], format_type: str = "text
         return "\n".join(output)
 
 
-def format_video_results(results: List[Dict[str, Any]], format_type: str = "text") -> str:
+def format_video_results(results: list[dict[str, Any]], format_type: str = "text") -> str:
     """Format video search results."""
     if not results:
         return "No video results found."

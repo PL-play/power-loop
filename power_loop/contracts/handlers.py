@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Protocol
+from typing import Any, Protocol
 
 from power_loop.contracts.events import AgentEvent
 from power_loop.contracts.hook_contexts import BaseHookCtx
-from power_loop.contracts.hooks import HookContext, HookDirective
+from power_loop.contracts.hooks import HookDirective
 
 
 class EventHandler(Protocol):
@@ -32,13 +33,13 @@ class ToolHandlerResult:
 
     ok: bool
     content: str
-    data: Dict[str, Any] = field(default_factory=dict)
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 class ToolHandler(Protocol):
-    def __call__(self, args: Dict[str, Any]) -> ToolHandlerResult | Dict[str, Any] | str | Awaitable[ToolHandlerResult | Dict[str, Any] | str]:
+    def __call__(self, args: dict[str, Any]) -> ToolHandlerResult | dict[str, Any] | str | Awaitable[ToolHandlerResult | dict[str, Any] | str]:
         ...
 
 
-ToolHandlerMap = Dict[str, ToolHandler]
+ToolHandlerMap = dict[str, ToolHandler]
 EventSubscriber = Callable[[EventHandler], None]

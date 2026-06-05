@@ -8,26 +8,28 @@ model utilities, but adapted to zrag's `LLMService` Protocol.
 
 from __future__ import annotations
 
-import json
-import inspect
-import logging
 import asyncio
-import random
+import inspect
+import json
+import logging
 import os
-from typing import cast, Callable
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
+import random
+from collections.abc import AsyncIterator, Callable, Sequence
+from typing import Any, cast
 
 from openai import AsyncOpenAI
 
 from .capabilities import ModelCapabilities, resolve_model_capabilities
-from .interface import LLMService, OpenAICompatibleChatConfig, LLMTokenUsage, LLMRequest, LLMResponse, \
-    LLMStreamChunk
+from .interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage, OpenAICompatibleChatConfig
 from .llm_utils import parse_json_from_model_output_detailed
 
 try:
-    from openai.types.chat import ChatCompletion, ChatCompletionMessage, \
-        ChatCompletionChunk  # type: ignore[import-not-found]
-except Exception as e:  # pragma: no cover
+    from openai.types.chat import (
+        ChatCompletion,
+        ChatCompletionChunk,  # type: ignore[import-not-found]
+        ChatCompletionMessage,
+    )
+except Exception:  # pragma: no cover
     # Runtime will still work because we treat these as typing-only. Keep minimal fallback.
     ChatCompletion = Any  # type: ignore[assignment]
     ChatCompletionMessage = Any  # type: ignore[assignment]
@@ -66,7 +68,7 @@ def _normalize_proxy_env_inplace() -> None:
 
 def _sanitize_debug_payload(value: Any) -> Any:
     if isinstance(value, dict):
-        sanitized: Dict[str, Any] = {}
+        sanitized: dict[str, Any] = {}
         for key, item in value.items():
             if key == "url" and isinstance(item, str) and item.startswith("data:"):
                 prefix, _, payload = item.partition(",")
@@ -79,7 +81,7 @@ def _sanitize_debug_payload(value: Any) -> Any:
     return value
 
 
-def _format_messages_for_debug(messages: Sequence[Dict[str, Any]]) -> str:
+def _format_messages_for_debug(messages: Sequence[dict[str, Any]]) -> str:
     sanitized = _sanitize_debug_payload(list(messages))
     return json.dumps(sanitized, ensure_ascii=False, indent=2)
 
@@ -97,7 +99,7 @@ class OpenAICompatibleChatLLMService(LLMService):
     def __init__(self, cfg: OpenAICompatibleChatConfig):
         self._cfg = cfg
         self._client: Any = None
-        self._last_usage: Dict[str, Any] = {}
+        self._last_usage: dict[str, Any] = {}
         self._capabilities: ModelCapabilities = resolve_model_capabilities(
             cfg.model,
             cfg.base_url,
@@ -114,7 +116,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             "set" if bool(cfg.api_key) else "missing",
         )
 
-    def get_last_token_usage(self) -> Dict[str, Any]:
+    def get_last_token_usage(self) -> dict[str, Any]:
         return dict(self._last_usage or {})
 
     @property
@@ -189,7 +191,7 @@ class OpenAICompatibleChatLLMService(LLMService):
 
         logger.debug("[llm:%s] request messages=%s kwargs=%s", method, rendered_messages, sanitized_kwargs)
 
-    def _usage_dict_from_any(self, usage: Any) -> Dict[str, Any]:
+    def _usage_dict_from_any(self, usage: Any) -> dict[str, Any]:
         """
         Normalize token usage from various provider shapes.
         Supports:
@@ -204,7 +206,7 @@ class OpenAICompatibleChatLLMService(LLMService):
                 "total_tokens": None,
             }
 
-        raw: Dict[str, Any] = {}
+        raw: dict[str, Any] = {}
 
         # dict-like
         if isinstance(usage, dict):
@@ -224,7 +226,7 @@ class OpenAICompatibleChatLLMService(LLMService):
                 except Exception:
                     raw = {}
 
-        def _safe_int_or_none(v: Any) -> Optional[int]:
+        def _safe_int_or_none(v: Any) -> int | None:
             if v is None:
                 return None
             if isinstance(v, bool):
@@ -241,7 +243,7 @@ class OpenAICompatibleChatLLMService(LLMService):
                     return None
             return None
 
-        def _pick_int(payload: Dict[str, Any], keys: List[str]) -> Optional[int]:
+        def _pick_int(payload: dict[str, Any], keys: list[str]) -> int | None:
             for key in keys:
                 if key in payload:
                     iv = _safe_int_or_none(payload.get(key))
@@ -249,7 +251,7 @@ class OpenAICompatibleChatLLMService(LLMService):
                         return iv
             return None
 
-        def _as_dict(v: Any) -> Dict[str, Any]:
+        def _as_dict(v: Any) -> dict[str, Any]:
             if isinstance(v, dict):
                 return v
             if hasattr(v, "model_dump"):
@@ -401,7 +403,7 @@ class OpenAICompatibleChatLLMService(LLMService):
     def _usage_obj(self, usage: Any = None) -> LLMTokenUsage:
         d = self._last_usage if usage is None else self._usage_dict_from_any(usage)
 
-        def _int_or_none(v: Any) -> Optional[int]:
+        def _int_or_none(v: Any) -> int | None:
             try:
                 return None if v is None else int(v)
             except Exception:
@@ -434,7 +436,7 @@ class OpenAICompatibleChatLLMService(LLMService):
         """
         Lightweight retry wrapper inspired by LangChain's ergonomics.
         """
-        last_err: Optional[Exception] = None
+        last_err: Exception | None = None
         attempts = max(1, int(self._cfg.max_retries) + 1)
         for i in range(attempts):
             try:
@@ -451,12 +453,12 @@ class OpenAICompatibleChatLLMService(LLMService):
                 await asyncio.sleep(delay)
         raise cast(Exception, last_err)
 
-    def _request_kwargs(self, request: LLMRequest) -> Dict[str, Any]:
+    def _request_kwargs(self, request: LLMRequest) -> dict[str, Any]:
         """
         Map `LLMRequest` into kwargs for OpenAI-compatible chat.completions.create.
         Falls back to self._cfg for default settings.
         """
-        out: Dict[str, Any] = dict(request.extra or {})
+        out: dict[str, Any] = dict(request.extra or {})
         out["model"] = request.model if request.model else self._cfg.model
         
         req_temp = request.temperature if request.temperature is not None else self._cfg.temperature
@@ -472,7 +474,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             if max_tokens is not None and max_tokens > 0:
                 out["max_tokens"] = max_tokens
 
-        reason_value: Optional[bool] = None
+        reason_value: bool | None = None
         if "reason" in out:
             reason_value = bool(out.pop("reason"))
         elif request.reason is not None:
@@ -515,18 +517,18 @@ class OpenAICompatibleChatLLMService(LLMService):
         self,
         request: LLMRequest,
         *,
-        on_chunk_delta_text: Optional[Callable[[str], Any]] = None,
-        on_chunk_think: Optional[Callable[[str], Any]] = None,
-        on_stream_end: Optional[Callable[[LLMResponse], Any]] = None,
+        on_chunk_delta_text: Callable[[str], Any] | None = None,
+        on_chunk_think: Callable[[str], Any] | None = None,
+        on_stream_end: Callable[[LLMResponse], Any] | None = None,
     ) -> LLMResponse:
         """
         Canonical non-streaming API (preferred).
         """
-        text_parts: List[str] = []
-        think_parts: List[str] = []
-        chunks: List[LLMStreamChunk] = []
-        last_tool_calls: List[Dict[str, Any]] = []
-        final_usage: Optional[LLMTokenUsage] = None
+        text_parts: list[str] = []
+        think_parts: list[str] = []
+        chunks: list[LLMStreamChunk] = []
+        last_tool_calls: list[dict[str, Any]] = []
+        final_usage: LLMTokenUsage | None = None
         last_raw_event: Any = None
 
         async for chunk in self.stream(request):
@@ -584,11 +586,11 @@ class OpenAICompatibleChatLLMService(LLMService):
         stream_kwargs["stream"] = True
         stream_kwargs.setdefault("stream_options", {"include_usage": True})
 
-        last_event: Optional[ChatCompletionChunk] = None
-        final_usage: Optional[LLMTokenUsage] = None
-        tool_call_store: Dict[str, Dict[str, Any]] = {}
-        tool_call_order: List[str] = []
-        tool_call_index_to_key: Dict[int, str] = {}
+        last_event: ChatCompletionChunk | None = None
+        final_usage: LLMTokenUsage | None = None
+        tool_call_store: dict[str, dict[str, Any]] = {}
+        tool_call_order: list[str] = []
+        tool_call_index_to_key: dict[int, str] = {}
         aggregated_text: str = ""
         current_request = request
         restart_count = 0
@@ -611,7 +613,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             except Exception:
                 return obj
 
-        def _merge_tool_calls_delta(delta_tool_calls_obj: Any) -> List[Dict[str, Any]]:
+        def _merge_tool_calls_delta(delta_tool_calls_obj: Any) -> list[dict[str, Any]]:
             """
             Merge OpenAI-compatible streaming `delta.tool_calls` into an aggregated list.
 
@@ -681,7 +683,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             if isinstance(v, str):
                 return v
             if isinstance(v, list):
-                parts: List[str] = []
+                parts: list[str] = []
                 for item in v:
                     if isinstance(item, str):
                         parts.append(item)
@@ -698,7 +700,7 @@ class OpenAICompatibleChatLLMService(LLMService):
                 return "".join(parts)
             return ""
 
-        def _extract_text_and_think_from_value(v: Any) -> Tuple[str, str]:
+        def _extract_text_and_think_from_value(v: Any) -> tuple[str, str]:
             """Split provider content blocks into user-visible text vs reasoning text.
 
             Some OpenAI-compatible providers stream `delta.content` as a list of
@@ -709,8 +711,8 @@ class OpenAICompatibleChatLLMService(LLMService):
                 return v, ""
 
             if isinstance(v, list):
-                text_parts: List[str] = []
-                think_parts: List[str] = []
+                text_parts: list[str] = []
+                think_parts: list[str] = []
                 for item in v:
                     if isinstance(item, str):
                         text_parts.append(item)
@@ -744,7 +746,7 @@ class OpenAICompatibleChatLLMService(LLMService):
 
             return "", ""
 
-        def _extract_delta_text_and_think(delta: Any) -> Tuple[str, str]:
+        def _extract_delta_text_and_think(delta: Any) -> tuple[str, str]:
             if delta is None:
                 return "", ""
 
@@ -810,11 +812,9 @@ class OpenAICompatibleChatLLMService(LLMService):
         self._emit_debug_payload(method="stream", messages=rendered_messages, kwargs=stream_kwargs)
 
         while True:
-            async def _open_stream() -> Any:
-                return await client.chat.completions.create(
-                    messages=rendered_messages,
-                    **stream_kwargs
-                )
+            # Bind loop variables explicitly to avoid late-binding in the closure (B023).
+            async def _open_stream(_msgs=rendered_messages, _kw=stream_kwargs) -> Any:
+                return await client.chat.completions.create(messages=_msgs, **_kw)
 
             stream: Any = await self._with_retries(
                 _open_stream,
@@ -828,7 +828,7 @@ class OpenAICompatibleChatLLMService(LLMService):
                     event: Any = event
                     last_event = event
                     delta_tool_calls: Any = None
-                    aggregated_tool_calls: List[Dict[str, Any]] = []
+                    aggregated_tool_calls: list[dict[str, Any]] = []
                     delta = None
                     choices = getattr(event, "choices", None)
                     if isinstance(choices, list) and choices:
@@ -849,9 +849,8 @@ class OpenAICompatibleChatLLMService(LLMService):
                                         choice0 = dumped_choices[0]
                                         if isinstance(choice0, dict):
                                             delta = choice0.get("delta")
-                            except Exception:
-                                logger.error("[llm:stream] failed to extract delta from model_dump: %s", e)
-                                pass
+                            except Exception as exc:
+                                logger.error("[llm:stream] failed to extract delta from model_dump: %s", exc)
 
                     try:
                         delta_text, delta_think = _extract_delta_text_and_think(delta)
@@ -924,7 +923,7 @@ class OpenAICompatibleChatLLMService(LLMService):
     async def chat_completion(
             self,
             *,
-            messages: Sequence[Dict[str, str]],
+            messages: Sequence[dict[str, str]],
             **kwargs: Any,
     ) -> Any:
         """

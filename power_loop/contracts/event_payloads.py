@@ -10,8 +10,7 @@ and the ``AgentEvent.payload`` property for backward compatibility.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
-
+from typing import Any
 
 # ── Base ──
 
@@ -23,8 +22,8 @@ class BaseEventPayload:
     Provides :meth:`to_dict` for backward-compatible dict serialization.
     """
 
-    def to_dict(self) -> Dict[str, Any]:
-        result: Dict[str, Any] = {}
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {}
         for k, v in self.__dict__.items():
             if not k.startswith("_"):
                 result[k] = v
@@ -90,7 +89,7 @@ class StreamCompletedPayload(BaseEventPayload):
 @dataclass
 class ToolCallStartedPayload(BaseEventPayload):
     name: str = ""
-    tool_input: Dict[str, Any] = field(default_factory=dict)
+    tool_input: dict[str, Any] = field(default_factory=dict)
     tool_call_id: str = ""
 
 
@@ -98,7 +97,7 @@ class ToolCallStartedPayload(BaseEventPayload):
 class ToolCallCompletedPayload(BaseEventPayload):
     name: str = ""
     output: str = ""
-    tool_input: Dict[str, Any] = field(default_factory=dict)
+    tool_input: dict[str, Any] = field(default_factory=dict)
     tool_call_id: str = ""
 
 
@@ -106,7 +105,7 @@ class ToolCallCompletedPayload(BaseEventPayload):
 class ToolCallFailedPayload(BaseEventPayload):
     name: str = ""
     output: str = ""
-    tool_input: Dict[str, Any] = field(default_factory=dict)
+    tool_input: dict[str, Any] = field(default_factory=dict)
     tool_call_id: str = ""
 
 
@@ -153,7 +152,7 @@ class HitRoundLimitStatusPayload(StatusChangedPayload):
 
 @dataclass
 class UsageUpdatedPayload(BaseEventPayload):
-    usage: Dict[str, Any] = field(default_factory=dict)
+    usage: dict[str, Any] = field(default_factory=dict)
 
 
 # ── Todo ──
@@ -162,8 +161,8 @@ class UsageUpdatedPayload(BaseEventPayload):
 @dataclass
 class TodoUpdatedPayload(BaseEventPayload):
     kind: str = "todo_snapshot"
-    items: List[Dict[str, Any]] = field(default_factory=list)
-    counts: Dict[str, int] = field(default_factory=dict)
+    items: list[dict[str, Any]] = field(default_factory=list)
+    counts: dict[str, int] = field(default_factory=dict)
     rendered: str = ""
     text: str = ""
 

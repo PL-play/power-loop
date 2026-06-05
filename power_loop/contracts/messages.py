@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal
+from typing import Any, Literal
 
 MessageRole = Literal["system", "user", "assistant", "tool"]
 
@@ -12,9 +12,9 @@ class ToolCall:
 
     id: str
     name: str
-    arguments: Dict[str, Any] = field(default_factory=dict)
+    arguments: dict[str, Any] = field(default_factory=dict)
 
-    def to_openai_tool_call(self) -> Dict[str, Any]:
+    def to_openai_tool_call(self) -> dict[str, Any]:
         import json
 
         return {
@@ -36,10 +36,10 @@ class AgentMessage:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     name: str | None = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_openai_message(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
+    def to_openai_message(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "role": self.role,
             "content": self.content,
         }

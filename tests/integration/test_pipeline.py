@@ -2,26 +2,23 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 from llm_client.interface import LLMResponse, LLMService, LLMTokenUsage
-
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.contracts.events import AgentEvent, AgentEventType
-from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
 from power_loop.contracts.hook_contexts import (
     LlmBeforeCtx,
     MessageAppendCtx,
     RoundStartCtx,
     ToolBeforeCtx,
 )
+from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.phase import PhaseContext, PhaseResult, phase
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
 from power_loop.core.state import ContextManager
-
 
 # ── Fake LLM ──
 

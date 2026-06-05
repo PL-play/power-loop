@@ -21,12 +21,15 @@ from __future__ import annotations
 
 import uuid
 from contextvars import ContextVar
-from typing import Any, Dict, Mapping
+from typing import TYPE_CHECKING, Any
 
-from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.event_payloads import SubagentLimitPayload, SubagentTaskStartPayload, SubagentTextPayload
+from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_event_bus, get_session_id
+
+if TYPE_CHECKING:
+    from power_loop.tools.registry import ToolRegistry
 
 # Tracks nesting depth per coroutine via contextvars.
 _spawn_depth: ContextVar[int] = ContextVar("power_loop_spawn_depth", default=0)
@@ -99,7 +102,7 @@ async def run_spawn_agent(
 
     # Lazy imports to avoid circular dependencies
     from power_loop.agent.loop import AgentLoop
-    from power_loop.agent.system_prompt import build_subagent_system_prompt, SystemPromptContext
+    from power_loop.agent.system_prompt import SystemPromptContext, build_subagent_system_prompt
     from power_loop.agent.types import AgentLoopConfig
     from power_loop.core.events import AgentEventBus
     from power_loop.tools import create_default_tool_registry
@@ -217,7 +220,7 @@ def _make_spawn_handler(
 
 
 def register_spawn_agent(
-        registry: "ToolRegistry",
+        registry: ToolRegistry,
         llm: Any,
         *,
         max_depth: int = DEFAULT_MAX_DEPTH,
@@ -233,7 +236,6 @@ def register_spawn_agent(
         registry = create_default_tool_registry(preset="core")
         register_spawn_agent(registry, llm)
     """
-    from power_loop.tools.registry import ToolRegistry  # noqa: F811
 
     handler = _make_spawn_handler(llm, max_depth=max_depth, bubble_events=bubble_events)
     registry.register(SPAWN_AGENT_DEFINITION, handler, overwrite=overwrite)

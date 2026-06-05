@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any
 
 from power_loop.contracts.tools import ToolDefinition, validate_tool_args
 

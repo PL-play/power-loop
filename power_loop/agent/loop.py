@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from typing import List
 
 from llm_client.interface import LLMService
-
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
+from power_loop.core.agent import agent_loop_async
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.runner import AgentRunner
-from power_loop.core.agent import agent_loop_async
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -38,7 +36,7 @@ class AgentLoop:
 
     async def run(
         self,
-        messages: List[LoopMessage],
+        messages: list[LoopMessage],
         stop_event: threading.Event | None = None,
         *,
         session_id: str | None = None,
@@ -55,7 +53,7 @@ class AgentLoop:
 
     def run_sync(
         self,
-        messages: List[LoopMessage],
+        messages: list[LoopMessage],
         stop_event: threading.Event | None = None,
         *,
         session_id: str | None = None,

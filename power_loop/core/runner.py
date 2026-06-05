@@ -1,22 +1,20 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
-import threading
-from typing import AsyncIterator, Iterator, Optional, Sequence
 
-from power_loop.contracts.events import AgentEvent
 from power_loop.core.agent_context import (
-    set_ctx,
-    set_event_bus,
-    set_hooks,
-    set_session_id,
     reset_ctx,
     reset_event_bus,
     reset_hooks,
     reset_session_id,
+    set_ctx,
+    set_event_bus,
+    set_hooks,
+    set_session_id,
 )
-from power_loop.core.events import AgentEventBus, DEFAULT_EVENT_BUS
-from power_loop.core.hooks import AgentHooks, DEFAULT_HOOKS
+from power_loop.core.events import DEFAULT_EVENT_BUS, AgentEventBus
+from power_loop.core.hooks import DEFAULT_HOOKS, AgentHooks
 from power_loop.core.state import ContextManager
 
 
@@ -33,7 +31,7 @@ class AgentRunner:
         self.hooks = hooks if hooks is not None else DEFAULT_HOOKS
 
     @contextmanager
-    def session(self, *, session_id: str | None = None) -> Iterator["AgentRunner"]:
+    def session(self, *, session_id: str | None = None) -> Iterator[AgentRunner]:
         tok_bus = set_event_bus(self.event_bus)
         tok_hooks = set_hooks(self.hooks)
         tok_ctx = set_ctx(ContextManager(role="main"))
@@ -47,7 +45,7 @@ class AgentRunner:
             reset_event_bus(tok_bus)
 
     @asynccontextmanager
-    async def session_async(self, *, session_id: str | None = None) -> AsyncIterator["AgentRunner"]:
+    async def session_async(self, *, session_id: str | None = None) -> AsyncIterator[AgentRunner]:
         tok_bus = set_event_bus(self.event_bus)
         tok_hooks = set_hooks(self.hooks)
         tok_ctx = set_ctx(ContextManager(role="main"))

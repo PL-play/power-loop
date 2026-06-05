@@ -1,22 +1,18 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import os
-import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from power_loop.core.agent_context import get_event_bus, get_session_id
-from power_loop.contracts.events import AgentEvent, AgentEventType
-from power_loop.contracts.event_payloads import TodoUpdatedPayload
-from power_loop.runtime.env import AGENT_DIR, SKILLS_DIR, WORKSPACE_DIR, safe_path
-from power_loop.runtime.skills import SKILL_LOADER
 from llm_client.interface import LLMRequest, LLMResponse
-
+from power_loop.contracts.event_payloads import TodoUpdatedPayload
+from power_loop.contracts.events import AgentEvent, AgentEventType
+from power_loop.core.agent_context import get_event_bus, get_session_id
+from power_loop.runtime.env import AGENT_DIR, SKILLS_DIR, WORKSPACE_DIR
+from power_loop.runtime.skills import SKILL_LOADER
 
 TOOL_MAX_LINES = 20
 
@@ -161,7 +157,7 @@ class ContextManager:
             reasoning = _pick(usage, ["completion_reasoning_tokens", "reasoning_tokens"])
             total_tokens = _pick(usage, ["total_tokens"])
 
-        usage = {
+        usage_out: dict[str, int] = {
             "prompt_tokens": input_tokens,
             "completion_tokens": output_tokens,
             "cache_read_tokens": cache_read,
@@ -173,9 +169,9 @@ class ContextManager:
             "cache_read": cache_read,
             "reasoning": reasoning,
         }
-        self.token_usage = usage
+        self.token_usage = usage_out
         self.last_input_tokens = input_tokens
-        return usage
+        return usage_out
 
     def reset_usage(self) -> None:
         self.last_input_tokens = 0

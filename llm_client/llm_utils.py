@@ -12,14 +12,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from .interface import LLMResponse
 
 
 def log_llm_json_result(
     logger: logging.Logger,
-    result: "LLMResponse",
+    result: LLMResponse,
     *,
     level: str = "info",
     prefix: str = "",
@@ -58,7 +58,7 @@ def strip_code_fences(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def extract_json_substring(text: str) -> Optional[str]:
+def extract_json_substring(text: str) -> str | None:
     """
     Extract the first top-level JSON object substring by brace matching.
     """
@@ -79,7 +79,7 @@ def extract_json_substring(text: str) -> Optional[str]:
     return None
 
 
-def _try_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+def _try_json_loads(s: str) -> tuple[dict[str, Any] | None, str | None]:
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
@@ -89,7 +89,7 @@ def _try_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         return None, f"json_decode_error:{e}"
 
 
-def parse_json_from_model_output(raw_text: str) -> Tuple[Dict[str, Any], Optional[str]]:
+def parse_json_from_model_output(raw_text: str) -> tuple[dict[str, Any], str | None]:
     """
     Parse JSON from model output with multi-step fallback.
     Returns (json_data, error_message).
@@ -127,7 +127,7 @@ def parse_json_from_model_output(raw_text: str) -> Tuple[Dict[str, Any], Optiona
     return {}, err
 
 
-def parse_json_from_model_output_detailed(raw_text: str) -> "LLMResponse":
+def parse_json_from_model_output_detailed(raw_text: str) -> LLMResponse:
     """
     Detailed parser that returns a rich `LLMResponse` with intermediate artifacts.
     This is the recommended API for new code.

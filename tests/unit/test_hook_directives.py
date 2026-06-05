@@ -1,9 +1,10 @@
 """Unit tests for HookDirective / HookResult control-flow mechanism."""
 from __future__ import annotations
 
+import asyncio
+
 from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
 from power_loop.core.hooks import AgentHooks
-
 
 # ---------------------------------------------------------------------------
 # 1. Basic: handlers that return HookContext still work (backward compat)
@@ -149,7 +150,6 @@ def test_multiple_handlers_context_return_preserves_directive():
 # 8. Async handlers
 # ---------------------------------------------------------------------------
 
-import asyncio
 
 def test_async_handler_directive():
     hooks = AgentHooks()

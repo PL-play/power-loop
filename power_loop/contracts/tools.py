@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping
+from typing import Any
 
 
 @dataclass(frozen=True)
 class ToolDefinition:
     name: str
     description: str
-    input_schema: Dict[str, Any] = field(default_factory=lambda: {"type": "object", "properties": {}})
+    input_schema: dict[str, Any] = field(default_factory=lambda: {"type": "object", "properties": {}})
     required_params: tuple[str, ...] = ()
 
-    def to_openai_tool(self) -> Dict[str, Any]:
+    def to_openai_tool(self) -> dict[str, Any]:
         return {
             "type": "function",
             "function": {
@@ -22,7 +23,7 @@ class ToolDefinition:
         }
 
 
-DEFAULT_REQUIRED_PARAMS: Dict[str, tuple[str, ...]] = {
+DEFAULT_REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
     "write_file": ("path", "content"),
     "read_file": ("path",),
     "edit_file": ("path", "old_text", "new_text"),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict
+from typing import Any
 
 
 class HookPoint(str, Enum):
@@ -52,7 +52,7 @@ class HookDirective(str, Enum):
 class HookContext:
     """Mutable context passed through each hook chain."""
 
-    values: Dict[str, Any] = field(default_factory=dict)
+    values: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

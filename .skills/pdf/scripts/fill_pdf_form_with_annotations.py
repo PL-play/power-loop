@@ -5,8 +5,6 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.annotations import FreeText
 
 
-
-
 def transform_from_image_coords(bbox, image_width, image_height, pdf_width, pdf_height):
     x_scale = pdf_width / image_width
     y_scale = pdf_height / image_height
@@ -32,7 +30,7 @@ def transform_from_pdf_coords(bbox, pdf_height):
 
 def fill_pdf_form(input_pdf_path, fields_json_path, output_pdf_path):
     
-    with open(fields_json_path, "r") as f:
+    with open(fields_json_path) as f:
         fields_data = json.load(f)
     
     reader = PdfReader(input_pdf_path)

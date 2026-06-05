@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import re
 from importlib import import_module
 from importlib.util import find_spec
-import re
 from pathlib import Path
 from typing import Any
 
-yaml = import_module("yaml") if find_spec("yaml") else None
-
 from power_loop.runtime.env import AGENT_DIR, SKILLS_DIR, WORKSPACE_DIR
+
+yaml = import_module("yaml") if find_spec("yaml") else None
 
 
 class SkillLoader:

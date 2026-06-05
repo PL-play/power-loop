@@ -13,8 +13,8 @@ Design goals
 from __future__ import annotations
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
 # Context that sections can reference
@@ -82,7 +82,7 @@ def section_security(_ctx: SystemPromptContext) -> str:
 
 def section_tool_guide(ctx: SystemPromptContext) -> str | None:
     """Per-tool usage hints.  Only emits tools that are actually registered."""
-    catalog: Dict[str, str] = {
+    catalog: dict[str, str] = {
         "bash": (
             "persistent session — cwd and env vars survive across calls. "
             "Use restart=true to reset. Avoid dangerous commands (rm -rf /, sudo)."
@@ -176,7 +176,7 @@ def section_skills(ctx: SystemPromptContext) -> str | None:
 
 
 # Ordered registry of all built-in sections.
-BUILTIN_SECTIONS: Dict[str, SectionRenderer] = OrderedDict([
+BUILTIN_SECTIONS: dict[str, SectionRenderer] = OrderedDict([
     ("identity", section_identity),
     ("style", section_style),
     ("workflow", section_workflow),
@@ -228,7 +228,7 @@ class SystemPromptBuilder:
         if use_defaults:
             self._sections.update(BUILTIN_SECTIONS)
 
-    def use(self, *names: str) -> "SystemPromptBuilder":
+    def use(self, *names: str) -> SystemPromptBuilder:
         """Keep only the named built-in sections (in given order)."""
         selected = OrderedDict()
         for name in names:
@@ -249,13 +249,20 @@ class SystemPromptBuilder:
         *,
         before: str | None = None,
         after: str | None = None,
-    ) -> "SystemPromptBuilder":
+    ) -> SystemPromptBuilder:
         """Add or replace a section.
 
         *renderer* can be a callable ``(ctx) -> str`` or a plain string.
         Use *before*/*after* to control position relative to an existing section.
         """
-        fn: SectionRenderer = (lambda _c, _s=renderer: _s) if isinstance(renderer, str) else renderer  # type: ignore[assignment]
+        fn: SectionRenderer
+        if isinstance(renderer, str):
+            _renderer_str: str = renderer
+
+            def fn(_c: SystemPromptContext, _s: str = _renderer_str) -> str:
+                return _s
+        else:
+            fn = renderer
 
         if before or after:
             anchor = before or after
@@ -276,7 +283,7 @@ class SystemPromptBuilder:
             self._sections[name] = fn
         return self
 
-    def remove(self, *names: str) -> "SystemPromptBuilder":
+    def remove(self, *names: str) -> SystemPromptBuilder:
         """Remove sections by name."""
         for name in names:
             self._sections.pop(name, None)
