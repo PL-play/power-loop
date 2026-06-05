@@ -130,6 +130,8 @@ async def _handle_run_agent(**kwargs: Any) -> str:
         )
     spec_payload = kwargs.get("spec")
     user_input = str(kwargs.get("input") or "")
+    if spec_payload is None:
+        return "Error: run_agent requires 'spec'."
     if not user_input:
         return "Error: run_agent requires 'input'."
     try:

@@ -30,5 +30,5 @@
 
 | 页面 | 你会学到 |
 |---|---|
-| [架构设计](../architecture.md) | 模块边界、Pipeline 阶段、关键不变量 |
+| [架构设计](../../architecture.md) | 模块边界、Pipeline 阶段、关键不变量 |
 | [Providers](providers.md) | OpenAI、DashScope、DeepSeek、本地 — 配置片段 |

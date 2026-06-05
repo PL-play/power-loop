@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 try:
-    from dotenv import load_dotenv  # type: ignore[import-untyped]
+    from dotenv import load_dotenv
 
     _PROJECT_ROOT = Path(__file__).resolve().parent.parent
     load_dotenv(_PROJECT_ROOT / ".env", override=False)

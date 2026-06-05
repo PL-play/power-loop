@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import (
     Any,
     Union,
+    cast,
     get_args,
     get_origin,
     get_type_hints,
@@ -14,11 +15,14 @@ from typing import (
 
 from .interface import LLMMessage, LLMRequest, LLMResponse, LLMService, LLMTool
 
+_pydantic: Any
 try:
     # Optional dependency (already used in other parts of this mono-repo).
-    from pydantic import BaseModel  # type: ignore
+    import pydantic as _pydantic
 except Exception:  # pragma: no cover
-    BaseModel = None  # type: ignore
+    _pydantic = None
+
+BaseModel: Any = getattr(_pydantic, "BaseModel", None)
 
 
 
@@ -106,8 +110,8 @@ class ToolRegistry:
             raise ValueError(f"duplicate tool name: {spec.name}")
         self._tools[spec.name] = spec
 
-    def to_llm_tools(self) -> list[LLMTool]:
-        return [t.to_llm_tool() for t in self._tools.values()]
+    def to_llm_tools(self) -> list[dict[str, Any]]:
+        return [dict(t.to_llm_tool()) for t in self._tools.values()]
 
     def get(self, name: str) -> ToolSpec | None:
         return self._tools.get(name)
@@ -289,8 +293,8 @@ def tool_spec_from(
     # pydantic BaseModel subclass as argument schema (signal tools often only need schema)
     if BaseModel is not None:
         try:
-            if isinstance(obj, type) and issubclass(obj, BaseModel):  # type: ignore[arg-type]
-                schema = obj.model_json_schema()  # type: ignore[union-attr]
+            if isinstance(obj, type) and issubclass(obj, BaseModel):
+                schema = cast(Any, obj).model_json_schema()
                 # Merge explicit description + docstring (both matter).
                 doc = (inspect.getdoc(obj) or "").strip()
                 desc = (description or "").strip()
@@ -641,5 +645,3 @@ async def execute_tool_safely(tool: ToolSpec, args: dict[str, Any]) -> Any:
         return await tool.ainvoke(coerced_args)
     except Exception as e:
         return {"error": f"tool_error:{tool.name}: {e}"}
-
-

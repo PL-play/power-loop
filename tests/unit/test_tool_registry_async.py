@@ -34,13 +34,17 @@ def test_async_handler_detected_at_register_time() -> None:
         return f"async:{x}"
 
     reg.register(DEF, handler)
-    assert reg.get("ping").is_async is True
+    tool = reg.get("ping")
+    assert tool is not None
+    assert tool.is_async is True
 
 
 def test_sync_handler_detected_as_sync() -> None:
     reg = ToolRegistry()
     reg.register(DEF, lambda x=0: f"sync:{x}")
-    assert reg.get("ping").is_async is False
+    tool = reg.get("ping")
+    assert tool is not None
+    assert tool.is_async is False
 
 
 def test_invoke_sync_on_async_handler_raises_clear_error() -> None:
@@ -95,5 +99,7 @@ async def test_callable_object_with_async_dunder_call_detected() -> None:
             return f"obj:{x}"
 
     reg.register(DEF, AsyncCallable())
-    assert reg.get("ping").is_async is True
+    tool = reg.get("ping")
+    assert tool is not None
+    assert tool.is_async is True
     assert await reg.invoke_async("ping", {"x": 7}) == "obj:7"

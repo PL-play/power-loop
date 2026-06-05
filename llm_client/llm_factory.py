@@ -15,7 +15,7 @@ import logging
 import os
 import random
 from collections.abc import AsyncIterator, Callable, Sequence
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from openai import AsyncOpenAI
 
@@ -23,16 +23,10 @@ from .capabilities import ModelCapabilities, resolve_model_capabilities
 from .interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage, OpenAICompatibleChatConfig
 from .llm_utils import parse_json_from_model_output_detailed
 
-try:
-    from openai.types.chat import (
-        ChatCompletion,
-        ChatCompletionChunk,  # type: ignore[import-not-found]
-        ChatCompletionMessage,
-    )
-except Exception:  # pragma: no cover
-    # Runtime will still work because we treat these as typing-only. Keep minimal fallback.
-    ChatCompletion = Any  # type: ignore[assignment]
-    ChatCompletionMessage = Any  # type: ignore[assignment]
+if TYPE_CHECKING:
+    from openai.types.chat import ChatCompletionChunk
+else:
+    ChatCompletionChunk = Any
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +120,6 @@ class OpenAICompatibleChatLLMService(LLMService):
     def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
-        from openai import AsyncOpenAI  # type: ignore
-
         _normalize_proxy_env_inplace()
 
         self._client = AsyncOpenAI(
@@ -828,7 +820,6 @@ class OpenAICompatibleChatLLMService(LLMService):
                 async for event in stream:
                     delta_text = ""
                     delta_think = ""
-                    event: Any = event
                     last_event = event
                     delta_tool_calls: Any = None
                     aggregated_tool_calls: list[dict[str, Any]] = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,7 @@ from power_loop.runtime.session_store import (
 
 
 @pytest.fixture
-def store() -> SessionStore:
+def store() -> Generator[SessionStore, None, None]:
     s = SessionStore.open(":memory:")
     yield s
     s.close()
@@ -73,7 +74,9 @@ def test_append_messages_allocates_monotonic_seq(store: SessionStore) -> None:
     assert [m.role for m in msgs] == ["user", "assistant", "tool"]
     assert msgs[1].tool_calls == [{"id": "tc1", "function": {"name": "f"}}]
     assert msgs[2].tool_call_id == "tc1"
-    assert store.get_state(sid).next_seq == 4
+    state = store.get_state(sid)
+    assert state is not None
+    assert state.next_seq == 4
 
 
 def test_record_compaction_marks_range_and_appends_note(store: SessionStore) -> None:
@@ -109,6 +112,7 @@ def test_record_compaction_marks_range_and_appends_note(store: SessionStore) -> 
     assert len(rows) == 1 and rows[0].from_seq == 2 and rows[0].to_seq == 4
 
     state = store.get_state(sid)
+    assert state is not None
     assert state.last_compact_seq == 1
     assert state.next_seq == 7
 
@@ -122,13 +126,16 @@ def test_subagent_links_to_parent_and_inherits_depth(store: SessionStore) -> Non
     grand = store.create_session(parent_session_id=child)
 
     child_row = store.get_session(child)
+    assert child_row is not None
     assert child_row.kind is SessionKind.SUBAGENT
     assert child_row.parent_session_id == parent
     assert child_row.spawn_depth == 1
     assert child_row.spawn_tool_call_id == "tc-spawn"
     assert child_row.lifecycle is SubagentLifecycle.LINKED
 
-    assert store.get_session(grand).spawn_depth == 2
+    grand_row = store.get_session(grand)
+    assert grand_row is not None
+    assert grand_row.spawn_depth == 2
     assert [c.session_id for c in store.list_children(parent)] == [child]
 
 
@@ -157,8 +164,9 @@ def test_close_session_cascades_linked_and_detaches_detached(store: SessionStore
     assert deleted == 2
     assert store.get_session(parent) is None
     assert store.get_session(linked) is None
-    assert store.get_session(detached) is not None
-    assert store.get_session(detached).parent_session_id is None
+    detached_row = store.get_session(detached)
+    assert detached_row is not None
+    assert detached_row.parent_session_id is None
     # Messages of removed sessions are gone.
     assert store.load_all_messages(linked) == []
 
@@ -188,11 +196,14 @@ def test_pending_round_index_set_get(store: SessionStore) -> None:
     store.set_round_index(sid, 7)
     store.set_pending(sid, {"tool_calls": ["tc1", "tc2"], "assistant_seq": 5})
     state = store.get_state(sid)
+    assert state is not None
     assert state.round_index == 7
     assert state.pending == {"tool_calls": ["tc1", "tc2"], "assistant_seq": 5}
 
     store.set_pending(sid, None)
-    assert store.get_state(sid).pending is None
+    state = store.get_state(sid)
+    assert state is not None
+    assert state.pending is None
 
 
 def test_record_usage_upserts(store: SessionStore) -> None:

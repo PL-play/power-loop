@@ -7,7 +7,7 @@ from power_loop import ToolDefinition, create_default_tool_registry
 from power_loop.runtime.env import WORKSPACE_DIR
 
 
-def main() -> None:
+def test_default_tool_registry_smoke() -> None:
     registry = create_default_tool_registry()
 
     # Validate default set
@@ -60,9 +60,3 @@ def main() -> None:
 
     # Cleanup temp file
     (WORKSPACE_DIR / temp_name).unlink(missing_ok=True)
-
-    print("smoke_tool_registry passed")
-
-
-if __name__ == "__main__":
-    main()

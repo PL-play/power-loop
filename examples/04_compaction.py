@@ -75,7 +75,7 @@ async def main() -> str:
         notes = [m for m in all_rows if m.name == "compact_note"]
         print(f"compactions recorded : {len(comps)}")
         print(f"messages compacted   : {folded}")
-        print(f"compact_note preview : {notes[0].content[:80]!r}")
+        print(f"compact_note preview : {(notes[0].content or '')[:80]!r}")
         return r.final_text
     finally:
         store.close()

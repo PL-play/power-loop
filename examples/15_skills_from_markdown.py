@@ -26,7 +26,6 @@ from __future__ import annotations
 import asyncio
 import re
 import textwrap
-from pathlib import Path
 
 from _helpers import make_llm
 

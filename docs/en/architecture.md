@@ -1,6 +1,6 @@
 # Architecture
 
-[中文](../zh/architecture.md) | [Back to docs](../README.md)
+[中文](../architecture.md) | [Back to docs](../README.md)
 
 power-loop's internal collaboration: module boundaries, the `send()` full chain, pipeline phases, pending state machine, compaction, sub-agents, and key invariants.
 
@@ -68,7 +68,7 @@ sequenceDiagram
     SAL->>Store: load_active_messages(sid)
     SAL->>Pipeline: run(history)
     Pipeline->>Pipeline: session.start hook
-    Pipeline->>Pipeline: memory.recall → inject
+    Pipeline->>Pipeline: memory.recall then inject
     loop round 0..max_rounds
         Pipeline->>Pipeline: round.start hook
         Pipeline->>Pipeline: compactor.maybe_compact
@@ -85,7 +85,7 @@ sequenceDiagram
             Pipeline->>Pipeline: tool.after hook
             Pipeline->>Store: append tool msg
         else no tools
-            Pipeline->>Pipeline: round.end → session.end
+            Pipeline->>Pipeline: round.end then session.end
             Pipeline-->>SAL: result
         end
     end
@@ -108,10 +108,10 @@ flowchart TD
     E --> F[llm.after]
     F --> G[append assistant msg]
     G --> H{has tool_calls?}
-    H -->|no| I[round.end → session.end]
+    H -->|no| I[round.end then session.end]
     H -->|yes| J[round.decide]
     J --> K[tools.batch.before]
-    K --> L[tool.before → invoke → tool.after]
+    K --> L[tool.before, invoke, tool.after]
     L --> M[append tool msg]
     M --> N{more tools?}
     N -->|yes| L
@@ -178,7 +178,7 @@ stateDiagram-v2
     Pending --> Recovered: resume() called
     Pending --> Aborted: abort_pending() called
     Recovered --> Clean: remaining tools executed
-    Aborted --> Clean: <aborted> msgs synthesized
+    Aborted --> Clean: aborted tool messages synthesized
 ```
 
 ## 6. Compaction
@@ -196,7 +196,7 @@ flowchart TD
     G --> H{summary success?}
     H -->|yes| I[replace span with compact_note]
     H -->|no| J[soft-fail: continue uncompacted]
-    I --> K[persist compaction → store.record_compaction]
+    I --> K[persist compaction audit]
     K --> Z
     J --> Z
 ```
@@ -224,9 +224,9 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    P[Parent Session<br/>sess_abc] --> C1[Child: researcher<br/>sess_def]
-    P --> C2[Child: reviewer<br/>sess_ghi]
-    C1 --> GC1[Grandchild: searcher<br/>sess_jkl]
+    P["Parent Session sess_abc"] --> C1["Child researcher sess_def"]
+    P --> C2["Child reviewer sess_ghi"]
+    C1 --> GC1["Grandchild searcher sess_jkl"]
 ```
 
 All children share the parent's `SessionStore`. `close_session(parent_sid, cascade=True)` recursively deletes the entire tree. `MAX_SPAWN_DEPTH = 3`.

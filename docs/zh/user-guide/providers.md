@@ -70,4 +70,4 @@ llm = create_llm_service_from_env(prefix="MY_APP")
 ## 下一步
 
 - [配置](configuration.md) — 所有 `AgentLoopConfig` 字段
-- [架构设计](../architecture.md) — LLM 调用如何融入 pipeline
+- [架构设计](../../architecture.md) — LLM 调用如何融入 pipeline

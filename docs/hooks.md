@@ -381,7 +381,7 @@ hooks.register(HookPoint.TOOL_BEFORE, ask_before_bash)
 ```
 
 完整可运行版（含白名单 / always-deny 注入式回调 / CLI input 默认实现）：
-[`examples/07_user_confirmation.py`](../examples/07_user_confirmation.py)。
+[`examples/07_human_approval.py`](../examples/07_human_approval.py)。
 
 ### 缓存短路
 

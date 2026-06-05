@@ -30,7 +30,7 @@ POWER_LOOP_MODEL=gpt-4o-mini
 # OPENAI_COMPAT_MODEL=…
 ```
 
-任何 OpenAI 兼容的 provider 都能用 — DashScope、DeepSeek、OpenRouter、Together、Groq、本地 Ollama/vLLM。更多 snippet 见 [Providers](../en/user-guide/providers.md)。
+任何 OpenAI 兼容的 provider 都能用 — DashScope、DeepSeek、OpenRouter、Together、Groq、本地 Ollama/vLLM。更多 snippet 见 [Providers](user-guide/providers.md)。
 
 ## 3. 第一个 Agent
 
@@ -104,5 +104,5 @@ print(result2.final_text)   # "你叫阿岚。"
 |---|---|
 | 加工具（bash、搜索…） | [快速入门：工具调用](user-guide/quickstart.md#工具调用) |
 | 流式输出 | [事件：流式](user-guide/events.md#stream-delta) |
-| 理解循环内部 | [架构设计](architecture.md) |
+| 理解循环内部 | [架构设计](../architecture.md) |
 | 查看完整示例 | [Examples](../../examples/) — 从 `00_hello_world.py` 开始 |

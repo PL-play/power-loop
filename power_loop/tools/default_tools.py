@@ -15,7 +15,7 @@ from typing import Any
 
 from power_loop.core.agent_context import get_ctx
 from power_loop.runtime.env import AGENT_DIR, AGENT_RW_ALLOWLIST, WORKSPACE_DIR, safe_path
-from power_loop.runtime.skills import SKILL_LOADER
+from power_loop.runtime.skills import get_default_loader
 
 RESULT_MAX_CHARS = 50000
 _HEAD_LINES = 30
@@ -667,7 +667,7 @@ def run_grep(pattern: str, path: str = ".", include: str | None = None, max_resu
 
 
 def run_load_skill(name: str) -> str:
-    return SKILL_LOADER.get_content(name)
+    return get_default_loader().get_content(name)
 
 class BackgroundManager:
     """Background command runner with task tracking."""

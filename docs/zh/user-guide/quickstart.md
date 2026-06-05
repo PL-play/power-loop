@@ -192,4 +192,4 @@ print(r2.final_text)  # → "你叫阿岚。"
 | 记忆 | [用户手册：记忆](memory.md) — 通过 `MemoryProvider` 跨会话召回 |
 | 重试与取消 | [用户手册：重试与取消](retry-cancel.md) — 优雅处理 LLM 失败 |
 | 结构化输出 | [用户手册：结构化输出](structured-output.md) — schema 校验的 JSON |
-| 完整示例列表 | [Examples](../../../examples/) — 15 个可运行示例，每个教一个概念 |
+| 完整示例列表 | [Examples](../../../examples/) — 20 个可运行示例，每个教一个概念 |

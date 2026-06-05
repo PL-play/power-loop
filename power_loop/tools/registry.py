@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from power_loop.contracts.errors import ToolNotFound, ToolValidationError
 from power_loop.contracts.tools import ToolDefinition, validate_tool_args
@@ -52,7 +52,7 @@ class ToolRegistry:
         if not is_async and not inspect.isfunction(handler) and callable(handler):
             # Callable object whose ``__call__`` is async (e.g. dataclass
             # with ``async def __call__``). Check that explicitly.
-            is_async = inspect.iscoroutinefunction(handler.__call__)
+            is_async = inspect.iscoroutinefunction(cast(Any, handler).__call__)
         self._tools[definition.name] = RegisteredTool(
             definition=definition, handler=handler, is_async=is_async,
         )
@@ -125,10 +125,11 @@ class ToolRegistry:
 
         self._raise_if_invalid(name, args)
 
+        handler = cast(Callable[..., Any], tool.handler)
         try:
-            return tool.handler(**dict(args))
+            return handler(**dict(args))
         except TypeError:
-            return tool.handler(dict(args))
+            return handler(dict(args))
 
     async def invoke_async(self, name: str, args: Mapping[str, Any]) -> Any:
         """Universal invocation entry. Raises :class:`ToolNotFound` if the
@@ -140,13 +141,14 @@ class ToolRegistry:
 
         self._raise_if_invalid(name, args)
 
+        handler = cast(Callable[..., Any], tool.handler)
         if tool.is_async:
-            return await tool.handler(**dict(args))
+            return await handler(**dict(args))
 
         try:
-            result = tool.handler(**dict(args))
+            result = handler(**dict(args))
         except TypeError:
-            result = tool.handler(dict(args))
+            result = handler(dict(args))
         if inspect.isawaitable(result):
             return await result
         return result

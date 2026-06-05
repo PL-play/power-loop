@@ -73,9 +73,9 @@ result = await run_agent_spec(spec, "查找所有 SQL 注入漏洞", parent_loop
 
 ```mermaid
 flowchart TD
-    P[父会话<br/>sess_abc] --> C1[子: researcher<br/>sess_def]
-    P --> C2[子: reviewer<br/>sess_ghi]
-    C1 --> GC1[孙: searcher<br/>sess_jkl]
+    P["父会话 sess_abc"] --> C1["子 researcher sess_def"]
+    P --> C2["子 reviewer sess_ghi"]
+    C1 --> GC1["孙 searcher sess_jkl"]
 ```
 
 所有子代理共享父代理的 `SessionStore`。`close_session(parent_sid, cascade=True)` 递归删除整棵树。

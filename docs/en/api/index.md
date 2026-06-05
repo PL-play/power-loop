@@ -2,47 +2,55 @@
 
 [中文](../../zh/api/index.md) | [Back to docs](../../README.md)
 
-Signature-level documentation for every public symbol. These are reference pages — for conceptual explanations, see the [User Guide](../user-guide/index.md).
+This page tracks the public surface that is available from `import power_loop`.
+For behavior and examples, use the linked user-guide pages. For exact signatures,
+inspect the source modules linked below.
+
+## Stability
+
+| Tier | Meaning |
+|---|---|
+| Stable | Backward compatible across minor releases. See `power_loop.STABLE_API`. |
+| Provisional | Re-exported from `power_loop` during 0.x, but may change. |
+| Internal | Submodule imports such as `power_loop.core.*`; no compatibility guarantee. |
 
 ## Core
 
-| Page | Covers |
-|---|---|
-| [StatefulAgentLoop](stateful-loop.md) | `send()` / `send_sync()` / `resume()` / `abort_pending()` / `close_session()` / `close()` / `get_messages()` / `get_pending()` |
-| [StatefulResult](stateful-result.md) | `session_id` / `status` / `final_text` / `rounds` / `pending_tool_calls` |
-| [AgentLoopConfig](config.md) | `system_prompt` / `max_rounds` / `temperature` / `max_tokens` / `compactor` / `retry_policy` / `memory` / `memory_budget_tokens` |
-| [SessionStore](session-store.md) | `open()` / `create_session()` / `append_message()` / `load_active_messages()` / `load_all_messages()` / `close()` |
+| Symbol | Covers | More |
+|---|---|---|
+| `StatefulAgentLoop` | `send`, `send_sync`, `resume`, `abort_pending`, `close_session`, `get_messages`, `get_pending` | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/agent/stateful_loop.py) |
+| `StatefulResult` | `session_id`, `status`, `final_text`, `rounds`, `pending_tool_calls` | [source](../../../power_loop/agent/stateful_loop.py) |
+| `AgentLoopConfig` | loop limits, temperature, compaction, retry, memory | [Configuration](../user-guide/configuration.md), [source](../../../power_loop/agent/types.py) |
+| `SessionStore` | SQLite sessions, messages, compactions, usage, pending state | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/runtime/session_store.py) |
 
-## Tools
+## Tools and Sub-Agents
 
-| Page | Covers |
-|---|---|
-| [ToolRegistry](tool-registry.md) | `register()` / `unregister()` / `invoke()` / `invoke_async()` / `validate()` / `to_openai_tools()` |
-| [ToolDefinition](tool-definition.md) | `name` / `description` / `input_schema` / `required_params` |
-| `AsyncToolInSyncContext` | Raised when sync `invoke()` called on async handler |
+| Symbol | Covers | More |
+|---|---|---|
+| `ToolRegistry` | register, invoke, validate, OpenAI tool conversion | [Tools](../user-guide/tools.md), [source](../../../power_loop/tools/registry.py) |
+| `ToolDefinition` | name, description, JSON Schema, required params | [Tools](../user-guide/tools.md), [source](../../../power_loop/contracts/tools.py) |
+| `AgentSpec` | declarative child-agent spec | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/runtime/spec.py) |
+| `run_agent_spec` | direct sub-agent execution | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/runtime/spec.py) |
+| `register_spawn_agent` | `spawn_agent` and `run_agent` meta-tools | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/tools/spawn_agent.py) |
 
-## Hooks & Events
+## Hooks and Events
 
-| Page | Covers |
-|---|---|
-| [Hooks](hooks.md) | `AgentHooks` / `HookPoint` (18 values) / `HookDirective` (4 values) / all `*Ctx` dataclasses |
-| [Events](events.md) | `AgentEventBus` / `AgentEventType` (24 values) / `AgentEvent` / all `*Payload` dataclasses |
+| Symbol | Covers | More |
+|---|---|---|
+| `AgentHooks` | registering sync/async hooks | [Hooks](../user-guide/hooks.md), [full reference](../../hooks.md) |
+| `HookPoint` | lifecycle hook enum | [Hooks](../user-guide/hooks.md), [source](../../../power_loop/contracts/hooks.py) |
+| `HookDirective` | continue, skip, break, short-circuit | [Hooks](../user-guide/hooks.md), [source](../../../power_loop/contracts/hooks.py) |
+| `AgentEventBus` | event subscriptions and publication | [Events](../user-guide/events.md), [full reference](../../events.md) |
+| `AgentEventType` | typed event names | [Events](../user-guide/events.md), [source](../../../power_loop/contracts/events.py) |
 
-## Runtime
+## Runtime Helpers
 
-| Page | Covers |
-|---|---|
-| [Errors](errors.md) | `PowerLoopError` + 11 subclasses (`SessionNotFoundError` / `LLMTimeout` / `ToolNotFound` / …) |
-| [LLMRetryPolicy](retry-policy.md) | `max_attempts` / `backoff_initial` / `backoff_max` / `total_timeout` / `retry_on` |
-| [CancellationToken](cancellation.md) | `from_any()` / `is_cancelled()` / `raise_if_cancelled()` / `cancel()` |
-| [StructuredOutputSpec](structured-output.md) | `name` / `schema` / `strict` / `to_openai_response_format()` |
-| [MemoryProvider](memory.md) | Protocol: `recall()` / `remember()`; `MemorySnapshot` |
-| [LLMProviderConfig](provider-config.md) | `from_env()` / `to_openai_compatible()` / `create_llm_service_from_config()` |
-| [Compactor](compactor.md) | `Compactor` Protocol / `DefaultCompactor` / `CompactionPlan` |
-
-## Sub-agents
-
-| Page | Covers |
-|---|---|
-| [AgentSpec](agent-spec.md) | `name` / `system_prompt` / `tools` / `max_rounds` / `model` / `lifecycle` |
-| [run_agent_spec](run-agent-spec.md) | `run_agent_spec(spec, input, *, parent_loop)` / `filtered_registry()` |
+| Symbol | Covers | More |
+|---|---|---|
+| `LLMRetryPolicy` | attempts, backoff, timeout, retry filter | [Retry & Cancel](../user-guide/retry-cancel.md), [source](../../../power_loop/runtime/retry.py) |
+| `CancellationToken` | uniform cancellation shape | [Retry & Cancel](../user-guide/retry-cancel.md), [source](../../../power_loop/runtime/cancellation.py) |
+| `StructuredOutputSpec` | response-format schema | [Structured Output](../user-guide/structured-output.md), [source](../../../power_loop/runtime/structured.py) |
+| `MemoryProvider` | recall and remember protocol | [Memory](../user-guide/memory.md), [source](../../../power_loop/runtime/memory.py) |
+| `LLMProviderConfig` | provider/env configuration | [Providers](../user-guide/providers.md), [source](../../../power_loop/runtime/provider.py) |
+| `DefaultCompactor` | context summary compaction | [Compaction](../user-guide/compaction.md), [source](../../../power_loop/runtime/compact.py) |
+| `PowerLoopError` and subclasses | common exception hierarchy | [source](../../../power_loop/contracts/errors.py) |

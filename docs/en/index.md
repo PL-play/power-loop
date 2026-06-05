@@ -32,4 +32,4 @@ power-loop is an **embeddable Agent execution kernel** — not a framework, not 
 
 ## API stability
 
-See [README §5 — Public API Stability](../README.md#public-api-稳定性约定) for the three-tier stability guarantee (STABLE / PROVISIONAL / INTERNAL).
+See the [API Reference](api/index.md) for the three-tier stability guarantee (Stable / Provisional / Internal).

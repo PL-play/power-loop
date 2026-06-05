@@ -12,7 +12,7 @@ flowchart TD
     B --> C{memory configured?}
     C -->|No| G[Round loop]
     C -->|Yes| D[memory.recall]
-    D --> E[tag_as_memory → system region]
+    D --> E[tag_as_memory then system region]
     E --> F[MEMORY_RECALLED hook]
     F --> G
     G --> H[session.end]
@@ -113,7 +113,7 @@ class SqliteFactMemory:
             db.execute("INSERT OR REPLACE INTO facts VALUES (?, ?)", (key, value))
 ```
 
-Full runnable version at [`examples/13_memory_sqlite.py`](../../examples/13_memory_sqlite.py).
+Full runnable version at [`examples/13_memory_sqlite.py`](../../../examples/13_memory_sqlite.py).
 
 ## Next
 

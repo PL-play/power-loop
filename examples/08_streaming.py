@@ -26,6 +26,7 @@ from power_loop import (
     AgentEventType,
     AgentLoopConfig,
     StatefulAgentLoop,
+    StreamDeltaPayload,
 )
 
 
@@ -35,7 +36,9 @@ def make_typewriter(bus: AgentEventBus) -> None:
     chars_printed: list[int] = [0]
 
     def on_delta(event: AgentEvent) -> None:
-        text = event.data.text  # StreamDeltaPayload
+        if not isinstance(event.data, StreamDeltaPayload):
+            return
+        text = event.data.text
         if event.data.is_think:
             return                          # 跳过 reasoning 流，只渲染最终回复
         print(text, end="", flush=True)

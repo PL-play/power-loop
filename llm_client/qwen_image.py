@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
-from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
+from urllib.request import BaseHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 
 import certifi
 
@@ -156,7 +156,7 @@ def _create_ssl_context() -> ssl.SSLContext:
 
 
 def _build_url_opener(use_proxy: bool):
-    handlers = [HTTPSHandler(context=_create_ssl_context())]
+    handlers: list[BaseHandler] = [HTTPSHandler(context=_create_ssl_context())]
     if not use_proxy:
         handlers.insert(0, ProxyHandler({}))
     return build_opener(*handlers)

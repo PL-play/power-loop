@@ -2,47 +2,53 @@
 
 [English](../../en/api/index.md) | [回到文档站](../../README.md)
 
-每个公开符号的签名级文档。这些是参考页面——概念解释见 [用户手册](../user-guide/index.md)。
+本页跟踪 `import power_loop` 可用的公开表面。行为说明和示例请看关联的用户手册；精确签名以源码链接为准。
+
+## 稳定性
+
+| 层级 | 含义 |
+|---|---|
+| Stable | 跨 minor 版本保持向后兼容，列表见 `power_loop.STABLE_API`。 |
+| Provisional | 0.x 阶段从 `power_loop` 顶层导出，但仍可能调整。 |
+| Internal | `power_loop.core.*` 等子模块导入，无兼容性承诺。 |
 
 ## 核心
 
-| 页面 | 覆盖 |
-|---|---|
-| [StatefulAgentLoop](stateful-loop.md) | `send()` / `send_sync()` / `resume()` / `abort_pending()` / `close_session()` / `close()` / `get_messages()` / `get_pending()` |
-| [StatefulResult](stateful-result.md) | `session_id` / `status` / `final_text` / `rounds` / `pending_tool_calls` |
-| [AgentLoopConfig](config.md) | `system_prompt` / `max_rounds` / `temperature` / `max_tokens` / `compactor` / `retry_policy` / `memory` / `memory_budget_tokens` |
-| [SessionStore](session-store.md) | `open()` / `create_session()` / `append_message()` / `load_active_messages()` / `load_all_messages()` / `close()` |
+| 符号 | 覆盖 | 更多 |
+|---|---|---|
+| `StatefulAgentLoop` | `send`、`send_sync`、`resume`、`abort_pending`、`close_session`、`get_messages`、`get_pending` | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/agent/stateful_loop.py) |
+| `StatefulResult` | `session_id`、`status`、`final_text`、`rounds`、`pending_tool_calls` | [源码](../../../power_loop/agent/stateful_loop.py) |
+| `AgentLoopConfig` | loop 限制、temperature、压缩、重试、记忆 | [配置](../user-guide/configuration.md)、[源码](../../../power_loop/agent/types.py) |
+| `SessionStore` | SQLite 会话、消息、压缩、usage、pending 状态 | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/runtime/session_store.py) |
 
-## 工具
+## 工具与子代理
 
-| 页面 | 覆盖 |
-|---|---|
-| [ToolRegistry](tool-registry.md) | `register()` / `unregister()` / `invoke()` / `invoke_async()` / `validate()` / `to_openai_tools()` |
-| [ToolDefinition](tool-definition.md) | `name` / `description` / `input_schema` / `required_params` |
-| `AsyncToolInSyncContext` | sync `invoke()` 对 async handler 调用时抛出 |
+| 符号 | 覆盖 | 更多 |
+|---|---|---|
+| `ToolRegistry` | 注册、调用、校验、OpenAI tool 转换 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/tools/registry.py) |
+| `ToolDefinition` | 名称、描述、JSON Schema、必填参数 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/contracts/tools.py) |
+| `AgentSpec` | 声明式子代理规格 | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/runtime/spec.py) |
+| `run_agent_spec` | 直接执行子代理 | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/runtime/spec.py) |
+| `register_spawn_agent` | `spawn_agent` 和 `run_agent` meta-tool | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/tools/spawn_agent.py) |
 
-## Hooks & Events
+## Hooks 与 Events
 
-| 页面 | 覆盖 |
-|---|---|
-| [Hooks](hooks.md) | `AgentHooks` / `HookPoint`（18 个值）/ `HookDirective`（4 个值）/ 全部 `*Ctx` dataclass |
-| [Events](events.md) | `AgentEventBus` / `AgentEventType`（24 个值）/ `AgentEvent` / 全部 `*Payload` dataclass |
+| 符号 | 覆盖 | 更多 |
+|---|---|---|
+| `AgentHooks` | 注册同步/异步 hook | [Hooks](../user-guide/hooks.md)、[完整参考](../../hooks.md) |
+| `HookPoint` | 生命周期 hook 枚举 | [Hooks](../user-guide/hooks.md)、[源码](../../../power_loop/contracts/hooks.py) |
+| `HookDirective` | continue、skip、break、short-circuit | [Hooks](../user-guide/hooks.md)、[源码](../../../power_loop/contracts/hooks.py) |
+| `AgentEventBus` | event 订阅和发布 | [Events](../user-guide/events.md)、[完整参考](../../events.md) |
+| `AgentEventType` | 类型化 event 名称 | [Events](../user-guide/events.md)、[源码](../../../power_loop/contracts/events.py) |
 
-## 运行时
+## 运行时辅助
 
-| 页面 | 覆盖 |
-|---|---|
-| [Errors](errors.md) | `PowerLoopError` + 11 个子类 |
-| [LLMRetryPolicy](retry-policy.md) | `max_attempts` / `backoff_initial` / `backoff_max` / `total_timeout` / `retry_on` |
-| [CancellationToken](cancellation.md) | `from_any()` / `is_cancelled()` / `raise_if_cancelled()` / `cancel()` |
-| [StructuredOutputSpec](structured-output.md) | `name` / `schema` / `strict` / `to_openai_response_format()` |
-| [MemoryProvider](memory.md) | 协议：`recall()` / `remember()`；`MemorySnapshot` |
-| [LLMProviderConfig](provider-config.md) | `from_env()` / `to_openai_compatible()` / `create_llm_service_from_config()` |
-| [Compactor](compactor.md) | `Compactor` 协议 / `DefaultCompactor` / `CompactionPlan` |
-
-## 子代理
-
-| 页面 | 覆盖 |
-|---|---|
-| [AgentSpec](agent-spec.md) | `name` / `system_prompt` / `tools` / `max_rounds` / `model` / `lifecycle` |
-| [run_agent_spec](run-agent-spec.md) | `run_agent_spec(spec, input, *, parent_loop)` / `filtered_registry()` |
+| 符号 | 覆盖 | 更多 |
+|---|---|---|
+| `LLMRetryPolicy` | 尝试次数、退避、超时、重试过滤 | [重试与取消](../user-guide/retry-cancel.md)、[源码](../../../power_loop/runtime/retry.py) |
+| `CancellationToken` | 统一取消形状 | [重试与取消](../user-guide/retry-cancel.md)、[源码](../../../power_loop/runtime/cancellation.py) |
+| `StructuredOutputSpec` | response-format schema | [结构化输出](../user-guide/structured-output.md)、[源码](../../../power_loop/runtime/structured.py) |
+| `MemoryProvider` | `recall` / `remember` 协议 | [记忆](../user-guide/memory.md)、[源码](../../../power_loop/runtime/memory.py) |
+| `LLMProviderConfig` | provider/env 配置 | [Providers](../user-guide/providers.md)、[源码](../../../power_loop/runtime/provider.py) |
+| `DefaultCompactor` | 上下文摘要压缩 | [压缩](../user-guide/compaction.md)、[源码](../../../power_loop/runtime/compact.py) |
+| `PowerLoopError` 及子类 | 通用异常层级 | [源码](../../../power_loop/contracts/errors.py) |

@@ -70,7 +70,15 @@ class ApprovalRequest:
     response: asyncio.Future[bool] = field(default_factory=asyncio.Future)
 
 
-def build_approval_hook(queue: asyncio.Queue[ApprovalRequest]) -> AgentHooks:
+@dataclass(frozen=True)
+class _Stop:
+    pass
+
+
+ApprovalQueueItem = ApprovalRequest | _Stop
+
+
+def build_approval_hook(queue: asyncio.Queue[ApprovalQueueItem]) -> AgentHooks:
     """每次 bash 调用都派一个 ApprovalRequest 到队列，等 future。"""
     hooks = AgentHooks()
 
@@ -97,11 +105,11 @@ def build_approval_hook(queue: asyncio.Queue[ApprovalRequest]) -> AgentHooks:
 # ── 3. 审批 worker：决定每条请求是 yes / no ──────────────────────────────
 
 
-_STOP = object()  # sentinel pushed into queue to tell the worker to exit
+_STOP = _Stop()  # sentinel pushed into queue to tell the worker to exit
 
 
 async def approval_worker(
-    queue: asyncio.Queue,
+    queue: asyncio.Queue[ApprovalQueueItem],
     *,
     decide: Callable[[str], bool],
 ) -> int:
@@ -114,9 +122,9 @@ async def approval_worker(
     handled = 0
     while True:
         item = await queue.get()
-        if item is _STOP:
+        if isinstance(item, _Stop):
             return handled
-        req: ApprovalRequest = item
+        req = item
         await asyncio.sleep(0.05)                   # 模拟 UI 思考时间
         verdict = decide(req.command)
         print(f"  [worker] {req.session_id[-6:]} → {req.command!r}: "
@@ -139,7 +147,7 @@ async def drive_session(
 
 
 async def main() -> list[dict[str, Any]]:
-    queue: asyncio.Queue[ApprovalRequest] = asyncio.Queue()
+    queue: asyncio.Queue[ApprovalQueueItem] = asyncio.Queue()
 
     registry = ToolRegistry()
     registry.register(BASH_TOOL, fake_bash)
@@ -178,7 +186,7 @@ async def main() -> list[dict[str, Any]]:
     handled = await worker
     print(f"\n[worker] handled {handled} approval request(s)")
     print(f"[sessions] {len(results)} sessions completed")
-    return results
+    return list(results)
 
 
 if __name__ == "__main__":

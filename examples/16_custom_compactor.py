@@ -29,7 +29,6 @@ from _helpers import make_llm
 from power_loop import AgentLoopConfig, StatefulAgentLoop
 from power_loop.runtime.compact import CompactionPlan
 
-
 # ── 1. Tail-only 压缩器：只保留最后 N 条消息 ────────────────────────────
 
 

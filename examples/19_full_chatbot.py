@@ -48,13 +48,11 @@ from power_loop import (
     HookDirective,
     HookPoint,
     MemorySnapshot,
-    SessionStore,
     StatefulAgentLoop,
     ToolDefinition,
     ToolRegistry,
 )
 from power_loop.contracts.hook_contexts import ToolBeforeCtx
-
 
 # ── 1. Tools ─────────────────────────────────────────────────────────────
 

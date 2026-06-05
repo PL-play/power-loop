@@ -29,7 +29,6 @@ from _helpers import make_llm
 
 from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, MemorySnapshot, StatefulAgentLoop
 
-
 # ── 1. Mock HTTP API ─────────────────────────────────────────────────────
 
 

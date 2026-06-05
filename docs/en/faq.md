@@ -106,4 +106,4 @@ The compactor (default-on) keeps sessions within the token budget by summarizing
 
 ## Contributing
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for development setup, code style, and PR process.
+See [CONTRIBUTING.md](../../CONTRIBUTING.md) for development setup, code style, and PR process.

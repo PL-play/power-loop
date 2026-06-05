@@ -94,7 +94,7 @@ Deeper validation (per-field types, enum, pattern) is left to the provider's str
 
 ## Full Example
 
-See [`examples/14_structured_card.py`](../../examples/14_structured_card.py) for a runnable example with real LLM extraction + repair + schema-failure demonstration.
+See [`examples/14_structured_card.py`](../../../examples/14_structured_card.py) for a runnable example with real LLM extraction + repair + schema-failure demonstration.
 
 ## Next
 

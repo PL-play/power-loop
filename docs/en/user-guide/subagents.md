@@ -96,9 +96,9 @@ except AgentSpecError as exc:
 
 ```mermaid
 flowchart TD
-    P[Parent Session<br/>sess_abc] --> C1[Child: researcher<br/>sess_def]
-    P --> C2[Child: reviewer<br/>sess_ghi]
-    C1 --> GC1[Grandchild: searcher<br/>sess_jkl]
+    P["Parent Session sess_abc"] --> C1["Child researcher sess_def"]
+    P --> C2["Child reviewer sess_ghi"]
+    C1 --> GC1["Grandchild searcher sess_jkl"]
 ```
 
 All children share the same `SessionStore` as the parent. `close_session(parent_sid, cascade=True)` recursively deletes the entire tree.

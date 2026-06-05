@@ -84,4 +84,4 @@ Hook 能改控制流；event 不能。
 
 ## 贡献
 
-见 [CONTRIBUTING.md](../CONTRIBUTING.md) 了解开发环境、代码规范和 PR 流程。
+见 [CONTRIBUTING.md](../../CONTRIBUTING.md) 了解开发环境、代码规范和 PR 流程。

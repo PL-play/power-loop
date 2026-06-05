@@ -12,7 +12,7 @@ power-loop 是一个**可嵌入的 Agent 执行内核**——不是框架，不�
 | [用户手册](user-guide/index.md) | 深入每个功能。 |
 | [教程](tutorials/index.md) | 从零构建项目。 |
 | [API 参考](api/index.md) | 签名级文档。 |
-| [架构设计](architecture.md) | 内部机制和设计决策。 |
+| [架构设计](../architecture.md) | 内部机制和设计决策。 |
 | [迁移指南](migration.md) | 从 0.1.x 升级。 |
 | [常见问题](faq.md) | FAQ。 |
 
@@ -32,4 +32,4 @@ power-loop 是一个**可嵌入的 Agent 执行内核**——不是框架，不�
 
 ## API 稳定性
 
-见 [README §5 — Public API 稳定性约定](../README.md#public-api-稳定性约定) 的三层分级（STABLE / PROVISIONAL / INTERNAL）。
+见 [API 参考](api/index.md) 的三层分级（Stable / Provisional / Internal）。

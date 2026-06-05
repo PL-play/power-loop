@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 
-from llm_client.interface import LLMResponse
+from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     MAX_SPAWN_DEPTH,
     AgentLoopConfig,
@@ -21,19 +23,32 @@ from power_loop.tools.spawn_agent import register_spawn_agent
 
 
 @dataclass
-class _Scripted:
+class _Scripted(LLMService):
     responses: list[LLMResponse] = field(default_factory=list)
     _idx: int = 0
 
-    async def complete(self, request, **kwargs):
+    async def complete(
+        self,
+        request: LLMRequest,
+        *,
+        on_chunk_delta_text: Callable[[str], Any] | None = None,
+        on_chunk_think: Callable[[str], Any] | None = None,
+        on_stream_end: Callable[[LLMResponse], Any] | None = None,
+    ) -> LLMResponse:
         if self._idx >= len(self.responses):
             return LLMResponse(raw_text="done")
         r = self.responses[self._idx]
         self._idx += 1
         return r
 
-    async def stream(self, request): raise NotImplementedError
-    async def close(self): return None
+    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+        async def _empty() -> AsyncIterator[LLMStreamChunk]:
+            if False:
+                yield LLMStreamChunk()
+
+        return _empty()
+
+    async def close(self) -> None: return None
 
 
 def _spawn_call(call_id: str, task: str) -> LLMResponse:
@@ -67,7 +82,7 @@ def _run_agent_call(call_id: str, spec: dict, user_input: str) -> LLMResponse:
 
 
 @pytest.fixture
-def store() -> SessionStore:
+def store() -> Generator[SessionStore, None, None]:
     s = SessionStore.open(":memory:")
     yield s
     s.close()

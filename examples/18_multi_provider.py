@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import os
 
-from _helpers import make_llm
 from dotenv import load_dotenv
 
 from power_loop import (
@@ -38,9 +37,13 @@ from power_loop import (
 load_dotenv()
 
 
-def _cfg_from_env(prefix: str) -> LLMProviderConfig:
+def _cfg_from_env(prefix: str) -> LLMProviderConfig | None:
     """Read ``{prefix}_BASE_URL`` etc. from env. Falls back to OPENAI_COMPAT_*."""
-    return LLMProviderConfig.from_env(prefix=prefix)
+    try:
+        return LLMProviderConfig.from_env(prefix=prefix)
+    except ValueError as exc:
+        print(f"[{prefix}] skipped: {exc}")
+        return None
 
 
 async def run_with_provider(label: str, config: LLMProviderConfig, question: str) -> str:
@@ -64,14 +67,14 @@ async def run_with_provider(label: str, config: LLMProviderConfig, question: str
 
 async def main() -> None:
     # ── 1. Primary provider (env) ────────────────────────────────────────
-    primary = LLMProviderConfig.from_env()  # reads POWER_LOOP_*
-    if primary.is_ready:
+    primary = _cfg_from_env("POWER_LOOP")
+    if primary is not None and primary.is_ready:
         await run_with_provider("Primary", primary,
                                 "In one word: what color is the sky on a clear day?")
 
     # ── 2. Alternate provider (env with custom prefix) ───────────────────
-    alt = LLMProviderConfig.from_env(prefix="ALT_LLM")
-    if alt.is_ready:
+    alt = _cfg_from_env("ALT_LLM")
+    if alt is not None and alt.is_ready:
         await run_with_provider("Alternate", alt,
                                 "In one word: what is the opposite of hot?")
 
@@ -87,7 +90,7 @@ async def main() -> None:
     )
     print(f"[Manual] cfg.provider={manual_cfg.provider}, "
           f"cfg.model={manual_cfg.model}, "
-          f"is_ready={manual_cfg.to_openai_compatible().is_ready}")
+          f"is_ready={manual_cfg.is_ready}")
 
 
 if __name__ == "__main__":

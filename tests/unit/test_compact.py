@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 
-from llm_client.interface import LLMResponse
+from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentLoopConfig,
     MessageState,
@@ -18,12 +20,19 @@ from power_loop.runtime.compact import CompactionPlan, DefaultCompactor
 
 
 @dataclass
-class _Scripted:
+class _Scripted(LLMService):
     responses: list[LLMResponse] = field(default_factory=list)
     calls: list = field(default_factory=list)
     _idx: int = 0
 
-    async def complete(self, request, **kwargs):
+    async def complete(
+        self,
+        request: LLMRequest,
+        *,
+        on_chunk_delta_text: Callable[[str], Any] | None = None,
+        on_chunk_think: Callable[[str], Any] | None = None,
+        on_stream_end: Callable[[LLMResponse], Any] | None = None,
+    ) -> LLMResponse:
         self.calls.append(request)
         if self._idx >= len(self.responses):
             return LLMResponse(raw_text="done")
@@ -31,8 +40,14 @@ class _Scripted:
         self._idx += 1
         return r
 
-    async def stream(self, request): raise NotImplementedError
-    async def close(self): return None
+    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+        async def _empty() -> AsyncIterator[LLMStreamChunk]:
+            if False:
+                yield LLMStreamChunk()
+
+        return _empty()
+
+    async def close(self) -> None: return None
 
 
 # ── budget ──────────────────────────────────────────────────────────────
@@ -65,7 +80,7 @@ async def test_compactor_triggers_above_threshold(monkeypatch) -> None:
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     cp = DefaultCompactor(trigger_ratio=0.5, keep_last_n=1)
     summary_llm = _Scripted(responses=[LLMResponse(raw_text="<summary>folded</summary>")])
-    msgs = [
+    msgs: list[dict[str, Any]] = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "x" * 5000},
         {"role": "assistant", "content": "y" * 5000},
@@ -89,7 +104,7 @@ async def test_compactor_never_splits_assistant_tool_pair(monkeypatch) -> None:
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     cp = DefaultCompactor(trigger_ratio=0.5, keep_last_n=1)
     summary_llm = _Scripted(responses=[LLMResponse(raw_text="<summary>ok</summary>")])
-    msgs = [
+    msgs: list[dict[str, Any]] = [
         {"role": "user", "content": "u1" * 1000},
         {"role": "assistant", "content": "a1", "tool_calls": [{"id": "tc"}]},
         {"role": "tool", "tool_call_id": "tc", "content": "out" * 1000},
@@ -110,7 +125,7 @@ async def test_compactor_expands_back_to_atomic_when_tail_starts_at_tool(monkeyp
     summary_llm = _Scripted(responses=[LLMResponse(raw_text="<summary>s</summary>")])
     # Tail boundary will fall on the trailing tool. Expansion must pull the
     # boundary back to the matching assistant so the pair stays kept.
-    msgs = [
+    msgs: list[dict[str, Any]] = [
         {"role": "user", "content": "u0" * 3000},
         {"role": "assistant", "content": "a0", "tool_calls": [{"id": "tc"}]},
         {"role": "tool", "tool_call_id": "tc", "content": "x" * 3000},
@@ -129,10 +144,25 @@ async def test_compactor_expands_back_to_atomic_when_tail_starts_at_tool(monkeyp
 async def test_compactor_returns_none_on_summary_error(monkeypatch) -> None:
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     @dataclass
-    class _RaisingLLM:
-        async def complete(self, request, **kwargs): raise RuntimeError("boom")
-        async def stream(self, request): raise NotImplementedError
-        async def close(self): return None
+    class _RaisingLLM(LLMService):
+        async def complete(
+            self,
+            request: LLMRequest,
+            *,
+            on_chunk_delta_text: Callable[[str], Any] | None = None,
+            on_chunk_think: Callable[[str], Any] | None = None,
+            on_stream_end: Callable[[LLMResponse], Any] | None = None,
+        ) -> LLMResponse:
+            raise RuntimeError("boom")
+
+        def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+            async def _empty() -> AsyncIterator[LLMStreamChunk]:
+                if False:
+                    yield LLMStreamChunk()
+
+            return _empty()
+
+        async def close(self) -> None: return None
 
     cp = DefaultCompactor(trigger_ratio=0.5, keep_last_n=1, summary_llm=_RaisingLLM())
     msgs = [
@@ -171,7 +201,7 @@ async def test_env_threshold_overrides_ratio(monkeypatch) -> None:
 
 
 @pytest.fixture
-def store() -> SessionStore:
+def store() -> Generator[SessionStore, None, None]:
     s = SessionStore.open(":memory:")
     yield s
     s.close()

@@ -87,7 +87,7 @@ bus.subscribe(AgentEventType.STATUS_CHANGED, lambda e: print(
 
 The compactor uses a heuristic token estimator (~4 chars/token) defined in `power_loop/runtime/budget.py`. It's not billing-accurate but monotonic with content size — good enough for triggering decisions.
 
-See also `trim_history()` in [budget.py](../../power_loop/runtime/budget.py) for a pure-trim (no LLM) alternative.
+See also `trim_history()` in [budget.py](../../../power_loop/runtime/budget.py) for a pure-trim (no LLM) alternative.
 
 ## Next
 

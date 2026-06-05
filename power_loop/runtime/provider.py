@@ -71,6 +71,10 @@ class LLMProviderConfig:
                 f"LLMProviderConfig missing required field(s): {', '.join(missing)}"
             )
 
+    @property
+    def is_ready(self) -> bool:
+        return bool(self.base_url and self.api_key and self.model)
+
     # ── Factories ───────────────────────────────────────────────────────
 
     @classmethod

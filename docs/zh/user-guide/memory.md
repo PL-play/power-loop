@@ -69,7 +69,7 @@ async def gate_memory(ctx: MemoryRecalledCtx) -> None:
 
 ## 示例
 
-完整可运行版见 [`examples/13_memory_sqlite.py`](../../examples/13_memory_sqlite.py)（SQLite 事实库跨会话召回）。
+完整可运行版见 [`examples/13_memory_sqlite.py`](../../../examples/13_memory_sqlite.py)（SQLite 事实库跨会话召回）。
 
 ## 下一步
 
