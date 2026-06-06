@@ -168,6 +168,15 @@ class MyToolProjector(RuntimeProjector):
 
 This means session state survives a new `StatefulAgentLoop` instance that shares the same `SessionStore`. Conversation history remains the protocol log; runtime state lives beside it and is projected into the prompt only when needed.
 
+You can combine the same primitives with hooks and events for richer flow control:
+
+- A `TOOL_BEFORE` hook can rewrite tool arguments, require approval, or skip execution.
+- A `TOOL_AFTER` hook can persist derived state with `get_tool_runtime_context()`.
+- Event subscribers can observe `TOOL_CALL_STARTED` / `TOOL_CALL_COMPLETED` and drive UI, logs, or external schedulers.
+- Tool handlers can query `ctx.loop.get_messages(ctx.session_id)` or `ctx.store.get_session(ctx.session_id)` when they need session-aware behavior.
+
+The default tools use these same extension points. There is no private channel required for user-defined tools to build similar workflows.
+
 ## Error Handling
 
 ```python

@@ -167,6 +167,15 @@ class MyToolProjector(RuntimeProjector):
 
 因此，只要共享同一个 `SessionStore`，这些运行时状态可以跨新的 `StatefulAgentLoop` 实例恢复。对话历史仍然是协议日志；运行时状态保存在旁路表中，只在需要时投影进 prompt。
 
+你还可以把同一组原语和 hooks/events 组合成更复杂的流程控制：
+
+- `TOOL_BEFORE` hook 可以改写工具参数、要求审批，或跳过执行。
+- `TOOL_AFTER` hook 可以通过 `get_tool_runtime_context()` 持久化派生状态。
+- event subscriber 可以观察 `TOOL_CALL_STARTED` / `TOOL_CALL_COMPLETED`，驱动 UI、日志或外部调度器。
+- 工具 handler 需要 session 感知行为时，可以查询 `ctx.loop.get_messages(ctx.session_id)` 或 `ctx.store.get_session(ctx.session_id)`。
+
+默认工具也使用这些扩展点。用户自定义工具不需要任何私有通道，就能构建类似流程。
+
 ## 错误处理
 
 ```python
