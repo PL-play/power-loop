@@ -24,6 +24,13 @@ def _caps(provider: str, model: str, **kwargs: Any) -> ModelCapabilities:
 
 
 CAPABILITY_OVERRIDE_ENV_MAP: dict[str, str] = {
+    "POWER_LOOP_SUPPORTS_IMAGE_INPUT": "supports_image_input",
+    "POWER_LOOP_SUPPORTS_PDF_INPUT_CHAT": "supports_pdf_input_chat",
+    "POWER_LOOP_SUPPORTS_PDF_INPUT_RESPONSES": "supports_pdf_input_responses",
+    "POWER_LOOP_SUPPORTS_DATA_URL": "supports_data_url",
+    "POWER_LOOP_SUPPORTS_TOOLS": "supports_tools",
+    "POWER_LOOP_SUPPORTS_STREAM": "supports_stream",
+    # Legacy fallback (deprecated, use POWER_LOOP_* instead)
     "OPENAI_COMPAT_SUPPORTS_IMAGE_INPUT": "supports_image_input",
     "OPENAI_COMPAT_SUPPORTS_PDF_INPUT_CHAT": "supports_pdf_input_chat",
     "OPENAI_COMPAT_SUPPORTS_PDF_INPUT_RESPONSES": "supports_pdf_input_responses",
