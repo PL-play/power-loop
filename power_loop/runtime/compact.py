@@ -64,7 +64,7 @@ class Compactor(Protocol):
 # ── default implementation ──────────────────────────────────────────────
 
 
-class DefaultCompactor:
+class DefaultCompactor(Compactor):
     """Vendor-neutral compactor matching the M1.7a contract."""
 
     def __init__(

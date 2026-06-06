@@ -15,6 +15,11 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from power_loop.contracts.tools import ToolDefinition
+    from power_loop.tools.registry import ToolRegistry
 
 # ---------------------------------------------------------------------------
 # Context that sections can reference
@@ -34,6 +39,10 @@ class SystemPromptContext:
     skill_descriptions: str = ""
     tool_names: Sequence[str] = ()
     extra: str = ""
+    # Tool definitions for auto-generated catalog (M1.10).
+    # Accepts a list of ToolDefinition objects or a ToolRegistry.
+    tool_definitions: Any = None
+    tool_catalog_header: str = "# Available Tools"
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +184,79 @@ def section_skills(ctx: SystemPromptContext) -> str | None:
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Tool catalog auto-injection (M1.10)
+# ---------------------------------------------------------------------------
+
+def format_tool_catalog(
+    tools: Sequence[ToolDefinition] | ToolRegistry,
+    *,
+    header: str = "# Available Tools",
+) -> str:
+    """Generate a human-readable tool catalog from definitions or a registry.
+
+    The returned string is designed to be appended to a system prompt so
+    the agent always knows which tools are registered and what they do.
+
+    **Parameter schema is intentionally omitted** — it is already sent to
+    the LLM via the structured ``tools=`` API parameter, so duplicating
+    it in the system prompt wastes tokens and risks drift.
+
+    Parameters
+    ----------
+    tools
+        A ``ToolRegistry`` (uses ``.definitions()``) or any sequence of
+        ``ToolDefinition`` objects.
+    header
+        Section header line.  Customise via ``AgentLoopConfig.tool_catalog_header``.
+
+    Returns
+    -------
+    str
+        Empty string when *tools* is empty; otherwise a multi-line section
+        starting with *header*.
+
+    Example output::
+
+        # Available Tools
+
+        - **bash**: Execute a shell command and return its output
+        - **read_file**: Read file contents with optional offset and limit
+        - **spawn_agent**: Delegate to sub-agent
+    """
+    # Accept both ToolRegistry and plain sequences.
+    if hasattr(tools, "definitions"):
+        defs: Sequence[ToolDefinition] = tools.definitions()  # type: ignore[union-attr]
+    else:
+        defs = tools
+
+    if not defs:
+        return ""
+
+    lines = [header, ""]
+    for defn in defs:
+        lines.append(f"- **{defn.name}**: {defn.description}")
+
+    return "\n".join(lines)
+
+
+def section_tool_catalog(ctx: SystemPromptContext) -> str | None:
+    """Auto-generated tool catalog section for :class:`SystemPromptBuilder`.
+
+    Reads ``ctx.tool_definitions`` (a list of ``ToolDefinition`` or a
+    ``ToolRegistry``).  Returns ``None`` when no definitions are provided,
+    so the section is silently omitted.
+
+    This is the builder-compatible wrapper around :func:`format_tool_catalog`.
+    The pipeline's auto-injection path calls ``format_tool_catalog`` directly
+    and does NOT go through this section.
+    """
+    if ctx.tool_definitions is None:
+        return None
+    result = format_tool_catalog(ctx.tool_definitions, header=ctx.tool_catalog_header)
+    return result if result else None
+
+
 # Ordered registry of all built-in sections.
 BUILTIN_SECTIONS: dict[str, SectionRenderer] = OrderedDict([
     ("identity", section_identity),
@@ -182,6 +264,7 @@ BUILTIN_SECTIONS: dict[str, SectionRenderer] = OrderedDict([
     ("workflow", section_workflow),
     ("security", section_security),
     ("tool_guide", section_tool_guide),
+    ("tool_catalog", section_tool_catalog),
     ("paths", section_paths),
     ("todo_discipline", section_todo_discipline),
     ("skills", section_skills),

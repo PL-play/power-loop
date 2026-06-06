@@ -17,7 +17,7 @@ from typing import Any
 
 from llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.sink import MessageSink, NullSink
-from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT
+from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT, format_tool_catalog
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
     CancellationRequested,
@@ -208,8 +208,20 @@ class AgentPipeline:
         self.stop_event = stop_event if isinstance(stop_event, threading.Event) else None
         self.sink: MessageSink = sink if sink is not None else NullSink()
 
-        self.system_prompt = (config.system_prompt or DEFAULT_AGENT_SYSTEM_PROMPT).strip()
+        base_prompt = (config.system_prompt or DEFAULT_AGENT_SYSTEM_PROMPT).strip()
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
+
+        # Auto-inject tool catalog into system prompt (M1.10).
+        # The catalog lives on self.system_prompt (a plain string attribute),
+        # NOT in self.history — the compactor never touches it.
+        if config.inject_tool_descriptions and tool_registry is not None:
+            catalog = format_tool_catalog(
+                tool_registry, header=config.tool_catalog_header,
+            )
+            if catalog:
+                base_prompt = f"{base_prompt}\n\n{catalog}"
+
+        self.system_prompt = base_prompt
         self.history: list[LoopMessage] = []
         self.rounds_since_todo = 0
         self._completed_rounds = 0

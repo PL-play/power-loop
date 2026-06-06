@@ -31,6 +31,21 @@ class AgentLoopConfig:
     memory_budget_tokens: int = 1500
     skills_dir: str | None = None
 
+    # ── Tool catalog auto-injection (M1.10) ──
+    #
+    # When ``inject_tool_descriptions`` is True (default), the pipeline
+    # automatically appends a human-readable tool catalog to the resolved
+    # system prompt.  The catalog is generated from the live
+    # ``ToolRegistry`` so the agent always knows which tools are
+    # available — even when the user-supplied system prompt does not
+    # mention them.
+    #
+    # The catalog lives inside ``self.system_prompt`` (a plain string
+    # attribute on the pipeline), NOT in ``self.history``, so the
+    # compactor never touches it.
+    inject_tool_descriptions: bool = True
+    tool_catalog_header: str = "# Available Tools"
+
 
 @dataclass
 class AgentLoopResult:

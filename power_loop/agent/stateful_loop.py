@@ -24,6 +24,7 @@ from typing import Any
 
 from llm_client.interface import LLMService
 from power_loop.agent.sink import SQLiteSink
+from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT, format_tool_catalog
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import SessionNotFoundError, SessionPendingError
 from power_loop.core.agent_context import reset_current_loop, set_current_loop
@@ -209,6 +210,52 @@ class StatefulAgentLoop:
     def get_pending(self, session_id: str) -> dict[str, Any] | None:
         state = self.store.get_state(session_id)
         return state.pending if state else None
+
+    def resolve_system_prompt(self, *, session_id: str | None = None) -> str:
+        """Return the system prompt the pipeline will actually use.
+
+        This mirrors the resolution logic in
+        :meth:`AgentPipeline.__init__`: falls back to
+        ``DEFAULT_AGENT_SYSTEM_PROMPT`` when ``config.system_prompt`` is
+        ``None``, then appends the auto-generated tool catalog when
+        ``config.inject_tool_descriptions`` is enabled.
+
+        Parameters
+        ----------
+        session_id
+            Optional session id.  When provided, the session-level
+            ``system_prompt`` (set via :meth:`new_session`) takes
+            precedence over ``config.system_prompt``, matching the
+            behaviour of :meth:`_create_session`.
+
+        Returns
+        -------
+        str
+            The fully resolved prompt string — exactly what the LLM
+            will see as the system message on the next :meth:`send`
+            call.
+        """
+        # Session-level prompt wins over config-level prompt.
+        base: str | None = None
+        if session_id is not None:
+            row = self.store.get_session(session_id)
+            if row is not None:
+                base = row.system_prompt
+
+        if base is None or not base.strip():
+            base = self.config.system_prompt or DEFAULT_AGENT_SYSTEM_PROMPT
+
+        base = base.strip()
+
+        if self.config.inject_tool_descriptions and self.tool_registry is not None:
+            catalog = format_tool_catalog(
+                self.tool_registry,
+                header=self.config.tool_catalog_header,
+            )
+            if catalog:
+                base = f"{base}\n\n{catalog}"
+
+        return base
 
     # ── internals ─────────────────────────────────────────────────────────
 

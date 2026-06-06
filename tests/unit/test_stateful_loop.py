@@ -350,3 +350,117 @@ async def test_compacted_messages_excluded_from_history(store: SessionStore) -> 
     assert [m.role for m in active] == ["system", "user"]
     assert [m.state for m in active] == [MessageState.ACTIVE, MessageState.ACTIVE]
     assert active[0].name == "compact_note"
+
+
+# ── resolve_system_prompt (M1.10) ────────────────────────────────────────
+
+
+def test_resolve_system_prompt_default(store: SessionStore) -> None:
+    """No config.system_prompt → DEFAULT_AGENT_SYSTEM_PROMPT + catalog."""
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="lookup", description="Look up info",
+            input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+            required_params=("q",),
+        ),
+        lambda **kw: "ok",
+    )
+    loop = StatefulAgentLoop(llm=_Scripted(), store=store, tool_registry=reg)
+    resolved = loop.resolve_system_prompt()
+    # Should contain the default prompt text
+    assert "interactive coding agent" in resolved
+    # Should contain the auto-injected tool catalog (name + description only)
+    assert "# Available Tools" in resolved
+    assert "- **lookup**: Look up info" in resolved
+    # Parameter schema should NOT be in the catalog (it's in tools= API param)
+    assert "q*(string)" not in resolved
+
+
+def test_resolve_system_prompt_with_config(store: SessionStore) -> None:
+    """Custom system_prompt + tool catalog appended."""
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="calc", description="Calculate",
+            input_schema={"type": "object", "properties": {"expr": {"type": "string"}}},
+            required_params=("expr",),
+        ),
+        lambda **kw: "42",
+    )
+    cfg = AgentLoopConfig(system_prompt="You are a math bot.")
+    loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=reg)
+    resolved = loop.resolve_system_prompt()
+    assert resolved.startswith("You are a math bot.")
+    assert "# Available Tools" in resolved
+    assert "- **calc**:" in resolved
+
+
+def test_resolve_system_prompt_injection_disabled(store: SessionStore) -> None:
+    """inject_tool_descriptions=False → no catalog appended."""
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="ping", description="Ping",
+            input_schema={"type": "object", "properties": {}},
+            required_params=(),
+        ),
+        lambda **kw: "pong",
+    )
+    cfg = AgentLoopConfig(system_prompt="Hello.", inject_tool_descriptions=False)
+    loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=reg)
+    resolved = loop.resolve_system_prompt()
+    assert resolved == "Hello."
+    assert "# Available Tools" not in resolved
+
+
+def test_resolve_system_prompt_no_registry(store: SessionStore) -> None:
+    """No tool_registry → no catalog appended."""
+    cfg = AgentLoopConfig(system_prompt="No tools here.")
+    loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=None)
+    resolved = loop.resolve_system_prompt()
+    assert resolved == "No tools here."
+
+
+def test_resolve_system_prompt_custom_header(store: SessionStore) -> None:
+    """Custom tool_catalog_header is respected."""
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="x", description="X tool",
+            input_schema={"type": "object", "properties": {}},
+            required_params=(),
+        ),
+        lambda **kw: "",
+    )
+    cfg = AgentLoopConfig(
+        system_prompt="Hi.",
+        tool_catalog_header="# Tool Reference",
+    )
+    loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=reg)
+    resolved = loop.resolve_system_prompt()
+    assert "# Tool Reference" in resolved
+    assert "# Available Tools" not in resolved
+
+
+def test_resolve_system_prompt_session_override(store: SessionStore) -> None:
+    """Session-level system_prompt overrides config-level prompt."""
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="t", description="T",
+            input_schema={"type": "object", "properties": {}},
+            required_params=(),
+        ),
+        lambda **kw: "",
+    )
+    cfg = AgentLoopConfig(system_prompt="Config prompt.")
+    loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=reg)
+    # Create session with override
+    sid = loop.new_session(system_prompt="Session prompt.")
+    resolved = loop.resolve_system_prompt(session_id=sid)
+    assert resolved.startswith("Session prompt.")
+    assert "Config prompt." not in resolved
+    # Catalog is still appended
+    assert "# Available Tools" in resolved
+

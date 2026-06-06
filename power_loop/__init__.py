@@ -32,6 +32,7 @@ from power_loop.agent.system_prompt import (
     build_agent_system_prompt,
     build_explore_subagent_system_prompt,
     build_subagent_system_prompt,
+    format_tool_catalog,
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult
 from power_loop.contracts.errors import (
@@ -313,6 +314,7 @@ __all__ = [
 	"build_agent_system_prompt",
 	"build_subagent_system_prompt",
 	"build_explore_subagent_system_prompt",
+	"format_tool_catalog",
 	"register_spawn_agent",
 	"SPAWN_AGENT_DEFINITION",
 	"RUN_AGENT_DEFINITION",
