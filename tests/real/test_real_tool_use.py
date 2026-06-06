@@ -66,7 +66,8 @@ async def test_tool_round_routes_through_registry_and_judges_answer() -> None:
             tool_registry=_build_registry(call_log),
         )
         q = "What is Lima's signature dish? Be brief."
-        r = await loop.send(q)
+        sid = loop.new_session()
+        r = await loop.send(q, session_id=sid)
         assert r.status == "completed"
         assert "lima" in call_log, (
             f"the model did not invoke the lookup tool; call_log={call_log}"

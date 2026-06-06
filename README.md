@@ -43,8 +43,9 @@ async def main() -> None:
         ),
     )
 
-    first = await loop.send("My favorite color is teal.")
-    second = await loop.send("What is my favorite color?", session_id=first.session_id)
+    sid = loop.new_session(metadata={"user_id": "demo"})
+    first = await loop.send("My favorite color is teal.", session_id=sid)
+    second = await loop.send("What is my favorite color?", session_id=sid)
 
     print(second.final_text)
 

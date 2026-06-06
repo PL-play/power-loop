@@ -106,10 +106,9 @@ async def main() -> None:
             "My hobby is hiking.",
             "I drink coffee every morning.",
         ]
-        sid = None
+        sid = loop.new_session()
         for fact in facts:
             r = await loop.send(f"Remember: {fact}", session_id=sid)
-            sid = r.session_id
 
         # Now ask — the compactor should have triggered, but the last few
         # exchanges (with the most recent facts) should still be in context.

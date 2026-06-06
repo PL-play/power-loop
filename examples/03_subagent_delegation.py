@@ -49,8 +49,10 @@ async def main() -> str:
                 compactor=None,
             ),
         )
+        sid = loop.new_session()
         result = await loop.send(
-            "Delegate this and report back: what is the capital of Japan?"
+            "Delegate this and report back: what is the capital of Japan?",
+            session_id=sid,
         )
         print(f"status        : {result.status}, rounds: {result.rounds}")
         print(f"reply         : {result.final_text}")

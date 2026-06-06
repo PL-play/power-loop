@@ -10,7 +10,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 
 | # | File | Concept | Key APIs |
 |---|---|---|---|
-| 00 | [`hello_world.py`](00_hello_world.py) | Minimal send | `StatefulAgentLoop`, `send()` |
+| 00 | [`hello_world.py`](00_hello_world.py) | Explicit session + send | `StatefulAgentLoop`, `new_session()`, `send()` |
 | 01 | [`multi_turn_chat.py`](01_multi_turn_chat.py) | Multi-turn conversation | `session_id`, `get_messages()` |
 | 02 | [`tool_calling.py`](02_tool_calling.py) | Custom tool + JSON Schema | `ToolRegistry`, `ToolDefinition` |
 | 03 | [`subagent_delegation.py`](03_subagent_delegation.py) | Imperative sub-agent | `spawn_agent`, `EPHEMERAL` |

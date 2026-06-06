@@ -30,7 +30,8 @@ loop = StatefulAgentLoop(
     ),
 )
 
-result = await loop.send("Find where authentication logic is defined in this project.")
+sid = loop.new_session()
+result = await loop.send("Find where authentication logic is defined in this project.", session_id=sid)
 # LLM: spawn_agent(task="search for auth code", preset="explore")
 # → child runs its own loop → parent gets the result
 ```

@@ -69,8 +69,10 @@ async def main() -> str:
             compactor=None,
         ),
     )
+    sid = loop.new_session()
     r = await loop.send(
-        "Explain in 3 short sentences why HTTPS is more secure than HTTP."
+        "Explain in 3 short sentences why HTTPS is more secure than HTTP.",
+        session_id=sid,
     )
     # final_text 与流式拼出的内容应该一致
     print(f"\n[result] status={r.status}, final_text len={len(r.final_text)}")

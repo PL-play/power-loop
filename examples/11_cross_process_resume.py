@@ -58,10 +58,11 @@ async def phase1(db_path: str) -> str:
         config=AgentLoopConfig(system_prompt=SYSTEM, max_rounds=1, compactor=None),
     )
     try:
-        r = await loop.send("记住：我叫阿岚，最喜欢的数字是 37。回一句确认就好。")
-        print(f"[phase1] sid={r.session_id}")
+        sid = loop.new_session()
+        r = await loop.send("记住：我叫阿岚，最喜欢的数字是 37。回一句确认就好。", session_id=sid)
+        print(f"[phase1] sid={sid}")
         print(f"[phase1] reply={r.final_text}")
-        return r.session_id
+        return sid
     finally:
         loop.close()
 

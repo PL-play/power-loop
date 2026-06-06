@@ -194,7 +194,8 @@ async def test_pipeline_retry_then_succeed_emits_retry_event() -> None:
             llm=llm, store=store, bus=bus,
             retry=LLMRetryPolicy(max_attempts=3, backoff_initial=0.001, backoff_max=0.001),
         )
-        r = await loop.send("hi")
+        sid = loop.new_session()
+        r = await loop.send("hi", session_id=sid)
         assert r.status == "completed"
         assert r.final_text == "hello"
         assert llm.calls == 3
@@ -216,7 +217,8 @@ async def test_pipeline_retry_exhausted_degrades() -> None:
             llm=llm, store=store, bus=bus, max_rounds=2,
             retry=LLMRetryPolicy(max_attempts=2, backoff_initial=0.001, backoff_max=0.001),
         )
-        r = await loop.send("hi")
+        sid = loop.new_session()
+        r = await loop.send("hi", session_id=sid)
         assert r.status == "degraded"
         assert "degraded" in r.final_text
         assert any(e.type == AgentEventType.LLM_DEGRADED for e in events)
@@ -244,7 +246,8 @@ async def test_pipeline_cancel_status_and_event() -> None:
             await asyncio.sleep(0.05)
             token.cancel("external_stop")
 
-        send_task = asyncio.create_task(loop.send("hi", stop_event=token))
+        sid = loop.new_session()
+        send_task = asyncio.create_task(loop.send("hi", session_id=sid, stop_event=token))
         await cancel_soon()
         result = await send_task
         assert result.status == "cancelled"

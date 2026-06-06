@@ -50,7 +50,7 @@ Passed to `remember()` at session end:
 | `final_text` | `str` | The last assistant reply |
 | `rounds` | `int` | Total rounds completed |
 | `status` | `str` | `"completed"` / `"cancelled"` / `"degraded"` / `"hit_round_limit"` |
-| `metadata` | `dict` | Caller-provided metadata from `send(metadata=...)` |
+| `metadata` | `dict` | Caller-provided metadata from `new_session(metadata=...)` |
 
 ## Injection Position
 

@@ -30,7 +30,8 @@ loop = StatefulAgentLoop(
     ),
 )
 
-result = await loop.send("找到项目中的认证逻辑代码。")
+sid = loop.new_session()
+result = await loop.send("找到项目中的认证逻辑代码。", session_id=sid)
 # LLM: spawn_agent(task="搜索认证代码", preset="explore")
 # → 子代理跑自己的循环 → 父代理拿到结果
 ```

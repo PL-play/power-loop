@@ -4,7 +4,7 @@
 
 **目标**：构建一个带持久化历史的多轮 CLI 聊天机器人——50 行 Python。
 
-**你会学到**：`StatefulAgentLoop`、`send()`、`session_id` 多轮、会话持久化、`get_messages()`。
+**你会学到**：`StatefulAgentLoop`、`new_session()`、`send()`、`session_id` 多轮、会话持久化、`get_messages()`。
 
 ## 1. 环境
 
@@ -37,12 +37,13 @@ async def main():
             max_rounds=1,
         ),
     )
+    session_id = loop.new_session()
 
     while True:
         user_input = input("\nYou: ")
         if user_input.lower() in ("exit", "quit"):
             break
-        result = await loop.send(user_input)
+        result = await loop.send(user_input, session_id=session_id)
         print(f"Bot: {result.final_text}")
 
     loop.close()
@@ -52,20 +53,19 @@ asyncio.run(main())
 
 ## 3. 多轮对话——记住上下文
 
-上面每次 `send` 创建新会话。持有一个 `session_id`：
+上面启动时显式创建一个会话。输入 `new` 时再创建新的 `session_id`：
 
 ```python
-session_id = None
+session_id = loop.new_session()
 
 while True:
     user_input = input("\nYou: ")
     if user_input.lower() == "new":
-        session_id = None
+        session_id = loop.new_session()
         print("[新会话]")
         continue
 
     result = await loop.send(user_input, session_id=session_id)
-    session_id = result.session_id
     print(f"Bot: {result.final_text}")
 ```
 
@@ -104,7 +104,7 @@ async def main():
             max_rounds=1,
         ),
     )
-    session_id = None
+    session_id = loop.new_session()
     try:
         print("Chatbot (输入 'new' 新会话, 'exit' 退出)")
         while True:
@@ -112,9 +112,8 @@ async def main():
             if not user_input: continue
             if user_input.lower() == "exit": break
             if user_input.lower() == "new":
-                session_id = None; print("[新会话]"); continue
+                session_id = loop.new_session(); print("[新会话]"); continue
             result = await loop.send(user_input, session_id=session_id)
-            session_id = result.session_id
             print(f"Bot: {result.final_text}")
     finally:
         loop.close()

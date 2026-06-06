@@ -64,7 +64,10 @@ sequenceDiagram
     participant LLM
     participant Tool as ToolRegistry
 
-    Caller->>SAL: send(user_input, session_id=?)
+    Caller->>SAL: new_session()
+    SAL->>Store: create_session()
+    Store-->>SAL: sid
+    Caller->>SAL: send(user_input, session_id=sid)
     SAL->>Store: load_active_messages(sid)
     SAL->>Pipeline: run(history)
     Pipeline->>Pipeline: session.start hook

@@ -67,8 +67,9 @@ async def cancel_soon():
     await asyncio.sleep(2)
     token.cancel("timeout")
 
+sid = loop.new_session()
 await asyncio.gather(
-    loop.send("long task", stop_event=token),
+    loop.send("long task", session_id=sid, stop_event=token),
     cancel_soon(),
 )
 # send 中抛出 CancellationRequested → pipeline 转为 status="cancelled"

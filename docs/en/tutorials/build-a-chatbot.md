@@ -4,7 +4,7 @@
 
 **Goal**: Build a multi-turn CLI chatbot with persistent session history — 50 lines of Python.
 
-**You'll learn**: `StatefulAgentLoop`, `send()`, multi-turn with `session_id`, session persistence, `get_messages()`.
+**You'll learn**: `StatefulAgentLoop`, `new_session()`, `send()`, multi-turn with `session_id`, session persistence, `get_messages()`.
 
 ## 1. Setup
 
@@ -37,12 +37,13 @@ async def main():
             max_rounds=1,
         ),
     )
+    session_id = loop.new_session()
 
     while True:
         user_input = input("\nYou: ")
         if user_input.lower() in ("exit", "quit"):
             break
-        result = await loop.send(user_input)
+        result = await loop.send(user_input, session_id=session_id)
         print(f"Bot: {result.final_text}")
 
     loop.close()
@@ -60,7 +61,7 @@ You: exit
 
 ## 3. Multi-Turn — Remember Context
 
-The bot above creates a **new session** every time. Let's keep a `session_id`:
+The bot above creates one explicit session and reuses it. To start fresh on demand, create a new `session_id`:
 
 ```python
 async def main():
@@ -74,7 +75,7 @@ async def main():
         ),
     )
 
-    session_id = None
+    session_id = loop.new_session()
 
     print("Chatbot (type 'new' for fresh session, 'exit' to quit)")
     while True:
@@ -82,12 +83,11 @@ async def main():
         if user_input.lower() == "exit":
             break
         if user_input.lower() == "new":
-            session_id = None
+            session_id = loop.new_session()
             print("[New session started]")
             continue
 
         result = await loop.send(user_input, session_id=session_id)
-        session_id = result.session_id
         print(f"Bot: {result.final_text}")
 
     loop.close()
@@ -141,7 +141,7 @@ async def main():
         ),
     )
 
-    session_id = None
+    session_id = loop.new_session()
     print("Chatbot (type 'new', 'history', or 'exit')")
     try:
         while True:
@@ -151,16 +151,15 @@ async def main():
             if user_input.lower() == "exit":
                 break
             if user_input.lower() == "new":
-                session_id = None
+                session_id = loop.new_session()
                 print("[New session]")
                 continue
-            if user_input.lower() == "history" and session_id:
+            if user_input.lower() == "history":
                 for m in loop.get_messages(session_id):
                     print(f"  [{m['role']}] {m.get('content', '')[:100]}")
                 continue
 
             result = await loop.send(user_input, session_id=session_id)
-            session_id = result.session_id
             print(f"Bot: {result.final_text}")
     finally:
         loop.close()

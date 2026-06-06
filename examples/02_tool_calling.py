@@ -80,7 +80,8 @@ async def main() -> str:
             compactor=None,
         ),
     )
-    result = await loop.send("What is Bangkok's signature dish?")
+    sid = loop.new_session()
+    result = await loop.send("What is Bangkok's signature dish?", session_id=sid)
     print(f"status: {result.status}, rounds: {result.rounds}")
     print(f"reply : {result.final_text}")
     return result.final_text

@@ -101,7 +101,8 @@ async def main() -> Path:
             compactor=None,
         ),
     )
-    r = await loop.send("Echo back the phrase: 'audit log demo'.")
+    sid = loop.new_session()
+    r = await loop.send("Echo back the phrase: 'audit log demo'.", session_id=sid)
     print(f"\n[reply] {r.final_text}\n")
 
     # 看一眼 audit 文件长什么样

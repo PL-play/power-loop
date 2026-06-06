@@ -2,21 +2,21 @@
 
 [English](../../en/user-guide/sessions.md) | [用户手册](../index.md)
 
-会话是 power-loop 中的对话单位。每次 `send()` 创建或延续一个会话——库管理历史、持久化和恢复。
+会话是 power-loop 中的对话单位。先用 `new_session()` 显式创建会话，再把返回的 `session_id` 传给每次 `send()`。库按这个 id 管理历史、持久化和恢复。
 
 ## 会话生命周期
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: send(user_input)
-    Active --> Active: send(user_input, session_id=...)
+    [*] --> Active: new_session()
+    Active --> Active: send(user_input, session_id=sid)
     Active --> Closed: close_session(sid)
     Active --> Pending: 工具调用中崩溃
     Pending --> Active: resume(sid) 或 abort_pending(sid)
     Closed --> [*]
 ```
 
-1. **创建**——调用 `send(user_input)` 时不传 `session_id`。
+1. **创建**——调用 `new_session()`。
 2. **延续**——后续 `send()` 传入相同 `session_id`。
 3. **悬挂**——进程在 `assistant(tool_calls)` 和最后一个 `tool` 消息之间崩溃。
 4. **关闭**——显式调用 `close_session(sid, cascade=True)`。
@@ -27,8 +27,8 @@ stateDiagram-v2
 loop = StatefulAgentLoop(llm=llm, config=config)
 
 # 新会话
-r1 = await loop.send("你好，我叫阿岚。")
-sid = r1.session_id  # → "sess_abc123..."
+sid = loop.new_session()  # → "sess_abc123..."
+r1 = await loop.send("你好，我叫阿岚。", session_id=sid)
 
 # 继续
 r2 = await loop.send("我叫什么？", session_id=sid)
@@ -91,8 +91,8 @@ db 文件是持久化锚点。在新进程中打开并继续：
 ```python
 # 进程 1
 loop = StatefulAgentLoop(llm=llm, db_path="./chat.db", config=config)
-r1 = await loop.send("记住：我喜欢的颜色是蓝色。")
-sid = r1.session_id
+sid = loop.new_session()
+r1 = await loop.send("记住：我喜欢的颜色是蓝色。", session_id=sid)
 loop.close()
 
 # 进程 2 —— 几小时后，不同的 Python 进程

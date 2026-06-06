@@ -71,11 +71,13 @@ loop = StatefulAgentLoop(
 ## 3. Run
 
 ```python
-result = await loop.send("What's the weather in Tokyo?")
+sid = loop.new_session()
+
+result = await loop.send("What's the weather in Tokyo?", session_id=sid)
 print(result.final_text)
 # Output: "The weather in Tokyo is sunny, 22°C."
 
-result = await loop.send("Search for Python async patterns")
+result = await loop.send("Search for Python async patterns", session_id=sid)
 print(result.final_text)
 # Output: "Search results for 'Python async patterns': (mock result)"
 ```
@@ -173,7 +175,8 @@ async def main():
         ),
     )
     try:
-        result = await loop.send("What's the weather in Tokyo?")
+        sid = loop.new_session()
+        result = await loop.send("What's the weather in Tokyo?", session_id=sid)
         print(f"Bot: {result.final_text}")
     finally:
         loop.close()

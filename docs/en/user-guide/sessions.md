@@ -2,22 +2,22 @@
 
 [中文](../../zh/user-guide/sessions.md) | [User Guide](../index.md)
 
-Sessions are the unit of conversation in power-loop. Each `send()` creates or continues a session — the library manages history, persistence, and recovery.
+Sessions are the unit of conversation in power-loop. Create one explicitly with `new_session()`, then pass its `session_id` to every `send()` call. The library manages history, persistence, and recovery for that id.
 
 ## Session Lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Active: send(user_input)
-    Active --> Active: send(user_input, session_id=...)
+    [*] --> Active: new_session()
+    Active --> Active: send(user_input, session_id=sid)
     Active --> Closed: close_session(sid)
     Active --> Pending: crash during tool_calls
     Pending --> Active: resume(sid) or abort_pending(sid)
     Closed --> [*]
 ```
 
-1. **Created** when you call `send(user_input)` without a `session_id`.
-2. **Continued** when you pass the same `session_id` to subsequent `send()` calls.
+1. **Created** when you call `new_session()`.
+2. **Continued** when you pass that `session_id` to `send()`.
 3. **Pending** if the process crashes between `assistant(tool_calls)` and the last `tool` message.
 4. **Closed** explicitly via `close_session(sid, cascade=True)`.
 
@@ -27,8 +27,8 @@ stateDiagram-v2
 loop = StatefulAgentLoop(llm=llm, config=config)
 
 # New session
-r1 = await loop.send("Hello, my name is Alan.")
-sid = r1.session_id  # → "sess_abc123..."
+sid = loop.new_session()  # → "sess_abc123..."
+r1 = await loop.send("Hello, my name is Alan.", session_id=sid)
 
 # Continue
 r2 = await loop.send("What is my name?", session_id=sid)
@@ -92,8 +92,8 @@ The db file is the persistence anchor. Open it in a new process and continue:
 ```python
 # Process 1
 loop = StatefulAgentLoop(llm=llm, db_path="./chat.db", config=config)
-r1 = await loop.send("Remember: my favorite color is blue.")
-sid = r1.session_id
+sid = loop.new_session()
+r1 = await loop.send("Remember: my favorite color is blue.", session_id=sid)
 loop.close()
 
 # Process 2 — hours later, different Python process

@@ -77,7 +77,8 @@ async def test_real_llm_retries_through_transient_then_completes() -> None:
                 ),
             ),
         )
-        r = await loop.send("Reply with the single word OK.")
+        sid = loop.new_session()
+        r = await loop.send("Reply with the single word OK.", session_id=sid)
         assert r.status == "completed", r
         assert llm.calls == 3
         retry_events = [e for e in events if e.type == AgentEventType.LLM_RETRY_ATTEMPTED]
@@ -110,7 +111,8 @@ async def test_real_llm_path_degrades_when_all_attempts_fail() -> None:
                 ),
             ),
         )
-        r = await loop.send("anything")
+        sid = loop.new_session()
+        r = await loop.send("anything", session_id=sid)
         assert r.status == "degraded"
         assert "degraded" in r.final_text
         assert any(e.type == AgentEventType.LLM_DEGRADED for e in events)

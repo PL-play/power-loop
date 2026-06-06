@@ -2,7 +2,7 @@
 
 [中文](../../zh/user-guide/quickstart.md) | [User Guide](../index.md)
 
-This single-page tutorial takes you from `send("hello")` all the way to sub-agents, compaction, and cross-process resume. Each section builds on the last. Run the code as you go.
+This single-page tutorial takes you from `new_session()` + `send(...)` all the way to sub-agents, compaction, and cross-process resume. Each section builds on the last. Run the code as you go.
 
 > **Prerequisites**: Install power-loop and set `POWER_LOOP_*` env vars. See [Getting Started](../getting-started.md).
 
@@ -24,7 +24,8 @@ async def main():
             max_rounds=1,
         ),
     )
-    result = await loop.send("Hello!")
+    sid = loop.new_session()
+    result = await loop.send("Hello!", session_id=sid)
     print(result.final_text)
     # → "Hello! How can I help?"
 
@@ -32,21 +33,22 @@ asyncio.run(main())
 ```
 
 **Key points**:
-- `send()` creates a new session and returns a `StatefulResult`.
+- `new_session()` creates the conversation; `send(..., session_id=sid)` appends the user turn and returns a `StatefulResult`.
 - `max_rounds=1` means "one LLM call, no tools" — the simplest possible loop.
 
 ## 2. Multi-Turn — Keep the Conversation Going
 
 ```python
-r1 = await loop.send("My name is Alan.")
-print(r1.session_id)  # e.g., "sess_abc123..."
+sid = loop.new_session()
+r1 = await loop.send("My name is Alan.", session_id=sid)
+print(sid)  # e.g., "sess_abc123..."
 
-r2 = await loop.send("What is my name?", session_id=r1.session_id)
+r2 = await loop.send("What is my name?", session_id=sid)
 print(r2.final_text)  # → "Your name is Alan."
 ```
 
 **Key points**:
-- Pass the `session_id` from the first result to continue the same conversation.
+- Pass the same `session_id` to continue the same conversation.
 - The library loads the full history from SQLite — you never manage `messages` yourself.
 - `loop.get_messages(sid)` returns the active history if you need it.
 
@@ -81,7 +83,8 @@ loop = StatefulAgentLoop(
     ),
 )
 
-result = await loop.send("What's the weather in Tokyo?")
+sid = loop.new_session()
+result = await loop.send("What's the weather in Tokyo?", session_id=sid)
 # LLM calls get_weather(city="Tokyo") → result.final_text mentions "sunny, 22°C"
 ```
 
@@ -110,9 +113,11 @@ loop = StatefulAgentLoop(
     ),
 )
 
+sid = loop.new_session()
 result = await loop.send(
     "Research: find the population of Tokyo, then tell me if it's "
-    "larger than London's population."
+    "larger than London's population.",
+    session_id=sid,
 )
 # LLM spawns a sub-agent → sub-agent runs its own loop → parent gets result
 ```
@@ -170,8 +175,8 @@ loop = StatefulAgentLoop(llm=llm, event_bus=bus, ...)
 ```python
 # Process 1
 loop = StatefulAgentLoop(llm=llm, db_path="./chat.db", ...)
-r1 = await loop.send("Remember: my name is Alan.")
-sid = r1.session_id
+sid = loop.new_session()
+r1 = await loop.send("Remember: my name is Alan.", session_id=sid)
 loop.close()
 
 # Process 2 (hours later, different Python process)

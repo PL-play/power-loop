@@ -1,9 +1,9 @@
 """StatefulAgentLoop — the single public entry point for power-loop.
 
-Owns a :class:`SessionStore` and gives callers a stateful, ``send(user_input,
-session_id=...)`` interface. Everything else — pipeline orchestration, hooks,
-events, tool invocation, persistence, pending-state machine — is wired up
-internally.
+Owns a :class:`SessionStore` and gives callers a stateful,
+``new_session()`` + ``send(user_input, session_id=...)`` interface.
+Everything else — pipeline orchestration, hooks, events, tool invocation,
+persistence, pending-state machine — is wired up internally.
 
 Failure model
 -------------
@@ -100,23 +100,37 @@ class StatefulAgentLoop:
 
     # ── primary API ───────────────────────────────────────────────────────
 
+    def new_session(
+        self,
+        *,
+        metadata: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
+    ) -> str:
+        """Create an empty session and return its id.
+
+        Call this before the first :meth:`send`. Keeping session creation
+        explicit makes ownership clear for web handlers, CLIs, background
+        jobs, and tests: every send targets an existing session id.
+        """
+        return self._create_session(metadata=metadata, system_prompt=system_prompt)
+
     async def send(
         self,
         user_input: str | LoopMessage,
-        session_id: str | None = None,
+        session_id: str,
         *,
-        metadata: dict[str, Any] | None = None,
         stop_event: CancellationLike = None,
     ) -> StatefulResult:
         """Append one user input to the session and run the loop.
 
-        Creates a new session if ``session_id`` is ``None``.
+        ``session_id`` must refer to an existing session created by
+        :meth:`new_session` (or by lower-level ``SessionStore`` APIs).
 
         Raises :class:`SessionPendingError` if the session has unresolved
         tool_calls; the caller must call :meth:`resume` or
         :meth:`abort_pending` first.
         """
-        sid = session_id or self._create_session(metadata=metadata)
+        sid = session_id
         async with self._lock_for(sid):
             self._ensure_session_or_raise(sid)
             self._raise_if_pending(sid)
@@ -126,13 +140,12 @@ class StatefulAgentLoop:
     def send_sync(
         self,
         user_input: str | LoopMessage,
-        session_id: str | None = None,
+        session_id: str,
         *,
-        metadata: dict[str, Any] | None = None,
         stop_event: CancellationLike = None,
     ) -> StatefulResult:
         return asyncio.run(
-            self.send(user_input, session_id, metadata=metadata, stop_event=stop_event)
+            self.send(user_input, session_id, stop_event=stop_event)
         )
 
     async def resume(

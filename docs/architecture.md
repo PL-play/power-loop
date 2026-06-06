@@ -60,8 +60,10 @@ sequenceDiagram
     participant LLM
     participant Tools as ToolRegistry
 
-    Caller->>Loop: send(user_input, session_id)
-    Loop->>Store: create or load session
+    Caller->>Loop: new_session()
+    Loop->>Store: create_session()
+    Store-->>Loop: sid
+    Caller->>Loop: send(user_input, session_id=sid)
     Loop->>Store: append user message
     Loop->>Store: load active messages
     Loop->>Pipeline: run(history)

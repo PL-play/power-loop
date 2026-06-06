@@ -72,7 +72,8 @@ async def judge_async(
             f"ANSWER:\n{answer}\n\n"
             f"RUBRIC (all must hold):\n{rubric}"
         )
-        result = await loop.send(user_msg)
+        sid = loop.new_session()
+        result = await loop.send(user_msg, session_id=sid)
         return _parse_verdict(result.final_text)
     finally:
         store.close()

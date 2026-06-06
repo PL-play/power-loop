@@ -28,7 +28,8 @@ async def test_single_send_returns_meaningful_reply() -> None:
             ),
         )
         q = "In one sentence, explain what HTTP stands for."
-        r = await loop.send(q)
+        sid = loop.new_session()
+        r = await loop.send(q, session_id=sid)
         assert r.status == "completed"
         assert r.final_text.strip()
         await assert_passes(
@@ -62,12 +63,13 @@ async def test_multi_turn_carries_session_history() -> None:
                 compactor=None,
             ),
         )
-        r1 = await loop.send("My favorite color is teal. Acknowledge briefly.")
+        sid = loop.new_session()
+        r1 = await loop.send("My favorite color is teal. Acknowledge briefly.", session_id=sid)
         assert r1.status == "completed"
 
         followup = "What did I just say my favorite color was?"
-        r2 = await loop.send(followup, session_id=r1.session_id)
-        assert r2.session_id == r1.session_id
+        r2 = await loop.send(followup, session_id=sid)
+        assert r2.session_id == sid
         await assert_passes(
             question=followup,
             answer=r2.final_text,
@@ -93,7 +95,8 @@ async def test_close_session_removes_history_from_store() -> None:
                 compactor=None,
             ),
         )
-        r = await loop.send("Say OK.")
+        sid = loop.new_session()
+        r = await loop.send("Say OK.", session_id=sid)
         assert store.get_session(r.session_id) is not None
         deleted = loop.close_session(r.session_id)
         assert deleted >= 1

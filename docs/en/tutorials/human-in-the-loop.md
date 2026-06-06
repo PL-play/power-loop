@@ -113,7 +113,8 @@ async def main():
 
     worker = asyncio.create_task(approval_worker())
     try:
-        result = await loop.send("List files in the current directory.")
+        sid = loop.new_session()
+        result = await loop.send("List files in the current directory.", session_id=sid)
         print(f"Bot: {result.final_text}")
     finally:
         worker.cancel()
@@ -129,7 +130,8 @@ sequenceDiagram
     participant H as TOOL_BEFORE Hook
     participant Q as asyncio.Queue
 
-    U->>L: send("delete cache.tmp")
+    U->>L: new_session()
+    U->>L: send("delete cache.tmp", session_id=sid)
     L->>L: LLM: bash(rm cache.tmp)
     L->>H: TOOL_BEFORE(bash, rm cache.tmp)
     H->>Q: put(ApprovalRequest)

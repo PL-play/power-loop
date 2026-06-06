@@ -95,7 +95,8 @@ async def scenario_completed_after_retries() -> None:
                 ),
             ),
         )
-        r = await loop.send("hi")
+        sid = loop.new_session()
+        r = await loop.send("hi", session_id=sid)
         print(f"  status={r.status} llm_calls={llm.calls} text={r.final_text.strip()!r}")
         print(f"  events: {[e.type.value for e in seen]}")
     finally:
@@ -121,7 +122,8 @@ async def scenario_degraded() -> None:
                 ),
             ),
         )
-        r = await loop.send("hi")
+        sid = loop.new_session()
+        r = await loop.send("hi", session_id=sid)
         print(f"  status={r.status} llm_calls={llm.calls}")
         print(f"  final_text={r.final_text!r}")
         print(f"  events: {[e.type.value for e in seen]}")
@@ -154,7 +156,8 @@ async def scenario_cancelled() -> None:
             await asyncio.sleep(0.2)              # 让 loop 进入第一次 retry sleep
             token.cancel("user_pressed_stop")
 
-        send_task = asyncio.create_task(loop.send("hi", stop_event=token))
+        sid = loop.new_session()
+        send_task = asyncio.create_task(loop.send("hi", session_id=sid, stop_event=token))
         await trip_cancel()
         r = await send_task
         print(f"  status={r.status} llm_calls={llm.calls}")

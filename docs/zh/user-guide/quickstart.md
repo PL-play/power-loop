@@ -2,7 +2,7 @@
 
 [English](../../en/user-guide/quickstart.md) | [用户手册](../index.md)
 
-本页带你从 `send("你好")` 一直走到子代理、上下文压缩和跨进程恢复。每节在前一节基础上推进。边看边跑代码。
+本页带你从 `new_session()` + `send(...)` 一直走到子代理、上下文压缩和跨进程恢复。每节在前一节基础上推进。边看边跑代码。
 
 > **前提**：安装 power-loop 并配置 `POWER_LOOP_*` 环境变量。见 [快速上手](../getting-started.md)。
 
@@ -24,7 +24,8 @@ async def main():
             max_rounds=1,
         ),
     )
-    result = await loop.send("你好！")
+    sid = loop.new_session()
+    result = await loop.send("你好！", session_id=sid)
     print(result.final_text)
     # → "你好！有什么可以帮你的？"
 
@@ -32,21 +33,22 @@ asyncio.run(main())
 ```
 
 **要点**：
-- `send()` 创建新 session，返回 `StatefulResult`。
+- `new_session()` 创建会话；`send(..., session_id=sid)` 追加用户轮次并返回 `StatefulResult`。
 - `max_rounds=1` 表示"一次 LLM 调用，无工具"——最简单的循环。
 
 ## 2. 多轮对话 — 让对话持续
 
 ```python
-r1 = await loop.send("我叫阿岚。")
-print(r1.session_id)  # 例如 "sess_abc123..."
+sid = loop.new_session()
+r1 = await loop.send("我叫阿岚。", session_id=sid)
+print(sid)  # 例如 "sess_abc123..."
 
-r2 = await loop.send("我叫什么？", session_id=r1.session_id)
+r2 = await loop.send("我叫什么？", session_id=sid)
 print(r2.final_text)  # → "你叫阿岚。"
 ```
 
 **要点**：
-- 传入第一个结果的 `session_id` 继续同一会话。
+- 传入同一个 `session_id` 继续同一会话。
 - 库自动从 SQLite 加载完整历史——你永远不需要手动管理 `messages`。
 - `loop.get_messages(sid)` 可以查看活跃历史。
 
@@ -81,7 +83,8 @@ loop = StatefulAgentLoop(
     ),
 )
 
-result = await loop.send("东京天气怎么样？")
+sid = loop.new_session()
+result = await loop.send("东京天气怎么样？", session_id=sid)
 # LLM 调用 get_weather(city="东京") → result.final_text 提到 "晴，22°C"
 ```
 
@@ -110,8 +113,10 @@ loop = StatefulAgentLoop(
     ),
 )
 
+sid = loop.new_session()
 result = await loop.send(
-    "研究一下：东京的人口是多少？比伦敦多吗？"
+    "研究一下：东京的人口是多少？比伦敦多吗？",
+    session_id=sid,
 )
 # LLM spawn 子代理 → 子代理跑自己的循环 → 父代理拿到结果
 ```
@@ -169,8 +174,8 @@ loop = StatefulAgentLoop(llm=llm, event_bus=bus, ...)
 ```python
 # 进程 1
 loop = StatefulAgentLoop(llm=llm, db_path="./chat.db", ...)
-r1 = await loop.send("记住：我叫阿岚。")
-sid = r1.session_id
+sid = loop.new_session()
+r1 = await loop.send("记住：我叫阿岚。", session_id=sid)
 loop.close()
 
 # 进程 2（几小时后，不同的 Python 进程）

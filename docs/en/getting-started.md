@@ -53,7 +53,8 @@ async def main():
         ),
     )
 
-    result = await loop.send("What does HTTP stand for?")
+    sid = loop.new_session()
+    result = await loop.send("What does HTTP stand for?", session_id=sid)
     print(result.final_text)
 
 asyncio.run(main())
@@ -70,7 +71,7 @@ HTTP stands for HyperText Transfer Protocol.
 
 ```mermaid
 flowchart LR
-    A[user_input] --> B[send]
+    A[new_session] --> B[send]
     B --> C[load session history]
     C --> D[LLM complete]
     D --> E[append assistant msg]
@@ -78,20 +79,21 @@ flowchart LR
     F --> G[StatefulResult]
 ```
 
-1. `send("What does HTTP stand for?")` creates a new session with that user message.
-2. The pipeline sends it to the LLM (with your `system_prompt`).
+1. `new_session()` creates an empty session and returns its `session_id`.
+2. `send(..., session_id=sid)` appends the user message and sends it to the LLM with your `system_prompt`.
 3. The LLM replies — no tools were called, so the round ends.
 4. `StatefulResult` carries `session_id`, `status="completed"`, `final_text`, and `rounds`.
 
 ## 5. Keep talking — multi-turn
 
 ```python
-result1 = await loop.send("My name is Alan.")
+sid = loop.new_session()
+result1 = await loop.send("My name is Alan.", session_id=sid)
 print(result1.final_text)
 
 result2 = await loop.send(
     "What is my name?",
-    session_id=result1.session_id,   # continue same session
+    session_id=sid,   # continue same session
 )
 print(result2.final_text)   # "Your name is Alan."
 ```

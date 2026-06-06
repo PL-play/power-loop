@@ -200,10 +200,13 @@ async def main() -> None:
         )
         try:
             print("User: What's the weather in Tokyo and what is 15 * 7?")
-            r1 = await loop.send("What's the weather in Tokyo and what is 15 * 7?")
+            sid_a = loop.new_session(metadata={"label": "session-a"})
+            r1 = await loop.send(
+                "What's the weather in Tokyo and what is 15 * 7?",
+                session_id=sid_a,
+            )
             print(f"\n\n[Session A] status={r1.status}, rounds={r1.rounds}")
             print(f"[Session A] tools used: {tool_log_a}")
-            sid_a = r1.session_id
         finally:
             loop.close()
 
@@ -220,9 +223,12 @@ async def main() -> None:
         )
         try:
             print("User: My name is Alan. I live in Shanghai. Confirm in one sentence.")
-            r2 = await loop2.send("My name is Alan. I live in Shanghai. Confirm in one sentence.")
+            sid_b = loop2.new_session(metadata={"label": "session-b"})
+            r2 = await loop2.send(
+                "My name is Alan. I live in Shanghai. Confirm in one sentence.",
+                session_id=sid_b,
+            )
             print(f"\n\n[Session B] status={r2.status}, rounds={r2.rounds}")
-            sid_b = r2.session_id
         finally:
             loop2.close()
 
@@ -244,14 +250,15 @@ async def main() -> None:
         )
         try:
             print("User: What is my name and where do I live?")
-            r3 = await loop3.send("What is my name and where do I live?")
+            sid_c = loop3.new_session(metadata={"label": "session-c"})
+            r3 = await loop3.send("What is my name and where do I live?", session_id=sid_c)
             print(f"\n\n[Session C] reply: {r3.final_text}")
             print(f"[Session C] status={r3.status}, rounds={r3.rounds}")
         finally:
             loop3.close()
 
         print(f"\n[Done] 3 sessions completed. "
-              f"Session A={sid_a[-8:]}, B={sid_b[-8:]}, C={r3.session_id[-8:]}")
+              f"Session A={sid_a[-8:]}, B={sid_b[-8:]}, C={sid_c[-8:]}")
 
 
 if __name__ == "__main__":

@@ -95,9 +95,11 @@ async def via_meta_tool() -> str:
                 compactor=None,
             ),
         )
+        sid = loop.new_session()
         r = await loop.send(
             "Delegate this to a sub-agent and report back: "
-            "what is (17 + 25) × 3?"
+            "what is (17 + 25) × 3?",
+            session_id=sid,
         )
         print("[via_meta_tool]")
         print(f"  status : {r.status}, rounds: {r.rounds}")
@@ -123,7 +125,8 @@ async def direct_call() -> str:
             ),
         )
         # 先跑一轮父，建立 parent_session_id 给后面 run_agent_spec 用
-        pr = await parent_loop.send("hi")
+        parent_sid = parent_loop.new_session()
+        pr = await parent_loop.send("hi", session_id=parent_sid)
 
         spec = AgentSpec(
             name="math-helper",

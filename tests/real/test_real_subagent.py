@@ -56,7 +56,8 @@ async def test_parent_can_spawn_subagent_via_tool() -> None:
             tool_registry=registry,
         )
         q = "Delegate this and report back: what is the capital of Japan?"
-        r = await loop.send(q)
+        sid = loop.new_session()
+        r = await loop.send(q, session_id=sid)
         assert r.status == "completed"
         # All EPHEMERAL children should be cleaned up by now.
         assert store.list_children(r.session_id) == []
@@ -88,8 +89,9 @@ async def test_run_agent_spec_with_linked_lifecycle_persists_child() -> None:
             ),
         )
         # Run one parent turn to get a parent session id in place.
-        pr = await parent_loop.send("hi")
-        parent_sid = pr.session_id
+        parent_sid = parent_loop.new_session()
+        pr = await parent_loop.send("hi", session_id=parent_sid)
+        assert pr.session_id == parent_sid
 
         # Now invoke run_agent_spec directly, simulating what the meta-tool
         # does internally. Use a child LLM with the same provider.

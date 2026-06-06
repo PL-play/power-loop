@@ -252,7 +252,8 @@ async def test_no_compactor_means_no_compaction(store: SessionStore) -> None:
     cfg = AgentLoopConfig(max_rounds=1, max_tokens=10, compactor=None)
     llm = _Scripted(responses=[LLMResponse(raw_text="ok")])
     loop = StatefulAgentLoop(llm=llm, store=store, config=cfg)
-    r = await loop.send("hi" * 5000)
+    sid = loop.new_session()
+    r = await loop.send("hi" * 5000, session_id=sid)
     assert store.list_compactions(r.session_id) == []
 
 

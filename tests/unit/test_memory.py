@@ -102,7 +102,8 @@ async def test_recalled_messages_injected_after_leading_system_and_tagged() -> N
         ])
         loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem)
 
-        await loop.send("hi")
+        sid = loop.new_session()
+        await loop.send("hi", session_id=sid)
 
         assert mem.recall_calls == 1
         sent = llm.seen[0]
@@ -138,7 +139,8 @@ async def test_recall_failure_is_soft_and_emits_event() -> None:
         mem = _FakeMemory(recall_raises=RuntimeError("backend down"))
         loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem)
 
-        r = await loop.send("hi")
+        sid = loop.new_session()
+        r = await loop.send("hi", session_id=sid)
         assert r.status == "completed"
 
         # No memory_* messages reached the LLM.
@@ -165,7 +167,8 @@ async def test_remember_failure_does_not_affect_result() -> None:
         mem = _FakeMemory(remember_raises=RuntimeError("disk full"))
         loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem)
 
-        r = await loop.send("hi")
+        sid = loop.new_session()
+        r = await loop.send("hi", session_id=sid)
         assert r.status == "completed"
         assert r.final_text == "ok"
 
@@ -185,7 +188,8 @@ async def test_remember_receives_snapshot_with_history_and_status() -> None:
         mem = _FakeMemory()
         loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem)
 
-        await loop.send("hi")
+        sid = loop.new_session()
+        await loop.send("hi", session_id=sid)
         assert len(mem.remembered) == 1
         snap = mem.remembered[0]
         assert snap.status == "completed"
@@ -217,7 +221,8 @@ async def test_memory_recalled_hook_skip_drops_injection() -> None:
         mem = _FakeMemory(to_recall=[{"content": "secret to redact"}])
         loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem, hooks=hooks)
 
-        await loop.send("hi")
+        sid = loop.new_session()
+        await loop.send("hi", session_id=sid)
         assert not any(str(m.get("name") or "").startswith("memory_") for m in llm.seen[0])
         recall_events = [e for e in events if e.type == AgentEventType.MEMORY_RECALLED]
         assert recall_events[0].payload["returned"] == 1

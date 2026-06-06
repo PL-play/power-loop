@@ -96,13 +96,25 @@ def store() -> Generator[SessionStore, None, None]:
 
 
 @pytest.mark.asyncio
-async def test_send_creates_session_and_persists_user_message(store: SessionStore) -> None:
+async def test_new_session_then_send_persists_user_message(store: SessionStore) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text="hi back")])
     loop = StatefulAgentLoop(
         llm=llm, store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=2),
     )
-    r = await loop.send("hello")
-    assert r.session_id.startswith("sess_")
+    sid = loop.new_session(metadata={"owner": "test"})
+    row = store.get_session(sid)
+    assert row is not None
+    assert row.system_prompt == "S"
+    assert row.metadata == {"owner": "test"}
+
+    custom_sid = loop.new_session(system_prompt="custom", metadata={"owner": "custom"})
+    custom_row = store.get_session(custom_sid)
+    assert custom_row is not None
+    assert custom_row.system_prompt == "custom"
+    assert custom_row.metadata == {"owner": "custom"}
+
+    r = await loop.send("hello", session_id=sid)
+    assert r.session_id == sid
     assert r.status == "completed"
     assert r.final_text == "hi back"
 
@@ -119,8 +131,9 @@ async def test_subsequent_send_reuses_history(store: SessionStore) -> None:
         LLMResponse(raw_text="r2"),
     ])
     loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=2))
-    r1 = await loop.send("first")
-    r2 = await loop.send("second", session_id=r1.session_id)
+    sid = loop.new_session()
+    r1 = await loop.send("first", session_id=sid)
+    r2 = await loop.send("second", session_id=sid)
     assert r2.session_id == r1.session_id
 
     # Second LLM call must see four messages: [user1, assistant1, user2]
@@ -138,6 +151,13 @@ async def test_unknown_session_id_raises(store: SessionStore) -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_requires_explicit_session_id(store: SessionStore) -> None:
+    loop = StatefulAgentLoop(llm=_Scripted(), store=store)
+    with pytest.raises(TypeError):
+        await loop.send("hello")  # type: ignore[call-arg]
+
+
+@pytest.mark.asyncio
 async def test_tool_round_persists_assistant_and_tool_messages(store: SessionStore) -> None:
     llm = _Scripted(responses=[
         _tool_resp("tc1", "echo", '{"text": "hi"}'),
@@ -148,7 +168,8 @@ async def test_tool_round_persists_assistant_and_tool_messages(store: SessionSto
         config=AgentLoopConfig(system_prompt="S", max_rounds=4),
         tool_registry=_echo_registry(),
     )
-    r = await loop.send("go")
+    sid = loop.new_session()
+    r = await loop.send("go", session_id=sid)
     assert r.status == "completed"
     assert r.final_text == "final answer"
 
@@ -254,7 +275,8 @@ async def test_resume_executes_pending_tools(store: SessionStore) -> None:
 async def test_close_session_wipes_data(store: SessionStore) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text="x")])
     loop = StatefulAgentLoop(llm=llm, store=store)
-    r = await loop.send("hi")
+    sid = loop.new_session()
+    r = await loop.send("hi", session_id=sid)
     assert loop.get_messages(r.session_id)
 
     deleted = loop.close_session(r.session_id)

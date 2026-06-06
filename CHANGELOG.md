@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### Changed — M2.7 显式 Session 创建（2026-06-06）
+
+- **`StatefulAgentLoop.new_session(metadata=None, system_prompt=None) -> str`** —— 新增显式会话创建入口。调用方先拿到 `session_id`，再传给每次 `send()` / `send_sync()`。
+- **Breaking**：`StatefulAgentLoop.send(user_input, session_id, *, stop_event=None)` 与 `send_sync(...)` 现在必须传入 `session_id`；不再在首次 `send()` 时隐式创建 session。
+- **Breaking**：`metadata` 从 `send(metadata=...)` 移到 `new_session(metadata=...)`。这样会话级信息在会话创建时固定，避免首条消息和会话生命周期耦合。
+- **文档 / 示例 / 测试**：README、双语 docs、examples、unit/real 测试全部改为 `sid = loop.new_session(); await loop.send(..., session_id=sid)`。
+- **版本**：`power_loop.__version__ = "0.3.0"`。
+
+### Public API（M2.7 变更）
+
+`StatefulAgentLoop.new_session` 顶层入口新增；`StatefulAgentLoop.send / send_sync` 签名破坏性变更，`session_id` 必填。
+
 ### Added — M1.1 LLM 重试 / 超时 / 取消（2026-06-05）
 
 - **`LLMRetryPolicy`**（`power_loop.runtime.retry`）—— 配置 `max_attempts` / `backoff_initial` / `backoff_max` / `total_timeout` / `retry_on`。指数退避（capped），跨所有 attempt 共享总超时；退避 sleep 是 cancel-aware 的（cancel 触发时不会傻等到底）。
@@ -141,7 +153,7 @@ Stateful refactor. The library now revolves around `StatefulAgentLoop` and a SQL
 
 ### Added
 
-- **`StatefulAgentLoop`** — the only public entry point. `send(user_input, session_id=None)` / `send_sync` / `resume(sid)` / `abort_pending(sid)` / `close_session(sid, cascade=True)` / `close()` / `get_messages(sid)` / `get_pending(sid)`. Per-session `asyncio.Lock` so one instance can drive any number of sessions concurrently.
+- **`StatefulAgentLoop`** — the only public entry point. `new_session()` / `send(user_input, session_id)` / `send_sync` / `resume(sid)` / `abort_pending(sid)` / `close_session(sid, cascade=True)` / `close()` / `get_messages(sid)` / `get_pending(sid)`. Per-session `asyncio.Lock` so one instance can drive any number of sessions concurrently.
 - **`SessionStore`** (`power_loop.runtime.session_store`) — SQLite-backed, the **only** thing that writes to disk. Five tables: `sessions` / `messages` / `compactions` / `usage_rounds` / `session_state`. Single connection + `threading.RLock`; WAL + busy_timeout. Public API surface for sessions, messages, compactions, usage, lifecycle.
 - **`MessageSink`** Protocol + `NullSink` + `SQLiteSink` — pipeline persistence hook. SQLiteSink owns the in-memory `_history_seqs` list that mirrors `pipeline.history` so the compactor can translate fold indices back to store rows.
 - **Pending state machine** — `assistant(tool_calls)` falling-into-store immediately marks `session_state.pending`; each matching `tool` message clears it. Mid-tool crash leaves a recoverable state. Next `send` raises `SessionPendingError`; caller picks `resume()` (replay remaining tools) or `abort_pending(sid, reason=…)` (synthesize `<aborted>` tool messages).
@@ -174,7 +186,7 @@ Stateful refactor. The library now revolves around `StatefulAgentLoop` and a SQL
 
 | Before (0.1.x) | After (0.2.0) |
 |---|---|
-| `AgentLoop(llm, config).run(messages=[…])` | `StatefulAgentLoop(llm=…, db_path=…, config=…).send(user_input)` |
+| `AgentLoop(llm, config).run(messages=[…])` | `sid = loop.new_session(); await loop.send(user_input, session_id=sid)` |
 | Caller manages `messages` list | Library loads from `SessionStore` by `session_id` |
 | No persistence | `db_path` (default `./power_loop_sessions.db`); `":memory:"` for tests |
 | No pending detection | Crash mid-tool → next `send` raises `SessionPendingError`; pick `resume()` or `abort_pending()` |

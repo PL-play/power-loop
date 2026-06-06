@@ -35,7 +35,8 @@ sequenceDiagram
     participant H as TOOL_BEFORE Hook
     participant Q as asyncio.Queue
 
-    U->>L: send("删除 cache.tmp")
+    U->>L: new_session()
+    U->>L: send("删除 cache.tmp", session_id=sid)
     L->>L: LLM: bash(rm cache.tmp)
     L->>H: TOOL_BEFORE
     H->>Q: 放入审批请求
@@ -100,7 +101,8 @@ async def main():
     )
     worker = asyncio.create_task(approval_worker())
     try:
-        r = await loop.send("列出当前目录文件。")
+        sid = loop.new_session()
+        r = await loop.send("列出当前目录文件。", session_id=sid)
         print(f"Bot: {r.final_text}")
     finally:
         worker.cancel(); loop.close()

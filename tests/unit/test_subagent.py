@@ -178,7 +178,8 @@ async def test_spawn_agent_creates_child_session_and_returns_text(store: Session
         llm=parent_llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=4),
     )
-    r = await loop.send("kick off")
+    sid = loop.new_session()
+    r = await loop.send("kick off", session_id=sid)
     assert r.status == "completed"
     assert r.final_text == "parent done"
 
@@ -208,7 +209,8 @@ async def test_run_agent_meta_tool_uses_strict_spec(store: SessionStore) -> None
         llm=parent_llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=3),
     )
-    r = await loop.send("go")
+    sid = loop.new_session()
+    r = await loop.send("go", session_id=sid)
     assert r.status == "completed"
     assert r.final_text == "parent wraps up"
 
@@ -225,7 +227,8 @@ async def test_run_agent_with_invalid_spec_returns_error(store: SessionStore) ->
         llm=parent_llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=2),
     )
-    r = await loop.send("go")
+    sid = loop.new_session()
+    r = await loop.send("go", session_id=sid)
     # The tool returns an error string; parent loop continues; final = "parent recovered".
     assert r.final_text == "parent recovered"
 
@@ -247,7 +250,8 @@ async def test_subagent_parent_link_recorded_when_lifecycle_linked(store: Sessio
         config=AgentLoopConfig(max_rounds=1),
     )
     # Drive the parent once so a parent session exists in contextvars-scoped runs.
-    pr = await parent_loop.send("hi")
+    parent_created_sid = parent_loop.new_session()
+    pr = await parent_loop.send("hi", session_id=parent_created_sid)
     parent_sid = pr.session_id
 
     # Now call run_agent_spec directly with a fresh child LLM scripted.
@@ -280,7 +284,8 @@ async def test_subagent_failure_preserves_session_even_when_ephemeral(store: Ses
     parent_loop = StatefulAgentLoop(
         llm=parent_llm, store=store, config=AgentLoopConfig(max_rounds=1),
     )
-    pr = await parent_loop.send("hi")
+    parent_created_sid = parent_loop.new_session()
+    pr = await parent_loop.send("hi", session_id=parent_created_sid)
     parent_sid = pr.session_id
 
     # Replace LLM so child always emits tool_calls → never completes → hit_round_limit.

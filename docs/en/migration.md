@@ -1,6 +1,30 @@
-# Migration Guide — 0.1.x → 0.2.0
+# Migration Guide
 
 [中文](../zh/migration.md) | [Back to docs](../README.md)
+
+## 0.2.x → 0.3.0
+
+power-loop v0.3.0 makes session creation explicit. `send()` no longer creates a session on the first call.
+
+```python
+# Before 0.3.0
+r1 = await loop.send("My name is Alan.")
+r2 = await loop.send("What is my name?", session_id=r1.session_id)
+
+# 0.3.0+
+sid = loop.new_session()
+r1 = await loop.send("My name is Alan.", session_id=sid)
+r2 = await loop.send("What is my name?", session_id=sid)
+```
+
+Move per-session metadata from `send(metadata=...)` to `new_session(metadata=...)`:
+
+```python
+sid = loop.new_session(metadata={"user_id": "alan"})
+result = await loop.send("Hello", session_id=sid)
+```
+
+## 0.1.x → 0.2.0
 
 power-loop v0.2.0 is a **hard break** from 0.1.x. The stateless `AgentLoop` is gone; everything revolves around `StatefulAgentLoop` and SQLite-backed `SessionStore`.
 
@@ -8,7 +32,7 @@ power-loop v0.2.0 is a **hard break** from 0.1.x. The stateless `AgentLoop` is g
 
 | 0.1.x | 0.2.0 |
 |---|---|
-| `AgentLoop(llm, config).run(messages=[...])` | `StatefulAgentLoop(llm=..., db_path=..., config=...).send(user_input)` |
+| `AgentLoop(llm, config).run(messages=[...])` | `sid = loop.new_session(); await loop.send(user_input, session_id=sid)` |
 | Caller manages `messages` list | Library loads from `SessionStore` by `session_id` |
 | No persistence | `db_path` (default `./power_loop_sessions.db`); `":memory:"` for tests |
 | No pending detection | Crash mid-tool → next `send` raises `SessionPendingError` |
@@ -35,7 +59,8 @@ result = loop.run(messages=[{"role": "user", "content": "hello"}])
 from power_loop import StatefulAgentLoop, AgentLoopConfig
 
 loop = StatefulAgentLoop(llm=llm, config=AgentLoopConfig(...))
-result = await loop.send("hello")
+sid = loop.new_session()
+result = await loop.send("hello", session_id=sid)
 ```
 
 ### 2. Manage Sessions via session_id
@@ -44,8 +69,9 @@ result = await loop.send("hello")
 
 **After**: pass `session_id` to continue a conversation:
 ```python
-r1 = await loop.send("My name is Alan.")
-r2 = await loop.send("What is my name?", session_id=r1.session_id)
+sid = loop.new_session()
+r1 = await loop.send("My name is Alan.", session_id=sid)
+r2 = await loop.send("What is my name?", session_id=sid)
 ```
 
 ### 3. Handle Pending State

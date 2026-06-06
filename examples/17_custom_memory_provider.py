@@ -131,7 +131,11 @@ async def main() -> None:
         ),
     )
     try:
-        r1 = await loop.send("My name is Alan and I work at Acme Corp. One sentence reply.")
+        sid1 = loop.new_session()
+        r1 = await loop.send(
+            "My name is Alan and I work at Acme Corp. One sentence reply.",
+            session_id=sid1,
+        )
         print(f"[Session A] reply: {r1.final_text}")
         print(f"[Session A] events: {events}")
     finally:
@@ -156,7 +160,11 @@ async def main() -> None:
         ),
     )
     try:
-        r2 = await loop2.send("What is my name and where do I work? One sentence.")
+        sid2 = loop2.new_session()
+        r2 = await loop2.send(
+            "What is my name and where do I work? One sentence.",
+            session_id=sid2,
+        )
         print(f"[Session B] reply: {r2.final_text}")
         print(f"[Session B] events: {events}")
     finally:

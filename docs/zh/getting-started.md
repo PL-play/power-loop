@@ -53,7 +53,8 @@ async def main():
         ),
     )
 
-    result = await loop.send("HTTP 是什么的缩写？")
+    sid = loop.new_session()
+    result = await loop.send("HTTP 是什么的缩写？", session_id=sid)
     print(result.final_text)
 
 asyncio.run(main())
@@ -70,7 +71,7 @@ HTTP 是 HyperText Transfer Protocol（超文本传输协议）的缩写。
 
 ```mermaid
 flowchart LR
-    A[user_input] --> B[send]
+    A[new_session] --> B[send]
     B --> C[加载会话历史]
     C --> D[LLM complete]
     D --> E[记录 assistant 消息]
@@ -78,20 +79,21 @@ flowchart LR
     F --> G[StatefulResult]
 ```
 
-1. `send(...)` 创建新 session，附上用户消息。
-2. Pipeline 把消息发给 LLM（附带你的 `system_prompt`）。
+1. `new_session()` 创建空 session 并返回 `session_id`。
+2. `send(..., session_id=sid)` 追加用户消息，并把消息发给 LLM（附带你的 `system_prompt`）。
 3. LLM 回复了——没有工具调用，这一轮结束。
 4. `StatefulResult` 包含 `session_id`、`status="completed"`、`final_text`、`rounds`。
 
 ## 5. 继续聊——多轮对话
 
 ```python
-result1 = await loop.send("我叫阿岚。")
+sid = loop.new_session()
+result1 = await loop.send("我叫阿岚。", session_id=sid)
 print(result1.final_text)
 
 result2 = await loop.send(
     "我叫什么？",
-    session_id=result1.session_id,   # 继续同一个 session
+    session_id=sid,   # 继续同一个 session
 )
 print(result2.final_text)   # "你叫阿岚。"
 ```
