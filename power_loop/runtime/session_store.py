@@ -6,6 +6,8 @@ Owns the persistence layer for stateful agent loops:
   - compactions    : audit of every compaction (which seq range → which note)
   - usage_rounds   : per-round token usage
   - session_state  : single-row per-session mutable state (next_seq, pending, …)
+  - session_runtime_state : per-session JSON state for tool/runtime protocols
+  - background_tasks : persisted background command task status
 
 The store is the **only** place that writes to disk. Callers (StatefulAgentLoop,
 the Sink that the pipeline drives, the subagent runtime) all go through here.
@@ -124,6 +126,30 @@ CREATE TABLE IF NOT EXISTS session_state (
     last_compact_seq  INTEGER NOT NULL DEFAULT 0,
     pending_json      TEXT
 );
+
+CREATE TABLE IF NOT EXISTS session_runtime_state (
+    session_id        TEXT NOT NULL,
+    key               TEXT NOT NULL,
+    value_json        TEXT,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (session_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS background_tasks (
+    session_id        TEXT NOT NULL,
+    task_id           TEXT NOT NULL,
+    command           TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    return_code       INTEGER,
+    output_tail       TEXT,
+    output_path       TEXT,
+    last_seen_at      INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (session_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_background_tasks_session_status
+    ON background_tasks(session_id, status, updated_at);
 """
 
 
@@ -179,6 +205,20 @@ class CompactionRow:
     after_tokens: int | None
     round_index: int | None
     created_at: int
+
+
+@dataclass
+class BackgroundTaskRow:
+    session_id: str
+    task_id: str
+    command: str
+    status: str
+    return_code: int | None
+    output_tail: str | None
+    output_path: str | None
+    last_seen_at: int
+    created_at: int
+    updated_at: int
 
 
 def _now_ms() -> int:
@@ -347,6 +387,8 @@ class SessionStore:
         self._conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM compactions WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM usage_rounds WHERE session_id=?", (session_id,))
+        self._conn.execute("DELETE FROM session_runtime_state WHERE session_id=?", (session_id,))
+        self._conn.execute("DELETE FROM background_tasks WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM session_state WHERE session_id=?", (session_id,))
         cur = self._conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
         deleted += cur.rowcount
@@ -575,6 +617,159 @@ class SessionStore:
                 (_dumps(pending) if pending else None, session_id),
             )
 
+    # ── runtime state ─────────────────────────────────────────────────────
+
+    def get_runtime_state(self, session_id: str, key: str, default: Any = None) -> Any:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT value_json FROM session_runtime_state
+                WHERE session_id=? AND key=?
+                """,
+                (session_id, key),
+            ).fetchone()
+        if row is None:
+            return default
+        value = _loads(row["value_json"])
+        return default if value is None else value
+
+    def set_runtime_state(self, session_id: str, key: str, value: Any) -> None:
+        now = _now_ms()
+        with self._lock, self._conn:
+            if self.get_session(session_id) is None:
+                raise ValueError(f"unknown session: {session_id}")
+            self._conn.execute(
+                """
+                INSERT INTO session_runtime_state (session_id, key, value_json, updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(session_id, key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                (session_id, key, _dumps(value), now),
+            )
+            self._conn.execute(
+                "UPDATE sessions SET updated_at=? WHERE session_id=?",
+                (now, session_id),
+            )
+
+    def delete_runtime_state(self, session_id: str, key: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM session_runtime_state WHERE session_id=? AND key=?",
+                (session_id, key),
+            )
+
+    # ── background tasks ──────────────────────────────────────────────────
+
+    def upsert_background_task(
+        self,
+        session_id: str,
+        *,
+        task_id: str,
+        command: str,
+        status: str,
+        return_code: int | None = None,
+        output_tail: str | None = None,
+        output_path: str | None = None,
+    ) -> None:
+        now = _now_ms()
+        with self._lock, self._conn:
+            if self.get_session(session_id) is None:
+                raise ValueError(f"unknown session: {session_id}")
+            existing = self._conn.execute(
+                """
+                SELECT last_seen_at, created_at FROM background_tasks
+                WHERE session_id=? AND task_id=?
+                """,
+                (session_id, task_id),
+            ).fetchone()
+            created_at = now
+            if existing is not None:
+                created_at = int(existing["created_at"])
+                now = max(now, int(existing["last_seen_at"]) + 1)
+            self._conn.execute(
+                """
+                INSERT INTO background_tasks (
+                    session_id, task_id, command, status, return_code,
+                    output_tail, output_path, last_seen_at, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(session_id, task_id) DO UPDATE SET
+                    command=excluded.command,
+                    status=excluded.status,
+                    return_code=excluded.return_code,
+                    output_tail=excluded.output_tail,
+                    output_path=excluded.output_path,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    session_id,
+                    task_id,
+                    command,
+                    status,
+                    return_code,
+                    output_tail,
+                    output_path,
+                    0,
+                    created_at,
+                    now,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE sessions SET updated_at=? WHERE session_id=?",
+                (now, session_id),
+            )
+
+    def get_background_task(self, session_id: str, task_id: str) -> BackgroundTaskRow | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM background_tasks
+                WHERE session_id=? AND task_id=?
+                """,
+                (session_id, task_id),
+            ).fetchone()
+        return _row_to_background_task(row) if row else None
+
+    def list_background_tasks(self, session_id: str) -> list[BackgroundTaskRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM background_tasks
+                WHERE session_id=?
+                ORDER BY created_at ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [_row_to_background_task(r) for r in rows]
+
+    def list_unseen_background_updates(self, session_id: str) -> list[BackgroundTaskRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM background_tasks
+                WHERE session_id=? AND updated_at > last_seen_at
+                ORDER BY updated_at ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return [_row_to_background_task(r) for r in rows]
+
+    def mark_background_seen(self, session_id: str, task_ids: list[str]) -> None:
+        if not task_ids:
+            return
+        now = _now_ms()
+        placeholders = ",".join("?" for _ in task_ids)
+        with self._lock, self._conn:
+            self._conn.execute(
+                f"""
+                UPDATE background_tasks
+                SET last_seen_at=?
+                WHERE session_id=? AND task_id IN ({placeholders})
+                """,
+                (now, session_id, *task_ids),
+            )
+
     # ── usage ─────────────────────────────────────────────────────────────
 
     def record_usage(
@@ -633,4 +828,19 @@ def _row_to_message(row: sqlite3.Row) -> MessageRow:
         state=MessageState(row["state"]),
         meta=_loads(row["meta_json"]) or {},
         created_at=row["created_at"],
+    )
+
+
+def _row_to_background_task(row: sqlite3.Row) -> BackgroundTaskRow:
+    return BackgroundTaskRow(
+        session_id=row["session_id"],
+        task_id=row["task_id"],
+        command=row["command"],
+        status=row["status"],
+        return_code=row["return_code"],
+        output_tail=row["output_tail"],
+        output_path=row["output_path"],
+        last_seen_at=row["last_seen_at"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )

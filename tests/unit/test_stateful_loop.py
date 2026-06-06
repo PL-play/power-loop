@@ -10,9 +10,11 @@ from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamC
 from power_loop import (
     AgentLoopConfig,
     MessageState,
+    RuntimeProjector,
     SessionPendingError,
     SessionStore,
     StatefulAgentLoop,
+    create_default_tool_registry,
 )
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.tools.registry import ToolRegistry
@@ -85,6 +87,13 @@ def _echo_registry() -> ToolRegistry:
     return reg
 
 
+class _CustomProjector(RuntimeProjector):
+    def project(self, *, store: Any, session_id: str, round_index: int, context: Any) -> list[dict[str, Any]]:
+        state = store.get_runtime_state(session_id, "custom", default={}) or {}
+        text = state.get("text", "")
+        return [{"role": "user", "name": "custom_runtime", "content": f"<custom>{text}</custom>"}] if text else []
+
+
 # ── Tests ──────────────────────────────────────────────────────────────
 
 
@@ -122,6 +131,171 @@ async def test_new_session_then_send_persists_user_message(store: SessionStore) 
     assert [m["role"] for m in msgs] == ["user", "assistant"]
     assert msgs[0]["content"] == "hello"
     assert msgs[1]["content"] == "hi back"
+
+
+@pytest.mark.asyncio
+async def test_todo_runtime_state_is_injected_without_persisting_virtual_message(store: SessionStore) -> None:
+    llm = _Scripted(
+        responses=[
+            _tool_resp(
+                "tc-todo",
+                "todo",
+                '{"items":[{"id":"one","text":"Implement runtime state","status":"in_progress"}]}',
+            ),
+            LLMResponse(raw_text="I see the runtime todo."),
+        ]
+    )
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        tool_registry=create_default_tool_registry(include=["todo"]),
+        config=AgentLoopConfig(system_prompt="Use todos.", max_rounds=3, compactor=None),
+    )
+    sid = loop.new_session()
+    result = await loop.send("make a todo", session_id=sid)
+
+    assert result.status == "completed"
+    todo_state = store.get_runtime_state(sid, "todo")
+    assert todo_state["items"][0]["text"] == "Implement runtime state"
+    assert any("<current_todos>" in str(msg.get("content", "")) for msg in llm.calls[1])
+    persisted = loop.get_messages(sid)
+    assert not any("<current_todos>" in str(msg.get("content", "")) for msg in persisted)
+
+
+@pytest.mark.asyncio
+async def test_todo_runtime_state_survives_new_loop_instance(store: SessionStore) -> None:
+    sid = store.create_session(system_prompt="S")
+    store.set_runtime_state(
+        sid,
+        "todo",
+        {
+            "items": [{"id": "persisted", "text": "Survive restart", "status": "in_progress"}],
+            "rendered": "[>] #persisted: Survive restart\n\n(0/1 completed)",
+            "counts": {"total": 1, "completed": 0},
+        },
+    )
+    store.append_message(sid, role="user", content="previous")
+    store.append_message(sid, role="assistant", content="previous answer")
+    llm = _Scripted(responses=[LLMResponse(raw_text="runtime state visible")])
+
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+    )
+    result = await loop.send("continue", session_id=sid)
+
+    assert result.status == "completed"
+    assert any("Survive restart" in str(msg.get("content", "")) for msg in llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_background_runtime_updates_are_injected_once(store: SessionStore) -> None:
+    sid = store.create_session(system_prompt="S")
+    store.append_message(sid, role="user", content="start")
+    store.append_message(sid, role="assistant", content="started")
+    store.upsert_background_task(
+        sid,
+        task_id="bg1",
+        command="printf done",
+        status="completed",
+        return_code=0,
+        output_tail="done",
+    )
+    llm = _Scripted(responses=[LLMResponse(raw_text="saw background"), LLMResponse(raw_text="no duplicate")])
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+    )
+
+    await loop.send("what happened?", session_id=sid)
+    assert any("<background_updates>" in str(msg.get("content", "")) for msg in llm.calls[0])
+    await loop.send("again?", session_id=sid)
+    assert not any("<background_updates>" in str(msg.get("content", "")) for msg in llm.calls[1])
+
+
+@pytest.mark.asyncio
+async def test_custom_runtime_projector_is_configurable(store: SessionStore) -> None:
+    sid = store.create_session(system_prompt="S")
+    store.set_runtime_state(sid, "custom", {"text": "CUSTOM_RUNTIME_VISIBLE"})
+    llm = _Scripted(responses=[LLMResponse(raw_text="custom visible")])
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        config=AgentLoopConfig(
+            system_prompt="S",
+            max_rounds=1,
+            compactor=None,
+            runtime_projectors=(_CustomProjector(),),
+        ),
+    )
+
+    await loop.send("check custom runtime", session_id=sid)
+    assert any("CUSTOM_RUNTIME_VISIBLE" in str(msg.get("content", "")) for msg in llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_runtime_projectors_can_be_disabled(store: SessionStore) -> None:
+    sid = store.create_session(system_prompt="S")
+    store.set_runtime_state(
+        sid,
+        "todo",
+        {
+            "items": [{"id": "hidden", "text": "SHOULD_NOT_INJECT", "status": "in_progress"}],
+            "rendered": "[>] #hidden: SHOULD_NOT_INJECT\n\n(0/1 completed)",
+        },
+    )
+    llm = _Scripted(responses=[LLMResponse(raw_text="no runtime")])
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        config=AgentLoopConfig(
+            system_prompt="S",
+            max_rounds=1,
+            compactor=None,
+            runtime_projectors=(),
+        ),
+    )
+
+    await loop.send("no runtime please", session_id=sid)
+    assert not any("SHOULD_NOT_INJECT" in str(msg.get("content", "")) for msg in llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_configured_skills_dir_is_in_prompt_and_load_skill(tmp_path, store: SessionStore) -> None:
+    skill_root = tmp_path / "skills"
+    skill_dir = skill_root / "runtime-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\ndescription: Runtime test skill\n---\nUse the runtime skill instructions.",
+        encoding="utf-8",
+    )
+    llm = _Scripted(
+        responses=[
+            _tool_resp("tc-skill", "load_skill", '{"name":"runtime-skill"}'),
+            LLMResponse(raw_text="loaded"),
+        ]
+    )
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        tool_registry=create_default_tool_registry(include=["load_skill"]),
+        config=AgentLoopConfig(
+            system_prompt="Use configured skills.",
+            skills_dir=str(skill_root),
+            max_rounds=3,
+            compactor=None,
+        ),
+    )
+    sid = loop.new_session()
+    resolved = loop.resolve_system_prompt(session_id=sid)
+    assert "runtime-skill" in resolved
+    assert str(skill_root) in resolved
+
+    await loop.send("load the runtime skill", session_id=sid)
+    tool_messages = [msg for msg in loop.get_messages(sid) if msg.get("role") == "tool"]
+    assert any("Use the runtime skill instructions." in str(msg.get("content", "")) for msg in tool_messages)
 
 
 @pytest.mark.asyncio
@@ -463,4 +637,3 @@ def test_resolve_system_prompt_session_override(store: SessionStore) -> None:
     assert "Config prompt." not in resolved
     # Catalog is still appended
     assert "# Available Tools" in resolved
-

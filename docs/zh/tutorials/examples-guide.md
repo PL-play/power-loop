@@ -32,6 +32,7 @@
 | [17](#17-自定义记忆提供者) | `custom_memory_provider.py` | HTTP 后端 MemoryProvider |
 | [18](#18-多-provider) | `multi_provider.py` | 多个 LLM 供应商 |
 | [19](#19-旗舰示例) | `full_chatbot.py` | **全部功能集合** |
+| [20](#20-默认工具) | `default_tools.py` | 内置文件/搜索/bash 工具 |
 
 ---
 
@@ -1040,6 +1041,33 @@ Your name is Alan and you live in Shanghai.
 
 ---
 
+## 20 · 默认工具
+
+**概念**：不依赖真实 LLM，逐个演示内置默认工具。
+
+### 代码
+
+```python
+registry = create_default_tool_registry(preset="full")
+
+registry.invoke("write_file", {"path": target, "content": "alpha\nbeta\n"})
+registry.invoke("read_file", {"path": target})
+registry.invoke("edit_file", {"path": target, "old_text": "beta", "new_text": "BETA"})
+registry.invoke("apply_patch", {"path": target, "patch": "@@ -1,2 +1,3 @@\n alpha\n BETA\n+gamma"})
+registry.invoke("glob", {"path": rel_root, "pattern": "*.py"})
+registry.invoke("grep", {"path": rel_root, "pattern": "VALUE", "include": "*.py"})
+registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
+```
+
+### 要点
+
+- `create_default_tool_registry(preset="full")` 会注册文件、搜索、shell、todo、skill 和后台任务工具。
+- 修改已有文件前，必须先用 `read_file` 读取，之后 `write_file`、`edit_file`、`apply_patch` 才会执行。
+- 定位文件优先用 `glob`，搜索内容优先用 `grep`；`bash` 更适合测试和构建。
+- 这个示例是确定性的，不需要 API 凭证。
+
+---
+
 ## 速查表
 
 | 我想… | 看哪个 |
@@ -1058,4 +1086,5 @@ Your name is Alan and you live in Shanghai.
 | 结构化 JSON 提取 | [14](#14-结构化输出) |
 | 注入领域知识 | [15](#15-markdown-技能) |
 | 切换多个 LLM 供应商 | [18](#18-多-provider) |
+| 试用内置工具 | [20](#20-默认工具) |
 | 看全部功能 | [19](#19-旗舰示例) |

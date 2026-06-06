@@ -30,6 +30,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 17 | [`custom_memory_provider.py`](17_custom_memory_provider.py) | HTTP-backed MemoryProvider | `MemoryProvider` Protocol, HTTP API mock |
 | 18 | [`multi_provider.py`](18_multi_provider.py) | Multiple LLM providers | `LLMProviderConfig`, `create_llm_service_from_config()` |
 | 19 | [`full_chatbot.py`](19_full_chatbot.py) | **Flagship**: all features on | session + tools + hooks + events + memory + compaction |
+| 20 | [`default_tools.py`](20_default_tools.py) | Built-in filesystem/search/bash tools | `create_default_tool_registry(preset="full")` |
 
 ## Running
 

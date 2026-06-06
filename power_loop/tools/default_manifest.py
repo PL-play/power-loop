@@ -4,20 +4,24 @@ from collections.abc import Sequence
 
 from power_loop.contracts.tools import ToolDefinition
 
-# Tool definitions copied from zero-code BASE_TOOLS entries for the default core tool set.
 DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="write_file",
         description=(
-            "Create or overwrite a file with the given content. Creates parent directories automatically. "
-            "IMPORTANT: Both 'path' and 'content' parameters are REQUIRED and must be provided in a single valid JSON object. "
-            "For large files, write the complete content in one call — do not split across multiple calls."
+            "Create a new UTF-8 text file or overwrite an existing one with the complete provided content. "
+            "Parent directories are created automatically. For safety, overwriting an existing file requires that you "
+            "have read it with read_file in this process and that it has not changed since that read; use edit_file or "
+            "apply_patch for smaller edits to existing files. Send the entire desired file content in one call, not chunks."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string"},
+                "path": {"type": "string", "description": "Workspace-relative path, absolute workspace path, or @workspace/..."},
+                "content": {"type": "string", "description": "Complete UTF-8 file content to write."},
+                "overwrite": {
+                    "type": "boolean",
+                    "description": "Whether an existing file may be overwritten. Defaults to true, still requiring a prior read.",
+                },
             },
             "required": ["path", "content"],
         },
@@ -25,13 +29,17 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="read_file",
-        description="Read file contents with line numbers, or list directory entries.",
+        description=(
+            "Read a UTF-8 text file with stable line numbers, or list a directory. Use this before edit_file, apply_patch, "
+            "or overwriting an existing file. Large files are paged by line range; use offset and limit to continue. "
+            "Binary-looking files are refused instead of decoded blindly."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "offset": {"type": "integer"},
-                "limit": {"type": "integer"},
+                "path": {"type": "string", "description": "Workspace-relative path, absolute workspace path, or @workspace/..."},
+                "offset": {"type": "integer", "description": "1-based starting line. Defaults to 1."},
+                "limit": {"type": "integer", "description": "Maximum number of lines to return."},
             },
             "required": ["path"],
         },
@@ -39,14 +47,21 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="edit_file",
-        description="Replace exact text in a file (old_text->new_text).",
+        description=(
+            "Replace text in an existing UTF-8 file using an exact, unique old_text snippet. Read the file first, then "
+            "include enough surrounding context that old_text matches exactly once. If multiple identical occurrences "
+            "should all change, set replace_all=true. The tool preserves BOM and dominant line endings and returns a diff."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "old_text": {"type": "string"},
-                "new_text": {"type": "string"},
-                "replace_all": {"type": "boolean"},
+                "path": {"type": "string", "description": "File to edit."},
+                "old_text": {"type": "string", "description": "Exact current text to replace. Must not be empty."},
+                "new_text": {"type": "string", "description": "Replacement text."},
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace every exact occurrence instead of requiring uniqueness. Defaults to false.",
+                },
             },
             "required": ["path", "old_text", "new_text"],
         },
@@ -54,12 +69,20 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="apply_patch",
-        description="Apply a patch to a file using @@ context lines for positioning and +/- for line changes.",
+        description=(
+            "Apply one or more unified-diff style hunks to an existing file. Read the file first. Prefer this for "
+            "multi-line or multi-hunk edits where exact search/replace would be awkward. Each hunk should include context "
+            "lines beginning with a space, deleted lines beginning with '-', and added lines beginning with '+'. Ambiguous "
+            "or stale hunks are rejected rather than guessed."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "patch": {"type": "string"},
+                "path": {"type": "string", "description": "File to patch."},
+                "patch": {
+                    "type": "string",
+                    "description": "Unified diff hunks, e.g. @@ -1,2 +1,2 @@ followed by context/delete/add lines.",
+                },
             },
             "required": ["path", "patch"],
         },
@@ -67,13 +90,18 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="bash",
-        description="Run a shell command in a persistent bash session rooted at workspace.",
+        description=(
+            "Run a shell command in a persistent bash session rooted at the workspace. Use dedicated tools for file reads, "
+            "writes, search, and patches whenever possible; use bash for tests, builds, package managers, git inspection, "
+            "and other CLI-only operations. Output is truncated, timeouts restart the shell to prevent leftover commands, "
+            "and obviously dangerous privileged/device-level commands are blocked. Set restart=true to reset the session."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "command": {"type": "string"},
-                "restart": {"type": "boolean"},
-                "timeout": {"type": "integer"},
+                "command": {"type": "string", "description": "Shell command to run."},
+                "restart": {"type": "boolean", "description": "Restart the persistent bash session instead of running command."},
+                "timeout": {"type": "integer", "description": "Seconds to wait before timing out. Range: 1-600."},
             },
             "required": ["command"],
         },
@@ -81,12 +109,19 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="glob",
-        description="Find files by glob pattern, sorted by modification time (newest first).",
+        description=(
+            "Find files or directories by glob pattern, sorted by modification time newest first. Prefer glob over bash/find "
+            "when locating paths. A bare name like '*.py' searches recursively as '**/*.py'. Common bulky directories such "
+            "as .git, node_modules, build, and dist are skipped. Hidden paths are skipped unless include_hidden=true or the "
+            "pattern explicitly mentions a hidden segment."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "pattern": {"type": "string"},
-                "path": {"type": "string"},
+                "pattern": {"type": "string", "description": "Glob pattern. Bare filenames are searched recursively."},
+                "path": {"type": "string", "description": "Directory to search. Defaults to workspace root."},
+                "max_results": {"type": "integer", "description": "Maximum paths to return. Defaults to 100, max 500."},
+                "include_hidden": {"type": "boolean", "description": "Include hidden files and directories. Defaults to false."},
             },
             "required": ["pattern"],
         },
@@ -94,14 +129,22 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="grep",
-        description="Search file contents by regex pattern.",
+        description=(
+            "Search UTF-8 text file contents by regex, returning file:line:content matches. Prefer grep over bash/rg/grep "
+            "commands for code search because it has workspace scoping, result caps, and binary/bulky directory filtering. "
+            "Use include for a glob filter such as '*.py' or 'src/**/*.ts'. Set literal=true when searching for exact text "
+            "rather than regex syntax."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "pattern": {"type": "string"},
-                "path": {"type": "string"},
-                "include": {"type": "string"},
-                "max_results": {"type": "integer"},
+                "pattern": {"type": "string", "description": "Regex pattern unless literal=true."},
+                "path": {"type": "string", "description": "File or directory to search. Defaults to workspace root."},
+                "include": {"type": "string", "description": "Optional glob filter, e.g. '*.py' or 'src/**/*.ts'."},
+                "max_results": {"type": "integer", "description": "Maximum matches to return. Defaults to 50, max 500."},
+                "literal": {"type": "boolean", "description": "Treat pattern as plain text instead of regex. Defaults to false."},
+                "case_sensitive": {"type": "boolean", "description": "Case-sensitive search. Defaults to true."},
+                "include_hidden": {"type": "boolean", "description": "Include hidden files and directories. Defaults to false."},
             },
             "required": ["pattern"],
         },

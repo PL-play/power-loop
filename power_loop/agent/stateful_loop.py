@@ -19,15 +19,20 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from llm_client.interface import LLMService
 from power_loop.agent.sink import SQLiteSink
-from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT, format_tool_catalog
+from power_loop.agent.system_prompt import (
+    DEFAULT_AGENT_SYSTEM_PROMPT,
+    SystemPromptContext,
+    format_tool_catalog,
+    section_skills,
+)
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import SessionNotFoundError, SessionPendingError
-from power_loop.core.agent_context import reset_current_loop, set_current_loop
+from power_loop.core.agent_context import get_ctx, reset_current_loop, set_current_loop
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.pipeline import (
@@ -37,7 +42,6 @@ from power_loop.core.pipeline import (
     _truncate_result,
 )
 from power_loop.core.runner import AgentRunner
-from power_loop.core.state import ContextManager
 from power_loop.runtime.cancellation import CancellationLike
 from power_loop.runtime.session_store import (
     DEFAULT_DB_PATH,
@@ -46,6 +50,7 @@ from power_loop.runtime.session_store import (
     SessionStore,
     SubagentLifecycle,
 )
+from power_loop.runtime.skills import SkillLoader
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -163,7 +168,12 @@ class StatefulAgentLoop:
         async with self._lock_for(session_id):
             self._ensure_session_or_raise(session_id)
             sink = SQLiteSink(self.store, session_id)
-            await self._execute_pending(session_id, sink)
+            async with self._runner.session_async(session_id=session_id):
+                loop_token = set_current_loop(self)
+                try:
+                    await self._execute_pending(session_id, sink)
+                finally:
+                    reset_current_loop(loop_token)
             return await self._run_loop(session_id, stop_event=stop_event, sink=sink)
 
     def abort_pending(self, session_id: str, *, reason: str = "aborted") -> int:
@@ -254,6 +264,21 @@ class StatefulAgentLoop:
             )
             if catalog:
                 base = f"{base}\n\n{catalog}"
+
+        skills = None
+        if self.config.skills_dir:
+            try:
+                loader = SkillLoader(self.config.skills_dir)
+                skills = section_skills(
+                    SystemPromptContext(
+                        skills_dir=str(loader.skills_dir),
+                        skill_descriptions=loader.get_descriptions(),
+                    )
+                )
+            except Exception:
+                skills = None
+        if skills:
+            base = f"{base}\n\n{skills}"
 
         return base
 
@@ -371,20 +396,25 @@ class StatefulAgentLoop:
         # Mirror loaded seqs into the sink so the compactor can translate
         # in-memory indices back to store rows when it folds messages.
         sink.init_history_seqs([r.seq for r in active_rows])
+        session_row = self.store.get_session(sid)
+        runtime_config = self.config
+        if session_row is not None and session_row.system_prompt and session_row.system_prompt != self.config.system_prompt:
+            runtime_config = replace(self.config, system_prompt=session_row.system_prompt)
 
         async with self._runner.session_async(session_id=sid):
             loop_token = set_current_loop(self)
             try:
                 pipeline = AgentPipeline(
                     llm=self.llm,
-                    config=self.config,
+                    config=runtime_config,
                     tool_registry=self.tool_registry,
                     hooks=self._runner.hooks,
                     bus=self._runner.event_bus,
-                    ctx=ContextManager(role="main"),
+                    ctx=get_ctx(),
                     session_id=sid,
                     stop_event=stop_event,
                     sink=sink,
+                    store=self.store,
                 )
                 result: AgentLoopResult = await pipeline.run(history)
             finally:

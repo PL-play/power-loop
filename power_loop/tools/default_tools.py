@@ -1,31 +1,84 @@
 from __future__ import annotations
 
-# NOTE: This module intentionally copies tool implementations from zero-code/core/tools.py
-# with only import-path adjustments for power-loop package layout.
 import difflib
+import fnmatch
 import os
 import queue
 import re
+import shlex
 import subprocess
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from power_loop.core.agent_context import get_ctx
+from power_loop.core.agent_context import get_ctx, get_current_loop, get_session_id
 from power_loop.runtime.env import AGENT_DIR, AGENT_RW_ALLOWLIST, WORKSPACE_DIR, safe_path
 from power_loop.runtime.skills import get_default_loader
 
 RESULT_MAX_CHARS = 50000
-_HEAD_LINES = 30
-_TAIL_LINES = 170
-SENTINEL = "___ZERO_CODE_CMD_DONE___"
+TEXT_FILE_MAX_BYTES = 5 * 1024 * 1024
+READ_DEFAULT_LIMIT = 2000
+READ_MAX_LIMIT = 20000
+SEARCH_MAX_RESULTS = 500
+GLOB_MAX_RESULTS = 500
+SENTINEL_PREFIX = "___POWER_LOOP_CMD_DONE_"
 
-FILE_READ_STATE: dict[str, float] = {}
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_COMMON_SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+    "vendor",
+}
+
+FILE_READ_STATE: dict[str, tuple[int, int]] = {}
 
 
-def _truncate_output(lines: list[str], head: int = _HEAD_LINES, tail: int = _TAIL_LINES) -> str:
+def _file_stamp(fp: Path) -> tuple[int, int]:
+    stat = fp.stat()
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _display_path(path: Path) -> str:
+    resolved = path.resolve()
+    if resolved.is_relative_to(WORKSPACE_DIR):
+        return str(resolved.relative_to(WORKSPACE_DIR))
+    if resolved.is_relative_to(AGENT_DIR):
+        return f"@agent/{resolved.relative_to(AGENT_DIR)}"
+    return str(resolved)
+
+
+def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def _truncate_chars(text: str, limit: int = RESULT_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head - 80
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n\n... ({omitted} chars omitted) ...\n\n{text[-tail:]}"
+
+
+def _truncate_lines(lines: list[str], head: int = 30, tail: int = 170) -> str:
     limit = head + tail
     if len(lines) <= limit:
         return "\n".join(lines)
@@ -37,176 +90,129 @@ def _truncate_output(lines: list[str], head: int = _HEAD_LINES, tail: int = _TAI
     )
 
 
-class BashSession:
-    """Persistent bash process with merged stdout/stderr via pty."""
+def _clean_terminal_line(line: str) -> str:
+    return _ANSI_RE.sub("", line).rstrip("\r")
 
-    def __init__(self, cwd: Path):
-        self._cwd = cwd
-        self._proc: subprocess.Popen | None = None
-        self._q: queue.Queue[str] = queue.Queue()
-        self._master_fd: int | None = None
-        self._start()
 
-    def _start(self) -> None:
-        import pty
+def _looks_binary(data: bytes) -> bool:
+    if b"\x00" in data:
+        return True
+    if not data:
+        return False
+    sample = data[:4096]
+    textish = sum(byte in b"\n\r\t\b\f" or 32 <= byte <= 126 for byte in sample)
+    return textish / len(sample) < 0.70
 
-        master_fd, slave_fd = pty.openpty()
-        try:
-            import termios
 
-            attrs = termios.tcgetattr(master_fd)
-            attrs[3] &= ~termios.ECHO
-            termios.tcsetattr(master_fd, termios.TCSANOW, attrs)
-        except Exception:
-            pass
-
-        env = os.environ.copy()
-        env["TERM"] = "dumb"
-
-        self._proc = subprocess.Popen(
-            ["/bin/bash", "--norc", "--noprofile"],
-            stdin=subprocess.PIPE,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            text=True,
-            bufsize=0,
-            cwd=str(self._cwd),
-            env=env,
+def _read_text(fp: Path, *, max_bytes: int | None = TEXT_FILE_MAX_BYTES) -> str:
+    if not fp.exists():
+        raise FileNotFoundError(fp)
+    if fp.is_dir():
+        raise IsADirectoryError(fp)
+    size = fp.stat().st_size
+    if max_bytes is not None and size > max_bytes:
+        raise ValueError(
+            f"File is too large to read as text ({size} bytes > {max_bytes} bytes): {_display_path(fp)}. "
+            "Use read_file with offset/limit for previews or grep/glob for targeted search."
         )
-        os.close(slave_fd)
-        self._master_fd = master_fd
-        self._q = queue.Queue()
-        threading.Thread(target=self._reader, daemon=True).start()
-
-    def _reader(self) -> None:
-        buf = ""
-        fd = self._master_fd
-        if fd is None:
-            return
-        try:
-            while True:
-                try:
-                    data = os.read(fd, 4096)
-                except OSError:
-                    break
-                if not data:
-                    break
-                buf += data.decode("utf-8", errors="replace")
-                while True:
-                    idx_n = buf.find("\n")
-                    idx_r = buf.find("\r")
-                    if idx_n == -1 and idx_r == -1:
-                        break
-                    candidates = [i for i in (idx_n, idx_r) if i != -1]
-                    cut = min(candidates)
-                    line, buf = buf[:cut], buf[cut + 1 :]
-                    if line:
-                        self._q.put(line)
-            if buf:
-                self._q.put(buf)
-        except Exception:
-            pass
-
-    def _drain(self, timeout: float, idle_timeout: float = 5.0) -> tuple[list[str], str | None]:
-        lines: list[str] = []
-        exit_code: str | None = None
-        deadline = time.monotonic() + timeout
-
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            wait = min(remaining, idle_timeout)
-            try:
-                line = self._q.get(timeout=wait)
-            except queue.Empty:
-                if self._proc is not None and self._proc.poll() is not None:
-                    while not self._q.empty():
-                        try:
-                            line = self._q.get_nowait()
-                            cleaned = re.sub(r"\\x1b\\[[0-9;]*[A-Za-z]", "", line).rstrip("\r")
-                            if SENTINEL in cleaned:
-                                parts = cleaned.strip().split()
-                                if len(parts) >= 2 and parts[-1].lstrip("-").isdigit():
-                                    exit_code = parts[-1]
-                                break
-                            lines.append(cleaned)
-                        except queue.Empty:
-                            break
-                    break
-                break
-
-            cleaned = re.sub(r"\\x1b\\[[0-9;]*[A-Za-z]", "", line).rstrip("\r")
-            if SENTINEL in cleaned:
-                parts = cleaned.strip().split()
-                if len(parts) >= 2 and parts[-1].lstrip("-").isdigit():
-                    exit_code = parts[-1]
-                break
-            lines.append(cleaned)
-
-        return lines, exit_code
-
-    def execute(self, command: str, timeout: int = 120) -> str:
-        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-        if any(d in command for d in dangerous):
-            return (
-                "Error: Dangerous command blocked.\n"
-                "For safety, interactive or privileged commands (like sudo / shutdown) "
-                "must be run manually in your own terminal, not via the agent bash tool."
-            )
-
-        if self._proc is None or self._proc.poll() is not None:
-            self._start()
-
-        assert self._proc is not None and self._proc.stdin is not None
-        full_cmd = f"{command}\\necho {SENTINEL} $?\\n"
-        try:
-            self._proc.stdin.write(full_cmd)
-            self._proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            self._start()
-            return "Error: Bash session crashed, restarted. Please retry."
-
-        lines, exit_code = self._drain(timeout, idle_timeout=5.0)
-        timed_out = exit_code is None
-
-        if timed_out and self._proc is not None and self._proc.poll() is not None:
-            exit_code = str(self._proc.returncode)
-            timed_out = False
-
-        header = f"exit_code={exit_code or '?'}"
-        if timed_out:
-            header += f"  (timed out after {timeout}s — command may still be running)"
-
-        body = _truncate_output(lines) if lines else "(no output)"
-        return f"{header}\\n{body}"[:RESULT_MAX_CHARS]
-
-    def restart(self) -> str:
-        if self._master_fd is not None:
-            try:
-                os.close(self._master_fd)
-            except OSError:
-                pass
-            self._master_fd = None
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except Exception:
-                self._proc.kill()
-        self._start()
-        return "Bash session restarted."
+    data = fp.read_bytes()
+    if _looks_binary(data):
+        raise ValueError(f"Refusing to read binary-looking file as text: {_display_path(fp)}")
+    return data.decode("utf-8", errors="replace")
 
 
-BASH = BashSession(WORKSPACE_DIR)
+def _remember_read(fp: Path) -> None:
+    FILE_READ_STATE[str(fp.resolve())] = _file_stamp(fp)
 
 
-def _display_path(path: Path) -> str:
+def _check_read_state(fp: Path) -> str | None:
+    key = str(fp.resolve())
+    if key not in FILE_READ_STATE:
+        return f"Error: File has not been read yet. Use read_file first before modifying: {_display_path(fp)}"
+    if fp.exists() and _file_stamp(fp) != FILE_READ_STATE[key]:
+        return f"Error: File changed since last read. Re-read it before modifying: {_display_path(fp)}"
+    return None
+
+
+def _detect_line_ending(content: str) -> str:
+    crlf_idx = content.find("\r\n")
+    lf_idx = content.find("\n")
+    if lf_idx == -1 or crlf_idx == -1:
+        return "\n"
+    return "\r\n" if crlf_idx == lf_idx - 1 else "\n"
+
+
+def _normalize_to_lf(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _restore_line_endings(text: str, ending: str) -> str:
+    return text.replace("\n", "\r\n") if ending == "\r\n" else text
+
+
+def _split_bom(content: str) -> tuple[str, str]:
+    if content.startswith("\ufeff"):
+        return "\ufeff", content[1:]
+    return "", content
+
+
+def _normalized_for_diagnostic(text: str) -> str:
+    result = _normalize_to_lf(text)
+    result = re.sub(r"[\u2018\u2019\u201a\u201b]", "'", result)
+    result = re.sub(r"[\u201c\u201d\u201e\u201f]", '"', result)
+    result = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]", "-", result)
+    result = re.sub(r"[\u00a0\u2002-\u200a\u202f\u205f\u3000]", " ", result)
+    return result
+
+
+def _line_numbers_for_offsets(content: str, needle: str, max_positions: int = 5) -> list[str]:
+    positions: list[str] = []
+    start = 0
+    while len(positions) < max_positions:
+        idx = content.find(needle, start)
+        if idx == -1:
+            break
+        positions.append(str(content[:idx].count("\n") + 1))
+        start = idx + max(1, len(needle))
+    return positions
+
+
+def _generate_diff(old_content: str, new_content: str, context: int = 3) -> str:
+    diff = difflib.unified_diff(
+        old_content.splitlines(),
+        new_content.splitlines(),
+        fromfile="before",
+        tofile="after",
+        lineterm="",
+        n=context,
+    )
+    return "\n".join(diff)
+
+
+def _is_hidden_path(path: Path, root: Path) -> bool:
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        rel_parts = path.parts
+    return any(part.startswith(".") and part not in (".", "..") for part in rel_parts)
+
+
+def _pattern_mentions_hidden(pattern: str) -> bool:
+    return any(part.startswith(".") for part in Path(pattern).parts)
+
+
+def _should_skip_dir(path: Path, root: Path, include_hidden: bool, pattern: str = "") -> bool:
+    name = path.name
+    if name in _COMMON_SKIP_DIRS:
+        return True
+    return not include_hidden and not _pattern_mentions_hidden(pattern) and _is_hidden_path(path, root)
+
+
+def _safe_relative_for_subprocess(path: Path) -> str:
     resolved = path.resolve()
     if resolved.is_relative_to(WORKSPACE_DIR):
-        return str(resolved.relative_to(WORKSPACE_DIR))
-    if resolved.is_relative_to(AGENT_DIR):
-        return f"@agent/{resolved.relative_to(AGENT_DIR)}"
+        rel = resolved.relative_to(WORKSPACE_DIR)
+        return "." if str(rel) == "." else rel.as_posix()
     return str(resolved)
 
 
@@ -248,41 +254,236 @@ def _validate_bash_command_scope(command: str) -> str | None:
 
     if any(hint in lowered for hint in _BASH_WRITE_HINTS):
         return (
-            "Error: Writing under agent home is blocked outside allowlisted paths (.cache/logs). "
+            "Error: Writing under agent home is blocked outside allowlisted paths (.cache/logs/skills). "
             "Use workspace files or allowlisted agent paths only."
         )
     if any(hint in lowered for hint in _BASH_READ_HINTS):
         return (
-            "Error: Reading agent-home internals is blocked outside allowlisted paths (.cache/logs). "
+            "Error: Reading agent-home internals is blocked outside allowlisted paths (.cache/logs/skills). "
             "Use load_skill(name) for skill content instead of direct file reads."
         )
     return None
 
 
+def _dangerous_command_reason(command: str) -> str | None:
+    lowered = command.strip().lower()
+    compact = re.sub(r"\s+", " ", lowered)
+    if re.search(r"\brm\s+(-[a-z]*[rf][a-z]*\s+|-[a-z]*[rf][a-z]*.*\s)(/|~|\$home)(\s|$)", compact):
+        return "refusing recursive deletion of a root/home path"
+    if re.search(r">\s*/dev/(sd|disk|rdisk|nvme|zero|mem)", compact):
+        return "refusing redirection to raw device paths"
+    try:
+        tokens = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        tokens = command.split()
+    commands = {Path(token).name for token in tokens if token and not token.startswith("-")}
+    blocked = {
+        "sudo",
+        "su",
+        "shutdown",
+        "reboot",
+        "halt",
+        "poweroff",
+        "mkfs",
+        "diskutil",
+        "dd",
+    }
+    used = sorted(commands & blocked)
+    if used:
+        return f"refusing privileged or device-level command: {', '.join(used)}"
+    return None
+
+
+class BashSession:
+    """Persistent bash process with stdout/stderr merged through a pty."""
+
+    def __init__(self, cwd: Path):
+        self._cwd = cwd
+        self._proc: subprocess.Popen[str] | None = None
+        self._q: queue.Queue[str] = queue.Queue()
+        self._master_fd: int | None = None
+        self._lock = threading.Lock()
+        self._start()
+
+    def _start(self) -> None:
+        import pty
+
+        master_fd, slave_fd = pty.openpty()
+        try:
+            import termios
+
+            attrs = termios.tcgetattr(master_fd)
+            attrs[3] &= ~termios.ECHO
+            termios.tcsetattr(master_fd, termios.TCSANOW, attrs)
+        except Exception:
+            pass
+
+        env = os.environ.copy()
+        env["TERM"] = "dumb"
+        env["NO_COLOR"] = "1"
+
+        self._proc = subprocess.Popen(
+            ["/bin/bash", "--norc", "--noprofile"],
+            stdin=subprocess.PIPE,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            text=True,
+            bufsize=0,
+            cwd=str(self._cwd),
+            env=env,
+        )
+        os.close(slave_fd)
+        self._master_fd = master_fd
+        self._q = queue.Queue()
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self) -> None:
+        buf = ""
+        fd = self._master_fd
+        if fd is None:
+            return
+        try:
+            while True:
+                try:
+                    data = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                buf += data.decode("utf-8", errors="replace")
+                while True:
+                    idx_n = buf.find("\n")
+                    idx_r = buf.find("\r")
+                    if idx_n == -1 and idx_r == -1:
+                        break
+                    cut = min(i for i in (idx_n, idx_r) if i != -1)
+                    line, buf = buf[:cut], buf[cut + 1 :]
+                    if line:
+                        self._q.put(line)
+            if buf:
+                self._q.put(buf)
+        except Exception:
+            pass
+
+    def _drain_until(self, sentinel: str, timeout: int, idle_timeout: float = 5.0) -> tuple[list[str], str | None]:
+        lines: list[str] = []
+        exit_code: str | None = None
+        deadline = time.monotonic() + timeout
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait = min(remaining, idle_timeout)
+            try:
+                raw_line = self._q.get(timeout=wait)
+            except queue.Empty:
+                if self._proc is not None and self._proc.poll() is not None:
+                    break
+                continue
+
+            line = _clean_terminal_line(raw_line)
+            if sentinel in line:
+                match = re.search(re.escape(sentinel) + r"\s+(-?\d+)", line)
+                if match:
+                    exit_code = match.group(1)
+                break
+            lines.append(line)
+
+        while not self._q.empty() and exit_code is None:
+            try:
+                line = _clean_terminal_line(self._q.get_nowait())
+            except queue.Empty:
+                break
+            if sentinel in line:
+                match = re.search(re.escape(sentinel) + r"\s+(-?\d+)", line)
+                if match:
+                    exit_code = match.group(1)
+                break
+            lines.append(line)
+        return lines, exit_code
+
+    def execute(self, command: str, timeout: int = 120) -> str:
+        reason = _dangerous_command_reason(command)
+        if reason:
+            return f"Error: Dangerous command blocked ({reason}). Run it manually if you really intend it."
+
+        with self._lock:
+            if self._proc is None or self._proc.poll() is not None:
+                self._start()
+
+            assert self._proc is not None and self._proc.stdin is not None
+            sentinel = f"{SENTINEL_PREFIX}{uuid.uuid4().hex}___"
+            full_cmd = f"{command}\nprintf '\\n{sentinel} %s\\n' $?\n"
+            try:
+                self._proc.stdin.write(full_cmd)
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                self._restart_locked()
+                return "Error: Bash session crashed and was restarted. Please retry the command."
+
+            lines, exit_code = self._drain_until(sentinel, timeout=timeout)
+            timed_out = exit_code is None
+            if timed_out:
+                self._restart_locked()
+
+        header = f"exit_code={exit_code or '?'}"
+        if timed_out:
+            header += f" (timed out after {timeout}s; bash session was restarted)"
+        body = _truncate_lines(lines) if lines else "(no output)"
+        return _truncate_chars(f"{header}\n{body}")
+
+    def _restart_locked(self) -> None:
+        if self._master_fd is not None:
+            try:
+                os.close(self._master_fd)
+            except OSError:
+                pass
+            self._master_fd = None
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except Exception:
+                self._proc.kill()
+        self._start()
+
+    def restart(self) -> str:
+        with self._lock:
+            self._restart_locked()
+        return "Bash session restarted."
+
+
+BASH = BashSession(WORKSPACE_DIR)
+
+
 def run_bash(command: str | None = None, restart: bool = False, timeout: int = 120) -> str:
     if restart:
         return BASH.restart()
-    if not command:
-        return "Error: command is required (or set restart=true)"
-    timeout = max(5, min(int(timeout), 600))
+    if not command or not command.strip():
+        return "Error: command is required (or set restart=true)."
+    timeout = _clamp_int(timeout, 120, 1, 600)
     scope_err = _validate_bash_command_scope(command)
     if scope_err:
         return scope_err
     return BASH.execute(command, timeout=timeout)
 
 
-def _list_directory(dp: Path) -> str:
+def _list_directory(dp: Path, limit: int = 200) -> str:
     entries = sorted(dp.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
     lines = [f"Directory: {_display_path(dp)}/"]
-    for entry in entries[:100]:
+    for entry in entries[:limit]:
         prefix = "d " if entry.is_dir() else "f "
         size = ""
         if entry.is_file():
-            size = f" ({entry.stat().st_size} bytes)"
+            try:
+                size = f" ({entry.stat().st_size} bytes)"
+            except OSError:
+                size = " (size unavailable)"
         lines.append(f"  {prefix}{entry.name}{size}")
-    if len(entries) > 100:
-        lines.append(f"  ... and {len(entries) - 100} more entries")
-    return "\\n".join(lines)
+    if len(entries) > limit:
+        lines.append(f"  ... and {len(entries) - limit} more entries")
+    return "\n".join(lines)
 
 
 def run_read(path: str, offset: int | None = None, limit: int | None = None) -> str:
@@ -290,126 +491,81 @@ def run_read(path: str, offset: int | None = None, limit: int | None = None) -> 
         fp = safe_path(path)
         if fp.is_dir():
             return _list_directory(fp)
-        text = fp.read_text()
+
+        text = _read_text(fp, max_bytes=None if limit is not None else TEXT_FILE_MAX_BYTES)
         all_lines = text.splitlines()
         total = len(all_lines)
         start = max(0, (offset or 1) - 1)
-        end = min(total, start + limit) if limit else total
+        page_limit = _clamp_int(limit, READ_DEFAULT_LIMIT, 1, READ_MAX_LIMIT) if limit is not None else READ_DEFAULT_LIMIT
+        end = min(total, start + page_limit)
         selected = all_lines[start:end]
         numbered = [f"{start + i + 1:>6}|{line}" for i, line in enumerate(selected)]
-        header = f"({total} lines total)"
-        if start > 0 or end < total:
-            header = f"(showing lines {start+1}-{end} of {total})"
-        FILE_READ_STATE[str(fp)] = fp.stat().st_mtime
-        return header + "\\n" + "\\n".join(numbered)
+        header = f"({_display_path(fp)}: showing lines {start + 1}-{end} of {total})"
+        if end < total:
+            header += f" Use offset={end + 1} to continue."
+        _remember_read(fp)
+        return _truncate_chars(header + ("\n" + "\n".join(numbered) if numbered else "\n(empty file)"))
     except Exception as e:
         return f"Error: {e}"
 
 
-def run_write(path: str, content: str) -> str:
+def run_write(path: str, content: str, overwrite: bool = True) -> str:
     try:
         fp = safe_path(path)
-        fp.parent.mkdir(parents=True, exist_ok=True)
+        if fp.exists() and fp.is_dir():
+            return f"Error: Cannot write file because path is a directory: {_display_path(fp)}"
         existed = fp.exists()
+        if existed and not overwrite:
+            return f"Error: File already exists and overwrite=false: {_display_path(fp)}"
+        if existed:
+            read_err = _check_read_state(fp)
+            if read_err:
+                return read_err.replace("modifying", "overwriting")
+
+        fp.parent.mkdir(parents=True, exist_ok=True)
         old_size = fp.stat().st_size if existed else 0
-        fp.write_text(content)
-        line_count = content.count("\\n") + (1 if content and not content.endswith("\\n") else 0)
+        fp.write_text(content, encoding="utf-8")
+        _remember_read(fp)
+        line_count = len(content.splitlines()) if content else 0
         display = _display_path(fp)
         if existed:
-            return f"Wrote {len(content)} bytes ({line_count} lines) to {display} (overwritten, was {old_size} bytes) [workspace: {WORKSPACE_DIR}]"
-        return f"Wrote {len(content)} bytes ({line_count} lines) to {display} (new file) [workspace: {WORKSPACE_DIR}]"
+            return f"Wrote {len(content)} bytes ({line_count} lines) to {display} (overwritten, was {old_size} bytes)"
+        return f"Wrote {len(content)} bytes ({line_count} lines) to {display} (new file)"
     except Exception as e:
         return f"Error: {e}"
 
 
-def _check_read_state(fp: Path) -> str | None:
-    key = str(fp)
-    if key not in FILE_READ_STATE:
-        return f"Error: File has not been read yet. Use read_file first before editing: {fp.name}"
-    if fp.exists():
-        current_mtime = fp.stat().st_mtime
-        if current_mtime > FILE_READ_STATE[key]:
-            return f"Error: File was modified since last read. Re-read it first: {fp.name}"
-    return None
-
-
-def _detect_line_ending(content: str) -> str:
-    crlf_idx = content.find("\\r\\n")
-    lf_idx = content.find("\\n")
-    if lf_idx == -1:
-        return "\\n"
-    if crlf_idx == -1:
-        return "\\n"
-    return "\\r\\n" if crlf_idx < lf_idx else "\\n"
-
-
-def _normalize_to_lf(text: str) -> str:
-    return text.replace("\\r\\n", "\\n").replace("\\r", "\\n")
-
-
-def _restore_line_endings(text: str, ending: str) -> str:
-    return text.replace("\\n", "\\r\\n") if ending == "\\r\\n" else text
-
-
-def _strip_bom(content: str) -> tuple[str, str]:
-    if content.startswith("\ufeff"):
-        return "\ufeff", content[1:]
-    return "", content
-
-
-def _normalize_unicode(text: str) -> str:
-    lines = text.split("\\n")
-    stripped = "\\n".join(line.rstrip() for line in lines)
-    result = re.sub(r"[\u2018\u2019\u201a\u201b]", "'", stripped)
-    result = re.sub(r"[\u201c\u201d\u201e\u201f]", '"', result)
-    result = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]", "-", result)
-    result = re.sub(r"[\u00a0\u2002-\u200a\u202f\u205f\u3000]", " ", result)
-    return result
-
-
-def _fuzzy_find(content: str, old_text: str) -> tuple[int, int, str] | None:
-    idx = content.find(old_text)
-    if idx != -1:
-        return idx, idx + len(old_text), content
-
-    lf_content = _normalize_to_lf(content)
-    lf_old = _normalize_to_lf(old_text)
-    idx = lf_content.find(lf_old)
-    if idx != -1:
-        return idx, idx + len(lf_old), lf_content
-
-    uni_content = _normalize_unicode(lf_content)
-    uni_old = _normalize_unicode(lf_old)
-    idx = uni_content.find(uni_old)
-    if idx != -1:
-        return idx, idx + len(uni_old), uni_content
-
-    trim_content = "\\n".join(line.strip() for line in lf_content.split("\\n"))
-    trim_old = "\\n".join(line.strip() for line in lf_old.split("\\n"))
-    idx = trim_content.find(trim_old)
-    if idx != -1:
-        return idx, idx + len(trim_old), trim_content
-
-    return None
-
-
-def _generate_diff(old_content: str, new_content: str, context: int = 3) -> str:
-    old_lines = old_content.split("\\n")
-    new_lines = new_content.split("\\n")
-    diff = difflib.unified_diff(old_lines, new_lines, lineterm="", n=context)
-    return "\\n".join(diff)
+def _find_unique_edit_span(content: str, old_text: str, path: str, replace_all: bool) -> tuple[int, int, int] | str:
+    if old_text == "":
+        return "Error: old_text must not be empty."
+    count = content.count(old_text)
+    if count == 0:
+        diagnostic_content = _normalized_for_diagnostic(content)
+        diagnostic_old = _normalized_for_diagnostic(old_text)
+        if diagnostic_old and diagnostic_content.count(diagnostic_old) > 0:
+            return (
+                f"Error: Text was only found after fuzzy normalization in {path}. "
+                "Use read_file and provide the exact current text to avoid unintended edits."
+            )
+        return f"Error: Text not found in {path}. Use read_file and provide a larger exact snippet."
+    if not replace_all and count > 1:
+        lines = ", ".join(_line_numbers_for_offsets(content, old_text))
+        return (
+            f"Error: old_text matches {count} locations in {path} (first lines: {lines}). "
+            "Provide more surrounding context to make it unique, or set replace_all=true."
+        )
+    start = content.find(old_text)
+    return start, start + len(old_text), count
 
 
 def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
     try:
         fp = safe_path(path)
-
         read_err = _check_read_state(fp)
         if read_err:
             return read_err
-
-        raw_content = fp.read_text()
-        bom, content = _strip_bom(raw_content)
+        raw_content = _read_text(fp, max_bytes=None)
+        bom, content = _split_bom(raw_content)
         original_ending = _detect_line_ending(content)
         normalized = _normalize_to_lf(content)
         norm_old = _normalize_to_lf(old_text)
@@ -418,256 +574,367 @@ def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False)
         if norm_old == norm_new:
             return "Error: old_text and new_text are identical."
 
+        span_or_error = _find_unique_edit_span(normalized, norm_old, path, replace_all)
+        if isinstance(span_or_error, str):
+            return span_or_error
+        start, end, count = span_or_error
+
         if replace_all:
-            match = _fuzzy_find(normalized, norm_old)
-            if match is None:
-                return f"Error: Text not found in {path}. Provide a larger unique snippet."
-            _, _, base = match
-            if base == normalized:
-                count = base.count(norm_old)
-                updated = base.replace(norm_old, norm_new)
-            else:
-                search_key = _normalize_unicode(norm_old)
-                count = base.count(search_key)
-                updated = base.replace(search_key, norm_new)
+            updated = normalized.replace(norm_old, norm_new)
         else:
-            match = _fuzzy_find(normalized, norm_old)
-            if match is None:
-                return f"Error: Text not found in {path}. Provide a larger unique snippet."
-            start, end, base = match
+            updated = normalized[:start] + norm_new + normalized[end:]
 
-            fuzzy_base = _normalize_unicode(_normalize_to_lf(base))
-            fuzzy_old = _normalize_unicode(norm_old)
-            occurrence_count = fuzzy_base.split(fuzzy_old)
-            count = len(occurrence_count) - 1
-            if count > 1:
-                positions = []
-                search_start = 0
-                for _ in range(min(count, 5)):
-                    idx = fuzzy_base.find(fuzzy_old, search_start)
-                    if idx == -1:
-                        break
-                    line_no = fuzzy_base[:idx].count("\\n") + 1
-                    positions.append(str(line_no))
-                    search_start = idx + 1
-                return (
-                    f"Error: old_text matches {count} locations in {path} (lines: {', '.join(positions)}). "
-                    "Provide more surrounding context to make it unique, or use replace_all=true."
-                )
-
-            updated = base[:start] + norm_new + base[end:]
-            count = 1
-
-        diff_output = _generate_diff(base, updated)
         final = bom + _restore_line_endings(updated, original_ending)
-        fp.write_text(final)
-        FILE_READ_STATE[str(fp)] = fp.stat().st_mtime
-
-        label = "replace_all" if replace_all else ("fuzzy match" if base != normalized else "exact")
-        return f"Edited {path} ({label}, {count} replacement{'s' if count != 1 else ''})\\n{diff_output}"
+        fp.write_text(final, encoding="utf-8")
+        _remember_read(fp)
+        label = "replace_all" if replace_all else "exact"
+        diff_output = _generate_diff(normalized, updated)
+        return (
+            f"Edited {_display_path(fp)} ({label}, {count} replacement{'s' if count != 1 else ''})"
+            + (f"\n{diff_output}" if diff_output else "")
+        )
     except Exception as e:
         return f"Error: {e}"
 
 
-def _seek_context(lines: list[str], context_lines: list[str], start_from: int = 0) -> int | None:
-    def _match_line(file_line: str, ctx_line: str) -> bool:
-        if file_line == ctx_line:
-            return True
-        if _normalize_unicode(file_line) == _normalize_unicode(ctx_line):
-            return True
-        if file_line.rstrip() == ctx_line.rstrip():
-            return True
-        if file_line.strip() == ctx_line.strip():
-            return True
-        return False
-
-    if not context_lines:
-        return start_from
-
-    for i in range(start_from, len(lines)):
-        if _match_line(lines[i], context_lines[0]):
-            if len(context_lines) == 1:
-                return i
-            all_match = True
-            for j, ctx in enumerate(context_lines[1:], 1):
-                if i + j >= len(lines) or not _match_line(lines[i + j], ctx):
-                    all_match = False
-                    break
-            if all_match:
-                return i
-    return None
+@dataclass
+class PatchHunk:
+    changes: list[tuple[str, str]]
+    old_start: int | None = None
+    anchor: str | None = None
 
 
-def _parse_patch(patch_text: str) -> list[dict[str, Any]]:
-    hunks: list[dict[str, Any]] = []
-    current_context: list[str] = []
-    current_changes: list[tuple[str, str]] = []
+_UNIFIED_HEADER_RE = re.compile(r"^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@(?:\s*(.*))?$")
 
-    for raw_line in patch_text.split("\\n"):
+
+def _parse_patch(patch_text: str) -> list[PatchHunk]:
+    hunks: list[PatchHunk] = []
+    current: PatchHunk | None = None
+
+    for raw_line in patch_text.splitlines():
+        if raw_line.startswith(("--- ", "+++ ", "diff --git ", "index ", "new file mode ", "deleted file mode ")):
+            continue
         if raw_line.startswith("@@"):
-            if current_changes:
-                hunks.append({"context": current_context, "changes": current_changes})
-                current_context = []
-                current_changes = []
-            ctx_text = raw_line[2:].strip() if len(raw_line) > 2 else ""
-            if ctx_text:
-                current_context.append(ctx_text)
-        elif raw_line.startswith("-"):
-            current_changes.append(("-", raw_line[1:]))
-        elif raw_line.startswith("+"):
-            current_changes.append(("+", raw_line[1:]))
-        elif raw_line.startswith(" "):
-            current_changes.append((" ", raw_line[1:]))
+            if current is not None:
+                hunks.append(current)
+            match = _UNIFIED_HEADER_RE.match(raw_line)
+            if match:
+                current = PatchHunk(changes=[], old_start=int(match.group(1)))
+            else:
+                anchor = raw_line[2:].strip()
+                current = PatchHunk(changes=[], anchor=anchor or None)
+            continue
+        if current is None:
+            continue
+        if raw_line.startswith(("+", "-", " ")):
+            current.changes.append((raw_line[0], raw_line[1:]))
+        elif raw_line == r"\ No newline at end of file":
+            continue
 
-    if current_changes:
-        hunks.append({"context": current_context, "changes": current_changes})
+    if current is not None:
+        hunks.append(current)
+    return [hunk for hunk in hunks if hunk.changes]
 
-    return hunks
+
+def _line_matches(file_line: str, patch_line: str) -> bool:
+    return file_line == patch_line or file_line.rstrip() == patch_line.rstrip()
+
+
+def _find_sequence(lines: list[str], sequence: list[str], start: int = 0) -> tuple[int | None, bool]:
+    if not sequence:
+        return start, False
+    positions: list[int] = []
+    max_start = len(lines) - len(sequence)
+    for idx in range(max(0, start), max_start + 1):
+        if all(_line_matches(lines[idx + j], expected) for j, expected in enumerate(sequence)):
+            positions.append(idx)
+            if len(positions) > 1:
+                return positions[0], True
+    if positions:
+        return positions[0], False
+    return None, False
+
+
+def _apply_hunks(lines: list[str], hunks: list[PatchHunk], path: str) -> list[str] | str:
+    cursor = 0
+    for index, hunk in enumerate(hunks, 1):
+        old_sequence = [text for op, text in hunk.changes if op in (" ", "-")]
+        replacement = [text for op, text in hunk.changes if op in (" ", "+")]
+
+        search_from = cursor
+        if hunk.old_start is not None:
+            search_from = max(0, hunk.old_start - 1)
+        if hunk.anchor and not old_sequence:
+            anchor_pos, ambiguous = _find_sequence(lines, [hunk.anchor], cursor)
+            if anchor_pos is None:
+                return f"Error: Could not locate anchor for hunk {index} in {path}: {hunk.anchor!r}"
+            if ambiguous:
+                return f"Error: Anchor for hunk {index} is ambiguous in {path}: {hunk.anchor!r}"
+            search_from = anchor_pos + 1
+
+        pos, ambiguous = _find_sequence(lines, old_sequence, search_from)
+        if pos is None and hunk.old_start is not None:
+            pos, ambiguous = _find_sequence(lines, old_sequence, cursor)
+        if pos is None:
+            preview = "\\n".join(old_sequence[:5])
+            return f"Error: Could not locate original lines for hunk {index} in {path}. First expected lines:\n{preview}"
+        if ambiguous:
+            return f"Error: Hunk {index} matches multiple locations in {path}. Add more context lines."
+
+        lines[pos : pos + len(old_sequence)] = replacement
+        cursor = pos + len(replacement)
+    return lines
 
 
 def run_apply_patch(path: str, patch: str) -> str:
     try:
         fp = safe_path(path)
-
         read_err = _check_read_state(fp)
         if read_err:
             return read_err
-
-        raw_content = fp.read_text()
-        bom, content = _strip_bom(raw_content)
+        raw_content = _read_text(fp, max_bytes=None)
+        bom, content = _split_bom(raw_content)
         original_ending = _detect_line_ending(content)
         normalized = _normalize_to_lf(content)
-        lines = normalized.split("\\n")
+        lines = normalized.split("\n")
 
         hunks = _parse_patch(patch)
         if not hunks:
-            return "Error: No valid hunks found in patch. Use @@ for context and +/- for changes."
+            return (
+                "Error: No valid hunks found. Use unified diff hunks like "
+                "'@@ -1,2 +1,2 @@' with space/context, -delete, and +add lines."
+            )
 
-        cursor = 0
-        for hi, hunk in enumerate(hunks):
-            ctx = hunk["context"]
-            changes = hunk["changes"]
+        result = _apply_hunks(list(lines), hunks, path)
+        if isinstance(result, str):
+            return result
+        updated = "\n".join(result)
+        if updated == normalized:
+            return f"No changes applied to {_display_path(fp)}."
 
-            if ctx:
-                pos = _seek_context(lines, ctx, cursor)
-                if pos is None:
-                    return (
-                        f"Error: Could not locate context for hunk {hi + 1} in {path}. "
-                        f"Context: {ctx!r}"
-                    )
-                cursor = pos + len(ctx)
-            else:
-                if hi == 0:
-                    cursor = 0
-
-            apply_at = cursor
-            i = apply_at
-            result_insert = []
-
-            for op, text in changes:
-                if op == "-":
-                    if i >= len(lines):
-                        return (
-                            f"Error: Hunk {hi + 1} tries to delete beyond end of file. "
-                            f"Expected: {text!r}"
-                        )
-                    file_line = lines[i]
-                    if not (
-                        file_line == text
-                        or file_line.strip() == text.strip()
-                        or _normalize_unicode(file_line) == _normalize_unicode(text)
-                    ):
-                        return (
-                            f"Error: Hunk {hi + 1} delete mismatch at line {i + 1}. "
-                            f"Expected: {text!r}, Found: {file_line!r}"
-                        )
-                    i += 1
-                elif op == "+":
-                    result_insert.append(text)
-                elif op == " ":
-                    if i >= len(lines):
-                        return (
-                            f"Error: Hunk {hi + 1} context line beyond end of file. "
-                            f"Expected: {text!r}"
-                        )
-                    i += 1
-                    result_insert.append(lines[i - 1])
-
-            lines[apply_at:i] = result_insert
-            cursor = apply_at + len(result_insert)
-
-        new_content = "\\n".join(lines)
-        diff_output = _generate_diff(normalized, new_content)
-        final = bom + _restore_line_endings(new_content, original_ending)
-        fp.write_text(final)
-        FILE_READ_STATE[str(fp)] = fp.stat().st_mtime
-
-        return f"Patched {path} ({len(hunks)} hunk{'s' if len(hunks) != 1 else ''})\\n{diff_output}"
+        final = bom + _restore_line_endings(updated, original_ending)
+        fp.write_text(final, encoding="utf-8")
+        _remember_read(fp)
+        diff_output = _generate_diff(normalized, updated)
+        return f"Patched {_display_path(fp)} ({len(hunks)} hunk{'s' if len(hunks) != 1 else ''})\n{diff_output}"
     except Exception as e:
         return f"Error: {e}"
 
 
-def run_glob(pattern: str, path: str = ".") -> str:
+def _iter_files_for_glob(base: Path, pattern: str, include_hidden: bool) -> list[Path]:
+    matches: list[Path] = []
+    patterns = [pattern]
+    if pattern.startswith("**/"):
+        patterns.append(pattern[3:])
+    if "**" in pattern:
+        for root, dirs, files in os.walk(base):
+            root_path = Path(root)
+            dirs[:] = [d for d in dirs if not _should_skip_dir(root_path / d, base, include_hidden, pattern)]
+            names = files + dirs
+            for name in names:
+                candidate = root_path / name
+                if not include_hidden and not _pattern_mentions_hidden(pattern) and _is_hidden_path(candidate, base):
+                    continue
+                rel = candidate.relative_to(base).as_posix()
+                if any(fnmatch.fnmatch(rel, candidate_pattern) for candidate_pattern in patterns):
+                    matches.append(candidate)
+    else:
+        for candidate in base.glob(pattern):
+            if _should_skip_dir(candidate, base, include_hidden, pattern):
+                continue
+            if not include_hidden and not _pattern_mentions_hidden(pattern) and _is_hidden_path(candidate, base):
+                continue
+            matches.append(candidate)
+    return matches
+
+
+def run_glob(pattern: str, path: str = ".", max_results: int = 100, include_hidden: bool = False) -> str:
     try:
         base = safe_path(path)
         if not base.is_dir():
             return f"Error: {path} is not a directory"
-        if not pattern.startswith("**/") and "/" not in pattern:
-            pattern = "**/" + pattern
-        matches = sorted(base.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not pattern.strip():
+            return "Error: pattern is required"
+        max_results = _clamp_int(max_results, 100, 1, GLOB_MAX_RESULTS)
+        search_pattern = pattern if pattern.startswith("**/") or "/" in pattern else f"**/{pattern}"
+        matches = _iter_files_for_glob(base, search_pattern, include_hidden)
+        matches = sorted(
+            set(matches),
+            key=lambda p: p.stat().st_mtime_ns if p.exists() else 0,
+            reverse=True,
+        )
         if not matches:
-            return f"No files matching '{pattern}' in {_display_path(base)} [workspace: {WORKSPACE_DIR}]"
-        header = f"[searched in: {_display_path(base)}, workspace: {WORKSPACE_DIR}]"
-        lines = [header] + [_display_path(m) for m in matches[:50]]
-        result = "\\n".join(lines)
-        if len(matches) > 50:
-            result += f"\\n... and {len(matches) - 50} more"
-        return result
+            return f"No files matching '{search_pattern}' in {_display_path(base)}"
+        limited = matches[:max_results]
+        lines = [f"[searched in: {_display_path(base)}]"] + [_display_path(match) for match in limited]
+        if len(matches) > max_results:
+            lines.append(f"... and {len(matches) - max_results} more")
+        return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
 
-def run_grep(pattern: str, path: str = ".", include: str | None = None, max_results: int = 50) -> str:
+def _grep_with_python(
+    pattern: str,
+    base: Path,
+    include: str | None,
+    max_results: int,
+    literal: bool,
+    case_sensitive: bool,
+    include_hidden: bool,
+) -> str:
+    flags = 0 if case_sensitive else re.IGNORECASE
+    compiled = re.compile(re.escape(pattern) if literal else pattern, flags)
+    roots = [base] if base.is_file() else []
+    if base.is_dir():
+        for root, dirs, files in os.walk(base):
+            root_path = Path(root)
+            dirs[:] = [d for d in dirs if not _should_skip_dir(root_path / d, base, include_hidden)]
+            for filename in files:
+                fp = root_path / filename
+                if include and not fnmatch.fnmatch(fp.relative_to(base).as_posix(), include):
+                    continue
+                if not include_hidden and _is_hidden_path(fp, base):
+                    continue
+                roots.append(fp)
+
+    results: list[str] = []
+    for fp in roots:
+        try:
+            data = fp.read_bytes()
+            if _looks_binary(data):
+                continue
+            text = data.decode("utf-8", errors="replace")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line_no, line in enumerate(text.splitlines(), 1):
+            if compiled.search(line):
+                results.append(f"{_display_path(fp)}:{line_no}:{line.rstrip()}")
+                if len(results) >= max_results:
+                    return "\n".join(results)
+    return "\n".join(results)
+
+
+def run_grep(
+    pattern: str,
+    path: str = ".",
+    include: str | None = None,
+    max_results: int = 50,
+    literal: bool = False,
+    case_sensitive: bool = True,
+    include_hidden: bool = False,
+) -> str:
     try:
         base = safe_path(path)
-        cmd = ["rg", "--no-heading", "--line-number", "--max-count", str(max_results), pattern, str(base)]
+        if not base.exists():
+            return f"Error: path does not exist: {path}"
+        if not pattern:
+            return "Error: pattern is required"
+        max_results = _clamp_int(max_results, 50, 1, SEARCH_MAX_RESULTS)
+
+        rg_cmd = [
+            "rg",
+            "--no-heading",
+            "--line-number",
+            "--with-filename",
+            "--color=never",
+            "--max-filesize",
+            "5M",
+            "--glob",
+            "!.git/**",
+            "--glob",
+            "!node_modules/**",
+            "--glob",
+            "!dist/**",
+            "--glob",
+            "!build/**",
+        ]
+        if include_hidden:
+            rg_cmd.append("--hidden")
+        if literal:
+            rg_cmd.append("--fixed-strings")
+        if not case_sensitive:
+            rg_cmd.append("--ignore-case")
         if include:
-            cmd.extend(["--glob", include])
+            rg_cmd.extend(["--glob", include])
+        if not include_hidden:
+            rg_cmd.extend(["--glob", "!.*", "--glob", "!**/.*"])
+        rg_cmd.extend(["--", pattern, _safe_relative_for_subprocess(base)])
+
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            if r.returncode > 1:
-                err = r.stderr.strip() or "rg failed"
-                return f"Error: {err}"
-            out = r.stdout.strip()
-            if not out:
-                return f"No matches for '{pattern}'"
-            lines = out.splitlines()[:max_results]
-            return "\\n".join(lines)
+            result = subprocess.run(
+                rg_cmd,
+                cwd=str(WORKSPACE_DIR),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode > 1:
+                return f"Error: {result.stderr.strip() or 'rg failed'}"
+            lines = [line for line in result.stdout.splitlines() if line][:max_results]
+            if not lines:
+                return f"No matches for '{pattern}' in {_display_path(base)}"
+            if len(result.stdout.splitlines()) > max_results:
+                lines.append(f"... results truncated at {max_results}")
+            return "\n".join(lines)
         except FileNotFoundError:
-            compiled = re.compile(pattern)
-            results = []
-            search_dir = base if base.is_dir() else base.parent
-            glob_pat = include or "**/*"
-            for fp in search_dir.glob(glob_pat):
-                if not fp.is_file():
-                    continue
-                try:
-                    for i, line in enumerate(fp.read_text().splitlines(), 1):
-                        if compiled.search(line):
-                            results.append(f"{_display_path(fp)}:{i}:{line.rstrip()}")
-                            if len(results) >= max_results:
-                                break
-                except (UnicodeDecodeError, PermissionError):
-                    continue
-                if len(results) >= max_results:
-                    break
-            return "\\n".join(results) if results else f"No matches for '{pattern}'"
+            output = _grep_with_python(pattern, base, include, max_results, literal, case_sensitive, include_hidden)
+            return output if output else f"No matches for '{pattern}' in {_display_path(base)}"
+    except re.error as e:
+        return f"Error: Invalid regex: {e}"
     except Exception as e:
         return f"Error: {e}"
 
 
 def run_load_skill(name: str) -> str:
+    loop = get_current_loop()
+    skills_dir = getattr(getattr(loop, "config", None), "skills_dir", None) if loop is not None else None
+    if skills_dir:
+        from power_loop.runtime.skills import SkillLoader
+
+        return SkillLoader(skills_dir).get_content(name)
     return get_default_loader().get_content(name)
+
+
+def _current_store_and_session() -> tuple[Any | None, str | None]:
+    loop = get_current_loop()
+    sid = get_session_id()
+    store = getattr(loop, "store", None) if loop is not None else None
+    return store, sid
+
+
+def _render_todos(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "No todos."
+    lines: list[str] = []
+    for item in items:
+        marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+        lines.append(f"{marker} #{item['id']}: {item['text']}")
+    done = sum(1 for item in items if item["status"] == "completed")
+    lines.append(f"\n({done}/{len(items)} completed)")
+    return "\n".join(lines)
+
+
+def _validate_todos(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if len(items) > 20:
+        raise ValueError("Max 20 todos allowed")
+    validated: list[dict[str, Any]] = []
+    in_progress_count = 0
+    for i, item in enumerate(items):
+        text = str(item.get("text", "")).strip()
+        status = str(item.get("status", "pending")).lower()
+        item_id = str(item.get("id", str(i + 1)))
+        if not text:
+            raise ValueError(f"Item {item_id}: text required")
+        if status not in ("pending", "in_progress", "completed"):
+            raise ValueError(f"Item {item_id}: invalid status '{status}'")
+        if status == "in_progress":
+            in_progress_count += 1
+        validated.append({"id": item_id, "text": text, "status": status})
+    if in_progress_count > 1:
+        raise ValueError("Only one task can be in_progress at a time")
+    return validated
+
 
 class BackgroundManager:
     """Background command runner with task tracking."""
@@ -677,28 +944,40 @@ class BackgroundManager:
         self._lock = threading.Lock()
 
     def run(self, command: str) -> str:
-        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-        if any(d in command for d in dangerous):
-            return (
-                "Error: Dangerous command blocked.\n"
-                "Background tasks do not support interactive or privileged commands "
-                "(like sudo / shutdown). Please run these manually in your own shell."
-            )
+        reason = _dangerous_command_reason(command)
+        if reason:
+            return f"Error: Dangerous command blocked ({reason}). Run it manually if you really intend it."
 
         scope_err = _validate_bash_command_scope(command)
         if scope_err:
             return scope_err
 
         task_id = str(uuid.uuid4())[:8]
+        store, sid = _current_store_and_session()
+        if store is not None and sid is not None:
+            store.upsert_background_task(
+                sid,
+                task_id=task_id,
+                command=command,
+                status="running",
+                output_tail=None,
+            )
         with self._lock:
-            self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+            self.tasks[task_id] = {"status": "running", "result": None, "command": command, "session_id": sid, "store": store}
 
         threading.Thread(target=self._execute, args=(task_id, command), daemon=True).start()
         return f"Background task {task_id} started: {command[:80]}"
 
     def _execute(self, task_id: str, command: str) -> None:
+        store = None
+        sid = None
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is not None:
+                store = task.get("store")
+                sid = task.get("session_id")
         try:
-            r = subprocess.run(
+            result = subprocess.run(
                 command,
                 shell=True,
                 cwd=str(WORKSPACE_DIR),
@@ -706,32 +985,58 @@ class BackgroundManager:
                 text=True,
                 timeout=300,
             )
-            output = (r.stdout + r.stderr).strip()[:50000]
-            status = "completed"
+            output = _truncate_chars((result.stdout + result.stderr).strip())
+            status = "completed" if result.returncode == 0 else f"failed({result.returncode})"
+            return_code = result.returncode
         except subprocess.TimeoutExpired:
             output = "Error: Timeout (300s)"
             status = "timeout"
+            return_code = None
         except Exception as e:  # pragma: no cover
             output = f"Error: {e}"
             status = "error"
+            return_code = None
 
         with self._lock:
             task = self.tasks.get(task_id)
             if task is not None:
                 task["status"] = status
                 task["result"] = output or "(no output)"
+        if store is not None and sid is not None:
+            try:
+                store.upsert_background_task(
+                    sid,
+                    task_id=task_id,
+                    command=command,
+                    status=status,
+                    return_code=return_code,
+                    output_tail=output or "(no output)",
+                )
+            except Exception:
+                pass
 
     def check(self, task_id: str | None = None) -> str:
+        store, sid = _current_store_and_session()
+        if store is not None and sid is not None:
+            if task_id:
+                row = store.get_background_task(sid, task_id)
+                if row is None:
+                    return f"Error: Unknown task {task_id}"
+                return f"[{row.status}] {row.command[:80]}\n{row.output_tail or '(running)'}"
+            rows = store.list_background_tasks(sid)
+            if not rows:
+                return "No background tasks."
+            return "\n".join(f"{row.task_id}: [{row.status}] {row.command[:80]}" for row in rows)
         with self._lock:
             if task_id:
                 task = self.tasks.get(task_id)
                 if not task:
                     return f"Error: Unknown task {task_id}"
-                return f"[{task['status']}] {task['command'][:60]}\n{task.get('result') or '(running)'}"
+                return f"[{task['status']}] {task['command'][:80]}\n{task.get('result') or '(running)'}"
 
             lines: list[str] = []
             for tid, task in self.tasks.items():
-                lines.append(f"{tid}: [{task['status']}] {task['command'][:60]}")
+                lines.append(f"{tid}: [{task['status']}] {task['command'][:80]}")
             return "\n".join(lines) if lines else "No background tasks."
 
 
@@ -747,18 +1052,47 @@ def check_background(task_id: str | None = None) -> str:
 
 
 def run_todo(items: list[dict[str, Any]]) -> str:
-    return get_ctx().todo.update(items)
+    validated = _validate_todos(items)
+    store, sid = _current_store_and_session()
+    if store is not None and sid is not None:
+        rendered = _render_todos(validated)
+        done = sum(1 for item in validated if item["status"] == "completed")
+        store.set_runtime_state(
+            sid,
+            "todo",
+            {
+                "items": validated,
+                "rendered": rendered,
+                "counts": {"total": len(validated), "completed": done},
+            },
+        )
+        # Keep the in-process context warm for UI/event compatibility.
+        get_ctx().todo.update(validated)
+        return rendered
+    return get_ctx().todo.update(validated)
 
 
-# Default tool handlers copied from zero-code mapping style.
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120)),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"], kw.get("overwrite", True)),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"], kw.get("replace_all", False)),
     "apply_patch": lambda **kw: run_apply_patch(kw["path"], kw["patch"]),
-    "glob": lambda **kw: run_glob(kw["pattern"], kw.get("path", ".")),
-    "grep": lambda **kw: run_grep(kw["pattern"], kw.get("path", "."), kw.get("include"), kw.get("max_results", 50)),
+    "glob": lambda **kw: run_glob(
+        kw["pattern"],
+        kw.get("path", "."),
+        kw.get("max_results", 100),
+        kw.get("include_hidden", False),
+    ),
+    "grep": lambda **kw: run_grep(
+        kw["pattern"],
+        kw.get("path", "."),
+        kw.get("include"),
+        kw.get("max_results", 50),
+        kw.get("literal", False),
+        kw.get("case_sensitive", True),
+        kw.get("include_hidden", False),
+    ),
     "load_skill": lambda **kw: run_load_skill(kw["name"]),
     "todo": lambda **kw: run_todo(kw["items"]),
     "background_run": lambda **kw: run_background(kw["command"]),

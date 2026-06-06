@@ -118,6 +118,13 @@ from power_loop.runtime.provider import (
     create_llm_service_from_env,
 )
 from power_loop.runtime.retry import LLMRetryPolicy, with_retry
+from power_loop.runtime.runtime_state import (
+    BackgroundRuntimeProjector,
+    RuntimeMessage,
+    RuntimeProjector,
+    TodoRuntimeProjector,
+    default_runtime_projectors,
+)
 from power_loop.runtime.session_store import (
     DEFAULT_DB_PATH,
     MAX_SPAWN_DEPTH,
@@ -207,6 +214,11 @@ __all__ = [
 	"CompactionFailed",
 	"LLMRetryPolicy",
 	"with_retry",
+	"RuntimeMessage",
+	"RuntimeProjector",
+	"TodoRuntimeProjector",
+	"BackgroundRuntimeProjector",
+	"default_runtime_projectors",
 	"CancellationToken",
 	"CancellationLike",
 	"LlmRetryAttemptedPayload",

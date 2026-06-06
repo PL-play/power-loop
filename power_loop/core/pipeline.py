@@ -17,7 +17,12 @@ from typing import Any
 
 from llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.sink import MessageSink, NullSink
-from power_loop.agent.system_prompt import DEFAULT_AGENT_SYSTEM_PROMPT, format_tool_catalog
+from power_loop.agent.system_prompt import (
+    DEFAULT_AGENT_SYSTEM_PROMPT,
+    SystemPromptContext,
+    format_tool_catalog,
+    section_skills,
+)
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
     CancellationRequested,
@@ -48,7 +53,6 @@ from power_loop.contracts.event_payloads import (
     ToolCallFailedPayload,
     ToolCallStartedPayload,
     UsageUpdatedPayload,
-    UserNotificationPayload,
 )
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hook_contexts import (
@@ -76,6 +80,7 @@ from power_loop.core.state import ContextManager
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.memory import MemorySnapshot, tag_as_memory
 from power_loop.runtime.retry import with_retry
+from power_loop.runtime.skills import SkillLoader
 from power_loop.tools.registry import ToolRegistry
 
 RESULT_MAX_CHARS = 50000
@@ -194,6 +199,7 @@ class AgentPipeline:
         session_id: str | None = None,
         stop_event: CancellationLike = None,
         sink: MessageSink | None = None,
+        store: Any | None = None,
     ) -> None:
         self.llm = llm
         self.config = config
@@ -207,6 +213,7 @@ class AgentPipeline:
         # Legacy attribute kept for hook ctx fields (RoundStartCtx.stop_event etc.).
         self.stop_event = stop_event if isinstance(stop_event, threading.Event) else None
         self.sink: MessageSink = sink if sink is not None else NullSink()
+        self.store = store
 
         base_prompt = (config.system_prompt or DEFAULT_AGENT_SYSTEM_PROMPT).strip()
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
@@ -221,10 +228,29 @@ class AgentPipeline:
             if catalog:
                 base_prompt = f"{base_prompt}\n\n{catalog}"
 
+        skill_section = self._build_skill_prompt_section()
+        if skill_section:
+            base_prompt = f"{base_prompt}\n\n{skill_section}"
+
         self.system_prompt = base_prompt
         self.history: list[LoopMessage] = []
         self.rounds_since_todo = 0
         self._completed_rounds = 0
+
+    def _build_skill_prompt_section(self) -> str:
+        if not self.config.skills_dir:
+            return ""
+        try:
+            loader = SkillLoader(self.config.skills_dir)
+        except Exception:
+            return ""
+        section = section_skills(
+            SystemPromptContext(
+                skills_dir=str(loader.skills_dir),
+                skill_descriptions=loader.get_descriptions(),
+            )
+        )
+        return section or ""
 
     # ── Helper: emit event ──
 
@@ -368,15 +394,6 @@ class AgentPipeline:
     async def prepare_round(self, round_index: int) -> None:
         """Prepare a new round: todo reminders, then run the pluggable
         compactor if one is configured on the loop config."""
-        # Todo reminder
-        if self.rounds_since_todo >= 5 and self.ctx.todo.has_in_progress:
-            await self._append_message(
-                {"role": "user", "content": "<reminder>You have an in_progress todo. Update your todos.</reminder>"},
-                round_index=round_index,
-            )
-            self._emit(AgentEventType.USER_NOTIFICATION, UserNotificationPayload(message="update your todos"), round_index=round_index)
-            self.rounds_since_todo = 0
-
         # Microcompact (legacy: dump large tool outputs to disk and replace
         # with a short pointer — orthogonal to LLM-based compaction).
         self.ctx.microcompact(self.history)
@@ -438,6 +455,28 @@ class AgentPipeline:
             messages_after_count=len(self.history),
         )
         await self.hooks.run_typed_async(HookPoint.COMPACT_AFTER, compact_after)
+
+    def _runtime_messages_for_round(self, round_index: int) -> list[LoopMessage]:
+        """Build transient runtime-state messages for the next LLM call.
+
+        These messages are deliberately not appended through ``_append_message``:
+        SQLite runtime state is the authority, and the message is just the
+        current projection the model needs for this round.
+        """
+        if self.store is None or self.session_id is None:
+            todo_snap = self.ctx.todo.snapshot_for_prompt()
+            return [{"role": "user", "content": todo_snap}] if todo_snap else []
+
+        messages: list[LoopMessage] = []
+        for projector in self.config.runtime_projectors:
+            projected = projector.project(
+                store=self.store,
+                session_id=self.session_id,
+                round_index=round_index,
+                context=self.ctx,
+            )
+            messages.extend(dict(msg) for msg in projected)
+        return messages
 
     async def call_llm(
         self,
@@ -587,15 +626,13 @@ class AgentPipeline:
             self.sink.on_round_started(round_idx)
             self._emit(AgentEventType.ROUND_STARTED, RoundStartedPayload(round_index=round_idx), round_index=round_idx)
 
-            # Todo snapshot injection
-            todo_snap = self.ctx.todo.snapshot_for_prompt()
-            if todo_snap:
-                await self._append_message({"role": "user", "content": todo_snap}, round_index=round_idx)
+            runtime_messages = self._runtime_messages_for_round(round_idx)
+            llm_messages = [*self.history, *runtime_messages]
 
             # ── Hook: LLM_BEFORE ──
             llm_before = LlmBeforeCtx(
                 round_index=round_idx,
-                messages=self.history,
+                messages=llm_messages,
                 system_prompt=self.system_prompt,
                 tools=self.runtime_tools,
                 max_tokens=int(self.config.max_tokens or 8000),
@@ -691,12 +728,6 @@ class AgentPipeline:
                     tool_calls=sanitized_tool_calls,
                     round_index=round_idx,
                 )
-
-            # Remove todo snapshot
-            if todo_snap:
-                idx = len(self.history) - 2
-                if idx >= 0 and self.history[idx].get("content") == todo_snap:
-                    self.history.pop(idx)
 
             # ── No tools → completed ──
             if not tool_calls:

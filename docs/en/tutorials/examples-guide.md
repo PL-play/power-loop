@@ -32,6 +32,7 @@ All examples share `_helpers.py` which loads `.env` and builds an LLM client. To
 | [17](#17-custom-memory-provider) | `custom_memory_provider.py` | HTTP-backed MemoryProvider |
 | [18](#18-multi-provider) | `multi_provider.py` | Multiple LLM providers |
 | [19](#19-full-chatbot) | `full_chatbot.py` | **Flagship**: all features combined |
+| [20](#20-default-tools) | `default_tools.py` | Built-in filesystem/search/bash tools |
 
 ---
 
@@ -1089,6 +1090,33 @@ Your name is Alan and you live in Shanghai.
 
 ---
 
+## 20 · Default Tools
+
+**Concept**: Exercise every built-in tool without a real LLM.
+
+### Code
+
+```python
+registry = create_default_tool_registry(preset="full")
+
+registry.invoke("write_file", {"path": target, "content": "alpha\nbeta\n"})
+registry.invoke("read_file", {"path": target})
+registry.invoke("edit_file", {"path": target, "old_text": "beta", "new_text": "BETA"})
+registry.invoke("apply_patch", {"path": target, "patch": "@@ -1,2 +1,3 @@\n alpha\n BETA\n+gamma"})
+registry.invoke("glob", {"path": rel_root, "pattern": "*.py"})
+registry.invoke("grep", {"path": rel_root, "pattern": "VALUE", "include": "*.py"})
+registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
+```
+
+### Key Points
+
+- `create_default_tool_registry(preset="full")` registers filesystem, search, shell, todo, skill, and background tools.
+- Existing files must be read before `write_file`, `edit_file`, or `apply_patch` can modify them.
+- `glob` and `grep` are preferred for locating files and searching content; `bash` is best for tests and builds.
+- This example is deterministic and does not require API credentials.
+
+---
+
 ## Quick Reference
 
 ### Choosing the right example
@@ -1109,4 +1137,5 @@ Your name is Alan and you live in Shanghai.
 | Extract structured JSON | [14](#14-structured-output) |
 | Inject domain knowledge | [15](#15-skills-from-markdown) |
 | Use multiple LLM providers | [18](#18-multi-provider) |
+| Try the built-in tools | [20](#20-default-tools) |
 | See everything together | [19](#19-full-chatbot) |

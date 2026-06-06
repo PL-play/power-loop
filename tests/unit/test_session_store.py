@@ -34,7 +34,15 @@ def test_open_creates_schema_in_file(tmp_path: Path) -> None:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        assert {"sessions", "messages", "compactions", "usage_rounds", "session_state"} <= names
+        assert {
+            "sessions",
+            "messages",
+            "compactions",
+            "usage_rounds",
+            "session_state",
+            "session_runtime_state",
+            "background_tasks",
+        } <= names
     finally:
         s.close()
 
@@ -184,11 +192,54 @@ def test_close_session_wipes_all_tables(store: SessionStore) -> None:
 
     store.close_session(sid)
 
-    for table in ("sessions", "messages", "compactions", "usage_rounds", "session_state"):
+    for table in (
+        "sessions",
+        "messages",
+        "compactions",
+        "usage_rounds",
+        "session_state",
+        "session_runtime_state",
+        "background_tasks",
+    ):
         n = store._conn.execute(
             f"SELECT count(*) FROM {table} WHERE session_id=?", (sid,)
         ).fetchone()[0]
         assert n == 0, f"{table} not fully wiped"
+
+
+def test_runtime_state_round_trips(store: SessionStore) -> None:
+    sid = store.create_session()
+    store.set_runtime_state(sid, "todo", {"items": [{"id": "a", "status": "pending"}]})
+    assert store.get_runtime_state(sid, "todo") == {"items": [{"id": "a", "status": "pending"}]}
+    assert store.get_runtime_state(sid, "missing", default={"x": 1}) == {"x": 1}
+    store.delete_runtime_state(sid, "todo")
+    assert store.get_runtime_state(sid, "todo") is None
+
+
+def test_background_tasks_round_trip_and_seen(store: SessionStore) -> None:
+    sid = store.create_session()
+    store.upsert_background_task(sid, task_id="t1", command="echo hi", status="running")
+    task = store.get_background_task(sid, "t1")
+    assert task is not None
+    assert task.status == "running"
+
+    updates = store.list_unseen_background_updates(sid)
+    assert [task.task_id for task in updates] == ["t1"]
+    store.mark_background_seen(sid, ["t1"])
+    assert store.list_unseen_background_updates(sid) == []
+
+    store.upsert_background_task(
+        sid,
+        task_id="t1",
+        command="echo hi",
+        status="completed",
+        return_code=0,
+        output_tail="hi",
+    )
+    updates = store.list_unseen_background_updates(sid)
+    assert len(updates) == 1
+    assert updates[0].status == "completed"
+    assert updates[0].output_tail == "hi"
 
 
 def test_pending_round_index_set_get(store: SessionStore) -> None:
