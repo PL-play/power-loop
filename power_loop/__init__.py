@@ -6,7 +6,10 @@ Stability tiers
 **STABLE** — 跨 minor 版本保证向后兼容；破坏性变更必须升 minor 版本 + CHANGELOG。
 业务方（如 DeepTalk `agent` 服务）只应依赖这一层。
 
-    AgentLoop, AgentLoopConfig, AgentLoopResult,
+    StatefulAgentLoop, StatefulResult,
+    AgentLoopConfig, AgentLoopResult,
+    SessionStore,
+    PowerLoopError,
     AgentHooks, AgentEventBus,
     HookPoint, HookDirective,
     ToolRegistry, ToolDefinition,

@@ -15,8 +15,6 @@ The catalog only lists tool names and descriptions.
 """
 from __future__ import annotations
 
-import pytest
-
 from power_loop import (
     AgentLoopConfig,
     SystemPromptBuilder,
@@ -32,7 +30,6 @@ from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.state import ContextManager
-
 
 # ── fixtures ─────────────────────────────────────────────────────────────
 

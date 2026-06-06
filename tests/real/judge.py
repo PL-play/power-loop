@@ -14,11 +14,9 @@ into the assertion message so debugging is one-glance.
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 from dataclasses import dataclass
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, StructuredOutputError, parse_structured
 
 from ._llm import make_llm
 
@@ -100,27 +98,34 @@ async def assert_passes(
     )
 
 
-# ── parsing ─────────────────────────────────────────────────────────────
-
-
-_JSON_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+_VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "passed": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": ["passed", "reason"],
+}
 
 
 def _parse_verdict(text: str) -> Verdict:
     text = (text or "").strip()
     if not text:
         return Verdict(passed=False, reason="judge returned empty text")
-    # Tolerate prose-wrapped JSON (some models add a leading sentence).
-    for candidate in [text, *_JSON_RE.findall(text)]:
+
+    candidates = [text]
+    if text.count("{") > text.count("}"):
+        candidates.append(text + ("}" * (text.count("{") - text.count("}"))))
+
+    for candidate in candidates:
         try:
-            obj = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(obj, dict):
+            obj = parse_structured(candidate, schema=_VERDICT_SCHEMA)
+        except StructuredOutputError:
             continue
         passed = bool(obj.get("passed"))
         reason = str(obj.get("reason") or "")
         return Verdict(passed=passed, reason=reason)
+
     return Verdict(
         passed=False,
         reason=f"judge produced unparseable output: {text[:200]}",
