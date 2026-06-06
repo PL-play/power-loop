@@ -33,6 +33,7 @@
 | [18](#18-多-provider) | `multi_provider.py` | 多个 LLM 供应商 |
 | [19](#19-旗舰示例) | `full_chatbot.py` | **全部功能集合** |
 | [20](#20-默认工具) | `default_tools.py` | 内置文件/搜索/bash 工具 |
+| [高级运行时](../../../examples/advanced_runtime/) | `advanced_runtime/` | 运行时绑定工具模式 |
 
 ---
 
@@ -1087,4 +1088,5 @@ registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
 | 注入领域知识 | [15](#15-markdown-技能) |
 | 切换多个 LLM 供应商 | [18](#18-多-provider) |
 | 试用内置工具 | [20](#20-默认工具) |
+| 构建运行时绑定工具 | [高级运行时](../../../examples/advanced_runtime/) |
 | 看全部功能 | [19](#19-旗舰示例) |

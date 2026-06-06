@@ -25,6 +25,7 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 | [Memory](memory.md) | `MemoryProvider` protocol, `recall` / `remember`, injection position |
 | [Retry & Cancel](retry-cancel.md) | `LLMRetryPolicy`, exponential backoff, `CancellationToken` |
 | [Structured Output](structured-output.md) | `StructuredOutputSpec`, `parse_structured`, JSON repair chain |
+| [Advanced Runtime Tools](advanced-runtime-tools.md) | Runtime state, projectors, hooks/events, custom flow control |
 
 ## Advanced
 

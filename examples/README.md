@@ -47,6 +47,10 @@ python examples/00_hello_world.py
 
 [`_helpers.py`](_helpers.py) provides `make_llm()` — loads `.env` and builds the configured LLM client. Each example imports it. If you copy an example into your own project, inline the two lines from `make_llm()` and drop the import.
 
+## Advanced runtime examples
+
+[`advanced_runtime/`](advanced_runtime/) contains focused examples for runtime-bound tools: custom `RuntimeProjector`s, `get_tool_runtime_context()`, hooks-based control flow, and event-bus observability. These examples use a scripted fake LLM and do not require API credentials.
+
 ## Next
 
 After `19`, explore the [User Guide](../docs/en/user-guide/index.md) for deep-dive reference docs, or the [Tutorials](../docs/en/tutorials/index.md) for step-by-step project builds.

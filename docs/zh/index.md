@@ -29,6 +29,7 @@ power-loop 是一个**可嵌入的 Agent 执行内核**——不是框架，不�
 - **重试 + 取消** — `LLMRetryPolicy` 指数退避；`CancellationToken` 统一取消形状
 - **结构化输出** — `StructuredOutputSpec` + 四级 JSON 修复链
 - **可插拔记忆** — `MemoryProvider` 协议，跨会话召回
+- **运行时绑定工具** — 持久工具状态、projector、hooks 和 events，用于高级流程控制
 
 ## API 稳定性
 

@@ -29,6 +29,7 @@ power-loop is an **embeddable Agent execution kernel** — not a framework, not 
 - **Retry + cancel** — `LLMRetryPolicy` with exponential backoff; `CancellationToken` for any cancel shape
 - **Structured output** — `StructuredOutputSpec` + JSON repair chain
 - **Pluggable memory** — `MemoryProvider` protocol for cross-session recall
+- **Runtime-bound tools** — durable tool state, projectors, hooks, and events for advanced flow control
 
 ## API stability
 

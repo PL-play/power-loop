@@ -25,6 +25,7 @@
 | [记忆](memory.md) | `MemoryProvider` 协议、`recall` / `remember`、注入位置 |
 | [重试与取消](retry-cancel.md) | `LLMRetryPolicy`、指数退避、`CancellationToken` |
 | [结构化输出](structured-output.md) | `StructuredOutputSpec`、`parse_structured`、JSON 修复链 |
+| [高级运行时工具](advanced-runtime-tools.md) | Runtime state、projector、hooks/events、自定义流程控制 |
 
 ## 高级
 

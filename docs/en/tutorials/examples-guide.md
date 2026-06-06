@@ -33,6 +33,7 @@ All examples share `_helpers.py` which loads `.env` and builds an LLM client. To
 | [18](#18-multi-provider) | `multi_provider.py` | Multiple LLM providers |
 | [19](#19-full-chatbot) | `full_chatbot.py` | **Flagship**: all features combined |
 | [20](#20-default-tools) | `default_tools.py` | Built-in filesystem/search/bash tools |
+| [Advanced Runtime](../../../examples/advanced_runtime/) | `advanced_runtime/` | Runtime-bound tool patterns |
 
 ---
 
@@ -1138,4 +1139,5 @@ registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
 | Inject domain knowledge | [15](#15-skills-from-markdown) |
 | Use multiple LLM providers | [18](#18-multi-provider) |
 | Try the built-in tools | [20](#20-default-tools) |
+| Build runtime-bound tools | [Advanced Runtime](../../../examples/advanced_runtime/) |
 | See everything together | [19](#19-full-chatbot) |
