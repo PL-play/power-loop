@@ -3,21 +3,37 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+import pytest
+
 from power_loop import create_default_tool_registry
-from power_loop.runtime.env import WORKSPACE_DIR
+from power_loop.runtime.env import RuntimeEnvError
+from power_loop.runtime.human_input import HumanInputRequired
 from power_loop.tools.default_tools import FILE_READ_STATE
 
 
-def _sandbox() -> Path:
-    path = WORKSPACE_DIR / ".tmp-default-tools" / uuid.uuid4().hex
+def _sandbox(workspace: Path) -> Path:
+    path = workspace / ".tmp-default-tools" / uuid.uuid4().hex
     path.mkdir(parents=True)
     return path
 
 
-def test_write_read_and_overwrite_guard() -> None:
-    registry = create_default_tool_registry()
-    root = _sandbox()
-    rel = root.relative_to(WORKSPACE_DIR).as_posix()
+def test_workspace_tools_require_explicit_workspace() -> None:
+    with pytest.raises(RuntimeEnvError, match="POWER_LOOP_WORKSPACE"):
+        create_default_tool_registry(include=["read_file"])
+
+
+def test_request_user_input_does_not_require_workspace() -> None:
+    registry = create_default_tool_registry(include=["request_user_input"])
+    with pytest.raises(HumanInputRequired) as exc:
+        registry.invoke("request_user_input", {"prompt": "Approve?", "kind": "confirm"})
+    assert exc.value.prompt == "Approve?"
+    assert exc.value.kind == "confirm"
+
+
+def test_write_read_and_overwrite_guard(tmp_path: Path) -> None:
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
 
     created = registry.invoke("write_file", {"path": f"{rel}/note.txt", "content": "alpha\nbeta\n"})
     assert "new file" in str(created)
@@ -32,10 +48,10 @@ def test_write_read_and_overwrite_guard() -> None:
     assert "changed since last read" in str(blocked).lower()
 
 
-def test_edit_requires_unique_exact_text_and_returns_diff() -> None:
-    registry = create_default_tool_registry()
-    root = _sandbox()
-    rel = root.relative_to(WORKSPACE_DIR).as_posix()
+def test_edit_requires_unique_exact_text_and_returns_diff(tmp_path: Path) -> None:
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
     target = f"{rel}/edit.txt"
     registry.invoke("write_file", {"path": target, "content": "one\ntwo\nthree\ntwo\n"})
     registry.invoke("read_file", {"path": target})
@@ -53,10 +69,10 @@ def test_edit_requires_unique_exact_text_and_returns_diff() -> None:
     assert (root / "edit.txt").read_text(encoding="utf-8") == "one\nTWO\nthree\ntwo\n"
 
 
-def test_apply_patch_accepts_unified_hunks() -> None:
-    registry = create_default_tool_registry()
-    root = _sandbox()
-    rel = root.relative_to(WORKSPACE_DIR).as_posix()
+def test_apply_patch_accepts_unified_hunks(tmp_path: Path) -> None:
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
     target = f"{rel}/patch.txt"
     registry.invoke("write_file", {"path": target, "content": "red\ngreen\nblue\n"})
     registry.invoke("read_file", {"path": target})
@@ -77,10 +93,10 @@ def test_apply_patch_accepts_unified_hunks() -> None:
     assert (root / "patch.txt").read_text(encoding="utf-8") == "red\nemerald\nblue\nviolet\n"
 
 
-def test_glob_and_grep_are_scoped_and_capped() -> None:
-    registry = create_default_tool_registry()
-    root = _sandbox()
-    rel = root.relative_to(WORKSPACE_DIR).as_posix()
+def test_glob_and_grep_are_scoped_and_capped(tmp_path: Path) -> None:
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
     (root / "a.py").write_text("needle = 1\n", encoding="utf-8")
     (root / "b.txt").write_text("needle = 2\n", encoding="utf-8")
     (root / ".hidden.py").write_text("needle = 3\n", encoding="utf-8")
@@ -97,8 +113,8 @@ def test_glob_and_grep_are_scoped_and_capped() -> None:
     assert "b.txt" not in str(grep)
 
 
-def test_bash_runs_and_blocks_obvious_danger() -> None:
-    registry = create_default_tool_registry()
+def test_bash_runs_and_blocks_obvious_danger(tmp_path: Path) -> None:
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
     ok = registry.invoke("bash", {"command": "printf 'hello-tools\\n'", "timeout": 5})
     assert "exit_code=0" in str(ok)
     assert "hello-tools" in str(ok)
@@ -107,8 +123,10 @@ def test_bash_runs_and_blocks_obvious_danger() -> None:
     assert "Dangerous command blocked" in str(blocked)
 
 
-def test_default_registry_contains_all_manifest_tools() -> None:
-    registry = create_default_tool_registry(preset="full")
+def test_default_registry_contains_all_manifest_tools(tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    registry = create_default_tool_registry(preset="full", workspace_dir=tmp_path, skills_dir=skills_root)
 
     todo = registry.invoke(
         "todo",

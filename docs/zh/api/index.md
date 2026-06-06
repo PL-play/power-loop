@@ -16,8 +16,8 @@
 
 | 符号 | 覆盖 | 更多 |
 |---|---|---|
-| `StatefulAgentLoop` | `new_session`、`send`、`send_sync`、`resume`、`abort_pending`、`close_session`、`get_messages`、`get_pending` | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/agent/stateful_loop.py) |
-| `StatefulResult` | `session_id`、`status`、`final_text`、`rounds`、`pending_tool_calls` | [源码](../../../power_loop/agent/stateful_loop.py) |
+| `StatefulAgentLoop` | `new_session`、`send`、`send_sync`、`resume`、`submit_input`、`abort_pending`、`close_session`、`get_messages`、`get_pending` | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/agent/stateful_loop.py) |
+| `StatefulResult` | `session_id`、`status`、`final_text`、`rounds`、`pending_tool_calls`、`pending_interactions` | [源码](../../../power_loop/agent/stateful_loop.py) |
 | `AgentLoopConfig` | loop 限制、temperature、压缩、重试、记忆 | [配置](../user-guide/configuration.md)、[源码](../../../power_loop/agent/types.py) |
 | `SessionStore` | SQLite 会话、消息、压缩、usage、pending 状态 | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/runtime/session_store.py) |
 

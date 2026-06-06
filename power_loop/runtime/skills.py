@@ -24,8 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from power_loop.contracts.tools import ToolDefinition
-from power_loop.runtime.env import AGENT_DIR, WORKSPACE_DIR
-from power_loop.runtime.env import SKILLS_DIR as ENV_SKILLS_DIR
+from power_loop.runtime.env import get_runtime_env
 
 _yaml = import_module("yaml") if find_spec("yaml") else None
 
@@ -46,16 +45,14 @@ LOAD_SKILL_DEFINITION = ToolDefinition(
 
 
 def _resolve_skills_dir(explicit: str | Path | None) -> Path:
-    """Resolve the skills directory from config, env, or default."""
+    """Resolve the skills directory from config or POWER_LOOP_SKILLS_DIR."""
     if explicit is not None:
         path = Path(explicit).expanduser()
-        if not path.is_absolute():
-            path = (AGENT_DIR / path).resolve()
-        else:
-            path = path.resolve()
+        path = path.resolve()
         if path.exists() and path.is_dir():
             return path
-    return ENV_SKILLS_DIR
+        raise FileNotFoundError(f"Skills directory does not exist: {path}")
+    return get_runtime_env().require_skills_dir()
 
 
 class SkillLoader:
@@ -132,12 +129,15 @@ class SkillLoader:
             return f"Error: Unknown skill '{name}'. Available: {available}"
         skill_path = Path(skill["path"]).resolve()
         skill_root = skill_path.parent
+        runtime_env = get_runtime_env()
+        workspace = runtime_env.workspace_dir or "(not configured)"
+        home = runtime_env.home_dir or "(not configured)"
         return (
             f'<skill name="{name}" path="{skill["path"]}">\n'
             f"Source: {skill['path']}\n\n"
             "[Execution Context]\n"
-            f"- Workspace (user project): {WORKSPACE_DIR}\n"
-            f"- Agent home: {AGENT_DIR}\n"
+            f"- Workspace (user project): {workspace}\n"
+            f"- Runtime home: {home}\n"
             f"- Skill root: {skill_root}\n"
             "- Rules:\n"
             f"  1) Run skill-relative commands from skill root: {skill_root}\n"
@@ -170,16 +170,18 @@ class SkillLoader:
         return self.get_content(name)
 
 
-# Module-level singleton for backward compatibility.
-_default_loader: SkillLoader | None = None
+# Module-level cache for backward compatibility.
+_default_loaders: dict[Path, SkillLoader] = {}
 
 
 def get_default_loader() -> SkillLoader:
-    """Return the module-level :class:`SkillLoader` singleton."""
-    global _default_loader
-    if _default_loader is None:
-        _default_loader = SkillLoader()
-    return _default_loader
+    """Return a cached :class:`SkillLoader` for the current runtime env."""
+    skills_dir = _resolve_skills_dir(None)
+    loader = _default_loaders.get(skills_dir)
+    if loader is None:
+        loader = SkillLoader(skills_dir)
+        _default_loaders[skills_dir] = loader
+    return loader
 
 
 def register_skill_tools(registry, *, skills_dir: str | Path | None = None) -> SkillLoader:

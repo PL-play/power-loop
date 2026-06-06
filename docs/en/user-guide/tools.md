@@ -106,15 +106,24 @@ If validation fails, `invoke_async()` raises `ToolValidationError` (a `PowerLoop
 ```python
 from power_loop import create_default_tool_registry
 
-registry = create_default_tool_registry(preset="core")
+registry = create_default_tool_registry(
+    preset="core",
+    workspace_dir="/path/to/project",
+)
 ```
+
+Filesystem, search, shell, and background tools require an explicit workspace.
+Pass `workspace_dir=...` or set `POWER_LOOP_WORKSPACE`; power-loop does not
+fall back to the process current working directory. `load_skill` uses
+`AgentLoopConfig.skills_dir`, `skills_dir=...`, or `POWER_LOOP_SKILLS_DIR`.
+Custom tools are unaffected and own their own path/config handling.
 
 Presets:
 
 | Preset | Tools |
 |---|---|
-| `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill` |
-| `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill` |
+| `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill`, `request_user_input` |
+| `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill`, `request_user_input` |
 | `full` | `core` plus `todo`, `background_run`, `check_background` |
 
 Recommended system prompt guidance:
@@ -137,6 +146,7 @@ Tool behavior:
 | `background_run` / `check_background` | Run and inspect non-interactive long commands. | Uses a private background task table and the same basic dangerous-command checks as `bash`. |
 | `todo` | Maintain an agent-visible task list. | Only one item can be `in_progress`. |
 | `load_skill` | Load a named skill's detailed instructions. | Unknown skills return an error listing available skill names. |
+| `request_user_input` | Pause for caller/user input. | Returns `status="waiting_for_input"` with `pending_interactions`; resume with `submit_input()`. |
 
 See [`examples/20_default_tools.py`](../../../examples/20_default_tools.py) for a runnable script that exercises every default tool without requiring a real LLM.
 
@@ -147,6 +157,7 @@ Some default tools are not just functions. They participate in the agent loop:
 - `todo` persists its current item list in the session SQLite database. Before each LLM round, power-loop projects that authoritative state into a transient `<current_todos>` user message. The projection is not saved into `messages`, so compaction cannot duplicate or corrupt it.
 - `background_run` records task status in SQLite. When a task changes from unseen to updated or completed, the next LLM round receives a transient `<background_updates>` message. `check_background` reads the same persisted task table.
 - `load_skill` uses `AgentLoopConfig.skills_dir` when configured. When `skills_dir` is set, the resolved system prompt includes the skills directory and available skill descriptions.
+- `request_user_input` is a control-flow tool. It does not wait inside the Python process. Instead, it persists a pending interaction and returns `StatefulResult(status="waiting_for_input")`. The caller shows `pending_interactions` to a user or API client, then calls `await loop.submit_input(session_id, interaction_id, value)` to append the matching tool result and continue.
 
 This behavior is built on public primitives. `SessionStore` exposes JSON runtime state and background task APIs, `get_tool_runtime_context()` gives tool handlers the current session/store, and `AgentLoopConfig.runtime_projectors` controls how persisted state becomes transient LLM messages. The default projectors are `TodoRuntimeProjector` and `BackgroundRuntimeProjector`; pass your own `RuntimeProjector` objects to support custom tools or disable the defaults with `runtime_projectors=()`.
 

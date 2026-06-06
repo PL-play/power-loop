@@ -63,6 +63,7 @@ class StatefulResult:
     final_text: str = ""
     rounds: int = 0
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    pending_interactions: list[dict[str, Any]] = field(default_factory=list)
 
 
 class StatefulAgentLoop:
@@ -167,13 +168,64 @@ class StatefulAgentLoop:
         """
         async with self._lock_for(session_id):
             self._ensure_session_or_raise(session_id)
+            waiting = self._waiting_result_if_needed(session_id)
+            if waiting is not None:
+                return waiting
             sink = SQLiteSink(self.store, session_id)
+            self._prime_sink_from_pending(session_id, sink)
             async with self._runner.session_async(session_id=session_id):
                 loop_token = set_current_loop(self)
                 try:
                     await self._execute_pending(session_id, sink)
                 finally:
                     reset_current_loop(loop_token)
+            return await self._run_loop(session_id, stop_event=stop_event, sink=sink)
+
+    async def submit_input(
+        self,
+        session_id: str,
+        interaction_id: str,
+        value: Any,
+        *,
+        stop_event: CancellationLike = None,
+    ) -> StatefulResult:
+        """Resolve a paused ``request_user_input`` interaction and continue.
+
+        ``request_user_input`` is persisted as pending session state instead of
+        awaiting in-process. The product layer can show the prompt/options to a
+        user, wait minutes or days, restart processes, then call this method
+        with the collected answer.
+        """
+        async with self._lock_for(session_id):
+            self._ensure_session_or_raise(session_id)
+            state = self.store.get_state(session_id)
+            pending = state.pending if state is not None else None
+            interactions = list((pending or {}).get("pending_interactions") or [])
+            interaction = next(
+                (item for item in interactions if str(item.get("interaction_id")) == str(interaction_id)),
+                None,
+            )
+            if interaction is None:
+                raise ValueError(f"pending interaction not found: {interaction_id}")
+
+            sink = SQLiteSink(self.store, session_id)
+            self._prime_sink_from_pending(session_id, sink)
+            round_index = int((pending or {}).get("round_index") or 0)
+            sink.on_message_appended(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(interaction["tool_call_id"]),
+                    "name": str(interaction.get("tool_name") or "request_user_input"),
+                    "content": _as_tool_result_text(value),
+                },
+                round_index=round_index,
+            )
+            self._remove_pending_interaction(session_id, str(interaction_id))
+
+            waiting = self._waiting_result_if_needed(session_id)
+            if waiting is not None:
+                return waiting
+
             return await self._run_loop(session_id, stop_event=stop_event, sink=sink)
 
     def abort_pending(self, session_id: str, *, reason: str = "aborted") -> int:
@@ -345,13 +397,14 @@ class StatefulAgentLoop:
         if state is None or not state.pending:
             return
         pending = state.pending
+        if pending.get("pending_interactions"):
+            return
         round_index = int(pending.get("round_index") or 0)
         tool_calls = pending.get("tool_calls") or []
         if not tool_calls:
             return
         # Initialize sink's in-memory unresolved set so auto-resolve works.
-        sink._unresolved = {str(tc.get("id") or "") for tc in tool_calls}
-        sink._assistant_seq = pending.get("assistant_seq")
+        self._prime_sink_from_pending(sid, sink)
         for tc in tool_calls:
             cid = str(tc.get("id") or "")
             name = _tool_call_name(tc)
@@ -425,6 +478,52 @@ class StatefulAgentLoop:
             final_text=result.final_text,
             rounds=result.rounds,
             pending_tool_calls=result.pending_tool_calls,
+            pending_interactions=result.pending_interactions,
+        )
+
+    def _prime_sink_from_pending(self, sid: str, sink: SQLiteSink) -> None:
+        state = self.store.get_state(sid)
+        if state is None or not state.pending:
+            return
+        pending = state.pending
+        tool_calls = list(pending.get("tool_calls") or [])
+        ids = {str(tc.get("id") or "") for tc in tool_calls if tc.get("id")}
+        ids.update(str(cid) for cid in pending.get("tool_call_ids", []) if cid)
+        sink._unresolved = ids
+        sink._assistant_seq = pending.get("assistant_seq")
+        sink._tool_calls = tool_calls
+
+    def _remove_pending_interaction(self, sid: str, interaction_id: str) -> None:
+        state = self.store.get_state(sid)
+        if state is None or not state.pending:
+            return
+        pending = dict(state.pending)
+        interactions = [
+            item
+            for item in list(pending.get("pending_interactions") or [])
+            if str(item.get("interaction_id")) != str(interaction_id)
+        ]
+        if interactions:
+            pending["pending_interactions"] = interactions
+            self.store.set_pending(sid, pending)
+            return
+        pending.pop("pending_interactions", None)
+        if pending.get("tool_call_ids") or pending.get("tool_calls"):
+            self.store.set_pending(sid, pending)
+
+    def _waiting_result_if_needed(self, sid: str) -> StatefulResult | None:
+        state = self.store.get_state(sid)
+        if state is None or not state.pending:
+            return None
+        pending = state.pending
+        interactions = list(pending.get("pending_interactions") or [])
+        if not interactions:
+            return None
+        return StatefulResult(
+            session_id=sid,
+            status="waiting_for_input",
+            pending_tool_calls=list(pending.get("tool_calls") or []),
+            pending_interactions=interactions,
         )
 
 
@@ -448,6 +547,12 @@ def _as_text(content: Any) -> str | None:
     if content is None or isinstance(content, str):
         return content
     return json.dumps(content, ensure_ascii=False)
+
+
+def _as_tool_result_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
 __all__ = ["StatefulAgentLoop", "StatefulResult", "MessageState"]

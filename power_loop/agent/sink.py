@@ -87,6 +87,7 @@ class SQLiteSink:
         self.session_id = session_id
         self._unresolved: set[str] = set()
         self._assistant_seq: int | None = None
+        self._tool_calls: list[dict[str, Any]] = []
         # Ordered seqs mirroring the pipeline's in-memory history. Initialized
         # by StatefulAgentLoop from the loaded active messages; appended to as
         # the pipeline emits new messages.
@@ -122,17 +123,29 @@ class SQLiteSink:
             if tool_call_id and tool_call_id in self._unresolved:
                 self._unresolved.discard(tool_call_id)
                 if self._unresolved:
-                    self.store.set_pending(
-                        self.session_id,
-                        {
-                            "assistant_seq": self._assistant_seq,
-                            "round_index": round_index,
-                            "tool_call_ids": sorted(self._unresolved),
-                        },
-                    )
+                    remaining_tool_calls = [
+                        tc for tc in self._tool_calls
+                        if str(tc.get("id") or "") in self._unresolved
+                    ]
+                    pending = {
+                        "assistant_seq": self._assistant_seq,
+                        "round_index": round_index,
+                        "tool_call_ids": sorted(self._unresolved),
+                        "tool_calls": remaining_tool_calls,
+                    }
+                    state = self.store.get_state(self.session_id)
+                    interactions = list((state.pending if state else {}).get("pending_interactions") or [])
+                    remaining_interactions = [
+                        item for item in interactions
+                        if str(item.get("tool_call_id") or "") in self._unresolved
+                    ]
+                    if remaining_interactions:
+                        pending["pending_interactions"] = remaining_interactions
+                    self.store.set_pending(self.session_id, pending)
                 else:
                     self.store.set_pending(self.session_id, None)
                     self._assistant_seq = None
+                    self._tool_calls = []
             return
         if role == "assistant":
             tool_calls = message.get("tool_calls")
@@ -165,6 +178,7 @@ class SQLiteSink:
         ids = [str(tc.get("id") or "") for tc in tool_calls if tc.get("id")]
         self._unresolved = set(ids)
         self._assistant_seq = assistant_seq
+        self._tool_calls = list(tool_calls)
         self.store.set_pending(
             self.session_id,
             {

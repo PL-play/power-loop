@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
 from typing import Any
@@ -188,6 +189,100 @@ async def test_todo_runtime_state_survives_new_loop_instance(store: SessionStore
 
     assert result.status == "completed"
     assert any("Survive restart" in str(msg.get("content", "")) for msg in llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_request_user_input_pauses_then_submit_resumes(store: SessionStore) -> None:
+    llm = _Scripted(
+        responses=[
+            _tool_resp(
+                "tc-input",
+                "request_user_input",
+                (
+                    '{"kind":"confirm","prompt":"Approve access?",'
+                    '"options":[{"id":"yes","label":"Yes"},{"id":"no","label":"No"}],'
+                    '"metadata":{"scope":"contacts"}}'
+                ),
+            ),
+            LLMResponse(raw_text="Approved path continued."),
+        ]
+    )
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        tool_registry=create_default_tool_registry(include=["request_user_input"]),
+        config=AgentLoopConfig(system_prompt="Ask before continuing.", max_rounds=3, compactor=None),
+    )
+    sid = loop.new_session()
+
+    result = await loop.send("needs approval", session_id=sid)
+
+    assert result.status == "waiting_for_input"
+    assert result.pending_tool_calls[0]["id"] == "tc-input"
+    assert len(result.pending_interactions) == 1
+    interaction = result.pending_interactions[0]
+    assert interaction["tool_call_id"] == "tc-input"
+    assert interaction["kind"] == "confirm"
+    assert interaction["prompt"] == "Approve access?"
+    assert interaction["options"][0]["id"] == "yes"
+    assert interaction["metadata"] == {"scope": "contacts"}
+    assert loop.get_pending(sid)["pending_interactions"][0]["interaction_id"] == interaction["interaction_id"]
+
+    blocked = await loop.resume(sid)
+    assert blocked.status == "waiting_for_input"
+    assert blocked.pending_interactions[0]["interaction_id"] == interaction["interaction_id"]
+
+    resumed = await loop.submit_input(sid, interaction["interaction_id"], {"choice": "yes"})
+
+    assert resumed.status == "completed"
+    assert resumed.final_text == "Approved path continued."
+    assert loop.get_pending(sid) is None
+    persisted = loop.get_messages(sid)
+    tool_messages = [msg for msg in persisted if msg["role"] == "tool"]
+    assert len(tool_messages) == 1
+    assert tool_messages[0]["tool_call_id"] == "tc-input"
+    assert json.loads(str(tool_messages[0]["content"])) == {"choice": "yes"}
+    assert any(msg.get("role") == "tool" and msg.get("tool_call_id") == "tc-input" for msg in llm.calls[1])
+
+
+@pytest.mark.asyncio
+async def test_request_user_input_survives_new_loop_instance(store: SessionStore) -> None:
+    first_llm = _Scripted(
+        responses=[
+            _tool_resp(
+                "tc-input",
+                "request_user_input",
+                '{"kind":"text","prompt":"What should I say?"}',
+            )
+        ]
+    )
+    first_loop = StatefulAgentLoop(
+        llm=first_llm,
+        store=store,
+        tool_registry=create_default_tool_registry(include=["request_user_input"]),
+        config=AgentLoopConfig(system_prompt="Ask externally.", max_rounds=2, compactor=None),
+    )
+    sid = first_loop.new_session()
+    waiting = await first_loop.send("pause", session_id=sid)
+    interaction_id = waiting.pending_interactions[0]["interaction_id"]
+
+    second_llm = _Scripted(responses=[LLMResponse(raw_text="Second process continued.")])
+    second_loop = StatefulAgentLoop(
+        llm=second_llm,
+        store=store,
+        tool_registry=create_default_tool_registry(include=["request_user_input"]),
+        config=AgentLoopConfig(system_prompt="Ask externally.", max_rounds=2, compactor=None),
+    )
+
+    resumed = await second_loop.submit_input(sid, interaction_id, "hello from user")
+
+    assert resumed.status == "completed"
+    assert resumed.final_text == "Second process continued."
+    assert second_loop.get_pending(sid) is None
+    assert any(
+        msg.get("role") == "tool" and msg.get("content") == "hello from user"
+        for msg in second_llm.calls[0]
+    )
 
 
 @pytest.mark.asyncio

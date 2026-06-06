@@ -78,6 +78,7 @@ from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.state import ContextManager
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
+from power_loop.runtime.human_input import HumanInputRequired
 from power_loop.runtime.memory import MemorySnapshot, tag_as_memory
 from power_loop.runtime.retry import with_retry
 from power_loop.runtime.skills import SkillLoader
@@ -376,15 +377,33 @@ class AgentPipeline:
             )
 
     def _make_result(self, status: str, *, final_text: str = "", rounds: int = 0,
-                     pending_tool_calls: list | None = None) -> AgentLoopResult:
+                     pending_tool_calls: list | None = None,
+                     pending_interactions: list | None = None) -> AgentLoopResult:
         self._completed_rounds = rounds  # for MemorySnapshot
         return AgentLoopResult(
             status=status,  # type: ignore[arg-type]
             final_text=final_text,
             rounds=rounds,
             pending_tool_calls=pending_tool_calls or [],
+            pending_interactions=pending_interactions or [],
             messages=self.history,
         )
+
+    def _persist_pending_interaction(
+        self,
+        *,
+        interaction: dict[str, Any],
+        round_index: int,
+    ) -> None:
+        if self.store is None or self.session_id is None:
+            return
+        state = self.store.get_state(self.session_id)
+        pending = dict(state.pending or {}) if state is not None else {}
+        interactions = list(pending.get("pending_interactions") or [])
+        interactions.append(interaction)
+        pending["pending_interactions"] = interactions
+        pending["round_index"] = round_index
+        self.store.set_pending(self.session_id, pending)
 
     # ══════════════════════════════════════════════════════════════
     # Phase methods — pure business logic with explicit parameters.
@@ -819,6 +838,17 @@ class AgentPipeline:
                 failed = False
                 try:
                     output, failed = await self.execute_tool(tool_name, tool_args)
+                except HumanInputRequired as exc:
+                    interaction = exc.to_pending(tool_call_id=call_id, tool_name=tool_name)
+                    self._persist_pending_interaction(interaction=interaction, round_index=round_idx)
+                    await self._finalize("waiting_for_input", final_text=assistant_text, rounds=round_idx + 1)
+                    return self._make_result(
+                        "waiting_for_input",
+                        final_text=assistant_text,
+                        rounds=round_idx + 1,
+                        pending_tool_calls=tool_calls,
+                        pending_interactions=[interaction],
+                    )
                 except Exception as exc:
                     # ── Hook: TOOL_ERROR ──
                     err_ctx = ToolErrorCtx(

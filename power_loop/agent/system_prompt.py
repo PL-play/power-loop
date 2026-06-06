@@ -146,17 +146,17 @@ def section_paths(ctx: SystemPromptContext) -> str | None:
     ]
     if ctx.agent_dir:
         lines.append(
-            f"- Agent home (library installation): {ctx.agent_dir}\n"
-            "  Agent-home internals are restricted. "
+            f"- Runtime home: {ctx.agent_dir}\n"
+            "  Runtime-home internals are restricted. "
             "Allowlisted paths: .cache, logs, and skills directory."
         )
         lines.append(
-            f"- IMPORTANT: Do NOT confuse workspace ({ctx.workspace_dir}) with agent home ({ctx.agent_dir})."
+            f"- IMPORTANT: Do NOT confuse workspace ({ctx.workspace_dir}) with runtime home ({ctx.agent_dir})."
         )
     if ctx.skills_dir:
         lines.append(f"- Skills directory: {ctx.skills_dir}")
     lines.append(
-        "- Use @workspace/<path> or @agent/<path> when an explicit root is needed, "
+        "- Use @workspace/<path> or @home/<path> when an explicit root is needed, "
         "but prefer plain relative paths (they default to workspace)."
     )
     return "\n".join(lines)

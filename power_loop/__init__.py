@@ -114,6 +114,8 @@ from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
 from power_loop.runtime.budget import estimate_text_tokens, estimate_tokens, trim_history
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
+from power_loop.runtime.env import RuntimeEnv, RuntimeEnvError
+from power_loop.runtime.human_input import HumanInputRequired, request_user_input
 from power_loop.runtime.memory import MemoryProvider, MemorySnapshot, tag_as_memory
 from power_loop.runtime.provider import (
     LLMProviderConfig,
@@ -228,6 +230,10 @@ __all__ = [
 	"get_tool_runtime_context",
 	"CancellationToken",
 	"CancellationLike",
+	"RuntimeEnv",
+	"RuntimeEnvError",
+	"HumanInputRequired",
+	"request_user_input",
 	"LlmRetryAttemptedPayload",
 	"LlmDegradedPayload",
 	"LoopCancelledPayload",

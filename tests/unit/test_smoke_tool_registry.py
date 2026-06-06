@@ -4,11 +4,10 @@ import uuid
 from pathlib import Path
 
 from power_loop import ToolDefinition, create_default_tool_registry
-from power_loop.runtime.env import WORKSPACE_DIR
 
 
-def test_default_tool_registry_smoke() -> None:
-    registry = create_default_tool_registry()
+def test_default_tool_registry_smoke(tmp_path: Path) -> None:
+    registry = create_default_tool_registry(workspace_dir=tmp_path, skills_dir=tmp_path / "skills")
 
     # Validate default set
     for name in [
@@ -20,6 +19,7 @@ def test_default_tool_registry_smoke() -> None:
         "glob",
         "grep",
         "load_skill",
+        "request_user_input",
     ]:
         assert registry.has(name), f"missing default tool: {name}"
 
@@ -59,4 +59,4 @@ def test_default_tool_registry_smoke() -> None:
     assert registry.invoke("echo_tool", {"text": "ok"}) == "echo:ok"
 
     # Cleanup temp file
-    (WORKSPACE_DIR / temp_name).unlink(missing_ok=True)
+    (tmp_path / temp_name).unlink(missing_ok=True)

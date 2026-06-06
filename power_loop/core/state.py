@@ -9,8 +9,7 @@ from llm_client.interface import LLMResponse
 from power_loop.contracts.event_payloads import TodoUpdatedPayload
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.core.agent_context import get_event_bus, get_session_id
-from power_loop.runtime.env import AGENT_DIR
-from power_loop.runtime.skills import get_default_loader
+from power_loop.runtime.env import get_runtime_env
 
 TOOL_MAX_LINES = 20
 
@@ -108,12 +107,7 @@ class ContextManager:
     micro_hot_tail: int = field(default_factory=lambda: int(os.getenv("CONTEXT_MICRO_HOT_TAIL", "10")))
     micro_size_limit: int = field(default_factory=lambda: int(os.getenv("CONTEXT_MICRO_SIZE_LIMIT", "1000")))
 
-    cache_dir: Path = field(default_factory=lambda: (AGENT_DIR / ".cache"))
-
-    def __post_init__(self) -> None:
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        # Ensure skills loader reads from correct runtime env.
-        _ = get_default_loader()
+    cache_dir: Path | None = None
 
     def track_file(self, path: str) -> None:
         if not path:
@@ -194,6 +188,9 @@ class ContextManager:
             if content.startswith("[tool output saved to"):
                 continue
             self._file_counter += 1
+            if self.cache_dir is None:
+                self.cache_dir = get_runtime_env().require_home_dir() / ".cache"
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache_path = self.cache_dir / f"tool_{self._file_counter:05d}.md"
             tool_name = str(msg.get("name") or "tool")
             tool_id = str(msg.get("tool_call_id") or "")
@@ -204,5 +201,5 @@ class ContextManager:
                 f"{content}\n"
             )
             cache_path.write_text(md, encoding="utf-8")
-            replaced = f"[tool output saved to {cache_path.relative_to(AGENT_DIR)}, {tool_name}, {len(content)} chars]"
+            replaced = f"[tool output saved to {cache_path}, {tool_name}, {len(content)} chars]"
             msg["content"] = replaced

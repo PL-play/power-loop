@@ -105,15 +105,23 @@ registry.register(weather_def, WeatherTool(api_key="..."))
 ```python
 from power_loop import create_default_tool_registry
 
-registry = create_default_tool_registry(preset="core")
+registry = create_default_tool_registry(
+    preset="core",
+    workspace_dir="/path/to/project",
+)
 ```
+
+文件、搜索、shell 和后台命令工具需要显式工作区。传 `workspace_dir=...` 或设置
+`POWER_LOOP_WORKSPACE`；power-loop 不会回退到进程当前工作目录。`load_skill` 使用
+`AgentLoopConfig.skills_dir`、`skills_dir=...` 或 `POWER_LOOP_SKILLS_DIR`。自定义工具不受影响，
+由实现方自己处理路径和配置。
 
 预设：
 
 | 预设 | 工具 |
 |---|---|
-| `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill` |
-| `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill` |
+| `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill`, `request_user_input` |
+| `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill`, `request_user_input` |
 | `full` | `core` 加上 `todo`, `background_run`, `check_background` |
 
 推荐系统提示词：
@@ -136,6 +144,7 @@ registry = create_default_tool_registry(preset="core")
 | `background_run` / `check_background` | 运行并查看非交互式长命令。 | 使用私有后台任务表，并复用 `bash` 的基础危险命令检查。 |
 | `todo` | 维护 Agent 可见任务列表。 | 同一时间只允许一个条目为 `in_progress`。 |
 | `load_skill` | 加载指定 skill 的详细说明。 | 未知 skill 会返回错误和可用 skill 名称。 |
+| `request_user_input` | 暂停等待调用方/用户输入。 | 返回 `status="waiting_for_input"` 和 `pending_interactions`；用 `submit_input()` 恢复。 |
 
 可运行示例见 [`examples/20_default_tools.py`](../../../examples/20_default_tools.py)，它不依赖真实 LLM，会逐个演示默认工具。
 
@@ -146,6 +155,7 @@ registry = create_default_tool_registry(preset="core")
 - `todo` 会把当前任务列表持久化到 session SQLite 数据库。每轮 LLM 调用前，power-loop 会把这个权威状态投影成临时 `<current_todos>` user 消息。这个投影不会写入 `messages`，所以不会被压缩重复或污染。
 - `background_run` 会把任务状态记录到 SQLite。任务从未读变为更新或完成后，下一轮 LLM 会收到临时 `<background_updates>` 消息。`check_background` 读取同一张持久化任务表。
 - `load_skill` 在配置了 `AgentLoopConfig.skills_dir` 时会使用该目录。设置 `skills_dir` 后，解析后的系统提示词会包含技能目录和可用 skill 描述。
+- `request_user_input` 是控制流工具，不会在 Python 进程里 await 等人。它会把待确认/待输入项持久化，然后返回 `StatefulResult(status="waiting_for_input")`。业务方把 `pending_interactions` 展示给用户或 API 调用方，收集结果后调用 `await loop.submit_input(session_id, interaction_id, value)`，loop 会补上对应 tool result 并继续执行。
 
 这些行为基于公开原语实现。`SessionStore` 暴露 JSON runtime state 和 background task API，`get_tool_runtime_context()` 让工具 handler 获取当前 session/store，`AgentLoopConfig.runtime_projectors` 控制持久化状态如何变成临时 LLM 消息。默认 projector 是 `TodoRuntimeProjector` 和 `BackgroundRuntimeProjector`；你可以传入自己的 `RuntimeProjector` 支持自定义工具，也可以用 `runtime_projectors=()` 关闭默认投影。
 

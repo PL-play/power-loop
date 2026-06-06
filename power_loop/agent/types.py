@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from power_loop.runtime.retry import LLMRetryPolicy
     from power_loop.runtime.runtime_state import RuntimeProjector
 
-LoopStatus = Literal["completed", "pending_tools", "cancelled", "hit_round_limit", "degraded"]
+LoopStatus = Literal["completed", "pending_tools", "waiting_for_input", "cancelled", "hit_round_limit", "degraded"]
 LoopMessage = dict[str, Any]
 
 
@@ -60,4 +60,5 @@ class AgentLoopResult:
     final_text: str = ""
     rounds: int = 0
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    pending_interactions: list[dict[str, Any]] = field(default_factory=list)
     messages: list[LoopMessage] = field(default_factory=list)

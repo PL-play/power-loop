@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any
 
 from power_loop.core.agent_context import get_ctx
-from power_loop.runtime.env import AGENT_DIR, AGENT_RW_ALLOWLIST, WORKSPACE_DIR, safe_path
+from power_loop.runtime.env import get_runtime_env, safe_path
+from power_loop.runtime.human_input import request_user_input
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
 
@@ -54,11 +55,12 @@ def _file_stamp(fp: Path) -> tuple[int, int]:
 
 
 def _display_path(path: Path) -> str:
+    runtime_env = get_runtime_env()
     resolved = path.resolve()
-    if resolved.is_relative_to(WORKSPACE_DIR):
-        return str(resolved.relative_to(WORKSPACE_DIR))
-    if resolved.is_relative_to(AGENT_DIR):
-        return f"@agent/{resolved.relative_to(AGENT_DIR)}"
+    if runtime_env.workspace_dir is not None and resolved.is_relative_to(runtime_env.workspace_dir):
+        return str(resolved.relative_to(runtime_env.workspace_dir))
+    if runtime_env.home_dir is not None and resolved.is_relative_to(runtime_env.home_dir):
+        return f"@home/{resolved.relative_to(runtime_env.home_dir)}"
     return str(resolved)
 
 
@@ -210,9 +212,10 @@ def _should_skip_dir(path: Path, root: Path, include_hidden: bool, pattern: str 
 
 
 def _safe_relative_for_subprocess(path: Path) -> str:
+    workspace_dir = get_runtime_env().require_workspace_dir()
     resolved = path.resolve()
-    if resolved.is_relative_to(WORKSPACE_DIR):
-        rel = resolved.relative_to(WORKSPACE_DIR)
+    if resolved.is_relative_to(workspace_dir):
+        rel = resolved.relative_to(workspace_dir)
         return "." if str(rel) == "." else rel.as_posix()
     return str(resolved)
 
@@ -240,22 +243,28 @@ _BASH_READ_HINTS = (
 
 
 def _is_agent_path_allowed_for_bash(command: str) -> bool:
-    lowered = command.lower()
-    if str(AGENT_DIR).lower() not in lowered:
+    runtime_env = get_runtime_env()
+    if runtime_env.home_dir is None:
         return True
-    return any(str(path).lower() in lowered for path in AGENT_RW_ALLOWLIST)
+    lowered = command.lower()
+    if str(runtime_env.home_dir).lower() not in lowered:
+        return True
+    return any(str(path).lower() in lowered for path in runtime_env.home_rw_allowlist)
 
 
 def _validate_bash_command_scope(command: str) -> str | None:
+    runtime_env = get_runtime_env()
+    if runtime_env.home_dir is None:
+        return None
     lowered = f" {command.lower()} "
-    if str(AGENT_DIR).lower() not in lowered:
+    if str(runtime_env.home_dir).lower() not in lowered:
         return None
     if _is_agent_path_allowed_for_bash(command):
         return None
 
     if any(hint in lowered for hint in _BASH_WRITE_HINTS):
         return (
-            "Error: Writing under agent home is blocked outside allowlisted paths (.cache/logs/skills). "
+            "Error: Writing under POWER_LOOP_HOME is blocked outside allowlisted paths (.cache/logs/skills). "
             "Use workspace files or allowlisted agent paths only."
         )
     if any(hint in lowered for hint in _BASH_READ_HINTS):
@@ -455,19 +464,29 @@ class BashSession:
         return "Bash session restarted."
 
 
-BASH = BashSession(WORKSPACE_DIR)
+_BASH_SESSIONS: dict[Path, BashSession] = {}
+
+
+def _bash_for_current_workspace() -> BashSession:
+    workspace_dir = get_runtime_env().require_workspace_dir()
+    session = _BASH_SESSIONS.get(workspace_dir)
+    if session is None:
+        session = BashSession(workspace_dir)
+        _BASH_SESSIONS[workspace_dir] = session
+    return session
 
 
 def run_bash(command: str | None = None, restart: bool = False, timeout: int = 120) -> str:
+    bash = _bash_for_current_workspace()
     if restart:
-        return BASH.restart()
+        return bash.restart()
     if not command or not command.strip():
         return "Error: command is required (or set restart=true)."
     timeout = _clamp_int(timeout, 120, 1, 600)
     scope_err = _validate_bash_command_scope(command)
     if scope_err:
         return scope_err
-    return BASH.execute(command, timeout=timeout)
+    return bash.execute(command, timeout=timeout)
 
 
 def _list_directory(dp: Path, limit: int = 200) -> str:
@@ -863,9 +882,10 @@ def run_grep(
         rg_cmd.extend(["--", pattern, _safe_relative_for_subprocess(base)])
 
         try:
+            workspace_dir = get_runtime_env().require_workspace_dir()
             result = subprocess.run(
                 rg_cmd,
-                cwd=str(WORKSPACE_DIR),
+                cwd=str(workspace_dir),
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -952,6 +972,7 @@ class BackgroundManager:
             return scope_err
 
         task_id = str(uuid.uuid4())[:8]
+        workspace_dir = get_runtime_env().require_workspace_dir()
         store, sid = _current_store_and_session()
         if store is not None and sid is not None:
             store.upsert_background_task(
@@ -962,7 +983,14 @@ class BackgroundManager:
                 output_tail=None,
             )
         with self._lock:
-            self.tasks[task_id] = {"status": "running", "result": None, "command": command, "session_id": sid, "store": store}
+            self.tasks[task_id] = {
+                "status": "running",
+                "result": None,
+                "command": command,
+                "session_id": sid,
+                "store": store,
+                "workspace_dir": workspace_dir,
+            }
 
         threading.Thread(target=self._execute, args=(task_id, command), daemon=True).start()
         return f"Background task {task_id} started: {command[:80]}"
@@ -975,11 +1003,16 @@ class BackgroundManager:
             if task is not None:
                 store = task.get("store")
                 sid = task.get("session_id")
+                workspace_dir = task.get("workspace_dir")
+            else:
+                workspace_dir = None
         try:
+            if not isinstance(workspace_dir, Path):
+                raise RuntimeError("Background task is missing workspace_dir")
             result = subprocess.run(
                 command,
                 shell=True,
-                cwd=str(WORKSPACE_DIR),
+                cwd=str(workspace_dir),
                 capture_output=True,
                 text=True,
                 timeout=300,
@@ -1096,4 +1129,10 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "todo": lambda **kw: run_todo(kw["items"]),
     "background_run": lambda **kw: run_background(kw["command"]),
     "check_background": lambda **kw: check_background(kw.get("task_id")),
+    "request_user_input": lambda **kw: request_user_input(
+        kind=kw.get("kind", "text"),
+        prompt=kw["prompt"],
+        options=kw.get("options") or [],
+        metadata=kw.get("metadata") or {},
+    ),
 }

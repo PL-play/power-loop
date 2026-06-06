@@ -208,6 +208,43 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=(),
     ),
+    ToolDefinition(
+        name="request_user_input",
+        description=(
+            "Ask the caller or product UI for external input, then pause the agent loop. "
+            "The loop returns status='waiting_for_input' with pending_interactions; resume by calling "
+            "StatefulAgentLoop.submit_input(session_id, interaction_id, value). Use this for confirmations, choices, "
+            "or text that must come from outside the LLM process."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "description": "Input kind such as text, confirm, or choice. Defaults to text.",
+                },
+                "prompt": {"type": "string", "description": "User-facing prompt or confirmation request."},
+                "options": {
+                    "type": "array",
+                    "description": "Optional choices for choice/confirm prompts.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "label": {"type": "string"},
+                            "description": {"type": "string"},
+                        },
+                    },
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Opaque caller metadata returned unchanged in pending_interactions.",
+                },
+            },
+            "required": ["prompt"],
+        },
+        required_params=("prompt",),
+    ),
 ]
 
 # Indexed lookup for selective registration.
@@ -227,6 +264,7 @@ CORE_TOOL_NAMES: tuple[str, ...] = (
     "glob",
     "grep",
     "load_skill",
+    "request_user_input",
 )
 
 # Read-only / exploration tools — no file mutation.  Matches zero-code EXPLORE_TOOLS.
@@ -236,6 +274,7 @@ EXPLORE_TOOL_NAMES: tuple[str, ...] = (
     "glob",
     "grep",
     "load_skill",
+    "request_user_input",
 )
 
 # Full set — everything including todo and background tasks.

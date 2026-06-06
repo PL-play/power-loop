@@ -33,6 +33,7 @@
 | [18](#18-多-provider) | `multi_provider.py` | 多个 LLM 供应商 |
 | [19](#19-旗舰示例) | `full_chatbot.py` | **全部功能集合** |
 | [20](#20-默认工具) | `default_tools.py` | 内置文件/搜索/bash 工具 |
+| [21](#21-可恢复人类输入) | `request_user_input.py` | 可恢复的外部输入 |
 | [高级运行时](../../../examples/advanced_runtime/) | `advanced_runtime/` | 运行时绑定工具模式 |
 
 ---
@@ -1049,7 +1050,7 @@ Your name is Alan and you live in Shanghai.
 ### 代码
 
 ```python
-registry = create_default_tool_registry(preset="full")
+registry = create_default_tool_registry(preset="full", workspace_dir="/path/to/project")
 
 registry.invoke("write_file", {"path": target, "content": "alpha\nbeta\n"})
 registry.invoke("read_file", {"path": target})
@@ -1062,10 +1063,35 @@ registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
 
 ### 要点
 
-- `create_default_tool_registry(preset="full")` 会注册文件、搜索、shell、todo、skill 和后台任务工具。
+- `create_default_tool_registry(preset="full", workspace_dir=...)` 会注册文件、搜索、shell、todo、skill 和后台任务工具。
 - 修改已有文件前，必须先用 `read_file` 读取，之后 `write_file`、`edit_file`、`apply_patch` 才会执行。
 - 定位文件优先用 `glob`，搜索内容优先用 `grep`；`bash` 更适合测试和构建。
 - 这个示例是确定性的，不需要 API 凭证。
+
+---
+
+## 21 · 可恢复人类输入
+
+**概念**：让 loop 暂停等待外部输入，但不阻塞 Python 进程。
+
+### 代码
+
+```python
+waiting = await loop.send("Draft and send a summary.", session_id=sid)
+interaction = waiting.pending_interactions[0]
+
+result = await loop.submit_input(
+    sid,
+    interaction["interaction_id"],
+    {"choice": "send"},
+)
+```
+
+### 要点
+
+- `request_user_input` 返回 `status="waiting_for_input"` 和可序列化的 `pending_interactions`。
+- 业务方负责把 prompt/options 展示到 UI 或 API；即使跨进程重启，也可以之后调用 `submit_input`。
+- `submit_input` 会补上对应 tool message，并用合法的 LLM tool-call 历史继续执行。
 
 ---
 

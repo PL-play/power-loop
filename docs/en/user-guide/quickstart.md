@@ -198,4 +198,4 @@ print(r2.final_text)  # → "Your name is Alan."
 | Memory | [User Guide: Memory](memory.md) — cross-session recall via `MemoryProvider` |
 | Retry & Cancel | [User Guide: Retry & Cancel](retry-cancel.md) — handle LLM failures gracefully |
 | Structured Output | [User Guide: Structured Output](structured-output.md) — force JSON with schema validation |
-| Full example list | [Examples](../../../examples/) — 20 runnable examples, each teaching one concept |
+| Full example list | [Examples](../../../examples/) — 21 runnable examples, each teaching one concept |

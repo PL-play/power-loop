@@ -13,13 +13,16 @@ stateDiagram-v2
     Active --> Closed: close_session(sid)
     Active --> Pending: crash during tool_calls
     Pending --> Active: resume(sid) or abort_pending(sid)
+    Active --> WaitingForInput: request_user_input
+    WaitingForInput --> Active: submit_input(sid, interaction_id, value)
     Closed --> [*]
 ```
 
 1. **Created** when you call `new_session()`.
 2. **Continued** when you pass that `session_id` to `send()`.
 3. **Pending** if the process crashes between `assistant(tool_calls)` and the last `tool` message.
-4. **Closed** explicitly via `close_session(sid, cascade=True)`.
+4. **Waiting for input** if the `request_user_input` tool asks the caller/UI to collect external input.
+5. **Closed** explicitly via `close_session(sid, cascade=True)`.
 
 ## Basic Usage
 
@@ -119,6 +122,20 @@ except SessionPendingError as exc:
     loop.abort_pending(sid, reason="user_cancelled")
     result = await loop.send("new input", session_id=sid)
 ```
+
+## Resumable User Input
+
+`request_user_input` intentionally pauses a session without blocking the Python process:
+
+```python
+waiting = await loop.send("needs confirmation", session_id=sid)
+interaction = waiting.pending_interactions[0]
+
+# Show interaction["prompt"] and interaction["options"] in your product UI.
+result = await loop.submit_input(sid, interaction["interaction_id"], {"choice": "yes"})
+```
+
+The pending interaction is stored in SQLite, so another process can reopen the same database and call `submit_input()` later.
 
 ## Closing Sessions
 

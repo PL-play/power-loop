@@ -160,7 +160,7 @@ def register_spawn_agent(registry, *, include_run_agent: bool = True, overwrite:
     Usage::
 
         from power_loop import create_default_tool_registry, register_spawn_agent
-        registry = create_default_tool_registry()
+        registry = create_default_tool_registry(workspace_dir="/path/to/project")
         register_spawn_agent(registry)
     """
     registry.register(SPAWN_AGENT_DEFINITION, _handle_spawn_agent, overwrite=overwrite)

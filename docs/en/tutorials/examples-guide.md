@@ -33,6 +33,7 @@ All examples share `_helpers.py` which loads `.env` and builds an LLM client. To
 | [18](#18-multi-provider) | `multi_provider.py` | Multiple LLM providers |
 | [19](#19-full-chatbot) | `full_chatbot.py` | **Flagship**: all features combined |
 | [20](#20-default-tools) | `default_tools.py` | Built-in filesystem/search/bash tools |
+| [21](#21-request-user-input) | `request_user_input.py` | Resumable external input |
 | [Advanced Runtime](../../../examples/advanced_runtime/) | `advanced_runtime/` | Runtime-bound tool patterns |
 
 ---
@@ -1098,7 +1099,7 @@ Your name is Alan and you live in Shanghai.
 ### Code
 
 ```python
-registry = create_default_tool_registry(preset="full")
+registry = create_default_tool_registry(preset="full", workspace_dir="/path/to/project")
 
 registry.invoke("write_file", {"path": target, "content": "alpha\nbeta\n"})
 registry.invoke("read_file", {"path": target})
@@ -1111,10 +1112,35 @@ registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
 
 ### Key Points
 
-- `create_default_tool_registry(preset="full")` registers filesystem, search, shell, todo, skill, and background tools.
+- `create_default_tool_registry(preset="full", workspace_dir=...)` registers filesystem, search, shell, todo, skill, and background tools.
 - Existing files must be read before `write_file`, `edit_file`, or `apply_patch` can modify them.
 - `glob` and `grep` are preferred for locating files and searching content; `bash` is best for tests and builds.
 - This example is deterministic and does not require API credentials.
+
+---
+
+## 21 · Request User Input
+
+**Concept**: Pause the loop for external input without blocking the Python process.
+
+### Code
+
+```python
+waiting = await loop.send("Draft and send a summary.", session_id=sid)
+interaction = waiting.pending_interactions[0]
+
+result = await loop.submit_input(
+    sid,
+    interaction["interaction_id"],
+    {"choice": "send"},
+)
+```
+
+### Key Points
+
+- `request_user_input` returns `status="waiting_for_input"` and a serializable `pending_interactions` payload.
+- The caller owns UI/API delivery and can wait across process restarts before calling `submit_input`.
+- `submit_input` appends the matching tool message and continues the loop with valid LLM tool-call protocol history.
 
 ---
 

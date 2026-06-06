@@ -13,13 +13,16 @@ stateDiagram-v2
     Active --> Closed: close_session(sid)
     Active --> Pending: 工具调用中崩溃
     Pending --> Active: resume(sid) 或 abort_pending(sid)
+    Active --> WaitingForInput: request_user_input
+    WaitingForInput --> Active: submit_input(sid, interaction_id, value)
     Closed --> [*]
 ```
 
 1. **创建**——调用 `new_session()`。
 2. **延续**——后续 `send()` 传入相同 `session_id`。
 3. **悬挂**——进程在 `assistant(tool_calls)` 和最后一个 `tool` 消息之间崩溃。
-4. **关闭**——显式调用 `close_session(sid, cascade=True)`。
+4. **等待输入**——`request_user_input` 要求调用方/UI 收集外部输入。
+5. **关闭**——显式调用 `close_session(sid, cascade=True)`。
 
 ## 基本用法
 
@@ -116,6 +119,20 @@ except SessionPendingError as exc:
     loop.abort_pending(sid, reason="user_cancelled")
     result = await loop.send("new input", session_id=sid)
 ```
+
+## 可恢复用户输入
+
+`request_user_input` 会有意暂停会话，但不会阻塞 Python 进程：
+
+```python
+waiting = await loop.send("needs confirmation", session_id=sid)
+interaction = waiting.pending_interactions[0]
+
+# 在产品 UI 里展示 interaction["prompt"] 和 interaction["options"]。
+result = await loop.submit_input(sid, interaction["interaction_id"], {"choice": "yes"})
+```
+
+待输入项会存进 SQLite，因此另一个进程之后重新打开同一个数据库，也可以调用 `submit_input()` 继续。
 
 ## 关闭会话
 
