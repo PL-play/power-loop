@@ -18,7 +18,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult

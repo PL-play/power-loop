@@ -1,13 +1,10 @@
-"""Unified LLM provider configuration (M1.4).
+"""Unified LLM provider configuration.
 
 Why
 ---
-The library wraps a **single** transport today —
-``OpenAICompatibleChatLLMService`` — but speaks to many actual providers
-through it (OpenAI, DashScope/Qwen, DeepSeek, OpenRouter, Together,
-Groq, local OpenAI-compatible servers). Each caller used to assemble an
-``OpenAICompatibleChatConfig`` by hand and read env vars in its own way,
-which made provider-swapping a per-call code change.
+The library exposes one config object while routing to provider-specific
+transports. OpenAI-compatible providers use ``OpenAICompatibleChatLLMService``;
+Anthropic-compatible endpoints use ``AnthropicMessagesLLMService``.
 
 ``LLMProviderConfig`` is the single config shape callers should target.
 Two factories build an ``LLMService`` from it:
@@ -17,10 +14,8 @@ Two factories build an ``LLMService`` from it:
   variables (``POWER_LOOP_*``), falling back to legacy
   ``OPENAI_COMPAT_*`` names so existing ``.env`` files keep working.
 
-The ``provider`` field is currently informational (a string tag) — when
-we add Anthropic-native transport in M3 it becomes the router key.
-Callers that want to pin to a specific provider can set it; today it
-does not affect the transport.
+The ``provider`` field is the routing key. Use ``provider="anthropic"``
+for Anthropic Messages API endpoints.
 """
 
 from __future__ import annotations
@@ -29,7 +24,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from llm_client.interface import LLMService, OpenAICompatibleChatConfig
+from llm_client.anthropic_factory import AnthropicMessagesLLMService
+from llm_client.interface import AnthropicChatConfig, LLMService, OpenAICompatibleChatConfig
 from llm_client.llm_factory import OpenAICompatibleChatLLMService
 
 DEFAULT_PREFIX = "POWER_LOOP"
@@ -43,9 +39,9 @@ class LLMProviderConfig:
     Required: ``base_url`` / ``api_key`` / ``model``. Everything else
     has sensible defaults that match :class:`OpenAICompatibleChatConfig`.
 
-    ``provider`` is a free-form tag (``"openai"`` / ``"dashscope"`` /
-    ``"deepseek"`` / …) used today only for telemetry and human
-    readability; it becomes the routing key when multi-transport lands.
+    ``provider`` is a routing key. ``"anthropic"`` selects the native
+    Anthropic Messages transport; other values use the OpenAI-compatible
+    transport.
     """
 
     base_url: str
@@ -137,11 +133,20 @@ class LLMProviderConfig:
     # ── Adaptation ──────────────────────────────────────────────────────
 
     def to_openai_compatible(self) -> OpenAICompatibleChatConfig:
-        """Render into the transport-specific config the current backend
-        expects. New transports (Anthropic-native in M3) will add their
-        own adapter alongside this one.
-        """
+        """Render into an OpenAI-compatible transport config."""
         return OpenAICompatibleChatConfig(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            model=self.model,
+            timeout_s=self.timeout_s,
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            max_retries=self.max_retries,
+        )
+
+    def to_anthropic(self) -> AnthropicChatConfig:
+        """Render into an Anthropic Messages API transport config."""
+        return AnthropicChatConfig(
             base_url=self.base_url,
             api_key=self.api_key,
             model=self.model,
@@ -155,9 +160,12 @@ class LLMProviderConfig:
 def create_llm_service_from_config(cfg: LLMProviderConfig) -> LLMService:
     """Build an ``LLMService`` from an :class:`LLMProviderConfig`.
 
-    Today this always returns an ``OpenAICompatibleChatLLMService``;
-    when a second transport lands it will dispatch on ``cfg.provider``.
+    ``provider="anthropic"`` routes to the Anthropic Messages API;
+    everything else routes to the OpenAI-compatible chat-completions API.
     """
+    provider = (cfg.provider or "").strip().lower()
+    if provider in {"anthropic", "claude", "dashscope-anthropic"}:
+        return AnthropicMessagesLLMService(cfg.to_anthropic())
     return OpenAICompatibleChatLLMService(cfg.to_openai_compatible())
 
 

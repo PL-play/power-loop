@@ -468,3 +468,18 @@ class OpenAICompatibleChatConfig:
     @property
     def is_ready(self) -> bool:
         return bool(self.base_url and self.api_key and self.model)
+
+
+@dataclass
+class AnthropicChatConfig:
+    base_url: str
+    api_key: str
+    model: str
+    timeout_s: float = 180.0
+    max_tokens: int = 8000
+    temperature: float = 0.0
+    max_retries: int = 3
+
+    @property
+    def is_ready(self) -> bool:
+        return bool(self.base_url and self.api_key and self.model)

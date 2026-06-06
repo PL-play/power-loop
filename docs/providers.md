@@ -2,10 +2,10 @@
 
 [English](en/user-guide/providers.md) | [回到文档站](README.md)
 
-power-loop speaks to LLMs through **one transport** today:
-`OpenAICompatibleChatLLMService`. Any provider that exposes an
-OpenAI-compatible `chat.completions` endpoint works — you only need
-three things: `base_url`, `api_key`, `model`.
+power-loop speaks to LLMs through `LLMProviderConfig` and `LLMService`.
+OpenAI-compatible `chat.completions` endpoints use
+`OpenAICompatibleChatLLMService`; Anthropic-compatible Messages API
+endpoints use `AnthropicMessagesLLMService`.
 
 Build the config one of three ways:
 
@@ -30,10 +30,9 @@ cfg = LLMProviderConfig(
 llm = create_llm_service_from_config(cfg)
 ```
 
-The `provider` field is **a tag**, not a router — it's currently
-informational (telemetry, logs, audit). When a second transport lands
-(M3, likely Anthropic-native), `create_llm_service_from_config` will
-dispatch on this field.
+The `provider` field is the transport router. Use `provider="anthropic"`
+for Anthropic Messages API endpoints; other values route to the
+OpenAI-compatible transport.
 
 ## Environment variables
 
@@ -45,7 +44,7 @@ honoured so older `.env` files keep working without edits.
 | `{PREFIX}_BASE_URL` | ✅ | — | Full chat-completions base, including `/v1` if your provider needs it. |
 | `{PREFIX}_API_KEY` | ✅ | — | Sent as `Authorization: Bearer …`. |
 | `{PREFIX}_MODEL` | ✅ | — | Provider-specific model ID (e.g. `gpt-4o-mini`, `qwen-plus`, `deepseek-chat`). |
-| `{PREFIX}_PROVIDER` | ⬜ | `openai` | Tag only — see above. |
+| `{PREFIX}_PROVIDER` | ⬜ | `openai` | Transport router: `anthropic` selects Anthropic Messages API; other values use OpenAI-compatible chat completions. |
 | `{PREFIX}_TIMEOUT_S` | ⬜ | `180` | HTTP timeout (seconds, float). |
 | `{PREFIX}_MAX_TOKENS` | ⬜ | `8000` | Per-request cap. |
 | `{PREFIX}_TEMPERATURE` | ⬜ | `0.0` | |
@@ -73,6 +72,15 @@ export POWER_LOOP_PROVIDER=dashscope
 export POWER_LOOP_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 export POWER_LOOP_API_KEY=sk-…
 export POWER_LOOP_MODEL=qwen-plus
+```
+
+### DashScope — Anthropic-compatible mode
+
+```bash
+export POWER_LOOP_PROVIDER=anthropic
+export POWER_LOOP_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
+export POWER_LOOP_API_KEY=sk-…
+export POWER_LOOP_MODEL=deepseek-v4-flash
 ```
 
 ### DeepSeek

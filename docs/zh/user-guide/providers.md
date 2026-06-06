@@ -2,7 +2,7 @@
 
 [English](../../en/user-guide/providers.md) | [用户手册](../index.md)
 
-power-loop 通过 `LLMProviderConfig` 和 `LLMService` 与 LLM 对话。任何暴露 OpenAI 兼容 `chat/completions` 端点的 provider 都能用。
+power-loop 通过 `LLMProviderConfig` 和 `LLMService` 与 LLM 对话。OpenAI 兼容 `chat/completions` 端点可以直接使用；Anthropic 兼容 Messages API 端点会走原生 Anthropic transport。
 
 ## 快速开始
 
@@ -44,6 +44,14 @@ export POWER_LOOP_MODEL=gpt-4o-mini
 export POWER_LOOP_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 export POWER_LOOP_API_KEY=sk-…
 export POWER_LOOP_MODEL=qwen-plus
+```
+
+### DashScope Anthropic 兼容端点
+```bash
+export POWER_LOOP_PROVIDER=anthropic
+export POWER_LOOP_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
+export POWER_LOOP_API_KEY=sk-…
+export POWER_LOOP_MODEL=deepseek-v4-flash
 ```
 
 ### DeepSeek

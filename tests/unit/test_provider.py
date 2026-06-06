@@ -114,6 +114,12 @@ def test_from_env_missing_fields_raises_with_clear_message() -> None:
         "POWER_LOOP_API_KEY": "sk-ds",
         "POWER_LOOP_MODEL": "deepseek-chat",
     },
+    {
+        "POWER_LOOP_PROVIDER": "anthropic",
+        "POWER_LOOP_BASE_URL": "https://dashscope.aliyuncs.com/apps/anthropic",
+        "POWER_LOOP_API_KEY": "sk-anthropic",
+        "POWER_LOOP_MODEL": "deepseek-v4-flash",
+    },
 ])
 def test_three_provider_styles_build_without_error(provider_env: dict[str, str]) -> None:
     cfg = LLMProviderConfig.from_env(env=provider_env)
@@ -123,6 +129,17 @@ def test_three_provider_styles_build_without_error(provider_env: dict[str, str])
     svc = create_llm_service_from_config(cfg)
     assert svc is not None
     assert hasattr(svc, "complete") and hasattr(svc, "stream")
+
+
+def test_anthropic_provider_routes_to_anthropic_transport() -> None:
+    cfg = LLMProviderConfig(
+        provider="anthropic",
+        base_url="https://dashscope.aliyuncs.com/apps/anthropic",
+        api_key="sk-test",
+        model="deepseek-v4-flash",
+    )
+    svc = create_llm_service_from_config(cfg)
+    assert svc.__class__.__name__ == "AnthropicMessagesLLMService"
 
 
 def test_create_llm_service_from_env_one_shot(monkeypatch: pytest.MonkeyPatch) -> None:

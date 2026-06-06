@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### Added — M2.8 Anthropic Messages API 传输（2026-06-06）
+
+- **`AnthropicMessagesLLMService`**（`llm_client.anthropic_factory`）—— 新增原生 Anthropic Messages API transport，复用统一 `LLMRequest` / `LLMResponse`。
+- **`LLMProviderConfig.provider` 成为路由键**：`provider="anthropic"` / `"claude"` / `"dashscope-anthropic"` 使用 Anthropic transport；其它 provider 仍使用 OpenAI-compatible transport。
+- **消息转换**：OpenAI-style `tool_calls` → Anthropic `tool_use` blocks；`role="tool"` → `tool_result` blocks；返回的 `tool_use` 统一转回 `LLMResponse.tool_calls`，pipeline 无需分支。
+- **测试配置**：real LLM helper 改为 `create_llm_service_from_env()`，支持 `POWER_LOOP_*` 与 legacy `OPENAI_COMPAT_*` 两组环境变量。
+- **版本**：`power_loop.__version__ = "0.4.0"`。
+
+### Public API（M2.8 新增）
+
+`AnthropicChatConfig` / `AnthropicMessagesLLMService` 可从子模块导入；顶层 `LLMProviderConfig` 的 `provider` 字段现在影响 transport 路由。
+
 ### Changed — M2.7 显式 Session 创建（2026-06-06）
 
 - **`StatefulAgentLoop.new_session(metadata=None, system_prompt=None) -> str`** —— 新增显式会话创建入口。调用方先拿到 `session_id`，再传给每次 `send()` / `send_sync()`。

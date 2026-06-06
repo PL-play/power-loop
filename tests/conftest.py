@@ -4,7 +4,7 @@ Test-tier policy (matches ROADMAP §四条护栏 4):
 
 - ``unit``         : pure control-flow / contract tests with fake LLM. Always on.
 - ``integration``  : multi-component scenarios with fake LLM. Always on.
-- ``real_llm``     : hits the real DashScope-compatible API.
+- ``real_llm``     : hits the real configured LLM provider.
                      - Default ON locally.
                      - ``--no-real`` reverses to skip.
                      - Automatically skipped if required env vars are missing
@@ -26,10 +26,9 @@ except ImportError:  # pragma: no cover - dotenv is a hard dep, but be defensive
     pass
 
 
-REAL_LLM_REQUIRED_ENV = (
-    "OPENAI_COMPAT_BASE_URL",
-    "OPENAI_COMPAT_API_KEY",
-    "OPENAI_COMPAT_MODEL",
+REAL_LLM_ENV_GROUPS = (
+    ("POWER_LOOP_BASE_URL", "POWER_LOOP_API_KEY", "POWER_LOOP_MODEL"),
+    ("OPENAI_COMPAT_BASE_URL", "OPENAI_COMPAT_API_KEY", "OPENAI_COMPAT_MODEL"),
 )
 
 
@@ -46,14 +45,14 @@ def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
     no_real = config.getoption("--no-real")
-    missing_env = [key for key in REAL_LLM_REQUIRED_ENV if not os.environ.get(key)]
+    has_real_env = any(all(os.environ.get(key) for key in group) for group in REAL_LLM_ENV_GROUPS)
 
     if no_real:
         skip_reason = "skipped via --no-real"
-    elif missing_env:
+    elif not has_real_env:
         skip_reason = (
-            f"real_llm skipped: missing env {missing_env}. "
-            "Set them in .env (locally) or as repo secrets (CI)."
+            "real_llm skipped: missing POWER_LOOP_* or OPENAI_COMPAT_* provider env. "
+            "Set one complete group in .env (locally) or as repo secrets (CI)."
         )
     else:
         skip_reason = None

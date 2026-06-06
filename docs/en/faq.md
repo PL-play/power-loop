@@ -18,7 +18,7 @@ Yes. Subscribe to `STREAM_DELTA` events for real-time token streaming. See [Even
 
 ### Does it work with Anthropic?
 
-Today, through the OpenAI-compatible transport. Native Anthropic transport is planned for M3.
+Yes. Set `POWER_LOOP_PROVIDER=anthropic` to use the native Anthropic Messages API transport. Anthropic-compatible endpoints such as DashScope's Anthropic app endpoint are supported.
 
 ## Configuration
 

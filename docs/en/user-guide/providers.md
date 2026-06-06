@@ -2,7 +2,7 @@
 
 [中文](../../zh/user-guide/providers.md) | [User Guide](../index.md)
 
-power-loop speaks to LLMs through `LLMProviderConfig` and `LLMService`. Any provider that exposes an OpenAI-compatible `chat/completions` endpoint works.
+power-loop speaks to LLMs through `LLMProviderConfig` and `LLMService`. OpenAI-compatible `chat/completions` endpoints work, and Anthropic-compatible Messages API endpoints are supported through the native Anthropic transport.
 
 ## Quick Start
 
@@ -33,7 +33,7 @@ llm = create_llm_service_from_config(cfg)
 | `POWER_LOOP_BASE_URL` | Yes | — | Full chat-completions base, including `/v1` |
 | `POWER_LOOP_API_KEY` | Yes | — | `Authorization: Bearer …` |
 | `POWER_LOOP_MODEL` | Yes | — | Provider-specific model ID |
-| `POWER_LOOP_PROVIDER` | No | `openai` | Tag for telemetry |
+| `POWER_LOOP_PROVIDER` | No | `openai` | Transport router: `anthropic` selects Anthropic Messages API; other values use OpenAI-compatible chat completions |
 | `POWER_LOOP_TIMEOUT_S` | No | `180` | HTTP timeout |
 | `POWER_LOOP_MAX_TOKENS` | No | `8000` | Per-request cap |
 | `POWER_LOOP_TEMPERATURE` | No | `0.0` | |
@@ -59,6 +59,15 @@ export POWER_LOOP_PROVIDER=dashscope
 export POWER_LOOP_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 export POWER_LOOP_API_KEY=sk-…
 export POWER_LOOP_MODEL=qwen-plus
+```
+
+### DashScope Anthropic-compatible endpoint
+
+```bash
+export POWER_LOOP_PROVIDER=anthropic
+export POWER_LOOP_BASE_URL=https://dashscope.aliyuncs.com/apps/anthropic
+export POWER_LOOP_API_KEY=sk-…
+export POWER_LOOP_MODEL=deepseek-v4-flash
 ```
 
 ### DeepSeek
@@ -87,7 +96,7 @@ class LLMProviderConfig:
     base_url: str              # required
     api_key: str               # required
     model: str                 # required
-    provider: str = "openai"   # informational tag
+    provider: str = "openai"   # transport router
     timeout_s: float = 180.0
     max_tokens: int = 8000
     temperature: float = 0.0

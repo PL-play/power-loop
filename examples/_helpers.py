@@ -9,13 +9,12 @@ from :func:`make_llm` and drop the import.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from llm_client.interface import OpenAICompatibleChatConfig
-from llm_client.llm_factory import OpenAICompatibleChatLLMService
+from llm_client.interface import LLMService
+from power_loop import LLMProviderConfig, create_llm_service_from_config
 
 
 def load_env() -> None:
@@ -27,19 +26,13 @@ def make_llm(
     *,
     max_tokens: int = 512,
     temperature: float = 0.0,
-) -> OpenAICompatibleChatLLMService:
-    """Build an OpenAI-compatible LLM client from environment variables.
+) -> LLMService:
+    """Build an LLM client from ``POWER_LOOP_*`` environment variables.
 
-    Expects ``OPENAI_COMPAT_BASE_URL`` / ``OPENAI_COMPAT_API_KEY`` /
-    ``OPENAI_COMPAT_MODEL`` in the environment (loaded by :func:`load_env`).
+    Legacy ``OPENAI_COMPAT_*`` variables still work as fallback.
     """
     load_env()
-    return OpenAICompatibleChatLLMService(
-        OpenAICompatibleChatConfig(
-            base_url=os.environ["OPENAI_COMPAT_BASE_URL"],
-            api_key=os.environ["OPENAI_COMPAT_API_KEY"],
-            model=os.environ["OPENAI_COMPAT_MODEL"],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-    )
+    cfg = LLMProviderConfig.from_env()
+    cfg.max_tokens = max_tokens
+    cfg.temperature = temperature
+    return create_llm_service_from_config(cfg)

@@ -36,7 +36,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 ```bash
 # Set up credentials (once)
 cp .env.example .env
-# edit .env with your OPENAI_COMPAT_BASE_URL / API_KEY / MODEL
+# edit .env with POWER_LOOP_BASE_URL / API_KEY / MODEL
 
 # Run any example
 python examples/00_hello_world.py
@@ -44,7 +44,7 @@ python examples/00_hello_world.py
 
 ## Shared helper
 
-[`_helpers.py`](_helpers.py) provides `make_llm()` — loads `.env` and builds an OpenAI-compatible client. Each example imports it. If you copy an example into your own project, inline the two lines from `make_llm()` and drop the import.
+[`_helpers.py`](_helpers.py) provides `make_llm()` — loads `.env` and builds the configured LLM client. Each example imports it. If you copy an example into your own project, inline the two lines from `make_llm()` and drop the import.
 
 ## Next
 

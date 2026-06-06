@@ -18,7 +18,7 @@ power-loop 是**内核**，不是框架。不预设 workflow DAG、记忆后端�
 
 ### 支持 Anthropic 吗？
 
-目前通过 OpenAI 兼容传输。原生 Anthropic 传输计划在 M3。
+支持。设置 `POWER_LOOP_PROVIDER=anthropic` 会使用原生 Anthropic Messages API transport；DashScope 的 Anthropic 兼容 app 端点也可以这样使用。
 
 ## 配置
 
