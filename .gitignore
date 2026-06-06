@@ -228,3 +228,7 @@ test_providers.py
 
 # references
 references/
+
+# Runtime database files
+*.db
+power_loop_sessions.db
