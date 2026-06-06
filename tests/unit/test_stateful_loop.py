@@ -15,6 +15,7 @@ from power_loop import (
     SessionStore,
     StatefulAgentLoop,
     create_default_tool_registry,
+    get_tool_runtime_context,
 )
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.tools.registry import ToolRegistry
@@ -233,6 +234,56 @@ async def test_custom_runtime_projector_is_configurable(store: SessionStore) -> 
 
     await loop.send("check custom runtime", session_id=sid)
     assert any("CUSTOM_RUNTIME_VISIBLE" in str(msg.get("content", "")) for msg in llm.calls[0])
+
+
+@pytest.mark.asyncio
+async def test_custom_tool_can_use_public_runtime_context(store: SessionStore) -> None:
+    reg = ToolRegistry()
+
+    def write_custom_state(**kw) -> str:
+        runtime = get_tool_runtime_context(required=True)
+        runtime.store.set_runtime_state(
+            runtime.session_id,
+            "custom",
+            {"text": kw["text"]},
+        )
+        return "custom runtime written"
+
+    reg.register(
+        ToolDefinition(
+            name="write_custom_state",
+            description="Write custom runtime state",
+            input_schema={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+            required_params=("text",),
+        ),
+        write_custom_state,
+    )
+    llm = _Scripted(
+        responses=[
+            _tool_resp("tc-custom", "write_custom_state", '{"text":"PUBLIC_RUNTIME_CONTEXT"}'),
+            LLMResponse(raw_text="done"),
+        ]
+    )
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        tool_registry=reg,
+        config=AgentLoopConfig(
+            system_prompt="S",
+            max_rounds=3,
+            compactor=None,
+            runtime_projectors=(_CustomProjector(),),
+        ),
+    )
+    sid = loop.new_session()
+
+    await loop.send("write custom state", session_id=sid)
+    assert store.get_runtime_state(sid, "custom") == {"text": "PUBLIC_RUNTIME_CONTEXT"}
+    assert any("PUBLIC_RUNTIME_CONTEXT" in str(msg.get("content", "")) for msg in llm.calls[1])
 
 
 @pytest.mark.asyncio

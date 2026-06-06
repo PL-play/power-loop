@@ -148,7 +148,23 @@ Some default tools are not just functions. They participate in the agent loop:
 - `background_run` records task status in SQLite. When a task changes from unseen to updated or completed, the next LLM round receives a transient `<background_updates>` message. `check_background` reads the same persisted task table.
 - `load_skill` uses `AgentLoopConfig.skills_dir` when configured. When `skills_dir` is set, the resolved system prompt includes the skills directory and available skill descriptions.
 
-This behavior is built on public primitives. `SessionStore` exposes JSON runtime state and background task APIs, and `AgentLoopConfig.runtime_projectors` controls how persisted state becomes transient LLM messages. The default projectors are `TodoRuntimeProjector` and `BackgroundRuntimeProjector`; pass your own `RuntimeProjector` objects to support custom tools or disable the defaults with `runtime_projectors=()`.
+This behavior is built on public primitives. `SessionStore` exposes JSON runtime state and background task APIs, `get_tool_runtime_context()` gives tool handlers the current session/store, and `AgentLoopConfig.runtime_projectors` controls how persisted state becomes transient LLM messages. The default projectors are `TodoRuntimeProjector` and `BackgroundRuntimeProjector`; pass your own `RuntimeProjector` objects to support custom tools or disable the defaults with `runtime_projectors=()`.
+
+```python
+from power_loop import RuntimeProjector, get_tool_runtime_context
+
+def remember_custom_state(value: str) -> str:
+    ctx = get_tool_runtime_context(required=True)
+    ctx.store.set_runtime_state(ctx.session_id, "my_tool", {"value": value})
+    return "saved"
+
+class MyToolProjector(RuntimeProjector):
+    def project(self, *, store, session_id, round_index, context):
+        state = store.get_runtime_state(session_id, "my_tool", default={}) or {}
+        if not state:
+            return []
+        return [{"role": "user", "name": "my_tool_state", "content": str(state)}]
+```
 
 This means session state survives a new `StatefulAgentLoop` instance that shares the same `SessionStore`. Conversation history remains the protocol log; runtime state lives beside it and is projected into the prompt only when needed.
 

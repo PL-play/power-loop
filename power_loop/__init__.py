@@ -123,7 +123,9 @@ from power_loop.runtime.runtime_state import (
     RuntimeMessage,
     RuntimeProjector,
     TodoRuntimeProjector,
+    ToolRuntimeContext,
     default_runtime_projectors,
+    get_tool_runtime_context,
 )
 from power_loop.runtime.session_store import (
     DEFAULT_DB_PATH,
@@ -216,9 +218,11 @@ __all__ = [
 	"with_retry",
 	"RuntimeMessage",
 	"RuntimeProjector",
+	"ToolRuntimeContext",
 	"TodoRuntimeProjector",
 	"BackgroundRuntimeProjector",
 	"default_runtime_projectors",
+	"get_tool_runtime_context",
 	"CancellationToken",
 	"CancellationLike",
 	"LlmRetryAttemptedPayload",

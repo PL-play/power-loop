@@ -14,8 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from power_loop.core.agent_context import get_ctx, get_current_loop, get_session_id
+from power_loop.core.agent_context import get_ctx
 from power_loop.runtime.env import AGENT_DIR, AGENT_RW_ALLOWLIST, WORKSPACE_DIR, safe_path
+from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
 
 RESULT_MAX_CHARS = 50000
@@ -887,8 +888,8 @@ def run_grep(
 
 
 def run_load_skill(name: str) -> str:
-    loop = get_current_loop()
-    skills_dir = getattr(getattr(loop, "config", None), "skills_dir", None) if loop is not None else None
+    runtime_ctx = get_tool_runtime_context()
+    skills_dir = getattr(runtime_ctx.config, "skills_dir", None) if runtime_ctx.config is not None else None
     if skills_dir:
         from power_loop.runtime.skills import SkillLoader
 
@@ -897,10 +898,8 @@ def run_load_skill(name: str) -> str:
 
 
 def _current_store_and_session() -> tuple[Any | None, str | None]:
-    loop = get_current_loop()
-    sid = get_session_id()
-    store = getattr(loop, "store", None) if loop is not None else None
-    return store, sid
+    runtime_ctx = get_tool_runtime_context()
+    return runtime_ctx.store, runtime_ctx.session_id
 
 
 def _render_todos(items: list[dict[str, Any]]) -> str:

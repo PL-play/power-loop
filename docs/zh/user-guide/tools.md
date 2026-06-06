@@ -147,7 +147,23 @@ registry = create_default_tool_registry(preset="core")
 - `background_run` 会把任务状态记录到 SQLite。任务从未读变为更新或完成后，下一轮 LLM 会收到临时 `<background_updates>` 消息。`check_background` 读取同一张持久化任务表。
 - `load_skill` 在配置了 `AgentLoopConfig.skills_dir` 时会使用该目录。设置 `skills_dir` 后，解析后的系统提示词会包含技能目录和可用 skill 描述。
 
-这些行为基于公开原语实现。`SessionStore` 暴露 JSON runtime state 和 background task API，`AgentLoopConfig.runtime_projectors` 控制持久化状态如何变成临时 LLM 消息。默认 projector 是 `TodoRuntimeProjector` 和 `BackgroundRuntimeProjector`；你可以传入自己的 `RuntimeProjector` 支持自定义工具，也可以用 `runtime_projectors=()` 关闭默认投影。
+这些行为基于公开原语实现。`SessionStore` 暴露 JSON runtime state 和 background task API，`get_tool_runtime_context()` 让工具 handler 获取当前 session/store，`AgentLoopConfig.runtime_projectors` 控制持久化状态如何变成临时 LLM 消息。默认 projector 是 `TodoRuntimeProjector` 和 `BackgroundRuntimeProjector`；你可以传入自己的 `RuntimeProjector` 支持自定义工具，也可以用 `runtime_projectors=()` 关闭默认投影。
+
+```python
+from power_loop import RuntimeProjector, get_tool_runtime_context
+
+def remember_custom_state(value: str) -> str:
+    ctx = get_tool_runtime_context(required=True)
+    ctx.store.set_runtime_state(ctx.session_id, "my_tool", {"value": value})
+    return "saved"
+
+class MyToolProjector(RuntimeProjector):
+    def project(self, *, store, session_id, round_index, context):
+        state = store.get_runtime_state(session_id, "my_tool", default={}) or {}
+        if not state:
+            return []
+        return [{"role": "user", "name": "my_tool_state", "content": str(state)}]
+```
 
 因此，只要共享同一个 `SessionStore`，这些运行时状态可以跨新的 `StatefulAgentLoop` 实例恢复。对话历史仍然是协议日志；运行时状态保存在旁路表中，只在需要时投影进 prompt。
 

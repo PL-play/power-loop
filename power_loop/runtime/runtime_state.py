@@ -6,6 +6,44 @@ from typing import Any, Protocol, runtime_checkable
 RuntimeMessage = dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ToolRuntimeContext:
+    """Current tool-call runtime context.
+
+    Tool handlers can call :func:`get_tool_runtime_context` to access the
+    active session id, ``SessionStore``, and loop config without importing
+    internal contextvars. This is the public primitive used by default
+    runtime-bound tools and available to user-defined tools.
+    """
+
+    session_id: str | None
+    store: Any | None
+    loop: Any | None
+    config: Any | None
+
+    @property
+    def has_session_store(self) -> bool:
+        return self.session_id is not None and self.store is not None
+
+
+def get_tool_runtime_context(*, required: bool = False) -> ToolRuntimeContext:
+    """Return context for the currently executing tool handler.
+
+    When called outside ``StatefulAgentLoop`` execution, fields are ``None``.
+    Pass ``required=True`` to raise a clear error instead.
+    """
+    from power_loop.core.agent_context import get_current_loop, get_session_id
+
+    loop = get_current_loop()
+    session_id = get_session_id()
+    store = getattr(loop, "store", None) if loop is not None else None
+    config = getattr(loop, "config", None) if loop is not None else None
+    ctx = ToolRuntimeContext(session_id=session_id, store=store, loop=loop, config=config)
+    if required and not ctx.has_session_store:
+        raise RuntimeError("No active StatefulAgentLoop session/store is available for this tool call.")
+    return ctx
+
+
 @runtime_checkable
 class RuntimeProjector(Protocol):
     """Project persisted runtime state into transient LLM messages.
@@ -100,6 +138,8 @@ __all__ = [
     "BackgroundRuntimeProjector",
     "RuntimeMessage",
     "RuntimeProjector",
+    "ToolRuntimeContext",
     "TodoRuntimeProjector",
     "default_runtime_projectors",
+    "get_tool_runtime_context",
 ]
