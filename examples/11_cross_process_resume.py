@@ -1,35 +1,41 @@
-"""11 · 跨进程恢复：``db_path="./real_file.db"`` 真的把会话续上
+"""11 · Cross-process resume: ``db_path="./real_file.db"`` persists the session
 
 What you learn
 --------------
-- ``StatefulAgentLoop(db_path=…)`` 落到一个**真实文件**（不是 ``":memory:"``），
-  整段会话都活在那个 SQLite 文件里：messages / pending / usage / compactions。
-- 进程退出后，**只要拿着** ``session_id`` **+ 同一个 db 路径**，新进程实例化
-  ``StatefulAgentLoop`` 并 ``send(..., session_id=sid)``，LLM 看到的就是完整历史。
-- 不需要任何「恢复」API：``SessionStore.open(path)`` 命中已存在文件即原样接上；
-  WAL + busy_timeout 让单文件被串行复用是安全的（不要并发多进程同写）。
+- ``StatefulAgentLoop(db_path=…)`` writes to a **real file** (not ``":memory:"``);
+  the entire session lives in that SQLite file: messages / pending / usage /
+  compactions.
+- After the process exits, **as long as you have** ``session_id`` **+ the same
+  db path**, a new process can instantiate ``StatefulAgentLoop`` and call
+  ``send(..., session_id=sid)`` — the LLM sees the full history.
+- No special "resume" API needed: ``SessionStore.open(path)`` seamlessly
+  reconnects to an existing file; WAL + busy_timeout make single-file serial
+  reuse safe (do NOT let multiple processes write concurrently).
 
-如何运行
---------
-本例自己 fork 一个子进程演示「真的换进程」：
+How to run
+----------
+This example forks a child process to demonstrate "real process swap":
 
-    python examples/11_persistence.py
+    python examples/11_cross_process_resume.py
 
-它会做两段事：
+It runs in two phases:
 
-1. **phase1**：父进程创建 session，问一个能立刻让 LLM 记住的事实（"我叫
-   阿岚，最喜欢的数字是 37"），关闭 loop、写 sid 到 stdout，进程返回。
-2. **phase2**：父进程用 ``subprocess.run`` 重新拉起 *本文件*，传入
-   ``phase2 <db_path> <sid>``。子进程**完全不知道 phase1 的内存**，只打开同一个
-   db 文件 → ``send("我叫什么？最喜欢的数字是多少？")`` → LLM 应当答出
-   「阿岚 / 37」。
+1. **phase1**: parent creates a session, tells the LLM a fact ("My name is
+   Alan, my favorite number is 37"), closes the loop, writes the sid to
+   stdout, then exits.
+2. **phase2**: parent uses ``subprocess.run`` to re-invoke *this file* with
+   ``phase2 <db_path> <sid>``. The child process has **zero knowledge of
+   phase1's memory** — it only opens the same db file →
+   ``send("What is my name? What is my favorite number?")`` → LLM should
+   answer "Alan / 37".
 
-如果跨进程把 db 路径打错（例如改成 ``other.db``），子进程会因为 session 不存在
-直接抛 ``SessionNotFoundError`` —— 这正是「持久化锚点是文件，不是内存」的证据。
+If the db path is wrong in the child (e.g. ``other.db``), it raises
+``SessionNotFoundError`` — proving the persistence anchor is the file, not
+memory.
 
 Run
 ---
-    python examples/11_persistence.py
+    python examples/11_cross_process_resume.py
 """
 
 from __future__ import annotations
@@ -51,7 +57,7 @@ SYSTEM = (
 
 
 async def phase1(db_path: str) -> str:
-    """父进程：建 session、塞一条事实、关闭、把 sid 返回给上层。"""
+    """Parent process: create session, store a fact, close, return sid."""
     loop = StatefulAgentLoop(
         llm=make_llm(max_tokens=200),
         db_path=db_path,
@@ -59,7 +65,10 @@ async def phase1(db_path: str) -> str:
     )
     try:
         sid = loop.new_session()
-        r = await loop.send("记住：我叫阿岚，最喜欢的数字是 37。回一句确认就好。", session_id=sid)
+        r = await loop.send(
+            "Remember: my name is Alan and my favorite number is 37. Confirm briefly.",
+            session_id=sid,
+        )
         print(f"[phase1] sid={sid}")
         print(f"[phase1] reply={r.final_text}")
         return sid
@@ -68,14 +77,17 @@ async def phase1(db_path: str) -> str:
 
 
 async def phase2(db_path: str, sid: str) -> str:
-    """子进程：只拿到 db_path + sid，直接续。"""
+    """Child process: only has db_path + sid, resumes directly."""
     loop = StatefulAgentLoop(
         llm=make_llm(max_tokens=200),
         db_path=db_path,
         config=AgentLoopConfig(system_prompt=SYSTEM, max_rounds=1, compactor=None),
     )
     try:
-        r = await loop.send("我叫什么？最喜欢的数字是多少？请只用一句话回答。", session_id=sid)
+        r = await loop.send(
+            "What is my name? What is my favorite number? One sentence only.",
+            session_id=sid,
+        )
         print(f"[phase2] reply={r.final_text}")
         return r.final_text
     finally:
@@ -83,14 +95,14 @@ async def phase2(db_path: str, sid: str) -> str:
 
 
 async def _run_parent() -> None:
-    # 用临时目录里的真实文件，避免污染仓库根。
+    # Use a real file in a temp directory to avoid polluting the repo root.
     with tempfile.TemporaryDirectory(prefix="power_loop_p11_") as tmp:
         db_path = str(Path(tmp) / "real_file.db")
         sid = await phase1(db_path)
-        assert Path(db_path).exists(), "phase1 应当在磁盘上留下文件"
+        assert Path(db_path).exists(), "phase1 should have left a file on disk"
 
-        print(f"\n--- 父进程退出 phase1，db 留在 {db_path} ---")
-        print("--- 重新拉起子进程跑 phase2 ---\n")
+        print(f"\n--- parent exits phase1, db left at {db_path} ---")
+        print("--- spawning child process for phase2 ---\n")
 
         cp = subprocess.run(
             [sys.executable, __file__, "phase2", db_path, sid],
@@ -102,16 +114,16 @@ async def _run_parent() -> None:
 
 
 def main() -> None:
-    # 子进程入口：argv = [..., "phase2", db_path, sid]
+    # Child process entry: argv = [..., "phase2", db_path, sid]
     if len(sys.argv) >= 4 and sys.argv[1] == "phase2":
         _, _, db_path, sid = sys.argv[:4]
         asyncio.run(phase2(db_path, sid))
         return
-    # 父进程入口
+    # Parent process entry
     asyncio.run(_run_parent())
 
 
 if __name__ == "__main__":
-    # 子进程从同一文件执行，需保证相对 import (_helpers) 找得到。
+    # Child process runs from this same file, so ensure relative imports work.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     main()

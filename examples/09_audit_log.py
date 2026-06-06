@@ -1,19 +1,25 @@
-"""09 · 全量审计日志：订阅所有 event → JSONL
+"""09 · 全量审计日志 / Audit log: subscribe to all events → JSONL
 
-What you learn
---------------
+What you learn / 你将学到
+--------------------------
 - ``bus.subscribe(None, fn)`` 订阅**所有**类型的事件——常用于审计 / 调试 / OTel
+  / subscribes to **all** event types — commonly used for audit / debugging / OTel
 - ``AgentEvent.payload`` 是 dict 形式（``data.to_dict()`` 自动填充），方便 JSON 序列化
+  / ``AgentEvent.payload`` is a dict (auto-populated via ``data.to_dict()``), easy to JSON serialize
 - ``AgentEvent.{type, session_id, round_index, stream_id, source}`` 是路由字段
+  / are routing fields
 - 订阅者错误默认隔离（``suppress_subscriber_errors=True``），不会污染主循环
+  / subscriber errors are isolated by default, won't affect the main loop
 - 适合 hook 到 ELK / Datadog / 自家 audit pipeline
+  / suitable for hooking into ELK / Datadog / custom audit pipelines
 
-Output
-------
+Output / 输出
+-------------
 跑完后会有一个 ``audit.jsonl`` 文件，每行一个 JSON 事件。
+/ After running, an ``audit.jsonl`` file is created, one JSON event per line.
 
-Run
----
+Run / 运行
+----------
     python examples/09_audit_log.py
 """
 
@@ -37,6 +43,7 @@ from power_loop import (
 )
 
 # ── 简单 echo 工具，让 audit 里出现 TOOL_* 事件 ───────────────────────────
+#    Simple echo tool to produce TOOL_* events in the audit log
 
 
 def echo_handler(**kwargs) -> str:
@@ -56,9 +63,10 @@ ECHO_TOOL = ToolDefinition(
 
 
 def attach_audit_writer(bus: AgentEventBus, path: Path) -> None:
-    """全量订阅 → 写 JSONL。"""
+    """全量订阅 → 写 JSONL / Subscribe to all → write JSONL."""
 
-    # mode="a" 允许多次 run 追加到同一文件；测试里用 tempfile.
+    # mode="a" 允许多次 run 追加到同一文件；测试里用 tempfile
+    # mode="a" allows multiple runs to append; tests use tempfile
     fh = open(path, "a", encoding="utf-8")
 
     def on_event(event: AgentEvent) -> None:
@@ -73,8 +81,9 @@ def attach_audit_writer(bus: AgentEventBus, path: Path) -> None:
         }
         fh.write(json.dumps(record, default=str, ensure_ascii=False) + "\n")
         fh.flush()                                              # demo 用：方便 tail -f
+                                                                 # demo: convenient for tail -f
 
-    # bus.subscribe(None, ...) 订阅所有事件类型
+    # bus.subscribe(None, ...) 订阅所有事件类型 / subscribe to all event types
     bus.subscribe(None, on_event)
 
 
@@ -105,7 +114,7 @@ async def main() -> Path:
     r = await loop.send("Echo back the phrase: 'audit log demo'.", session_id=sid)
     print(f"\n[reply] {r.final_text}\n")
 
-    # 看一眼 audit 文件长什么样
+    # 看一眼 audit 文件长什么样 / Peek at the audit file
     lines = audit_path.read_text(encoding="utf-8").splitlines()
     print(f"[audit] wrote {len(lines)} events to {audit_path}")
     type_counter: dict[str, int] = {}

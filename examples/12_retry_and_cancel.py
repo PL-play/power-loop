@@ -1,25 +1,38 @@
-"""12 · LLM 重试 / 超时 / 取消（M1.1）
+"""12 · LLM 重试 / 超时 / 取消 / Retry, timeout, and cancellation
 
-What you learn
---------------
+What you learn / 你将学到
+--------------------------
 - 配 ``AgentLoopConfig.retry_policy=LLMRetryPolicy(...)`` 让 ``call_llm`` 在
   抛 ``retry_on`` 异常时自动重试，指数退避到 ``backoff_max`` 封顶。
+  / configuring ``retry_policy=LLMRetryPolicy(...)`` makes ``call_llm`` auto-retry
+  on ``retry_on`` exceptions, with exponential backoff capped at ``backoff_max``
 - 总时长 ``total_timeout`` 跨所有 attempt 累计；超时直接报 ``LLMTimeout`` →
   pipeline 翻译成 ``status="degraded"``。
+  / ``total_timeout`` accumulates across all attempts; timeout raises ``LLMTimeout`` →
+  pipeline translates to ``status="degraded"``
 - ``CancellationToken`` 是「一个形状统治所有 cancel」：``threading.Event`` /
   ``asyncio.Event`` / 任意 ``Callable[[], bool]`` / owned ``token.cancel()``
   全都兼容。Cancel 在 retry sleep 中也会立刻生效，不会等满 backoff。
-- 三种 outcome：``completed``（重试后成功）/ ``degraded``（重试耗尽或超时）/
-  ``cancelled``（外部 cancel）—— 全部通过 ``StatefulResult.status`` 一眼可读。
+  / ``CancellationToken`` unifies all cancel shapes: ``threading.Event`` /
+  ``asyncio.Event`` / any ``Callable[[], bool]`` / owned ``token.cancel()`` —
+  all compatible. Cancel takes effect even during retry backoff sleep.
+- 三种 outcome / Three outcomes:
+  ``completed``（重试后成功 / success after retries）/
+  ``degraded``（重试耗尽或超时 / retries exhausted or timeout）/
+  ``cancelled``（外部 cancel / external cancel）
 
-为啥这是 must-have
-------------------
+为啥这是 must-have / Why this is a must-have
+----------------------------------------------
 云厂商 LLM 抖动是日常（429、连接重置、流被服务端中断）。没有 retry → 一次
 小抖动就 hard-fail 整轮。这段代码用一个**注入失败的 LLM 包装**确定性演示
 所有路径，不依赖真实网络真的抽风。
+/ Cloud LLM hiccups are the norm (429s, connection resets, server-side stream
+interruptions). Without retry → a single hiccup hard-fails the entire round.
+This code deterministically demonstrates all paths using an **injected-failure
+LLM wrapper**, no real network flakiness needed.
 
-Run
----
+Run / 运行
+----------
     python examples/12_retry_and_cancel.py
 """
 
@@ -42,7 +55,9 @@ from power_loop import (
 
 
 class FlakyWrap(LLMService):
-    """包装真实 LLM；前 ``fail_first`` 次抛 RuntimeError 模拟抖动，之后透传。"""
+    """包装真实 LLM；前 ``fail_first`` 次抛 RuntimeError 模拟抖动，之后透传。
+    / Wraps real LLM; raises RuntimeError for first ``fail_first`` calls to simulate
+    flakiness, then passes through."""
 
     def __init__(self, inner: LLMService, *, fail_first: int) -> None:
         self.inner = inner
@@ -63,7 +78,8 @@ class FlakyWrap(LLMService):
 
 
 def _new_bus_with_audit() -> tuple[AgentEventBus, list]:
-    """订阅 retry / degraded / cancel 三类事件，方便外部观察。"""
+    """订阅 retry / degraded / cancel 三类事件，方便外部观察。
+    / Subscribe to retry / degraded / cancel events for external observation."""
     bus = AgentEventBus()
     seen: list = []
     interesting = {
@@ -75,7 +91,7 @@ def _new_bus_with_audit() -> tuple[AgentEventBus, list]:
     return bus, seen
 
 
-# ── Scenario 1: 抖两次后第三次成功 ────────────────────────────────────────
+# ── Scenario 1: 抖两次后第三次成功 / Transient failures, eventually succeeds
 
 
 async def scenario_completed_after_retries() -> None:
@@ -103,7 +119,7 @@ async def scenario_completed_after_retries() -> None:
         store.close()
 
 
-# ── Scenario 2: 永远失败 → degraded ────────────────────────────────────────
+# ── Scenario 2: 永远失败 → degraded / All attempts fail → degraded
 
 
 async def scenario_degraded() -> None:
@@ -131,7 +147,7 @@ async def scenario_degraded() -> None:
         store.close()
 
 
-# ── Scenario 3: 外部 cancel 在 retry sleep 中触发 ─────────────────────────
+# ── Scenario 3: 外部 cancel 在 retry sleep 中触发 / External cancel during retry backoff
 
 
 async def scenario_cancelled() -> None:
@@ -154,6 +170,7 @@ async def scenario_cancelled() -> None:
 
         async def trip_cancel() -> None:
             await asyncio.sleep(0.2)              # 让 loop 进入第一次 retry sleep
+                                                   # let the loop enter its first retry sleep
             token.cancel("user_pressed_stop")
 
         sid = loop.new_session()

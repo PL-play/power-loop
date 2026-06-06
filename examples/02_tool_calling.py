@@ -1,22 +1,26 @@
-"""02 · 工具调用：让模型调你写的 Python 函数
+"""02 · 工具调用 / Tool calling: let the model call your Python functions
 
-What you learn
---------------
+What you learn / 你将学到
+--------------------------
 - :class:`ToolDefinition` 声明工具名 / 描述 / JSON Schema / required 参数
-- :class:`ToolRegistry` 注册定义 → handler
+  / declares tool name / description / JSON Schema / required params
+- :class:`ToolRegistry` 注册定义 → handler / registers definition → handler
 - 模型看到工具描述 → 自主决定调用 → power-loop 转发参数 → handler 返回字符串 → 模型继续
+  / model sees tool descriptions → decides to call → power-loop forwards args →
+  handler returns string → model continues
 
-Why ``max_rounds > 1``
-----------------------
-工具调用是两步：
-  Round 1: LLM 决定调用 `lookup_dish(city="Bangkok")`
-  Round 2: 工具结果回灌，LLM 看到 "pad thai" 给出最终回答
+Why ``max_rounds > 1`` / 为什么 max_rounds 必须大于 1
+------------------------------------------------------
+工具调用是两步 / Tool calling is two steps:
+  Round 1: LLM 决定调用 `lookup_dish(city="Bangkok")` / decides to call
+  Round 2: 工具结果回灌，LLM 看到 "pad thai" 给出最终回答 / tool result fed back
 
-所以 ``max_rounds=1`` 跑不通工具——必须 ≥ 2。
+所以 ``max_rounds=1`` 跑不通工具——必须 ≥ 2
+/ So ``max_rounds=1`` cannot complete a tool call — must be ≥ 2.
 
-Run
----
-    python examples/02_tool_use.py
+Run / 运行
+----------
+    python examples/02_tool_calling.py
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ from power_loop import (
     ToolRegistry,
 )
 
-# ── 1. 定义工具 ─────────────────────────────────────────────────────────
+# ── 1. 定义工具 / Define tools ──────────────────────────────────────────
 
 DISHES = {
     "tokyo": "sushi",
@@ -43,7 +47,8 @@ DISHES = {
 
 
 def lookup_dish(**kwargs) -> str:
-    """Sync handler. handler 也可以是 ``async def``，ToolRegistry 自动适配。"""
+    """Sync handler. handler 也可以是 ``async def``，ToolRegistry 自动适配。
+    / Sync handler. Handlers can also be ``async def`` — ToolRegistry adapts automatically."""
     city = str(kwargs.get("city") or "").strip().lower()
     return DISHES.get(city, f"No data for {city!r}")
 
@@ -57,10 +62,11 @@ LOOKUP_TOOL = ToolDefinition(
         "required": ["city"],
     },
     required_params=("city",),   # 校验在 handler 之前，缺参直接报错给模型
+                                  # validation runs before handler; missing params → error to model
 )
 
 
-# ── 2. 注册并跑循环 ─────────────────────────────────────────────────────
+# ── 2. 注册并跑循环 / Register and run the loop ─────────────────────────
 
 
 async def main() -> str:
@@ -74,9 +80,9 @@ async def main() -> str:
         config=AgentLoopConfig(
             system_prompt=(
                 "You answer questions about local cuisine. "
-                "Use the `lookup_dish` tool — it is the only authoritative source."
             ),
             max_rounds=4,         # ≥ 2，留余地给可能的多次工具调用
+                                   # ≥ 2, with headroom for multiple tool calls
             compactor=None,
         ),
     )

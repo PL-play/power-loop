@@ -1,33 +1,44 @@
-"""19 · 旗舰示例：全能聊天机器人（session + tools + hooks + events + memory + compaction）
+"""19 · 旗舰示例 / Flagship: full-featured chatbot
+     (session + tools + hooks + events + memory + compaction)
 
-## What you'll learn
+## What you'll learn / 你将学到
 - 一个 ``StatefulAgentLoop`` 同时开启：session 持久化、两个自定义工具、安全门 hook、
   流式事件订阅、跨会话 SQLite 记忆、默认上下文压缩。
+  / a single ``StatefulAgentLoop`` simultaneously enables: session persistence,
+  two custom tools, safety gate hook, streaming event subscription, cross-session
+  SQLite memory, and default context compaction
 - 这是 power-loop 的「全功能演示」——适合做集成测试或新人了解全部能力。
+  / this is power-loop's "full-feature demo" — ideal for integration tests or
+  newcomers wanting to see all capabilities at once
 
-## Prerequisites
+## Prerequisites / 前提
 - 需要 ``.env`` 配置 ``POWER_LOOP_*``
+  / requires ``.env`` with ``POWER_LOOP_*``
 
-## Run
+## Run / 运行
     python examples/19_full_chatbot.py
 
-## Expected output
-    [Stream] 我是power-loop的旗舰示例...
+## Expected output / 预期输出
+    [Stream] I am the flagship demo of power-loop...
     [Tool] get_weather → "Weather in Tokyo: sunny, 22°C"
     [Memory] Session A ended, facts stored
     [Session B] Agent recalls from memory
-    [Done] 2 sessions completed, all features verified
+    [Done] 3 sessions completed, all features verified
 
-## Key concepts
-- **Session persistence**: 两个 session 共用同一个 ``db_path``，通过 ``session_id`` 延续。
-- **Tools**: ``get_weather`` + ``calculator`` 两个自定义工具。
-- **Hooks**: ``TOOL_BEFORE`` 安全门——拦截危险操作。
-- **Events**: 订阅 ``STREAM_DELTA`` 做打字机效果，``TOOL_CALL_STARTED`` 追踪工具调用。
-- **Memory**: SQLite 事实库，跨 session 召回。
-- **Compaction**: 默认开启（``DefaultCompactor``），长会话自动压缩。
+## Key concepts / 关键概念
+- **Session persistence / 会话持久化**: 两个 session 共用同一个 ``db_path``，通过 ``session_id`` 延续。
+  / multiple sessions share the same ``db_path``, continued via ``session_id``
+- **Tools / 工具**: ``get_weather`` + ``calculator`` 两个自定义工具。/ two custom tools
+- **Hooks / 钩子**: ``TOOL_BEFORE`` 安全门——拦截危险操作。/ safety gate — blocks dangerous operations
+- **Events / 事件**: 订阅 ``STREAM_DELTA`` 做打字机效果，``TOOL_CALL_STARTED`` 追踪工具调用。
+  / subscribe to ``STREAM_DELTA`` for typewriter effect, ``TOOL_CALL_STARTED`` to track tool calls
+- **Memory / 记忆**: SQLite 事实库，跨 session 召回。/ SQLite fact store, cross-session recall
+- **Compaction / 压缩**: 默认开启（``DefaultCompactor``），长会话自动压缩。
+  / enabled by default (``DefaultCompactor``), auto-compacts long conversations
 
-## Next
+## Next / 下一步
 这是 examples/ 的最后一站。完整文档见 `docs/en/index.md`。
+/ This is the last stop in examples/. Full documentation at `docs/en/index.md`.
 """
 
 from __future__ import annotations
@@ -54,7 +65,7 @@ from power_loop import (
 )
 from power_loop.contracts.hook_contexts import ToolBeforeCtx
 
-# ── 1. Tools ─────────────────────────────────────────────────────────────
+# ── 1. Tools / 工具 ──────────────────────────────────────────────────────
 
 
 def get_weather(city: str) -> str:
@@ -97,7 +108,7 @@ REGISTRY.register(
 )
 
 
-# ── 2. Hooks ─────────────────────────────────────────────────────────────
+# ── 2. Hooks / 钩子 ──────────────────────────────────────────────────────
 
 
 HOOKS = AgentHooks()
@@ -114,7 +125,7 @@ def safety_gate(ctx: ToolBeforeCtx) -> None:
 HOOKS.register(HookPoint.TOOL_BEFORE, safety_gate)
 
 
-# ── 3. Memory ────────────────────────────────────────────────────────────
+# ── 3. Memory / 记忆 ─────────────────────────────────────────────────────
 
 
 class SqliteFactMemory:
@@ -142,7 +153,7 @@ class SqliteFactMemory:
                 c.commit()
 
 
-# ── 4. Events ────────────────────────────────────────────────────────────
+# ── 4. Events / 事件 ─────────────────────────────────────────────────────
 
 
 def build_event_bus() -> tuple[AgentEventBus, list[str]]:
@@ -163,7 +174,7 @@ def build_event_bus() -> tuple[AgentEventBus, list[str]]:
     return bus, log
 
 
-# ── 5. System Prompt ─────────────────────────────────────────────────────
+# ── 5. System Prompt / 系统提示词 ─────────────────────────────────────────
 
 
 SYSTEM = (
@@ -176,7 +187,7 @@ SYSTEM = (
 )
 
 
-# ── 6. Main ──────────────────────────────────────────────────────────────
+# ── 6. Main / 主程序 ─────────────────────────────────────────────────────
 
 
 async def main() -> None:
@@ -188,6 +199,7 @@ async def main() -> None:
         llm = make_llm(max_tokens=300, temperature=0.0)
 
         # ── Session A: tool calling + memory ─────────────────────────────
+        #    工具调用 + 记忆
         print("=== Session A: tool calling + memory ===\n")
         bus_a, tool_log_a = build_event_bus()
 
@@ -211,6 +223,7 @@ async def main() -> None:
             loop.close()
 
         # ── Session B: cross-session memory recall ───────────────────────
+        #    跨会话记忆召回
         print("\n=== Session B: cross-session memory recall ===\n")
         bus_b, tool_log_b = build_event_bus()
 
@@ -232,12 +245,13 @@ async def main() -> None:
         finally:
             loop2.close()
 
-        # ── Verify memory persisted ──────────────────────────────────────
+        # ── Verify memory persisted / 验证记忆已持久化 ────────────────────
         with sqlite3.connect(mem_path) as c:
             facts = {r[0]: r[1] for r in c.execute("SELECT key, value FROM facts").fetchall()}
         print(f"\n[Memory] facts stored: {facts}")
 
         # ── Session C: new session, should recall Alan's facts ───────────
+        #    新会话，应当召回 Alan 的事实
         print("\n=== Session C: recall from memory ===\n")
         bus_c, _ = build_event_bus()
 

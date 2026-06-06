@@ -1,30 +1,43 @@
-"""07 · 中断 / 用户确认：执行 bash 前问一句
+"""07 · 中断 / 用户确认 / Human approval: confirm before executing bash
 
-What you learn
---------------
+What you learn / 你将学到
+--------------------------
 - ``TOOL_BEFORE`` hook 是 async 的：handler 里可以 ``await`` 任意 UI / WebSocket /
   CLI 输入，模型那边就**真的在等**——没有定时器
+  / ``TOOL_BEFORE`` hook is async: handler can ``await`` any UI / WebSocket /
+  CLI input — the model **actually waits**, no timers
 - 同意 → 默认 CONTINUE，工具正常跑
+  / Approve → default CONTINUE, tool runs normally
 - 拒绝 → ``ctx.output = "[denied]"`` + ``ctx.directive = HookDirective.SKIP``
   会被 pipeline 当成这个工具的返回结果，写一条 ``role=tool`` 消息回灌给 LLM；
   pending 状态自动清零，协议合法
-- LLM 看到 ``[denied]`` 会自然改方向（"那我换个办法 / 好的我不动它了"）
+  / Deny → ``ctx.output = "[denied]"`` + ``ctx.directive = HookDirective.SKIP``
+  becomes the tool's return value, written as ``role=tool`` message back to LLM;
+  pending state auto-clears, protocol stays valid
+- LLM 看到 ``[denied]`` 会自然改方向
+  / LLM naturally changes direction upon seeing ``[denied]``
 
-设计要点
---------
+设计要点 / Design notes
+------------------------
 - ``confirm_fn`` 是注入式回调，CLI 跑时用 ``input()``，测试时塞固定决策
+  / ``confirm_fn`` is an injectable callback: ``input()`` for CLI, fixed decision for tests
 - 白名单：``ls`` / ``pwd`` / ``echo`` / ``cat`` 这类只读命令自动放行，不打扰用户
+  / whitelist: read-only commands like ``ls`` / ``pwd`` auto-approved, no user interruption
 - 危险关键字（``rm`` / ``sudo`` / ``mv`` / ``dd`` 等）一律要求 confirm
+  / dangerous keywords (``rm`` / ``sudo`` / ``mv`` / ``dd`` etc.) always require confirm
 
-⚠️ 工具参数命名注意
--------------------
+⚠️ 工具参数命名注意 / Tool parameter naming note
+--------------------------------------------------
 power-loop 内置 ``DEFAULT_REQUIRED_PARAMS`` 给名为 ``bash`` 的工具预留了参数名
 ``command``。我们用相同名字以避开校验冲突——如果换成 ``cmd``，registry 的
 默认校验会把所有 bash 调用挡掉。
+/ power-loop's built-in ``DEFAULT_REQUIRED_PARAMS`` reserves the parameter name
+``command`` for tools named ``bash``. We use the same name to avoid validation
+conflicts — using ``cmd`` would block all bash calls.
 
-Run
----
-    python examples/07_user_confirmation.py
+Run / 运行
+----------
+    python examples/07_human_approval.py
 """
 
 from __future__ import annotations
@@ -46,13 +59,14 @@ from power_loop import (
 )
 from power_loop.contracts.hook_contexts import ToolBeforeCtx
 
-# ── 1. 一个简单的 bash 工具 ───────────────────────────────────────────────
+# ── 1. 一个简单的 bash 工具 / A simple bash tool ─────────────────────────
 
 EXECUTED: list[str] = []
 
 
 def fake_bash(**kwargs) -> str:
-    """Fake 实现避免真的跑命令。真实场景下接 subprocess。"""
+    """Fake 实现避免真的跑命令。真实场景下接 subprocess。
+    / Fake implementation to avoid running real commands. Use subprocess in production."""
     cmd = str(kwargs.get("command") or "")
     EXECUTED.append(cmd)
     if cmd.startswith("ls"):
@@ -74,7 +88,7 @@ BASH_TOOL = ToolDefinition(
 )
 
 
-# ── 2. 确认策略 ───────────────────────────────────────────────────────────
+# ── 2. 确认策略 / Confirmation policy ─────────────────────────────────────
 
 DANGEROUS_TOKENS = ("rm ", "rm\t", " rm", "sudo", "mv ", "dd ", "chmod ", "chown ", " > /")
 SAFE_PREFIXES = ("ls", "pwd", "echo", "cat ", "head ", "tail ", "wc ")
@@ -90,7 +104,7 @@ ConfirmFn = Callable[[str], Awaitable[bool]]
 
 
 async def cli_confirm(cmd: str) -> bool:
-    """默认实现：CLI input。"""
+    """默认实现：CLI input / Default: CLI input."""
     print(f"\n[CONFIRM] About to run:\n    {cmd}\nproceed? [y/N]: ", end="", flush=True)
     line = await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
     return line.strip().lower() in ("y", "yes")
@@ -106,7 +120,7 @@ def build_hook(confirm_fn: ConfirmFn) -> AgentHooks:
 
         if is_safe(cmd):
             print(f"[auto-approve] {cmd}")
-            return                                # 直接放行
+            return                                # 直接放行 / auto-approve
 
         approved = await confirm_fn(cmd)
         if not approved:
@@ -117,7 +131,7 @@ def build_hook(confirm_fn: ConfirmFn) -> AgentHooks:
     return hooks
 
 
-# ── 3. 主程序 ─────────────────────────────────────────────────────────────
+# ── 3. 主程序 / Main program ──────────────────────────────────────────────
 
 
 async def run_with_policy(confirm_fn: ConfirmFn, prompt: str) -> str:
@@ -149,9 +163,10 @@ async def run_with_policy(confirm_fn: ConfirmFn, prompt: str) -> str:
 
 
 async def main() -> str:
-    # 演示：用户**拒绝**任何危险命令。
+    # 演示：用户**拒绝**任何危险命令
+    # Demo: user **denies** all dangerous commands
     async def always_deny(cmd: str) -> bool:
-        print(f"[CONFIRM] {cmd!r} → 模拟用户输入 N（拒绝）")
+        print(f"[CONFIRM] {cmd!r} → simulating user input N (deny)")
         return False
 
     EXECUTED.clear()

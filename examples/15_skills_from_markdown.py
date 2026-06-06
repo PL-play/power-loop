@@ -1,24 +1,36 @@
 """15 · Skills：从 SKILL.md 文件加载领域知识注入 system prompt
+     / Loading domain knowledge from SKILL.md files into system prompt
 
-## What you'll learn
+## What you'll learn / 你将学到
 - 加载 ``SKILL.md`` 格式的 frontmatter 文件并解析出 name / description / instructions
+  / load ``SKILL.md`` formatted frontmatter files and parse name / description / instructions
 - 把 skill 内容拼接进 ``AgentLoopConfig.system_prompt`` 作为领域知识
+  / splice skill content into ``AgentLoopConfig.system_prompt`` as domain knowledge
 - Agent 能按照 skill 里定义的规则回答问题
+  / Agent answers questions following rules defined in the skill
 
-## Prerequisites
+## Prerequisites / 前提
 - 需要 ``.env`` 配置 ``POWER_LOOP_*``（或 ``OPENAI_COMPAT_*``）
+  / requires ``.env`` with ``POWER_LOOP_*`` (or ``OPENAI_COMPAT_*``)
 
-## Run
+## Run / 运行
     python examples/15_skills_from_markdown.py
 
-## Key concepts
+## Key concepts / 关键概念
 - **SKILL.md**: Markdown 文件，YAML frontmatter 声明 ``name`` / ``description``，
   正文是给 Agent 的指令。这是 power-loop 里最轻量的「给 Agent 注入领域知识」的方式。
-- **System prompt 组装**: 多个 skill 可以拼接成一个 system prompt，业务方自由组合。
+  / Markdown file with YAML frontmatter declaring ``name`` / ``description``;
+  body contains instructions for the Agent. The lightest way to inject domain
+  knowledge into an Agent in power-loop.
+- **System prompt 组装 / System prompt assembly**: 多个 skill 可以拼接成一个 system prompt，业务方自由组合。
+  / multiple skills can be spliced into a single system prompt; freely composable by the application
 - 本例不依赖 ``runtime/skills.py``（那是内部实现），直接演示外部如何加载文件。
+  / this example does not depend on ``runtime/skills.py`` (internal implementation);
+  demonstrates external file loading directly
 
-## Next
+## Next / 下一步
 看看 `16_custom_compactor.py` — 实现自定义压缩策略
+/ see `16_custom_compactor.py` — implement a custom compaction strategy
 """
 
 from __future__ import annotations
@@ -32,6 +44,7 @@ from _helpers import make_llm
 from power_loop import AgentLoopConfig, StatefulAgentLoop
 
 # ── 1. 两个简单的 SKILL.md 文件（inline，不写盘）───────────────────────
+#    Two simple SKILL.md files (inline, not written to disk)
 
 SKILL_PYTHON = textwrap.dedent("""\
     ---
@@ -61,7 +74,7 @@ SKILL_SECURITY = textwrap.dedent("""\
     """)
 
 
-# ── 2. 简易 frontmatter 解析器 ──────────────────────────────────────────
+# ── 2. 简易 frontmatter 解析器 / Simple frontmatter parser ──────────────
 
 
 def parse_skill_md(text: str) -> dict[str, str]:
@@ -93,7 +106,7 @@ def build_system_prompt(*skills: str) -> str:
     return prompt
 
 
-# ── 3. 跑两个场景 ────────────────────────────────────────────────────────
+# ── 3. 跑两个场景 / Run two scenarios ────────────────────────────────────
 
 
 async def main() -> None:

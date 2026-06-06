@@ -1,16 +1,22 @@
-"""08 · 流式渲染：订阅 STREAM_DELTA 做打字机效果
+"""08 · 流式渲染 / Streaming: subscribe to STREAM_DELTA for typewriter effect
 
-What you learn
---------------
+What you learn / 你将学到
+--------------------------
 - ``AgentEventBus`` 是只读旁路通道——订阅事件不影响主循环
+  / ``AgentEventBus`` is a read-only side channel — subscribing does not affect the main loop
 - ``STREAM_DELTA`` 在 LLM 每吐一片 token 时触发，``event.data.text`` 是这一片
+  / ``STREAM_DELTA`` fires each time the LLM emits a token chunk; ``event.data.text`` is that chunk
 - ``stream_id`` 区分流（同一会话理论可并发多个，主流默认 ``"main"``）
+  / ``stream_id`` distinguishes streams (theoretically multiple per session; main defaults to ``"main"``)
 - ``STREAM_THINK_DELTA`` 是 reasoning/thinking 段，部分模型才有
+  / ``STREAM_THINK_DELTA`` is for reasoning/thinking segments, only some models emit it
 - 订阅可以 sync 或 async；bus 自动判断并 await
+  / subscribers can be sync or async; bus auto-detects and awaits
 - ``bus.subscribe(None, fn)`` 订阅**所有**事件（debug 用），单类型订阅传 enum
+  / ``bus.subscribe(None, fn)`` subscribes to **all** events (for debugging); pass enum for single type
 
-Run
----
+Run / 运行
+----------
     python examples/08_streaming.py
 """
 
@@ -41,6 +47,7 @@ def make_typewriter(bus: AgentEventBus) -> None:
         text = event.data.text
         if event.data.is_think:
             return                          # 跳过 reasoning 流，只渲染最终回复
+                                             # skip reasoning stream, only render final reply
         print(text, end="", flush=True)
         chars_printed[0] += len(text)
 
@@ -75,6 +82,7 @@ async def main() -> str:
         session_id=sid,
     )
     # final_text 与流式拼出的内容应该一致
+    # final_text should match what was streamed
     print(f"\n[result] status={r.status}, final_text len={len(r.final_text)}")
     return r.final_text
 

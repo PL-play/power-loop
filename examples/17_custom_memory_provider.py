@@ -1,24 +1,33 @@
-"""17 · 自定义 MemoryProvider：HTTP API 后端跨会话记忆
+"""17 · 自定义 MemoryProvider / Custom MemoryProvider: HTTP API-backed cross-session memory
 
-## What you'll learn
+## What you'll learn / 你将学到
 - 实现 ``MemoryProvider`` 协议，用 HTTP API 做后端（模拟真实 DeepTalk 架构）
+  / implement the ``MemoryProvider`` protocol with an HTTP API backend (simulating real DeepTalk architecture)
 - ``recall()`` 从远程拉取记忆，``remember()`` 推送到远程
+  / ``recall()`` fetches memory from remote, ``remember()`` pushes to remote
 - 软失败：API 不可用时不影响 Agent 回复
+  / soft-fail: Agent replies are not affected when the API is unavailable
 
-## Prerequisites
+## Prerequisites / 前提
 - 需要 ``.env`` 配置 ``POWER_LOOP_*``
+  / requires ``.env`` with ``POWER_LOOP_*``
 - 不需要真实的 HTTP 服务——本例用 mock 函数模拟
+  / no real HTTP service needed — this example uses mock functions
 
-## Run
+## Run / 运行
     python examples/17_custom_memory_provider.py
 
-## Key concepts
+## Key concepts / 关键概念
 - **MemoryProvider**: 两个方法：``recall()`` 在 session 开始时调用，``remember()`` 在结束时调用。
+  / two methods: ``recall()`` called at session start, ``remember()`` called at session end
 - 失败绝不阻塞用户获取回复——框架发 ``MEMORY_FAILED`` 事件，照常返回。
+  / failures never block the user from getting a reply — framework emits ``MEMORY_FAILED`` and continues
 - 本例模拟「DeepTalk 风格」的 HTTP API 后端——`api/memory/recall` 和 `api/memory/remember`。
+  / this example simulates a "DeepTalk-style" HTTP API backend — `api/memory/recall` and `api/memory/remember`
 
-## Next
+## Next / 下一步
 看看 `18_multi_provider.py` — 同时使用三家不同的 LLM provider
+/ see `18_multi_provider.py` — use three different LLM providers simultaneously
 """
 
 from __future__ import annotations
@@ -33,7 +42,8 @@ from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, MemorySna
 
 
 class MockMemoryAPI:
-    """模拟后端记忆服务。数据库用内存 dict 代替。"""
+    """模拟后端记忆服务。数据库用内存 dict 代替。
+    / Mock backend memory service. Uses in-memory dict as the database."""
 
     def __init__(self) -> None:
         self._store: dict[str, dict[str, str]] = {}  # user_id → {key: value}
@@ -98,7 +108,7 @@ class HttpMemoryProvider:
             pass  # soft-fail
 
 
-# ── 3. Run ────────────────────────────────────────────────────────────────
+# ── 3. Run / 运行 ────────────────────────────────────────────────────────
 
 
 SYSTEM = (

@@ -1,18 +1,19 @@
-"""00 · 最简：发一条、拿一条回复
+"""00 · 最简示例 / Minimal: send one message, get one reply
 
 The shortest possible power-loop program. No system prompt, no tools, no
 persistence — just feed the model one string and print the reply.
 
-What you learn
---------------
-- ``StatefulAgentLoop(llm=…)`` 是唯一公开入口
-- ``loop.new_session()`` 显式创建 session
+What you learn / 你将学到
+--------------------------
+- ``StatefulAgentLoop(llm=…)`` 是唯一公开入口 / the only public entry point
+- ``loop.new_session()`` 显式创建 session / explicitly creates a session
 - ``await loop.send(user_input, session_id=sid)`` 返回 :class:`StatefulResult`
-- ``db_path=":memory:"`` → 不落盘的临时 store；生产请传文件路径
+- ``db_path=":memory:"`` → 不落盘的临时 store / ephemeral in-memory store;
+  use a file path in production
 
-Run
----
-    python examples/00_minimal.py
+Run / 运行
+----------
+    python examples/00_hello_world.py
 """
 
 from __future__ import annotations

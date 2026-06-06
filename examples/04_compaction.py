@@ -1,18 +1,26 @@
-"""04 · 上下文压缩：DefaultCompactor 自动折叠长历史
+"""04 · 上下文压缩 / Compaction: DefaultCompactor auto-folds long history
 
-What you learn
---------------
+What you learn / 你将学到
+--------------------------
 - ``AgentLoopConfig.compactor`` 接受任何实现 :class:`Compactor` 协议的对象；
   默认 ``DefaultCompactor()`` 已开启
+  / accepts any object implementing the :class:`Compactor` protocol;
+  ``DefaultCompactor()`` is enabled by default
 - 触发条件：``estimate_tokens(history) ≥ max_tokens × trigger_ratio``；
   env ``CONTEXT_COMPACT_THRESHOLD`` 可设绝对阈值
+  / trigger: ``estimate_tokens(history) ≥ max_tokens × trigger_ratio``;
+  env ``CONTEXT_COMPACT_THRESHOLD`` overrides with an absolute threshold
 - 触发后：被折叠的消息在 store 里标 ``state='compacted_out'``，
   插入一条 ``role=system, name=compact_note`` 摘要，
   ``compactions`` 表新增审计行
+  / after trigger: folded messages marked ``state='compacted_out'`` in store,
+  a ``role=system, name=compact_note`` summary is inserted, ``compactions`` table
+  gets an audit row
 - 模型基于 "system + compact_note + 最近一段尾巴" 继续答题
+  / model continues with "system + compact_note + recent tail"
 
-Run
----
+Run / 运行
+----------
     python examples/04_compaction.py
 """
 
@@ -33,7 +41,8 @@ from power_loop.runtime.compact import DefaultCompactor
 
 
 def _seed_fat_history(store: SessionStore, sid: str, turns: int = 4) -> None:
-    """灌入若干轮 user/assistant，让 history 远超阈值。"""
+    """灌入若干轮 user/assistant，让 history 远超阈值。
+    / Seed several user/assistant turns so history far exceeds the threshold."""
     for i in range(turns):
         store.append_message(sid, role="user", content="filler " + ("u" * 400), round_index=i)
         store.append_message(
@@ -44,7 +53,7 @@ def _seed_fat_history(store: SessionStore, sid: str, turns: int = 4) -> None:
 
 
 async def main() -> str:
-    # 强制低阈值，保证每次都触发
+    # 强制低阈值，保证每次都触发 / Force low threshold to guarantee trigger
     os.environ["CONTEXT_COMPACT_THRESHOLD"] = "500"
 
     store = SessionStore.open(":memory:")
@@ -68,7 +77,7 @@ async def main() -> str:
         print(f"status   : {r.status}, rounds: {r.rounds}")
         print(f"reply    : {r.final_text}")
 
-        # ── 查看压缩痕迹 ──
+        # ── 查看压缩痕迹 / Inspect compaction traces ──
         comps = store.list_compactions(sid)
         all_rows = store.load_all_messages(sid)
         folded = sum(1 for m in all_rows if m.state is MessageState.COMPACTED_OUT)

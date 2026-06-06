@@ -1,17 +1,21 @@
-"""06 · 声明式子代理：父 LLM 提交 AgentSpec JSON
+"""06 · 声明式子代理 / Declarative sub-agent: parent submits AgentSpec JSON
 
-What you learn
---------------
-- 区分两种 subagent 入口：
-    * ``spawn_agent`` — 命令式（kwargs，库内构造 AgentSpec），见 example 03
-    * ``run_agent``   — 声明式（父 LLM 提交完整 AgentSpec JSON），本例
+What you learn / 你将学到
+--------------------------
+- 区分两种 subagent 入口 / Two subagent entry points:
+    * ``spawn_agent`` — 命令式 / imperative (kwargs, library builds AgentSpec), see example 03
+    * ``run_agent``   — 声明式 / declarative (parent LLM submits full AgentSpec JSON), this example
 - ``AgentSpec`` 是 strict-schema：未知字段 / 非法 lifecycle / max_rounds 越界
   → ``AgentSpecError``，调用直接报错而非静默忽略
+  / strict-schema: unknown fields / invalid lifecycle / out-of-range max_rounds
+  → ``AgentSpecError`` (raises, not silently ignored)
 - ``tools`` 字段是父 registry 的白名单：父限定子可见的能力集，防过权
+  / ``tools`` is a whitelist of parent registry: limits child's visible capabilities
 - 直接调 ``run_agent_spec`` 也行（绕过 LLM-as-driver，适合测试 / 编排框架）
+  / can also call ``run_agent_spec`` directly (bypass LLM-as-driver, good for tests / orchestration)
 
-Run
----
+Run / 运行
+----------
     python examples/06_declarative_subagent.py
 """
 
@@ -41,11 +45,13 @@ from power_loop.core.agent_context import (
 from power_loop.runtime.spec import run_agent_spec
 
 # ── 1. 父 registry：提供 calculator + spawn meta-tools ────────────────────
+#    Parent registry: calculator + spawn meta-tools
 
 
 def calculator(**kwargs) -> str:
     expr = str(kwargs.get("expr") or "").strip()
     # 用 ast 解析比 eval 安全；这里 demo 偷懒
+    # ast parsing is safer than eval; this demo takes a shortcut
     try:
         return str(eval(expr, {"__builtins__": {}}, {}))     # noqa: S307
     except Exception as exc:
@@ -67,16 +73,19 @@ def _build_parent_registry() -> ToolRegistry:
         ),
         calculator,
     )
-    # 注入 spawn_agent + run_agent 两个 meta-tool。
+    # 注入 spawn_agent + run_agent 两个 meta-tool
+    # Inject spawn_agent + run_agent meta-tools
     register_spawn_agent(reg)
     return reg
 
 
 # ── 2. 父 LLM 通过 run_agent meta-tool 自动驱动子代理 ─────────────────────
+#    Parent LLM drives child agent via run_agent meta-tool
 
 
 async def via_meta_tool() -> str:
-    """让父 LLM 自己拼 AgentSpec 调 run_agent。"""
+    """让父 LLM 自己拼 AgentSpec 调 run_agent。
+    / Let the parent LLM build AgentSpec and call run_agent itself."""
     store = SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
@@ -110,10 +119,12 @@ async def via_meta_tool() -> str:
 
 
 # ── 3. 直接调 run_agent_spec：绕过 LLM 驱动，自己拼 spec ──────────────────
+#    Direct run_agent_spec call: bypass LLM driver, build spec in code
 
 
 async def direct_call() -> str:
-    """从 Python 代码直接拼 AgentSpec 并跑——适合测试 / 编排框架。"""
+    """从 Python 代码直接拼 AgentSpec 并跑——适合测试 / 编排框架。
+    / Build AgentSpec from Python code and run — ideal for tests / orchestration."""
     store = SessionStore.open(":memory:")
     try:
         parent_loop = StatefulAgentLoop(
@@ -125,16 +136,17 @@ async def direct_call() -> str:
             ),
         )
         # 先跑一轮父，建立 parent_session_id 给后面 run_agent_spec 用
+        # Run one parent turn to establish parent_session_id for run_agent_spec
         parent_sid = parent_loop.new_session()
         pr = await parent_loop.send("hi", session_id=parent_sid)
 
         spec = AgentSpec(
             name="math-helper",
             system_prompt="Compute the expression. Reply with the number only.",
-            tools=["calc"],                                  # 只白名单 calc
+            tools=["calc"],                                  # 只白名单 calc / whitelist only calc
             max_rounds=3,
             max_tokens=128,
-            lifecycle=SubagentLifecycle.LINKED.value,         # 保留供审计
+            lifecycle=SubagentLifecycle.LINKED.value,         # 保留供审计 / preserve for audit
         )
 
         tok_loop = set_current_loop(parent_loop)
@@ -157,7 +169,7 @@ async def direct_call() -> str:
         store.close()
 
 
-# ── 4. AgentSpec strict-schema 演示 ─────────────────────────────────────
+# ── 4. AgentSpec strict-schema 演示 / Strict-schema demo ────────────────
 
 
 def show_strict_schema() -> None:
@@ -165,19 +177,19 @@ def show_strict_schema() -> None:
 
     print("[strict-schema]")
 
-    # 未知字段 → 拒绝
+    # 未知字段 → 拒绝 / unknown field → rejected
     try:
         AgentSpec.from_json('{"name":"x","system_prompt":"y","evil":true}')
     except AgentSpecError as exc:
         print(f"  reject unknown field   : {exc}")
 
-    # max_rounds 越界 → 拒绝
+    # max_rounds 越界 → 拒绝 / out-of-range max_rounds → rejected
     try:
         AgentSpec(name="x", system_prompt="y", max_rounds=999)
     except AgentSpecError as exc:
         print(f"  reject max_rounds=999  : {exc}")
 
-    # 合法
+    # 合法 / valid
     spec = AgentSpec.from_dict({"name": "ok", "system_prompt": "p", "max_rounds": 3})
     print(f"  valid spec parsed      : name={spec.name!r}, rounds={spec.max_rounds}")
     print(f"  dump JSON              : {json.dumps({'name': spec.name, 'max_rounds': spec.max_rounds})}\n")
