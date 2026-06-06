@@ -54,19 +54,19 @@ flowchart TB
 ```mermaid
 sequenceDiagram
     participant Caller
-    participant Loop as StatefulAgentLoop
+    participant Agent as StatefulAgentLoop
     participant Store as SessionStore
     participant Pipeline as AgentPipeline
     participant LLM
     participant Tools as ToolRegistry
 
-    Caller->>Loop: new_session()
-    Loop->>Store: create_session()
-    Store-->>Loop: sid
-    Caller->>Loop: send(user_input, session_id=sid)
-    Loop->>Store: append user message
-    Loop->>Store: load active messages
-    Loop->>Pipeline: run(history)
+    Caller->>Agent: new_session()
+    Agent->>Store: create_session()
+    Store-->>Agent: sid
+    Caller->>Agent: send(user_input, session_id=sid)
+    Agent->>Store: append user message
+    Agent->>Store: load active messages
+    Agent->>Pipeline: run(history)
     Pipeline->>Pipeline: session.start hook
     loop each round
         Pipeline->>Pipeline: round.start hook
@@ -80,10 +80,10 @@ sequenceDiagram
             Pipeline->>Store: append tool message
         else final answer
             Pipeline->>Pipeline: session.end hook
-            Pipeline-->>Loop: AgentLoopResult
+            Pipeline-->>Agent: AgentLoopResult
         end
     end
-    Loop-->>Caller: StatefulResult
+    Agent-->>Caller: StatefulResult
 ```
 
 ## 3. Pipeline 单轮
@@ -171,17 +171,17 @@ flowchart TD
 ```mermaid
 sequenceDiagram
     participant Parent as Parent Pipeline
-    participant Loop as StatefulAgentLoop
+    participant Agent as StatefulAgentLoop
     participant Store as SessionStore
     participant Child as Child Pipeline
 
-    Parent->>Loop: spawn_agent(task, preset)
-    Loop->>Store: create child session
-    Store-->>Loop: child_sid
-    Loop->>Child: run(child_history)
-    Child-->>Loop: child result
-    Loop->>Store: close or keep child session
-    Loop-->>Parent: subagent result text
+    Parent->>Agent: spawn_agent(task, preset)
+    Agent->>Store: create child session
+    Store-->>Agent: child_sid
+    Agent->>Child: run(child_history)
+    Child-->>Agent: child result
+    Agent->>Store: close or keep child session
+    Agent-->>Parent: subagent result text
 ```
 
 ```mermaid

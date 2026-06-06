@@ -7,16 +7,11 @@ ROOT = Path(__file__).resolve().parents[2]
 MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 MERMAID_BLOCK_RE = re.compile(r"```mermaid\n(.*?)\n```", re.DOTALL)
 
-SKIP_DOCS = {
-    ROOT / "docs" / "DOC_PLAN.md",
-}
-
-
 def _published_markdown_files() -> list[Path]:
     return [
         path
         for path in sorted(ROOT.rglob("*.md"))
-        if ".skills" not in path.parts and path not in SKIP_DOCS
+        if ".skills" not in path.parts
     ]
 
 
