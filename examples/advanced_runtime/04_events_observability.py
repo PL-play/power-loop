@@ -5,6 +5,11 @@ Scenario
 An operations console wants an audit stream for tool calls without changing
 tool implementations. Subscribe to the event bus and collect lifecycle events.
 
+Note
+----
+This example calls your configured real LLM and asks it to invoke a tool.
+Make sure `.env` is configured and be mindful of provider usage/cost.
+
 Run:
     python examples/advanced_runtime/04_events_observability.py
 """
@@ -15,11 +20,10 @@ import asyncio
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _runtime_helpers import ScriptedLLM, tool_response
+from _helpers import make_llm
 
-from llm_client.interface import LLMResponse
 from power_loop import (
     AgentEvent,
     AgentEventBus,
@@ -61,18 +65,19 @@ async def main() -> list[str]:
 
     bus.subscribe(None, on_event)
 
-    llm = ScriptedLLM(
-        responses=[
-            tool_response("tc-worker", "restart_worker", '{"name":"search-indexer"}'),
-            LLMResponse(raw_text="Worker restart complete."),
-        ]
-    )
     loop = StatefulAgentLoop(
-        llm=llm,
+        llm=make_llm(max_tokens=512, temperature=0.0),
         store=SessionStore.open(":memory:"),
         tool_registry=registry,
         event_bus=bus,
-        config=AgentLoopConfig(system_prompt="You operate workers.", max_rounds=3, compactor=None),
+        config=AgentLoopConfig(
+            system_prompt=(
+                "You operate workers. Call restart_worker with name='search-indexer'. "
+                "After the tool returns, answer briefly."
+            ),
+            max_rounds=4,
+            compactor=None,
+        ),
     )
     sid = loop.new_session()
 

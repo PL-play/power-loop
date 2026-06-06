@@ -2,7 +2,7 @@
 
 [Back to examples](../README.md)
 
-These examples show how to build runtime-bound tools from public power-loop primitives. They use a scripted fake LLM, so they run without API credentials.
+These examples show how to build runtime-bound tools from public power-loop primitives. They call your configured real LLM, so make sure `.env` contains working provider credentials and be mindful of provider usage/cost.
 
 | File | Scenario | Key APIs |
 |---|---|---|

@@ -6,6 +6,11 @@ A support triage tool needs the current session metadata and message count. It
 uses `get_tool_runtime_context()` instead of private internals, writes runtime
 state, and a custom projector exposes that state to the following LLM round.
 
+Note
+----
+This example calls your configured real LLM and asks it to invoke a tool.
+Make sure `.env` is configured and be mindful of provider usage/cost.
+
 Run:
     python examples/advanced_runtime/02_tool_runtime_context.py
 """
@@ -17,11 +22,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _runtime_helpers import ScriptedLLM, tool_response
+from _helpers import make_llm
 
-from llm_client.interface import LLMResponse
 from power_loop import (
     AgentLoopConfig,
     RuntimeProjector,
@@ -62,20 +66,17 @@ async def main() -> str:
         ToolDefinition(name="capture_ticket_context", description="Capture current support ticket context."),
         capture_ticket_context,
     )
-    llm = ScriptedLLM(
-        responses=[
-            tool_response("tc-ticket", "capture_ticket_context"),
-            LLMResponse(raw_text="Ticket state visible for customer Ada."),
-        ]
-    )
     store = SessionStore.open(":memory:")
     loop = StatefulAgentLoop(
-        llm=llm,
+        llm=make_llm(max_tokens=512, temperature=0.0),
         store=store,
         tool_registry=registry,
         config=AgentLoopConfig(
-            system_prompt="You triage support tickets.",
-            max_rounds=3,
+            system_prompt=(
+                "You triage support tickets. First call capture_ticket_context. "
+                "After the tool returns, use the projected ticket_state and mention the customer name."
+            ),
+            max_rounds=4,
             compactor=None,
             runtime_projectors=(TicketProjector(),),
         ),

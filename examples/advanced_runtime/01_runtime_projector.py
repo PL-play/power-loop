@@ -6,6 +6,11 @@ An incident commander dashboard keeps authoritative state in SQLite. The LLM
 should see the latest incident state every round, but that projection should
 not be persisted as chat history.
 
+Note
+----
+This example calls your configured real LLM. Make sure `.env` is configured
+and be mindful of provider usage/cost.
+
 Run:
     python examples/advanced_runtime/01_runtime_projector.py
 """
@@ -17,11 +22,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _runtime_helpers import ScriptedLLM
+from _helpers import make_llm
 
-from llm_client.interface import LLMResponse
 from power_loop import AgentLoopConfig, RuntimeProjector, SessionStore, StatefulAgentLoop
 
 
@@ -53,12 +57,14 @@ async def main() -> str:
         {"severity": "SEV2", "summary": "checkout latency above threshold"},
     )
 
-    llm = ScriptedLLM(responses=[LLMResponse(raw_text="Incident state visible: SEV2 checkout latency.")])
     loop = StatefulAgentLoop(
-        llm=llm,
+        llm=make_llm(max_tokens=256, temperature=0.0),
         store=store,
         config=AgentLoopConfig(
-            system_prompt="You assist an incident commander.",
+            system_prompt=(
+                "You assist an incident commander. Use the runtime-projected "
+                "incident state when answering. Keep the answer to one sentence."
+            ),
             max_rounds=1,
             compactor=None,
             runtime_projectors=(IncidentProjector(),),
@@ -67,7 +73,6 @@ async def main() -> str:
 
     result = await loop.send("What is the latest incident state?", session_id=sid)
     print(result.final_text)
-    print("projected message:", llm.calls[0][-1]["content"])
     return result.final_text
 
 

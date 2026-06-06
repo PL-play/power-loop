@@ -49,7 +49,7 @@ python examples/00_hello_world.py
 
 ## Advanced runtime examples
 
-[`advanced_runtime/`](advanced_runtime/) contains focused examples for runtime-bound tools: custom `RuntimeProjector`s, `get_tool_runtime_context()`, hooks-based control flow, and event-bus observability. These examples use a scripted fake LLM and do not require API credentials.
+[`advanced_runtime/`](advanced_runtime/) contains focused examples for runtime-bound tools: custom `RuntimeProjector`s, `get_tool_runtime_context()`, hooks-based control flow, and event-bus observability. These examples call your configured real LLM, so make sure `.env` is set and watch provider usage/cost.
 
 ## Next
 

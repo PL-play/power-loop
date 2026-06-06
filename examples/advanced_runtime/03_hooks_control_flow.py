@@ -6,6 +6,11 @@ An LLM tries to deploy to production. A `TOOL_BEFORE` hook rewrites the target
 to staging unless a human approval flag is present. A `TOOL_AFTER` hook records
 the deployment audit state in SQLite.
 
+Note
+----
+This example calls your configured real LLM and asks it to invoke a tool.
+Make sure `.env` is configured and be mindful of provider usage/cost.
+
 Run:
     python examples/advanced_runtime/03_hooks_control_flow.py
 """
@@ -16,11 +21,10 @@ import asyncio
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _runtime_helpers import ScriptedLLM, tool_response
+from _helpers import make_llm
 
-from llm_client.interface import LLMResponse
 from power_loop import (
     AgentHooks,
     AgentLoopConfig,
@@ -75,18 +79,19 @@ async def main() -> str:
     hooks.register(HookPoint.TOOL_AFTER, audit_deploy)
 
     store = SessionStore.open(":memory:")
-    llm = ScriptedLLM(
-        responses=[
-            tool_response("tc-deploy", "deploy_service", '{"service":"checkout","target":"production"}'),
-            LLMResponse(raw_text="Deployment redirected to staging."),
-        ]
-    )
     loop = StatefulAgentLoop(
-        llm=llm,
+        llm=make_llm(max_tokens=512, temperature=0.0),
         store=store,
         tool_registry=registry,
         hooks=hooks,
-        config=AgentLoopConfig(system_prompt="You operate deployments.", max_rounds=3, compactor=None),
+        config=AgentLoopConfig(
+            system_prompt=(
+                "You operate deployments. Call deploy_service with service='checkout' "
+                "and target='production'. After the tool returns, report the actual target used."
+            ),
+            max_rounds=4,
+            compactor=None,
+        ),
     )
     sid = loop.new_session()
 
