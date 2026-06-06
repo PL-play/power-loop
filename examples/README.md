@@ -1,6 +1,6 @@
 # Examples
 
-[Back to docs](../docs/README.md)
+[Back to docs](../docs/README.md) | [Detailed Guide](../docs/en/tutorials/examples-guide.md) | [详细指南](../docs/zh/tutorials/examples-guide.md)
 
 Each file in this directory is a standalone, runnable Python script that teaches **one concept**. They are ordered progressively — start at `00` and move forward.
 

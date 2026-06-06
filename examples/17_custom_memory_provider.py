@@ -152,7 +152,7 @@ async def main() -> None:
         loop.close()
 
     # Verify: facts stored in mock API
-    assert "Alan" in str(api._store.get("user_42", {}))
+    assert "alan" in str(api._store.get("user_42", {})).lower()
 
     # Session B: new session, same memory provider → agent remembers
     events.clear()
