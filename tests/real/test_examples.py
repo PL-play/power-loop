@@ -123,6 +123,18 @@ def test_example_10_concurrent_sessions_runs() -> None:
     assert len(sids) == 3
 
 
+def test_example_21_request_user_input_runs() -> None:
+    """Real LLM pauses through request_user_input, then submit_input resumes."""
+    module = _load_example("21_request_user_input.py")
+    results = asyncio.run(module.main(answers=["gentle", "send"]))
+    assert len(results) == 2
+    assert {item["label"] for item in results} == {"summary", "send"}
+    assert all(item["status"] == "completed" for item in results)
+    assert all(item["final_text"].strip() for item in results)
+    assert any("gentle" in item["final_text"].lower() for item in results)
+    assert any("send" in item["final_text"].lower() for item in results)
+
+
 def test_example_07_human_approval_runs() -> None:
     """Always-deny confirm_fn: dangerous commands must NEVER execute;
     safe whitelist commands may still execute; final answer must

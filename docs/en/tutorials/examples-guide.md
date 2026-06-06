@@ -1126,18 +1126,23 @@ registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
 ### Code
 
 ```python
-waiting = await loop.send("Draft and send a summary.", session_id=sid)
-interaction = waiting.pending_interactions[0]
+waiting = []
+for label, request in REQUESTS.items():
+    sid = loop.new_session(metadata={"label": label})
+    result = await loop.send(request, session_id=sid)
+    print(result.status, result.pending_interactions)
+    waiting.append((label, sid, result.pending_interactions[0]))
 
-result = await loop.submit_input(
-    sid,
-    interaction["interaction_id"],
-    {"choice": "send"},
-)
+for label, sid, interaction in waiting:
+    answer = input("> ")
+    resumed = await loop.submit_input(sid, interaction["interaction_id"], {"choice": answer})
+    print(resumed.final_text)
 ```
 
 ### Key Points
 
+- This example uses the configured real LLM; the model really calls `request_user_input`.
+- It starts two sessions, lets both return a `StatefulResult(status="waiting_for_input")`, then resumes them one by one.
 - `request_user_input` returns `status="waiting_for_input"` and a serializable `pending_interactions` payload.
 - The caller owns UI/API delivery and can wait across process restarts before calling `submit_input`.
 - `submit_input` appends the matching tool message and continues the loop with valid LLM tool-call protocol history.

@@ -1077,18 +1077,23 @@ registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
 ### 代码
 
 ```python
-waiting = await loop.send("Draft and send a summary.", session_id=sid)
-interaction = waiting.pending_interactions[0]
+waiting = []
+for label, request in REQUESTS.items():
+    sid = loop.new_session(metadata={"label": label})
+    result = await loop.send(request, session_id=sid)
+    print(result.status, result.pending_interactions)
+    waiting.append((label, sid, result.pending_interactions[0]))
 
-result = await loop.submit_input(
-    sid,
-    interaction["interaction_id"],
-    {"choice": "send"},
-)
+for label, sid, interaction in waiting:
+    answer = input("> ")
+    resumed = await loop.submit_input(sid, interaction["interaction_id"], {"choice": answer})
+    print(resumed.final_text)
 ```
 
 ### 要点
 
+- 这个示例使用已配置的真实 LLM；模型会真的调用 `request_user_input`。
+- 它启动两个 session，让二者都先返回 `StatefulResult(status="waiting_for_input")`，然后逐个恢复。
 - `request_user_input` 返回 `status="waiting_for_input"` 和可序列化的 `pending_interactions`。
 - 业务方负责把 prompt/options 展示到 UI 或 API；即使跨进程重启，也可以之后调用 `submit_input`。
 - `submit_input` 会补上对应 tool message，并用合法的 LLM tool-call 历史继续执行。

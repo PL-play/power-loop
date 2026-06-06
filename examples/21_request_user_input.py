@@ -1,11 +1,9 @@
 """21 · Request user input / 可恢复的人类输入
 
-Demonstrates ``request_user_input`` as a special built-in tool:
-
-1. the LLM requests external input;
-2. the loop returns ``status="waiting_for_input"`` instead of blocking;
-3. the caller submits the collected answer with ``submit_input``;
-4. the loop continues from the same persisted session.
+This example uses a real LLM. It starts two independent sessions, lets each
+session pause through the built-in ``request_user_input`` tool, prints the
+returned ``StatefulResult``, asks you to fill the answers in a tiny terminal
+REPL, then resumes both sessions with ``submit_input``.
 
 Run:
 
@@ -15,73 +13,42 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
-from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
+from _helpers import make_llm
+
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, create_default_tool_registry
 
+SYSTEM_PROMPT = """You are demonstrating resumable human input.
 
-@dataclass
-class ScriptedLLM(LLMService):
-    responses: list[LLMResponse]
-    calls: list[list[dict[str, Any]]] = field(default_factory=list)
-    index: int = 0
+Rules:
+- For each new user request, first call request_user_input exactly once.
+- Use kind="choice".
+- Provide two concise options with ids.
+- After the tool result arrives, produce one final sentence that mentions the chosen id.
+- Do not call request_user_input again after receiving its tool result.
+"""
 
-    async def complete(
-        self,
-        request: LLMRequest,
-        *,
-        on_chunk_delta_text: Callable[[str], Any] | None = None,
-        on_chunk_think: Callable[[str], Any] | None = None,
-        on_stream_end: Callable[[LLMResponse], Any] | None = None,
-    ) -> LLMResponse:
-        self.calls.append(list(request.messages))
-        response = self.responses[self.index]
-        self.index += 1
-        return response
-
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-        async def _empty() -> AsyncIterator[LLMStreamChunk]:
-            if False:
-                yield LLMStreamChunk()
-
-        return _empty()
-
-    async def close(self) -> None:
-        return None
+REQUESTS = {
+    "summary": (
+        "Draft a one-sentence relationship check-in. Before finalizing, ask "
+        "whether the tone should be 'gentle' or 'direct'."
+    ),
+    "send": (
+        "Prepare a one-sentence note to send. Before finalizing, ask whether "
+        "the caller wants to 'send' or 'revise'."
+    ),
+}
 
 
-def _tool_call_response() -> LLMResponse:
-    return LLMResponse(
-        raw_text="I need a confirmation before continuing.",
-        tool_calls=[
-            {
-                "id": "tc_confirm_1",
-                "type": "function",
-                "function": {
-                    "name": "request_user_input",
-                    "arguments": (
-                        '{"kind":"confirm","prompt":"Send this relationship summary?",'
-                        '"options":[{"id":"send","label":"Send"},{"id":"revise","label":"Revise"}],'
-                        '"metadata":{"surface":"chat_composer"}}'
-                    ),
-                },
-            }
-        ],
-    )
-
-
-async def main() -> None:
-    llm = ScriptedLLM(
-        responses=[
-            _tool_call_response(),
-            LLMResponse(raw_text="Confirmed. I will send the summary now."),
-        ]
-    )
+async def main(answers: Sequence[str] | None = None) -> list[dict[str, Any]]:
+    llm = make_llm(max_tokens=700, temperature=0.0)
     registry = create_default_tool_registry(include=["request_user_input"])
+    provided_answers = list(answers or [])
 
     with tempfile.TemporaryDirectory(prefix="power-loop-input-") as tmp:
         store = SessionStore.open(f"{tmp}/sessions.sqlite3")
@@ -89,24 +56,80 @@ async def main() -> None:
             llm=llm,
             store=store,
             tool_registry=registry,
-            config=AgentLoopConfig(system_prompt="Ask for confirmation when needed.", max_rounds=3, compactor=None),
+            config=AgentLoopConfig(system_prompt=SYSTEM_PROMPT, max_rounds=4, compactor=None),
         )
-        sid = loop.new_session()
 
-        waiting = await loop.send("Draft and send a summary.", session_id=sid)
-        interaction = waiting.pending_interactions[0]
-        print(f"status: {waiting.status}")
-        print(f"prompt: {interaction['prompt']}")
-        print(f"options: {[option['id'] for option in interaction['options']]}")
+        try:
+            waiting: list[dict[str, Any]] = []
+            for label, request in REQUESTS.items():
+                sid = loop.new_session(metadata={"label": label})
+                result = await loop.send(request, session_id=sid)
+                if result.status != "waiting_for_input" or not result.pending_interactions:
+                    raise RuntimeError(f"session {label} did not pause for input: {result!r}")
 
-        result = await loop.submit_input(
-            sid,
-            interaction["interaction_id"],
-            {"choice": "send"},
-        )
-        print(f"status: {result.status}")
-        print(f"final: {result.final_text}")
-        store.close()
+                print(f"\n[{label}] first StatefulResult")
+                print(_json(result))
+                waiting.append({"label": label, "sid": sid, "result": result})
+
+            completed: list[dict[str, Any]] = []
+            for item in waiting:
+                label = item["label"]
+                result = item["result"]
+                interaction = result.pending_interactions[0]
+                answer = _next_answer(provided_answers, interaction)
+                resumed = await loop.submit_input(
+                    item["sid"],
+                    interaction["interaction_id"],
+                    {"choice": answer},
+                )
+
+                print(f"\n[{label}] resumed StatefulResult")
+                print(_json(resumed))
+                completed.append(
+                    {
+                        "label": label,
+                        "session_id": item["sid"],
+                        "answer": answer,
+                        "status": resumed.status,
+                        "final_text": resumed.final_text,
+                    }
+                )
+
+            return completed
+        finally:
+            await llm.close()
+            store.close()
+
+
+def _next_answer(provided_answers: list[str], interaction: dict[str, Any]) -> str:
+    options = [str(option.get("id") or option.get("label") or "") for option in interaction.get("options", [])]
+    options = [option for option in options if option]
+    if provided_answers:
+        answer = provided_answers.pop(0)
+        print(f"\n[auto-answer] {interaction['prompt']} -> {answer}")
+        return answer
+
+    print("\n[input required]")
+    print(interaction["prompt"])
+    if options:
+        print("Options: " + ", ".join(options))
+    while True:
+        answer = input("> ").strip()
+        if answer and (not options or answer in options):
+            return answer
+        if options:
+            print("Please enter one of: " + ", ".join(options))
+        else:
+            print("Please enter a non-empty answer.")
+
+
+def _json(value: Any) -> str:
+    def default(obj: Any) -> Any:
+        if is_dataclass(obj):
+            return asdict(obj)
+        return repr(obj)
+
+    return json.dumps(value, ensure_ascii=False, indent=2, default=default)
 
 
 if __name__ == "__main__":
