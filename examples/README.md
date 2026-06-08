@@ -32,6 +32,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 19 | [`full_chatbot.py`](19_full_chatbot.py) | **Flagship**: all features on | session + tools + hooks + events + memory + compaction |
 | 20 | [`default_tools.py`](20_default_tools.py) | Built-in filesystem/search/bash tools | `create_default_tool_registry(preset="full")` |
 | 21 | [`request_user_input.py`](21_request_user_input.py) | Resumable human input | `request_user_input`, `submit_input()` |
+| 22 | [`follow_up_steering.py`](22_follow_up_steering.py) | In-flight steering | `follow_up()`, `FollowUpQueued`, `<follow_up>` |
 
 ## Running
 

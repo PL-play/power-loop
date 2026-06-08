@@ -1149,6 +1149,38 @@ for label, sid, interaction in waiting:
 
 ---
 
+## 22 · Follow-Up Steering
+
+**Concept**: Inject steering text while a session is still running, without blocking on the current `send()`.
+
+### Code
+
+```python
+send_task = asyncio.create_task(loop.send("Write about patience.", session_id=sid))
+
+while not loop._lock_for(sid).locked():
+    await asyncio.sleep(0.01)
+
+queued = await loop.follow_up(
+    "Your final answer MUST include the exact word STEERED in uppercase.",
+    sid,
+)
+assert isinstance(queued, FollowUpQueued)
+
+result = await send_task
+print(result.final_text)
+```
+
+### Key Points
+
+- This example uses the configured real LLM and a one-round `echo` tool call so the run spans multiple pipeline rounds.
+- While `send()` holds the per-session lock, `follow_up()` returns `FollowUpQueued` immediately instead of blocking.
+- At the next round boundary, queued items merge into one user message wrapped in `<follow_up>...</follow_up>`.
+- When the session is idle, `follow_up()` behaves like `send()`.
+- Contrast with `submit_input()`: follow-up steering is same-process and targets the **next** LLM round; submit-input resumes a paused `request_user_input` tool call.
+
+---
+
 ## Quick Reference
 
 ### Choosing the right example
@@ -1170,5 +1202,7 @@ for label, sid, interaction in waiting:
 | Inject domain knowledge | [15](#15-skills-from-markdown) |
 | Use multiple LLM providers | [18](#18-multi-provider) |
 | Try the built-in tools | [20](#20-default-tools) |
+| Pause for human input | [21](#21-request-user-input) |
+| Steer an in-flight run | [22](#22-follow-up-steering) |
 | Build runtime-bound tools | [Advanced Runtime](../../../examples/advanced_runtime/) |
 | See everything together | [19](#19-full-chatbot) |

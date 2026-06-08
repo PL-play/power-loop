@@ -1100,6 +1100,38 @@ for label, sid, interaction in waiting:
 
 ---
 
+## 22 · 运行中追加指引
+
+**概念**：在 session 仍在运行时注入补充指引，而不阻塞当前 `send()`。
+
+### 代码
+
+```python
+send_task = asyncio.create_task(loop.send("Write about patience.", session_id=sid))
+
+while not loop._lock_for(sid).locked():
+    await asyncio.sleep(0.01)
+
+queued = await loop.follow_up(
+    "Your final answer MUST include the exact word STEERED in uppercase.",
+    sid,
+)
+assert isinstance(queued, FollowUpQueued)
+
+result = await send_task
+print(result.final_text)
+```
+
+### 要点
+
+- 本示例使用已配置的真实 LLM，并通过一次 `echo` 工具调用让 run 跨越多轮 pipeline。
+- 当 `send()` 持有 per-session 锁时，`follow_up()` 会立即返回 `FollowUpQueued`，不会阻塞。
+- 在下一轮边界，队列中的多条 follow-up 会合并为一条 `<follow_up>...</follow_up>` user 消息。
+- 当 session 空闲时，`follow_up()` 的行为与 `send()` 相同。
+- 与 `submit_input()` 对比：follow-up 面向同进程、作用于**下一轮** LLM；submit-input 用于恢复已暂停的 `request_user_input` tool call。
+
+---
+
 ## 速查表
 
 | 我想… | 看哪个 |
@@ -1119,5 +1151,7 @@ for label, sid, interaction in waiting:
 | 注入领域知识 | [15](#15-markdown-技能) |
 | 切换多个 LLM 供应商 | [18](#18-多-provider) |
 | 试用内置工具 | [20](#20-默认工具) |
+| 暂停等待人类输入 | [21](#21-可恢复人类输入) |
+| 运行中追加指引 | [22](#22-运行中追加指引) |
 | 构建运行时绑定工具 | [高级运行时](../../../examples/advanced_runtime/) |
 | 看全部功能 | [19](#19-旗舰示例) |

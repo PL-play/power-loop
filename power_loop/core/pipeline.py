@@ -201,6 +201,7 @@ class AgentPipeline:
         stop_event: CancellationLike = None,
         sink: MessageSink | None = None,
         store: Any | None = None,
+        drain_follow_ups: Any | None = None,
     ) -> None:
         self.llm = llm
         self.config = config
@@ -215,6 +216,7 @@ class AgentPipeline:
         self.stop_event = stop_event if isinstance(stop_event, threading.Event) else None
         self.sink: MessageSink = sink if sink is not None else NullSink()
         self.store = store
+        self._drain_follow_ups = drain_follow_ups
 
         base_prompt = (config.system_prompt or DEFAULT_AGENT_SYSTEM_PROMPT).strip()
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
@@ -638,6 +640,12 @@ class AgentPipeline:
             # Apply hook-modified messages
             if isinstance(round_ctx.messages, list):
                 self.history = round_ctx.messages
+
+            # ── In-flight steering: drain follow-up queue at round boundary ──
+            if self._drain_follow_ups is not None:
+                drained = await self._drain_follow_ups()
+                for msg in drained:
+                    await self._append_message(msg, round_index=round_idx)
 
             # ── Business logic: prepare round ──
             await self.prepare_round(round_idx)

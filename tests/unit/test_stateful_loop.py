@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ import pytest
 from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentLoopConfig,
+    FollowUpQueued,
     MessageState,
     RuntimeProjector,
     SessionPendingError,
@@ -783,3 +785,75 @@ def test_resolve_system_prompt_session_override(store: SessionStore) -> None:
     assert "Config prompt." not in resolved
     # Catalog is still appended
     assert "# Available Tools" in resolved
+
+
+class _GateLLM(_Scripted):
+    """Blocks the first LLM call until released — simulates a long in-flight run."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.release_first = asyncio.Event()
+
+    async def complete(self, request: LLMRequest, **kwargs: Any) -> LLMResponse:
+        if self._idx == 0:
+            await self.release_first.wait()
+        return await super().complete(request, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_follow_up_while_running_queues_for_next_round(store: SessionStore) -> None:
+    llm = _GateLLM(
+        responses=[
+            _tool_resp("c1", "echo", '{"text":"step1"}'),
+            LLMResponse(raw_text="steered done"),
+        ]
+    )
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4),
+        tool_registry=_echo_registry(),
+    )
+    sid = loop.new_session()
+
+    send_task = asyncio.create_task(loop.send("start task", sid))
+
+    for _ in range(200):
+        if loop._lock_for(sid).locked():
+            break
+        await asyncio.sleep(0.005)
+    else:
+        pytest.fail("expected session lock to be held during send")
+
+    queued = await loop.follow_up("please focus on feelings", sid)
+    assert isinstance(queued, FollowUpQueued)
+    assert queued.queue_depth == 1
+
+    llm.release_first.set()
+    result = await send_task
+    assert result.status == "completed"
+    assert result.final_text == "steered done"
+    assert len(llm.calls) >= 2
+    second_request = llm.calls[1]
+    follow_contents = [
+        str(m.get("content") or "")
+        for m in second_request
+        if m.get("name") == "follow_up" or "<follow_up>" in str(m.get("content") or "")
+    ]
+    assert any("please focus on feelings" in c for c in follow_contents)
+
+
+@pytest.mark.asyncio
+async def test_follow_up_when_idle_degrades_to_send(store: SessionStore) -> None:
+    llm = _Scripted(responses=[LLMResponse(raw_text="idle reply")])
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=2),
+    )
+    sid = loop.new_session()
+    result = await loop.follow_up("hello", sid)
+    assert not isinstance(result, FollowUpQueued)
+    assert result.final_text == "idle reply"
+    rows = store.load_active_messages(sid)
+    assert any(r.role == "user" and r.content == "hello" for r in rows)

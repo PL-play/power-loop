@@ -1,7 +1,8 @@
 """StatefulAgentLoop — the single public entry point for power-loop.
 
 Owns a :class:`SessionStore` and gives callers a stateful,
-``new_session()`` + ``send(user_input, session_id=...)`` interface.
+``new_session()`` + ``send(user_input, session_id=...)`` interface, plus
+:meth:`follow_up` for steering an in-flight loop without blocking.
 Everything else — pipeline orchestration, hooks, events, tool invocation,
 persistence, pending-state machine — is wired up internally.
 
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from llm_client.interface import LLMService
+from power_loop.agent.follow_up import FollowUpQueued, merge_follow_up_inputs
 from power_loop.agent.sink import SQLiteSink
 from power_loop.agent.system_prompt import (
     DEFAULT_AGENT_SYSTEM_PROMPT,
@@ -93,6 +95,8 @@ class StatefulAgentLoop:
         self.tool_registry = tool_registry
         self._runner = AgentRunner(event_bus=event_bus, hooks=hooks)
         self._locks: dict[str, asyncio.Lock] = {}
+        self._follow_up_queues: dict[str, list[str | LoopMessage]] = {}
+        self._follow_up_queue_locks: dict[str, asyncio.Lock] = {}
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -143,6 +147,42 @@ class StatefulAgentLoop:
             self._raise_if_pending(sid)
             self._persist_user_input(sid, user_input)
             return await self._run_loop(sid, stop_event=stop_event)
+
+    async def follow_up(
+        self,
+        user_input: str | LoopMessage,
+        session_id: str,
+        *,
+        stop_event: CancellationLike = None,
+    ) -> StatefulResult | FollowUpQueued:
+        """Steer an in-flight loop, or fall back to :meth:`send`.
+
+        When the session lock is held by a running :meth:`send` / :meth:`resume`
+        / :meth:`submit_input`, the input is appended to a per-session queue.
+        The pipeline drains that queue at each **round** boundary (before
+        ``prepare_round``), injects a wrapped ``<follow_up>`` user message, and
+        clears the drained items.
+
+        When the session is idle (lock not held), behaves like :meth:`send`.
+        """
+        sid = session_id
+        self._ensure_session_or_raise(sid)
+        session_lock = self._lock_for(sid)
+        if session_lock.locked():
+            depth = await self._enqueue_follow_up(sid, user_input)
+            return FollowUpQueued(session_id=sid, queue_depth=depth)
+        return await self.send(user_input, sid, stop_event=stop_event)
+
+    def follow_up_sync(
+        self,
+        user_input: str | LoopMessage,
+        session_id: str,
+        *,
+        stop_event: CancellationLike = None,
+    ) -> StatefulResult | FollowUpQueued:
+        return asyncio.run(
+            self.follow_up(user_input, session_id, stop_event=stop_event)
+        )
 
     def send_sync(
         self,
@@ -365,6 +405,25 @@ class StatefulAgentLoop:
             self._locks[sid] = lock
         return lock
 
+    def _follow_up_queue_lock_for(self, sid: str) -> asyncio.Lock:
+        lock = self._follow_up_queue_locks.get(sid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._follow_up_queue_locks[sid] = lock
+        return lock
+
+    async def _enqueue_follow_up(self, sid: str, user_input: str | LoopMessage) -> int:
+        async with self._follow_up_queue_lock_for(sid):
+            queue = self._follow_up_queues.setdefault(sid, [])
+            queue.append(user_input)
+            return len(queue)
+
+    async def _drain_follow_up_messages(self, sid: str) -> list[LoopMessage]:
+        async with self._follow_up_queue_lock_for(sid):
+            pending = self._follow_up_queues.pop(sid, [])
+        merged = merge_follow_up_inputs(pending)
+        return [merged] if merged is not None else []
+
     def _ensure_session_or_raise(self, sid: str) -> None:
         if self.store.get_session(sid) is None:
             raise SessionNotFoundError(sid)
@@ -457,6 +516,9 @@ class StatefulAgentLoop:
         async with self._runner.session_async(session_id=sid):
             loop_token = set_current_loop(self)
             try:
+                async def _drain_follow_ups() -> list[LoopMessage]:
+                    return await self._drain_follow_up_messages(sid)
+
                 pipeline = AgentPipeline(
                     llm=self.llm,
                     config=runtime_config,
@@ -468,6 +530,7 @@ class StatefulAgentLoop:
                     stop_event=stop_event,
                     sink=sink,
                     store=self.store,
+                    drain_follow_ups=_drain_follow_ups,
                 )
                 result: AgentLoopResult = await pipeline.run(history)
             finally:
@@ -555,4 +618,4 @@ def _as_tool_result_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-__all__ = ["StatefulAgentLoop", "StatefulResult", "MessageState"]
+__all__ = ["StatefulAgentLoop", "StatefulResult", "MessageState", "FollowUpQueued"]

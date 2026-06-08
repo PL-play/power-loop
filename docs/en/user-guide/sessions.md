@@ -137,6 +137,41 @@ result = await loop.submit_input(sid, interaction["interaction_id"], {"choice": 
 
 The pending interaction is stored in SQLite, so another process can reopen the same database and call `submit_input()` later.
 
+## In-Flight Steering (`follow_up`)
+
+When a session is already running (`send`, `resume`, or `submit_input` holds the per-session lock), a second `send()` on the same session would block until the current run finishes. Use `follow_up()` instead to inject steering text without waiting:
+
+```python
+send_task = asyncio.create_task(loop.send("long task", session_id=sid))
+
+# Wait until the session lock is held (same process).
+while not loop._lock_for(sid).locked():
+    await asyncio.sleep(0.01)
+
+queued = await loop.follow_up("Also mention the budget constraint", sid)
+assert isinstance(queued, FollowUpQueued)
+assert queued.queue_depth == 1
+
+result = await send_task
+```
+
+At each **round boundary** (after `ROUND_START`, before `prepare_round`), the pipeline drains the per-session queue, merges multiple follow-ups into one user message, and appends:
+
+```xml
+<follow_up>
+Also mention the budget constraint
+</follow_up>
+```
+
+When the session is idle (lock not held), `follow_up()` degrades to `send()`.
+
+| API | Use when |
+|---|---|
+| `submit_input()` | The loop paused on `request_user_input`; you have an `interaction_id` and may resume from another process later. |
+| `follow_up()` | The loop is still running in the same process; you want to steer the **next** LLM round without blocking on the current run. |
+
+See [Example 22](../../../examples/22_follow_up_steering.py) and [Examples Guide §22](../tutorials/examples-guide.md#22--follow-up-steering).
+
 ## Closing Sessions
 
 ```python

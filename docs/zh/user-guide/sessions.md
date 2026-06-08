@@ -134,6 +134,41 @@ result = await loop.submit_input(sid, interaction["interaction_id"], {"choice": 
 
 待输入项会存进 SQLite，因此另一个进程之后重新打开同一个数据库，也可以调用 `submit_input()` 继续。
 
+## 运行中追加指引（`follow_up`）
+
+当会话已在运行（`send` / `resume` / `submit_input` 持有 per-session 锁）时，对同一会话再调用 `send()` 会阻塞到当前 run 结束。若要在不等待的情况下注入补充指引，使用 `follow_up()`：
+
+```python
+send_task = asyncio.create_task(loop.send("long task", session_id=sid))
+
+# 等待 session 锁被占用（同一进程内）。
+while not loop._lock_for(sid).locked():
+    await asyncio.sleep(0.01)
+
+queued = await loop.follow_up("Also mention the budget constraint", sid)
+assert isinstance(queued, FollowUpQueued)
+assert queued.queue_depth == 1
+
+result = await send_task
+```
+
+Pipeline 会在每个**轮次边界**（`ROUND_START` 之后、`prepare_round` 之前）排空 per-session 队列，将多条 follow-up 合并为一条 user 消息并写入 transcript：
+
+```xml
+<follow_up>
+Also mention the budget constraint
+</follow_up>
+```
+
+当会话空闲（锁未被占用）时，`follow_up()` 会降级为 `send()`。
+
+| API | 适用场景 |
+|---|---|
+| `submit_input()` | loop 因 `request_user_input` 暂停；你有 `interaction_id`，可跨进程稍后恢复。 |
+| `follow_up()` | loop 仍在同一进程内运行；你想在**下一轮** LLM 调用前注入指引，而不阻塞当前 run。 |
+
+详见 [示例 22](../../../examples/22_follow_up_steering.py) 与 [示例指南 §22](../tutorials/examples-guide.md#22--运行中追加指引)。
+
 ## 关闭会话
 
 ```python

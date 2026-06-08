@@ -7,6 +7,7 @@ Stability tiers
 业务方（如 DeepTalk `agent` 服务）只应依赖这一层。
 
     StatefulAgentLoop, StatefulResult,
+    FollowUpQueued,
     AgentLoopConfig, AgentLoopResult,
     SessionStore,
     PowerLoopError,
@@ -21,10 +22,11 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
+from power_loop.agent.follow_up import FollowUpQueued
 from power_loop.agent.system_prompt import (
     BUILTIN_SECTIONS,
     DEFAULT_AGENT_SYSTEM_PROMPT,

@@ -135,6 +135,20 @@ def test_example_21_request_user_input_runs() -> None:
     assert any("send" in item["final_text"].lower() for item in results)
 
 
+def test_example_22_follow_up_steering_runs() -> None:
+    """Real LLM run accepts follow_up steering before the next round."""
+    module = _load_example("22_follow_up_steering.py")
+    result = asyncio.run(
+        module.main(
+            steering="Your final answer MUST include the exact word STEERED in uppercase."
+        )
+    )
+    assert result["status"] == "completed"
+    assert result["queue_depth"] == 1
+    assert result["follow_up_message_count"] >= 1
+    assert "STEERED" in result["final_text"]
+
+
 def test_example_07_human_approval_runs() -> None:
     """Always-deny confirm_fn: dangerous commands must NEVER execute;
     safe whitelist commands may still execute; final answer must

@@ -18,8 +18,9 @@ inspect the source modules linked below.
 
 | Symbol | Covers | More |
 |---|---|---|
-| `StatefulAgentLoop` | `new_session`, `send`, `send_sync`, `resume`, `submit_input`, `abort_pending`, `close_session`, `get_messages`, `get_pending` | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/agent/stateful_loop.py) |
+| `StatefulAgentLoop` | `new_session`, `send`, `send_sync`, `follow_up`, `follow_up_sync`, `resume`, `submit_input`, `abort_pending`, `close_session`, `get_messages`, `get_pending` | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/agent/stateful_loop.py) |
 | `StatefulResult` | `session_id`, `status`, `final_text`, `rounds`, `pending_tool_calls`, `pending_interactions` | [source](../../../power_loop/agent/stateful_loop.py) |
+| `FollowUpQueued` | `session_id`, `queue_depth` — returned when `follow_up()` enqueues steering input for the next round | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/agent/follow_up.py) |
 | `AgentLoopConfig` | loop limits, temperature, compaction, retry, memory | [Configuration](../user-guide/configuration.md), [source](../../../power_loop/agent/types.py) |
 | `SessionStore` | SQLite sessions, messages, compactions, usage, pending state | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/runtime/session_store.py) |
 

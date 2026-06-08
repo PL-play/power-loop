@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-06-08
+
+### Added — In-flight steering (`follow_up`)
+
+- **`StatefulAgentLoop.follow_up()` / `follow_up_sync()`** — enqueue steering input while a session run is in flight; idle sessions degrade to `send()`.
+- **`FollowUpQueued`** — immediate return shape when input is queued for the next pipeline round.
+- **Round-boundary drain** — merged follow-ups append as a wrapped `<follow_up>` user message before `prepare_round`.
+- **Example 22**, bilingual docs, and unit/real tests for the steering path.
+
 ### Added — M2.8 Anthropic Messages API 传输（2026-06-06）
 
 - **`AnthropicMessagesLLMService`**（`llm_client.anthropic_factory`）—— 新增原生 Anthropic Messages API transport，复用统一 `LLMRequest` / `LLMResponse`。
