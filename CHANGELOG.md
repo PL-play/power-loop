@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-06-11
+
+### Fixed
+
+- `SQLiteNoteMemory.remember` 的签名对齐 `MemoryProvider` 协议（keyword-only
+  `snapshot=` / `session_id=`）；0.8.0 的位置参数签名会在 session 结束时触发
+  `MEMORY_FAILED`（软失败，不影响回复，但有噪音日志）。
+
 ## [0.8.0] — 2026-06-11
 
 ### Added

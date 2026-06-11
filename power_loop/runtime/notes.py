@@ -190,5 +190,10 @@ class SQLiteNoteMemory:
             return []
         return [{"role": "system", "name": "memory_notes", "content": text}]
 
-    async def remember(self, snapshot: Any) -> None:  # noqa: ARG002
+    async def remember(
+        self,
+        *,
+        snapshot: Any,
+        session_id: str | None = None,
+    ) -> None:
         return None

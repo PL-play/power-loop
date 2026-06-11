@@ -175,7 +175,7 @@ def test_recall_empty_session_returns_nothing(store: SessionStore) -> None:
 
 def test_remember_is_noop(store: SessionStore) -> None:
     provider = SQLiteNoteMemory(store)
-    assert asyncio.run(provider.remember(object())) is None
+    assert asyncio.run(provider.remember(snapshot=object(), session_id=SID)) is None
 
 
 def test_default_policy_sane() -> None:
