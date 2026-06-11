@@ -186,6 +186,54 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=("items",),
     ),
     ToolDefinition(
+        name="note_add",
+        description=(
+            "Save a short persistent note to your own memory. Notes survive context compaction and are "
+            "shown back to you at the start of every turn. Use for durable facts, preferences, ongoing "
+            "task state — not for transcripts or long content (put those in files). When notes are full "
+            "you must delete or merge old ones first. Set pinned=true for notes that must never be "
+            "hidden or auto-evicted."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "The note text. Keep it short and self-contained."},
+                "pinned": {"type": "boolean", "description": "Pinned notes are always visible and never auto-evicted. Default false."},
+            },
+            "required": ["content"],
+        },
+        required_params=("content",),
+    ),
+    ToolDefinition(
+        name="note_update",
+        description=(
+            "Rewrite or (un)pin one of your existing notes by its #id. Use to keep memory current "
+            "instead of piling up near-duplicates, and to merge related notes into one."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "note_id": {"type": "integer", "description": "The #id shown in YOUR NOTES."},
+                "content": {"type": "string", "description": "New text replacing the old content."},
+                "pinned": {"type": "boolean", "description": "Set or clear the pinned flag."},
+            },
+            "required": ["note_id"],
+        },
+        required_params=("note_id",),
+    ),
+    ToolDefinition(
+        name="note_delete",
+        description="Delete one of your notes by its #id when it is stale or no longer worth remembering.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "note_id": {"type": "integer", "description": "The #id shown in YOUR NOTES."},
+            },
+            "required": ["note_id"],
+        },
+        required_params=("note_id",),
+    ),
+    ToolDefinition(
         name="background_run",
         description="Run a shell command in a private background worker (non-interactive).",
         input_schema={

@@ -22,7 +22,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "0.7.2"
+__version__ = "0.8.0"
 
 from power_loop.agent.follow_up import FollowUpQueued
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
@@ -124,6 +124,13 @@ from power_loop.runtime.exec_backend import (
 )
 from power_loop.runtime.human_input import HumanInputRequired, request_user_input
 from power_loop.runtime.memory import MemoryProvider, MemorySnapshot, tag_as_memory
+from power_loop.runtime.notes import (
+    DEFAULT_NOTES_POLICY,
+    NotesFullError,
+    NotesPolicy,
+    SQLiteNoteMemory,
+    render_notes,
+)
 from power_loop.runtime.provider import (
     LLMProviderConfig,
     create_llm_service_from_config,
@@ -256,6 +263,11 @@ __all__ = [
 	"MemoryProvider",
 	"MemorySnapshot",
 	"tag_as_memory",
+	"NotesPolicy",
+	"NotesFullError",
+	"SQLiteNoteMemory",
+	"DEFAULT_NOTES_POLICY",
+	"render_notes",
 	"MemoryRecalledCtx",
 	"MemoryRecalledPayload",
 	"MemoryFailedPayload",

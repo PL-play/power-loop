@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from power_loop.runtime.compact import Compactor
     from power_loop.runtime.memory import MemoryProvider
+    from power_loop.runtime.notes import NotesPolicy
     from power_loop.runtime.retry import LLMRetryPolicy
     from power_loop.runtime.runtime_state import RuntimeProjector
 
@@ -35,6 +36,9 @@ class AgentLoopConfig:
     retry_policy: LLMRetryPolicy | None = None
     memory: MemoryProvider | None = None
     memory_budget_tokens: int = 1500
+    # Bounds for the note_add/note_update/note_delete tools (agent-authored
+    # notes). None → DEFAULT_NOTES_POLICY. See power_loop.runtime.notes.
+    notes_policy: NotesPolicy | None = None
     skills_dir: str | None = None
     runtime_projectors: tuple[RuntimeProjector, ...] = field(default_factory=_default_runtime_projectors)
 

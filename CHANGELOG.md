@@ -8,6 +8,25 @@
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-06-11
+
+### Added
+
+- **Agent-authored notes（自主记忆）**：模型用工具自己维护的持久笔记，存在 session store 新增的
+  `notes` 表里（按 session 隔离，`close_session` 级联删除）。
+  - 新默认工具 `note_add` / `note_update` / `note_delete`（进入 `full` preset；`core`/`explore` 不含）。
+  - `SQLiteNoteMemory`：实现 `MemoryProvider` 协议，`recall()` 把该 session 的笔记渲染成一条
+    `memory_notes` system 消息每次 send 注入；`remember()` no-op（写入由工具实时完成）。
+  - `NotesPolicy(max_notes=50, max_note_chars=1000, inject_max_chars=8000, eviction="reject")`：
+    默认**拒绝式**容量——满了报错并提示模型先删/合并（静默遗忘是 agent 记忆最糟的失败模式）；
+    `eviction="fifo"` 切换为队列式淘汰（pinned 永不被自动淘汰）。注入超预算时优先隐藏最老的
+    未 pin 条目并在文本中声明隐藏数量。
+  - `AgentLoopConfig.notes_policy` 字段；顶层导出 `NotesPolicy` / `NotesFullError` /
+    `SQLiteNoteMemory` / `DEFAULT_NOTES_POLICY` / `render_notes`。
+  - `SessionStore` 新方法：`add_note` / `update_note` / `delete_note` / `list_notes` / `count_notes`，
+    `NoteRow` dataclass。旧数据库自动建表，完全向后兼容。
+  - 新示例 `examples/24_agent_notes.py`；单测 `tests/unit/test_notes.py`（18 例）。
+
 ## [0.7.2] — 2026-06-11
 
 ### Fixed

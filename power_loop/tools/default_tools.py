@@ -1135,6 +1135,49 @@ def run_todo(items: list[dict[str, Any]]) -> str:
     return get_ctx().todo.update(validated)
 
 
+def _notes_policy() -> Any:
+    """Resolve the active NotesPolicy: loop config override or the default."""
+    from power_loop.runtime.notes import DEFAULT_NOTES_POLICY
+
+    runtime_ctx = get_tool_runtime_context()
+    policy = getattr(runtime_ctx.config, "notes_policy", None) if runtime_ctx.config else None
+    return policy or DEFAULT_NOTES_POLICY
+
+
+def _notes_store_and_session() -> tuple[Any, str]:
+    store, sid = _current_store_and_session()
+    if store is None or sid is None:
+        raise RuntimeError("note tools need an active session (StatefulAgentLoop)")
+    return store, sid
+
+
+def run_note_add(content: str, pinned: bool = False) -> str:
+    from power_loop.runtime.notes import add_note_checked
+
+    store, sid = _notes_store_and_session()
+    policy = _notes_policy()
+    note = add_note_checked(store, sid, content, pinned=pinned, policy=policy)
+    count = store.count_notes(sid)
+    return f"noted as #{note.note_id} ({count}/{policy.max_notes} notes used)"
+
+
+def run_note_update(note_id: int, content: str | None = None, pinned: bool | None = None) -> str:
+    from power_loop.runtime.notes import update_note_checked
+
+    store, sid = _notes_store_and_session()
+    update_note_checked(
+        store, sid, int(note_id), content=content, pinned=pinned, policy=_notes_policy()
+    )
+    return f"note #{note_id} updated"
+
+
+def run_note_delete(note_id: int) -> str:
+    store, sid = _notes_store_and_session()
+    if not store.delete_note(sid, int(note_id)):
+        raise ValueError(f"note #{note_id} does not exist")
+    return f"note #{note_id} deleted ({store.count_notes(sid)} remaining)"
+
+
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120)),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
@@ -1158,6 +1201,11 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     ),
     "load_skill": lambda **kw: run_load_skill(kw["name"]),
     "todo": lambda **kw: run_todo(kw["items"]),
+    "note_add": lambda **kw: run_note_add(kw["content"], kw.get("pinned", False)),
+    "note_update": lambda **kw: run_note_update(
+        kw["note_id"], kw.get("content"), kw.get("pinned")
+    ),
+    "note_delete": lambda **kw: run_note_delete(kw["note_id"]),
     "background_run": lambda **kw: run_background(kw["command"]),
     "check_background": lambda **kw: check_background(kw.get("task_id")),
     "request_user_input": lambda **kw: request_user_input(

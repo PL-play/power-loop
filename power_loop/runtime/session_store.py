@@ -8,6 +8,7 @@ Owns the persistence layer for stateful agent loops:
   - session_state  : single-row per-session mutable state (next_seq, pending, …)
   - session_runtime_state : per-session JSON state for tool/runtime protocols
   - background_tasks : persisted background command task status
+  - notes            : agent-authored persistent notes (self-managed memory)
 
 The store is the **only** place that writes to disk. Callers (StatefulAgentLoop,
 the Sink that the pipeline drives, the subagent runtime) all go through here.
@@ -150,6 +151,16 @@ CREATE TABLE IF NOT EXISTS background_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_background_tasks_session_status
     ON background_tasks(session_id, status, updated_at);
+
+CREATE TABLE IF NOT EXISTS notes (
+    session_id        TEXT NOT NULL,
+    note_id           INTEGER NOT NULL,
+    content           TEXT NOT NULL,
+    pinned            INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (session_id, note_id)
+);
 """
 
 
@@ -217,6 +228,19 @@ class BackgroundTaskRow:
     output_tail: str | None
     output_path: str | None
     last_seen_at: int
+    created_at: int
+    updated_at: int
+
+
+@dataclass
+class NoteRow:
+    """One agent-authored note. ``note_id`` is a short per-session integer so
+    the model can reference notes naturally ("update note 3")."""
+
+    session_id: str
+    note_id: int
+    content: str
+    pinned: bool
     created_at: int
     updated_at: int
 
@@ -389,6 +413,7 @@ class SessionStore:
         self._conn.execute("DELETE FROM usage_rounds WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM session_runtime_state WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM background_tasks WHERE session_id=?", (session_id,))
+        self._conn.execute("DELETE FROM notes WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM session_state WHERE session_id=?", (session_id,))
         cur = self._conn.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
         deleted += cur.rowcount
@@ -769,6 +794,92 @@ class SessionStore:
                 """,
                 (now, session_id, *task_ids),
             )
+
+    # ── notes (agent-authored persistent memory) ──────────────────────────
+
+    def add_note(self, session_id: str, content: str, *, pinned: bool = False) -> NoteRow:
+        """Insert a note with the next per-session note_id and return it."""
+        now = _now_ms()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(note_id), 0) + 1 AS nid FROM notes WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            note_id = int(row["nid"])
+            self._conn.execute(
+                """
+                INSERT INTO notes (session_id, note_id, content, pinned, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, note_id, content, 1 if pinned else 0, now, now),
+            )
+        return NoteRow(
+            session_id=session_id,
+            note_id=note_id,
+            content=content,
+            pinned=pinned,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def update_note(
+        self,
+        session_id: str,
+        note_id: int,
+        *,
+        content: str | None = None,
+        pinned: bool | None = None,
+    ) -> bool:
+        """Update content and/or pinned flag. Returns False if the note doesn't exist."""
+        sets: list[str] = ["updated_at=?"]
+        params: list[Any] = [_now_ms()]
+        if content is not None:
+            sets.append("content=?")
+            params.append(content)
+        if pinned is not None:
+            sets.append("pinned=?")
+            params.append(1 if pinned else 0)
+        params.extend([session_id, note_id])
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                f"UPDATE notes SET {', '.join(sets)} WHERE session_id=? AND note_id=?",
+                params,
+            )
+        return cur.rowcount > 0
+
+    def delete_note(self, session_id: str, note_id: int) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM notes WHERE session_id=? AND note_id=?",
+                (session_id, note_id),
+            )
+        return cur.rowcount > 0
+
+    def list_notes(self, session_id: str) -> list[NoteRow]:
+        """All notes for a session in note_id (= creation) order."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM notes WHERE session_id=? ORDER BY note_id",
+                (session_id,),
+            ).fetchall()
+        return [
+            NoteRow(
+                session_id=r["session_id"],
+                note_id=int(r["note_id"]),
+                content=r["content"],
+                pinned=bool(r["pinned"]),
+                created_at=int(r["created_at"]),
+                updated_at=int(r["updated_at"]),
+            )
+            for r in rows
+        ]
+
+    def count_notes(self, session_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM notes WHERE session_id=?", (session_id,)
+            ).fetchone()
+        return int(row["n"])
 
     # ── usage ─────────────────────────────────────────────────────────────
 
