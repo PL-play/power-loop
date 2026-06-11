@@ -756,8 +756,18 @@ class AgentPipeline:
                     round_index=round_idx,
                 )
 
-            # ── No tools → completed ──
+            # ── No tools → completed (unless a follow-up is waiting) ──
             if not tool_calls:
+                # In-flight steering arriving during this (otherwise terminal)
+                # round would never be drained at a later round-start, so it
+                # would be silently dropped. Drain here: if anything is queued,
+                # run another round to address it instead of completing.
+                if self._drain_follow_ups is not None:
+                    drained = await self._drain_follow_ups()
+                    if drained:
+                        for msg in drained:
+                            await self._append_message(msg, round_index=round_idx)
+                        continue
                 self._emit(AgentEventType.ROUND_COMPLETED,
                            RoundCompletedPayload(round_index=round_idx, has_tools=False), round_index=round_idx)
                 round_end = RoundEndCtx(

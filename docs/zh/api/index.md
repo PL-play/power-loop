@@ -26,8 +26,10 @@
 
 | 符号 | 覆盖 | 更多 |
 |---|---|---|
-| `ToolRegistry` | 注册、调用、校验、OpenAI tool 转换 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/tools/registry.py) |
+| `ToolRegistry` | 注册、调用、校验、OpenAI tool 转换、`names()` 与受限 `subset()` registry | [工具](../user-guide/tools.md)、[源码](../../../power_loop/tools/registry.py) |
 | `ToolDefinition` | 名称、描述、JSON Schema、必填参数 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/contracts/tools.py) |
+| `create_default_tool_registry` | 已绑定或运行时解析的内置工具 registry | [工具](../user-guide/tools.md)、[源码](../../../power_loop/tools/__init__.py) |
+| `DEFAULT_TOOL_HANDLERS` | 用于自定义 registry 组合的公开 handler 映射 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/tools/default_tools.py) |
 | `AgentSpec` | 声明式子代理规格 | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/runtime/spec.py) |
 | `run_agent_spec` | 直接执行子代理 | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/runtime/spec.py) |
 | `register_spawn_agent` | `spawn_agent` 和 `run_agent` meta-tool | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/tools/spawn_agent.py) |
@@ -52,4 +54,6 @@
 | `MemoryProvider` | `recall` / `remember` 协议 | [记忆](../user-guide/memory.md)、[源码](../../../power_loop/runtime/memory.py) |
 | `LLMProviderConfig` | provider/env 配置 | [Providers](../user-guide/providers.md)、[源码](../../../power_loop/runtime/provider.py) |
 | `DefaultCompactor` | 上下文摘要压缩 | [压缩](../user-guide/compaction.md)、[源码](../../../power_loop/runtime/compact.py) |
+| `RuntimeEnv`, `runtime_env_context` | 每次调用的 workspace/home/skills 与 shell backend | [工具](../user-guide/tools.md)、[源码](../../../power_loop/runtime/env.py) |
+| `ShellBackend`, `LocalShellBackend` | 持久 shell 启动方式与执行目标标识 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/runtime/exec_backend.py) |
 | `PowerLoopError` 及子类 | 通用异常层级 | [源码](../../../power_loop/contracts/errors.py) |

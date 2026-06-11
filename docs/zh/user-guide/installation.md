@@ -30,7 +30,7 @@ pip install -e ".[dev]"
 
 ```python
 from power_loop import StatefulAgentLoop, AgentLoopConfig, __version__
-print(__version__)  # → "0.2.0"
+print(__version__)  # → "0.7.2"
 ```
 
 ## 下一步

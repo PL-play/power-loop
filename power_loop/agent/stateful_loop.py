@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -131,11 +132,21 @@ class StatefulAgentLoop:
         session_id: str,
         *,
         stop_event: CancellationLike = None,
+        tools: Sequence[str] | ToolRegistry | None = None,
+        system_prompt: str | None = None,
     ) -> StatefulResult:
         """Append one user input to the session and run the loop.
 
         ``session_id`` must refer to an existing session created by
         :meth:`new_session` (or by lower-level ``SessionStore`` APIs).
+
+        Per-call overrides (do not mutate loop/session state):
+
+        - ``tools``: restrict this run to a subset of the loop's tools. Pass a
+          sequence of tool names (allowlisted from the loop registry) or a
+          ``ToolRegistry`` to use directly. The model only *sees* these tools.
+        - ``system_prompt``: override the system prompt for this run only
+          (precedence: this arg > session system_prompt > config).
 
         Raises :class:`SessionPendingError` if the session has unresolved
         tool_calls; the caller must call :meth:`resume` or
@@ -146,7 +157,9 @@ class StatefulAgentLoop:
             self._ensure_session_or_raise(sid)
             self._raise_if_pending(sid)
             self._persist_user_input(sid, user_input)
-            return await self._run_loop(sid, stop_event=stop_event)
+            return await self._run_loop(
+                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt
+            )
 
     async def follow_up(
         self,
@@ -154,6 +167,8 @@ class StatefulAgentLoop:
         session_id: str,
         *,
         stop_event: CancellationLike = None,
+        tools: Sequence[str] | ToolRegistry | None = None,
+        system_prompt: str | None = None,
     ) -> StatefulResult | FollowUpQueued:
         """Steer an in-flight loop, or fall back to :meth:`send`.
 
@@ -171,7 +186,9 @@ class StatefulAgentLoop:
         if session_lock.locked():
             depth = await self._enqueue_follow_up(sid, user_input)
             return FollowUpQueued(session_id=sid, queue_depth=depth)
-        return await self.send(user_input, sid, stop_event=stop_event)
+        return await self.send(
+            user_input, sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt
+        )
 
     def follow_up_sync(
         self,
@@ -179,9 +196,17 @@ class StatefulAgentLoop:
         session_id: str,
         *,
         stop_event: CancellationLike = None,
+        tools: Sequence[str] | ToolRegistry | None = None,
+        system_prompt: str | None = None,
     ) -> StatefulResult | FollowUpQueued:
         return asyncio.run(
-            self.follow_up(user_input, session_id, stop_event=stop_event)
+            self.follow_up(
+                user_input,
+                session_id,
+                stop_event=stop_event,
+                tools=tools,
+                system_prompt=system_prompt,
+            )
         )
 
     def send_sync(
@@ -190,9 +215,17 @@ class StatefulAgentLoop:
         session_id: str,
         *,
         stop_event: CancellationLike = None,
+        tools: Sequence[str] | ToolRegistry | None = None,
+        system_prompt: str | None = None,
     ) -> StatefulResult:
         return asyncio.run(
-            self.send(user_input, session_id, stop_event=stop_event)
+            self.send(
+                user_input,
+                session_id,
+                stop_event=stop_event,
+                tools=tools,
+                system_prompt=system_prompt,
+            )
         )
 
     async def resume(
@@ -495,12 +528,25 @@ class StatefulAgentLoop:
                 # exists. Surface failure via content text.
                 pass
 
+    def _resolve_registry(
+        self, tools: Sequence[str] | ToolRegistry | None
+    ) -> ToolRegistry | None:
+        if tools is None:
+            return self.tool_registry
+        if isinstance(tools, ToolRegistry):
+            return tools
+        if self.tool_registry is None:
+            return None
+        return self.tool_registry.subset(tools)
+
     async def _run_loop(
         self,
         sid: str,
         *,
         stop_event: CancellationLike,
         sink: SQLiteSink | None = None,
+        tools: Sequence[str] | ToolRegistry | None = None,
+        system_prompt: str | None = None,
     ) -> StatefulResult:
         sink = sink if sink is not None else SQLiteSink(self.store, sid)
         active_rows = self.store.load_active_messages(sid)
@@ -509,9 +555,14 @@ class StatefulAgentLoop:
         # in-memory indices back to store rows when it folds messages.
         sink.init_history_seqs([r.seq for r in active_rows])
         session_row = self.store.get_session(sid)
+        # System prompt precedence: per-call > session > config.
+        effective_sp = system_prompt
+        if effective_sp is None and session_row is not None and session_row.system_prompt:
+            effective_sp = session_row.system_prompt
         runtime_config = self.config
-        if session_row is not None and session_row.system_prompt and session_row.system_prompt != self.config.system_prompt:
-            runtime_config = replace(self.config, system_prompt=session_row.system_prompt)
+        if effective_sp is not None and effective_sp != self.config.system_prompt:
+            runtime_config = replace(self.config, system_prompt=effective_sp)
+        effective_registry = self._resolve_registry(tools)
 
         async with self._runner.session_async(session_id=sid):
             loop_token = set_current_loop(self)
@@ -522,7 +573,7 @@ class StatefulAgentLoop:
                 pipeline = AgentPipeline(
                     llm=self.llm,
                     config=runtime_config,
-                    tool_registry=self.tool_registry,
+                    tool_registry=effective_registry,
                     hooks=self._runner.hooks,
                     bus=self._runner.event_bus,
                     ctx=get_ctx(),

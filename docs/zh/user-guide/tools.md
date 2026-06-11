@@ -116,6 +116,44 @@ registry = create_default_tool_registry(
 `AgentLoopConfig.skills_dir`、`skills_dir=...` 或 `POWER_LOOP_SKILLS_DIR`。自定义工具不受影响，
 由实现方自己处理路径和配置。
 
+### 每次调用的工具白名单
+
+只注册一次工具全集，每个 run 只向模型暴露当次允许的工具：
+
+```python
+result = await loop.send(
+    "Inspect the project",
+    session_id=sid,
+    tools=["read_file", "glob", "grep"],
+)
+```
+
+名称序列通过 `ToolRegistry.subset()` 解析；未知名称会被忽略，LLM 只会收到
+选中工具的 definition。`ToolRegistry.names()` 返回已注册名称；也可以直接传入另一个
+`ToolRegistry`。
+
+### 未绑定 registry
+
+同一 registry 需要跨 workspace 复用时，可将环境解析延迟到 handler 调用时：
+
+```python
+from power_loop import RuntimeEnv, create_default_tool_registry, runtime_env_context
+
+registry = create_default_tool_registry(preset="core", bind=False)
+
+with runtime_env_context(RuntimeEnv(workspace_dir="/srv/tenant-a")):
+    result = await registry.invoke_async("read_file", {"path": "README.md"})
+```
+
+`DEFAULT_TOOL_HANDLERS` 也是公开 API，便于 host 用内置 handler 组合自定义 definition。
+
+### Shell 执行边界
+
+默认 `LocalShellBackend` 直接在 host 上启动 `/bin/bash` 并继承 host 环境；它只负责编排，
+不提供隔离。不可信命令必须由 host 注入 `ShellBackend`，在 container、gVisor 或其它 sandbox
+内启动。`session_key(workspace_dir)` 标识持久 shell 缓存对应的执行目标；不同目标必须返回
+不同 key。
+
 预设：
 
 | 预设 | 工具 |

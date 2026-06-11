@@ -8,6 +8,16 @@ power-loop gives application code one small interface, `StatefulAgentLoop`, and 
 
 It is a library, not a service or a full application framework. You keep ownership of product logic, HTTP APIs, auth, queues, RAG, UI, and deployment.
 
+### Scope: orchestration, not isolation
+
+power-loop **orchestrates** the agent loop; it does **not sandbox** tool execution. The
+built-in `bash` / file tools run **in-process** (a `subprocess` shell inheriting the host
+environment) — convenient for trusted, local use, but **not a security boundary**. If your
+agent runs model-authored or otherwise untrusted commands, run them in your own sandbox
+(container / gVisor / microVM) and inject it via the `ShellBackend` seam
+(`runtime.exec_backend`); power-loop launches the persistent shell through your backend.
+Keep secrets in your orchestrator — the loop does not scrub the tool environment for you.
+
 ## Install
 
 ```bash
@@ -77,6 +87,37 @@ See [Getting Started](docs/en/getting-started.md) for the complete first run.
 | Structured JSON output | [Structured Output](docs/en/user-guide/structured-output.md) |
 | Pluggable cross-session memory | [Memory](docs/en/user-guide/memory.md) |
 | Provider configuration | [Providers](docs/en/user-guide/providers.md) |
+
+### Per-call overrides
+
+Build one loop and reuse it across callers; restrict tools or swap the system
+prompt **per `send`** without rebuilding (the model only *sees* the allowed
+tools). Ideal for multi-tenant hosts.
+
+```python
+# loop registered with all tools; this run exposes only "get_weather"
+await loop.send("…", session_id=sid, tools=["get_weather"])
+
+# per-run system prompt override (precedence: per-call > session > config)
+await loop.send("…", session_id=sid, system_prompt="You are a terse bot.")
+```
+
+The same overrides are available on `send_sync()`. When `follow_up()` is idle
+and falls back to a new send, it accepts them too. A follow-up queued into an
+already running call keeps that call's active tool and prompt policy.
+
+For a multi-tenant host that reuses one registry across workspaces, build an
+**unbound** registry and supply the workspace at invocation time:
+
+```python
+from power_loop import RuntimeEnv, create_default_tool_registry, runtime_env_context
+
+registry = create_default_tool_registry(preset="core", bind=False)
+with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
+    result = await registry.invoke_async("read_file", {"path": "README.md"})
+```
+
+See [`examples/23_per_send_overrides.py`](examples/23_per_send_overrides.py).
 
 ## Public API
 

@@ -137,6 +137,24 @@ result = await loop.submit_input(sid, interaction["interaction_id"], {"choice": 
 
 The pending interaction is stored in SQLite, so another process can reopen the same database and call `submit_input()` later.
 
+## Per-Call Overrides
+
+`send()` and `send_sync()` accept `tools=` and `system_prompt=` without
+mutating the loop or stored session:
+
+```python
+result = await loop.send(
+    "Summarize the repository",
+    session_id=sid,
+    tools=["read_file", "glob", "grep"],
+    system_prompt="Be concise and cite file paths.",
+)
+```
+
+Prompt precedence is per-call override, then session prompt, then loop config.
+The model only sees the selected tool definitions. Idle `follow_up()` and
+`follow_up_sync()` forward the same options when they degrade to a new send.
+
 ## In-Flight Steering (`follow_up`)
 
 When a session is already running (`send`, `resume`, or `submit_input` holds the per-session lock), a second `send()` on the same session would block until the current run finishes. Use `follow_up()` instead to inject steering text without waiting:
@@ -164,6 +182,9 @@ Also mention the budget constraint
 ```
 
 When the session is idle (lock not held), `follow_up()` degrades to `send()`.
+When it queues into an already active run, that run keeps the `tools` and
+`system_prompt` policy selected by the call that started it; follow-up text
+steers the next round but does not replace the active security boundary.
 
 | API | Use when |
 |---|---|

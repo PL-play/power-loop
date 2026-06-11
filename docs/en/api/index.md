@@ -28,8 +28,10 @@ inspect the source modules linked below.
 
 | Symbol | Covers | More |
 |---|---|---|
-| `ToolRegistry` | register, invoke, validate, OpenAI tool conversion | [Tools](../user-guide/tools.md), [source](../../../power_loop/tools/registry.py) |
+| `ToolRegistry` | register, invoke, validate, OpenAI tool conversion, `names()`, restricted `subset()` registries | [Tools](../user-guide/tools.md), [source](../../../power_loop/tools/registry.py) |
 | `ToolDefinition` | name, description, JSON Schema, required params | [Tools](../user-guide/tools.md), [source](../../../power_loop/contracts/tools.py) |
+| `create_default_tool_registry` | bound or runtime-resolved built-in tool registry | [Tools](../user-guide/tools.md), [source](../../../power_loop/tools/__init__.py) |
+| `DEFAULT_TOOL_HANDLERS` | public handler mapping for custom registry composition | [Tools](../user-guide/tools.md), [source](../../../power_loop/tools/default_tools.py) |
 | `AgentSpec` | declarative child-agent spec | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/runtime/spec.py) |
 | `run_agent_spec` | direct sub-agent execution | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/runtime/spec.py) |
 | `register_spawn_agent` | `spawn_agent` and `run_agent` meta-tools | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/tools/spawn_agent.py) |
@@ -54,4 +56,6 @@ inspect the source modules linked below.
 | `MemoryProvider` | recall and remember protocol | [Memory](../user-guide/memory.md), [source](../../../power_loop/runtime/memory.py) |
 | `LLMProviderConfig` | provider/env configuration | [Providers](../user-guide/providers.md), [source](../../../power_loop/runtime/provider.py) |
 | `DefaultCompactor` | context summary compaction | [Compaction](../user-guide/compaction.md), [source](../../../power_loop/runtime/compact.py) |
+| `RuntimeEnv`, `runtime_env_context` | per-invocation workspace/home/skills and shell backend | [Tools](../user-guide/tools.md), [source](../../../power_loop/runtime/env.py) |
+| `ShellBackend`, `LocalShellBackend` | persistent-shell launch and execution-target identity | [Tools](../user-guide/tools.md), [source](../../../power_loop/runtime/exec_backend.py) |
 | `PowerLoopError` and subclasses | common exception hierarchy | [source](../../../power_loop/contracts/errors.py) |

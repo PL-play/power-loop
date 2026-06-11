@@ -33,6 +33,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 20 | [`default_tools.py`](20_default_tools.py) | Built-in filesystem/search/bash tools | `create_default_tool_registry(preset="full")` |
 | 21 | [`request_user_input.py`](21_request_user_input.py) | Resumable human input | `request_user_input`, `submit_input()` |
 | 22 | [`follow_up_steering.py`](22_follow_up_steering.py) | In-flight steering | `follow_up()`, `FollowUpQueued`, `<follow_up>` |
+| 23 | [`23_per_send_overrides.py`](23_per_send_overrides.py) | Per-call tool/prompt overrides | `send(tools=, system_prompt=)`, `ToolRegistry.subset` |
 
 ## Running
 

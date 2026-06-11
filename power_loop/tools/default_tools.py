@@ -16,6 +16,7 @@ from typing import Any
 
 from power_loop.core.agent_context import get_ctx
 from power_loop.runtime.env import get_runtime_env, safe_path
+from power_loop.runtime.exec_backend import DEFAULT_SHELL_BACKEND, ShellBackend
 from power_loop.runtime.human_input import request_user_input
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
@@ -305,10 +306,16 @@ def _dangerous_command_reason(command: str) -> str | None:
 
 
 class BashSession:
-    """Persistent bash process with stdout/stderr merged through a pty."""
+    """Persistent bash process with stdout/stderr merged through a pty.
 
-    def __init__(self, cwd: Path):
+    How the shell process is launched is delegated to a ``ShellBackend`` so a
+    host can route execution into a sandbox; the default backend runs an
+    in-process ``/bin/bash`` in ``cwd`` (original behavior).
+    """
+
+    def __init__(self, cwd: Path, backend: ShellBackend | None = None):
         self._cwd = cwd
+        self._backend: ShellBackend = backend or DEFAULT_SHELL_BACKEND
         self._proc: subprocess.Popen[str] | None = None
         self._q: queue.Queue[str] = queue.Queue()
         self._master_fd: int | None = None
@@ -328,18 +335,16 @@ class BashSession:
         except Exception:
             pass
 
-        env = os.environ.copy()
-        env["TERM"] = "dumb"
-        env["NO_COLOR"] = "1"
+        env = self._backend.launch_env(self._cwd)
 
         self._proc = subprocess.Popen(
-            ["/bin/bash", "--norc", "--noprofile"],
+            self._backend.launch_argv(self._cwd),
             stdin=subprocess.PIPE,
             stdout=slave_fd,
             stderr=slave_fd,
             text=True,
             bufsize=0,
-            cwd=str(self._cwd),
+            cwd=self._backend.launch_cwd(self._cwd),
             env=env,
         )
         os.close(slave_fd)
@@ -463,16 +468,42 @@ class BashSession:
             self._restart_locked()
         return "Bash session restarted."
 
+    @property
+    def backend(self) -> ShellBackend:
+        return self._backend
 
-_BASH_SESSIONS: dict[Path, BashSession] = {}
+    def close(self) -> None:
+        with self._lock:
+            if self._master_fd is not None:
+                try:
+                    os.close(self._master_fd)
+                except OSError:
+                    pass
+                self._master_fd = None
+            if self._proc and self._proc.poll() is None:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=3)
+                except Exception:
+                    self._proc.kill()
+            self._proc = None
+
+
+_BASH_SESSIONS: dict[Any, BashSession] = {}
 
 
 def _bash_for_current_workspace() -> BashSession:
-    workspace_dir = get_runtime_env().require_workspace_dir()
-    session = _BASH_SESSIONS.get(workspace_dir)
+    env = get_runtime_env()
+    workspace_dir = env.require_workspace_dir()
+    backend = env.shell_backend or DEFAULT_SHELL_BACKEND
+    # Key by the backend's session_key: same execution target (workspace +
+    # backend, e.g. a specific sandbox container) reuses one persistent shell;
+    # different targets get distinct sessions.
+    key = backend.session_key(workspace_dir)
+    session = _BASH_SESSIONS.get(key)
     if session is None:
-        session = BashSession(workspace_dir)
-        _BASH_SESSIONS[workspace_dir] = session
+        session = BashSession(workspace_dir, backend)
+        _BASH_SESSIONS[key] = session
     return session
 
 

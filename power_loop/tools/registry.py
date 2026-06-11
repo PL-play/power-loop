@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -68,6 +68,23 @@ class ToolRegistry:
 
     def definitions(self) -> list[ToolDefinition]:
         return [item.definition for item in self._tools.values()]
+
+    def names(self) -> list[str]:
+        return list(self._tools.keys())
+
+    def subset(self, names: Iterable[str]) -> ToolRegistry:
+        """Return a new registry with only the named tools (definition + handler).
+
+        Unknown names are ignored. Used for per-call tool allowlisting so the
+        model only sees a permitted subset — see ``StatefulAgentLoop.send(tools=...)``.
+        The new registry shares handler callables (no rebinding).
+        """
+        wanted = set(names)
+        new = ToolRegistry()
+        for name, rt in self._tools.items():
+            if name in wanted:
+                new.register(rt.definition, rt.handler, overwrite=True)
+        return new
 
     def to_openai_tools(self) -> list[dict[str, Any]]:
         return [d.to_openai_tool() for d in self.definitions()]

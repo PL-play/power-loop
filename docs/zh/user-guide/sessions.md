@@ -134,6 +134,23 @@ result = await loop.submit_input(sid, interaction["interaction_id"], {"choice": 
 
 待输入项会存进 SQLite，因此另一个进程之后重新打开同一个数据库，也可以调用 `submit_input()` 继续。
 
+## 每次调用覆盖
+
+`send()` 和 `send_sync()` 接受 `tools=` 与 `system_prompt=`，且不会修改 loop 或已存储的
+session：
+
+```python
+result = await loop.send(
+    "Summarize the repository",
+    session_id=sid,
+    tools=["read_file", "glob", "grep"],
+    system_prompt="Be concise and cite file paths.",
+)
+```
+
+prompt 优先级为：每次调用覆盖 > session prompt > loop config。模型只能看到选中工具的
+definition。当 session 空闲、`follow_up()` / `follow_up_sync()` 降级为新 send 时，也会透传这些参数。
+
 ## 运行中追加指引（`follow_up`）
 
 当会话已在运行（`send` / `resume` / `submit_input` 持有 per-session 锁）时，对同一会话再调用 `send()` 会阻塞到当前 run 结束。若要在不等待的情况下注入补充指引，使用 `follow_up()`：
@@ -161,6 +178,8 @@ Also mention the budget constraint
 ```
 
 当会话空闲（锁未被占用）时，`follow_up()` 会降级为 `send()`。
+当 follow-up 被排入正在运行的 run 时，该 run 会继续使用启动它的调用所选定的 `tools` 与
+`system_prompt` 策略；follow-up 文本会引导下一轮，但不会在 run 中途替换安全边界。
 
 | API | 适用场景 |
 |---|---|

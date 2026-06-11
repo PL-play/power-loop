@@ -7,6 +7,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
+from power_loop.runtime.exec_backend import ShellBackend
+
 
 class RuntimeEnvError(RuntimeError):
     """Raised when an opt-in runtime feature is missing required paths."""
@@ -19,6 +21,10 @@ class RuntimeEnv:
     workspace_dir: Path | None = None
     home_dir: Path | None = None
     skills_dir: Path | None = None
+    # How the persistent shell is launched. None => in-process /bin/bash
+    # (LocalShellBackend). A host that runs untrusted shell can inject a
+    # sandboxing backend here; see runtime.exec_backend.
+    shell_backend: ShellBackend | None = None
 
     @classmethod
     def from_env(

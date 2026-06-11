@@ -1132,6 +1132,36 @@ print(result.final_text)
 
 ---
 
+## 23 · 每次调用覆盖
+
+**概念**：复用同一 loop，每次 send 单独选择工具白名单和 system prompt；同一个未绑定的
+默认 registry 也可跨运行时 workspace 复用。
+
+### 代码
+
+```python
+result = await loop.send(
+    "Check Tokyo weather and AAPL",
+    session_id=sid,
+    tools=["get_weather"],
+    system_prompt="Answer briefly.",
+)
+
+unbound = create_default_tool_registry(include=["read_file"], bind=False)
+with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
+    text = await unbound.invoke_async("read_file", {"path": "profile.txt"})
+```
+
+### 要点
+
+- 名称序列会解析为 `ToolRegistry.subset()`；LLM 根本收不到被拒绝工具的 definition。
+- `system_prompt` 只对当次 run 生效，优先级高于 session 和 loop config。
+- `send_sync()` 以及空闲时的 `follow_up()` / `follow_up_sync()` 支持同样的覆盖。
+- `bind=False` 不需要预先绑定 workspace；handler 会在调用时解析当前 `RuntimeEnv`。
+- 默认本地 shell 不是 sandbox。需要隔离时由 host 注入 `ShellBackend`。
+
+---
+
 ## 速查表
 
 | 我想… | 看哪个 |
@@ -1153,5 +1183,6 @@ print(result.final_text)
 | 试用内置工具 | [20](#20-默认工具) |
 | 暂停等待人类输入 | [21](#21-可恢复人类输入) |
 | 运行中追加指引 | [22](#22-运行中追加指引) |
+| 复用 loop 且按调用切换策略 | [23](#23-每次调用覆盖) |
 | 构建运行时绑定工具 | [高级运行时](../../../examples/advanced_runtime/) |
 | 看全部功能 | [19](#19-旗舰示例) |

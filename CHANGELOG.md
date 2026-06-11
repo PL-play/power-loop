@@ -8,6 +8,54 @@
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-06-11
+
+### Fixed
+
+- Export `runtime_env_context` from the top-level package so the documented `bind=False` flow works without an internal import.
+- Forward `tools=` and `system_prompt=` through `send_sync()` and idle `follow_up_sync()` as well as the async APIs.
+
+### Docs and tests
+
+- Document per-call overrides, unbound registries, and `ShellBackend` in the English and Chinese guides/API reference.
+- Extend example 23 with a real unbound-registry invocation across two runtime workspaces.
+- Add regression coverage for sync overrides and runtime resolution of unbound handlers.
+
+## [0.7.1] — 2026-06-11
+
+### Docs
+
+- New **example 23** (`examples/23_per_send_overrides.py`) demonstrating per-call `tools=` allowlisting and `system_prompt=` override, plus a README "Per-call overrides" section. No code changes vs 0.7.0.
+
+## [0.7.0] — 2026-06-11
+
+### Added — Per-call overrides & cleaner public surface
+
+- **`StatefulAgentLoop.send(..., tools=, system_prompt=)`** and **`follow_up(..., tools=, system_prompt=)`** — per-call overrides that do not mutate loop/session state. `tools` accepts a sequence of tool names (allowlisted from the loop registry) or a `ToolRegistry`; the model only *sees* the permitted subset. `system_prompt` overrides for that run only (precedence: per-call > session > config). Enables multi-tenant reuse of one cached loop without runtime hook gating.
+- **`ToolRegistry.subset(names)`** and **`ToolRegistry.names()`** — derive a restricted registry.
+- **`create_default_tool_registry(..., bind=False)`** — build an **unbound** registry whose handlers read the current `RuntimeEnv` at call time (caller supplies it per call via `runtime_env_context`); no eager workspace requirement. `DEFAULT_TOOL_HANDLERS` is now part of the public API.
+- **`ShellBackend.session_key(workspace_dir)`** — the persistent `BashSession` is now cached by the backend's execution-target key, so swapping backends (e.g. local ↔ sandbox, or distinct sandbox containers) no longer needs ad-hoc rebuilds.
+
+### Fixed
+
+- Follow-up dropped on a terminal round (0.6.0) — see below; plus `__init__` export/lint hygiene (`FollowUpQueued`, `DEFAULT_TOOL_HANDLERS` now exported).
+
+### Docs
+
+- README: explicit **"orchestration, not isolation"** scope note — built-in `bash`/file tools run in-process and are not a security boundary; sandbox via the `ShellBackend` seam.
+
+## [0.6.0] — 2026-06-11
+
+### Fixed — Follow-up on a terminal round
+
+- A follow-up enqueued during an otherwise-terminal round (model returned a final answer with no tool calls) was never drained — the queue only drained at the *next* round start, which never came. The loop now drains pending follow-ups before completing and runs another round to address them, so absorbed steering input is always processed.
+
+## [0.5.0] — 2026-06-11
+
+### Added — Pluggable shell backend
+
+- **`runtime.exec_backend`** (`ShellBackend` protocol, `LocalShellBackend`, `DEFAULT_SHELL_BACKEND`) and **`RuntimeEnv.shell_backend`** — host code can route the persistent shell into an isolated sandbox (e.g. `docker exec`) instead of an in-process `/bin/bash`, without changing tool implementations. Default behavior unchanged.
+
 ## [0.4.1] — 2026-06-08
 
 ### Added — In-flight steering (`follow_up`)

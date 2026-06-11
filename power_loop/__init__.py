@@ -22,11 +22,11 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "0.4.1"
+__version__ = "0.7.2"
 
+from power_loop.agent.follow_up import FollowUpQueued
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
-from power_loop.agent.follow_up import FollowUpQueued
 from power_loop.agent.system_prompt import (
     BUILTIN_SECTIONS,
     DEFAULT_AGENT_SYSTEM_PROMPT,
@@ -116,7 +116,12 @@ from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
 from power_loop.runtime.budget import estimate_text_tokens, estimate_tokens, trim_history
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
-from power_loop.runtime.env import RuntimeEnv, RuntimeEnvError
+from power_loop.runtime.env import RuntimeEnv, RuntimeEnvError, runtime_env_context
+from power_loop.runtime.exec_backend import (
+    DEFAULT_SHELL_BACKEND,
+    LocalShellBackend,
+    ShellBackend,
+)
 from power_loop.runtime.human_input import HumanInputRequired, request_user_input
 from power_loop.runtime.memory import MemoryProvider, MemorySnapshot, tag_as_memory
 from power_loop.runtime.provider import (
@@ -157,7 +162,12 @@ from power_loop.runtime.structured import (
     StructuredOutputSpec,
     parse_structured,
 )
-from power_loop.tools import ToolRegistry, build_registry, create_default_tool_registry
+from power_loop.tools import (
+    DEFAULT_TOOL_HANDLERS,
+    ToolRegistry,
+    build_registry,
+    create_default_tool_registry,
+)
 from power_loop.tools.default_manifest import (
     CORE_TOOL_NAMES,
     EXPLORE_TOOL_NAMES,
@@ -234,6 +244,10 @@ __all__ = [
 	"CancellationLike",
 	"RuntimeEnv",
 	"RuntimeEnvError",
+	"runtime_env_context",
+	"ShellBackend",
+	"LocalShellBackend",
+	"DEFAULT_SHELL_BACKEND",
 	"HumanInputRequired",
 	"request_user_input",
 	"LlmRetryAttemptedPayload",
@@ -327,6 +341,8 @@ __all__ = [
 	"AsyncToolInSyncContext",
 	"build_registry",
 	"create_default_tool_registry",
+	"DEFAULT_TOOL_HANDLERS",
+	"FollowUpQueued",
 	"get_tool_definitions",
 	"CORE_TOOL_NAMES",
 	"EXPLORE_TOOL_NAMES",

@@ -118,6 +118,49 @@ fall back to the process current working directory. `load_skill` uses
 `AgentLoopConfig.skills_dir`, `skills_dir=...`, or `POWER_LOOP_SKILLS_DIR`.
 Custom tools are unaffected and own their own path/config handling.
 
+### Per-call allowlists
+
+Register the superset once, then expose only the tools allowed for one run:
+
+```python
+result = await loop.send(
+    "Inspect the project",
+    session_id=sid,
+    tools=["read_file", "glob", "grep"],
+)
+```
+
+The sequence is resolved through `ToolRegistry.subset()`, so unknown names are
+ignored and the LLM only receives definitions for the selected tools.
+`ToolRegistry.names()` returns the registered names. You may also pass a
+separate `ToolRegistry` directly.
+
+### Unbound registries
+
+For a host that reuses one registry across workspaces, defer environment
+resolution until handler invocation:
+
+```python
+from power_loop import RuntimeEnv, create_default_tool_registry, runtime_env_context
+
+registry = create_default_tool_registry(preset="core", bind=False)
+
+with runtime_env_context(RuntimeEnv(workspace_dir="/srv/tenant-a")):
+    result = await registry.invoke_async("read_file", {"path": "README.md"})
+```
+
+`DEFAULT_TOOL_HANDLERS` is public for hosts that need to compose the built-in
+handlers with their own definitions.
+
+### Shell execution boundary
+
+The default `LocalShellBackend` starts `/bin/bash` on the host and inherits the
+host environment. It is orchestration, not isolation. Untrusted commands need
+a host-provided `ShellBackend` that launches inside a container, gVisor, or
+another sandbox. `session_key(workspace_dir)` identifies the execution target
+used to cache persistent shell sessions; different targets must return
+different keys.
+
 Presets:
 
 | Preset | Tools |

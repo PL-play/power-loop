@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+from power_loop.tools.default_manifest import get_tool_definitions
+from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
 from power_loop.tools.registry import ToolRegistry, build_registry
 
 _WORKSPACE_TOOL_NAMES = {
@@ -28,6 +30,7 @@ def create_default_tool_registry(
     workspace_dir: str | Path | None = None,
     home_dir: str | Path | None = None,
     skills_dir: str | Path | None = None,
+    bind: bool = True,
 ) -> ToolRegistry:
     """Create a :class:`ToolRegistry` pre-loaded with default tools.
 
@@ -47,6 +50,9 @@ def create_default_tool_registry(
             If omitted, ``POWER_LOOP_HOME`` is used when present.
         skills_dir: Optional default skills directory for ``load_skill``.
             If omitted, ``POWER_LOOP_SKILLS_DIR`` is used when present.
+        bind: When true (default), bind handlers to one ``RuntimeEnv`` now.
+            When false, return handlers that resolve the current
+            ``runtime_env_context`` at invocation time.
 
     Examples::
 
@@ -65,10 +71,11 @@ def create_default_tool_registry(
             workspace_dir="/path/to/project",
         )
     """
-    from power_loop.tools.default_manifest import get_tool_definitions
-    from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-
     definitions = get_tool_definitions(preset=preset, include=include, exclude=exclude)
+    if not bind:
+        # Unbound: handlers read the current RuntimeEnv at call time; the caller
+        # supplies it per call via runtime_env_context(...). No eager workspace.
+        return build_registry(definitions, DEFAULT_TOOL_HANDLERS)
     names = {definition.name for definition in definitions}
     runtime_env = RuntimeEnv.from_env(
         workspace_dir=workspace_dir,
@@ -100,4 +107,6 @@ __all__ = [
     "ToolRegistry",
     "build_registry",
     "create_default_tool_registry",
+    "get_tool_definitions",
+    "DEFAULT_TOOL_HANDLERS",
 ]

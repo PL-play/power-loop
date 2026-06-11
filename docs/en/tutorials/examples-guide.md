@@ -1181,6 +1181,36 @@ print(result.final_text)
 
 ---
 
+## 23 · Per-Call Overrides
+
+**Concept**: Reuse one loop while selecting a tool allowlist and system prompt
+for each send; reuse an unbound default registry across runtime workspaces.
+
+### Code
+
+```python
+result = await loop.send(
+    "Check Tokyo weather and AAPL",
+    session_id=sid,
+    tools=["get_weather"],
+    system_prompt="Answer briefly.",
+)
+
+unbound = create_default_tool_registry(include=["read_file"], bind=False)
+with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
+    text = await unbound.invoke_async("read_file", {"path": "profile.txt"})
+```
+
+### Key Points
+
+- A name sequence is resolved as `ToolRegistry.subset()`; the LLM never receives denied tool definitions.
+- `system_prompt` applies only to that run, with precedence over the session and loop config.
+- `send_sync()` and idle `follow_up()` / `follow_up_sync()` support the same overrides.
+- `bind=False` avoids an eager workspace requirement; handlers resolve the current `RuntimeEnv` when invoked.
+- The default local shell is not a sandbox. Inject a `ShellBackend` when commands need isolation.
+
+---
+
 ## Quick Reference
 
 ### Choosing the right example
@@ -1204,5 +1234,6 @@ print(result.final_text)
 | Try the built-in tools | [20](#20-default-tools) |
 | Pause for human input | [21](#21-request-user-input) |
 | Steer an in-flight run | [22](#22-follow-up-steering) |
+| Reuse one loop with per-call policies | [23](#23-per-call-overrides) |
 | Build runtime-bound tools | [Advanced Runtime](../../../examples/advanced_runtime/) |
 | See everything together | [19](#19-full-chatbot) |
