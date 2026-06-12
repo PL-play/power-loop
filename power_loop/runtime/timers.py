@@ -9,6 +9,10 @@ Design (one store file = one process, like everything else here):
   idle session gets a regular ``send``; a session mid-run gets the note
   injected at the next round boundary (``FollowUpQueued``). There is exactly
   one path into a conversation.
+* **Recurrence is declared at creation** (``interval_s`` on the row /
+  ``every_seconds`` on the tool): NULL = one-shot (``firing -> fired``);
+  set = the firing re-arms at fire-time + interval (fixed-delay) until
+  cancelled. Cancelling is the only way a recurring timer ends.
 * **At-least-once.** A claim is a compare-and-set ``armed -> firing``; rows
   stuck in ``firing`` (process died mid-fire) are re-armed on the next
   :meth:`TimerRunner.start` / periodic recovery sweep and may deliver twice.
@@ -172,10 +176,9 @@ class TimerRunner:
             self._emit(timer, "cancelled")
             return
         if ctx.directive == HookDirective.SKIP:
-            store.transition_timer(
-                timer.session_id, timer.timer_id,
-                from_status="firing", to_status="fired",
-            )
+            # Skip THIS firing only: a recurring timer still re-arms for the
+            # next period; a one-shot is done.
+            store.finish_firing_timer(timer.session_id, timer.timer_id)
             self._emit(timer, "skipped")
             return
         if ctx.postpone_s and ctx.postpone_s > 0:
@@ -192,10 +195,9 @@ class TimerRunner:
 
         result = await self._loop.follow_up(ctx.message, timer.session_id)
         outcome = "queued" if isinstance(result, FollowUpQueued) else "delivered"
-        store.transition_timer(
-            timer.session_id, timer.timer_id,
-            from_status="firing", to_status="fired",
-        )
+        # One-shot -> fired; recurring -> re-armed at fire-time + interval
+        # (fixed-delay: periods missed while the process was down collapse).
+        store.finish_firing_timer(timer.session_id, timer.timer_id)
         self._emit(timer, outcome)
         logger.info(
             "timers: %s/%d %s (note=%r)",

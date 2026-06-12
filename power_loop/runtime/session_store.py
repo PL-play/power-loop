@@ -173,6 +173,9 @@ CREATE TABLE IF NOT EXISTS timers (
     due_at            INTEGER NOT NULL,
     note              TEXT NOT NULL,
     status            TEXT NOT NULL DEFAULT 'armed',
+    interval_s        INTEGER,
+    fire_count        INTEGER NOT NULL DEFAULT 0,
+    last_fired_at     INTEGER,
     created_at        INTEGER NOT NULL,
     updated_at        INTEGER NOT NULL,
     PRIMARY KEY (session_id, timer_id)
@@ -193,15 +196,21 @@ CREATE TABLE IF NOT EXISTS notes (
 
 @dataclass
 class TimerRow:
-    """A durable per-session wake-up. status: armed -> firing -> fired,
-    or armed -> cancelled. The TIMER row is the source of truth; any
-    in-process scheduling is just an accelerator over it."""
+    """A durable per-session wake-up. One-shot (interval_s is None):
+    armed -> firing -> fired | cancelled. Recurring (interval_s set):
+    armed -> firing -> armed again at fire-time + interval (fixed-delay,
+    missed periods while down collapse into one) until cancelled.
+    The row is the source of truth; in-process scheduling is just an
+    accelerator over it."""
 
     session_id: str
     timer_id: int
     due_at: int  # epoch ms
     note: str
     status: str
+    interval_s: int | None
+    fire_count: int
+    last_fired_at: int | None
     created_at: int
     updated_at: int
 
@@ -304,6 +313,19 @@ class NoteRow:
     updated_at: int
 
 
+def _micro_migrate(conn: sqlite3.Connection) -> None:
+    """Additive column upgrades for stores created by older versions
+    (CREATE TABLE IF NOT EXISTS never alters an existing table)."""
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(timers)")}
+    for name, ddl in (
+        ("interval_s", "ALTER TABLE timers ADD COLUMN interval_s INTEGER"),
+        ("fire_count", "ALTER TABLE timers ADD COLUMN fire_count INTEGER NOT NULL DEFAULT 0"),
+        ("last_fired_at", "ALTER TABLE timers ADD COLUMN last_fired_at INTEGER"),
+    ):
+        if name not in cols:
+            conn.execute(ddl)
+
+
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
@@ -349,6 +371,7 @@ class SessionStore:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(SCHEMA_SQL)
+        _micro_migrate(conn)
         return cls(conn, path_str)
 
     def close(self) -> None:
@@ -1031,7 +1054,9 @@ class SessionStore:
 
     # ── timers (durable wake-ups; see runtime/timers.py) ──────────────────
 
-    def create_timer(self, session_id: str, *, due_at: int, note: str) -> TimerRow:
+    def create_timer(
+        self, session_id: str, *, due_at: int, note: str, interval_s: int | None = None
+    ) -> TimerRow:
         now = _now_ms()
         with self._lock, self._conn:
             row = self._conn.execute(
@@ -1042,12 +1067,14 @@ class SessionStore:
             self._conn.execute(
                 """
                 INSERT INTO timers (session_id, timer_id, due_at, note, status,
-                                    created_at, updated_at)
-                VALUES (?,?,?,?, 'armed', ?, ?)
+                                    interval_s, created_at, updated_at)
+                VALUES (?,?,?,?, 'armed', ?, ?, ?)
                 """,
-                (session_id, timer_id, int(due_at), note, now, now),
+                (session_id, timer_id, int(due_at), note,
+                 int(interval_s) if interval_s else None, now, now),
             )
-        return TimerRow(session_id, timer_id, int(due_at), note, "armed", now, now)
+        return TimerRow(session_id, timer_id, int(due_at), note, "armed",
+                        int(interval_s) if interval_s else None, 0, None, now, now)
 
     def get_timer(self, session_id: str, timer_id: int) -> TimerRow | None:
         with self._lock:
@@ -1102,6 +1129,27 @@ class SessionStore:
             )
             return cur.rowcount > 0
 
+    def finish_firing_timer(self, session_id: str, timer_id: int) -> bool:
+        """Complete a delivery: one-shot firing -> fired; recurring firing ->
+        armed at now + interval (fixed-delay — missed periods collapse).
+        Bumps fire_count / last_fired_at either way."""
+        now = _now_ms()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """
+                UPDATE timers SET
+                    status = CASE WHEN interval_s IS NULL THEN 'fired' ELSE 'armed' END,
+                    due_at = CASE WHEN interval_s IS NULL THEN due_at
+                                  ELSE ? + interval_s * 1000 END,
+                    fire_count = fire_count + 1,
+                    last_fired_at = ?,
+                    updated_at = ?
+                WHERE session_id=? AND timer_id=? AND status='firing'
+                """,
+                (now, now, now, session_id, int(timer_id)),
+            )
+            return cur.rowcount > 0
+
     def recover_stale_firing_timers(self, *, older_than_ms: int) -> int:
         """Re-arm 'firing' rows that never finished (process died mid-fire).
         At-least-once: a re-armed timer may deliver twice; the TIMER_FIRE hook
@@ -1123,6 +1171,9 @@ def _row_to_timer(row: sqlite3.Row) -> TimerRow:
         due_at=row["due_at"],
         note=row["note"],
         status=row["status"],
+        interval_s=row["interval_s"],
+        fire_count=row["fire_count"],
+        last_fired_at=row["last_fired_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

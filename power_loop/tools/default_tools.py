@@ -1190,7 +1190,7 @@ WAKEUP_MAX_DELAY_S = 30 * 86400
 WAKEUP_MAX_LIVE = 10  # live (armed) timers per session
 
 
-def run_schedule_wakeup(delay_seconds: int, note: str) -> str:
+def run_schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | None = None) -> str:
     import time as _time
 
     store, sid = _timers_store_and_session()
@@ -1198,6 +1198,11 @@ def run_schedule_wakeup(delay_seconds: int, note: str) -> str:
     if not (WAKEUP_MIN_DELAY_S <= delay <= WAKEUP_MAX_DELAY_S):
         raise ValueError(
             f"delay_seconds must be between {WAKEUP_MIN_DELAY_S} and {WAKEUP_MAX_DELAY_S}"
+        )
+    interval = int(every_seconds) if every_seconds else None
+    if interval is not None and not (WAKEUP_MIN_DELAY_S <= interval <= WAKEUP_MAX_DELAY_S):
+        raise ValueError(
+            f"every_seconds must be between {WAKEUP_MIN_DELAY_S} and {WAKEUP_MAX_DELAY_S}"
         )
     if not (note or "").strip():
         raise ValueError("note is required — write what future-you should do")
@@ -1208,8 +1213,14 @@ def run_schedule_wakeup(delay_seconds: int, note: str) -> str:
             "Cancel or merge some first (list_wakeups / cancel_wakeup)."
         )
     timer = store.create_timer(
-        sid, due_at=int(_time.time() * 1000 + delay * 1000), note=note.strip()
+        sid, due_at=int(_time.time() * 1000 + delay * 1000), note=note.strip(),
+        interval_s=interval,
     )
+    if interval:
+        return (
+            f"Recurring wake-up #{timer.timer_id} scheduled: first in {delay}s, "
+            f"then every {interval}s until you cancel it."
+        )
     return f"Wake-up #{timer.timer_id} scheduled in {delay}s. You'll receive your note."
 
 
@@ -1222,7 +1233,9 @@ def run_list_wakeups() -> str:
         return "No wake-ups scheduled."
     now = _time.time() * 1000
     lines = [
-        f"#{t.timer_id} in {max(0, int((t.due_at - now) / 1000))}s ({t.status}): {t.note}"
+        f"#{t.timer_id} in {max(0, int((t.due_at - now) / 1000))}s"
+        + (f" (every {t.interval_s}s, fired {t.fire_count}x)" if t.interval_s else "")
+        + f" ({t.status}): {t.note}"
         for t in timers
     ]
     return "\n".join(lines)
@@ -1270,7 +1283,9 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
         kw["note_id"], kw.get("content"), kw.get("pinned")
     ),
     "note_delete": lambda **kw: run_note_delete(kw["note_id"]),
-    "schedule_wakeup": lambda **kw: run_schedule_wakeup(kw["delay_seconds"], kw["note"]),
+    "schedule_wakeup": lambda **kw: run_schedule_wakeup(
+        kw["delay_seconds"], kw["note"], kw.get("every_seconds")
+    ),
     "list_wakeups": lambda **kw: run_list_wakeups(),
     "cancel_wakeup": lambda **kw: run_cancel_wakeup(kw["timer_id"]),
     "current_time": lambda **kw: run_current_time(),

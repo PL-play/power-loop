@@ -238,14 +238,16 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         description=(
             "Schedule a durable wake-up for yourself: after the delay you receive your note "
             "back as a message and can act on it (check a long task, follow up on a promise). "
+            "Set every_seconds to make it RECURRING (fires repeatedly until you cancel_wakeup). "
             "Survives restarts. Requires the host to run a TimerRunner; if the host documented "
             "no timer support, don't rely on this firing."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "delay_seconds": {"type": "integer", "description": "Seconds from now (min 5, max 30 days)."},
+                "delay_seconds": {"type": "integer", "description": "Seconds until the FIRST fire (min 5, max 30 days)."},
                 "note": {"type": "string", "description": "What future-you should do when woken. Be specific."},
+                "every_seconds": {"type": "integer", "description": "Optional: repeat every N seconds after each fire (fixed-delay) until cancelled. Omit for one-shot."},
             },
             "required": ["delay_seconds", "note"],
         },

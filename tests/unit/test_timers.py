@@ -245,6 +245,64 @@ async def test_stale_firing_rows_recovered_on_start(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_recurring_timer_rearms_until_cancelled(tmp_path):
+    loop = _loop(tmp_path, responses=[
+        LLMResponse(raw_text="beat 1", content_text="beat 1"),
+        LLMResponse(raw_text="beat 2", content_text="beat 2"),
+    ])
+    sid = loop.new_session()
+    past = int(time.time() * 1000) - 1000
+    loop.schedule_timer(sid, due_at_ms=past, note="heartbeat", interval_s=3600)
+    runner = TimerRunner(loop)
+    assert await runner.scan_once() == 1
+    row = loop.store.get_timer(sid, 1)
+    assert row.status == "armed"          # re-armed, not fired
+    assert row.fire_count == 1
+    assert row.due_at > int(time.time() * 1000)  # fixed-delay: now + interval
+    # not due yet → second scan is a no-op
+    assert await runner.scan_once() == 0
+    # force it due again → second delivery
+    loop.store.transition_timer(sid, 1, from_status="armed", to_status="armed", due_at=past)
+    assert await runner.scan_once() == 1
+    assert loop.store.get_timer(sid, 1).fire_count == 2
+    # cancel is the only exit
+    assert loop.cancel_timer(sid, 1) is True
+    assert loop.store.get_timer(sid, 1).status == "cancelled"
+    loop.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_skip_keeps_recurring_cycle(tmp_path):
+    from power_loop import HookDirective
+    from power_loop.core.hooks import AgentHooks
+
+    hooks = AgentHooks()
+    hooks.register(HookPoint.TIMER_FIRE, lambda ctx: setattr(ctx, "directive", HookDirective.SKIP))
+    loop = _loop(tmp_path, hooks=hooks)
+    sid = loop.new_session()
+    loop.schedule_timer(
+        sid, due_at_ms=int(time.time() * 1000) - 1000, note="n", interval_s=3600
+    )
+    await TimerRunner(loop).scan_once()
+    row = loop.store.get_timer(sid, 1)
+    assert row.status == "armed"  # skipped this period, cycle continues
+    # nothing delivered
+    assert not [m for m in loop.get_messages(sid) if m.get("role") == "user"]
+    loop.close()
+
+
+def test_one_shot_vs_recurring_declared_at_creation(tmp_path):
+    loop = _loop(tmp_path)
+    sid = loop.new_session()
+    one = loop.schedule_timer(sid, delay_s=60, note="once")
+    rec = loop.schedule_timer(sid, delay_s=60, note="repeat", interval_s=300)
+    assert one.interval_s is None and rec.interval_s == 300
+    with pytest.raises(ValueError):
+        loop.schedule_timer(sid, delay_s=60, note="bad", interval_s=0)
+    loop.close()
+
+
+@pytest.mark.asyncio
 async def test_timer_for_deleted_session_is_cancelled(tmp_path):
     loop = _loop(tmp_path)
     sid = loop.new_session()

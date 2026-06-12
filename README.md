@@ -205,13 +205,20 @@ restarts, and cascade-deletes with its session. Firing is a normal message —
 `follow_up` delivers it (idle session → a regular send; mid-run → injected at
 the next round boundary), so there is exactly one path into a conversation.
 
+One-shot vs recurring is **declared at creation**: `every_seconds` on the
+tool / `interval_s` on the API. A recurring timer re-arms after each delivery
+at fire-time + interval (fixed-delay — periods missed while the process was
+down collapse into one), and `cancel` is the only way it ends.
+
 ```python
 from power_loop import TimerRunner, HookPoint, TimerFireCtx
 
 # agent-side: register the default tools schedule_wakeup / list_wakeups /
-# cancel_wakeup / current_time — the model schedules its own wake-ups.
+# cancel_wakeup / current_time — the model schedules its own wake-ups
+# (schedule_wakeup(delay_seconds, note, every_seconds=None)).
 # host-side:
 loop.schedule_timer(sid, delay_s=600, note="check the export job")
+loop.schedule_timer(sid, delay_s=60, note="heartbeat", interval_s=3600)  # recurring
 
 runner = TimerRunner(loop)        # scans store.due_timers(), re-arms stale rows
 await runner.start()

@@ -8,6 +8,21 @@
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-06-12
+
+### Added
+
+- **周期性定时任务（一等语义，创建时声明）**：`timers` 表新增 `interval_s` /
+  `fire_count` / `last_fired_at`（旧库自动微迁移补列）。
+  - `interval_s IS NULL` = 一次性（`firing → fired`）；设置 = 每次投递后
+    `firing → armed`，`due_at = 触发时刻 + interval`（**fixed-delay**：
+    停机期间漏掉的周期坍缩成一次，不会补发风暴）；`cancel` 是周期任务唯一出口。
+  - 工具 `schedule_wakeup` 新增可选 `every_seconds`；`loop.schedule_timer`
+    新增 `interval_s`；`list_wakeups` 显示周期与已触发次数。
+  - hook 语义随之落位：SKIP = 跳过本次、周期照常排下次；BREAK = 终止整个周期。
+- **真实 LLM 测试** `tests/real/test_real_timers.py`：模型自排唤醒并在被叫醒后
+  执行 note（暗号复述）；周期 timer 连续两次真实投递后 cancel 终止。
+
 ## [0.11.0] — 2026-06-12
 
 ### Added

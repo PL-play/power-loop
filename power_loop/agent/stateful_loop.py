@@ -380,11 +380,14 @@ class StatefulAgentLoop:
         delay_s: float | None = None,
         due_at_ms: int | None = None,
         note: str,
+        interval_s: int | None = None,
     ):
         """Create a durable wake-up for this session (external/orchestrator
         path; agents use the ``schedule_wakeup`` tool). Provide exactly one of
-        ``delay_s`` / ``due_at_ms``. Fires only while a ``TimerRunner`` (or an
-        external scheduler polling ``store.due_timers()``) is running."""
+        ``delay_s`` / ``due_at_ms``. ``interval_s`` makes it recurring: after
+        each delivery it re-arms at fire-time + interval (fixed-delay) until
+        cancelled. Fires only while a ``TimerRunner`` (or an external
+        scheduler polling ``store.due_timers()``) is running."""
         import time as _time
 
         self._ensure_session_or_raise(session_id)
@@ -397,7 +400,11 @@ class StatefulAgentLoop:
         else:
             assert delay_s is not None
             due = int(_time.time() * 1000 + float(delay_s) * 1000)
-        return self.store.create_timer(session_id, due_at=due, note=note.strip())
+        if interval_s is not None and int(interval_s) < 1:
+            raise ValueError("interval_s must be >= 1 second")
+        return self.store.create_timer(
+            session_id, due_at=due, note=note.strip(), interval_s=interval_s
+        )
 
     def cancel_timer(self, session_id: str, timer_id: int) -> bool:
         """Cancel an armed timer. Returns False when it already fired /

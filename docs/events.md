@@ -232,6 +232,8 @@ Payload — `TimerFiredPayload`：
 | `outcome` | `str` | `delivered` / `queued`（运行中注入 follow_up）/ `skipped` / `cancelled` / `postponed` / `error` |
 
 每次到期 timer 被处理时触发一次（含被 hook 否决的情况，看 `outcome`）。
+周期性 timer（创建时设 `interval_s` / 工具参数 `every_seconds`）每个周期各
+触发一次本事件；投递后自动重排（fixed-delay），cancel 才会终止。
 
 ### 2.6 Todo
 

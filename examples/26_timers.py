@@ -11,6 +11,9 @@ What you learn / 你将学到
   空闲 = 正常 send，运行中 = 轮边界插话，**进会话只有一条路**
 - ``HookPoint.TIMER_FIRE``：投递前的否决点（busy 判断 / 去重 / 改期 / 取消），
   无 hook 默认直接投递
+- **一次性 vs 周期性在创建时声明**：``every_seconds`` / ``interval_s``——
+  NULL = 一次性（fired 终结）；设置 = 每次投递后从触发时刻 + interval 重排
+  （fixed-delay，停机漏掉的坍缩成一次），cancel 是周期任务唯一的出口
 
 设计要点 / Design notes
 -----------------------
