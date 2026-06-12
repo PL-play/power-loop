@@ -134,7 +134,8 @@ class SQLiteSink:
                         "tool_calls": remaining_tool_calls,
                     }
                     state = self.store.get_state(self.session_id)
-                    interactions = list((state.pending if state else {}).get("pending_interactions") or [])
+                    prior = state.pending if state is not None and state.pending else {}
+                    interactions = list(prior.get("pending_interactions") or [])
                     remaining_interactions = [
                         item for item in interactions
                         if str(item.get("tool_call_id") or "") in self._unresolved

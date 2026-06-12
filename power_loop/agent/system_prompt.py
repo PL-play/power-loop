@@ -226,7 +226,7 @@ def format_tool_catalog(
     """
     # Accept both ToolRegistry and plain sequences.
     if hasattr(tools, "definitions"):
-        defs: Sequence[ToolDefinition] = tools.definitions()  # type: ignore[union-attr]
+        defs: Sequence[ToolDefinition] = tools.definitions()
     else:
         defs = tools
 
