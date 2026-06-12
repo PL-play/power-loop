@@ -104,6 +104,8 @@ class ContextManager:
     usage_totals: dict[str, int] = field(default_factory=dict)
     #: 可选计数器，供测试/扩展使用；**不会**被 ``update_usage`` 自动递增
     api_calls: int = 0
+    #: 本次 run 已执行的工具调用次数（pipeline.execute_tool 递增）。
+    tool_calls: int = 0
 
     subagent_records: list[dict[str, Any]] = field(default_factory=list)
 

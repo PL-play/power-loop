@@ -204,12 +204,33 @@ class HitRoundLimitStatusPayload(StatusChangedPayload):
     max_rounds: int = 0
 
 
+@dataclass
+class BudgetExceededStatusPayload(StatusChangedPayload):
+    kind: str = "budget_exceeded"
+    budget_tokens: int = 0
+    spent_tokens: int = 0
+    rounds: int = 0
+
+
 # ── Usage ──
 
 
 @dataclass
 class UsageUpdatedPayload(BaseEventPayload):
     usage: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PhaseEventPayload(BaseEventPayload):
+    """Generic payload for events published by the ``@phase`` decorator
+    (user-defined pipelines). Built-in pipeline events all have their own
+    typed payload class; this wrapper guarantees ``event.data`` is never
+    None even on the generic path."""
+
+    values: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self.values)
 
 
 # ── Todo ──

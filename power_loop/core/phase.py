@@ -28,6 +28,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from power_loop.contracts.event_payloads import PhaseEventPayload
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint
 
@@ -147,7 +148,7 @@ def phase(
             if start_event is not None:
                 bus.publish(AgentEvent(
                     type=start_event,
-                    payload=ctx.values.get("event_payload", {}),
+                    data=PhaseEventPayload(values=ctx.values.get("event_payload", {})),
                     **event_meta,
                 ))
 
@@ -186,7 +187,7 @@ def phase(
             if end_event is not None:
                 bus.publish(AgentEvent(
                     type=end_event,
-                    payload=ctx.values.get("event_payload", {}),
+                    data=PhaseEventPayload(values=ctx.values.get("event_payload", {})),
                     **event_meta,
                 ))
 

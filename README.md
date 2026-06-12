@@ -18,6 +18,13 @@ agent runs model-authored or otherwise untrusted commands, run them in your own 
 (`runtime.exec_backend`); power-loop launches the persistent shell through your backend.
 Keep secrets in your orchestrator — the loop does not scrub the tool environment for you.
 
+**One store file = one process.** Per-session serialization is an in-process
+`asyncio.Lock`; the SQLite store itself happily opens from multiple processes,
+but two processes calling `send()` on the same session bypass all ordering
+guarantees and can interleave histories. Run one process per store file (scale
+by sharding sessions across processes/files), or put your own distributed lock
+in front.
+
 Likewise there is **no built-in scheduler/timer**: a session only runs while a `send()` /
 `resume()` call is in flight. "Wake this agent again in 10 minutes" is orchestrator state —
 keep it in your own durable store and call `send()` when it fires (that survives restarts;
@@ -140,6 +147,40 @@ res.usage
 For per-call, real-time metering subscribe to the `usage_updated` event (one
 per LLM call, tagged with `session_id`). See
 [`examples/25_token_usage.py`](examples/25_token_usage.py).
+
+**Budget guardrail** — cap real provider tokens per run (rounds are cheap,
+tokens are money):
+
+```python
+config = AgentLoopConfig(max_rounds=24, max_tokens_per_run=50_000)
+res = await loop.send("…", session_id=sid)
+res.status  # "budget_exceeded" when the cap is hit
+```
+
+Checked at round boundaries: the round that crosses the budget finishes
+cleanly (no dangling tool_calls), then the loop stops without paying for the
+next LLM call. A `status_changed` event with `kind="budget_exceeded"` fires.
+
+**Session statistics** — cumulative accounting persisted in the store,
+bumped once per finished send:
+
+```python
+stats = loop.get_session_stats(sid)
+# SessionStatsRow(sends=12, rounds=29, llm_calls=31, tool_calls=18,
+#                 prompt_tokens=…, completion_tokens=…, total_tokens=…,
+#                 first_send_at=…, last_send_at=…)
+loop.list_session_stats()  # every session, most recently active first
+```
+
+**Structured event logging** — one JSON line per event, stdlib-only:
+
+```python
+from power_loop.contrib.logging_sink import attach_logging_sink
+
+bus = AgentEventBus(suppress_subscriber_errors=True)
+attach_logging_sink(bus)   # or events={AgentEventType.USAGE_UPDATED}
+loop = StatefulAgentLoop(llm=llm, event_bus=bus, ...)
+```
 
 ### Crash recovery: `heal_pending`
 

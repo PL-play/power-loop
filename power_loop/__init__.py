@@ -22,7 +22,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 from power_loop.agent.follow_up import FollowUpQueued
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
@@ -56,12 +56,14 @@ from power_loop.contracts.event_payloads import (
     AgentErrorPayload,
     AutoCompactStatusPayload,
     BaseEventPayload,
+    BudgetExceededStatusPayload,
     HitRoundLimitStatusPayload,
     LlmDegradedPayload,
     LlmRetryAttemptedPayload,
     LoopCancelledPayload,
     MemoryFailedPayload,
     MemoryRecalledPayload,
+    PhaseEventPayload,
     RoundCompletedPayload,
     RoundStartedPayload,
     RoundToolsPresentPayload,
@@ -153,6 +155,7 @@ from power_loop.runtime.session_store import (
     MessageState,
     SessionKind,
     SessionRow,
+    SessionStatsRow,
     SessionStatus,
     SessionStore,
     SubagentLifecycle,
@@ -221,6 +224,7 @@ __all__ = [
 	"AgentLoopResult",
 	"SessionStore",
 	"SessionRow",
+	"SessionStatsRow",
 	"SessionStatus",
 	"SessionKind",
 	"SubagentLifecycle",
@@ -330,7 +334,9 @@ __all__ = [
 	"StatusChangedPayload",
 	"AutoCompactStatusPayload",
 	"RoundUsageStatusPayload",
+	"BudgetExceededStatusPayload",
 	"HitRoundLimitStatusPayload",
+	"PhaseEventPayload",
 	"UsageUpdatedPayload",
 	"TodoUpdatedPayload",
 	"UserNotificationPayload",

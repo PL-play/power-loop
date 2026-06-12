@@ -87,6 +87,17 @@ async def main() -> None:
             f"in={res2.usage.get('prompt_tokens')} out={res2.usage.get('completion_tokens')}"
         )
 
+        # ── 累计记账：session_stats（store 持久化，跨 send 累加） ────────
+        stats = loop.get_session_stats(sid)
+        print(
+            f"session stats: sends={stats.sends} rounds={stats.rounds} "
+            f"llm_calls={stats.llm_calls} tool_calls={stats.tool_calls} "
+            f"in={stats.prompt_tokens} out={stats.completion_tokens}"
+        )
+
+        # ── 预算护栏：max_tokens_per_run（这里演示配置位置，真实值按需设） ──
+        # AgentLoopConfig(max_tokens_per_run=50_000) → 越界后 status="budget_exceeded"
+
         loop.close()
 
 

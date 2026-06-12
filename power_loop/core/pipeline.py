@@ -34,6 +34,7 @@ from power_loop.contracts.errors import (
 from power_loop.contracts.event_payloads import (
     AutoCompactStatusPayload,
     BaseEventPayload,
+    BudgetExceededStatusPayload,
     HitRoundLimitStatusPayload,
     LlmDegradedPayload,
     LlmRetryAttemptedPayload,
@@ -390,6 +391,7 @@ class AgentPipeline:
             pending_interactions=pending_interactions or [],
             messages=self.history,
             usage=dict(self.ctx.usage_totals),
+            tool_calls=int(self.ctx.tool_calls),
         )
 
     def _persist_pending_interaction(
@@ -578,6 +580,7 @@ class AgentPipeline:
         return response
 
     async def execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> tuple[str, bool]:
+        self.ctx.tool_calls += 1
         """Execute a single tool and return ``(output_string, failed)``.
 
         Catches :class:`ToolNotFound` / :class:`ToolValidationError` from
@@ -625,6 +628,28 @@ class AgentPipeline:
             if _is_cancelled(self.cancel_token):
                 await self._finalize("cancelled")
                 return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx)
+
+            # ── Per-run token budget (round boundary: the round that crossed
+            # the budget already finished cleanly, so no dangling tool_calls;
+            # we stop before paying for the next LLM call). ──
+            budget = self.config.max_tokens_per_run
+            if budget is not None and round_idx > 0:
+                totals = self.ctx.usage_totals
+                spent = int(totals.get("prompt_tokens", 0)) + int(totals.get("completion_tokens", 0))
+                if spent >= int(budget):
+                    self._emit(
+                        AgentEventType.STATUS_CHANGED,
+                        BudgetExceededStatusPayload(
+                            budget_tokens=int(budget), spent_tokens=spent, rounds=round_idx,
+                        ),
+                        round_index=round_idx,
+                    )
+                    await self._finalize("budget_exceeded", rounds=round_idx)
+                    return self._make_result(
+                        "budget_exceeded",
+                        final_text="[budget_exceeded]",
+                        rounds=round_idx,
+                    )
 
             # ── Hook: ROUND_START ──
             round_ctx = RoundStartCtx(

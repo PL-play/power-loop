@@ -28,6 +28,7 @@ import secrets
 import sqlite3
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -152,6 +153,20 @@ CREATE TABLE IF NOT EXISTS background_tasks (
 CREATE INDEX IF NOT EXISTS idx_background_tasks_session_status
     ON background_tasks(session_id, status, updated_at);
 
+CREATE TABLE IF NOT EXISTS session_stats (
+    session_id        TEXT PRIMARY KEY,
+    sends             INTEGER NOT NULL DEFAULT 0,
+    rounds            INTEGER NOT NULL DEFAULT 0,
+    llm_calls         INTEGER NOT NULL DEFAULT 0,
+    tool_calls        INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens      INTEGER NOT NULL DEFAULT 0,
+    first_send_at     INTEGER,
+    last_send_at      INTEGER,
+    updated_at        INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS notes (
     session_id        TEXT NOT NULL,
     note_id           INTEGER NOT NULL,
@@ -162,6 +177,23 @@ CREATE TABLE IF NOT EXISTS notes (
     PRIMARY KEY (session_id, note_id)
 );
 """
+
+
+@dataclass
+class SessionStatsRow:
+    """Cumulative per-session accounting (bumped once per finished send)."""
+
+    session_id: str
+    sends: int
+    rounds: int
+    llm_calls: int
+    tool_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    first_send_at: int | None
+    last_send_at: int | None
+    updated_at: int
 
 
 @dataclass
@@ -411,6 +443,7 @@ class SessionStore:
         self._conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM compactions WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM usage_rounds WHERE session_id=?", (session_id,))
+        self._conn.execute("DELETE FROM session_stats WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM session_runtime_state WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM background_tasks WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM notes WHERE session_id=?", (session_id,))
@@ -906,6 +939,83 @@ class SessionStore:
                     total_tokens, model, _now_ms(),
                 ),
             )
+
+
+    # ── session statistics (cumulative, accounting-grade) ────────────────
+    # ``usage_rounds`` is keyed (session, round_index) and round indexes
+    # restart at 0 every send, so it overwrites itself across sends — fine
+    # for inspecting the latest run, useless for accounting. This table is
+    # the cumulative source of truth, bumped once per finished send.
+
+    def bump_session_stats(
+        self,
+        session_id: str,
+        usage: Mapping[str, Any],
+        *,
+        rounds: int = 0,
+        tool_calls: int = 0,
+    ) -> None:
+        now = _now_ms()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO session_stats (
+                    session_id, sends, rounds, llm_calls, tool_calls,
+                    prompt_tokens, completion_tokens, total_tokens,
+                    first_send_at, last_send_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    sends             = sends + 1,
+                    rounds            = rounds + excluded.rounds,
+                    llm_calls         = llm_calls + excluded.llm_calls,
+                    tool_calls        = tool_calls + excluded.tool_calls,
+                    prompt_tokens     = prompt_tokens + excluded.prompt_tokens,
+                    completion_tokens = completion_tokens + excluded.completion_tokens,
+                    total_tokens      = total_tokens + excluded.total_tokens,
+                    last_send_at      = excluded.last_send_at,
+                    updated_at        = excluded.updated_at
+                """,
+                (
+                    session_id, 1,
+                    int(rounds),
+                    int(usage.get("calls") or 0),
+                    int(tool_calls),
+                    int(usage.get("prompt_tokens") or 0),
+                    int(usage.get("completion_tokens") or 0),
+                    int(usage.get("total_tokens") or 0),
+                    now, now, now,
+                ),
+            )
+
+    def get_session_stats(self, session_id: str) -> SessionStatsRow | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM session_stats WHERE session_id=?", (session_id,)
+            ).fetchone()
+        return _row_to_stats(row) if row is not None else None
+
+    def list_session_stats(self) -> list[SessionStatsRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM session_stats ORDER BY updated_at DESC"
+            ).fetchall()
+        return [_row_to_stats(r) for r in rows]
+
+
+def _row_to_stats(row: sqlite3.Row) -> SessionStatsRow:
+    return SessionStatsRow(
+        session_id=row["session_id"],
+        sends=row["sends"],
+        rounds=row["rounds"],
+        llm_calls=row["llm_calls"],
+        tool_calls=row["tool_calls"],
+        prompt_tokens=row["prompt_tokens"],
+        completion_tokens=row["completion_tokens"],
+        total_tokens=row["total_tokens"],
+        first_send_at=row["first_send_at"],
+        last_send_at=row["last_send_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 def _row_to_session(row: sqlite3.Row) -> SessionRow:

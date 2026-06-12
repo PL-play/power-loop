@@ -35,7 +35,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 22 | [`follow_up_steering.py`](22_follow_up_steering.py) | In-flight steering | `follow_up()`, `FollowUpQueued`, `<follow_up>` |
 | 23 | [`23_per_send_overrides.py`](23_per_send_overrides.py) | Per-call tool/prompt overrides | `send(tools=, system_prompt=)`, `ToolRegistry.subset` |
 | 24 | [`24_agent_notes.py`](24_agent_notes.py) | Agent-authored notes | `note_add/update/delete`, `SQLiteNoteMemory`, `NotesPolicy` |
-| 25 | [`25_token_usage.py`](25_token_usage.py) | Token usage accounting | `result.usage`, `usage_updated` event |
+| 25 | [`25_token_usage.py`](25_token_usage.py) | Token usage accounting | `result.usage`, `get_session_stats`, `max_tokens_per_run`, `usage_updated` |
 
 ## Running
 

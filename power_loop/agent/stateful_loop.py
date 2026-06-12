@@ -74,6 +74,8 @@ class StatefulResult:
     #: {prompt_tokens, completion_tokens, cache_read_tokens, reasoning_tokens,
     #:  total_tokens, calls}. Empty when the run never reached the LLM.
     usage: dict[str, int] = field(default_factory=dict)
+    #: Tool invocations executed during this send.
+    tool_calls: int = 0
 
 
 class StatefulAgentLoop:
@@ -363,6 +365,18 @@ class StatefulAgentLoop:
 
     # ── inspection ────────────────────────────────────────────────────────
 
+    def get_session_stats(self, session_id: str):
+        """Cumulative accounting for one session (sends / llm_calls /
+        prompt / completion / total tokens), or ``None`` before its first
+        completed send. See ``SessionStatsRow``."""
+        self._ensure_session_or_raise(session_id)
+        return self.store.get_session_stats(session_id)
+
+    def list_session_stats(self):
+        """Cumulative accounting for every session in this store,
+        most-recently-active first."""
+        return self.store.list_session_stats()
+
     def get_messages(self, session_id: str, *, include_compacted: bool = False) -> list[LoopMessage]:
         rows = (
             self.store.load_all_messages(session_id)
@@ -615,6 +629,12 @@ class StatefulAgentLoop:
                 result: AgentLoopResult = await pipeline.run(history)
             finally:
                 reset_current_loop(loop_token)
+        try:
+            self.store.bump_session_stats(
+                sid, result.usage, rounds=result.rounds, tool_calls=result.tool_calls,
+            )
+        except Exception:
+            logger.exception("session_stats bump failed for %s (continuing)", sid)
         return StatefulResult(
             session_id=sid,
             status=result.status,
@@ -623,6 +643,7 @@ class StatefulAgentLoop:
             pending_tool_calls=result.pending_tool_calls,
             pending_interactions=result.pending_interactions,
             usage=result.usage,
+            tool_calls=result.tool_calls,
         )
 
     def _prime_sink_from_pending(self, sid: str, sink: SQLiteSink) -> None:

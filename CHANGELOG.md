@@ -8,6 +8,38 @@
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-06-12
+
+### Added
+
+- **`AgentLoopConfig.max_tokens_per_run`**：per-run 真实 token 预算护栏。轮边界
+  检查（越界的那一轮完整结束，不留未决 tool_calls），命中后 status =
+  `budget_exceeded`（新 LoopStatus 值），发 `status_changed`
+  （`BudgetExceededStatusPayload`，kind="budget_exceeded"）。默认关闭。
+- **Session 统计**：store 新表 `session_stats`（每次 send 结束累加一次：sends /
+  rounds / llm_calls / tool_calls / prompt / completion / total tokens /
+  first_send_at / last_send_at），随
+  `close_session` 级联删除；新 API `loop.get_session_stats(sid)` /
+  `loop.list_session_stats()`（`SessionStatsRow`）。注意 `usage_rounds` 表按
+  (session, round_index) 覆盖、跨 send 不可累计——记账请用 session_stats。
+- **`power_loop.contrib.logging_sink.attach_logging_sink(bus)`**：标准结构化
+  日志 sink，每个事件一行 JSON（stdlib-only，长字段截断），消灭每个接入方
+  重写"事件→日志"胶水的重复劳动。
+
+- `AgentLoopResult.tool_calls` / `StatefulResult.tool_calls`：本次 run 执行的
+  工具调用次数（`ContextManager.tool_calls` 计数）。
+
+### Changed
+
+- **同步工具 handler 现在跑在工作线程**（`asyncio.to_thread`，contextvars 正常
+  传播）：慢的同步工具不再阻塞事件循环和同进程的其它 session。需要留在事件循环
+  线程的 handler 请改 `async def`。
+- `@phase` 装饰器发布的 start/end 事件改为携带 `PhaseEventPayload`（typed
+  `data`）——至此**所有**内部事件发射路径都保证 `event.data` 非 None（新增契约
+  测试）。
+- README：补「一个 store 文件 = 一个进程」的多进程边界声明（跨进程并发安全
+  暂不实现，先文档约束）。
+
 ## [0.9.0] — 2026-06-12
 
 ### Added

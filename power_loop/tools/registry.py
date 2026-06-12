@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -151,7 +152,14 @@ class ToolRegistry:
     async def invoke_async(self, name: str, args: Mapping[str, Any]) -> Any:
         """Universal invocation entry. Raises :class:`ToolNotFound` if the
         tool is not registered, :class:`ToolValidationError` if args fail
-        validation."""
+        validation.
+
+        Sync handlers run in a worker thread (``asyncio.to_thread``) so a
+        slow tool — a blocking subprocess, a network call — never stalls the
+        event loop and every other session on it. contextvars (runtime env,
+        session identity) propagate into the thread. Handlers that must run
+        on the loop thread should be ``async def``.
+        """
         tool = self._tools.get(name)
         if tool is None:
             raise ToolNotFound(name)
@@ -162,10 +170,13 @@ class ToolRegistry:
         if tool.is_async:
             return await handler(**dict(args))
 
-        try:
-            result = handler(**dict(args))
-        except TypeError:
-            result = handler(dict(args))
+        def _call_sync() -> Any:
+            try:
+                return handler(**dict(args))
+            except TypeError:
+                return handler(dict(args))
+
+        result = await asyncio.to_thread(_call_sync)
         if inspect.isawaitable(result):
             return await result
         return result

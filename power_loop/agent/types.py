@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from power_loop.runtime.retry import LLMRetryPolicy
     from power_loop.runtime.runtime_state import RuntimeProjector
 
-LoopStatus = Literal["completed", "pending_tools", "waiting_for_input", "cancelled", "hit_round_limit", "degraded"]
+LoopStatus = Literal["completed", "pending_tools", "waiting_for_input", "cancelled", "hit_round_limit", "budget_exceeded", "degraded"]
 LoopMessage = dict[str, Any]
 
 
@@ -32,6 +32,12 @@ class AgentLoopConfig:
     max_rounds: int = 24
     temperature: float | None = 0.0
     max_tokens: int | None = 8000
+    #: Hard per-run token budget (prompt + completion summed over the whole
+    #: run, real provider usage — see ``ContextManager.usage_totals``). Checked
+    #: at round boundaries: the round that crosses the budget still finishes
+    #: (so no tool_calls are left dangling), then the loop stops with
+    #: status="budget_exceeded". ``None`` disables.
+    max_tokens_per_run: int | None = None
     compactor: Compactor | None = field(default_factory=_default_compactor)
     retry_policy: LLMRetryPolicy | None = None
     memory: MemoryProvider | None = None
@@ -70,3 +76,5 @@ class AgentLoopResult:
     #: {prompt_tokens, completion_tokens, cache_read_tokens, reasoning_tokens,
     #:  total_tokens, calls}. Empty dict when the run never reached the LLM.
     usage: dict[str, int] = field(default_factory=dict)
+    #: Tool invocations executed during this run.
+    tool_calls: int = 0
