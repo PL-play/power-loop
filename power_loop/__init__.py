@@ -22,7 +22,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 from power_loop.agent.follow_up import FollowUpQueued
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
@@ -79,6 +79,7 @@ from power_loop.contracts.event_payloads import (
     SubagentTaskStartPayload,
     SubagentTextPayload,
     SystemLogPayload,
+    TimerFiredPayload,
     TodoUpdatedPayload,
     ToolCallCompletedPayload,
     ToolCallFailedPayload,
@@ -101,6 +102,7 @@ from power_loop.contracts.hook_contexts import (
     RoundStartCtx,
     SessionEndCtx,
     SessionStartCtx,
+    TimerFireCtx,
     ToolAfterCtx,
     ToolBeforeCtx,
     ToolErrorCtx,
@@ -159,6 +161,7 @@ from power_loop.runtime.session_store import (
     SessionStatus,
     SessionStore,
     SubagentLifecycle,
+    TimerRow,
 )
 from power_loop.runtime.skills import (
     LOAD_SKILL_DEFINITION,
@@ -172,6 +175,7 @@ from power_loop.runtime.structured import (
     StructuredOutputSpec,
     parse_structured,
 )
+from power_loop.runtime.timers import TimerRunner
 from power_loop.tools import (
     DEFAULT_TOOL_HANDLERS,
     ToolRegistry,
@@ -225,6 +229,10 @@ __all__ = [
 	"SessionStore",
 	"SessionRow",
 	"SessionStatsRow",
+	"TimerRow",
+	"TimerRunner",
+	"TimerFireCtx",
+	"TimerFiredPayload",
 	"SessionStatus",
 	"SessionKind",
 	"SubagentLifecycle",

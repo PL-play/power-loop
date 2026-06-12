@@ -363,6 +363,55 @@ class StatefulAgentLoop:
             )
         return len(tool_calls)
 
+    # ── timers (durable wake-ups; fired by runtime.timers.TimerRunner) ────
+
+    @property
+    def hooks(self):
+        return self._runner.hooks
+
+    @property
+    def event_bus(self):
+        return self._runner.event_bus
+
+    def schedule_timer(
+        self,
+        session_id: str,
+        *,
+        delay_s: float | None = None,
+        due_at_ms: int | None = None,
+        note: str,
+    ):
+        """Create a durable wake-up for this session (external/orchestrator
+        path; agents use the ``schedule_wakeup`` tool). Provide exactly one of
+        ``delay_s`` / ``due_at_ms``. Fires only while a ``TimerRunner`` (or an
+        external scheduler polling ``store.due_timers()``) is running."""
+        import time as _time
+
+        self._ensure_session_or_raise(session_id)
+        if (delay_s is None) == (due_at_ms is None):
+            raise ValueError("provide exactly one of delay_s / due_at_ms")
+        if not (note or "").strip():
+            raise ValueError("note is required — the agent needs to know why it woke up")
+        if due_at_ms is not None:
+            due = int(due_at_ms)
+        else:
+            assert delay_s is not None
+            due = int(_time.time() * 1000 + float(delay_s) * 1000)
+        return self.store.create_timer(session_id, due_at=due, note=note.strip())
+
+    def cancel_timer(self, session_id: str, timer_id: int) -> bool:
+        """Cancel an armed timer. Returns False when it already fired /
+        was cancelled / never existed."""
+        self._ensure_session_or_raise(session_id)
+        return self.store.transition_timer(
+            session_id, int(timer_id), from_status="armed", to_status="cancelled"
+        )
+
+    def list_timers(self, session_id: str):
+        """Live (armed/firing) timers for this session, soonest first."""
+        self._ensure_session_or_raise(session_id)
+        return self.store.list_timers(session_id)
+
     # ── inspection ────────────────────────────────────────────────────────
 
     def get_session_stats(self, session_id: str):

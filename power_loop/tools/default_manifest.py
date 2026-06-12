@@ -234,6 +234,46 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=("note_id",),
     ),
     ToolDefinition(
+        name="schedule_wakeup",
+        description=(
+            "Schedule a durable wake-up for yourself: after the delay you receive your note "
+            "back as a message and can act on it (check a long task, follow up on a promise). "
+            "Survives restarts. Requires the host to run a TimerRunner; if the host documented "
+            "no timer support, don't rely on this firing."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "delay_seconds": {"type": "integer", "description": "Seconds from now (min 5, max 30 days)."},
+                "note": {"type": "string", "description": "What future-you should do when woken. Be specific."},
+            },
+            "required": ["delay_seconds", "note"],
+        },
+        required_params=("delay_seconds", "note"),
+    ),
+    ToolDefinition(
+        name="list_wakeups",
+        description="List your scheduled wake-ups (#id, seconds until due, note).",
+        input_schema={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
+        name="cancel_wakeup",
+        description="Cancel one of your scheduled wake-ups by its #id.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "timer_id": {"type": "integer", "description": "The #id from list_wakeups / schedule_wakeup."},
+            },
+            "required": ["timer_id"],
+        },
+        required_params=("timer_id",),
+    ),
+    ToolDefinition(
+        name="current_time",
+        description="Current local date and time (with weekday). Use before scheduling wake-ups or reasoning about deadlines.",
+        input_schema={"type": "object", "properties": {}},
+    ),
+    ToolDefinition(
         name="background_run",
         description="Run a shell command in a private background worker (non-interactive).",
         input_schema={

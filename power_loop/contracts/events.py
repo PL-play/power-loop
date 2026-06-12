@@ -41,6 +41,7 @@ class AgentEventType(str, Enum):
     # Status and usage
     STATUS_CHANGED = "status_changed"
     USAGE_UPDATED = "usage_updated"
+    TIMER_FIRED = "timer_fired"
 
     # Task list / planner (optional feature, used when todo tool is enabled)
     TODO_UPDATED = "todo_updated"

@@ -60,6 +60,30 @@ class SessionEndCtx(BaseHookCtx):
     final_text: str | None = None
 
 
+# ── Timer ──
+
+
+@dataclass
+class TimerFireCtx(BaseHookCtx):
+    """Context for :pyattr:`HookPoint.TIMER_FIRE` — runs when a due timer is
+    about to be delivered to its session. The orchestrator's veto point:
+    check busy state, dedupe after at-least-once re-fires, audit, reroute.
+
+    Directives: CONTINUE delivers (default); SKIP marks the firing as skipped
+    (no delivery, timer done); BREAK cancels the timer. Set ``postpone_s`` > 0
+    (with CONTINUE) to re-arm at now + postpone_s instead of delivering.
+    Handler may rewrite ``message`` — the text that will be injected.
+    """
+
+    session_id: str = ""
+    timer_id: int = 0
+    note: str = ""
+    due_at: int = 0  # epoch ms
+    message: str = ""
+    # Handler output
+    postpone_s: float = 0.0
+
+
 # ── Round ──
 
 

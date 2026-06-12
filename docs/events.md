@@ -220,6 +220,19 @@ res.usage  # {"prompt_tokens": ..., "completion_tokens": ..., "calls": ..., ...}
 是 dict（`event.data` 才是 dataclass，且部分发射路径只填 dict），取值时
 按 dict 处理最稳：`(event.payload or {}).get("usage")`。
 
+#### `timer_fired`
+
+Payload — `TimerFiredPayload`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `timer_id` | `int` | session 内的 timer 编号 |
+| `note` | `str` | 创建时写给自己的备注 |
+| `due_at` | `int` | 到期时间（epoch ms） |
+| `outcome` | `str` | `delivered` / `queued`（运行中注入 follow_up）/ `skipped` / `cancelled` / `postponed` / `error` |
+
+每次到期 timer 被处理时触发一次（含被 hook 否决的情况，看 `outcome`）。
+
 ### 2.6 Todo
 
 #### `todo_updated`

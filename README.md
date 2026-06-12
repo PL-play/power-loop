@@ -25,10 +25,11 @@ guarantees and can interleave histories. Run one process per store file (scale
 by sharding sessions across processes/files), or put your own distributed lock
 in front.
 
-Likewise there is **no built-in scheduler/timer**: a session only runs while a `send()` /
-`resume()` call is in flight. "Wake this agent again in 10 minutes" is orchestrator state —
-keep it in your own durable store and call `send()` when it fires (that survives restarts;
-an in-process timer would not).
+A session still only runs while a `send()` / `resume()` call is in flight — but since
+0.11 there are **durable timers** ("wake this session at T with this note"): rows in the
+session store, created by the agent (`schedule_wakeup` tool) or the host
+(`loop.schedule_timer`), fired by a `TimerRunner` you explicitly start (or by your own
+scheduler polling `store.due_timers()`). No runner running = nothing fires.
 
 ## Install
 
@@ -196,6 +197,37 @@ res = await loop.send("…", session_id=sid, heal_pending=True)
 ```
 
 Or recover explicitly with `resume(sid)` / `abort_pending(sid)`.
+
+### Durable timers
+
+A timer is **data, not a task**: it lives in the session store, survives
+restarts, and cascade-deletes with its session. Firing is a normal message —
+`follow_up` delivers it (idle session → a regular send; mid-run → injected at
+the next round boundary), so there is exactly one path into a conversation.
+
+```python
+from power_loop import TimerRunner, HookPoint, TimerFireCtx
+
+# agent-side: register the default tools schedule_wakeup / list_wakeups /
+# cancel_wakeup / current_time — the model schedules its own wake-ups.
+# host-side:
+loop.schedule_timer(sid, delay_s=600, note="check the export job")
+
+runner = TimerRunner(loop)        # scans store.due_timers(), re-arms stale rows
+await runner.start()
+
+# optional orchestrator veto point before every delivery:
+def gate(ctx: TimerFireCtx):
+    if my_system_is_busy():
+        ctx.postpone_s = 60       # or HookDirective.SKIP / BREAK (cancel)
+loop.hooks.register(HookPoint.TIMER_FIRE, gate)
+```
+
+Semantics are **at-least-once**: a process dying mid-fire re-arms the row and
+it may deliver twice — dedupe in the `TIMER_FIRE` hook if that matters. A
+`timer_fired` event reports every outcome (`delivered` / `queued` / `skipped`
+/ `cancelled` / `postponed` / `error`). See
+[`examples/26_timers.py`](examples/26_timers.py).
 
 ## Public API
 

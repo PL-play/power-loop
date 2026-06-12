@@ -221,6 +221,18 @@ class UsageUpdatedPayload(BaseEventPayload):
 
 
 @dataclass
+class TimerFiredPayload(BaseEventPayload):
+    """Outcome of one due-timer firing: delivered / queued (session was
+    mid-run, injected as follow_up) / skipped / cancelled / postponed /
+    error."""
+
+    timer_id: int = 0
+    note: str = ""
+    due_at: int = 0
+    outcome: str = "delivered"
+
+
+@dataclass
 class PhaseEventPayload(BaseEventPayload):
     """Generic payload for events published by the ``@phase`` decorator
     (user-defined pipelines). Built-in pipeline events all have their own

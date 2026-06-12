@@ -167,6 +167,18 @@ CREATE TABLE IF NOT EXISTS session_stats (
     updated_at        INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS timers (
+    session_id        TEXT NOT NULL,
+    timer_id          INTEGER NOT NULL,
+    due_at            INTEGER NOT NULL,
+    note              TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'armed',
+    created_at        INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (session_id, timer_id)
+);
+CREATE INDEX IF NOT EXISTS idx_timers_due ON timers (status, due_at);
+
 CREATE TABLE IF NOT EXISTS notes (
     session_id        TEXT NOT NULL,
     note_id           INTEGER NOT NULL,
@@ -177,6 +189,21 @@ CREATE TABLE IF NOT EXISTS notes (
     PRIMARY KEY (session_id, note_id)
 );
 """
+
+
+@dataclass
+class TimerRow:
+    """A durable per-session wake-up. status: armed -> firing -> fired,
+    or armed -> cancelled. The TIMER row is the source of truth; any
+    in-process scheduling is just an accelerator over it."""
+
+    session_id: str
+    timer_id: int
+    due_at: int  # epoch ms
+    note: str
+    status: str
+    created_at: int
+    updated_at: int
 
 
 @dataclass
@@ -444,6 +471,7 @@ class SessionStore:
         self._conn.execute("DELETE FROM compactions WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM usage_rounds WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM session_stats WHERE session_id=?", (session_id,))
+        self._conn.execute("DELETE FROM timers WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM session_runtime_state WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM background_tasks WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM notes WHERE session_id=?", (session_id,))
@@ -1000,6 +1028,104 @@ class SessionStore:
                 "SELECT * FROM session_stats ORDER BY updated_at DESC"
             ).fetchall()
         return [_row_to_stats(r) for r in rows]
+
+    # ── timers (durable wake-ups; see runtime/timers.py) ──────────────────
+
+    def create_timer(self, session_id: str, *, due_at: int, note: str) -> TimerRow:
+        now = _now_ms()
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(timer_id), 0) + 1 AS tid FROM timers WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            timer_id = int(row["tid"])
+            self._conn.execute(
+                """
+                INSERT INTO timers (session_id, timer_id, due_at, note, status,
+                                    created_at, updated_at)
+                VALUES (?,?,?,?, 'armed', ?, ?)
+                """,
+                (session_id, timer_id, int(due_at), note, now, now),
+            )
+        return TimerRow(session_id, timer_id, int(due_at), note, "armed", now, now)
+
+    def get_timer(self, session_id: str, timer_id: int) -> TimerRow | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM timers WHERE session_id=? AND timer_id=?",
+                (session_id, int(timer_id)),
+            ).fetchone()
+        return _row_to_timer(row) if row is not None else None
+
+    def list_timers(
+        self, session_id: str, *, statuses: tuple[str, ...] = ("armed", "firing")
+    ) -> list[TimerRow]:
+        marks = ",".join("?" for _ in statuses)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM timers WHERE session_id=? AND status IN ({marks}) "
+                "ORDER BY due_at ASC",
+                (session_id, *statuses),
+            ).fetchall()
+        return [_row_to_timer(r) for r in rows]
+
+    def due_timers(self, *, now: int | None = None, limit: int = 50) -> list[TimerRow]:
+        """Armed timers whose due_at has passed, oldest first."""
+        ts = _now_ms() if now is None else int(now)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM timers WHERE status='armed' AND due_at<=? "
+                "ORDER BY due_at ASC LIMIT ?",
+                (ts, int(limit)),
+            ).fetchall()
+        return [_row_to_timer(r) for r in rows]
+
+    def transition_timer(
+        self,
+        session_id: str,
+        timer_id: int,
+        *,
+        from_status: str,
+        to_status: str,
+        due_at: int | None = None,
+    ) -> bool:
+        """Compare-and-set status transition (claims are race-free even with
+        several runners on one store within the process). Optionally moves
+        due_at (postpone). Returns False when from_status no longer matches."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                """
+                UPDATE timers SET status=?, due_at=COALESCE(?, due_at), updated_at=?
+                WHERE session_id=? AND timer_id=? AND status=?
+                """,
+                (to_status, due_at, _now_ms(), session_id, int(timer_id), from_status),
+            )
+            return cur.rowcount > 0
+
+    def recover_stale_firing_timers(self, *, older_than_ms: int) -> int:
+        """Re-arm 'firing' rows that never finished (process died mid-fire).
+        At-least-once: a re-armed timer may deliver twice; the TIMER_FIRE hook
+        is the place to dedupe if that matters."""
+        cutoff = _now_ms() - int(older_than_ms)
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE timers SET status='armed', updated_at=? "
+                "WHERE status='firing' AND updated_at<?",
+                (_now_ms(), cutoff),
+            )
+            return cur.rowcount
+
+
+def _row_to_timer(row: sqlite3.Row) -> TimerRow:
+    return TimerRow(
+        session_id=row["session_id"],
+        timer_id=row["timer_id"],
+        due_at=row["due_at"],
+        note=row["note"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 def _row_to_stats(row: sqlite3.Row) -> SessionStatsRow:

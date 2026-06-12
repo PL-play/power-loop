@@ -8,6 +8,29 @@
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-06-12
+
+### Added
+
+- **持久定时唤醒（durable timers）**：store 新表 `timers`（timer = 数据非任务，
+  跨重启存活，随 session 级联删除）。
+  - Agent 侧默认工具：`schedule_wakeup(delay_seconds, note)` /
+    `list_wakeups` / `cancel_wakeup(timer_id)` / `current_time`（不在任何
+    preset 里，按需 `get_tool_definitions(include=[...])` 注册）。
+  - 宿主侧 API：`loop.schedule_timer(sid, delay_s=|due_at_ms=, note=)` /
+    `loop.cancel_timer` / `loop.list_timers`（与工具写同一批行）。
+  - **`TimerRunner(loop)`**：进程内扫描器——`start()` 时回收 stale `firing`
+    行（at-least-once，可能二次投递），到期 CAS 认领后经 **`follow_up`**
+    投递（空闲 = send，运行中 = 轮边界注入；进会话只有一条路）。
+    不启动 runner（或外部调度器轮询 `store.due_timers()`）则永不触发。
+  - **`HookPoint.TIMER_FIRE`** + `TimerFireCtx`：投递前编排否决点——
+    CONTINUE 投递 / SKIP 跳过 / BREAK 取消 / `postpone_s` 改期，可改写
+    投递文本；无 hook 默认投递。
+  - 事件 `timer_fired`（`TimerFiredPayload`，outcome: delivered / queued /
+    skipped / cancelled / postponed / error）。
+  - `loop.hooks` / `loop.event_bus` 公开只读属性。
+- 新示例 `examples/26_timers.py`；新增单测 `tests/unit/test_timers.py`（9 个）。
+
 ## [0.10.0] — 2026-06-12
 
 ### Added

@@ -1178,6 +1178,70 @@ def run_note_delete(note_id: int) -> str:
     return f"note #{note_id} deleted ({store.count_notes(sid)} remaining)"
 
 
+def _timers_store_and_session() -> tuple[Any, str]:
+    store, sid = _current_store_and_session()
+    if store is None or sid is None:
+        raise RuntimeError("wakeup tools need an active session (StatefulAgentLoop)")
+    return store, sid
+
+
+WAKEUP_MIN_DELAY_S = 5
+WAKEUP_MAX_DELAY_S = 30 * 86400
+WAKEUP_MAX_LIVE = 10  # live (armed) timers per session
+
+
+def run_schedule_wakeup(delay_seconds: int, note: str) -> str:
+    import time as _time
+
+    store, sid = _timers_store_and_session()
+    delay = int(delay_seconds)
+    if not (WAKEUP_MIN_DELAY_S <= delay <= WAKEUP_MAX_DELAY_S):
+        raise ValueError(
+            f"delay_seconds must be between {WAKEUP_MIN_DELAY_S} and {WAKEUP_MAX_DELAY_S}"
+        )
+    if not (note or "").strip():
+        raise ValueError("note is required — write what future-you should do")
+    live = [t for t in store.list_timers(sid) if t.status == "armed"]
+    if len(live) >= WAKEUP_MAX_LIVE:
+        return (
+            f"Budget exceeded: {len(live)} wake-ups already scheduled. "
+            "Cancel or merge some first (list_wakeups / cancel_wakeup)."
+        )
+    timer = store.create_timer(
+        sid, due_at=int(_time.time() * 1000 + delay * 1000), note=note.strip()
+    )
+    return f"Wake-up #{timer.timer_id} scheduled in {delay}s. You'll receive your note."
+
+
+def run_list_wakeups() -> str:
+    import time as _time
+
+    store, sid = _timers_store_and_session()
+    timers = store.list_timers(sid)
+    if not timers:
+        return "No wake-ups scheduled."
+    now = _time.time() * 1000
+    lines = [
+        f"#{t.timer_id} in {max(0, int((t.due_at - now) / 1000))}s ({t.status}): {t.note}"
+        for t in timers
+    ]
+    return "\n".join(lines)
+
+
+def run_cancel_wakeup(timer_id: int) -> str:
+    store, sid = _timers_store_and_session()
+    if store.transition_timer(sid, int(timer_id), from_status="armed", to_status="cancelled"):
+        return f"Wake-up #{timer_id} cancelled."
+    return f"Wake-up #{timer_id} not found or already fired."
+
+
+def run_current_time() -> str:
+    import datetime as _dt
+
+    now = _dt.datetime.now(_dt.timezone.utc).astimezone()
+    return now.strftime("%Y-%m-%d %H:%M:%S %Z (%A)")
+
+
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120)),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
@@ -1206,6 +1270,10 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
         kw["note_id"], kw.get("content"), kw.get("pinned")
     ),
     "note_delete": lambda **kw: run_note_delete(kw["note_id"]),
+    "schedule_wakeup": lambda **kw: run_schedule_wakeup(kw["delay_seconds"], kw["note"]),
+    "list_wakeups": lambda **kw: run_list_wakeups(),
+    "cancel_wakeup": lambda **kw: run_cancel_wakeup(kw["timer_id"]),
+    "current_time": lambda **kw: run_current_time(),
     "background_run": lambda **kw: run_background(kw["command"]),
     "check_background": lambda **kw: check_background(kw.get("task_id")),
     "request_user_input": lambda **kw: request_user_input(
