@@ -18,6 +18,11 @@ agent runs model-authored or otherwise untrusted commands, run them in your own 
 (`runtime.exec_backend`); power-loop launches the persistent shell through your backend.
 Keep secrets in your orchestrator — the loop does not scrub the tool environment for you.
 
+Likewise there is **no built-in scheduler/timer**: a session only runs while a `send()` /
+`resume()` call is in flight. "Wake this agent again in 10 minutes" is orchestrator state —
+keep it in your own durable store and call `send()` when it fires (that survives restarts;
+an in-process timer would not).
+
 ## Install
 
 ```bash
@@ -118,6 +123,38 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 ```
 
 See [`examples/23_per_send_overrides.py`](examples/23_per_send_overrides.py).
+
+### Token usage accounting
+
+Every `send()` returns the run's cumulative token usage — summed over all LLM
+calls of that run (tool loops make several) — so cost accounting needs no event
+plumbing:
+
+```python
+res = await loop.send("…", session_id=sid)
+res.usage
+# {"prompt_tokens": 1234, "completion_tokens": 56, "cache_read_tokens": 0,
+#  "reasoning_tokens": 0, "total_tokens": 1290, "calls": 2}
+```
+
+For per-call, real-time metering subscribe to the `usage_updated` event (one
+per LLM call, tagged with `session_id`). See
+[`examples/25_token_usage.py`](examples/25_token_usage.py).
+
+### Crash recovery: `heal_pending`
+
+A run killed mid tool-call leaves the session with unresolved `tool_calls`;
+the next `send()` raises `SessionPendingError` (the message protocol forbids
+continuing). Orchestrators whose runs can legitimately die (human interrupts,
+process restarts) can opt into self-healing:
+
+```python
+res = await loop.send("…", session_id=sid, heal_pending=True)
+# stale tool_calls are aborted with synthetic <aborted> results, then the
+# send proceeds. Default remains raise — healing discards in-flight work.
+```
+
+Or recover explicitly with `resume(sid)` / `abort_pending(sid)`.
 
 ## Public API
 

@@ -389,6 +389,7 @@ class AgentPipeline:
             pending_tool_calls=pending_tool_calls or [],
             pending_interactions=pending_interactions or [],
             messages=self.history,
+            usage=dict(self.ctx.usage_totals),
         )
 
     def _persist_pending_interaction(

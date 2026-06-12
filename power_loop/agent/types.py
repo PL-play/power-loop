@@ -66,3 +66,7 @@ class AgentLoopResult:
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     pending_interactions: list[dict[str, Any]] = field(default_factory=list)
     messages: list[LoopMessage] = field(default_factory=list)
+    #: Cumulative token usage across every LLM call of this run:
+    #: {prompt_tokens, completion_tokens, cache_read_tokens, reasoning_tokens,
+    #:  total_tokens, calls}. Empty dict when the run never reached the LLM.
+    usage: dict[str, int] = field(default_factory=dict)

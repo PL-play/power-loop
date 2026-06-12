@@ -52,7 +52,10 @@ class SessionPendingError(PowerLoopError):
         )
         super().__init__(
             f"session {session_id} has {len(pending_tool_calls)} unresolved tool_calls"
-            f" from round (assistant_seq={assistant_seq}): {names}"
+            f" from round (assistant_seq={assistant_seq}): {names}."
+            " Recover with resume(sid) to finish them, abort_pending(sid) to"
+            " discard them, or call send(..., heal_pending=True) to auto-abort"
+            " and proceed"
         )
 
 

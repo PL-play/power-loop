@@ -94,7 +94,14 @@ class ContextManager:
     recent_files: list[str] = field(default_factory=list)
     _file_counter: int = 0
 
+    #: Usage of the **last** LLM call only (overwritten by every
+    #: :meth:`update_usage`). For whole-run totals use :attr:`usage_totals`.
     token_usage: dict[str, Any] = field(default_factory=dict)
+    #: Cumulative usage across every LLM call of this context's lifetime
+    #: (one context = one ``send``/run): prompt_tokens / completion_tokens /
+    #: cache_read_tokens / reasoning_tokens / total_tokens / calls.
+    #: Surfaced on ``AgentLoopResult.usage`` and ``StatefulResult.usage``.
+    usage_totals: dict[str, int] = field(default_factory=dict)
     #: 可选计数器，供测试/扩展使用；**不会**被 ``update_usage`` 自动递增
     api_calls: int = 0
 
@@ -165,6 +172,11 @@ class ContextManager:
             "reasoning": reasoning,
         }
         self.token_usage = usage_out
+        totals = self.usage_totals
+        totals["calls"] = totals.get("calls", 0) + 1
+        for key in ("prompt_tokens", "completion_tokens", "cache_read_tokens",
+                    "reasoning_tokens", "total_tokens"):
+            totals[key] = totals.get(key, 0) + usage_out[key]
         return usage_out
 
     def microcompact(self, messages: list[dict[str, Any]]) -> None:

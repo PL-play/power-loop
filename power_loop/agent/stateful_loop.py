@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -56,6 +57,8 @@ from power_loop.runtime.session_store import (
 from power_loop.runtime.skills import SkillLoader
 from power_loop.tools.registry import ToolRegistry
 
+logger = logging.getLogger("power_loop.stateful")
+
 
 @dataclass
 class StatefulResult:
@@ -67,6 +70,10 @@ class StatefulResult:
     rounds: int = 0
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     pending_interactions: list[dict[str, Any]] = field(default_factory=list)
+    #: Cumulative token usage for this send (summed over every LLM call):
+    #: {prompt_tokens, completion_tokens, cache_read_tokens, reasoning_tokens,
+    #:  total_tokens, calls}. Empty when the run never reached the LLM.
+    usage: dict[str, int] = field(default_factory=dict)
 
 
 class StatefulAgentLoop:
@@ -134,6 +141,7 @@ class StatefulAgentLoop:
         stop_event: CancellationLike = None,
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
+        heal_pending: bool = False,
     ) -> StatefulResult:
         """Append one user input to the session and run the loop.
 
@@ -149,13 +157,24 @@ class StatefulAgentLoop:
           (precedence: this arg > session system_prompt > config).
 
         Raises :class:`SessionPendingError` if the session has unresolved
-        tool_calls; the caller must call :meth:`resume` or
-        :meth:`abort_pending` first.
+        tool_calls (a previous run died mid tool-call); the caller must call
+        :meth:`resume` or :meth:`abort_pending` first — or pass
+        ``heal_pending=True`` to have ``send`` abort the stale tool_calls
+        itself and proceed (the right default for orchestrators whose runs
+        can be killed, e.g. by a human interrupt).
         """
         sid = session_id
         async with self._lock_for(sid):
             self._ensure_session_or_raise(sid)
-            self._raise_if_pending(sid)
+            if heal_pending:
+                healed = self._heal_pending(sid)
+                if healed:
+                    logger.warning(
+                        "send(heal_pending=True): aborted %d stale tool_call(s) "
+                        "in session %s before proceeding", healed, sid,
+                    )
+            else:
+                self._raise_if_pending(sid)
             self._persist_user_input(sid, user_input)
             return await self._run_loop(
                 sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt
@@ -217,6 +236,7 @@ class StatefulAgentLoop:
         stop_event: CancellationLike = None,
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
+        heal_pending: bool = False,
     ) -> StatefulResult:
         return asyncio.run(
             self.send(
@@ -225,6 +245,7 @@ class StatefulAgentLoop:
                 stop_event=stop_event,
                 tools=tools,
                 system_prompt=system_prompt,
+                heal_pending=heal_pending,
             )
         )
 
@@ -300,6 +321,14 @@ class StatefulAgentLoop:
                 return waiting
 
             return await self._run_loop(session_id, stop_event=stop_event, sink=sink)
+
+    def _heal_pending(self, sid: str) -> int:
+        """abort_pending without the session-existence re-check (callers in
+        send already hold the lock and have validated the session)."""
+        state = self.store.get_state(sid)
+        if state is None or not state.pending:
+            return 0
+        return self.abort_pending(sid, reason="auto-healed by send(heal_pending=True)")
 
     def abort_pending(self, session_id: str, *, reason: str = "aborted") -> int:
         """Synthesize ``<aborted: reason>`` tool messages for every unresolved
@@ -593,6 +622,7 @@ class StatefulAgentLoop:
             rounds=result.rounds,
             pending_tool_calls=result.pending_tool_calls,
             pending_interactions=result.pending_interactions,
+            usage=result.usage,
         )
 
     def _prime_sink_from_pending(self, sid: str, sink: SQLiteSink) -> None:

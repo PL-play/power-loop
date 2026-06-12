@@ -204,7 +204,21 @@ Payload — `UsageUpdatedPayload`：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `usage` | `dict` | 原始 LLM usage dict |
+| `usage` | `dict` | 归一化后的本次 LLM 调用 usage（`prompt_tokens` / `completion_tokens` / `cache_read_tokens` / `reasoning_tokens` / `total_tokens` + `input`/`output` 别名） |
+
+每次 LLM 调用触发一次（**单次调用量，非累计**）。只想要整个 run 的总量时
+**不需要订阅这个事件**——直接读返回值：
+
+```python
+res = await loop.send("hi", session_id=sid)
+res.usage  # {"prompt_tokens": ..., "completion_tokens": ..., "calls": ..., ...}
+           # 本次 send 全部 LLM 调用的累计；没碰到 LLM 时为空 dict
+```
+
+订阅事件适合做**实时**计量（按调用粒度、跨 session 汇总等），事件带
+`session_id` 可归属。注意：与所有事件一样，handler 收到的 `event.payload`
+是 dict（`event.data` 才是 dataclass，且部分发射路径只填 dict），取值时
+按 dict 处理最稳：`(event.payload or {}).get("usage")`。
 
 ### 2.6 Todo
 

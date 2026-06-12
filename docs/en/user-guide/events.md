@@ -83,7 +83,7 @@ Access payload fields with IDE autocomplete via `event.data.field_name`.
 | Event | Payload | When |
 |---|---|---|
 | `status_changed` | Varied by `kind` | Compaction, usage, round limit |
-| `usage_updated` | `usage` dict | Token usage parsed from LLM response |
+| `usage_updated` | `usage` dict | Token usage of ONE LLM call (per-call, not cumulative). For whole-run totals just read `result.usage` on the `send()` return value instead of subscribing. |
 
 ### Sub-agent
 

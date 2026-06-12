@@ -8,6 +8,33 @@
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-06-12
+
+### Added
+
+- **`StatefulResult.usage` / `AgentLoopResult.usage`**：每次 `send`/run 返回累计
+  token 用量（对该 run 的全部 LLM 调用求和：`prompt_tokens` / `completion_tokens` /
+  `cache_read_tokens` / `reasoning_tokens` / `total_tokens` / `calls`）。此前只能
+  订阅 `usage_updated` 事件自行累加（事件是单次调用量、覆盖式），编排方做成本
+  记账需要自建 tracker——现在直接读返回值。
+- **`ContextManager.usage_totals`**：`update_usage` 在保持 `token_usage`（末次
+  调用）语义不变的同时累计总量。
+- **`send(..., heal_pending=True)`**（含 `send_sync`）：session 因上一个 run
+  被杀死在 tool-call 中途而带有未决 `tool_calls` 时，自动 `abort_pending` 后
+  继续本次 send，不再抛 `SessionPendingError`。默认仍为 raise（自愈会丢弃
+  未完成的工具结果，应由调用方显式选择）。
+- `SessionPendingError` 报错信息补充三条恢复路径指引（`resume` /
+  `abort_pending` / `heal_pending=True`）。
+- 文档：README 增加 token 记账与 heal_pending 小节、明确「无内置定时器」的
+  范围边界；events 文档明确 `usage_updated` 为单次调用量、整 run 总量应读
+  `result.usage`、handler 中 `event.payload` 按 dict 取值。
+- 新示例 `examples/25_token_usage.py`；新增单测 `tests/unit/test_usage_and_heal.py`。
+
+### Notes
+
+- 本版本由 DeepTalk 多 agent 编排落地反推：token 成本面板需要 per-run 用量、
+  人类中断 run 后 session 被未决 tool_calls 卡死，是两处真实暴露的不足。
+
 ## [0.8.1] — 2026-06-11
 
 ### Fixed
