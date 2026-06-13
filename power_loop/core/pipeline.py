@@ -788,6 +788,22 @@ class AgentPipeline:
                 # round would never be drained at a later round-start, so it
                 # would be silently dropped. Drain here: if anything is queued,
                 # run another round to address it instead of completing.
+                #
+                # Residual micro-race (accepted-follow_up vs. terminal drain),
+                # handled BEST-EFFORT by design: a follow_up enqueued in the
+                # window *after* this drain returns empty but *before* the
+                # caller releases the session lock is still accepted into the
+                # in-process queue — within this process it is not lost (the
+                # now-idle session's next send() drains it at round start). The
+                # only loss is if the host process restarts in that window
+                # before the next send drains it: the in-process queue is not
+                # persisted, so the just-accepted item is dropped on restart.
+                # We accept this rather than add cross-restart durability here:
+                # the queue is intentionally in-process, and DeepTalk dispatch
+                # is best-effort (restart seeks to end, no replay) with
+                # consistency reestablished by api persistence + client seq
+                # sync and the next ambient/explicit wake. See agent
+                # session_folder.py ("in-process only; lost on restart").
                 if self._drain_follow_ups is not None:
                     drained = await self._drain_follow_ups()
                     if drained:
