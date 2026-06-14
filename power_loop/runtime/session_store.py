@@ -141,6 +141,17 @@ CREATE TABLE IF NOT EXISTS session_runtime_state (
     PRIMARY KEY (session_id, key)
 );
 
+-- Keyed JSON owned by an arbitrary scope key (NOT a session): the blackboard
+-- and other cross-session shared state. No session existence check / no cascade
+-- with any session — the owner is opaque (e.g. a workflow run id, a board id).
+CREATE TABLE IF NOT EXISTS shared_state (
+    owner             TEXT NOT NULL,
+    key               TEXT NOT NULL,
+    value_json        TEXT,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (owner, key)
+);
+
 CREATE TABLE IF NOT EXISTS background_tasks (
     session_id        TEXT NOT NULL,
     task_id           TEXT NOT NULL,
@@ -818,6 +829,40 @@ class SessionStore:
             self._conn.execute(
                 "DELETE FROM session_runtime_state WHERE session_id=? AND key=?",
                 (session_id, key),
+            )
+
+    # ── shared_state: keyed JSON owned by an arbitrary scope (not a session) ──
+
+    def get_shared_state(self, owner: str, key: str, default: Any = None) -> Any:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value_json FROM shared_state WHERE owner=? AND key=?",
+                (owner, key),
+            ).fetchone()
+        if row is None:
+            return default
+        value = _loads(row["value_json"])
+        return default if value is None else value
+
+    def set_shared_state(self, owner: str, key: str, value: Any) -> None:
+        now = _now_ms()
+        with self._lock, self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO shared_state (owner, key, value_json, updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(owner, key) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    updated_at=excluded.updated_at
+                """,
+                (owner, key, _dumps(value), now),
+            )
+
+    def delete_shared_state(self, owner: str, key: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM shared_state WHERE owner=? AND key=?",
+                (owner, key),
             )
 
     # ── background tasks ──────────────────────────────────────────────────

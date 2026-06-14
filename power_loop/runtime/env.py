@@ -6,8 +6,12 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from power_loop.runtime.exec_backend import ShellBackend
+
+if TYPE_CHECKING:
+    from power_loop.runtime.blackboard import Blackboard
 
 
 class RuntimeEnvError(RuntimeError):
@@ -25,6 +29,12 @@ class RuntimeEnv:
     # (LocalShellBackend). A host that runs untrusted shell can inject a
     # sandboxing backend here; see runtime.exec_backend.
     shell_backend: ShellBackend | None = None
+    # Shared coordination board for agents that share ``blackboard_id``, and this
+    # agent's board id. Both None => no board (default; isolated). The board_*
+    # tools resolve these at call time; inject a host implementation for a
+    # conversation-scoped / cross-process board. See runtime.blackboard.
+    blackboard: Blackboard | None = None
+    blackboard_id: str | None = None
 
     @classmethod
     def from_env(

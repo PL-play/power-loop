@@ -118,6 +118,13 @@ from power_loop.core.hooks import AgentHooks
 from power_loop.core.phase import PhaseContext, PhaseResult, phase
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.runner import AgentRunner
+from power_loop.runtime.blackboard import (
+    Blackboard,
+    BlackboardEntry,
+    BlackboardError,
+    SqliteBlackboard,
+    render_entries,
+)
 from power_loop.runtime.budget import estimate_text_tokens, estimate_tokens, trim_history
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.env import RuntimeEnv, RuntimeEnvError, runtime_env_context
@@ -182,6 +189,7 @@ from power_loop.tools import (
     build_registry,
     create_default_tool_registry,
 )
+from power_loop.tools.blackboard import register_blackboard_tools
 from power_loop.tools.default_manifest import (
     CORE_TOOL_NAMES,
     EXPLORE_TOOL_NAMES,
@@ -267,6 +275,12 @@ __all__ = [
 	"ShellBackend",
 	"LocalShellBackend",
 	"DEFAULT_SHELL_BACKEND",
+	"Blackboard",
+	"BlackboardEntry",
+	"BlackboardError",
+	"SqliteBlackboard",
+	"render_entries",
+	"register_blackboard_tools",
 	"HumanInputRequired",
 	"request_user_input",
 	"LlmRetryAttemptedPayload",
