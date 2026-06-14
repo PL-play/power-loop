@@ -131,8 +131,13 @@ def test_example_21_request_user_input_runs() -> None:
     assert {item["label"] for item in results} == {"summary", "send"}
     assert all(item["status"] == "completed" for item in results)
     assert all(item["final_text"].strip() for item in results)
-    assert any("gentle" in item["final_text"].lower() for item in results)
-    assert any("send" in item["final_text"].lower() for item in results)
+    # The two interactions were answered "gentle" then "send"; assert the model
+    # engaged with each — robust to wording ("send"/"sent"/"sending"), since the
+    # final text is non-deterministic. The "send" branch is already proven by the
+    # label assertion above.
+    texts = [item["final_text"].lower() for item in results]
+    assert any("gentle" in t for t in texts)
+    assert any(("send" in t or "sent" in t) for t in texts)
 
 
 def test_example_22_follow_up_steering_runs() -> None:
