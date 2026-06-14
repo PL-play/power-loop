@@ -13,6 +13,22 @@ import pytest
 
 from llm_client.interface import LLMResponse
 from power_loop import StructuredOutputError, StructuredOutputSpec, parse_structured
+from power_loop.runtime.structured import _extract_first_json_object
+
+
+def test_extract_skips_stray_closing_brace_before_json() -> None:
+    """Regression: a '}' in prose before the real object used to drive the brace
+    depth negative so the object was never returned (valid output rejected)."""
+    assert _extract_first_json_object('Use the }} placeholder. Result: {"ok": true}') == '{"ok": true}'
+    assert _extract_first_json_object('set x = a} ; then {"a": 1}') == '{"a": 1}'
+    assert _extract_first_json_object('{"a": {"b": 1}}') == '{"a": {"b": 1}}'  # nested
+    assert _extract_first_json_object("no json here") is None
+
+
+def test_parse_structured_recovers_after_stray_brace() -> None:
+    out = parse_structured('thoughts}} then {"label": "urgent"}', schema={"type": "object"})
+    assert out == {"label": "urgent"}
+
 
 # ── Spec ────────────────────────────────────────────────────────────────
 

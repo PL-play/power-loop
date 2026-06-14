@@ -111,6 +111,11 @@ def _extract_first_json_object(text: str) -> str | None:
                 start = i
             depth += 1
         elif ch == "}":
+            if depth == 0:
+                # A stray '}' before any '{' (common in prose: "}}" placeholders,
+                # code snippets). Ignore it instead of going negative — otherwise
+                # the real object that follows is never balanced and we return None.
+                continue
             depth -= 1
             if depth == 0 and start >= 0:
                 return text[start : i + 1]

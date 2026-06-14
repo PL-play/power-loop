@@ -128,6 +128,17 @@ def test_foreach_requires_items_source():
     assert any("items_from" in p or "items" in p for p in ei.value.problems)
 
 
+def test_duplicate_agent_ids_rejected():
+    """Agent ids key results/journal/replay — duplicates must fail validation,
+    not silently mis-replay the wrong node on resume."""
+    with pytest.raises(WorkflowSpecError) as ei:
+        WorkflowSpec.from_json({"name": "w", "root": {"type": "sequence", "steps": [
+            {"type": "agent", "id": "dup", "spec": {"name": "a", "system_prompt": "p"}},
+            {"type": "agent", "id": "dup", "spec": {"name": "b", "system_prompt": "p"}},
+        ]}})
+    assert any("duplicate" in p and "dup" in p for p in ei.value.problems)
+
+
 # ── execution ────────────────────────────────────────────────────────────────
 
 

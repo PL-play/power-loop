@@ -221,8 +221,14 @@ class WorkflowSpec:
         if "root" not in data:
             problems.append("missing required key 'root'")
         else:
-            declared_ids: set[str] = set()
-            _collect_agent_ids(data["root"], declared_ids)
+            id_list: list[str] = []
+            _collect_agent_ids(data["root"], id_list)
+            declared_ids: set[str] = set(id_list)
+            # Agent ids key results, journal steps, and replay — they MUST be
+            # unique, or resume replays the wrong node / refs become ambiguous.
+            dupes = sorted({i for i in id_list if id_list.count(i) > 1})
+            if dupes:
+                problems.append(f"duplicate agent node id(s): {dupes} — agent ids must be unique")
             root = _parse_node(data["root"], "root", problems, declared_ids)
 
         if problems:
@@ -344,12 +350,13 @@ def _parse_budget(data: Any, problems: list[str]) -> WorkflowBudget | None:
     return WorkflowBudget(max_tokens=int(mt), stop_at_remaining_pct=float(pct))
 
 
-def _collect_agent_ids(data: Any, out: set[str]) -> None:
-    """Pre-walk the (raw) tree gathering every agent-node ``id`` for ref checks."""
+def _collect_agent_ids(data: Any, out: list[str]) -> None:
+    """Pre-walk the (raw) tree gathering every agent-node ``id`` (with duplicates,
+    so the caller can both build the ref-check set and detect collisions)."""
     if not isinstance(data, dict):
         return
     if data.get("type") == "agent" and isinstance(data.get("id"), str):
-        out.add(data["id"])
+        out.append(data["id"])
     for key in ("steps", "branches"):
         for child in data.get(key) or []:
             _collect_agent_ids(child, out)

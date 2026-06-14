@@ -164,6 +164,31 @@ async def test_wake_delivers_to_idle_parent_once():
     assert loop.get_session_stats(psid).sends == 1
 
 
+async def test_eager_wake_does_not_double_wake():
+    """Regression: eager_wake delivers immediately AND arms a durable timer; the
+    eager path bypasses TIMER_FIRE, so it must claim 'woke' or the timer fires a
+    SECOND time. Parent must wake exactly once."""
+    import asyncio
+
+    loop = _loop()
+    psid = loop.new_session()
+    register_wake_guard(loop)
+    wf = create_workflow(SINGLE, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True, eager_wake=True)
+    await handle.task
+    # let the fire-and-forget eager follow_up task run
+    for _ in range(25):
+        await asyncio.sleep(0.02)
+        if loop.get_session_stats(psid) is not None:
+            break
+    assert loop.get_session_stats(psid).sends == 1  # eager woke once
+    assert get_workflow(loop, psid, handle.run_id)["woke"] is True  # claimed
+
+    # the durable timer still fires, but the guard now SKIPs it (no 2nd wake)
+    await TimerRunner(loop).scan_once()
+    assert loop.get_session_stats(psid).sends == 1
+
+
 def test_wake_guard_dedupes_rearmed_timer():
     loop = _loop()
     psid = loop.new_session()

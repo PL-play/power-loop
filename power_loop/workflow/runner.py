@@ -161,10 +161,15 @@ def spawn_background(
             _publish(loop, parent_sid, run_id, "failed", "failed", level="error")
         _wake(loop, parent_sid, note)
         if eager_wake:
-            # Non-durable fast-path; the timer above is the durable backstop and
-            # the wake-guard dedupes the double delivery.
-            with _suppress():
-                asyncio.create_task(loop.follow_up(note, parent_sid))
+            # Non-durable fast-path on top of the durable timer above. The eager
+            # delivery bypasses TIMER_FIRE, so the wake-guard can't dedupe it —
+            # we must CLAIM the wake here (set journal 'woke'), so the later timer
+            # firing is skipped by the guard. Without this, the parent wakes twice.
+            j = journal.read(store, parent_sid, run_id)
+            if j is not None and not j.get("woke"):
+                journal.update(store, parent_sid, run_id, woke=True)
+                with _suppress():
+                    asyncio.create_task(loop.follow_up(note, parent_sid))
 
     task = asyncio.create_task(_bg(), name=f"workflow-{run_id}")
     task_set.add(task)
