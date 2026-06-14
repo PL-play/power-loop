@@ -32,6 +32,16 @@ class AgentLoopConfig:
     max_rounds: int = 24
     temperature: float | None = 0.0
     max_tokens: int | None = 8000
+    #: Per-loop model override. When set, every LLM request of this loop carries
+    #: it (the provider uses ``request.model`` over its own configured model), so
+    #: a sub-agent / workflow step can run on a different model than the global
+    #: one. ``None`` → use the LLM service's configured model.
+    model: str | None = None
+    #: OpenAI-compatible ``response_format`` (e.g. a json_schema dict from
+    #: ``StructuredOutputSpec.to_openai_response_format()``), forwarded on the
+    #: main generation call so the provider returns structured output. ``None``
+    #: → free-form text.
+    response_format: dict[str, Any] | None = None
     #: Hard per-run token budget (prompt + completion summed over the whole
     #: run, real provider usage — see ``ContextManager.usage_totals``). Checked
     #: at round boundaries: the round that crosses the budget still finishes

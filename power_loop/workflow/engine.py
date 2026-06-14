@@ -95,7 +95,9 @@ class InProcessExecutor:
             raw = await run_agent_spec(spec, user_input, parent_loop=parent_loop)
         finally:
             reset_session_id(token)
-        raw["usage"] = _usage_for(parent_loop, raw.get("session_id"))
+        # run_agent_spec now surfaces usage; fall back to persisted session stats.
+        if not raw.get("usage"):
+            raw["usage"] = _usage_for(parent_loop, raw.get("session_id"))
         return raw
 
 
@@ -201,7 +203,9 @@ class WorkflowEngine:
             if extras:
                 user_input = user_input + "\n\n--- context ---\n" + "\n\n".join(extras)
 
-        spec = replace(node.spec, lifecycle="linked")  # keep trace + readable usage
+        # keep trace + readable usage (linked); enforce structured output at the
+        # provider via the node's output_schema so real models return JSON, not prose.
+        spec = replace(node.spec, lifecycle="linked", output_schema=node.output_schema)
         raw = await self._executor.run_agent(
             spec, user_input, parent_loop=self._loop, driver_sid=driver_sid
         )

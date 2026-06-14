@@ -48,7 +48,10 @@ SPEC = {
                 "id": "plan",
                 "spec": {
                     "name": "planner",
-                    "system_prompt": "Break the topic into exactly 3 short subtopics.",
+                    "system_prompt": (
+                        "Break the topic into exactly 3 short subtopics. "
+                        'Respond ONLY with JSON: {"subtopics": ["...", "...", "..."]}.'
+                    ),
                 },
                 "input": "Topic: {{input}}",
                 # Structured output so downstream foreach can read plan.subtopics.
@@ -107,13 +110,18 @@ async def main() -> str:
     result = await wf.run()
 
     print(f"status     : {result.status}")
-    print(f"subtopics  : {result.results['plan'].payload}")
+    if result.errors:
+        print(f"errors     : {result.errors}")
+    plan = result.results.get("plan")
+    print(f"subtopics  : {plan.payload if plan else None}")
     print(f"tokens     : {result.usage.get('total_tokens')}")
-    print("\n--- final synthesis ---")
-    print(result.results["synthesize"].text)
+    syn = result.results.get("synthesize")
+    if syn:
+        print("\n--- final synthesis ---")
+        print(syn.text)
     print("\n--- run summary ---")
     print(result.summary())
-    return result.results["synthesize"].text
+    return syn.text if syn else ""
 
 
 # ── Letting the main agent author workflows itself (LLM-facing) ──────────────

@@ -266,3 +266,45 @@ async def test_tool_runs_and_returns_summary():
     finally:
         reset_current_loop(token)
     assert "workflow 'wf' -> completed" in out
+
+
+# ── per-subagent LLM override (B1) + output_schema enforcement ────────────────
+
+
+async def test_agent_node_model_and_output_schema_reach_llm_request():
+    """A node's spec.model and output_schema must reach the actual LLMRequest:
+    model overrides the global; output_schema becomes a json_schema response_format."""
+    captured: dict = {}
+
+    @dataclass
+    class _CapLLM(LLMService):
+        async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,
+                           on_chunk_think=None, on_stream_end=None) -> LLMResponse:
+            captured["model"] = request.model
+            captured["response_format"] = request.response_format
+            return LLMResponse(raw_text='{"x": 1}', content_text='{"x": 1}')
+
+        def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+            async def _e() -> AsyncIterator[LLMStreamChunk]:
+                if False:
+                    yield LLMStreamChunk()
+            return _e()
+
+        async def close(self) -> None:
+            return None
+
+    loop = StatefulAgentLoop(
+        llm=_CapLLM(), db_path=tempfile.mktemp(suffix=".db"),
+        config=AgentLoopConfig(system_prompt="o", max_rounds=2, compactor=None),
+    )
+    spec = {"name": "w", "root": {"type": "agent", "id": "a",
+            "spec": {"name": "a", "system_prompt": "p", "model": "my-model-x"},
+            "output_schema": {"name": "S", "schema": {"type": "object", "required": ["x"],
+                "properties": {"x": {"type": "integer"}}}}}}
+    res = await create_workflow(spec, parent_loop=loop).run()
+    assert res.status == "completed"
+    assert captured["model"] == "my-model-x"  # per-subagent model override reached the request
+    assert captured["response_format"] is not None  # output_schema -> response_format
+    assert captured["response_format"].get("type") == "json_schema"
+    assert res.results["a"].payload == {"x": 1}  # parsed structured output
+    assert res.results["a"].usage is not None  # usage surfaced (B2)

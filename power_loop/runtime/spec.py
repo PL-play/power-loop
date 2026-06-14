@@ -60,7 +60,8 @@ class AgentSpec:
     max_rounds: int = 8
     max_tokens: int = 4000
     temperature: float = 0.0
-    model: str | None = None
+    model: str | None = None      # per-subagent model override (None = inherit the service default)
+    output_schema: dict[str, Any] | None = None   # {name, schema}; enforces structured output
     lifecycle: str = SubagentLifecycle.EPHEMERAL.value
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -80,6 +81,8 @@ class AgentSpec:
             SubagentLifecycle(self.lifecycle)
         except ValueError as exc:
             raise AgentSpecError(f"unknown lifecycle: {self.lifecycle}") from exc
+        if self.output_schema is not None and not isinstance(self.output_schema, dict):
+            raise AgentSpecError("AgentSpec.output_schema must be an object or None")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgentSpec:
@@ -171,11 +174,22 @@ async def run_agent_spec(
                 "depth": parent_row.spawn_depth + 1,
             }
 
+    response_format = None
+    if spec.output_schema:
+        from power_loop.runtime.structured import StructuredOutputSpec
+
+        response_format = StructuredOutputSpec(
+            name=str(spec.output_schema.get("name") or "Output"),
+            schema=spec.output_schema.get("schema") or spec.output_schema,
+        ).to_openai_response_format()
+
     child_config = AgentLoopConfig(
         system_prompt=spec.system_prompt,
         max_rounds=int(spec.max_rounds),
         max_tokens=int(spec.max_tokens),
         temperature=float(spec.temperature),
+        model=spec.model,
+        response_format=response_format,
     )
 
     child_sid = parent_loop.store.create_session(
@@ -230,4 +244,5 @@ async def run_agent_spec(
         "final_text": result.final_text,
         "rounds": result.rounds,
         "depth": depth,
+        "usage": dict(result.usage or {}),
     }

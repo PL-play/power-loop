@@ -538,6 +538,8 @@ class AgentPipeline:
             tool_choice="auto" if tools else None,  # DashScope rejects "auto" with no tools
             max_tokens=max_tokens,
             temperature=temperature,
+            model=self.config.model,                 # per-loop model override (None = service default)
+            response_format=self.config.response_format,  # structured output when set
         )
 
         async def _do_call() -> LLMResponse:
@@ -1004,6 +1006,7 @@ class AgentPipeline:
             tool_choice="auto" if self.runtime_tools else None,
             max_tokens=int(self.config.max_tokens or 8000),
             temperature=float(self.config.temperature or 0),
+            model=self.config.model,
         ))
         final_text = (getattr(final_resp, "raw_text", "") or getattr(final_resp, "content_text", "") or "").strip()
         self._emit(AgentEventType.USAGE_UPDATED, UsageUpdatedPayload(usage=self.ctx.update_usage(final_resp)))
