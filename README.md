@@ -1,35 +1,41 @@
 # power-loop
 
-[Documentation](docs/en/index.md) | [中文文档](docs/zh/index.md) | [Examples](examples/README.md) | [Changelog](CHANGELOG.md)
+[![PyPI](https://img.shields.io/pypi/v/power-loop.svg)](https://pypi.org/project/power-loop/)
+[![Python](https://img.shields.io/pypi/pyversions/power-loop.svg)](https://pypi.org/project/power-loop/)
+[![License](https://img.shields.io/badge/license-see%20LICENSE-blue.svg)](LICENSE)
 
-Embeddable, stateful agent execution for Python.
+[Documentation](docs/en/index.md) · [中文文档](docs/zh/index.md) · [Examples](examples/README.md) · [Changelog](CHANGELOG.md)
 
-power-loop gives application code one small interface, `StatefulAgentLoop`, and handles the repetitive agent runtime work around it: multi-turn LLM loops, tool calls, hooks, events, context compaction, sub-agents, retry/cancel, structured output, memory, and SQLite-backed session persistence.
+**The agent runtime that disappears into your app.** One class, one SQLite file, zero infrastructure — and you get durable multi-turn sessions, tool calling, sub-agents, deterministic multi-agent **workflows that resume across a crash**, durable timers, and process-level sandboxing. No service to run, no framework to adopt, no Redis/Postgres/queue to stand up.
 
-It is a library, not a service or a full application framework. You keep ownership of product logic, HTTP APIs, auth, queues, RAG, UI, and deployment.
+```python
+from power_loop import StatefulAgentLoop, create_llm_service_from_env
 
-### Scope: orchestration, not isolation
+loop = StatefulAgentLoop(llm=create_llm_service_from_env(), db_path="app.db")
+sid = loop.new_session()
+await loop.send("Remember my favorite color is teal.", session_id=sid)
+print((await loop.send("What's my favorite color?", session_id=sid)).final_text)
+# → "Your favorite color is teal."   (persisted in app.db; survives restarts)
+```
 
-power-loop **orchestrates** the agent loop; it does **not sandbox** tool execution. The
-built-in `bash` / file tools run **in-process** (a `subprocess` shell inheriting the host
-environment) — convenient for trusted, local use, but **not a security boundary**. If your
-agent runs model-authored or otherwise untrusted commands, run them in your own sandbox
-(container / gVisor / microVM) and inject it via the `ShellBackend` seam
-(`runtime.exec_backend`); power-loop launches the persistent shell through your backend.
-Keep secrets in your orchestrator — the loop does not scrub the tool environment for you.
+That's the whole setup. The conversation is already durable, resumable, and tool-capable.
 
-**One store file = one process.** Per-session serialization is an in-process
-`asyncio.Lock`; the SQLite store itself happily opens from multiple processes,
-but two processes calling `send()` on the same session bypass all ordering
-guarantees and can interleave histories. Run one process per store file (scale
-by sharding sessions across processes/files), or put your own distributed lock
-in front.
+---
 
-A session still only runs while a `send()` / `resume()` call is in flight — but since
-0.11 there are **durable timers** ("wake this session at T with this note"): rows in the
-session store, created by the agent (`schedule_wakeup` tool) or the host
-(`loop.schedule_timer`), fired by a `TimerRunner` you explicitly start (or by your own
-scheduler polling `store.due_timers()`). No runner running = nothing fires.
+## Why power-loop
+
+Most "agent frameworks" ask you to build your app *inside* them. power-loop is the opposite: a **library** you embed. You keep your HTTP layer, your auth, your queues, your RAG, your UI, your deploy. It just runs the agent loop — well, and durably.
+
+- 🪶 **Featherweight.** No `pydantic`, no LangChain, no graph DSL to learn. The runtime is a handful of files; the public surface is essentially one class. Deps are just your LLM client + stdlib.
+- 💾 **Zero infrastructure.** Sessions, timers, sub-agent trees, workflow journals, the shared blackboard — all in **one SQLite file**. Copy the file, you've copied the state. Scale by sharding files across processes.
+- 🔌 **Provider-agnostic.** Any OpenAI-compatible endpoint or the native Anthropic Messages API, selected by env vars. Swap models per sub-agent or per workflow step.
+- ⏱️ **Durable by default.** Crash mid-run and `resume()`. Agents schedule their own wake-ups with **durable timers** that survive restarts. Workflows **replay completed steps and re-run only the unfinished tail** after a process death.
+- 🧩 **Composable from one loop to a fleet.** Start with `send()`. Add tools. Spawn sub-agents. Fan out a deterministic **workflow** (`sequence` / `parallel` / `foreach` / `branch`). Run each leaf in its **own process and DB** behind a sandbox. Same primitives all the way up.
+- 🛡️ **Isolation seams where it counts.** Tool-level sandboxing via a `ShellBackend` (drop in gVisor/Docker for `bash`); process-level sandboxing via a `WorkerLauncher` (wrap a whole sub-agent worker per leaf). power-loop stays sandbox-agnostic; you choose the policy.
+- 🔬 **Built to be observed.** Typed events for every stream chunk, tool call, round, and usage update. Per-run + per-session token accounting. Hard per-run token budgets. One-line JSON event logging.
+- ✅ **Real-LLM tested.** A dedicated `tests/real/` suite runs the library — workflows, resume, sandboxed subprocess agents, structured output, compaction — against a live model, not just mocks.
+
+---
 
 ## Install
 
@@ -37,46 +43,7 @@ scheduler polling `store.due_timers()`). No runner running = nothing fires.
 pip install power-loop
 ```
 
-For local development:
-
-```bash
-git clone https://github.com/PL-play/power-loop.git
-cd power-loop
-pip install -e ".[dev]"
-```
-
-Python 3.10+ is required.
-
-## Quick Example
-
-```python
-import asyncio
-
-from power_loop import AgentLoopConfig, StatefulAgentLoop, create_llm_service_from_env
-
-
-async def main() -> None:
-    llm = create_llm_service_from_env()
-    loop = StatefulAgentLoop(
-        llm=llm,
-        db_path="./power_loop_sessions.db",
-        config=AgentLoopConfig(
-            system_prompt="You are a concise assistant.",
-            max_rounds=4,
-        ),
-    )
-
-    sid = loop.new_session(metadata={"user_id": "demo"})
-    first = await loop.send("My favorite color is teal.", session_id=sid)
-    second = await loop.send("What is my favorite color?", session_id=sid)
-
-    print(second.final_text)
-
-
-asyncio.run(main())
-```
-
-Configure any OpenAI-compatible endpoint with environment variables:
+Point it at any OpenAI-compatible endpoint (or `POWER_LOOP_PROVIDER=anthropic`):
 
 ```bash
 POWER_LOOP_BASE_URL=https://api.openai.com/v1
@@ -84,209 +51,157 @@ POWER_LOOP_API_KEY=sk-...
 POWER_LOOP_MODEL=gpt-4o-mini
 ```
 
-See [Getting Started](docs/en/getting-started.md) for the complete first run.
+Python 3.10+. See [Getting Started](docs/en/getting-started.md).
 
-## What It Provides
+---
 
-| Capability | Where to read more |
-|---|---|
-| Stateful sessions and cross-process resume | [Sessions](docs/en/user-guide/sessions.md) |
-| Tool calling with JSON Schema validation | [Tools](docs/en/user-guide/tools.md) |
-| Lifecycle hooks for control flow | [Hooks](docs/en/user-guide/hooks.md) |
-| Typed events for streaming, audit, and metrics | [Events](docs/en/user-guide/events.md) |
-| Context compaction | [Compaction](docs/en/user-guide/compaction.md) |
-| Sub-agents with `AgentSpec` | [Sub-agents](docs/en/user-guide/subagents.md) |
-| Retry, timeout, and cancellation | [Retry & Cancel](docs/en/user-guide/retry-cancel.md) |
-| Structured JSON output | [Structured Output](docs/en/user-guide/structured-output.md) |
-| Pluggable cross-session memory | [Memory](docs/en/user-guide/memory.md) |
-| Provider configuration | [Providers](docs/en/user-guide/providers.md) |
+## What you get
 
-### Per-call overrides
+| Capability | One-liner | Docs |
+|---|---|---|
+| **Stateful sessions** | Durable multi-turn memory + cross-process resume, backed by SQLite | [Sessions](docs/en/user-guide/sessions.md) |
+| **Tool calling** | JSON-Schema-validated tools; built-in `bash`/file/search/skills presets | [Tools](docs/en/user-guide/tools.md) |
+| **Sub-agents** | Delegate to a child loop via `AgentSpec` (own prompt/tools/model) | [Sub-agents](docs/en/user-guide/subagents.md) |
+| **Dynamic workflows** | Declarative JSON DSL (`sequence`/`parallel`/`foreach`/`branch`) the LLM can author; deterministic engine | [feasibility](docs/dynamic-workflow-feasibility.md) |
+| **Workflow resume** | Journals each step; after a crash, replays completed steps and re-runs only the tail | — |
+| **Subprocess executor** | Each workflow leaf in its own OS process + own DB; sandbox per leaf | — |
+| **Shared blackboard** | A scoped, durable coordination board multiple agents read/write | — |
+| **Durable timers** | Agents schedule their own wake-ups; survive restarts; one-shot or recurring | [examples/26](examples/26_timers.py) |
+| **Hooks** | Veto/observe at every lifecycle point (round, tool, compaction, timer) | [Hooks](docs/en/user-guide/hooks.md) |
+| **Typed events** | Streaming, audit, metrics — strongly typed payloads | [Events](docs/en/user-guide/events.md) |
+| **Context compaction** | Auto-summarize old turns; never splits a tool-call pair | [Compaction](docs/en/user-guide/compaction.md) |
+| **Retry / timeout / cancel** | Unified cancellation token; provider-aware retry | [Retry & Cancel](docs/en/user-guide/retry-cancel.md) |
+| **Structured output** | `output_schema` → provider `response_format` → parsed & validated | [Structured](docs/en/user-guide/structured-output.md) |
+| **Token budgets & usage** | Per-run cap (`budget_exceeded`), per-run + per-session accounting | below |
+| **Pluggable memory** | Cross-session recall via a `MemoryProvider` Protocol | [Memory](docs/en/user-guide/memory.md) |
+| **Crash recovery** | `heal_pending` / `resume` / `abort_pending` for runs killed mid tool-call | below |
 
-Build one loop and reuse it across callers; restrict tools or swap the system
-prompt **per `send`** without rebuilding (the model only *sees* the allowed
-tools). Ideal for multi-tenant hosts.
+---
+
+## Highlights
+
+### Deterministic multi-agent workflows — that the model can author, and that survive a crash
+
+Sub-agent delegation is *model-driven* ("go do this"). When you want **code-driven, deterministic** orchestration — fan out over a list, branch on a result, run a pipeline — describe it as a `WorkflowSpec` and let the engine interpret it. The only LLM calls are the leaves; `sequence`/`parallel`/`foreach`/`branch` are plain code.
 
 ```python
-# loop registered with all tools; this run exposes only "get_weather"
-await loop.send("…", session_id=sid, tools=["get_weather"])
+from power_loop.workflow import create_workflow
 
-# per-run system prompt override (precedence: per-call > session > config)
-await loop.send("…", session_id=sid, system_prompt="You are a terse bot.")
+spec = {
+    "name": "research", "input": "the Japanese tea ceremony",
+    "root": {"type": "sequence", "steps": [
+        {"type": "agent", "id": "plan",
+         "spec": {"name": "planner", "system_prompt": "Break the topic into 3 subtopics."},
+         "output_schema": {"name": "Plan", "schema": {"type": "object", "required": ["subtopics"],
+            "properties": {"subtopics": {"type": "array", "items": {"type": "string"}}}}}},
+        {"type": "foreach", "id": "research", "items_from": "plan.subtopics", "as": "t",
+         "parallel": True, "max_concurrency": 3,
+         "body": {"type": "agent", "id": "r",
+                  "spec": {"name": "researcher", "system_prompt": "Write 2 sentences on {{t}}."},
+                  "input": "Subtopic: {{t}}"}},
+        {"type": "agent", "id": "write",
+         "spec": {"name": "writer", "system_prompt": "Synthesize the notes."},
+         "inputs_from": ["research"]},
+    ]},
+}
+result = await create_workflow(spec, parent_loop=loop).run()
 ```
 
-The same overrides are available on `send_sync()`. When `follow_up()` is idle
-and falls back to a new send, it accepts them too. A follow-up queued into an
-already running call keeps that call's active tool and prompt policy.
+Validated on creation (every problem reported at once — perfect for an LLM to repair). Run it **detached**, and the parent agent is woken on completion via a durable timer. Crash halfway through the fan-out? `resume_run(loop, parent_sid, run_id)` replays the planner + finished researchers from the journal and re-runs only what's left. Register it as a tool and the agent builds and submits workflows itself.
 
-For a multi-tenant host that reuses one registry across workspaces, build an
-**unbound** registry and supply the workspace at invocation time:
+### Run untrusted sub-agents in real sandboxes — without sandboxing the parent
+
+The default executor runs leaves in-process. The **subprocess executor** runs each leaf in its own OS process against its own SQLite file (so the one-writer-per-file rule holds trivially), and a `WorkerLauncher` lets you wrap that process — per leaf, by inspecting its granted tools — in gVisor / Docker / firejail. A safe orchestrator can spawn a `bash`-wielding child that runs fully confined:
 
 ```python
-from power_loop import RuntimeEnv, create_default_tool_registry, runtime_env_context
+from power_loop.workflow import SubprocessExecutor, WorkerBootstrap, create_workflow
 
-registry = create_default_tool_registry(preset="core", bind=False)
-with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
-    result = await registry.invoke_async("read_file", {"path": "README.md"})
+ex = SubprocessExecutor(
+    bootstrap=WorkerBootstrap(llm_from_env=True, tool_preset="core"),
+    launcher=my_gvisor_launcher,   # wraps the worker command per leaf; fail-closed
+    timeout_s=120,
+)
+await create_workflow(spec, parent_loop=loop, executor=ex).run()
 ```
 
-See [`examples/23_per_send_overrides.py`](examples/23_per_send_overrides.py).
+A crashed or killed worker becomes a failed leaf — which `resume` re-runs. Each leaf's private DB is kept for inspection (or GC'd).
 
-### Token usage accounting
+### Durable timers — the agent wakes itself up
 
-Every `send()` returns the run's cumulative token usage — summed over all LLM
-calls of that run (tool loops make several) — so cost accounting needs no event
-plumbing:
+A timer is **data, not a task**: a row in the store that survives restarts and cascade-deletes with its session. Give the agent the `schedule_wakeup` tool and it can say "check back in 10 minutes" — for real.
 
 ```python
-res = await loop.send("…", session_id=sid)
-res.usage
-# {"prompt_tokens": 1234, "completion_tokens": 56, "cache_read_tokens": 0,
-#  "reasoning_tokens": 0, "total_tokens": 1290, "calls": 2}
-```
-
-For per-call, real-time metering subscribe to the `usage_updated` event (one
-per LLM call, tagged with `session_id`). See
-[`examples/25_token_usage.py`](examples/25_token_usage.py).
-
-**Budget guardrail** — cap real provider tokens per run (rounds are cheap,
-tokens are money):
-
-```python
-config = AgentLoopConfig(max_rounds=24, max_tokens_per_run=50_000)
-res = await loop.send("…", session_id=sid)
-res.status  # "budget_exceeded" when the cap is hit
-```
-
-Checked at round boundaries: the round that crosses the budget finishes
-cleanly (no dangling tool_calls), then the loop stops without paying for the
-next LLM call. A `status_changed` event with `kind="budget_exceeded"` fires.
-
-**Session statistics** — cumulative accounting persisted in the store,
-bumped once per finished send:
-
-```python
-stats = loop.get_session_stats(sid)
-# SessionStatsRow(sends=12, rounds=29, llm_calls=31, tool_calls=18,
-#                 prompt_tokens=…, completion_tokens=…, total_tokens=…,
-#                 first_send_at=…, last_send_at=…)
-loop.list_session_stats()  # every session, most recently active first
-```
-
-**Structured event logging** — one JSON line per event, stdlib-only:
-
-```python
-from power_loop.contrib.logging_sink import attach_logging_sink
-
-bus = AgentEventBus(suppress_subscriber_errors=True)
-attach_logging_sink(bus)   # or events={AgentEventType.USAGE_UPDATED}
-loop = StatefulAgentLoop(llm=llm, event_bus=bus, ...)
-```
-
-### Crash recovery: `heal_pending`
-
-A run killed mid tool-call leaves the session with unresolved `tool_calls`;
-the next `send()` raises `SessionPendingError` (the message protocol forbids
-continuing). Orchestrators whose runs can legitimately die (human interrupts,
-process restarts) can opt into self-healing:
-
-```python
-res = await loop.send("…", session_id=sid, heal_pending=True)
-# stale tool_calls are aborted with synthetic <aborted> results, then the
-# send proceeds. Default remains raise — healing discards in-flight work.
-```
-
-Or recover explicitly with `resume(sid)` / `abort_pending(sid)`.
-
-### Durable timers
-
-A timer is **data, not a task**: it lives in the session store, survives
-restarts, and cascade-deletes with its session. Firing is a normal message —
-`follow_up` delivers it (idle session → a regular send; mid-run → injected at
-the next round boundary), so there is exactly one path into a conversation.
-
-One-shot vs recurring is **declared at creation**: `every_seconds` on the
-tool / `interval_s` on the API. A recurring timer re-arms after each delivery
-at fire-time + interval (fixed-delay — periods missed while the process was
-down collapse into one), and `cancel` is the only way it ends.
-
-```python
-from power_loop import TimerRunner, HookPoint, TimerFireCtx
-
-# agent-side: register the default tools schedule_wakeup / list_wakeups /
-# cancel_wakeup / current_time — the model schedules its own wake-ups
-# (schedule_wakeup(delay_seconds, note, every_seconds=None)).
-# host-side:
+from power_loop import TimerRunner
 loop.schedule_timer(sid, delay_s=600, note="check the export job")
 loop.schedule_timer(sid, delay_s=60, note="heartbeat", interval_s=3600)  # recurring
-
-runner = TimerRunner(loop)        # scans store.due_timers(), re-arms stale rows
-await runner.start()
-
-# optional orchestrator veto point before every delivery:
-def gate(ctx: TimerFireCtx):
-    if my_system_is_busy():
-        ctx.postpone_s = 60       # or HookDirective.SKIP / BREAK (cancel)
-loop.hooks.register(HookPoint.TIMER_FIRE, gate)
+await TimerRunner(loop).start()   # fires due timers as normal follow-ups
 ```
 
-Semantics are **at-least-once**: a process dying mid-fire re-arms the row and
-it may deliver twice — dedupe in the `TIMER_FIRE` hook if that matters. A
-`timer_fired` event reports every outcome (`delivered` / `queued` / `skipped`
-/ `cancelled` / `postponed` / `error`). See
-[`examples/26_timers.py`](examples/26_timers.py).
-
-## Public API
-
-Stable imports are re-exported from `power_loop`:
+### Structured output you can branch on
 
 ```python
-from power_loop import (
-    AgentLoopConfig,
-    StatefulAgentLoop,
-    StatefulResult,
-    ToolDefinition,
-    ToolRegistry,
-)
+from power_loop import AgentLoopConfig, StructuredOutputSpec, parse_structured
+
+schema = {"type": "object", "required": ["label"], "properties": {"label": {"type": "string"}}}
+fmt = StructuredOutputSpec(name="Triage", schema=schema).to_openai_response_format()
+loop = StatefulAgentLoop(llm=llm, db_path="app.db",
+                         config=AgentLoopConfig(response_format=fmt))   # also per sub-agent / workflow node
+res = await loop.send("Classify: 'my card was charged twice'", session_id=sid)
+triage = parse_structured(res.final_text, schema=schema)   # {"label": "billing"}
 ```
 
-The stability tiers are:
+(In a workflow, a node's `output_schema` does this automatically so downstream `items_from` / `branch.on` can read the parsed payload — see the workflow example above.)
+
+### Hard token budgets + usage accounting, no event plumbing
+
+```python
+res = await loop.send("…", session_id=sid)          # config: max_tokens_per_run=50_000
+res.usage      # {"prompt_tokens":…, "completion_tokens":…, "total_tokens":…, "calls": 2}
+res.status     # "budget_exceeded" if the per-run cap was hit (stops before the next call)
+loop.get_session_stats(sid)   # cumulative, persisted per session
+```
+
+### Crash recovery
+
+```python
+# a run killed mid tool-call leaves unresolved tool_calls; opt into self-healing:
+res = await loop.send("…", session_id=sid, heal_pending=True)
+# or recover explicitly: loop.resume(sid) / loop.abort_pending(sid)
+```
+
+More in [`examples/`](examples/README.md) — 27 runnable programs from `00_hello_world.py` to the full chatbot and the dynamic-workflow demo.
+
+---
+
+## Honest scope
+
+power-loop **orchestrates**; it does not, by itself, **isolate**. The built-in `bash`/file tools run in-process and inherit the host environment — convenient for trusted, local use, **not a security boundary**. For untrusted/model-authored commands, inject a sandbox via the `ShellBackend` seam (tool-level) or run leaves through the `SubprocessExecutor` + `WorkerLauncher` (process-level). Keep secrets in your orchestrator.
+
+**One store file = one writer process.** Per-session ordering is an in-process `asyncio.Lock`; two processes calling `send()` on the same session bypass it. Run one process per store file (shard sessions across files), or put your own distributed lock in front. A session only advances while a `send()`/`resume()` or a timer firing is in flight.
+
+---
+
+## Public API & stability
+
+Stable imports are re-exported from `power_loop` (`StatefulAgentLoop`, `AgentLoopConfig`, `StatefulResult`, `ToolDefinition`, `ToolRegistry`, …). Tiers:
 
 | Tier | Meaning |
 |---|---|
-| Stable | Backward compatible across minor releases. Listed in `power_loop.STABLE_API`. |
-| Provisional | Available from the top-level package during 0.x, but may change. |
-| Internal | Submodule imports such as `power_loop.core.*`; no compatibility promise. |
+| **Stable** | Backward compatible across minor releases. Listed in `power_loop.STABLE_API`. |
+| **Provisional** | Re-exported from the top-level package during 0.x; may change. |
+| **Internal** | `power_loop.core.*` etc.; no compatibility promise. |
 
-See the [API reference](docs/en/api/index.md) for the current surface.
-
-## Examples
-
-The `examples/` directory is ordered from minimal usage to full chatbot composition:
-
-```bash
-python examples/00_hello_world.py
-python examples/02_tool_calling.py
-python examples/19_full_chatbot.py
-```
-
-The full list is in [examples/README.md](examples/README.md).
+See the [API reference](docs/en/api/index.md).
 
 ## Development
 
 ```bash
+git clone https://github.com/PL-play/power-loop.git && cd power-loop
 pip install -e ".[dev]"
 ruff check .
-pytest -q --no-real
+pytest -q --no-real     # unit suite; drop --no-real to run the live-LLM suite
 ```
 
-Real LLM examples/tests use `POWER_LOOP_*` or the legacy `OPENAI_COMPAT_*` variables.
+## Links
 
-## Project Links
-
-- [Documentation index](docs/README.md)
-- [Architecture](docs/en/architecture.md)
-- [Roadmap](ROADMAP.md)
-- [Changelog](CHANGELOG.md)
-- [Contributing](CONTRIBUTING.md)
-- [License](LICENSE)
+[Docs](docs/README.md) · [Architecture](docs/en/architecture.md) · [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [License](LICENSE)
