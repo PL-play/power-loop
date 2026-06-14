@@ -24,9 +24,20 @@ from typing import Any
 
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.contracts.errors import SpecValidationError
+from power_loop.contracts.event_payloads import (
+    SubagentCompletedPayload,
+    SubagentLimitPayload,
+    SubagentTaskStartPayload,
+    SubagentTextPayload,
+)
+from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.runtime.cancellation import CancellationLike
 from power_loop.runtime.session_store import MAX_SPAWN_DEPTH, SubagentLifecycle
 from power_loop.tools.registry import ToolRegistry
+
+# Lifecycle events published from run_agent_spec carry this source so sinks can
+# attribute them to a sub-agent (vs the parent's own pipeline events).
+SUBAGENT_EVENT_SOURCE = "subagent"
 
 __all__ = [
     "AgentSpec",
@@ -133,6 +144,31 @@ def filtered_registry(
     return sub
 
 
+def _publish_subagent_event(
+    parent_loop: Any,
+    parent_sid: str | None,
+    event_type: AgentEventType,
+    payload: Any,
+) -> None:
+    """Best-effort publish of a sub-agent lifecycle event on the parent's bus.
+
+    The event is attributed to ``parent_sid`` (so it surfaces in the parent /
+    host event stream) and tagged ``source="subagent"``. Observability must
+    never break a run, so all errors are swallowed.
+    """
+    try:
+        parent_loop.event_bus.publish(
+            AgentEvent(
+                type=event_type,
+                data=payload,
+                session_id=parent_sid,
+                source=SUBAGENT_EVENT_SOURCE,
+            )
+        )
+    except Exception:  # noqa: BLE001 — observability must never break a run
+        pass
+
+
 async def run_agent_spec(
     spec: AgentSpec | dict[str, Any] | str,
     user_input: str,
@@ -215,6 +251,18 @@ async def run_agent_spec(
         metadata=dict(spec.metadata),
     )
 
+    child_row = parent_loop.store.get_session(child_sid)
+    depth = child_row.spawn_depth if child_row is not None else 1
+    _publish_subagent_event(
+        parent_loop, parent_sid, AgentEventType.SUBAGENT_TASK_START,
+        SubagentTaskStartPayload(
+            task=user_input,
+            preset=str(spec.metadata.get("preset") or "core"),
+            sub_session_id=child_sid,
+            depth=depth,
+        ),
+    )
+
     sub_registry = filtered_registry(parent_loop.tool_registry, spec.tools)
 
     # Build a sibling loop sharing the same store + registry-subset.
@@ -230,6 +278,31 @@ async def run_agent_spec(
     )
     result = await child_loop.send(user_input, session_id=child_sid, stop_event=stop_event)
 
+    # ── Sub-agent lifecycle events (source="subagent", on the parent stream) ──
+    # TEXT only when the child produced an answer; LIMIT for the round-limit
+    # failure mode it specifically models; COMPLETED is the terminal marker
+    # always emitted last.
+    if result.status == "completed":
+        _publish_subagent_event(
+            parent_loop, parent_sid, AgentEventType.SUBAGENT_TEXT,
+            SubagentTextPayload(
+                sub_session_id=child_sid, status=result.status,
+                rounds=result.rounds, final_text=result.final_text or "",
+            ),
+        )
+    elif result.status == "hit_round_limit":
+        _publish_subagent_event(
+            parent_loop, parent_sid, AgentEventType.SUBAGENT_LIMIT,
+            SubagentLimitPayload(sub_session_id=child_sid, max_rounds=int(spec.max_rounds)),
+        )
+    _publish_subagent_event(
+        parent_loop, parent_sid, AgentEventType.SUBAGENT_COMPLETED,
+        SubagentCompletedPayload(
+            sub_session_id=child_sid, status=result.status,
+            rounds=result.rounds, final_text=result.final_text or "",
+        ),
+    )
+
     # Lifecycle cleanup.
     if spec.lifecycle == SubagentLifecycle.EPHEMERAL.value:
         if result.status == "completed":
@@ -240,11 +313,6 @@ async def run_agent_spec(
             returned_sid = child_sid
     else:
         returned_sid = child_sid
-
-    child_row = parent_loop.store.get_session(child_sid)
-    depth = child_row.spawn_depth if child_row is not None else (
-        (parent_loop.store.get_session(parent_sid).spawn_depth + 1) if parent_sid else 1
-    )
 
     return {
         "session_id": returned_sid,
