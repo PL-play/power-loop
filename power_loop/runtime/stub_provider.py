@@ -9,6 +9,7 @@ agent loop without a real provider or network.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -33,6 +34,7 @@ class EchoLLMService(LLMService):
 
     reply: str | None = None
     prefix: str = ""
+    sleep_s: float = 0.0  # artificial latency, for exercising cancel/timeout paths
 
     async def complete(
         self,
@@ -42,6 +44,8 @@ class EchoLLMService(LLMService):
         on_chunk_think=None,
         on_stream_end=None,
     ) -> LLMResponse:
+        if self.sleep_s:
+            await asyncio.sleep(self.sleep_s)
         text = self.reply
         if text is None:
             last = ""

@@ -301,7 +301,9 @@ class WorkflowEngine:
             payload=payload,
             usage=dict(raw.get("usage") or {}),
             session_id=raw.get("session_id"),
-            error=err,
+            # output_schema parse error takes precedence; otherwise surface any
+            # error the executor reported (e.g. a subprocess timeout / crash).
+            error=err or raw.get("error"),
         )
         self._results[node.id] = res
         self._last = res

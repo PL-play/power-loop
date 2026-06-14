@@ -129,6 +129,9 @@ class LLMProviderConfig:
             reply = _get("ECHO_REPLY")
             if reply is not None:
                 extra["echo_reply"] = reply
+            sleep = _get("ECHO_SLEEP")
+            if sleep is not None:
+                extra["echo_sleep_s"] = float(sleep)
 
         return cls(
             base_url=base_url or "",
@@ -182,6 +185,7 @@ def create_llm_service_from_config(cfg: LLMProviderConfig) -> LLMService:
         return EchoLLMService(
             reply=cfg.extra.get("echo_reply"),
             prefix=cfg.extra.get("echo_prefix", ""),
+            sleep_s=float(cfg.extra.get("echo_sleep_s") or 0.0),
         )
     if provider in {"anthropic", "claude", "dashscope-anthropic"}:
         return AnthropicMessagesLLMService(cfg.to_anthropic())

@@ -247,8 +247,27 @@ class WorkerJob:
         )
 
 
+def _maybe_fault_inject(job: WorkerJob) -> None:
+    """Test-only fault injection: hard-crash the worker for a named node.
+
+    Gated behind ``POWER_LOOP_TEST_CRASH_NODES`` (comma-separated node ids), which
+    production never sets. ``os._exit`` kills the process before it writes a result
+    frame, simulating a worker that died mid-run — the orchestrator records the
+    leaf as failed and the resume tier re-runs exactly it.
+    """
+    import os
+
+    nodes = os.environ.get("POWER_LOOP_TEST_CRASH_NODES", "").strip()
+    if not nodes:
+        return
+    nid = (job.spec.get("metadata") or {}).get("workflow_node_id")
+    if nid and nid in {n.strip() for n in nodes.split(",") if n.strip()}:
+        os._exit(13)
+
+
 async def run_job(job: WorkerJob) -> dict[str, Any]:
     """Execute a job in this process: rebuild the bootstrap and run the spec."""
+    _maybe_fault_inject(job)
     bootstrap = _bootstrap_from_dict(job.bootstrap)
     return await run_spec_isolated(
         job.spec, job.user_input,
