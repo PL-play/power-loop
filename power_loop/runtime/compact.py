@@ -185,9 +185,13 @@ class DefaultCompactor(Compactor):
         tail_start = self._expand_back_to_atomic(messages, tail_start)
         if tail_start <= sys_end:
             return None
+        # ``tail_start`` is already a clean boundary (``_expand_back_to_atomic``
+        # guarantees the kept tail never starts on an orphan ``tool``), so folding
+        # [sys_end, tail_start-1] always folds complete assistant↔tool pairs.
+        # Do NOT walk ``end`` back over trailing ``tool`` messages here: that would
+        # fold an ``assistant(tool_calls)`` while leaving its ``tool`` replies in
+        # the kept tail — a protocol-invalid orphan tool (HTTP 400 on the next call).
         end = tail_start - 1
-        while end > sys_end and messages[end].get("role") == "tool":
-            end -= 1
         if end < sys_end:
             return None
         return (sys_end, end)

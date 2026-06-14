@@ -425,7 +425,15 @@ class SessionStore:
             p = Path(path_str).expanduser()
             p.parent.mkdir(parents=True, exist_ok=True)
             path_str = str(p)
-        conn = sqlite3.connect(path_str, check_same_thread=False, isolation_level=None)
+        # isolation_level="" (deferred) — NOT None (autocommit). With autocommit,
+        # `with self._conn:` is a no-op (no transaction is ever open), so the
+        # multi-statement writers (append_message's INSERT+next_seq bump,
+        # create_session's two inserts, record_compaction, the cascade delete, …)
+        # were NOT atomic: a failure between statements left corrupt state (e.g. a
+        # message persisted but next_seq not bumped → permanent UNIQUE wedge).
+        # Deferred mode makes Python auto-BEGIN before DML and the `with` block
+        # commit/rollback, restoring the atomicity those methods document.
+        conn = sqlite3.connect(path_str, check_same_thread=False, isolation_level="")
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")

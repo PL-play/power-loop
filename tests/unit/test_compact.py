@@ -99,23 +99,45 @@ async def test_compactor_triggers_above_threshold(monkeypatch) -> None:
 # ── DefaultCompactor: atomic pair preservation ─────────────────────────
 
 
+def _assert_no_orphan_tools(messages: list[dict[str, Any]]) -> None:
+    """Every ``tool`` message must follow an ``assistant(tool_calls)`` whose ids
+    include its tool_call_id — i.e. the history is protocol-valid (no orphan)."""
+    open_ids: set = set()
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            open_ids |= {tc.get("id") for tc in m["tool_calls"]}
+        elif role == "tool":
+            assert m.get("tool_call_id") in open_ids, (
+                f"orphan tool {m.get('tool_call_id')!r} (no preceding assistant.tool_calls)"
+            )
+
+
 @pytest.mark.asyncio
-async def test_compactor_never_splits_assistant_tool_pair(monkeypatch) -> None:
+async def test_compactor_never_orphans_tool_when_user_follows_pair(monkeypatch) -> None:
+    """Regression: a completed assistant↔tool pair followed by a new user turn
+    must not be split. The fold boundary used to walk back over the trailing
+    tool, folding the assistant but KEEPING its tool → an orphan tool that the
+    provider rejects (HTTP 400). Now the whole pair folds together."""
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     cp = DefaultCompactor(trigger_ratio=0.5, keep_last_n=1)
     summary_llm = _Scripted(responses=[LLMResponse(raw_text="<summary>ok</summary>")])
     msgs: list[dict[str, Any]] = [
+        {"role": "system", "content": "sys"},
         {"role": "user", "content": "u1" * 1000},
-        {"role": "assistant", "content": "a1", "tool_calls": [{"id": "tc"}]},
-        {"role": "tool", "tool_call_id": "tc", "content": "out" * 1000},
-        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "u2" * 1000},
+        {"role": "assistant", "content": "call", "tool_calls": [{"id": "tc1"}]},
+        {"role": "tool", "tool_call_id": "tc1", "content": "out" * 1000},
+        {"role": "user", "content": "u3"},
     ]
     plan = await cp.maybe_compact(msgs, llm=summary_llm, max_tokens=2000, round_index=1)
-    # If tail keep_last_n=1 lands on the user u2 only, the assistant/tool
-    # pair must NOT straddle: either both folded or both kept.
-    if plan is not None:
-        # If fold_end_idx == 2 (the tool), assistant at 1 must also be in fold
-        assert not (plan.fold_end_idx == 2 and plan.fold_start_idx > 1)
+    assert plan is not None  # there is foldable history here
+    note = {"role": "system", "name": "compact_note", "content": plan.summary_text}
+    result = msgs[: plan.fold_start_idx] + [note] + msgs[plan.fold_end_idx + 1 :]
+    _assert_no_orphan_tools(result)  # would FAIL before the fix (orphan tc1)
+    # u3 is the kept tail, so the whole tool pair must be folded away.
+    assert not any(m.get("role") == "tool" for m in result)
 
 
 @pytest.mark.asyncio
