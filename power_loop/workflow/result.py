@@ -8,11 +8,12 @@ results it can branch on, so the workflow layer wraps every step in
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["AgentResult", "WorkflowResult", "SharedBudget"]
+__all__ = ["AgentResult", "WorkflowResult", "SharedBudget", "WorkflowRunHandle"]
 
 
 @dataclass
@@ -35,6 +36,17 @@ class AgentResult:
     @property
     def ok(self) -> bool:
         return self.status == "completed"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "status": self.status,
+            "text": self.text,
+            "payload": self.payload,
+            "usage": self.usage,
+            "session_id": self.session_id,
+            "error": self.error,
+        }
 
 
 @dataclass
@@ -69,6 +81,16 @@ class WorkflowResult:
         if self.usage.get("total_tokens"):
             lines.append(f"tokens: {self.usage['total_tokens']}")
         return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "results": {k: v.to_dict() for k, v in self.results.items()},
+            "final": self.final.to_dict() if self.final else None,
+            "usage": self.usage,
+            "errors": self.errors,
+        }
 
 
 def _oneline(text: str, limit: int = 160) -> str:
@@ -118,3 +140,22 @@ class SharedBudget:
         with self._lock:
             return {"max_tokens": self.max_tokens, "spent": self._spent,
                     "remaining": max(0, self.max_tokens - self._spent)}
+
+
+@dataclass
+class WorkflowRunHandle:
+    """Handle for a detached workflow run.
+
+    ``run_id`` is the journal key suffix (``workflow:run:<run_id>``) used by
+    :func:`power_loop.workflow.get_workflow` to read status/detail; ``task`` is
+    the background ``asyncio.Task`` driving the run (retained by the
+    :class:`Workflow` so it is not garbage-collected mid-flight).
+
+    NOTE: the completion **wake** of the parent agent is delivered by a durable
+    timer — it fires only while a ``TimerRunner`` (or an external poller of
+    ``store.due_timers()``) is running on the host. Without one, the run still
+    completes and the journal updates, but the parent is not auto-woken.
+    """
+
+    run_id: str
+    task: asyncio.Task[None]

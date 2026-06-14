@@ -12,17 +12,23 @@ shape but raises ``NotImplementedError`` for ``detached=True`` for now.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from .engine import Executor, WorkflowEngine
-from .result import SharedBudget, WorkflowResult
+from .result import SharedBudget, WorkflowResult, WorkflowRunHandle
 from .spec import WorkflowSpec
 
 __all__ = ["Workflow", "create_workflow"]
 
 
 class Workflow:
-    """A validated workflow bound to a parent loop, ready to run."""
+    """A validated workflow bound to a parent loop, ready to run.
+
+    ``parent_session_id`` is the agent session that owns this run — required for
+    detached execution (it is journaled under that session and woken on
+    completion). Synchronous :meth:`run` does not need it.
+    """
 
     def __init__(
         self,
@@ -31,28 +37,37 @@ class Workflow:
         parent_loop: Any,
         executor: Executor | None = None,
         budget: SharedBudget | None = None,
+        parent_session_id: str | None = None,
     ) -> None:
         self.spec = spec
         self._loop = parent_loop
         self._executor = executor
         self._budget = budget
+        self._parent_sid = parent_session_id
+        self._tasks: set[asyncio.Task[None]] = set()  # retain detached tasks (GC guard)
 
     async def run(self) -> WorkflowResult:
-        """Interpret the spec to completion (in-process) and return the result."""
+        """Interpret the spec to completion (in-process, synchronous) and return it."""
         engine = WorkflowEngine(self._loop, executor=self._executor, budget=self._budget)
         return await engine.run(self.spec)
 
-    async def start(self, *, detached: bool = False) -> WorkflowResult:
-        """Forward-compatible entry point.
+    async def start(
+        self, *, detached: bool = False, eager_wake: bool = False
+    ) -> WorkflowResult | WorkflowRunHandle:
+        """Run the workflow.
 
-        ``detached=True`` (run in the background, wake the parent agent via a
-        completion hook) is a later tier and not yet implemented.
+        * ``detached=False`` (default): run synchronously, return a
+          :class:`WorkflowResult`.
+        * ``detached=True``: run in the background, return a
+          :class:`WorkflowRunHandle` immediately; the parent agent (identified by
+          ``parent_session_id``) is woken on completion via a durable timer.
+          Requires a ``parent_session_id`` and a running ``TimerRunner`` on the
+          host. ``eager_wake=True`` adds a non-durable instant wake on top.
         """
         if detached:
-            raise NotImplementedError(
-                "detached execution + completion callback is a later tier; "
-                "use `await workflow.run()` for synchronous in-process execution."
-            )
+            from .runner import run_detached  # local import avoids import cycle
+
+            return await run_detached(self, eager_wake=eager_wake)
         return await self.run()
 
 
@@ -62,13 +77,18 @@ def create_workflow(
     parent_loop: Any,
     executor: Executor | None = None,
     budget: SharedBudget | None = None,
+    parent_session_id: str | None = None,
 ) -> Workflow:
     """Validate ``spec_json`` and return a runnable :class:`Workflow`.
 
     Accepts raw JSON / a dict (validated here) or an already-built
     :class:`WorkflowSpec`. Raises
     :class:`~power_loop.workflow.spec.WorkflowSpecError` (all problems
-    aggregated) if an unvalidated payload is invalid.
+    aggregated) if an unvalidated payload is invalid. Pass
+    ``parent_session_id`` to enable detached execution.
     """
     spec = spec_json if isinstance(spec_json, WorkflowSpec) else WorkflowSpec.from_json(spec_json)
-    return Workflow(spec, parent_loop=parent_loop, executor=executor, budget=budget)
+    return Workflow(
+        spec, parent_loop=parent_loop, executor=executor, budget=budget,
+        parent_session_id=parent_session_id,
+    )

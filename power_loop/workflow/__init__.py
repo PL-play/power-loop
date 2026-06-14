@@ -40,7 +40,9 @@ from .engine import (
     WorkflowRunError,
     in_workflow,
 )
-from .result import AgentResult, SharedBudget, WorkflowResult
+from .introspect import get_workflow, list_workflows
+from .result import AgentResult, SharedBudget, WorkflowResult, WorkflowRunHandle
+from .runner import register_wake_guard, run_detached
 from .spec import (
     AgentNode,
     BranchNode,
@@ -52,7 +54,11 @@ from .spec import (
     WorkflowSpec,
     WorkflowSpecError,
 )
-from .tool import CREATE_WORKFLOW_DEFINITION, register_workflow_tools
+from .tool import (
+    CREATE_WORKFLOW_DEFINITION,
+    WORKFLOW_STATUS_DEFINITION,
+    register_workflow_tools,
+)
 
 __all__ = [
     # spec / DSL
@@ -75,10 +81,18 @@ __all__ = [
     "AgentResult",
     "WorkflowResult",
     "SharedBudget",
+    "WorkflowRunHandle",
     # host api
     "Workflow",
     "create_workflow",
-    # llm-facing tool
+    # detached execution + wake (D3)
+    "run_detached",
+    "register_wake_guard",
+    # introspection (D4)
+    "list_workflows",
+    "get_workflow",
+    # llm-facing tools
     "CREATE_WORKFLOW_DEFINITION",
+    "WORKFLOW_STATUS_DEFINITION",
     "register_workflow_tools",
 ]

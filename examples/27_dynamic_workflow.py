@@ -122,11 +122,27 @@ async def main() -> str:
 #   from power_loop.workflow import register_workflow_tools
 #
 #   registry = create_default_tool_registry(preset="core")
-#   register_workflow_tools(registry)        # adds the `create_workflow` meta-tool
+#   register_workflow_tools(registry)        # adds create_workflow + workflow_status
 #   loop = StatefulAgentLoop(llm=make_llm(), db_path=":memory:", tool_registry=registry)
 #   # Now the model can emit a WorkflowSpec JSON and call create_workflow itself.
 #   # (Don't grant this tool to a workflow's own leaf agents — nested runs are
 #   #  refused in this tier.)
+
+
+# ── Detached execution + completion wake (middle tier) ───────────────────────
+#
+#   from power_loop import TimerRunner
+#   from power_loop.workflow import create_workflow, register_wake_guard, get_workflow
+#
+#   register_wake_guard(loop)                 # dedupe at-least-once wake timers
+#   await TimerRunner(loop).start()           # REQUIRED: delivers the wake
+#   parent_sid = loop.new_session()
+#   wf = create_workflow(SPEC, parent_loop=loop, parent_session_id=parent_sid)
+#   handle = await wf.start(detached=True)    # returns immediately; runs in background
+#   # ... the parent agent can pass_turn now; it is woken with the result when done.
+#   # Inspect any time:
+#   #   get_workflow(loop, parent_sid, handle.run_id, detail=True)  -> status + steps + usage
+#   #   list_workflows(loop, parent_sid)                            -> all runs
 
 
 if __name__ == "__main__":

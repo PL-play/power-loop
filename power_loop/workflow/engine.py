@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import Any, Protocol
@@ -129,10 +130,15 @@ class WorkflowEngine:
         *,
         executor: Executor | None = None,
         budget: SharedBudget | None = None,
+        on_step: Callable[[AgentResult], None] | None = None,
     ) -> None:
         self._loop = parent_loop
         self._executor = executor or InProcessExecutor()
         self._budget = budget
+        # Optional per-step observer fired when each agent node settles
+        # (completed / failed / budget_exceeded). Used by the detached runner to
+        # journal live progress. Must not raise; errors are swallowed.
+        self._on_step = on_step
         self._results: dict[str, AgentResult] = {}
         self._errors: list[str] = []
         self._last: AgentResult | None = None
@@ -186,6 +192,7 @@ class WorkflowEngine:
             res = AgentResult(node_id=node.id, status="budget_exceeded", text="",
                               error="shared token budget exhausted")
             self._results[node.id] = res
+            self._emit_step(res)
             return res
 
         user_input = _render(node.input, env)
@@ -222,7 +229,16 @@ class WorkflowEngine:
         self._last = res
         if self._budget is not None:
             self._budget.commit(res.usage)
+        self._emit_step(res)
         return res
+
+    def _emit_step(self, res: AgentResult) -> None:
+        if self._on_step is None:
+            return
+        try:
+            self._on_step(res)
+        except Exception:  # noqa: BLE001 — observer must never break the run
+            pass
 
     async def _exec_sequence(self, node: SequenceNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         last: AgentResult | None = None
