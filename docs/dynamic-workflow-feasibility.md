@@ -195,7 +195,7 @@ detail = get_workflow(run_id, detail=True)           # 表 + events + get_sessio
 |---|---|---|
 | **最小** | sequence+parallel+foreach 的 in-process **同步**执行 + JSON 校验 | 仅 contextvar sharp edge：显式传 sid（可纯在 workflow 层 set/reset INTERNAL setter，或推动 core 加显式 `parent_sid` 参数） |
 | **中** | + SQLite 持久化（新表）+ TimerRunner 驱动 + `WORKFLOW_*` hook 完成回调唤醒主 agent + LINKED 子 session | + `run_agent_spec` surface usage、forward stop_event；`AgentSpec.output_schema` |
-| **完整** | + 编排级 resume/journal + `SharedBudget` 跨子代理池 + 活进度树（wire `SUBAGENT_*`/`source` + parent_session_id 关联 + 事件 buffer）+ 可选 subprocess executor | + `MAX_SPAWN_DEPTH` 可配；subprocess 需单 writer 漏斗（最难，单独立项） |
+| **完整** | + 编排级 resume/journal ✅（`resume_run`/`resume_detached`：journal 持久化 spec + 每步 text/payload，重放已完成步、只重跑未完成尾；foreach 以 aggregate 原子重放；幂等 key 注入叶子 metadata）+ `SharedBudget` 跨子代理池 ✅ + 活进度树 ✅（`SUBAGENT_*`/`source` 已接线 + parent_session_id 关联）+ 可选 subprocess executor（仍 deferred） | + `MAX_SPAWN_DEPTH` 可配 ✅；subprocess 需单 writer 漏斗（最难，单独立项，未做） |
 
 ---
 

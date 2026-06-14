@@ -38,7 +38,27 @@ if TYPE_CHECKING:
 
     from .api import Workflow
 
-__all__ = ["run_detached", "make_wake_guard", "register_wake_guard"]
+__all__ = [
+    "run_detached", "make_wake_guard", "register_wake_guard", "make_on_step", "spawn_background",
+]
+
+
+def make_on_step(store: Any, parent_sid: str, run_id: str):
+    """Build the per-step journaling callback the engine fires as nodes settle.
+
+    Captures the step's output (``text`` / ``payload``) too, so a completed step
+    can be replayed (not re-run) when the run is resumed.
+    """
+
+    def _on_step(res: AgentResult) -> None:
+        journal.record_step(
+            store, parent_sid, run_id,
+            node_id=res.node_id, status=res.status,
+            session_id=res.session_id, usage=res.usage, error=res.error,
+            text=res.text, payload=res.payload,
+        )
+
+    return _on_step
 
 
 def _wake_note(run_id: str, status: str, extra: str = "") -> str:
@@ -93,22 +113,44 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
         raise WorkflowRunError("parent session not found; cannot start detached run")
 
     run_id = secrets.token_hex(8)
-    journal.seed(store, parent_sid, run_id, workflow.spec.name)
+    journal.seed(store, parent_sid, run_id, workflow.spec.name, spec=workflow.spec.to_dict())
 
-    def _on_step(res: AgentResult) -> None:
-        journal.record_step(
-            store, parent_sid, run_id,
-            node_id=res.node_id, status=res.status,
-            session_id=res.session_id, usage=res.usage, error=res.error,
+    def _build_engine() -> WorkflowEngine:
+        return WorkflowEngine(
+            loop, executor=workflow._executor, budget=workflow._budget,
+            on_step=make_on_step(store, parent_sid, run_id),
+            stop_event=workflow._cancel, run_id=run_id,
         )
+
+    return spawn_background(
+        loop, parent_sid, run_id,
+        build_engine=_build_engine, run_spec=workflow.spec,
+        cancel_token=workflow._cancel, eager_wake=eager_wake, task_set=workflow._tasks,
+    )
+
+
+def spawn_background(
+    loop: Any,
+    parent_sid: str,
+    run_id: str,
+    *,
+    build_engine: Any,
+    run_spec: Any,
+    cancel_token: Any,
+    eager_wake: bool,
+    task_set: set[Any],
+) -> WorkflowRunHandle:
+    """Drive a workflow engine on a background task; journal + wake on finish.
+
+    Shared by first-run (``run_detached``) and ``resume_detached``. The engine is
+    built lazily inside the task so its construction happens on the run's own
+    task. Returns a handle immediately.
+    """
+    store = loop.store
 
     async def _bg() -> None:
         try:
-            engine = WorkflowEngine(
-                loop, executor=workflow._executor, budget=workflow._budget, on_step=_on_step,
-                stop_event=workflow._cancel,
-            )
-            result = await engine.run(workflow.spec)
+            result = await build_engine().run(run_spec)
             await asyncio.to_thread(journal.finalize, store, parent_sid, run_id, result)
             note = _wake_note(run_id, result.status)
             _publish(loop, parent_sid, run_id, "completed", result.status,
@@ -125,9 +167,9 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
                 asyncio.create_task(loop.follow_up(note, parent_sid))
 
     task = asyncio.create_task(_bg(), name=f"workflow-{run_id}")
-    workflow._tasks.add(task)
-    task.add_done_callback(workflow._tasks.discard)
-    return WorkflowRunHandle(run_id=run_id, task=task, cancel_token=workflow._cancel)
+    task_set.add(task)
+    task.add_done_callback(task_set.discard)
+    return WorkflowRunHandle(run_id=run_id, task=task, cancel_token=cancel_token)
 
 
 class _suppress:

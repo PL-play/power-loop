@@ -59,26 +59,43 @@ def run_key(run_id: str) -> str:
     return f"{JOURNAL_PREFIX}{run_id}"
 
 
-def new_journal(run_id: str, workflow: str, driver_sid: str | None = None) -> dict[str, Any]:
+def new_journal(
+    run_id: str,
+    workflow: str,
+    driver_sid: str | None = None,
+    spec: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     now = _now_ms()
     return {
         "run_id": run_id,
         "workflow": workflow,
         "driver_sid": driver_sid,
+        # The serialized WorkflowSpec (WorkflowSpec.to_dict()) so the run can be
+        # resumed after a process restart without the caller re-supplying it.
+        "spec": spec,
         "status": "running",
         "created_at_ms": now,
         "updated_at_ms": now,
         "finished_at_ms": None,
         "woke": False,
+        # Bumped each time the run is (re)started; lets introspection tell a
+        # resumed run from a first run.
+        "attempts": 1,
         "steps": [],
         "result": None,
         "error": None,
     }
 
 
-def seed(store: SessionStore, parent_sid: str, run_id: str, workflow: str) -> dict[str, Any]:
+def seed(
+    store: SessionStore,
+    parent_sid: str,
+    run_id: str,
+    workflow: str,
+    spec: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Create the run journal and add it to the parent's run index."""
-    j = new_journal(run_id, workflow)
+    j = new_journal(run_id, workflow, spec=spec)
     store.set_runtime_state(parent_sid, run_key(run_id), j)
     _append_index(store, parent_sid, run_id)
     return j
@@ -116,8 +133,15 @@ def record_step(
     session_id: str | None = None,
     usage: dict[str, int] | None = None,
     error: str | None = None,
+    text: str | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> None:
-    """Append (or replace) a per-step record as the engine progresses."""
+    """Append (or replace) a per-step record as the engine progresses.
+
+    ``text`` / ``payload`` capture the step's *output* so a completed step can be
+    replayed (not re-run) on resume and feed downstream ``inputs_from`` /
+    ``items_from`` / ``branch.on`` references.
+    """
     j = store.get_runtime_state(parent_sid, run_key(run_id), default=None)
     if j is None:
         return
@@ -127,6 +151,8 @@ def record_step(
         "session_id": session_id,
         "usage": usage or {},
         "error": error,
+        "text": text or "",
+        "payload": payload,
     }
     steps = [s for s in j.get("steps", []) if s.get("node_id") != node_id]
     steps.append(step)

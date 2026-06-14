@@ -231,6 +231,97 @@ class WorkflowSpec:
         assert root is not None  # guaranteed when no problems
         return cls(name=name, root=root, input=wf_input, budget=budget, metadata=dict(metadata))
 
+    # ── serialization (round-trips through from_json) ───────────────────────
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize back to the JSON shape ``from_json`` accepts.
+
+        Used to persist the spec in a run's journal so a workflow can be resumed
+        across a process restart without the caller re-supplying it. The result
+        round-trips: ``WorkflowSpec.from_json(spec.to_dict())`` rebuilds an
+        equivalent spec.
+        """
+        out: dict[str, Any] = {"name": self.name, "root": _node_to_dict(self.root)}
+        if self.input:
+            out["input"] = self.input
+        if self.budget is not None:
+            out["budget"] = {
+                "max_tokens": self.budget.max_tokens,
+                "stop_at_remaining_pct": self.budget.stop_at_remaining_pct,
+            }
+        if self.metadata:
+            out["metadata"] = dict(self.metadata)
+        return out
+
+
+# ── serialization helpers ───────────────────────────────────────────────────
+
+
+def _agent_spec_to_dict(spec: AgentSpec) -> dict[str, Any]:
+    """The declared AgentSpec fields, as a dict from_json round-trips."""
+    from dataclasses import asdict
+
+    return asdict(spec)
+
+
+def _node_to_dict(node: WorkflowNode) -> dict[str, Any]:
+    if isinstance(node, AgentNode):
+        out: dict[str, Any] = {
+            "type": "agent",
+            "id": node.id,
+            "spec": _agent_spec_to_dict(node.spec),
+        }
+        if node.input != "{{input}}":
+            out["input"] = node.input
+        if node.inputs_from:
+            out["inputs_from"] = list(node.inputs_from)
+        if node.output_schema is not None:
+            out["output_schema"] = node.output_schema
+        return out
+    if isinstance(node, SequenceNode):
+        out = {"type": "sequence", "steps": [_node_to_dict(s) for s in node.steps]}
+        if node.id is not None:
+            out["id"] = node.id
+        return out
+    if isinstance(node, ParallelNode):
+        out = {
+            "type": "parallel",
+            "branches": [_node_to_dict(b) for b in node.branches],
+            "max_concurrency": node.max_concurrency,
+            "on_error": node.on_error,
+        }
+        if node.id is not None:
+            out["id"] = node.id
+        return out
+    if isinstance(node, ForeachNode):
+        out = {
+            "type": "foreach",
+            "as": node.as_var,
+            "body": _node_to_dict(node.body),
+            "parallel": node.parallel,
+            "max_concurrency": node.max_concurrency,
+            "on_error": node.on_error,
+        }
+        if node.id is not None:
+            out["id"] = node.id
+        if node.items_from is not None:
+            out["items_from"] = node.items_from
+        if node.items is not None:
+            out["items"] = list(node.items)
+        return out
+    if isinstance(node, BranchNode):
+        out = {
+            "type": "branch",
+            "on": node.on,
+            "cases": {k: _node_to_dict(v) for k, v in node.cases.items()},
+        }
+        if node.id is not None:
+            out["id"] = node.id
+        if node.default is not None:
+            out["default"] = _node_to_dict(node.default)
+        return out
+    raise TypeError(f"cannot serialize node of type {type(node).__name__}")
+
 
 # ── parsing helpers ─────────────────────────────────────────────────────────
 

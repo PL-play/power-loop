@@ -24,9 +24,12 @@ Quick start (host code)::
     result = await wf.run()
     print(result.summary())
 
-This is the minimal tier: in-process, synchronous. Detached execution with a
-completion callback that wakes the parent agent, orchestration-level resume, and
-an out-of-process executor are deferred to later tiers (see
+Beyond the synchronous in-process core, this package also provides detached
+execution with a completion callback that wakes the parent agent
+(:func:`run_detached` + :func:`register_wake_guard`) and orchestration-level
+resume across a process restart (:func:`resume_run` / :func:`resume_detached`,
+which replay completed steps from the run journal and re-run only the unfinished
+tail). An out-of-process executor remains deferred (see
 ``docs/dynamic-workflow-feasibility.md``).
 """
 
@@ -42,6 +45,12 @@ from .engine import (
 )
 from .introspect import get_workflow, list_workflows
 from .result import AgentResult, SharedBudget, WorkflowResult, WorkflowRunHandle
+from .resume import (
+    rehydrate,
+    replayable_node_ids,
+    resume_detached,
+    resume_run,
+)
 from .runner import register_wake_guard, run_detached
 from .spec import (
     AgentNode,
@@ -88,6 +97,11 @@ __all__ = [
     # detached execution + wake (D3)
     "run_detached",
     "register_wake_guard",
+    # orchestration-level resume across restart (full tier)
+    "resume_run",
+    "resume_detached",
+    "rehydrate",
+    "replayable_node_ids",
     # introspection (D4)
     "list_workflows",
     "get_workflow",

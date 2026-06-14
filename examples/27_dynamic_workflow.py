@@ -153,5 +153,26 @@ async def main() -> str:
 #   #   list_workflows(loop, parent_sid)                            -> all runs
 
 
+# ── Resume across a process restart (full tier) ──────────────────────────────
+#
+# A detached run journals its spec + each step's output. If the process dies
+# mid-run, point a fresh loop (same DB path) at the run id and resume: completed
+# steps are replayed (their sub-agent is NOT called again), only the unfinished
+# tail re-runs.
+#
+#   from power_loop.workflow import resume_run, resume_detached, get_workflow
+#
+#   # ... new process, same db_path; parent_sid + run_id known (persisted by you)
+#   info = get_workflow(loop, parent_sid, run_id)        # status == "failed"/"running"?
+#   result = await resume_run(loop, parent_sid, run_id)  # sync; replays + finishes tail
+#   #   or, to resume in the background and wake the parent on completion:
+#   #   handle = await resume_detached(loop, parent_sid, run_id)
+#   #
+#   # Re-supply executor=/budget= if the original run used non-default ones — only
+#   # data is journaled, runtime objects come from the live process. Each leaf gets
+#   # a stable metadata["idempotency_key"] = f"{run_id}:{node_id}" so side-effecting
+#   # tools can dedupe a re-run.
+
+
 if __name__ == "__main__":
     asyncio.run(main())

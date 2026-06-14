@@ -149,6 +149,8 @@ class WorkflowEngine:
         budget: SharedBudget | None = None,
         on_step: Callable[[AgentResult], None] | None = None,
         stop_event: CancellationLike = None,
+        replay: dict[str, AgentResult] | None = None,
+        run_id: str | None = None,
     ) -> None:
         self._loop = parent_loop
         self._executor = executor or InProcessExecutor()
@@ -161,17 +163,39 @@ class WorkflowEngine:
         # stop at their next checkpoint, and checked before spawning new leaves
         # so a cancelled run stops fanning out.
         self._cancel: CancellationToken = CancellationToken.from_any(stop_event)
+        # Resume support: results of already-completed nodes, keyed by node id,
+        # rehydrated from a run's journal. A node whose id is here is replayed
+        # (its cached result is returned) instead of re-executed. Foreach-body
+        # ids must NOT appear here (they share one id across iterations) — only
+        # individually-addressable nodes and foreach *aggregate* ids belong.
+        self._replay: dict[str, AgentResult] = dict(replay or {})
+        # Stable id for this run; threaded into each leaf's metadata as an
+        # idempotency key so side-effecting tools can dedupe across a resume.
+        self._run_id = run_id
         self._results: dict[str, AgentResult] = {}
         self._errors: list[str] = []
         self._last: AgentResult | None = None
         self._budget_hit = False
         self._cancelled = False
+        # Token usage accumulated exactly once per real leaf execution (and once
+        # per replayed result on resume). Robust against the foreach-body id
+        # collision, which would double/under-count if summed from _results.
+        self._usage_acc: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        # >0 while executing inside a foreach body: suppresses per-iteration step
+        # journaling (those leaves share one id and aren't individually
+        # replayable). The foreach's aggregate is journaled instead.
+        self._emit_suppressed = 0
 
     async def run(self, spec: WorkflowSpec) -> WorkflowResult:
         if self._budget is None and spec.budget is not None:
             self._budget = SharedBudget(
                 spec.budget.max_tokens, stop_at_remaining_pct=spec.budget.stop_at_remaining_pct
             )
+        # On resume, pre-charge the (fresh) budget with tokens already spent by
+        # replayed steps so the shared ceiling accounts for the whole run.
+        if self._budget is not None and self._replay:
+            for r in self._replay.values():
+                self._budget.commit(r.usage)
         driver_sid = self._loop.new_session(metadata={"kind": "wf_driver", "workflow": spec.name})
         env: dict[str, Any] = {"input": spec.input}
         status = "completed"
@@ -212,6 +236,15 @@ class WorkflowEngine:
         raise WorkflowRunError(f"unknown node type: {type(node).__name__}")
 
     async def _exec_agent(self, node: AgentNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
+        # Resume: a completed node is replayed from the journal, not re-run. Pop
+        # so a body id that somehow leaked in can only ever replay once.
+        replayed = self._replay.pop(node.id, None)
+        if replayed is not None:
+            self._results[node.id] = replayed
+            self._last = replayed
+            self._add_usage(replayed.usage)
+            return replayed
+
         if self._cancel.is_cancelled():
             self._cancelled = True
             res = AgentResult(node_id=node.id, status="cancelled", text="",
@@ -236,7 +269,14 @@ class WorkflowEngine:
 
         # keep trace + readable usage (linked); enforce structured output at the
         # provider via the node's output_schema so real models return JSON, not prose.
-        spec = replace(node.spec, lifecycle="linked", output_schema=node.output_schema)
+        # Thread a stable idempotency key (run_id:node_id) into the leaf's
+        # metadata so side-effecting tools can dedupe if the step re-runs on resume.
+        spec = replace(
+            node.spec,
+            lifecycle="linked",
+            output_schema=node.output_schema,
+            metadata={**node.spec.metadata, **self._step_idempotency(node.id)},
+        )
         raw = await self._executor.run_agent(
             spec, user_input, parent_loop=self._loop, driver_sid=driver_sid,
             stop_event=self._cancel,
@@ -265,13 +305,31 @@ class WorkflowEngine:
         )
         self._results[node.id] = res
         self._last = res
+        self._add_usage(res.usage)
         if self._budget is not None:
             self._budget.commit(res.usage)
         self._emit_step(res)
         return res
 
+    def _add_usage(self, usage: dict[str, int] | None) -> None:
+        for k in self._usage_acc:
+            self._usage_acc[k] += int((usage or {}).get(k, 0) or 0)
+
+    def _step_idempotency(self, node_id: str) -> dict[str, Any]:
+        """Stable per-step keys injected into a leaf's metadata. Empty for an
+        ad-hoc (non-journaled) run with no run_id."""
+        if not self._run_id:
+            return {}
+        return {
+            "workflow_run_id": self._run_id,
+            "workflow_node_id": node_id,
+            "idempotency_key": f"{self._run_id}:{node_id}",
+        }
+
     def _emit_step(self, res: AgentResult) -> None:
-        if self._on_step is None:
+        # Inside a foreach body, per-iteration leaves are not journaled (they
+        # share one id and aren't individually replayable); the aggregate is.
+        if self._on_step is None or self._emit_suppressed > 0:
             return
         try:
             self._on_step(res)
@@ -303,6 +361,16 @@ class WorkflowEngine:
         return next((r for r in reversed(gathered) if isinstance(r, AgentResult)), None)
 
     async def _exec_foreach(self, node: ForeachNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
+        # Resume: a foreach is replayed atomically via its journaled aggregate.
+        # (Its body leaves share one id across iterations, so they can't be
+        # replayed individually — a half-done foreach re-runs in full.)
+        if node.id:
+            replayed = self._replay.pop(node.id, None)
+            if replayed is not None:
+                self._results[node.id] = replayed
+                self._add_usage(replayed.usage)  # aggregate carries summed leaf usage
+                return replayed
+
         items = self._resolve_items(node)
         sem = asyncio.Semaphore(node.max_concurrency)
 
@@ -313,20 +381,26 @@ class WorkflowEngine:
                     return await self._exec(node.body, child_env, driver_sid)
             return await self._exec(node.body, child_env, driver_sid)
 
-        if node.parallel:
-            gathered = await asyncio.gather(
-                *(one(it) for it in items),
-                return_exceptions=(node.on_error == "continue"),
-            )
-        else:
-            gathered = []
-            for it in items:
-                try:
-                    gathered.append(await one(it))
-                except Exception as exc:  # noqa: BLE001
-                    if node.on_error == "halt":
-                        raise
-                    gathered.append(exc)
+        # Per-iteration leaves are not journaled individually (see _emit_step);
+        # the aggregate below is the resume unit. Reset even if a body raises.
+        self._emit_suppressed += 1
+        try:
+            if node.parallel:
+                gathered = await asyncio.gather(
+                    *(one(it) for it in items),
+                    return_exceptions=(node.on_error == "continue"),
+                )
+            else:
+                gathered = []
+                for it in items:
+                    try:
+                        gathered.append(await one(it))
+                    except Exception as exc:  # noqa: BLE001
+                        if node.on_error == "halt":
+                            raise
+                        gathered.append(exc)
+        finally:
+            self._emit_suppressed -= 1
 
         leaves = [r for r in gathered if isinstance(r, AgentResult)]
         for r in gathered:
@@ -338,8 +412,14 @@ class WorkflowEngine:
                 status="completed",
                 text="\n\n".join(r.text for r in leaves),
                 payload={"items": [r.payload if r.payload is not None else r.text for r in leaves]},
+                # Sum leaf usage so total/resume accounting includes the fan-out
+                # (leaves already counted live; the aggregate carries it for the
+                # journal so a replayed foreach contributes its tokens).
+                usage=_sum_usage(leaves),
             )
             self._results[node.id] = agg
+            # Journal the aggregate so resume can skip the whole foreach.
+            self._emit_step(agg)
             return agg
         return leaves[-1] if leaves else None
 
@@ -385,11 +465,17 @@ class WorkflowEngine:
         return res.payload[key]
 
     def _total_usage(self) -> dict[str, int]:
-        total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        for r in self._results.values():
-            for k in total:
-                total[k] += int(r.usage.get(k, 0) or 0)
-        return total
+        # Accumulated once per real leaf / replayed result — not summed from
+        # _results (where foreach bodies share one id and would mis-count).
+        return dict(self._usage_acc)
+
+
+def _sum_usage(results: list[AgentResult]) -> dict[str, int]:
+    total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for r in results:
+        for k in total:
+            total[k] += int((r.usage or {}).get(k, 0) or 0)
+    return total
 
 
 def _render(template: str, env: dict[str, Any]) -> str:
