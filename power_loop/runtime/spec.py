@@ -204,15 +204,18 @@ async def run_agent_spec(
     parent_sid = get_session_id()
 
     # Pre-check depth so we don't even create the session row if it'll bounce.
+    # The effective ceiling lives on the store (configurable); fall back to the
+    # module default for any custom store that predates the attribute.
+    max_depth = getattr(parent_loop.store, "max_spawn_depth", MAX_SPAWN_DEPTH)
     if parent_sid is not None:
         parent_row = parent_loop.store.get_session(parent_sid)
-        if parent_row is not None and parent_row.spawn_depth + 1 > MAX_SPAWN_DEPTH:
+        if parent_row is not None and parent_row.spawn_depth + 1 > max_depth:
             return {
                 "session_id": None,
                 "status": "rejected",
                 "final_text": (
                     f"spawn rejected — depth {parent_row.spawn_depth + 1} "
-                    f"exceeds max {MAX_SPAWN_DEPTH}"
+                    f"exceeds max {max_depth}"
                 ),
                 "rounds": 0,
                 "depth": parent_row.spawn_depth + 1,

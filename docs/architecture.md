@@ -221,7 +221,7 @@ flowchart LR
 | `(session_id, seq)` 单调唯一 | `SessionStore.append_message` |
 | compaction 不切开工具调用原子对 | `DefaultCompactor` |
 | compaction 失败软降级 | `DefaultCompactor.maybe_compact` |
-| 子代理深度不超过 `MAX_SPAWN_DEPTH` | `SessionStore.create_session` |
+| 子代理深度不超过 `store.max_spawn_depth`（默认 `MAX_SPAWN_DEPTH=3`，可配） | `SessionStore.create_session` |
 | `SQLiteSink._history_seqs` 与 pipeline history 一一对应 | `SQLiteSink` |
 | 子代理共享父代理的 `SessionStore` | `run_agent_spec` |
 

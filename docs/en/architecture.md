@@ -232,7 +232,7 @@ flowchart TD
     C1 --> GC1["Grandchild searcher sess_jkl"]
 ```
 
-All children share the parent's `SessionStore`. `close_session(parent_sid, cascade=True)` recursively deletes the entire tree. `MAX_SPAWN_DEPTH = 3`.
+All children share the parent's `SessionStore`. `close_session(parent_sid, cascade=True)` recursively deletes the entire tree. Spawn depth is capped at `store.max_spawn_depth` (default `MAX_SPAWN_DEPTH = 3`); configure it via `SessionStore.open(max_spawn_depth=...)` or `StatefulAgentLoop(..., max_spawn_depth=...)`.
 
 ## 9. Concurrency and Isolation
 
@@ -263,7 +263,7 @@ One `StatefulAgentLoop` can drive any number of sessions concurrently. Each sess
 | `messages.state ∈ {active, compacted_out}` | Schema + Sink/Store | Wrong history loaded |
 | Compaction never splits `assistant(tool_calls) ↔ tool` | `DefaultCompactor._expand_back_to_atomic` | Protocol-invalid LLM request |
 | Compaction fails soft → `None` | `DefaultCompactor.maybe_compact` try/except | Long session hard-fails |
-| `MAX_SPAWN_DEPTH = 3` | `SessionStore.create_session` | Deep recursion stack overflow |
+| `spawn_depth ≤ store.max_spawn_depth` (default 3) | `SessionStore.create_session` | Deep recursion stack overflow |
 | `_history_seqs` 1:1 with `pipeline.history` | `SQLiteSink` methods | Compaction hits wrong seq range |
 | `close_session` physically deletes 5 tables | `SessionStore._delete_session_tree` | Data leak / orphan rows |
 | Sub-agent shares parent's `SessionStore` | `run_agent_spec` passes `parent_loop.store` | Broken parent-child link |

@@ -62,7 +62,7 @@
 4. **fan-in barrier 与 pipeline 语义**。`parallel()` 的 N 个子只是 `list_children` 里按 `created_at` 排的兄弟——**无 batch id、无 done/running/failed rollup**。fan-in 全靠内存里的 `StatefulResult` 重建，crash 后**无"该批次哪些已完成"的持久查询**。需要：有 barrier 的 `parallel`（全到齐再继续）vs 无 barrier 的流式 `pipeline`（一个 stage 出结果就喂下一 stage）两套语义。
 5. **活进度树（live progress tree）**。`SUBAGENT_*` 事件**inert**、`scope` 硬编码 `"main"`、`source` 槽**未赋值**、事件**无 parent_session_id**、bus **无 replay/late-join**。进度树今天只能从 `SessionStore.parent_session_id` + `get_session_stats` 轮询重建。需要：wire 现有 dead 的 `SUBAGENT_*` + `source` 槽（廉价，consumer 已在），新增 PHASE/JOIN 事件类型 + 事件 buffer。
 6. **one-process-per-store-file 对 fan-out 的约束**。WAL 只保证跨进程**读**安全，**写必须单进程**。直接阻断 M3 subprocess executor（每子代理一个 `python -m power_loop.runner` 进程写同一 store = 并发写）。in-process fan-out 没问题（单 writer + per-session 锁 + store RLock）；多进程 fan-out 需要单一 owning writer（RPC 漏斗，未提供）或 per-worker 分文件（则 fan-in 无共享 store）。**无 lease/leader/fencing 强制单写**。
-7. **次要但要处理**：`MAX_SPAWN_DEPTH=3` 模块常量**不可配**（pipeline-of-pipeline 易撞墙）；非 `completed` 终态的 EPHEMERAL 子**泄漏 session 行**（长 fan-out 无 GC）；contextvar session 身份在嵌套并行下脆弱；notes/memory **无 typed/keyed/scoped** 黑板；human-input 无 workflow 级 gating；follow-up 队列**非持久**。
+7. **次要但要处理**：~~`MAX_SPAWN_DEPTH=3` 模块常量**不可配**~~（已修：现为 `store.max_spawn_depth`，经 `SessionStore.open(max_spawn_depth=)` / `StatefulAgentLoop(max_spawn_depth=)` 可配，默认仍 3）；非 `completed` 终态的 EPHEMERAL 子**泄漏 session 行**（长 fan-out 无 GC）；contextvar session 身份在嵌套并行下脆弱；notes/memory **无 typed/keyed/scoped** 黑板；human-input 无 workflow 级 gating；follow-up 队列**非持久**。
 
 ---
 

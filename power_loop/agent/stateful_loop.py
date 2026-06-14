@@ -49,6 +49,7 @@ from power_loop.core.runner import AgentRunner
 from power_loop.runtime.cancellation import CancellationLike
 from power_loop.runtime.session_store import (
     DEFAULT_DB_PATH,
+    MAX_SPAWN_DEPTH,
     MessageRow,
     MessageState,
     SessionStore,
@@ -97,9 +98,20 @@ class StatefulAgentLoop:
         tool_registry: ToolRegistry | None = None,
         hooks: AgentHooks | None = None,
         event_bus: AgentEventBus | None = None,
+        max_spawn_depth: int | None = None,
     ) -> None:
         self.llm = llm
-        self.store = store if store is not None else SessionStore.open(db_path)
+        if store is not None:
+            self.store = store
+            # An explicit limit overrides the (possibly shared) store's setting.
+            # Validation happens in the store's property setter.
+            if max_spawn_depth is not None:
+                self.store.max_spawn_depth = max_spawn_depth
+        else:
+            self.store = SessionStore.open(
+                db_path,
+                max_spawn_depth=(MAX_SPAWN_DEPTH if max_spawn_depth is None else max_spawn_depth),
+            )
         self._owns_store = store is None
         self.config = config if config is not None else AgentLoopConfig()
         self.tool_registry = tool_registry

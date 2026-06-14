@@ -68,7 +68,7 @@ result = await run_agent_spec(spec, "查找所有 SQL 注入漏洞", parent_loop
 
 ## 深度限制
 
-`MAX_SPAWN_DEPTH = 3` — 子代理可以 spawn 自己的子代理，但链条不超过 3 层。在 `SessionStore.create_session()` 强制执行。
+`MAX_SPAWN_DEPTH = 3` 是默认值 —— 子代理在 root 之下最多嵌套这么多层（depth 1、2、3 允许，depth 4 会报错）。在 `SessionStore.create_session()` 强制执行。可按 store 配置：`SessionStore.open(max_spawn_depth=N)` 或 `StatefulAgentLoop(..., max_spawn_depth=N)`。
 
 ## 会话树
 

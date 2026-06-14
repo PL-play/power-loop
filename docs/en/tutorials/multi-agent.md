@@ -114,7 +114,7 @@ AgentSpec(name="x", system_prompt="...", lifecycle="detached")
 
 ## 6. Depth Limit
 
-`MAX_SPAWN_DEPTH = 3` — a sub-agent can spawn its own sub-agent, but the chain cannot exceed 3 levels. Trying to spawn a 4th level raises an error.
+`MAX_SPAWN_DEPTH = 3` (the default) — sub-agents may nest up to this many levels below the root: root → child (depth 1) → grandchild (depth 2) → great-grandchild (depth 3) is allowed; creating a session at depth 4 raises an error. The ceiling is configurable per store: `SessionStore.open(max_spawn_depth=N)` or `StatefulAgentLoop(..., max_spawn_depth=N)`.
 
 ## Complete Code
 

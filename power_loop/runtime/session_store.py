@@ -35,6 +35,10 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_DB_PATH = "./power_loop_sessions.db"
+#: Default ceiling on sub-agent nesting (a chain of at most this many levels).
+#: This is only the *default*; the effective limit is per-:class:`SessionStore`
+#: (``store.max_spawn_depth``), configurable via :meth:`SessionStore.open` or the
+#: ``max_spawn_depth`` argument of ``StatefulAgentLoop``.
 MAX_SPAWN_DEPTH = 3
 
 
@@ -334,6 +338,17 @@ def _new_session_id() -> str:
     return "sess_" + secrets.token_hex(12)
 
 
+def _coerce_max_spawn_depth(value: int) -> int:
+    """Validate a spawn-depth ceiling: a positive int (≥1). Raises ValueError."""
+    try:
+        depth = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"max_spawn_depth must be an int ≥ 1, got {value!r}") from None
+    if depth < 1:
+        raise ValueError(f"max_spawn_depth must be ≥ 1, got {depth}")
+    return depth
+
+
 def _dumps(obj: Any) -> str | None:
     if obj is None:
         return None
@@ -349,15 +364,50 @@ def _loads(s: str | None) -> Any:
 class SessionStore:
     """Owns the SQLite connection and exposes typed CRUD over the schema."""
 
-    def __init__(self, conn: sqlite3.Connection, path: str) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        path: str,
+        *,
+        max_spawn_depth: int = MAX_SPAWN_DEPTH,
+    ) -> None:
         self._conn = conn
         self._lock = threading.RLock()
         self.path = path
+        self.max_spawn_depth = max_spawn_depth  # validated by the property setter
+
+    @property
+    def max_spawn_depth(self) -> int:
+        """Ceiling on sub-agent nesting depth for sessions created by this store.
+
+        A per-process config knob, not per-request state: set it once before
+        the store is used concurrently. (It is read in ``create_session``
+        outside the DB lock, so mutating it while spawns are in flight is a
+        last-writer-wins ordering question — harmless on a set-once value.)
+        """
+        return self._max_spawn_depth
+
+    @max_spawn_depth.setter
+    def max_spawn_depth(self, value: int) -> None:
+        self._max_spawn_depth = _coerce_max_spawn_depth(value)
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     @classmethod
-    def open(cls, path: str | Path = DEFAULT_DB_PATH) -> SessionStore:
+    def open(
+        cls,
+        path: str | Path = DEFAULT_DB_PATH,
+        *,
+        max_spawn_depth: int = MAX_SPAWN_DEPTH,
+    ) -> SessionStore:
+        """Open (creating if needed) the SQLite-backed store at ``path``.
+
+        ``max_spawn_depth`` caps how deeply sub-agents may nest (a chain of at
+        most this many levels); it is enforced in :meth:`create_session` and
+        pre-checked in ``run_agent_spec``. Defaults to :data:`MAX_SPAWN_DEPTH`.
+        The limit lives on the store instance (not in the DB), so it is a
+        property of *this* process's handle, not persisted.
+        """
         path_str = str(path)
         # ":memory:" stays as-is; file paths get expanded.
         if path_str != ":memory:":
@@ -372,7 +422,7 @@ class SessionStore:
         conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(SCHEMA_SQL)
         _micro_migrate(conn)
-        return cls(conn, path_str)
+        return cls(conn, path_str, max_spawn_depth=max_spawn_depth)
 
     def close(self) -> None:
         with self._lock:
@@ -402,7 +452,8 @@ class SessionStore:
         """Insert a new session row and its empty session_state row.
 
         For subagents, supply ``parent_session_id``; ``spawn_depth`` is computed
-        from the parent and enforced against :data:`MAX_SPAWN_DEPTH`.
+        from the parent and enforced against this store's ``max_spawn_depth``
+        (default :data:`MAX_SPAWN_DEPTH`).
         """
         spawn_depth = 0
         if parent_session_id is not None:
@@ -410,9 +461,9 @@ class SessionStore:
             if parent is None:
                 raise ValueError(f"parent session not found: {parent_session_id}")
             spawn_depth = parent.spawn_depth + 1
-            if spawn_depth > MAX_SPAWN_DEPTH:
+            if spawn_depth > self.max_spawn_depth:
                 raise ValueError(
-                    f"spawn depth {spawn_depth} exceeds max {MAX_SPAWN_DEPTH}"
+                    f"spawn depth {spawn_depth} exceeds max {self.max_spawn_depth}"
                 )
             kind = SessionKind.SUBAGENT
 
