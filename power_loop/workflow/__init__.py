@@ -68,6 +68,7 @@ from .tool import (
     WORKFLOW_STATUS_DEFINITION,
     register_workflow_tools,
 )
+from .worker import WorkerBootstrap, WorkerBootstrapError, run_spec_isolated
 
 __all__ = [
     # spec / DSL
@@ -105,6 +106,10 @@ __all__ = [
     # introspection (D4)
     "list_workflows",
     "get_workflow",
+    # isolated worker core (subprocess executor — Phase 0)
+    "WorkerBootstrap",
+    "WorkerBootstrapError",
+    "run_spec_isolated",
     # llm-facing tools
     "CREATE_WORKFLOW_DEFINITION",
     "WORKFLOW_STATUS_DEFINITION",
