@@ -37,6 +37,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 24 | [`24_agent_notes.py`](24_agent_notes.py) | Agent-authored notes | `note_add/update/delete`, `SQLiteNoteMemory`, `NotesPolicy` |
 | 25 | [`25_token_usage.py`](25_token_usage.py) | Token usage accounting | `result.usage`, `get_session_stats`, `max_tokens_per_run`, `usage_updated` |
 | 26 | [`26_timers.py`](26_timers.py) | Durable timers / self wake-ups | `schedule_wakeup`, `TimerRunner`, `HookPoint.TIMER_FIRE` |
+| 27 | [`27_dynamic_workflow.py`](27_dynamic_workflow.py) | Declarative multi-agent workflow | `power_loop.workflow`, `WorkflowSpec`, `create_workflow`, `register_workflow_tools` |
 
 ## Running
 
