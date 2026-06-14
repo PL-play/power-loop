@@ -8,6 +8,42 @@
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-06-14
+
+### Added
+
+- **动态工作流（`power_loop.workflow`，可选子模块）**：声明式 `WorkflowSpec` JSON
+  DSL（`agent`/`sequence`/`parallel`/`foreach`/`branch`，创建即严格校验、问题一次性聚合），
+  确定性 in-process 引擎，叶子是普通子代理。
+  - **detached 执行 + 完成回调唤醒主 agent**（`run_detached` + `register_wake_guard`，
+    经 durable timer → `follow_up`），`SharedBudget` 跨子代理 token 池，
+    LLM-facing `create_workflow` / `workflow_status` 工具。
+  - **跨进程重启的编排级 resume**（`resume_run` / `resume_detached`）：journal 持久化
+    spec + 每步 text/payload，重放已完成步、只重跑未完成尾；`foreach` 以 aggregate 原子
+    重放；幂等 key（`run_id:node_id`）注入叶子 metadata。
+- **进程外执行器（subprocess executor）**：`run_spec_isolated` + `WorkerBootstrap`
+  （每个子代理独立 SQLite 库，依赖只从配置重建）、`SubprocessExecutor`（每叶一进程，
+  插现有 `Executor` 缝；取消=SIGTERM→SIGKILL、超时/崩溃→failed→resume 重跑、
+  子库保留/GC `cleanup_run`/`reap_runs`）、**`WorkerLauncher` 缝**（按叶子注入
+  runsc/docker 等进程级沙箱，fail-closed）。
+- **作用域共享黑板（`runtime.blackboard`）**：`Blackboard` 异步 Protocol + 默认
+  `SqliteBlackboard`（新 `shared_state` 表，append + 按条目更新/删除）、`RuntimeEnv`
+  新增 `blackboard`/`blackboard_id` 注入缝、通用 `board_*` 工具
+  （`register_blackboard_tools`，kinds/statuses 由宿主定策略）。
+- **config 可选离线 echo provider**（`provider="echo"`）：确定性、无网络，便于子进程/
+  集成测试。
+
+### Changed
+
+- `AgentSpec` 新增 `output_schema`（→ provider `response_format` + `parse_structured`）；
+  `AgentLoopConfig` 新增 `model` / `response_format`（**每子代理/工作流步可覆盖全局模型**）。
+- `run_agent_spec` 现在**转发 `stop_event`**（协作式取消子代理）、**surface `result.usage`**，
+  并发布此前一直未接线的 `SUBAGENT_*` 生命周期事件（带 `AgentEvent.source="subagent"`）。
+- `MAX_SPAWN_DEPTH` 由硬常量改为**每 store 可配**（`SessionStore.open(max_spawn_depth=)` /
+  `StatefulAgentLoop(max_spawn_depth=)`，默认仍 3）。
+- `SessionStore` 新增 `shared_state` 表与 `get/set/delete_shared_state`（owner-keyed JSON，
+  不绑定 session）。
+
 ## [0.12.0] — 2026-06-12
 
 ### Added
