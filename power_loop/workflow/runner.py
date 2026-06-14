@@ -55,7 +55,7 @@ def make_on_step(store: Any, parent_sid: str, run_id: str):
             store, parent_sid, run_id,
             node_id=res.node_id, status=res.status,
             session_id=res.session_id, usage=res.usage, error=res.error,
-            text=res.text, payload=res.payload,
+            text=res.text, payload=res.payload, db_path=res.db_path,
         )
 
     return _on_step

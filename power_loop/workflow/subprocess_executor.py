@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
@@ -34,11 +36,53 @@ from power_loop.runtime.spec import AgentSpec
 
 from .worker import WorkerBootstrap, WorkerJob, decode_result
 
-__all__ = ["SubprocessExecutor"]
+__all__ = ["SubprocessExecutor", "cleanup_run", "reap_runs"]
 
 
 def _safe(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)[:64] or "x"
+
+
+def _remove_db(db_path: str) -> None:
+    """Remove a leaf db and its WAL sidecars (-wal / -shm)."""
+    for p in (db_path, db_path + "-wal", db_path + "-shm"):
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def cleanup_run(runs_dir: str, run_id: str) -> None:
+    """Delete all per-leaf dbs for one run (its ``runs_dir/<run_id>/`` directory).
+
+    Call when the supervisor is done inspecting a finished run.
+    """
+    shutil.rmtree(Path(runs_dir) / _safe(run_id), ignore_errors=True)
+
+
+def reap_runs(runs_dir: str, *, older_than_s: float, now: float | None = None) -> list[str]:
+    """Reap run directories whose newest file is older than ``older_than_s``.
+
+    Age is mtime-based (no run bookkeeping needed). Returns the run dir names
+    removed. Use as a periodic GC so kept-for-inspection dbs don't accumulate
+    forever.
+    """
+    base = Path(runs_dir)
+    if not base.is_dir():
+        return []
+    cutoff = (time.time() if now is None else now) - float(older_than_s)
+    reaped: list[str] = []
+    for run_dir in base.iterdir():
+        if not run_dir.is_dir():
+            continue
+        files = list(run_dir.iterdir())
+        newest = max((f.stat().st_mtime for f in files), default=run_dir.stat().st_mtime)
+        if newest < cutoff:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            reaped.append(run_dir.name)
+    return reaped
 
 
 class SubprocessExecutor:
@@ -53,6 +97,7 @@ class SubprocessExecutor:
         env: dict[str, str] | None = None,
         timeout_s: float | None = None,
         term_grace_s: float = 3.0,
+        delete_on_success: bool = False,
     ) -> None:
         # Validate up front that this bootstrap can cross a process boundary.
         self._bootstrap_dict = bootstrap.to_serializable_dict()
@@ -61,6 +106,10 @@ class SubprocessExecutor:
         self._env_overrides = dict(env) if env is not None else None
         self._timeout_s = timeout_s
         self._term_grace_s = term_grace_s
+        # Default: keep every leaf db so the supervisor can inspect it afterward
+        # (use reap_runs / cleanup_run to GC). Set True to drop a leaf db as soon
+        # as it completes — useful for high-fan-out runs you won't inspect.
+        self._delete_on_success = delete_on_success
 
     async def run_agent(
         self,
@@ -111,7 +160,13 @@ class SubprocessExecutor:
         outcome, stdout_b, stderr_b = await self._await_proc(proc, comm, token)
         stdout = (stdout_b or b"").decode(errors="replace")
         stderr = (stderr_b or b"").decode(errors="replace")
-        return self._to_result(job, outcome, proc.returncode, stdout, stderr)
+        result = self._to_result(job, outcome, proc.returncode, stdout, stderr)
+        # Retention: keep failed/cancelled leaves for debugging; optionally drop
+        # a completed leaf's db right away.
+        if self._delete_on_success and result.get("status") == "completed":
+            _remove_db(job.db_path)
+            result = {**result, "db_path": None}
+        return result
 
     async def _await_proc(
         self, proc: asyncio.subprocess.Process, comm: asyncio.Future, token: CancellationToken

@@ -131,6 +131,7 @@ def rehydrate(
             usage=step.get("usage") or {},
             session_id=step.get("session_id"),
             error=step.get("error"),
+            db_path=step.get("db_path"),
         )
     return spec, replay, j
 

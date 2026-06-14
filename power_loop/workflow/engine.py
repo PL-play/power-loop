@@ -304,6 +304,7 @@ class WorkflowEngine:
             # output_schema parse error takes precedence; otherwise surface any
             # error the executor reported (e.g. a subprocess timeout / crash).
             error=err or raw.get("error"),
+            db_path=raw.get("db_path"),
         )
         self._results[node.id] = res
         self._last = res

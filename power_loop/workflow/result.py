@@ -32,6 +32,10 @@ class AgentResult:
     usage: dict[str, int] = field(default_factory=dict)
     session_id: str | None = None
     error: str | None = None
+    #: For an out-of-process leaf, the path to its private SQLite db (so the
+    #: supervisor can open it read-only and inspect the full trace). None for
+    #: in-process leaves (they share the orchestrator's store).
+    db_path: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -46,6 +50,7 @@ class AgentResult:
             "usage": self.usage,
             "session_id": self.session_id,
             "error": self.error,
+            "db_path": self.db_path,
         }
 
 

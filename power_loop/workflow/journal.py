@@ -135,12 +135,14 @@ def record_step(
     error: str | None = None,
     text: str | None = None,
     payload: dict[str, Any] | None = None,
+    db_path: str | None = None,
 ) -> None:
     """Append (or replace) a per-step record as the engine progresses.
 
     ``text`` / ``payload`` capture the step's *output* so a completed step can be
     replayed (not re-run) on resume and feed downstream ``inputs_from`` /
-    ``items_from`` / ``branch.on`` references.
+    ``items_from`` / ``branch.on`` references. ``db_path`` records an
+    out-of-process leaf's private db so it can be inspected after the fact.
     """
     j = store.get_runtime_state(parent_sid, run_key(run_id), default=None)
     if j is None:
@@ -153,6 +155,7 @@ def record_step(
         "error": error,
         "text": text or "",
         "payload": payload,
+        "db_path": db_path,
     }
     steps = [s for s in j.get("steps", []) if s.get("node_id") != node_id]
     steps.append(step)

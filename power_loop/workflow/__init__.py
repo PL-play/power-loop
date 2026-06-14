@@ -63,7 +63,7 @@ from .spec import (
     WorkflowSpec,
     WorkflowSpecError,
 )
-from .subprocess_executor import SubprocessExecutor
+from .subprocess_executor import SubprocessExecutor, cleanup_run, reap_runs
 from .tool import (
     CREATE_WORKFLOW_DEFINITION,
     WORKFLOW_STATUS_DEFINITION,
@@ -112,6 +112,8 @@ __all__ = [
     "WorkerBootstrapError",
     "run_spec_isolated",
     "SubprocessExecutor",
+    "cleanup_run",
+    "reap_runs",
     # llm-facing tools
     "CREATE_WORKFLOW_DEFINITION",
     "WORKFLOW_STATUS_DEFINITION",
