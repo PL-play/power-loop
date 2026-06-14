@@ -280,6 +280,27 @@ class AgentPipeline:
         self.history.append(ctx.message)
         self.sink.on_message_appended(ctx.message, round_index=round_index)
 
+    async def _resolve_skipped_tool_calls(
+        self, skipped: list[Mapping[str, Any]], *, reason: str, round_idx: int
+    ) -> None:
+        """Append a synthetic ``tool`` message for each un-executed tool_call.
+
+        When the tool loop exits early (TOOL_AFTER BREAK, or a user-input request
+        batched before later tool_calls), the remaining tool_calls would otherwise
+        be left without responses — a protocol-invalid sequence the provider
+        rejects (and a session left wrongly 'pending'). This resolves them.
+        """
+        for tc in skipped:
+            await self._append_message(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(tc.get("id") or ""),
+                    "name": _tool_call_name(tc),
+                    "content": f"[skipped: {reason}]",
+                },
+                round_index=round_idx,
+            )
+
     # ── Helper: finalize session ──
 
     async def _finalize(self, reason: str, *, final_text: str | None = None,
@@ -857,7 +878,7 @@ class AgentPipeline:
 
             # ── Execute tools ──
             used_todo = False
-            for tool_call in tool_calls:
+            for i, tool_call in enumerate(tool_calls):
                 if _is_cancelled(self.cancel_token):
                     await self._finalize("cancelled")
                     return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx + 1)
@@ -903,6 +924,13 @@ class AgentPipeline:
                 except HumanInputRequired as exc:
                     interaction = exc.to_pending(tool_call_id=call_id, tool_name=tool_name)
                     self._persist_pending_interaction(interaction=interaction, round_index=round_idx)
+                    # The model batched request_user_input with later tool_calls;
+                    # those won't run. Resolve them so the resumed turn isn't an
+                    # invalid sequence (assistant.tool_calls with no matching tool).
+                    await self._resolve_skipped_tool_calls(
+                        tool_calls[i + 1 :], reason="superseded by a user-input request",
+                        round_idx=round_idx,
+                    )
                     await self._finalize("waiting_for_input", final_text=assistant_text, rounds=round_idx + 1)
                     return self._make_result(
                         "waiting_for_input",
@@ -965,8 +993,14 @@ class AgentPipeline:
                     round_index=round_idx,
                 )
 
-                # TOOL_AFTER BREAK → stop remaining tools
+                # TOOL_AFTER BREAK → stop remaining tools. Still resolve them so
+                # the next round's request isn't an invalid sequence (assistant
+                # with tool_calls that have no matching tool responses).
                 if ta_ctx.directive == HookDirective.BREAK:
+                    await self._resolve_skipped_tool_calls(
+                        tool_calls[i + 1 :], reason="tool.after hook stopped the batch",
+                        round_idx=round_idx,
+                    )
                     break
 
             # ── Hook: TOOLS_BATCH_AFTER ──
