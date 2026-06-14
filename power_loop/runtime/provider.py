@@ -119,6 +119,17 @@ class LLMProviderConfig:
         temperature = float(_get("TEMPERATURE", "0") or 0)
         max_retries = int(_get("MAX_RETRIES", "3") or 3)
 
+        extra: dict[str, Any] = {}
+        if provider.strip().lower() in {"echo", "stub"}:
+            # The offline echo provider needs no real endpoint; supply placeholders
+            # so the required-field check passes, and pass through an optional reply.
+            base_url = base_url or "echo://local"
+            api_key = api_key or "echo"
+            model = model or "echo"
+            reply = _get("ECHO_REPLY")
+            if reply is not None:
+                extra["echo_reply"] = reply
+
         return cls(
             base_url=base_url or "",
             api_key=api_key or "",
@@ -128,6 +139,7 @@ class LLMProviderConfig:
             max_tokens=max_tokens,
             temperature=temperature,
             max_retries=max_retries,
+            extra=extra,
         )
 
     # ── Adaptation ──────────────────────────────────────────────────────
@@ -164,6 +176,13 @@ def create_llm_service_from_config(cfg: LLMProviderConfig) -> LLMService:
     everything else routes to the OpenAI-compatible chat-completions API.
     """
     provider = (cfg.provider or "").strip().lower()
+    if provider in {"echo", "stub"}:
+        from power_loop.runtime.stub_provider import EchoLLMService
+
+        return EchoLLMService(
+            reply=cfg.extra.get("echo_reply"),
+            prefix=cfg.extra.get("echo_prefix", ""),
+        )
     if provider in {"anthropic", "claude", "dashscope-anthropic"}:
         return AnthropicMessagesLLMService(cfg.to_anthropic())
     return OpenAICompatibleChatLLMService(cfg.to_openai_compatible())

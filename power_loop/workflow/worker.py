@@ -23,8 +23,9 @@ seam.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from power_loop.contracts.errors import PowerLoopError
@@ -33,7 +34,21 @@ if TYPE_CHECKING:
     from llm_client.interface import LLMService
     from power_loop.tools.registry import ToolRegistry
 
-__all__ = ["WorkerBootstrap", "WorkerBootstrapError", "run_spec_isolated"]
+__all__ = [
+    "WorkerBootstrap",
+    "WorkerBootstrapError",
+    "WorkerJob",
+    "run_spec_isolated",
+    "run_job",
+    "encode_result",
+    "decode_result",
+    "main",
+]
+
+# Frame marker so the parent can pick the result line out of a worker's stdout
+# even if logging or prints leaked onto the same stream. Plain ASCII on purpose:
+# control chars like RS (0x1e) are line boundaries to str.splitlines().
+RESULT_SENTINEL = "__POWERLOOP_WF_RESULT__ "
 
 
 class WorkerBootstrapError(PowerLoopError):
@@ -166,3 +181,122 @@ async def run_spec_isolated(
     finally:
         # Close the connection but keep the file: the supervisor inspects it later.
         loop.close()
+
+
+# ── serialization: bootstrap + job + result framing (Phase 1 IPC contract) ────
+
+# Only these WorkerBootstrap fields survive a process boundary (factories cannot).
+_BOOTSTRAP_SERIALIZABLE = (
+    "llm_from_env", "provider_prefix", "tool_preset", "workspace_dir", "home_dir",
+)
+
+
+def _bootstrap_to_dict(b: WorkerBootstrap) -> dict[str, Any]:
+    if b.llm_factory is not None or b.registry_factory is not None:
+        raise WorkerBootstrapError(
+            "cannot serialize a WorkerBootstrap with factories for a subprocess; "
+            "use the config path (llm_from_env / tool_preset) instead"
+        )
+    if not b.llm_from_env:
+        raise WorkerBootstrapError(
+            "a subprocess WorkerBootstrap needs llm_from_env=True (the worker rebuilds "
+            "its provider from env/config)"
+        )
+    return {k: getattr(b, k) for k in _BOOTSTRAP_SERIALIZABLE}
+
+
+def _bootstrap_from_dict(d: dict[str, Any]) -> WorkerBootstrap:
+    return WorkerBootstrap(**{k: d.get(k) for k in _BOOTSTRAP_SERIALIZABLE if k in d})
+
+
+# Attach as methods for ergonomics.
+WorkerBootstrap.to_serializable_dict = _bootstrap_to_dict  # type: ignore[attr-defined]
+WorkerBootstrap.from_dict = staticmethod(_bootstrap_from_dict)  # type: ignore[attr-defined]
+
+
+@dataclass
+class WorkerJob:
+    """One unit of out-of-process work: everything a worker needs, as pure data."""
+
+    spec: dict[str, Any]
+    user_input: str
+    db_path: str
+    bootstrap: dict[str, Any] = field(default_factory=dict)
+    max_spawn_depth: int | None = None
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "spec": self.spec,
+                "user_input": self.user_input,
+                "db_path": self.db_path,
+                "bootstrap": self.bootstrap,
+                "max_spawn_depth": self.max_spawn_depth,
+            }
+        )
+
+    @classmethod
+    def from_json(cls, payload: str | dict[str, Any]) -> WorkerJob:
+        d = json.loads(payload) if isinstance(payload, str) else dict(payload)
+        return cls(
+            spec=d["spec"],
+            user_input=d.get("user_input", ""),
+            db_path=d["db_path"],
+            bootstrap=d.get("bootstrap") or {},
+            max_spawn_depth=d.get("max_spawn_depth"),
+        )
+
+
+async def run_job(job: WorkerJob) -> dict[str, Any]:
+    """Execute a job in this process: rebuild the bootstrap and run the spec."""
+    bootstrap = _bootstrap_from_dict(job.bootstrap)
+    return await run_spec_isolated(
+        job.spec, job.user_input,
+        bootstrap=bootstrap, db_path=job.db_path, max_spawn_depth=job.max_spawn_depth,
+    )
+
+
+def encode_result(obj: dict[str, Any]) -> str:
+    """Frame a result envelope as a single sentinel-prefixed line."""
+    return RESULT_SENTINEL + json.dumps(obj)
+
+
+def decode_result(stdout: str) -> dict[str, Any]:
+    """Pull the result envelope out of a worker's stdout (last framed line wins)."""
+    # Split on real newlines only; the JSON payload escapes its own newlines, and
+    # str.splitlines() would also break on exotic separators inside the text.
+    for line in reversed(stdout.split("\n")):
+        if line.startswith(RESULT_SENTINEL):
+            return json.loads(line[len(RESULT_SENTINEL):])
+    raise WorkerBootstrapError("no result frame found in worker output")
+
+
+def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None) -> int:
+    """Worker process entrypoint: read a job from stdin, run it, frame the result.
+
+    ``python -m power_loop.workflow.worker`` runs this. ``stdin``/``stdout`` are
+    injectable so the entrypoint can be exercised in-process by tests.
+    """
+    import asyncio
+    import sys
+    import traceback
+
+    src = stdin if stdin is not None else sys.stdin
+    out = stdout if stdout is not None else sys.stdout
+    try:
+        job = WorkerJob.from_json(src.read())
+        result = asyncio.run(run_job(job))
+        envelope: dict[str, Any] = {"ok": True, "result": result}
+    except BaseException as exc:  # noqa: BLE001 — a worker must always report, never hang
+        envelope = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        }
+    out.write(encode_result(envelope) + "\n")
+    out.flush()
+    return 0 if envelope.get("ok") else 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
