@@ -63,6 +63,7 @@ from .spec import (
     WorkflowSpec,
     WorkflowSpecError,
 )
+from .subprocess_executor import SubprocessExecutor
 from .tool import (
     CREATE_WORKFLOW_DEFINITION,
     WORKFLOW_STATUS_DEFINITION,
@@ -106,10 +107,11 @@ __all__ = [
     # introspection (D4)
     "list_workflows",
     "get_workflow",
-    # isolated worker core (subprocess executor — Phase 0)
+    # isolated worker core + out-of-process executor (Phase 0/1)
     "WorkerBootstrap",
     "WorkerBootstrapError",
     "run_spec_isolated",
+    "SubprocessExecutor",
     # llm-facing tools
     "CREATE_WORKFLOW_DEFINITION",
     "WORKFLOW_STATUS_DEFINITION",
