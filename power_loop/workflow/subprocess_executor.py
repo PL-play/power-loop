@@ -29,14 +29,67 @@ import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from power_loop.runtime.cancellation import CancellationToken
 from power_loop.runtime.spec import AgentSpec
 
 from .worker import WorkerBootstrap, WorkerJob, decode_result
 
-__all__ = ["SubprocessExecutor", "cleanup_run", "reap_runs"]
+__all__ = [
+    "SubprocessExecutor",
+    "WorkerLauncher",
+    "DirectWorkerLauncher",
+    "cleanup_run",
+    "reap_runs",
+]
+
+
+@runtime_checkable
+class WorkerLauncher(Protocol):
+    """How a worker process is launched — the seam for process-level sandboxing.
+
+    power-loop stays sandbox-agnostic: by default the worker runs bare
+    (:class:`DirectWorkerLauncher`). An integrator injects a launcher that wraps
+    the command (``runsc``/gVisor, ``docker run``, ``firejail``, ``nsjail`` …) so
+    the *child* runs confined while the orchestrator stays unconfined — the only
+    way to give a sub-agent stronger isolation than its parent. This mirrors how
+    deeptalk swaps power-loop's in-process bash for a sandboxed ``ShellBackend``,
+    one level up: there it wraps the *shell*, here it wraps the *whole worker*.
+
+    ``build`` is called once per leaf with the leaf's :class:`AgentSpec` (so the
+    policy can decide *per leaf* by inspecting ``spec.tools``) and the paths the
+    worker will touch. It returns the ``(argv, env)`` to spawn.
+
+    Mounts/paths are the launcher's responsibility: the worker uses ``db_path``
+    (and the bootstrap's ``workspace_dir``) verbatim, so a sandbox must make those
+    paths resolve to the same location inside it (e.g. an identity bind-mount).
+    """
+
+    def build(
+        self,
+        *,
+        base_argv: list[str],
+        base_env: dict[str, str] | None,
+        spec: AgentSpec,
+        db_path: str,
+        workspace_dir: str | None,
+    ) -> tuple[list[str], dict[str, str] | None]: ...
+
+
+class DirectWorkerLauncher:
+    """Default: run the worker bare (no sandbox), command/env unchanged."""
+
+    def build(
+        self,
+        *,
+        base_argv: list[str],
+        base_env: dict[str, str] | None,
+        spec: AgentSpec,
+        db_path: str,
+        workspace_dir: str | None,
+    ) -> tuple[list[str], dict[str, str] | None]:
+        return base_argv, base_env
 
 
 def _safe(name: str) -> str:
@@ -98,6 +151,7 @@ class SubprocessExecutor:
         timeout_s: float | None = None,
         term_grace_s: float = 3.0,
         delete_on_success: bool = False,
+        launcher: WorkerLauncher | None = None,
     ) -> None:
         # Validate up front that this bootstrap can cross a process boundary.
         self._bootstrap_dict = bootstrap.to_serializable_dict()
@@ -106,6 +160,9 @@ class SubprocessExecutor:
         self._env_overrides = dict(env) if env is not None else None
         self._timeout_s = timeout_s
         self._term_grace_s = term_grace_s
+        # How the worker process is launched. Default = bare; inject a launcher
+        # to wrap it in a sandbox (per leaf — see WorkerLauncher).
+        self._launcher: WorkerLauncher = launcher or DirectWorkerLauncher()
         # Default: keep every leaf db so the supervisor can inspect it afterward
         # (use reap_runs / cleanup_run to GC). Set True to drop a leaf db as soon
         # as it completes — useful for high-fan-out runs you won't inspect.
@@ -128,7 +185,7 @@ class SubprocessExecutor:
             db_path=db_path,
             bootstrap=self._bootstrap_dict,
         )
-        return await self._spawn_and_collect(job, CancellationToken.from_any(stop_event))
+        return await self._spawn_and_collect(job, spec, CancellationToken.from_any(stop_event))
 
     # ── db path: unique per invocation (foreach bodies share a node id) ───────
 
@@ -148,14 +205,28 @@ class SubprocessExecutor:
             return None  # inherit parent environment
         return {**os.environ, **self._env_overrides}
 
-    async def _spawn_and_collect(self, job: WorkerJob, token: CancellationToken) -> dict[str, Any]:
-        proc = await asyncio.create_subprocess_exec(
-            self._py, "-m", "power_loop.workflow.worker",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._child_env(),
-        )
+    async def _spawn_and_collect(
+        self, job: WorkerJob, spec: AgentSpec, token: CancellationToken
+    ) -> dict[str, Any]:
+        base = {"session_id": None, "rounds": 0, "usage": {}, "db_path": job.db_path}
+        try:
+            argv, env = self._launcher.build(
+                base_argv=[self._py, "-m", "power_loop.workflow.worker"],
+                base_env=self._child_env(),
+                spec=spec,
+                db_path=job.db_path,
+                workspace_dir=self._bootstrap_dict.get("workspace_dir"),
+            )
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed: a launch/sandbox error is a failed leaf, not a hang
+            return {**base, "status": "failed", "error": f"worker launch failed: {exc}",
+                    "final_text": f"[worker launch failed] {type(exc).__name__}: {exc}"}
         comm = asyncio.ensure_future(proc.communicate(input=job.to_json().encode()))
         outcome, stdout_b, stderr_b = await self._await_proc(proc, comm, token)
         stdout = (stdout_b or b"").decode(errors="replace")
