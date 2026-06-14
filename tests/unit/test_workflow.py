@@ -213,7 +213,7 @@ def test_shared_budget_can_spawn_and_commit():
 async def test_engine_budget_stops_spawning():
     @dataclass
     class _StubExec:
-        async def run_agent(self, spec, user_input, *, parent_loop, driver_sid):
+        async def run_agent(self, spec, user_input, *, parent_loop, driver_sid, stop_event=None):
             return {"status": "completed", "final_text": "ok", "session_id": None,
                     "usage": {"total_tokens": 60}}
 

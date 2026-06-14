@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from power_loop.runtime.cancellation import CancellationToken
+
 from .engine import Executor, WorkflowEngine
 from .result import SharedBudget, WorkflowResult, WorkflowRunHandle
 from .spec import WorkflowSpec
@@ -45,10 +47,26 @@ class Workflow:
         self._budget = budget
         self._parent_sid = parent_session_id
         self._tasks: set[asyncio.Task[None]] = set()  # retain detached tasks (GC guard)
+        # Owned token, flipped by cancel(). Forwarded into the engine → every
+        # in-flight sub-agent, so cancelling tears down the whole run.
+        self._cancel = CancellationToken()
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        """Request cancellation of this workflow.
+
+        In-flight sub-agents stop at their next round/checkpoint and the run
+        settles with ``status="cancelled"``; no further steps are spawned. Safe
+        to call from any thread or before the run starts. For a detached run,
+        prefer :meth:`WorkflowRunHandle.cancel`.
+        """
+        self._cancel.cancel(reason)
 
     async def run(self) -> WorkflowResult:
         """Interpret the spec to completion (in-process, synchronous) and return it."""
-        engine = WorkflowEngine(self._loop, executor=self._executor, budget=self._budget)
+        engine = WorkflowEngine(
+            self._loop, executor=self._executor, budget=self._budget,
+            stop_event=self._cancel,
+        )
         return await engine.run(self.spec)
 
     async def start(

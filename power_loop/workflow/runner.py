@@ -105,7 +105,8 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
     async def _bg() -> None:
         try:
             engine = WorkflowEngine(
-                loop, executor=workflow._executor, budget=workflow._budget, on_step=_on_step
+                loop, executor=workflow._executor, budget=workflow._budget, on_step=_on_step,
+                stop_event=workflow._cancel,
             )
             result = await engine.run(workflow.spec)
             await asyncio.to_thread(journal.finalize, store, parent_sid, run_id, result)
@@ -126,7 +127,7 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
     task = asyncio.create_task(_bg(), name=f"workflow-{run_id}")
     workflow._tasks.add(task)
     task.add_done_callback(workflow._tasks.discard)
-    return WorkflowRunHandle(run_id=run_id, task=task)
+    return WorkflowRunHandle(run_id=run_id, task=task, cancel_token=workflow._cancel)
 
 
 class _suppress:

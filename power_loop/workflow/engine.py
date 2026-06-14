@@ -35,6 +35,7 @@ from dataclasses import replace
 from typing import Any, Protocol
 
 from power_loop.core.agent_context import reset_session_id, set_session_id
+from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.spec import AgentSpec, run_agent_spec
 from power_loop.runtime.structured import StructuredOutputError, parse_structured
 
@@ -77,7 +78,13 @@ class Executor(Protocol):
     """
 
     async def run_agent(
-        self, spec: AgentSpec, user_input: str, *, parent_loop: Any, driver_sid: str
+        self,
+        spec: AgentSpec,
+        user_input: str,
+        *,
+        parent_loop: Any,
+        driver_sid: str,
+        stop_event: CancellationLike = None,
     ) -> dict[str, Any]: ...
 
 
@@ -85,14 +92,22 @@ class InProcessExecutor:
     """Default executor: run the sub-agent in this process via ``run_agent_spec``."""
 
     async def run_agent(
-        self, spec: AgentSpec, user_input: str, *, parent_loop: Any, driver_sid: str
+        self,
+        spec: AgentSpec,
+        user_input: str,
+        *,
+        parent_loop: Any,
+        driver_sid: str,
+        stop_event: CancellationLike = None,
     ) -> dict[str, Any]:
         # Make this leaf a child of the driver session. Set inside the coroutine
         # so concurrent fan-out tasks (each with their own context copy) don't
         # clobber each other's parent id.
         token = set_session_id(driver_sid)
         try:
-            raw = await run_agent_spec(spec, user_input, parent_loop=parent_loop)
+            raw = await run_agent_spec(
+                spec, user_input, parent_loop=parent_loop, stop_event=stop_event
+            )
         finally:
             reset_session_id(token)
         # run_agent_spec now surfaces usage; fall back to persisted session stats.
@@ -133,6 +148,7 @@ class WorkflowEngine:
         executor: Executor | None = None,
         budget: SharedBudget | None = None,
         on_step: Callable[[AgentResult], None] | None = None,
+        stop_event: CancellationLike = None,
     ) -> None:
         self._loop = parent_loop
         self._executor = executor or InProcessExecutor()
@@ -141,10 +157,15 @@ class WorkflowEngine:
         # (completed / failed / budget_exceeded). Used by the detached runner to
         # journal live progress. Must not raise; errors are swallowed.
         self._on_step = on_step
+        # Cooperative cancellation: forwarded into every in-flight leaf so they
+        # stop at their next checkpoint, and checked before spawning new leaves
+        # so a cancelled run stops fanning out.
+        self._cancel: CancellationToken = CancellationToken.from_any(stop_event)
         self._results: dict[str, AgentResult] = {}
         self._errors: list[str] = []
         self._last: AgentResult | None = None
         self._budget_hit = False
+        self._cancelled = False
 
     async def run(self, spec: WorkflowSpec) -> WorkflowResult:
         if self._budget is None and spec.budget is not None:
@@ -162,7 +183,9 @@ class WorkflowEngine:
             self._errors.append(str(exc))
         finally:
             _IN_WORKFLOW.reset(guard)
-        if self._budget_hit:
+        if self._cancelled or self._cancel.is_cancelled():
+            status = "cancelled"
+        elif self._budget_hit:
             status = "budget_exceeded"
         return WorkflowResult(
             name=spec.name,
@@ -189,6 +212,14 @@ class WorkflowEngine:
         raise WorkflowRunError(f"unknown node type: {type(node).__name__}")
 
     async def _exec_agent(self, node: AgentNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
+        if self._cancel.is_cancelled():
+            self._cancelled = True
+            res = AgentResult(node_id=node.id, status="cancelled", text="",
+                              error="workflow cancelled before this step started")
+            self._results[node.id] = res
+            self._emit_step(res)
+            return res
+
         if self._budget is not None and not self._budget.can_spawn():
             self._budget_hit = True
             res = AgentResult(node_id=node.id, status="budget_exceeded", text="",
@@ -207,8 +238,11 @@ class WorkflowEngine:
         # provider via the node's output_schema so real models return JSON, not prose.
         spec = replace(node.spec, lifecycle="linked", output_schema=node.output_schema)
         raw = await self._executor.run_agent(
-            spec, user_input, parent_loop=self._loop, driver_sid=driver_sid
+            spec, user_input, parent_loop=self._loop, driver_sid=driver_sid,
+            stop_event=self._cancel,
         )
+        if str(raw.get("status")) == "cancelled":
+            self._cancelled = True
         payload: dict[str, Any] | None = None
         err: str | None = None
         if node.output_schema is not None and raw.get("status") == "completed":
@@ -248,7 +282,7 @@ class WorkflowEngine:
         last: AgentResult | None = None
         for step in node.steps:
             last = await self._exec(step, env, driver_sid)
-            if self._budget_hit:
+            if self._budget_hit or self._cancelled:
                 break
         return last
 

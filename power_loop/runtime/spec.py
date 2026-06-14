@@ -24,6 +24,7 @@ from typing import Any
 
 from power_loop.agent.types import AgentLoopConfig
 from power_loop.contracts.errors import SpecValidationError
+from power_loop.runtime.cancellation import CancellationLike
 from power_loop.runtime.session_store import MAX_SPAWN_DEPTH, SubagentLifecycle
 from power_loop.tools.registry import ToolRegistry
 
@@ -138,11 +139,18 @@ async def run_agent_spec(
     *,
     parent_loop: Any,
     spawn_tool_call_id: str | None = None,
+    stop_event: CancellationLike = None,
 ) -> dict[str, Any]:
     """Materialize ``spec`` as a child session under ``parent_loop`` and run it.
 
     Returns a dict with ``final_text``, ``status``, ``rounds``, ``session_id``,
     ``depth`` — easy for the parent LLM to consume as a tool result.
+
+    ``stop_event`` (any :data:`CancellationLike`: a ``CancellationToken``,
+    ``threading.Event`` / ``asyncio.Event``, or ``() -> bool``) is forwarded to
+    the child's run loop. When it fires, the child stops at the next round /
+    cancellation checkpoint and returns ``status="cancelled"`` — the way an
+    orchestrator (e.g. a workflow) tears down in-flight sub-agents.
 
     Lifecycle:
       * ``EPHEMERAL`` (default) → child session is deleted on success;
@@ -220,7 +228,7 @@ async def run_agent_spec(
         hooks=parent_loop._runner.hooks,
         event_bus=parent_loop._runner.event_bus,
     )
-    result = await child_loop.send(user_input, session_id=child_sid)
+    result = await child_loop.send(user_input, session_id=child_sid, stop_event=stop_event)
 
     # Lifecycle cleanup.
     if spec.lifecycle == SubagentLifecycle.EPHEMERAL.value:

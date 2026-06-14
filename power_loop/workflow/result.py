@@ -59,7 +59,7 @@ class WorkflowResult:
     """
 
     name: str
-    status: str  # "completed" | "failed" | "budget_exceeded"
+    status: str  # "completed" | "failed" | "budget_exceeded" | "cancelled"
     results: dict[str, AgentResult] = field(default_factory=dict)
     final: AgentResult | None = None
     usage: dict[str, int] = field(default_factory=dict)
@@ -155,7 +155,18 @@ class WorkflowRunHandle:
     timer — it fires only while a ``TimerRunner`` (or an external poller of
     ``store.due_timers()``) is running on the host. Without one, the run still
     completes and the journal updates, but the parent is not auto-woken.
+
+    :meth:`cancel` requests cooperative cancellation: in-flight sub-agents stop
+    at their next checkpoint and the run settles with ``status="cancelled"``
+    (the journal is finalized and the parent woken as usual). It does **not**
+    hard-abort the ``asyncio.Task``, so the run tears down cleanly.
     """
 
     run_id: str
     task: asyncio.Task[None]
+    cancel_token: Any | None = None  # CancellationToken; flipped by cancel()
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        """Request cooperative cancellation of this detached run."""
+        if self.cancel_token is not None:
+            self.cancel_token.cancel(reason)
