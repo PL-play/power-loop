@@ -3,17 +3,10 @@
 Stability tiers
 ---------------
 
-**STABLE** — 跨 minor 版本保证向后兼容；破坏性变更必须升 minor 版本 + CHANGELOG。
-业务方（如 DeepTalk `agent` 服务）只应依赖这一层。
-
-    StatefulAgentLoop, StatefulResult,
-    FollowUpQueued,
-    AgentLoopConfig, AgentLoopResult,
-    SessionStore,
-    PowerLoopError,
-    AgentHooks, AgentEventBus,
-    HookPoint, HookDirective,
-    ToolRegistry, ToolDefinition,
+**STABLE** — 跨 minor 版本保证向后兼容；破坏性变更必须升 major 版本 + CHANGELOG。
+业务方（如 DeepTalk `agent` 服务）只应依赖这一层。**权威清单是本模块的 ``STABLE_API``
+元组**（不在 docstring 里重复罗列以免漂移；测试会校验 ``STABLE_API`` 与 ``__all__`` 一致，
+并有 SemVer 守卫：未升 major 而删除/改名 STABLE 符号会让测试失败）。
 
 **PROVISIONAL** — 顶层有 re-export，但 0.x 阶段可能调整。生产代码引用前要确认。
 （其余在 ``__all__`` 中、不在上方 STABLE 列表中的所有符号。）
@@ -24,6 +17,17 @@ Stability tiers
 
 __version__ = "0.13.1"
 
+# Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
+# a custom LLMService) don't reach into the internal vendored transport package (H3.4).
+from llm_client.interface import (
+    AnthropicChatConfig,
+    LLMRequest,
+    LLMResponse,
+    LLMService,
+    LLMStreamChunk,
+    LLMTokenUsage,
+    OpenAICompatibleChatConfig,
+)
 from power_loop.agent.follow_up import FollowUpQueued
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
@@ -204,9 +208,13 @@ from power_loop.tools.spawn_agent import (
     register_spawn_agent,
 )
 
+# The authoritative STABLE tier (single source of truth — tests assert the module
+# docstring and __all__ agree, and a SemVer guard fails if a symbol is dropped/renamed
+# without a major bump). Add freely; never remove/rename within a major version.
 STABLE_API = (
     "StatefulAgentLoop",
     "StatefulResult",
+    "FollowUpQueued",
     "AgentLoopConfig",
     "AgentLoopResult",
     "SessionStore",
@@ -234,6 +242,14 @@ __all__ = [
 	"StatefulResult",
 	"AgentLoopConfig",
 	"AgentLoopResult",
+	# LLM contract (PROVISIONAL)
+	"LLMService",
+	"LLMRequest",
+	"LLMResponse",
+	"LLMStreamChunk",
+	"LLMTokenUsage",
+	"OpenAICompatibleChatConfig",
+	"AnthropicChatConfig",
 	"SessionStore",
 	"SessionRow",
 	"SessionStatsRow",

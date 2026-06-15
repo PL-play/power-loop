@@ -13,6 +13,13 @@
 
 ### Added
 
+- **（H3.4）顶层 re-export LLM 契约**：`LLMService` / `LLMRequest` / `LLMResponse` /
+  `LLMStreamChunk` / `LLMTokenUsage` / `OpenAICompatibleChatConfig` / `AnthropicChatConfig`
+  现可 `from power_loop import …`(PROVISIONAL),写 `llm.*` hook 或自定义 `LLMService` 不必再
+  伸进内部 transport 包。
+- **（H3.6）`STABLE_API` 成为稳定层的单一事实源 + SemVer 守卫**：docstring 不再重复罗列(消除
+  三方漂移),`FollowUpQueued` 归入 STABLE;新增测试校验 STABLE_API 与 `__all__`/模块属性一致,
+  并冻结 v0 基线——未升 major 删除/改名 STABLE 符号即测试失败。
 - **（H2 测试/CI 加固）覆盖率门禁 + 严格 marker + 示例冒烟 + 免-extras 导入腿**：
   CI 的 pytest 现在跑 `--cov=power_loop --cov=llm_client --cov-fail-under=70`(当前 72.6%);
   pytest `addopts` 加 `--strict-markers --strict-config`(typo marker / 未知 ini key 直接报错);
@@ -47,6 +54,11 @@
 
 ### Changed
 
+- **（H3.5，安装方式）核心依赖瘦身为仅 `certifi`**：`socksio`(从未直接 import,httpx 按需
+  传递)移除;`python-dotenv`(仅 examples/tests)移入 dev;`pyyaml` → `[skills]` extra
+  (缺失时 `load_skill` 优雅降级、不报错)、`pypdf` → `[pdf]` extra(PDF 输入,懒加载);
+  `[all]` 现含两家 transport + skills + pdf。删除 `requirements.txt`(pyproject 为单一事实源)。
+  classifier 升 `4 - Beta`(H3.7)。
 - **（H3.1）transport 惰性导入 + 可选 extras**：`anthropic` / `openai` 从硬依赖移入
   `[project.optional-dependencies]`；`power_loop.runtime.provider` 仅在真正构造对应 provider
   时才导入其 SDK。`import power_loop` 现在零 SDK 即可成功（featherweight 名副其实）。

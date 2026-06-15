@@ -11,7 +11,7 @@ license = { text = "MIT" }
 keywords = ["agent", "llm", "openai", "anthropic", "tool-use", "hooks"]
 authors = [{ name = "zhangran", email = "zhangran24@126.com" }]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
@@ -22,23 +22,24 @@ classifiers = [
   "Topic :: Software Development :: Libraries",
 ]
 dynamic = ["version"]
+# Featherweight core (H3.5): only what the SDK-free core actually imports. Transports
+# and optional features (YAML skill frontmatter, PDF input) are extras; socksio was
+# unused (httpx pulls it transitively for SOCKS) and python-dotenv is examples/tests-only.
 dependencies = [
-  "socksio>=1.0.0",
-  "python-dotenv>=1.0.0",
-  "pyyaml>=6.0",
-  "pypdf>=5.3.0",
   "certifi>=2024.0.0",
 ]
 
 [project.optional-dependencies]
-# Vendor LLM SDKs are optional (H3.1): the core imports SDK-free and only pulls a
+# Transports are optional (H3.1): the core imports SDK-free and only pulls a
 # transport when you actually construct that provider. Pick the one(s) you use:
 #   pip install 'power-loop[openai]'      # OpenAI-compatible endpoints
 #   pip install 'power-loop[anthropic]'   # Anthropic Messages API endpoints
-#   pip install 'power-loop[all]'         # both
+#   pip install 'power-loop[all]'         # both transports + skills + pdf
 anthropic = ["anthropic>=0.42.0"]
 openai = ["openai>=1.52.0"]
-all = ["anthropic>=0.42.0", "openai>=1.52.0"]
+skills = ["pyyaml>=6.0"]          # YAML frontmatter parsing in load_skill (degrades to none without it)
+pdf = ["pypdf>=5.3.0"]            # PDF input parsing in the multimodal helper
+all = ["anthropic>=0.42.0", "openai>=1.52.0", "pyyaml>=6.0", "pypdf>=5.3.0"]
 dev = [
   "pytest>=7.0.0",
   "pytest-asyncio>=0.21.0",
@@ -46,9 +47,12 @@ dev = [
   "hypothesis>=6.0.0",
   "ruff>=0.6.0",
   "mypy>=1.10.0",
-  # dev/test exercises both real transports
+  # dev/test exercises both transports + the optional features + examples' .env loader
   "anthropic>=0.42.0",
   "openai>=1.52.0",
+  "pyyaml>=6.0",
+  "pypdf>=5.3.0",
+  "python-dotenv>=1.0.0",
 ]
 
 [project.urls]
