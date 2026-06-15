@@ -21,6 +21,11 @@
 - **（OBS-2）持久化 JSONL 事件 sink + 回放。** `attach_jsonl_sink(bus, path, …)` 把完整信封
   (经脱敏/截断)按行写入大小轮转文件;`replay(path)` 跨轮转按 `seq` 顺序还原成 `AgentEvent`。
   脱敏策略抽到共享的 `contrib/_redact`(logging 与 jsonl 复用)。
+- **（OBS-3）事件总线背压。** 文档化硬契约:同步订阅者必须快、不可阻塞(否则卡住 agent 循环)。
+  新增 opt-in `AgentEventBus(sync_dispatch="thread", queue_maxsize=…, on_overflow=…)`:同步订阅者
+  改由后台线程经有界队列消费,`publish()` 立即返回,慢订阅者不再卡循环;队列满按 `on_overflow`
+  (`drop_newest`/`drop_oldest`/`block`)处理并计入 `bus.dropped`;`shutdown()` 先排空再停线程。
+  默认 `inline`,行为不变。异步订阅者仍调度到事件循环(不下放到无 loop 的线程)。
 
 ## [0.16.0] — 2026-06-15
 

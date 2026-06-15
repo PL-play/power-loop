@@ -50,7 +50,7 @@ real LLM in `tests/real/test_real_durability.py`.***
 | **OBS-1** ✅ | `AgentEvent.to_dict()/from_dict()` carrying `ts`+`seq`+`mono`; `logging_sink` now emits the envelope (seq/ts). `from_dict` presence-checks timing (doesn't re-stamp or advance the global seq counter). **Foundation.** *(`test_event_serialization.py`)* | S (0.5–1d) | additive |
 | **OBS-6** ✅ | Monotonic `mono` (`perf_counter`) field on `AgentEvent` for skew-free latency/span math (survives wall-clock rollback). *(`test_event_serialization.py`)* | S (0.5d) | additive |
 | **OBS-2** ✅ | Durable rotating JSONL sink (`attach_jsonl_sink`) + `replay()`; redaction factored into shared `contrib/_redact.py`. *(`test_event_serialization.py`)* | M (1–2d) | additive |
-| **OBS-3** | Backpressure: documented "sync subscribers must not block" contract + opt-in bounded-queue/offloaded dispatch with a drop policy (default stays inline). | L (2–3d) | additive |
+| **OBS-3** ✅ | Backpressure: documented "sync subscribers must not block" contract + opt-in `sync_dispatch="thread"` (bounded queue + `on_overflow` drop policy + `shutdown()`); default inline → no regression. *(`test_event_bus_backpressure.py`)* | L (2–3d) | additive |
 | **OBS-4** | Metrics sink (`MetricsBackend` Protocol + Prometheus/StatsD) behind `[metrics]` extra. | M (1.5–2d) | additive |
 | **OBS-5** | OpenTelemetry span bridge (session→round→llm/tool spans) behind `[otel]` extra. *(dep OBS-6)* | L (2–3d) | additive |
 
