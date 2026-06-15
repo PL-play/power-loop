@@ -187,6 +187,23 @@ def test_example_29_shared_blackboard_runs() -> None:
     assert result["n"] >= 3, result
 
 
+def test_example_30_subprocess_isolation_runs() -> None:
+    """Each workflow leaf runs in its own process + db (SubprocessExecutor),
+    and the WorkerLauncher seam fires once per leaf."""
+    module = _load_example("30_subprocess_isolation.py")
+    out = asyncio.run(module.main())
+    assert out["status"] == "completed", out
+    assert "paris" in out["france_text"].lower(), out
+    assert "tokyo" in out["japan_text"].lower(), out
+    # DB-per-leaf isolation: two leaves → two distinct db files.
+    assert out["distinct_db_count"] == 2, out
+    # The launcher seam was invoked once per leaf, with the leaf's spec.
+    assert out["launch_count"] == 2, out
+    assert out["launched_specs"] == ["geographer", "geographer"], out
+    # A leaf's private store is inspectable afterward.
+    assert out["inspected_assistant"] is True, out
+
+
 def test_example_07_human_approval_runs() -> None:
     """Always-deny confirm_fn: dangerous commands must NEVER execute;
     safe whitelist commands may still execute; final answer must

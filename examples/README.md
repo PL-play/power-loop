@@ -40,6 +40,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 27 | [`27_dynamic_workflow.py`](27_dynamic_workflow.py) | Declarative multi-agent workflow | `power_loop.workflow`, `WorkflowSpec`, `create_workflow`, `register_workflow_tools` |
 | 28 | [`28_docker_shell_backend.py`](28_docker_shell_backend.py) | **Sandbox**: model-authored bash inside Docker | `ShellBackend`, `RuntimeEnv(shell_backend=…)`, `runtime_env_context` |
 | 29 | [`29_shared_blackboard.py`](29_shared_blackboard.py) | **Coordination**: two agents share a scoped board | `SqliteBlackboard`, `register_blackboard_tools`, `RuntimeEnv(blackboard=…)` |
+| 30 | [`30_subprocess_isolation.py`](30_subprocess_isolation.py) | **Isolation**: each workflow leaf in its own process + DB | `SubprocessExecutor`, `WorkerBootstrap`, `WorkerLauncher` |
 
 ## Running
 
