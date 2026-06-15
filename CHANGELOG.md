@@ -23,9 +23,17 @@
   经新增的 `CompactionContext.current_tokens` 交给 compactor 做触发判定,避免每轮重扫全历史
   (实测 5ms@1万 / 26ms@5万 每轮 → O(1))。对自定义 compactor 完全向后兼容(不传则照旧全扫)。
 
+- **（SCALE-2）只读 WAL 连接池(opt-in)。** `SessionStore.open(read_pool_size=N)` 开 N 个额外的
+  只读连接(`query_only=ON`),读操作(`load_active_messages`/`load_all_messages`)从池中取连接、
+  与唯一写连接并发执行,不再排队等写锁——读密集 fan-out 下显著降低读延迟。写入仍由单写连接+RLock
+  串行(正确性不变);WAL 保证池读看到读开始前已提交的全部写入。默认关闭;`:memory:` 自动回退
+  (内存库连接不可共享)。含持写锁时池读不被阻塞的并发回归测试。
+
 ### Changed
 
 - `CompactionContext` 新增可选字段 `current_tokens`(增量 token 估算提示;附加、向后兼容)。
+- `SessionStore.open` / 构造器新增可选 `read_pool_size`(默认 0,行为不变)。
+- `bench` fanout 场景支持 `db_path` + `read_pool_size`,以测量 SCALE-2 的读并发收益。
 
 ## [0.15.0] — 2026-06-15
 

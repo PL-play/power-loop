@@ -37,7 +37,7 @@ real LLM in `tests/real/test_real_durability.py`.***
 | ID | Item | Effort | API |
 |----|------|--------|-----|
 | **SCALE-1** ✅ | `bench/` harness + deterministic `FakeLLM`, 3 scenarios (FANOUT / BIG-HISTORY / THROUGHPUT) → JSON report; non-blocking CI smoke (`bench.yml`). **The priority — done.** *(`python -m bench [--smoke]`, `tests/bench/test_bench_smoke.py`; big_history already shows the O(history) per-round cost SCALE-4 targets)* | L (3–4d) | additive |
-| **SCALE-2** | Read-only WAL connection pool so reads stop serializing behind the writer `RLock`. *(dep SCALE-1)* | M (2–3d) | additive |
+| **SCALE-2** ✅ | Opt-in read-only WAL connection pool (`open(read_pool_size=N)`) so reads run concurrently with the single writer instead of serializing behind its lock; `query_only=ON` readers, file-DB only (`:memory:` falls back), default off. *(`test_session_store_read_pool.py` incl. a held-write-lock concurrency test)* | M (2–3d) | additive |
 | **SCALE-3** ✅ | Offload the per-send `load_active_messages` read via `to_thread` (the O(history) hot-path read; the other named ops are cold sync helpers). *(`test_store_offload.py`)* | S (1d) | none |
 | **SCALE-4** ✅ | Bound the default-on per-round O(history) `estimate_tokens` scan: pipeline keeps a self-invalidating incremental estimate, handed to the compactor via `CompactionContext.current_tokens` (measured 5ms@10k / 26ms@50k per round → O(1)). *(`test_token_estimate_cache.py`)* | M (1–2d) | additive |
 | **SCALE-5** | `docs/.../scaling.md` (EN+ZH) grounded in SCALE-1 numbers + one-db-per-process multi-process guidance. *(dep SCALE-1)* | M (1–2d) | none |

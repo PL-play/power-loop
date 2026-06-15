@@ -24,15 +24,20 @@ from other processes still work. For asyncio callers, wrap calls in
 from __future__ import annotations
 
 import json
+import logging
+import queue
 import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = "./power_loop_sessions.db"
 #: Default ceiling on sub-agent nesting (a chain of at most this many levels).
@@ -447,11 +452,55 @@ class SessionStore:
         path: str,
         *,
         max_spawn_depth: int = MAX_SPAWN_DEPTH,
+        read_pool_size: int = 0,
     ) -> None:
         self._conn = conn
         self._lock = threading.RLock()
         self.path = path
         self.max_spawn_depth = max_spawn_depth  # validated by the property setter
+        # SCALE-2: optional pool of read-only connections. The single writer (self._conn
+        # under self._lock) stays the sole source of truth for next_seq + write atomicity;
+        # WAL lets these readers run concurrently with it WITHOUT taking the write lock, so
+        # large concurrent reads (e.g. many sessions loading history) stop serializing
+        # behind one writer. query_only=ON makes them physically unable to write. Disabled
+        # by default; impossible for ":memory:" (each connect is a SEPARATE database).
+        self._read_pool: queue.Queue[sqlite3.Connection] | None = None
+        if read_pool_size and read_pool_size > 0:
+            if path == ":memory:":
+                logger.warning(
+                    "read_pool_size=%d ignored for an in-memory store: each :memory: "
+                    "connection is a separate database, so a pooled reader could not see "
+                    "the writer's data. Reads use the write connection.", read_pool_size,
+                )
+            else:
+                pool: queue.Queue[sqlite3.Connection] = queue.Queue()
+                for _ in range(int(read_pool_size)):
+                    rc = sqlite3.connect(path, check_same_thread=False, isolation_level="")  # type: ignore[call-overload]
+                    rc.row_factory = sqlite3.Row
+                    rc.execute("PRAGMA busy_timeout=5000")
+                    rc.execute("PRAGMA query_only=ON")  # belt-and-suspenders: cannot write
+                    pool.put(rc)
+                self._read_pool = pool
+
+    @contextmanager
+    def _read_cursor(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection for a read-only query.
+
+        With a read pool, checks one out (concurrent reads, no contention on the write
+        RLock) and returns it after; otherwise yields the write connection under the
+        RLock (the default — identical to the historical behavior). A pooled reader in
+        WAL mode sees every transaction committed before the read begins, which is all a
+        post-write load needs."""
+        pool = self._read_pool
+        if pool is not None:
+            rc = pool.get()
+            try:
+                yield rc
+            finally:
+                pool.put(rc)
+        else:
+            with self._lock:
+                yield self._conn
 
     @property
     def max_spawn_depth(self) -> int:
@@ -476,6 +525,7 @@ class SessionStore:
         path: str | Path = DEFAULT_DB_PATH,
         *,
         max_spawn_depth: int = MAX_SPAWN_DEPTH,
+        read_pool_size: int = 0,
     ) -> SessionStore:
         """Open (creating if needed) the SQLite-backed store at ``path``.
 
@@ -484,6 +534,11 @@ class SessionStore:
         pre-checked in ``run_agent_spec``. Defaults to :data:`MAX_SPAWN_DEPTH`.
         The limit lives on the store instance (not in the DB), so it is a
         property of *this* process's handle, not persisted.
+
+        ``read_pool_size`` (SCALE-2, default 0 = off) opens that many extra read-only
+        connections so reads run concurrently with the single writer instead of
+        serializing behind its lock — worth it under read-heavy fan-out. Ignored for
+        ``:memory:`` (connections can't share an in-memory database).
         """
         path_str = str(path)
         # ":memory:" stays as-is; file paths get expanded.
@@ -534,11 +589,20 @@ class SessionStore:
         ).fetchone()[0] == 0
         conn.executescript(SCHEMA_SQL)
         _apply_migrations(conn, is_fresh=is_fresh)
-        return cls(conn, path_str, max_spawn_depth=max_spawn_depth)
+        return cls(
+            conn, path_str, max_spawn_depth=max_spawn_depth, read_pool_size=read_pool_size
+        )
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+            if self._read_pool is not None:
+                while not self._read_pool.empty():
+                    try:
+                        self._read_pool.get_nowait().close()
+                    except queue.Empty:  # pragma: no cover - guarded by empty()
+                        break
+                self._read_pool = None
 
     def __enter__(self) -> SessionStore:
         return self
@@ -737,8 +801,8 @@ class SessionStore:
         by :meth:`record_compaction`), else its ``seq`` — with ``seq`` as a stable
         tiebreak. A note that predates the ``ord`` field falls back to its ``seq``.
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_cursor() as c:
+            rows = c.execute(
                 """
                 SELECT * FROM messages
                 WHERE session_id=? AND state=?
@@ -751,8 +815,8 @@ class SessionStore:
         return messages
 
     def load_all_messages(self, session_id: str) -> list[MessageRow]:
-        with self._lock:
-            rows = self._conn.execute(
+        with self._read_cursor() as c:
+            rows = c.execute(
                 "SELECT * FROM messages WHERE session_id=? ORDER BY seq ASC",
                 (session_id,),
             ).fetchall()

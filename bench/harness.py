@@ -87,10 +87,19 @@ def _new_loop(store: SessionStore, latency_s: float) -> StatefulAgentLoop:
     )
 
 
-async def run_fanout(*, sessions: int, latency_s: float = 0.0) -> dict[str, Any]:
+async def run_fanout(
+    *,
+    sessions: int,
+    latency_s: float = 0.0,
+    db_path: str = ":memory:",
+    read_pool_size: int = 0,
+) -> dict[str, Any]:
     """N concurrent sessions, one send each. Measures wall-clock throughput
-    (sessions/sec) and per-send latency under single-RLock contention."""
-    store = SessionStore.open(":memory:")
+    (sessions/sec) and per-send latency under single-RLock contention.
+
+    Pass a file ``db_path`` + ``read_pool_size>0`` to measure the SCALE-2 read pool
+    (the pool is declined for the default ``:memory:`` store)."""
+    store = SessionStore.open(db_path, read_pool_size=read_pool_size)
     try:
         loop = _new_loop(store, latency_s)
         sids = [loop.new_session() for _ in range(sessions)]
@@ -108,6 +117,7 @@ async def run_fanout(*, sessions: int, latency_s: float = 0.0) -> dict[str, Any]
             "scenario": "fanout",
             "sessions": sessions,
             "latency_s": latency_s,
+            "read_pool_size": read_pool_size,
             "wall_s": round(wall, 4),
             "sessions_per_sec": round(sessions / wall, 1) if wall > 0 else None,
             "send_latency": _summarize_latencies(latencies),
