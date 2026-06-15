@@ -146,7 +146,7 @@ loop = StatefulAgentLoop(llm=llm, hooks=hooks, ...)
 ```
 
 **Key points**:
-- 18 hook points cover every phase: `session.start`, `round.start`, `llm.before`, `tool.before`, `compact.before`, …
+- 17 hook points cover every phase: `session.start`, `round.start`, `llm.before`, `tool.before`, `compact.before`, …
 - Hooks can modify messages, skip tools, short-circuit LLM calls, or end the loop.
 - Async hooks work — `await` a user confirmation UI before running `bash`.
 
@@ -168,7 +168,7 @@ loop = StatefulAgentLoop(llm=llm, event_bus=bus, ...)
 **Key points**:
 - Events are read-only — they cannot change control flow (use hooks for that).
 - `bus.subscribe(None, fn)` subscribes to ALL events (audit log, debug).
-- 24 event types with typed payloads.
+- 30 event types with typed payloads.
 
 ## 7. Persistence — Survive Process Restarts
 

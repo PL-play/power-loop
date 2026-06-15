@@ -11,7 +11,7 @@ license = { text = "MIT" }
 keywords = ["agent", "llm", "openai", "anthropic", "tool-use", "hooks"]
 authors = [{ name = "zhangran", email = "zhangran24@126.com" }]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
@@ -63,6 +63,8 @@ dev = [
   # observability backends, so CI exercises the metrics + OTel sinks (OBS-4/5)
   "prometheus-client>=0.19",
   "opentelemetry-sdk>=1.20",
+  # the MCP SDK, so CI runs the real-stdio-server MCP adapter test (ECO-1)
+  "mcp>=1.0",
 ]
 
 [project.urls]

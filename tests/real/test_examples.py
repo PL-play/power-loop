@@ -293,3 +293,15 @@ def test_example_37_custom_retrieval_tool_runs() -> None:
     module = _load_example("37_custom_retrieval_tool.py")
     final = asyncio.run(module.main())
     assert "zero" in final.lower() or "0" in final
+
+
+def test_example_38_mcp_tools_runs() -> None:
+    """The MCP example spins up a real FastMCP stdio server and the agent calls its
+    add tool (21+21). Skipped if the mcp SDK isn't installed."""
+    import importlib.util
+    if importlib.util.find_spec("mcp") is None:
+        import pytest
+        pytest.skip("mcp SDK not installed")
+    module = _load_example("38_mcp_tools.py")
+    summary = asyncio.run(module.main())
+    assert "mcp.add" in summary and "42" in summary

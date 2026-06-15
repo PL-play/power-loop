@@ -13,7 +13,7 @@ pip install 'power-loop[openai]'      # any OpenAI-compatible endpoint
 pip install -e '../power-loop[openai]'
 ```
 
-The SDK-free core depends only on `certifi`; the transport is pulled in by the extra
+The SDK-free core has zero runtime dependencies; the transport is pulled in by the extra
 you choose. To use the native Anthropic Messages API, install `'power-loop[anthropic]'`
 and set `POWER_LOOP_PROVIDER=anthropic`.
 

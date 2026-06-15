@@ -145,7 +145,7 @@ loop = StatefulAgentLoop(llm=llm, hooks=hooks, ...)
 ```
 
 **要点**：
-- 18 个 hook 点覆盖每个阶段：`session.start`、`round.start`、`llm.before`、`tool.before`、`compact.before`、……
+- 17 个 hook 点覆盖每个阶段：`session.start`、`round.start`、`llm.before`、`tool.before`、`compact.before`、……
 - Hook 可以改消息、跳过工具、短路 LLM 调用、或直接结束循环。
 - Async hook 可用——在跑 `bash` 之前 `await` 用户确认 UI。
 
@@ -167,7 +167,7 @@ loop = StatefulAgentLoop(llm=llm, event_bus=bus, ...)
 **要点**：
 - Event 只读——不能改变控制流（控制流用 hook）。
 - `bus.subscribe(None, fn)` 订阅所有事件（审计日志、调试）。
-- 24 种事件类型，带类型化 payload。
+- 30 种事件类型，带类型化 payload。
 
 ## 7. 持久化 — 跨进程恢复
 

@@ -176,7 +176,7 @@ res = await loop.send("…", session_id=sid, heal_pending=True)
 # or recover explicitly: loop.resume(sid) / loop.abort_pending(sid)
 ```
 
-More in [`examples/`](examples/README.md) — 38 runnable programs from `00_hello_world.py` to the full chatbot, dynamic workflows, the memory/compaction/recall demos (`31`–`33`), and the durability/scaling/observability demos (`34`–`37`).
+More in [`examples/`](examples/README.md) — 39 runnable programs from `00_hello_world.py` to the full chatbot, dynamic workflows, the memory/compaction/recall demos (`31`–`33`), and the durability/scaling/observability/MCP demos (`34`–`38`).
 
 ---
 
@@ -195,7 +195,7 @@ Stable imports are re-exported from `power_loop` (`StatefulAgentLoop`, `AgentLoo
 | Tier | Meaning |
 |---|---|
 | **Stable** | Backward compatible across minor releases. Listed in `power_loop.STABLE_API`. |
-| **Provisional** | Re-exported from the top-level package during 0.x; may change. |
+| **Provisional** | Re-exported from the top-level package; may change in a future minor. |
 | **Internal** | `power_loop.core.*` etc.; no compatibility promise. |
 
 See the [API reference](docs/en/api/index.md).
@@ -217,8 +217,9 @@ Using power-loop in production? Open a PR adding a line here — real usage is t
 
 ## Project status & governance
 
-`0.x`, MIT-licensed, primarily a single maintainer (see commit history). The API-stability
-tiers are machine-enforced (`STABLE_API` + a SemVer-guard test) and releases are
+`1.x`, MIT-licensed, primarily a single maintainer (see commit history). The API-stability
+tiers are machine-enforced (`STABLE_API` + a SemVer-guard test — a STABLE break needs a
+major bump) and releases are
 reproducible by anyone (see [CONTRIBUTING → Releasing](CONTRIBUTING.md#releasing-maintainers)),
 so the project is forkable and the dependency is legible — but weigh the bus factor and
 the project's age for your own risk tolerance. Security: see [SECURITY.md](SECURITY.md)

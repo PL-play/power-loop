@@ -9,7 +9,7 @@
 | 层级 | 含义 |
 |---|---|
 | Stable | 跨 minor 版本保持向后兼容，列表见 `power_loop.STABLE_API`。 |
-| Provisional | 0.x 阶段从 `power_loop` 顶层导出，但仍可能调整。 |
+| Provisional | 从 `power_loop` 顶层导出，但未来 minor 可能调整。 |
 | Internal | `power_loop.core.*` 等子模块导入，无兼容性承诺。 |
 
 ## 核心
@@ -61,7 +61,9 @@
 ## LLM 契约
 
 provider 无关的 LLM 类型，从顶层 re-export（`from power_loop import …`），不必伸进 vendored
-transport 包。**PROVISIONAL**（0.x 阶段可能调整）。
+transport 包。**1.0 起 STABLE** —— `LLMService`、`LLMRequest`、`LLMResponse`、`LLMStreamChunk`、
+`LLMProviderConfig` 与 `create_llm_service_from_env`/`_config` 工厂已冻结,使 `StatefulAgentLoop`
+具备「构造闭包」(可仅用 STABLE 符号构造、使用、实现自定义 provider)。
 
 | 符号 | 覆盖 | 更多 |
 |---|---|---|

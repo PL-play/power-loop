@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "0.18.0"
+__version__ = "1.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -244,6 +244,16 @@ STABLE_API = (
     "HookDirective",
     "ToolRegistry",
     "ToolDefinition",
+    # LLM contract — STABLE as of 1.0 so the flagship StatefulAgentLoop has
+    # *construction closure*: you can build and use it (and implement a custom
+    # provider) from STABLE-only symbols. Frozen for the 1.x line.
+    "LLMService",
+    "LLMRequest",
+    "LLMResponse",
+    "LLMStreamChunk",
+    "LLMProviderConfig",
+    "create_llm_service_from_env",
+    "create_llm_service_from_config",
 )
 
 __all__ = [
@@ -253,7 +263,7 @@ __all__ = [
 	"StatefulResult",
 	"AgentLoopConfig",
 	"AgentLoopResult",
-	# LLM contract (PROVISIONAL)
+	# LLM contract (STABLE as of 1.0 — see STABLE_API)
 	"LLMService",
 	"LLMRequest",
 	"LLMResponse",

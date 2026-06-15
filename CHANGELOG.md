@@ -3,10 +3,38 @@
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，
 并遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-破坏性变更只能出现在 minor（0.x 阶段）或 major 版本，
+1.0 起,对 **STABLE** API 的破坏性变更只能出现在 major 版本,
 并且必须在此文件中显式列出受影响的 Public API。
 
 ## [Unreleased]
+
+## [1.0.0] — 2026-06-16
+
+**First stable release.** The `STABLE` public API is now under SemVer: a break to it
+requires a major bump (`2.0.0`), enforced by the frozen-baseline guard. The post-0.14.1
+hardening roadmap is complete — durability (0.15), scale (0.16), observability (0.17),
+ecosystem (0.18) — and the release-readiness audit's blockers are resolved.
+
+### Changed
+
+- **STABLE API — construction closure (the 1.0 gate).** Promoted the LLM contract into
+  `STABLE_API` (frozen): `LLMService`, `LLMRequest`, `LLMResponse`, `LLMStreamChunk`,
+  `LLMProviderConfig`, and `create_llm_service_from_env` / `create_llm_service_from_config`.
+  The flagship `StatefulAgentLoop` can now be **built, used, and given a custom provider
+  using STABLE-only symbols** — previously its mandatory `llm=` collaborator was Provisional,
+  making the freeze hollow. Error `.code` strings are now a frozen contract too
+  (`test_stable_error_codes_are_frozen`).
+- **Post-1.0 SemVer everywhere.** Classifier → `Production/Stable`; CONTRIBUTING / CHANGELOG /
+  SECURITY / README / API-reference prose updated from the 0.x "breaks-in-a-minor" model to
+  "a STABLE break needs a major bump". Stale doc counts (hooks 18→17, events 24→30) and the
+  last "depends only on certifi" onboarding line (the core is zero-dependency) corrected.
+
+### Added
+
+- **Real MCP server test + example.** `StdioMCPClient` is now validated end-to-end against
+  a live FastMCP stdio server (`test_mcp_real_server.py` — not just a fake source), and
+  `examples/38_mcp_tools.py` shows an agent calling a real MCP server's tool. `mcp` added to
+  the dev/CI extras so this runs in CI.
 
 ## [0.18.0] — 2026-06-16
 

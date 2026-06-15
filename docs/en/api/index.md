@@ -11,7 +11,7 @@ inspect the source modules linked below.
 | Tier | Meaning |
 |---|---|
 | Stable | Backward compatible across minor releases. See `power_loop.STABLE_API`. |
-| Provisional | Re-exported from `power_loop` during 0.x, but may change. |
+| Provisional | Re-exported from `power_loop`, but may change in a future minor. |
 | Internal | Submodule imports such as `power_loop.core.*`; no compatibility guarantee. |
 
 ## Core
@@ -63,7 +63,10 @@ inspect the source modules linked below.
 ## LLM Contract
 
 The provider-agnostic LLM types, re-exported from the top level (`from power_loop import …`) so
-you don't reach into the vendored transport package. **PROVISIONAL** (may adjust during 0.x).
+you don't reach into the vendored transport package. **STABLE as of 1.0** — `LLMService`,
+`LLMRequest`, `LLMResponse`, `LLMStreamChunk`, `LLMProviderConfig`, and the
+`create_llm_service_from_env`/`_config` factories are frozen so `StatefulAgentLoop` has
+construction closure (you can build + use + implement a provider from STABLE symbols).
 
 | Symbol | Covers | More |
 |---|---|---|

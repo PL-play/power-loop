@@ -13,7 +13,7 @@ pip install 'power-loop[openai]'      # 任意 OpenAI 兼容端点
 pip install -e '../power-loop[openai]'
 ```
 
-SDK-free 核心只依赖 `certifi`；transport 由你选择的 extra 拉入。要用原生 Anthropic Messages API，
+SDK-free 核心零运行时依赖；transport 由你选择的 extra 拉入。要用原生 Anthropic Messages API，
 装 `'power-loop[anthropic]'` 并设 `POWER_LOOP_PROVIDER=anthropic`。
 
 需要 Python 3.10+。

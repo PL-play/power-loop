@@ -20,7 +20,7 @@
 | [工具](tools.md) | `ToolRegistry`、`ToolDefinition`、JSON Schema 校验、sync vs async |
 | [扩展工具](extending-tools.md) | 自定义工具配方、按调用白名单、MCP(`contrib.mcp`)、为什么不捆绑连接器 |
 | [子代理](subagents.md) | `spawn_agent`、`AgentSpec`、`run_agent_spec`、生命周期 |
-| [Hooks](hooks.md) | 18 个 `HookPoint`、类型化 Ctx、directive、常见模式 |
+| [Hooks](hooks.md) | 17 个 `HookPoint`、类型化 Ctx、directive、常见模式 |
 | [Events](events.md) | 各种 `AgentEventType`、类型化 payload、订阅模式 |
 | [可观测性](observability.md) | 持久化 JSONL sink + `replay`、指标(Prometheus/StatsD)、OpenTelemetry span、背压 |
 | [压缩](compaction.md) | `DefaultCompactor`、`trigger_ratio`、保留最后 N 轮、自定义 `Compactor` |

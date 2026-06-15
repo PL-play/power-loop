@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-power-loop is `0.x`. Security fixes land on the **latest released minor** only; upgrade to
-the newest version to receive them.
+Security fixes land on the **latest released `1.x`** only; upgrade to the newest version to
+receive them.
 
 ## Reporting a vulnerability
 
@@ -14,7 +14,7 @@ Please report security issues **privately**, not in public issues/PRs:
 - email the maintainer listed in `pyproject.toml` (`[project].authors`).
 
 Include a description, affected version, and a minimal reproduction. This is a
-single-maintainer `0.x` project: triage is **best-effort, with no response-time SLA**.
+single-maintainer project: triage is **best-effort, with no response-time SLA**.
 Please allow time for a fix before any public disclosure.
 
 ## Security model — read this before deploying
