@@ -8,6 +8,51 @@
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-06-15
+
+修复版本：一次系统性核心能力 bug 审计（5 个并行 agent）发现的全部 16 个问题，
+逐一修复并补回归测试。无 Public API 破坏性变更，纯修复 + 一个新示例。
+
+### Fixed
+
+- **（BLOCKER）压缩越界孤儿 `tool` 消息**：`_compactable_span` 会把折叠终点回退越过
+  尾部 `tool` 消息，在“工具回合后用户继续说话”时留下没有配对 assistant 的孤儿
+  `tool`，导致下一次请求 HTTP 400。移除该回退逻辑（边界已由 `_expand_back_to_atomic`
+  保证），旧测试方向写反（误判通过）也一并改正。
+- **（CRITICAL）`SessionStore` 非原子写**：sqlite 以 `isolation_level=None`（autocommit）
+  打开，`with self._conn:` 从不真正开启事务 → 多语句写入（如 `append_message` 推进
+  `next_seq`）非原子。改为延迟事务（`isolation_level=""`）。
+- **轮次上限收尾绕过统一调用路径**：达到 `max_rounds` 的总结调用直接 `llm.complete`，
+  绕过取消 / 重试 / 超时 / 每-loop 模型 / 流事件。改为走 `call_llm`，并加预调用取消检查点
+  与同主循环一致的 degrade 处理。
+- **流事件不配对**：LLM 调用失败 / 重试耗尽 / 取消时只发了 `STREAM_STARTED` 没有终结
+  事件，订阅者悬挂。`STREAM_COMPLETED` 改到 `finally` 发出，必然配对。
+- **重试退避不可取消、且会溢出**：退避 `asyncio.sleep` 不响应取消（与文档承诺相悖）→
+  改为分片轮询 token 的 `_cancellable_sleep`；`2**(attempt-1)` 对超大 `max_attempts`
+  会在 `min()` 前就 `OverflowError` → 先把指数 cap 在 32。
+- **定时器 stale 恢复重复触发**：一次比 `stale_firing_s`（默认 120s）更久的“live”投递
+  会被周期性恢复扫描重新 arm 并二次触发。新增 `SessionStore.heartbeat_firing_timer`，
+  投递期间后台心跳持续刷新 `firing` 行（节流为 stale 窗口的 1/4，可经新构造参数
+  `heartbeat_interval_s` 覆盖）。
+- **`grep` 在 rg 与 Python 回退路径下结果分叉**：rg 仅排除少数目录、且 root-anchored、
+  又排在 include glob 之前（会被覆盖）；改为对每个 `_COMMON_SKIP_DIRS` 生成
+  `!**/<dir>/**`（任意深度）并置于 include glob 之后（rg 后者优先），与回退一致。
+  顺带修正截断计数（按实际展示的非空行计数）。
+- **结构化输出**：`_extract_first_json_object` 遇到首个 `{` 之前的游离 `}` 会让深度变负
+  从而拒绝合法 JSON；忽略深度 0 处的 `}`。文档漂移修正：声称的“单引号修复”代码从未
+  实现（正则也无法安全实现），文档对齐为保守的尾逗号修复。
+- **工作流**：`from_json` 接受重复 agent id（resume 时会重放错节点）→ 拒绝重复；
+  `eager_wake` 会重复唤醒父 agent（绕过 `TIMER_FIRE` 使 wake-guard 无法去重）→ eager
+  路径先 claim journal `woke`。
+- **早退工具循环留下悬挂 `tool_calls`**：`TOOL_AFTER` BREAK、以及 `request_user_input`
+  与其它工具同批时，未执行的工具调用没有配对 `tool` 结果 → 非法序列 / 幻影 pending；
+  新增 `_resolve_skipped_tool_calls` 补合成 `[skipped]` 结果。
+
+### Added
+
+- **示例 `28_docker_shell_backend.py`**：通过 `ShellBackend` 缝把内置 bash 换成
+  `docker exec`，模型写的 shell 在隔离容器内执行（真实 LLM 验证）。
+
 ## [0.13.0] — 2026-06-14
 
 ### Added
