@@ -77,11 +77,11 @@ Python 3.10+. See [Getting Started](docs/en/getting-started.md).
 | **Context compaction** | Auto-summarize old turns; never splits a tool-call pair | [Compaction](docs/en/user-guide/compaction.md) |
 | **Retry / timeout / cancel** | Unified cancellation token; provider-aware retry | [Retry & Cancel](docs/en/user-guide/retry-cancel.md) |
 | **Structured output** | `output_schema` → provider `response_format` → parsed & validated | [Structured](docs/en/user-guide/structured-output.md) |
-| **Token budgets & usage** | Per-run cap (`budget_exceeded`), per-run + per-session accounting | below |
+| **Token budgets & usage** | Per-run cap (`budget_exceeded`), per-run + per-session accounting | [Budgets & usage ↓](#hard-token-budgets--usage-accounting-no-event-plumbing) |
 | **Pluggable memory** | Cross-session recall via a `MemoryProvider` Protocol | [Memory](docs/en/user-guide/memory.md) |
 | **Recall compacted detail** | `recall_compacted` tool pulls back exact turns compaction folded out | [Compaction](docs/en/user-guide/compaction.md) |
 | **Stable error codes** | Every `PowerLoopError` carries a machine-readable `code` (`llm.timeout`, `session.pending`, `tool.not_found`, …); branch on `exc.code` | [API: error codes](docs/en/api/index.md#error-codes) |
-| **Crash recovery** | `heal_pending` / `resume` / `abort_pending` for runs killed mid tool-call | below |
+| **Crash recovery** | `heal_pending` / `resume` / `abort_pending` for runs killed mid tool-call | [Pending recovery](docs/en/user-guide/sessions.md#pending-recovery) |
 
 ---
 
