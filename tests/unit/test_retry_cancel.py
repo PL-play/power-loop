@@ -254,3 +254,29 @@ async def test_pipeline_cancel_status_and_event() -> None:
         assert any(e.type == AgentEventType.LOOP_CANCELLED for e in events)
     finally:
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_backoff_sleep_is_cancellable() -> None:
+    """Cancelling during a long backoff raises promptly, not after the full sleep
+    (the backoff used to be a plain asyncio.sleep that ignored the token)."""
+    policy = LLMRetryPolicy(max_attempts=5, backoff_initial=10.0, backoff_max=30.0)
+    tok = CancellationToken()
+
+    async def call() -> str:
+        raise RuntimeError("boom")  # always retryable → enters the backoff sleep
+
+    task = asyncio.ensure_future(with_retry(call, policy=policy, token=tok))
+    await asyncio.sleep(0.2)  # first attempt fails → now in the 10s backoff
+    tok.cancel()
+    t0 = time.monotonic()
+    with pytest.raises(CancellationRequested):
+        await task
+    assert time.monotonic() - t0 < 2.0  # promptly cancelled, not ~10s later
+
+
+def test_backoff_does_not_overflow_for_huge_attempt() -> None:
+    """A pathological max_attempts must not raise OverflowError computing 2**exp."""
+    policy = LLMRetryPolicy(max_attempts=5000, backoff_initial=1.0, backoff_max=8.0)
+    assert policy.backoff_for_attempt(2000) == 8.0  # clamped, no OverflowError
+    assert policy.backoff_for_attempt(1) == 1.0

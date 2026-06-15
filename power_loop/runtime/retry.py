@@ -108,8 +108,12 @@ class LLMRetryPolicy:
         """
         if attempt <= 0:
             return 0.0
-        backoff = self.backoff_initial * (2 ** (attempt - 1))
-        return min(backoff, self.backoff_max)
+        # Cap the exponent before computing 2**exp: a huge max_attempts would make
+        # 2**(attempt-1) exceed the max IEEE-754 double and raise OverflowError on
+        # the float multiply, before min() could clamp. 2**32 s (~136 yr) already
+        # dwarfs any sane backoff_max, so the cap is invisible to real configs.
+        exp = min(attempt - 1, 32)
+        return min(self.backoff_initial * (2 ** exp), self.backoff_max)
 
 
 RetryAttemptCallback = Callable[[int, BaseException, float], None]
@@ -171,12 +175,24 @@ async def with_retry(
                     # Hook errors must not corrupt the retry loop.
                     pass
 
-            if sleep_for > 0:
-                await asyncio.sleep(sleep_for)
-            token.raise_if_cancelled()
+            await _cancellable_sleep(sleep_for, token)
 
     assert last_error is not None  # loop only exits via return / raise / last_error set
     raise LLMRetryExhausted(attempts=policy.max_attempts, last_error=last_error) from last_error
+
+
+async def _cancellable_sleep(seconds: float, token: CancellationToken, *, slice_s: float = 0.05) -> None:
+    """Sleep ``seconds``, but raise ``CancellationRequested`` promptly (within one
+    ``slice_s``) if ``token`` flips — rather than waiting the full backoff. Polls
+    because ``CancellationToken`` (which may wrap a callable / threading.Event) is
+    not awaitable."""
+    remaining = seconds
+    while remaining > 0:
+        token.raise_if_cancelled()
+        nap = slice_s if remaining > slice_s else remaining
+        await asyncio.sleep(nap)
+        remaining -= nap
+    token.raise_if_cancelled()
 
 
 __all__ = ["LLMRetryPolicy", "RetryAttemptCallback", "with_retry"]

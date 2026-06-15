@@ -576,29 +576,33 @@ class AgentPipeline:
             )
 
         policy = self.config.retry_policy
-        if policy is None:
-            response = await _do_call()
-        else:
-            def _on_retry(attempt: int, exc: BaseException, sleep_s: float) -> None:
-                self._emit(
-                    AgentEventType.LLM_RETRY_ATTEMPTED,
-                    LlmRetryAttemptedPayload(
-                        attempt=attempt,
-                        max_attempts=policy.max_attempts,
-                        error_type=type(exc).__name__,
-                        error_message=str(exc)[:500],
-                        next_sleep_seconds=sleep_s,
-                    ),
-                    round_index=round_index,
-                    stream_id="main",
+        # STREAM_COMPLETED in a finally so it ALWAYS pairs with the STREAM_STARTED
+        # emitted in _do_call — otherwise a failed/exhausted/cancelled call left
+        # dangling 'started' events with no terminal, stranding stream subscribers.
+        try:
+            if policy is None:
+                response = await _do_call()
+            else:
+                def _on_retry(attempt: int, exc: BaseException, sleep_s: float) -> None:
+                    self._emit(
+                        AgentEventType.LLM_RETRY_ATTEMPTED,
+                        LlmRetryAttemptedPayload(
+                            attempt=attempt,
+                            max_attempts=policy.max_attempts,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc)[:500],
+                            next_sleep_seconds=sleep_s,
+                        ),
+                        round_index=round_index,
+                        stream_id="main",
+                    )
+
+                response = await with_retry(
+                    _do_call, policy=policy, token=self.cancel_token, on_retry=_on_retry,
                 )
-
-            response = await with_retry(
-                _do_call, policy=policy, token=self.cancel_token, on_retry=_on_retry,
-            )
-
-        self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
-                   round_index=round_index, stream_id="main")
+        finally:
+            self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
+                       round_index=round_index, stream_id="main")
 
         return response
 
@@ -1033,15 +1037,40 @@ class AgentPipeline:
         })
         self._emit(AgentEventType.STATUS_CHANGED, HitRoundLimitStatusPayload(max_rounds=int(self.config.max_rounds)))
 
-        final_resp = await self.llm.complete(LLMRequest(
-            messages=self.history,
-            system_prompt=self.system_prompt,
-            tools=self.runtime_tools,
-            tool_choice="auto" if self.runtime_tools else None,
-            max_tokens=int(self.config.max_tokens or 8000),
-            temperature=float(self.config.temperature or 0),
-            model=self.config.model,
-        ))
+        max_rounds = int(self.config.max_rounds)
+        # Honor cancellation before the (billable) summary call.
+        if _is_cancelled(self.cancel_token):
+            await self._finalize("cancelled")
+            return self._make_result("cancelled", final_text="[cancelled by user]", rounds=max_rounds)
+        # Route through call_llm so the final summary gets the same retry / timeout /
+        # cancellation handling, per-loop model, and stream events as every other
+        # call — instead of an unguarded llm.complete that could hang, ignore a
+        # cancel, or crash the run on a transient error.
+        try:
+            final_resp = await self.call_llm(
+                max_rounds,
+                messages=self.history,
+                system_prompt=self.system_prompt,
+                tools=self.runtime_tools,
+                max_tokens=int(self.config.max_tokens or 8000),
+                temperature=float(self.config.temperature or 0),
+            )
+        except CancellationRequested as exc:
+            self._emit(AgentEventType.LOOP_CANCELLED,
+                       LoopCancelledPayload(reason=exc.reason, round_index=max_rounds))
+            await self._finalize("cancelled")
+            return self._make_result("cancelled", final_text=f"[cancelled: {exc.reason}]", rounds=max_rounds)
+        except (LLMRetryExhausted, LLMTimeout) as exc:
+            reason = "timeout" if isinstance(exc, LLMTimeout) else "retry_exhausted"
+            inner = getattr(exc, "last_error", exc)
+            self._emit(AgentEventType.LLM_DEGRADED, LlmDegradedPayload(
+                reason=reason, attempts=getattr(exc, "attempts", 0),
+                error_type=type(inner).__name__, error_message=str(inner)[:500]),
+                round_index=max_rounds)
+            msg = f"[degraded: LLM {reason} — {type(inner).__name__}: {str(inner)[:200]}]"
+            await self._append_message({"role": "assistant", "content": msg}, round_index=max_rounds)
+            await self._finalize("degraded", final_text=msg, rounds=max_rounds)
+            return self._make_result("degraded", final_text=msg, rounds=max_rounds)
         final_text = (getattr(final_resp, "raw_text", "") or getattr(final_resp, "content_text", "") or "").strip()
         self._emit(AgentEventType.USAGE_UPDATED, UsageUpdatedPayload(usage=self.ctx.update_usage(final_resp)))
         await self._finalize("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",
