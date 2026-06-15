@@ -21,6 +21,15 @@
 
 ### Added
 
+- **（ECO-6)扩展工具手册 + 示例。** `docs/{en,zh}/user-guide/extending-tools.md`:自定义工具配方
+  (`ToolDefinition`+handler+`register`)、按调用白名单、把 MCP 作为外部连接器路径、以及"为什么
+  不捆绑连接器"的内核理念;新增示例 `37_custom_retrieval_tool`(进程内确定性检索工具)。
+- **（ECO-5)`SECURITY.md`。** 支持版本、私密漏洞上报渠道(尽力而为、无 SLA),以及"编排而非隔离"
+  的安全模型(内置 bash/file 工具**不是**沙箱 → 用 `ShellBackend`/`SubprocessExecutor`;密钥留在
+  编排层;磁盘 SQLite 为明文)。
+- **（ECO-7)bus-factor surrogates。** CONTRIBUTING 增加可复现的 `Releasing` 流程;README 增加
+  "Used by" 与 "Project status & governance"(单维护者、MIT、可分叉、机器化 API 稳定性守卫)。
+
 - **（ECO-1)MCP 工具适配器。** `contrib/mcp`:无依赖的 `MCPToolSource` Protocol +
   `register_mcp_tools`——把 MCP 工具的 `inputSchema` 直接映射成 `ToolDefinition`(`required`
   驱动缺参校验),注册的异步 handler 把调用代理给 source;外加 `[mcp]` extra 之后惰性导入 `mcp`

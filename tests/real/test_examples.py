@@ -285,3 +285,11 @@ def test_example_36_observability_runs() -> None:
     module = _load_example("36_observability.py")
     summary = asyncio.run(module.main())
     assert "persisted" in summary and "metric rounds=1" in summary and "llm_calls=1" in summary
+
+
+def test_example_37_custom_retrieval_tool_runs() -> None:
+    """The custom-tool example: the agent calls the registered search_docs tool and
+    answers from the knowledge base (zero runtime deps)."""
+    module = _load_example("37_custom_retrieval_tool.py")
+    final = asyncio.run(module.main())
+    assert "zero" in final.lower() or "0" in final

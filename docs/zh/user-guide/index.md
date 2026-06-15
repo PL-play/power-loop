@@ -18,6 +18,7 @@
 |---|---|
 | [会话](sessions.md) | `SessionStore`、多轮对话、跨进程恢复、会话生命周期 |
 | [工具](tools.md) | `ToolRegistry`、`ToolDefinition`、JSON Schema 校验、sync vs async |
+| [扩展工具](extending-tools.md) | 自定义工具配方、按调用白名单、MCP(`contrib.mcp`)、为什么不捆绑连接器 |
 | [子代理](subagents.md) | `spawn_agent`、`AgentSpec`、`run_agent_spec`、生命周期 |
 | [Hooks](hooks.md) | 18 个 `HookPoint`、类型化 Ctx、directive、常见模式 |
 | [Events](events.md) | 各种 `AgentEventType`、类型化 payload、订阅模式 |

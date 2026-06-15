@@ -47,6 +47,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 34 | [`34_durability_lifecycle.py`](34_durability_lifecycle.py) | **Durability**: prune folded originals, VACUUM, export/import, graceful `aclose()` | `prune_compacted_messages`, `vacuum`, `export_session`/`import_session`, `aclose` |
 | 35 | [`35_scaling_and_read_pool.py`](35_scaling_and_read_pool.py) | **Scale**: concurrent sessions over a read-only WAL pool; the `bench/` harness | `read_pool_size`, `python -m bench` |
 | 36 | [`36_observability.py`](36_observability.py) | **Observability**: durable JSONL sink + `replay` + metrics | `attach_jsonl_sink`, `replay`, `attach_metrics_sink` |
+| 37 | [`37_custom_retrieval_tool.py`](37_custom_retrieval_tool.py) | **Extending**: register a custom (retrieval) tool — the no-bundled-connectors recipe | `ToolDefinition`, `ToolRegistry`, `tools=` allowlist |
 
 ## Running
 

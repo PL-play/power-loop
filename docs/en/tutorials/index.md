@@ -12,7 +12,7 @@ Step-by-step project walkthroughs. Each tutorial builds a working application fr
 | [Tool Calling](tool-calling.md) | Agent with weather search, bash, and file tools | Beginner |
 | [Human-in-the-Loop](human-in-the-loop.md) | Agent that asks before running dangerous commands | Intermediate |
 | [Multi-Agent System](multi-agent.md) | Parent agent delegates research to sub-agents | Intermediate |
-| [Examples Guide](examples-guide.md) | Walkthrough of all 37 runnable examples with real output | All levels |
+| [Examples Guide](examples-guide.md) | Walkthrough of all 38 runnable examples with real output | All levels |
 
 ## Coming soon
 

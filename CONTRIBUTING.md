@@ -50,8 +50,34 @@ pytest -m "not real_llm"
 
 Write commits in the imperative mood. Reference milestone tags (`M1.1`, `M2.5`, etc.) when relevant.
 
+## Releasing (maintainers)
+
+The release is reproducible by anyone with PyPI rights — no hidden steps:
+
+1. Bump `power_loop.__version__` in `power_loop/__init__.py` (the version is read from
+   there; `pyproject.toml` has no separate version string).
+2. Move the `CHANGELOG.md` `[Unreleased]` entries under a new `## [X.Y.Z] — DATE` heading;
+   leave a fresh empty `[Unreleased]`. Call out any breaking change explicitly (0.x allows
+   breaks in a minor bump, but they must be listed).
+3. Commit, then `git tag -a vX.Y.Z -m "…"` and push `main` + the tag.
+4. Build clean and publish:
+   ```bash
+   rm -rf build dist *.egg-info
+   python -m build
+   twine check dist/*
+   twine upload dist/power_loop-X.Y.Z*
+   ```
+   The wheel must ship **only** the `power_loop` package (no bare `llm_client`/`bench`) —
+   `tests/unit/test_packaging.py` and the build guard this.
+5. CI (`.github/workflows/ci.yml`) gates every push: ruff, mypy, and `pytest --no-real`
+   with the coverage floor. The `import-without-extras` job proves the core stays
+   dependency-free; the `bench` workflow runs the SCALE-1 smoke (non-blocking).
+
+SemVer at 0.x: a breaking change is a **minor** bump (`0.x.0`); a pure fix is a patch.
+
 ## Where to Start
 
-- [ROADMAP.md](ROADMAP.md) — current milestones and priorities
+- [ROADMAP_1.0.md](ROADMAP_1.0.md) — the road to 1.0 (current); [ROADMAP.md](ROADMAP.md) — historical M0–M3 plan
 - [docs/README.md](docs/README.md) — documentation index
 - [examples/](examples/) — runnable examples, each covering one concept
+- [SECURITY.md](SECURITY.md) — security model + how to report a vulnerability

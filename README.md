@@ -176,7 +176,7 @@ res = await loop.send("…", session_id=sid, heal_pending=True)
 # or recover explicitly: loop.resume(sid) / loop.abort_pending(sid)
 ```
 
-More in [`examples/`](examples/README.md) — 37 runnable programs from `00_hello_world.py` to the full chatbot, dynamic workflows, the memory/compaction/recall demos (`31`–`33`), and the durability/scaling/observability demos (`34`–`36`).
+More in [`examples/`](examples/README.md) — 38 runnable programs from `00_hello_world.py` to the full chatbot, dynamic workflows, the memory/compaction/recall demos (`31`–`33`), and the durability/scaling/observability demos (`34`–`37`).
 
 ---
 
@@ -209,6 +209,21 @@ ruff check .
 pytest -q --no-real     # unit suite; drop --no-real to run the live-LLM suite
 ```
 
+## Used by
+
+- **DeepTalk** — the agent runtime for a 1-on-1 relationship-IM product's in-conversation agents.
+
+Using power-loop in production? Open a PR adding a line here — real usage is the best signal.
+
+## Project status & governance
+
+`0.x`, MIT-licensed, primarily a single maintainer (see commit history). The API-stability
+tiers are machine-enforced (`STABLE_API` + a SemVer-guard test) and releases are
+reproducible by anyone (see [CONTRIBUTING → Releasing](CONTRIBUTING.md#releasing-maintainers)),
+so the project is forkable and the dependency is legible — but weigh the bus factor and
+the project's age for your own risk tolerance. Security: see [SECURITY.md](SECURITY.md)
+(best-effort, no SLA). Contributions and co-maintainers welcome.
+
 ## Links
 
-[Docs](docs/README.md) · [Architecture](docs/en/architecture.md) · [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [License](LICENSE)
+[Docs](docs/README.md) · [Architecture](docs/en/architecture.md) · [Roadmap to 1.0](ROADMAP_1.0.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [License](LICENSE)

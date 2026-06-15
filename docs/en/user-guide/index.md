@@ -18,6 +18,7 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 |---|---|
 | [Sessions](sessions.md) | `SessionStore`, multi-turn, cross-process resume, session lifecycle |
 | [Tools](tools.md) | `ToolRegistry`, `ToolDefinition`, JSON Schema validation, sync vs async handlers |
+| [Extending with tools](extending-tools.md) | The custom-tool recipe, per-call allowlisting, MCP (`contrib.mcp`), why no bundled connectors |
 | [Sub-agents](subagents.md) | `spawn_agent`, `AgentSpec`, `run_agent_spec`, lifecycle (EPHEMERAL / LINKED / DETACHED) |
 | [Hooks](hooks.md) | All 18 `HookPoint`s, typed Ctx, directives, common patterns |
 | [Events](events.md) | All `AgentEventType`s, typed payloads, subscriber patterns |

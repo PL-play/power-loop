@@ -54,7 +54,7 @@ real LLM in `tests/real/test_real_durability.py`.***
 | **OBS-4** ✅ | Metrics sink: dep-free `MetricsBackend` Protocol + event→metric mapping; shipped `PrometheusBackend` (`[prometheus]`) / `StatsDBackend` (`[statsd]`), lazy-imported. *(`test_metrics_sink.py`)* | M (1.5–2d) | additive |
 | **OBS-5** ✅ | OpenTelemetry span bridge: session→round→llm/tool span tree from the paired events, behind `[otel]` extra (lazy import). *(`test_otel_sink.py`)* | L (2–3d) | additive |
 
-## Phase 0.18.0 — Ecosystem & supply-chain: MCP, provenance, zero-dep core, governance
+## Phase 0.18.0 — Ecosystem & supply-chain: MCP, provenance, zero-dep core, governance ✅ DONE
 *Least coupled to the core; benefits from a stable kernel to point adopters at. ~7.5–9 days.*
 
 | ID | Item | Effort | API |
@@ -63,9 +63,9 @@ real LLM in `tests/real/test_real_durability.py`.***
 | **ECO-2** ✅ | `_vendor/llm_client/VENDOR.md` (source, MIT license, vendored date, local mods incl. the 0.18.0 removals) + `scripts/sync_vendor.sh` (re-vendor + prune + import-rewrite). | S (1d) | none |
 | **ECO-3** ✅ | Deleted dead vendored `qwen_image.py` + `web_search.py` (sole `certifi` importer) → `dependencies = []` → **literally zero-dependency core**. Verified: import-without-extras + real-LLM HTTPS smoke green. | S (0.5d) | none |
 | **ECO-1** ✅ | MCP client adapter: dep-free `MCPToolSource` Protocol + `register_mcp_tools` (maps MCP `inputSchema`→`ToolDefinition`, `required`→validation, proxies calls) + `StdioMCPClient` behind `[mcp]` (lazy). *(`test_mcp_adapter.py` via a fake source)* | M (3–4d) | additive |
-| **ECO-6** | Extension cookbook + `ToolRegistry` recipe + 1–2 examples (HTTP-API tool, in-memory vector retrieval) — **NOT** bundled connectors. *(dep ECO-1)* | M (2–3d) | none |
-| **ECO-5** | `SECURITY.md` (reporting channel + "in-process tools are NOT a sandbox; use `ShellBackend`/`SubprocessExecutor`"; best-effort no-SLA). | S (0.5d) | none |
-| **ECO-7** | Bus-factor surrogates: documented `RELEASING` process + README "Used by" stub + governance note. | S (0.5–1d) | none |
+| **ECO-6** ✅ | Extension cookbook (`docs/.../extending-tools.md` EN+ZH: the recipe, allowlisting, MCP connector path, why no bundled connectors) + example `37_custom_retrieval_tool`. | M (2–3d) | none |
+| **ECO-5** ✅ | `SECURITY.md`: supported versions, private reporting channel (best-effort no-SLA), and the "orchestrates, not isolates" security model (in-process tools are NOT a sandbox → `ShellBackend`/`SubprocessExecutor`). | S (0.5d) | none |
+| **ECO-7** ✅ | Bus-factor surrogates: documented `RELEASING` process in CONTRIBUTING + README "Used by" + "Project status & governance" note. | S (0.5–1d) | none |
 
 ---
 
