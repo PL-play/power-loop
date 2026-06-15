@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+from power_loop.runtime.env import RuntimeEnv, get_runtime_env, runtime_env_context
 from power_loop.tools.default_manifest import get_tool_definitions
 from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
 from power_loop.tools.registry import ToolRegistry, build_registry
@@ -30,6 +31,9 @@ def create_default_tool_registry(
     workspace_dir: str | Path | None = None,
     home_dir: str | Path | None = None,
     skills_dir: str | Path | None = None,
+    shell_backend: Any | None = None,
+    blackboard: Any | None = None,
+    blackboard_id: str | None = None,
     bind: bool = True,
 ) -> ToolRegistry:
     """Create a :class:`ToolRegistry` pre-loaded with default tools.
@@ -82,6 +86,15 @@ def create_default_tool_registry(
         home_dir=home_dir,
         skills_dir=skills_dir,
     )
+    # Bind an explicit ShellBackend/Blackboard if the caller passed one; otherwise the
+    # bound handlers inherit whatever the outer runtime_env_context injects (H5.1).
+    if shell_backend is not None or blackboard is not None or blackboard_id is not None:
+        runtime_env = replace(
+            runtime_env,
+            shell_backend=shell_backend if shell_backend is not None else runtime_env.shell_backend,
+            blackboard=blackboard if blackboard is not None else runtime_env.blackboard,
+            blackboard_id=blackboard_id if blackboard_id is not None else runtime_env.blackboard_id,
+        )
     if names & _WORKSPACE_TOOL_NAMES:
         runtime_env.require_workspace_dir()
     return build_registry(definitions, _bind_handlers(DEFAULT_TOOL_HANDLERS, runtime_env))
@@ -97,7 +110,20 @@ def _bind_handlers(handlers: dict[str, Any], runtime_env: RuntimeEnv) -> dict[st
 def _bind_handler(handler: Any, runtime_env: RuntimeEnv) -> Any:
     @wraps(handler)
     def _wrapped(**kwargs: Any) -> Any:
-        with runtime_env_context(runtime_env):
+        # H5.1: bind the registry's PATHS (workspace/home/skills) but do NOT clobber
+        # an outer runtime_env_context's injected ShellBackend/Blackboard. A host that
+        # wraps a send() in `runtime_env_context(shell_backend=sandbox, ...)` must still
+        # have its sandbox honored; previously the bind reset the contextvar to a
+        # path-only snapshot (shell_backend=None), silently defeating the injection.
+        # The bound env wins only where it set a value explicitly.
+        outer = get_runtime_env()
+        merged = replace(
+            runtime_env,
+            shell_backend=runtime_env.shell_backend or outer.shell_backend,
+            blackboard=runtime_env.blackboard or outer.blackboard,
+            blackboard_id=runtime_env.blackboard_id or outer.blackboard_id,
+        )
+        with runtime_env_context(merged):
             return handler(**kwargs)
 
     return _wrapped

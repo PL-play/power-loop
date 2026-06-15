@@ -131,7 +131,13 @@ class StatefulAgentLoop:
 
     def close_session(self, session_id: str, *, cascade: bool = True) -> int:
         """Physically delete the session and (by default) its LINKED subtree."""
-        return self.store.close_session(session_id, cascade=cascade)
+        n = self.store.close_session(session_id, cascade=cascade)
+        # Drop the per-session in-memory bookkeeping so a long-lived loop that
+        # cycles through many sessions doesn't leak a Lock per session id (C12).
+        self._locks.pop(session_id, None)
+        self._follow_up_queue_locks.pop(session_id, None)
+        self._follow_up_queues.pop(session_id, None)
+        return n
 
     # ── primary API ───────────────────────────────────────────────────────
 

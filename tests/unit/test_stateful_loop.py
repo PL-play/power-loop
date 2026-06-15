@@ -900,3 +900,21 @@ async def test_unexpected_error_emits_agent_error_and_terminal(store: SessionSto
     assert err.data.error_type == "RuntimeError" and "hook boom" in err.data.error
     ended = next(e for e in events if e.type == AgentEventType.SESSION_ENDED)
     assert ended.data.reason == "error"
+
+
+@pytest.mark.asyncio
+async def test_close_session_clears_per_session_locks(store: SessionStore) -> None:
+    """C12: close_session must drop the per-session in-memory lock/queue entries so a
+    long-lived loop cycling many sessions doesn't leak a Lock per session id."""
+    loop = StatefulAgentLoop(
+        llm=_Scripted(responses=[LLMResponse(raw_text="ok")]), store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+    )
+    sid = loop.new_session()
+    await loop.send("hi", session_id=sid)
+    assert sid in loop._locks  # populated on send
+
+    loop.close_session(sid)
+    assert sid not in loop._locks
+    assert sid not in loop._follow_up_queue_locks
+    assert sid not in loop._follow_up_queues

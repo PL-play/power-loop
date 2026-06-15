@@ -86,6 +86,15 @@
 
 ### Fixed
 
+- **（H5.1）绑定默认工具注册表会遮蔽外层注入的 `ShellBackend`/`Blackboard`**：`bind=True` 时
+  `_bind_handler` 在调用期把 runtime_env 重置为「仅路径」快照(`shell_backend=None`),悄悄
+  defeats 宿主在 `runtime_env_context(shell_backend=sandbox, …)` 里注入的沙箱/board。改为调用期
+  **合并**:绑定的是路径(workspace/home/skills),而 ShellBackend/Blackboard 继承外层上下文
+  (注册表若显式设置则其优先);`create_default_tool_registry` 新增 `shell_backend`/`blackboard`/
+  `blackboard_id` 参数。
+- **（H1.10 / C12）`close_session` 不清理 per-session 内存锁**：长生命周期 loop 轮换大量 session
+  会按 session id 泄漏 `asyncio.Lock`。`close_session` 现在 pop 掉 `_locks` /
+  `_follow_up_queue_locks` / `_follow_up_queues` 三个字典的对应键。
 - **（H2.4 / C14，安全）`bash` 危险命令守卫漏过 `rm -rf /<系统目录>`**：写安全分支测试时发现
   `_dangerous_command_reason` 的 rm 正则只匹配**裸**根/家目录(`/` / `~` / `$HOME` 且后接
   空白或行尾),`rm -rf /etc`、`rm -rf /usr/local`、`rm -rf /var/lib` 这类**子路径删除全部漏过**
