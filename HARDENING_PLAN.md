@@ -1,5 +1,16 @@
 # power-loop: Hardening Plan to 1.0 (continuation past 0.13.1)
 
+> **Status — shipped in 0.14.0 (2026-06-15):** all confirmed correctness bugs **C1–C8** fixed
+> (each red-before/green-after); **H1** correctness lockdown complete (incl. C12); **H2** test/CI
+> rigor (coverage gate, strict markers, property tests, examples-smoke, import-without-extras leg,
+> security-branch tests — which found & fixed a real `rm -rf /<sysdir>` false-negative); **H3**
+> packaging (lazy SDK imports + extras, vendored `llm_client`, featherweight core, top-level LLM
+> re-exports, STABLE_API single-source + SemVer guard, py.typed, Beta classifier); **H4** the
+> high-value observability (per-call LLM events, error codes, logging hygiene + redaction; ts/seq
+> envelope); **H5.1** the bind-injection footgun; plus the **H7** compaction-coordination track
+> (recall_compacted tool + widened Compactor). Deferred as acceptable: H4.3 subagent provenance,
+> H5.2 bounded-growth, C10/C11/C13, H2.8/H2.10.
+>
 > Continues `ROADMAP.md` (M0–M3, most of M3 shipped) toward a 1.0-grade "very high standard" bar. Tracks below are named **H1–H6** to sit after M3 without renumbering it. Same conventions as ROADMAP: every track ends with README + CHANGELOG updates or it doesn't count; LLM-behavior items require ≥1 real-LLM test.
 >
 > Method: this plan is the output of a 6-dimension code audit (core correctness · workflow/subprocess/blackboard · test rigor · packaging/API/typing · observability · architecture/DX), followed by an **adversarial verification pass** that re-read the cited code for every concrete bug-claim and tried to refute it. Only claims that survived are in §1; the refuted/downgraded ones are listed for credibility.
