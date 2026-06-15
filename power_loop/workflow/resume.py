@@ -140,6 +140,7 @@ def _mark_resuming(store: SessionStore, parent_sid: str, run_id: str, j: dict[st
     """Flip a finished/failed journal back to running and bump the attempt count."""
     journal.update(
         store, parent_sid, run_id,
+        allow_terminal=True,  # an intentional terminal→running restart, not a late clobber
         status="running",
         attempts=int(j.get("attempts", 1)) + 1,
         finished_at_ms=None,

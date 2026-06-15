@@ -8,6 +8,47 @@
 
 ## [Unreleased]
 
+硬化计划 `HARDENING_PLAN.md`（0.13.1 → 1.0）的「本周 quick wins」首批落地：H1 正确性锁定
+4 项 + H3 打包 2 项 + H4 可观测性 1 项，全部配红前/绿后回归测试。
+
+### Added
+
+- **（H4.2）`AgentEvent` 增加 `ts` + 单调 `seq` 信封字段**：每个事件自动盖上墙钟时间与
+  进程内单调序号（`itertools.count`，CPython 原子），从而可时间戳化、可全序化——这是
+  OTel span 桥接与重建交错子代理/工作流事件流的基石。两字段排除在相等性之外，不定义事件身份。
+- **（H3.3）发布 PEP 561 `py.typed` 标记**：下游 mypy/pyright 现在能看到 power-loop 的类型
+  注解（此前整套带注解的 Public API 对类型检查器不可见）。
+- 新增回归测试：`reap_runs` 并发 unlink、eager_wake 失败重挂、journal 终态冻结、
+  AGENT_ERROR 终结事件、事件 `ts/seq`、provider 惰性导入、py.typed 装车、以及
+  **默认 OpenAI 流式 transport 的单元测试**（`tests/unit/test_openai_transport.py`，
+  把默认 provider 从仅夜间真实 LLM 覆盖提升为每-PR 覆盖，H2.2）。
+
+### Changed
+
+- **（H3.1）transport 惰性导入 + 可选 extras**：`anthropic` / `openai` 从硬依赖移入
+  `[project.optional-dependencies]`；`power_loop.runtime.provider` 仅在真正构造对应 provider
+  时才导入其 SDK。`import power_loop` 现在零 SDK 即可成功（featherweight 名副其实）。
+  **安装方式变化**：请改用 `pip install 'power-loop[openai]'` / `[anthropic]` / `[all]`；
+  缺失所选 SDK 时构造 provider 会抛出带安装提示的清晰 `ImportError`。README 同步更新。
+
+### Fixed
+
+- **（H1.5）未捕获异常逃逸时既无 `SESSION_ENDED` 也无错误事件**：`pipeline.run()` 中
+  raise 的 hook / sink / store I/O 直接抛出，看过 `SESSION_STARTED` 的订阅者被悬挂，且
+  「文档声称会发」的 `AGENT_ERROR` 通道实为死代码。现在在调用点捕获 → 发 `AGENT_ERROR` +
+  终结 `_finalize("error")`（`SESSION_ENDED`）→ 原样 re-raise；`_finalize` 改为幂等。
+- **（H1.4）`eager_wake` 触发未跟踪的 follow_up 任务，可被 GC → 永久丢失父唤醒**：claim
+  woke 后用裸 `create_task` 触发、句柄丢弃（CPython 仅持弱引用），且 woke 已 claim 会压制
+  durable timer。现在保留任务引用，失败/取消时经 done-callback 重开 woke 并重挂 durable
+  timer，父代理仍恰好被唤醒一次。
+- **（H1.3）finalized journal 的迟到写回退**：孤儿叶子（`on_error="halt"`，见 H1.2）在 run
+  终态后的 `record_step`/`update` 会用陈旧整 blob 把 `status` 退回 `running`、`result` 置空。
+  journal 达到终态后冻结 status/result/steps（`record_step` 在写前重读最新 blob 并合并）；
+  唤醒/resume 等正当写入用 `allow_terminal=True` 显式放行。
+- **（H1.6）`reap_runs` 遇并发 unlink 会中止整轮 GC**：未保护的 `f.stat()` 在 worker /
+  `delete_on_success` 并发删 db/WAL 时抛 `FileNotFoundError`，使后续所有 run 目录漏回收。
+  改为逐文件 + 逐目录吞 `OSError` 并继续（对齐 `_remove_db`）。
+
 ## [0.13.1] — 2026-06-15
 
 修复版本：一次系统性核心能力 bug 审计（5 个并行 agent）发现的全部 16 个问题，

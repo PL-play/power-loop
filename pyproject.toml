@@ -23,8 +23,6 @@ classifiers = [
 ]
 dynamic = ["version"]
 dependencies = [
-  "anthropic>=0.42.0",
-  "openai>=1.52.0",
   "socksio>=1.0.0",
   "python-dotenv>=1.0.0",
   "pyyaml>=6.0",
@@ -33,11 +31,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Vendor LLM SDKs are optional (H3.1): the core imports SDK-free and only pulls a
+# transport when you actually construct that provider. Pick the one(s) you use:
+#   pip install 'power-loop[openai]'      # OpenAI-compatible endpoints
+#   pip install 'power-loop[anthropic]'   # Anthropic Messages API endpoints
+#   pip install 'power-loop[all]'         # both
+anthropic = ["anthropic>=0.42.0"]
+openai = ["openai>=1.52.0"]
+all = ["anthropic>=0.42.0", "openai>=1.52.0"]
 dev = [
   "pytest>=7.0.0",
   "pytest-asyncio>=0.21.0",
   "ruff>=0.6.0",
   "mypy>=1.10.0",
+  # dev/test exercises both real transports
+  "anthropic>=0.42.0",
+  "openai>=1.52.0",
 ]
 
 [project.urls]
@@ -48,6 +57,11 @@ Roadmap = "https://github.com/PL-play/power-loop/blob/main/ROADMAP.md"
 
 [tool.setuptools]
 include-package-data = true
+
+# PEP 561: ship the inline-types marker so downstream mypy/pyright see power-loop's
+# annotations (H3.3). Without this the entire annotated public API is invisible.
+[tool.setuptools.package-data]
+power_loop = ["py.typed"]
 
 [tool.setuptools.dynamic]
 version = { attr = "power_loop.__version__" }

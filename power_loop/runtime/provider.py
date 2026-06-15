@@ -24,9 +24,12 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from llm_client.anthropic_factory import AnthropicMessagesLLMService
+# Only the SDK-free interface (config dataclasses + the LLMService Protocol) is
+# imported at module load. The concrete transports pull heavy vendor SDKs
+# (``anthropic`` / ``openai``) and are imported lazily inside
+# :func:`create_llm_service_from_config`, so ``import power_loop`` stays
+# featherweight and works with neither SDK installed (H3.1).
 from llm_client.interface import AnthropicChatConfig, LLMService, OpenAICompatibleChatConfig
-from llm_client.llm_factory import OpenAICompatibleChatLLMService
 
 DEFAULT_PREFIX = "POWER_LOOP"
 LEGACY_PREFIX = "OPENAI_COMPAT"
@@ -188,7 +191,21 @@ def create_llm_service_from_config(cfg: LLMProviderConfig) -> LLMService:
             sleep_s=float(cfg.extra.get("echo_sleep_s") or 0.0),
         )
     if provider in {"anthropic", "claude", "dashscope-anthropic"}:
+        try:
+            from llm_client.anthropic_factory import AnthropicMessagesLLMService
+        except ImportError as exc:  # pragma: no cover - exercised via H2.5 import-leg
+            raise ImportError(
+                f"provider={cfg.provider!r} needs the 'anthropic' SDK, which is not "
+                "installed. Install it with:  pip install 'power-loop[anthropic]'"
+            ) from exc
         return AnthropicMessagesLLMService(cfg.to_anthropic())
+    try:
+        from llm_client.llm_factory import OpenAICompatibleChatLLMService
+    except ImportError as exc:  # pragma: no cover - exercised via H2.5 import-leg
+        raise ImportError(
+            f"provider={cfg.provider!r} needs the 'openai' SDK, which is not "
+            "installed. Install it with:  pip install 'power-loop[openai]'"
+        ) from exc
     return OpenAICompatibleChatLLMService(cfg.to_openai_compatible())
 
 

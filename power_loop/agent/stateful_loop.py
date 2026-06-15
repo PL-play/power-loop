@@ -694,7 +694,15 @@ class StatefulAgentLoop:
                     store=self.store,
                     drain_follow_ups=_drain_follow_ups,
                 )
-                result: AgentLoopResult = await pipeline.run(history)
+                try:
+                    result: AgentLoopResult = await pipeline.run(history)
+                except Exception as exc:
+                    # An unexpected error escaped the pipeline (a raising hook, sink,
+                    # prepare_round, store I/O …). Emit the advertised AGENT_ERROR
+                    # channel + a terminal SESSION_ENDED so subscribers that saw
+                    # SESSION_STARTED aren't stranded, then re-raise unchanged (H1.5).
+                    await pipeline._emit_error_terminal(exc)
+                    raise
             finally:
                 reset_current_loop(loop_token)
         try:

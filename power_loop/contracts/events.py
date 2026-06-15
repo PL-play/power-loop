@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import count
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from power_loop.contracts.event_payloads import BaseEventPayload
+
+# Process-wide monotonic event counter. ``itertools.count.__next__`` is atomic in
+# CPython, so this is a thread-safe total order across every bus/session/sub-agent
+# in the process — the basis for ordering interleaved streams (H4.2).
+_event_seq = count(1)
 
 
 class AgentEventType(str, Enum):
@@ -81,7 +88,19 @@ class AgentEvent:
     round_index: int | None = None
     stream_id: str | None = None
     source: str | None = None
+    # Envelope timing/ordering (H4.2): wall-clock creation time (epoch seconds) and a
+    # process-wide monotonic sequence. Together they timestamp and totally-order every
+    # event — the keystone for an OpenTelemetry span bridge and for reconstructing
+    # interleaved sub-agent/workflow streams. Auto-populated when left at their
+    # defaults; a deserializer may pass explicit values to preserve the original
+    # ordering. Excluded from equality so they never define event identity.
+    ts: float = field(default=0.0, compare=False)
+    seq: int = field(default=0, compare=False)
 
     def __post_init__(self) -> None:
         if self.data is not None and not self.payload:
             self.payload = self.data.to_dict()
+        if not self.ts:
+            self.ts = time.time()
+        if not self.seq:
+            self.seq = next(_event_seq)

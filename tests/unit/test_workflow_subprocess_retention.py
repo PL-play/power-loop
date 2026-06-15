@@ -133,3 +133,50 @@ def test_reap_runs_removes_old_keeps_recent(tmp_path) -> None:
     assert reaped == ["old"]
     assert not old.exists()
     assert recent.exists()
+
+
+def test_reap_runs_survives_concurrent_unlink(tmp_path) -> None:
+    """A file vanishing mid-sweep must not abort the whole sweep (H1.6).
+
+    The worker processes and ``delete_on_success`` remove dbs + WAL sidecars
+    concurrently, so ``f.stat()`` can race a real unlink. A dangling symlink is the
+    deterministic stand-in: stat() follows it and raises ``FileNotFoundError``.
+    Before the guard, that exception escaped and stranded every later run dir.
+    """
+    runs = tmp_path / "r"
+    past = time.time() - 10_000
+
+    racy = runs / "racy"
+    racy.mkdir(parents=True)
+    (racy / "real__1.db").write_text("x")
+    os.symlink(str(tmp_path / "gone" / "missing.db"), racy / "vanished__2.db")
+    os.utime(racy / "real__1.db", (past, past))
+    os.utime(racy, (past, past))
+
+    # A second old run dir that must still be reaped even though 'racy' raced.
+    other = runs / "other"
+    other.mkdir(parents=True)
+    (other / "b__1.db").write_text("y")
+    os.utime(other / "b__1.db", (past, past))
+    os.utime(other, (past, past))
+
+    reaped = reap_runs(str(runs), older_than_s=3600)  # must not raise
+
+    assert set(reaped) == {"racy", "other"}
+    assert not racy.exists()
+    assert not other.exists()
+
+
+def test_reap_runs_falls_back_to_dir_mtime_when_all_files_vanish(tmp_path) -> None:
+    """If every file in a run dir is unstattable, fall back to the dir's own mtime
+    rather than crashing or silently never reaping it (H1.6)."""
+    runs = tmp_path / "r"
+    past = time.time() - 10_000
+    d = runs / "only-symlinks"
+    d.mkdir(parents=True)
+    os.symlink(str(tmp_path / "gone" / "a.db"), d / "a__1.db")
+    os.utime(d, (past, past))
+
+    reaped = reap_runs(str(runs), older_than_s=3600)
+    assert reaped == ["only-symlinks"]
+    assert not d.exists()

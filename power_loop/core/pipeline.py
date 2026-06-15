@@ -10,6 +10,7 @@ wrapper that delegates to ``AgentPipeline.run()``.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from collections.abc import Mapping
 from datetime import datetime
@@ -32,6 +33,7 @@ from power_loop.contracts.errors import (
     ToolValidationError,
 )
 from power_loop.contracts.event_payloads import (
+    AgentErrorPayload,
     AutoCompactStatusPayload,
     BaseEventPayload,
     BudgetExceededStatusPayload,
@@ -84,6 +86,8 @@ from power_loop.runtime.memory import MemorySnapshot, tag_as_memory
 from power_loop.runtime.retry import with_retry
 from power_loop.runtime.skills import SkillLoader
 from power_loop.tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 RESULT_MAX_CHARS = 50000
 
@@ -240,6 +244,11 @@ class AgentPipeline:
         self.history: list[LoopMessage] = []
         self.rounds_since_todo = 0
         self._completed_rounds = 0
+        # Terminal-event bookkeeping (H1.5): emit SESSION_ENDED at most once, and
+        # only after SESSION_STARTED, so an error-path finalize can't double-fire
+        # or strand subscribers.
+        self._session_started = False
+        self._finalized = False
 
     def _build_skill_prompt_section(self) -> str:
         if not self.config.skills_dir:
@@ -305,6 +314,9 @@ class AgentPipeline:
 
     async def _finalize(self, reason: str, *, final_text: str | None = None,
                         rounds: int | None = None) -> None:
+        if self._finalized:
+            return  # idempotent: SESSION_ENDED fires exactly once per run
+        self._finalized = True
         if rounds is not None:
             self._completed_rounds = rounds
         ctx = SessionEndCtx(
@@ -314,6 +326,36 @@ class AgentPipeline:
         await self.hooks.run_typed_async(HookPoint.SESSION_END, ctx)
         self._emit(AgentEventType.SESSION_ENDED, SessionEndedPayload(reason=reason))
         await self._maybe_remember(reason=reason, final_text=final_text or "")
+
+    async def _emit_error_terminal(self, exc: BaseException) -> None:
+        """Emit the ``AGENT_ERROR`` channel + a terminal ``SESSION_ENDED`` after an
+        unexpected exception escaped :meth:`run` (a raising hook, sink, prepare_round,
+        store I/O …). Subscribers that saw ``SESSION_STARTED`` would otherwise be
+        stranded with no terminal, and the documented ``AGENT_ERROR`` channel would
+        stay dead code (H1.5).
+
+        Best-effort and self-guarding: it must NEVER mask the original exception, so
+        every step is wrapped and the caller re-raises ``exc`` after this returns.
+        """
+        try:
+            self._emit(
+                AgentEventType.AGENT_ERROR,
+                AgentErrorPayload(error=str(exc), error_type=type(exc).__name__),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("AGENT_ERROR emit failed for session %s", self.session_id)
+        if not self._session_started:
+            return  # no start was observed → nothing to terminate
+        try:
+            await self._finalize("error")
+        except Exception:  # noqa: BLE001 — a SESSION_END hook / remember may itself raise
+            logger.exception("error-path finalize failed for session %s", self.session_id)
+            # Guarantee a terminal event even if the SESSION_END hook raised before
+            # _finalize could emit it.
+            try:
+                self._emit(AgentEventType.SESSION_ENDED, SessionEndedPayload(reason="error"))
+            except Exception:  # noqa: BLE001
+                pass
 
     # ── Memory: recall at start, remember at end (M1.9) ──
 
@@ -644,6 +686,7 @@ class AgentPipeline:
         if isinstance(session_ctx.messages, list):
             self.history = session_ctx.messages
         self._emit(AgentEventType.SESSION_STARTED, SessionStartedPayload(scope="main"))
+        self._session_started = True
 
         # ── Memory recall (M1.9) ──
         await self._maybe_recall()

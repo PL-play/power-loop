@@ -161,15 +161,7 @@ def spawn_background(
             _publish(loop, parent_sid, run_id, "failed", "failed", level="error")
         _wake(loop, parent_sid, note)
         if eager_wake:
-            # Non-durable fast-path on top of the durable timer above. The eager
-            # delivery bypasses TIMER_FIRE, so the wake-guard can't dedupe it —
-            # we must CLAIM the wake here (set journal 'woke'), so the later timer
-            # firing is skipped by the guard. Without this, the parent wakes twice.
-            j = journal.read(store, parent_sid, run_id)
-            if j is not None and not j.get("woke"):
-                journal.update(store, parent_sid, run_id, woke=True)
-                with _suppress():
-                    asyncio.create_task(loop.follow_up(note, parent_sid))
+            _eager_wake(loop, store, parent_sid, run_id, note, task_set)
 
     task = asyncio.create_task(_bg(), name=f"workflow-{run_id}")
     task_set.add(task)
@@ -177,12 +169,57 @@ def spawn_background(
     return WorkflowRunHandle(run_id=run_id, task=task, cancel_token=cancel_token)
 
 
-class _suppress:
-    def __enter__(self) -> None:
-        return None
+def _eager_wake(
+    loop: Any, store: Any, parent_sid: str, run_id: str, note: str, task_set: set[Any]
+) -> None:
+    """Non-durable fast-path layered on the durable timer (already armed above).
 
-    def __exit__(self, *exc: object) -> bool:
-        return True  # swallow any error from the optional eager wake
+    The eager delivery bypasses ``TIMER_FIRE``, so :func:`make_wake_guard` can't
+    dedupe it — we CLAIM the wake (journal ``woke=True``) so the later durable timer
+    is skipped and the parent wakes exactly once.
+
+    The follow_up is a real, fallible coroutine, so we must NOT fire-and-forget it:
+    a bare ``create_task`` is only weakly referenced by CPython and can be GC'd
+    mid-flight, and the coroutine can raise *after* we claimed the wake — and since
+    the durable timer is then suppressed, the parent would be lost forever. So we
+    RETAIN the task in ``task_set`` and, if it fails/cancels, re-open the claim and
+    re-arm a durable timer (see :func:`_recover_eager_wake`).
+    """
+    j = journal.read(store, parent_sid, run_id)
+    if j is None or j.get("woke"):
+        return
+    journal.update(store, parent_sid, run_id, allow_terminal=True, woke=True)
+    eager = asyncio.create_task(
+        loop.follow_up(note, parent_sid), name=f"workflow-eagerwake-{run_id}"
+    )
+    task_set.add(eager)
+    eager.add_done_callback(task_set.discard)
+    eager.add_done_callback(
+        lambda t: _recover_eager_wake(loop, store, parent_sid, run_id, note, t)
+    )
+
+
+def _recover_eager_wake(
+    loop: Any, store: Any, parent_sid: str, run_id: str, note: str, task: Any
+) -> None:
+    """Done-callback for the eager follow_up.
+
+    On success, leave ``woke=True`` (the durable timer stays suppressed). On failure
+    or cancellation the parent was never woken yet the durable timer is suppressed —
+    so re-open the claim and re-arm a fresh durable timer. The wake-guard dedupes if
+    the original timer is also still pending, so the parent still wakes exactly once.
+    A done-callback must never raise, hence the broad guards.
+    """
+    if not task.cancelled() and task.exception() is None:
+        return  # eager delivery succeeded
+    try:
+        j = journal.read(store, parent_sid, run_id)
+        if j is None or not j.get("woke"):
+            return  # already re-opened, or the run is gone
+        journal.update(store, parent_sid, run_id, allow_terminal=True, woke=False)
+    except Exception:  # noqa: BLE001 — recovery must not raise inside a callback
+        return
+    _wake(loop, parent_sid, note)
 
 
 def make_wake_guard(store: Any):

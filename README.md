@@ -39,8 +39,13 @@ Most "agent frameworks" ask you to build your app *inside* them. power-loop is t
 
 ## Install
 
+The core imports SDK-free; pick the transport extra you use (the vendor SDK is only
+pulled in when you actually construct that provider):
+
 ```bash
-pip install power-loop
+pip install 'power-loop[openai]'      # any OpenAI-compatible endpoint
+pip install 'power-loop[anthropic]'   # the native Anthropic Messages API
+pip install 'power-loop[all]'         # both
 ```
 
 Point it at any OpenAI-compatible endpoint (or `POWER_LOOP_PROVIDER=anthropic`):

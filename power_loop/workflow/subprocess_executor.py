@@ -128,13 +128,30 @@ def reap_runs(runs_dir: str, *, older_than_s: float, now: float | None = None) -
     cutoff = (time.time() if now is None else now) - float(older_than_s)
     reaped: list[str] = []
     for run_dir in base.iterdir():
-        if not run_dir.is_dir():
+        # A whole-dir guard: the leaf workers and ``delete_on_success`` remove
+        # dbs + WAL sidecars concurrently, so any stat/iterdir here can race a
+        # concurrent unlink. Swallow per-dir OS errors and move on — one vanished
+        # file must never abort the sweep and strand every later run dir. Mirrors
+        # ``_remove_db``'s swallow-and-continue.
+        try:
+            if not run_dir.is_dir():
+                continue
+            mtimes: list[float] = []
+            for f in run_dir.iterdir():
+                try:
+                    mtimes.append(f.stat().st_mtime)
+                except OSError:
+                    continue  # file vanished mid-sweep
+            try:
+                fallback = run_dir.stat().st_mtime
+            except OSError:
+                continue  # the run dir itself vanished — nothing to reap
+            newest = max(mtimes, default=fallback)
+            if newest < cutoff:
+                shutil.rmtree(run_dir, ignore_errors=True)
+                reaped.append(run_dir.name)
+        except OSError:
             continue
-        files = list(run_dir.iterdir())
-        newest = max((f.stat().st_mtime for f in files), default=run_dir.stat().st_mtime)
-        if newest < cutoff:
-            shutil.rmtree(run_dir, ignore_errors=True)
-            reaped.append(run_dir.name)
     return reaped
 
 

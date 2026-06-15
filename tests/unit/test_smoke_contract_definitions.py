@@ -68,5 +68,19 @@ def main() -> None:
     print("smoke_contract_definitions passed")
 
 
+def test_agent_event_has_ts_and_monotonic_seq() -> None:
+    """H4.2: every event auto-stamps a wall-clock ``ts`` and a process-wide
+    monotonic ``seq`` so streams are timestampable and totally orderable."""
+    e1 = AgentEvent(type=AgentEventType.ROUND_STARTED, payload={"round": 1})
+    e2 = AgentEvent(type=AgentEventType.ROUND_COMPLETED, payload={"round": 1})
+    assert e1.ts > 0 and e2.ts > 0
+    assert isinstance(e1.seq, int) and e2.seq > e1.seq  # strictly increasing order
+    # seq/ts are excluded from equality (envelope metadata, not identity)
+    assert AgentEvent(type=AgentEventType.SESSION_ENDED) == AgentEvent(type=AgentEventType.SESSION_ENDED)
+    # explicit values are preserved (a deserializer can replay original ordering)
+    replayed = AgentEvent(type=AgentEventType.SESSION_ENDED, ts=123.5, seq=7)
+    assert replayed.ts == 123.5 and replayed.seq == 7
+
+
 if __name__ == "__main__":
     main()

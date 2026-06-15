@@ -857,3 +857,46 @@ async def test_follow_up_when_idle_degrades_to_send(store: SessionStore) -> None
     assert result.final_text == "idle reply"
     rows = store.load_active_messages(sid)
     assert any(r.role == "user" and r.content == "hello" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_unexpected_error_emits_agent_error_and_terminal(store: SessionStore) -> None:
+    """H1.5: an exception escaping the pipeline (e.g. a raising hook) emits the
+    advertised AGENT_ERROR channel + a terminal SESSION_ENDED — so a subscriber that
+    saw SESSION_STARTED is not stranded — and re-raises the original error unchanged."""
+    from power_loop import AgentEventBus, AgentEventType, AgentHooks
+    from power_loop.contracts.hooks import HookPoint
+
+    # Isolated hooks/event_bus: the no-arg defaults are PROCESS-GLOBAL singletons
+    # (DEFAULT_HOOKS / DEFAULT_EVENT_BUS), so a raising hook registered on them would
+    # leak into every other test's loop.
+    loop = StatefulAgentLoop(
+        llm=_Scripted(responses=[LLMResponse(raw_text="hi")]),
+        store=store,
+        config=AgentLoopConfig(system_prompt="sys", max_rounds=2, compactor=None),
+        hooks=AgentHooks(),
+        event_bus=AgentEventBus(),
+    )
+    sid = loop.new_session()
+
+    def explode(ctx: Any) -> None:
+        raise RuntimeError("hook boom")
+
+    loop.hooks.register(HookPoint.ROUND_START, explode)
+
+    events: list[Any] = []
+    for et in (AgentEventType.SESSION_STARTED, AgentEventType.AGENT_ERROR, AgentEventType.SESSION_ENDED):
+        loop.event_bus.subscribe(et, events.append)
+
+    with pytest.raises(RuntimeError, match="hook boom"):
+        await loop.send("hi", session_id=sid)
+
+    types = [e.type for e in events]
+    assert AgentEventType.SESSION_STARTED in types  # subscriber saw a start …
+    assert AgentEventType.AGENT_ERROR in types      # … the error channel is live …
+    assert AgentEventType.SESSION_ENDED in types     # … and a terminal arrived
+
+    err = next(e for e in events if e.type == AgentEventType.AGENT_ERROR)
+    assert err.data.error_type == "RuntimeError" and "hook boom" in err.data.error
+    ended = next(e for e in events if e.type == AgentEventType.SESSION_ENDED)
+    assert ended.data.reason == "error"

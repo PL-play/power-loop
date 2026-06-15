@@ -97,6 +97,36 @@ def test_journal_roundtrip():
     assert "r1" in journal.list_run_ids(store, psid)
 
 
+def test_journal_frozen_after_finalize():
+    """H1.3: once a run is terminal, a late record_step / plain update must not
+    revert its status or result (defense against the C2 orphan-clobber)."""
+    loop = _loop()
+    psid = loop.new_session()
+    store = loop.store
+    journal.seed(store, psid, "r1", "wf")
+    res = WorkflowResult(name="wf", status="completed",
+                         results={"a": AgentResult("a", "completed", "ok")})
+    journal.finalize(store, psid, "r1", res)
+    assert journal.read(store, psid, "r1")["status"] == "completed"
+
+    # a late orphan step settling after finalize is ignored — status/result frozen
+    journal.record_step(store, psid, "r1", node_id="late", status="running",
+                        session_id="s", text="stale")
+    j = journal.read(store, psid, "r1")
+    assert j["status"] == "completed"  # NOT reverted to running
+    assert j["result"]["name"] == "wf"  # result preserved
+    assert all(s["node_id"] != "late" for s in j["steps"])  # late step dropped
+
+    # a plain update is frozen too — first finalize wins
+    journal.update(store, psid, "r1", status="running", result=None)
+    assert journal.read(store, psid, "r1")["status"] == "completed"
+
+    # but allow_terminal=True writes (wake / resume) still land
+    journal.update(store, psid, "r1", allow_terminal=True, woke=True)
+    after = journal.read(store, psid, "r1")
+    assert after["woke"] is True and after["status"] == "completed"  # status untouched
+
+
 # ── D3: detached execution ───────────────────────────────────────────────────
 
 
@@ -186,6 +216,46 @@ async def test_eager_wake_does_not_double_wake():
 
     # the durable timer still fires, but the guard now SKIPs it (no 2nd wake)
     await TimerRunner(loop).scan_once()
+    assert loop.get_session_stats(psid).sends == 1
+
+
+async def test_eager_wake_failure_rearms_durable_timer():
+    """Regression (H1.4): if the eager follow_up RAISES after claiming the wake, the
+    parent would be lost forever (durable timer suppressed by woke=True). The failure
+    must re-open the claim and re-arm the timer so the parent still wakes — once."""
+    loop = _loop()
+    psid = loop.new_session()
+    register_wake_guard(loop)
+
+    orig_follow_up = loop.follow_up
+    calls = {"n": 0}
+
+    async def flaky_follow_up(note, sid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("eager delivery boom")  # only the eager call fails
+        return await orig_follow_up(note, sid)
+
+    loop.follow_up = flaky_follow_up  # type: ignore[assignment]
+
+    wf = create_workflow(SINGLE, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True, eager_wake=True)
+    await handle.task
+
+    # let the eager follow_up fail and its done-callback re-open the claim
+    for _ in range(50):
+        await asyncio.sleep(0.02)
+        if get_workflow(loop, psid, handle.run_id)["woke"] is False:
+            break
+    assert get_workflow(loop, psid, handle.run_id)["woke"] is False  # claim re-opened
+    assert loop.get_session_stats(psid) is None  # eager failed → parent NOT woken yet
+    assert loop.list_timers(psid)  # a durable wake timer is (re-)armed
+
+    # the durable timer now delivers the wake — exactly once
+    await TimerRunner(loop).scan_once()
+    stats = loop.get_session_stats(psid)
+    assert stats is not None and stats.sends == 1
+    await TimerRunner(loop).scan_once()  # idempotent
     assert loop.get_session_stats(psid).sends == 1
 
 
