@@ -7,8 +7,7 @@
 ## 快速开始
 
 ```python
-from llm_client.interface import LLMRequest
-from power_loop import StructuredOutputSpec, parse_structured
+from power_loop import LLMRequest, StructuredOutputSpec, parse_structured
 
 spec = StructuredOutputSpec(
     name="UserCard",

@@ -14,13 +14,13 @@ from typing import Any
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
 from power_loop import (
     AgentEventBus,
     AgentEventType,
     AgentLoopConfig,
     StatefulAgentLoop,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.contrib.logging_sink import attach_logging_sink
 from power_loop.tools.registry import ToolRegistry

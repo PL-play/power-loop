@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop import AgentLoopConfig, FollowUpQueued, SessionStore, StatefulAgentLoop
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.follow_up import (
     FOLLOW_UP_MESSAGE_NAME,
     format_follow_up_user_message,

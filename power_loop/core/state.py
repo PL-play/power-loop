@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from llm_client.interface import LLMResponse
+from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.contracts.event_payloads import TodoUpdatedPayload
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.core.agent_context import get_event_bus, get_session_id

@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from llm_client.interface import LLMResponse
+from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.contracts.errors import PowerLoopError
 
 

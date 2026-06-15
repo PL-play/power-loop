@@ -42,7 +42,6 @@ import asyncio
 
 from _helpers import make_llm
 
-from llm_client.interface import LLMService
 from power_loop import (
     AgentEventBus,
     AgentEventType,
@@ -52,6 +51,7 @@ from power_loop import (
     SessionStore,
     StatefulAgentLoop,
 )
+from power_loop._vendor.llm_client.interface import LLMService
 
 
 class FlakyWrap(LLMService):

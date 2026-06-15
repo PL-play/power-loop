@@ -6,7 +6,6 @@ from typing import Any
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     MAX_SPAWN_DEPTH,
     AgentLoopConfig,
@@ -16,6 +15,7 @@ from power_loop import (
     StatefulAgentLoop,
     SubagentLifecycle,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.spec import filtered_registry, run_agent_spec
 from power_loop.tools.registry import ToolRegistry

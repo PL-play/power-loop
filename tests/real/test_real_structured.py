@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import pytest
 
-from llm_client.interface import LLMRequest
 from power_loop import StructuredOutputSpec, parse_structured
+from power_loop._vendor.llm_client.interface import LLMRequest
 
 from ._llm import make_llm
 

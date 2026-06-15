@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentLoopConfig,
     LocalShellBackend,
@@ -20,6 +19,7 @@ from power_loop import (
     create_default_tool_registry,
     runtime_env_context,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 
 
 @dataclass

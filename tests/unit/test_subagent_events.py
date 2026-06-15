@@ -20,8 +20,8 @@ from typing import Any
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import AgentLoopConfig, AgentSpec, SessionStore, StatefulAgentLoop
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import (

@@ -6,7 +6,6 @@ from typing import Any
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentEvent,
     AgentEventBus,
@@ -21,6 +20,7 @@ from power_loop import (
     ToolRegistry,
     get_tool_runtime_context,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 
 
 @dataclass

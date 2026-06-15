@@ -54,6 +54,12 @@
 
 ### Changed
 
+- **（H3.2，打包）`llm_client` 收编进 `power_loop._vendor`**：wheel 不再发布一个裸的顶层
+  `llm_client` 包(消除与他人 PyPI 包/本地模块的命名抢注/冲突风险)——`top_level.txt` 现在只有
+  `power_loop`。内部引用改走 `power_loop._vendor.llm_client.*`(包内仍用相对导入,无需动)。
+  **若你此前直接 `from llm_client.interface import …`**:改用顶层 re-export
+  `from power_loop import LLMRequest, LLMResponse, …`(H3.4);工厂类属内部,改用
+  `create_llm_service_from_config` / `create_llm_service_from_env`。
 - **（H3.5，安装方式）核心依赖瘦身为仅 `certifi`**：`socksio`(从未直接 import,httpx 按需
   传递)移除;`python-dotenv`(仅 examples/tests)移入 dev;`pyyaml` → `[skills]` extra
   (缺失时 `load_skill` 优雅降级、不报错)、`pypdf` → `[pdf]` extra(PDF 输入,懒加载);

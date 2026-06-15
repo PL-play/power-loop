@@ -29,7 +29,7 @@ from typing import Any
 # (``anthropic`` / ``openai``) and are imported lazily inside
 # :func:`create_llm_service_from_config`, so ``import power_loop`` stays
 # featherweight and works with neither SDK installed (H3.1).
-from llm_client.interface import AnthropicChatConfig, LLMService, OpenAICompatibleChatConfig
+from power_loop._vendor.llm_client.interface import AnthropicChatConfig, LLMService, OpenAICompatibleChatConfig
 
 DEFAULT_PREFIX = "POWER_LOOP"
 LEGACY_PREFIX = "OPENAI_COMPAT"
@@ -192,7 +192,7 @@ def create_llm_service_from_config(cfg: LLMProviderConfig) -> LLMService:
         )
     if provider in {"anthropic", "claude", "dashscope-anthropic"}:
         try:
-            from llm_client.anthropic_factory import AnthropicMessagesLLMService
+            from power_loop._vendor.llm_client.anthropic_factory import AnthropicMessagesLLMService
         except ImportError as exc:  # pragma: no cover - exercised via H2.5 import-leg
             raise ImportError(
                 f"provider={cfg.provider!r} needs the 'anthropic' SDK, which is not "
@@ -200,7 +200,7 @@ def create_llm_service_from_config(cfg: LLMProviderConfig) -> LLMService:
             ) from exc
         return AnthropicMessagesLLMService(cfg.to_anthropic())
     try:
-        from llm_client.llm_factory import OpenAICompatibleChatLLMService
+        from power_loop._vendor.llm_client.llm_factory import OpenAICompatibleChatLLMService
     except ImportError as exc:  # pragma: no cover - exercised via H2.5 import-leg
         raise ImportError(
             f"provider={cfg.provider!r} needs the 'openai' SDK, which is not "

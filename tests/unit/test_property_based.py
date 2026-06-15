@@ -14,7 +14,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.runtime.compact import DefaultCompactor
 from power_loop.runtime.structured import StructuredOutputError, parse_structured
 

@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from llm_client.interface import LLMResponse
 from power_loop import (
     AgentEventBus,
     AgentEventType,
@@ -30,6 +29,7 @@ from power_loop import (
     SessionStore,
     StatefulAgentLoop,
 )
+from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.contracts.hook_contexts import MemoryRecalledCtx
 
 # ── Fakes ────────────────────────────────────────────────────────────────

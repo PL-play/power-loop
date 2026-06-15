@@ -33,8 +33,8 @@ def test_importing_power_loop_does_not_pull_vendor_sdks() -> None:
 @pytest.mark.parametrize(
     ("provider", "module", "extra"),
     [
-        ("openai", "llm_client.llm_factory", "openai"),
-        ("anthropic", "llm_client.anthropic_factory", "anthropic"),
+        ("openai", "power_loop._vendor.llm_client.llm_factory", "openai"),
+        ("anthropic", "power_loop._vendor.llm_client.anthropic_factory", "anthropic"),
     ],
 )
 def test_missing_sdk_raises_clear_install_hint(

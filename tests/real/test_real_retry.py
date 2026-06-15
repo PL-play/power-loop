@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import pytest
 
-from llm_client.interface import LLMService
 from power_loop import (
     AgentEventBus,
     AgentEventType,
@@ -28,6 +27,7 @@ from power_loop import (
     SessionStore,
     StatefulAgentLoop,
 )
+from power_loop._vendor.llm_client.interface import LLMService
 
 from ._llm import make_llm
 

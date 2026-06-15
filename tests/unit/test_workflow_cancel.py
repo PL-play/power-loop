@@ -20,7 +20,6 @@ from dataclasses import dataclass
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentLoopConfig,
     AgentSpec,
@@ -28,6 +27,7 @@ from power_loop import (
     StatefulAgentLoop,
     run_agent_spec,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.core.agent_context import reset_session_id, set_session_id
 from power_loop.workflow import SharedBudget, WorkflowSpec, create_workflow
 from power_loop.workflow.engine import WorkflowEngine

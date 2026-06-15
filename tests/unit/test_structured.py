@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from llm_client.interface import LLMResponse
 from power_loop import StructuredOutputError, StructuredOutputSpec, parse_structured
+from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.runtime.structured import _extract_first_json_object
 
 

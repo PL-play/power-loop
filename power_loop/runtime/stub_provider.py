@@ -13,7 +13,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from llm_client.interface import (
+from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
     LLMService,

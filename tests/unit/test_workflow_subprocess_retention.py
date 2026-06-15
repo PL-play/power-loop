@@ -9,8 +9,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.workflow import (
     SubprocessExecutor,
     WorkerBootstrap,

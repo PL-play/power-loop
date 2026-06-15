@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentLoopConfig,
     SessionStore,
@@ -22,6 +21,7 @@ from power_loop import (
     ToolDefinition,
     create_default_tool_registry,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.hooks import HookDirective, HookPoint
 from power_loop.core.hooks import AgentHooks
 from power_loop.tools.registry import ToolRegistry

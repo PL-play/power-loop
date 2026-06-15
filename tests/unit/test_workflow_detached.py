@@ -10,8 +10,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import AgentEventType, AgentLoopConfig, StatefulAgentLoop, TimerRunner
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.hook_contexts import TimerFireCtx
 from power_loop.contracts.hooks import HookDirective
 from power_loop.core.agent_context import (

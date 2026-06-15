@@ -194,12 +194,12 @@ async def test_note_tool_writes_and_next_send_injects(store: SessionStore) -> No
     from dataclasses import dataclass, field
     from typing import Any
 
-    from llm_client.interface import LLMRequest, LLMResponse, LLMStreamChunk
     from power_loop import (
         AgentLoopConfig,
         StatefulAgentLoop,
         create_default_tool_registry,
     )
+    from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMStreamChunk
 
     @dataclass
     class _Scripted:

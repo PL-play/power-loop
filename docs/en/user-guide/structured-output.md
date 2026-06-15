@@ -7,8 +7,7 @@ Force LLMs to return valid JSON that matches a schema. `StructuredOutputSpec` te
 ## Quick Start
 
 ```python
-from llm_client.interface import LLMRequest
-from power_loop import StructuredOutputSpec, parse_structured
+from power_loop import LLMRequest, StructuredOutputSpec, parse_structured
 
 spec = StructuredOutputSpec(
     name="UserCard",

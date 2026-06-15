@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from llm_client.interface import LLMService
+from power_loop._vendor.llm_client.interface import LLMService
 from power_loop.agent.follow_up import FollowUpQueued, merge_follow_up_inputs
 from power_loop.agent.sink import SQLiteSink
 from power_loop.agent.system_prompt import (

@@ -13,8 +13,8 @@ from typing import Any, cast
 
 import pytest
 
-from llm_client.interface import LLMRequest, OpenAICompatibleChatConfig
-from llm_client.llm_factory import OpenAICompatibleChatLLMService
+from power_loop._vendor.llm_client.interface import LLMRequest, OpenAICompatibleChatConfig
+from power_loop._vendor.llm_client.llm_factory import OpenAICompatibleChatLLMService
 
 pytestmark = pytest.mark.unit
 

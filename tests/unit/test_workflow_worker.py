@@ -16,8 +16,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import SessionStore
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import WorkerBootstrap, WorkerBootstrapError, run_spec_isolated
 from power_loop.workflow.worker import (

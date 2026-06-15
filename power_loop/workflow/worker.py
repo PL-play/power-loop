@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 from power_loop.contracts.errors import PowerLoopError
 
 if TYPE_CHECKING:
-    from llm_client.interface import LLMService
+    from power_loop._vendor.llm_client.interface import LLMService
     from power_loop.tools.registry import ToolRegistry
 
 __all__ = [

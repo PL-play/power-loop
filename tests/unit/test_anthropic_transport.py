@@ -7,8 +7,8 @@ from typing import Any, cast
 
 import pytest
 
-from llm_client.anthropic_factory import AnthropicMessagesLLMService
-from llm_client.interface import AnthropicChatConfig, LLMRequest
+from power_loop._vendor.llm_client.anthropic_factory import AnthropicMessagesLLMService
+from power_loop._vendor.llm_client.interface import AnthropicChatConfig, LLMRequest
 
 
 class _FakeMessages:

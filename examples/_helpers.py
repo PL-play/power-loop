@@ -13,8 +13,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from llm_client.interface import LLMService
 from power_loop import LLMProviderConfig, create_llm_service_from_config
+from power_loop._vendor.llm_client.interface import LLMService
 
 
 def load_env() -> None:

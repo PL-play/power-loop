@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.sink import MessageSink, NullSink
 from power_loop.agent.system_prompt import (
     DEFAULT_AGENT_SYSTEM_PROMPT,

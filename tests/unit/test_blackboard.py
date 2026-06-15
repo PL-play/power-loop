@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentLoopConfig,
     BlackboardEntry,
@@ -18,6 +17,7 @@ from power_loop import (
     register_blackboard_tools,
     render_entries,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.core.agent_context import (
     reset_current_loop,
     reset_session_id,

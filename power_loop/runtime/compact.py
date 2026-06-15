@@ -28,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from llm_client.interface import LLMRequest
+from power_loop._vendor.llm_client.interface import LLMRequest
 from power_loop.runtime.budget import estimate_tokens
 
 if TYPE_CHECKING:

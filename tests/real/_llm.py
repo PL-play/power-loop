@@ -7,8 +7,8 @@ when the required env vars are absent.
 
 from __future__ import annotations
 
-from llm_client.interface import LLMService
 from power_loop import LLMProviderConfig, create_llm_service_from_config
+from power_loop._vendor.llm_client.interface import LLMService
 
 
 def make_llm(

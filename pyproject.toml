@@ -73,7 +73,9 @@ power_loop = ["py.typed"]
 version = { attr = "power_loop.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["power_loop*", "llm_client*"]
+# llm_client is vendored under power_loop/_vendor (H3.2) — the wheel ships only the
+# `power_loop` top-level package, no squat-prone bare `llm_client`.
+include = ["power_loop*"]
 exclude = ["tests*", "docs*", "references*", "examples*", "temp*", "images*"]
 
 # ── ruff ──

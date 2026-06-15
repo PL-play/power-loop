@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentEventBus,
     AgentEventType,
@@ -19,6 +18,7 @@ from power_loop import (
     StatefulAgentLoop,
     ToolDefinition,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.unit

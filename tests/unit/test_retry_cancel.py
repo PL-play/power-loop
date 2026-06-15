@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from llm_client.interface import LLMResponse
 from power_loop import (
     AgentEventBus,
     AgentEventType,
@@ -32,6 +31,7 @@ from power_loop import (
     SessionStore,
     StatefulAgentLoop,
 )
+from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.contracts.errors import CancellationRequested
 from power_loop.runtime.retry import with_retry
 

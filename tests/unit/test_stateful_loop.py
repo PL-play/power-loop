@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentLoopConfig,
     FollowUpQueued,
@@ -20,6 +19,7 @@ from power_loop import (
     create_default_tool_registry,
     get_tool_runtime_context,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.tools.registry import ToolRegistry
 

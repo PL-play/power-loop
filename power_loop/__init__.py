@@ -19,7 +19,7 @@ __version__ = "0.13.1"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
-from llm_client.interface import (
+from power_loop._vendor.llm_client.interface import (
     AnthropicChatConfig,
     LLMRequest,
     LLMResponse,

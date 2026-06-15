@@ -6,13 +6,13 @@ from typing import Any
 
 import pytest
 
-from llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop import (
     AgentLoopConfig,
     MessageState,
     SessionStore,
     StatefulAgentLoop,
 )
+from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.runtime.budget import estimate_message_tokens, estimate_tokens
 from power_loop.runtime.compact import CompactionPlan, DefaultCompactor
 

@@ -35,8 +35,8 @@ import json
 
 from _helpers import make_llm
 
-from llm_client.interface import LLMRequest
 from power_loop import StructuredOutputError, StructuredOutputSpec, parse_structured
+from power_loop._vendor.llm_client.interface import LLMRequest
 
 # ── 1. 卡片 schema —— 关系洞察周报里可能用到的一小段 ─────────────────────
 #    Card schema — a small slice that might appear in a relationship insight report
