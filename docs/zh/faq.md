@@ -10,7 +10,7 @@
 
 ### 和 LangChain / CrewAI / AutoGen 有什么区别？
 
-power-loop 是**内核**，不是框架。不预设 workflow DAG、记忆后端或 prompt 模板。你自带 LLM、工具和记忆——库提供执行循环、hooks 和持久化。约 5k 行 Python，不是 100k 行的依赖树。
+power-loop 是**内核**，不是框架。不预设 workflow DAG、记忆后端或 prompt 模板。你自带 LLM、工具和记忆——库提供执行循环、hooks 和持久化。约 1.7 万行 Python，不是 100k 行的依赖树。
 
 ### 支持流式输出吗？
 

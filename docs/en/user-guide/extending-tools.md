@@ -4,7 +4,7 @@
 
 power-loop is a **kernel**, not a batteries-included platform: it ships no connectors, no
 vector stores, no SaaS integrations. That is deliberate — those carry dependencies,
-opinions, and churn that don't belong in a ~5k-line core. Instead you bring your own
+opinions, and churn that don't belong in a ~17k-line core. Instead you bring your own
 tools through the `ToolRegistry`, and reach external systems either by writing a thin tool
 or via [MCP](#external-systems-mcp). This page is the recipe.
 

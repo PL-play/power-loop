@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### Docs
+
+- Rewrote the README for the 1.0 launch (marketing-quality but honest): full 1.0 feature
+  coverage (durability/scale/observability/MCP/zero-dep), a **bilingual** `README.zh.md`,
+  a "Start here" + goal-based navigation map, an honest "How it compares" section, and a
+  stability/SemVer + honest-scope section. All README links validated.
+- Honesty fix: corrected the stale "~5k-line core" claim to the actual ~17k lines
+  (zero-dependency, pure stdlib) across README + faq + extending-tools (EN/ZH).
+
 ## [1.0.0] — 2026-06-16
 
 **First stable release.** The `STABLE` public API is now under SemVer: a break to it

@@ -10,7 +10,7 @@ An embeddable Agent execution kernel for Python. It gives you the Agent loop (LL
 
 ### How is it different from LangChain / CrewAI / AutoGen?
 
-power-loop is a **kernel**, not a framework. It doesn't prescribe workflow DAGs, memory backends, or prompt templates. You bring your own LLM, tools, and memory — the library provides the execution loop, hooks, and persistence. It's ~5k lines of Python, not a 100k-line dependency tree.
+power-loop is a **kernel**, not a framework. It doesn't prescribe workflow DAGs, memory backends, or prompt templates. You bring your own LLM, tools, and memory — the library provides the execution loop, hooks, and persistence. It's ~17k lines of Python, not a 100k-line dependency tree.
 
 ### Does it support streaming?
 
