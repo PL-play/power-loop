@@ -154,6 +154,25 @@ def test_example_22_follow_up_steering_runs() -> None:
     assert "STEERED" in result["final_text"]
 
 
+def test_example_28_docker_shell_backend_runs() -> None:
+    """Model-authored bash runs INSIDE a container via a custom ShellBackend.
+    Skips cleanly when Docker is unavailable."""
+    import pytest
+
+    module = _load_example("28_docker_shell_backend.py")
+    result = asyncio.run(module.main())
+    if result is None:
+        pytest.skip("Docker not available")
+    bash = result["bash_outputs"].lower()
+    # Proof from the RAW bash output (not the model's prose): the shell ran in
+    # the container (Debian image, not the host) and saw the bind-mounted file.
+    assert "debian" in bash, f"shell did not run in the container image: {bash!r}"
+    assert "hello from the host machine" in bash, (
+        f"bind-mounted host file not visible inside the sandbox: {bash!r}"
+    )
+    assert result["final_text"].strip()
+
+
 def test_example_07_human_approval_runs() -> None:
     """Always-deny confirm_fn: dangerous commands must NEVER execute;
     safe whitelist commands may still execute; final answer must
