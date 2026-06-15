@@ -48,6 +48,13 @@
 
 ### Fixed
 
+- **（H1.2 / C2）`parallel`/`foreach` 在 `on_error="halt"` 下不取消在飞的兄弟分支**：
+  `asyncio.gather(return_exceptions=False)` 首个失败即 re-raise,但**不取消**其它仍在跑的
+  分支——它们继续烧真实 LLM 调用,迟到的 `record_step` 还能污染已 finalize 的 journal。新增
+  `WorkflowEngine._gather_branches`:halt 时首个失败即 `task.cancel()` 其余兄弟、置
+  `self._cancelled`、best-effort 翻 `self._cancel`,排空后再 re-raise;`continue` 行为不变。
+  (journal 污染那半已由 H1.3 终态冻结堵住。)新增 `tests/unit/test_workflow_fanout.py`:
+  parallel/foreach halt 取消兄弟 + 无遗留任务 + continue 仍收集全部错误(红前/绿后)。
 - **（H1.1 / C1，最高严重度）记忆召回与压缩的 `_history_seqs` 错位 → 压缩标错 DB 行**：
   `_maybe_recall` 把 `memory_*` 消息直接插进 `pipeline.history`（绕过 sink），使
   `sink._history_seqs` 与 history 错位 `len(recalled)`，随后 `on_compaction` →

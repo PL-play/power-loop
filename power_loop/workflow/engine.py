@@ -347,6 +347,44 @@ class WorkflowEngine:
                 break
         return last
 
+    async def _gather_branches(
+        self, coros: list[Any], *, on_error: str
+    ) -> list[Any]:
+        """Run branch coroutines concurrently with halt-aware cancellation (H1.2/C2).
+
+        ``on_error="continue"``: collect every result/exception (return_exceptions).
+        ``on_error="halt"``: on the FIRST failure, **cancel the still-running
+        siblings** (so they stop burning real LLM calls and can't clobber the journal
+        with a late step), drain them, then re-raise — unlike ``asyncio.gather``,
+        which re-raises but leaves the siblings running detached.
+        """
+        tasks = [asyncio.ensure_future(c) for c in coros]
+        if not tasks:
+            return []
+        if on_error == "continue":
+            return await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        except asyncio.CancelledError:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        first_exc: BaseException | None = next(
+            (t.exception() for t in tasks
+             if t.done() and not t.cancelled() and t.exception() is not None),
+            None,
+        )
+        if first_exc is not None:
+            self._cancelled = True
+            self._cancel.cancel("workflow halt: sibling branch failed")  # best-effort (owned tokens)
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise first_exc
+        return [t.result() for t in tasks]
+
     async def _exec_parallel(self, node: ParallelNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         sem = asyncio.Semaphore(node.max_concurrency)
 
@@ -354,9 +392,8 @@ class WorkflowEngine:
             async with sem:
                 return await self._exec(branch, dict(env), driver_sid)
 
-        gathered = await asyncio.gather(
-            *(one(b) for b in node.branches),
-            return_exceptions=(node.on_error == "continue"),
+        gathered = await self._gather_branches(
+            [one(b) for b in node.branches], on_error=node.on_error
         )
         for r in gathered:
             if isinstance(r, BaseException):
@@ -389,9 +426,8 @@ class WorkflowEngine:
         self._emit_suppressed += 1
         try:
             if node.parallel:
-                gathered = await asyncio.gather(
-                    *(one(it) for it in items),
-                    return_exceptions=(node.on_error == "continue"),
+                gathered = await self._gather_branches(
+                    [one(it) for it in items], on_error=node.on_error
                 )
             else:
                 gathered = []
