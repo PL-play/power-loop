@@ -26,6 +26,18 @@
   改由后台线程经有界队列消费,`publish()` 立即返回,慢订阅者不再卡循环;队列满按 `on_overflow`
   (`drop_newest`/`drop_oldest`/`block`)处理并计入 `bus.dropped`;`shutdown()` 先排空再停线程。
   默认 `inline`,行为不变。异步订阅者仍调度到事件循环(不下放到无 loop 的线程)。
+- **（OBS-4)指标 sink。** `contrib/metrics_sink`:无依赖的 `MetricsBackend` Protocol +
+  事件→指标映射(llm 调用/重试、工具调用成败、轮次、错误、token 用量),映射本身不依赖任何
+  第三方库(可用假后端测试);出厂 `PrometheusBackend`(`[prometheus]`)与 `StatsDBackend`
+  (`[statsd]`)惰性导入各自客户端。
+- **（OBS-5)OpenTelemetry span 桥。** `contrib/otel_sink`:把成对的 `*_STARTED`/`*_COMPLETED`
+  事件映射成 session→round→llm/tool 的 span 树,接入任意 OTel 后端;在 `[otel]` extra 之后,
+  `opentelemetry` 惰性导入(无依赖也可 import 本模块)。`close()` 结束所有未闭合 span。
+
+### Changed
+
+- 新增可选 extras:`prometheus` / `statsd` / `otel`,并并入 `all`;`dev` 增加
+  `prometheus-client` + `opentelemetry-sdk` 以便 CI 跑 OBS-4/5 后端测试。
 
 ## [0.16.0] — 2026-06-15
 

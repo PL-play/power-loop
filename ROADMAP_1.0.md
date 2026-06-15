@@ -42,7 +42,7 @@ real LLM in `tests/real/test_real_durability.py`.***
 | **SCALE-4** ✅ | Bound the default-on per-round O(history) `estimate_tokens` scan: pipeline keeps a self-invalidating incremental estimate, handed to the compactor via `CompactionContext.current_tokens` (measured 5ms@10k / 26ms@50k per round → O(1)). *(`test_token_estimate_cache.py`)* | M (1–2d) | additive |
 | **SCALE-5** ✅ | `docs/{en,zh}/user-guide/scaling.md` grounded in measured harness numbers (fan-out plateau ~1000/s; big-history linear; sequential drift) + read-pool + retention knobs + one-db-per-process multi-process pattern + honest caveats. Examples `34` (durability) + `35` (scaling/read-pool). | M (1–2d) | none |
 
-## Phase 0.17.0 — Observability: durable, replayable, ordered events + metrics/trace bridges
+## Phase 0.17.0 — Observability: durable, replayable, ordered events + metrics/trace bridges ✅ DONE
 *One canonical event serializer; bridges behind optional extras (core stays SDK-free). ~8–10.5 days.*
 
 | ID | Item | Effort | API |
@@ -51,8 +51,8 @@ real LLM in `tests/real/test_real_durability.py`.***
 | **OBS-6** ✅ | Monotonic `mono` (`perf_counter`) field on `AgentEvent` for skew-free latency/span math (survives wall-clock rollback). *(`test_event_serialization.py`)* | S (0.5d) | additive |
 | **OBS-2** ✅ | Durable rotating JSONL sink (`attach_jsonl_sink`) + `replay()`; redaction factored into shared `contrib/_redact.py`. *(`test_event_serialization.py`)* | M (1–2d) | additive |
 | **OBS-3** ✅ | Backpressure: documented "sync subscribers must not block" contract + opt-in `sync_dispatch="thread"` (bounded queue + `on_overflow` drop policy + `shutdown()`); default inline → no regression. *(`test_event_bus_backpressure.py`)* | L (2–3d) | additive |
-| **OBS-4** | Metrics sink (`MetricsBackend` Protocol + Prometheus/StatsD) behind `[metrics]` extra. | M (1.5–2d) | additive |
-| **OBS-5** | OpenTelemetry span bridge (session→round→llm/tool spans) behind `[otel]` extra. *(dep OBS-6)* | L (2–3d) | additive |
+| **OBS-4** ✅ | Metrics sink: dep-free `MetricsBackend` Protocol + event→metric mapping; shipped `PrometheusBackend` (`[prometheus]`) / `StatsDBackend` (`[statsd]`), lazy-imported. *(`test_metrics_sink.py`)* | M (1.5–2d) | additive |
+| **OBS-5** ✅ | OpenTelemetry span bridge: session→round→llm/tool span tree from the paired events, behind `[otel]` extra (lazy import). *(`test_otel_sink.py`)* | L (2–3d) | additive |
 
 ## Phase 0.18.0 — Ecosystem & supply-chain: MCP, provenance, zero-dep core, governance
 *Least coupled to the core; benefits from a stable kernel to point adopters at. ~7.5–9 days.*
