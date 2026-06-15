@@ -13,6 +13,13 @@
 
 ### Added
 
+- **（H2 测试/CI 加固）覆盖率门禁 + 严格 marker + 示例冒烟 + 免-extras 导入腿**：
+  CI 的 pytest 现在跑 `--cov=power_loop --cov=llm_client --cov-fail-under=70`(当前 72.6%);
+  pytest `addopts` 加 `--strict-markers --strict-config`(typo marker / 未知 ini key 直接报错);
+  新增 `tests/unit/test_examples_smoke.py`——逐个 import 全部 35 个 `examples/NN_*.py`,public API
+  改名会让 CI 立刻红(语义校验仍留夜间真实 LLM);新增 CI job `import-without-extras`——只装核心
+  (不装 `[openai]`/`[anthropic]`)后 `import power_loop` + 跑惰性导入测试,守住「零 SDK 可导入」。
+  dev 依赖加 `pytest-cov` / `hypothesis`。
 - **（H7 Phase 2）`Compactor` 协议加可选 `CompactionContext`——折叠前可联动记忆**：
   `maybe_compact` 现在可**选**接收 `context: CompactionContext`(暴露注入的
   `MemoryProvider` + `session_id` + 只读 `fetch_messages`),自定义压缩器可在折叠前把要点

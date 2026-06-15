@@ -35,4 +35,27 @@ jobs:
         run: mypy power_loop
 
       - name: Pytest (unit + integration, real_llm auto-skipped without env)
-        run: pytest --no-real -q
+        run: >-
+          pytest --no-real -q
+          --cov=power_loop --cov=llm_client
+          --cov-report=term-missing:skip-covered --cov-fail-under=70
+
+  # H2.5: prove the library imports SDK-free (featherweight positioning). Installs
+  # the core only — no [openai]/[anthropic] extras — then imports + runs the
+  # lazy-import tests.
+  import-without-extras:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install core only (no transport extras) + pytest
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest pytest-asyncio
+      - name: Import power_loop with zero SDKs
+        run: python -c "import power_loop; print('import OK', power_loop.__version__)"
+      - name: Lazy-import tests
+        run: pytest tests/unit/test_provider_lazy_import.py -q -p no:cacheprovider

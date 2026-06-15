@@ -42,6 +42,7 @@ all = ["anthropic>=0.42.0", "openai>=1.52.0"]
 dev = [
   "pytest>=7.0.0",
   "pytest-asyncio>=0.21.0",
+  "pytest-cov>=4.0.0",
   "hypothesis>=6.0.0",
   "ruff>=0.6.0",
   "mypy>=1.10.0",
@@ -102,6 +103,9 @@ check_untyped_defs = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# --strict-markers: an unregistered marker is a collection error (catches typos).
+# --strict-config: an unknown ini key is an error. Coverage flags are opt-in (CI).
+addopts = "--strict-markers --strict-config"
 markers = [
   "unit: pure control-flow / contract tests (fake LLM, fast)",
   "integration: multi-component scenarios with fake LLM",
@@ -109,4 +113,17 @@ markers = [
 ]
 filterwarnings = [
   "ignore::DeprecationWarning",
+]
+
+# ── coverage (opt-in: CI runs `pytest --cov=power_loop --cov=llm_client`) ──
+[tool.coverage.run]
+source = ["power_loop", "llm_client"]
+omit = ["*/tests/*", "*/examples/*"]
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@(abc\\.)?abstractmethod",
+  "\\.\\.\\.",
 ]
