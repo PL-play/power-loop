@@ -48,6 +48,14 @@
 
 ### Fixed
 
+- **（H1.9 / C8）同步 SQLite 写阻塞事件循环 → 多会话互相拖死**：pipeline 的写路径
+  store/sink 调用同步执行,某会话一次有竞争的写(`busy_timeout` 最高 5s)会卡住整个
+  事件循环、拖住其它所有会话。修复:把**写路径** sink/store 调用(`on_message_appended` /
+  `on_compaction` / `on_round_started` / `on_assistant_tool_calls` / `on_round_ended` /
+  `bump_session_stats`)用 `asyncio.to_thread` 下放到线程(RLock 已保证线程安全);**读保持内联**
+  (快、少竞争)。`NullSink` 无 I/O,跳过线程跳转零开销。新增 `tests/unit/test_store_offload.py`:
+  阻塞写期间并发 ticker 仍推进(红前 ticker≈停摆 / 绿后照常);`StatefulAgentLoop` 并发文档
+  同步更正。
 - **（H1.7 / C6）同步 `publish()` 静默吞掉 async 订阅者异常**：有运行中的 loop 时,async
   handler 被 `loop.create_task` fire-and-forget,`suppress_subscriber_errors=False` 的
   re-raise 发生在脱离的 task 里,只剩一条 "Task exception was never retrieved" 的 GC 告警;

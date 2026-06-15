@@ -9,6 +9,7 @@ wrapper that delegates to ``AgentPipeline.run()``.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import json
@@ -266,6 +267,11 @@ class AgentPipeline:
         # or strand subscribers.
         self._session_started = False
         self._finalized = False
+        # H1.9/C8: a real persistence sink does blocking SQLite writes; offload those
+        # to a thread so one session's contended write (busy_timeout up to 5s) can't
+        # freeze the event loop and stall every other session. NullSink is a no-op,
+        # so skip the thread-pool hop for it.
+        self._sink_offload = not isinstance(self.sink, NullSink)
 
     def _build_skill_prompt_section(self) -> str:
         if not self.config.skills_dir:
@@ -294,6 +300,18 @@ class AgentPipeline:
             stream_id=stream_id,
         ))
 
+    # ── Helper: run a write-path sink call (offloaded for real persistence) ──
+
+    async def _emit_sink(self, fn: Any, *args: Any, **kwargs: Any) -> None:
+        """Invoke a write-path sink callback, off the event loop for a real
+        (blocking SQLite) sink so a contended write can't stall the loop (H1.9/C8).
+        Awaited, so per-session ordering is preserved; the loop just runs other
+        sessions during the I/O."""
+        if self._sink_offload:
+            await asyncio.to_thread(fn, *args, **kwargs)
+        else:
+            fn(*args, **kwargs)
+
     # ── Helper: append message (with MESSAGE_APPEND hook) ──
 
     async def _append_message(self, msg: LoopMessage, *, round_index: int | None = None) -> None:
@@ -304,7 +322,7 @@ class AgentPipeline:
         )
         await self.hooks.run_typed_async(HookPoint.MESSAGE_APPEND, ctx)
         self.history.append(ctx.message)
-        self.sink.on_message_appended(ctx.message, round_index=round_index)
+        await self._emit_sink(self.sink.on_message_appended, ctx.message, round_index=round_index)
 
     async def _resolve_skipped_tool_calls(
         self, skipped: list[Mapping[str, Any]], *, reason: str, round_idx: int
@@ -582,7 +600,8 @@ class AgentPipeline:
         # Persist (no-op for NullSink). Pass the pre-fold history length so the
         # sink can refuse to persist if its index↔seq map ever drifts out of
         # alignment (H1.1 safety net), rather than mark the wrong rows.
-        self.sink.on_compaction(
+        await self._emit_sink(
+            self.sink.on_compaction,
             fold_start_idx=plan.fold_start_idx,
             fold_end_idx=plan.fold_end_idx,
             summary_text=plan.summary_text,
@@ -802,7 +821,7 @@ class AgentPipeline:
             # ── Business logic: prepare round ──
             await self.prepare_round(round_idx)
 
-            self.sink.on_round_started(round_idx)
+            await self._emit_sink(self.sink.on_round_started, round_idx)
             self._emit(AgentEventType.ROUND_STARTED, RoundStartedPayload(round_index=round_idx), round_index=round_idx)
 
             runtime_messages = self._runtime_messages_for_round(round_idx)
@@ -902,7 +921,8 @@ class AgentPipeline:
             # Mark pending IMMEDIATELY so a crash here leaves a recoverable state.
             if sanitized_tool_calls:
                 assistant_seq = len(self.history)  # 1-based position in history
-                self.sink.on_assistant_tool_calls(
+                await self._emit_sink(
+                    self.sink.on_assistant_tool_calls,
                     assistant_seq=assistant_seq,
                     tool_calls=sanitized_tool_calls,
                     round_index=round_idx,
@@ -943,7 +963,7 @@ class AgentPipeline:
                     has_tools=False, response_text=assistant_text,
                 )
                 await self.hooks.run_typed_async(HookPoint.ROUND_END, round_end)
-                self.sink.on_round_ended(round_idx, usage=usage)
+                await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
                 await self._finalize("completed", final_text=assistant_text, rounds=round_idx + 1)
                 return self._make_result("completed", final_text=assistant_text, rounds=round_idx + 1)
 

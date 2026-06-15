@@ -82,10 +82,12 @@ class StatefulResult:
 class StatefulAgentLoop:
     """The only public entry point for running an agent loop.
 
-    A single instance can drive any number of sessions concurrently (one
-    session never blocks another beyond SQLite's row-level locking). The
-    store is owned by the loop; callers may share it across multiple
-    StatefulAgentLoop instances if they need different configs.
+    A single instance can drive any number of sessions concurrently on one event
+    loop: write-path SQLite I/O (message appends, compaction persistence, stats) is
+    offloaded to a worker thread (H1.9), so one session's contended write does not
+    freeze the loop and stall the others. (Reads remain inline — they're fast and
+    rarely contended.) The store is owned by the loop; callers may share it across
+    multiple StatefulAgentLoop instances if they need different configs.
     """
 
     def __init__(
@@ -706,7 +708,9 @@ class StatefulAgentLoop:
             finally:
                 reset_current_loop(loop_token)
         try:
-            self.store.bump_session_stats(
+            # Offload the stats write off the event loop (H1.9/C8).
+            await asyncio.to_thread(
+                self.store.bump_session_stats,
                 sid, result.usage, rounds=result.rounds, tool_calls=result.tool_calls,
             )
         except Exception:
