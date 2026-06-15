@@ -20,7 +20,8 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 | [Tools](tools.md) | `ToolRegistry`, `ToolDefinition`, JSON Schema validation, sync vs async handlers |
 | [Sub-agents](subagents.md) | `spawn_agent`, `AgentSpec`, `run_agent_spec`, lifecycle (EPHEMERAL / LINKED / DETACHED) |
 | [Hooks](hooks.md) | All 18 `HookPoint`s, typed Ctx, directives, common patterns |
-| [Events](events.md) | All 24 `AgentEventType`s, typed payloads, subscriber patterns |
+| [Events](events.md) | All `AgentEventType`s, typed payloads, subscriber patterns |
+| [Observability](observability.md) | Durable JSONL sink + `replay`, metrics (Prometheus/StatsD), OpenTelemetry spans, backpressure |
 | [Compaction](compaction.md) | `DefaultCompactor`, `trigger_ratio`, keep-last-N, custom `Compactor` |
 | [Memory](memory.md) | `MemoryProvider` protocol, `recall` / `remember`, injection position |
 | [Retry & Cancel](retry-cancel.md) | `LLMRetryPolicy`, exponential backoff, `CancellationToken` |

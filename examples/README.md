@@ -46,6 +46,7 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 33 | [`33_coordinating_compactor.py`](33_coordinating_compactor.py) | Custom compactor that remembers must-keep detail before folding | `CompactionContext`, `Compactor` |
 | 34 | [`34_durability_lifecycle.py`](34_durability_lifecycle.py) | **Durability**: prune folded originals, VACUUM, export/import, graceful `aclose()` | `prune_compacted_messages`, `vacuum`, `export_session`/`import_session`, `aclose` |
 | 35 | [`35_scaling_and_read_pool.py`](35_scaling_and_read_pool.py) | **Scale**: concurrent sessions over a read-only WAL pool; the `bench/` harness | `read_pool_size`, `python -m bench` |
+| 36 | [`36_observability.py`](36_observability.py) | **Observability**: durable JSONL sink + `replay` + metrics | `attach_jsonl_sink`, `replay`, `attach_metrics_sink` |
 
 ## Running
 

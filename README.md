@@ -176,7 +176,7 @@ res = await loop.send("…", session_id=sid, heal_pending=True)
 # or recover explicitly: loop.resume(sid) / loop.abort_pending(sid)
 ```
 
-More in [`examples/`](examples/README.md) — 36 runnable programs from `00_hello_world.py` to the full chatbot, dynamic workflows, the memory/compaction/recall demos (`31`–`33`), and the durability + scaling demos (`34`–`35`).
+More in [`examples/`](examples/README.md) — 37 runnable programs from `00_hello_world.py` to the full chatbot, dynamic workflows, the memory/compaction/recall demos (`31`–`33`), and the durability/scaling/observability demos (`34`–`36`).
 
 ---
 

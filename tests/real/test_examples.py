@@ -277,3 +277,11 @@ def test_example_35_scaling_and_read_pool_runs() -> None:
     summary = asyncio.run(module.main())
     assert "3/3 concurrent sessions completed" in summary
     assert "read_pool_size=4" in summary
+
+
+def test_example_36_observability_runs() -> None:
+    """The observability example persists events to JSONL and replays them in seq order
+    while a metrics backend counts rounds/llm calls."""
+    module = _load_example("36_observability.py")
+    summary = asyncio.run(module.main())
+    assert "persisted" in summary and "metric rounds=1" in summary and "llm_calls=1" in summary
