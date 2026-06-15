@@ -7,7 +7,7 @@ Two things, kept deliberately small:
    OpenAI-compatible ``response_format`` dict the provider expects.
 2. :func:`parse_structured` —— extracts a JSON object from any LLM
    response text, repairs common defects (markdown fences, trailing
-   commas, single quotes), and optionally validates against a minimal
+   commas), and optionally validates against a minimal
    subset of JSON Schema (``type=="object"`` + ``required`` keys).
 
 We do **not** depend on jsonschema or pydantic for parsing. The schema
@@ -125,8 +125,13 @@ def _extract_first_json_object(text: str) -> str | None:
 def _try_repair_json(blob: str) -> str:
     """Apply cheap, reversible fixes that recover from typical LLM JSON noise.
 
-    Order matters: fence strip → trailing-comma → single→double quotes
-    (only when an attempt to ``json.loads`` already failed)."""
+    Currently this removes trailing commas before ``}`` / ``]`` — the defect
+    that most often survives fence-stripping and balanced-object extraction.
+    Markdown fences are stripped earlier by :func:`_strip_markdown_fences`, and
+    this stays deliberately conservative: notably it does **not** rewrite
+    single quotes to double quotes, because a regex can't do that without
+    corrupting apostrophes inside string values. Only run after a direct
+    ``json.loads`` has already failed."""
     # Trailing commas before } or ]
     return re.sub(r",(\s*[}\]])", r"\1", blob)
 

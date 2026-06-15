@@ -891,14 +891,6 @@ def run_grep(
             "--color=never",
             "--max-filesize",
             "5M",
-            "--glob",
-            "!.git/**",
-            "--glob",
-            "!node_modules/**",
-            "--glob",
-            "!dist/**",
-            "--glob",
-            "!build/**",
         ]
         if include_hidden:
             rg_cmd.append("--hidden")
@@ -908,6 +900,15 @@ def run_grep(
             rg_cmd.append("--ignore-case")
         if include:
             rg_cmd.extend(["--glob", include])
+        # Exclude the same directories the Python fallback prunes
+        # (_COMMON_SKIP_DIRS), at ANY depth, and AFTER the include glob so the
+        # exclusion wins (rg uses last-glob-wins precedence). The old root-
+        # anchored "!node_modules/**" globs missed nested copies and could be
+        # overridden by a later include, so results diverged depending on
+        # whether rg or the Python fallback ran. "**/" matches zero or more
+        # leading dirs, so this covers both top-level and nested matches.
+        for skip in sorted(_COMMON_SKIP_DIRS):
+            rg_cmd.extend(["--glob", f"!**/{skip}/**"])
         if not include_hidden:
             rg_cmd.extend(["--glob", "!.*", "--glob", "!**/.*"])
         rg_cmd.extend(["--", pattern, _safe_relative_for_subprocess(base)])
@@ -923,10 +924,14 @@ def run_grep(
             )
             if result.returncode > 1:
                 return f"Error: {result.stderr.strip() or 'rg failed'}"
-            lines = [line for line in result.stdout.splitlines() if line][:max_results]
+            # Count and slice the SAME (non-blank) set so the truncation notice
+            # reflects what's actually shown — counting raw splitlines (incl.
+            # blanks) could claim truncation when nothing was dropped.
+            all_lines = [line for line in result.stdout.splitlines() if line]
+            lines = all_lines[:max_results]
             if not lines:
                 return f"No matches for '{pattern}' in {_display_path(base)}"
-            if len(result.stdout.splitlines()) > max_results:
+            if len(all_lines) > max_results:
                 lines.append(f"... results truncated at {max_results}")
             return "\n".join(lines)
         except FileNotFoundError:

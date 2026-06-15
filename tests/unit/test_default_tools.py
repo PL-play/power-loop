@@ -113,6 +113,76 @@ def test_glob_and_grep_are_scoped_and_capped(tmp_path: Path) -> None:
     assert "b.txt" not in str(grep)
 
 
+def _grep_matched_files(output: str) -> set[str]:
+    """Filenames from grep output lines (``path:line:text``), env-independent."""
+    files: set[str] = set()
+    for line in output.splitlines():
+        if line.startswith("...") or ":" not in line:
+            continue
+        files.add(line.split(":", 1)[0].lstrip("./"))
+    return files
+
+
+def test_grep_rg_command_excludes_all_common_skip_dirs_after_include(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rg command must carry a ``!**/<dir>/**`` exclusion for EVERY
+    _COMMON_SKIP_DIRS entry (matches at any depth) placed AFTER the include
+    glob, so rg's last-glob-wins precedence lets the exclusion win — matching
+    the Python fallback, which prunes those dirs unconditionally. Hermetic: we
+    capture the argv instead of depending on a real rg binary (rg may be a
+    shell alias, not on PATH for subprocess)."""
+    import subprocess as _sp
+
+    import power_loop.tools.default_tools as dt
+    from power_loop.tools.default_tools import _COMMON_SKIP_DIRS
+
+    captured: dict[str, list[str]] = {}
+
+    def _spy(cmd, **kw):  # noqa: ANN001, ANN202
+        captured["argv"] = list(cmd)
+        return _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(dt.subprocess, "run", _spy)
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    registry.invoke("grep", {"path": ".", "pattern": "NEEDLE", "include": "*.py"})
+
+    argv = captured["argv"]
+    for d in _COMMON_SKIP_DIRS:
+        assert f"!**/{d}/**" in argv, f"missing exclusion for {d}: {argv}"
+    # Exclusions must come AFTER the include glob (last-glob-wins → exclusion wins).
+    inc_idx = argv.index("*.py")
+    first_skip_idx = min(argv.index(f"!**/{d}/**") for d in _COMMON_SKIP_DIRS)
+    assert inc_idx < first_skip_idx, f"include must precede skip-dir globs: {argv}"
+
+
+def test_grep_python_fallback_prunes_common_skip_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Python fallback (rg unavailable) must prune _COMMON_SKIP_DIRS at any
+    depth — the contract the rg globs above are kept in parity with."""
+    import power_loop.tools.default_tools as dt
+
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "keep.py").write_text("NEEDLE = 1\n", encoding="utf-8")
+    for d in ("__pycache__", "node_modules", "target", "vendor", ".venv"):
+        (tmp_path / d).mkdir()
+        (tmp_path / d / "skip.py").write_text("NEEDLE = 2\n", encoding="utf-8")
+    (tmp_path / "pkg" / "__pycache__").mkdir()  # nested skip dir
+    (tmp_path / "pkg" / "__pycache__" / "skip.py").write_text("NEEDLE = 3\n", encoding="utf-8")
+
+    def _no_rg(*a, **k):  # noqa: ANN002, ANN003, ANN202
+        raise FileNotFoundError("rg not installed")
+
+    monkeypatch.setattr(dt.subprocess, "run", _no_rg)
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    out = str(registry.invoke("grep", {"path": ".", "pattern": "NEEDLE", "max_results": 50}))
+
+    assert _grep_matched_files(out) == {"pkg/keep.py"}, out
+    for leaked in ("__pycache__", "node_modules", "target", "vendor", ".venv"):
+        assert leaked not in out, f"fallback leaked {leaked}: {out}"
+
+
 def test_bash_runs_and_blocks_obvious_danger(tmp_path: Path) -> None:
     registry = create_default_tool_registry(workspace_dir=tmp_path)
     ok = registry.invoke("bash", {"command": "printf 'hello-tools\\n'", "timeout": 5})
