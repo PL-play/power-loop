@@ -19,6 +19,12 @@ __version__ = "0.13.1"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
+# Library logging hygiene (H4.5): attach a NullHandler to the package-root logger so
+# importing power-loop never emits "No handlers could be found" noise or logs unless
+# the application explicitly configures handlers. All module loggers live under this
+# "power_loop.*" subtree (getLogger(__name__)), so one handler routes the whole tree.
+import logging as _logging
+
 from power_loop._vendor.llm_client.interface import (
     AnthropicChatConfig,
     LLMRequest,
@@ -209,6 +215,9 @@ from power_loop.tools.spawn_agent import (
     SPAWN_AGENT_DEFINITION,
     register_spawn_agent,
 )
+
+_logging.getLogger("power_loop").addHandler(_logging.NullHandler())
+
 
 # The authoritative STABLE tier (single source of truth — tests assert the module
 # docstring and __all__ agree, and a SemVer guard fails if a symbol is dropped/renamed

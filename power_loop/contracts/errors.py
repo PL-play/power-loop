@@ -10,11 +10,20 @@ from typing import Any
 
 
 class PowerLoopError(Exception):
-    """Base for all power-loop raised exceptions."""
+    """Base for all power-loop raised exceptions.
+
+    Each subclass carries a stable, machine-readable ``code`` (a dotted string) so
+    callers can branch on ``exc.code`` instead of class identity — robust across
+    refactors and easy to log/translate (H4.4). ``code`` is a class attribute.
+    """
+
+    code: str = "power_loop.error"
 
 
 class SessionNotFoundError(PowerLoopError):
     """Raised when a ``session_id`` does not exist in the store."""
+
+    code = "session.not_found"
 
     def __init__(self, session_id: str) -> None:
         super().__init__(f"session not found: {session_id}")
@@ -35,6 +44,8 @@ class SessionPendingError(PowerLoopError):
         ``<aborted>`` tool messages, restoring protocol validity, then
         proceed with the new user input.
     """
+
+    code = "session.pending"
 
     def __init__(
         self,
@@ -67,6 +78,8 @@ class LLMTimeout(PowerLoopError):
     LLM calls were made before giving up.
     """
 
+    code = "llm.timeout"
+
     def __init__(self, *, elapsed: float, attempts: int, total_timeout: float) -> None:
         self.elapsed = elapsed
         self.attempts = attempts
@@ -83,6 +96,8 @@ class LLMRetryExhausted(PowerLoopError):
     ``last_error`` is the exception raised by the most recent attempt — the
     direct cause of the give-up. Always set as ``__cause__`` via ``raise from``.
     """
+
+    code = "llm.retry_exhausted"
 
     def __init__(self, *, attempts: int, last_error: BaseException) -> None:
         self.attempts = attempts
@@ -102,6 +117,8 @@ class CancellationRequested(PowerLoopError):
     result for them).
     """
 
+    code = "cancelled"
+
     def __init__(self, reason: str = "cancelled") -> None:
         self.reason = reason
         super().__init__(reason)
@@ -113,9 +130,13 @@ class CompactionFailed(PowerLoopError):
     only raised when the loop must be aborted because the un-compacted
     history blew the context window."""
 
+    code = "compaction.failed"
+
 
 class ToolNotFound(PowerLoopError):
     """Raised when a tool name is not registered in the :class:`ToolRegistry`."""
+
+    code = "tool.not_found"
 
     def __init__(self, tool_name: str) -> None:
         self.tool_name = tool_name
@@ -124,6 +145,8 @@ class ToolNotFound(PowerLoopError):
 
 class ToolValidationError(PowerLoopError):
     """Raised when tool arguments fail schema / required-param validation."""
+
+    code = "tool.invalid_args"
 
     def __init__(self, tool_name: str, message: str) -> None:
         self.tool_name = tool_name
@@ -137,6 +160,8 @@ class SpecValidationError(PowerLoopError):
     Replaces the previous ``AgentSpecError(ValueError)``. ``field`` is the
     spec key that caused the failure (or ``None`` for a general error).
     """
+
+    code = "spec.invalid"
 
     def __init__(self, message: str, *, field: str | None = None) -> None:
         self.field = field

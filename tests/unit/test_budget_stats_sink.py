@@ -252,7 +252,31 @@ async def test_logging_sink_emits_json_lines(tmp_path, caplog):
 
 
 def test_logging_sink_truncates_long_fields():
-    from power_loop.contrib.logging_sink import _truncate
+    from power_loop.contrib.logging_sink import _sanitize
 
-    out = _truncate({"text": "x" * 1000, "n": 5}, 100)
+    out = _sanitize({"text": "x" * 1000, "n": 5}, 100, ())
     assert len(out["text"]) < 120 and out["n"] == 5
+
+
+def test_logging_sink_redacts_secret_keys():
+    """H4.5: values of secret-named keys are replaced with *** at any depth; the
+    match is a case-insensitive substring on the key name."""
+    from power_loop.contrib.logging_sink import _DEFAULT_REDACT_KEYS, _sanitize
+
+    redact = tuple(k.lower() for k in _DEFAULT_REDACT_KEYS)
+    payload = {
+        "API_KEY": "sk-secret",
+        "Authorization": "Bearer xyz",
+        "tool_input": {"password": "hunter2", "path": "/ok"},
+        "headers": [{"x-access_key": "leak"}],
+        "model": "gpt-x",
+    }
+    out = _sanitize(payload, 500, redact)
+    assert out["API_KEY"] == "***"
+    assert out["Authorization"] == "***"
+    assert out["tool_input"]["password"] == "***"
+    assert out["tool_input"]["path"] == "/ok"      # non-secret preserved
+    assert out["headers"][0]["x-access_key"] == "***"
+    assert out["model"] == "gpt-x"
+    # disabling redaction (empty tuple) leaves values intact
+    assert _sanitize({"api_key": "k"}, 500, ())["api_key"] == "k"

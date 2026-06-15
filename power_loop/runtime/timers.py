@@ -44,7 +44,7 @@ from power_loop.runtime.session_store import TimerRow
 if TYPE_CHECKING:  # pragma: no cover
     from power_loop.agent.stateful_loop import StatefulAgentLoop
 
-logger = logging.getLogger("power_loop.timers")
+logger = logging.getLogger(__name__)
 
 DEFAULT_SCAN_INTERVAL_S = 2.0
 DEFAULT_STALE_FIRING_S = 120.0

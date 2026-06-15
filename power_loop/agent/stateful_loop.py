@@ -58,7 +58,7 @@ from power_loop.runtime.session_store import (
 from power_loop.runtime.skills import SkillLoader
 from power_loop.tools.registry import ToolRegistry
 
-logger = logging.getLogger("power_loop.stateful")
+logger = logging.getLogger(__name__)
 
 
 @dataclass

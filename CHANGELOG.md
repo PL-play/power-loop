@@ -13,6 +13,14 @@
 
 ### Added
 
+- **（H4.4）机器可读错误码**：每个 `PowerLoopError` 子类带稳定的类级 `code`(点分串,如
+  `llm.timeout` / `session.pending` / `tool.not_found` / `spec.invalid`),调用方可按
+  `exc.code` 分支而非类身份——重构友好、便于日志/翻译。
+- **（H4.5）日志卫生**：`import power_loop` 给包根 logger 挂 `NullHandler`(无 handler 噪声、
+  应用未配置即不输出);两处硬编码 logger 名改 `getLogger(__name__)`(全树归于 `power_loop.*`);
+  `attach_logging_sink` 新增 `redact_keys`——默认对 `api_key`/`authorization`/`secret`/
+  `password`/`*_token` 等密钥名的值脱敏为 `***`(故意不含裸 `token`,避免误伤 `*_tokens` 计数),
+  可传 `()` 关闭或自定义。
 - **（H4.1）每次 LLM 调用的观测事件**：`call_llm` 现在每个 attempt 发
   `LLM_CALL_STARTED` / `LLM_CALL_COMPLETED`(按 `call_id` 配对),带 round/attempt/model、
   `duration_ms`(perf_counter)、成功/失败 + `error_type`、以及**本次调用**的
