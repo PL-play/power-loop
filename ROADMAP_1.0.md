@@ -36,7 +36,7 @@ real LLM in `tests/real/test_real_durability.py`.***
 
 | ID | Item | Effort | API |
 |----|------|--------|-----|
-| **SCALE-1** | `bench/` harness + deterministic `FakeLLM`, 3 scenarios (FANOUT / BIG-HISTORY / THROUGHPUT) → JSON report; non-blocking CI smoke. **The priority.** | L (3–4d) | additive |
+| **SCALE-1** ✅ | `bench/` harness + deterministic `FakeLLM`, 3 scenarios (FANOUT / BIG-HISTORY / THROUGHPUT) → JSON report; non-blocking CI smoke (`bench.yml`). **The priority — done.** *(`python -m bench [--smoke]`, `tests/bench/test_bench_smoke.py`; big_history already shows the O(history) per-round cost SCALE-4 targets)* | L (3–4d) | additive |
 | **SCALE-2** | Read-only WAL connection pool so reads stop serializing behind the writer `RLock`. *(dep SCALE-1)* | M (2–3d) | additive |
 | **SCALE-3** | Offload remaining inline store ops (`set_pending`, pending-interaction persist, per-send `load_active_messages`) via `to_thread`. *(dep SCALE-1)* | S (1d) | none |
 | **SCALE-4** | Bound/cache the default-on per-round O(history) `estimate_tokens` scan. *(dep SCALE-1)* | M (1–2d) | additive |

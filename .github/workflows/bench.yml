@@ -1,0 +1,41 @@
+name: bench
+
+# SCALE-1 benchmark/soak smoke. NON-BLOCKING (continue-on-error): absolute throughput
+# is environment-sensitive (runners are noisy), so CI only proves the harness runs and
+# reports sane, monotone numbers. Authoritative figures are recorded out-of-band on
+# stated reference hardware (see docs scaling guide / SCALE-5).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  bench-smoke:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Bench smoke tests
+        run: pytest -m bench -q
+
+      - name: Bench smoke sweep -> JSON
+        run: python -m bench --smoke | tee bench-smoke.json
+
+      - name: Upload bench JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-smoke
+          path: bench-smoke.json

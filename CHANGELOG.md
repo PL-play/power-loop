@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- **（SCALE-1）基准/压测台。** 新增**不随 wheel 发布**的 `bench/` 包:确定性 `FakeLLM`(可调人工
+  延迟,不打真实 provider)驱动真实 `StatefulAgentLoop`+`SessionStore`,三个场景(FANOUT 并发会话 /
+  BIG-HISTORY 大历史 / THROUGHPUT 持续吞吐)产出 JSON 报告(sessions/sec、p50/p99 读写延迟)。
+  `python -m bench [--smoke]` 运行;`tests/bench/test_bench_smoke.py` 烟囱测试 + 非阻塞 CI
+  (`.github/workflows/bench.yml`)。把"推理出的"单进程上限变成"测出来的",并已暴露 BIG-HISTORY
+  的 O(history) 每轮成本(SCALE-4 的目标)。
+
 ## [0.15.0] — 2026-06-15
 
 迈向 1.0 的硬化路线图（见 `ROADMAP_1.0.md`）**第一阶段:持久化**。把长期存活的磁盘

@@ -109,6 +109,8 @@ check_untyped_defs = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# repo root on sys.path so the (un-packaged) `bench` harness is importable in tests.
+pythonpath = ["."]
 # --strict-markers: an unregistered marker is a collection error (catches typos).
 # --strict-config: an unknown ini key is an error. Coverage flags are opt-in (CI).
 addopts = "--strict-markers --strict-config"
@@ -116,6 +118,7 @@ markers = [
   "unit: pure control-flow / contract tests (fake LLM, fast)",
   "integration: multi-component scenarios with fake LLM",
   "real_llm: hits the real DashScope-compatible API; default ON locally, skipped if key missing",
+  "bench: SCALE-1 benchmark/soak harness smoke (fast subset; full sweep via `python -m bench`)",
 ]
 filterwarnings = [
   "ignore::DeprecationWarning",
