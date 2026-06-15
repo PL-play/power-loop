@@ -305,7 +305,7 @@ class _FakeMemory:
         return None
 
 
-async def _run_compaction(store: SessionStore, *, memory=None, hooks=None) -> tuple[str, list, set]:
+async def _run_compaction(store: SessionStore, *, memory=None, hooks=None, compactor=None) -> tuple[str, list, set]:
     """Seed a fat 5-pair history, send one turn (forcing compaction), return
     (sid, all_rows, set-of-compacted_out-seqs)."""
     sid = store.create_session(system_prompt="S")
@@ -318,13 +318,88 @@ async def _run_compaction(store: SessionStore, *, memory=None, hooks=None) -> tu
     ])
     cfg = AgentLoopConfig(
         system_prompt="S", max_rounds=2, max_tokens=4000,
-        compactor=DefaultCompactor(keep_last_n=1), memory=memory,
+        compactor=compactor if compactor is not None else DefaultCompactor(keep_last_n=1),
+        memory=memory,
     )
     loop = StatefulAgentLoop(llm=llm, store=store, config=cfg, hooks=hooks)
     await loop.send("kick another round", session_id=sid)
     rows = store.load_all_messages(sid)
     compacted = {r.seq for r in rows if r.state is MessageState.COMPACTED_OUT}
     return sid, rows, compacted
+
+
+# ── H7 Phase 2: optional CompactionContext + back-compat ───────────────────
+
+
+def test_maybe_compact_context_introspection() -> None:
+    """The pipeline gate decides which compactors get the optional context."""
+    from power_loop.core.pipeline import _maybe_compact_accepts_context
+
+    assert _maybe_compact_accepts_context(DefaultCompactor.maybe_compact) is True
+
+    class _Old:
+        async def maybe_compact(self, messages, *, llm, max_tokens, round_index): ...
+
+    class _Kwargs:
+        async def maybe_compact(self, messages, **kw): ...
+
+    assert _maybe_compact_accepts_context(_Old.maybe_compact) is False
+    assert _maybe_compact_accepts_context(_Kwargs.maybe_compact) is True
+
+
+@pytest.mark.asyncio
+async def test_context_aware_compactor_receives_populated_context(monkeypatch) -> None:
+    """A context-accepting compactor is handed session_id + the configured memory
+    + a working read-only fetch_messages accessor."""
+    monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")
+    from power_loop.runtime.compact import CompactionContext
+
+    class _RecordingCompactor(DefaultCompactor):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.seen: CompactionContext | None = None
+
+        async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
+            self.seen = context
+            return await super().maybe_compact(
+                messages, llm=llm, max_tokens=max_tokens, round_index=round_index, context=context)
+
+    mem = _FakeMemory(to_recall=[])
+    cmp = _RecordingCompactor(keep_last_n=1)
+    store = SessionStore.open(":memory:")
+    try:
+        sid, _, compacted = await _run_compaction(store, memory=mem, compactor=cmp)
+        assert compacted, "should have compacted"
+        ctx = cmp.seen
+        assert ctx is not None
+        assert ctx.session_id == sid
+        assert ctx.memory is mem
+        assert callable(ctx.fetch_messages)
+        fetched = ctx.fetch_messages(1, 10)
+        assert fetched and all("role" in m and "seq" in m for m in fetched)
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_old_signature_compactor_still_works(monkeypatch) -> None:
+    """Back-compat: a compactor with the OLD signature (no `context`) must NOT be
+    passed context — it runs end-to-end without a TypeError and still compacts."""
+    class _OldStyleCompactor:
+        async def maybe_compact(self, messages, *, llm, max_tokens, round_index):
+            if len(messages) < 4:
+                return None
+            return CompactionPlan(
+                fold_start_idx=1, fold_end_idx=len(messages) - 2,
+                summary_text="old-style summary", before_tokens=100, after_tokens=10)
+
+    store = SessionStore.open(":memory:")
+    try:
+        sid, _, compacted = await _run_compaction(store, compactor=_OldStyleCompactor())
+        assert compacted, "old-signature compactor should still fold rows"
+        assert store.list_compactions(sid), "and persist the compaction"
+    finally:
+        store.close()
 
 
 @pytest.mark.asyncio

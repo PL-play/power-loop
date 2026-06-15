@@ -24,11 +24,37 @@ Design contract (from ROADMAP §M1.7a / README §1):
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from llm_client.interface import LLMRequest
 from power_loop.runtime.budget import estimate_tokens
+
+if TYPE_CHECKING:
+    from power_loop.runtime.memory import MemoryProvider
+
+
+@dataclass(frozen=True)
+class CompactionContext:
+    """Optional coordinate handle passed to a compactor at fold time (H7 Phase 2).
+
+    Lets a *custom* compactor capture must-keep detail into the **injected**
+    ``MemoryProvider`` (or read store rows) before the fold drops it from the active
+    window — e.g. ``await context.memory.remember(snapshot=...)`` with the slice
+    ``messages[plan.fold_start_idx : plan.fold_end_idx + 1]``.
+
+    Additive and optional: :class:`DefaultCompactor` ignores it, and the pipeline
+    only passes it to compactors whose ``maybe_compact`` accepts a ``context``
+    parameter (signature-checked), so pre-existing compactors keep working unchanged.
+    """
+
+    session_id: str | None = None
+    memory: MemoryProvider | None = None
+    round_index: int = 0
+    # Read-only accessor: (from_seq, to_seq) -> message dicts in that seq range,
+    # including already-compacted rows. None when no store is attached.
+    fetch_messages: Callable[[int, int], list[dict[str, Any]]] | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +84,7 @@ class Compactor(Protocol):
         llm: Any,
         max_tokens: int,
         round_index: int,
+        context: CompactionContext | None = None,
     ) -> CompactionPlan | None: ...
 
 
@@ -117,7 +144,10 @@ class DefaultCompactor(Compactor):
         llm: Any,
         max_tokens: int,
         round_index: int,
+        context: CompactionContext | None = None,
     ) -> CompactionPlan | None:
+        # The default compactor does not coordinate with memory/tools; it accepts
+        # `context` only so the pipeline can pass it uniformly (it is ignored here).
         before = estimate_tokens(messages)
         if not self._should_trigger(before, max_tokens):
             return None
@@ -301,4 +331,4 @@ def _note(text: str) -> dict[str, Any]:
     return {"role": "system", "name": "compact_note", "content": text}
 
 
-__all__ = ["Compactor", "CompactionPlan", "DefaultCompactor"]
+__all__ = ["Compactor", "CompactionContext", "CompactionPlan", "DefaultCompactor"]

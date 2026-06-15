@@ -95,6 +95,17 @@ def test_example_32_recall_compacted_runs() -> None:
     assert out["answer_has_code"] is True, out
 
 
+def test_example_33_coordinating_compactor_runs() -> None:
+    """A memory-coordinating compactor captures the folded slice (H7 Phase 2); the
+    codename it captured survives into a brand-new session via recall."""
+    module = _load_example("33_coordinating_compactor.py")
+    out = asyncio.run(module.main())
+    # deterministic: the compactor captured the slice (with the codename) at fold time
+    assert out["captured_has_codename"] is True, out
+    # correctness: a new session recalls it and answers
+    assert out["answer_has_codename"] is True, out
+
+
 def test_example_05_pending_recovery_runs() -> None:
     module = _load_example("05_pending_recovery.py")
     final_text = asyncio.run(module.main())

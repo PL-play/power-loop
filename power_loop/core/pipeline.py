@@ -9,6 +9,8 @@ wrapper that delegates to ``AgentPipeline.run()``.
 """
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import logging
 import threading
@@ -81,6 +83,7 @@ from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.state import ContextManager
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
+from power_loop.runtime.compact import CompactionContext
 from power_loop.runtime.human_input import HumanInputRequired
 from power_loop.runtime.memory import MemorySnapshot, tag_as_memory
 from power_loop.runtime.retry import with_retry
@@ -90,6 +93,20 @@ from power_loop.tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 RESULT_MAX_CHARS = 50000
+
+
+@functools.cache
+def _maybe_compact_accepts_context(func: Any) -> bool:
+    """Whether a compactor's ``maybe_compact`` accepts the optional ``context``
+    kwarg (or ``**kwargs``). Cached per function — introspect once. The back-compat
+    gate for H7 Phase 2 so old-signature compactors are never passed ``context``."""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "context" in params
 
 
 # ── Utility functions (unchanged from old agent.py) ──
@@ -483,6 +500,32 @@ class AgentPipeline:
     # Hook orchestration is handled entirely by run().
     # ══════════════════════════════════════════════════════════════
 
+    def _build_compaction_context(self, round_index: int) -> CompactionContext:
+        """Build the optional handle a context-aware compactor receives (H7 P2):
+        the configured MemoryProvider + a read-only seq-range message accessor."""
+        store = self.store
+        sid = self.session_id
+
+        def _fetch(from_seq: int, to_seq: int) -> list[dict[str, Any]]:
+            assert store is not None and sid is not None  # set only when has_store
+            rows = store.load_all_messages(sid)
+            return [
+                {
+                    "role": r.role, "name": r.name, "content": r.content,
+                    "tool_calls": r.tool_calls, "tool_call_id": r.tool_call_id,
+                    "seq": r.seq, "round_index": r.round_index,
+                }
+                for r in rows if from_seq <= r.seq <= to_seq
+            ]
+
+        has_store = store is not None and sid is not None
+        return CompactionContext(
+            session_id=sid,
+            memory=self.config.memory,
+            round_index=round_index,
+            fetch_messages=_fetch if has_store else None,
+        )
+
     async def prepare_round(self, round_index: int) -> None:
         """Prepare a new round: todo reminders, then run the pluggable
         compactor if one is configured on the loop config."""
@@ -502,12 +545,17 @@ class AgentPipeline:
         if compact_before.directive == HookDirective.SKIP:
             return
 
-        plan = await compactor.maybe_compact(
-            self.history,
+        compact_kwargs: dict[str, Any] = dict(
             llm=self.llm,
             max_tokens=int(self.config.max_tokens or 0),
             round_index=round_index,
         )
+        # Back-compat: only hand the optional CompactionContext to compactors whose
+        # maybe_compact() actually accepts it, so pre-existing (old-signature) custom
+        # compactors keep working unchanged (H7 Phase 2).
+        if _maybe_compact_accepts_context(type(compactor).maybe_compact):
+            compact_kwargs["context"] = self._build_compaction_context(round_index)
+        plan = await compactor.maybe_compact(self.history, **compact_kwargs)
         if plan is None:
             return
 

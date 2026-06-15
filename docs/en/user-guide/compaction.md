@@ -87,6 +87,29 @@ class MyCompactor:
 config = AgentLoopConfig(compactor=MyCompactor())
 ```
 
+### Coordinating with memory (capture before folding)
+
+`maybe_compact` may take an **optional** `context: CompactionContext` — the configured `MemoryProvider`, the `session_id`, and a read-only `fetch_messages(from_seq, to_seq)` accessor. A custom compactor can use it to persist must-keep detail into [memory](memory.md) *before* the fold drops it from the active window:
+
+```python
+from power_loop import MemorySnapshot
+from power_loop.runtime.compact import DefaultCompactor
+
+class CoordinatingCompactor(DefaultCompactor):
+    async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
+        plan = await super().maybe_compact(
+            messages, llm=llm, max_tokens=max_tokens, round_index=round_index)
+        if plan and context and context.memory:
+            slice_ = messages[plan.fold_start_idx : plan.fold_end_idx + 1]
+            await context.memory.remember(
+                snapshot=MemorySnapshot(session_id=context.session_id or "",
+                                        messages=slice_, status="compaction"),
+                session_id=context.session_id)
+        return plan
+```
+
+The `context` parameter is **opt-in and back-compatible**: the pipeline only passes it to compactors whose `maybe_compact` accepts it (signature-checked), so existing compactors with the old signature keep working unchanged, and `DefaultCompactor` ignores it. Memory stays an injected seam — the library never persists it for you. The `status="compaction"` value is a convention so providers can distinguish a fold-time capture from a session-end snapshot. See [`examples/33_coordinating_compactor.py`](../../../examples/33_coordinating_compactor.py).
+
 ## Events
 
 Subscribe to compaction events for observability:

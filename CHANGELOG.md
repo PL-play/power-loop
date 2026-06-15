@@ -13,6 +13,14 @@
 
 ### Added
 
+- **（H7 Phase 2）`Compactor` 协议加可选 `CompactionContext`——折叠前可联动记忆**：
+  `maybe_compact` 现在可**选**接收 `context: CompactionContext`(暴露注入的
+  `MemoryProvider` + `session_id` + 只读 `fetch_messages`),自定义压缩器可在折叠前把要点
+  `remember` 进记忆,跨 session 留存。**向后兼容**:pipeline 按签名判断,只对接受 `context`
+  的压缩器传(老签名压缩器照常工作);`DefaultCompactor` 忽略它,行为不变。新增
+  `power_loop.runtime.compact.CompactionContext`(PROVISIONAL)。单测:签名内省门、
+  context-aware 压缩器收到完整 context、**老签名压缩器仍可用**(两方向红前/绿后);真实 LLM
+  示例 `examples/33_coordinating_compactor.py`(折叠时捕获的事实跨新 session 经 recall 存活)。
 - **（H7 Phase 1）`recall_compacted` 工具——按需取回被压缩折叠的细节**：压缩把旧消息折叠成
   `compact_note` 并标 `compacted_out`,但原文**没删**(仍在 store 里)。新默认工具
   `recall_compacted(query?, from_seq?, to_seq?, limit?)` 让 agent 在摘要缺具体细节时把原文

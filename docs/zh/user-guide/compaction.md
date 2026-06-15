@@ -81,6 +81,29 @@ class MyCompactor:
 config = AgentLoopConfig(compactor=MyCompactor())
 ```
 
+### 联动记忆（折叠前先捕获）
+
+`maybe_compact` 可**选**接收一个 `context: CompactionContext`——注入的 `MemoryProvider`、`session_id`，以及只读的 `fetch_messages(from_seq, to_seq)` 读取器。自定义压缩器可以在折叠把内容移出活跃窗口**之前**,把要点 `remember` 进[记忆](memory.md):
+
+```python
+from power_loop import MemorySnapshot
+from power_loop.runtime.compact import DefaultCompactor
+
+class CoordinatingCompactor(DefaultCompactor):
+    async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
+        plan = await super().maybe_compact(
+            messages, llm=llm, max_tokens=max_tokens, round_index=round_index)
+        if plan and context and context.memory:
+            slice_ = messages[plan.fold_start_idx : plan.fold_end_idx + 1]
+            await context.memory.remember(
+                snapshot=MemorySnapshot(session_id=context.session_id or "",
+                                        messages=slice_, status="compaction"),
+                session_id=context.session_id)
+        return plan
+```
+
+`context` 参数**可选且向后兼容**:pipeline 只会把它传给签名接受它的压缩器(按签名判断),所以老签名的压缩器照常工作,`DefaultCompactor` 也直接忽略它。记忆始终是注入的 seam——库不会替你持久化。`status="compaction"` 是个约定,让 provider 区分「折叠时捕获」和「会话结束快照」。参见 [`examples/33_coordinating_compactor.py`](../../../examples/33_coordinating_compactor.py)。
+
 ## 下一步
 
 - [记忆](memory.md) — 通过 `MemoryProvider` 跨会话召回

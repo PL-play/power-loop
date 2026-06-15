@@ -1,6 +1,8 @@
 # Design draft — Compaction coordination (widen `Compactor` + retrieve-on-demand)
 
-> Status: **DRAFT for review — no implementation yet.** Proposes a way for context
+> Status: **Phase 1 + Phase 2 SHIPPED** (recall_compacted tool; CompactionContext +
+> widened Compactor). Phase 3 (compaction-hook span enrichment) remains optional/deferred.
+> Original draft below. Proposes a way for context
 > compaction to (1) coordinate with the injected `MemoryProvider`/tools so important
 > detail is captured *before* it leaves the active window, and (2) let the agent pull
 > previously-compacted detail back *on demand*. Stays inside the library's seam
