@@ -21,6 +21,10 @@
 
 ### Added
 
+- **（ECO-1)MCP 工具适配器。** `contrib/mcp`:无依赖的 `MCPToolSource` Protocol +
+  `register_mcp_tools`——把 MCP 工具的 `inputSchema` 直接映射成 `ToolDefinition`(`required`
+  驱动缺参校验),注册的异步 handler 把调用代理给 source;外加 `[mcp]` extra 之后惰性导入 `mcp`
+  SDK 的默认 `StdioMCPClient`(stdio MCP server)。映射本身可用假 source 测试,无需 `mcp` 依赖。
 - **（ECO-2)vendored llm_client 溯源。** `_vendor/llm_client/VENDOR.md`(来源、MIT 许可、
   vendored 日期、本地修改含 0.18.0 的删除)+ `scripts/sync_vendor.sh`(重新 vendor:拷贝、
   裁剪未用模块、改写 import 到 vendored 路径)。
