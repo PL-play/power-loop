@@ -12,7 +12,7 @@
 | [工具调用](tool-calling.md) | 带天气、bash、文件工具的 Agent | 入门 |
 | [人在回路](human-in-the-loop.md) | 执行危险命令前请求用户确认 | 进阶 |
 | [多 Agent 系统](multi-agent.md) | 父 Agent 委托研究任务给子 Agent | 进阶 |
-| [示例指南](examples-guide.md) | 全部 34 个可运行示例的逐一讲解，含真实输出 | 全难度 |
+| [示例指南](examples-guide.md) | 全部 36 个可运行示例的逐一讲解，含真实输出 | 全难度 |
 
 ## 即将推出
 

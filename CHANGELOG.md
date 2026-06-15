@@ -29,6 +29,12 @@
   串行(正确性不变);WAL 保证池读看到读开始前已提交的全部写入。默认关闭;`:memory:` 自动回退
   (内存库连接不可共享)。含持写锁时池读不被阻塞的并发回归测试。
 
+- **（SCALE-5）扩展性文档 + 示例。** 新增 `docs/{en,zh}/user-guide/scaling.md`:单写模型、读连接池、
+  保留/VACUUM、多进程(一文件一进程)模式、调优旋钮,全部基于 `bench/` 实测数据(fan-out 在
+  ~1000 sessions/sec 见顶;大历史每次 send 成本随历史线性增长——压缩使其平坦),并诚实标注上限。
+  新增示例 `34_durability_lifecycle`(裁剪/VACUUM/导出导入/优雅停机)与
+  `35_scaling_and_read_pool`(读池 + 并发会话 + 压测台)。
+
 ### Changed
 
 - `CompactionContext` 新增可选字段 `current_tokens`(增量 token 估算提示;附加、向后兼容)。

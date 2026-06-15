@@ -41,6 +41,11 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 28 | [`28_docker_shell_backend.py`](28_docker_shell_backend.py) | **Sandbox**: model-authored bash inside Docker | `ShellBackend`, `RuntimeEnv(shell_backend=…)`, `runtime_env_context` |
 | 29 | [`29_shared_blackboard.py`](29_shared_blackboard.py) | **Coordination**: two agents share a scoped board | `SqliteBlackboard`, `register_blackboard_tools`, `RuntimeEnv(blackboard=…)` |
 | 30 | [`30_subprocess_isolation.py`](30_subprocess_isolation.py) | **Isolation**: each workflow leaf in its own process + DB | `SubprocessExecutor`, `WorkerBootstrap`, `WorkerLauncher` |
+| 31 | [`31_memory_with_compaction.py`](31_memory_with_compaction.py) | Cross-session memory recall alongside the default compactor | `MemoryProvider`, `DefaultCompactor` |
+| 32 | [`32_recall_compacted.py`](32_recall_compacted.py) | Pull back exact turns that compaction folded out | `recall_compacted` tool |
+| 33 | [`33_coordinating_compactor.py`](33_coordinating_compactor.py) | Custom compactor that remembers must-keep detail before folding | `CompactionContext`, `Compactor` |
+| 34 | [`34_durability_lifecycle.py`](34_durability_lifecycle.py) | **Durability**: prune folded originals, VACUUM, export/import, graceful `aclose()` | `prune_compacted_messages`, `vacuum`, `export_session`/`import_session`, `aclose` |
+| 35 | [`35_scaling_and_read_pool.py`](35_scaling_and_read_pool.py) | **Scale**: concurrent sessions over a read-only WAL pool; the `bench/` harness | `read_pool_size`, `python -m bench` |
 
 ## Running
 

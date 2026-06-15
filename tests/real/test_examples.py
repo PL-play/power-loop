@@ -258,3 +258,22 @@ def test_example_07_human_approval_runs() -> None:
     assert any(kw in low for kw in ("deni", "not execute", "refused", "cannot")), (
         f"reply does not acknowledge denial: {final_text!r}"
     )
+
+
+def test_example_34_durability_lifecycle_runs() -> None:
+    """The durability example must complete the real send, fold+prune, reclaim disk,
+    and round-trip the (complete) archive into a fresh store."""
+    module = _load_example("34_durability_lifecycle.py")
+    summary = asyncio.run(module.main())
+    assert "compactions=1" in summary  # the seeded turns folded
+    assert "pruned_originals=" in summary and "pruned_originals=0" not in summary
+    assert "first-active='compact_note'" in summary  # ordering preserved on reimport
+    assert "compacted_kept=" in summary and "compacted_kept=0" not in summary  # archive is complete
+
+
+def test_example_35_scaling_and_read_pool_runs() -> None:
+    """The scaling example runs several concurrent sessions over a read-pool store."""
+    module = _load_example("35_scaling_and_read_pool.py")
+    summary = asyncio.run(module.main())
+    assert "3/3 concurrent sessions completed" in summary
+    assert "read_pool_size=4" in summary

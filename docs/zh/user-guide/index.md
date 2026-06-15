@@ -36,6 +36,12 @@
 | [共享黑板](blackboard.md) | `SqliteBlackboard`、`board_*` 工具、多代理协作 |
 | [沙箱与隔离](sandboxing.md) | `ShellBackend`（沙箱化 bash）、`WorkerLauncher`（沙箱化叶子进程） |
 
+## 性能与扩展
+
+| 页面 | 你会学到 |
+|---|---|
+| [扩展性](scaling.md) | 单写模型、读连接池、保留/VACUUM、`bench/` 压测台、实测数据、多进程模式 |
+
 ## 高级
 
 | 页面 | 你会学到 |

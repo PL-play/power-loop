@@ -36,6 +36,12 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 | [Shared Blackboard](blackboard.md) | `SqliteBlackboard`, `board_*` tools, multi-agent coordination |
 | [Sandboxing & Isolation](sandboxing.md) | `ShellBackend` (sandbox bash), `WorkerLauncher` (sandbox a leaf process) |
 
+## Performance & scale
+
+| Page | What you'll learn |
+|---|---|
+| [Scaling](scaling.md) | Single-writer model, the read pool, retention/VACUUM, the `bench/` harness, measured numbers, the multi-process pattern |
+
 ## Advanced
 
 | Page | What you'll learn |
