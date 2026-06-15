@@ -26,10 +26,13 @@ __all__ = ["register_blackboard_tools"]
 _NO_BOARD = "Error: no shared board is configured for this agent."
 
 
-def _resolve_board() -> tuple[Blackboard | None, str | None]:
+def _resolve_board() -> tuple[Blackboard, str] | None:
+    """The live board + this agent's board_id, or ``None`` when none is configured.
+    Returning a single sentinel (not ``(None, None)``) lets callers narrow BOTH the
+    board and the id to non-None with one ``is None`` check."""
     env = get_runtime_env()
     if env.blackboard is None or not env.blackboard_id:
-        return None, None
+        return None
     return env.blackboard, env.blackboard_id
 
 
@@ -51,17 +54,19 @@ async def _snapshot(board: Blackboard, board_id: str, *, header: str) -> str:
 
 
 async def _board_read(**_kw: Any) -> str:
-    board, board_id = _resolve_board()
-    if board is None:
+    resolved = _resolve_board()
+    if resolved is None:
         return _NO_BOARD
+    board, board_id = resolved
     return await _snapshot(board, board_id, header="Shared board:")
 
 
 def _make_post(kinds: tuple[str, ...], statuses: tuple[str, ...], default_kind: str):
     async def _board_post(**kw: Any) -> str:
-        board, board_id = _resolve_board()
-        if board is None:
+        resolved = _resolve_board()
+        if resolved is None:
             return _NO_BOARD
+        board, board_id = resolved
         text = str(kw.get("text") or "").strip()
         if not text:
             return "Error: 'text' is required."
@@ -82,9 +87,10 @@ def _make_post(kinds: tuple[str, ...], statuses: tuple[str, ...], default_kind: 
 
 def _make_update(statuses: tuple[str, ...]):
     async def _board_update(**kw: Any) -> str:
-        board, board_id = _resolve_board()
-        if board is None:
+        resolved = _resolve_board()
+        if resolved is None:
             return _NO_BOARD
+        board, board_id = resolved
         try:
             entry_id = int(kw["entry_id"])
         except (KeyError, TypeError, ValueError):
@@ -102,9 +108,10 @@ def _make_update(statuses: tuple[str, ...]):
 
 
 async def _board_remove(**kw: Any) -> str:
-    board, board_id = _resolve_board()
-    if board is None:
+    resolved = _resolve_board()
+    if resolved is None:
         return _NO_BOARD
+    board, board_id = resolved
     try:
         entry_id = int(kw["entry_id"])
     except (KeyError, TypeError, ValueError):

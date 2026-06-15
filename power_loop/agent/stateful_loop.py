@@ -164,7 +164,7 @@ class StatefulAgentLoop:
                     asyncio.gather(*(_wait_idle(lock) for lock in locks)),
                     timeout=drain_timeout_s,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:  # noqa: UP041 — distinct from builtin on py3.10
                 logger.warning(
                     "aclose: timed out after %.1fs waiting for in-flight sends to drain",
                     drain_timeout_s,

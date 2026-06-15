@@ -171,7 +171,9 @@ class SubprocessExecutor:
         launcher: WorkerLauncher | None = None,
     ) -> None:
         # Validate up front that this bootstrap can cross a process boundary.
-        self._bootstrap_dict = bootstrap.to_serializable_dict()
+        # to_serializable_dict is attached to WorkerBootstrap at import time in
+        # worker.py (ergonomic method), so it's invisible to the type checker here.
+        self._bootstrap_dict = bootstrap.to_serializable_dict()  # type: ignore[attr-defined]
         self._runs_dir = Path(runs_dir) if runs_dir else Path(tempfile.gettempdir()) / "power_loop_wf_runs"
         self._py = python_executable or sys.executable
         self._env_overrides = dict(env) if env is not None else None
@@ -225,7 +227,7 @@ class SubprocessExecutor:
     async def _spawn_and_collect(
         self, job: WorkerJob, spec: AgentSpec, token: CancellationToken
     ) -> dict[str, Any]:
-        base = {"session_id": None, "rounds": 0, "usage": {}, "db_path": job.db_path}
+        base: dict[str, Any] = {"session_id": None, "rounds": 0, "usage": {}, "db_path": job.db_path}
         try:
             argv, env = self._launcher.build(
                 base_argv=[self._py, "-m", "power_loop.workflow.worker"],
@@ -296,7 +298,7 @@ class SubprocessExecutor:
     def _to_result(
         self, job: WorkerJob, outcome: str, returncode: int | None, stdout: str, stderr: str
     ) -> dict[str, Any]:
-        base = {"session_id": None, "rounds": 0, "usage": {}, "db_path": job.db_path}
+        base: dict[str, Any] = {"session_id": None, "rounds": 0, "usage": {}, "db_path": job.db_path}
         if outcome == "cancelled":
             return {**base, "status": "cancelled", "final_text": "[cancelled by orchestrator]"}
         if outcome == "timeout":

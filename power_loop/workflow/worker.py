@@ -206,7 +206,9 @@ def _bootstrap_to_dict(b: WorkerBootstrap) -> dict[str, Any]:
 
 
 def _bootstrap_from_dict(d: dict[str, Any]) -> WorkerBootstrap:
-    return WorkerBootstrap(**{k: d.get(k) for k in _BOOTSTRAP_SERIALIZABLE if k in d})
+    # d[k] (not d.get) under the `k in d` guard → values type as Any, not Any | None,
+    # so the **kwargs splat matches the dataclass's typed fields.
+    return WorkerBootstrap(**{k: d[k] for k in _BOOTSTRAP_SERIALIZABLE if k in d})
 
 
 # Attach as methods for ergonomics.

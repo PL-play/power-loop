@@ -16,7 +16,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -328,7 +328,7 @@ class AgentPipeline:
         await self._emit_sink(self.sink.on_message_appended, ctx.message, round_index=round_index)
 
     async def _resolve_skipped_tool_calls(
-        self, skipped: list[Mapping[str, Any]], *, reason: str, round_idx: int
+        self, skipped: Sequence[Mapping[str, Any]], *, reason: str, round_idx: int
     ) -> None:
         """Append a synthetic ``tool`` message for each un-executed tool_call.
 

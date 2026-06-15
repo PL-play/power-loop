@@ -509,7 +509,12 @@ class SessionStore:
         # interleaved next_seq race. Cross-process safety is NOT this store's model
         # (one file = one process); a stray second writer would instead be caught by
         # the messages ``(session_id, seq)`` primary key raising IntegrityError.
-        conn = sqlite3.connect(path_str, check_same_thread=False, isolation_level="")
+        # isolation_level="" is the legacy deferred sentinel (auto-BEGIN before DML);
+        # typeshed only types the Literal[...]|None variants, so this overload is a
+        # stub gap, not a runtime issue.
+        conn = sqlite3.connect(  # type: ignore[call-overload]
+            path_str, check_same_thread=False, isolation_level=""
+        )
         conn.row_factory = sqlite3.Row
         # auto_vacuum must be chosen BEFORE the database's first table is created and
         # before WAL initializes the header — hence the very first pragma. On an EXISTING

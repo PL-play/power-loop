@@ -21,6 +21,7 @@ from power_loop.core.agent_context import get_current_loop, get_session_id
 from .api import create_workflow
 from .engine import in_workflow
 from .introspect import get_workflow, list_workflows
+from .result import WorkflowRunHandle
 from .spec import WorkflowSpec, WorkflowSpecError
 
 __all__ = [
@@ -117,6 +118,9 @@ async def _handle_create_workflow(**kwargs: Any) -> str:
         if not parent_sid:
             return "Error: detached workflows require an active session; run without 'detached'."
         handle = await wf.start(detached=True)
+        # start(detached=True) always returns a WorkflowRunHandle (the union's other
+        # arm is the non-detached path); narrow so .run_id is well-typed.
+        assert isinstance(handle, WorkflowRunHandle)
         return (
             f"Started detached workflow '{spec.name}' as run {handle.run_id}. "
             f"You will be woken with the result when it finishes — you may pass_turn now. "
