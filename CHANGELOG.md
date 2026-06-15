@@ -8,7 +8,21 @@
 
 ## [Unreleased]
 
-迈向 1.0 的硬化路线图（见 `ROADMAP_1.0.md`）开始落地。
+## [0.15.0] — 2026-06-15
+
+迈向 1.0 的硬化路线图（见 `ROADMAP_1.0.md`）**第一阶段:持久化**。把长期存活的磁盘
+`SessionStore`(本库的核心卖点)做成生产可用:可随版本升级、可回收空间、可导出归档、可优雅停机。
+绝大多数为**纯增量** API;存储层的破坏性变更集中于本版本一次(见 Changed)。真机端到端验证见
+`tests/real/test_real_durability.py`。
+
+### Changed
+
+- **（破坏性·存储）schema 版本网关。** `SessionStore.open()` 现在用 `PRAGMA user_version`
+  门控:**拒绝打开版本高于本构建的 `.db`** 并给出清晰报错(对手改库者是行为变更)。这是后续一切
+  schema 变更的前提,确保 ≤0.14.1 的旧库(`user_version=0`)被识别为 legacy 并经迁移步骤 1 升级,
+  而非静默保持旧结构。所有存储层变更都集中在本版本这一次"存储形态拐点"。
+- **（破坏性·存储)新建库默认 `auto_vacuum=INCREMENTAL`**(仅影响新建文件的空闲页行为;既有文件
+  保持原样,不在 open 时做阻塞式全量 VACUUM)。
 
 ### Added
 
