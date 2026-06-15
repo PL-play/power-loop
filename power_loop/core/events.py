@@ -35,6 +35,10 @@ class AgentEventBus:
         self._global_handlers: list[_SubscribedHandler] = []
         self._counter = 0
         self._suppress_subscriber_errors = suppress_subscriber_errors
+        # Background tasks spawned for async subscribers from the SYNC publish()
+        # path. Retained so CPython can't GC them mid-flight (it only weakly refs a
+        # bare create_task); discarded by a done-callback that also surfaces errors.
+        self._async_tasks: set[asyncio.Task[Any]] = set()
 
     def subscribe(
         self,
@@ -83,6 +87,25 @@ class AgentEventBus:
                 return
             raise
 
+    def _on_async_publish_done(self, task: asyncio.Task[Any]) -> None:
+        """Done-callback for an async subscriber scheduled from sync ``publish()``.
+
+        Always retrieve the exception (so it isn't a silent "Task exception was never
+        retrieved" GC warning). When ``suppress_subscriber_errors`` is False the
+        coroutine re-raised, so surface it loudly at ERROR — async subscribers that
+        need inline error handling should use :meth:`publish_async`.
+        """
+        self._async_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _logger.error(
+                "AgentEventBus: async subscriber raised in sync publish() "
+                "(use publish_async to handle these inline)",
+                exc_info=exc,
+            )
+
     def publish(self, event: AgentEvent) -> None:
         """Publish synchronously.
 
@@ -104,7 +127,9 @@ class AgentEventBus:
                     async def _run_coro(coro: Any) -> None:
                         await self._await_handler_result(coro)
 
-                    loop.create_task(_run_coro(result))
+                    task = loop.create_task(_run_coro(result))
+                    self._async_tasks.add(task)
+                    task.add_done_callback(self._on_async_publish_done)
                 else:
                     asyncio.run(self._await_handler_result(result))
 

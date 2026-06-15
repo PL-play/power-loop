@@ -48,6 +48,12 @@
 
 ### Fixed
 
+- **（H1.7 / C6）同步 `publish()` 静默吞掉 async 订阅者异常**：有运行中的 loop 时,async
+  handler 被 `loop.create_task` fire-and-forget,`suppress_subscriber_errors=False` 的
+  re-raise 发生在脱离的 task 里,只剩一条 "Task exception was never retrieved" 的 GC 告警;
+  且 task 未被引用,可被 GC。修复:保留 task(防 GC)+ done-callback 取回异常——未抑制时
+  在 ERROR 级别大声记录(async 订阅者要内联处理异常请用 `publish_async`)。新增
+  `tests/unit/test_event_bus_async.py`(保留→排空、抑制吞掉、未抑制记 ERROR;红前/绿后)。
 - **（H1.2 / C2）`parallel`/`foreach` 在 `on_error="halt"` 下不取消在飞的兄弟分支**：
   `asyncio.gather(return_exceptions=False)` 首个失败即 re-raise,但**不取消**其它仍在跑的
   分支——它们继续烧真实 LLM 调用,迟到的 `record_step` 还能污染已 finalize 的 journal。新增
