@@ -110,9 +110,32 @@ async def main() -> dict:
         print(f"code buried in folded rows : {code_in_folded}")
         print(f"recall_compacted called    : {'recall_compacted' in tools_called}")
         print(f"answer contains the code   : {answer_has_code}")
+
+        # Deterministic end-to-end check: invoke the tool directly on the REAL
+        # compacted session and confirm it recovers the buried code. (Whether the
+        # MODEL chose to call it autonomously above is non-deterministic — a soft
+        # demo — but the retrieval path itself must always work.)
+        from power_loop.core.agent_context import (
+            reset_current_loop,
+            reset_session_id,
+            set_current_loop,
+            set_session_id,
+        )
+        from power_loop.tools.default_tools import run_recall_compacted
+
+        t_loop, t_sid = set_current_loop(loop), set_session_id(sid)
+        try:
+            tool_out = run_recall_compacted(query="rack serial")
+        finally:
+            reset_session_id(t_sid)
+            reset_current_loop(t_loop)
+        code_retrievable = _norm(ACCESS_CODE) in _norm(tool_out)
+        print(f"recall_compacted recovers it : {code_retrievable}")
+
         return {
             "final_text": r.final_text,
             "code_in_folded": code_in_folded,
+            "code_retrievable": code_retrievable,
             "answer_has_code": answer_has_code,
             "recall_called": "recall_compacted" in tools_called,
         }
