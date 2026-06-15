@@ -86,6 +86,7 @@ from power_loop.contracts.hooks import HookDirective, HookPoint
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.state import ContextManager
+from power_loop.runtime.budget import estimate_message_tokens, estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.compact import CompactionContext
 from power_loop.runtime.human_input import HumanInputRequired
@@ -263,6 +264,13 @@ class AgentPipeline:
 
         self.system_prompt = base_prompt
         self.history: list[LoopMessage] = []
+        # SCALE-4: self-invalidating running token estimate of self.history.
+        # ``_tok_len`` is the history length ``_tok_total`` was computed for, or -1 when
+        # dirty. The append path bumps it incrementally (O(1)/round); every wholesale
+        # reassignment invalidates it; _estimate_history_tokens recomputes on any
+        # length mismatch — so it is always correct, just cheaper on the common path.
+        self._tok_total = 0
+        self._tok_len = -1
         self.rounds_since_todo = 0
         self._completed_rounds = 0
         # Terminal-event bookkeeping (H1.5): emit SESSION_ENDED at most once, and
@@ -325,6 +333,11 @@ class AgentPipeline:
         )
         await self.hooks.run_typed_async(HookPoint.MESSAGE_APPEND, ctx)
         self.history.append(ctx.message)
+        # SCALE-4: keep the token estimate current incrementally on the hot append path
+        # — only when the cache was already in sync (else leave it for a full recompute).
+        if self._tok_len == len(self.history) - 1:
+            self._tok_total += estimate_message_tokens(ctx.message)
+            self._tok_len = len(self.history)
         await self._emit_sink(self.sink.on_message_appended, ctx.message, round_index=round_index)
 
     async def _resolve_skipped_tool_calls(
@@ -521,6 +534,20 @@ class AgentPipeline:
     # Hook orchestration is handled entirely by run().
     # ══════════════════════════════════════════════════════════════
 
+    def _estimate_history_tokens(self) -> int:
+        """Current history token estimate, maintained incrementally (SCALE-4).
+
+        Returns the cached total when it is still in sync with ``self.history``
+        (the append path keeps it current); otherwise recomputes from scratch — which
+        covers folds, recall front-inserts, run-start, and any hook that replaced the
+        list. Correct by construction: a stale cache is detected by the length check or
+        an explicit invalidation, never trusted blindly.
+        """
+        if self._tok_len != len(self.history):
+            self._tok_total = estimate_tokens(self.history)
+            self._tok_len = len(self.history)
+        return self._tok_total
+
     def _build_compaction_context(self, round_index: int) -> CompactionContext:
         """Build the optional handle a context-aware compactor receives (H7 P2):
         the configured MemoryProvider + a read-only seq-range message accessor."""
@@ -545,6 +572,7 @@ class AgentPipeline:
             memory=self.config.memory,
             round_index=round_index,
             fetch_messages=_fetch if has_store else None,
+            current_tokens=self._estimate_history_tokens(),
         )
 
     async def prepare_round(self, round_index: int) -> None:
@@ -795,6 +823,7 @@ class AgentPipeline:
     async def run(self, messages: list[LoopMessage]) -> AgentLoopResult:
         """Run the full agent loop. Returns when done, cancelled, or hit round limit."""
         self.history = [dict(m) for m in messages]
+        self._tok_len = -1  # SCALE-4: wholesale (re)assignment invalidates the estimate
 
         # ── Session start ──
         session_ctx = SessionStartCtx(
@@ -803,6 +832,7 @@ class AgentPipeline:
         await self.hooks.run_typed_async(HookPoint.SESSION_START, session_ctx)
         if isinstance(session_ctx.messages, list):
             self.history = session_ctx.messages
+            self._tok_len = -1  # a hook may have replaced history (even same-length)
         self._emit(AgentEventType.SESSION_STARTED, SessionStartedPayload(scope="main"))
         self._session_started = True
 
@@ -854,6 +884,7 @@ class AgentPipeline:
             # Apply hook-modified messages
             if isinstance(round_ctx.messages, list):
                 self.history = round_ctx.messages
+                self._tok_len = -1  # SCALE-4: a ROUND_START hook may have replaced history
 
             # ── In-flight steering: drain follow-up queue at round boundary ──
             if self._drain_follow_ups is not None:

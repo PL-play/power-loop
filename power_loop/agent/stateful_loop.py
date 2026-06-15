@@ -733,7 +733,11 @@ class StatefulAgentLoop:
         system_prompt: str | None = None,
     ) -> StatefulResult:
         sink = sink if sink is not None else SQLiteSink(self.store, sid)
-        active_rows = self.store.load_active_messages(sid)
+        # Offload the per-send active-history load (O(active-history) SQLite read +
+        # logical re-sort) off the event loop — for a large session it would otherwise
+        # block every other task for the duration of the read (SCALE-3). The store's
+        # RLock keeps this thread-safe.
+        active_rows = await asyncio.to_thread(self.store.load_active_messages, sid)
         history = [_row_to_loop_message(r) for r in active_rows]
         # Mirror loaded seqs into the sink so the compactor can translate
         # in-memory indices back to store rows when it folds messages. Pass the

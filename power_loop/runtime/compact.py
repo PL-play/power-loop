@@ -55,6 +55,10 @@ class CompactionContext:
     # Read-only accessor: (from_seq, to_seq) -> message dicts in that seq range,
     # including already-compacted rows. None when no store is attached.
     fetch_messages: Callable[[int, int], list[dict[str, Any]]] | None = None
+    # The pipeline's incrementally-maintained token estimate of the current history
+    # (SCALE-4). When provided, a compactor can use it for its trigger check instead
+    # of re-scanning every message every round (O(history) → O(1)). None ⇒ scan.
+    current_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -146,9 +150,14 @@ class DefaultCompactor(Compactor):
         round_index: int,
         context: CompactionContext | None = None,
     ) -> CompactionPlan | None:
-        # The default compactor does not coordinate with memory/tools; it accepts
-        # `context` only so the pipeline can pass it uniformly (it is ignored here).
-        before = estimate_tokens(messages)
+        # The default compactor does not coordinate with memory/tools, but it DOES use
+        # the pipeline's incremental token estimate when offered (SCALE-4) to avoid an
+        # O(history) re-scan every round; it falls back to a full scan otherwise.
+        before = (
+            context.current_tokens
+            if context is not None and context.current_tokens is not None
+            else estimate_tokens(messages)
+        )
         if not self._should_trigger(before, max_tokens):
             return None
         span = self._compactable_span(messages)

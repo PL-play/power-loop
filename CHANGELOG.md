@@ -16,6 +16,16 @@
   `python -m bench [--smoke]` 运行;`tests/bench/test_bench_smoke.py` 烟囱测试 + 非阻塞 CI
   (`.github/workflows/bench.yml`)。把"推理出的"单进程上限变成"测出来的",并已暴露 BIG-HISTORY
   的 O(history) 每轮成本(SCALE-4 的目标)。
+- **（SCALE-3）卸载每次 send 的活动历史读取。** `_run_loop` 里 `load_active_messages`(O(active-history)
+  的 SQLite 读 + 逻辑重排)改走 `asyncio.to_thread`,大会话加载不再卡住事件循环上的其它任务。
+- **（SCALE-4）压缩触发的 token 估算从每轮 O(history) 降为 O(1)。** pipeline 维护一个自失效的
+  增量 token 估算(append 增量更新;fold/recall/hook 替换历史时失效并重算,**永远等于全量重算**),
+  经新增的 `CompactionContext.current_tokens` 交给 compactor 做触发判定,避免每轮重扫全历史
+  (实测 5ms@1万 / 26ms@5万 每轮 → O(1))。对自定义 compactor 完全向后兼容(不传则照旧全扫)。
+
+### Changed
+
+- `CompactionContext` 新增可选字段 `current_tokens`(增量 token 估算提示;附加、向后兼容)。
 
 ## [0.15.0] — 2026-06-15
 
