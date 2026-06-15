@@ -671,8 +671,18 @@ class StatefulAgentLoop:
         active_rows = self.store.load_active_messages(sid)
         history = [_row_to_loop_message(r) for r in active_rows]
         # Mirror loaded seqs into the sink so the compactor can translate
-        # in-memory indices back to store rows when it folds messages.
-        sink.init_history_seqs([r.seq for r in active_rows])
+        # in-memory indices back to store rows when it folds messages. Pass the
+        # parallel logical positions too: a compact_note's identity seq is high,
+        # but it sits at its logical ``ord`` (set when it was folded) — load order
+        # and the sink's index map must agree on that, or the next fold mis-maps.
+        sink.init_history_seqs(
+            [r.seq for r in active_rows],
+            [
+                int(r.meta["ord"]) if r.name == "compact_note" and r.meta.get("ord") is not None
+                else r.seq
+                for r in active_rows
+            ],
+        )
         session_row = self.store.get_session(sid)
         # System prompt precedence: per-call > session > config.
         effective_sp = system_prompt

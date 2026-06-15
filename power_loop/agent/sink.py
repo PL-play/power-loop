@@ -102,12 +102,27 @@ class SQLiteSink:
         # messages injected by _maybe_recall (which never persist). Keeping these
         # placeholders is what preserves the index↔seq invariant so on_compaction
         # maps fold indices to the RIGHT rows (H1.1 / C1).
+        #
+        # ``_history_seqs`` holds each slot's *identity* seq (the DB row id, used to
+        # mark the exact rows compacted_out). ``_history_ord`` holds each slot's
+        # *logical* position, index-for-index. They differ for a ``compact_note``:
+        # its identity is a fresh high seq, but it logically sits where its folded
+        # range began. Tracking both keeps marking correct under a non-monotonic
+        # identity map AND lets the note reload at the right position (C1 fix).
         self._history_seqs: list[int | None] = []
+        self._history_ord: list[int | None] = []
 
-    def init_history_seqs(self, seqs: list[int]) -> None:
+    def init_history_seqs(
+        self, seqs: list[int], ords: list[int] | None = None
+    ) -> None:
         """Called by :class:`StatefulAgentLoop` with the seqs of the loaded
-        active messages, in the same order they sit in pipeline.history."""
+        active messages, in the same order they sit in pipeline.history.
+
+        ``ords`` is the parallel list of logical positions (a ``compact_note``'s
+        ``meta['ord']``, else the row's ``seq``). Omitting it mirrors ``seqs``
+        (correct whenever no folded note is present)."""
         self._history_seqs = list(seqs)
+        self._history_ord = list(ords) if ords is not None else list(seqs)
 
     def on_messages_inserted(self, *, index: int, count: int) -> None:
         """Record that ``count`` in-memory-only messages were spliced into
@@ -118,6 +133,7 @@ class SQLiteSink:
             return
         idx = max(0, min(index, len(self._history_seqs)))
         self._history_seqs[idx:idx] = [None] * count
+        self._history_ord[idx:idx] = [None] * count
 
     # ── messages ───────────────────────────────────────────────
 
@@ -139,6 +155,7 @@ class SQLiteSink:
                 round_index=round_index,
             )
             self._history_seqs.append(seq)
+            self._history_ord.append(seq)
             # Auto-resolve pending: when the matching tool message lands,
             # drop it from the unresolved set and clear pending once empty.
             if tool_call_id and tool_call_id in self._unresolved:
@@ -179,6 +196,7 @@ class SQLiteSink:
                 round_index=round_index,
             )
             self._history_seqs.append(seq)
+            self._history_ord.append(seq)
             if tool_calls:
                 self._assistant_seq = seq
             return
@@ -191,6 +209,7 @@ class SQLiteSink:
             round_index=round_index,
         )
         self._history_seqs.append(seq)
+        self._history_ord.append(seq)
 
     # ── pending state machine ──────────────────────────────────
 
@@ -256,21 +275,62 @@ class SQLiteSink:
                 self.session_id,
             )
             return
+        # Mark the EXACT set of identity seqs being folded (skip None placeholders
+        # for in-memory-only recalled messages). An explicit set — not a BETWEEN
+        # range over the translated boundary seqs — is what stays correct when a
+        # prior compact_note left ``_history_seqs`` non-monotonic (C1): a range
+        # could invert (fold nothing in the DB while the in-memory fold proceeds)
+        # or sweep active kept-tail rows.
+        fold_slice = self._history_seqs[fold_start_idx : fold_end_idx + 1]
+        fold_seqs = [s for s in fold_slice if s is not None]
+        if not fold_seqs:
+            # The folded range was entirely in-memory-only (recalled placeholders),
+            # so there are no DB rows to mark and no note is persisted. But the
+            # pipeline still replaced the range with ONE note message in its
+            # in-memory history; mirror that as a single ``None`` placeholder so the
+            # index maps stay length-aligned with ``history`` (otherwise the next
+            # fold trips the expected_history_len safety net and stops persisting).
+            self._history_seqs = (
+                self._history_seqs[:fold_start_idx]
+                + [None]
+                + self._history_seqs[fold_end_idx + 1 :]
+            )
+            self._history_ord = (
+                self._history_ord[:fold_start_idx]
+                + [None]
+                + self._history_ord[fold_end_idx + 1 :]
+            )
+            return
+        # The note logically sits where the folded range began. Use the first
+        # persisted slot's *logical* position (its ord), not its identity seq, so
+        # a folded-in prior note contributes its logical position rather than its
+        # high row id — and the new note reloads at the right place.
+        ord_slice = [o for o in self._history_ord[fold_start_idx : fold_end_idx + 1]
+                     if o is not None]
+        order_key = ord_slice[0] if ord_slice else min(fold_seqs)
         _, note_seq = self.store.record_compaction(
             self.session_id,
-            from_seq=from_seq,
-            to_seq=to_seq,
+            from_seq=min(fold_seqs),
+            to_seq=max(fold_seqs),
             note_content=summary_text,
             before_tokens=before_tokens,
             after_tokens=after_tokens,
             round_index=round_index,
+            fold_seqs=fold_seqs,
+            order_key=order_key,
         )
-        # In the in-memory history the cut range is replaced by ONE note
-        # message; mirror that here.
+        # In the in-memory history the cut range is replaced by ONE note message;
+        # mirror that in both parallel maps (identity = the new note row's seq;
+        # logical position = where the folded range began).
         self._history_seqs = (
             self._history_seqs[:fold_start_idx]
             + [note_seq]
             + self._history_seqs[fold_end_idx + 1 :]
+        )
+        self._history_ord = (
+            self._history_ord[:fold_start_idx]
+            + [order_key]
+            + self._history_ord[fold_end_idx + 1 :]
         )
 
     def on_round_ended(

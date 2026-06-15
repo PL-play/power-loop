@@ -644,7 +644,16 @@ class SessionStore:
         return seq
 
     def load_active_messages(self, session_id: str) -> list[MessageRow]:
-        """Return all messages in ``state='active'`` order by seq."""
+        """Return active messages in **logical** order.
+
+        Ordinarily ``seq`` *is* logical order, but a ``compact_note`` is allocated
+        a fresh high identity ``seq`` while logically belonging where the folded
+        range began (it summarizes older turns). Ordering purely by ``seq`` would
+        sink the note below the kept tail it should precede. We therefore order by
+        each row's logical position — ``meta['ord']`` for a ``compact_note`` (set
+        by :meth:`record_compaction`), else its ``seq`` — with ``seq`` as a stable
+        tiebreak. A note that predates the ``ord`` field falls back to its ``seq``.
+        """
         with self._lock:
             rows = self._conn.execute(
                 """
@@ -654,7 +663,9 @@ class SessionStore:
                 """,
                 (session_id, MessageState.ACTIVE.value),
             ).fetchall()
-        return [_row_to_message(r) for r in rows]
+        messages = [_row_to_message(r) for r in rows]
+        messages.sort(key=_logical_order_key)
+        return messages
 
     def load_all_messages(self, session_id: str) -> list[MessageRow]:
         with self._lock:
@@ -685,9 +696,31 @@ class SessionStore:
         after_tokens: int | None,
         round_index: int | None,
         note_meta: dict[str, Any] | None = None,
+        fold_seqs: list[int] | None = None,
+        order_key: int | None = None,
     ) -> tuple[int, int]:
-        """Mark ``[from_seq, to_seq]`` as ``compacted_out`` and append a
+        """Mark the folded messages ``compacted_out`` and append a
         ``compact_note`` message in one transaction.
+
+        Two marking modes:
+
+        * ``fold_seqs`` given — mark the **exact set** of those seqs. This is
+          the correct mode and what :class:`SQLiteSink` uses. It is robust when
+          the in-memory history's index→seq map is non-monotonic: a previous
+          ``compact_note`` carries a high *identity* ``seq`` at a low *logical*
+          position, so a contiguous ``BETWEEN from_seq AND to_seq`` over those
+          translated seqs could **invert** (``from_seq > to_seq`` → mark nothing
+          while the in-memory fold proceeds → in-memory/DB divergence) or sweep
+          active kept-tail rows. An explicit ``seq IN (…)`` set folds precisely
+          what was folded, with no ordering assumption.
+        * ``fold_seqs`` omitted — legacy ``BETWEEN from_seq AND to_seq`` range
+          (kept for direct callers/tests that fold a known contiguous range).
+
+        ``order_key`` is the note's **logical** position (decoupled from its
+        identity ``seq``, which is monotonic-allocated and high): the note logically
+        sits where the folded range began, not where its row id lands. It is stored
+        as ``meta['ord']`` and used by :meth:`load_active_messages` to order the
+        note correctly on reload. Defaults to the span's low end.
 
         Returns ``(compact_seq, note_seq)``.
         """
@@ -702,15 +735,31 @@ class SessionStore:
             note_seq = int(state_row["next_seq"])
             compact_seq = int(state_row["last_compact_seq"]) + 1
 
-            self._conn.execute(
-                "UPDATE messages SET state=? WHERE session_id=? AND seq BETWEEN ? AND ?",
-                (MessageState.COMPACTED_OUT.value, session_id, from_seq, to_seq),
-            )
+            if fold_seqs is not None:
+                uniq = [int(s) for s in dict.fromkeys(fold_seqs)]
+                if uniq:
+                    placeholders = ",".join("?" * len(uniq))
+                    self._conn.execute(
+                        f"UPDATE messages SET state=? "
+                        f"WHERE session_id=? AND seq IN ({placeholders})",
+                        (MessageState.COMPACTED_OUT.value, session_id, *uniq),
+                    )
+                span_from = min(uniq) if uniq else from_seq
+                span_to = max(uniq) if uniq else to_seq
+            else:
+                self._conn.execute(
+                    "UPDATE messages SET state=? WHERE session_id=? AND seq BETWEEN ? AND ?",
+                    (MessageState.COMPACTED_OUT.value, session_id, from_seq, to_seq),
+                )
+                span_from, span_to = from_seq, to_seq
+
+            note_ord = int(order_key) if order_key is not None else int(span_from)
             meta = dict(note_meta or {})
             meta.update({
                 "compacted_at_round": round_index,
-                "from_seq": from_seq,
-                "to_seq": to_seq,
+                "from_seq": span_from,
+                "to_seq": span_to,
+                "ord": note_ord,
                 "original_tokens": before_tokens,
                 "summary_tokens": after_tokens,
             })
@@ -735,7 +784,7 @@ class SessionStore:
                 ) VALUES (?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    session_id, compact_seq, note_seq, from_seq, to_seq,
+                    session_id, compact_seq, note_seq, span_from, span_to,
                     before_tokens, after_tokens, round_index, now,
                 ),
             )
@@ -1356,6 +1405,20 @@ def _row_to_message(row: sqlite3.Row) -> MessageRow:
         meta=_loads(row["meta_json"]) or {},
         created_at=row["created_at"],
     )
+
+
+def _logical_order_key(m: MessageRow) -> tuple[int, int]:
+    """Sort key putting each active message at its logical position.
+
+    A ``compact_note`` logically sits where its folded range began
+    (``meta['ord']``), not at its high identity ``seq``. Everything else sorts
+    by ``seq``. ``seq`` is the stable tiebreak.
+    """
+    if m.name == "compact_note":
+        ord_val = m.meta.get("ord")
+        if ord_val is not None:
+            return (int(ord_val), m.seq)
+    return (m.seq, m.seq)
 
 
 def _row_to_background_task(row: sqlite3.Row) -> BackgroundTaskRow:

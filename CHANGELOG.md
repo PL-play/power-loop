@@ -8,6 +8,34 @@
 
 ## [Unreleased]
 
+## [0.14.1] — 2026-06-15
+
+修复一个在 0.14.0 中发现的**高危持久化损坏**（C1 的同进程二次压缩遗漏分支）。纯 bug 修复，
+无 Public API 破坏。
+
+### Fixed
+
+- **同一次运行内的第二次压缩会损坏持久化状态（C1 续）。** `compact_note` 被分配一个全新的**高**
+  身份 `seq`（来自 `next_seq`），却被放在内存历史的**低**逻辑位置，使 `SQLiteSink._history_seqs`
+  这个 index→seq 映射**非单调**。后果有二：
+  - **数据损坏**：同一次运行内的第二次折叠把折叠边界经非单调映射翻译后，以
+    `from_seq > to_seq` 调用 `record_compaction` → `UPDATE … WHERE seq BETWEEN from_seq AND to_seq`
+    在 DB 里**一行都不标记**（内存却照折）→ 内存历史与持久化 active 集**分叉**，并向
+    `compactions` 审计表写入倒置的 `(from,to)` 行。
+  - **重排错误**：即使只折叠一次，note 因高 `seq` 在重载（`load_active_messages ORDER BY seq`）
+    时**沉到 kept 尾部之后**，旧轮次的摘要出现在较新消息之后。
+  - **修复**：把**身份**（高 `seq`，保持 append-only 与 recall 语义）与**逻辑位置**解耦。
+    `record_compaction` 现在按**显式 seq 集合**（`seq IN (…)`，不再用 BETWEEN 区间，对非单调映射
+    免疫）标记折叠行，并把 note 的逻辑位置存为 `meta['ord']`，审计区间用 min/max（不再倒置）。
+    `SQLiteSink` 新增并行的 `_history_ord`（逐槽逻辑位置）；`load_active_messages` 改按**逻辑序**
+    返回（`compact_note` 按 `meta['ord']` 排，否则按 `seq`）。这条直接修正了 0.14.0 的
+    `HARDENING_PLAN` 验收声明“no compacted_out mis-map under recall+compaction”遗漏的同进程二次
+    压缩场景——该场景此前**完全无测试**。
+  - **回归测试**（`tests/unit/test_compaction_double_fold.py`，11 例）：同一次运行内二/三次折叠
+    的内存↔DB 一致性、无倒置审计行、单次/中段折叠后 note 重载位置、reload-then-fold 恢复链路、
+    显式集合标记、纯占位符折叠的映射对齐，以及一个 200 例 hypothesis 随机 append/fold 调度不变式
+    （reload 必须逐字复现内存 active 历史），外加一个端到端「一次 send 内折叠两次」的真实管线用例。
+
 ## [0.14.0] — 2026-06-15
 
 硬化计划 `HARDENING_PLAN.md`（0.13.1 → 1.0）的一次大批量推进：**全部已确认正确性 bug
