@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+迈向 1.0 的硬化路线图**第四阶段:生态/供应链/治理**(进行中)。
+
+### Changed
+
+- **（ECO-3)核心零运行时依赖。** 删除 vendored 死代码 `qwen_image.py` + `web_search.py`
+  (power-loop 从未导入;`qwen_image` 是 `certifi` 的**唯一**导入者),从 `dependencies` 移除
+  `certifi` → 基础依赖集为空。受支持的用法不受影响(transports 经 extras 自带 CA 处理);已用
+  import-without-extras + 真机 HTTPS 冒烟验证。
+- **（ECO-4)修正过期覆盖率目标。** `--cov=llm_client` → 仅 `--cov=power_loop`(vendored 子包
+  随之被统计),ci.yml 与 pyproject 同步;覆盖率门槛 74% > 70%。
+
+### Added
+
+- **（ECO-2)vendored llm_client 溯源。** `_vendor/llm_client/VENDOR.md`(来源、MIT 许可、
+  vendored 日期、本地修改含 0.18.0 的删除)+ `scripts/sync_vendor.sh`(重新 vendor:拷贝、
+  裁剪未用模块、改写 import 到 vendored 路径)。
+
 ## [0.17.0] — 2026-06-15
 
 迈向 1.0 的硬化路线图**第三阶段:可观测性**。事件信封序列化 + 单调时钟、持久可回放的 JSONL

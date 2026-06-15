@@ -37,7 +37,7 @@ jobs:
       - name: Pytest (unit + integration, real_llm auto-skipped without env)
         run: >-
           pytest --no-real -q
-          --cov=power_loop --cov=llm_client
+          --cov=power_loop
           --cov-report=term-missing:skip-covered --cov-fail-under=70
 
   # H2.5: prove the library imports SDK-free (featherweight positioning). Installs

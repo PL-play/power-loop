@@ -59,9 +59,9 @@ real LLM in `tests/real/test_real_durability.py`.***
 
 | ID | Item | Effort | API |
 |----|------|--------|-----|
-| **ECO-4** | Fix stale coverage target `--cov=llm_client` → `power_loop._vendor.llm_client` (or just `--cov=power_loop`). *(land first)* | S (0.25d) | none |
-| **ECO-2** | `_vendor/llm_client/VENDOR.md` (upstream repo + pinned commit + version + license + sync date + local mods) + `scripts/sync_vendor.sh`. *(precedes ECO-3)* | S (1d) | none |
-| **ECO-3** | Delete dead vendored `qwen_image.py` + `web_search.py` → drop `certifi` → **literally zero-dependency core**. *(dep ECO-2; verify real-LLM HTTPS smoke)* | S (0.5d) | none |
+| **ECO-4** ✅ | Coverage target fixed to `--cov=power_loop` (the vendored llm_client is measured transitively); dropped the stale `--cov=llm_client` in ci.yml + pyproject. Coverage gate 74% > 70%. | S (0.25d) | none |
+| **ECO-2** ✅ | `_vendor/llm_client/VENDOR.md` (source, MIT license, vendored date, local mods incl. the 0.18.0 removals) + `scripts/sync_vendor.sh` (re-vendor + prune + import-rewrite). | S (1d) | none |
+| **ECO-3** ✅ | Deleted dead vendored `qwen_image.py` + `web_search.py` (sole `certifi` importer) → `dependencies = []` → **literally zero-dependency core**. Verified: import-without-extras + real-LLM HTTPS smoke green. | S (0.5d) | none |
 | **ECO-1** | MCP client adapter: `MCPToolSource` Protocol + `StdioMCPClient` behind `[mcp]` extra, mapping MCP `inputSchema` → `ToolDefinition`. **Biggest ecosystem reach.** | M (3–4d) | additive |
 | **ECO-6** | Extension cookbook + `ToolRegistry` recipe + 1–2 examples (HTTP-API tool, in-memory vector retrieval) — **NOT** bundled connectors. *(dep ECO-1)* | M (2–3d) | none |
 | **ECO-5** | `SECURITY.md` (reporting channel + "in-process tools are NOT a sandbox; use `ShellBackend`/`SubprocessExecutor`"; best-effort no-SLA). | S (0.5d) | none |

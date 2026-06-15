@@ -11,8 +11,8 @@
 
 ## Install
 
-The core depends only on `certifi`; the OpenAI/Anthropic SDK is pulled in only by the extra
-you install. Constructing a provider without its extra raises a clear `ImportError`.
+The core has **zero runtime dependencies** (pure stdlib); the OpenAI/Anthropic SDK is pulled
+in only by the extra you install. Constructing a provider without its extra raises a clear `ImportError`.
 
 ```bash
 # Pick a transport extra:

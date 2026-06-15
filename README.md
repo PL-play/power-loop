@@ -26,7 +26,7 @@ That's the whole setup. The conversation is already durable, resumable, and tool
 
 Most "agent frameworks" ask you to build your app *inside* them. power-loop is the opposite: a **library** you embed. You keep your HTTP layer, your auth, your queues, your RAG, your UI, your deploy. It just runs the agent loop — well, and durably.
 
-- 🪶 **Featherweight.** No `pydantic`, no LangChain, no graph DSL to learn. The runtime is a handful of files; the public surface is essentially one class. The SDK-free core depends only on `certifi` + stdlib — the OpenAI/Anthropic transport is pulled in only via the extra you install.
+- 🪶 **Featherweight.** No `pydantic`, no LangChain, no graph DSL to learn. The runtime is a handful of files; the public surface is essentially one class. The SDK-free core has **zero runtime dependencies** (pure stdlib) — the OpenAI/Anthropic transport is pulled in only via the extra you install.
 - 💾 **Zero infrastructure.** Sessions, timers, sub-agent trees, workflow journals, the shared blackboard — all in **one SQLite file**. Copy the file, you've copied the state. Scale by sharding files across processes.
 - 🔌 **Provider-agnostic.** Any OpenAI-compatible endpoint or the native Anthropic Messages API, selected by env vars. Swap models per sub-agent or per workflow step.
 - ⏱️ **Durable by default.** Crash mid-run and `resume()`. Agents schedule their own wake-ups with **durable timers** that survive restarts. Workflows **replay completed steps and re-run only the unfinished tail** after a process death.

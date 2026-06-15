@@ -11,8 +11,8 @@
 
 ## 安装
 
-核心只依赖 `certifi`；OpenAI/Anthropic SDK 仅由你安装的 extra 拉入。不装对应 extra 就构造
-provider 会抛出带安装提示的清晰 `ImportError`。
+核心**零运行时依赖**(纯标准库);OpenAI/Anthropic SDK 仅由你安装的 extra 拉入。不装对应 extra
+就构造 provider 会抛出带安装提示的清晰 `ImportError`。
 
 ```bash
 # 选一个 transport extra：

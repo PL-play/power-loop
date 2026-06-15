@@ -25,9 +25,9 @@ dynamic = ["version"]
 # Featherweight core (H3.5): only what the SDK-free core actually imports. Transports
 # and optional features (YAML skill frontmatter, PDF input) are extras; socksio was
 # unused (httpx pulls it transitively for SOCKS) and python-dotenv is examples/tests-only.
-dependencies = [
-  "certifi>=2024.0.0",
-]
+# Zero runtime dependencies (ECO-3): the SDK-free core is pure stdlib. LLM transports,
+# skills(yaml), pdf, and the observability backends are all optional extras below.
+dependencies = []
 
 [project.optional-dependencies]
 # Transports are optional (H3.1): the core imports SDK-free and only pulls a
@@ -133,9 +133,10 @@ filterwarnings = [
   "ignore::DeprecationWarning",
 ]
 
-# ── coverage (opt-in: CI runs `pytest --cov=power_loop --cov=llm_client`) ──
+# ── coverage (opt-in: CI runs `pytest --cov=power_loop`) — the vendored llm_client is
+# measured transitively under power_loop._vendor, so a separate target is stale (ECO-4) ──
 [tool.coverage.run]
-source = ["power_loop", "llm_client"]
+source = ["power_loop"]
 omit = ["*/tests/*", "*/examples/*"]
 
 [tool.coverage.report]
