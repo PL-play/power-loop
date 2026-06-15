@@ -1254,10 +1254,25 @@ class SessionStore:
             )
             return cur.rowcount > 0
 
+    def heartbeat_firing_timer(self, session_id: str, timer_id: int) -> bool:
+        """Re-stamp a 'firing' row's ``updated_at`` so a slow-but-live delivery
+        isn't reclaimed as stale by :meth:`recover_stale_firing_timers` and
+        double-fired. Returns False if the row is no longer 'firing' (already
+        finished, re-armed, or cancelled) — the caller has lost the claim."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE timers SET updated_at=? "
+                "WHERE session_id=? AND timer_id=? AND status='firing'",
+                (_now_ms(), session_id, int(timer_id)),
+            )
+            return cur.rowcount > 0
+
     def recover_stale_firing_timers(self, *, older_than_ms: int) -> int:
         """Re-arm 'firing' rows that never finished (process died mid-fire).
         At-least-once: a re-armed timer may deliver twice; the TIMER_FIRE hook
-        is the place to dedupe if that matters."""
+        is the place to dedupe if that matters. A *live* slow delivery keeps its
+        row fresh via :meth:`heartbeat_firing_timer`, so only genuinely stuck
+        rows (older than ``older_than_ms``) are reclaimed."""
         cutoff = _now_ms() - int(older_than_ms)
         with self._lock, self._conn:
             cur = self._conn.execute(

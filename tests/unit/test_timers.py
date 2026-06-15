@@ -302,6 +302,80 @@ def test_one_shot_vs_recurring_declared_at_creation(tmp_path):
     loop.close()
 
 
+def test_heartbeat_firing_timer_store_cas(tmp_path):
+    """heartbeat_firing_timer re-stamps only a row that is actually 'firing'."""
+    loop = _loop(tmp_path)
+    sid = loop.new_session()
+    loop.schedule_timer(sid, delay_s=3600, note="n")
+    # armed row → not firing → heartbeat is a no-op
+    assert loop.store.heartbeat_firing_timer(sid, 1) is False
+    assert loop.store.transition_timer(sid, 1, from_status="armed", to_status="firing")
+    before = loop.store.get_timer(sid, 1).updated_at
+    loop.store._conn.execute(  # age it so the bump is observable
+        "UPDATE timers SET updated_at = updated_at - 5000 WHERE session_id=?", (sid,)
+    )
+    assert loop.store.heartbeat_firing_timer(sid, 1) is True
+    assert loop.store.get_timer(sid, 1).updated_at >= before
+    # once it leaves 'firing', heartbeat can no longer claim it
+    loop.store.finish_firing_timer(sid, 1)
+    assert loop.store.heartbeat_firing_timer(sid, 1) is False
+    loop.close()
+
+
+@pytest.mark.asyncio
+async def test_live_slow_delivery_is_not_reclaimed_as_stale(tmp_path):
+    """A delivery longer than the stale window must NOT be re-armed by the
+    recovery sweep and double-fired — the heartbeat keeps the 'firing' row
+    fresh. Pre-fix the row aged past stale_firing_s mid-delivery and fired
+    a second time."""
+
+    @dataclass
+    class _SlowLLM(LLMService):
+        delay_s: float = 0.8
+
+        async def complete(self, request, *, on_chunk_delta_text=None,
+                           on_chunk_think=None, on_stream_end=None):
+            await asyncio.sleep(self.delay_s)
+            return LLMResponse(raw_text="woke", content_text="woke")
+
+        def stream(self, request):
+            async def _e():
+                if False:
+                    yield LLMStreamChunk()
+            return _e()
+
+        async def close(self):
+            return None
+
+    loop = StatefulAgentLoop(
+        llm=_SlowLLM(delay_s=0.8),
+        db_path=str(tmp_path / "s.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=2),
+    )
+    sid = loop.new_session()
+    loop.schedule_timer(sid, due_at_ms=int(time.time() * 1000) - 1000, note="do the thing")
+    # stale window 0.5s << 0.8s delivery; heartbeat every 0.05s keeps it alive.
+    runner = TimerRunner(loop, stale_firing_s=0.5, heartbeat_interval_s=0.05)
+
+    scan_task = asyncio.create_task(runner.scan_once())
+    reclaimed_total = 0
+    # Hammer the recovery sweep throughout the slow delivery.
+    while not scan_task.done():
+        reclaimed_total += loop.store.recover_stale_firing_timers(older_than_ms=500)
+        await asyncio.sleep(0.05)
+    fired = await scan_task
+
+    assert fired == 1
+    assert reclaimed_total == 0, "live delivery was wrongly reclaimed as stale"
+    row = loop.store.get_timer(sid, 1)
+    assert row.status == "fired"
+    assert row.fire_count == 1, f"timer double-fired: fire_count={row.fire_count}"
+    delivered = [m for m in loop.get_messages(sid)
+                 if m.get("role") == "user" and "do the thing" in str(m.get("content"))]
+    assert len(delivered) == 1, f"expected exactly one delivery, got {len(delivered)}"
+    loop.close()
+
+
 @pytest.mark.asyncio
 async def test_timer_for_deleted_session_is_cancelled(tmp_path):
     loop = _loop(tmp_path)

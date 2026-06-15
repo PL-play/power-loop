@@ -30,6 +30,7 @@ Timers are created by the agent itself (``schedule_wakeup`` /
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -80,10 +81,19 @@ class TimerRunner:
         *,
         scan_interval_s: float = DEFAULT_SCAN_INTERVAL_S,
         stale_firing_s: float = DEFAULT_STALE_FIRING_S,
+        heartbeat_interval_s: float | None = None,
     ) -> None:
         self._loop = loop
         self._scan_interval = float(scan_interval_s)
         self._stale_firing_ms = int(stale_firing_s * 1000)
+        # While a claimed 'firing' row is being delivered we re-stamp it on this
+        # cadence so a slow-but-live delivery stays comfortably fresh before the
+        # stale cutoff. A quarter of the stale window by default (floored at 1s to
+        # avoid hammering sqlite); overridable for tests / unusual configs.
+        self._heartbeat_interval_s = (
+            float(heartbeat_interval_s) if heartbeat_interval_s is not None
+            else max(1.0, stale_firing_s / 4.0)
+        )
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -150,6 +160,37 @@ class TimerRunner:
             timer.session_id, timer.timer_id, from_status="armed", to_status="firing"
         ):
             return
+        # Heartbeat the 'firing' row while the (possibly slow) hook + delivery run,
+        # so a live delivery longer than stale_firing_s is NOT reclaimed as stale
+        # and double-fired. Cancelled in finally once the row leaves 'firing'.
+        hb = asyncio.create_task(self._heartbeat_firing(timer), name="power-loop-timer-hb")
+        try:
+            await self._deliver_claimed(timer)
+        finally:
+            hb.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hb
+
+    async def _heartbeat_firing(self, timer: TimerRow) -> None:
+        """Re-stamp the claimed 'firing' row every quarter-of-the-stale-window so
+        a slow-but-live delivery stays fresh and is never re-armed by the recovery
+        sweep. Stops itself if the claim is lost (row no longer 'firing')."""
+        interval = self._heartbeat_interval_s
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                if not self._loop.store.heartbeat_firing_timer(
+                    timer.session_id, timer.timer_id
+                ):
+                    return  # row left 'firing' — nothing left to keep alive
+            except Exception:
+                logger.exception(
+                    "timers: heartbeat failed for %s/%d (continuing)",
+                    timer.session_id, timer.timer_id,
+                )
+
+    async def _deliver_claimed(self, timer: TimerRow) -> None:
+        store = self._loop.store
         if store.get_session(timer.session_id) is None:
             store.transition_timer(
                 timer.session_id, timer.timer_id,
