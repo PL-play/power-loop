@@ -121,13 +121,76 @@ class StatefulAgentLoop:
         self._locks: dict[str, asyncio.Lock] = {}
         self._follow_up_queues: dict[str, list[str | LoopMessage]] = {}
         self._follow_up_queue_locks: dict[str, asyncio.Lock] = {}
+        self._closing = False
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Close the underlying store (if owned). Does NOT delete sessions."""
+        """Close the underlying store (if owned). Does NOT delete sessions.
+
+        Synchronous and abrupt: it does NOT wait for in-flight sends or pending async
+        event-bus tasks, so calling it while a send runs can race a background store
+        write. Prefer :meth:`aclose` (or ``async with loop:``) for graceful shutdown.
+        """
         if self._owns_store:
             self.store.close()
+
+    async def aclose(self, *, drain_timeout_s: float = 30.0) -> None:
+        """Graceful, async shutdown: quiesce, then stop.
+
+        1. Flip a closing flag so new :meth:`send`/:meth:`follow_up` raise immediately.
+        2. Wait for every in-flight send to finish by acquiring each per-session lock
+           (a running send holds its lock until its background store writes complete —
+           this is what prevents the ``close()`` race that could close the connection
+           out from under an ``asyncio.to_thread`` write → ``ProgrammingError``).
+        3. Drain pending async event-bus subscriber tasks.
+        4. Checkpoint the WAL and close the store (only if this loop owns it).
+
+        Idempotent and bounded by ``drain_timeout_s`` (per wait phase). Safe to call via
+        ``async with StatefulAgentLoop(...) as loop:``.
+        """
+        self._closing = True
+        # (2) wait for in-flight sends to drain. Acquiring then releasing each lock
+        # blocks until any holder (a running send) finishes; new sends are already
+        # blocked by the closing flag, so no lock can be re-taken behind us.
+        locks = list(self._locks.values())
+        if locks:
+            async def _wait_idle(lock: asyncio.Lock) -> None:
+                async with lock:
+                    return
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(_wait_idle(lock) for lock in locks)),
+                    timeout=drain_timeout_s,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "aclose: timed out after %.1fs waiting for in-flight sends to drain",
+                    drain_timeout_s,
+                )
+        # (3) let queued async subscribers finish (best-effort, bounded).
+        try:
+            await self.event_bus.drain(timeout=drain_timeout_s)
+        except Exception:  # pragma: no cover - drain must never block teardown
+            logger.warning("aclose: event-bus drain raised; continuing", exc_info=True)
+        # (4) checkpoint + close the owned store.
+        if self._owns_store:
+            try:
+                self.store.checkpoint(mode="TRUNCATE")
+            except Exception:  # pragma: no cover - checkpoint is best-effort
+                logger.warning("aclose: WAL checkpoint failed; closing anyway", exc_info=True)
+            self.store.close()
+
+    async def __aenter__(self) -> StatefulAgentLoop:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.aclose()
+
+    def _raise_if_closing(self) -> None:
+        if self._closing:
+            raise RuntimeError("StatefulAgentLoop is closing; no new sends accepted")
 
     def close_session(self, session_id: str, *, cascade: bool = True) -> int:
         """Physically delete the session and (by default) its LINKED subtree."""
@@ -186,6 +249,7 @@ class StatefulAgentLoop:
         can be killed, e.g. by a human interrupt).
         """
         sid = session_id
+        self._raise_if_closing()
         async with self._lock_for(sid):
             self._ensure_session_or_raise(sid)
             if heal_pending:
@@ -222,6 +286,7 @@ class StatefulAgentLoop:
         When the session is idle (lock not held), behaves like :meth:`send`.
         """
         sid = session_id
+        self._raise_if_closing()
         self._ensure_session_or_raise(sid)
         session_lock = self._lock_for(sid)
         if session_lock.locked():

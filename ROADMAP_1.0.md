@@ -18,17 +18,18 @@ trails as 1.0.x.
 
 ---
 
-## Phase 0.15.0 — Durable store: survive upgrades, reclaim space, shut down cleanly
+## Phase 0.15.0 — Durable store: survive upgrades, reclaim space, shut down cleanly ✅ DONE
 *Foundational. The migration gate must land before any other schema change so existing ≤0.14.1 `.db`
-files survive. ~9.5–10.5 days. The single storage-shape inflection.*
+files survive. The single storage-shape inflection. **All items shipped; validated end-to-end against a
+real LLM in `tests/real/test_real_durability.py`.***
 
 | ID | Item | Effort | API |
 |----|------|--------|-----|
-| **OPS-1** ✅ | `PRAGMA user_version` gate + ordered additive migration ladder (`CURRENT_SCHEMA_VERSION` + `MIGRATIONS` tuple; fold the timers-only `_micro_migrate` into step 1; refuse to open a newer-than-code DB). **Prerequisite for every later schema change.** *(done — `test_session_store_migrations.py`)* | M (1.5–2d) | additive |
-| **OPS-2** | Opt-in retention: `prune_compacted_messages` / age-out `usage_rounds` / delete terminal timers (caller-driven; preserves `compact_note` so `meta['ord']` ordering is intact). | M (1.5d) | additive |
-| **OPS-3** | Reclamation: `auto_vacuum=INCREMENTAL` for fresh DBs + `vacuum()` + `checkpoint(TRUNCATE)`. *(dep OPS-2)* | S–M (1d) | additive |
-| **OPS-4** | `export_session()/import_session()` — full durable state as a `schema_version`-stamped JSON + `sqlite3.backup()`. *(dep OPS-1)* | M (1.5d) | additive |
-| **OPS-5** | `async aclose()`/quiesce + `__aenter__/__aexit__` on `StatefulAgentLoop`: closing flag, drain in-flight sends (acquire all per-session locks), await pending async event tasks, `checkpoint(TRUNCATE)` then close — fixes the `close()`-races-a-`to_thread`-write `ProgrammingError`. Optional (non-default) signal install. *(dep OPS-3)* | M–L (2–2.5d) | additive |
+| **OPS-1** ✅ | `PRAGMA user_version` gate + ordered additive migration ladder (`CURRENT_SCHEMA_VERSION` + `MIGRATIONS` tuple; fold the timers-only `_micro_migrate` into step 1; refuse to open a newer-than-code DB). **Prerequisite for every later schema change.** *(`test_session_store_migrations.py`)* | M (1.5–2d) | additive |
+| **OPS-2** ✅ | Opt-in retention: `prune_compacted_messages` / `prune_usage_rounds` / `prune_timers` (caller-driven, irreversible; preserves `compact_note` so `meta['ord']` ordering is intact). *(`test_session_store_retention.py`)* | M (1.5d) | additive |
+| **OPS-3** ✅ | Reclamation: `auto_vacuum=INCREMENTAL` for fresh DBs + `vacuum(incremental=…)` + `checkpoint(mode=…)`. *(`test_session_store_retention.py`)* | S–M (1d) | additive |
+| **OPS-4** ✅ | `export_session()/import_session()` — full durable state as a `schema_version`-stamped JSON + `backup()` via `sqlite3` online backup. *(`test_session_store_export.py`)* | M (1.5d) | additive |
+| **OPS-5** ✅ | `async aclose()`/quiesce + `__aenter__/__aexit__` on `StatefulAgentLoop`: closing flag, drain in-flight sends (acquire all per-session locks), `AgentEventBus.drain()` pending async tasks, `checkpoint(TRUNCATE)` then close — fixes the `close()`-races-a-`to_thread`-write `ProgrammingError`. *(`test_stateful_loop_aclose.py`)* | M–L (2–2.5d) | additive |
 
 ## Phase 0.16.0 — Measure the single-process ceiling; de-bottleneck the read path
 *Convert "reasoned" → "measured". ~9.5–11 days. SCALE-1 gates the rest (each fix measured before/after).*

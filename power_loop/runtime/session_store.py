@@ -358,6 +358,22 @@ MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
     (1, _migration_0001_timers_columns),
 )
 
+#: Per-session tables (all keyed by ``session_id``) captured by
+#: :meth:`SessionStore.export_session` / replayed by ``import_session``. ``sessions``
+#: is first so the parent row lands before its children. ``shared_state`` is excluded
+#: (owner-scoped, not session-scoped); ``background_tasks`` is excluded (transient).
+_EXPORT_TABLES: tuple[str, ...] = (
+    "sessions",
+    "session_state",
+    "messages",
+    "compactions",
+    "usage_rounds",
+    "session_runtime_state",
+    "timers",
+    "notes",
+    "session_stats",
+)
+
 
 def _apply_migrations(conn: sqlite3.Connection, *, is_fresh: bool) -> None:
     """Bring an opened DB to :data:`CURRENT_SCHEMA_VERSION` via the ``PRAGMA
@@ -495,13 +511,19 @@ class SessionStore:
         # the messages ``(session_id, seq)`` primary key raising IntegrityError.
         conn = sqlite3.connect(path_str, check_same_thread=False, isolation_level="")
         conn.row_factory = sqlite3.Row
+        # auto_vacuum must be chosen BEFORE the database's first table is created and
+        # before WAL initializes the header — hence the very first pragma. On an EXISTING
+        # file it is a harmless no-op (changing it would need a full VACUUM), so set it
+        # unconditionally; fresh stores thus get INCREMENTAL free-page reclamation,
+        # reclaimable cheaply via vacuum(incremental=True) after prune/close_session.
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
-        # Detect a brand-new DB BEFORE creating tables, so the migration ladder can
-        # stamp a fresh file at CURRENT_SCHEMA_VERSION (no steps to run) vs. upgrade an
-        # existing one. ":memory:" is always fresh (new connection per open()).
+        # Detect a brand-new DB (no tables yet) so the migration ladder can stamp a fresh
+        # file at CURRENT_SCHEMA_VERSION vs. upgrade an existing one. ":memory:" is always
+        # fresh (new connection per open()).
         is_fresh = conn.execute(
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sessions'"
         ).fetchone()[0] == 0
@@ -878,6 +900,175 @@ class SessionStore:
             )
             for r in rows
         ]
+
+    # ── retention & reclamation (OPS-2 / OPS-3) ───────────────────────────
+    #
+    # All retention is OPT-IN and caller-driven — the store never deletes on its own
+    # (matching its "only place that writes, nothing magic" contract). Pruning the
+    # folded ``compacted_out`` originals is IRREVERSIBLE and removes what
+    # ``recall_compacted`` can surface; ``compact_note`` rows are ``state='active'``
+    # and are never touched, so ``load_active_messages`` is unaffected.
+
+    def prune_compacted_messages(
+        self,
+        session_id: str,
+        *,
+        older_than_ms: int | None = None,
+        keep_recent: int = 0,
+    ) -> int:
+        """Delete folded-out (``state='compacted_out'``) message rows for a session.
+
+        ``older_than_ms`` — only prune rows older than this many ms (by ``created_at``);
+        ``None`` prunes regardless of age. ``keep_recent`` — always retain the N most
+        recent compacted rows (by ``seq``). Returns the number of rows deleted.
+        Irreversible; ``compact_note`` (active) rows are never deleted.
+        """
+        sql = "DELETE FROM messages WHERE session_id=? AND state=?"
+        params: list[Any] = [session_id, MessageState.COMPACTED_OUT.value]
+        if older_than_ms is not None:
+            sql += " AND created_at < ?"
+            params.append(_now_ms() - int(older_than_ms))
+        if keep_recent and keep_recent > 0:
+            sql += (
+                " AND seq NOT IN (SELECT seq FROM messages WHERE session_id=? AND state=? "
+                "ORDER BY seq DESC LIMIT ?)"
+            )
+            params += [session_id, MessageState.COMPACTED_OUT.value, int(keep_recent)]
+        with self._lock, self._conn:
+            return int(self._conn.execute(sql, params).rowcount)
+
+    def prune_usage_rounds(
+        self,
+        session_id: str,
+        *,
+        keep_last: int | None = None,
+        older_than_ms: int | None = None,
+    ) -> int:
+        """Delete per-round usage accounting rows. ``keep_last`` retains the N most
+        recent (by ``round_index``); ``older_than_ms`` prunes rows older than that age
+        (by ``created_at``). Cumulative ``session_stats`` is untouched. Returns deletions."""
+        sql = "DELETE FROM usage_rounds WHERE session_id=?"
+        params: list[Any] = [session_id]
+        if older_than_ms is not None:
+            sql += " AND created_at < ?"
+            params.append(_now_ms() - int(older_than_ms))
+        if keep_last and keep_last > 0:
+            sql += (
+                " AND round_index NOT IN (SELECT round_index FROM usage_rounds "
+                "WHERE session_id=? ORDER BY round_index DESC LIMIT ?)"
+            )
+            params += [session_id, int(keep_last)]
+        with self._lock, self._conn:
+            return int(self._conn.execute(sql, params).rowcount)
+
+    def prune_timers(
+        self,
+        session_id: str,
+        *,
+        statuses: tuple[str, ...] = ("fired", "cancelled"),
+        older_than_ms: int | None = None,
+    ) -> int:
+        """Delete timers in terminal ``statuses`` (default fired/cancelled), optionally
+        only those whose ``updated_at`` is older than ``older_than_ms``. Armed/recurring
+        timers in other statuses are never touched. Returns deletions."""
+        if not statuses:
+            return 0
+        placeholders = ",".join("?" * len(statuses))
+        sql = f"DELETE FROM timers WHERE session_id=? AND status IN ({placeholders})"
+        params: list[Any] = [session_id, *statuses]
+        if older_than_ms is not None:
+            sql += " AND updated_at < ?"
+            params.append(_now_ms() - int(older_than_ms))
+        with self._lock, self._conn:
+            return int(self._conn.execute(sql, params).rowcount)
+
+    def checkpoint(self, *, mode: str = "TRUNCATE") -> None:
+        """Run a WAL checkpoint (default ``TRUNCATE`` — flush the -wal back into the
+        main file and shrink the -wal to zero). Cheap; safe to call periodically."""
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"invalid checkpoint mode: {mode!r}")
+        with self._lock:
+            self._conn.execute(f"PRAGMA wal_checkpoint({mode})")
+
+    def vacuum(self, *, incremental: bool = True) -> None:
+        """Reclaim free pages. ``incremental=True`` runs ``PRAGMA incremental_vacuum``
+        (cheap, only effective when the DB was created with ``auto_vacuum=INCREMENTAL``
+        — the default for fresh stores); ``incremental=False`` runs a full ``VACUUM``
+        (rewrites the whole file: reclaims everything but is blocking and needs free
+        disk). Call after :meth:`prune_compacted_messages` / :meth:`close_session` to
+        actually shrink the file on disk."""
+        with self._lock:
+            if incremental:
+                self._conn.execute("PRAGMA incremental_vacuum")
+            else:
+                # VACUUM cannot run inside a transaction; this connection is in deferred
+                # mode and no `with self._conn:` is open here, so we are in autocommit.
+                self._conn.execute("VACUUM")
+
+    # ── export / archival (OPS-4) ─────────────────────────────────────────
+
+    def export_session(self, session_id: str) -> dict[str, Any]:
+        """Serialize a session's FULL durable state (the session row + all messages
+        incl. compacted, compactions, usage rounds, runtime state, timers, notes, stats)
+        into a JSON-serializable dict stamped with the current ``schema_version``.
+
+        Pairs with :meth:`import_session` for archive-then-prune and cross-store moves.
+        Raises ``ValueError`` for an unknown session."""
+        with self._lock:
+            version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+            tables: dict[str, list[dict[str, Any]]] = {}
+            for table in _EXPORT_TABLES:
+                rows = self._conn.execute(
+                    f"SELECT * FROM {table} WHERE session_id=?", (session_id,)  # noqa: S608 (fixed table list)
+                ).fetchall()
+                tables[table] = [dict(r) for r in rows]
+        if not tables["sessions"]:
+            raise ValueError(f"unknown session: {session_id}")
+        return {"schema_version": version, "session_id": session_id, "tables": tables}
+
+    def import_session(
+        self, data: Mapping[str, Any], *, new_session_id: str | None = None
+    ) -> str:
+        """Insert a session previously produced by :meth:`export_session` under a new
+        (or supplied) id, in one transaction. Returns the new ``session_id``.
+
+        Refuses an export whose ``schema_version`` is newer than this build supports, or
+        a target id that already exists. Columns absent from an older export default."""
+        version = int(data.get("schema_version", 0))
+        if version > CURRENT_SCHEMA_VERSION:
+            raise ValueError(
+                f"export schema_version {version} is newer than this power_loop build "
+                f"supports (max {CURRENT_SCHEMA_VERSION})"
+            )
+        tables = data["tables"]
+        new_id = new_session_id or _new_session_id()
+        with self._lock, self._conn:
+            if self._conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id=?", (new_id,)
+            ).fetchone():
+                raise ValueError(f"session already exists: {new_id}")
+            for table in _EXPORT_TABLES:
+                for raw_row in tables.get(table, []):
+                    row = dict(raw_row)
+                    row["session_id"] = new_id
+                    cols = list(row.keys())
+                    collist = ",".join(cols)
+                    placeholders = ",".join("?" * len(cols))
+                    self._conn.execute(
+                        f"INSERT INTO {table} ({collist}) VALUES ({placeholders})",  # noqa: S608
+                        [row[c] for c in cols],
+                    )
+        return new_id
+
+    def backup(self, dest_path: str | Path) -> None:
+        """Write a consistent snapshot of the WHOLE store to ``dest_path`` using SQLite's
+        online backup API (safe while the store is in use). Overwrites ``dest_path``."""
+        dest = sqlite3.connect(str(dest_path))
+        try:
+            with self._lock:
+                self._conn.backup(dest)
+        finally:
+            dest.close()
 
     # ── state ─────────────────────────────────────────────────────────────
 

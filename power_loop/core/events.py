@@ -106,6 +106,17 @@ class AgentEventBus:
                 exc_info=exc,
             )
 
+    async def drain(self, *, timeout: float | None = None) -> None:
+        """Await all in-flight async-subscriber tasks scheduled from sync ``publish()``.
+
+        Graceful shutdown (``StatefulAgentLoop.aclose``) calls this so queued
+        observability/side-effect handlers finish — or time out — before the bus's owner
+        tears down, instead of being dropped mid-flight. Returns once they settle."""
+        pending = [t for t in self._async_tasks if not t.done()]
+        if not pending:
+            return
+        await asyncio.wait(pending, timeout=timeout)
+
     def publish(self, event: AgentEvent) -> None:
         """Publish synchronously.
 

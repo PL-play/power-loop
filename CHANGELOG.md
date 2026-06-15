@@ -19,6 +19,20 @@
   原先硬编码、仅针对 `timers` 的 `_micro_migrate` 收编为迁移步骤 1(对 legacy `user_version=0`
   幂等升级)。这是后续一切 schema 变更的**前提**——没有它,既有 `.db` 在升级时会静默保持旧结构
   (`CREATE TABLE IF NOT EXISTS` 永不改表)。回归测试见 `tests/unit/test_session_store_migrations.py`。
+- **（OPS-2）按需保留/裁剪。** `SessionStore` 新增**调用方驱动、绝不隐式**的清理方法:
+  `prune_compacted_messages`(删折叠出的 `compacted_out` 原文,保留 `compact_note`/active,
+  支持 `older_than_ms`/`keep_recent`,**不可逆**)、`prune_usage_rounds`、`prune_timers`(仅终态)。
+- **（OPS-3）空间回收。** 新建库默认 `auto_vacuum=INCREMENTAL`;新增 `vacuum(incremental=…)`
+  与 `checkpoint(mode=…)`——配合 OPS-2/`close_session` 真正缩小磁盘文件、回收 WAL。
+- **（OPS-4）会话导出/导入 + 整库备份。** `export_session` 把单会话全部持久态序列化为带
+  `schema_version` 的 JSON,`import_session` 落到新 id(拒绝更高版本/已存在 id);`backup()`
+  走 SQLite 在线备份 API 产出可直接打开的整库快照。支持「先归档再裁剪」与跨库迁移。
+- **（OPS-5）优雅异步停机。** `StatefulAgentLoop.aclose()` + `async with`:先拒收新 send,
+  再逐个获取 per-session 锁等待在飞 send 落盘完成(修复 `close()` 与 `to_thread` 写竞争导致的
+  `ProgrammingError`),drain 待决异步事件订阅者(`AgentEventBus.drain()`),checkpoint 后关库。
+  同步 `close()` 保留但标注为非优雅。回归:`test_session_store_retention.py` /
+  `test_session_store_export.py` / `test_stateful_loop_aclose.py` + 真机 `tests/real/test_real_durability.py`
+  端到端走通「压缩→裁剪→VACUUM→导出→aclose→重开(迁移网关)→导入」全链路。
 
 ## [0.14.1] — 2026-06-15
 
