@@ -64,6 +64,10 @@ This matters when [memory recall](memory.md) is also on. Recalled `memory_*` mes
 
 See [`examples/31_memory_with_compaction.py`](../../../examples/31_memory_with_compaction.py) for recall + compaction in one session.
 
+### Retrieving folded detail on demand
+
+Folded messages are not deleted — they remain `compacted_out` rows in the store. The optional **`recall_compacted`** tool lets the agent pull them back when the `compact_note` lacks a specific detail (an exact value, path, decision). It reads only the current session's folded rows (read-only), filtered by keyword or seq range. Add it to the agent's tools (`include=["recall_compacted", ...]` or the `full` preset). See [`examples/32_recall_compacted.py`](../../../examples/32_recall_compacted.py) and the [Tools guide](tools.md).
+
 ## Custom Compactor
 
 Implement the `Compactor` protocol to plug in your own strategy:

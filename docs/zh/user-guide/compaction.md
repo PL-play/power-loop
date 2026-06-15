@@ -62,6 +62,10 @@ config_no = AgentLoopConfig(compactor=None)
 
 参见 [`examples/31_memory_with_compaction.py`](../../../examples/31_memory_with_compaction.py)：同一会话里召回 + 压缩共存。
 
+### 按需取回被折叠的细节
+
+被折叠的消息没有删——它们仍是 store 里 `compacted_out` 的行。可选的 **`recall_compacted`** 工具让 agent 在 `compact_note` 缺某个具体细节(精确数值/路径/决策)时把原文捞回来。它只读**当前会话**被折叠的行,可按关键词或 seq 区间过滤。把它加进 agent 的工具集(`include=["recall_compacted", ...]` 或 `full` preset)。参见 [`examples/32_recall_compacted.py`](../../../examples/32_recall_compacted.py) 与[工具指南](tools.md)。
+
 ## 自定义压缩器
 
 实现 `Compactor` 协议：

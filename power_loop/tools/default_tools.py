@@ -1260,6 +1260,63 @@ def run_current_time() -> str:
     return now.strftime("%Y-%m-%d %H:%M:%S %Z (%A)")
 
 
+# ── recall_compacted: pull back detail that compaction folded out ──────────
+
+RECALL_COMPACTED_MAX_LIMIT = 50
+RECALL_COMPACTED_CONTENT_CHARS = 2000
+
+
+def run_recall_compacted(
+    query: str | None = None,
+    from_seq: int | None = None,
+    to_seq: int | None = None,
+    limit: int = 20,
+) -> str:
+    """Surface THIS session's compacted-out (folded) messages on demand.
+
+    Compaction summarizes old turns into a ``compact_note`` and marks the originals
+    ``compacted_out`` — they leave the active window but are NOT deleted. When the
+    note isn't enough, this retrieves the originals (read-only, current session only),
+    filtered by keyword (``query``, case-insensitive substring) and/or seq range.
+    """
+    from power_loop.runtime.session_store import MessageState
+
+    ctx = get_tool_runtime_context(required=True)
+    store, sid = ctx.store, ctx.session_id
+    assert store is not None and sid is not None  # required=True guarantees this
+
+    limit = max(1, min(int(limit or 20), RECALL_COMPACTED_MAX_LIMIT))
+    rows = [r for r in store.load_all_messages(sid) if r.state is MessageState.COMPACTED_OUT]
+    if from_seq is not None:
+        rows = [r for r in rows if r.seq >= int(from_seq)]
+    if to_seq is not None:
+        rows = [r for r in rows if r.seq <= int(to_seq)]
+    if query and query.strip():
+        q = query.strip().lower()
+        rows = [r for r in rows if q in (r.content or "").lower()]
+
+    total = len(rows)
+    if total == 0:
+        return "No compacted (folded-out) messages match this query/range."
+
+    shown = rows[-limit:]  # rows are seq-ascending → most recent matches
+    blocks: list[str] = []
+    for r in shown:
+        body = r.content or ""
+        if len(body) > RECALL_COMPACTED_CONTENT_CHARS:
+            body = body[:RECALL_COMPACTED_CONTENT_CHARS] + " …[truncated]"
+        head = f"[seq {r.seq} · {r.role}"
+        if r.round_index is not None:
+            head += f" · round {r.round_index}"
+        head += "]"
+        blocks.append(f"{head}\n{body}")
+
+    header = f"{len(shown)} of {total} compacted message(s)"
+    if total > len(shown):
+        header += f" (showing the {len(shown)} most recent; narrow with query/from_seq/to_seq)"
+    return header + ":\n\n" + "\n\n".join(blocks)
+
+
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120)),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
@@ -1294,6 +1351,9 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "list_wakeups": lambda **kw: run_list_wakeups(),
     "cancel_wakeup": lambda **kw: run_cancel_wakeup(kw["timer_id"]),
     "current_time": lambda **kw: run_current_time(),
+    "recall_compacted": lambda **kw: run_recall_compacted(
+        kw.get("query"), kw.get("from_seq"), kw.get("to_seq"), kw.get("limit", 20)
+    ),
     "background_run": lambda **kw: run_background(kw["command"]),
     "check_background": lambda **kw: check_background(kw.get("task_id")),
     "request_user_input": lambda **kw: request_user_input(

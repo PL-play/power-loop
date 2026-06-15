@@ -83,6 +83,18 @@ def test_example_31_memory_with_compaction_runs() -> None:
     )
 
 
+def test_example_32_recall_compacted_runs() -> None:
+    """A code buried in folded-out turns is recoverable via recall_compacted; the
+    agent retrieves it and answers correctly (H7 Phase 1)."""
+    module = _load_example("32_recall_compacted.py")
+    out = asyncio.run(module.main())
+    # deterministic: the code really is in the compacted_out rows (tool's data source)
+    assert out["code_in_folded"] is True, out
+    # correctness: the model recovered the exact code (via the tool or the summary),
+    # compared on a normalized form (robust to markdown/hyphen/spacing rendering)
+    assert out["answer_has_code"] is True, out
+
+
 def test_example_05_pending_recovery_runs() -> None:
     module = _load_example("05_pending_recovery.py")
     final_text = asyncio.run(module.main())

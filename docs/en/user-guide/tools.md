@@ -190,6 +190,7 @@ Tool behavior:
 | `todo` | Maintain an agent-visible task list. | Only one item can be `in_progress`. |
 | `load_skill` | Load a named skill's detailed instructions. | Unknown skills return an error listing available skill names. |
 | `request_user_input` | Pause for caller/user input. | Returns `status="waiting_for_input"` with `pending_interactions`; resume with `submit_input()`. |
+| `recall_compacted` | Pull back messages that [compaction](compaction.md) folded out of the active window. | Read-only, **current session only**. Filter by `query` (substring) and/or `from_seq`/`to_seq`; capped to the most recent `limit`. In the `full` preset; cherry-pick via `include=["recall_compacted"]`. |
 
 See [`examples/20_default_tools.py`](../../../examples/20_default_tools.py) for a runnable script that exercises every default tool without requiring a real LLM.
 
@@ -201,6 +202,7 @@ Some default tools are not just functions. They participate in the agent loop:
 - `background_run` records task status in SQLite. When a task changes from unseen to updated or completed, the next LLM round receives a transient `<background_updates>` message. `check_background` reads the same persisted task table.
 - `load_skill` uses `AgentLoopConfig.skills_dir` when configured. When `skills_dir` is set, the resolved system prompt includes the skills directory and available skill descriptions.
 - `request_user_input` is a control-flow tool. It does not wait inside the Python process. Instead, it persists a pending interaction and returns `StatefulResult(status="waiting_for_input")`. The caller shows `pending_interactions` to a user or API client, then calls `await loop.submit_input(session_id, interaction_id, value)` to append the matching tool result and continue.
+- `recall_compacted` reads the current session's `compacted_out` rows via `get_tool_runtime_context()`. Compaction summarizes old turns into a `compact_note` and marks the originals `compacted_out` — they leave the active window but are not deleted. This tool surfaces them on demand (read-only, session-scoped) when the note lacks a specific detail. See [Compaction](compaction.md).
 
 This behavior is built on public primitives. `SessionStore` exposes JSON runtime state and background task APIs, `get_tool_runtime_context()` gives tool handlers the current session/store, and `AgentLoopConfig.runtime_projectors` controls how persisted state becomes transient LLM messages. The default projectors are `TodoRuntimeProjector` and `BackgroundRuntimeProjector`; pass your own `RuntimeProjector` objects to support custom tools or disable the defaults with `runtime_projectors=()`.
 

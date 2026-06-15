@@ -13,6 +13,13 @@
 
 ### Added
 
+- **（H7 Phase 1）`recall_compacted` 工具——按需取回被压缩折叠的细节**：压缩把旧消息折叠成
+  `compact_note` 并标 `compacted_out`,但原文**没删**(仍在 store 里)。新默认工具
+  `recall_compacted(query?, from_seq?, to_seq?, limit?)` 让 agent 在摘要缺具体细节时把原文
+  捞回来——**只读、仅当前会话**、按关键词/seq 过滤、按 `limit` 取最近若干条。属 `full` preset
+  (也可 `include=["recall_compacted"]` 单挑)。8 个单测(过滤/空/会话隔离/排除 active/截断)+
+  真实 LLM 示例 `examples/32_recall_compacted.py`(把编码埋进被折叠的轮次,用极小 summary 预算
+  逼出工具调用)+ en/zh 文档。设计见 `docs/compaction-coordination-design.md`(H7 轨道)。
 - **（H4.2）`AgentEvent` 增加 `ts` + 单调 `seq` 信封字段**：每个事件自动盖上墙钟时间与
   进程内单调序号（`itertools.count`，CPython 原子），从而可时间戳化、可全序化——这是
   OTel span 桥接与重建交错子代理/工作流事件流的基石。两字段排除在相等性之外，不定义事件身份。

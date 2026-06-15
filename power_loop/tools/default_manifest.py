@@ -276,6 +276,27 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         input_schema={"type": "object", "properties": {}},
     ),
     ToolDefinition(
+        name="recall_compacted",
+        description=(
+            "Retrieve older messages that context compaction summarized out of your active "
+            "window. They were folded into a compact_note and marked compacted_out — they "
+            "still exist, just aren't shown each turn. Use this ONLY when the compact_note "
+            "lacks a specific detail you need (an exact value, path, decision, error). Filter "
+            "by query (case-insensitive substring over message content) and/or a from_seq/to_seq "
+            "range; limit caps how many are returned (most recent first)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Case-insensitive substring to match in folded message content."},
+                "from_seq": {"type": "integer", "description": "Only return folded messages with seq >= this."},
+                "to_seq": {"type": "integer", "description": "Only return folded messages with seq <= this."},
+                "limit": {"type": "integer", "description": "Max messages to return (most recent first). Default 20, max 50."},
+            },
+        },
+        required_params=(),
+    ),
+    ToolDefinition(
         name="background_run",
         description="Run a shell command in a private background worker (non-interactive).",
         input_schema={

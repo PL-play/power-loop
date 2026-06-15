@@ -183,6 +183,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir="/srv/tenant-a")):
 | `todo` | 维护 Agent 可见任务列表。 | 同一时间只允许一个条目为 `in_progress`。 |
 | `load_skill` | 加载指定 skill 的详细说明。 | 未知 skill 会返回错误和可用 skill 名称。 |
 | `request_user_input` | 暂停等待调用方/用户输入。 | 返回 `status="waiting_for_input"` 和 `pending_interactions`；用 `submit_input()` 恢复。 |
+| `recall_compacted` | 把被[压缩](compaction.md)折叠出活跃窗口的旧消息捞回来。 | 只读、**仅当前会话**。可按 `query`(子串)和/或 `from_seq`/`to_seq` 过滤；按 `limit` 取最近若干条。在 `full` preset 里；也可 `include=["recall_compacted"]` 单挑。 |
 
 可运行示例见 [`examples/20_default_tools.py`](../../../examples/20_default_tools.py)，它不依赖真实 LLM，会逐个演示默认工具。
 
