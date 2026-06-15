@@ -71,6 +71,18 @@ def test_example_04_compaction_runs() -> None:
     )
 
 
+def test_example_31_memory_with_compaction_runs() -> None:
+    """Recall + compaction coexist (H1.1/C1): the recalled facts survive the fold
+    and the in-example invariant asserts (no memory rows persisted, clean fold set).
+    The reply must use the recalled facts."""
+    module = _load_example("31_memory_with_compaction.py")
+    final_text = asyncio.run(module.main())
+    low = final_text.lower()
+    assert "alan" in low and "37" in low, (
+        f"recalled facts did not survive compaction: {final_text!r}"
+    )
+
+
 def test_example_05_pending_recovery_runs() -> None:
     module = _load_example("05_pending_recovery.py")
     final_text = asyncio.run(module.main())

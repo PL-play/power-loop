@@ -52,6 +52,16 @@ config_no = AgentLoopConfig(compactor=None)
 | **每轮最多一次** | `round_compacted=True` 防重复 |
 | **软失败** | 摘要 LLM 调用失败 → 用原（未压缩）历史继续 |
 
+## 持久化与记忆召回
+
+挂了 `SQLiteSink`（带 store 的 `StatefulAgentLoop` 默认如此）时，折叠会同时落库：被折叠行标 `compacted_out`，追加一条 `compact_note` 行，`compactions` 表加一条审计行。sink 通过一张与 `pipeline.history` 对齐的「内存索引 → store seq」映射，把压缩器给出的**内存索引**翻译成**store 行 seq**。
+
+开了[记忆召回](memory.md)时这点尤其关键：召回的 `memory_*` 消息被插到历史**最前端**（system 区），但**永不落库**——它们归 `MemoryProvider` 所有。sink 为每条召回消息记一个占位，保持映射对齐；否则后续折叠会把索引映射到**错误的行**，把不该压的消息标成 `compacted_out`。两者干净共存：召回的事实躲过折叠（system 区天然保留），也不会泄漏进 store。
+
+> **安全网**：一旦该映射失准——例如某个 `SESSION_START`/`ROUND_START` hook 在 sink 不知情的情况下**整体替换** `ctx.messages`——sink 会**跳过本次压缩的持久化**，而不是冒险标错行。内存折叠照常生效（不影响 LLM 调用）；未持久化的压缩下一轮会重新触发，且因为 active 行未被动过，resume 仍然正确。若要在 hook 里改历史，优先**追加**而非整体替换。
+
+参见 [`examples/31_memory_with_compaction.py`](../../../examples/31_memory_with_compaction.py)：同一会话里召回 + 压缩共存。
+
 ## 自定义压缩器
 
 实现 `Compactor` 协议：

@@ -33,6 +33,15 @@
 
 ### Fixed
 
+- **（H1.1 / C1，最高严重度）记忆召回与压缩的 `_history_seqs` 错位 → 压缩标错 DB 行**：
+  `_maybe_recall` 把 `memory_*` 消息直接插进 `pipeline.history`（绕过 sink），使
+  `sink._history_seqs` 与 history 错位 `len(recalled)`，随后 `on_compaction` →
+  `record_compaction` 按错位索引把**错误的行**标 `compacted_out`（静默、持久、会级联）。
+  修复：新增 `sink.on_messages_inserted`，召回时为每条非持久化消息插入占位以保持
+  index↔seq 对齐；并给 `on_compaction` 加 `expected_history_len` 对齐安全网——一旦
+  映射失准（如 `SESSION_START` hook 整体替换历史，C9），**跳过本次压缩持久化**而非
+  标错行（内存折叠照常，active 行不动，resume 仍正确）。新增 `examples/31_memory_with_compaction.py`
+  （真实 LLM）+ 跨「有/无召回」等价性回归测试。
 - **（H1.5）未捕获异常逃逸时既无 `SESSION_ENDED` 也无错误事件**：`pipeline.run()` 中
   raise 的 hook / sink / store I/O 直接抛出，看过 `SESSION_STARTED` 的订阅者被悬挂，且
   「文档声称会发」的 `AGENT_ERROR` 通道实为死代码。现在在调用点捕获 → 发 `AGENT_ERROR` +

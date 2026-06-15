@@ -287,3 +287,105 @@ async def test_compactor_plan_dataclass_shape() -> None:
     )
     assert p.fold_end_idx - p.fold_start_idx == 2
     assert p.summary_text == "x"
+
+
+# ── H1.1 / C1: recall must not shift which DB rows get compacted_out ────────
+
+
+@dataclass
+class _FakeMemory:
+    """Recalls canned messages; never persists (the provider owns its memory)."""
+
+    to_recall: list[dict] = field(default_factory=list)
+
+    async def recall(self, *, messages, session_id, budget_tokens=1500):
+        return [dict(m) for m in self.to_recall]
+
+    async def remember(self, *, snapshot, session_id):
+        return None
+
+
+async def _run_compaction(store: SessionStore, *, memory=None, hooks=None) -> tuple[str, list, set]:
+    """Seed a fat 5-pair history, send one turn (forcing compaction), return
+    (sid, all_rows, set-of-compacted_out-seqs)."""
+    sid = store.create_session(system_prompt="S")
+    for i in range(5):
+        store.append_message(sid, role="user", content="u" * 4000, round_index=i)
+        store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
+    llm = _Scripted(responses=[
+        LLMResponse(raw_text="<summary>folded earlier turns</summary>"),
+        LLMResponse(raw_text="done"),
+    ])
+    cfg = AgentLoopConfig(
+        system_prompt="S", max_rounds=2, max_tokens=4000,
+        compactor=DefaultCompactor(keep_last_n=1), memory=memory,
+    )
+    loop = StatefulAgentLoop(llm=llm, store=store, config=cfg, hooks=hooks)
+    await loop.send("kick another round", session_id=sid)
+    rows = store.load_all_messages(sid)
+    compacted = {r.seq for r in rows if r.state is MessageState.COMPACTED_OUT}
+    return sid, rows, compacted
+
+
+@pytest.mark.asyncio
+async def test_recall_does_not_shift_compacted_rows(monkeypatch) -> None:
+    """C1 regression: recalled memory_* messages are injected at the FRONT of
+    history; with the index↔seq map kept aligned, the SAME real conversation rows
+    are marked compacted_out whether or not memory was recalled. Before the fix the
+    range was shifted by len(recalled) → the wrong rows were marked (silent
+    persisted corruption)."""
+    monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")  # tiny → always fires on the fat seed
+    store_a = SessionStore.open(":memory:")
+    store_b = SessionStore.open(":memory:")
+    try:
+        sid_a, _, compacted_no_mem = await _run_compaction(store_a, memory=None)
+        mem = _FakeMemory(to_recall=[
+            {"content": "user prefers concise replies"},
+            {"content": "user lives in Shanghai"},
+        ])
+        sid_b, rows_b, compacted_with_mem = await _run_compaction(store_b, memory=mem)
+
+        assert compacted_no_mem, "baseline run should have compacted some rows"
+        # The exact same real rows are folded — recall shifts indices, not seqs.
+        assert compacted_with_mem == compacted_no_mem
+        # the recorded audit range matches too
+        assert [(c.from_seq, c.to_seq) for c in store_a.list_compactions(sid_a)] == \
+               [(c.from_seq, c.to_seq) for c in store_b.list_compactions(sid_b)]
+        # recalled memory is NEVER persisted as a session row
+        assert not any((r.name or "").startswith("memory_") for r in rows_b)
+        # and the kept tail (most-recent rows) is NOT compacted out
+        active = {r.seq for r in rows_b if r.state is MessageState.ACTIVE}
+        assert active and active.isdisjoint(compacted_with_mem)
+    finally:
+        store_a.close()
+        store_b.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_skips_persistence_when_history_seqs_desync(monkeypatch) -> None:
+    """C9 safety net: a SESSION_START hook that replaces history wholesale desyncs
+    the sink's index↔seq map. on_compaction must then REFUSE to persist (rather than
+    mark wrong rows compacted_out); the run still completes, active rows untouched."""
+    from power_loop import AgentHooks
+    from power_loop.contracts.hooks import HookPoint
+
+    monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")
+    store = SessionStore.open(":memory:")
+    try:
+        hooks = AgentHooks()
+
+        def prepend_msg(ctx) -> None:
+            # add a message the sink was never told about → length desync
+            ctx.messages = [{"role": "system", "content": "injected by hook"}, *ctx.messages]
+
+        hooks.register(HookPoint.SESSION_START, prepend_msg)
+
+        sid, rows, compacted = await _run_compaction(store, hooks=hooks)
+
+        # safety net engaged: nothing persisted as compacted, no audit row
+        assert compacted == set()
+        assert store.list_compactions(sid) == []
+        # the original rows remain ACTIVE (a resume would be correct)
+        assert all(r.state is MessageState.ACTIVE for r in rows if r.name != "compact_note")
+    finally:
+        store.close()

@@ -13,10 +13,13 @@ Three concrete sinks ship here:
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Protocol, runtime_checkable
 
 from power_loop.agent.types import LoopMessage
 from power_loop.runtime.session_store import SessionStore
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -29,6 +32,7 @@ class MessageSink(Protocol):
 
     def on_round_started(self, round_index: int) -> None: ...
     def on_message_appended(self, message: LoopMessage, *, round_index: int | None) -> None: ...
+    def on_messages_inserted(self, *, index: int, count: int) -> None: ...
     def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None: ...
@@ -41,6 +45,7 @@ class MessageSink(Protocol):
         before_tokens: int,
         after_tokens: int,
         round_index: int,
+        expected_history_len: int | None = None,
     ) -> None: ...
     def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None
@@ -52,6 +57,7 @@ class NullSink:
 
     def on_round_started(self, round_index: int) -> None: ...
     def on_message_appended(self, message: LoopMessage, *, round_index: int | None) -> None: ...
+    def on_messages_inserted(self, *, index: int, count: int) -> None: ...
     def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None: ...
@@ -64,6 +70,7 @@ class NullSink:
         before_tokens: int,
         after_tokens: int,
         round_index: int,
+        expected_history_len: int | None = None,
     ) -> None: ...
     def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None
@@ -88,15 +95,29 @@ class SQLiteSink:
         self._unresolved: set[str] = set()
         self._assistant_seq: int | None = None
         self._tool_calls: list[dict[str, Any]] = []
-        # Ordered seqs mirroring the pipeline's in-memory history. Initialized
-        # by StatefulAgentLoop from the loaded active messages; appended to as
-        # the pipeline emits new messages.
-        self._history_seqs: list[int] = []
+        # Ordered seqs mirroring the pipeline's in-memory history, index-for-index.
+        # Initialized by StatefulAgentLoop from the loaded active messages; grown by
+        # on_message_appended; spliced by on_compaction. A ``None`` entry is a slot
+        # for an in-memory-only message with no DB row — recalled ``memory_*``
+        # messages injected by _maybe_recall (which never persist). Keeping these
+        # placeholders is what preserves the index↔seq invariant so on_compaction
+        # maps fold indices to the RIGHT rows (H1.1 / C1).
+        self._history_seqs: list[int | None] = []
 
     def init_history_seqs(self, seqs: list[int]) -> None:
         """Called by :class:`StatefulAgentLoop` with the seqs of the loaded
         active messages, in the same order they sit in pipeline.history."""
         self._history_seqs = list(seqs)
+
+    def on_messages_inserted(self, *, index: int, count: int) -> None:
+        """Record that ``count`` in-memory-only messages were spliced into
+        ``pipeline.history`` at ``index`` without being persisted (recalled
+        ``memory_*``). Insert matching ``None`` placeholders so ``_history_seqs``
+        stays index-aligned with ``history`` and later folds map to the right rows."""
+        if count <= 0:
+            return
+        idx = max(0, min(index, len(self._history_seqs)))
+        self._history_seqs[idx:idx] = [None] * count
 
     # ── messages ───────────────────────────────────────────────
 
@@ -199,17 +220,42 @@ class SQLiteSink:
         before_tokens: int,
         after_tokens: int,
         round_index: int,
+        expected_history_len: int | None = None,
     ) -> None:
         """Persist a compaction: mark messages [fold_start_idx, fold_end_idx]
         in the in-memory history as ``compacted_out`` in the store, append the
         ``compact_note`` row, and rewrite ``_history_seqs`` to mirror the
         post-compaction in-memory history (so future appends keep the index
         invariant).
+
+        Alignment safety net (H1.1): the fold indices are positions in
+        ``pipeline.history``; we translate them through ``_history_seqs``, so the
+        two MUST be the same length. If they are not — a desync from some message
+        mutated outside the sink (a SESSION_START/ROUND_START hook replacing the
+        list wholesale, C9), or a fold index that lands on a non-persisted
+        ``None`` placeholder — we **skip persistence** rather than mark the wrong
+        rows ``compacted_out``. The in-memory fold still stands; the un-persisted
+        compaction simply re-triggers next round (active rows are untouched, so a
+        resume is correct), trading a missed optimization for zero corruption.
         """
+        if expected_history_len is not None and len(self._history_seqs) != expected_history_len:
+            logger.warning(
+                "skip compaction persistence for %s: _history_seqs (%d) misaligned with "
+                "history (%d) — refusing to mark possibly-wrong rows compacted_out",
+                self.session_id, len(self._history_seqs), expected_history_len,
+            )
+            return
         if not (0 <= fold_start_idx <= fold_end_idx < len(self._history_seqs)):
             return  # defensive: out-of-range indices → no-op
         from_seq = self._history_seqs[fold_start_idx]
         to_seq = self._history_seqs[fold_end_idx]
+        if from_seq is None or to_seq is None:
+            logger.warning(
+                "skip compaction persistence for %s: fold boundary lands on a "
+                "non-persisted (recalled) message — refusing to compact it out",
+                self.session_id,
+            )
+            return
         _, note_seq = self.store.record_compaction(
             self.session_id,
             from_seq=from_seq,

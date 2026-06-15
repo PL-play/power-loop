@@ -414,6 +414,11 @@ class AgentPipeline:
         while insert_at < n and self.history[insert_at].get("role") == "system":
             insert_at += 1
         self.history[insert_at:insert_at] = tagged
+        # These memory_* messages are injected into history but never persisted
+        # (the MemoryProvider owns them). Tell the sink so it can keep its
+        # index↔seq map aligned — otherwise a later compaction marks the WRONG
+        # DB rows compacted_out (H1.1 / C1).
+        self.sink.on_messages_inserted(index=insert_at, count=len(tagged))
 
         self._emit(
             AgentEventType.MEMORY_RECALLED,
@@ -526,7 +531,9 @@ class AgentPipeline:
             + [note_msg]
             + self.history[plan.fold_end_idx + 1 :]
         )
-        # Persist (no-op for NullSink).
+        # Persist (no-op for NullSink). Pass the pre-fold history length so the
+        # sink can refuse to persist if its index↔seq map ever drifts out of
+        # alignment (H1.1 safety net), rather than mark the wrong rows.
         self.sink.on_compaction(
             fold_start_idx=plan.fold_start_idx,
             fold_end_idx=plan.fold_end_idx,
@@ -534,6 +541,7 @@ class AgentPipeline:
             before_tokens=plan.before_tokens,
             after_tokens=plan.after_tokens,
             round_index=round_index,
+            expected_history_len=before_len,
         )
         compact_after = CompactAfterCtx(
             round_index=round_index,
