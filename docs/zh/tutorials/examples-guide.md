@@ -1162,6 +1162,33 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 
 ---
 
+## 24–30 · 较新示例
+
+覆盖 0.11–0.13 新增的能力。每条都链接到可运行文件，以及深入讲解它的用户手册页面。
+
+### 24 · Agent 笔记
+Agent 给自己写持久化笔记（`note_add` / `note_update` / `note_delete`），经 `SQLiteNoteMemory` 持久化，并按 `NotesPolicy` 在每轮重新注入。→ [示例](../../../examples/24_agent_notes.py) · [记忆](../user-guide/memory.md)
+
+### 25 · Token 用量
+用 `result.usage`、`get_session_stats` 和 `usage_updated` 事件统计 token；用 `max_tokens_per_run` 给单次运行设上限。→ [示例](../../../examples/25_token_usage.py) · [配置](../user-guide/configuration.md)
+
+### 26 · 持久化定时器
+Agent 给自己排定唤醒（`schedule_wakeup`），由 `TimerRunner` 当作普通回合触发。一次性或循环；`TIMER_FIRE` hook 可否决/推迟。→ [示例](../../../examples/26_timers.py) · [定时器](../user-guide/timers.md)
+
+### 27 · 动态工作流
+声明式 `WorkflowSpec`（sequence / foreach），叶子是子代理，由确定性引擎解释执行。创建即校验，用 `create_workflow(...).run()` 运行。→ [示例](../../../examples/27_dynamic_workflow.py) · [工作流](../user-guide/workflows.md)
+
+### 28 · Docker Shell 后端
+通过 `ShellBackend` 缝把进程内 bash 换成 `docker exec` —— 模型写的 shell 在隔离容器里运行。→ [示例](../../../examples/28_docker_shell_backend.py) · [沙箱](../user-guide/sandboxing.md)
+
+### 29 · 共享黑板
+两个 agent 在一块作用域黑板上协作（`SqliteBlackboard` + `board_*` 工具）：planner 贴任务，worker 认领并完成。→ [示例](../../../examples/29_shared_blackboard.py) · [黑板](../user-guide/blackboard.md)
+
+### 30 · 子进程隔离
+`SubprocessExecutor` 让每个工作流叶子在各自的进程 + 数据库中运行；`WorkerLauncher` 缝把每个叶子包进沙箱。→ [示例](../../../examples/30_subprocess_isolation.py) · [沙箱](../user-guide/sandboxing.md)
+
+---
+
 ## 速查表
 
 | 我想… | 看哪个 |
@@ -1184,5 +1211,12 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 | 暂停等待人类输入 | [21](#21-可恢复人类输入) |
 | 运行中追加指引 | [22](#22-运行中追加指引) |
 | 复用 loop 且按调用切换策略 | [23](#23-每次调用覆盖) |
+| 让 agent 给自己记笔记 | [24](#24--agent-笔记) |
+| 统计并限制 token 用量 | [25](#25--token-用量) |
+| 让 agent 稍后唤醒自己 | [26](#26--持久化定时器) |
+| 编排确定性多代理流水线 | [27](#27--动态工作流) |
+| 沙箱化模型写的 bash | [28](#28--docker-shell-后端) |
+| 多个 agent 在共享黑板上协作 | [29](#29--共享黑板) |
+| 按进程隔离工作流叶子 | [30](#30--子进程隔离) |
 | 构建运行时绑定工具 | [高级运行时](../../../examples/advanced_runtime/) |
 | 看全部功能 | [19](#19-旗舰示例) |

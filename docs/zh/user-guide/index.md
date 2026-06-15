@@ -25,7 +25,16 @@
 | [记忆](memory.md) | `MemoryProvider` 协议、`recall` / `remember`、注入位置 |
 | [重试与取消](retry-cancel.md) | `LLMRetryPolicy`、指数退避、`CancellationToken` |
 | [结构化输出](structured-output.md) | `StructuredOutputSpec`、`parse_structured`、JSON 修复链 |
+| [定时器](timers.md) | 持久化自我唤醒、`TimerRunner`、循环定时器、`TIMER_FIRE` |
 | [高级运行时工具](advanced-runtime-tools.md) | Runtime state、projector、hooks/events、自定义流程控制 |
+
+## 编排与隔离
+
+| 页面 | 你会学到 |
+|---|---|
+| [动态工作流](workflows.md) | `WorkflowSpec` DSL、确定性引擎、detached 执行、跨重启 resume |
+| [共享黑板](blackboard.md) | `SqliteBlackboard`、`board_*` 工具、多代理协作 |
+| [沙箱与隔离](sandboxing.md) | `ShellBackend`（沙箱化 bash）、`WorkerLauncher`（沙箱化叶子进程） |
 
 ## 高级
 

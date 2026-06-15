@@ -25,7 +25,16 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 | [Memory](memory.md) | `MemoryProvider` protocol, `recall` / `remember`, injection position |
 | [Retry & Cancel](retry-cancel.md) | `LLMRetryPolicy`, exponential backoff, `CancellationToken` |
 | [Structured Output](structured-output.md) | `StructuredOutputSpec`, `parse_structured`, JSON repair chain |
+| [Timers](timers.md) | Durable self-wake-ups, `TimerRunner`, recurring timers, `TIMER_FIRE` |
 | [Advanced Runtime Tools](advanced-runtime-tools.md) | Runtime state, projectors, hooks/events, custom flow control |
+
+## Orchestration & isolation
+
+| Page | What you'll learn |
+|---|---|
+| [Dynamic Workflows](workflows.md) | `WorkflowSpec` DSL, deterministic engine, detached runs, cross-restart resume |
+| [Shared Blackboard](blackboard.md) | `SqliteBlackboard`, `board_*` tools, multi-agent coordination |
+| [Sandboxing & Isolation](sandboxing.md) | `ShellBackend` (sandbox bash), `WorkerLauncher` (sandbox a leaf process) |
 
 ## Advanced
 

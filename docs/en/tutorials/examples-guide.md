@@ -1211,6 +1211,33 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 
 ---
 
+## 24–30 · Newer examples
+
+These cover the capabilities added in 0.11–0.13. Each links to the runnable file and to the User Guide page that explains it in depth.
+
+### 24 · Agent Notes
+The agent writes durable notes to itself (`note_add` / `note_update` / `note_delete`), persisted via `SQLiteNoteMemory` and re-injected each turn under a `NotesPolicy`. → [example](../../../examples/24_agent_notes.py) · [Memory](../user-guide/memory.md)
+
+### 25 · Token Usage
+Account for tokens with `result.usage`, `get_session_stats`, and the `usage_updated` event; cap a run with `max_tokens_per_run`. → [example](../../../examples/25_token_usage.py) · [Configuration](../user-guide/configuration.md)
+
+### 26 · Durable Timers
+The agent schedules its own wake-ups (`schedule_wakeup`); a `TimerRunner` fires them as normal turns. One-shot or recurring; the `TIMER_FIRE` hook vetoes/postpones. → [example](../../../examples/26_timers.py) · [Timers](../user-guide/timers.md)
+
+### 27 · Dynamic Workflow
+A declarative `WorkflowSpec` (sequence / foreach) whose leaves are sub-agents, interpreted by a deterministic engine. Validate on creation, run with `create_workflow(...).run()`. → [example](../../../examples/27_dynamic_workflow.py) · [Workflows](../user-guide/workflows.md)
+
+### 28 · Docker Shell Backend
+Swap the in-process bash for `docker exec` via the `ShellBackend` seam — model-authored shell runs inside an isolated container. → [example](../../../examples/28_docker_shell_backend.py) · [Sandboxing](../user-guide/sandboxing.md)
+
+### 29 · Shared Blackboard
+Two agents coordinate on one scoped board (`SqliteBlackboard` + `board_*` tools): a planner posts tasks, a worker claims and completes them. → [example](../../../examples/29_shared_blackboard.py) · [Blackboard](../user-guide/blackboard.md)
+
+### 30 · Subprocess Isolation
+`SubprocessExecutor` runs each workflow leaf in its own process + DB; the `WorkerLauncher` seam wraps each leaf in a sandbox. → [example](../../../examples/30_subprocess_isolation.py) · [Sandboxing](../user-guide/sandboxing.md)
+
+---
+
 ## Quick Reference
 
 ### Choosing the right example
@@ -1235,5 +1262,12 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 | Pause for human input | [21](#21-request-user-input) |
 | Steer an in-flight run | [22](#22-follow-up-steering) |
 | Reuse one loop with per-call policies | [23](#23-per-call-overrides) |
+| Have the agent take notes | [24](#24-agent-notes) |
+| Track and cap token usage | [25](#25-token-usage) |
+| Let the agent wake itself later | [26](#26-durable-timers) |
+| Orchestrate a deterministic multi-agent pipeline | [27](#27-dynamic-workflow) |
+| Sandbox model-authored bash | [28](#28-docker-shell-backend) |
+| Coordinate peer agents on a shared board | [29](#29-shared-blackboard) |
+| Isolate workflow leaves per process | [30](#30-subprocess-isolation) |
 | Build runtime-bound tools | [Advanced Runtime](../../../examples/advanced_runtime/) |
 | See everything together | [19](#19-full-chatbot) |
