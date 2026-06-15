@@ -68,9 +68,9 @@ Python 3.10+. See [Getting Started](docs/en/getting-started.md).
 | **Tool calling** | JSON-Schema-validated tools; built-in `bash`/file/search/skills presets | [Tools](docs/en/user-guide/tools.md) |
 | **Sub-agents** | Delegate to a child loop via `AgentSpec` (own prompt/tools/model) | [Sub-agents](docs/en/user-guide/subagents.md) |
 | **Dynamic workflows** | Declarative JSON DSL (`sequence`/`parallel`/`foreach`/`branch`) the LLM can author; deterministic engine | [feasibility](docs/dynamic-workflow-feasibility.md) |
-| **Workflow resume** | Journals each step; after a crash, replays completed steps and re-runs only the tail | — |
-| **Subprocess executor** | Each workflow leaf in its own OS process + own DB; sandbox per leaf | — |
-| **Shared blackboard** | A scoped, durable coordination board multiple agents read/write | — |
+| **Workflow resume** | Journals each step; after a crash, replays completed steps and re-runs only the tail | [Workflows](docs/en/user-guide/workflows.md) |
+| **Subprocess executor** | Each workflow leaf in its own OS process + own DB; sandbox per leaf | [Sandboxing](docs/en/user-guide/sandboxing.md) |
+| **Shared blackboard** | A scoped, durable coordination board multiple agents read/write | [Blackboard](docs/en/user-guide/blackboard.md) |
 | **Durable timers** | Agents schedule their own wake-ups; survive restarts; one-shot or recurring | [examples/26](examples/26_timers.py) |
 | **Hooks** | Veto/observe at every lifecycle point (round, tool, compaction, timer) | [Hooks](docs/en/user-guide/hooks.md) |
 | **Typed events** | Streaming, audit, metrics — strongly typed payloads | [Events](docs/en/user-guide/events.md) |
@@ -80,7 +80,7 @@ Python 3.10+. See [Getting Started](docs/en/getting-started.md).
 | **Token budgets & usage** | Per-run cap (`budget_exceeded`), per-run + per-session accounting | below |
 | **Pluggable memory** | Cross-session recall via a `MemoryProvider` Protocol | [Memory](docs/en/user-guide/memory.md) |
 | **Recall compacted detail** | `recall_compacted` tool pulls back exact turns compaction folded out | [Compaction](docs/en/user-guide/compaction.md) |
-| **Stable error codes** | Every `PowerLoopError` carries a machine-readable `code` (`llm.timeout`, `session.pending`, `tool.not_found`, …); branch on `exc.code` | below |
+| **Stable error codes** | Every `PowerLoopError` carries a machine-readable `code` (`llm.timeout`, `session.pending`, `tool.not_found`, …); branch on `exc.code` | [API: error codes](docs/en/api/index.md#error-codes) |
 | **Crash recovery** | `heal_pending` / `resume` / `abort_pending` for runs killed mid tool-call | below |
 
 ---
