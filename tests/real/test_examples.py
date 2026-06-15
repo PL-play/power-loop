@@ -173,6 +173,20 @@ def test_example_28_docker_shell_backend_runs() -> None:
     assert result["final_text"].strip()
 
 
+def test_example_29_shared_blackboard_runs() -> None:
+    """Two agents coordinate on one scoped shared board: the planner posts
+    tasks, the worker reads them and updates one + leaves a note."""
+    module = _load_example("29_shared_blackboard.py")
+    result = asyncio.run(module.main())
+    # Both agents wrote to the SAME board (coordination), authored correctly.
+    assert set(result["authors"]) == {"planner", "worker"}, result
+    # The worker advanced a task it found on the board (open → done).
+    assert "done" in result["statuses"], result
+    # The worker also left a free-form note.
+    assert "note" in result["kinds"], result
+    assert result["n"] >= 3, result
+
+
 def test_example_07_human_approval_runs() -> None:
     """Always-deny confirm_fn: dangerous commands must NEVER execute;
     safe whitelist commands may still execute; final answer must
