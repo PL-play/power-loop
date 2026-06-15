@@ -279,8 +279,21 @@ def _validate_bash_command_scope(command: str) -> str | None:
 def _dangerous_command_reason(command: str) -> str | None:
     lowered = command.strip().lower()
     compact = re.sub(r"\s+", " ", lowered)
-    if re.search(r"\brm\s+(-[a-z]*[rf][a-z]*\s+|-[a-z]*[rf][a-z]*.*\s)(/|~|\$home)(\s|$)", compact):
-        return "refusing recursive deletion of a root/home path"
+    # Recursive/force rm targeting root, home, or a top-level SYSTEM directory.
+    # The target alternatives below deliberately allow /tmp and relative paths
+    # (scratch is fine) while blocking '/', '~', '$HOME', '~/…', '$HOME/…', and
+    # '/etc', '/usr/local', '/var/…' etc. The flag group repeats so 'rm -r -f /x'
+    # is caught too. (Older regex only matched the BARE root/home — it missed
+    # 'rm -rf /etc', a real false-negative.)
+    if re.search(
+        r"\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+"
+        r"(?:/(?:\s|$)"                                       # bare /
+        r"|~(?:/|\s|$)"                                       # ~ or ~/…
+        r"|\$home"                                           # $HOME or $HOME/…
+        r"|/(?:bin|boot|dev|etc|home|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)(?:/|\s|$))",  # /sysdir…
+        compact,
+    ):
+        return "refusing recursive deletion of a root/home/system path"
     if re.search(r">\s*/dev/(sd|disk|rdisk|nvme|zero|mem)", compact):
         return "refusing redirection to raw device paths"
     try:

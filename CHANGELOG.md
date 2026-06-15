@@ -48,6 +48,13 @@
 
 ### Fixed
 
+- **（H2.4 / C14，安全）`bash` 危险命令守卫漏过 `rm -rf /<系统目录>`**：写安全分支测试时发现
+  `_dangerous_command_reason` 的 rm 正则只匹配**裸**根/家目录(`/` / `~` / `$HOME` 且后接
+  空白或行尾),`rm -rf /etc`、`rm -rf /usr/local`、`rm -rf /var/lib` 这类**子路径删除全部漏过**
+  (真实 false-negative)。改正则:阻断根/家目录及 `/(bin|boot|dev|etc|home|lib|opt|proc|root|run|sbin|srv|sys|usr|var)`
+  系统目录(含子路径与 `~/…` / `$HOME/…`),同时仍放行 `/tmp` 与相对路径;flag 组可重复(`rm -r -f /x` 也拦)。
+  新增 `tests/unit/test_bash_guards.py`(37 例):各阻断/放行命令 + `_validate_bash_command_scope`
+  的家目录读写/allowlist/越界全覆盖(此前零覆盖)。
 - **（H1.9 / C8）同步 SQLite 写阻塞事件循环 → 多会话互相拖死**：pipeline 的写路径
   store/sink 调用同步执行,某会话一次有竞争的写(`busy_timeout` 最高 5s)会卡住整个
   事件循环、拖住其它所有会话。修复:把**写路径** sink/store 调用(`on_message_appended` /
