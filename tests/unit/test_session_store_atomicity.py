@@ -42,3 +42,36 @@ def test_write_block_commits_on_success():
         assert s.get_runtime_state(sid, "k") == "v"
     finally:
         s.close()
+
+
+def test_leading_select_then_dml_rolls_back_atomically():
+    """The read-modify-write shape used by append_message/record_compaction etc.:
+    a leading SELECT (which under deferred isolation runs in autocommit) followed by
+    DML that then fails must still roll back the DML — the `with self._conn:` block
+    covers every write after the first DML. (H1.8.)"""
+    s = SessionStore.open(":memory:")
+    try:
+        sid = s.create_session()
+        s.append_message(sid, role="user", content="first")
+        before = s._conn.execute(
+            "SELECT next_seq FROM session_state WHERE session_id=?", (sid,)
+        ).fetchone()["next_seq"]
+
+        with pytest.raises(RuntimeError):
+            with s._lock, s._conn:
+                # leading SELECT — the C7 case: begins NO transaction by itself
+                s._conn.execute(
+                    "SELECT next_seq FROM session_state WHERE session_id=?", (sid,)
+                ).fetchone()
+                # a DML opens the transaction …
+                s._conn.execute(
+                    "UPDATE session_state SET next_seq=next_seq+5 WHERE session_id=?", (sid,)
+                )
+                raise RuntimeError("boom after leading select + dml")
+
+        after = s._conn.execute(
+            "SELECT next_seq FROM session_state WHERE session_id=?", (sid,)
+        ).fetchone()["next_seq"]
+        assert after == before  # the UPDATE rolled back atomically
+    finally:
+        s.close()

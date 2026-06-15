@@ -427,12 +427,22 @@ class SessionStore:
             path_str = str(p)
         # isolation_level="" (deferred) — NOT None (autocommit). With autocommit,
         # `with self._conn:` is a no-op (no transaction is ever open), so the
-        # multi-statement writers (append_message's INSERT+next_seq bump,
+        # multi-statement WRITES (append_message's INSERT + next_seq bump,
         # create_session's two inserts, record_compaction, the cascade delete, …)
-        # were NOT atomic: a failure between statements left corrupt state (e.g. a
+        # were not atomic: a failure between statements left corrupt state (e.g. a
         # message persisted but next_seq not bumped → permanent UNIQUE wedge).
-        # Deferred mode makes Python auto-BEGIN before DML and the `with` block
-        # commit/rollback, restoring the atomicity those methods document.
+        # Deferred mode auto-BEGINs before the first DML, so the `with` block's
+        # commit/rollback makes each method's multi-statement WRITE atomic.
+        #
+        # NOTE on the read-modify-write methods (SELECT next_seq → INSERT → UPDATE):
+        # deferred mode begins the transaction at the first DML, NOT at the leading
+        # SELECT, so that SELECT reads in autocommit. The read-modify-write is still
+        # atomic IN-PROCESS because every accessor holds ``self._lock`` (an RLock)
+        # across the whole `with self._lock, self._conn:` block, serializing readers
+        # and writers — that lock, not the transaction, is what prevents an
+        # interleaved next_seq race. Cross-process safety is NOT this store's model
+        # (one file = one process); a stray second writer would instead be caught by
+        # the messages ``(session_id, seq)`` primary key raising IntegrityError.
         conn = sqlite3.connect(path_str, check_same_thread=False, isolation_level="")
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
