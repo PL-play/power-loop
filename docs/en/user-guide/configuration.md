@@ -116,6 +116,29 @@ config = AgentLoopConfig(retry_policy=retry, ...)
 
 See [Retry & Cancel](retry-cancel.md) for the full retry lifecycle.
 
+## Logging hygiene
+
+`import power_loop` attaches a `logging.NullHandler` to the `power_loop` root logger, so the
+library stays silent until your app configures logging (all module loggers live under the
+`power_loop.*` subtree).
+
+For structured event logs, attach the JSON-lines sink — one line per event to the
+`power_loop.events` logger:
+
+```python
+from power_loop.contrib.logging_sink import attach_logging_sink
+attach_logging_sink(bus)                          # all events, INFO, secrets redacted
+```
+
+It **redacts secret-looking payload keys by default** (`api_key` / `authorization` / `secret` /
+`password` / `*_token`, case-insensitive substring; bare `token` is intentionally *not* redacted so
+`prompt_tokens`/`completion_tokens` counts survive). Override or disable:
+
+```python
+attach_logging_sink(bus, redact_keys=("api_key", "x-internal-secret"))  # custom denylist
+attach_logging_sink(bus, redact_keys=())                                 # no redaction
+```
+
 ## Next
 
 - [Sessions](sessions.md) — understand the session lifecycle

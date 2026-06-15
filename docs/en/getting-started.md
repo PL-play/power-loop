@@ -7,10 +7,15 @@ Get power-loop running in 5 minutes — from `pip install` to your first agent r
 ## 1. Install
 
 ```bash
-pip install power-loop
-# or, for development
-pip install -e ../power-loop   # if you're in DeepTalk-style multi-repo setup
+pip install 'power-loop[openai]'      # any OpenAI-compatible endpoint
+# or 'power-loop[anthropic]' for the native Anthropic Messages API, or [all] for both
+# for development:
+pip install -e '../power-loop[openai]'
 ```
+
+The SDK-free core depends only on `certifi`; the transport is pulled in by the extra
+you choose. To use the native Anthropic Messages API, install `'power-loop[anthropic]'`
+and set `POWER_LOOP_PROVIDER=anthropic`.
 
 Python 3.10+ required.
 

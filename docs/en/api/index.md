@@ -58,4 +58,34 @@ inspect the source modules linked below.
 | `DefaultCompactor` | context summary compaction | [Compaction](../user-guide/compaction.md), [source](../../../power_loop/runtime/compact.py) |
 | `RuntimeEnv`, `runtime_env_context` | per-invocation workspace/home/skills and shell backend | [Tools](../user-guide/tools.md), [source](../../../power_loop/runtime/env.py) |
 | `ShellBackend`, `LocalShellBackend` | persistent-shell launch and execution-target identity | [Tools](../user-guide/tools.md), [source](../../../power_loop/runtime/exec_backend.py) |
-| `PowerLoopError` and subclasses | common exception hierarchy | [source](../../../power_loop/contracts/errors.py) |
+| `PowerLoopError` and subclasses | common exception hierarchy; every subclass carries a stable dotted `code` (class attribute) — branch on `exc.code`, not class identity | [Error codes](#error-codes), [source](../../../power_loop/contracts/errors.py) |
+
+## LLM Contract
+
+The provider-agnostic LLM types, re-exported from the top level (`from power_loop import …`) so
+you don't reach into the vendored transport package. **PROVISIONAL** (may adjust during 0.x).
+
+| Symbol | Covers | More |
+|---|---|---|
+| `LLMService` | the LLM Protocol you implement or wrap | [Providers](../user-guide/providers.md), [source](../../../power_loop/runtime/provider.py) |
+| `LLMRequest`, `LLMResponse`, `LLMStreamChunk`, `LLMTokenUsage` | request/response/stream/usage shapes (used in `llm.*` hooks and custom services) | [Providers](../user-guide/providers.md) |
+| `OpenAICompatibleChatConfig`, `AnthropicChatConfig` | per-transport config dataclasses | [Providers](../user-guide/providers.md) |
+| `create_llm_service_from_env`, `create_llm_service_from_config`, `LLMProviderConfig` | build an `LLMService` from env/config | [Configuration](../user-guide/configuration.md) |
+
+## Error codes
+
+Every exception inherits from `PowerLoopError` and exposes a stable, machine-readable `code`
+(a dotted string). Branch on `exc.code` rather than the class — it's robust across refactors.
+
+| Exception | `code` |
+|---|---|
+| `PowerLoopError` (base) | `power_loop.error` |
+| `SessionNotFoundError` | `session.not_found` |
+| `SessionPendingError` | `session.pending` |
+| `LLMTimeout` | `llm.timeout` |
+| `LLMRetryExhausted` | `llm.retry_exhausted` |
+| `CancellationRequested` | `cancelled` |
+| `CompactionFailed` | `compaction.failed` |
+| `ToolNotFound` | `tool.not_found` |
+| `ToolValidationError` | `tool.invalid_args` |
+| `SpecValidationError` | `spec.invalid` |

@@ -21,8 +21,8 @@ power-loop is an **embeddable Agent execution kernel** — not a framework, not 
 - **LLM abstraction** — one `LLMService` interface, multiple transports (OpenAI-compatible, Anthropic Messages API)
 - **Multi-turn loop** — `new_session()` creates the conversation; `send(user_input, session_id=sid)` appends turns
 - **Tool calling** — register tools with JSON Schema validation; sync and async handlers
-- **Hooks** — 18 hook points to intercept every phase of the loop
-- **Event bus** — 24 typed events for observability, audit, streaming
+- **Hooks** — 17 hook points to intercept every phase of the loop
+- **Event bus** — 30 typed events for observability, audit, streaming
 - **Declarative sub-agents** — `AgentSpec` → one-shot child agent with tool whitelist
 - **Context compaction** — automatic LLM-summary compaction, default-on
 - **Session persistence** — SQLite-backed, cross-process resume

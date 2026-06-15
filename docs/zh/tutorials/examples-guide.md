@@ -1162,9 +1162,9 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 
 ---
 
-## 24–30 · 较新示例
+## 24–33 · 较新示例
 
-覆盖 0.11–0.13 新增的能力。每条都链接到可运行文件，以及深入讲解它的用户手册页面。
+覆盖 0.11–0.14 新增的能力。每条都链接到可运行文件，以及深入讲解它的用户手册页面。
 
 ### 24 · Agent 笔记
 Agent 给自己写持久化笔记（`note_add` / `note_update` / `note_delete`），经 `SQLiteNoteMemory` 持久化，并按 `NotesPolicy` 在每轮重新注入。→ [示例](../../../examples/24_agent_notes.py) · [记忆](../user-guide/memory.md)
@@ -1186,6 +1186,15 @@ Agent 给自己排定唤醒（`schedule_wakeup`），由 `TimerRunner` 当作普
 
 ### 30 · 子进程隔离
 `SubprocessExecutor` 让每个工作流叶子在各自的进程 + 数据库中运行；`WorkerLauncher` 缝把每个叶子包进沙箱。→ [示例](../../../examples/30_subprocess_isolation.py) · [沙箱](../user-guide/sandboxing.md)
+
+### 31 · 记忆 + 压缩共存
+召回的 `memory_*` 消息在 system 区、永不折叠；同一会话里的长历史照常触发 `DefaultCompactor` —— 两者共存，召回的记忆也不会落库。→ [示例](../../../examples/31_memory_with_compaction.py) · [记忆](../user-guide/memory.md) · [压缩](../user-guide/compaction.md)
+
+### 32 · 取回被压缩的细节
+压缩把旧轮次折叠成 `compact_note` 并标 `compacted_out` —— 原文没删。`recall_compacted` 工具让 agent 在需要时把埋掉的细节逐字捞回来。→ [示例](../../../examples/32_recall_compacted.py) · [压缩](../user-guide/compaction.md)
+
+### 33 · 联动记忆的压缩器
+`Compactor.maybe_compact` 可选接收 `CompactionContext`（注入的 `MemoryProvider` + session_id + 只读读取器），自定义压缩器可在折叠前把要点 `remember` 进记忆；`DefaultCompactor` 与老签名压缩器不受影响。→ [示例](../../../examples/33_coordinating_compactor.py) · [压缩](../user-guide/compaction.md) · [记忆](../user-guide/memory.md)
 
 ---
 

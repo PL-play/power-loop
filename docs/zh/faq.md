@@ -36,6 +36,22 @@ power-loop 是**内核**，不是框架。不预设 workflow DAG、记忆后端�
 config = AgentLoopConfig(compactor=None)
 ```
 
+### 怎么用程序区分不同错误？
+
+每个异常都继承 `PowerLoopError`，并带稳定、机器可读的 `code`（点分串）。按 `exc.code` 分支，而非类身份：
+
+```python
+from power_loop import PowerLoopError
+try:
+    await loop.send("hi", session_id=sid)
+except PowerLoopError as exc:
+    if exc.code == "llm.timeout": ...
+    elif exc.code == "session.pending": ...   # resume / abort_pending / heal_pending
+```
+
+常见 code：`llm.timeout`、`llm.retry_exhausted`、`session.pending`、`session.not_found`、
+`tool.not_found`、`tool.invalid_args`、`spec.invalid`。详见 [API 参考](api/index.md#错误码)。
+
 ## 会话
 
 ### 怎么跨进程共享会话？

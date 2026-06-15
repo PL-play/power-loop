@@ -63,6 +63,11 @@ with runtime_env_context(env):
     await loop.send("Run the tests with bash.", session_id=sid)
 ```
 
+> **0.14.0 起**不一定非用 `bind=False`：带 workspace 的 bound 注册表仍会尊重外层
+> `runtime_env_context(...)` 注入的 `ShellBackend`（bind 不再把它重置掉）。也可以直接传：
+> `create_default_tool_registry(include=["bash"], workspace_dir=ws, shell_backend=DockerShellBackend("my-sandbox"))`。
+> 当一个注册表要跨多个 workspace/沙箱复用时，`bind=False` 仍是正确选择。
+
 完整可运行的版本见 [示例 28](../../../examples/28_docker_shell_backend.py)（它证明了隔离的有效性：shell 会报告容器的操作系统，并读取一个 bind-mount 进来的宿主文件）。DeepTalk 正是用这个接缝，配合一个按会话隔离的 gVisor（`runsc`）容器。
 
 ## WorkerLauncher — sandbox a workflow leaf process

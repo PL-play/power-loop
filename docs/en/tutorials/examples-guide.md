@@ -1211,9 +1211,9 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 
 ---
 
-## 24–30 · Newer examples
+## 24–33 · Newer examples
 
-These cover the capabilities added in 0.11–0.13. Each links to the runnable file and to the User Guide page that explains it in depth.
+These cover the capabilities added in 0.11–0.14. Each links to the runnable file and to the User Guide page that explains it in depth.
 
 ### 24 · Agent Notes
 The agent writes durable notes to itself (`note_add` / `note_update` / `note_delete`), persisted via `SQLiteNoteMemory` and re-injected each turn under a `NotesPolicy`. → [example](../../../examples/24_agent_notes.py) · [Memory](../user-guide/memory.md)
@@ -1235,6 +1235,15 @@ Two agents coordinate on one scoped board (`SqliteBlackboard` + `board_*` tools)
 
 ### 30 · Subprocess Isolation
 `SubprocessExecutor` runs each workflow leaf in its own process + DB; the `WorkerLauncher` seam wraps each leaf in a sandbox. → [example](../../../examples/30_subprocess_isolation.py) · [Sandboxing](../user-guide/sandboxing.md)
+
+### 31 · Memory + Compaction Together
+Recalled `memory_*` messages live in the system region and are never folded, while a long history in the same session still triggers `DefaultCompactor` — the two coexist and recalled memory is never persisted. → [example](../../../examples/31_memory_with_compaction.py) · [Memory](../user-guide/memory.md) · [Compaction](../user-guide/compaction.md)
+
+### 32 · Recall Compacted Detail
+Compaction folds old turns into a `compact_note` and marks them `compacted_out` — the originals are not deleted. The `recall_compacted` tool lets the agent pull a buried detail back verbatim on demand. → [example](../../../examples/32_recall_compacted.py) · [Compaction](../user-guide/compaction.md)
+
+### 33 · Coordinating Compactor
+`Compactor.maybe_compact` can optionally receive a `CompactionContext` (injected `MemoryProvider` + session_id + read accessor) so a custom compactor can `remember` must-keep detail before folding; `DefaultCompactor` and old-signature compactors are unchanged. → [example](../../../examples/33_coordinating_compactor.py) · [Compaction](../user-guide/compaction.md) · [Memory](../user-guide/memory.md)
 
 ---
 

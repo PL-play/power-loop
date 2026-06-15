@@ -2,6 +2,28 @@
 
 [English](../en/migration.md) | [回到文档站](../README.md)
 
+## 0.13.x → 0.14.0
+
+1. **`llm_client` 收编进库内。** 现位于 `power_loop._vendor.llm_client`，裸的顶层 `llm_client`
+   包已不存在。直接 import 的都要改：
+   ```python
+   # 之前 —— 已无法 import
+   from llm_client.interface import LLMRequest, LLMResponse, LLMService
+   # 之后 —— 用顶层 re-export
+   from power_loop import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage, \
+       OpenAICompatibleChatConfig, AnthropicChatConfig
+   ```
+   具体 service 类属内部实现 —— 用公开工厂 `create_llm_service_from_env()` /
+   `create_llm_service_from_config(LLMProviderConfig(...))` 构造。
+2. **Transport 成为 extras。** 核心瘦身为仅 `certifi`；装对应 extra：
+   `pip install 'power-loop[openai]'`（或 `[anthropic]` / `[all]`；另有 `[skills]` / `[pdf]`）。
+   不装对应 SDK 就构造 provider 会抛带 `pip install` 提示的 `ImportError`。
+3. **删除 `requirements.txt`** —— `pyproject.toml` 为单一事实源，按 `power-loop[openai]==0.14.0` 锁版。
+4. **发布 `py.typed`**（PEP 561）—— 下游 mypy/pyright 现在能看到 power-loop 的类型。
+5. 可选采纳的新面：每调用 LLM 事件（`LLM_CALL_STARTED` / `LLM_CALL_COMPLETED`）、现已真实发射的
+   `AGENT_ERROR`、`ts`+`seq` 事件信封、以及稳定的 `exc.code` 错误码 —— 见[事件](user-guide/events.md)
+   与 API 参考。
+
 ## 0.2.x → 0.3.0
 
 power-loop v0.3.0 改为显式创建会话。`send()` 不再在第一次调用时自动创建 session。

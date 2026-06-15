@@ -56,4 +56,34 @@
 | `DefaultCompactor` | 上下文摘要压缩 | [压缩](../user-guide/compaction.md)、[源码](../../../power_loop/runtime/compact.py) |
 | `RuntimeEnv`, `runtime_env_context` | 每次调用的 workspace/home/skills 与 shell backend | [工具](../user-guide/tools.md)、[源码](../../../power_loop/runtime/env.py) |
 | `ShellBackend`, `LocalShellBackend` | 持久 shell 启动方式与执行目标标识 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/runtime/exec_backend.py) |
-| `PowerLoopError` 及子类 | 通用异常层级 | [源码](../../../power_loop/contracts/errors.py) |
+| `PowerLoopError` 及子类 | 通用异常层级；每个子类带稳定的点分 `code`（类属性）—— 按 `exc.code` 分支，而非类身份 | [错误码](#错误码), [源码](../../../power_loop/contracts/errors.py) |
+
+## LLM 契约
+
+provider 无关的 LLM 类型，从顶层 re-export（`from power_loop import …`），不必伸进 vendored
+transport 包。**PROVISIONAL**（0.x 阶段可能调整）。
+
+| 符号 | 覆盖 | 更多 |
+|---|---|---|
+| `LLMService` | 你实现或包装的 LLM Protocol | [Providers](../user-guide/providers.md), [源码](../../../power_loop/runtime/provider.py) |
+| `LLMRequest`, `LLMResponse`, `LLMStreamChunk`, `LLMTokenUsage` | 请求/响应/流/用量形状（用于 `llm.*` hook 和自定义 service） | [Providers](../user-guide/providers.md) |
+| `OpenAICompatibleChatConfig`, `AnthropicChatConfig` | 各 transport 的配置 dataclass | [Providers](../user-guide/providers.md) |
+| `create_llm_service_from_env`, `create_llm_service_from_config`, `LLMProviderConfig` | 从 env/config 构造 `LLMService` | [配置](../user-guide/configuration.md) |
+
+## 错误码
+
+每个异常都继承 `PowerLoopError` 并带稳定、机器可读的 `code`（点分串）。按 `exc.code` 分支
+而非类身份 —— 重构友好。
+
+| 异常 | `code` |
+|---|---|
+| `PowerLoopError`（基类） | `power_loop.error` |
+| `SessionNotFoundError` | `session.not_found` |
+| `SessionPendingError` | `session.pending` |
+| `LLMTimeout` | `llm.timeout` |
+| `LLMRetryExhausted` | `llm.retry_exhausted` |
+| `CancellationRequested` | `cancelled` |
+| `CompactionFailed` | `compaction.failed` |
+| `ToolNotFound` | `tool.not_found` |
+| `ToolValidationError` | `tool.invalid_args` |
+| `SpecValidationError` | `spec.invalid` |

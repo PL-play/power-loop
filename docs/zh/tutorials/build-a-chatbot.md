@@ -9,7 +9,7 @@
 ## 1. 环境
 
 ```bash
-pip install power-loop python-dotenv
+pip install 'power-loop[openai]' python-dotenv
 ```
 
 配置 `.env`：

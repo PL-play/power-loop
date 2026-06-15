@@ -2,6 +2,29 @@
 
 [中文](../zh/migration.md) | [Back to docs](../README.md)
 
+## 0.13.x → 0.14.0
+
+1. **`llm_client` is vendored.** It now lives at `power_loop._vendor.llm_client` and the
+   bare top-level `llm_client` package is gone. Replace any direct import:
+   ```python
+   # before — no longer importable
+   from llm_client.interface import LLMRequest, LLMResponse, LLMService
+   # after — use the top-level re-exports
+   from power_loop import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage, \
+       OpenAICompatibleChatConfig, AnthropicChatConfig
+   ```
+   The concrete service classes are internal — build a service with the public factories
+   `create_llm_service_from_env()` / `create_llm_service_from_config(LLMProviderConfig(...))`.
+2. **Transports are extras.** The core trims to `certifi`; install a transport extra:
+   `pip install 'power-loop[openai]'` (or `[anthropic]` / `[all]`; also `[skills]` / `[pdf]`).
+   Constructing a provider without its SDK raises an `ImportError` with a `pip install` hint.
+3. **`requirements.txt` was deleted** — `pyproject.toml` is the single source of truth. Pin via
+   `power-loop[openai]==0.14.0`.
+4. **`py.typed` is shipped** (PEP 561) — downstream mypy/pyright now see power-loop's types.
+5. New surfaces you may want to adopt: per-call LLM events (`LLM_CALL_STARTED` / `LLM_CALL_COMPLETED`),
+   the now-real `AGENT_ERROR` channel, the `ts`+`seq` event envelope, and stable `exc.code` error
+   codes — see [Events](user-guide/events.md) and the API reference.
+
 ## 0.2.x → 0.3.0
 
 power-loop v0.3.0 makes session creation explicit. `send()` no longer creates a session on the first call.
@@ -89,7 +112,8 @@ except SessionPendingError:
 
 ### 4. Use LLMProviderConfig
 
-**Before**:
+**Before** (legacy external `llm_client` — removed; vendored as `power_loop._vendor.llm_client`
+since 0.14.0, see the [0.13.x → 0.14.0](#013x--0140) section above):
 ```python
 from llm_client.interface import OpenAICompatibleChatConfig
 from llm_client.llm_factory import OpenAICompatibleChatLLMService

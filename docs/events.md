@@ -42,6 +42,8 @@ Event 是 power-loop 的**旁路观测**通道。订阅者**只读**——event 
 | `round_index` | 触发时所在的轮次（部分事件） |
 | `stream_id` | 流式事件的流 id（同一回合可能并行多个） |
 | `source` | 事件来源标签，常用于子代理冒泡：`"subagent:<sid>"` |
+| `ts` | 事件创建时刻（epoch 秒），默认时自动填充 |
+| `seq` | 进程级单调递增序号，对所有 bus/session/子代理全序排序（H4.2）；不参与相等性比较 |
 
 ```python
 def on_delta(event: AgentEvent) -> None:
@@ -250,6 +252,34 @@ Payload — `TodoUpdatedPayload`：
 
 **典型订阅者**：UI 任务清单面板。
 
+### 2.6b 每次 LLM 调用生命周期（per-call）
+
+> **0.14.0 起可用（H4.1）。** 每个 LLM 调用 attempt 发一对事件，可按 `call_id` 配对，
+> 拿到**单次调用**的延迟与用量（区别于 `usage_updated` 的累计值）——重试逐次可见。
+
+#### `llm_call_started`
+
+每个 LLM 调用 attempt 开始时触发（在重试/流式之前）。Payload — `LlmCallStartedPayload`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `call_id` | `str` | `r<round>.a<attempt>`，与 `llm_call_completed` 配对 |
+| `round_index` | `int` | |
+| `attempt` | `int` | 从 1 起的 attempt 序号 |
+| `model` | `str` | 本次调用的模型（per-loop override 或服务默认） |
+
+#### `llm_call_completed`
+
+每个 attempt 结束时触发（成功**或**失败）。Payload — `LlmCallCompletedPayload`：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `call_id` / `round_index` / `attempt` / `model` | | 同上，与 started 配对 |
+| `duration_ms` | `float` | `perf_counter` 测得的本次调用墙钟耗时 |
+| `success` | `bool` | 成功 / 失败 |
+| `error_type` | `str` | 失败时的异常类名 |
+| `prompt_tokens` / `completion_tokens` / `total_tokens` | `int \| None` | **本次调用**的用量（非累计） |
+
 ### 2.7 LLM retry / cancel lifecycle
 
 > 当 `AgentLoopConfig.retry_policy` 启用时触发。**M1.1 起可用。**
@@ -341,9 +371,13 @@ Payload — `AgentErrorPayload`：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `error` | `str` | |
-| `error_type` | `str` | |
-| `details` | `str` | |
+| `error` | `str` | `str(exc)` |
+| `error_type` | `str` | 异常类名 |
+| `details` | `str` | 可选的额外上下文 |
+
+> **何时触发（0.14.0 起真实发射）**：当未预期异常逃逸出 `run()`（抛错的 hook / sink /
+> prepare_round / store I/O 等）时，由 `_emit_error_terminal` 发一次 `agent_error`，随后补发
+> 终止性 `session_ended(reason="error")`（H1.5；此前为「文档存在但从不触发」的死通道）。
 
 #### `system_log`
 

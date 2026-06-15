@@ -36,6 +36,23 @@ Yes. Set `POWER_LOOP_BASE_URL=http://localhost:11434/v1` and `POWER_LOOP_API_KEY
 config = AgentLoopConfig(compactor=None)
 ```
 
+### How do I tell errors apart programmatically?
+
+Every exception inherits from `PowerLoopError` and carries a stable, machine-readable `code`
+(a dotted string). Branch on `exc.code`, not the class:
+
+```python
+from power_loop import PowerLoopError
+try:
+    await loop.send("hi", session_id=sid)
+except PowerLoopError as exc:
+    if exc.code == "llm.timeout": ...
+    elif exc.code == "session.pending": ...   # resume / abort_pending / heal_pending
+```
+
+Common codes: `llm.timeout`, `llm.retry_exhausted`, `session.pending`, `session.not_found`,
+`tool.not_found`, `tool.invalid_args`, `spec.invalid`. See the [API reference](api/index.md#error-codes).
+
 ## Sessions
 
 ### How do I share a session between processes?

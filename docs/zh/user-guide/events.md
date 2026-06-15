@@ -34,13 +34,14 @@ loop = StatefulAgentLoop(llm=llm, event_bus=bus, config=config)
 | 轮次 | 3 | `round_started`, `round_completed`, `round_tools_present` |
 | 流式 | 4 | `stream_started`, `stream_delta`, `stream_think_delta`, `stream_completed` |
 | 工具 | 3 | `tool_call_started`, `tool_call_completed`, `tool_call_failed` |
-| 状态/用量 | 2 | `status_changed`（3 种子类型）, `usage_updated` |
+| 状态/用量 | 3 | `status_changed`（4 种子类型）, `usage_updated`, `timer_fired` |
 | 子代理 | 4 | `subagent_task_start`, `subagent_text`, `subagent_limit`, `subagent_completed` |
+| 每次LLM调用 | 2 | `llm_call_started`, `llm_call_completed`（按 `call_id` 配对，含本次调用延迟/用量；0.14.0） |
 | 重试/取消 | 3 | `llm_retry_attempted`, `llm_degraded`, `loop_cancelled` |
 | 记忆 | 2 | `memory_recalled`, `memory_failed` |
-| 其他 | 3 | `todo_updated`, `user_notification`, `agent_error`, `system_log` |
+| 其他 | 4 | `todo_updated`, `user_notification`, `agent_error`（异常逃逸 `run()` 时真实发射，随后补发 `session_ended(reason="error")`）, `system_log` |
 
-**共 24 种事件**，每种带类型化 payload。
+**共 30 种事件**，每种带类型化 payload。
 
 ## 常见模式
 

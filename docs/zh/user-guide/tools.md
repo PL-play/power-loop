@@ -160,7 +160,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir="/srv/tenant-a")):
 |---|---|
 | `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill`, `request_user_input` |
 | `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill`, `request_user_input` |
-| `full` | `core` 加上 `todo`, `background_run`, `check_background` |
+| `full` | `core` 加上 `todo`、`note_add`/`note_update`/`note_delete`、`schedule_wakeup`/`list_wakeups`/`cancel_wakeup`、`current_time`、`recall_compacted`、`background_run`、`check_background` |
 
 推荐系统提示词：
 
@@ -178,7 +178,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir="/srv/tenant-a")):
 | `apply_patch` | 对单个文件应用 unified diff 风格 hunk。 | 需要先读文件。过期或歧义 hunk 会被拒绝，不会猜测位置。 |
 | `glob` | 用 glob 模式查找路径。 | 裸文件名会递归搜索。默认跳过常见大目录。隐藏路径需要 `include_hidden=true` 或显式隐藏模式。 |
 | `grep` | 用正则或字面量搜索文本内容。 | 优先使用 ripgrep，缺失时回退 Python 实现。限制结果数，跳过疑似二进制文件和常见大目录。 |
-| `bash` | 运行测试、构建、包管理器和 git 命令。 | 在工作区根目录的持久 bash 会话中运行。超时会重启 shell，避免残留命令。明显的特权/设备级危险命令会被拦截。 |
+| `bash` | 运行测试、构建、包管理器和 git 命令。 | 在工作区根目录的持久 bash 会话中运行。超时会重启 shell，避免残留命令。特权/设备级命令（`sudo`、`dd`、`mkfs` 等）以及对 根/家目录/系统目录 的递归 `rm -rf` 会被拦截；`/tmp` 与相对路径允许。 |
 | `background_run` / `check_background` | 运行并查看非交互式长命令。 | 使用私有后台任务表，并复用 `bash` 的基础危险命令检查。 |
 | `todo` | 维护 Agent 可见任务列表。 | 同一时间只允许一个条目为 `in_progress`。 |
 | `load_skill` | 加载指定 skill 的详细说明。 | 未知 skill 会返回错误和可用 skill 名称。 |

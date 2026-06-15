@@ -103,9 +103,11 @@ export POWER_LOOP_MODEL=llama3.1
 
 ## Migrating from the old per-vendor config
 
-Before (each caller hand-rolled this):
+Before — pre-power-loop, **no longer importable** (the `llm_client` package is now
+vendored at `power_loop._vendor.llm_client`; the concrete service classes are internal):
 
 ```python
+# legacy — kept only to show what you're migrating FROM
 from llm_client.interface import OpenAICompatibleChatConfig
 from llm_client.llm_factory import OpenAICompatibleChatLLMService
 
@@ -117,12 +119,17 @@ llm = OpenAICompatibleChatLLMService(OpenAICompatibleChatConfig(
 ))
 ```
 
-After:
+After — build the service via the public factory; the `provider` field routes to the
+right transport (`anthropic` → Anthropic Messages API, anything else → OpenAI-compatible
+chat completions). Don't import the concrete service classes directly:
 
 ```python
 from power_loop import create_llm_service_from_env
 
 llm = create_llm_service_from_env()
+# explicit-config form:
+# from power_loop import LLMProviderConfig, create_llm_service_from_config
+# llm = create_llm_service_from_config(LLMProviderConfig(base_url=..., api_key=..., model=...))
 ```
 
 The legacy `OPENAI_COMPAT_*` env names still resolve through the

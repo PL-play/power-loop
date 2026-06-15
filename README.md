@@ -26,13 +26,13 @@ That's the whole setup. The conversation is already durable, resumable, and tool
 
 Most "agent frameworks" ask you to build your app *inside* them. power-loop is the opposite: a **library** you embed. You keep your HTTP layer, your auth, your queues, your RAG, your UI, your deploy. It just runs the agent loop — well, and durably.
 
-- 🪶 **Featherweight.** No `pydantic`, no LangChain, no graph DSL to learn. The runtime is a handful of files; the public surface is essentially one class. Deps are just your LLM client + stdlib.
+- 🪶 **Featherweight.** No `pydantic`, no LangChain, no graph DSL to learn. The runtime is a handful of files; the public surface is essentially one class. The SDK-free core depends only on `certifi` + stdlib — the OpenAI/Anthropic transport is pulled in only via the extra you install.
 - 💾 **Zero infrastructure.** Sessions, timers, sub-agent trees, workflow journals, the shared blackboard — all in **one SQLite file**. Copy the file, you've copied the state. Scale by sharding files across processes.
 - 🔌 **Provider-agnostic.** Any OpenAI-compatible endpoint or the native Anthropic Messages API, selected by env vars. Swap models per sub-agent or per workflow step.
 - ⏱️ **Durable by default.** Crash mid-run and `resume()`. Agents schedule their own wake-ups with **durable timers** that survive restarts. Workflows **replay completed steps and re-run only the unfinished tail** after a process death.
 - 🧩 **Composable from one loop to a fleet.** Start with `send()`. Add tools. Spawn sub-agents. Fan out a deterministic **workflow** (`sequence` / `parallel` / `foreach` / `branch`). Run each leaf in its **own process and DB** behind a sandbox. Same primitives all the way up.
 - 🛡️ **Isolation seams where it counts.** Tool-level sandboxing via a `ShellBackend` (drop in gVisor/Docker for `bash`); process-level sandboxing via a `WorkerLauncher` (wrap a whole sub-agent worker per leaf). power-loop stays sandbox-agnostic; you choose the policy.
-- 🔬 **Built to be observed.** Typed events for every stream chunk, tool call, round, and usage update. Per-run + per-session token accounting. Hard per-run token budgets. One-line JSON event logging.
+- 🔬 **Built to be observed.** Typed events for every stream chunk, tool call, round, and **individual LLM call** (`LLM_CALL_STARTED`/`LLM_CALL_COMPLETED` carry `call_id`/`attempt`/`duration_ms`/per-call usage), plus a real `AGENT_ERROR` channel on crash. Every event is `ts`+`seq` stamped and totally ordered. Per-run + per-session token accounting. Hard per-run token budgets. One-line JSON event logging (with secret-name redaction by default).
 - ✅ **Real-LLM tested.** A dedicated `tests/real/` suite runs the library — workflows, resume, sandboxed subprocess agents, structured output, compaction — against a live model, not just mocks.
 
 ---
@@ -79,6 +79,8 @@ Python 3.10+. See [Getting Started](docs/en/getting-started.md).
 | **Structured output** | `output_schema` → provider `response_format` → parsed & validated | [Structured](docs/en/user-guide/structured-output.md) |
 | **Token budgets & usage** | Per-run cap (`budget_exceeded`), per-run + per-session accounting | below |
 | **Pluggable memory** | Cross-session recall via a `MemoryProvider` Protocol | [Memory](docs/en/user-guide/memory.md) |
+| **Recall compacted detail** | `recall_compacted` tool pulls back exact turns compaction folded out | [Compaction](docs/en/user-guide/compaction.md) |
+| **Stable error codes** | Every `PowerLoopError` carries a machine-readable `code` (`llm.timeout`, `session.pending`, `tool.not_found`, …); branch on `exc.code` | below |
 | **Crash recovery** | `heal_pending` / `resume` / `abort_pending` for runs killed mid tool-call | below |
 
 ---
@@ -174,7 +176,7 @@ res = await loop.send("…", session_id=sid, heal_pending=True)
 # or recover explicitly: loop.resume(sid) / loop.abort_pending(sid)
 ```
 
-More in [`examples/`](examples/README.md) — 27 runnable programs from `00_hello_world.py` to the full chatbot and the dynamic-workflow demo.
+More in [`examples/`](examples/README.md) — 34 runnable programs from `00_hello_world.py` to the full chatbot, dynamic workflows, and the memory/compaction/recall demos (`31`–`33`).
 
 ---
 

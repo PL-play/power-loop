@@ -63,6 +63,12 @@ with runtime_env_context(env):
     await loop.send("Run the tests with bash.", session_id=sid)
 ```
 
+> **Since 0.14.0** you don't *have* to use `bind=False`: a bound registry built with a workspace
+> still honors a `ShellBackend` injected by an outer `runtime_env_context(...)` (the bind no longer
+> resets it). You can also pass one directly:
+> `create_default_tool_registry(include=["bash"], workspace_dir=ws, shell_backend=DockerShellBackend("my-sandbox"))`.
+> `bind=False` remains the right choice when one registry is reused across many workspaces/sandboxes.
+
 See [example 28](../../../examples/28_docker_shell_backend.py) for a complete, runnable version (it proves isolation: the shell reports the container's OS and reads a bind-mounted host file). DeepTalk uses this exact seam with a per-conversation gVisor (`runsc`) container.
 
 ## WorkerLauncher — sandbox a workflow leaf process

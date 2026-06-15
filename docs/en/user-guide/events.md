@@ -4,7 +4,7 @@
 
 Events are the **read-only observation** channel. Subscribers see everything that happens — but cannot change control flow (use [Hooks](hooks.md) for that).
 
-> **Full reference**: [docs/events.md](../../events.md) — all 24 event types with typed payload fields.
+> **Full reference**: [docs/events.md](../../events.md) — all 30 event types with typed payload fields.
 
 ## Quick Example
 
@@ -40,6 +40,8 @@ class AgentEvent:
     round_index: int | None
     stream_id: str | None
     source: str | None            # "subagent:<sid>" for child agents
+    ts: float                     # epoch-seconds creation time (auto-filled)
+    seq: int                      # process-wide monotonic order (H4.2)
 ```
 
 Access payload fields with IDE autocomplete via `event.data.field_name`.
@@ -94,6 +96,16 @@ Access payload fields with IDE autocomplete via `event.data.field_name`.
 | `subagent_limit` | `sub_session_id`, `max_rounds` | Child hit round limit |
 | `subagent_completed` | Same as `subagent_text` | Child finished normally |
 
+### Per-call LLM (0.14.0)
+
+Each LLM call attempt emits a pair (paired by `call_id`), exposing per-call latency
+and usage — unlike `usage_updated`'s cumulative totals — so retries are individually visible.
+
+| Event | Payload | When |
+|---|---|---|
+| `llm_call_started` | `call_id`, `round_index`, `attempt`, `model` | Start of each LLM call attempt |
+| `llm_call_completed` | `call_id`, `duration_ms`, `success`, `error_type`, per-call `prompt_/completion_/total_tokens` | Each attempt finishes (success or error) |
+
 ### Retry / Cancel (M1.1)
 
 | Event | Payload | When |
@@ -115,7 +127,7 @@ Access payload fields with IDE autocomplete via `event.data.field_name`.
 |---|---|---|
 | `todo_updated` | `items`, `counts` | Todo list changed |
 | `user_notification` | `message` | Library wants to tell the user something |
-| `agent_error` | `error`, `error_type` | Internal error |
+| `agent_error` | `error`, `error_type` | An unexpected exception escaped `run()` (raising hook/sink/store); now actually emitted (H1.5), followed by `session_ended(reason="error")` |
 | `system_log` | `message`, `level` | Internal log message |
 
 ## Common Patterns

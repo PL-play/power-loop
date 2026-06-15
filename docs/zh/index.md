@@ -21,8 +21,8 @@ power-loop 是一个**可嵌入的 Agent 执行内核**——不是框架，不�
 - **LLM 抽象** — 单一 `LLMService` 接口，多 transport（OpenAI 兼容，Anthropic Messages API）
 - **多轮循环** — `new_session()` 创建会话；`send(user_input, session_id=sid)` 追加轮次
 - **工具调用** — JSON Schema 校验注册；sync + async 处理器
-- **Hooks** — 18 个挂载点拦截循环每个阶段
-- **事件总线** — 24 种类型化事件，覆盖观测/审计/流式
+- **Hooks** — 17 个挂载点拦截循环每个阶段
+- **事件总线** — 30 种类型化事件，覆盖观测/审计/流式
 - **声明式子代理** — `AgentSpec` → 一次性子代理，工具白名单
 - **上下文压缩** — LLM 摘要压缩，默认开启
 - **会话持久化** — SQLite 存储，跨进程恢复

@@ -167,7 +167,7 @@ Presets:
 |---|---|
 | `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill`, `request_user_input` |
 | `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill`, `request_user_input` |
-| `full` | `core` plus `todo`, `background_run`, `check_background` |
+| `full` | `core` plus `todo`, `note_add`/`note_update`/`note_delete`, `schedule_wakeup`/`list_wakeups`/`cancel_wakeup`, `current_time`, `recall_compacted`, `background_run`, `check_background` |
 
 Recommended system prompt guidance:
 
@@ -185,7 +185,7 @@ Tool behavior:
 | `apply_patch` | Apply unified-diff style hunks to one file. | Requires a prior read. Stale or ambiguous hunks are rejected instead of guessed. |
 | `glob` | Find paths by glob pattern. | Bare names search recursively. Common bulky directories are skipped. Hidden paths require `include_hidden=true` or an explicit hidden pattern. |
 | `grep` | Search text content by regex or literal string. | Uses ripgrep when available, with Python fallback. Results are capped, binary-looking files and bulky directories are skipped. |
-| `bash` | Run tests, builds, package managers, and git commands. | Runs in a persistent workspace-rooted bash session. Timeouts restart the shell to avoid leftover commands. Obvious privileged/device-level commands are blocked. |
+| `bash` | Run tests, builds, package managers, and git commands. | Runs in a persistent workspace-rooted bash session. Timeouts restart the shell to avoid leftover commands. Privileged/device-level commands (`sudo`, `dd`, `mkfs`, …) and recursive `rm -rf` of root/home/system directories are blocked; `/tmp` and relative paths are allowed. |
 | `background_run` / `check_background` | Run and inspect non-interactive long commands. | Uses a private background task table and the same basic dangerous-command checks as `bash`. |
 | `todo` | Maintain an agent-visible task list. | Only one item can be `in_progress`. |
 | `load_skill` | Load a named skill's detailed instructions. | Unknown skills return an error listing available skill names. |

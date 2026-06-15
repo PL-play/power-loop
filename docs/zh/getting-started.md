@@ -7,10 +7,14 @@
 ## 1. 安装
 
 ```bash
-pip install power-loop
-# 或开发模式
-pip install -e ../power-loop   # DeepTalk 风格多仓库
+pip install 'power-loop[openai]'      # 任意 OpenAI 兼容端点
+# 或 'power-loop[anthropic]'（原生 Anthropic Messages API），或 [all]（两者都装）
+# 开发模式：
+pip install -e '../power-loop[openai]'
 ```
+
+SDK-free 核心只依赖 `certifi`；transport 由你选择的 extra 拉入。要用原生 Anthropic Messages API，
+装 `'power-loop[anthropic]'` 并设 `POWER_LOOP_PROVIDER=anthropic`。
 
 需要 Python 3.10+。
 

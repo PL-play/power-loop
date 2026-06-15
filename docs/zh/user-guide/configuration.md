@@ -116,6 +116,26 @@ config = AgentLoopConfig(retry_policy=retry, ...)
 
 详见 [重试与取消](retry-cancel.md) 了解完整重试生命周期。
 
+## 日志卫生
+
+`import power_loop` 会给 `power_loop` 根 logger 挂一个 `logging.NullHandler`，所以在你的应用配置
+日志之前，库保持静默（所有模块 logger 都归在 `power_loop.*` 子树下）。
+
+要做结构化事件日志，挂上 JSON-lines sink —— 每个事件一行，写到 `power_loop.events` logger：
+
+```python
+from power_loop.contrib.logging_sink import attach_logging_sink
+attach_logging_sink(bus)                          # 全部事件、INFO、默认脱敏
+```
+
+它**默认对密钥名的值脱敏**（`api_key` / `authorization` / `secret` / `password` / `*_token`，
+大小写不敏感子串；故意不含裸 `token`，以免误伤 `prompt_tokens`/`completion_tokens` 计数）。可覆盖或关闭：
+
+```python
+attach_logging_sink(bus, redact_keys=("api_key", "x-internal-secret"))  # 自定义 denylist
+attach_logging_sink(bus, redact_keys=())                                 # 不脱敏
+```
+
 ## 下一步
 
 - [会话](sessions.md) — 理解会话生命周期
