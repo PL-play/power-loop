@@ -25,6 +25,10 @@ class AgentEventType(str, Enum):
     ROUND_COMPLETED = "round_completed"
     ROUND_TOOLS_PRESENT = "round_tools_present"
 
+    # LLM call lifecycle (per attempt — latency / usage / retry attribution)
+    LLM_CALL_STARTED = "llm_call_started"
+    LLM_CALL_COMPLETED = "llm_call_completed"
+
     # LLM retry / cancellation lifecycle
     LLM_RETRY_ATTEMPTED = "llm_retry_attempted"
     LLM_DEGRADED = "llm_degraded"

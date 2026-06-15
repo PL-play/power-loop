@@ -1,0 +1,115 @@
+"""H4.1: per-call LLM events (LLM_CALL_STARTED / LLM_CALL_COMPLETED).
+
+A subscriber must see one STARTED + one COMPLETED per attempt (paired by call_id),
+with per-call latency + per-call (not cumulative) token usage, so retries are
+individually visible.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+
+import pytest
+
+from power_loop import (
+    AgentEventBus,
+    AgentEventType,
+    AgentLoopConfig,
+    LLMRequest,
+    LLMResponse,
+    LLMService,
+    LLMStreamChunk,
+    LLMTokenUsage,
+    SessionStore,
+    StatefulAgentLoop,
+)
+from power_loop.runtime.retry import LLMRetryPolicy
+
+pytestmark = pytest.mark.unit
+
+
+@dataclass
+class _UsageLLM(LLMService):
+    """Returns a reply with per-call token usage; optionally fails the first N calls."""
+    fail_first: int = 0
+    _calls: int = 0
+
+    async def complete(self, request: LLMRequest, *, on_chunk_delta_text: Callable | None = None,
+                       on_chunk_think: Callable | None = None, on_stream_end: Callable | None = None) -> LLMResponse:
+        self._calls += 1
+        if self._calls <= self.fail_first:
+            raise RuntimeError("transient")
+        return LLMResponse(
+            raw_text="ok",
+            token_usage=LLMTokenUsage(prompt_tokens=11, completion_tokens=7, total_tokens=18),
+        )
+
+    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+        async def _e() -> AsyncIterator[LLMStreamChunk]:
+            if False:
+                yield LLMStreamChunk()
+        return _e()
+
+    async def close(self) -> None:
+        return None
+
+
+def _collect(bus: AgentEventBus) -> dict[AgentEventType, list]:
+    seen: dict[AgentEventType, list] = {
+        AgentEventType.LLM_CALL_STARTED: [], AgentEventType.LLM_CALL_COMPLETED: [],
+    }
+    for et in seen:
+        bus.subscribe(et, lambda e: seen[e.type].append(e.data))
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_single_call_emits_paired_started_completed_with_usage() -> None:
+    store = SessionStore.open(":memory:")
+    try:
+        bus = AgentEventBus()
+        seen = _collect(bus)
+        loop = StatefulAgentLoop(
+            llm=_UsageLLM(), store=store, event_bus=bus,
+            config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+        )
+        await loop.send("hi", session_id=loop.new_session())
+
+        started = seen[AgentEventType.LLM_CALL_STARTED]
+        completed = seen[AgentEventType.LLM_CALL_COMPLETED]
+        assert len(started) == 1 and len(completed) == 1
+        assert started[0].call_id == completed[0].call_id  # paired
+        c = completed[0]
+        assert c.success is True
+        assert c.duration_ms >= 0.0
+        assert (c.prompt_tokens, c.completion_tokens, c.total_tokens) == (11, 7, 18)  # PER-CALL usage
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_retries_are_individually_visible() -> None:
+    """Two transient failures then success → three STARTED + three COMPLETED with
+    distinct call_ids; the two failures are success=False."""
+    store = SessionStore.open(":memory:")
+    try:
+        bus = AgentEventBus()
+        seen = _collect(bus)
+        loop = StatefulAgentLoop(
+            llm=_UsageLLM(fail_first=2), store=store, event_bus=bus,
+            config=AgentLoopConfig(
+                system_prompt="S", max_rounds=1, compactor=None,
+                retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0.0, backoff_max=0.0),
+            ),
+        )
+        await loop.send("hi", session_id=loop.new_session())
+
+        completed = seen[AgentEventType.LLM_CALL_COMPLETED]
+        assert len(seen[AgentEventType.LLM_CALL_STARTED]) == 3
+        assert len(completed) == 3
+        assert len({c.call_id for c in completed}) == 3       # distinct per attempt
+        assert [c.success for c in completed] == [False, False, True]
+        assert [c.error_type for c in completed[:2]] == ["RuntimeError", "RuntimeError"]
+    finally:
+        store.close()

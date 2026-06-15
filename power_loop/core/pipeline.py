@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import threading
+import time
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
@@ -41,6 +42,8 @@ from power_loop.contracts.event_payloads import (
     BaseEventPayload,
     BudgetExceededStatusPayload,
     HitRoundLimitStatusPayload,
+    LlmCallCompletedPayload,
+    LlmCallStartedPayload,
     LlmDegradedPayload,
     LlmRetryAttemptedPayload,
     LoopCancelledPayload,
@@ -680,17 +683,57 @@ class AgentPipeline:
             response_format=self.config.response_format,  # structured output when set
         )
 
+        model_name = self.config.model or ""
+        attempt_box = [0]
+
         async def _do_call() -> LLMResponse:
             # STREAM_STARTED is emitted **per attempt** so subscribers know
             # a fresh stream is beginning; STREAM_COMPLETED only on success
             # of the attempt that returns.
+            attempt_box[0] += 1
+            attempt = attempt_box[0]
+            call_id = f"r{round_index}.a{attempt}"
             self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
                        round_index=round_index, stream_id="main")
-            return await self.llm.complete(
-                request,
-                on_chunk_delta_text=_on_delta,
-                on_chunk_think=_on_think,
+            # Per-call observability (H4.1): pair STARTED/COMPLETED by call_id so a
+            # subscriber sees per-attempt latency + per-call (not cumulative) usage,
+            # making retries individually visible.
+            self._emit(
+                AgentEventType.LLM_CALL_STARTED,
+                LlmCallStartedPayload(call_id=call_id, round_index=round_index,
+                                      attempt=attempt, model=model_name),
+                round_index=round_index, stream_id="main",
             )
+            t0 = time.perf_counter()
+            try:
+                resp = await self.llm.complete(
+                    request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
+                )
+            except BaseException as exc:
+                self._emit(
+                    AgentEventType.LLM_CALL_COMPLETED,
+                    LlmCallCompletedPayload(
+                        call_id=call_id, round_index=round_index, attempt=attempt,
+                        model=model_name, duration_ms=(time.perf_counter() - t0) * 1000.0,
+                        success=False, error_type=type(exc).__name__,
+                    ),
+                    round_index=round_index, stream_id="main",
+                )
+                raise
+            usage = getattr(resp, "token_usage", None)
+            self._emit(
+                AgentEventType.LLM_CALL_COMPLETED,
+                LlmCallCompletedPayload(
+                    call_id=call_id, round_index=round_index, attempt=attempt,
+                    model=model_name, duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    success=True,
+                    prompt_tokens=getattr(usage, "prompt_tokens", None),
+                    completion_tokens=getattr(usage, "completion_tokens", None),
+                    total_tokens=getattr(usage, "total_tokens", None),
+                ),
+                round_index=round_index, stream_id="main",
+            )
+            return resp
 
         policy = self.config.retry_policy
         # STREAM_COMPLETED in a finally so it ALWAYS pairs with the STREAM_STARTED

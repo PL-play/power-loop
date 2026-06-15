@@ -13,6 +13,11 @@
 
 ### Added
 
+- **（H4.1）每次 LLM 调用的观测事件**：`call_llm` 现在每个 attempt 发
+  `LLM_CALL_STARTED` / `LLM_CALL_COMPLETED`(按 `call_id` 配对),带 round/attempt/model、
+  `duration_ms`(perf_counter)、成功/失败 + `error_type`、以及**本次调用**的
+  token usage(区别于 `USAGE_UPDATED` 的累计值)——重试因此逐次可见。新增两个 payload
+  与枚举值,顶层 re-export。OTel 桥接的基石(配合 H4.2 的 `ts`/`seq`)。
 - **（H3.4）顶层 re-export LLM 契约**：`LLMService` / `LLMRequest` / `LLMResponse` /
   `LLMStreamChunk` / `LLMTokenUsage` / `OpenAICompatibleChatConfig` / `AnthropicChatConfig`
   现可 `from power_loop import …`(PROVISIONAL),写 `llm.*` hook 或自定义 `LLMService` 不必再

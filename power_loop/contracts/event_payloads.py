@@ -34,6 +34,38 @@ class BaseEventPayload:
 
 
 @dataclass
+class LlmCallStartedPayload(BaseEventPayload):
+    """Emitted at the start of each LLM call *attempt* (before retry/streaming).
+
+    ``call_id`` is unique per attempt within a run (``r<round>.a<attempt>``) so a
+    subscriber can pair STARTED/COMPLETED and attribute latency/usage per attempt.
+    """
+    call_id: str = ""
+    round_index: int = 0
+    attempt: int = 1
+    model: str = ""
+
+
+@dataclass
+class LlmCallCompletedPayload(BaseEventPayload):
+    """Emitted when an LLM call attempt finishes (success OR error).
+
+    ``token_usage`` here is for THIS call only — unlike ``USAGE_UPDATED`` which
+    carries the cumulative round/run totals — so retries are individually visible.
+    """
+    call_id: str = ""
+    round_index: int = 0
+    attempt: int = 1
+    model: str = ""
+    duration_ms: float = 0.0
+    success: bool = True
+    error_type: str = ""
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+
+@dataclass
 class LlmRetryAttemptedPayload(BaseEventPayload):
     """Emitted after each *failed* LLM attempt that will be retried.
 
