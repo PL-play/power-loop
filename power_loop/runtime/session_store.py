@@ -28,7 +28,7 @@ import secrets
 import sqlite3
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -328,9 +328,18 @@ class NoteRow:
     updated_at: int
 
 
-def _micro_migrate(conn: sqlite3.Connection) -> None:
-    """Additive column upgrades for stores created by older versions
-    (CREATE TABLE IF NOT EXISTS never alters an existing table)."""
+#: Current on-disk schema version, stamped into ``PRAGMA user_version``. Bump this
+#: AND append a ``(N, fn)`` step to :data:`MIGRATIONS` for ANY change to ``SCHEMA_SQL``
+#: (a new column/index/table or a backfill) so existing ``.db`` files are upgraded on
+#: open instead of silently keeping the old shape (``CREATE TABLE IF NOT EXISTS`` never
+#: alters an existing table).
+CURRENT_SCHEMA_VERSION = 1
+
+
+def _migration_0001_timers_columns(conn: sqlite3.Connection) -> None:
+    """Additive ``timers`` columns for stores created before they existed. Idempotent
+    (ALTERs only the columns still missing), so it safely upgrades a legacy
+    ``user_version=0`` DB — this folds in the old hardcoded ``_micro_migrate``."""
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(timers)")}
     for name, ddl in (
         ("interval_s", "ALTER TABLE timers ADD COLUMN interval_s INTEGER"),
@@ -339,6 +348,47 @@ def _micro_migrate(conn: sqlite3.Connection) -> None:
     ):
         if name not in cols:
             conn.execute(ddl)
+
+
+#: Ordered migration ladder: ``(target_version, fn)``. Each ``fn`` brings a DB from
+#: ``target_version - 1`` to ``target_version`` and MUST be idempotent (guard with
+#: ``PRAGMA table_info`` / ``sqlite_master`` checks) so a crashed/retried upgrade and a
+#: legacy ``user_version=0`` DB both converge. Append, never reorder or mutate shipped steps.
+MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
+    (1, _migration_0001_timers_columns),
+)
+
+
+def _apply_migrations(conn: sqlite3.Connection, *, is_fresh: bool) -> None:
+    """Bring an opened DB to :data:`CURRENT_SCHEMA_VERSION` via the ``PRAGMA
+    user_version`` ladder.
+
+    * A *fresh* DB (``SCHEMA_SQL`` just created the latest shape) is stamped directly.
+    * An *existing* DB runs every :data:`MIGRATIONS` step with ``target > user_version``,
+      in order, inside one transaction (a failing step rolls the DDL back and the version
+      is NOT advanced — the next open() retries the idempotent steps).
+    * A DB whose ``user_version`` is *newer* than this build supports is refused, rather
+      than silently operated on with a mismatched code path.
+    """
+    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if is_fresh:
+        conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+        return
+    if current > CURRENT_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"session store schema version {current} is newer than this power_loop "
+            f"build supports (max {CURRENT_SCHEMA_VERSION}); upgrade power_loop to open "
+            "this database."
+        )
+    if current >= CURRENT_SCHEMA_VERSION:
+        return  # already current — nothing to do
+    with conn:  # atomic DDL: a failing step rolls back, version stays unchanged
+        for target, fn in MIGRATIONS:
+            if target > current:
+                fn(conn)
+    # Stamp only after every step committed, so a crash before this leaves the version
+    # at `current` and the idempotent steps simply re-run on the next open().
+    conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
 
 
 def _now_ms() -> int:
@@ -449,8 +499,14 @@ class SessionStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
+        # Detect a brand-new DB BEFORE creating tables, so the migration ladder can
+        # stamp a fresh file at CURRENT_SCHEMA_VERSION (no steps to run) vs. upgrade an
+        # existing one. ":memory:" is always fresh (new connection per open()).
+        is_fresh = conn.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sessions'"
+        ).fetchone()[0] == 0
         conn.executescript(SCHEMA_SQL)
-        _micro_migrate(conn)
+        _apply_migrations(conn, is_fresh=is_fresh)
         return cls(conn, path_str, max_spawn_depth=max_spawn_depth)
 
     def close(self) -> None:

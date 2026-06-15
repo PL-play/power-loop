@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+迈向 1.0 的硬化路线图（见 `ROADMAP_1.0.md`）开始落地。
+
+### Added
+
+- **（OPS-1）SessionStore schema 版本网关 + 迁移阶梯。** 引入 `PRAGMA user_version` 门控与
+  有序、幂等、纯增量的 `MIGRATIONS` 阶梯（`CURRENT_SCHEMA_VERSION` + `_apply_migrations`）。
+  `open()` 在建表前探测是否全新库:全新库直接盖章到当前版本,既有库按 `target > user_version`
+  顺序跑迁移(单事务,失败回滚则不前进版本),**版本高于本构建的库直接拒绝打开**并给出清晰报错。
+  原先硬编码、仅针对 `timers` 的 `_micro_migrate` 收编为迁移步骤 1(对 legacy `user_version=0`
+  幂等升级)。这是后续一切 schema 变更的**前提**——没有它,既有 `.db` 在升级时会静默保持旧结构
+  (`CREATE TABLE IF NOT EXISTS` 永不改表)。回归测试见 `tests/unit/test_session_store_migrations.py`。
+
 ## [0.14.1] — 2026-06-15
 
 修复一个在 0.14.0 中发现的**高危持久化损坏**（C1 的同进程二次压缩遗漏分支）。纯 bug 修复，

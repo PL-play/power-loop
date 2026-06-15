@@ -24,7 +24,7 @@ files survive. ~9.5–10.5 days. The single storage-shape inflection.*
 
 | ID | Item | Effort | API |
 |----|------|--------|-----|
-| **OPS-1** | `PRAGMA user_version` gate + ordered additive migration ladder (`CURRENT_SCHEMA_VERSION` + `MIGRATIONS` tuple; fold the timers-only `_micro_migrate` into step 1; refuse to open a newer-than-code DB). **Prerequisite for every later schema change.** | M (1.5–2d) | additive |
+| **OPS-1** ✅ | `PRAGMA user_version` gate + ordered additive migration ladder (`CURRENT_SCHEMA_VERSION` + `MIGRATIONS` tuple; fold the timers-only `_micro_migrate` into step 1; refuse to open a newer-than-code DB). **Prerequisite for every later schema change.** *(done — `test_session_store_migrations.py`)* | M (1.5–2d) | additive |
 | **OPS-2** | Opt-in retention: `prune_compacted_messages` / age-out `usage_rounds` / delete terminal timers (caller-driven; preserves `compact_note` so `meta['ord']` ordering is intact). | M (1.5d) | additive |
 | **OPS-3** | Reclamation: `auto_vacuum=INCREMENTAL` for fresh DBs + `vacuum()` + `checkpoint(TRUNCATE)`. *(dep OPS-2)* | S–M (1d) | additive |
 | **OPS-4** | `export_session()/import_session()` — full durable state as a `schema_version`-stamped JSON + `sqlite3.backup()`. *(dep OPS-1)* | M (1.5d) | additive |
