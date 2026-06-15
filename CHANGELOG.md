@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+迈向 1.0 的硬化路线图**第三阶段:可观测性**(进行中)。
+
+### Added
+
+- **（OBS-1）事件信封序列化。** `AgentEvent.to_dict()/from_dict()` 携带 `ts`/`seq`/`mono`,
+  作为持久化与外部导出的基础;`from_dict` 对时序字段做**存在性检查**(非真值检查)——序列化的
+  `seq` 权威保留,既不重新盖章也不推进进程级 `_event_seq` 计数器。`logging_sink` 现在也输出
+  信封序号(`seq`/`ts`),日志行可排序、可与持久事件流对账(此前丢弃信封)。
+- **（OBS-6）单调时钟字段。** `AgentEvent.mono`(`perf_counter` 秒,进程相对)用于跨事件延迟/
+  span 计算,不受 NTP/墙钟回拨影响(`ts` 仍为可读可导出的墙钟时间)。
+- **（OBS-2）持久化 JSONL 事件 sink + 回放。** `attach_jsonl_sink(bus, path, …)` 把完整信封
+  (经脱敏/截断)按行写入大小轮转文件;`replay(path)` 跨轮转按 `seq` 顺序还原成 `AgentEvent`。
+  脱敏策略抽到共享的 `contrib/_redact`(logging 与 jsonl 复用)。
+
 ## [0.16.0] — 2026-06-15
 
 迈向 1.0 的硬化路线图**第二阶段:扩展性**。把"推理出的"单进程上限变成"测出来的"(自带 `bench/`

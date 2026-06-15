@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import count
@@ -100,6 +101,10 @@ class AgentEvent:
     # ordering. Excluded from equality so they never define event identity.
     ts: float = field(default=0.0, compare=False)
     seq: int = field(default=0, compare=False)
+    # OBS-6: process-relative monotonic clock (perf_counter seconds). ``ts`` is wall-clock
+    # — readable and exportable but non-monotonic under NTP/clock steps; ``mono`` is what
+    # latency/duration math and the OTel span bridge should use within a process.
+    mono: float = field(default=0.0, compare=False)
 
     def __post_init__(self) -> None:
         if self.data is not None and not self.payload:
@@ -108,3 +113,49 @@ class AgentEvent:
             self.ts = time.time()
         if not self.seq:
             self.seq = next(_event_seq)
+        if not self.mono:
+            self.mono = time.perf_counter()
+
+    # ── serialization (OBS-1) ──────────────────────────────────────────────
+
+    def to_dict(self) -> dict[str, Any]:
+        """JSON-serializable envelope incl. ts/seq/mono and the payload dict.
+
+        The basis for durable event sinks (contrib/jsonl_sink) and any external export;
+        round-trips via :meth:`from_dict`."""
+        return {
+            "type": self.type.value,
+            "session_id": self.session_id,
+            "round_index": self.round_index,
+            "stream_id": self.stream_id,
+            "source": self.source,
+            "ts": self.ts,
+            "seq": self.seq,
+            "mono": self.mono,
+            "payload": self.payload,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> AgentEvent:
+        """Reconstruct from :meth:`to_dict` output.
+
+        Envelope timing is **presence-checked, not truthiness-checked**: a serialized
+        ``ts``/``seq``/``mono`` is authoritative, so we pass it straight through (which
+        also means ``__post_init__`` does NOT re-stamp it or advance the process-wide
+        ``_event_seq`` counter). A dict missing those keys gets fresh auto-assigned
+        values, exactly like a newly-emitted event."""
+        kwargs: dict[str, Any] = {
+            "type": AgentEventType(d["type"]),
+            "payload": dict(d.get("payload") or {}),
+            "session_id": d.get("session_id"),
+            "round_index": d.get("round_index"),
+            "stream_id": d.get("stream_id"),
+            "source": d.get("source"),
+        }
+        if d.get("ts") is not None:
+            kwargs["ts"] = float(d["ts"])
+        if d.get("seq") is not None:
+            kwargs["seq"] = int(d["seq"])
+        if d.get("mono") is not None:
+            kwargs["mono"] = float(d["mono"])
+        return cls(**kwargs)
