@@ -8,14 +8,68 @@
 
 ## [Unreleased]
 
+## [2.0.0] — 2026-06-16
+
+**Pluggable storage + an async, stateless, resumable loop.** The store became a
+backend-neutral **async** facade (SQLite by default; PostgreSQL/MySQL by DSN) and the
+public API went fully async. These are breaking changes to the **STABLE** surface — hence
+the major bump. Single-file SQLite stays the zero-infrastructure default; nothing else is
+required to upgrade beyond `await`-ing the now-async calls.
+
+### Breaking (STABLE API)
+
+- **The public API is async.** `StatefulAgentLoop` session-management methods that were
+  synchronous are now coroutines and must be `await`ed: `new_session`, `close_session`,
+  `get_messages`, `get_pending`, `resolve_system_prompt`, `abort_pending`, `schedule_timer`,
+  `cancel_timer`, `list_timers`, `get_session_stats`, `list_session_stats` (plus the new
+  `prewarm`). Every `SessionStore` method is a coroutine, and `SessionStore.open(...)` is now
+  `await SessionStore.open(...)`. `send` / `follow_up` / `resume` / `submit_input` were already
+  async; the `send_sync` / `follow_up_sync` wrappers stay synchronous. STABLE symbol *names*
+  are unchanged (the SemVer name-guard still passes); the break is the sync→async signatures.
+- **Store schema changed — no on-disk migration from 1.x.** Tables now carry a configurable
+  prefix (`pl_` by default); the `session_runtime_state` / `shared_state` `key` column was
+  renamed to `state_key` (a MySQL reserved word); the SQLite `PRAGMA user_version` ladder was
+  replaced by a portable, backend-neutral `pl_schema_migrations` version table. A pre-2.0 `.db`
+  is not read by 2.0 — start fresh or `export_session` → `import_session`.
+- **Removed the read-only WAL connection pool (`read_pool_size`).** The async SQLite backend
+  offloads each statement to a worker thread under a single writer lock; PG/MySQL are natively
+  async. Scale by choosing a server backend or sharding SQLite files across processes.
+
+### Added
+
+- **Pluggable storage backends.** One store written once against a tiny async
+  `Database` / `Dialect` port, with **SQLite** (default, zero-dependency), **PostgreSQL**
+  (`power-loop[postgres]`, asyncpg) and **MySQL** (`power-loop[mysql]`, aiomysql). `open_store(dsn)`
+  and `StatefulAgentLoop(dsn=, table_prefix=, schema=)` select the backend by DSN scheme; PG/MySQL
+  are real multi-writer servers (per-session seq via `SELECT … FOR UPDATE`). A backend-agnostic
+  conformance suite runs against all three. New top-level exports: `open_store`, `SchemaPolicy`,
+  `StoreSchemaError`.
+- **`SchemaPolicy` provisioning.** `AUTO_CREATE` (default) creates tables if missing; `VERIFY`
+  only checks and raises `StoreSchemaError` — whose `.ddl` carries (and prints) the complete
+  per-backend provisioning script. `create_schema: bool` kept as a deprecated alias.
+- **Stateless, resumable loop + per-session window cache.** The loop holds no authoritative
+  session state, so a cold/fresh loop resumes any session from `dsn` + `session_id`;
+  `await loop.prewarm(session_id)` pre-loads the active window; an LRU active-window cache
+  (`session_cache_size`, default 256, `0` disables; `loop.cache_stats`) accelerates hot paths
+  as a pure, validated accelerator that never changes what the model sees.
+- New example `39_pluggable_backends_and_resume.py`; a **Storage backends** user-guide page
+  (EN + ZH) with the exact per-backend DDL.
+
+### Fixed
+
+- Window cache could serve a stale, row-missing window after an out-of-band durable append
+  (`resume` / `submit_input` / `abort_pending` / `heal_pending`, or a second loop sharing the
+  store) — fixed with a contiguity guard in the cache; covered by warm-vs-cold regression tests
+  (caught by an adversarial code-review pass).
+- Carries the post-1.0 deep-review hardening merged on `main` (sandbox/import/workflow-cluster
+  fixes + latent-finding guards) and the async `_bind_handler` runtime-env fix + restored
+  `max_spawn_depth` validation surfaced during the swap.
+
 ### Docs
 
-- Rewrote the README for the 1.0 launch (marketing-quality but honest): full 1.0 feature
-  coverage (durability/scale/observability/MCP/zero-dep), a **bilingual** `README.zh.md`,
-  a "Start here" + goal-based navigation map, an honest "How it compares" section, and a
-  stability/SemVer + honest-scope section. All README links validated.
-- Honesty fix: corrected the stale "~5k-line core" claim to the actual ~17k lines
-  (zero-dependency, pure stdlib) across README + faq + extending-tools (EN/ZH).
+- README / README.zh rewritten around **loop engineering**, pluggable storage, and
+  statelessness; the full EN/ZH user-guide + tutorials swept to the async API; a new Storage
+  backends page; an async-API + storage migration note.
 
 ## [1.0.0] — 2026-06-16
 
