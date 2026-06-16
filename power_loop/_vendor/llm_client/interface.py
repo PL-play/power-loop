@@ -50,9 +50,12 @@ class LLMRequest:
     # Structured output helpers
     parse_json: bool = False
 
-    # Reasoning switch for providers supporting `reason` flag.
-    # Default enabled as requested; set to False to disable.
-    reason: bool | None = True
+    # Reasoning switch for providers supporting a non-standard `reason` flag.
+    # Default None (opt-in): a True default injected extra_body={"reason": True} into
+    # EVERY OpenAI-compatible request, which strict servers 400 on and reasoning-capable
+    # gateways silently honor (changing output/latency/cost — even for the temperature-0
+    # compaction summarizer). Set reason=True explicitly to send it.
+    reason: bool | None = None
 
     # Tool calling (OpenAI-compatible). Keep optional to avoid forcing every impl to support it.
     tools: list[dict[str, Any]] | None = None
@@ -101,7 +104,7 @@ class LLMRequest:
             temperature: float | None = None,
             max_tokens: int | None = None,
             parse_json: bool = False,
-            reason: bool | None = True,
+            reason: bool | None = None,
             **kwargs: Any,
     ) -> "LLMRequest":
         return cls(
