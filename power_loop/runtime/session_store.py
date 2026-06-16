@@ -456,6 +456,7 @@ class SessionStore:
     ) -> None:
         self._conn = conn
         self._lock = threading.RLock()
+        self._closed = False
         self.path = path
         self.max_spawn_depth = max_spawn_depth  # validated by the property setter
         # SCALE-2: optional pool of read-only connections. The single writer (self._conn
@@ -493,13 +494,32 @@ class SessionStore:
         post-write load needs."""
         pool = self._read_pool
         if pool is not None:
-            rc = pool.get()
+            if self._closed:
+                raise RuntimeError("SessionStore is closed")
+            # A concurrent abrupt close() may drain the pool between here and now;
+            # bound the wait so we surface a CLEAR error instead of hanging forever or
+            # using a closed connection (U4). The documented quiesce-then-close path is
+            # aclose()/`async with`, which waits for in-flight sends first.
+            try:
+                rc = pool.get(timeout=10.0)
+            except queue.Empty as exc:
+                raise RuntimeError("SessionStore read pool unavailable (closed?)") from exc
             try:
                 yield rc
             finally:
-                pool.put(rc)
+                # Don't return the connection to a pool that close() has dropped — close
+                # it directly so a closed store leaks nothing.
+                if self._closed or self._read_pool is not pool:
+                    try:
+                        rc.close()
+                    except Exception:
+                        pass
+                else:
+                    pool.put(rc)
         else:
             with self._lock:
+                if self._closed:
+                    raise RuntimeError("SessionStore is closed")
                 yield self._conn
 
     @property
@@ -595,6 +615,9 @@ class SessionStore:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return  # idempotent
+            self._closed = True  # set first so a concurrent _read_cursor fails clearly
             self._conn.close()
             if self._read_pool is not None:
                 while not self._read_pool.empty():

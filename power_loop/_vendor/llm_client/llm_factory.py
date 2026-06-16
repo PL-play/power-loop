@@ -901,6 +901,17 @@ class OpenAICompatibleChatLLMService(LLMService):
                 current_request = self._build_resume_request(request, aggregated_text)
                 rendered_messages = current_request.to_messages(self._capabilities)
                 self._emit_debug_payload(method="stream-resume", messages=rendered_messages, kwargs=stream_kwargs)
+                # Reset the tool-call accumulators before re-opening the stream: a tool
+                # call only partially streamed on the interrupted attempt has truncated
+                # (invalid-JSON) arguments and would otherwise be emitted ALONGSIDE the
+                # resume attempt's call — a duplicate, and an empty-args execution of the
+                # broken one. The resume request carries only the partial assistant TEXT
+                # plus a continue instruction, which cannot validly resume a half-streamed
+                # tool-call JSON, so the resume attempt must produce a fresh, complete set.
+                # (aggregated_text is intentionally kept — it is the resume's basis.) (U3)
+                tool_call_store.clear()
+                tool_call_order.clear()
+                tool_call_index_to_key.clear()
                 continue
 
         # Final chunk carries best-effort usage + last raw event so callers can inspect finish_reason, tool_calls, etc.

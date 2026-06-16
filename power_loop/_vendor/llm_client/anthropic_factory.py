@@ -163,6 +163,10 @@ class AnthropicMessagesLLMService(LLMService):
         text = self._text_from_content(msg.get("content"))
         if text:
             blocks.append({"type": "text", "text": text})
+        # Translate / surface non-text blocks (images) rather than silently dropping
+        # them as _text_from_content does — otherwise multimodal input vanishes with no
+        # error (U2). Symmetric with the OpenAI transport's image handling.
+        blocks.extend(self._non_text_blocks(msg.get("content")))
 
         for call in self._normalize_openai_tool_calls(msg.get("tool_calls") or msg.get("function_call")):
             fn = call.get("function") or {}
@@ -187,6 +191,48 @@ class AnthropicMessagesLLMService(LLMService):
                 prev.extend(item["content"])
                 return
         messages.append(item)
+
+    def _non_text_blocks(self, content: Any) -> list[dict[str, Any]]:
+        """Translate OpenAI ``image_url`` / passthrough ``image`` blocks into Anthropic
+        image blocks; emit a VISIBLE marker for any other non-text block. Never drops a
+        non-text block silently. Text items are handled by ``_text_from_content``."""
+        if not isinstance(content, list):
+            return []
+        out: list[dict[str, Any]] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype in (None, "text"):
+                continue  # text already collected by _text_from_content
+            if itype == "image" and isinstance(item.get("source"), dict):
+                out.append({"type": "image", "source": item["source"]})  # already Anthropic shape
+                continue
+            if itype == "image_url":
+                block = self._anthropic_image_block(item.get("image_url"))
+                out.append(block if block is not None
+                           else {"type": "text", "text": "[image dropped: unsupported url]"})
+                continue
+            out.append({"type": "text", "text": f"[unsupported content block dropped: {itype}]"})
+        return out
+
+    @staticmethod
+    def _anthropic_image_block(image_url: Any) -> dict[str, Any] | None:
+        url = image_url.get("url") if isinstance(image_url, dict) else image_url
+        if not isinstance(url, str) or not url:
+            return None
+        if url.startswith("data:"):
+            # data:<media_type>;base64,<data>
+            try:
+                header, data = url.split(",", 1)
+            except ValueError:
+                return None
+            media_type = header[len("data:"):].split(";")[0] or "image/png"
+            return {"type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": data}}
+        if url.startswith(("http://", "https://")):
+            return {"type": "image", "source": {"type": "url", "url": url}}
+        return None
 
     def _text_from_content(self, content: Any) -> str:
         if content is None:

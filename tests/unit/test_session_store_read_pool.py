@@ -103,3 +103,30 @@ def test_pooled_reads_run_concurrently_with_a_held_write_lock(tmp_path: Path) ->
         t.join(timeout=5)
     finally:
         store.close()
+
+
+def test_read_after_close_raises_clear_error_pooled(tmp_path: Path) -> None:
+    """U4 guard: a read against a closed store surfaces a CLEAR error, not a raw
+    sqlite ProgrammingError or an infinite hang on a drained pool."""
+    store = SessionStore.open(str(tmp_path / "c.db"), read_pool_size=2)
+    sid = store.create_session(session_id="s")
+    _seed(store, sid, 3)
+    assert len(store.load_active_messages(sid)) == 3  # works while open
+    store.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        store.load_active_messages(sid)
+
+
+def test_read_after_close_raises_clear_error_unpooled() -> None:
+    store = SessionStore.open(":memory:")  # no pool → write-conn read path
+    sid = store.create_session(session_id="s")
+    store.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        store.load_active_messages(sid)
+
+
+def test_close_is_idempotent(tmp_path: Path) -> None:
+    store = SessionStore.open(str(tmp_path / "i.db"), read_pool_size=2)
+    store.create_session(session_id="s")
+    store.close()
+    store.close()  # must not raise
