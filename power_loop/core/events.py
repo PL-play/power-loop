@@ -167,12 +167,21 @@ class AgentEventBus:
             if item is None:  # explicit shutdown sentinel
                 return
             sub, event = item
-            result = self._invoke_handler(sub, event)
-            if asyncio.iscoroutine(result):  # a sync callable that returned a coroutine
-                try:
+            # The worker MUST outlive any single subscriber: with the default
+            # suppress_subscriber_errors=False, _invoke_handler re-raises, which —
+            # if it escaped here — would kill the worker thread and silently drop
+            # every subsequent event (queue fills with no consumer), or deadlock the
+            # publisher under on_overflow="block" (C11). Contain it per-item.
+            try:
+                result = self._invoke_handler(sub, event)
+                if asyncio.iscoroutine(result):  # a sync callable that returned a coroutine
                     asyncio.run(self._await_handler_result(result))
-                except Exception:
-                    _logger.exception("AgentEventBus: offloaded coroutine subscriber raised")
+            except Exception:
+                _logger.exception(
+                    "AgentEventBus: offloaded subscriber raised; worker continues "
+                    "(event_type=%s)",
+                    event.type,
+                )
 
     def _enqueue_sync(self, sub: _SubscribedHandler, event: AgentEvent) -> None:
         """Hand a sync subscriber to the worker thread, applying the overflow policy."""

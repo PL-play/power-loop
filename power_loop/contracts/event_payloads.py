@@ -188,6 +188,10 @@ class ToolCallCompletedPayload(BaseEventPayload):
     output: str = ""
     tool_input: dict[str, Any] = field(default_factory=dict)
     tool_call_id: str = ""
+    # The pipeline emits TOOL_CALL_COMPLETED for EVERY tool call as the terminal
+    # event (after a TOOL_CALL_FAILED when it failed), so sinks can rely on a single
+    # terminal. ``failed`` lets a sink tell the two apart without double-counting.
+    failed: bool = False
 
 
 @dataclass

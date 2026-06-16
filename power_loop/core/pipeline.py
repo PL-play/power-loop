@@ -1210,7 +1210,8 @@ class AgentPipeline:
                                round_index=round_idx)
 
                 self._emit(AgentEventType.TOOL_CALL_COMPLETED,
-                           ToolCallCompletedPayload(name=tool_name, output=output, tool_input=tool_args, tool_call_id=call_id),
+                           ToolCallCompletedPayload(name=tool_name, output=output, tool_input=tool_args,
+                                                    tool_call_id=call_id, failed=failed),
                            round_index=round_idx)
 
                 await self._append_message(
