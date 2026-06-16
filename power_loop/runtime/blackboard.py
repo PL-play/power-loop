@@ -30,6 +30,7 @@ independent and should stay isolated; a board is opt-in for collaboration.
 from __future__ import annotations
 
 import asyncio
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol, runtime_checkable
@@ -132,7 +133,12 @@ class SqliteBlackboard:
         self._store = store
         self._max_entries = int(max_entries)
         self._max_text_len = int(max_text_len)
-        self._locks: dict[str, asyncio.Lock] = {}
+        # Weak-valued so a per-run/per-conversation board_id's lock is dropped once no
+        # RMW holds it — otherwise a long-lived process driving many distinct board_ids
+        # accumulated one Lock per id forever (C24). The `async with self._lock(id)`
+        # critical section keeps a strong ref for its duration, so concurrent callers
+        # still share one lock; it is only collectible while idle.
+        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     def _lock(self, board_id: str) -> asyncio.Lock:
         lock = self._locks.get(board_id)

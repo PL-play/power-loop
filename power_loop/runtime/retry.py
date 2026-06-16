@@ -146,11 +146,26 @@ async def with_retry(
             )
 
         try:
+            if deadline is not None:
+                # Bound the in-flight call by the REMAINING wall-clock budget, not just
+                # the between-attempts deadline — otherwise a single hung call blows
+                # past total_timeout (bounded only by the transport's own timeout). (C16)
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    return await asyncio.wait_for(call(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise LLMTimeout(
+                        elapsed=time.monotonic() - start,
+                        attempts=attempt + 1,
+                        total_timeout=policy.total_timeout or 0.0,
+                    ) from exc
             return await call()
         except CancellationRequested:
             raise
         except asyncio.CancelledError:
             raise
+        except LLMTimeout:
+            raise  # terminal: our budget timeout must not be swallowed by retry_on
         except policy.retry_on as exc:
             last_error = exc
             is_last = attempt == policy.max_attempts - 1
