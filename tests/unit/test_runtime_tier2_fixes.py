@@ -78,48 +78,50 @@ def _dummy(coltype: str):
     return "x"
 
 
-def test_close_session_clears_every_session_keyed_table() -> None:
-    store = SessionStore.open(":memory:")
+async def test_close_session_clears_every_session_keyed_table() -> None:
+    store = await SessionStore.open(":memory:")
     try:
-        conn = store._conn
-        all_tables = [r[0] for r in conn.execute(
+        db = store._db
+        messages_table = f"{store.table_prefix}messages"
+        all_tables = [r["name"] for r in await db.fetchall(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
         session_tables = []
         for t in all_tables:
-            cols = conn.execute(f"PRAGMA table_info({t})").fetchall()  # noqa: S608 (schema names)
-            if any(c[1] == "session_id" for c in cols):
+            cols = await db.fetchall(f"PRAGMA table_info({t})")  # noqa: S608 (schema names)
+            if any(c["name"] == "session_id" for c in cols):
                 session_tables.append((t, cols))
         assert {t for t, _ in session_tables}  # sanity: there ARE session-keyed tables
 
-        sid = store.create_session()  # also creates a session_state row
+        sid = await store.create_session()  # also creates a session_state row
         for t, cols in session_tables:
-            have = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE session_id=?", (sid,)).fetchone()[0]  # noqa: S608
+            have = (await db.fetchone(f"SELECT COUNT(*) AS c FROM {t} WHERE session_id=?", (sid,)))["c"]  # noqa: S608
             if have:
                 continue
-            if t == "messages":
-                store.append_message(sid, role="user", content="m", round_index=0)
+            if t == messages_table:
+                await store.append_message(sid, role="user", content="m", round_index=0)
                 continue
             names, vals = ["session_id"], [sid]
-            for _cid, name, ctype, notnull, dflt, _pk in cols:
+            for c in cols:
+                name, ctype, notnull, dflt = c["name"], c["type"], c["notnull"], c["dflt_value"]
                 if name == "session_id":
                     continue
                 if notnull and dflt is None:
                     names.append(name)
                     vals.append(_dummy(ctype))
             ph = ",".join("?" * len(names))
-            with store._lock, conn:
-                conn.execute(f"INSERT INTO {t} ({','.join(names)}) VALUES ({ph})", vals)  # noqa: S608
+            async with db.transaction() as tx:
+                await tx.execute(f"INSERT INTO {t} ({','.join(names)}) VALUES ({ph})", vals)  # noqa: S608
 
         # every session-keyed table is seeded for sid
         for t, _ in session_tables:
-            n = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE session_id=?", (sid,)).fetchone()[0]  # noqa: S608
+            n = (await db.fetchone(f"SELECT COUNT(*) AS c FROM {t} WHERE session_id=?", (sid,)))["c"]  # noqa: S608
             assert n > 0, f"failed to seed {t}"
 
-        store.close_session(sid, cascade=True)
+        await store.close_session(sid, cascade=True)
 
         # close_session must have cleared EVERY session-keyed table
         for t, _ in session_tables:
-            n = conn.execute(f"SELECT COUNT(*) FROM {t} WHERE session_id=?", (sid,)).fetchone()[0]  # noqa: S608
+            n = (await db.fetchone(f"SELECT COUNT(*) AS c FROM {t} WHERE session_id=?", (sid,)))["c"]  # noqa: S608
             assert n == 0, f"close_session left rows in {t} — add it to _delete_session_tree"
     finally:
-        store.close()
+        await store.close()

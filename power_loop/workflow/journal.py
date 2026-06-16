@@ -29,7 +29,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from power_loop.runtime.session_store import SessionStore
+    from power_loop.runtime.store.store import SessionStore
 
     from .result import WorkflowResult
 
@@ -94,7 +94,7 @@ def new_journal(
     }
 
 
-def seed(
+async def seed(
     store: SessionStore,
     parent_sid: str,
     run_id: str,
@@ -103,23 +103,23 @@ def seed(
 ) -> dict[str, Any]:
     """Create the run journal and add it to the parent's run index."""
     j = new_journal(run_id, workflow, spec=spec)
-    store.set_runtime_state(parent_sid, run_key(run_id), j)
-    _append_index(store, parent_sid, run_id)
+    await store.set_runtime_state(parent_sid, run_key(run_id), j)
+    await _append_index(store, parent_sid, run_id)
     return j
 
 
-def _append_index(store: SessionStore, parent_sid: str, run_id: str) -> None:
-    idx = store.get_runtime_state(parent_sid, INDEX_KEY, default=[]) or []
+async def _append_index(store: SessionStore, parent_sid: str, run_id: str) -> None:
+    idx = await store.get_runtime_state(parent_sid, INDEX_KEY, default=[]) or []
     if run_id not in idx:
         idx.append(run_id)
-        store.set_runtime_state(parent_sid, INDEX_KEY, idx)
+        await store.set_runtime_state(parent_sid, INDEX_KEY, idx)
 
 
-def read(store: SessionStore, parent_sid: str, run_id: str) -> dict[str, Any] | None:
-    return store.get_runtime_state(parent_sid, run_key(run_id), default=None)
+async def read(store: SessionStore, parent_sid: str, run_id: str) -> dict[str, Any] | None:
+    return await store.get_runtime_state(parent_sid, run_key(run_id), default=None)
 
 
-def update(
+async def update(
     store: SessionStore,
     parent_sid: str,
     run_id: str,
@@ -135,18 +135,18 @@ def update(
     legitimately mutate a finished run pass ``allow_terminal=True``: the completion
     wake's ``woke`` flag, and resume flipping a finished run back to ``running``.
     """
-    j = store.get_runtime_state(parent_sid, run_key(run_id), default=None)
+    j = await store.get_runtime_state(parent_sid, run_key(run_id), default=None)
     if j is None:
         return None
     if _is_terminal(j.get("status")) and not allow_terminal:
         return j  # frozen — ignore the late write, first finalize wins
     j.update(fields)
     j["updated_at_ms"] = _now_ms()
-    store.set_runtime_state(parent_sid, run_key(run_id), j)
+    await store.set_runtime_state(parent_sid, run_key(run_id), j)
     return j
 
 
-def record_step(
+async def record_step(
     store: SessionStore,
     parent_sid: str,
     run_id: str,
@@ -167,7 +167,7 @@ def record_step(
     ``items_from`` / ``branch.on`` references. ``db_path`` records an
     out-of-process leaf's private db so it can be inspected after the fact.
     """
-    j = store.get_runtime_state(parent_sid, run_key(run_id), default=None)
+    j = await store.get_runtime_state(parent_sid, run_key(run_id), default=None)
     if j is None or _is_terminal(j.get("status")):
         # Gone, or already finalized: a step settling this late (an orphaned sibling
         # under on_error='halt', H1.2) must not clobber the terminal status/result
@@ -186,18 +186,18 @@ def record_step(
     # Re-read immediately before writing so the step merges onto the freshest blob
     # (preserving a status/result a concurrent finalize just wrote) and bail if the
     # run finalized in between — shrinks the un-CAS'd read-modify-write window.
-    fresh = store.get_runtime_state(parent_sid, run_key(run_id), default=None)
+    fresh = await store.get_runtime_state(parent_sid, run_key(run_id), default=None)
     if fresh is None or _is_terminal(fresh.get("status")):
         return
     steps = [s for s in fresh.get("steps", []) if s.get("node_id") != node_id]
     steps.append(step)
     fresh["steps"] = steps
     fresh["updated_at_ms"] = _now_ms()
-    store.set_runtime_state(parent_sid, run_key(run_id), fresh)
+    await store.set_runtime_state(parent_sid, run_key(run_id), fresh)
 
 
-def finalize(store: SessionStore, parent_sid: str, run_id: str, result: WorkflowResult) -> None:
-    update(
+async def finalize(store: SessionStore, parent_sid: str, run_id: str, result: WorkflowResult) -> None:
+    await update(
         store,
         parent_sid,
         run_id,
@@ -208,8 +208,8 @@ def finalize(store: SessionStore, parent_sid: str, run_id: str, result: Workflow
     )
 
 
-def fail(store: SessionStore, parent_sid: str, run_id: str, exc: BaseException) -> None:
-    update(
+async def fail(store: SessionStore, parent_sid: str, run_id: str, exc: BaseException) -> None:
+    await update(
         store,
         parent_sid,
         run_id,
@@ -219,5 +219,5 @@ def fail(store: SessionStore, parent_sid: str, run_id: str, exc: BaseException) 
     )
 
 
-def list_run_ids(store: SessionStore, parent_sid: str) -> list[str]:
-    return list(store.get_runtime_state(parent_sid, INDEX_KEY, default=[]) or [])
+async def list_run_ids(store: SessionStore, parent_sid: str) -> list[str]:
+    return list(await store.get_runtime_state(parent_sid, INDEX_KEY, default=[]) or [])

@@ -36,11 +36,11 @@ def _resolve_board() -> tuple[Blackboard, str] | None:
     return env.blackboard, env.blackboard_id
 
 
-def _author() -> str | None:
+async def _author() -> str | None:
     ctx = get_tool_runtime_context()
     if ctx.store is not None and ctx.session_id:
         try:
-            row = ctx.store.get_session(ctx.session_id)
+            row = await ctx.store.get_session(ctx.session_id)
             md = (getattr(row, "metadata", None) or {}) if row is not None else {}
             return md.get("spec_name") or md.get("name") or ctx.session_id
         except Exception:  # noqa: BLE001 — author is best-effort
@@ -77,7 +77,7 @@ def _make_post(kinds: tuple[str, ...], statuses: tuple[str, ...], default_kind: 
         if status is not None and status not in statuses:
             return f"Error: status must be one of {list(statuses)}."
         try:
-            await board.post(board_id, text=text, kind=kind, status=status, author=_author())
+            await board.post(board_id, text=text, kind=kind, status=status, author=await _author())
         except BlackboardError as exc:
             return f"Error: {exc}"
         return await _snapshot(board, board_id, header="Posted. Shared board:")

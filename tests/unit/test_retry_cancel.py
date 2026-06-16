@@ -180,7 +180,7 @@ def test_callable_raising_treated_as_not_cancelled() -> None:
 
 @pytest.mark.asyncio
 async def test_pipeline_retry_then_succeed_emits_retry_event() -> None:
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         events: list = []
         bus = AgentEventBus()
@@ -194,7 +194,7 @@ async def test_pipeline_retry_then_succeed_emits_retry_event() -> None:
             llm=llm, store=store, bus=bus,
             retry=LLMRetryPolicy(max_attempts=3, backoff_initial=0.001, backoff_max=0.001),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("hi", session_id=sid)
         assert r.status == "completed"
         assert r.final_text == "hello"
@@ -202,12 +202,12 @@ async def test_pipeline_retry_then_succeed_emits_retry_event() -> None:
         retry_events = [e for e in events if e.type == AgentEventType.LLM_RETRY_ATTEMPTED]
         assert len(retry_events) == 2
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_pipeline_retry_exhausted_degrades() -> None:
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         events: list = []
         bus = AgentEventBus()
@@ -217,18 +217,18 @@ async def test_pipeline_retry_exhausted_degrades() -> None:
             llm=llm, store=store, bus=bus, max_rounds=2,
             retry=LLMRetryPolicy(max_attempts=2, backoff_initial=0.001, backoff_max=0.001),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("hi", session_id=sid)
         assert r.status == "degraded"
         assert "degraded" in r.final_text
         assert any(e.type == AgentEventType.LLM_DEGRADED for e in events)
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_pipeline_cancel_status_and_event() -> None:
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         events: list = []
         bus = AgentEventBus()
@@ -246,14 +246,14 @@ async def test_pipeline_cancel_status_and_event() -> None:
             await asyncio.sleep(0.05)
             token.cancel("external_stop")
 
-        sid = loop.new_session()
+        sid = await loop.new_session()
         send_task = asyncio.create_task(loop.send("hi", session_id=sid, stop_event=token))
         await cancel_soon()
         result = await send_task
         assert result.status == "cancelled"
         assert any(e.type == AgentEventType.LOOP_CANCELLED for e in events)
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio

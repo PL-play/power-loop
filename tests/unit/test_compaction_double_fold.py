@@ -22,7 +22,8 @@ that the in-memory active set and order ALWAYS equal what reload reconstructs.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Generator
+import asyncio
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,15 +55,15 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
-def store() -> Generator[SessionStore, None, None]:
-    s = SessionStore.open(":memory:")
+async def store() -> AsyncIterator[SessionStore]:
+    s = await SessionStore.open(":memory:")
     yield s
-    s.close()
+    await s.close()
 
 
-def _append(sink: SQLiteSink, n: int, *, start_round: int = 0) -> None:
+async def _append(sink: SQLiteSink, n: int, *, start_round: int = 0) -> None:
     for i in range(n):
-        sink.on_message_appended(
+        await sink.on_message_appended(
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}"},
             round_index=start_round + i,
         )
@@ -73,12 +74,12 @@ def _inmem_active(sink: SQLiteSink) -> list[int]:
     return [s for s in sink._history_seqs if s is not None]
 
 
-def _db_active_seqs(store: SessionStore, sid: str) -> list[int]:
-    return [r.seq for r in store.load_active_messages(sid)]
+async def _db_active_seqs(store: SessionStore, sid: str) -> list[int]:
+    return [r.seq for r in await store.load_active_messages(sid)]
 
 
-def _fold(sink: SQLiteSink, start: int, end: int, *, summary: str, rnd: int) -> None:
-    sink.on_compaction(
+async def _fold(sink: SQLiteSink, start: int, end: int, *, summary: str, rnd: int) -> None:
+    await sink.on_compaction(
         fold_start_idx=start,
         fold_end_idx=end,
         summary_text=summary,
@@ -89,108 +90,108 @@ def _fold(sink: SQLiteSink, start: int, end: int, *, summary: str, rnd: int) -> 
     )
 
 
-def _assert_consistent(store: SessionStore, sid: str, sink: SQLiteSink) -> None:
+async def _assert_consistent(store: SessionStore, sid: str, sink: SQLiteSink) -> None:
     """The strong invariant: reload reproduces the EXACT in-memory active history
     — same membership AND same order — and no audit row is inverted."""
-    assert _inmem_active(sink) == _db_active_seqs(store, sid), (
+    assert _inmem_active(sink) == await _db_active_seqs(store, sid), (
         "in-memory active history diverged from the persisted/reloaded active set"
     )
-    for c in store.list_compactions(sid):
+    for c in await store.list_compactions(sid):
         assert c.from_seq <= c.to_seq, f"inverted audit row ({c.from_seq},{c.to_seq})"
 
 
 # ── Facet A: the corruption ──────────────────────────────────────────────────
 
 
-def test_two_folds_one_run_no_divergence(store: SessionStore) -> None:
+async def test_two_folds_one_run_no_divergence(store: SessionStore) -> None:
     """Two folds within ONE run must keep in-memory history == persisted active set
     (the regression: previously 5 in-mem vs 9 in DB)."""
-    sid = store.create_session(session_id="s")
+    sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
 
-    _append(sink, 6)
-    _fold(sink, 0, 2, summary="S1", rnd=6)
-    _assert_consistent(store, sid, sink)
+    await _append(sink, 6)
+    await _fold(sink, 0, 2, summary="S1", rnd=6)
+    await _assert_consistent(store, sid, sink)
 
-    _append(sink, 4, start_round=6)
-    _fold(sink, 0, 3, summary="S2", rnd=10)  # folds the prior note + tail head
+    await _append(sink, 4, start_round=6)
+    await _fold(sink, 0, 3, summary="S2", rnd=10)  # folds the prior note + tail head
 
-    _assert_consistent(store, sid, sink)
+    await _assert_consistent(store, sid, sink)
     # exactly one active compact_note survives (each fold merges the prior note in)
-    notes = [r for r in store.load_active_messages(sid) if r.name == "compact_note"]
+    notes = [r for r in await store.load_active_messages(sid) if r.name == "compact_note"]
     assert len(notes) == 1
 
 
-def test_three_folds_one_run_stay_consistent(store: SessionStore) -> None:
+async def test_three_folds_one_run_stay_consistent(store: SessionStore) -> None:
     """Stress the same-run regime past two folds."""
-    sid = store.create_session(session_id="s")
+    sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
     rnd = 0
     for _ in range(3):
-        _append(sink, 4, start_round=rnd)
+        await _append(sink, 4, start_round=rnd)
         rnd += 4
         # fold everything but the last message
-        _fold(sink, 0, len(sink._history_seqs) - 2, summary=f"S{rnd}", rnd=rnd)
-        _assert_consistent(store, sid, sink)
+        await _fold(sink, 0, len(sink._history_seqs) - 2, summary=f"S{rnd}", rnd=rnd)
+        await _assert_consistent(store, sid, sink)
 
 
-def test_no_inverted_audit_rows(store: SessionStore) -> None:
+async def test_no_inverted_audit_rows(store: SessionStore) -> None:
     """The compactions audit table never records from_seq > to_seq."""
-    sid = store.create_session(session_id="s")
+    sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
-    _append(sink, 6)
-    _fold(sink, 0, 2, summary="S1", rnd=6)
-    _append(sink, 4, start_round=6)
-    _fold(sink, 0, 3, summary="S2", rnd=10)
-    audit = [(c.from_seq, c.to_seq) for c in store.list_compactions(sid)]
+    await _append(sink, 6)
+    await _fold(sink, 0, 2, summary="S1", rnd=6)
+    await _append(sink, 4, start_round=6)
+    await _fold(sink, 0, 3, summary="S2", rnd=10)
+    audit = [(c.from_seq, c.to_seq) for c in await store.list_compactions(sid)]
     assert audit and all(a <= b for a, b in audit), audit
 
 
 # ── Facet B: reload ordering ─────────────────────────────────────────────────
 
 
-def test_single_fold_note_reloads_at_front(store: SessionStore) -> None:
+async def test_single_fold_note_reloads_at_front(store: SessionStore) -> None:
     """A prefix fold's note summarizes the oldest turns → it must reload FIRST,
     not sink below the kept tail (the high-identity-seq bug)."""
-    sid = store.create_session(session_id="s")
+    sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
-    _append(sink, 6)
-    _fold(sink, 0, 2, summary="S", rnd=6)
+    await _append(sink, 6)
+    await _fold(sink, 0, 2, summary="S", rnd=6)
 
-    rows = store.load_active_messages(sid)
+    rows = await store.load_active_messages(sid)
     assert rows[0].name == "compact_note", [r.name or r.role for r in rows]
-    _assert_consistent(store, sid, sink)
+    await _assert_consistent(store, sid, sink)
 
 
-def test_middle_fold_note_reloads_between_head_and_tail(store: SessionStore) -> None:
+async def test_middle_fold_note_reloads_between_head_and_tail(store: SessionStore) -> None:
     """A note that folds a MIDDLE span sorts after the kept head and before the
     kept tail on reload (logical position, not identity seq)."""
-    sid = store.create_session(session_id="s")
+    sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
-    _append(sink, 6)  # seqs 1..6
+    await _append(sink, 6)  # seqs 1..6
     # keep head [1,2], fold middle [3,4,5] (indices 2..4), keep tail [6]
-    _fold(sink, 2, 4, summary="MID", rnd=6)
+    await _fold(sink, 2, 4, summary="MID", rnd=6)
 
-    rows = store.load_active_messages(sid)
+    rows = await store.load_active_messages(sid)
     names = [r.name or r.role for r in rows]
     note_pos = names.index("compact_note")
     seqs = [r.seq for r in rows]
     assert seqs[:note_pos] == [1, 2], seqs
     assert rows[-1].seq == 6
-    _assert_consistent(store, sid, sink)
+    await _assert_consistent(store, sid, sink)
 
 
 # ── resume regime: reload then fold again ────────────────────────────────────
 
 
-def _reseed_sink(store: SessionStore, sid: str) -> SQLiteSink:
+async def _reseed_sink(store: SessionStore, sid: str) -> SQLiteSink:
     """Build a fresh sink seeded from the DB exactly as StatefulAgentLoop does."""
-    rows = store.load_active_messages(sid)
+    rows = await store.load_active_messages(sid)
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs(
         [r.seq for r in rows],
@@ -204,90 +205,90 @@ def _reseed_sink(store: SessionStore, sid: str) -> SQLiteSink:
     return sink
 
 
-def test_reload_then_fold_consistent(store: SessionStore) -> None:
+async def test_reload_then_fold_consistent(store: SessionStore) -> None:
     """Fold, simulate a process restart (reseed the sink from the DB), append more,
     fold again — the reloaded logical map must keep marking correct."""
-    sid = store.create_session(session_id="s")
+    sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
-    _append(sink, 6)
-    _fold(sink, 0, 2, summary="S1", rnd=6)
+    await _append(sink, 6)
+    await _fold(sink, 0, 2, summary="S1", rnd=6)
 
-    sink2 = _reseed_sink(store, sid)
+    sink2 = await _reseed_sink(store, sid)
     # the reseeded in-memory order must already match the DB
-    assert _inmem_active(sink2) == _db_active_seqs(store, sid)
-    _append(sink2, 3, start_round=10)
-    _fold(sink2, 0, 2, summary="S2", rnd=13)
-    _assert_consistent(store, sid, sink2)
+    assert _inmem_active(sink2) == await _db_active_seqs(store, sid)
+    await _append(sink2, 3, start_round=10)
+    await _fold(sink2, 0, 2, summary="S2", rnd=13)
+    await _assert_consistent(store, sid, sink2)
 
 
-def test_leading_note_refold_across_memory_placeholders(store: SessionStore) -> None:
+async def test_leading_note_refold_across_memory_placeholders(store: SessionStore) -> None:
     """C7 persistence path: after a fold the compact_note leads the active set; on a
     resumed run, recalled memory_* placeholders are injected AFTER it, and a SECOND
     fold (with the C7 fix) now starts at index 0 — the leading note. The note's REAL
     seq is the span's start boundary (never a None), the memory placeholders sit
     strictly inside the span and are skipped when marking, and exactly ONE active note
     survives with the in-memory map consistent with the reloaded DB."""
-    sid = store.create_session(session_id="s")
+    sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
-    _append(sink, 6)
-    _fold(sink, 0, 2, summary="S1", rnd=6)  # persisted note now leads the active set
+    await _append(sink, 6)
+    await _fold(sink, 0, 2, summary="S1", rnd=6)  # persisted note now leads the active set
 
     # simulate a restart: reseed from DB (note lands at index 0 with real seq + ord)
-    sink2 = _reseed_sink(store, sid)
-    assert store.load_active_messages(sid)[0].name == "compact_note"
+    sink2 = await _reseed_sink(store, sid)
+    assert (await store.load_active_messages(sid))[0].name == "compact_note"
     # _maybe_recall injects memory_* AFTER leading system rows → placeholders at index 1
     sink2.on_messages_inserted(index=1, count=2)
-    _append(sink2, 4, start_round=10)  # cold turns + a kept tail
+    await _append(sink2, 4, start_round=10)  # cold turns + a kept tail
 
     # fold from index 0 (the leading note) ACROSS the memory placeholders + cold turns
-    _fold(sink2, 0, len(sink2._history_seqs) - 2, summary="S2", rnd=14)
+    await _fold(sink2, 0, len(sink2._history_seqs) - 2, summary="S2", rnd=14)
 
-    _assert_consistent(store, sid, sink2)
-    notes = [r for r in store.load_active_messages(sid) if r.name == "compact_note"]
+    await _assert_consistent(store, sid, sink2)
+    notes = [r for r in await store.load_active_messages(sid) if r.name == "compact_note"]
     assert len(notes) == 1  # the old note merged in → exactly one
 
 
 # ── record_compaction: explicit fold-set marking ─────────────────────────────
 
 
-def test_fold_over_only_placeholders_keeps_maps_aligned(store: SessionStore) -> None:
+async def test_fold_over_only_placeholders_keeps_maps_aligned(store: SessionStore) -> None:
     """A fold whose span is entirely in-memory-only (recalled ``None``) placeholders
     persists nothing, but must still mirror the pipeline's in-memory fold so the
     index maps stay length-aligned — and a subsequent real fold stays consistent."""
-    sid = store.create_session(session_id="s")
+    sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
     # two recalled placeholders at the front, then two real messages
     sink.on_messages_inserted(index=0, count=2)
-    _append(sink, 2)
+    await _append(sink, 2)
     assert len(sink._history_seqs) == len(sink._history_ord) == 4
 
     # fold the two placeholders (indices 0..1) — nothing to persist
-    _fold(sink, 0, 1, summary="P", rnd=2)
+    await _fold(sink, 0, 1, summary="P", rnd=2)
     assert len(sink._history_seqs) == len(sink._history_ord)  # stayed aligned
-    assert store.list_compactions(sid) == []  # nothing persisted
-    _assert_consistent(store, sid, sink)
+    assert await store.list_compactions(sid) == []  # nothing persisted
+    await _assert_consistent(store, sid, sink)
 
     # a subsequent real fold still persists correctly (safety net not tripped)
-    _append(sink, 2, start_round=2)
+    await _append(sink, 2, start_round=2)
     real_start = next(i for i, s in enumerate(sink._history_seqs) if s is not None)
-    _fold(sink, real_start, len(sink._history_seqs) - 2, summary="R", rnd=4)
-    _assert_consistent(store, sid, sink)
-    assert store.list_compactions(sid), "the real fold should have persisted"
+    await _fold(sink, real_start, len(sink._history_seqs) - 2, summary="R", rnd=4)
+    await _assert_consistent(store, sid, sink)
+    assert await store.list_compactions(sid), "the real fold should have persisted"
 
 
-def test_record_compaction_explicit_set_marks_exactly_those(store: SessionStore) -> None:
-    sid = store.create_session(session_id="s")
-    seqs = [store.append_message(sid, role="user", content=f"m{i}") for i in range(5)]
+async def test_record_compaction_explicit_set_marks_exactly_those(store: SessionStore) -> None:
+    sid = await store.create_session(session_id="s")
+    seqs = [await store.append_message(sid, role="user", content=f"m{i}") for i in range(5)]
     # fold a NON-contiguous subset; only those become compacted_out
-    store.record_compaction(
+    await store.record_compaction(
         sid, from_seq=min(seqs[1], seqs[3]), to_seq=max(seqs[1], seqs[3]),
         note_content="n", before_tokens=1, after_tokens=1, round_index=0,
         fold_seqs=[seqs[1], seqs[3]], order_key=seqs[1],
     )
-    by_seq = {r.seq: r.state for r in store.load_all_messages(sid)}
+    by_seq = {r.seq: r.state for r in await store.load_all_messages(sid)}
     assert by_seq[seqs[1]] is MessageState.COMPACTED_OUT
     assert by_seq[seqs[3]] is MessageState.COMPACTED_OUT
     assert by_seq[seqs[0]] is MessageState.ACTIVE
@@ -295,21 +296,21 @@ def test_record_compaction_explicit_set_marks_exactly_those(store: SessionStore)
     assert by_seq[seqs[4]] is MessageState.ACTIVE
 
 
-def test_record_compaction_unordered_fold_seqs_not_inverted(store: SessionStore) -> None:
+async def test_record_compaction_unordered_fold_seqs_not_inverted(store: SessionStore) -> None:
     """Passing fold_seqs whose translated boundary would invert under BETWEEN
     (high-then-low) still marks every one and records a sane audit span."""
-    sid = store.create_session(session_id="s")
-    seqs = [store.append_message(sid, role="user", content=f"m{i}") for i in range(5)]
-    store.record_compaction(
+    sid = await store.create_session(session_id="s")
+    seqs = [await store.append_message(sid, role="user", content=f"m{i}") for i in range(5)]
+    await store.record_compaction(
         sid, from_seq=seqs[0], to_seq=seqs[3], note_content="n",
         before_tokens=1, after_tokens=1, round_index=0,
         fold_seqs=[seqs[3], seqs[0], seqs[1]],  # deliberately unordered
         order_key=seqs[0],
     )
-    compacted = {r.seq for r in store.load_all_messages(sid)
+    compacted = {r.seq for r in await store.load_all_messages(sid)
                  if r.state is MessageState.COMPACTED_OUT}
     assert compacted == {seqs[0], seqs[1], seqs[3]}
-    c = store.list_compactions(sid)[0]
+    c = (await store.list_compactions(sid))[0]
     assert c.from_seq <= c.to_seq
 
 
@@ -339,35 +340,39 @@ def _schedule(draw: Any) -> list[tuple[str, int]]:
 @given(ops=_schedule())
 @settings(max_examples=200, deadline=None)
 def test_random_schedule_keeps_reload_equal_to_inmemory(ops: list[tuple[str, int]]) -> None:
-    store = SessionStore.open(":memory:")
-    try:
-        sid = store.create_session(session_id="p")
-        sink = SQLiteSink(store, sid)
-        sink.init_history_seqs([])
-        rnd = 0
-        for kind, val in ops:
-            if kind == "append":
-                _append(sink, val, start_round=rnd)
-                rnd += val
-                continue
-            # fold: need at least 2 real messages to pick a non-trivial span
-            length = len(sink._history_seqs)
-            if length < 2:
-                continue
-            # resolve a valid [start, end] from the seed value
-            start = val % (length - 1)
-            end = start + (val % (length - start))
-            end = min(end, length - 1)
-            if end < start:
-                continue
-            _fold(sink, start, end, summary=f"S{rnd}", rnd=rnd)
-            rnd += 1
-            # INVARIANT: reload reproduces the exact in-memory active history
-            assert _inmem_active(sink) == _db_active_seqs(store, sid)
-            for c in store.list_compactions(sid):
-                assert c.from_seq <= c.to_seq
-    finally:
-        store.close()
+    # Hypothesis cannot drive an async test function, so run the async body itself.
+    async def _body(ops: list[tuple[str, int]]) -> None:
+        store = await SessionStore.open(":memory:")
+        try:
+            sid = await store.create_session(session_id="p")
+            sink = SQLiteSink(store, sid)
+            sink.init_history_seqs([])
+            rnd = 0
+            for kind, val in ops:
+                if kind == "append":
+                    await _append(sink, val, start_round=rnd)
+                    rnd += val
+                    continue
+                # fold: need at least 2 real messages to pick a non-trivial span
+                length = len(sink._history_seqs)
+                if length < 2:
+                    continue
+                # resolve a valid [start, end] from the seed value
+                start = val % (length - 1)
+                end = start + (val % (length - start))
+                end = min(end, length - 1)
+                if end < start:
+                    continue
+                await _fold(sink, start, end, summary=f"S{rnd}", rnd=rnd)
+                rnd += 1
+                # INVARIANT: reload reproduces the exact in-memory active history
+                assert _inmem_active(sink) == await _db_active_seqs(store, sid)
+                for c in await store.list_compactions(sid):
+                    assert c.from_seq <= c.to_seq
+        finally:
+            await store.close()
+
+    asyncio.run(_body(ops))
 
 
 # ── end-to-end: two compactions in ONE send through the real pipeline ────────
@@ -449,10 +454,10 @@ async def test_two_compactions_in_one_send_end_to_end(store: SessionStore, monke
     """The real bug regime, end-to-end: a multi-round send that folds twice must
     leave a coherent, correctly-ordered session that reloads and recalls cleanly."""
     monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")  # tiny → folds every round
-    sid = store.create_session(system_prompt="S")
+    sid = await store.create_session(system_prompt="S")
     for i in range(4):
-        store.append_message(sid, role="user", content="u" * 4000, round_index=i)
-        store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
+        await store.append_message(sid, role="user", content="u" * 4000, round_index=i)
+        await store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
 
     cfg = AgentLoopConfig(
         system_prompt="S", max_rounds=6, max_tokens=4000,
@@ -466,19 +471,19 @@ async def test_two_compactions_in_one_send_end_to_end(store: SessionStore, monke
     assert r.status == "completed"
 
     # more than one fold actually happened (the regime that used to corrupt)
-    assert len(store.list_compactions(sid)) >= 2, store.list_compactions(sid)
+    assert len(await store.list_compactions(sid)) >= 2, await store.list_compactions(sid)
 
     # exactly one active compact_note, and it reloads at the FRONT
-    active = store.load_active_messages(sid)
+    active = await store.load_active_messages(sid)
     notes = [m for m in active if m.name == "compact_note"]
     assert len(notes) == 1
     assert active[0].name == "compact_note", [m.name or m.role for m in active]
 
     # no inverted audit rows
-    assert all(c.from_seq <= c.to_seq for c in store.list_compactions(sid))
+    assert all(c.from_seq <= c.to_seq for c in await store.list_compactions(sid))
 
     # the folded originals are retained (recall path) and consistent
-    compacted = [m for m in store.load_all_messages(sid)
+    compacted = [m for m in await store.load_all_messages(sid)
                  if m.state is MessageState.COMPACTED_OUT]
     assert compacted, "folded originals must be retained for recall"
 
@@ -489,4 +494,4 @@ async def test_two_compactions_in_one_send_end_to_end(store: SessionStore, monke
     )
     r2 = await loop2.send("again", session_id=sid, tools=["blob"])
     assert r2.status == "completed"
-    assert store.load_active_messages(sid)[0].name == "compact_note"
+    assert (await store.load_active_messages(sid))[0].name == "compact_note"

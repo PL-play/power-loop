@@ -1,4 +1,6 @@
-"""Regression: SessionStore writers are transactional (rollback on mid-block error)."""
+"""Regression: the async SessionStore's transactions are atomic — a block that
+raises partway through rolls back every write in it (explicit BEGIN/ROLLBACK in
+the SQLite backend, serialized by the store's writer lock)."""
 from __future__ import annotations
 
 import pytest
@@ -8,70 +10,69 @@ from power_loop import SessionStore
 pytestmark = pytest.mark.unit
 
 
-def test_write_block_rolls_back_on_failure():
-    s = SessionStore.open(":memory:")
+async def test_write_block_rolls_back_on_failure():
+    s = await SessionStore.open(":memory:")
     try:
-        sid = s.create_session()
-        # Simulate a multi-write method that raises partway through its
-        # `with self._conn:` block: the partial write MUST roll back.
+        sid = await s.create_session()
+        # A multi-write transaction that raises partway through MUST roll back the
+        # partial write.
         with pytest.raises(RuntimeError):
-            with s._conn:
-                s._conn.execute(
-                    "INSERT INTO session_runtime_state(session_id,key,value_json,updated_at)"
-                    " VALUES (?,?,?,?)",
+            async with s._db.transaction() as tx:
+                await tx.execute(
+                    f"INSERT INTO {s.t.session_runtime_state}"
+                    "(session_id,key,value_json,updated_at) VALUES (?,?,?,?)",
                     (sid, "k", '"v"', 1),
                 )
-                raise RuntimeError("boom mid-method")
-        # autocommit (isolation_level=None) would have persisted the row;
-        # deferred isolation rolls it back.
-        assert s.get_runtime_state(sid, "k", default=None) is None
+                raise RuntimeError("boom mid-transaction")
+        assert await s.get_runtime_state(sid, "k", default=None) is None
     finally:
-        s.close()
+        await s.close()
 
 
-def test_write_block_commits_on_success():
-    s = SessionStore.open(":memory:")
+async def test_write_block_commits_on_success():
+    s = await SessionStore.open(":memory:")
     try:
-        sid = s.create_session()
-        with s._conn:
-            s._conn.execute(
-                "INSERT INTO session_runtime_state(session_id,key,value_json,updated_at)"
-                " VALUES (?,?,?,?)",
+        sid = await s.create_session()
+        async with s._db.transaction() as tx:
+            await tx.execute(
+                f"INSERT INTO {s.t.session_runtime_state}"
+                "(session_id,key,value_json,updated_at) VALUES (?,?,?,?)",
                 (sid, "k", '"v"', 1),
             )
-        assert s.get_runtime_state(sid, "k") == "v"
+        assert await s.get_runtime_state(sid, "k") == "v"
     finally:
-        s.close()
+        await s.close()
 
 
-def test_leading_select_then_dml_rolls_back_atomically():
+async def test_leading_select_then_dml_rolls_back_atomically():
     """The read-modify-write shape used by append_message/record_compaction etc.:
-    a leading SELECT (which under deferred isolation runs in autocommit) followed by
-    DML that then fails must still roll back the DML — the `with self._conn:` block
-    covers every write after the first DML. (H1.8.)"""
-    s = SessionStore.open(":memory:")
+    a leading SELECT followed by DML that then fails must still roll back the DML —
+    the transaction block covers every write in it."""
+    s = await SessionStore.open(":memory:")
     try:
-        sid = s.create_session()
-        s.append_message(sid, role="user", content="first")
-        before = s._conn.execute(
-            "SELECT next_seq FROM session_state WHERE session_id=?", (sid,)
-        ).fetchone()["next_seq"]
+        sid = await s.create_session()
+        await s.append_message(sid, role="user", content="first")
+        before_row = await s._db.fetchone(
+            f"SELECT next_seq FROM {s.t.session_state} WHERE session_id=?", (sid,)
+        )
+        before = before_row["next_seq"]
 
         with pytest.raises(RuntimeError):
-            with s._lock, s._conn:
-                # leading SELECT — the C7 case: begins NO transaction by itself
-                s._conn.execute(
-                    "SELECT next_seq FROM session_state WHERE session_id=?", (sid,)
-                ).fetchone()
-                # a DML opens the transaction …
-                s._conn.execute(
-                    "UPDATE session_state SET next_seq=next_seq+5 WHERE session_id=?", (sid,)
+            async with s._db.transaction() as tx:
+                # leading SELECT inside the transaction
+                await tx.fetchone(
+                    f"SELECT next_seq FROM {s.t.session_state} WHERE session_id=?", (sid,)
+                )
+                # a DML write …
+                await tx.execute(
+                    f"UPDATE {s.t.session_state} SET next_seq=next_seq+5 WHERE session_id=?",
+                    (sid,),
                 )
                 raise RuntimeError("boom after leading select + dml")
 
-        after = s._conn.execute(
-            "SELECT next_seq FROM session_state WHERE session_id=?", (sid,)
-        ).fetchone()["next_seq"]
-        assert after == before  # the UPDATE rolled back atomically
+        after_row = await s._db.fetchone(
+            f"SELECT next_seq FROM {s.t.session_state} WHERE session_id=?", (sid,)
+        )
+        assert after_row["next_seq"] == before  # the UPDATE rolled back atomically
     finally:
-        s.close()
+        await s.close()

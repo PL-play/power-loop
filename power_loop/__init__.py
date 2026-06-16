@@ -169,19 +169,6 @@ from power_loop.runtime.runtime_state import (
     default_runtime_projectors,
     get_tool_runtime_context,
 )
-from power_loop.runtime.session_store import (
-    DEFAULT_DB_PATH,
-    MAX_SPAWN_DEPTH,
-    MessageRow,
-    MessageState,
-    SessionKind,
-    SessionRow,
-    SessionStatsRow,
-    SessionStatus,
-    SessionStore,
-    SubagentLifecycle,
-    TimerRow,
-)
 from power_loop.runtime.skills import (
     LOAD_SKILL_DEFINITION,
     SkillLoader,
@@ -189,6 +176,21 @@ from power_loop.runtime.skills import (
     register_skill_tools,
 )
 from power_loop.runtime.spec import AgentSpec, AgentSpecError, run_agent_spec
+from power_loop.runtime.store.store import (
+    DEFAULT_DB_PATH,
+    MAX_SPAWN_DEPTH,
+    SessionStore,
+)
+from power_loop.runtime.store.types import (
+    MessageRow,
+    MessageState,
+    SessionKind,
+    SessionRow,
+    SessionStatsRow,
+    SessionStatus,
+    SubagentLifecycle,
+    TimerRow,
+)
 from power_loop.runtime.structured import (
     StructuredOutputError,
     StructuredOutputSpec,

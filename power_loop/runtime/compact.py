@@ -24,7 +24,7 @@ Design contract (from ROADMAP §M1.7a / README §1):
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -52,9 +52,10 @@ class CompactionContext:
     session_id: str | None = None
     memory: MemoryProvider | None = None
     round_index: int = 0
-    # Read-only accessor: (from_seq, to_seq) -> message dicts in that seq range,
-    # including already-compacted rows. None when no store is attached.
-    fetch_messages: Callable[[int, int], list[dict[str, Any]]] | None = None
+    # Read-only async accessor: (from_seq, to_seq) -> message dicts in that seq range,
+    # including already-compacted rows. None when no store is attached. Async because the
+    # store is async (the backend offloads I/O); ``await ctx.fetch_messages(a, b)``.
+    fetch_messages: Callable[[int, int], Awaitable[list[dict[str, Any]]]] | None = None
     # The pipeline's incrementally-maintained token estimate of the current history
     # (SCALE-4). When provided, a compactor can use it for its trigger check instead
     # of re-scanning every message every round (O(history) → O(1)). None ⇒ scan.

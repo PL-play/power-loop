@@ -50,7 +50,7 @@ from .spec import (
 )
 
 if TYPE_CHECKING:
-    from power_loop.runtime.session_store import SessionStore
+    from power_loop.runtime.store.store import SessionStore
 
     from .result import WorkflowRunHandle
 
@@ -98,7 +98,7 @@ def _collect(node: WorkflowNode, *, in_foreach_body: bool, out: set[str]) -> Non
         return
 
 
-def rehydrate(
+async def rehydrate(
     store: SessionStore, parent_sid: str, run_id: str
 ) -> tuple[WorkflowSpec, dict[str, AgentResult], dict[str, Any]]:
     """Load a run's journal and rebuild (spec, replay-cache, journal blob).
@@ -106,7 +106,7 @@ def rehydrate(
     Raises :class:`WorkflowRunError` if the run is unknown or predates spec
     persistence (and so cannot be resumed).
     """
-    j = journal.read(store, parent_sid, run_id)
+    j = await journal.read(store, parent_sid, run_id)
     if j is None:
         raise WorkflowRunError(f"cannot resume: no journal for run {run_id!r} under {parent_sid!r}")
     spec_dict = j.get("spec")
@@ -136,9 +136,9 @@ def rehydrate(
     return spec, replay, j
 
 
-def _mark_resuming(store: SessionStore, parent_sid: str, run_id: str, j: dict[str, Any]) -> None:
+async def _mark_resuming(store: SessionStore, parent_sid: str, run_id: str, j: dict[str, Any]) -> None:
     """Flip a finished/failed journal back to running and bump the attempt count."""
-    journal.update(
+    await journal.update(
         store, parent_sid, run_id,
         allow_terminal=True,  # an intentional terminal→running restart, not a late clobber
         status="running",
@@ -167,9 +167,9 @@ async def resume_run(
     ``executor`` / ``budget`` if the original run used one. A ``budget`` is
     pre-charged with the tokens already spent by replayed steps.
     """
-    store = loop.store
-    spec, replay, j = rehydrate(store, parent_sid, run_id)
-    _mark_resuming(store, parent_sid, run_id, j)
+    store = await loop._ensure_store()
+    spec, replay, j = await rehydrate(store, parent_sid, run_id)
+    await _mark_resuming(store, parent_sid, run_id, j)
     engine = WorkflowEngine(
         loop, executor=executor, budget=budget,
         on_step=make_on_step(store, parent_sid, run_id), replay=replay, run_id=run_id,
@@ -177,9 +177,9 @@ async def resume_run(
     try:
         result = await engine.run(spec)
     except Exception as exc:  # noqa: BLE001 — mirror detached: journal then re-raise
-        journal.fail(store, parent_sid, run_id, exc)
+        await journal.fail(store, parent_sid, run_id, exc)
         raise
-    journal.finalize(store, parent_sid, run_id, result)
+    await journal.finalize(store, parent_sid, run_id, result)
     return result
 
 
@@ -199,11 +199,11 @@ async def resume_detached(
     ``register_wake_guard``. Re-supply ``executor`` / ``budget`` if the original
     run used non-default ones.
     """
-    store = loop.store
-    if store.get_session(parent_sid) is None:
+    store = await loop._ensure_store()
+    if await store.get_session(parent_sid) is None:
         raise WorkflowRunError("parent session not found; cannot resume detached run")
-    spec, replay, j = rehydrate(store, parent_sid, run_id)
-    _mark_resuming(store, parent_sid, run_id, j)
+    spec, replay, j = await rehydrate(store, parent_sid, run_id)
+    await _mark_resuming(store, parent_sid, run_id, j)
     cancel_token = CancellationToken()
 
     def _build_engine() -> WorkflowEngine:

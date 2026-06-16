@@ -32,7 +32,8 @@ from power_loop.contracts.event_payloads import (
 )
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.runtime.cancellation import CancellationLike
-from power_loop.runtime.session_store import MAX_SPAWN_DEPTH, SubagentLifecycle
+from power_loop.runtime.store.store import MAX_SPAWN_DEPTH
+from power_loop.runtime.store.types import SubagentLifecycle
 from power_loop.tools.registry import ToolRegistry
 
 # Lifecycle events published from run_agent_spec carry this source so sinks can
@@ -206,9 +207,10 @@ async def run_agent_spec(
     # Pre-check depth so we don't even create the session row if it'll bounce.
     # The effective ceiling lives on the store (configurable); fall back to the
     # module default for any custom store that predates the attribute.
-    max_depth = getattr(parent_loop.store, "max_spawn_depth", MAX_SPAWN_DEPTH)
+    store = await parent_loop._ensure_store()
+    max_depth = getattr(store, "max_spawn_depth", MAX_SPAWN_DEPTH)
     if parent_sid is not None:
-        parent_row = parent_loop.store.get_session(parent_sid)
+        parent_row = await store.get_session(parent_sid)
         if parent_row is not None and parent_row.spawn_depth + 1 > max_depth:
             return {
                 "session_id": None,
@@ -239,7 +241,7 @@ async def run_agent_spec(
         response_format=response_format,
     )
 
-    child_sid = parent_loop.store.create_session(
+    child_sid = await store.create_session(
         system_prompt=spec.system_prompt,
         config={
             "spec_name": spec.name,
@@ -254,7 +256,7 @@ async def run_agent_spec(
         metadata=dict(spec.metadata),
     )
 
-    child_row = parent_loop.store.get_session(child_sid)
+    child_row = await store.get_session(child_sid)
     depth = child_row.spawn_depth if child_row is not None else 1
     _publish_subagent_event(
         parent_loop, parent_sid, AgentEventType.SUBAGENT_TASK_START,
@@ -273,7 +275,7 @@ async def run_agent_spec(
 
     child_loop = StatefulAgentLoop(
         llm=parent_loop.llm,
-        store=parent_loop.store,
+        store=store,
         config=child_config,
         tool_registry=sub_registry,
         hooks=parent_loop._runner.hooks,
@@ -309,7 +311,7 @@ async def run_agent_spec(
     # Lifecycle cleanup.
     if spec.lifecycle == SubagentLifecycle.EPHEMERAL.value:
         if result.status == "completed":
-            parent_loop.store.close_session(child_sid, cascade=True)
+            await store.close_session(child_sid, cascade=True)
             returned_sid: str | None = None
         else:
             # Preserve for debugging.

@@ -154,24 +154,24 @@ class SqliteBlackboard:
             raise BlackboardError("board_id is required")
         return f"{STORE_KEY_PREFIX}{board_id}"
 
-    def _load_doc(self, board_id: str) -> dict[str, Any]:
-        # Stored in the SessionStore's sqlite `shared_state` table, owned by the
+    async def _load_doc(self, board_id: str) -> dict[str, Any]:
+        # Stored in the SessionStore's `shared_state` table, owned by the
         # board id (NOT a session — boards outlive any one agent session).
-        doc = self._store.get_shared_state(self._owner(board_id), self._DOC_KEY, default=None)
+        doc = await self._store.get_shared_state(self._owner(board_id), self._DOC_KEY, default=None)
         if not isinstance(doc, dict) or not isinstance(doc.get("entries"), list):
             return {"version": 1, "next_id": 1, "entries": []}
         doc.setdefault("version", 1)
         doc.setdefault("next_id", 1)
         return doc
 
-    def _save_doc(self, board_id: str, doc: dict[str, Any]) -> None:
-        self._store.set_shared_state(self._owner(board_id), self._DOC_KEY, doc)
+    async def _save_doc(self, board_id: str, doc: dict[str, Any]) -> None:
+        await self._store.set_shared_state(self._owner(board_id), self._DOC_KEY, doc)
 
     def _clean(self, text: str) -> str:
         return (text or "").strip()[: self._max_text_len]
 
     async def read(self, board_id: str) -> list[BlackboardEntry]:
-        doc = self._load_doc(board_id)
+        doc = await self._load_doc(board_id)
         return [BlackboardEntry.from_dict(e) for e in doc.get("entries", [])]
 
     async def post(
@@ -182,7 +182,7 @@ class SqliteBlackboard:
         if not body:
             raise BlackboardError("text is required")
         async with self._lock(board_id):
-            doc = self._load_doc(board_id)
+            doc = await self._load_doc(board_id)
             if len(doc["entries"]) >= self._max_entries:
                 raise BlackboardError(
                     f"board is full ({self._max_entries} entries); remove stale entries first"
@@ -195,7 +195,7 @@ class SqliteBlackboard:
                 created_at=now, updated_at=now,
             )
             doc["entries"].append(entry.to_dict())
-            self._save_doc(board_id, doc)
+            await self._save_doc(board_id, doc)
             return entry
 
     async def update(
@@ -204,7 +204,7 @@ class SqliteBlackboard:
         if text is None and status is None:
             raise BlackboardError("nothing to update: provide text and/or status")
         async with self._lock(board_id):
-            doc = self._load_doc(board_id)
+            doc = await self._load_doc(board_id)
             for e in doc["entries"]:
                 if int(e.get("id", -1)) == entry_id:
                     if text is not None:
@@ -215,16 +215,16 @@ class SqliteBlackboard:
                     if status is not None:
                         e["status"] = status
                     e["updated_at"] = _now_iso()
-                    self._save_doc(board_id, doc)
+                    await self._save_doc(board_id, doc)
                     return BlackboardEntry.from_dict(e)
             raise BlackboardError(f"no board entry with id #{entry_id}")
 
     async def remove(self, board_id: str, entry_id: int) -> bool:
         async with self._lock(board_id):
-            doc = self._load_doc(board_id)
+            doc = await self._load_doc(board_id)
             before = len(doc["entries"])
             doc["entries"] = [e for e in doc["entries"] if int(e.get("id", -1)) != entry_id]
             if len(doc["entries"]) == before:
                 raise BlackboardError(f"no board entry with id #{entry_id}")
-            self._save_doc(board_id, doc)
+            await self._save_doc(board_id, doc)
             return True

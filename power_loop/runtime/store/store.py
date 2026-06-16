@@ -42,6 +42,22 @@ from power_loop.runtime.store.types import (
 DEFAULT_TABLE_PREFIX = "pl_"
 DEFAULT_MAX_SPAWN_DEPTH = 3
 
+# Back-compat public aliases (the names the rest of power-loop and its callers
+# import). The async store is the canonical source for these now.
+MAX_SPAWN_DEPTH = DEFAULT_MAX_SPAWN_DEPTH
+DEFAULT_DB_PATH = "./power_loop_sessions.db"
+
+
+def _coerce_max_spawn_depth(value: int) -> int:
+    """Validate a spawn-depth ceiling: a positive int (≥1). Raises ValueError."""
+    try:
+        depth = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"max_spawn_depth must be an int ≥ 1, got {value!r}") from None
+    if depth < 1:
+        raise ValueError(f"max_spawn_depth must be ≥ 1, got {depth}")
+    return depth
+
 
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
@@ -124,9 +140,23 @@ class SessionStore:
         table_prefix: str = DEFAULT_TABLE_PREFIX,
     ) -> None:
         self._db = db
-        self.max_spawn_depth = int(max_spawn_depth)
+        self.max_spawn_depth = max_spawn_depth  # validated by the property setter
         self.table_prefix = table_prefix
         self.t = _Tables(table_prefix)
+
+    @property
+    def max_spawn_depth(self) -> int:
+        """Ceiling on sub-agent nesting depth for sessions created by this store.
+
+        A per-process config knob, not per-request state: set it once before the store
+        is used concurrently (it is read in ``create_session`` outside any DB lock, so
+        mutating it mid-flight is a last-writer-wins ordering question — harmless on a
+        set-once value)."""
+        return self._max_spawn_depth
+
+    @max_spawn_depth.setter
+    def max_spawn_depth(self, value: int) -> None:
+        self._max_spawn_depth = _coerce_max_spawn_depth(value)
 
     @classmethod
     async def open(
@@ -1155,4 +1185,10 @@ def _row_to_background_task(row: Row) -> BackgroundTaskRow:
     )
 
 
-__all__ = ["SessionStore", "DEFAULT_TABLE_PREFIX", "DEFAULT_MAX_SPAWN_DEPTH"]
+__all__ = [
+    "SessionStore",
+    "DEFAULT_TABLE_PREFIX",
+    "DEFAULT_MAX_SPAWN_DEPTH",
+    "MAX_SPAWN_DEPTH",
+    "DEFAULT_DB_PATH",
+]

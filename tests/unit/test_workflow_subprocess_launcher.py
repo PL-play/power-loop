@@ -40,9 +40,9 @@ class _OrchLLM(LLMService):
         return None
 
 
-def _loop() -> StatefulAgentLoop:
+async def _loop() -> StatefulAgentLoop:
     return StatefulAgentLoop(
-        llm=_OrchLLM(), store=SessionStore.open(":memory:"),
+        llm=_OrchLLM(), store=await SessionStore.open(":memory:"),
         config=AgentLoopConfig(system_prompt="o", max_rounds=2, compactor=None),
     )
 
@@ -77,7 +77,7 @@ class _RecordingLauncher:
 
 async def test_launcher_receives_per_leaf_context(tmp_path) -> None:
     rec = _RecordingLauncher()
-    res = await WorkflowEngine(_loop(), executor=_exec(tmp_path / "r", launcher=rec), run_id="ctx").run(
+    res = await WorkflowEngine(await _loop(), executor=_exec(tmp_path / "r", launcher=rec), run_id="ctx").run(
         WorkflowSpec.from_json({"name": "w", "root": {"type": "agent", "id": "leaf",
                                "spec": {"name": "leaf", "system_prompt": "p"}}}))
     assert res.results["leaf"].status == "completed"
@@ -100,7 +100,7 @@ async def test_launcher_can_decide_per_leaf_by_tools(tmp_path) -> None:
              "spec": {"name": "risky", "system_prompt": "p", "tools": ["bash"]}},
         ]},
     })
-    res = await WorkflowEngine(_loop(), executor=_exec(tmp_path / "r", launcher=rec), run_id="pl").run(spec)
+    res = await WorkflowEngine(await _loop(), executor=_exec(tmp_path / "r", launcher=rec), run_id="pl").run(spec)
     assert res.status == "completed"
     by_node = {c["node"]: c for c in rec.calls}
     assert by_node["safe"]["wrapped"] is False   # no risky tool → run bare
@@ -119,7 +119,7 @@ async def test_launcher_controls_child_env(tmp_path) -> None:
 
     # executor env sets the provider but NOT the reply; the launcher injects it.
     ex = _exec(tmp_path / "r", launcher=_EnvLauncher(), env={"POWER_LOOP_PROVIDER": "echo"})
-    res = await WorkflowEngine(_loop(), executor=ex, run_id="env").run(
+    res = await WorkflowEngine(await _loop(), executor=ex, run_id="env").run(
         WorkflowSpec.from_json({"name": "w", "root": {"type": "agent", "id": "leaf",
                                "spec": {"name": "leaf", "system_prompt": "p"}}}))
     assert res.results["leaf"].text == "from-launcher-env"
@@ -137,7 +137,7 @@ async def test_wrapped_command_still_runs(tmp_path) -> None:
 
     ex = _exec(tmp_path / "r", launcher=_EnvPrefixLauncher(),
                env={"POWER_LOOP_PROVIDER": "echo", "POWER_LOOP_ECHO_REPLY": "wrapped-ok"})
-    res = await WorkflowEngine(_loop(), executor=ex, run_id="wrap").run(
+    res = await WorkflowEngine(await _loop(), executor=ex, run_id="wrap").run(
         WorkflowSpec.from_json({"name": "w", "root": {"type": "agent", "id": "leaf",
                                "spec": {"name": "leaf", "system_prompt": "p"}}}))
     assert res.results["leaf"].text == "wrapped-ok"
@@ -152,7 +152,7 @@ async def test_launcher_failure_fails_leaf_closed(tmp_path) -> None:
         def build(self, *, base_argv, base_env, spec, db_path, workspace_dir):
             raise RuntimeError("sandbox unavailable")
 
-    res = await WorkflowEngine(_loop(), executor=_exec(tmp_path / "r", launcher=_BrokenLauncher()),
+    res = await WorkflowEngine(await _loop(), executor=_exec(tmp_path / "r", launcher=_BrokenLauncher()),
                                run_id="fc").run(
         WorkflowSpec.from_json({"name": "w", "root": {"type": "agent", "id": "leaf",
                                "spec": {"name": "leaf", "system_prompt": "p"}}}))

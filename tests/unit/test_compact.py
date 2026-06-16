@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Generator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -283,10 +283,10 @@ async def test_env_threshold_overrides_ratio(monkeypatch) -> None:
 
 
 @pytest.fixture
-def store() -> Generator[SessionStore, None, None]:
-    s = SessionStore.open(":memory:")
+async def store() -> AsyncIterator[SessionStore]:
+    s = await SessionStore.open(":memory:")
     yield s
-    s.close()
+    await s.close()
 
 
 @pytest.mark.asyncio
@@ -294,11 +294,11 @@ async def test_compaction_persists_to_store_and_marks_state(store: SessionStore,
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     """Long history forces compaction during the next send; verify the store
     has compacted_out rows + a compact_note + a compactions audit row."""
-    sid = store.create_session(system_prompt="S")
+    sid = await store.create_session(system_prompt="S")
     # Seed history: 5 user/assistant pairs of fat content + nothing pending.
     for i in range(5):
-        store.append_message(sid, role="user", content="u" * 4000, round_index=i)
-        store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
+        await store.append_message(sid, role="user", content="u" * 4000, round_index=i)
+        await store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
 
     summary = "<summary>folded earlier turns</summary>"
     final_text = "after compact"
@@ -312,14 +312,14 @@ async def test_compaction_persists_to_store_and_marks_state(store: SessionStore,
     assert r.status == "completed"
     assert r.final_text == final_text
 
-    compactions = store.list_compactions(sid)
+    compactions = await store.list_compactions(sid)
     assert len(compactions) == 1
     rec = compactions[0]
     assert rec.from_seq >= 1 and rec.to_seq > rec.from_seq
 
     # Verify the corresponding range is now compacted_out and a compact_note
     # exists between them.
-    all_rows = store.load_all_messages(sid)
+    all_rows = await store.load_all_messages(sid)
     by_seq = {row.seq: row for row in all_rows}
     for s in range(rec.from_seq, rec.to_seq + 1):
         assert by_seq[s].state is MessageState.COMPACTED_OUT
@@ -334,9 +334,9 @@ async def test_no_compactor_means_no_compaction(store: SessionStore) -> None:
     cfg = AgentLoopConfig(max_rounds=1, max_tokens=10, compactor=None)
     llm = _Scripted(responses=[LLMResponse(raw_text="ok")])
     loop = StatefulAgentLoop(llm=llm, store=store, config=cfg)
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send("hi" * 5000, session_id=sid)
-    assert store.list_compactions(r.session_id) == []
+    assert await store.list_compactions(r.session_id) == []
 
 
 @pytest.mark.asyncio
@@ -368,10 +368,10 @@ class _FakeMemory:
 async def _run_compaction(store: SessionStore, *, memory=None, hooks=None, compactor=None) -> tuple[str, list, set]:
     """Seed a fat 5-pair history, send one turn (forcing compaction), return
     (sid, all_rows, set-of-compacted_out-seqs)."""
-    sid = store.create_session(system_prompt="S")
+    sid = await store.create_session(system_prompt="S")
     for i in range(5):
-        store.append_message(sid, role="user", content="u" * 4000, round_index=i)
-        store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
+        await store.append_message(sid, role="user", content="u" * 4000, round_index=i)
+        await store.append_message(sid, role="assistant", content="a" * 4000, round_index=i)
     llm = _Scripted(responses=[
         LLMResponse(raw_text="<summary>folded earlier turns</summary>"),
         LLMResponse(raw_text="done"),
@@ -383,7 +383,7 @@ async def _run_compaction(store: SessionStore, *, memory=None, hooks=None, compa
     )
     loop = StatefulAgentLoop(llm=llm, store=store, config=cfg, hooks=hooks)
     await loop.send("kick another round", session_id=sid)
-    rows = store.load_all_messages(sid)
+    rows = await store.load_all_messages(sid)
     compacted = {r.seq for r in rows if r.state is MessageState.COMPACTED_OUT}
     return sid, rows, compacted
 
@@ -426,7 +426,7 @@ async def test_context_aware_compactor_receives_populated_context(monkeypatch) -
 
     mem = _FakeMemory(to_recall=[])
     cmp = _RecordingCompactor(keep_last_n=1)
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         sid, _, compacted = await _run_compaction(store, memory=mem, compactor=cmp)
         assert compacted, "should have compacted"
@@ -435,10 +435,10 @@ async def test_context_aware_compactor_receives_populated_context(monkeypatch) -
         assert ctx.session_id == sid
         assert ctx.memory is mem
         assert callable(ctx.fetch_messages)
-        fetched = ctx.fetch_messages(1, 10)
+        fetched = await ctx.fetch_messages(1, 10)
         assert fetched and all("role" in m and "seq" in m for m in fetched)
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -453,13 +453,13 @@ async def test_old_signature_compactor_still_works(monkeypatch) -> None:
                 fold_start_idx=1, fold_end_idx=len(messages) - 2,
                 summary_text="old-style summary", before_tokens=100, after_tokens=10)
 
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         sid, _, compacted = await _run_compaction(store, compactor=_OldStyleCompactor())
         assert compacted, "old-signature compactor should still fold rows"
-        assert store.list_compactions(sid), "and persist the compaction"
+        assert await store.list_compactions(sid), "and persist the compaction"
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -470,8 +470,8 @@ async def test_recall_does_not_shift_compacted_rows(monkeypatch) -> None:
     range was shifted by len(recalled) → the wrong rows were marked (silent
     persisted corruption)."""
     monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")  # tiny → always fires on the fat seed
-    store_a = SessionStore.open(":memory:")
-    store_b = SessionStore.open(":memory:")
+    store_a = await SessionStore.open(":memory:")
+    store_b = await SessionStore.open(":memory:")
     try:
         sid_a, _, compacted_no_mem = await _run_compaction(store_a, memory=None)
         mem = _FakeMemory(to_recall=[
@@ -484,16 +484,16 @@ async def test_recall_does_not_shift_compacted_rows(monkeypatch) -> None:
         # The exact same real rows are folded — recall shifts indices, not seqs.
         assert compacted_with_mem == compacted_no_mem
         # the recorded audit range matches too
-        assert [(c.from_seq, c.to_seq) for c in store_a.list_compactions(sid_a)] == \
-               [(c.from_seq, c.to_seq) for c in store_b.list_compactions(sid_b)]
+        assert [(c.from_seq, c.to_seq) for c in await store_a.list_compactions(sid_a)] == \
+               [(c.from_seq, c.to_seq) for c in await store_b.list_compactions(sid_b)]
         # recalled memory is NEVER persisted as a session row
         assert not any((r.name or "").startswith("memory_") for r in rows_b)
         # and the kept tail (most-recent rows) is NOT compacted out
         active = {r.seq for r in rows_b if r.state is MessageState.ACTIVE}
         assert active and active.isdisjoint(compacted_with_mem)
     finally:
-        store_a.close()
-        store_b.close()
+        await store_a.close()
+        await store_b.close()
 
 
 @pytest.mark.asyncio
@@ -505,7 +505,7 @@ async def test_compaction_skips_persistence_when_history_seqs_desync(monkeypatch
     from power_loop.contracts.hooks import HookPoint
 
     monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         hooks = AgentHooks()
 
@@ -519,8 +519,8 @@ async def test_compaction_skips_persistence_when_history_seqs_desync(monkeypatch
 
         # safety net engaged: nothing persisted as compacted, no audit row
         assert compacted == set()
-        assert store.list_compactions(sid) == []
+        assert await store.list_compactions(sid) == []
         # the original rows remain ACTIVE (a resume would be correct)
         assert all(r.state is MessageState.ACTIVE for r in rows if r.name != "compact_note")
     finally:
-        store.close()
+        await store.close()

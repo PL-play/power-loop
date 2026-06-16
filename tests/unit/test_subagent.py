@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Generator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -82,10 +82,10 @@ def _run_agent_call(call_id: str, spec: dict, user_input: str) -> LLMResponse:
 
 
 @pytest.fixture
-def store() -> Generator[SessionStore, None, None]:
-    s = SessionStore.open(":memory:")
+async def store() -> AsyncIterator[SessionStore]:
+    s = await SessionStore.open(":memory:")
     yield s
-    s.close()
+    await s.close()
 
 
 # ── AgentSpec validation ────────────────────────────────────────────────
@@ -178,13 +178,13 @@ async def test_spawn_agent_creates_child_session_and_returns_text(store: Session
         llm=parent_llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=4),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send("kick off", session_id=sid)
     assert r.status == "completed"
     assert r.final_text == "parent done"
 
     # Child session should be EPHEMERAL-deleted on success.
-    children = store.list_children(r.session_id)
+    children = await store.list_children(r.session_id)
     assert children == []
 
 
@@ -209,7 +209,7 @@ async def test_run_agent_meta_tool_uses_strict_spec(store: SessionStore) -> None
         llm=parent_llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=3),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send("go", session_id=sid)
     assert r.status == "completed"
     assert r.final_text == "parent wraps up"
@@ -227,13 +227,13 @@ async def test_run_agent_with_invalid_spec_returns_error(store: SessionStore) ->
         llm=parent_llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=2),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send("go", session_id=sid)
     # The tool returns an error string; parent loop continues; final = "parent recovered".
     assert r.final_text == "parent recovered"
 
     # No child sessions should have been created.
-    assert store.list_children(r.session_id) == []
+    assert await store.list_children(r.session_id) == []
 
 
 @pytest.mark.asyncio
@@ -250,7 +250,7 @@ async def test_subagent_parent_link_recorded_when_lifecycle_linked(store: Sessio
         config=AgentLoopConfig(max_rounds=1),
     )
     # Drive the parent once so a parent session exists in contextvars-scoped runs.
-    parent_created_sid = parent_loop.new_session()
+    parent_created_sid = await parent_loop.new_session()
     pr = await parent_loop.send("hi", session_id=parent_created_sid)
     parent_sid = pr.session_id
 
@@ -269,7 +269,7 @@ async def test_subagent_parent_link_recorded_when_lifecycle_linked(store: Sessio
 
     assert child_result["status"] == "completed"
     assert child_result["session_id"] is not None  # preserved (LINKED)
-    children = store.list_children(parent_sid)
+    children = await store.list_children(parent_sid)
     assert len(children) == 1
     assert children[0].parent_session_id == parent_sid
     assert children[0].lifecycle is SubagentLifecycle.LINKED
@@ -284,7 +284,7 @@ async def test_subagent_failure_preserves_session_even_when_ephemeral(store: Ses
     parent_loop = StatefulAgentLoop(
         llm=parent_llm, store=store, config=AgentLoopConfig(max_rounds=1),
     )
-    parent_created_sid = parent_loop.new_session()
+    parent_created_sid = await parent_loop.new_session()
     pr = await parent_loop.send("hi", session_id=parent_created_sid)
     parent_sid = pr.session_id
 
@@ -321,7 +321,7 @@ async def test_subagent_failure_preserves_session_even_when_ephemeral(store: Ses
     assert result["status"] != "completed"
     # Preserved for debugging despite EPHEMERAL lifecycle.
     assert result["session_id"] is not None
-    assert store.get_session(result["session_id"]) is not None
+    assert await store.get_session(result["session_id"]) is not None
 
 
 @pytest.mark.asyncio
@@ -329,10 +329,10 @@ async def test_spawn_depth_rejection(store: SessionStore) -> None:
     """When depth would exceed MAX_SPAWN_DEPTH, run_agent_spec returns rejected
     instead of creating a child session."""
     # Pre-create a parent chain at depth MAX_SPAWN_DEPTH so the next spawn fails.
-    sid = store.create_session()
+    sid = await store.create_session()
     cur = sid
     for _ in range(MAX_SPAWN_DEPTH):
-        cur = store.create_session(parent_session_id=cur)
+        cur = await store.create_session(parent_session_id=cur)
     deep_parent_sid = cur  # at depth = MAX_SPAWN_DEPTH
 
     parent_loop = StatefulAgentLoop(
@@ -359,7 +359,7 @@ async def test_spawn_depth_rejection(store: SessionStore) -> None:
     assert result["status"] == "rejected"
     assert result["session_id"] is None
     # No new sessions created beyond the chain we built.
-    assert store.list_children(deep_parent_sid) == []
+    assert await store.list_children(deep_parent_sid) == []
 
 
 def test_spawn_agent_outside_loop_returns_clear_error() -> None:

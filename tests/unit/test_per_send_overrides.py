@@ -3,6 +3,7 @@ ShellBackend.session_key — power-loop 0.7.0 additions."""
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,7 +13,6 @@ from power_loop import (
     AgentLoopConfig,
     LocalShellBackend,
     RuntimeEnv,
-    SessionStore,
     StatefulAgentLoop,
     ToolDefinition,
     ToolRegistry,
@@ -62,7 +62,7 @@ def _registry() -> ToolRegistry:
 def _loop(llm: _Recorder, *, system_prompt: str = "BASE") -> StatefulAgentLoop:
     return StatefulAgentLoop(
         llm=llm,
-        store=SessionStore.open(":memory:"),
+        db_path=":memory:",
         tool_registry=_registry(),
         config=AgentLoopConfig(system_prompt=system_prompt, max_rounds=1, compactor=None),
     )
@@ -82,7 +82,7 @@ def test_subset_keeps_only_named_tools():
 async def test_send_tools_allowlist_limits_what_model_sees():
     llm = _Recorder()
     loop = _loop(llm)
-    sid = loop.new_session()
+    sid = await loop.new_session()
     await loop.send("hi", sid, tools=["alpha"])
     assert llm.seen_tools[-1] == ["alpha"]
 
@@ -90,7 +90,7 @@ async def test_send_tools_allowlist_limits_what_model_sees():
 async def test_send_without_override_sees_all_tools():
     llm = _Recorder()
     loop = _loop(llm)
-    sid = loop.new_session()
+    sid = await loop.new_session()
     await loop.send("hi", sid)
     assert sorted(llm.seen_tools[-1]) == ["alpha", "beta", "gamma"]
 
@@ -98,7 +98,7 @@ async def test_send_without_override_sees_all_tools():
 async def test_send_tools_accepts_a_registry():
     llm = _Recorder()
     loop = _loop(llm)
-    sid = loop.new_session()
+    sid = await loop.new_session()
     only_beta = _registry().subset(["beta"])
     await loop.send("hi", sid, tools=only_beta)
     assert llm.seen_tools[-1] == ["beta"]
@@ -110,7 +110,7 @@ async def test_send_tools_accepts_a_registry():
 async def test_send_system_prompt_override():
     llm = _Recorder()
     loop = _loop(llm, system_prompt="BASE")
-    sid = loop.new_session()
+    sid = await loop.new_session()
     await loop.send("hi", sid, system_prompt="OVERRIDE-PROMPT")
     assert llm.seen_system[-1] is not None
     assert "OVERRIDE-PROMPT" in llm.seen_system[-1]
@@ -120,7 +120,7 @@ async def test_send_system_prompt_override():
 async def test_send_default_uses_config_prompt():
     llm = _Recorder()
     loop = _loop(llm, system_prompt="BASE-PROMPT")
-    sid = loop.new_session()
+    sid = await loop.new_session()
     await loop.send("hi", sid)
     assert "BASE-PROMPT" in (llm.seen_system[-1] or "")
 
@@ -128,7 +128,7 @@ async def test_send_default_uses_config_prompt():
 def test_send_sync_forwards_per_call_overrides():
     llm = _Recorder()
     loop = _loop(llm, system_prompt="BASE")
-    sid = loop.new_session()
+    sid = asyncio.run(loop.new_session())
     loop.send_sync("hi", sid, tools=["gamma"], system_prompt="SYNC-PROMPT")
     assert llm.seen_tools[-1] == ["gamma"]
     assert "SYNC-PROMPT" in (llm.seen_system[-1] or "")
@@ -137,7 +137,7 @@ def test_send_sync_forwards_per_call_overrides():
 def test_follow_up_sync_forwards_overrides_when_idle():
     llm = _Recorder()
     loop = _loop(llm, system_prompt="BASE")
-    sid = loop.new_session()
+    sid = asyncio.run(loop.new_session())
     loop.follow_up_sync("hi", sid, tools=["beta"], system_prompt="FOLLOW-UP-PROMPT")
     assert llm.seen_tools[-1] == ["beta"]
     assert "FOLLOW-UP-PROMPT" in (llm.seen_system[-1] or "")

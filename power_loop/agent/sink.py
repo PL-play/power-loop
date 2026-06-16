@@ -17,7 +17,7 @@ import logging
 from typing import Any, Protocol, runtime_checkable
 
 from power_loop.agent.types import LoopMessage
-from power_loop.runtime.session_store import SessionStore
+from power_loop.runtime.store.store import SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +30,13 @@ class MessageSink(Protocol):
     normal paths — sinks degrade gracefully and log internally if needed.
     """
 
-    def on_round_started(self, round_index: int) -> None: ...
-    def on_message_appended(self, message: LoopMessage, *, round_index: int | None) -> None: ...
-    def on_messages_inserted(self, *, index: int, count: int) -> None: ...
-    def on_assistant_tool_calls(
+    async def on_round_started(self, round_index: int) -> None: ...
+    async def on_message_appended(self, message: LoopMessage, *, round_index: int | None) -> None: ...
+    def on_messages_inserted(self, *, index: int, count: int) -> None: ...  # pure (no I/O) → sync
+    async def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None: ...
-    def on_compaction(
+    async def on_compaction(
         self,
         *,
         fold_start_idx: int,
@@ -47,7 +47,7 @@ class MessageSink(Protocol):
         round_index: int,
         expected_history_len: int | None = None,
     ) -> None: ...
-    def on_round_ended(
+    async def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None
     ) -> None: ...
 
@@ -55,13 +55,13 @@ class MessageSink(Protocol):
 class NullSink:
     """No-op sink. Used when the pipeline runs without persistence."""
 
-    def on_round_started(self, round_index: int) -> None: ...
-    def on_message_appended(self, message: LoopMessage, *, round_index: int | None) -> None: ...
+    async def on_round_started(self, round_index: int) -> None: ...
+    async def on_message_appended(self, message: LoopMessage, *, round_index: int | None) -> None: ...
     def on_messages_inserted(self, *, index: int, count: int) -> None: ...
-    def on_assistant_tool_calls(
+    async def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None: ...
-    def on_compaction(
+    async def on_compaction(
         self,
         *,
         fold_start_idx: int,
@@ -72,7 +72,7 @@ class NullSink:
         round_index: int,
         expected_history_len: int | None = None,
     ) -> None: ...
-    def on_round_ended(
+    async def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None
     ) -> None: ...
 
@@ -137,16 +137,16 @@ class SQLiteSink:
 
     # ── messages ───────────────────────────────────────────────
 
-    def on_round_started(self, round_index: int) -> None:
-        self.store.set_round_index(self.session_id, round_index)
+    async def on_round_started(self, round_index: int) -> None:
+        await self.store.set_round_index(self.session_id, round_index)
 
-    def on_message_appended(
+    async def on_message_appended(
         self, message: LoopMessage, *, round_index: int | None
     ) -> None:
         role = message.get("role")
         if role == "tool":
             tool_call_id = str(message.get("tool_call_id") or "")
-            seq = self.store.append_message(
+            seq = await self.store.append_message(
                 self.session_id,
                 role="tool",
                 content=_as_text(message.get("content")),
@@ -171,7 +171,7 @@ class SQLiteSink:
                         "tool_call_ids": sorted(self._unresolved),
                         "tool_calls": remaining_tool_calls,
                     }
-                    state = self.store.get_state(self.session_id)
+                    state = await self.store.get_state(self.session_id)
                     prior = state.pending if state is not None and state.pending else {}
                     interactions = list(prior.get("pending_interactions") or [])
                     remaining_interactions = [
@@ -180,15 +180,15 @@ class SQLiteSink:
                     ]
                     if remaining_interactions:
                         pending["pending_interactions"] = remaining_interactions
-                    self.store.set_pending(self.session_id, pending)
+                    await self.store.set_pending(self.session_id, pending)
                 else:
-                    self.store.set_pending(self.session_id, None)
+                    await self.store.set_pending(self.session_id, None)
                     self._assistant_seq = None
                     self._tool_calls = []
             return
         if role == "assistant":
             tool_calls = message.get("tool_calls")
-            seq = self.store.append_message(
+            seq = await self.store.append_message(
                 self.session_id,
                 role="assistant",
                 content=_as_text(message.get("content")),
@@ -201,7 +201,7 @@ class SQLiteSink:
                 self._assistant_seq = seq
             return
         # user / system / anything else
-        seq = self.store.append_message(
+        seq = await self.store.append_message(
             self.session_id,
             role=str(role or "user"),
             content=_as_text(message.get("content")),
@@ -213,14 +213,14 @@ class SQLiteSink:
 
     # ── pending state machine ──────────────────────────────────
 
-    def on_assistant_tool_calls(
+    async def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None:
         ids = [str(tc.get("id") or "") for tc in tool_calls if tc.get("id")]
         self._unresolved = set(ids)
         self._assistant_seq = assistant_seq
         self._tool_calls = list(tool_calls)
-        self.store.set_pending(
+        await self.store.set_pending(
             self.session_id,
             {
                 "assistant_seq": assistant_seq,
@@ -230,7 +230,7 @@ class SQLiteSink:
             },
         )
 
-    def on_compaction(
+    async def on_compaction(
         self,
         *,
         fold_start_idx: int,
@@ -308,7 +308,7 @@ class SQLiteSink:
         ord_slice = [o for o in self._history_ord[fold_start_idx : fold_end_idx + 1]
                      if o is not None]
         order_key = ord_slice[0] if ord_slice else min(fold_seqs)
-        _, note_seq = self.store.record_compaction(
+        _, note_seq = await self.store.record_compaction(
             self.session_id,
             from_seq=min(fold_seqs),
             to_seq=max(fold_seqs),
@@ -333,11 +333,11 @@ class SQLiteSink:
             + self._history_ord[fold_end_idx + 1 :]
         )
 
-    def on_round_ended(
+    async def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None
     ) -> None:
         if usage:
-            self.store.record_usage(
+            await self.store.record_usage(
                 self.session_id,
                 round_index=round_index,
                 prompt_tokens=_int_or_none(usage.get("prompt_tokens") or usage.get("input")),

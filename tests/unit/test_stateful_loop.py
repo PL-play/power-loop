@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator, Callable, Generator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -92,8 +92,8 @@ def _echo_registry() -> ToolRegistry:
 
 
 class _CustomProjector(RuntimeProjector):
-    def project(self, *, store: Any, session_id: str, round_index: int, context: Any) -> list[dict[str, Any]]:
-        state = store.get_runtime_state(session_id, "custom", default={}) or {}
+    async def project(self, *, store: Any, session_id: str, round_index: int, context: Any) -> list[dict[str, Any]]:
+        state = await store.get_runtime_state(session_id, "custom", default={}) or {}
         text = state.get("text", "")
         return [{"role": "user", "name": "custom_runtime", "content": f"<custom>{text}</custom>"}] if text else []
 
@@ -102,10 +102,10 @@ class _CustomProjector(RuntimeProjector):
 
 
 @pytest.fixture
-def store() -> Generator[SessionStore, None, None]:
-    s = SessionStore.open(":memory:")
+async def store() -> AsyncIterator[SessionStore]:
+    s = await SessionStore.open(":memory:")
     yield s
-    s.close()
+    await s.close()
 
 
 @pytest.mark.asyncio
@@ -114,14 +114,14 @@ async def test_new_session_then_send_persists_user_message(store: SessionStore) 
     loop = StatefulAgentLoop(
         llm=llm, store=store, config=AgentLoopConfig(system_prompt="S", max_rounds=2),
     )
-    sid = loop.new_session(metadata={"owner": "test"})
-    row = store.get_session(sid)
+    sid = await loop.new_session(metadata={"owner": "test"})
+    row = await store.get_session(sid)
     assert row is not None
     assert row.system_prompt == "S"
     assert row.metadata == {"owner": "test"}
 
-    custom_sid = loop.new_session(system_prompt="custom", metadata={"owner": "custom"})
-    custom_row = store.get_session(custom_sid)
+    custom_sid = await loop.new_session(system_prompt="custom", metadata={"owner": "custom"})
+    custom_row = await store.get_session(custom_sid)
     assert custom_row is not None
     assert custom_row.system_prompt == "custom"
     assert custom_row.metadata == {"owner": "custom"}
@@ -131,7 +131,7 @@ async def test_new_session_then_send_persists_user_message(store: SessionStore) 
     assert r.status == "completed"
     assert r.final_text == "hi back"
 
-    msgs = loop.get_messages(r.session_id)
+    msgs = await loop.get_messages(r.session_id)
     assert [m["role"] for m in msgs] == ["user", "assistant"]
     assert msgs[0]["content"] == "hello"
     assert msgs[1]["content"] == "hi back"
@@ -155,21 +155,21 @@ async def test_todo_runtime_state_is_injected_without_persisting_virtual_message
         tool_registry=create_default_tool_registry(include=["todo"]),
         config=AgentLoopConfig(system_prompt="Use todos.", max_rounds=3, compactor=None),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("make a todo", session_id=sid)
 
     assert result.status == "completed"
-    todo_state = store.get_runtime_state(sid, "todo")
+    todo_state = await store.get_runtime_state(sid, "todo")
     assert todo_state["items"][0]["text"] == "Implement runtime state"
     assert any("<current_todos>" in str(msg.get("content", "")) for msg in llm.calls[1])
-    persisted = loop.get_messages(sid)
+    persisted = await loop.get_messages(sid)
     assert not any("<current_todos>" in str(msg.get("content", "")) for msg in persisted)
 
 
 @pytest.mark.asyncio
 async def test_todo_runtime_state_survives_new_loop_instance(store: SessionStore) -> None:
-    sid = store.create_session(system_prompt="S")
-    store.set_runtime_state(
+    sid = await store.create_session(system_prompt="S")
+    await store.set_runtime_state(
         sid,
         "todo",
         {
@@ -178,8 +178,8 @@ async def test_todo_runtime_state_survives_new_loop_instance(store: SessionStore
             "counts": {"total": 1, "completed": 0},
         },
     )
-    store.append_message(sid, role="user", content="previous")
-    store.append_message(sid, role="assistant", content="previous answer")
+    await store.append_message(sid, role="user", content="previous")
+    await store.append_message(sid, role="assistant", content="previous answer")
     llm = _Scripted(responses=[LLMResponse(raw_text="runtime state visible")])
 
     loop = StatefulAgentLoop(
@@ -215,7 +215,7 @@ async def test_request_user_input_pauses_then_submit_resumes(store: SessionStore
         tool_registry=create_default_tool_registry(include=["request_user_input"]),
         config=AgentLoopConfig(system_prompt="Ask before continuing.", max_rounds=3, compactor=None),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
 
     result = await loop.send("needs approval", session_id=sid)
 
@@ -228,7 +228,7 @@ async def test_request_user_input_pauses_then_submit_resumes(store: SessionStore
     assert interaction["prompt"] == "Approve access?"
     assert interaction["options"][0]["id"] == "yes"
     assert interaction["metadata"] == {"scope": "contacts"}
-    assert loop.get_pending(sid)["pending_interactions"][0]["interaction_id"] == interaction["interaction_id"]
+    assert (await loop.get_pending(sid))["pending_interactions"][0]["interaction_id"] == interaction["interaction_id"]
 
     blocked = await loop.resume(sid)
     assert blocked.status == "waiting_for_input"
@@ -238,8 +238,8 @@ async def test_request_user_input_pauses_then_submit_resumes(store: SessionStore
 
     assert resumed.status == "completed"
     assert resumed.final_text == "Approved path continued."
-    assert loop.get_pending(sid) is None
-    persisted = loop.get_messages(sid)
+    assert await loop.get_pending(sid) is None
+    persisted = await loop.get_messages(sid)
     tool_messages = [msg for msg in persisted if msg["role"] == "tool"]
     assert len(tool_messages) == 1
     assert tool_messages[0]["tool_call_id"] == "tc-input"
@@ -264,7 +264,7 @@ async def test_request_user_input_survives_new_loop_instance(store: SessionStore
         tool_registry=create_default_tool_registry(include=["request_user_input"]),
         config=AgentLoopConfig(system_prompt="Ask externally.", max_rounds=2, compactor=None),
     )
-    sid = first_loop.new_session()
+    sid = await first_loop.new_session()
     waiting = await first_loop.send("pause", session_id=sid)
     interaction_id = waiting.pending_interactions[0]["interaction_id"]
 
@@ -280,7 +280,7 @@ async def test_request_user_input_survives_new_loop_instance(store: SessionStore
 
     assert resumed.status == "completed"
     assert resumed.final_text == "Second process continued."
-    assert second_loop.get_pending(sid) is None
+    assert await second_loop.get_pending(sid) is None
     assert any(
         msg.get("role") == "tool" and msg.get("content") == "hello from user"
         for msg in second_llm.calls[0]
@@ -289,10 +289,10 @@ async def test_request_user_input_survives_new_loop_instance(store: SessionStore
 
 @pytest.mark.asyncio
 async def test_background_runtime_updates_are_injected_once(store: SessionStore) -> None:
-    sid = store.create_session(system_prompt="S")
-    store.append_message(sid, role="user", content="start")
-    store.append_message(sid, role="assistant", content="started")
-    store.upsert_background_task(
+    sid = await store.create_session(system_prompt="S")
+    await store.append_message(sid, role="user", content="start")
+    await store.append_message(sid, role="assistant", content="started")
+    await store.upsert_background_task(
         sid,
         task_id="bg1",
         command="printf done",
@@ -315,8 +315,8 @@ async def test_background_runtime_updates_are_injected_once(store: SessionStore)
 
 @pytest.mark.asyncio
 async def test_custom_runtime_projector_is_configurable(store: SessionStore) -> None:
-    sid = store.create_session(system_prompt="S")
-    store.set_runtime_state(sid, "custom", {"text": "CUSTOM_RUNTIME_VISIBLE"})
+    sid = await store.create_session(system_prompt="S")
+    await store.set_runtime_state(sid, "custom", {"text": "CUSTOM_RUNTIME_VISIBLE"})
     llm = _Scripted(responses=[LLMResponse(raw_text="custom visible")])
     loop = StatefulAgentLoop(
         llm=llm,
@@ -337,9 +337,9 @@ async def test_custom_runtime_projector_is_configurable(store: SessionStore) -> 
 async def test_custom_tool_can_use_public_runtime_context(store: SessionStore) -> None:
     reg = ToolRegistry()
 
-    def write_custom_state(**kw) -> str:
+    async def write_custom_state(**kw) -> str:
         runtime = get_tool_runtime_context(required=True)
-        runtime.store.set_runtime_state(
+        await runtime.store.set_runtime_state(
             runtime.session_id,
             "custom",
             {"text": kw["text"]},
@@ -376,17 +376,17 @@ async def test_custom_tool_can_use_public_runtime_context(store: SessionStore) -
             runtime_projectors=(_CustomProjector(),),
         ),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
 
     await loop.send("write custom state", session_id=sid)
-    assert store.get_runtime_state(sid, "custom") == {"text": "PUBLIC_RUNTIME_CONTEXT"}
+    assert await store.get_runtime_state(sid, "custom") == {"text": "PUBLIC_RUNTIME_CONTEXT"}
     assert any("PUBLIC_RUNTIME_CONTEXT" in str(msg.get("content", "")) for msg in llm.calls[1])
 
 
 @pytest.mark.asyncio
 async def test_runtime_projectors_can_be_disabled(store: SessionStore) -> None:
-    sid = store.create_session(system_prompt="S")
-    store.set_runtime_state(
+    sid = await store.create_session(system_prompt="S")
+    await store.set_runtime_state(
         sid,
         "todo",
         {
@@ -436,13 +436,13 @@ async def test_configured_skills_dir_is_in_prompt_and_load_skill(tmp_path, store
             compactor=None,
         ),
     )
-    sid = loop.new_session()
-    resolved = loop.resolve_system_prompt(session_id=sid)
+    sid = await loop.new_session()
+    resolved = await loop.resolve_system_prompt(session_id=sid)
     assert "runtime-skill" in resolved
     assert str(skill_root) in resolved
 
     await loop.send("load the runtime skill", session_id=sid)
-    tool_messages = [msg for msg in loop.get_messages(sid) if msg.get("role") == "tool"]
+    tool_messages = [msg for msg in await loop.get_messages(sid) if msg.get("role") == "tool"]
     assert any("Use the runtime skill instructions." in str(msg.get("content", "")) for msg in tool_messages)
 
 
@@ -453,7 +453,7 @@ async def test_subsequent_send_reuses_history(store: SessionStore) -> None:
         LLMResponse(raw_text="r2"),
     ])
     loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=2))
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r1 = await loop.send("first", session_id=sid)
     r2 = await loop.send("second", session_id=sid)
     assert r2.session_id == r1.session_id
@@ -490,16 +490,16 @@ async def test_tool_round_persists_assistant_and_tool_messages(store: SessionSto
         config=AgentLoopConfig(system_prompt="S", max_rounds=4),
         tool_registry=_echo_registry(),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send("go", session_id=sid)
     assert r.status == "completed"
     assert r.final_text == "final answer"
 
-    roles = [m["role"] for m in loop.get_messages(r.session_id)]
+    roles = [m["role"] for m in await loop.get_messages(r.session_id)]
     assert roles == ["user", "assistant", "tool", "assistant"]
 
     # Pending must have been cleared after the tool message landed.
-    assert loop.get_pending(r.session_id) is None
+    assert await loop.get_pending(r.session_id) is None
 
 
 @pytest.mark.asyncio
@@ -511,13 +511,13 @@ async def test_pending_state_blocks_followup_send(store: SessionStore) -> None:
     without a real interrupt, but the invariant we test is the same.
     """
     loop = StatefulAgentLoop(llm=_Scripted(), store=store)
-    sid = store.create_session(system_prompt="S")
-    seq = store.append_message(
+    sid = await store.create_session(system_prompt="S")
+    seq = await store.append_message(
         sid, role="assistant",
         tool_calls=[{"id": "tc-stuck", "function": {"name": "echo", "arguments": "{}"}}],
         round_index=0,
     )
-    store.set_pending(sid, {
+    await store.set_pending(sid, {
         "assistant_seq": seq, "round_index": 0,
         "tool_call_ids": ["tc-stuck"],
         "tool_calls": [{"id": "tc-stuck", "function": {"name": "echo", "arguments": "{}"}}],
@@ -537,23 +537,23 @@ async def test_abort_pending_restores_session(store: SessionStore) -> None:
         llm=llm, store=store, tool_registry=_echo_registry(),
         config=AgentLoopConfig(max_rounds=3),
     )
-    sid = store.create_session()
-    seq = store.append_message(
+    sid = await store.create_session()
+    seq = await store.append_message(
         sid, role="assistant",
         tool_calls=[{"id": "tc-x", "function": {"name": "echo", "arguments": "{}"}}],
         round_index=0,
     )
-    store.set_pending(sid, {
+    await store.set_pending(sid, {
         "assistant_seq": seq, "round_index": 0,
         "tool_call_ids": ["tc-x"],
         "tool_calls": [{"id": "tc-x", "function": {"name": "echo", "arguments": "{}"}}],
     })
 
-    aborted = loop.abort_pending(sid, reason="user_cancelled")
+    aborted = await loop.abort_pending(sid, reason="user_cancelled")
     assert aborted == 1
-    assert loop.get_pending(sid) is None
+    assert await loop.get_pending(sid) is None
 
-    msgs = loop.get_messages(sid)
+    msgs = await loop.get_messages(sid)
     tool_msg = next(m for m in msgs if m["role"] == "tool")
     assert "<aborted: user_cancelled>" in tool_msg["content"]
 
@@ -570,14 +570,14 @@ async def test_resume_executes_pending_tools(store: SessionStore) -> None:
         llm=llm, store=store, tool_registry=_echo_registry(),
         config=AgentLoopConfig(max_rounds=3),
     )
-    sid = store.create_session()
-    store.append_message(sid, role="user", content="kick off")
-    asst_seq = store.append_message(
+    sid = await store.create_session()
+    await store.append_message(sid, role="user", content="kick off")
+    asst_seq = await store.append_message(
         sid, role="assistant",
         tool_calls=[{"id": "tc-y", "function": {"name": "echo", "arguments": "{\"text\":\"resumed\"}"}}],
         round_index=0,
     )
-    store.set_pending(sid, {
+    await store.set_pending(sid, {
         "assistant_seq": asst_seq, "round_index": 0,
         "tool_call_ids": ["tc-y"],
         "tool_calls": [{"id": "tc-y", "function": {"name": "echo", "arguments": "{\"text\":\"resumed\"}"}}],
@@ -587,23 +587,23 @@ async def test_resume_executes_pending_tools(store: SessionStore) -> None:
     assert r.status == "completed"
     assert r.final_text == "after resume"
 
-    msgs = loop.get_messages(sid)
+    msgs = await loop.get_messages(sid)
     tool_msg = next(m for m in msgs if m["role"] == "tool")
     assert tool_msg["content"] == "resumed"
-    assert loop.get_pending(sid) is None
+    assert await loop.get_pending(sid) is None
 
 
 @pytest.mark.asyncio
 async def test_close_session_wipes_data(store: SessionStore) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text="x")])
     loop = StatefulAgentLoop(llm=llm, store=store)
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send("hi", session_id=sid)
-    assert loop.get_messages(r.session_id)
+    assert await loop.get_messages(r.session_id)
 
-    deleted = loop.close_session(r.session_id)
+    deleted = await loop.close_session(r.session_id)
     assert deleted == 1
-    assert store.get_session(r.session_id) is None
+    assert await store.get_session(r.session_id) is None
 
 
 @pytest.mark.asyncio
@@ -615,9 +615,9 @@ async def test_pending_set_then_cleared_during_normal_tool_round(store: SessionS
 
     reg = ToolRegistry()
 
-    def _spy(**kw):
+    async def _spy(**kw):
         # Snapshot pending while the tool is executing.
-        seen_pending.append(store.get_state(sid_box["sid"]).pending)
+        seen_pending.append((await store.get_state(sid_box["sid"])).pending)
         return "ok"
 
     reg.register(
@@ -633,12 +633,12 @@ async def test_pending_set_then_cleared_during_normal_tool_round(store: SessionS
         LLMResponse(raw_text="done"),
     ])
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=reg)
-    sid_box["sid"] = store.create_session(system_prompt=None)
+    sid_box["sid"] = await store.create_session(system_prompt=None)
     r = await loop.send("go", session_id=sid_box["sid"])
     assert r.status == "completed"
     assert seen_pending and seen_pending[0] is not None
     assert "tc-spy" in seen_pending[0]["tool_call_ids"]
-    assert loop.get_pending(r.session_id) is None
+    assert await loop.get_pending(r.session_id) is None
 
 
 def test_close_releases_owned_store(tmp_path) -> None:
@@ -648,27 +648,28 @@ def test_close_releases_owned_store(tmp_path) -> None:
     loop.close()
 
 
-def test_does_not_close_external_store(store: SessionStore) -> None:
+@pytest.mark.asyncio
+async def test_does_not_close_external_store(store: SessionStore) -> None:
     loop = StatefulAgentLoop(llm=_Scripted(), store=store)
     loop.close()
     # store is still usable
-    sid = store.create_session()
-    assert store.get_session(sid) is not None
+    sid = await store.create_session()
+    assert await store.get_session(sid) is not None
 
 
 @pytest.mark.asyncio
 async def test_compacted_messages_excluded_from_history(store: SessionStore) -> None:
     """Pipeline must see only state=active messages on resume."""
-    sid = store.create_session(system_prompt="S")
-    store.append_message(sid, role="user", content="old1")
-    store.append_message(sid, role="assistant", content="old2")
-    store.record_compaction(
+    sid = await store.create_session(system_prompt="S")
+    await store.append_message(sid, role="user", content="old1")
+    await store.append_message(sid, role="assistant", content="old2")
+    await store.record_compaction(
         sid, from_seq=1, to_seq=2, note_content="summary of old1+old2",
         before_tokens=100, after_tokens=10, round_index=0,
     )
-    store.append_message(sid, role="user", content="latest")
+    await store.append_message(sid, role="user", content="latest")
 
-    active = store.load_active_messages(sid)
+    active = await store.load_active_messages(sid)
     assert [m.role for m in active] == ["system", "user"]
     assert [m.state for m in active] == [MessageState.ACTIVE, MessageState.ACTIVE]
     assert active[0].name == "compact_note"
@@ -677,7 +678,8 @@ async def test_compacted_messages_excluded_from_history(store: SessionStore) -> 
 # ── resolve_system_prompt (M1.10) ────────────────────────────────────────
 
 
-def test_resolve_system_prompt_default(store: SessionStore) -> None:
+@pytest.mark.asyncio
+async def test_resolve_system_prompt_default(store: SessionStore) -> None:
     """No config.system_prompt → DEFAULT_AGENT_SYSTEM_PROMPT + catalog."""
     reg = ToolRegistry()
     reg.register(
@@ -689,7 +691,7 @@ def test_resolve_system_prompt_default(store: SessionStore) -> None:
         lambda **kw: "ok",
     )
     loop = StatefulAgentLoop(llm=_Scripted(), store=store, tool_registry=reg)
-    resolved = loop.resolve_system_prompt()
+    resolved = await loop.resolve_system_prompt()
     # Should contain the default prompt text
     assert "interactive coding agent" in resolved
     # Should contain the auto-injected tool catalog (name + description only)
@@ -699,7 +701,8 @@ def test_resolve_system_prompt_default(store: SessionStore) -> None:
     assert "q*(string)" not in resolved
 
 
-def test_resolve_system_prompt_with_config(store: SessionStore) -> None:
+@pytest.mark.asyncio
+async def test_resolve_system_prompt_with_config(store: SessionStore) -> None:
     """Custom system_prompt + tool catalog appended."""
     reg = ToolRegistry()
     reg.register(
@@ -712,13 +715,14 @@ def test_resolve_system_prompt_with_config(store: SessionStore) -> None:
     )
     cfg = AgentLoopConfig(system_prompt="You are a math bot.")
     loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=reg)
-    resolved = loop.resolve_system_prompt()
+    resolved = await loop.resolve_system_prompt()
     assert resolved.startswith("You are a math bot.")
     assert "# Available Tools" in resolved
     assert "- **calc**:" in resolved
 
 
-def test_resolve_system_prompt_injection_disabled(store: SessionStore) -> None:
+@pytest.mark.asyncio
+async def test_resolve_system_prompt_injection_disabled(store: SessionStore) -> None:
     """inject_tool_descriptions=False → no catalog appended."""
     reg = ToolRegistry()
     reg.register(
@@ -731,20 +735,22 @@ def test_resolve_system_prompt_injection_disabled(store: SessionStore) -> None:
     )
     cfg = AgentLoopConfig(system_prompt="Hello.", inject_tool_descriptions=False)
     loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=reg)
-    resolved = loop.resolve_system_prompt()
+    resolved = await loop.resolve_system_prompt()
     assert resolved == "Hello."
     assert "# Available Tools" not in resolved
 
 
-def test_resolve_system_prompt_no_registry(store: SessionStore) -> None:
+@pytest.mark.asyncio
+async def test_resolve_system_prompt_no_registry(store: SessionStore) -> None:
     """No tool_registry → no catalog appended."""
     cfg = AgentLoopConfig(system_prompt="No tools here.")
     loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=None)
-    resolved = loop.resolve_system_prompt()
+    resolved = await loop.resolve_system_prompt()
     assert resolved == "No tools here."
 
 
-def test_resolve_system_prompt_custom_header(store: SessionStore) -> None:
+@pytest.mark.asyncio
+async def test_resolve_system_prompt_custom_header(store: SessionStore) -> None:
     """Custom tool_catalog_header is respected."""
     reg = ToolRegistry()
     reg.register(
@@ -760,12 +766,13 @@ def test_resolve_system_prompt_custom_header(store: SessionStore) -> None:
         tool_catalog_header="# Tool Reference",
     )
     loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=reg)
-    resolved = loop.resolve_system_prompt()
+    resolved = await loop.resolve_system_prompt()
     assert "# Tool Reference" in resolved
     assert "# Available Tools" not in resolved
 
 
-def test_resolve_system_prompt_session_override(store: SessionStore) -> None:
+@pytest.mark.asyncio
+async def test_resolve_system_prompt_session_override(store: SessionStore) -> None:
     """Session-level system_prompt overrides config-level prompt."""
     reg = ToolRegistry()
     reg.register(
@@ -779,8 +786,8 @@ def test_resolve_system_prompt_session_override(store: SessionStore) -> None:
     cfg = AgentLoopConfig(system_prompt="Config prompt.")
     loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=cfg, tool_registry=reg)
     # Create session with override
-    sid = loop.new_session(system_prompt="Session prompt.")
-    resolved = loop.resolve_system_prompt(session_id=sid)
+    sid = await loop.new_session(system_prompt="Session prompt.")
+    resolved = await loop.resolve_system_prompt(session_id=sid)
     assert resolved.startswith("Session prompt.")
     assert "Config prompt." not in resolved
     # Catalog is still appended
@@ -814,7 +821,7 @@ async def test_follow_up_while_running_queues_for_next_round(store: SessionStore
         config=AgentLoopConfig(system_prompt="S", max_rounds=4),
         tool_registry=_echo_registry(),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
 
     send_task = asyncio.create_task(loop.send("start task", sid))
 
@@ -851,11 +858,11 @@ async def test_follow_up_when_idle_degrades_to_send(store: SessionStore) -> None
         store=store,
         config=AgentLoopConfig(system_prompt="S", max_rounds=2),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.follow_up("hello", sid)
     assert not isinstance(result, FollowUpQueued)
     assert result.final_text == "idle reply"
-    rows = store.load_active_messages(sid)
+    rows = await store.load_active_messages(sid)
     assert any(r.role == "user" and r.content == "hello" for r in rows)
 
 
@@ -877,7 +884,7 @@ async def test_unexpected_error_emits_agent_error_and_terminal(store: SessionSto
         hooks=AgentHooks(),
         event_bus=AgentEventBus(),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
 
     def explode(ctx: Any) -> None:
         raise RuntimeError("hook boom")
@@ -910,11 +917,11 @@ async def test_close_session_clears_per_session_locks(store: SessionStore) -> No
         llm=_Scripted(responses=[LLMResponse(raw_text="ok")]), store=store,
         config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     await loop.send("hi", session_id=sid)
     assert sid in loop._locks  # populated on send
 
-    loop.close_session(sid)
+    await loop.close_session(sid)
     assert sid not in loop._locks
     assert sid not in loop._follow_up_queue_locks
     assert sid not in loop._follow_up_queues

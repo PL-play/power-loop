@@ -38,21 +38,21 @@ async def test_recurring_rearm_collapses_missed_periods(tmp_path):
         db_path=str(tmp_path / "s.db"),
         config=AgentLoopConfig(system_prompt="t", max_rounds=4),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     interval = 100
     way_past = int(time.time() * 1000) - 10 * 3600 * 1000  # overdue by 10h
-    loop.schedule_timer(sid, due_at_ms=way_past, note="hb", interval_s=interval)
+    await loop.schedule_timer(sid, due_at_ms=way_past, note="hb", interval_s=interval)
     runner = TimerRunner(loop)
     assert await runner.scan_once() == 1
-    row = loop.store.get_timer(sid, 1)
+    row = await loop.store.get_timer(sid, 1)
     now = int(time.time() * 1000)
     assert row.status == "armed"
     assert row.due_at > now, "recurring re-arm landed in the past (catch-up storm)"
     assert abs(row.due_at - (now + interval * 1000)) < 5000
     assert await runner.scan_once() == 0  # not due again -> no storm
-    loop.close()
+    await loop.aclose()
 
-def test_timer_due_at_boundary_is_inclusive(tmp_path):
+async def test_timer_due_at_boundary_is_inclusive(tmp_path):
     import time
 
     from power_loop import AgentLoopConfig, StatefulAgentLoop
@@ -73,14 +73,14 @@ def test_timer_due_at_boundary_is_inclusive(tmp_path):
         llm=_NoLLM(), db_path=str(tmp_path / "s.db"),
         config=AgentLoopConfig(system_prompt="t", max_rounds=1),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     now = int(time.time() * 1000)
-    loop.schedule_timer(sid, due_at_ms=now, note="exact")
-    assert len(loop.store.due_timers(now=now)) == 1
-    assert len(loop.store.due_timers(now=now - 1)) == 0  # 1ms early -> not due
-    loop.close()
+    await loop.schedule_timer(sid, due_at_ms=now, note="exact")
+    assert len(await loop.store.due_timers(now=now)) == 1
+    assert len(await loop.store.due_timers(now=now - 1)) == 0  # 1ms early -> not due
+    await loop.aclose()
 
-def test_interval_zero_normalizes_to_one_shot(tmp_path):
+async def test_interval_zero_normalizes_to_one_shot(tmp_path):
     import time
 
     from power_loop import AgentLoopConfig, StatefulAgentLoop
@@ -101,11 +101,11 @@ def test_interval_zero_normalizes_to_one_shot(tmp_path):
         llm=_NoLLM(), db_path=str(tmp_path / "s.db"),
         config=AgentLoopConfig(system_prompt="t", max_rounds=1),
     )
-    sid = loop.new_session()
-    row = loop.store.create_timer(sid, due_at=int(time.time() * 1000), note="z", interval_s=0)
+    sid = await loop.new_session()
+    row = await loop.store.create_timer(sid, due_at=int(time.time() * 1000), note="z", interval_s=0)
     assert row.interval_s is None
-    assert loop.store.get_timer(sid, row.timer_id).interval_s is None
-    loop.close()
+    assert (await loop.store.get_timer(sid, row.timer_id)).interval_s is None
+    await loop.aclose()
 
 @pytest.mark.asyncio
 async def test_non_retryable_error_not_retried_and_not_wrapped():

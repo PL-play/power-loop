@@ -39,7 +39,7 @@ from power_loop.contracts.event_payloads import TimerFiredPayload
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hook_contexts import TimerFireCtx
 from power_loop.contracts.hooks import HookDirective, HookPoint
-from power_loop.runtime.session_store import TimerRow
+from power_loop.runtime.store.types import TimerRow
 
 if TYPE_CHECKING:  # pragma: no cover
     from power_loop.agent.stateful_loop import StatefulAgentLoop
@@ -98,7 +98,8 @@ class TimerRunner:
         self._stop = asyncio.Event()
 
     async def start(self) -> None:
-        recovered = self._loop.store.recover_stale_firing_timers(
+        store = await self._loop._ensure_store()
+        recovered = await store.recover_stale_firing_timers(
             older_than_ms=self._stale_firing_ms
         )
         if recovered:
@@ -117,7 +118,8 @@ class TimerRunner:
         """Fire everything currently due. Returns the number fired (any
         outcome). Exposed for tests and external schedulers."""
         fired = 0
-        for timer in self._loop.store.due_timers():
+        store = await self._loop._ensure_store()
+        for timer in await store.due_timers():
             try:
                 await self._fire(timer)
                 fired += 1
@@ -126,7 +128,7 @@ class TimerRunner:
                     "timers: firing %s/%d failed; postponing 30s",
                     timer.session_id, timer.timer_id,
                 )
-                self._loop.store.transition_timer(
+                await store.transition_timer(
                     timer.session_id, timer.timer_id,
                     from_status="firing", to_status="armed",
                     due_at=int(time.time() * 1000) + 30_000,
@@ -146,7 +148,8 @@ class TimerRunner:
             try:
                 # Periodic recovery so a crashed *other* runner's rows are
                 # also picked up eventually, not only at start().
-                self._loop.store.recover_stale_firing_timers(
+                store = await self._loop._ensure_store()
+                await store.recover_stale_firing_timers(
                     older_than_ms=self._stale_firing_ms
                 )
                 await self.scan_once()
@@ -154,9 +157,9 @@ class TimerRunner:
                 logger.exception("timers: scan failed (continuing)")
 
     async def _fire(self, timer: TimerRow) -> None:
-        store = self._loop.store
+        store = await self._loop._ensure_store()
         # Claim (CAS): lost claims mean another runner took it.
-        if not store.transition_timer(
+        if not await store.transition_timer(
             timer.session_id, timer.timer_id, from_status="armed", to_status="firing"
         ):
             return
@@ -176,10 +179,11 @@ class TimerRunner:
         a slow-but-live delivery stays fresh and is never re-armed by the recovery
         sweep. Stops itself if the claim is lost (row no longer 'firing')."""
         interval = self._heartbeat_interval_s
+        store = await self._loop._ensure_store()
         while True:
             await asyncio.sleep(interval)
             try:
-                if not self._loop.store.heartbeat_firing_timer(
+                if not await store.heartbeat_firing_timer(
                     timer.session_id, timer.timer_id
                 ):
                     return  # row left 'firing' — nothing left to keep alive
@@ -190,9 +194,9 @@ class TimerRunner:
                 )
 
     async def _deliver_claimed(self, timer: TimerRow) -> None:
-        store = self._loop.store
-        if store.get_session(timer.session_id) is None:
-            store.transition_timer(
+        store = await self._loop._ensure_store()
+        if await store.get_session(timer.session_id) is None:
+            await store.transition_timer(
                 timer.session_id, timer.timer_id,
                 from_status="firing", to_status="cancelled",
             )
@@ -210,7 +214,7 @@ class TimerRunner:
         await self._loop.hooks.run_typed_async(HookPoint.TIMER_FIRE, ctx)
 
         if ctx.directive == HookDirective.BREAK:
-            store.transition_timer(
+            await store.transition_timer(
                 timer.session_id, timer.timer_id,
                 from_status="firing", to_status="cancelled",
             )
@@ -219,11 +223,11 @@ class TimerRunner:
         if ctx.directive == HookDirective.SKIP:
             # Skip THIS firing only: a recurring timer still re-arms for the
             # next period; a one-shot is done.
-            store.finish_firing_timer(timer.session_id, timer.timer_id)
+            await store.finish_firing_timer(timer.session_id, timer.timer_id)
             self._emit(timer, "skipped")
             return
         if ctx.postpone_s and ctx.postpone_s > 0:
-            store.transition_timer(
+            await store.transition_timer(
                 timer.session_id, timer.timer_id,
                 from_status="firing", to_status="armed",
                 due_at=int(time.time() * 1000) + int(ctx.postpone_s * 1000),
@@ -238,7 +242,7 @@ class TimerRunner:
         outcome = "queued" if isinstance(result, FollowUpQueued) else "delivered"
         # One-shot -> fired; recurring -> re-armed at fire-time + interval
         # (fixed-delay: periods missed while the process was down collapse).
-        store.finish_firing_timer(timer.session_id, timer.timer_id)
+        await store.finish_firing_timer(timer.session_id, timer.timer_id)
         self._emit(timer, outcome)
         logger.info(
             "timers: %s/%d %s (note=%r)",

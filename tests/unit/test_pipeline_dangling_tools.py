@@ -85,13 +85,13 @@ async def test_tool_after_break_resolves_remaining_tool_calls() -> None:
         LLMResponse(raw_text="done", content_text="done"),
     ])
     loop = StatefulAgentLoop(
-        llm=llm, store=SessionStore.open(":memory:"), tool_registry=reg, hooks=hooks,
+        llm=llm, store=await SessionStore.open(":memory:"), tool_registry=reg, hooks=hooks,
         config=AgentLoopConfig(system_prompt="o", max_rounds=4, compactor=None),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("go", session_id=sid)
     assert result.status == "completed"
-    _assert_no_dangling(loop.get_messages(sid))  # c2 must have a (skipped) response
+    _assert_no_dangling(await loop.get_messages(sid))  # c2 must have a (skipped) response
     # the session must NOT be left pending → a second send works (no SessionPendingError)
     r2 = await loop.send("again", session_id=sid)
     assert r2.status in ("completed", "hit_round_limit")
@@ -110,17 +110,17 @@ async def test_request_user_input_batched_resolves_later_tool_calls() -> None:
         LLMResponse(raw_text="resumed done", content_text="resumed done"),
     ])
     loop = StatefulAgentLoop(
-        llm=llm, store=SessionStore.open(":memory:"), tool_registry=reg,
+        llm=llm, store=await SessionStore.open(":memory:"), tool_registry=reg,
         config=AgentLoopConfig(system_prompt="o", max_rounds=4, compactor=None),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("go", session_id=sid)
     assert result.status == "waiting_for_input"
     # c1 executed, c3 resolved as skipped (not dangling); c2 is the interaction.
-    responded = {m.get("tool_call_id") for m in loop.get_messages(sid) if m.get("role") == "tool"}
+    responded = {m.get("tool_call_id") for m in await loop.get_messages(sid) if m.get("role") == "tool"}
     assert "c1" in responded and "c3" in responded
 
     interaction_id = result.pending_interactions[0]["interaction_id"]
     resumed = await loop.submit_input(sid, interaction_id, {"choice": "yes"})
     assert resumed.status == "completed"
-    _assert_no_dangling(loop.get_messages(sid))  # full valid sequence after resume
+    _assert_no_dangling(await loop.get_messages(sid))  # full valid sequence after resume

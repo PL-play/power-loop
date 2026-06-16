@@ -13,7 +13,7 @@ the exception abort the engine (the journal keeps what completed), then calls
 from __future__ import annotations
 
 import json
-from collections.abc import Generator
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import pytest
@@ -53,13 +53,13 @@ class _LLM(LLMService):
 
 
 @pytest.fixture
-def loop() -> Generator[StatefulAgentLoop, None, None]:
+async def loop() -> AsyncIterator[StatefulAgentLoop]:
     lp = StatefulAgentLoop(
-        llm=_LLM(), store=SessionStore.open(":memory:"),
+        llm=_LLM(), store=await SessionStore.open(":memory:"),
         config=AgentLoopConfig(system_prompt="o", max_rounds=2, compactor=None),
     )
     yield lp
-    lp.close()
+    await lp.aclose()
 
 
 # ── controllable executor ─────────────────────────────────────────────────────
@@ -113,15 +113,15 @@ def test_replayable_ids_excludes_foreach_body() -> None:
     assert ids == {"plan", "research", "write"}  # 'body' (foreach body) excluded
 
 
-def test_rehydrate_refuses_journal_without_spec(loop: StatefulAgentLoop) -> None:
-    sid = loop.new_session()
-    journal_mod.seed(loop.store, sid, "r1", "w", spec=None)  # legacy-style: no spec
+async def test_rehydrate_refuses_journal_without_spec(loop: StatefulAgentLoop) -> None:
+    sid = await loop.new_session()
+    await journal_mod.seed(loop.store, sid, "r1", "w", spec=None)  # legacy-style: no spec
     with pytest.raises(Exception, match="no spec persisted"):
-        rehydrate(loop.store, sid, "r1")
+        await rehydrate(loop.store, sid, "r1")
 
 
 async def test_resume_replays_completed_and_reruns_tail(loop: StatefulAgentLoop) -> None:
-    sid = loop.new_session()
+    sid = await loop.new_session()
     run_id = "run-linear"
     spec = WorkflowSpec.from_json({
         "name": "w", "input": "topic",
@@ -135,12 +135,12 @@ async def test_resume_replays_completed_and_reruns_tail(loop: StatefulAgentLoop)
 
     # Attempt 1: crash on 'b'. 'a' completes and is journaled.
     ex1 = _CtlExec(fail_nodes_once={"b"})
-    journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
+    await journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
     eng1 = WorkflowEngine(loop, executor=ex1, on_step=make_on_step(loop.store, sid, run_id),
                           run_id=run_id)
     with pytest.raises(RuntimeError, match="boom-node:b"):
         await eng1.run(spec)
-    j = journal_mod.read(loop.store, sid, run_id)
+    j = await journal_mod.read(loop.store, sid, run_id)
     assert [s["node_id"] for s in j["steps"] if s["status"] == "completed"] == ["a"]
 
     # Resume with a healthy executor.
@@ -154,12 +154,12 @@ async def test_resume_replays_completed_and_reruns_tail(loop: StatefulAgentLoop)
     c_input = next(inp for nid, inp in ex2.runs if nid == "c")
     assert "out:a" in c_input
     # journal finalized as completed, attempts bumped
-    j2 = journal_mod.read(loop.store, sid, run_id)
+    j2 = await journal_mod.read(loop.store, sid, run_id)
     assert j2["status"] == "completed" and j2["attempts"] == 2
 
 
 async def test_resume_foreach_replayed_atomically(loop: StatefulAgentLoop) -> None:
-    sid = loop.new_session()
+    sid = await loop.new_session()
     run_id = "run-foreach-done"
     spec = WorkflowSpec.from_json({
         "name": "w", "input": "x",
@@ -178,12 +178,12 @@ async def test_resume_foreach_replayed_atomically(loop: StatefulAgentLoop) -> No
 
     # Attempt 1: plan + the whole foreach complete; crash on 'write'.
     ex1 = _CtlExec(fail_nodes_once={"write"}, structured={"plan": {"subs": ["x", "y"]}})
-    journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
+    await journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
     eng1 = WorkflowEngine(loop, executor=ex1, on_step=make_on_step(loop.store, sid, run_id),
                           run_id=run_id)
     with pytest.raises(RuntimeError, match="boom-node:write"):
         await eng1.run(spec)
-    done = {s["node_id"] for s in journal_mod.read(loop.store, sid, run_id)["steps"]
+    done = {s["node_id"] for s in (await journal_mod.read(loop.store, sid, run_id))["steps"]
             if s["status"] == "completed"}
     assert {"plan", "research"} <= done  # foreach aggregate journaled
 
@@ -198,7 +198,7 @@ async def test_resume_foreach_replayed_atomically(loop: StatefulAgentLoop) -> No
 
 
 async def test_resume_reruns_foreach_when_it_died_midway(loop: StatefulAgentLoop) -> None:
-    sid = loop.new_session()
+    sid = await loop.new_session()
     run_id = "run-foreach-partial"
     spec = WorkflowSpec.from_json({
         "name": "w", "input": "x",
@@ -215,12 +215,12 @@ async def test_resume_reruns_foreach_when_it_died_midway(loop: StatefulAgentLoop
 
     # Attempt 1: plan completes; foreach crashes on the 2nd item → aggregate NOT journaled.
     ex1 = _CtlExec(fail_input_substr_once={"yy"}, structured={"plan": {"subs": ["xx", "yy"]}})
-    journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
+    await journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
     eng1 = WorkflowEngine(loop, executor=ex1, on_step=make_on_step(loop.store, sid, run_id),
                           run_id=run_id)
     with pytest.raises(RuntimeError, match="boom-input:yy"):
         await eng1.run(spec)
-    done = {s["node_id"] for s in journal_mod.read(loop.store, sid, run_id)["steps"]
+    done = {s["node_id"] for s in (await journal_mod.read(loop.store, sid, run_id))["steps"]
             if s["status"] == "completed"}
     assert "plan" in done and "research" not in done  # no aggregate → foreach re-runs
 
@@ -233,13 +233,13 @@ async def test_resume_reruns_foreach_when_it_died_midway(loop: StatefulAgentLoop
 
 
 async def test_idempotency_key_threaded_into_leaf_metadata(loop: StatefulAgentLoop) -> None:
-    sid = loop.new_session()
+    sid = await loop.new_session()
     run_id = "run-idem"
     spec = WorkflowSpec.from_json({
         "name": "w", "root": {"type": "agent", "id": "only",
                               "spec": {"name": "only", "system_prompt": "p"}}})
     ex = _CtlExec()
-    journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
+    await journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
     eng = WorkflowEngine(loop, executor=ex, on_step=make_on_step(loop.store, sid, run_id),
                          run_id=run_id)
     await eng.run(spec)
@@ -254,7 +254,7 @@ async def test_foreach_usage_counted_and_body_not_journaled_individually(
 ) -> None:
     """The fan-out's tokens roll into the aggregate + run total, and the journal
     records the foreach as ONE aggregate step (not one-overwriting-record-per-item)."""
-    sid = loop.new_session()
+    sid = await loop.new_session()
     run_id = "run-usage"
     spec = WorkflowSpec.from_json({
         "name": "w", "input": "x",
@@ -269,7 +269,7 @@ async def test_foreach_usage_counted_and_body_not_journaled_individually(
         ]},
     })
     ex = _CtlExec(structured={"plan": {"subs": ["a", "b", "c"]}})  # 7 tokens per leaf
-    journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
+    await journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
     eng = WorkflowEngine(loop, executor=ex, on_step=make_on_step(loop.store, sid, run_id),
                          run_id=run_id)
     result = await eng.run(spec)
@@ -278,7 +278,7 @@ async def test_foreach_usage_counted_and_body_not_journaled_individually(
     assert result.usage["total_tokens"] == 28
     assert result.results["research"].usage["total_tokens"] == 21  # aggregate carries the fan-out
     # Journal records the foreach as ONE aggregate step, body leaves not journaled.
-    steps = {s["node_id"]: s for s in journal_mod.read(loop.store, sid, run_id)["steps"]}
+    steps = {s["node_id"]: s for s in (await journal_mod.read(loop.store, sid, run_id))["steps"]}
     assert set(steps) == {"plan", "research"}  # 'body' not individually journaled
     assert steps["research"]["usage"]["total_tokens"] == 21
 
@@ -288,7 +288,7 @@ async def test_resume_budget_precharge_includes_replayed_foreach(loop: StatefulA
     aggregate), so the shared ceiling accounts for the whole run."""
     from power_loop.workflow import SharedBudget
 
-    sid = loop.new_session()
+    sid = await loop.new_session()
     run_id = "run-budget"
     spec = WorkflowSpec.from_json({
         "name": "w", "input": "x",
@@ -305,7 +305,7 @@ async def test_resume_budget_precharge_includes_replayed_foreach(loop: StatefulA
     })
     # Attempt 1: plan + foreach(2 items) complete (3 leaves * 7 = 21 tokens), crash on write.
     ex1 = _CtlExec(fail_nodes_once={"write"}, structured={"plan": {"subs": ["a", "b"]}})
-    journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
+    await journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
     eng1 = WorkflowEngine(loop, executor=ex1, on_step=make_on_step(loop.store, sid, run_id),
                           run_id=run_id)
     with pytest.raises(RuntimeError):

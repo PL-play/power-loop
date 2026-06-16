@@ -9,7 +9,6 @@ wrapper that delegates to ``AgentPipeline.run()``.
 """
 from __future__ import annotations
 
-import asyncio
 import functools
 import inspect
 import json
@@ -278,11 +277,6 @@ class AgentPipeline:
         # or strand subscribers.
         self._session_started = False
         self._finalized = False
-        # H1.9/C8: a real persistence sink does blocking SQLite writes; offload those
-        # to a thread so one session's contended write (busy_timeout up to 5s) can't
-        # freeze the event loop and stall every other session. NullSink is a no-op,
-        # so skip the thread-pool hop for it.
-        self._sink_offload = not isinstance(self.sink, NullSink)
 
     def _build_skill_prompt_section(self) -> str:
         if not self.config.skills_dir:
@@ -314,14 +308,11 @@ class AgentPipeline:
     # ── Helper: run a write-path sink call (offloaded for real persistence) ──
 
     async def _emit_sink(self, fn: Any, *args: Any, **kwargs: Any) -> None:
-        """Invoke a write-path sink callback, off the event loop for a real
-        (blocking SQLite) sink so a contended write can't stall the loop (H1.9/C8).
-        Awaited, so per-session ordering is preserved; the loop just runs other
-        sessions during the I/O."""
-        if self._sink_offload:
-            await asyncio.to_thread(fn, *args, **kwargs)
-        else:
-            fn(*args, **kwargs)
+        """Invoke an async write-path sink callback. The sink delegates to the async
+        store, whose backend offloads blocking I/O itself (SQLite → threadpool; PG/MySQL
+        → real async), so the event loop is never stalled. Awaited, so per-session
+        ordering is preserved; the loop runs other sessions during the I/O."""
+        await fn(*args, **kwargs)
 
     # ── Helper: append message (with MESSAGE_APPEND hook) ──
 
@@ -513,7 +504,7 @@ class AgentPipeline:
             tool_calls=int(self.ctx.tool_calls),
         )
 
-    def _persist_pending_interaction(
+    async def _persist_pending_interaction(
         self,
         *,
         interaction: dict[str, Any],
@@ -521,13 +512,13 @@ class AgentPipeline:
     ) -> None:
         if self.store is None or self.session_id is None:
             return
-        state = self.store.get_state(self.session_id)
+        state = await self.store.get_state(self.session_id)
         pending = dict(state.pending or {}) if state is not None else {}
         interactions = list(pending.get("pending_interactions") or [])
         interactions.append(interaction)
         pending["pending_interactions"] = interactions
         pending["round_index"] = round_index
-        self.store.set_pending(self.session_id, pending)
+        await self.store.set_pending(self.session_id, pending)
 
     # ══════════════════════════════════════════════════════════════
     # Phase methods — pure business logic with explicit parameters.
@@ -554,9 +545,9 @@ class AgentPipeline:
         store = self.store
         sid = self.session_id
 
-        def _fetch(from_seq: int, to_seq: int) -> list[dict[str, Any]]:
+        async def _fetch(from_seq: int, to_seq: int) -> list[dict[str, Any]]:
             assert store is not None and sid is not None  # set only when has_store
-            rows = store.load_all_messages(sid)
+            rows = await store.load_all_messages(sid)
             return [
                 {
                     "role": r.role, "name": r.name, "content": r.content,
@@ -658,11 +649,11 @@ class AgentPipeline:
         )
         await self.hooks.run_typed_async(HookPoint.COMPACT_AFTER, compact_after)
 
-    def _runtime_messages_for_round(self, round_index: int) -> list[LoopMessage]:
+    async def _runtime_messages_for_round(self, round_index: int) -> list[LoopMessage]:
         """Build transient runtime-state messages for the next LLM call.
 
         These messages are deliberately not appended through ``_append_message``:
-        SQLite runtime state is the authority, and the message is just the
+        the store's runtime state is the authority, and the message is just the
         current projection the model needs for this round.
         """
         if self.store is None or self.session_id is None:
@@ -671,7 +662,7 @@ class AgentPipeline:
 
         messages: list[LoopMessage] = []
         for projector in self.config.runtime_projectors:
-            projected = projector.project(
+            projected = await projector.project(
                 store=self.store,
                 session_id=self.session_id,
                 round_index=round_index,
@@ -915,7 +906,7 @@ class AgentPipeline:
             await self._emit_sink(self.sink.on_round_started, round_idx)
             self._emit(AgentEventType.ROUND_STARTED, RoundStartedPayload(round_index=round_idx), round_index=round_idx)
 
-            runtime_messages = self._runtime_messages_for_round(round_idx)
+            runtime_messages = await self._runtime_messages_for_round(round_idx)
             llm_messages = [*self.history, *runtime_messages]
 
             # ── Hook: LLM_BEFORE ──
@@ -1144,7 +1135,7 @@ class AgentPipeline:
                     output, failed = await self.execute_tool(tool_name, tool_args)
                 except HumanInputRequired as exc:
                     interaction = exc.to_pending(tool_call_id=call_id, tool_name=tool_name)
-                    self._persist_pending_interaction(interaction=interaction, round_index=round_idx)
+                    await self._persist_pending_interaction(interaction=interaction, round_index=round_idx)
                     # The model batched request_user_input with later tool_calls;
                     # those won't run. Resolve them so the resumed turn isn't an
                     # invalid sequence (assistant.tool_calls with no matching tool).

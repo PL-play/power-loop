@@ -48,9 +48,9 @@ class _OrchLLM(LLMService):
         return None
 
 
-def _loop() -> StatefulAgentLoop:
+async def _loop() -> StatefulAgentLoop:
     return StatefulAgentLoop(
-        llm=_OrchLLM(), store=SessionStore.open(":memory:"),
+        llm=_OrchLLM(), store=await SessionStore.open(":memory:"),
         config=AgentLoopConfig(system_prompt="o", max_rounds=2, compactor=None),
     )
 
@@ -72,7 +72,7 @@ _ONE_LEAF = {"name": "w", "root": {"type": "agent", "id": "only",
 
 async def test_timeout_kills_worker_and_reports_failed(tmp_path) -> None:
     ex = _executor(str(tmp_path / "r"), sleep=10, timeout_s=0.5)  # worker sleeps >> timeout
-    res = await WorkflowEngine(_loop(), executor=ex, run_id="to").run(
+    res = await WorkflowEngine(await _loop(), executor=ex, run_id="to").run(
         WorkflowSpec.from_json(_ONE_LEAF))
     leaf = res.results["only"]
     assert leaf.status == "failed"
@@ -82,7 +82,7 @@ async def test_timeout_kills_worker_and_reports_failed(tmp_path) -> None:
 async def test_cancel_midflight_terminates_worker(tmp_path) -> None:
     ex = _executor(str(tmp_path / "r"), sleep=10)  # long enough to cancel during
     token = CancellationToken()
-    eng = WorkflowEngine(_loop(), executor=ex, run_id="cx", stop_event=token)
+    eng = WorkflowEngine(await _loop(), executor=ex, run_id="cx", stop_event=token)
     task = asyncio.ensure_future(eng.run(WorkflowSpec.from_json(_ONE_LEAF)))
 
     # Wait until the worker has actually started (created its db), then cancel.
@@ -102,7 +102,7 @@ async def test_cancel_midflight_terminates_worker(tmp_path) -> None:
 
 async def test_hard_crash_reported_as_failed(tmp_path) -> None:
     ex = _executor(str(tmp_path / "r"), crash_nodes="only")  # worker os._exit's, no frame
-    res = await WorkflowEngine(_loop(), executor=ex, run_id="cr").run(
+    res = await WorkflowEngine(await _loop(), executor=ex, run_id="cr").run(
         WorkflowSpec.from_json(_ONE_LEAF))
     leaf = res.results["only"]
     assert leaf.status == "failed"
@@ -113,8 +113,8 @@ async def test_subprocess_crash_then_resume_reruns_only_failed_leaf(tmp_path) ->
     """Headline: a→b in subprocesses; b's worker hard-crashes on attempt 1. On
     resume, a is REPLAYED (keeps its attempt-1 text) and only b re-runs (fresh
     process, new text)."""
-    loop = _loop()
-    sid = loop.new_session()
+    loop = await _loop()
+    sid = await loop.new_session()
     run_id = "fr"
     spec = WorkflowSpec.from_json({
         "name": "w", "input": "x",
@@ -127,11 +127,11 @@ async def test_subprocess_crash_then_resume_reruns_only_failed_leaf(tmp_path) ->
 
     # Attempt 1: reply R1; crash leaf b. a completes (R1) and is journaled; b fails.
     ex1 = _executor(str(tmp_path / "r"), reply="R1", crash_nodes="b")
-    journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
+    await journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
     eng1 = WorkflowEngine(loop, executor=ex1, on_step=make_on_step(loop.store, sid, run_id),
                           run_id=run_id)
     await eng1.run(spec)
-    done = {s["node_id"]: s["status"] for s in journal_mod.read(loop.store, sid, run_id)["steps"]}
+    done = {s["node_id"]: s["status"] for s in (await journal_mod.read(loop.store, sid, run_id))["steps"]}
     assert done.get("a") == "completed" and done.get("b") != "completed"
 
     # Resume with a healthy executor that replies R2.

@@ -14,7 +14,7 @@ All four carry ``source="subagent"`` and are attributed to the parent session.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable, Generator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -60,10 +60,10 @@ class _Scripted(LLMService):
 
 
 @pytest.fixture
-def store() -> Generator[SessionStore, None, None]:
-    s = SessionStore.open(":memory:")
+async def store() -> AsyncIterator[SessionStore]:
+    s = await SessionStore.open(":memory:")
     yield s
-    s.close()
+    await s.close()
 
 
 def _collect(loop: StatefulAgentLoop) -> tuple[list[AgentEvent], Callable[[AgentEventType], list[AgentEvent]]]:
@@ -88,7 +88,7 @@ async def test_completed_subagent_emits_start_text_completed(store: SessionStore
         llm=_Scripted(responses=[LLMResponse(raw_text="parent", content_text="parent")]),
         store=store, config=AgentLoopConfig(max_rounds=1),
     )
-    parent_sid = (await parent_loop.send("hi", session_id=parent_loop.new_session())).session_id
+    parent_sid = (await parent_loop.send("hi", session_id=await parent_loop.new_session())).session_id
     events, of_type = _collect(parent_loop)
 
     parent_loop.llm = _Scripted(responses=[LLMResponse(raw_text="child out", content_text="child out")])
@@ -124,7 +124,7 @@ async def test_round_limited_subagent_emits_limit_not_text(store: SessionStore) 
         llm=_Scripted(responses=[LLMResponse(raw_text="parent", content_text="parent")]),
         store=store, config=AgentLoopConfig(max_rounds=1),
     )
-    parent_sid = (await parent_loop.send("hi", session_id=parent_loop.new_session())).session_id
+    parent_sid = (await parent_loop.send("hi", session_id=await parent_loop.new_session())).session_id
     _, of_type = _collect(parent_loop)
 
     # Child calls a resolvable tool every round so rounds are exhausted cleanly

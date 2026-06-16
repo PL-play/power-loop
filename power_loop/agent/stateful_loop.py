@@ -47,15 +47,17 @@ from power_loop.core.pipeline import (
 )
 from power_loop.core.runner import AgentRunner
 from power_loop.runtime.cancellation import CancellationLike
-from power_loop.runtime.session_store import (
+from power_loop.runtime.skills import SkillLoader
+from power_loop.runtime.store.store import (
     DEFAULT_DB_PATH,
     MAX_SPAWN_DEPTH,
+    SessionStore,
+)
+from power_loop.runtime.store.types import (
     MessageRow,
     MessageState,
-    SessionStore,
     SubagentLifecycle,
 )
-from power_loop.runtime.skills import SkillLoader
 from power_loop.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -83,11 +85,12 @@ class StatefulAgentLoop:
     """The only public entry point for running an agent loop.
 
     A single instance can drive any number of sessions concurrently on one event
-    loop: write-path SQLite I/O (message appends, compaction persistence, stats) is
-    offloaded to a worker thread (H1.9), so one session's contended write does not
-    freeze the loop and stall the others. (Reads remain inline — they're fast and
-    rarely contended.) The store is owned by the loop; callers may share it across
-    multiple StatefulAgentLoop instances if they need different configs.
+    loop: the store is async, and its SQLite backend runs every statement in a worker
+    thread (``asyncio.to_thread``) under a single writer lock, so one session's
+    contended write does not freeze the loop and stall the others. PostgreSQL/MySQL
+    backends are natively async. The store is owned by the loop (opened lazily on first
+    async use); callers may share an already-opened store across multiple
+    StatefulAgentLoop instances if they need different configs.
     """
 
     def __init__(
@@ -103,18 +106,17 @@ class StatefulAgentLoop:
         max_spawn_depth: int | None = None,
     ) -> None:
         self.llm = llm
-        if store is not None:
-            self.store = store
+        # The store is async (``await SessionStore.open(...)``), but construction is
+        # sync — so an owned store is opened LAZILY on the first async use via
+        # :meth:`_ensure_store`. An explicitly-passed store is already open.
+        self.store: SessionStore | None = store
+        self._db_path = db_path
+        self._explicit_max_spawn_depth = max_spawn_depth
+        if store is not None and max_spawn_depth is not None:
             # An explicit limit overrides the (possibly shared) store's setting.
-            # Validation happens in the store's property setter.
-            if max_spawn_depth is not None:
-                self.store.max_spawn_depth = max_spawn_depth
-        else:
-            self.store = SessionStore.open(
-                db_path,
-                max_spawn_depth=(MAX_SPAWN_DEPTH if max_spawn_depth is None else max_spawn_depth),
-            )
+            store.max_spawn_depth = max_spawn_depth
         self._owns_store = store is None
+        self._store_open_lock = asyncio.Lock()
         self.config = config if config is not None else AgentLoopConfig()
         self.tool_registry = tool_registry
         self._runner = AgentRunner(event_bus=event_bus, hooks=hooks)
@@ -123,17 +125,50 @@ class StatefulAgentLoop:
         self._follow_up_queue_locks: dict[str, asyncio.Lock] = {}
         self._closing = False
 
+    async def _ensure_store(self) -> SessionStore:
+        """Return the loop's store, opening an owned one on first use.
+
+        Construction is sync but the store is async, so the SQLite backend (and its
+        schema) is opened the first time any async method needs it. An explicitly
+        supplied store is returned unchanged.
+        """
+        if self.store is not None:
+            return self.store
+        async with self._store_open_lock:
+            if self.store is None:
+                self.store = await SessionStore.open(
+                    self._db_path,
+                    max_spawn_depth=(
+                        MAX_SPAWN_DEPTH if self._explicit_max_spawn_depth is None
+                        else self._explicit_max_spawn_depth
+                    ),
+                )
+        return self.store
+
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def close(self) -> None:
         """Close the underlying store (if owned). Does NOT delete sessions.
 
         Synchronous and abrupt: it does NOT wait for in-flight sends or pending async
-        event-bus tasks, so calling it while a send runs can race a background store
-        write. Prefer :meth:`aclose` (or ``async with loop:``) for graceful shutdown.
+        event-bus tasks. The store is async, so this can only close cleanly when no
+        event loop is running (it drives ``store.close()`` via ``asyncio.run``); when
+        called from inside a running loop it schedules the close and warns. Prefer
+        :meth:`aclose` (or ``async with loop:``) for graceful shutdown.
         """
-        if self._owns_store:
-            self.store.close()
+        if not self._owns_store or self.store is None:
+            return
+        store = self.store
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(store.close())
+        else:
+            logger.warning(
+                "StatefulAgentLoop.close() called inside a running event loop; "
+                "use 'await loop.aclose()' for graceful async shutdown"
+            )
+            asyncio.ensure_future(store.close())
 
     async def aclose(self, *, drain_timeout_s: float = 30.0) -> None:
         """Graceful, async shutdown: quiesce, then stop.
@@ -174,13 +209,13 @@ class StatefulAgentLoop:
             await self.event_bus.drain(timeout=drain_timeout_s)
         except Exception:  # pragma: no cover - drain must never block teardown
             logger.warning("aclose: event-bus drain raised; continuing", exc_info=True)
-        # (4) checkpoint + close the owned store.
-        if self._owns_store:
+        # (4) checkpoint + close the owned store (only if it was ever opened).
+        if self._owns_store and self.store is not None:
             try:
-                self.store.checkpoint(mode="TRUNCATE")
+                await self.store.checkpoint(mode="TRUNCATE")
             except Exception:  # pragma: no cover - checkpoint is best-effort
                 logger.warning("aclose: WAL checkpoint failed; closing anyway", exc_info=True)
-            self.store.close()
+            await self.store.close()
 
     async def __aenter__(self) -> StatefulAgentLoop:
         return self
@@ -192,9 +227,10 @@ class StatefulAgentLoop:
         if self._closing:
             raise RuntimeError("StatefulAgentLoop is closing; no new sends accepted")
 
-    def close_session(self, session_id: str, *, cascade: bool = True) -> int:
+    async def close_session(self, session_id: str, *, cascade: bool = True) -> int:
         """Physically delete the session and (by default) its LINKED subtree."""
-        n = self.store.close_session(session_id, cascade=cascade)
+        store = await self._ensure_store()
+        n = await store.close_session(session_id, cascade=cascade)
         # Drop the per-session in-memory bookkeeping so a long-lived loop that
         # cycles through many sessions doesn't leak a Lock per session id (C12).
         self._locks.pop(session_id, None)
@@ -204,7 +240,7 @@ class StatefulAgentLoop:
 
     # ── primary API ───────────────────────────────────────────────────────
 
-    def new_session(
+    async def new_session(
         self,
         *,
         metadata: dict[str, Any] | None = None,
@@ -216,7 +252,7 @@ class StatefulAgentLoop:
         explicit makes ownership clear for web handlers, CLIs, background
         jobs, and tests: every send targets an existing session id.
         """
-        return self._create_session(metadata=metadata, system_prompt=system_prompt)
+        return await self._create_session(metadata=metadata, system_prompt=system_prompt)
 
     async def send(
         self,
@@ -250,18 +286,19 @@ class StatefulAgentLoop:
         """
         sid = session_id
         self._raise_if_closing()
+        await self._ensure_store()
         async with self._lock_for(sid):
-            self._ensure_session_or_raise(sid)
+            await self._ensure_session_or_raise(sid)
             if heal_pending:
-                healed = self._heal_pending(sid)
+                healed = await self._heal_pending(sid)
                 if healed:
                     logger.warning(
                         "send(heal_pending=True): aborted %d stale tool_call(s) "
                         "in session %s before proceeding", healed, sid,
                     )
             else:
-                self._raise_if_pending(sid)
-            self._persist_user_input(sid, user_input)
+                await self._raise_if_pending(sid)
+            await self._persist_user_input(sid, user_input)
             return await self._run_loop(
                 sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt
             )
@@ -287,7 +324,8 @@ class StatefulAgentLoop:
         """
         sid = session_id
         self._raise_if_closing()
-        self._ensure_session_or_raise(sid)
+        await self._ensure_store()
+        await self._ensure_session_or_raise(sid)
         session_lock = self._lock_for(sid)
         if session_lock.locked():
             depth = await self._enqueue_follow_up(sid, user_input)
@@ -347,13 +385,14 @@ class StatefulAgentLoop:
         No-op (but still valid) if the session has no pending state — equivalent
         to "run one more round with no new user input".
         """
+        store = await self._ensure_store()
         async with self._lock_for(session_id):
-            self._ensure_session_or_raise(session_id)
-            waiting = self._waiting_result_if_needed(session_id)
+            await self._ensure_session_or_raise(session_id)
+            waiting = await self._waiting_result_if_needed(session_id)
             if waiting is not None:
                 return waiting
-            sink = SQLiteSink(self.store, session_id)
-            self._prime_sink_from_pending(session_id, sink)
+            sink = SQLiteSink(store, session_id)
+            await self._prime_sink_from_pending(session_id, sink)
             async with self._runner.session_async(session_id=session_id):
                 loop_token = set_current_loop(self)
                 try:
@@ -377,9 +416,10 @@ class StatefulAgentLoop:
         user, wait minutes or days, restart processes, then call this method
         with the collected answer.
         """
+        store = await self._ensure_store()
         async with self._lock_for(session_id):
-            self._ensure_session_or_raise(session_id)
-            state = self.store.get_state(session_id)
+            await self._ensure_session_or_raise(session_id)
+            state = await store.get_state(session_id)
             pending = state.pending if state is not None else None
             interactions = list((pending or {}).get("pending_interactions") or [])
             interaction = next(
@@ -389,10 +429,10 @@ class StatefulAgentLoop:
             if interaction is None:
                 raise ValueError(f"pending interaction not found: {interaction_id}")
 
-            sink = SQLiteSink(self.store, session_id)
-            self._prime_sink_from_pending(session_id, sink)
+            sink = SQLiteSink(store, session_id)
+            await self._prime_sink_from_pending(session_id, sink)
             round_index = int((pending or {}).get("round_index") or 0)
-            sink.on_message_appended(
+            await sink.on_message_appended(
                 {
                     "role": "tool",
                     "tool_call_id": str(interaction["tool_call_id"]),
@@ -401,29 +441,31 @@ class StatefulAgentLoop:
                 },
                 round_index=round_index,
             )
-            self._remove_pending_interaction(session_id, str(interaction_id))
+            await self._remove_pending_interaction(session_id, str(interaction_id))
 
-            waiting = self._waiting_result_if_needed(session_id)
+            waiting = await self._waiting_result_if_needed(session_id)
             if waiting is not None:
                 return waiting
 
             return await self._run_loop(session_id, stop_event=stop_event, sink=sink)
 
-    def _heal_pending(self, sid: str) -> int:
+    async def _heal_pending(self, sid: str) -> int:
         """abort_pending without the session-existence re-check (callers in
         send already hold the lock and have validated the session)."""
-        state = self.store.get_state(sid)
+        store = await self._ensure_store()
+        state = await store.get_state(sid)
         if state is None or not state.pending:
             return 0
-        return self.abort_pending(sid, reason="auto-healed by send(heal_pending=True)")
+        return await self.abort_pending(sid, reason="auto-healed by send(heal_pending=True)")
 
-    def abort_pending(self, session_id: str, *, reason: str = "aborted") -> int:
+    async def abort_pending(self, session_id: str, *, reason: str = "aborted") -> int:
         """Synthesize ``<aborted: reason>`` tool messages for every unresolved
         tool_call, restoring message-protocol validity. Returns the number of
         aborted tool_calls.
         """
-        self._ensure_session_or_raise(session_id)
-        state = self.store.get_state(session_id)
+        store = await self._ensure_store()
+        await self._ensure_session_or_raise(session_id)
+        state = await store.get_state(session_id)
         if state is None or not state.pending:
             return 0
         pending = state.pending
@@ -431,13 +473,13 @@ class StatefulAgentLoop:
         tool_calls = pending.get("tool_calls") or [
             {"id": cid} for cid in pending.get("tool_call_ids", [])
         ]
-        sink = SQLiteSink(self.store, session_id)
+        sink = SQLiteSink(store, session_id)
         sink._unresolved = {str(tc.get("id") or "") for tc in tool_calls}
         sink._assistant_seq = pending.get("assistant_seq")
         for tc in tool_calls:
             cid = str(tc.get("id") or "")
             name = _tool_call_name(tc) if "function" in tc or "name" in tc else None
-            sink.on_message_appended(
+            await sink.on_message_appended(
                 {
                     "role": "tool",
                     "tool_call_id": cid,
@@ -458,7 +500,7 @@ class StatefulAgentLoop:
     def event_bus(self):
         return self._runner.event_bus
 
-    def schedule_timer(
+    async def schedule_timer(
         self,
         session_id: str,
         *,
@@ -475,7 +517,8 @@ class StatefulAgentLoop:
         scheduler polling ``store.due_timers()``) is running."""
         import time as _time
 
-        self._ensure_session_or_raise(session_id)
+        store = await self._ensure_store()
+        await self._ensure_session_or_raise(session_id)
         if (delay_s is None) == (due_at_ms is None):
             raise ValueError("provide exactly one of delay_s / due_at_ms")
         if not (note or "").strip():
@@ -487,50 +530,56 @@ class StatefulAgentLoop:
             due = int(_time.time() * 1000 + float(delay_s) * 1000)
         if interval_s is not None and int(interval_s) < 1:
             raise ValueError("interval_s must be >= 1 second")
-        return self.store.create_timer(
+        return await store.create_timer(
             session_id, due_at=due, note=note.strip(), interval_s=interval_s
         )
 
-    def cancel_timer(self, session_id: str, timer_id: int) -> bool:
+    async def cancel_timer(self, session_id: str, timer_id: int) -> bool:
         """Cancel an armed timer. Returns False when it already fired /
         was cancelled / never existed."""
-        self._ensure_session_or_raise(session_id)
-        return self.store.transition_timer(
+        store = await self._ensure_store()
+        await self._ensure_session_or_raise(session_id)
+        return await store.transition_timer(
             session_id, int(timer_id), from_status="armed", to_status="cancelled"
         )
 
-    def list_timers(self, session_id: str):
+    async def list_timers(self, session_id: str):
         """Live (armed/firing) timers for this session, soonest first."""
-        self._ensure_session_or_raise(session_id)
-        return self.store.list_timers(session_id)
+        store = await self._ensure_store()
+        await self._ensure_session_or_raise(session_id)
+        return await store.list_timers(session_id)
 
     # ── inspection ────────────────────────────────────────────────────────
 
-    def get_session_stats(self, session_id: str):
+    async def get_session_stats(self, session_id: str):
         """Cumulative accounting for one session (sends / llm_calls /
         prompt / completion / total tokens), or ``None`` before its first
         completed send. See ``SessionStatsRow``."""
-        self._ensure_session_or_raise(session_id)
-        return self.store.get_session_stats(session_id)
+        store = await self._ensure_store()
+        await self._ensure_session_or_raise(session_id)
+        return await store.get_session_stats(session_id)
 
-    def list_session_stats(self):
+    async def list_session_stats(self):
         """Cumulative accounting for every session in this store,
         most-recently-active first."""
-        return self.store.list_session_stats()
+        store = await self._ensure_store()
+        return await store.list_session_stats()
 
-    def get_messages(self, session_id: str, *, include_compacted: bool = False) -> list[LoopMessage]:
+    async def get_messages(self, session_id: str, *, include_compacted: bool = False) -> list[LoopMessage]:
+        store = await self._ensure_store()
         rows = (
-            self.store.load_all_messages(session_id)
+            await store.load_all_messages(session_id)
             if include_compacted
-            else self.store.load_active_messages(session_id)
+            else await store.load_active_messages(session_id)
         )
         return [_row_to_loop_message(r) for r in rows]
 
-    def get_pending(self, session_id: str) -> dict[str, Any] | None:
-        state = self.store.get_state(session_id)
+    async def get_pending(self, session_id: str) -> dict[str, Any] | None:
+        store = await self._ensure_store()
+        state = await store.get_state(session_id)
         return state.pending if state else None
 
-    def resolve_system_prompt(self, *, session_id: str | None = None) -> str:
+    async def resolve_system_prompt(self, *, session_id: str | None = None) -> str:
         """Return the system prompt the pipeline will actually use.
 
         This mirrors the resolution logic in
@@ -557,7 +606,8 @@ class StatefulAgentLoop:
         # Session-level prompt wins over config-level prompt.
         base: str | None = None
         if session_id is not None:
-            row = self.store.get_session(session_id)
+            store = await self._ensure_store()
+            row = await store.get_session(session_id)
             if row is not None:
                 base = row.system_prompt
 
@@ -593,7 +643,7 @@ class StatefulAgentLoop:
 
     # ── internals ─────────────────────────────────────────────────────────
 
-    def _create_session(
+    async def _create_session(
         self,
         *,
         metadata: dict[str, Any] | None,
@@ -602,7 +652,8 @@ class StatefulAgentLoop:
         lifecycle: SubagentLifecycle = SubagentLifecycle.EPHEMERAL,
         system_prompt: str | None = None,
     ) -> str:
-        return self.store.create_session(
+        store = await self._ensure_store()
+        return await store.create_session(
             system_prompt=system_prompt or self.config.system_prompt,
             config={
                 "max_rounds": self.config.max_rounds,
@@ -641,12 +692,14 @@ class StatefulAgentLoop:
         merged = merge_follow_up_inputs(pending)
         return [merged] if merged is not None else []
 
-    def _ensure_session_or_raise(self, sid: str) -> None:
-        if self.store.get_session(sid) is None:
+    async def _ensure_session_or_raise(self, sid: str) -> None:
+        store = await self._ensure_store()
+        if await store.get_session(sid) is None:
             raise SessionNotFoundError(sid)
 
-    def _raise_if_pending(self, sid: str) -> None:
-        state = self.store.get_state(sid)
+    async def _raise_if_pending(self, sid: str) -> None:
+        store = await self._ensure_store()
+        state = await store.get_state(sid)
         if state is not None and state.pending:
             pending = state.pending
             raise SessionPendingError(
@@ -655,12 +708,13 @@ class StatefulAgentLoop:
                 pending_tool_calls=pending.get("tool_calls", []),
             )
 
-    def _persist_user_input(self, sid: str, user_input: str | LoopMessage) -> None:
+    async def _persist_user_input(self, sid: str, user_input: str | LoopMessage) -> None:
+        store = await self._ensure_store()
         if isinstance(user_input, str):
-            self.store.append_message(sid, role="user", content=user_input)
+            await store.append_message(sid, role="user", content=user_input)
             return
         role = user_input.get("role", "user")
-        self.store.append_message(
+        await store.append_message(
             sid,
             role=str(role),
             content=_as_text(user_input.get("content")),
@@ -669,7 +723,8 @@ class StatefulAgentLoop:
 
     async def _execute_pending(self, sid: str, sink: SQLiteSink) -> None:
         """Replay leftover tool_calls. Idempotent if there is no pending."""
-        state = self.store.get_state(sid)
+        store = await self._ensure_store()
+        state = await store.get_state(sid)
         if state is None or not state.pending:
             return
         pending = state.pending
@@ -680,7 +735,7 @@ class StatefulAgentLoop:
         if not tool_calls:
             return
         # Initialize sink's in-memory unresolved set so auto-resolve works.
-        self._prime_sink_from_pending(sid, sink)
+        await self._prime_sink_from_pending(sid, sink)
         for tc in tool_calls:
             cid = str(tc.get("id") or "")
             name = _tool_call_name(tc)
@@ -698,7 +753,7 @@ class StatefulAgentLoop:
                     output, failed = str(raw), False
                 except Exception as exc:
                     output, failed = f"Error on resume: {exc}", True
-            sink.on_message_appended(
+            await sink.on_message_appended(
                 {
                     "role": "tool",
                     "tool_call_id": cid,
@@ -732,12 +787,12 @@ class StatefulAgentLoop:
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
     ) -> StatefulResult:
-        sink = sink if sink is not None else SQLiteSink(self.store, sid)
-        # Offload the per-send active-history load (O(active-history) SQLite read +
-        # logical re-sort) off the event loop — for a large session it would otherwise
-        # block every other task for the duration of the read (SCALE-3). The store's
-        # RLock keeps this thread-safe.
-        active_rows = await asyncio.to_thread(self.store.load_active_messages, sid)
+        store = await self._ensure_store()
+        sink = sink if sink is not None else SQLiteSink(store, sid)
+        # The async store offloads its own blocking I/O (SQLite → threadpool; PG/MySQL
+        # → real async), so the per-send active-history load no longer blocks the event
+        # loop — other sessions run during the read (SCALE-3).
+        active_rows = await store.load_active_messages(sid)
         history = [_row_to_loop_message(r) for r in active_rows]
         # Mirror loaded seqs into the sink so the compactor can translate
         # in-memory indices back to store rows when it folds messages. Pass the
@@ -752,7 +807,7 @@ class StatefulAgentLoop:
                 for r in active_rows
             ],
         )
-        session_row = self.store.get_session(sid)
+        session_row = await store.get_session(sid)
         # System prompt precedence: per-call > session > config.
         effective_sp = system_prompt
         if effective_sp is None and session_row is not None and session_row.system_prompt:
@@ -778,7 +833,7 @@ class StatefulAgentLoop:
                     session_id=sid,
                     stop_event=stop_event,
                     sink=sink,
-                    store=self.store,
+                    store=store,
                     drain_follow_ups=_drain_follow_ups,
                 )
                 try:
@@ -793,9 +848,9 @@ class StatefulAgentLoop:
             finally:
                 reset_current_loop(loop_token)
         try:
-            # Offload the stats write off the event loop (H1.9/C8).
-            await asyncio.to_thread(
-                self.store.bump_session_stats,
+            # The async store offloads its own blocking I/O, so this no longer
+            # needs an explicit thread hop (H1.9/C8).
+            await store.bump_session_stats(
                 sid, result.usage, rounds=result.rounds, tool_calls=result.tool_calls,
             )
         except Exception:
@@ -811,8 +866,9 @@ class StatefulAgentLoop:
             tool_calls=result.tool_calls,
         )
 
-    def _prime_sink_from_pending(self, sid: str, sink: SQLiteSink) -> None:
-        state = self.store.get_state(sid)
+    async def _prime_sink_from_pending(self, sid: str, sink: SQLiteSink) -> None:
+        store = await self._ensure_store()
+        state = await store.get_state(sid)
         if state is None or not state.pending:
             return
         pending = state.pending
@@ -823,8 +879,9 @@ class StatefulAgentLoop:
         sink._assistant_seq = pending.get("assistant_seq")
         sink._tool_calls = tool_calls
 
-    def _remove_pending_interaction(self, sid: str, interaction_id: str) -> None:
-        state = self.store.get_state(sid)
+    async def _remove_pending_interaction(self, sid: str, interaction_id: str) -> None:
+        store = await self._ensure_store()
+        state = await store.get_state(sid)
         if state is None or not state.pending:
             return
         pending = dict(state.pending)
@@ -835,14 +892,15 @@ class StatefulAgentLoop:
         ]
         if interactions:
             pending["pending_interactions"] = interactions
-            self.store.set_pending(sid, pending)
+            await store.set_pending(sid, pending)
             return
         pending.pop("pending_interactions", None)
         if pending.get("tool_call_ids") or pending.get("tool_calls"):
-            self.store.set_pending(sid, pending)
+            await store.set_pending(sid, pending)
 
-    def _waiting_result_if_needed(self, sid: str) -> StatefulResult | None:
-        state = self.store.get_state(sid)
+    async def _waiting_result_if_needed(self, sid: str) -> StatefulResult | None:
+        store = await self._ensure_store()
+        state = await store.get_state(sid)
         if state is None or not state.pending:
             return None
         pending = state.pending

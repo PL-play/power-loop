@@ -11,7 +11,7 @@ The depth ceiling is no longer a hard module constant: it lives on the
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Generator
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import pytest
@@ -36,50 +36,50 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
-def store() -> Generator[SessionStore, None, None]:
-    s = SessionStore.open(":memory:")
+async def store() -> AsyncIterator[SessionStore]:
+    s = await SessionStore.open(":memory:")
     yield s
-    s.close()
+    await s.close()
 
 
 # ── store-level config ────────────────────────────────────────────────────
 
 
-def test_default_is_module_constant() -> None:
-    s = SessionStore.open(":memory:")
+async def test_default_is_module_constant() -> None:
+    s = await SessionStore.open(":memory:")
     try:
         assert s.max_spawn_depth == MAX_SPAWN_DEPTH
     finally:
-        s.close()
+        await s.close()
 
 
-def test_open_accepts_custom_limit() -> None:
-    s = SessionStore.open(":memory:", max_spawn_depth=1)
+async def test_open_accepts_custom_limit() -> None:
+    s = await SessionStore.open(":memory:", max_spawn_depth=1)
     try:
         assert s.max_spawn_depth == 1
-        root = s.create_session()
-        child = s.create_session(parent_session_id=root)  # depth 1 == limit: ok
+        root = await s.create_session()
+        child = await s.create_session(parent_session_id=root)  # depth 1 == limit: ok
         with pytest.raises(ValueError, match="exceeds max 1"):
-            s.create_session(parent_session_id=child)  # depth 2 > 1: rejected
+            await s.create_session(parent_session_id=child)  # depth 2 > 1: rejected
     finally:
-        s.close()
+        await s.close()
 
 
-def test_higher_limit_allows_deeper_chain() -> None:
-    s = SessionStore.open(":memory:", max_spawn_depth=5)
+async def test_higher_limit_allows_deeper_chain() -> None:
+    s = await SessionStore.open(":memory:", max_spawn_depth=5)
     try:
-        cur = s.create_session()
+        cur = await s.create_session()
         for _ in range(5):  # would blow the default of 3
-            cur = s.create_session(parent_session_id=cur)
+            cur = await s.create_session(parent_session_id=cur)
         assert s.max_spawn_depth == 5
     finally:
-        s.close()
+        await s.close()
 
 
 @pytest.mark.parametrize("bad", [0, -1, "x", None])
-def test_invalid_limit_rejected(bad: object) -> None:
+async def test_invalid_limit_rejected(bad: object) -> None:
     with pytest.raises(ValueError, match="max_spawn_depth"):
-        SessionStore.open(":memory:", max_spawn_depth=bad)  # type: ignore[arg-type]
+        await SessionStore.open(":memory:", max_spawn_depth=bad)  # type: ignore[arg-type]
 
 
 def test_property_setter_validates(store: SessionStore) -> None:
@@ -115,12 +115,13 @@ class _LLM(LLMService):
         return None
 
 
-def test_loop_forwards_limit_to_owned_store() -> None:
+async def test_loop_forwards_limit_to_owned_store() -> None:
     loop = StatefulAgentLoop(llm=_LLM(), db_path=":memory:", max_spawn_depth=9)
     try:
-        assert loop.store.max_spawn_depth == 9
+        store = await loop._ensure_store()
+        assert store.max_spawn_depth == 9
     finally:
-        loop.close()
+        await loop.aclose()
 
 
 def test_loop_overrides_shared_store_limit(store: SessionStore) -> None:
@@ -143,8 +144,8 @@ async def test_run_agent_spec_honors_configured_limit(store: SessionStore) -> No
         store=store, config=AgentLoopConfig(max_rounds=1),
     )
     # Build a parent chain already at depth 1 (== limit) so the next spawn bounces.
-    root = store.create_session()
-    at_limit = store.create_session(parent_session_id=root)  # depth 1
+    root = await store.create_session()
+    at_limit = await store.create_session(parent_session_id=root)  # depth 1
 
     parent_loop.llm = _LLM(responses=[LLMResponse(raw_text="child", content_text="child")])
     tok_loop = set_current_loop(parent_loop)
@@ -171,11 +172,14 @@ async def test_run_agent_spec_falls_back_when_store_lacks_attr() -> None:
         spawn_depth = MAX_SPAWN_DEPTH  # already at the default ceiling
 
     class _StoreNoAttr:  # duck-typed: only what the pre-check touches, no max_spawn_depth
-        def get_session(self, sid: str) -> _Row:
+        async def get_session(self, sid: str) -> _Row:
             return _Row()
 
     class _FakeLoop:
         store = _StoreNoAttr()
+
+        async def _ensure_store(self) -> _StoreNoAttr:
+            return self.store
 
     tok = set_session_id("parent")
     try:

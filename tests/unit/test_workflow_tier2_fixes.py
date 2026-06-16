@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, StatefulAgentLoop
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.workflow import SubprocessExecutor, WorkerBootstrap, WorkflowSpec
 from power_loop.workflow.engine import WorkflowEngine
@@ -40,7 +40,7 @@ class _OrchLLM(LLMService):
 
 def _loop() -> StatefulAgentLoop:
     return StatefulAgentLoop(
-        llm=_OrchLLM(), store=SessionStore.open(":memory:"),
+        llm=_OrchLLM(), db_path=":memory:",
         config=AgentLoopConfig(system_prompt="o", max_rounds=2, compactor=None),
     )
 

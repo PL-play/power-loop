@@ -104,7 +104,7 @@ async def test_send_result_carries_summed_usage(tmp_path):
         config=AgentLoopConfig(system_prompt="t", max_rounds=4),
         tool_registry=reg,
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     res = await loop.send("hi", session_id=sid)
     assert res.status == "completed"
     assert res.usage["prompt_tokens"] == 250
@@ -125,7 +125,7 @@ async def test_each_send_gets_its_own_usage(tmp_path):
         llm=llm, db_path=str(tmp_path / "s.db"),
         config=AgentLoopConfig(system_prompt="t"),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r1 = await loop.send("a", session_id=sid)
     r2 = await loop.send("b", session_id=sid)
     assert r1.usage["prompt_tokens"] == 10
@@ -136,14 +136,14 @@ async def test_each_send_gets_its_own_usage(tmp_path):
 # ── send(heal_pending=True) ─────────────────────────────────────────────
 
 
-def _wedge_session(loop: StatefulAgentLoop, sid: str) -> None:
+async def _wedge_session(loop: StatefulAgentLoop, sid: str) -> None:
     """Simulate a run killed mid tool-call: pending tool_calls in the store."""
-    loop.store.append_message(
+    await loop.store.append_message(
         sid, role="assistant", content="",
         tool_calls=[{"id": "dead1", "type": "function",
                      "function": {"name": "echo", "arguments": "{}"}}],
     )
-    loop.store.set_pending(sid, {
+    await loop.store.set_pending(sid, {
         "assistant_seq": 1, "round_index": 0,
         "tool_call_ids": ["dead1"],
         "tool_calls": [{"id": "dead1", "type": "function",
@@ -159,8 +159,8 @@ async def test_send_raises_pending_by_default_with_guidance(tmp_path):
         llm=_Scripted(responses=[_resp("ok", prompt=1, completion=1)]),
         db_path=str(tmp_path / "s.db"), config=AgentLoopConfig(system_prompt="t"),
     )
-    sid = loop.new_session()
-    _wedge_session(loop, sid)
+    sid = await loop.new_session()
+    await _wedge_session(loop, sid)
     with pytest.raises(SessionPendingError) as ei:
         await loop.send("hello", session_id=sid)
     assert "heal_pending=True" in str(ei.value)
@@ -175,13 +175,13 @@ async def test_send_heal_pending_aborts_and_proceeds(tmp_path):
         llm=_Scripted(responses=[_resp("recovered", prompt=1, completion=1)]),
         db_path=str(tmp_path / "s.db"), config=AgentLoopConfig(system_prompt="t"),
     )
-    sid = loop.new_session()
-    _wedge_session(loop, sid)
+    sid = await loop.new_session()
+    await _wedge_session(loop, sid)
     res = await loop.send("hello again", session_id=sid, heal_pending=True)
     assert res.status == "completed"
     assert res.final_text == "recovered"
     # The dead tool_call got a synthetic <aborted> tool message.
-    msgs = loop.get_messages(sid)
+    msgs = await loop.get_messages(sid)
     aborted = [m for m in msgs if m.get("role") == "tool" and "aborted" in str(m.get("content"))]
     assert len(aborted) == 1
     # Healthy session: heal_pending is a no-op.

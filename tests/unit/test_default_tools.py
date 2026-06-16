@@ -193,12 +193,12 @@ def test_bash_runs_and_blocks_obvious_danger(tmp_path: Path) -> None:
     assert "Dangerous command blocked" in str(blocked)
 
 
-def test_default_registry_contains_all_manifest_tools(tmp_path: Path) -> None:
+async def test_default_registry_contains_all_manifest_tools(tmp_path: Path) -> None:
     skills_root = tmp_path / "skills"
     skills_root.mkdir()
     registry = create_default_tool_registry(preset="full", workspace_dir=tmp_path, skills_dir=skills_root)
 
-    todo = registry.invoke(
+    todo = await registry.invoke_async(
         "todo",
         {
             "items": [
@@ -209,13 +209,13 @@ def test_default_registry_contains_all_manifest_tools(tmp_path: Path) -> None:
     )
     assert "write" in str(todo)
 
-    skill = registry.invoke("load_skill", {"name": "missing-skill-for-test"})
+    skill = await registry.invoke_async("load_skill", {"name": "missing-skill-for-test"})
     assert "Unknown skill" in str(skill)
 
-    started = registry.invoke("background_run", {"command": "printf 'background-ok\\n'"})
+    started = await registry.invoke_async("background_run", {"command": "printf 'background-ok\\n'"})
     assert "Background task" in str(started)
     task_id = str(started).split()[2]
-    checked = registry.invoke("check_background", {"task_id": task_id})
+    checked = await registry.invoke_async("check_background", {"task_id": task_id})
     assert task_id or checked
 
     assert FILE_READ_STATE
