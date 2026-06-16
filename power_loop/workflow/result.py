@@ -72,7 +72,10 @@ class WorkflowResult:
 
     @property
     def ok(self) -> bool:
-        return self.status == "completed"
+        # A run that collected branch errors under on_error="continue" still settles
+        # with status="completed"; ``ok`` must reflect that something failed so a
+        # caller gating on result.ok doesn't treat a partial failure as success (C13).
+        return self.status == "completed" and not self.errors
 
     def summary(self) -> str:
         """A short human/LLM-readable rollup (used by the create_workflow tool)."""

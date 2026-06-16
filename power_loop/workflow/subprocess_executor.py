@@ -247,7 +247,22 @@ class SubprocessExecutor:
             return {**base, "status": "failed", "error": f"worker launch failed: {exc}",
                     "final_text": f"[worker launch failed] {type(exc).__name__}: {exc}"}
         comm = asyncio.ensure_future(proc.communicate(input=job.to_json().encode()))
-        outcome, stdout_b, stderr_b = await self._await_proc(proc, comm, token)
+        try:
+            outcome, stdout_b, stderr_b = await self._await_proc(proc, comm, token)
+        except asyncio.CancelledError:
+            # The engine cancelled this leaf's TASK (host shutdown, an enclosing
+            # halt, or WorkflowRunHandle teardown). The cooperative token path in
+            # _await_proc handles its own cancel, but a task-level CancelledError
+            # raised at the await would unwind WITHOUT killing the child — orphaning
+            # the worker process + its 3 pipes (C3). Signal it to die synchronously
+            # (a signal send can't hang or be re-cancelled) and drop the pipe future.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            comm.cancel()
+            raise
         stdout = (stdout_b or b"").decode(errors="replace")
         stderr = (stderr_b or b"").decode(errors="replace")
         result = self._to_result(job, outcome, proc.returncode, stdout, stderr)
