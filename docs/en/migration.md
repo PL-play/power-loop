@@ -2,6 +2,45 @@
 
 [中文](../zh/migration.md) | [Back to docs](../README.md)
 
+## 1.x — async API · pluggable storage · stateless loops
+
+Three changes worth adopting in any current code:
+
+1. **The public API is async.** Session-management methods that used to be synchronous are now
+   coroutines and must be `await`ed: `new_session`, `close_session`, `get_messages`, `get_pending`,
+   `resolve_system_prompt`, `abort_pending`, `prewarm`, the timer methods (`schedule_timer` /
+   `cancel_timer` / `list_timers`), and the stats methods (`get_session_stats` /
+   `list_session_stats`). Every `SessionStore` method is a coroutine too (`await store.open(...)`,
+   `await store.append_message(...)`, …). `send` / `follow_up` / `resume` / `submit_input` were
+   already async; the `send_sync` / `follow_up_sync` wrappers stay synchronous.
+   ```python
+   # before
+   sid = loop.new_session()
+   msgs = loop.get_messages(sid)
+   # after
+   sid = await loop.new_session()
+   msgs = await loop.get_messages(sid)
+   ```
+
+2. **Storage is pluggable.** The store opens by DSN: a bare path or `sqlite://…` selects SQLite
+   (the zero-infra default), `postgresql://…` selects PostgreSQL (`pip install 'power-loop[postgres]'`),
+   `mysql://…` selects MySQL (`pip install 'power-loop[mysql]'`). The loop accepts `dsn=` (the
+   alias `db_path=` still works), `table_prefix=` (default `pl_`), and
+   `schema=SchemaPolicy.AUTO_CREATE | VERIFY`. `AUTO_CREATE` (default) creates tables if missing;
+   `VERIFY` only checks and raises `StoreSchemaError` (carrying the exact DDL in `.ddl`) when the
+   schema is absent. The store version lives in a portable, backend-neutral `pl_schema_migrations`
+   table that works identically on all three backends and refuses a newer-than-code database.
+   `create_schema: bool` is a deprecated alias (`True → AUTO_CREATE`, `False → VERIFY`). See
+   [Storage backends](user-guide/storage-backends.md).
+
+3. **The loop is stateless / resumable.** A `StatefulAgentLoop` holds no authoritative session
+   state — all of it lives in the store — so a cold/fresh loop resumes any session by id: just
+   construct with the same `dsn` + `session_id` and `send()`. An optional
+   `await loop.prewarm(session_id)` pre-loads the active window. The loop keeps a per-session
+   active-window cache (`session_cache_size`, default 256, `0` disables; inspect `loop.cache_stats`)
+   that caches only the durable projection — a pure accelerator that never changes what the model
+   sees.
+
 ## 0.13.x → 0.14.0
 
 1. **`llm_client` is vendored.** It now lives at `power_loop._vendor.llm_client` and the
@@ -35,7 +74,7 @@ r1 = await loop.send("My name is Alan.")
 r2 = await loop.send("What is my name?", session_id=r1.session_id)
 
 # 0.3.0+
-sid = loop.new_session()
+sid = await loop.new_session()
 r1 = await loop.send("My name is Alan.", session_id=sid)
 r2 = await loop.send("What is my name?", session_id=sid)
 ```
@@ -43,7 +82,7 @@ r2 = await loop.send("What is my name?", session_id=sid)
 Move per-session metadata from `send(metadata=...)` to `new_session(metadata=...)`:
 
 ```python
-sid = loop.new_session(metadata={"user_id": "alan"})
+sid = await loop.new_session(metadata={"user_id": "alan"})
 result = await loop.send("Hello", session_id=sid)
 ```
 
@@ -55,7 +94,7 @@ power-loop v0.2.0 is a **hard break** from 0.1.x. The stateless `AgentLoop` is g
 
 | 0.1.x | 0.2.0 |
 |---|---|
-| `AgentLoop(llm, config).run(messages=[...])` | `sid = loop.new_session(); await loop.send(user_input, session_id=sid)` |
+| `AgentLoop(llm, config).run(messages=[...])` | `sid = await loop.new_session(); await loop.send(user_input, session_id=sid)` |
 | Caller manages `messages` list | Library loads from `SessionStore` by `session_id` |
 | No persistence | `db_path` (default `./power_loop_sessions.db`); `":memory:"` for tests |
 | No pending detection | Crash mid-tool → next `send` raises `SessionPendingError` |
@@ -82,7 +121,7 @@ result = loop.run(messages=[{"role": "user", "content": "hello"}])
 from power_loop import StatefulAgentLoop, AgentLoopConfig
 
 loop = StatefulAgentLoop(llm=llm, config=AgentLoopConfig(...))
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send("hello", session_id=sid)
 ```
 
@@ -92,7 +131,7 @@ result = await loop.send("hello", session_id=sid)
 
 **After**: pass `session_id` to continue a conversation:
 ```python
-sid = loop.new_session()
+sid = await loop.new_session()
 r1 = await loop.send("My name is Alan.", session_id=sid)
 r2 = await loop.send("What is my name?", session_id=sid)
 ```
@@ -106,7 +145,7 @@ r2 = await loop.send("What is my name?", session_id=sid)
 try:
     result = await loop.send("do something", session_id=sid)
 except SessionPendingError:
-    loop.abort_pending(sid, reason="user_cancelled")
+    await loop.abort_pending(sid, reason="user_cancelled")
     result = await loop.send("new input", session_id=sid)
 ```
 

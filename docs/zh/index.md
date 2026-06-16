@@ -25,7 +25,7 @@ power-loop 是一个**可嵌入的 Agent 执行内核**——不是框架，不�
 - **事件总线** — 30 种类型化事件，覆盖观测/审计/流式
 - **声明式子代理** — `AgentSpec` → 一次性子代理，工具白名单
 - **上下文压缩** — LLM 摘要压缩，默认开启
-- **会话持久化** — SQLite 存储，跨进程恢复
+- **可插拔存储 + 无状态循环** — 默认零基础设施的单 SQLite 文件，`dsn=` 即可换 PostgreSQL / MySQL（见 [存储后端](user-guide/storage-backends.md)）；`StatefulAgentLoop` 不持有权威状态，冷进程凭 `dsn` + `session_id` 即可恢复任意会话
 - **重试 + 取消** — `LLMRetryPolicy` 指数退避；`CancellationToken` 统一取消形状
 - **结构化输出** — `StructuredOutputSpec` + 四级 JSON 修复链
 - **可插拔记忆** — `MemoryProvider` 协议，跨会话召回

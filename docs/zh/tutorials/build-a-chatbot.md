@@ -37,7 +37,7 @@ async def main():
             max_rounds=1,
         ),
     )
-    session_id = loop.new_session()
+    session_id = await loop.new_session()
 
     while True:
         user_input = input("\nYou: ")
@@ -56,12 +56,12 @@ asyncio.run(main())
 上面启动时显式创建一个会话。输入 `new` 时再创建新的 `session_id`：
 
 ```python
-session_id = loop.new_session()
+session_id = await loop.new_session()
 
 while True:
     user_input = input("\nYou: ")
     if user_input.lower() == "new":
-        session_id = loop.new_session()
+        session_id = await loop.new_session()
         print("[新会话]")
         continue
 
@@ -87,6 +87,10 @@ result = await loop.send("还记得我吗？", session_id="之前保存的 sessi
 print(result.final_text)  # → "你是阿岚！"
 ```
 
+循环不持有权威状态，所以重启后的进程凭相同的 `dsn`/`db_path` + `session_id` 即可恢复会话。默认存储是
+零基础设施的单 SQLite 文件；需要共享的多写入者服务时，把 `dsn=` 换成 PostgreSQL / MySQL URL 即可——
+见 [存储后端](../user-guide/storage-backends.md)。
+
 ## 完整代码
 
 ```python
@@ -104,7 +108,7 @@ async def main():
             max_rounds=1,
         ),
     )
-    session_id = loop.new_session()
+    session_id = await loop.new_session()
     try:
         print("Chatbot (输入 'new' 新会话, 'exit' 退出)")
         while True:
@@ -112,7 +116,7 @@ async def main():
             if not user_input: continue
             if user_input.lower() == "exit": break
             if user_input.lower() == "new":
-                session_id = loop.new_session(); print("[新会话]"); continue
+                session_id = await loop.new_session(); print("[新会话]"); continue
             result = await loop.send(user_input, session_id=session_id)
             print(f"Bot: {result.final_text}")
     finally:

@@ -57,7 +57,7 @@ async def main():
         ),
     )
 
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("HTTP 是什么的缩写？", session_id=sid)
     print(result.final_text)
 
@@ -91,7 +91,7 @@ flowchart LR
 ## 5. 继续聊——多轮对话
 
 ```python
-sid = loop.new_session()
+sid = await loop.new_session()
 result1 = await loop.send("我叫阿岚。", session_id=sid)
 print(result1.final_text)
 
@@ -102,7 +102,8 @@ result2 = await loop.send(
 print(result2.final_text)   # "你叫阿岚。"
 ```
 
-库自动从 SQLite 加载完整历史。你永远不需要手动管理 `messages` 列表。
+库自动从存储后端加载完整历史。你永远不需要手动管理 `messages` 列表。默认是零基础设施的单 SQLite 文件；
+想换成 PostgreSQL / MySQL 只需传 `dsn=`，上层代码不变——见 [存储后端](user-guide/storage-backends.md)。
 
 ## 6. 下一步
 

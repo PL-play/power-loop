@@ -73,7 +73,7 @@ token = CancellationToken.from_any(None)  # never cancelled
 Pass to `send()`:
 
 ```python
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send("do something", session_id=sid, stop_event=token)
 # or
 result = await loop.send("do something", session_id=sid, stop_event=threading.Event())
@@ -88,7 +88,7 @@ async def cancel_soon():
     await asyncio.sleep(2)
     token.cancel("timeout")
 
-sid = loop.new_session()
+sid = await loop.new_session()
 # The send will raise CancellationRequested mid-loop
 # → pipeline translates to status="cancelled"
 await asyncio.gather(

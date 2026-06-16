@@ -71,7 +71,7 @@ loop = StatefulAgentLoop(
     ),
 )
 
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send("东京天气怎么样？", session_id=sid)
 print(result.final_text)  # → "东京天气：晴，22°C。"
 ```
@@ -124,7 +124,7 @@ async def main():
         config=AgentLoopConfig(system_prompt="使用工具。简洁。", max_rounds=4),
     )
     try:
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("东京天气怎么样？", session_id=sid)
         print(f"Bot: {r.final_text}")
     finally:

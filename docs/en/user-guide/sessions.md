@@ -30,7 +30,7 @@ stateDiagram-v2
 loop = StatefulAgentLoop(llm=llm, config=config)
 
 # New session
-sid = loop.new_session()  # → "sess_abc123..."
+sid = await loop.new_session()  # → "sess_abc123..."
 r1 = await loop.send("Hello, my name is Alan.", session_id=sid)
 
 # Continue
@@ -38,74 +38,86 @@ r2 = await loop.send("What is my name?", session_id=sid)
 print(r2.final_text)  # → "Your name is Alan."
 
 # Inspect history
-messages = loop.get_messages(sid)
+messages = await loop.get_messages(sid)
 for m in messages:
     print(m["role"], m.get("content", "")[:60])
 ```
 
-**Key**: You never build `messages` lists. The library loads history from SQLite by `session_id`.
+**Key**: You never build `messages` lists. The library loads history from the store by `session_id`.
 
 ## SessionStore
 
-`SessionStore` is the SQLite-backed persistence layer. You typically don't interact with it directly — `StatefulAgentLoop` manages it. But you can access it for inspection or advanced use.
+`SessionStore` is the backend-neutral persistence layer. You typically don't interact with it directly — `StatefulAgentLoop` manages it. But you can open one yourself for inspection, sharing across loops, or advanced use. The backend is chosen by DSN: a bare path or `sqlite://…` is SQLite (the zero-infra default), `postgresql://…` / `mysql://…` are real multi-writer servers behind optional driver extras. Every store method is a coroutine.
 
 ```python
-from power_loop import SessionStore
+from power_loop import SessionStore, open_store
 
-store = SessionStore.open("./my_sessions.db")
-
-# List all sessions
-sessions = store.list_sessions()  # list of SessionRow
+# SQLite (default backend): open by path.
+store = await SessionStore.open("./my_sessions.db")
+# Or pick any backend by DSN (e.g. to share one store across loops):
+# store = await open_store("postgresql://u:p@host/app", table_prefix="pl_")
 
 # Read a specific session
-session = store.get_session(sid)
+session = await store.get_session(sid)
 print(session.status)     # "active" | "closed"
 print(session.created_at)
 
 # Read messages
-active = store.load_active_messages(sid)     # non-compacted
-all_msgs = store.load_all_messages(sid)       # including compacted-out
+active = await store.load_active_messages(sid)     # non-compacted
+all_msgs = await store.load_all_messages(sid)       # including compacted-out
+
+# Read a session's direct sub-agent children
+children = await store.list_children(sid)           # list of SessionRow
 
 # Close
-store.close()
+await store.close()
 ```
+
+See [Storage backends](storage-backends.md) for picking SQLite vs PostgreSQL/MySQL, the per-backend DDL, and schema provisioning (`SchemaPolicy`).
 
 ### Tables
 
-`SessionStore` manages 5 tables:
+The store keeps everything in 12 tables plus a version table, all under the `table_prefix` (default `pl_`). The core ones:
 
 | Table | Purpose |
 |---|---|
-| `sessions` | One row per session: `session_id`, `status`, `kind`, `parent_session_id`, timestamps |
-| `messages` | Ordered `(session_id, seq)` message log with `state` (`active` / `compacted_out`) |
-| `compactions` | Log of every compaction: `(session_id, compact_seq)`, what was folded |
-| `usage_rounds` | Per-round token usage: `(session_id, round_index)`, prompt/completion tokens |
-| `session_state` | Mutable state blob: current `pending` tool_calls, `context_compact_count` |
+| `pl_sessions` | One row per session: `session_id`, `status`, `kind`, `parent_session_id`, timestamps |
+| `pl_messages` | Ordered `(session_id, seq)` message log with `state` (`active` / `compacted_out`) |
+| `pl_compactions` | Log of every compaction: `(session_id, compact_seq)`, what was folded |
+| `pl_usage_rounds` | Per-round token usage: `(session_id, round_index)`, prompt/completion tokens |
+| `pl_session_state` | Mutable state: `next_seq`, `round_index`, current `pending` tool_calls |
+| `pl_timers` / `pl_notes` / `pl_session_stats` / … | Durable timers, notes, per-session stats, runtime/shared state, background tasks |
+| `pl_schema_migrations` | Portable version table — works identically on every backend and refuses a newer-than-code database |
 
-### SQLite Settings
+The exact DDL for each backend is in [Storage backends](storage-backends.md#the-ddl-per-backend).
 
-- **WAL mode** — concurrent reads are safe.
-- **`busy_timeout=5000`** — 5-second timeout on write contention.
-- **Single connection + `threading.RLock`** — writes are serialized; multiple `StatefulAgentLoop` instances on the same file are safe as long as they don't concurrently write the same session.
+### Storage settings
+
+- **Backend-neutral.** The same store runs on SQLite (default), PostgreSQL, or MySQL — picked by DSN. PostgreSQL/MySQL are natively async; their drivers are optional extras.
+- **SQLite: WAL + `busy_timeout`** — WAL mode is on so reads don't block the writer; a busy timeout absorbs brief write contention.
+- **One writer per session.** The async store offloads blocking SQLite I/O to a worker thread under a single writer lock that keeps `next_seq` collision-free; PostgreSQL/MySQL allocate per-session sequences with a `SELECT … FOR UPDATE` row lock. Multiple `StatefulAgentLoop` instances on the same store are safe as long as a given session is driven by one writer at a time. See [Scaling](scaling.md).
 
 ## Cross-Process Resume
 
-The db file is the persistence anchor. Open it in a new process and continue:
+The store is the persistence anchor; the loop holds **no authoritative state**. Reconstruct a loop from the same `dsn` + `session_id` in any process and continue — a fresh, cold loop resumes from nothing else:
 
 ```python
 # Process 1
-loop = StatefulAgentLoop(llm=llm, db_path="./chat.db", config=config)
-sid = loop.new_session()
+loop = StatefulAgentLoop(llm=llm, dsn="./chat.db", config=config)
+sid = await loop.new_session()
 r1 = await loop.send("Remember: my favorite color is blue.", session_id=sid)
 loop.close()
 
 # Process 2 — hours later, different Python process
-loop2 = StatefulAgentLoop(llm=llm, db_path="./chat.db", config=config)
+loop2 = StatefulAgentLoop(llm=llm, dsn="./chat.db", config=config)
+await loop2.prewarm(sid)  # optional: pre-load the active window
 r2 = await loop2.send("What is my favorite color?", session_id=sid)
 print(r2.final_text)  # → "Your favorite color is blue."
 ```
 
-> **Warning**: Do not concurrently write the same session from multiple processes. The `asyncio.Lock` only protects within one `StatefulAgentLoop` instance. For multi-process, use one writer per session.
+The same applies with a server backend — point both processes at `postgresql://…` / `mysql://…` (see [Storage backends](storage-backends.md)).
+
+> **Warning**: A given session must be driven by one writer at a time. The `asyncio.Lock` only protects within one `StatefulAgentLoop` instance, so serialize a session's sends in your dispatcher/queue layer when many processes share a store. With SQLite, run one writer process per file (shard sessions across files); see [Scaling](scaling.md).
 
 ## Pending Recovery
 
@@ -119,7 +131,7 @@ except SessionPendingError as exc:
     # Option A: finish executing the pending tools
     result = await loop.resume(sid)
     # Option B: abort and move on
-    loop.abort_pending(sid, reason="user_cancelled")
+    await loop.abort_pending(sid, reason="user_cancelled")
     result = await loop.send("new input", session_id=sid)
 ```
 
@@ -135,7 +147,7 @@ interaction = waiting.pending_interactions[0]
 result = await loop.submit_input(sid, interaction["interaction_id"], {"choice": "yes"})
 ```
 
-The pending interaction is stored in SQLite, so another process can reopen the same database and call `submit_input()` later.
+The pending interaction is persisted in the store, so another process can reconstruct the loop from the same `dsn` and call `submit_input()` later.
 
 ## Per-Call Overrides
 
@@ -197,13 +209,13 @@ See [Example 22](../../../examples/22_follow_up_steering.py) and [Examples Guide
 
 ```python
 # Close one session (and all its child sub-agent sessions if cascade=True)
-loop.close_session(sid, cascade=True)
+await loop.close_session(sid, cascade=True)
 
 # Close the entire store (all sessions)
 loop.close()
 ```
 
-Closed sessions are **physically deleted** from SQLite — all messages, compactions, and usage records are removed.
+Closed sessions are **physically deleted** from the store — all messages, compactions, and usage records are removed.
 
 ## Next
 

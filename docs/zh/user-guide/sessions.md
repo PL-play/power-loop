@@ -30,7 +30,7 @@ stateDiagram-v2
 loop = StatefulAgentLoop(llm=llm, config=config)
 
 # 新会话
-sid = loop.new_session()  # → "sess_abc123..."
+sid = await loop.new_session()  # → "sess_abc123..."
 r1 = await loop.send("你好，我叫阿岚。", session_id=sid)
 
 # 继续
@@ -38,71 +38,86 @@ r2 = await loop.send("我叫什么？", session_id=sid)
 print(r2.final_text)  # → "你叫阿岚。"
 
 # 查看历史
-messages = loop.get_messages(sid)
+messages = await loop.get_messages(sid)
 for m in messages:
     print(m["role"], m.get("content", "")[:60])
 ```
 
-**关键**：你永远不需要手动构建 `messages` 列表。库通过 `session_id` 从 SQLite 加载历史。
+**关键**：你永远不需要手动构建 `messages` 列表。库通过 `session_id` 从 store 加载历史。
 
 ## SessionStore
 
-`SessionStore` 是 SQLite 持久化层。通常不需要直接交互——`StatefulAgentLoop` 管理它。但可以访问用于检查或高级用法。
+`SessionStore` 是后端中立的持久化层。通常不需要直接交互——`StatefulAgentLoop` 管理它。但你可以自己打开一个用于检查、跨 loop 共享或高级用法。后端由 DSN 选择：裸路径或 `sqlite://…` 是 SQLite（零基础设施的默认值），`postgresql://…` / `mysql://…` 是真正的多写者服务器，藏在可选的 driver extra 后面。store 的每个方法都是协程。
 
 ```python
-from power_loop import SessionStore
+from power_loop import SessionStore, open_store
 
-store = SessionStore.open("./my_sessions.db")
-
-# 列出所有会话
-sessions = store.list_sessions()  # SessionRow 列表
+# SQLite（默认后端）：按路径打开。
+store = await SessionStore.open("./my_sessions.db")
+# 或按 DSN 选任意后端（例如跨多个 loop 共享一个 store）：
+# store = await open_store("postgresql://u:p@host/app", table_prefix="pl_")
 
 # 读取特定会话
-session = store.get_session(sid)
+session = await store.get_session(sid)
 print(session.status)     # "active" | "closed"
+print(session.created_at)
 
 # 读取消息
-active = store.load_active_messages(sid)     # 未压缩的
-all_msgs = store.load_all_messages(sid)       # 含已压缩的
+active = await store.load_active_messages(sid)     # 未压缩的
+all_msgs = await store.load_all_messages(sid)       # 含已压缩的
+
+# 读取某会话的直接子代理
+children = await store.list_children(sid)           # SessionRow 列表
 
 # 关闭
-store.close()
+await store.close()
 ```
+
+选 SQLite 还是 PostgreSQL/MySQL、各后端的 DDL、以及 schema 配置（`SchemaPolicy`），见 [存储后端](storage-backends.md)。
 
 ### 表结构
 
-`SessionStore` 管理 5 张表：
+store 把所有东西放在 12 张表加一张版本表里，全部带 `table_prefix`（默认 `pl_`）。核心几张：
 
 | 表 | 用途 |
 |---|---|
-| `sessions` | 每个会话一行：`session_id`、`status`、`kind`、`parent_session_id`、时间戳 |
-| `messages` | 按 `(session_id, seq)` 排序的消息日志，含 `state`（`active` / `compacted_out`） |
-| `compactions` | 每次压缩日志：`(session_id, compact_seq)`，折叠内容 |
-| `usage_rounds` | 每轮 token 用量：`(session_id, round_index)`，prompt/completion tokens |
-| `session_state` | 可变状态：当前 `pending` tool_calls、`context_compact_count` |
+| `pl_sessions` | 每个会话一行：`session_id`、`status`、`kind`、`parent_session_id`、时间戳 |
+| `pl_messages` | 按 `(session_id, seq)` 排序的消息日志，含 `state`（`active` / `compacted_out`） |
+| `pl_compactions` | 每次压缩日志：`(session_id, compact_seq)`，折叠内容 |
+| `pl_usage_rounds` | 每轮 token 用量：`(session_id, round_index)`，prompt/completion tokens |
+| `pl_session_state` | 可变状态：`next_seq`、`round_index`、当前 `pending` tool_calls |
+| `pl_timers` / `pl_notes` / `pl_session_stats` / … | 持久化定时器、笔记、每会话统计、runtime/shared state、后台任务 |
+| `pl_schema_migrations` | 可移植的版本表——在每种后端上行为一致，并拒绝比代码更新的数据库 |
 
-### SQLite 配置
+各后端的精确 DDL 见 [存储后端](storage-backends.md#各后端的-ddl)。
 
-- **WAL 模式**——并发读取安全。
-- **`busy_timeout=5000`**——写入争用 5 秒超时。
-- **单连接 + `threading.RLock`**——写入串行化；多个 `StatefulAgentLoop` 实例在同一文件上安全，只要不同时写同一 session。
+### 存储配置
+
+- **后端中立。** 同一个 store 跑在 SQLite（默认）、PostgreSQL 或 MySQL 上——由 DSN 选择。PostgreSQL/MySQL 原生异步；其 driver 是可选 extra。
+- **SQLite：WAL + `busy_timeout`** —— 开启 WAL，读不会阻塞写者；busy timeout 吸收短暂的写入争用。
+- **每会话一个写者。** 异步 store 把阻塞的 SQLite I/O 卸载到 worker 线程，在单一写者锁下执行，从而保证 `next_seq` 不碰撞；PostgreSQL/MySQL 用 `SELECT … FOR UPDATE` 行锁分配每会话序号。多个 `StatefulAgentLoop` 实例在同一 store 上安全，只要每个 session 同一时刻只由一个写者驱动。见 [扩展性](scaling.md)。
 
 ## 跨进程恢复
 
-db 文件是持久化锚点。在新进程中打开并继续：
+store 是持久化锚点；loop **不持有任何权威状态**。在任意进程中用相同的 `dsn` + `session_id` 重建 loop 即可继续——一个全新的冷 loop 不需要别的就能恢复：
 
 ```python
 # 进程 1
-loop = StatefulAgentLoop(llm=llm, db_path="./chat.db", config=config)
-sid = loop.new_session()
+loop = StatefulAgentLoop(llm=llm, dsn="./chat.db", config=config)
+sid = await loop.new_session()
 r1 = await loop.send("记住：我喜欢的颜色是蓝色。", session_id=sid)
 loop.close()
 
 # 进程 2 —— 几小时后，不同的 Python 进程
-loop2 = StatefulAgentLoop(llm=llm, db_path="./chat.db", config=config)
+loop2 = StatefulAgentLoop(llm=llm, dsn="./chat.db", config=config)
+await loop2.prewarm(sid)  # 可选：预加载活动窗口
 r2 = await loop2.send("我喜欢什么颜色？", session_id=sid)
 print(r2.final_text)  # → "你喜欢蓝色。"
 ```
+
+换成服务器后端也一样——把两个进程都指向 `postgresql://…` / `mysql://…`（见 [存储后端](storage-backends.md)）。
+
+> **注意**：同一个 session 同一时刻必须只由一个写者驱动。`asyncio.Lock` 只在单个 `StatefulAgentLoop` 实例内保护，因此当多个进程共享一个 store 时，请在你的 dispatcher/queue 层把同一 session 的 send 串行化。用 SQLite 时，每个文件跑一个写者进程（把 session 按文件分片）；见 [扩展性](scaling.md)。
 
 ## 悬挂恢复
 
@@ -116,7 +131,7 @@ except SessionPendingError as exc:
     # 选项 A：完成执行悬挂的工具
     result = await loop.resume(sid)
     # 选项 B：放弃并继续
-    loop.abort_pending(sid, reason="user_cancelled")
+    await loop.abort_pending(sid, reason="user_cancelled")
     result = await loop.send("new input", session_id=sid)
 ```
 
@@ -191,8 +206,8 @@ Also mention the budget constraint
 ## 关闭会话
 
 ```python
-# 关闭一个会话（cascade=True 时间时关闭所有子代理会话）
-loop.close_session(sid, cascade=True)
+# 关闭一个会话（cascade=True 时一并关闭所有子代理会话）
+await loop.close_session(sid, cascade=True)
 
 # 关闭整个 store（所有会话）
 loop.close()

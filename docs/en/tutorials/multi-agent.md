@@ -48,7 +48,7 @@ loop = StatefulAgentLoop(
     ),
 )
 
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send(
     "Find where authentication logic is implemented in this project. "
     "Then tell me if it uses JWT or session tokens.",
@@ -148,7 +148,7 @@ async def main():
     )
     try:
         # Imperative
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r1 = await loop.send("Research: what does read_file return?", session_id=sid)
         print(f"Imperative: {r1.final_text[:200]}")
 

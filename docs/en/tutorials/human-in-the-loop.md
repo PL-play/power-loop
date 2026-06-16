@@ -113,7 +113,7 @@ async def main():
 
     worker = asyncio.create_task(approval_worker())
     try:
-        sid = loop.new_session()
+        sid = await loop.new_session()
         result = await loop.send("List files in the current directory.", session_id=sid)
         print(f"Bot: {result.final_text}")
     finally:

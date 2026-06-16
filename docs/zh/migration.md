@@ -2,6 +2,40 @@
 
 [English](../en/migration.md) | [回到文档站](../README.md)
 
+## 1.x — 异步 API · 可插拔存储 · 无状态循环
+
+任何现有代码都值得采纳的三处变化：
+
+1. **公开 API 改为异步。** 原本同步的会话管理方法现在都是协程，必须 `await`：`new_session`、
+   `close_session`、`get_messages`、`get_pending`、`resolve_system_prompt`、`abort_pending`、
+   `prewarm`，定时器方法（`schedule_timer` / `cancel_timer` / `list_timers`），以及统计方法
+   （`get_session_stats` / `list_session_stats`）。`SessionStore` 的每个方法也都是协程
+   （`await store.open(...)`、`await store.append_message(...)`…）。`send` / `follow_up` /
+   `resume` / `submit_input` 本来就是异步的；`send_sync` / `follow_up_sync` 包装器保持同步。
+   ```python
+   # 之前
+   sid = loop.new_session()
+   msgs = loop.get_messages(sid)
+   # 之后
+   sid = await loop.new_session()
+   msgs = await loop.get_messages(sid)
+   ```
+
+2. **存储可插拔。** 存储按 DSN 打开：裸路径或 `sqlite://…` 选 SQLite（零基础设施默认），
+   `postgresql://…` 选 PostgreSQL（`pip install 'power-loop[postgres]'`），`mysql://…` 选 MySQL
+   （`pip install 'power-loop[mysql]'`）。循环接受 `dsn=`（别名 `db_path=` 仍可用）、`table_prefix=`
+   （默认 `pl_`）和 `schema=SchemaPolicy.AUTO_CREATE | VERIFY`。`AUTO_CREATE`（默认）在表缺失时创建；
+   `VERIFY` 只检查，schema 缺失时抛 `StoreSchemaError`（`.ddl` 里带着完整建表脚本）。存储版本存放在可移植、
+   后端中立的 `pl_schema_migrations` 表里，三种后端表现一致，并拒绝打开比代码更新的数据库。
+   `create_schema: bool` 是已弃用的别名（`True → AUTO_CREATE`，`False → VERIFY`）。见
+   [存储后端](user-guide/storage-backends.md)。
+
+3. **循环无状态 / 可恢复。** `StatefulAgentLoop` 不持有权威会话状态——状态全在存储里——所以冷启动 /
+   全新的循环凭 id 即可恢复任意会话：用相同的 `dsn` + `session_id` 构造并 `send()` 即可。可选的
+   `await loop.prewarm(session_id)` 预加载活动窗口。循环为每个会话维护一份活动窗口缓存
+   （`session_cache_size`，默认 256，`0` 关闭；用 `loop.cache_stats` 查看），它只缓存持久化投影——
+   一个纯加速器，绝不改变模型看到的内容。
+
 ## 0.13.x → 0.14.0
 
 1. **`llm_client` 收编进库内。** 现位于 `power_loop._vendor.llm_client`，裸的顶层 `llm_client`
@@ -34,7 +68,7 @@ r1 = await loop.send("我叫阿岚。")
 r2 = await loop.send("我叫什么？", session_id=r1.session_id)
 
 # 0.3.0+
-sid = loop.new_session()
+sid = await loop.new_session()
 r1 = await loop.send("我叫阿岚。", session_id=sid)
 r2 = await loop.send("我叫什么？", session_id=sid)
 ```
@@ -42,7 +76,7 @@ r2 = await loop.send("我叫什么？", session_id=sid)
 每个会话的 metadata 从 `send(metadata=...)` 移到 `new_session(metadata=...)`：
 
 ```python
-sid = loop.new_session(metadata={"user_id": "alan"})
+sid = await loop.new_session(metadata={"user_id": "alan"})
 result = await loop.send("你好", session_id=sid)
 ```
 
@@ -54,7 +88,7 @@ v0.2.0 与 0.1.x **不兼容**。无状态的 `AgentLoop` 已移除；一切围�
 
 | 0.1.x | 0.2.0 |
 |---|---|
-| `AgentLoop(llm, config).run(messages=[...])` | `sid = loop.new_session(); await loop.send(user_input, session_id=sid)` |
+| `AgentLoop(llm, config).run(messages=[...])` | `sid = await loop.new_session(); await loop.send(user_input, session_id=sid)` |
 | 调用方管理 `messages` 列表 | 库从 `SessionStore` 按 `session_id` 加载 |
 | 无持久化 | `db_path`（默认 `./power_loop_sessions.db`） |
 | 无悬挂检测 | 工具中崩溃 → 下次 `send` 抛 `SessionPendingError` |
@@ -67,7 +101,7 @@ v0.2.0 与 0.1.x **不兼容**。无状态的 `AgentLoop` 已移除；一切围�
 ### 1. 替换入口
 
 **前**：`AgentLoop(llm, config).run(messages=[...])`
-**后**：先 `sid = loop.new_session()`，再 `await loop.send("hello", session_id=sid)`。
+**后**：先 `sid = await loop.new_session()`，再 `await loop.send("hello", session_id=sid)`。
 
 ### 2. 用 session_id 管理会话
 

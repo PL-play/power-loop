@@ -37,7 +37,7 @@ async def main():
             max_rounds=1,
         ),
     )
-    session_id = loop.new_session()
+    session_id = await loop.new_session()
 
     while True:
         user_input = input("\nYou: ")
@@ -75,7 +75,7 @@ async def main():
         ),
     )
 
-    session_id = loop.new_session()
+    session_id = await loop.new_session()
 
     print("Chatbot (type 'new' for fresh session, 'exit' to quit)")
     while True:
@@ -83,7 +83,7 @@ async def main():
         if user_input.lower() == "exit":
             break
         if user_input.lower() == "new":
-            session_id = loop.new_session()
+            session_id = await loop.new_session()
             print("[New session started]")
             continue
 
@@ -113,10 +113,15 @@ result = await loop.send("还记得我吗？", session_id="sess_saved_from_previ
 print(result.final_text)  # → "你是阿岚！"
 ```
 
+The loop holds no authoritative state, so the restarted process resumes the session from
+nothing but the same `dsn`/`db_path` + `session_id`. The default store is a single zero-infra
+SQLite file; swap `dsn=` for a PostgreSQL/MySQL URL when you need a shared multi-writer server —
+see [Storage backends](../user-guide/storage-backends.md).
+
 ## 5. View the History
 
 ```python
-messages = loop.get_messages(session_id)
+messages = await loop.get_messages(session_id)
 for m in messages:
     print(f"[{m['role']}] {m.get('content', '')[:80]}")
 ```
@@ -141,7 +146,7 @@ async def main():
         ),
     )
 
-    session_id = loop.new_session()
+    session_id = await loop.new_session()
     print("Chatbot (type 'new', 'history', or 'exit')")
     try:
         while True:
@@ -151,11 +156,11 @@ async def main():
             if user_input.lower() == "exit":
                 break
             if user_input.lower() == "new":
-                session_id = loop.new_session()
+                session_id = await loop.new_session()
                 print("[New session]")
                 continue
             if user_input.lower() == "history":
-                for m in loop.get_messages(session_id):
+                for m in await loop.get_messages(session_id):
                     print(f"  [{m['role']}] {m.get('content', '')[:100]}")
                 continue
 

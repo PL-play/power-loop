@@ -17,6 +17,7 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 | Page | What you'll learn |
 |---|---|
 | [Sessions](sessions.md) | `SessionStore`, multi-turn, cross-process resume, session lifecycle |
+| [Storage backends](storage-backends.md) | `dsn=` picks SQLite (default) / PostgreSQL / MySQL; `SchemaPolicy` provisioning, per-backend DDL, preconditions |
 | [Tools](tools.md) | `ToolRegistry`, `ToolDefinition`, JSON Schema validation, sync vs async handlers |
 | [Extending with tools](extending-tools.md) | The custom-tool recipe, per-call allowlisting, MCP (`contrib.mcp`), why no bundled connectors |
 | [Sub-agents](subagents.md) | `spawn_agent`, `AgentSpec`, `run_agent_spec`, lifecycle (EPHEMERAL / LINKED / DETACHED) |
@@ -42,7 +43,7 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 
 | Page | What you'll learn |
 |---|---|
-| [Scaling](scaling.md) | Single-writer model, the read pool, retention/VACUUM, the `bench/` harness, measured numbers, the multi-process pattern |
+| [Scaling](scaling.md) | Per-session writer model, picking SQLite vs a server backend, retention/VACUUM, the `bench/` harness, measured numbers, sharding & scale-out |
 
 ## Advanced
 

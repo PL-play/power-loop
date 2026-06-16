@@ -4,7 +4,7 @@
 
 Each file in this directory is a standalone, runnable Python script that teaches **one concept**. They are ordered progressively — start at `00` and move forward.
 
-All examples are automatically validated by `tests/real/test_examples.py` against a real LLM.
+A representative subset is validated by `tests/real/test_examples.py` against a real LLM; every example is import/parse-clean and runnable as `python examples/NN_*.py` with your `.env` configured.
 
 ## List
 
@@ -45,10 +45,11 @@ All examples are automatically validated by `tests/real/test_examples.py` agains
 | 32 | [`32_recall_compacted.py`](32_recall_compacted.py) | Pull back exact turns that compaction folded out | `recall_compacted` tool |
 | 33 | [`33_coordinating_compactor.py`](33_coordinating_compactor.py) | Custom compactor that remembers must-keep detail before folding | `CompactionContext`, `Compactor` |
 | 34 | [`34_durability_lifecycle.py`](34_durability_lifecycle.py) | **Durability**: prune folded originals, VACUUM, export/import, graceful `aclose()` | `prune_compacted_messages`, `vacuum`, `export_session`/`import_session`, `aclose` |
-| 35 | [`35_scaling_and_read_pool.py`](35_scaling_and_read_pool.py) | **Scale**: concurrent sessions over a read-only WAL pool; the `bench/` harness | `read_pool_size`, `python -m bench` |
+| 35 | [`35_scaling_and_read_pool.py`](35_scaling_and_read_pool.py) | **Scale**: concurrent sessions on the async store; the `bench/` harness | `asyncio.gather` fan-out, `python -m bench` |
 | 36 | [`36_observability.py`](36_observability.py) | **Observability**: durable JSONL sink + `replay` + metrics | `attach_jsonl_sink`, `replay`, `attach_metrics_sink` |
 | 37 | [`37_custom_retrieval_tool.py`](37_custom_retrieval_tool.py) | **Extending**: register a custom (retrieval) tool — the no-bundled-connectors recipe | `ToolDefinition`, `ToolRegistry`, `tools=` allowlist |
 | 38 | [`38_mcp_tools.py`](38_mcp_tools.py) | **MCP**: wire a real MCP server's tools into the agent | `StdioMCPClient`, `register_mcp_tools` (`power-loop[mcp]`) |
+| 39 | [`39_pluggable_backends_and_resume.py`](39_pluggable_backends_and_resume.py) | **Storage**: pick a backend by DSN (SQLite/PG/MySQL), resume a session from a cold loop, schema policy | `dsn=`, `SchemaPolicy`, `StoreSchemaError`, `prewarm()`, `cache_stats` |
 
 ## Running
 
