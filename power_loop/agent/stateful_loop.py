@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -48,8 +49,10 @@ from power_loop.core.pipeline import (
 from power_loop.core.runner import AgentRunner
 from power_loop.runtime.cancellation import CancellationLike
 from power_loop.runtime.skills import SkillLoader
+from power_loop.runtime.store.schema import SchemaPolicy
 from power_loop.runtime.store.store import (
     DEFAULT_DB_PATH,
+    DEFAULT_TABLE_PREFIX,
     MAX_SPAWN_DEPTH,
     SessionStore,
 )
@@ -61,6 +64,21 @@ from power_loop.runtime.store.types import (
 from power_loop.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _SessionCache:
+    """A loop-local, rebuildable accelerator for one session's active window.
+
+    ``rows`` is EXACTLY what ``store.load_active_messages(session_id)`` returns at the moment
+    ``next_seq`` was observed — the DURABLE projection, never the pipeline's mutated working
+    copy (recall placeholders / microcompacted content are re-applied fresh each send, never
+    cached). ``next_seq`` is the validity token: a send reuses ``rows`` iff the live
+    ``session_state.next_seq`` still matches; any mismatch (another writer, or a fold) forces a
+    reload. So a cold loop with an empty cache reproduces identical behavior."""
+
+    next_seq: int
+    rows: list[MessageRow]
 
 
 @dataclass
@@ -98,19 +116,40 @@ class StatefulAgentLoop:
         *,
         llm: LLMService,
         store: SessionStore | None = None,
-        db_path: str = DEFAULT_DB_PATH,
+        db_path: str | None = None,
+        dsn: str | None = None,
+        table_prefix: str | None = None,
+        schema: SchemaPolicy | str | None = None,
         config: AgentLoopConfig | None = None,
         tool_registry: ToolRegistry | None = None,
         hooks: AgentHooks | None = None,
         event_bus: AgentEventBus | None = None,
         max_spawn_depth: int | None = None,
+        session_cache_size: int = 256,
     ) -> None:
+        """Bind the loop to a store. Pass EITHER a pre-opened ``store=`` (e.g. shared across
+        loops) OR a store config to lazily open one: ``dsn=`` (a DSN or sqlite path; ``db_path``
+        is an accepted alias) + ``table_prefix=`` + ``schema=`` (a :class:`SchemaPolicy`). The
+        loop holds no authoritative session state — it can be freely (re)created to resume any
+        session by id: ``send(user_input, session_id=sid)`` loads that session from the store.
+
+        ``session_cache_size`` bounds an LRU of per-session active-window caches (0 disables);
+        the cache only accelerates long-lived multi-send loops and is always a rebuildable
+        accelerator, never a source of truth.
+        """
         self.llm = llm
-        # The store is async (``await SessionStore.open(...)``), but construction is
-        # sync — so an owned store is opened LAZILY on the first async use via
-        # :meth:`_ensure_store`. An explicitly-passed store is already open.
+        if store is not None and any(x is not None for x in (db_path, dsn, table_prefix, schema)):
+            raise ValueError(
+                "pass EITHER store= (a pre-opened store) OR store-config "
+                "(dsn=/db_path=/table_prefix=/schema=) — not both"
+            )
+        # The store is async (``await open_store(...)``) but construction is sync, so an owned
+        # store is opened LAZILY on first async use via :meth:`_ensure_store`. A passed store is
+        # already open.
         self.store: SessionStore | None = store
-        self._db_path = db_path
+        self._dsn = dsn if dsn is not None else (db_path if db_path is not None else DEFAULT_DB_PATH)
+        self._table_prefix = table_prefix if table_prefix is not None else DEFAULT_TABLE_PREFIX
+        self._schema = schema
         self._explicit_max_spawn_depth = max_spawn_depth
         if store is not None and max_spawn_depth is not None:
             # An explicit limit overrides the (possibly shared) store's setting.
@@ -124,26 +163,83 @@ class StatefulAgentLoop:
         self._follow_up_queues: dict[str, list[str | LoopMessage]] = {}
         self._follow_up_queue_locks: dict[str, asyncio.Lock] = {}
         self._closing = False
+        # ── per-session active-window cache (rebuildable accelerator; see _SessionCache) ──
+        self._session_cache_size = int(session_cache_size)
+        self._session_cache: OrderedDict[str, _SessionCache] = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
 
     async def _ensure_store(self) -> SessionStore:
         """Return the loop's store, opening an owned one on first use.
 
-        Construction is sync but the store is async, so the SQLite backend (and its
-        schema) is opened the first time any async method needs it. An explicitly
-        supplied store is returned unchanged.
+        Construction is sync but the store is async, so the backend (SQLite/PG/MySQL, by DSN
+        scheme) and its schema are opened the first time any async method needs it, routed
+        through :func:`power_loop.runtime.store.factory.open_store`. A supplied store is
+        returned unchanged.
         """
         if self.store is not None:
             return self.store
         async with self._store_open_lock:
             if self.store is None:
-                self.store = await SessionStore.open(
-                    self._db_path,
+                from power_loop.runtime.store.factory import open_store
+
+                self.store = await open_store(
+                    self._dsn,
                     max_spawn_depth=(
                         MAX_SPAWN_DEPTH if self._explicit_max_spawn_depth is None
                         else self._explicit_max_spawn_depth
                     ),
+                    table_prefix=self._table_prefix,
+                    schema=self._schema,
                 )
         return self.store
+
+    # ── per-session active-window cache helpers ─────────────────────────────
+
+    def _cache_get(self, sid: str, next_seq: int) -> list[MessageRow] | None:
+        """Return the cached active rows iff the validity token still matches; else None."""
+        if self._session_cache_size <= 0:
+            return None
+        entry = self._session_cache.get(sid)
+        if entry is not None and entry.next_seq == next_seq:
+            self._session_cache.move_to_end(sid)  # LRU touch
+            self._cache_hits += 1
+            return entry.rows
+        self._cache_misses += 1
+        return None
+
+    def _cache_put(self, sid: str, next_seq: int, rows: list[MessageRow]) -> None:
+        if self._session_cache_size <= 0:
+            return
+        self._session_cache[sid] = _SessionCache(next_seq=next_seq, rows=list(rows))
+        self._session_cache.move_to_end(sid)
+        while len(self._session_cache) > self._session_cache_size:
+            self._session_cache.popitem(last=False)  # evict LRU
+            self._cache_evictions += 1
+
+    def _cache_append(self, sid: str, row: MessageRow, *, new_next_seq: int) -> None:
+        """Extend a live cache entry with one row the loop itself just appended (keeping the
+        durable projection current without a reload). No-op if there's no live entry."""
+        entry = self._session_cache.get(sid)
+        if entry is not None:
+            entry.rows.append(row)
+            entry.next_seq = new_next_seq
+
+    def _cache_invalidate(self, sid: str) -> None:
+        self._session_cache.pop(sid, None)
+
+    @property
+    def cache_stats(self) -> dict[str, int]:
+        """Observability for the per-session window cache: hits / misses / evictions /
+        live entry count. (100% misses ⇒ the cache never helps this workload, e.g. spawn /
+        workflow child loops that send once and are discarded.)"""
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "evictions": self._cache_evictions,
+            "entries": len(self._session_cache),
+        }
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
@@ -236,6 +332,7 @@ class StatefulAgentLoop:
         self._locks.pop(session_id, None)
         self._follow_up_queue_locks.pop(session_id, None)
         self._follow_up_queues.pop(session_id, None)
+        self._cache_invalidate(session_id)
         return n
 
     # ── primary API ───────────────────────────────────────────────────────
@@ -253,6 +350,24 @@ class StatefulAgentLoop:
         jobs, and tests: every send targets an existing session id.
         """
         return await self._create_session(metadata=metadata, system_prompt=system_prompt)
+
+    async def prewarm(self, session_id: str) -> bool:
+        """Pre-load a session's active window into the loop cache so the FIRST :meth:`send`
+        skips its initial reload. Returns ``False`` if the session does not exist.
+
+        Pure optimization for the cold-start/resume case (a freshly-created loop pointed at an
+        existing session): sending without ``prewarm`` is behaviorally identical — it just pays
+        one reload on the first send. (To *finish pending tool-calls* on resume, use
+        :meth:`resume`, not this.)"""
+        store = await self._ensure_store()
+        if await store.get_session(session_id) is None:
+            return False
+        if self._session_cache_size > 0:
+            state = await store.get_state(session_id)
+            rows = await store.load_active_messages(session_id)
+            if state is not None:
+                self._cache_put(session_id, state.next_seq, rows)
+        return True
 
     async def send(
         self,
@@ -710,15 +825,28 @@ class StatefulAgentLoop:
 
     async def _persist_user_input(self, sid: str, user_input: str | LoopMessage) -> None:
         store = await self._ensure_store()
+        role: str
+        content: str | None
+        name: str | None
         if isinstance(user_input, str):
-            await store.append_message(sid, role="user", content=user_input)
-            return
-        role = user_input.get("role", "user")
-        await store.append_message(
+            role, content, name = "user", user_input, None
+        else:
+            role = str(user_input.get("role", "user"))
+            content = _as_text(user_input.get("content"))
+            name = user_input.get("name")
+        seq = await store.append_message(sid, role=role, content=content, name=name)
+        # Keep a live cache entry current with the loop's OWN append (no reload): the next
+        # send's next_seq token will then match and reuse the cached window. No-op if this
+        # session isn't cached. The row mirrors what append_message persisted (only
+        # seq/role/content/name are consumed when rebuilding the working history).
+        self._cache_append(
             sid,
-            role=str(role),
-            content=_as_text(user_input.get("content")),
-            name=user_input.get("name"),
+            MessageRow(
+                session_id=sid, seq=seq, role=role, name=name, content=content,
+                tool_calls=None, tool_call_id=None, round_index=None,
+                state=MessageState.ACTIVE, meta={}, created_at=0,
+            ),
+            new_next_seq=seq + 1,
         )
 
     async def _execute_pending(self, sid: str, sink: SQLiteSink) -> None:
@@ -788,11 +916,27 @@ class StatefulAgentLoop:
         system_prompt: str | None = None,
     ) -> StatefulResult:
         store = await self._ensure_store()
+        # Cache only the plain-send path: resume()/submit_input() pass a pre-primed sink built
+        # from pending state (NOT a full init_history_seqs), so they must neither read from nor
+        # write to the window cache — they self-invalidate via the next_seq bump from their own
+        # appended tool rows. Capture eligibility BEFORE constructing the default sink.
+        cache_eligible = sink is None and self._session_cache_size > 0
         sink = sink if sink is not None else SQLiteSink(store, sid)
-        # The async store offloads its own blocking I/O (SQLite → threadpool; PG/MySQL
-        # → real async), so the per-send active-history load no longer blocks the event
-        # loop — other sessions run during the read (SCALE-3).
-        active_rows = await store.load_active_messages(sid)
+        # The async store offloads its own blocking I/O (SQLite → threadpool; PG/MySQL → real
+        # async). When this session's window cache is current (token = session_state.next_seq,
+        # already advanced by the just-persisted user input), reuse it and skip the O(active-
+        # history) load entirely; otherwise load in full and (re)populate the cache.
+        active_rows: list[MessageRow] | None = None
+        cache_token: int | None = None
+        if cache_eligible:
+            state = await store.get_state(sid)
+            if state is not None:
+                cache_token = state.next_seq
+                active_rows = self._cache_get(sid, state.next_seq)
+        if active_rows is None:
+            active_rows = await store.load_active_messages(sid)
+            if cache_eligible and cache_token is not None:
+                self._cache_put(sid, cache_token, active_rows)
         history = [_row_to_loop_message(r) for r in active_rows]
         # Mirror loaded seqs into the sink so the compactor can translate
         # in-memory indices back to store rows when it folds messages. Pass the
@@ -847,6 +991,22 @@ class StatefulAgentLoop:
                     raise
             finally:
                 reset_current_loop(loop_token)
+        # ── Maintain the window cache from the DURABLE store, never the pipeline's mutated
+        # working `history` (recall placeholders / microcompacted content would diverge). A
+        # fold reshuffled the older active set → invalidate (next send full-reloads). Otherwise
+        # extend with the active tail this send appended (a cheap O(delta) read, incl. any
+        # follow-up rows drained mid-run) so back-to-back sends stay on the fast path. ──
+        if cache_eligible:
+            if sink.compactions_applied > 0:
+                self._cache_invalidate(sid)
+            else:
+                entry = self._session_cache.get(sid)
+                post_state = await store.get_state(sid)
+                if entry is not None and post_state is not None:
+                    if post_state.next_seq != entry.next_seq:
+                        delta = await store.load_active_messages(sid, after_seq=entry.next_seq)
+                        entry.rows.extend(delta)
+                        entry.next_seq = post_state.next_seq
         try:
             # The async store offloads its own blocking I/O, so this no longer
             # needs an explicit thread hop (H1.9/C8).

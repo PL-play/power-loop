@@ -95,6 +95,11 @@ class SQLiteSink:
         self._unresolved: set[str] = set()
         self._assistant_seq: int | None = None
         self._tool_calls: list[dict[str, Any]] = []
+        # Count of compactions persisted during this sink's lifetime (one sink per send).
+        # StatefulAgentLoop reads it after a run to decide whether its per-session row cache
+        # can be extended with a cheap delta read (no fold this run) or must be invalidated
+        # (a fold reshuffled the older active set, so the cached window is stale).
+        self.compactions_applied = 0
         # Ordered seqs mirroring the pipeline's in-memory history, index-for-index.
         # Initialized by StatefulAgentLoop from the loaded active messages; grown by
         # on_message_appended; spliced by on_compaction. A ``None`` entry is a slot
@@ -332,6 +337,11 @@ class SQLiteSink:
             + [order_key]
             + self._history_ord[fold_end_idx + 1 :]
         )
+        # A fold actually hit the DB (rows → compacted_out + a new note row), reshuffling the
+        # durable active set. The loop's per-session row cache can no longer be extended with a
+        # delta read and must be invalidated. (The in-memory-only-placeholder path above returns
+        # before here precisely because it changes no durable rows.)
+        self.compactions_applied += 1
 
     async def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None

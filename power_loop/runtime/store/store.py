@@ -23,7 +23,7 @@ from typing import Any
 
 from power_loop.runtime.store.capabilities import Maintenance
 from power_loop.runtime.store.db import Database, Row
-from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION, ensure_schema
+from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION, SchemaPolicy, ensure_schema
 from power_loop.runtime.store.types import (
     BackgroundTaskRow,
     CompactionRow,
@@ -165,14 +165,18 @@ class SessionStore:
         *,
         max_spawn_depth: int = DEFAULT_MAX_SPAWN_DEPTH,
         table_prefix: str = DEFAULT_TABLE_PREFIX,
-        create_schema: bool = True,
+        schema: SchemaPolicy | str | None = None,
+        create_schema: bool | None = None,
     ) -> SessionStore:
-        """Open a SQLite-backed store (the default backend). Postgres/MySQL get their
-        own ``open``/DSN factory in later phases."""
+        """Open a SQLite-backed store (the default backend). For Postgres/MySQL use
+        :func:`power_loop.runtime.store.factory.open_store` with a DSN.
+
+        ``schema`` is a :class:`SchemaPolicy` (default AUTO_CREATE). ``create_schema`` (bool)
+        is a deprecated alias kept for the 1.x line (True→AUTO_CREATE, False→VERIFY)."""
         from power_loop.runtime.store.backends.sqlite import SqliteDatabase
 
         db = SqliteDatabase.open(path)
-        await ensure_schema(db, table_prefix, create_schema=create_schema)
+        await ensure_schema(db, table_prefix, policy=schema, create_schema=create_schema)
         return cls(db, max_spawn_depth=max_spawn_depth, table_prefix=table_prefix)
 
     @property
@@ -316,13 +320,27 @@ class SessionStore:
             )
         return seq
 
-    async def load_active_messages(self, session_id: str) -> list[MessageRow]:
+    async def load_active_messages(
+        self, session_id: str, *, after_seq: int | None = None
+    ) -> list[MessageRow]:
         """Active messages in **logical** order (a ``compact_note`` sorts at its
-        ``meta['ord']``, not its high identity ``seq``)."""
-        rows = await self._db.fetchall(
-            f"SELECT * FROM {self.t.messages} WHERE session_id=? AND state=? ORDER BY seq ASC",
-            (session_id, MessageState.ACTIVE.value),
-        )
+        ``meta['ord']``, not its high identity ``seq``).
+
+        ``after_seq`` (inclusive) returns only the active tail with ``seq >= after_seq`` — a
+        cheap O(delta) read for incrementally extending a cached window after the caller's own
+        appends (valid only when no compaction reshuffled the older active set; the caller
+        must reload in full otherwise)."""
+        if after_seq is None:
+            rows = await self._db.fetchall(
+                f"SELECT * FROM {self.t.messages} WHERE session_id=? AND state=? ORDER BY seq ASC",
+                (session_id, MessageState.ACTIVE.value),
+            )
+        else:
+            rows = await self._db.fetchall(
+                f"SELECT * FROM {self.t.messages} WHERE session_id=? AND state=? AND seq>=? "
+                "ORDER BY seq ASC",
+                (session_id, MessageState.ACTIVE.value, int(after_seq)),
+            )
         messages = [_row_to_message(r) for r in rows]
         messages.sort(key=_logical_order_key)
         return messages

@@ -152,9 +152,59 @@ injection stays; `db_path=` becomes sugar for `sqlite:///…`; add `open_store(d
   dockerized MySQL 8. The `session_runtime_state`/`shared_state` `key` column was renamed to
   `state_key` (MySQL reserved word) — backend-neutral, invisible to callers.
 
+## Resumable loop, schema policy & the per-session window cache
+
+* **Loop binding (multi-backend).** `StatefulAgentLoop` is sync-constructed but lazy-opens its
+  owned store through `open_store(dsn, table_prefix=, schema=)` on first async use, so it binds
+  to SQLite/PG/MySQL by DSN + prefix. Pass EITHER a pre-opened `store=` (shared across loops,
+  the DeepTalk path) OR a store config (`dsn=`/`db_path=`/`table_prefix=`/`schema=`) — passing
+  both raises. The loop holds no authoritative session state, so it is freely re-creatable:
+  `send(user_input, session_id=sid)` resumes any session by id (a fresh cold loop reproduces
+  identical behavior). `prewarm(sid)` optionally pre-loads a session's window so the first send
+  skips its reload. (Resuming PENDING tool-calls is the separate `resume()` method.)
+
+* **`SchemaPolicy`** governs provisioning at open: `AUTO_CREATE` (default) probes the version
+  table and, if absent, creates every table/index + stamps; a DDL failure (no CREATE rights)
+  raises `StoreSchemaError` carrying the **complete** provisioning script (migrations table +
+  all CREATEs + the version stamp) so an operator can run it by hand. `VERIFY` only checks and
+  raises (with the same script) if missing/stale — for roles with no DDL rights, provision
+  out-of-band then open VERIFY. `create_schema: bool` is a deprecated alias (True→AUTO_CREATE,
+  False→VERIFY). The version stamp is an idempotent `ON CONFLICT DO NOTHING` / `INSERT IGNORE`.
+
+* **Per-session window cache.** The loop keeps an LRU of each session's *durable* active
+  projection (the `load_active_messages` rows + the `next_seq` validity token), NOT the
+  pipeline's mutated working history — so recall placeholders and microcompacted content (both
+  transient, never persisted) and any session-prompt edit are re-applied/re-read fresh each
+  send. A send reuses the window iff the live `next_seq` still matches (and extends it with a
+  cheap delta read of its own appends); a fold or any other writer's change forces a reload. So
+  the cache is a rebuildable accelerator that never changes what the LLM sees — proven by a
+  warm-vs-cold conformance suite (`test_loop_resume_cache.py`) asserting byte-identical prompts
+  under recall, microcompaction, double-fold compaction, and a between-send prompt edit. Only
+  the plain-send path is cached (resume/submit_input keep their own pre-primed sinks).
+
+### Preconditions (documented, not silently assumed)
+
+* **Single-writer-per-session.** The per-session lock is in-memory/per-loop-instance; it gives
+  no cross-process mutual exclusion. The window cache stays *data-safe* across processes (a
+  stale token forces a reload, never serves wrong-accepted data) but the pending-state machine
+  assumes one writer per session at a time. Driving one session from two loops/processes
+  concurrently needs a DB-level guard (advisory lock / session-state epoch CAS) — a follow-up.
+* **Concurrent first-boot.** `AUTO_CREATE` is idempotent and self-heals on retry but is NOT
+  atomic on MySQL (DDL auto-commits) and takes no cross-process lock; N instances booting
+  against a *fresh* server DB simultaneously should provision out-of-band and open `VERIFY`. A
+  `pg_advisory_xact_lock` / `GET_LOCK` guard for true concurrent first-boot is a follow-up.
+* **Cache scope (non-goal).** The cache is per-loop, so spawn / workflow child loops (one send,
+  then discarded) never hit it; only long-lived multi-session front-door loops benefit. Entry
+  COUNT is LRU-bounded (`session_cache_size`, default 256, 0 disables); total bytes are not, so
+  a few large pre-compaction sessions can dominate RAM. `cache_stats` exposes hits/misses/
+  evictions for visibility.
+
 ## Testing
 
 SQLite `:memory:` stays the fast default + the backend the unit suite uses. A backend-agnostic
 **conformance** suite (the behaviors every backend must satisfy: seq monotonicity under concurrency,
 compaction ordering, cascade, upsert accumulate, timer CAS, atomic rollback) runs against SQLite
-always and against PG/MySQL when a server DSN is provided (gated like the live-LLM suite).
+always and against PG/MySQL when a server DSN is provided (gated like the live-LLM suite). The
+resumable-loop + window-cache invariants (warm == cold prompts under recall / microcompact /
+double-fold / prompt-edit; schema policy; next_seq monotonicity; delta load) are pinned by
+`test_loop_resume_cache.py` + `test_store_schema_policy.py`, with gated PG/MySQL loop-binding smokes.

@@ -176,6 +176,8 @@ from power_loop.runtime.skills import (
     register_skill_tools,
 )
 from power_loop.runtime.spec import AgentSpec, AgentSpecError, run_agent_spec
+from power_loop.runtime.store.factory import open_store
+from power_loop.runtime.store.schema import SchemaPolicy, StoreSchemaError
 from power_loop.runtime.store.store import (
     DEFAULT_DB_PATH,
     MAX_SPAWN_DEPTH,
@@ -274,6 +276,9 @@ __all__ = [
 	"OpenAICompatibleChatConfig",
 	"AnthropicChatConfig",
 	"SessionStore",
+	"open_store",
+	"SchemaPolicy",
+	"StoreSchemaError",
 	"SessionRow",
 	"SessionStatsRow",
 	"TimerRow",

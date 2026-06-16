@@ -11,7 +11,7 @@ the matching extra only when their scheme is used.
 from __future__ import annotations
 
 from power_loop.runtime.store.db import Database
-from power_loop.runtime.store.schema import ensure_schema
+from power_loop.runtime.store.schema import SchemaPolicy, ensure_schema
 from power_loop.runtime.store.store import (
     DEFAULT_MAX_SPAWN_DEPTH,
     DEFAULT_TABLE_PREFIX,
@@ -24,10 +24,14 @@ async def open_store(
     *,
     max_spawn_depth: int = DEFAULT_MAX_SPAWN_DEPTH,
     table_prefix: str = DEFAULT_TABLE_PREFIX,
-    create_schema: bool = True,
+    schema: SchemaPolicy | str | None = None,
+    create_schema: bool | None = None,
 ) -> SessionStore:
+    """Open an async store for ``dsn`` (scheme → backend), provisioned per ``schema``
+    (:class:`SchemaPolicy`, default AUTO_CREATE). ``create_schema`` (bool) is a deprecated
+    alias (True→AUTO_CREATE, False→VERIFY)."""
     db = await _make_database(dsn)
-    await ensure_schema(db, table_prefix, create_schema=create_schema)
+    await ensure_schema(db, table_prefix, policy=schema, create_schema=create_schema)
     return SessionStore(db, max_spawn_depth=max_spawn_depth, table_prefix=table_prefix)
 
 
