@@ -95,11 +95,11 @@ class SqliteDialect:
                 round_index INTEGER NOT NULL DEFAULT 0, last_compact_seq INTEGER NOT NULL DEFAULT 0,
                 pending_json TEXT)""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
-                session_id TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT,
-                updated_at INTEGER NOT NULL, PRIMARY KEY (session_id, key))""",
+                session_id TEXT NOT NULL, state_key TEXT NOT NULL, value_json TEXT,
+                updated_at INTEGER NOT NULL, PRIMARY KEY (session_id, state_key))""",
             f"""CREATE TABLE IF NOT EXISTS {p}shared_state (
-                owner TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT,
-                updated_at INTEGER NOT NULL, PRIMARY KEY (owner, key))""",
+                owner TEXT NOT NULL, state_key TEXT NOT NULL, value_json TEXT,
+                updated_at INTEGER NOT NULL, PRIMARY KEY (owner, state_key))""",
             f"""CREATE TABLE IF NOT EXISTS {p}background_tasks (
                 session_id TEXT NOT NULL, task_id TEXT NOT NULL, command TEXT NOT NULL,
                 status TEXT NOT NULL, return_code INTEGER, output_tail TEXT, output_path TEXT,
@@ -141,7 +141,7 @@ class SqliteDialect:
 def _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols) -> str:
     """ON CONFLICT … DO UPDATE renderer shared by SQLite and Postgres (identical syntax,
     including the ``excluded`` pseudo-table and the ``col = table.col + excluded.col``
-    accumulate). MySQL overrides this in Phase 3 (ON DUPLICATE KEY UPDATE / VALUES())."""
+    accumulate). MySQL overrides ``upsert`` with ``ON DUPLICATE KEY UPDATE … AS new_row``."""
     cols = [*key_cols, *val_cols, *add_cols, *insert_only_cols]
     placeholders = ",".join("?" * len(cols))
     sets = [f"{c}=excluded.{c}" for c in val_cols]
@@ -209,11 +209,11 @@ class PostgresDialect:
                 round_index BIGINT NOT NULL DEFAULT 0, last_compact_seq BIGINT NOT NULL DEFAULT 0,
                 pending_json TEXT)""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
-                session_id TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT,
-                updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, key))""",
+                session_id TEXT NOT NULL, state_key TEXT NOT NULL, value_json TEXT,
+                updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, state_key))""",
             f"""CREATE TABLE IF NOT EXISTS {p}shared_state (
-                owner TEXT NOT NULL, key TEXT NOT NULL, value_json TEXT,
-                updated_at BIGINT NOT NULL, PRIMARY KEY (owner, key))""",
+                owner TEXT NOT NULL, state_key TEXT NOT NULL, value_json TEXT,
+                updated_at BIGINT NOT NULL, PRIMARY KEY (owner, state_key))""",
             f"""CREATE TABLE IF NOT EXISTS {p}background_tasks (
                 session_id TEXT NOT NULL, task_id TEXT NOT NULL, command TEXT NOT NULL,
                 status TEXT NOT NULL, return_code BIGINT, output_tail TEXT, output_path TEXT,
@@ -253,4 +253,114 @@ class PostgresDialect:
         return row
 
 
-__all__ = ["Dialect", "SqliteDialect", "PostgresDialect"]
+# ── MySQL ─────────────────────────────────────────────────────────────────────
+# Pure SQL rendering only (no driver import) — the aiomysql-backed Database lives in
+# backends/mysql.py. Differences from PG that live here: paramstyle is ``%s`` (and a
+# literal ``%`` must be escaped to ``%%`` for the driver's %-formatting); string PK/index
+# columns must be VARCHAR (MySQL can't index/PK a TEXT without a prefix length); indexes
+# are declared INLINE in CREATE TABLE (MySQL has no ``CREATE INDEX IF NOT EXISTS``); and
+# upsert is ``ON DUPLICATE KEY UPDATE … VALUES(col)`` rather than ``ON CONFLICT … excluded``.
+
+
+class MySQLDialect:
+    name = "mysql"
+
+    def translate(self, sql: str) -> str:
+        # The driver (aiomysql/PyMySQL) uses ``%s`` and runs ``query % args``, so a literal
+        # ``%`` must be doubled. Our SQL contains no ``%`` literals today, but escape first
+        # to stay correct if one is ever added, then map qmark → ``%s``.
+        return sql.replace("%", "%%").replace("?", "%s")
+
+    def ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        # utf8mb4 + InnoDB. INTEGER→BIGINT (epoch-ms time + counters); string PK/index
+        # columns → VARCHAR(255) (≤ the 3072-byte large-prefix limit even for the 2-col
+        # composite PKs); small enum-like columns → VARCHAR(32); JSON/free text → TEXT.
+        # Indexes are declared inline (no CREATE INDEX IF NOT EXISTS in MySQL).
+        opts = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}sessions (
+                session_id VARCHAR(255) NOT NULL, created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL, system_prompt TEXT, model VARCHAR(255),
+                config_json TEXT, status VARCHAR(32) NOT NULL DEFAULT 'active',
+                kind VARCHAR(32) NOT NULL DEFAULT 'root', parent_session_id VARCHAR(255),
+                spawn_tool_call_id VARCHAR(255), spawn_depth BIGINT NOT NULL DEFAULT 0,
+                lifecycle VARCHAR(32) NOT NULL DEFAULT 'ephemeral', metadata_json TEXT,
+                PRIMARY KEY (session_id),
+                KEY {p}idx_sessions_parent (parent_session_id)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}messages (
+                session_id VARCHAR(255) NOT NULL, seq BIGINT NOT NULL, role VARCHAR(32) NOT NULL,
+                name VARCHAR(255), content TEXT, tool_calls_json TEXT, tool_call_id VARCHAR(255),
+                round_index BIGINT, state VARCHAR(32) NOT NULL DEFAULT 'active', meta_json TEXT,
+                created_at BIGINT NOT NULL, PRIMARY KEY (session_id, seq),
+                KEY {p}idx_messages_session_state (session_id, state, seq)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}compactions (
+                session_id VARCHAR(255) NOT NULL, compact_seq BIGINT NOT NULL, note_seq BIGINT NOT NULL,
+                from_seq BIGINT NOT NULL, to_seq BIGINT NOT NULL, before_tokens BIGINT,
+                after_tokens BIGINT, round_index BIGINT, created_at BIGINT NOT NULL,
+                PRIMARY KEY (session_id, compact_seq)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}usage_rounds (
+                session_id VARCHAR(255) NOT NULL, round_index BIGINT NOT NULL, prompt_tokens BIGINT,
+                completion_tokens BIGINT, total_tokens BIGINT, model VARCHAR(255),
+                created_at BIGINT NOT NULL, PRIMARY KEY (session_id, round_index)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}session_state (
+                session_id VARCHAR(255) NOT NULL, next_seq BIGINT NOT NULL DEFAULT 1,
+                round_index BIGINT NOT NULL DEFAULT 0, last_compact_seq BIGINT NOT NULL DEFAULT 0,
+                pending_json TEXT, PRIMARY KEY (session_id)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
+                session_id VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json TEXT,
+                updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, state_key)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}shared_state (
+                owner VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json TEXT,
+                updated_at BIGINT NOT NULL, PRIMARY KEY (owner, state_key)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}background_tasks (
+                session_id VARCHAR(255) NOT NULL, task_id VARCHAR(255) NOT NULL, command TEXT NOT NULL,
+                status VARCHAR(32) NOT NULL, return_code BIGINT, output_tail TEXT, output_path TEXT,
+                last_seen_at BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, task_id),
+                KEY {p}idx_bgtasks_session_status (session_id, status, updated_at)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}session_stats (
+                session_id VARCHAR(255) NOT NULL, sends BIGINT NOT NULL DEFAULT 0,
+                rounds BIGINT NOT NULL DEFAULT 0, llm_calls BIGINT NOT NULL DEFAULT 0,
+                tool_calls BIGINT NOT NULL DEFAULT 0, prompt_tokens BIGINT NOT NULL DEFAULT 0,
+                completion_tokens BIGINT NOT NULL DEFAULT 0, total_tokens BIGINT NOT NULL DEFAULT 0,
+                first_send_at BIGINT, last_send_at BIGINT, updated_at BIGINT NOT NULL,
+                PRIMARY KEY (session_id)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}timers (
+                session_id VARCHAR(255) NOT NULL, timer_id BIGINT NOT NULL, due_at BIGINT NOT NULL,
+                note TEXT NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'armed', interval_s BIGINT,
+                fire_count BIGINT NOT NULL DEFAULT 0, last_fired_at BIGINT,
+                created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
+                PRIMARY KEY (session_id, timer_id),
+                KEY {p}idx_timers_due (status, due_at)) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}notes (
+                session_id VARCHAR(255) NOT NULL, note_id BIGINT NOT NULL, content TEXT NOT NULL,
+                pinned TINYINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id)) {opts}""",
+        ]
+
+    def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
+        # MySQL: INSERT … AS new_row ON DUPLICATE KEY UPDATE col=new_row.col; accumulate via
+        # col=col+new_row.col; insert_only_cols are inserted but omitted from the UPDATE (so
+        # they are preserved on conflict). The row-alias form (MySQL 8.0.19+) replaces the
+        # deprecated VALUES() function.
+        cols = [*key_cols, *val_cols, *add_cols, *insert_only_cols]
+        placeholders = ",".join("?" * len(cols))
+        sets = [f"{c}=new_row.{c}" for c in val_cols]
+        sets += [f"{c}={table}.{c}+new_row.{c}" for c in add_cols]
+        return (
+            f"INSERT INTO {table} ({','.join(cols)}) VALUES ({placeholders}) AS new_row "
+            f"ON DUPLICATE KEY UPDATE {','.join(sets)}"
+        )
+
+    async def lock_state(self, tx, state_table, session_id):
+        # Real multi-writer safety: lock the session_state row for the rest of the txn.
+        row = await tx.fetchone(
+            f"SELECT * FROM {state_table} WHERE session_id=? FOR UPDATE", (session_id,)
+        )
+        if row is None:
+            raise ValueError(f"unknown session: {session_id}")
+        return row
+
+
+__all__ = ["Dialect", "SqliteDialect", "PostgresDialect", "MySQLDialect"]

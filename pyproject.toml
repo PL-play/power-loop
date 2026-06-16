@@ -44,10 +44,11 @@ statsd = ["statsd>=4.0"]                   # contrib.metrics_sink StatsDBackend 
 otel = ["opentelemetry-sdk>=1.20"]         # contrib.otel_sink span bridge (OBS-5)
 mcp = ["mcp>=1.0"]                         # contrib.mcp StdioMCPClient (ECO-1)
 postgres = ["asyncpg>=0.29"]               # runtime.store PostgreSQL backend
+mysql = ["aiomysql>=0.2"]                   # runtime.store MySQL backend (pure-Python driver)
 all = [
     "anthropic>=0.42.0", "openai>=1.52.0", "pyyaml>=6.0", "pypdf>=5.3.0",
     "prometheus-client>=0.19", "statsd>=4.0", "opentelemetry-sdk>=1.20", "mcp>=1.0",
-    "asyncpg>=0.29",
+    "asyncpg>=0.29", "aiomysql>=0.2",
 ]
 dev = [
   "pytest>=7.0.0",
@@ -69,6 +70,8 @@ dev = [
   "mcp>=1.0",
   # the Postgres driver, so CI runs the PG store conformance suite when a server is up
   "asyncpg>=0.29",
+  # the MySQL driver, so CI runs the MySQL store conformance suite when a server is up
+  "aiomysql>=0.2",
 ]
 
 [project.urls]

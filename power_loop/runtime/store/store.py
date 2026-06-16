@@ -117,7 +117,7 @@ _EXPORT_TABLES: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
         "session_id", "round_index", "prompt_tokens", "completion_tokens", "total_tokens",
         "model", "created_at")),
     ("session_runtime_state", lambda t: t.session_runtime_state, (
-        "session_id", "key", "value_json", "updated_at")),
+        "session_id", "state_key", "value_json", "updated_at")),
     ("timers", lambda t: t.timers, (
         "session_id", "timer_id", "due_at", "note", "status", "interval_s", "fire_count",
         "last_fired_at", "created_at", "updated_at")),
@@ -854,7 +854,7 @@ class SessionStore:
     async def get_runtime_state(self, session_id: str, key: str, default: Any = None) -> Any:
         row = await self._db.fetchone(
             f"SELECT value_json FROM {self.t.session_runtime_state} "
-            "WHERE session_id=? AND key=?",
+            "WHERE session_id=? AND state_key=?",
             (session_id, key),
         )
         if row is None:
@@ -872,7 +872,7 @@ class SessionStore:
                 raise ValueError(f"unknown session: {session_id}")
             sql = self._db.dialect.upsert(
                 self.t.session_runtime_state,
-                ("session_id", "key"),
+                ("session_id", "state_key"),
                 ("value_json", "updated_at"),
             )
             await tx.execute(sql, (session_id, key, _dumps(value), now))
@@ -884,14 +884,14 @@ class SessionStore:
     async def delete_runtime_state(self, session_id: str, key: str) -> None:
         async with self._db.transaction() as tx:
             await tx.execute(
-                f"DELETE FROM {self.t.session_runtime_state} WHERE session_id=? AND key=?",
+                f"DELETE FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key=?",
                 (session_id, key),
             )
 
     # ── shared_state: keyed JSON owned by an arbitrary scope (not a session) ──
     async def get_shared_state(self, owner: str, key: str, default: Any = None) -> Any:
         row = await self._db.fetchone(
-            f"SELECT value_json FROM {self.t.shared_state} WHERE owner=? AND key=?",
+            f"SELECT value_json FROM {self.t.shared_state} WHERE owner=? AND state_key=?",
             (owner, key),
         )
         if row is None:
@@ -904,7 +904,7 @@ class SessionStore:
         async with self._db.transaction() as tx:
             sql = self._db.dialect.upsert(
                 self.t.shared_state,
-                ("owner", "key"),
+                ("owner", "state_key"),
                 ("value_json", "updated_at"),
             )
             await tx.execute(sql, (owner, key, _dumps(value), now))
@@ -912,7 +912,7 @@ class SessionStore:
     async def delete_shared_state(self, owner: str, key: str) -> None:
         async with self._db.transaction() as tx:
             await tx.execute(
-                f"DELETE FROM {self.t.shared_state} WHERE owner=? AND key=?",
+                f"DELETE FROM {self.t.shared_state} WHERE owner=? AND state_key=?",
                 (owner, key),
             )
 
@@ -947,22 +947,22 @@ class SessionStore:
                 # the row reappears in list_unseen_background_updates (updated_at >
                 # last_seen_at) even if wall-clock ms did not move since mark_background_seen.
                 now = max(now, int(existing["last_seen_at"]) + 1)
-            # Hand-written upsert: the INSERT carries `last_seen_at` and `created_at`
-            # but the ON CONFLICT path must NOT overwrite either (last_seen_at is the
-            # reader's cursor; created_at is immutable), so the generic dialect.upsert
-            # (which updates every val_col) cannot express it. See `notes`/dialect_additions.
+            # Upsert where the INSERT carries `last_seen_at` and `created_at` but the
+            # conflict path must NOT overwrite either (last_seen_at is the reader's
+            # cursor; created_at is immutable) — that's exactly `insert_only_cols`, so the
+            # generic dialect.upsert expresses it backend-neutrally. Param order matches
+            # the renderer: key_cols + val_cols + insert_only_cols.
+            sql = self._db.dialect.upsert(
+                self.t.background_tasks,
+                ("session_id", "task_id"),
+                ("command", "status", "return_code", "output_tail", "output_path", "updated_at"),
+                insert_only_cols=("last_seen_at", "created_at"),
+            )
             await tx.execute(
-                f"INSERT INTO {self.t.background_tasks} ("
-                "session_id, task_id, command, status, return_code, "
-                "output_tail, output_path, last_seen_at, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(session_id, task_id) DO UPDATE SET "
-                "command=excluded.command, status=excluded.status, "
-                "return_code=excluded.return_code, output_tail=excluded.output_tail, "
-                "output_path=excluded.output_path, updated_at=excluded.updated_at",
+                sql,
                 (
                     session_id, task_id, command, status, return_code,
-                    output_tail, output_path, 0, created_at, now,
+                    output_tail, output_path, now, 0, created_at,
                 ),
             )
             await tx.execute(

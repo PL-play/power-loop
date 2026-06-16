@@ -1,6 +1,8 @@
 # Design: Pluggable storage backends (SQLite · PostgreSQL · MySQL)
 
-Status: **in progress** (Phase 1). Decisions locked: **async-first**, **hand-rolled thin dialect**, **PostgreSQL first**.
+Status: **DONE** — SQLite (default, zero-dep), PostgreSQL (`[postgres]`), and MySQL (`[mysql]`)
+backends all ship, the full caller swap to the async API is complete, and the conformance suite
+runs against all three. Decisions locked: **async-first**, **hand-rolled thin dialect**.
 
 ## Goal
 
@@ -137,11 +139,18 @@ injection stays; `db_path=` becomes sugar for `sqlite:///…`; add `open_store(d
 
 ## Phased roadmap
 
-- **Phase 1** — async store abstraction + SQLite backend; convert callers; full suite green on SQLite.
-- **Phase 2** — PostgreSQL backend (`power-loop[postgres]`); shared store **conformance** test suite
-  run against a dockerized PG; document multi-writer.
-- **Phase 3** — MySQL backend (`power-loop[mysql]`); `open_store` DSN factory; docs + extras +
-  STABLE-API baseline updates.
+- **Phase 1** ✅ — async store abstraction + SQLite backend; conformance suite; full suite green.
+- **Phase 2** ✅ — PostgreSQL backend (`power-loop[postgres]`); conformance run against a dockerized
+  PG; `SELECT … FOR UPDATE` seq allocation → genuinely multi-writer.
+- **Caller swap** ✅ — `StatefulAgentLoop` + every internal caller, the unit/real test suites, the
+  bench harness, and all examples flipped to the async API (lazy-open owned store; `await`
+  everywhere). Legacy `session_store.py` kept only as the parity oracle.
+- **Phase 3** ✅ — MySQL backend (`power-loop[mysql]`, pure-Python `aiomysql`): `MySQLDialect`
+  (`?`→`%s`, VARCHAR PK/index cols + utf8mb4, inline indexes, `ON DUPLICATE KEY UPDATE … AS new_row`
+  upsert, `FOR UPDATE` seq alloc) + `MySQLDatabase` (autocommit pool, `CLIENT.FOUND_ROWS` so
+  `rowcount` = matched rows for CAS parity); `open_store` `mysql://` DSN; conformance run against a
+  dockerized MySQL 8. The `session_runtime_state`/`shared_state` `key` column was renamed to
+  `state_key` (MySQL reserved word) — backend-neutral, invisible to callers.
 
 ## Testing
 

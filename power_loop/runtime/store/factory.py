@@ -2,7 +2,7 @@
 
     sqlite:///path/to.db | sqlite://:memory: | :memory: | ./relative.db   → SQLite
     postgresql://user:pw@host:port/db | postgres://…                       → PostgreSQL
-    mysql://…  (Phase 3)                                                   → MySQL
+    mysql://user:pw@host:port/db                                           → MySQL
 
 The SQLite backend is the zero-dependency default; postgres/mysql pull their driver from
 the matching extra only when their scheme is used.
@@ -37,7 +37,9 @@ async def _make_database(dsn: str) -> Database:
 
         return await PostgresDatabase.connect(dsn)
     if dsn.startswith("mysql://"):
-        raise NotImplementedError("MySQL backend lands in Phase 3")
+        from power_loop.runtime.store.backends.mysql import MySQLDatabase
+
+        return await MySQLDatabase.connect(dsn)
     # SQLite (default): ":memory:", a "sqlite://…" URL, or a bare filesystem path.
     from power_loop.runtime.store.backends.sqlite import SqliteDatabase
 

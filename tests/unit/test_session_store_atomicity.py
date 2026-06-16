@@ -20,7 +20,7 @@ async def test_write_block_rolls_back_on_failure():
             async with s._db.transaction() as tx:
                 await tx.execute(
                     f"INSERT INTO {s.t.session_runtime_state}"
-                    "(session_id,key,value_json,updated_at) VALUES (?,?,?,?)",
+                    "(session_id,state_key,value_json,updated_at) VALUES (?,?,?,?)",
                     (sid, "k", '"v"', 1),
                 )
                 raise RuntimeError("boom mid-transaction")
@@ -36,7 +36,7 @@ async def test_write_block_commits_on_success():
         async with s._db.transaction() as tx:
             await tx.execute(
                 f"INSERT INTO {s.t.session_runtime_state}"
-                "(session_id,key,value_json,updated_at) VALUES (?,?,?,?)",
+                "(session_id,state_key,value_json,updated_at) VALUES (?,?,?,?)",
                 (sid, "k", '"v"', 1),
             )
         assert await s.get_runtime_state(sid, "k") == "v"

@@ -55,10 +55,13 @@ async def ensure_schema(db: Database, prefix: str, *, create_schema: bool = True
             f"CREATE TABLE IF NOT EXISTS {vtable} "
             f"(id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL)"
         )
-        for stmt in db.dialect.ddl(prefix):
-            await tx.execute(stmt)
         row = await tx.fetchone(f"SELECT version FROM {vtable} WHERE id=1")
         if row is None:
+            # Fresh store: create every table, then stamp. The per-table DDL runs ONLY on
+            # first init (not every open) — re-running CREATE TABLE IF NOT EXISTS is a no-op
+            # on SQLite/PG but emits a warning per table on MySQL, so gate it on the stamp.
+            for stmt in db.dialect.ddl(prefix):
+                await tx.execute(stmt)
             await tx.execute(
                 f"INSERT INTO {vtable} (id, version) VALUES (1, ?)", (CURRENT_SCHEMA_VERSION,)
             )
