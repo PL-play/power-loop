@@ -221,6 +221,34 @@ def test_reload_then_fold_consistent(store: SessionStore) -> None:
     _assert_consistent(store, sid, sink2)
 
 
+def test_leading_note_refold_across_memory_placeholders(store: SessionStore) -> None:
+    """C7 persistence path: after a fold the compact_note leads the active set; on a
+    resumed run, recalled memory_* placeholders are injected AFTER it, and a SECOND
+    fold (with the C7 fix) now starts at index 0 — the leading note. The note's REAL
+    seq is the span's start boundary (never a None), the memory placeholders sit
+    strictly inside the span and are skipped when marking, and exactly ONE active note
+    survives with the in-memory map consistent with the reloaded DB."""
+    sid = store.create_session(session_id="s")
+    sink = SQLiteSink(store, sid)
+    sink.init_history_seqs([])
+    _append(sink, 6)
+    _fold(sink, 0, 2, summary="S1", rnd=6)  # persisted note now leads the active set
+
+    # simulate a restart: reseed from DB (note lands at index 0 with real seq + ord)
+    sink2 = _reseed_sink(store, sid)
+    assert store.load_active_messages(sid)[0].name == "compact_note"
+    # _maybe_recall injects memory_* AFTER leading system rows → placeholders at index 1
+    sink2.on_messages_inserted(index=1, count=2)
+    _append(sink2, 4, start_round=10)  # cold turns + a kept tail
+
+    # fold from index 0 (the leading note) ACROSS the memory placeholders + cold turns
+    _fold(sink2, 0, len(sink2._history_seqs) - 2, summary="S2", rnd=14)
+
+    _assert_consistent(store, sid, sink2)
+    notes = [r for r in store.load_active_messages(sid) if r.name == "compact_note"]
+    assert len(notes) == 1  # the old note merged in → exactly one
+
+
 # ── record_compaction: explicit fold-set marking ─────────────────────────────
 
 

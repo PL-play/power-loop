@@ -96,6 +96,66 @@ async def test_compactor_triggers_above_threshold(monkeypatch) -> None:
     assert plan.fold_end_idx < len(msgs) - 1
 
 
+@pytest.mark.asyncio
+async def test_leading_compact_note_is_refolded_not_orphaned(monkeypatch) -> None:
+    """C7 regression: a leading compact_note must be FOLDABLE (merged into the new
+    note), not mistaken for the original system_prompt (which is NOT in history) and
+    preserved forever. A second compaction over a history that already starts with a
+    compact_note must yield exactly ONE compact_note, not two."""
+    monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
+    cp = DefaultCompactor(trigger_ratio=0.5, keep_last_n=1)
+    summary_llm = _Scripted(responses=[LLMResponse(raw_text="<summary>merged</summary>")])
+    msgs: list[dict[str, Any]] = [
+        {"role": "system", "name": "compact_note", "content": "older summary"},
+        {"role": "user", "content": "x" * 5000},
+        {"role": "assistant", "content": "y" * 5000},
+        {"role": "user", "content": "last"},
+    ]
+    plan = await cp.maybe_compact(msgs, llm=summary_llm, max_tokens=4000, round_index=3)
+    assert plan is not None
+    assert plan.fold_start_idx == 0  # the leading compact_note is INCLUDED → merged
+    # Applying the plan collapses [old note + cold turns] into ONE new note.
+    note = {"role": "system", "name": "compact_note", "content": plan.summary_text}
+    result = msgs[: plan.fold_start_idx] + [note] + msgs[plan.fold_end_idx + 1 :]
+    notes = [m for m in result if m.get("name") == "compact_note"]
+    assert len(notes) == 1
+    assert notes[0]["content"] == "merged"
+
+
+def test_compactable_span_preserves_genuine_system_and_memory() -> None:
+    """The fix must still preserve a genuine injected system row (empty name) and
+    recalled memory_* rows — only a leading compact_note becomes foldable."""
+    cp = DefaultCompactor(trigger_ratio=0.5, keep_last_n=1)
+    msgs: list[dict[str, Any]] = [
+        {"role": "system", "content": "real system prompt"},
+        {"role": "system", "name": "memory_1", "content": "recalled fact"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "last"},
+    ]
+    span = cp._compactable_span(msgs)
+    assert span is not None
+    assert span[0] == 2  # both the system prompt and memory_1 are preserved
+
+
+def test_compactable_span_folds_leading_note_before_memory() -> None:
+    """Real reload+recall order is [compact_note, memory_*, conversation] (recall
+    injects memory AFTER leading system rows). The leading compact_note must still be
+    foldable (span starts at 0); the memory_* rows fall INSIDE the span and are
+    handled by the sink (their non-persisted placeholders are skipped when marking)."""
+    cp = DefaultCompactor(trigger_ratio=0.5, keep_last_n=1)
+    msgs: list[dict[str, Any]] = [
+        {"role": "system", "name": "compact_note", "content": "old"},
+        {"role": "system", "name": "memory_1", "content": "recalled"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "last"},
+    ]
+    span = cp._compactable_span(msgs)
+    assert span is not None
+    assert span[0] == 0  # the leading compact_note folds (not preserved as a phantom prompt)
+
+
 # ── DefaultCompactor: atomic pair preservation ─────────────────────────
 
 

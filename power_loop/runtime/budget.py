@@ -133,6 +133,13 @@ def trim_history(
     body_budget = remaining - system_tokens
 
     if body_budget < 0:
+        tail = messages[tail_start:]
+        if not tail:
+            # No tail at all (e.g. an all-system history that exceeds budget).
+            # Never return an empty list for a non-empty input: keep the system
+            # block (contract: system is preserved when keep_system=True; dropping
+            # it would lose the prompt entirely and break the next LLM call).
+            return list(messages[:sys_end]) if sys_end > 0 else list(messages)
         # Can't even fit system + tail. Degrade: drop system, keep only tail.
         if estimate_tokens(messages[tail_start:]) > max_tokens:
             # Tail alone exceeds budget — last resort: trim from tail end too.

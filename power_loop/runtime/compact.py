@@ -197,17 +197,26 @@ class DefaultCompactor(Compactor):
     ) -> tuple[int, int] | None:
         """Return the inclusive index range we can safely fold, or None.
 
-        Preserves the first ``system`` message (the original system_prompt)
-        and ``memory_*`` messages. Old ``compact_note`` messages are foldable
-        so at most one compact_note ever exists.
+        The original system_prompt is NOT in ``messages`` (it is passed to the LLM
+        out-of-band), so the only leading ``system`` rows here are recalled
+        ``memory_*`` rows (preserve — the MemoryProvider owns them) and prior
+        ``compact_note`` rows. A leading ``compact_note`` is FOLDABLE: it must be
+        merged into the new note so at most one ``compact_note`` ever exists (C7).
+        Folding it out is safe even when recalled ``memory_*`` placeholders sit
+        inside the span — the sink skips non-persisted rows when marking.
         """
         n = len(messages)
         if n == 0:
             return None
-        # Find end of preserved system block: first system msg + memory_* msgs.
+        # Find end of preserved system block. A leading compact_note is NOT
+        # preserved (it must fold/merge); genuine injected system rows and
+        # memory_* rows are.
         sys_end = 0
-        # Always preserve the first system message (the original system_prompt).
-        if sys_end < n and messages[sys_end].get("role") == "system":
+        if (
+            sys_end < n
+            and messages[sys_end].get("role") == "system"
+            and (messages[sys_end].get("name") or "") != "compact_note"
+        ):
             sys_end = 1
             # Preserve subsequent memory_* messages (they share system-region protection).
             while sys_end < n and messages[sys_end].get("role") == "system":

@@ -18,7 +18,9 @@ import pytest
 from power_loop.runtime.session_store import (
     CURRENT_SCHEMA_VERSION,
     MessageState,
+    SessionKind,
     SessionStore,
+    SubagentLifecycle,
 )
 
 pytestmark = pytest.mark.unit
@@ -84,6 +86,36 @@ def test_import_rejects_unknown_target_collision(store: SessionStore) -> None:
     blob = store.export_session(sid)
     with pytest.raises(ValueError, match="already exists"):
         store.import_session(blob, new_session_id=sid)  # collides with the source
+
+
+def test_import_detaches_subagent_lineage(store: SessionStore) -> None:
+    """C2 regression: a re-imported subagent must NOT keep the source's
+    ``parent_session_id`` / ``spawn_*`` — otherwise closing the (unrelated) original
+    parent cascade-deletes the freshly-restored session."""
+    parent = store.create_session(system_prompt="P")
+    # a real subagent with a non-null spawn_tool_call_id and spawn_depth=1, so the
+    # export carries genuine lineage values that the import must reset.
+    child = store.create_session(
+        system_prompt="C", parent_session_id=parent,
+        spawn_tool_call_id="tc_123", lifecycle=SubagentLifecycle.LINKED,
+    )
+    src = store.get_session(child)
+    assert src is not None and src.spawn_tool_call_id == "tc_123" and src.spawn_depth == 1
+    blob = json.loads(json.dumps(store.export_session(child)))
+
+    restored = store.import_session(blob, new_session_id="restored")
+    sess = store.get_session(restored)
+    assert sess is not None
+    # lineage is detached: independent root, not a child of the original parent
+    assert sess.parent_session_id is None
+    assert sess.spawn_tool_call_id is None  # the real "tc_123" was reset
+    assert sess.spawn_depth == 0
+    assert sess.kind is SessionKind.ROOT
+
+    # closing the original parent (cascade) must NOT destroy the import
+    removed = store.close_session(parent, cascade=True)
+    assert store.get_session("restored") is not None
+    assert removed == 2  # only parent + its real child, not the detached import
 
 
 def test_import_refuses_newer_schema(store: SessionStore) -> None:

@@ -58,10 +58,15 @@ def _file_stamp(fp: Path) -> tuple[int, int]:
 def _display_path(path: Path) -> str:
     runtime_env = get_runtime_env()
     resolved = path.resolve()
-    if runtime_env.workspace_dir is not None and resolved.is_relative_to(runtime_env.workspace_dir):
-        return str(resolved.relative_to(runtime_env.workspace_dir))
-    if runtime_env.home_dir is not None and resolved.is_relative_to(runtime_env.home_dir):
-        return f"@home/{resolved.relative_to(runtime_env.home_dir)}"
+    # Compare against RESOLVED roots: ``resolved`` has symlinks/.. collapsed, so an
+    # unresolved (symlinked) workspace_dir would otherwise fail is_relative_to and
+    # render an absolute path for files that are in fact inside the workspace.
+    ws = runtime_env.workspace_dir.resolve() if runtime_env.workspace_dir is not None else None
+    home = runtime_env.home_dir.resolve() if runtime_env.home_dir is not None else None
+    if ws is not None and resolved.is_relative_to(ws):
+        return str(resolved.relative_to(ws))
+    if home is not None and resolved.is_relative_to(home):
+        return f"@home/{resolved.relative_to(home)}"
     return str(resolved)
 
 
@@ -139,11 +144,21 @@ def _check_read_state(fp: Path) -> str | None:
 
 
 def _detect_line_ending(content: str) -> str:
-    crlf_idx = content.find("\r\n")
-    lf_idx = content.find("\n")
-    if lf_idx == -1 or crlf_idx == -1:
-        return "\n"
-    return "\r\n" if crlf_idx == lf_idx - 1 else "\n"
+    """Pick the file's dominant line ending by COUNT (not first occurrence).
+
+    Returns ``\\r\\n``, ``\\r`` (classic Mac), or ``\\n``. The old first-occurrence
+    heuristic flattened a CRLF file to LF whenever a stray lone-LF appeared before
+    the first CRLF, and never recognized CR-only files. A truly mixed file still
+    normalizes to its dominant ending (the edit tools normalize→edit→restore a
+    single ending; per-line fidelity for mixed files is out of scope)."""
+    crlf = content.count("\r\n")
+    lf = content.count("\n") - crlf      # lone LF (each \r\n contributes one \n)
+    cr = content.count("\r") - crlf      # lone CR (each \r\n contributes one \r)
+    if crlf >= lf and crlf >= cr and crlf > 0:
+        return "\r\n"
+    if cr > lf:
+        return "\r"
+    return "\n"
 
 
 def _normalize_to_lf(text: str) -> str:
@@ -151,7 +166,11 @@ def _normalize_to_lf(text: str) -> str:
 
 
 def _restore_line_endings(text: str, ending: str) -> str:
-    return text.replace("\n", "\r\n") if ending == "\r\n" else text
+    if ending == "\r\n":
+        return text.replace("\n", "\r\n")
+    if ending == "\r":
+        return text.replace("\n", "\r")
+    return text
 
 
 def _split_bom(content: str) -> tuple[str, str]:
@@ -213,7 +232,10 @@ def _should_skip_dir(path: Path, root: Path, include_hidden: bool, pattern: str 
 
 
 def _safe_relative_for_subprocess(path: Path) -> str:
-    workspace_dir = get_runtime_env().require_workspace_dir()
+    # Resolve the workspace too (see safe_path): comparing a resolved candidate
+    # against an unresolved/symlinked workspace_dir would wrongly fall through to
+    # the absolute path for an in-workspace target.
+    workspace_dir = get_runtime_env().require_workspace_dir().resolve()
     resolved = path.resolve()
     if resolved.is_relative_to(workspace_dir):
         rel = resolved.relative_to(workspace_dir)
@@ -723,7 +745,6 @@ def _apply_hunks(lines: list[str], hunks: list[PatchHunk], path: str) -> list[st
     cursor = 0
     for index, hunk in enumerate(hunks, 1):
         old_sequence = [text for op, text in hunk.changes if op in (" ", "-")]
-        replacement = [text for op, text in hunk.changes if op in (" ", "+")]
 
         search_from = cursor
         if hunk.old_start is not None:
@@ -745,6 +766,22 @@ def _apply_hunks(lines: list[str], hunks: list[PatchHunk], path: str) -> list[st
         if ambiguous:
             return f"Error: Hunk {index} matches multiple locations in {path}. Add more context lines."
 
+        # Build the replacement from the FILE's actual matched lines for context
+        # (' ') positions — not the patch's rendering. The match may be fuzzy
+        # (rstrip-equal, see _line_matches), so reusing the patch text for context
+        # lines would silently rewrite untouched lines (e.g. strip trailing
+        # whitespace). Only '+' lines come from the patch; '-' lines are dropped.
+        matched = lines[pos : pos + len(old_sequence)]
+        replacement: list[str] = []
+        fi = 0
+        for op, text in hunk.changes:
+            if op == " ":
+                replacement.append(matched[fi])
+                fi += 1
+            elif op == "-":
+                fi += 1
+            elif op == "+":
+                replacement.append(text)
         lines[pos : pos + len(old_sequence)] = replacement
         cursor = pos + len(replacement)
     return lines
@@ -804,7 +841,12 @@ def _iter_files_for_glob(base: Path, pattern: str, include_hidden: bool) -> list
                     matches.append(candidate)
     else:
         for candidate in base.glob(pattern):
-            if _should_skip_dir(candidate, base, include_hidden, pattern):
+            # Mirror the ** branch's whole-directory pruning: base.glob only filters
+            # the matched leaf, so a pattern like "*/*.py" would otherwise return
+            # files under node_modules/.git/.venv/... Reject if the leaf OR ANY
+            # ancestor directory is a _COMMON_SKIP_DIRS dir.
+            rel_parts = candidate.relative_to(base).parts
+            if any(part in _COMMON_SKIP_DIRS for part in rel_parts):
                 continue
             if not include_hidden and not _pattern_mentions_hidden(pattern) and _is_hidden_path(candidate, base):
                 continue
@@ -873,9 +915,13 @@ def _grep_with_python(
             continue
         for line_no, line in enumerate(text.splitlines(), 1):
             if compiled.search(line):
-                results.append(f"{_display_path(fp)}:{line_no}:{line.rstrip()}")
                 if len(results) >= max_results:
+                    # One more match than we'll show → results were truncated. Emit
+                    # the same notice the rg path appends so output doesn't silently
+                    # differ by whether ripgrep happens to be installed.
+                    results.append(f"... results truncated at {max_results}")
                     return "\n".join(results)
+                results.append(f"{_display_path(fp)}:{line_no}:{line.rstrip()}")
     return "\n".join(results)
 
 
@@ -1021,7 +1067,13 @@ class BackgroundManager:
             return scope_err
 
         task_id = str(uuid.uuid4())[:8]
-        workspace_dir = get_runtime_env().require_workspace_dir()
+        env = get_runtime_env()
+        workspace_dir = env.require_workspace_dir()
+        # Capture the injected ShellBackend HERE (the daemon thread below runs
+        # outside this contextvar). background_run must honor the same sandbox seam
+        # as `bash` — running on the host would bypass an installed sandbox and leak
+        # the host environment (C1).
+        shell_backend = env.shell_backend
         store, sid = _current_store_and_session()
         if store is not None and sid is not None:
             store.upsert_background_task(
@@ -1039,6 +1091,7 @@ class BackgroundManager:
                 "session_id": sid,
                 "store": store,
                 "workspace_dir": workspace_dir,
+                "shell_backend": shell_backend,
             }
 
         threading.Thread(target=self._execute, args=(task_id, command), daemon=True).start()
@@ -1047,21 +1100,30 @@ class BackgroundManager:
     def _execute(self, task_id: str, command: str) -> None:
         store = None
         sid = None
+        shell_backend: ShellBackend | None = None
         with self._lock:
             task = self.tasks.get(task_id)
             if task is not None:
                 store = task.get("store")
                 sid = task.get("session_id")
                 workspace_dir = task.get("workspace_dir")
+                shell_backend = task.get("shell_backend")
             else:
                 workspace_dir = None
         try:
             if not isinstance(workspace_dir, Path):
                 raise RuntimeError("Background task is missing workspace_dir")
+            # Launch through the ShellBackend (same seam as `bash`): feed the command
+            # to the backend-launched shell's stdin so an installed sandbox actually
+            # contains it, instead of running shell=True on the host (C1). For the
+            # default LocalShellBackend this is an in-process bash, equivalent to the
+            # prior behavior; for a sandbox backend it runs inside the sandbox.
+            backend = shell_backend or DEFAULT_SHELL_BACKEND
             result = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(workspace_dir),
+                backend.launch_argv(workspace_dir),
+                input=command,
+                cwd=backend.launch_cwd(workspace_dir),
+                env=backend.launch_env(workspace_dir),
                 capture_output=True,
                 text=True,
                 timeout=300,
