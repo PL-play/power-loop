@@ -221,15 +221,27 @@ class WorkflowSpec:
         if "root" not in data:
             problems.append("missing required key 'root'")
         else:
-            id_list: list[str] = []
-            _collect_agent_ids(data["root"], id_list)
-            declared_ids: set[str] = set(id_list)
-            # Agent ids key results, journal steps, and replay — they MUST be
-            # unique, or resume replays the wrong node / refs become ambiguous.
-            dupes = sorted({i for i in id_list if id_list.count(i) > 1})
+            # EVERY node id (agent + every container's id) shares one
+            # _results/journal/replay namespace, so they MUST be globally unique —
+            # a foreach-aggregate id colliding with an agent id silently corrupts
+            # data flow and diverges replay (C5).
+            all_ids: list[str] = []
+            _collect_all_ids(data["root"], all_ids)
+            dupes = sorted({i for i in all_ids if all_ids.count(i) > 1})
             if dupes:
-                problems.append(f"duplicate agent node id(s): {dupes} — agent ids must be unique")
-            root = _parse_node(data["root"], "root", problems, declared_ids)
+                problems.append(
+                    f"duplicate node id(s): {dupes} — every node id (agent and container) "
+                    f"must be unique across the workflow"
+                )
+            # Valid reference targets: agent ids + foreach aggregate ids, excluding
+            # anything inside a foreach body (mirrors resume.replayable_node_ids).
+            referenceable_ids: set[str] = set()
+            _collect_referenceable_ids(data["root"], referenceable_ids, in_body=False)
+            # Ids living inside a foreach body are not individually referenceable on
+            # resume (C4); collect them so a reference targeting one gets a precise error.
+            body_ids: set[str] = set()
+            _collect_foreach_body_ids(data["root"], body_ids, in_body=False)
+            root = _parse_node(data["root"], "root", problems, referenceable_ids, body_ids)
 
         if problems:
             raise WorkflowSpecError(problems)
@@ -350,22 +362,95 @@ def _parse_budget(data: Any, problems: list[str]) -> WorkflowBudget | None:
     return WorkflowBudget(max_tokens=int(mt), stop_at_remaining_pct=float(pct))
 
 
-def _collect_agent_ids(data: Any, out: list[str]) -> None:
-    """Pre-walk the (raw) tree gathering every agent-node ``id`` (with duplicates,
-    so the caller can both build the ref-check set and detect collisions)."""
+def _collect_referenceable_ids(data: Any, out: set[str], *, in_body: bool) -> None:
+    """Pre-walk the (raw) tree gathering the ids a ``inputs_from`` / ``items_from`` /
+    ``branch.on`` reference may legitimately target: agent ids and foreach *aggregate*
+    ids, EXCLUDING anything inside a foreach body. Mirrors
+    :func:`resume.replayable_node_ids` (the ids whose result lands in ``_results`` and
+    is replayed on resume) so the validator accepts exactly what the engine can
+    resolve — including referencing a top-level foreach aggregate, not just agents."""
     if not isinstance(data, dict):
         return
-    if data.get("type") == "agent" and isinstance(data.get("id"), str):
-        out.append(data["id"])
+    ntype = data.get("type")
+    nid = data.get("id")
+    if not in_body and isinstance(nid, str) and nid.strip() and ntype in ("agent", "foreach"):
+        out.add(nid)
     for key in ("steps", "branches"):
         for child in data.get(key) or []:
-            _collect_agent_ids(child, out)
+            _collect_referenceable_ids(child, out, in_body=in_body)
     if isinstance(data.get("body"), dict):
-        _collect_agent_ids(data["body"], out)
+        _collect_referenceable_ids(data["body"], out, in_body=in_body or ntype == "foreach")
     if isinstance(data.get("default"), dict):
-        _collect_agent_ids(data["default"], out)
+        _collect_referenceable_ids(data["default"], out, in_body=in_body)
     for child in (data.get("cases") or {}).values():
-        _collect_agent_ids(child, out)
+        _collect_referenceable_ids(child, out, in_body=in_body)
+
+
+def _collect_all_ids(data: Any, out: list[str]) -> None:
+    """Pre-walk the (raw) tree gathering EVERY node ``id`` — agent and container
+    alike — with duplicates. A foreach *aggregate* id, an agent id, and a
+    sequence/parallel/branch id all share one ``_results``/journal/replay namespace,
+    so a collision between any two (e.g. a foreach id equal to an agent id) silently
+    corrupts data flow and resume (C5). Used to enforce GLOBAL id uniqueness."""
+    if not isinstance(data, dict):
+        return
+    nid = data.get("id")
+    if isinstance(nid, str) and nid.strip():
+        out.append(nid)
+    for key in ("steps", "branches"):
+        for child in data.get(key) or []:
+            _collect_all_ids(child, out)
+    if isinstance(data.get("body"), dict):
+        _collect_all_ids(data["body"], out)
+    if isinstance(data.get("default"), dict):
+        _collect_all_ids(data["default"], out)
+    for child in (data.get("cases") or {}).values():
+        _collect_all_ids(child, out)
+
+
+def _collect_foreach_body_ids(data: Any, out: set[str], *, in_body: bool) -> None:
+    """Pre-walk the (raw) tree gathering ids that live INSIDE a foreach body — every
+    agent id and every nested-foreach aggregate id reachable through a foreach body.
+
+    These ids are not individually addressable on resume: a foreach is replayed
+    atomically via its aggregate, so a body node's journaled result is never put
+    back in ``_results`` (mirrors :func:`resume.replayable_node_ids`'s
+    ``in_foreach_body`` walk). Any ``inputs_from`` / ``items_from`` / ``branch.on``
+    that targets one of these works on attempt 1 but raises on resume (C4), so the
+    validator must reject such references."""
+    if not isinstance(data, dict):
+        return
+    ntype = data.get("type")
+    nid = data.get("id")
+    if in_body and isinstance(nid, str) and nid.strip() and ntype in ("agent", "foreach"):
+        out.add(nid)
+    for key in ("steps", "branches"):
+        for child in data.get(key) or []:
+            _collect_foreach_body_ids(child, out, in_body=in_body)
+    if isinstance(data.get("body"), dict):
+        # Descending through a foreach's body flips (and keeps) in_body True.
+        _collect_foreach_body_ids(data["body"], out, in_body=in_body or ntype == "foreach")
+    if isinstance(data.get("default"), dict):
+        _collect_foreach_body_ids(data["default"], out, in_body=in_body)
+    for child in (data.get("cases") or {}).values():
+        _collect_foreach_body_ids(child, out, in_body=in_body)
+
+
+def _check_not_body_ref(
+    ref: str, path: str, what: str, body_ids: set[str], problems: list[str]
+) -> bool:
+    """Reject a reference whose target node lives inside a foreach body (C4). Returns
+    True if it flagged a problem (so callers can skip the unknown-ref check)."""
+    target = _ref_target(ref)
+    if target in body_ids:
+        problems.append(
+            f"{path}: '{what}' references '{target}', which is a node inside a foreach "
+            f"body — foreach-body nodes are not individually addressable (their id is "
+            f"shared across iterations and not replayed on resume); reference the "
+            f"foreach's aggregate id instead"
+        )
+        return True
+    return False
 
 
 def _ref_target(ref: str) -> str:
@@ -374,7 +459,7 @@ def _ref_target(ref: str) -> str:
 
 
 def _parse_node(
-    data: Any, path: str, problems: list[str], ids: set[str]
+    data: Any, path: str, problems: list[str], ids: set[str], body_ids: set[str]
 ) -> WorkflowNode | None:
     if not isinstance(data, dict):
         problems.append(f"{path}: node must be an object")
@@ -387,15 +472,15 @@ def _parse_node(
         return None
 
     if ntype == "agent":
-        return _parse_agent(data, path, problems)
+        return _parse_agent(data, path, problems, body_ids)
     if ntype == "sequence":
-        return _parse_sequence(data, path, problems, ids)
+        return _parse_sequence(data, path, problems, ids, body_ids)
     if ntype == "parallel":
-        return _parse_parallel(data, path, problems, ids)
+        return _parse_parallel(data, path, problems, ids, body_ids)
     if ntype == "foreach":
-        return _parse_foreach(data, path, problems, ids)
+        return _parse_foreach(data, path, problems, ids, body_ids)
     if ntype == "branch":
-        return _parse_branch(data, path, problems, ids)
+        return _parse_branch(data, path, problems, ids, body_ids)
     return None  # unreachable
 
 
@@ -405,7 +490,9 @@ def _check_unknown(data: dict, allowed: set[str], path: str, problems: list[str]
         problems.append(f"{path}: unknown key(s): {sorted(unknown)}")
 
 
-def _parse_agent(data: dict, path: str, problems: list[str]) -> AgentNode | None:
+def _parse_agent(
+    data: dict, path: str, problems: list[str], body_ids: set[str]
+) -> AgentNode | None:
     _check_unknown(
         data, {"type", "id", "spec", "input", "inputs_from", "output_schema"}, path, problems
     )
@@ -434,6 +521,9 @@ def _parse_agent(data: dict, path: str, problems: list[str]) -> AgentNode | None
     if not (isinstance(inputs_from, list) and all(isinstance(x, str) for x in inputs_from)):
         problems.append(f"{path}: 'inputs_from' must be a list[str]")
         inputs_from = []
+    else:
+        for ref in inputs_from:
+            _check_not_body_ref(ref, path, "inputs_from", body_ids, problems)
 
     out_schema = data.get("output_schema")
     if out_schema is not None and not isinstance(out_schema, dict):
@@ -452,19 +542,26 @@ def _parse_agent(data: dict, path: str, problems: list[str]) -> AgentNode | None
     )
 
 
-def _parse_sequence(data: dict, path: str, problems: list[str], ids: set[str]) -> SequenceNode | None:
+def _parse_sequence(
+    data: dict, path: str, problems: list[str], ids: set[str], body_ids: set[str]
+) -> SequenceNode | None:
     _check_unknown(data, {"type", "id", "steps"}, path, problems)
     steps_raw = data.get("steps")
     if not isinstance(steps_raw, list) or not steps_raw:
         problems.append(f"{path}: 'steps' must be a non-empty list")
         return None
-    steps = [_parse_node(s, f"{path}.steps[{i}]", problems, ids) for i, s in enumerate(steps_raw)]
+    steps = [
+        _parse_node(s, f"{path}.steps[{i}]", problems, ids, body_ids)
+        for i, s in enumerate(steps_raw)
+    ]
     if any(s is None for s in steps):
         return None
     return SequenceNode(type="sequence", id=data.get("id"), steps=tuple(s for s in steps if s))
 
 
-def _parse_parallel(data: dict, path: str, problems: list[str], ids: set[str]) -> ParallelNode | None:
+def _parse_parallel(
+    data: dict, path: str, problems: list[str], ids: set[str], body_ids: set[str]
+) -> ParallelNode | None:
     _check_unknown(data, {"type", "id", "branches", "max_concurrency", "on_error"}, path, problems)
     branches_raw = data.get("branches")
     if not isinstance(branches_raw, list) or not branches_raw:
@@ -473,7 +570,8 @@ def _parse_parallel(data: dict, path: str, problems: list[str], ids: set[str]) -
     mc = _int_ge1(data.get("max_concurrency", 5), f"{path}.max_concurrency", problems)
     on_err = _on_error(data.get("on_error", "halt"), path, problems)
     branches = [
-        _parse_node(b, f"{path}.branches[{i}]", problems, ids) for i, b in enumerate(branches_raw)
+        _parse_node(b, f"{path}.branches[{i}]", problems, ids, body_ids)
+        for i, b in enumerate(branches_raw)
     ]
     if any(b is None for b in branches):
         return None
@@ -486,7 +584,9 @@ def _parse_parallel(data: dict, path: str, problems: list[str], ids: set[str]) -
     )
 
 
-def _parse_foreach(data: dict, path: str, problems: list[str], ids: set[str]) -> ForeachNode | None:
+def _parse_foreach(
+    data: dict, path: str, problems: list[str], ids: set[str], body_ids: set[str]
+) -> ForeachNode | None:
     _check_unknown(
         data,
         {"type", "id", "items_from", "items", "as", "body", "parallel", "max_concurrency", "on_error"},
@@ -507,9 +607,12 @@ def _parse_foreach(data: dict, path: str, problems: list[str], ids: set[str]) ->
     if items_from is not None:
         if not isinstance(items_from, str):
             problems.append(f"{path}: 'items_from' must be a string 'node_id.key'")
-        elif _ref_target(items_from) not in ids:
+        elif (
+            not _check_not_body_ref(items_from, path, "items_from", body_ids, problems)
+            and _ref_target(items_from) not in ids
+        ):
             problems.append(
-                f"{path}: 'items_from' references unknown agent node "
+                f"{path}: 'items_from' references unknown node "
                 f"'{_ref_target(items_from)}' (known: {sorted(ids)})"
             )
     if items is not None and not isinstance(items, list):
@@ -527,7 +630,7 @@ def _parse_foreach(data: dict, path: str, problems: list[str], ids: set[str]) ->
     if "body" not in data:
         problems.append(f"{path}: foreach requires 'body'")
     else:
-        body = _parse_node(data["body"], f"{path}.body", problems, ids)
+        body = _parse_node(data["body"], f"{path}.body", problems, ids, body_ids)
     if body is None:
         return None
     return ForeachNode(
@@ -543,15 +646,20 @@ def _parse_foreach(data: dict, path: str, problems: list[str], ids: set[str]) ->
     )
 
 
-def _parse_branch(data: dict, path: str, problems: list[str], ids: set[str]) -> BranchNode | None:
+def _parse_branch(
+    data: dict, path: str, problems: list[str], ids: set[str], body_ids: set[str]
+) -> BranchNode | None:
     _check_unknown(data, {"type", "id", "on", "cases", "default"}, path, problems)
     on = data.get("on")
     if not isinstance(on, str) or not on.strip():
         problems.append(f"{path}: branch requires a non-empty string 'on' ('node_id.key')")
         on = "?"
-    elif _ref_target(on) not in ids:
+    elif (
+        not _check_not_body_ref(on, path, "on", body_ids, problems)
+        and _ref_target(on) not in ids
+    ):
         problems.append(
-            f"{path}: 'on' references unknown agent node '{_ref_target(on)}' (known: {sorted(ids)})"
+            f"{path}: 'on' references unknown node '{_ref_target(on)}' (known: {sorted(ids)})"
         )
     cases_raw = data.get("cases")
     cases: dict[str, WorkflowNode] = {}
@@ -559,12 +667,12 @@ def _parse_branch(data: dict, path: str, problems: list[str], ids: set[str]) -> 
         problems.append(f"{path}: branch requires a non-empty 'cases' object")
     else:
         for key, child in cases_raw.items():
-            parsed = _parse_node(child, f"{path}.cases[{key!r}]", problems, ids)
+            parsed = _parse_node(child, f"{path}.cases[{key!r}]", problems, ids, body_ids)
             if parsed is not None:
                 cases[str(key)] = parsed
     default = None
     if data.get("default") is not None:
-        default = _parse_node(data["default"], f"{path}.default", problems, ids)
+        default = _parse_node(data["default"], f"{path}.default", problems, ids, body_ids)
     if not cases:
         return None
     return BranchNode(type="branch", id=data.get("id"), on=on, cases=cases, default=default)

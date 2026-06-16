@@ -1021,7 +1021,13 @@ class BackgroundManager:
             return scope_err
 
         task_id = str(uuid.uuid4())[:8]
-        workspace_dir = get_runtime_env().require_workspace_dir()
+        env = get_runtime_env()
+        workspace_dir = env.require_workspace_dir()
+        # Capture the injected ShellBackend HERE (the daemon thread below runs
+        # outside this contextvar). background_run must honor the same sandbox seam
+        # as `bash` — running on the host would bypass an installed sandbox and leak
+        # the host environment (C1).
+        shell_backend = env.shell_backend
         store, sid = _current_store_and_session()
         if store is not None and sid is not None:
             store.upsert_background_task(
@@ -1039,6 +1045,7 @@ class BackgroundManager:
                 "session_id": sid,
                 "store": store,
                 "workspace_dir": workspace_dir,
+                "shell_backend": shell_backend,
             }
 
         threading.Thread(target=self._execute, args=(task_id, command), daemon=True).start()
@@ -1047,21 +1054,30 @@ class BackgroundManager:
     def _execute(self, task_id: str, command: str) -> None:
         store = None
         sid = None
+        shell_backend: ShellBackend | None = None
         with self._lock:
             task = self.tasks.get(task_id)
             if task is not None:
                 store = task.get("store")
                 sid = task.get("session_id")
                 workspace_dir = task.get("workspace_dir")
+                shell_backend = task.get("shell_backend")
             else:
                 workspace_dir = None
         try:
             if not isinstance(workspace_dir, Path):
                 raise RuntimeError("Background task is missing workspace_dir")
+            # Launch through the ShellBackend (same seam as `bash`): feed the command
+            # to the backend-launched shell's stdin so an installed sandbox actually
+            # contains it, instead of running shell=True on the host (C1). For the
+            # default LocalShellBackend this is an in-process bash, equivalent to the
+            # prior behavior; for a sandbox backend it runs inside the sandbox.
+            backend = shell_backend or DEFAULT_SHELL_BACKEND
             result = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(workspace_dir),
+                backend.launch_argv(workspace_dir),
+                input=command,
+                cwd=backend.launch_cwd(workspace_dir),
+                env=backend.launch_env(workspace_dir),
                 capture_output=True,
                 text=True,
                 timeout=300,

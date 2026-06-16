@@ -357,6 +357,15 @@ class WorkflowEngine:
         siblings** (so they stop burning real LLM calls and can't clobber the journal
         with a late step), drain them, then re-raise — unlike ``asyncio.gather``,
         which re-raises but leaves the siblings running detached.
+
+        Halt is scoped to THIS node's own siblings (C6): we cancel only the tasks of
+        *this* gather and re-raise. We deliberately do NOT flip the run-wide
+        ``self._cancel`` token or set ``self._cancelled`` here — doing so would tear
+        down unrelated in-flight branches of an *enclosing* ``on_error="continue"``
+        node and force the whole run to ``"cancelled"``. The raised exception
+        propagates naturally: a containing ``continue`` collects it as a branch error,
+        a containing ``halt``/``sequence`` re-raises, and the top level becomes
+        ``"failed"`` (or surfaces the raw exception) — never a spurious ``"cancelled"``.
         """
         tasks = [asyncio.ensure_future(c) for c in coros]
         if not tasks:
@@ -376,8 +385,8 @@ class WorkflowEngine:
             None,
         )
         if first_exc is not None:
-            self._cancelled = True
-            self._cancel.cancel("workflow halt: sibling branch failed")  # best-effort (owned tokens)
+            # Cancel only THIS gather's own in-flight siblings; scope it here so a
+            # nested halt cannot poison unrelated subtrees or the run-wide token (C6).
             for t in tasks:
                 if not t.done():
                     t.cancel()

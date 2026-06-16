@@ -1102,7 +1102,15 @@ class SessionStore:
         (or supplied) id, in one transaction. Returns the new ``session_id``.
 
         Refuses an export whose ``schema_version`` is newer than this build supports, or
-        a target id that already exists. Columns absent from an older export default."""
+        a target id that already exists. Columns absent from an older export default.
+
+        An imported session is an INDEPENDENT root: its lineage columns
+        (``parent_session_id`` / ``spawn_tool_call_id`` / ``spawn_depth`` / ``kind``)
+        are reset rather than copied from the source. Otherwise a re-imported subagent
+        would stay linked to the source's *original* parent and be silently
+        cascade-deleted when that unrelated parent is closed — destroying the
+        just-restored session (C2).
+        """
         version = int(data.get("schema_version", 0))
         if version > CURRENT_SCHEMA_VERSION:
             raise ValueError(
@@ -1120,6 +1128,13 @@ class SessionStore:
                 for raw_row in tables.get(table, []):
                     row = dict(raw_row)
                     row["session_id"] = new_id
+                    if table == "sessions":
+                        # Detach lineage so the import is an independent root (see
+                        # docstring), never silently re-linked to the source's parent.
+                        row["parent_session_id"] = None
+                        row["spawn_tool_call_id"] = None
+                        row["spawn_depth"] = 0
+                        row["kind"] = SessionKind.ROOT.value
                     cols = list(row.keys())
                     collist = ",".join(cols)
                     placeholders = ",".join("?" * len(cols))
