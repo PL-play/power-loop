@@ -58,10 +58,15 @@ def _file_stamp(fp: Path) -> tuple[int, int]:
 def _display_path(path: Path) -> str:
     runtime_env = get_runtime_env()
     resolved = path.resolve()
-    if runtime_env.workspace_dir is not None and resolved.is_relative_to(runtime_env.workspace_dir):
-        return str(resolved.relative_to(runtime_env.workspace_dir))
-    if runtime_env.home_dir is not None and resolved.is_relative_to(runtime_env.home_dir):
-        return f"@home/{resolved.relative_to(runtime_env.home_dir)}"
+    # Compare against RESOLVED roots: ``resolved`` has symlinks/.. collapsed, so an
+    # unresolved (symlinked) workspace_dir would otherwise fail is_relative_to and
+    # render an absolute path for files that are in fact inside the workspace.
+    ws = runtime_env.workspace_dir.resolve() if runtime_env.workspace_dir is not None else None
+    home = runtime_env.home_dir.resolve() if runtime_env.home_dir is not None else None
+    if ws is not None and resolved.is_relative_to(ws):
+        return str(resolved.relative_to(ws))
+    if home is not None and resolved.is_relative_to(home):
+        return f"@home/{resolved.relative_to(home)}"
     return str(resolved)
 
 
@@ -213,7 +218,10 @@ def _should_skip_dir(path: Path, root: Path, include_hidden: bool, pattern: str 
 
 
 def _safe_relative_for_subprocess(path: Path) -> str:
-    workspace_dir = get_runtime_env().require_workspace_dir()
+    # Resolve the workspace too (see safe_path): comparing a resolved candidate
+    # against an unresolved/symlinked workspace_dir would wrongly fall through to
+    # the absolute path for an in-workspace target.
+    workspace_dir = get_runtime_env().require_workspace_dir().resolve()
     resolved = path.resolve()
     if resolved.is_relative_to(workspace_dir):
         rel = resolved.relative_to(workspace_dir)

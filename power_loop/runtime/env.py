@@ -120,7 +120,14 @@ def _is_in_home_rw_allowlist(path: Path, env: RuntimeEnv) -> bool:
 
 def safe_path(p: str, purpose: str = "rw", *, env: RuntimeEnv | None = None) -> Path:
     runtime_env = env if env is not None else get_runtime_env()
-    workspace_dir = runtime_env.require_workspace_dir()
+    # Resolve the workspace before comparing: ``candidate`` below is always resolved
+    # (symlinks + ``..`` collapsed), so the boundary check must compare against an
+    # equally-canonical workspace. A directly-constructed RuntimeEnv may carry an
+    # unresolved/symlinked workspace_dir (``from_env`` resolves, direct construction
+    # does not); without this, a symlinked workspace (e.g. macOS /tmp→/private/tmp)
+    # would reject every legitimate in-workspace path.
+    workspace_dir = runtime_env.require_workspace_dir().resolve()
+    home_dir = runtime_env.home_dir.resolve() if runtime_env.home_dir is not None else None
 
     raw_input = (p or "").strip()
     if not raw_input:
@@ -129,7 +136,7 @@ def safe_path(p: str, purpose: str = "rw", *, env: RuntimeEnv | None = None) -> 
     if raw_input.startswith("@workspace/"):
         candidate = (workspace_dir / raw_input[len("@workspace/") :]).resolve()
     elif raw_input.startswith("@home/"):
-        candidate = (runtime_env.require_home_dir() / raw_input[len("@home/") :]).resolve()
+        candidate = (runtime_env.require_home_dir().resolve() / raw_input[len("@home/") :]).resolve()
     else:
         raw = Path(raw_input).expanduser()
         if raw.is_absolute():
@@ -140,7 +147,7 @@ def safe_path(p: str, purpose: str = "rw", *, env: RuntimeEnv | None = None) -> 
     if candidate.is_relative_to(workspace_dir):
         return candidate
 
-    if runtime_env.home_dir is not None and candidate.is_relative_to(runtime_env.home_dir):
+    if home_dir is not None and candidate.is_relative_to(home_dir):
         if _is_in_home_rw_allowlist(candidate, runtime_env):
             return candidate
         raise ValueError(
