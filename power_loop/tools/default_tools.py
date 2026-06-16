@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,7 +48,11 @@ _COMMON_SKIP_DIRS = {
     "vendor",
 }
 
-FILE_READ_STATE: dict[str, tuple[int, int]] = {}
+# Process-global optimistic read-before-write stamps. Bounded (LRU) so a long-lived
+# process that reads many distinct files can't grow it without limit (C9).
+_MAX_FILE_READ_STATE = 4096
+FILE_READ_STATE: OrderedDict[str, tuple[int, int]] = OrderedDict()
+_FILE_READ_STATE_LOCK = threading.Lock()
 
 
 def _file_stamp(fp: Path) -> tuple[int, int]:
@@ -131,14 +136,20 @@ def _read_text(fp: Path, *, max_bytes: int | None = TEXT_FILE_MAX_BYTES) -> str:
 
 
 def _remember_read(fp: Path) -> None:
-    FILE_READ_STATE[str(fp.resolve())] = _file_stamp(fp)
+    key = str(fp.resolve())
+    with _FILE_READ_STATE_LOCK:
+        FILE_READ_STATE[key] = _file_stamp(fp)
+        FILE_READ_STATE.move_to_end(key)
+        while len(FILE_READ_STATE) > _MAX_FILE_READ_STATE:
+            FILE_READ_STATE.popitem(last=False)  # evict least-recently-read
 
 
 def _check_read_state(fp: Path) -> str | None:
     key = str(fp.resolve())
-    if key not in FILE_READ_STATE:
+    stamp = FILE_READ_STATE.get(key)  # .get(): tolerate a concurrent LRU eviction
+    if stamp is None:
         return f"Error: File has not been read yet. Use read_file first before modifying: {_display_path(fp)}"
-    if fp.exists() and _file_stamp(fp) != FILE_READ_STATE[key]:
+    if fp.exists() and _file_stamp(fp) != stamp:
         return f"Error: File changed since last read. Re-read it before modifying: {_display_path(fp)}"
     return None
 
@@ -524,7 +535,14 @@ class BashSession:
             self._proc = None
 
 
-_BASH_SESSIONS: dict[Any, BashSession] = {}
+# Process-global cache of persistent shells, keyed by backend.session_key. Bounded
+# (LRU) and lock-guarded: sync tool handlers run under asyncio.to_thread, so without
+# the lock concurrent calls for one key would each spawn a BashSession and orphan all
+# but the last (C8); without the bound, many distinct workspaces would leak processes/
+# threads/fds without limit (C9). Evicting a session closes its process+thread+fd.
+_MAX_BASH_SESSIONS = 64
+_BASH_SESSIONS: OrderedDict[Any, BashSession] = OrderedDict()
+_BASH_SESSIONS_LOCK = threading.Lock()
 
 
 def _bash_for_current_workspace() -> BashSession:
@@ -535,11 +553,36 @@ def _bash_for_current_workspace() -> BashSession:
     # backend, e.g. a specific sandbox container) reuses one persistent shell;
     # different targets get distinct sessions.
     key = backend.session_key(workspace_dir)
-    session = _BASH_SESSIONS.get(key)
-    if session is None:
+    # Double-checked, lock-guarded get-or-create: exactly one session per key is ever
+    # constructed even under concurrent to_thread calls (C8). Creation holds the lock
+    # (it spawns a subprocess) — rare enough that serializing it is fine.
+    with _BASH_SESSIONS_LOCK:
+        session = _BASH_SESSIONS.get(key)
+        if session is not None:
+            _BASH_SESSIONS.move_to_end(key)  # mark most-recently-used
+            return session
         session = BashSession(workspace_dir, backend)
         _BASH_SESSIONS[key] = session
-    return session
+        while len(_BASH_SESSIONS) > _MAX_BASH_SESSIONS:
+            _, evicted = _BASH_SESSIONS.popitem(last=False)  # drop least-recently-used
+            try:
+                evicted.close()
+            except Exception:
+                pass
+        return session
+
+
+def close_all_bash_sessions() -> None:
+    """Close and drop every cached persistent bash session (each owns a subprocess +
+    reader thread + pty fd). A host can call this on shutdown to reclaim resources;
+    the next bash call lazily recreates whatever it needs."""
+    with _BASH_SESSIONS_LOCK:
+        for session in list(_BASH_SESSIONS.values()):
+            try:
+                session.close()
+            except Exception:
+                pass
+        _BASH_SESSIONS.clear()
 
 
 def run_bash(command: str | None = None, restart: bool = False, timeout: int = 120) -> str:
