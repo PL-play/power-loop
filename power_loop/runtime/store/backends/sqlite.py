@@ -118,5 +118,29 @@ class SqliteDatabase:
             self._closed = True
             await asyncio.to_thread(self._conn.close)
 
+    # ── Maintenance capability (SQLite-only; see store/capabilities.py) ─────────
+    async def checkpoint(self, *, mode: str = "TRUNCATE") -> None:
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"invalid checkpoint mode: {mode!r}")
+        async with self._lock:
+            await asyncio.to_thread(self._conn.execute, f"PRAGMA wal_checkpoint({mode})")
+
+    async def vacuum(self, *, incremental: bool = True) -> None:
+        async with self._lock:
+            # VACUUM cannot run inside a transaction; this conn is in autocommit mode.
+            sql = "PRAGMA incremental_vacuum" if incremental else "VACUUM"
+            await asyncio.to_thread(self._conn.execute, sql)
+
+    async def backup(self, dest_path: str) -> None:
+        def _backup() -> None:
+            dest = sqlite3.connect(dest_path)
+            try:
+                self._conn.backup(dest)
+            finally:
+                dest.close()
+
+        async with self._lock:
+            await asyncio.to_thread(_backup)
+
 
 __all__ = ["SqliteDatabase"]

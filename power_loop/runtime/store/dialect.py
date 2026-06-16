@@ -36,10 +36,12 @@ class Dialect(Protocol):
         val_cols: Sequence[str],
         *,
         add_cols: Sequence[str] = (),
+        insert_only_cols: Sequence[str] = (),
     ) -> str:
         """Render an idempotent INSERT-or-UPDATE. ``val_cols`` are overwritten;
-        ``add_cols`` are accumulated (``col = col + new``). ``?`` placeholders for
-        ``key_cols + val_cols + add_cols`` in that order."""
+        ``add_cols`` are accumulated (``col = col + new``); ``insert_only_cols`` are set
+        on INSERT but PRESERVED on conflict (e.g. ``first_send_at``). ``?`` placeholders
+        for ``key_cols + val_cols + add_cols + insert_only_cols`` in that order."""
         ...
 
     async def lock_state(self, tx: Transaction, state_table: str, session_id: str) -> Row:
@@ -124,8 +126,8 @@ class SqliteDialect:
                 updated_at INTEGER NOT NULL, PRIMARY KEY (session_id, note_id))""",
         ]
 
-    def upsert(self, table, key_cols, val_cols, *, add_cols=()):
-        cols = [*key_cols, *val_cols, *add_cols]
+    def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
+        cols = [*key_cols, *val_cols, *add_cols, *insert_only_cols]
         placeholders = ",".join("?" * len(cols))
         sets = [f"{c}=excluded.{c}" for c in val_cols]
         sets += [f"{c}={table}.{c}+excluded.{c}" for c in add_cols]
