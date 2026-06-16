@@ -160,6 +160,12 @@ class ContextManager:
             )
             reasoning = _pick(usage, ["completion_reasoning_tokens", "reasoning_tokens"])
             total_tokens = _pick(usage, ["total_tokens"])
+            if total_tokens == 0 and (input_tokens or output_tokens):
+                # Derive total when the provider omits it (the bundled OpenAI/
+                # Anthropic factories already do this). Otherwise SharedBudget —
+                # which charges total_tokens — never advances for a vendor-neutral
+                # custom LLMService that reports only prompt/completion.
+                total_tokens = input_tokens + output_tokens
 
         usage_out: dict[str, int] = {
             "prompt_tokens": input_tokens,
@@ -193,7 +199,10 @@ class ContextManager:
         if len(tool_output_indices) <= self.micro_hot_tail:
             return
 
-        cold = tool_output_indices[:-self.micro_hot_tail]
+        # Keep the last ``micro_hot_tail`` tool outputs hot; spill the rest. Avoid
+        # ``[:-n]`` — it is ``[:0]`` (spills NOTHING) when micro_hot_tail==0, the
+        # opposite of "keep zero hot". CONTEXT_MICRO_HOT_TAIL=0 is a valid config.
+        cold = tool_output_indices[: len(tool_output_indices) - self.micro_hot_tail]
         for i in cold:
             msg = messages[i]
             content = msg.get("content", "")
