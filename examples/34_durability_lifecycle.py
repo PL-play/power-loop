@@ -41,8 +41,9 @@ async def main() -> str:
     tmp = Path(tempfile.mkdtemp(prefix="pl_durability_"))
     db = str(tmp / "agent.db")
 
-    # A read pool (SCALE-2) is opt-in and harmless here — shows the knob.
-    store = SessionStore.open(db, read_pool_size=2)
+    # The async store offloads every statement to a worker thread and serializes
+    # writers behind one asyncio.Lock — no read-pool knob to configure.
+    store = await SessionStore.open(db)
     cfg = AgentLoopConfig(
         system_prompt="Answer the user's latest question concisely.",
         max_rounds=1, max_tokens=400,
@@ -51,45 +52,46 @@ async def main() -> str:
 
     pruned = 0
     async with StatefulAgentLoop(llm=make_llm(max_tokens=200), store=store, config=cfg) as loop:
-        sid = loop.new_session()
+        sid = await loop.new_session()
         # Seed several fat earlier turns the compactor must fold on the next send
         # (big enough that reclaiming them visibly shrinks the file).
         for i in range(12):
-            store.append_message(sid, role="user", content="context " + "u" * 3000, round_index=i)
-            store.append_message(sid, role="assistant", content="noted " + "a" * 3000, round_index=i)
+            await store.append_message(sid, role="user", content="context " + "u" * 3000, round_index=i)
+            await store.append_message(sid, role="assistant", content="noted " + "a" * 3000, round_index=i)
 
         result = await loop.send("Name the largest planet in our solar system.", session_id=sid)
         assert result.status == "completed"
 
-        compactions = store.list_compactions(sid)
-        active_before = [(m.role, m.name) for m in store.load_active_messages(sid)]
+        compactions = await store.list_compactions(sid)
+        active_before = [(m.role, m.name) for m in await store.load_active_messages(sid)]
 
         # OPS-4: ARCHIVE the full session first (incl. the folded-out originals) — so the
         # export is complete; then reclaim locally. This is the "archive then prune" order.
-        blob = store.export_session(sid)
+        blob = await store.export_session(sid)
 
         # OPS-2/3: reclaim the folded-out originals + shrink the file on disk.
-        store.checkpoint(mode="TRUNCATE")
+        await store.checkpoint(mode="TRUNCATE")
         size_before = Path(db).stat().st_size
-        pruned = store.prune_compacted_messages(sid)
-        store.vacuum(incremental=False)
-        store.checkpoint(mode="TRUNCATE")  # flush the VACUUM's rewrite out of the WAL
+        pruned = await store.prune_compacted_messages(sid)
+        await store.vacuum(incremental=False)
+        await store.checkpoint(mode="TRUNCATE")  # flush the VACUUM's rewrite out of the WAL
         size_after = Path(db).stat().st_size
 
         # The active window (compact_note + kept tail) is untouched by pruning.
-        assert [(m.role, m.name) for m in store.load_active_messages(sid)] == active_before
+        assert [(m.role, m.name) for m in await store.load_active_messages(sid)] == active_before
     # ← async-with exit ran aclose(): drained the send, checkpointed, closed the store.
 
     # OPS-4: import the (complete) archive into a brand-new store under a new id.
-    other = SessionStore.open(str(tmp / "restored.db"))
+    other = await SessionStore.open(str(tmp / "restored.db"))
     try:
-        new_sid = other.import_session(blob, new_session_id="restored")
-        restored_first = other.load_active_messages(new_sid)[0].name  # the compact_note, in order
+        new_sid = await other.import_session(blob, new_session_id="restored")
+        first_active = (await other.load_active_messages(new_sid))[0].name  # compact_note, in order
+        restored_first = first_active
         restored_compacted = sum(
-            1 for m in other.load_all_messages(new_sid) if m.state is MessageState.COMPACTED_OUT
+            1 for m in await other.load_all_messages(new_sid) if m.state is MessageState.COMPACTED_OUT
         )
     finally:
-        other.close()
+        await other.close()
 
     summary = (
         f"answer={result.final_text!r} | compactions={len(compactions)} | "

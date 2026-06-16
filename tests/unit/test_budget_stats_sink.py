@@ -106,7 +106,7 @@ async def test_budget_exceeded_stops_at_round_boundary(tmp_path):
         config=AgentLoopConfig(system_prompt="t", max_rounds=6, max_tokens_per_run=500),
         tool_registry=_echo_registry(), event_bus=bus,
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     res = await loop.send("hi", session_id=sid)
     assert res.status == "budget_exceeded"
     assert res.usage["prompt_tokens"] == 1000  # round 2 never ran
@@ -115,7 +115,7 @@ async def test_budget_exceeded_stops_at_round_boundary(tmp_path):
     assert res2.status in ("completed", "budget_exceeded")
     kinds = [(e.payload or {}).get("kind") for e in events]
     assert "budget_exceeded" in kinds
-    loop.close()
+    await loop.aclose()
 
 
 @pytest.mark.asyncio
@@ -125,10 +125,10 @@ async def test_budget_disabled_by_default(tmp_path):
         llm=llm, db_path=str(tmp_path / "s.db"),
         config=AgentLoopConfig(system_prompt="t"),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     res = await loop.send("hi", session_id=sid)
     assert res.status == "completed"
-    loop.close()
+    await loop.aclose()
 
 
 # ── session stats ───────────────────────────────────────────────────────
@@ -144,11 +144,11 @@ async def test_session_stats_accumulate_across_sends(tmp_path):
         llm=llm, db_path=str(tmp_path / "s.db"),
         config=AgentLoopConfig(system_prompt="t"),
     )
-    sid = loop.new_session()
-    assert loop.get_session_stats(sid) is None  # before first send
+    sid = await loop.new_session()
+    assert await loop.get_session_stats(sid) is None  # before first send
     await loop.send("a", session_id=sid)
     await loop.send("b", session_id=sid)
-    stats = loop.get_session_stats(sid)
+    stats = await loop.get_session_stats(sid)
     assert stats is not None
     assert (stats.sends, stats.llm_calls) == (2, 2)
     assert stats.prompt_tokens == 30
@@ -156,11 +156,11 @@ async def test_session_stats_accumulate_across_sends(tmp_path):
     assert stats.rounds == 2 and stats.tool_calls == 0
     assert stats.first_send_at is not None
     assert stats.first_send_at <= stats.last_send_at
-    assert loop.list_session_stats()[0].session_id == sid
+    assert (await loop.list_session_stats())[0].session_id == sid
     # cascade delete with the session
-    loop.close_session(sid)
-    assert loop.store.get_session_stats(sid) is None
-    loop.close()
+    await loop.close_session(sid)
+    assert await loop.store.get_session_stats(sid) is None
+    await loop.aclose()
 
 
 # ── sync tools run off the event loop ───────────────────────────────────
@@ -185,7 +185,7 @@ async def test_sync_tool_does_not_block_event_loop(tmp_path):
         config=AgentLoopConfig(system_prompt="t", max_rounds=4),
         tool_registry=_echo_registry(slow_echo),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
 
     ticks = 0
 
@@ -202,8 +202,8 @@ async def test_sync_tool_does_not_block_event_loop(tmp_path):
     assert seen["thread"] != main_thread  # ran in a worker thread
     assert ticks >= 4  # event loop kept ticking during the 0.3s sleep
     assert res.tool_calls == 1
-    assert loop.get_session_stats(sid).tool_calls == 1
-    loop.close()
+    assert (await loop.get_session_stats(sid)).tool_calls == 1
+    await loop.aclose()
 
 
 # ── phase events always carry typed data ────────────────────────────────
@@ -220,12 +220,12 @@ async def test_all_emitted_events_have_data(tmp_path):
         config=AgentLoopConfig(system_prompt="t", max_rounds=4),
         tool_registry=_echo_registry(), event_bus=bus,
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     await loop.send("hi", session_id=sid)
     assert captured, "expected events"
     missing = [e.type for e in captured if e.data is None]
     assert not missing, f"events without typed data: {missing}"
-    loop.close()
+    await loop.aclose()
 
 
 # ── logging sink ────────────────────────────────────────────────────────
@@ -240,7 +240,7 @@ async def test_logging_sink_emits_json_lines(tmp_path, caplog):
         llm=llm, db_path=str(tmp_path / "s.db"),
         config=AgentLoopConfig(system_prompt="t"), event_bus=bus,
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     with caplog.at_level(logging.INFO, logger="power_loop.events"):
         await loop.send("hi", session_id=sid)
     lines = [json.loads(r.message) for r in caplog.records
@@ -248,7 +248,7 @@ async def test_logging_sink_emits_json_lines(tmp_path, caplog):
     assert lines and all(line["event"] == "usage_updated" for line in lines)
     assert lines[0]["payload"]["usage"]["prompt_tokens"] == 7
     assert lines[0]["session_id"] == sid
-    loop.close()
+    await loop.aclose()
 
 
 def test_logging_sink_truncates_long_fields():

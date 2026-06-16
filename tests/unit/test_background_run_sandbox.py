@@ -50,7 +50,7 @@ def _wait(mgr: BackgroundManager, task_id: str, timeout: float = 5.0) -> str:
     raise AssertionError("background task did not finish in time")
 
 
-def test_background_run_launches_through_shell_backend(monkeypatch, tmp_path) -> None:
+async def test_background_run_launches_through_shell_backend(monkeypatch, tmp_path) -> None:
     captured: dict = {}
 
     def fake_run(argv, **kw):
@@ -70,7 +70,7 @@ def test_background_run_launches_through_shell_backend(monkeypatch, tmp_path) ->
 
     mgr = BackgroundManager()
     with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path, shell_backend=_MarkerBackend())):
-        started = mgr.run("echo hi")
+        started = await mgr.run("echo hi")
     task_id = started.split()[2]
     _wait(mgr, task_id)
 
@@ -82,12 +82,12 @@ def test_background_run_launches_through_shell_backend(monkeypatch, tmp_path) ->
     assert captured["env"].get("PL_SANDBOX_MARKER") == "sandbox-123"
 
 
-def test_background_run_executes_in_backend_environment(tmp_path) -> None:
+async def test_background_run_executes_in_backend_environment(tmp_path) -> None:
     """End-to-end with real bash: the command actually runs inside the backend's
     environment (the host env alone would never define PL_SANDBOX_MARKER)."""
     mgr = BackgroundManager()
     with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path, shell_backend=_MarkerBackend())):
-        started = mgr.run("echo marker=$PL_SANDBOX_MARKER")
+        started = await mgr.run("echo marker=$PL_SANDBOX_MARKER")
     task_id = started.split()[2]
     _wait(mgr, task_id)
     assert "marker=sandbox-123" in (mgr.tasks[task_id]["result"] or "")

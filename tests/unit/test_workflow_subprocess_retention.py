@@ -43,9 +43,9 @@ class _OrchLLM(LLMService):
         return None
 
 
-def _loop() -> StatefulAgentLoop:
+async def _loop() -> StatefulAgentLoop:
     return StatefulAgentLoop(
-        llm=_OrchLLM(), store=SessionStore.open(":memory:"),
+        llm=_OrchLLM(), store=await SessionStore.open(":memory:"),
         config=AgentLoopConfig(system_prompt="o", max_rounds=2, compactor=None),
     )
 
@@ -63,11 +63,11 @@ _ONE_LEAF = {"name": "w", "root": {"type": "agent", "id": "only",
 
 
 async def test_leaf_db_path_is_journaled_and_inspectable(tmp_path) -> None:
-    loop = _loop()
-    sid = loop.new_session()
+    loop = await _loop()
+    sid = await loop.new_session()
     run_id = "dbp"
     spec = WorkflowSpec.from_json(_ONE_LEAF)
-    journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
+    await journal_mod.seed(loop.store, sid, run_id, spec.name, spec=spec.to_dict())
     ex = _executor(str(tmp_path / "r"))
     res = await WorkflowEngine(
         loop, executor=ex, on_step=make_on_step(loop.store, sid, run_id), run_id=run_id,
@@ -76,22 +76,22 @@ async def test_leaf_db_path_is_journaled_and_inspectable(tmp_path) -> None:
     leaf = res.results["only"]
     assert leaf.db_path and os.path.exists(leaf.db_path)
     # journaled, so a supervisor can find + open the private db after the fact
-    step = next(s for s in journal_mod.read(loop.store, sid, run_id)["steps"]
+    step = next(s for s in (await journal_mod.read(loop.store, sid, run_id))["steps"]
                 if s["node_id"] == "only")
     assert step["db_path"] == leaf.db_path
-    info = get_workflow(loop, sid, run_id, detail=True)
+    info = await get_workflow(loop, sid, run_id, detail=True)
     assert any(s.get("db_path") == leaf.db_path for s in info["steps"])
 
-    store = SessionStore.open(leaf.db_path)
+    store = await SessionStore.open(leaf.db_path)
     try:
-        assert any(m.role == "assistant" for m in store.load_all_messages(leaf.session_id))
+        assert any(m.role == "assistant" for m in await store.load_all_messages(leaf.session_id))
     finally:
-        store.close()
+        await store.close()
 
 
 async def test_delete_on_success_drops_completed_leaf_db(tmp_path) -> None:
     ex = _executor(str(tmp_path / "r"), delete_on_success=True)
-    res = await WorkflowEngine(_loop(), executor=ex, run_id="del").run(
+    res = await WorkflowEngine(await _loop(), executor=ex, run_id="del").run(
         WorkflowSpec.from_json(_ONE_LEAF))
     leaf = res.results["only"]
     assert leaf.status == "completed"
@@ -100,7 +100,7 @@ async def test_delete_on_success_drops_completed_leaf_db(tmp_path) -> None:
 
 async def test_default_keeps_completed_leaf_db(tmp_path) -> None:
     ex = _executor(str(tmp_path / "r"))  # delete_on_success defaults False
-    res = await WorkflowEngine(_loop(), executor=ex, run_id="keep").run(
+    res = await WorkflowEngine(await _loop(), executor=ex, run_id="keep").run(
         WorkflowSpec.from_json(_ONE_LEAF))
     assert os.path.exists(res.results["only"].db_path)
 

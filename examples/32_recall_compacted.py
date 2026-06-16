@@ -44,12 +44,12 @@ def _norm(s: str | None) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
-def _seed_with_buried_code(store: SessionStore, sid: str) -> None:
+async def _seed_with_buried_code(store: SessionStore, sid: str) -> None:
     """Bury the code as an INCIDENTAL detail mid-filler (not flagged "remember
     this"), then a lot of fat filler so it lands well inside the folded-out range.
     Incidental specifics are exactly what a summary tends to drop — making the
     tool the reliable way to get it back."""
-    store.append_message(
+    await store.append_message(
         sid, role="user",
         content=(
             "Here's the full context of the migration: " + ("blah " * 60)
@@ -58,19 +58,19 @@ def _seed_with_buried_code(store: SessionStore, sid: str) -> None:
         ),
         round_index=0,
     )
-    store.append_message(sid, role="assistant", content="Understood, continuing the setup. " + ("ok " * 60), round_index=0)
+    await store.append_message(sid, role="assistant", content="Understood, continuing the setup. " + ("ok " * 60), round_index=0)
     for i in range(1, 6):
-        store.append_message(sid, role="user", content="(unrelated step) " + ("filler " * 140), round_index=i)
-        store.append_message(sid, role="assistant", content="done " + ("ok " * 140), round_index=i)
+        await store.append_message(sid, role="user", content="(unrelated step) " + ("filler " * 140), round_index=i)
+        await store.append_message(sid, role="assistant", content="done " + ("ok " * 140), round_index=i)
 
 
 async def main() -> dict:
     os.environ["CONTEXT_COMPACT_THRESHOLD"] = "500"  # force the early turns to fold
 
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
-        sid = store.create_session(system_prompt="S")
-        _seed_with_buried_code(store, sid)
+        sid = await store.create_session(system_prompt="S")
+        await _seed_with_buried_code(store, sid)
 
         tools_called: list[str] = []
         loop = StatefulAgentLoop(
@@ -103,7 +103,7 @@ async def main() -> dict:
         print(f"tools    : {tools_called}")
 
         # the code is recoverable from the folded rows (the tool's data source)
-        folded = [m for m in store.load_all_messages(sid)
+        folded = [m for m in await store.load_all_messages(sid)
                   if m.state is MessageState.COMPACTED_OUT and ACCESS_CODE in (m.content or "")]
         code_in_folded = bool(folded)
         answer_has_code = _norm(ACCESS_CODE) in _norm(r.final_text)  # robust to bold/hyphen/spacing
@@ -125,7 +125,7 @@ async def main() -> dict:
 
         t_loop, t_sid = set_current_loop(loop), set_session_id(sid)
         try:
-            tool_out = run_recall_compacted(query="rack serial")
+            tool_out = await run_recall_compacted(query="rack serial")
         finally:
             reset_session_id(t_sid)
             reset_current_loop(t_loop)
@@ -140,7 +140,7 @@ async def main() -> dict:
             "recall_called": "recall_compacted" in tools_called,
         }
     finally:
-        store.close()
+        await store.close()
 
 
 if __name__ == "__main__":

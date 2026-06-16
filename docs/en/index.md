@@ -25,7 +25,7 @@ power-loop is an **embeddable Agent execution kernel** — not a framework, not 
 - **Event bus** — 30 typed events for observability, audit, streaming
 - **Declarative sub-agents** — `AgentSpec` → one-shot child agent with tool whitelist
 - **Context compaction** — automatic LLM-summary compaction, default-on
-- **Session persistence** — SQLite-backed, cross-process resume
+- **Session persistence** — pluggable store: zero-infra SQLite by default, or PostgreSQL/MySQL by DSN ([Storage backends](user-guide/storage-backends.md)); the loop is stateless, so any session resumes cross-process from a `dsn` + `session_id`
 - **Retry + cancel** — `LLMRetryPolicy` with exponential backoff; `CancellationToken` for any cancel shape
 - **Structured output** — `StructuredOutputSpec` + JSON repair chain
 - **Pluggable memory** — `MemoryProvider` protocol for cross-session recall

@@ -66,14 +66,14 @@ async def test_isolated_worker_runs_from_config_only_and_leaves_inspectable_db()
     assert os.path.exists(db)  # the sub-agent's own ledger persists for inspection
 
     # Supervisor opens the sub-agent's private db read-side and sees the full trace.
-    store = SessionStore.open(db)
+    store = await SessionStore.open(db)
     try:
-        msgs = store.load_all_messages(result["session_id"])
+        msgs = await store.load_all_messages(result["session_id"])
         roles = [m.role for m in msgs]
         assert "user" in roles and "assistant" in roles
         assert any("do the thing" in (m.content or "") for m in msgs)
     finally:
-        store.close()
+        await store.close()
     os.remove(db)
 
 

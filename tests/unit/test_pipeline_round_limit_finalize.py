@@ -63,10 +63,10 @@ async def test_round_limit_final_call_routes_through_call_llm() -> None:
     llm = _Scripted(responses=[_tool_call("c1", "echo"),
                                LLMResponse(raw_text="summary", content_text="summary")])
     loop = StatefulAgentLoop(
-        llm=llm, store=SessionStore.open(":memory:"), tool_registry=reg, event_bus=bus,
+        llm=llm, store=await SessionStore.open(":memory:"), tool_registry=reg, event_bus=bus,
         config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
     )
-    res = await loop.send("go", session_id=loop.new_session())
+    res = await loop.send("go", session_id=await loop.new_session())
     assert res.status == "hit_round_limit"
     starts = sum(1 for e in events if e.type == AgentEventType.STREAM_STARTED)
     completes = sum(1 for e in events if e.type == AgentEventType.STREAM_COMPLETED)
@@ -96,13 +96,13 @@ async def test_call_llm_emits_stream_completed_on_failure() -> None:
     events: list = []
     bus.subscribe(None, events.append)
     loop = StatefulAgentLoop(
-        llm=_FailLLM(), store=SessionStore.open(":memory:"), event_bus=bus,
+        llm=_FailLLM(), store=await SessionStore.open(":memory:"), event_bus=bus,
         config=AgentLoopConfig(
             system_prompt="o", max_rounds=2, compactor=None,
             retry_policy=LLMRetryPolicy(max_attempts=2, backoff_initial=0.001, backoff_max=0.002),
         ),
     )
-    res = await loop.send("go", session_id=loop.new_session())
+    res = await loop.send("go", session_id=await loop.new_session())
     assert res.status == "degraded"
     starts = sum(1 for e in events if e.type == AgentEventType.STREAM_STARTED)
     completes = sum(1 for e in events if e.type == AgentEventType.STREAM_COMPLETED)

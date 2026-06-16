@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Generator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -69,18 +69,18 @@ def _tool_resp(call_id: str, name: str, args: str = "{}") -> LLMResponse:
 
 
 class _InspectProjector(RuntimeProjector):
-    def project(self, *, store: Any, session_id: str, round_index: int, context: Any) -> list[dict[str, Any]]:
-        state = store.get_runtime_state(session_id, "inspect", default={}) or {}
+    async def project(self, *, store: Any, session_id: str, round_index: int, context: Any) -> list[dict[str, Any]]:
+        state = await store.get_runtime_state(session_id, "inspect", default={}) or {}
         if not state:
             return []
         return [{"role": "user", "name": "inspect_state", "content": f"<inspect_state>{state}</inspect_state>"}]
 
 
 @pytest.fixture
-def store() -> Generator[SessionStore, None, None]:
-    s = SessionStore.open(":memory:")
+async def store() -> AsyncIterator[SessionStore]:
+    s = await SessionStore.open(":memory:")
     yield s
-    s.close()
+    await s.close()
 
 
 def test_tool_runtime_context_outside_loop_is_explicit() -> None:
@@ -99,11 +99,11 @@ def test_tool_runtime_context_outside_loop_is_explicit() -> None:
 async def test_custom_tool_queries_session_and_projects_state(store: SessionStore) -> None:
     reg = ToolRegistry()
 
-    def inspect_session(**_: Any) -> str:
+    async def inspect_session(**_: Any) -> str:
         runtime = get_tool_runtime_context(required=True)
-        session = runtime.store.get_session(runtime.session_id)
-        messages = runtime.loop.get_messages(runtime.session_id)
-        runtime.store.set_runtime_state(
+        session = await runtime.store.get_session(runtime.session_id)
+        messages = await runtime.loop.get_messages(runtime.session_id)
+        await runtime.store.set_runtime_state(
             runtime.session_id,
             "inspect",
             {
@@ -134,11 +134,11 @@ async def test_custom_tool_queries_session_and_projects_state(store: SessionStor
             runtime_projectors=(_InspectProjector(),),
         ),
     )
-    sid = loop.new_session(metadata={"owner": "alice"})
+    sid = await loop.new_session(metadata={"owner": "alice"})
 
     await loop.send("inspect this session", session_id=sid)
 
-    state = store.get_runtime_state(sid, "inspect")
+    state = await store.get_runtime_state(sid, "inspect")
     assert state == {"owner": "alice", "message_count": 2}
     assert any("alice" in str(msg.get("content", "")) for msg in llm.calls[1])
     assert any("message_count" in str(msg.get("content", "")) for msg in llm.calls[1])
@@ -148,9 +148,9 @@ async def test_custom_tool_queries_session_and_projects_state(store: SessionStor
 async def test_hooks_can_modify_tool_args_and_write_runtime_state(store: SessionStore) -> None:
     reg = ToolRegistry()
 
-    def save_value(value: str) -> str:
+    async def save_value(value: str) -> str:
         runtime = get_tool_runtime_context(required=True)
-        runtime.store.set_runtime_state(runtime.session_id, "inspect", {"value": value})
+        await runtime.store.set_runtime_state(runtime.session_id, "inspect", {"value": value})
         return f"saved {value}"
 
     reg.register(
@@ -172,10 +172,10 @@ async def test_hooks_can_modify_tool_args_and_write_runtime_state(store: Session
         if ctx.tool_name == "save_value":
             ctx.tool_args["value"] = "hooked-value"
 
-    def after_tool(ctx: Any) -> None:
+    async def after_tool(ctx: Any) -> None:
         if ctx.tool_name == "save_value":
             runtime = get_tool_runtime_context(required=True)
-            runtime.store.set_runtime_state(runtime.session_id, "after_hook", {"output": ctx.output})
+            await runtime.store.set_runtime_state(runtime.session_id, "after_hook", {"output": ctx.output})
 
     hooks.register(HookPoint.TOOL_BEFORE, before_tool)
     hooks.register(HookPoint.TOOL_AFTER, after_tool)
@@ -193,12 +193,12 @@ async def test_hooks_can_modify_tool_args_and_write_runtime_state(store: Session
         hooks=hooks,
         config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
 
     await loop.send("save a value", session_id=sid)
 
-    assert store.get_runtime_state(sid, "inspect") == {"value": "hooked-value"}
-    assert store.get_runtime_state(sid, "after_hook") == {"output": "saved hooked-value"}
+    assert await store.get_runtime_state(sid, "inspect") == {"value": "hooked-value"}
+    assert await store.get_runtime_state(sid, "after_hook") == {"output": "saved hooked-value"}
 
 
 @pytest.mark.asyncio
@@ -229,7 +229,7 @@ async def test_events_observe_custom_tool_lifecycle(store: SessionStore) -> None
         event_bus=bus,
         config=AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
 
     await loop.send("ping", session_id=sid)
 

@@ -41,7 +41,7 @@ def _noop_registry() -> ToolRegistry:
 
 @pytest.mark.asyncio
 async def test_pending_blocks_then_abort_clears_then_send_works() -> None:
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=256, temperature=0.2),
@@ -58,9 +58,9 @@ async def test_pending_blocks_then_abort_clears_then_send_works() -> None:
             tool_registry=_noop_registry(),
         )
 
-        sid = store.create_session(system_prompt="S")
-        store.append_message(sid, role="user", content="initial prompt")
-        seq = store.append_message(
+        sid = await store.create_session(system_prompt="S")
+        await store.append_message(sid, role="user", content="initial prompt")
+        seq = await store.append_message(
             sid,
             role="assistant",
             tool_calls=[{
@@ -69,7 +69,7 @@ async def test_pending_blocks_then_abort_clears_then_send_works() -> None:
             }],
             round_index=0,
         )
-        store.set_pending(sid, {
+        await store.set_pending(sid, {
             "assistant_seq": seq, "round_index": 0,
             "tool_call_ids": ["tc-stuck"],
             "tool_calls": [{
@@ -81,9 +81,9 @@ async def test_pending_blocks_then_abort_clears_then_send_works() -> None:
         with pytest.raises(SessionPendingError):
             await loop.send("anything", session_id=sid)
 
-        aborted = loop.abort_pending(sid, reason="crash-simulated")
+        aborted = await loop.abort_pending(sid, reason="crash-simulated")
         assert aborted == 1
-        assert loop.get_pending(sid) is None
+        assert await loop.get_pending(sid) is None
 
         q = "In one short sentence, what does HTML stand for?"
         r = await loop.send(q, session_id=sid)
@@ -98,4 +98,4 @@ async def test_pending_blocks_then_abort_clears_then_send_works() -> None:
             ),
         )
     finally:
-        store.close()
+        await store.close()

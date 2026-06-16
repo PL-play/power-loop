@@ -76,7 +76,7 @@ async def main() -> str:
             compactor=None,
         ),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send(
         "Explain in 3 short sentences why HTTPS is more secure than HTTP.",
         session_id=sid,

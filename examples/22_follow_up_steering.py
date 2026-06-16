@@ -66,7 +66,7 @@ async def main(steering: str | None = None) -> dict[str, Any]:
     steering_text = steering or DEFAULT_STEERING
 
     with tempfile.TemporaryDirectory(prefix="power-loop-follow-up-") as tmp:
-        store = SessionStore.open(f"{tmp}/sessions.sqlite3")
+        store = await SessionStore.open(f"{tmp}/sessions.sqlite3")
         loop = StatefulAgentLoop(
             llm=llm,
             store=store,
@@ -75,7 +75,7 @@ async def main(steering: str | None = None) -> dict[str, Any]:
         )
 
         try:
-            sid = loop.new_session(metadata={"demo": "follow_up"})
+            sid = await loop.new_session(metadata={"demo": "follow_up"})
             send_task = asyncio.create_task(
                 loop.send(
                     "Write one sentence about patience while waiting for good news.",
@@ -95,7 +95,7 @@ async def main(steering: str | None = None) -> dict[str, Any]:
                 raise RuntimeError(f"expected FollowUpQueued while running, got {queued!r}")
 
             result = await send_task
-            messages = loop.get_messages(sid)
+            messages = await loop.get_messages(sid)
             follow_rows = [
                 m
                 for m in messages
@@ -115,7 +115,7 @@ async def main(steering: str | None = None) -> dict[str, Any]:
             return payload
         finally:
             await llm.close()
-            store.close()
+            await store.close()
 
 
 def _json(value: Any) -> str:

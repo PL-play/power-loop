@@ -17,6 +17,7 @@
 | 页面 | 你会学到 |
 |---|---|
 | [会话](sessions.md) | `SessionStore`、多轮对话、跨进程恢复、会话生命周期 |
+| [存储后端](storage-backends.md) | `dsn=` 选 SQLite（默认）/ PostgreSQL / MySQL；`SchemaPolicy` 置备、各后端 DDL、前置条件 |
 | [工具](tools.md) | `ToolRegistry`、`ToolDefinition`、JSON Schema 校验、sync vs async |
 | [扩展工具](extending-tools.md) | 自定义工具配方、按调用白名单、MCP(`contrib.mcp`)、为什么不捆绑连接器 |
 | [子代理](subagents.md) | `spawn_agent`、`AgentSpec`、`run_agent_spec`、生命周期 |
@@ -42,7 +43,7 @@
 
 | 页面 | 你会学到 |
 |---|---|
-| [扩展性](scaling.md) | 单写模型、读连接池、保留/VACUUM、`bench/` 压测台、实测数据、多进程模式 |
+| [扩展性](scaling.md) | 每会话写者模型、选 SQLite 还是服务器后端、保留/VACUUM、`bench/` 压测台、实测数据、分片与横向扩展 |
 
 ## 高级
 

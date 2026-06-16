@@ -17,8 +17,8 @@ from ._llm import make_llm
 
 
 class _RealCustomProjector(RuntimeProjector):
-    def project(self, *, store, session_id, round_index, context):
-        state = store.get_runtime_state(session_id, "real_custom", default={}) or {}
+    async def project(self, *, store, session_id, round_index, context):
+        state = await store.get_runtime_state(session_id, "real_custom", default={}) or {}
         marker = state.get("marker")
         if not marker:
             return []
@@ -27,10 +27,10 @@ class _RealCustomProjector(RuntimeProjector):
 
 @pytest.mark.asyncio
 async def test_real_llm_sees_sqlite_runtime_state(tmp_path) -> None:
-    store = SessionStore.open(tmp_path / "runtime.db")
+    store = await SessionStore.open(tmp_path / "runtime.db")
     try:
-        sid = store.create_session()
-        store.set_runtime_state(
+        sid = await store.create_session()
+        await store.set_runtime_state(
             sid,
             "todo",
             {
@@ -39,7 +39,7 @@ async def test_real_llm_sees_sqlite_runtime_state(tmp_path) -> None:
                 "counts": {"total": 1, "completed": 0},
             },
         )
-        store.upsert_background_task(
+        await store.upsert_background_task(
             sid,
             task_id="bg-real",
             command="printf BG_RUNTIME_DONE_42",
@@ -68,12 +68,12 @@ async def test_real_llm_sees_sqlite_runtime_state(tmp_path) -> None:
             assert "RUNTIME_SQLITE_TODO_42" in result.final_text
             assert "BG_RUNTIME_DONE_42" in result.final_text
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_real_llm_todo_tool_persists_to_sqlite(tmp_path) -> None:
-    store = SessionStore.open(tmp_path / "todo.db")
+    store = await SessionStore.open(tmp_path / "todo.db")
     try:
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=512, temperature=0.0),
@@ -89,24 +89,24 @@ async def test_real_llm_todo_tool_persists_to_sqlite(tmp_path) -> None:
                 compactor=None,
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         result = await loop.send("Create the todo now using the todo tool.", session_id=sid)
-        todo_state = store.get_runtime_state(sid, "todo", default={}) or {}
+        todo_state = await store.get_runtime_state(sid, "todo", default={}) or {}
         rendered = str(todo_state.get("rendered", ""))
         assert "REAL_LLM_SQLITE_TODO" in rendered, result.final_text
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_real_llm_custom_tool_uses_public_runtime_context(tmp_path) -> None:
-    store = SessionStore.open(tmp_path / "custom-tool.db")
+    store = await SessionStore.open(tmp_path / "custom-tool.db")
     try:
         registry = ToolRegistry()
 
-        def save_runtime_marker(marker: str) -> str:
+        async def save_runtime_marker(marker: str) -> str:
             ctx = get_tool_runtime_context(required=True)
-            ctx.store.set_runtime_state(ctx.session_id, "real_custom", {"marker": marker})
+            await ctx.store.set_runtime_state(ctx.session_id, "real_custom", {"marker": marker})
             return f"saved marker {marker}"
 
         registry.register(
@@ -136,24 +136,24 @@ async def test_real_llm_custom_tool_uses_public_runtime_context(tmp_path) -> Non
                 runtime_projectors=(_RealCustomProjector(),),
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         result = await loop.send("Save the runtime marker using the tool now.", session_id=sid)
 
-        state = store.get_runtime_state(sid, "real_custom", default={}) or {}
+        state = await store.get_runtime_state(sid, "real_custom", default={}) or {}
         assert state.get("marker") == "REAL_CUSTOM_RUNTIME_42", result.final_text
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_real_llm_sees_custom_projector_after_tool_write(tmp_path) -> None:
-    store = SessionStore.open(tmp_path / "custom-projector.db")
+    store = await SessionStore.open(tmp_path / "custom-projector.db")
     try:
         registry = ToolRegistry()
 
-        def save_runtime_marker(marker: str) -> str:
+        async def save_runtime_marker(marker: str) -> str:
             ctx = get_tool_runtime_context(required=True)
-            ctx.store.set_runtime_state(ctx.session_id, "real_custom", {"marker": marker})
+            await ctx.store.set_runtime_state(ctx.session_id, "real_custom", {"marker": marker})
             return f"saved marker {marker}"
 
         registry.register(
@@ -184,10 +184,10 @@ async def test_real_llm_sees_custom_projector_after_tool_write(tmp_path) -> None
                 runtime_projectors=(_RealCustomProjector(),),
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         result = await loop.send("Run the custom runtime flow.", session_id=sid)
 
         if "CUSTOM_PROJECTOR_VISIBLE" not in result.final_text:
             assert "REAL_PROJECTOR_VISIBLE_42" in result.final_text
     finally:
-        store.close()
+        await store.close()

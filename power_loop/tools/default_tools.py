@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import difflib
 import fnmatch
 import os
@@ -1100,7 +1101,7 @@ class BackgroundManager:
         self.tasks: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-    def run(self, command: str) -> str:
+    async def run(self, command: str) -> str:
         reason = _dangerous_command_reason(command)
         if reason:
             return f"Error: Dangerous command blocked ({reason}). Run it manually if you really intend it."
@@ -1118,8 +1119,14 @@ class BackgroundManager:
         # the host environment (C1).
         shell_backend = env.shell_backend
         store, sid = _current_store_and_session()
+        # Capture the running event loop so the daemon thread can drive the async
+        # store's writes back on it (the store's transaction/lock are loop-bound).
+        try:
+            event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            event_loop = None
         if store is not None and sid is not None:
-            store.upsert_background_task(
+            await store.upsert_background_task(
                 sid,
                 task_id=task_id,
                 command=command,
@@ -1133,6 +1140,7 @@ class BackgroundManager:
                 "command": command,
                 "session_id": sid,
                 "store": store,
+                "event_loop": event_loop,
                 "workspace_dir": workspace_dir,
                 "shell_backend": shell_backend,
             }
@@ -1143,12 +1151,14 @@ class BackgroundManager:
     def _execute(self, task_id: str, command: str) -> None:
         store = None
         sid = None
+        event_loop = None
         shell_backend: ShellBackend | None = None
         with self._lock:
             task = self.tasks.get(task_id)
             if task is not None:
                 store = task.get("store")
                 sid = task.get("session_id")
+                event_loop = task.get("event_loop")
                 workspace_dir = task.get("workspace_dir")
                 shell_backend = task.get("shell_backend")
             else:
@@ -1188,28 +1198,35 @@ class BackgroundManager:
             if task is not None:
                 task["status"] = status
                 task["result"] = output or "(no output)"
-        if store is not None and sid is not None:
+        if store is not None and sid is not None and event_loop is not None:
+            # Drive the async store write on the owning event loop from this daemon
+            # thread (the store's lock/transaction are loop-bound). Best-effort: the
+            # loop may be closed during shutdown.
             try:
-                store.upsert_background_task(
-                    sid,
-                    task_id=task_id,
-                    command=command,
-                    status=status,
-                    return_code=return_code,
-                    output_tail=output or "(no output)",
+                fut = asyncio.run_coroutine_threadsafe(
+                    store.upsert_background_task(
+                        sid,
+                        task_id=task_id,
+                        command=command,
+                        status=status,
+                        return_code=return_code,
+                        output_tail=output or "(no output)",
+                    ),
+                    event_loop,
                 )
+                fut.result(timeout=30)
             except Exception:
                 pass
 
-    def check(self, task_id: str | None = None) -> str:
+    async def check(self, task_id: str | None = None) -> str:
         store, sid = _current_store_and_session()
         if store is not None and sid is not None:
             if task_id:
-                row = store.get_background_task(sid, task_id)
+                row = await store.get_background_task(sid, task_id)
                 if row is None:
                     return f"Error: Unknown task {task_id}"
                 return f"[{row.status}] {row.command[:80]}\n{row.output_tail or '(running)'}"
-            rows = store.list_background_tasks(sid)
+            rows = await store.list_background_tasks(sid)
             if not rows:
                 return "No background tasks."
             return "\n".join(f"{row.task_id}: [{row.status}] {row.command[:80]}" for row in rows)
@@ -1229,21 +1246,21 @@ class BackgroundManager:
 BG = BackgroundManager()
 
 
-def run_background(command: str) -> str:
-    return BG.run(command)
+async def run_background(command: str) -> str:
+    return await BG.run(command)
 
 
-def check_background(task_id: str | None = None) -> str:
-    return BG.check(task_id)
+async def check_background(task_id: str | None = None) -> str:
+    return await BG.check(task_id)
 
 
-def run_todo(items: list[dict[str, Any]]) -> str:
+async def run_todo(items: list[dict[str, Any]]) -> str:
     validated = _validate_todos(items)
     store, sid = _current_store_and_session()
     if store is not None and sid is not None:
         rendered = _render_todos(validated)
         done = sum(1 for item in validated if item["status"] == "completed")
-        store.set_runtime_state(
+        await store.set_runtime_state(
             sid,
             "todo",
             {
@@ -1274,31 +1291,31 @@ def _notes_store_and_session() -> tuple[Any, str]:
     return store, sid
 
 
-def run_note_add(content: str, pinned: bool = False) -> str:
+async def run_note_add(content: str, pinned: bool = False) -> str:
     from power_loop.runtime.notes import add_note_checked
 
     store, sid = _notes_store_and_session()
     policy = _notes_policy()
-    note = add_note_checked(store, sid, content, pinned=pinned, policy=policy)
-    count = store.count_notes(sid)
+    note = await add_note_checked(store, sid, content, pinned=pinned, policy=policy)
+    count = await store.count_notes(sid)
     return f"noted as #{note.note_id} ({count}/{policy.max_notes} notes used)"
 
 
-def run_note_update(note_id: int, content: str | None = None, pinned: bool | None = None) -> str:
+async def run_note_update(note_id: int, content: str | None = None, pinned: bool | None = None) -> str:
     from power_loop.runtime.notes import update_note_checked
 
     store, sid = _notes_store_and_session()
-    update_note_checked(
+    await update_note_checked(
         store, sid, int(note_id), content=content, pinned=pinned, policy=_notes_policy()
     )
     return f"note #{note_id} updated"
 
 
-def run_note_delete(note_id: int) -> str:
+async def run_note_delete(note_id: int) -> str:
     store, sid = _notes_store_and_session()
-    if not store.delete_note(sid, int(note_id)):
+    if not await store.delete_note(sid, int(note_id)):
         raise ValueError(f"note #{note_id} does not exist")
-    return f"note #{note_id} deleted ({store.count_notes(sid)} remaining)"
+    return f"note #{note_id} deleted ({await store.count_notes(sid)} remaining)"
 
 
 def _timers_store_and_session() -> tuple[Any, str]:
@@ -1313,7 +1330,7 @@ WAKEUP_MAX_DELAY_S = 30 * 86400
 WAKEUP_MAX_LIVE = 10  # live (armed) timers per session
 
 
-def run_schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | None = None) -> str:
+async def run_schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | None = None) -> str:
     import time as _time
 
     store, sid = _timers_store_and_session()
@@ -1329,13 +1346,13 @@ def run_schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | None
         )
     if not (note or "").strip():
         raise ValueError("note is required — write what future-you should do")
-    live = [t for t in store.list_timers(sid) if t.status == "armed"]
+    live = [t for t in await store.list_timers(sid) if t.status == "armed"]
     if len(live) >= WAKEUP_MAX_LIVE:
         return (
             f"Budget exceeded: {len(live)} wake-ups already scheduled. "
             "Cancel or merge some first (list_wakeups / cancel_wakeup)."
         )
-    timer = store.create_timer(
+    timer = await store.create_timer(
         sid, due_at=int(_time.time() * 1000 + delay * 1000), note=note.strip(),
         interval_s=interval,
     )
@@ -1347,11 +1364,11 @@ def run_schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | None
     return f"Wake-up #{timer.timer_id} scheduled in {delay}s. You'll receive your note."
 
 
-def run_list_wakeups() -> str:
+async def run_list_wakeups() -> str:
     import time as _time
 
     store, sid = _timers_store_and_session()
-    timers = store.list_timers(sid)
+    timers = await store.list_timers(sid)
     if not timers:
         return "No wake-ups scheduled."
     now = _time.time() * 1000
@@ -1364,9 +1381,9 @@ def run_list_wakeups() -> str:
     return "\n".join(lines)
 
 
-def run_cancel_wakeup(timer_id: int) -> str:
+async def run_cancel_wakeup(timer_id: int) -> str:
     store, sid = _timers_store_and_session()
-    if store.transition_timer(sid, int(timer_id), from_status="armed", to_status="cancelled"):
+    if await store.transition_timer(sid, int(timer_id), from_status="armed", to_status="cancelled"):
         return f"Wake-up #{timer_id} cancelled."
     return f"Wake-up #{timer_id} not found or already fired."
 
@@ -1384,7 +1401,7 @@ RECALL_COMPACTED_MAX_LIMIT = 50
 RECALL_COMPACTED_CONTENT_CHARS = 2000
 
 
-def run_recall_compacted(
+async def run_recall_compacted(
     query: str | None = None,
     from_seq: int | None = None,
     to_seq: int | None = None,
@@ -1397,14 +1414,14 @@ def run_recall_compacted(
     note isn't enough, this retrieves the originals (read-only, current session only),
     filtered by keyword (``query``, case-insensitive substring) and/or seq range.
     """
-    from power_loop.runtime.session_store import MessageState
+    from power_loop.runtime.store.types import MessageState
 
     ctx = get_tool_runtime_context(required=True)
     store, sid = ctx.store, ctx.session_id
     assert store is not None and sid is not None  # required=True guarantees this
 
     limit = max(1, min(int(limit or 20), RECALL_COMPACTED_MAX_LIMIT))
-    rows = [r for r in store.load_all_messages(sid) if r.state is MessageState.COMPACTED_OUT]
+    rows = [r for r in await store.load_all_messages(sid) if r.state is MessageState.COMPACTED_OUT]
     if from_seq is not None:
         rows = [r for r in rows if r.seq >= int(from_seq)]
     if to_seq is not None:
@@ -1435,6 +1452,52 @@ def run_recall_compacted(
     return header + ":\n\n" + "\n\n".join(blocks)
 
 
+# Async tool handlers are registered as ``async def`` adapters (NOT sync lambdas that
+# merely return a coroutine): the registry uses ``inspect.iscoroutinefunction`` to decide
+# sync-vs-async dispatch and to keep the per-call ``runtime_env_context`` held across the
+# await — a sync lambda returning a coroutine would let the env reset before the body runs.
+async def _h_todo(**kw: Any) -> Any:
+    return await run_todo(kw["items"])
+
+
+async def _h_note_add(**kw: Any) -> Any:
+    return await run_note_add(kw["content"], kw.get("pinned", False))
+
+
+async def _h_note_update(**kw: Any) -> Any:
+    return await run_note_update(kw["note_id"], kw.get("content"), kw.get("pinned"))
+
+
+async def _h_note_delete(**kw: Any) -> Any:
+    return await run_note_delete(kw["note_id"])
+
+
+async def _h_schedule_wakeup(**kw: Any) -> Any:
+    return await run_schedule_wakeup(kw["delay_seconds"], kw["note"], kw.get("every_seconds"))
+
+
+async def _h_list_wakeups(**kw: Any) -> Any:
+    return await run_list_wakeups()
+
+
+async def _h_cancel_wakeup(**kw: Any) -> Any:
+    return await run_cancel_wakeup(kw["timer_id"])
+
+
+async def _h_recall_compacted(**kw: Any) -> Any:
+    return await run_recall_compacted(
+        kw.get("query"), kw.get("from_seq"), kw.get("to_seq"), kw.get("limit", 20)
+    )
+
+
+async def _h_background_run(**kw: Any) -> Any:
+    return await run_background(kw["command"])
+
+
+async def _h_check_background(**kw: Any) -> Any:
+    return await check_background(kw.get("task_id"))
+
+
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120)),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
@@ -1457,23 +1520,17 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
         kw.get("include_hidden", False),
     ),
     "load_skill": lambda **kw: run_load_skill(kw["name"]),
-    "todo": lambda **kw: run_todo(kw["items"]),
-    "note_add": lambda **kw: run_note_add(kw["content"], kw.get("pinned", False)),
-    "note_update": lambda **kw: run_note_update(
-        kw["note_id"], kw.get("content"), kw.get("pinned")
-    ),
-    "note_delete": lambda **kw: run_note_delete(kw["note_id"]),
-    "schedule_wakeup": lambda **kw: run_schedule_wakeup(
-        kw["delay_seconds"], kw["note"], kw.get("every_seconds")
-    ),
-    "list_wakeups": lambda **kw: run_list_wakeups(),
-    "cancel_wakeup": lambda **kw: run_cancel_wakeup(kw["timer_id"]),
+    "todo": _h_todo,
+    "note_add": _h_note_add,
+    "note_update": _h_note_update,
+    "note_delete": _h_note_delete,
+    "schedule_wakeup": _h_schedule_wakeup,
+    "list_wakeups": _h_list_wakeups,
+    "cancel_wakeup": _h_cancel_wakeup,
     "current_time": lambda **kw: run_current_time(),
-    "recall_compacted": lambda **kw: run_recall_compacted(
-        kw.get("query"), kw.get("from_seq"), kw.get("to_seq"), kw.get("limit", 20)
-    ),
-    "background_run": lambda **kw: run_background(kw["command"]),
-    "check_background": lambda **kw: check_background(kw.get("task_id")),
+    "recall_compacted": _h_recall_compacted,
+    "background_run": _h_background_run,
+    "check_background": _h_check_background,
     "request_user_input": lambda **kw: request_user_input(
         kind=kw.get("kind", "text"),
         prompt=kw["prompt"],

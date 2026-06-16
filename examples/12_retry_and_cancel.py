@@ -99,7 +99,7 @@ async def scenario_completed_after_retries() -> None:
     bus, seen = _new_bus_with_audit()
     inner = make_llm(max_tokens=64, temperature=0)
     llm = FlakyWrap(inner, fail_first=2)
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=llm, store=store, event_bus=bus,
@@ -111,12 +111,12 @@ async def scenario_completed_after_retries() -> None:
                 ),
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("hi", session_id=sid)
         print(f"  status={r.status} llm_calls={llm.calls} text={r.final_text.strip()!r}")
         print(f"  events: {[e.type.value for e in seen]}")
     finally:
-        store.close()
+        await store.close()
 
 
 # ── Scenario 2: 永远失败 → degraded / All attempts fail → degraded
@@ -127,7 +127,7 @@ async def scenario_degraded() -> None:
     bus, seen = _new_bus_with_audit()
     inner = make_llm(max_tokens=64, temperature=0)
     llm = FlakyWrap(inner, fail_first=1_000_000)  # always fail
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=llm, store=store, event_bus=bus,
@@ -138,13 +138,13 @@ async def scenario_degraded() -> None:
                 ),
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("hi", session_id=sid)
         print(f"  status={r.status} llm_calls={llm.calls}")
         print(f"  final_text={r.final_text!r}")
         print(f"  events: {[e.type.value for e in seen]}")
     finally:
-        store.close()
+        await store.close()
 
 
 # ── Scenario 3: 外部 cancel 在 retry sleep 中触发 / External cancel during retry backoff
@@ -156,7 +156,7 @@ async def scenario_cancelled() -> None:
     inner = make_llm(max_tokens=64, temperature=0)
     llm = FlakyWrap(inner, fail_first=1_000_000)  # always fail → will retry / sleep
     token = CancellationToken()
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=llm, store=store, event_bus=bus,
@@ -173,14 +173,14 @@ async def scenario_cancelled() -> None:
                                                    # let the loop enter its first retry sleep
             token.cancel("user_pressed_stop")
 
-        sid = loop.new_session()
+        sid = await loop.new_session()
         send_task = asyncio.create_task(loop.send("hi", session_id=sid, stop_event=token))
         await trip_cancel()
         r = await send_task
         print(f"  status={r.status} llm_calls={llm.calls}")
         print(f"  events: {[e.type.value for e in seen]}")
     finally:
-        store.close()
+        await store.close()
 
 
 async def main() -> None:

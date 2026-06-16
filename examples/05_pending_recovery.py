@@ -55,12 +55,12 @@ def _build_registry() -> ToolRegistry:
     return reg
 
 
-def _simulate_crash_pending(store: SessionStore, sid: str) -> int:
+async def _simulate_crash_pending(store: SessionStore, sid: str) -> int:
     """直接往 store 里塞一条 assistant(tool_calls) + 把 pending 标上，
     等价于「LLM 已返回，但 tool 调用还没跑完进程就挂了」。
     / Write an assistant(tool_calls) to the store + mark pending — equivalent to
     "LLM returned but process crashed before tool calls finished"."""
-    asst_seq = store.append_message(
+    asst_seq = await store.append_message(
         sid, role="assistant",
         tool_calls=[{
             "id": "tc-stuck",
@@ -68,7 +68,7 @@ def _simulate_crash_pending(store: SessionStore, sid: str) -> int:
         }],
         round_index=0,
     )
-    store.set_pending(sid, {
+    await store.set_pending(sid, {
         "assistant_seq": asst_seq, "round_index": 0,
         "tool_call_ids": ["tc-stuck"],
         "tool_calls": [{
@@ -80,7 +80,7 @@ def _simulate_crash_pending(store: SessionStore, sid: str) -> int:
 
 
 async def main() -> str:
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=make_llm(),
@@ -95,9 +95,9 @@ async def main() -> str:
 
         # 1. 准备一个被「半成品」打断的 session
         #    Prepare a session interrupted by a half-finished tool call
-        sid = store.create_session(system_prompt="S")
-        store.append_message(sid, role="user", content="initial prompt")
-        _simulate_crash_pending(store, sid)
+        sid = await store.create_session(system_prompt="S")
+        await store.append_message(sid, role="user", content="initial prompt")
+        await _simulate_crash_pending(store, sid)
 
         # 2. 直接 send 会抛 — 协议禁止把悬挂态丢给 LLM
         #    Direct send raises — protocol forbids passing pending state to LLM
@@ -109,15 +109,15 @@ async def main() -> str:
 
         # 3. 选择 abort_pending（也可以 await loop.resume(sid)）
         #    Choose abort_pending (or alternatively: await loop.resume(sid))
-        n = loop.abort_pending(sid, reason="user_cancelled")
-        print(f"[abort_pending] aborted {n} tool_call(s); pending now {loop.get_pending(sid)}")
+        n = await loop.abort_pending(sid, reason="user_cancelled")
+        print(f"[abort_pending] aborted {n} tool_call(s); pending now {await loop.get_pending(sid)}")
 
         # 4. 现在 send 可以正常往下走 / Now send proceeds normally
         r = await loop.send("In one sentence: what does HTML stand for?", session_id=sid)
         print(f"[send]  status={r.status}, reply={r.final_text}")
         return r.final_text
     finally:
-        store.close()
+        await store.close()
 
 
 if __name__ == "__main__":

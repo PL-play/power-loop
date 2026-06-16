@@ -212,7 +212,7 @@ async def main() -> None:
         )
         try:
             print("User: What's the weather in Tokyo and what is 15 * 7?")
-            sid_a = loop.new_session(metadata={"label": "session-a"})
+            sid_a = await loop.new_session(metadata={"label": "session-a"})
             r1 = await loop.send(
                 "What's the weather in Tokyo and what is 15 * 7?",
                 session_id=sid_a,
@@ -220,7 +220,7 @@ async def main() -> None:
             print(f"\n\n[Session A] status={r1.status}, rounds={r1.rounds}")
             print(f"[Session A] tools used: {tool_log_a}")
         finally:
-            loop.close()
+            await loop.aclose()
 
         # ── Session B: cross-session memory recall ───────────────────────
         #    跨会话记忆召回
@@ -236,14 +236,14 @@ async def main() -> None:
         )
         try:
             print("User: My name is Alan. I live in Shanghai. Confirm in one sentence.")
-            sid_b = loop2.new_session(metadata={"label": "session-b"})
+            sid_b = await loop2.new_session(metadata={"label": "session-b"})
             r2 = await loop2.send(
                 "My name is Alan. I live in Shanghai. Confirm in one sentence.",
                 session_id=sid_b,
             )
             print(f"\n\n[Session B] status={r2.status}, rounds={r2.rounds}")
         finally:
-            loop2.close()
+            await loop2.aclose()
 
         # ── Verify memory persisted / 验证记忆已持久化 ────────────────────
         with sqlite3.connect(mem_path) as c:
@@ -264,12 +264,12 @@ async def main() -> None:
         )
         try:
             print("User: What is my name and where do I live?")
-            sid_c = loop3.new_session(metadata={"label": "session-c"})
+            sid_c = await loop3.new_session(metadata={"label": "session-c"})
             r3 = await loop3.send("What is my name and where do I live?", session_id=sid_c)
             print(f"\n\n[Session C] reply: {r3.final_text}")
             print(f"[Session C] status={r3.status}, rounds={r3.rounds}")
         finally:
-            loop3.close()
+            await loop3.aclose()
 
         print(f"\n[Done] 3 sessions completed. "
               f"Session A={sid_a[-8:]}, B={sid_b[-8:]}, C={sid_c[-8:]}")

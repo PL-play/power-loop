@@ -5,7 +5,10 @@
 ## Requirements
 
 - **Python 3.10+** — uses `str | None` syntax and `asyncio` improvements.
-- **SQLite 3.35+** — bundled with Python on all major platforms.
+- **A storage backend.** SQLite is the zero-infra default (3.35+, bundled with Python on all
+  major platforms — no extra needed). For a multi-writer server, install `[postgres]`
+  (asyncpg) or `[mysql]` (aiomysql) and point the `dsn=` at it. See
+  [Storage backends](storage-backends.md).
 - An **OpenAI-compatible LLM endpoint** (or an Anthropic Messages API endpoint) — plus the
   matching transport extra (`[openai]` or `[anthropic]`); the core ships SDK-free.
 
@@ -18,9 +21,12 @@ in only by the extra you install. Constructing a provider without its extra rais
 # Pick a transport extra:
 pip install 'power-loop[openai]'      # OpenAI-compatible /chat/completions (DashScope, DeepSeek, Ollama/vLLM, …)
 pip install 'power-loop[anthropic]'   # Anthropic Messages API endpoints
+# Optional storage backends (SQLite is built in — no extra needed):
+pip install 'power-loop[postgres]'    # PostgreSQL backend (asyncpg)
+pip install 'power-loop[mysql]'       # MySQL backend (aiomysql, pure-Python)
 pip install 'power-loop[skills]'      # YAML skill frontmatter (load_skill)
 pip install 'power-loop[pdf]'         # PDF input in the multimodal helper
-pip install 'power-loop[all]'         # both transports + skills + pdf
+pip install 'power-loop[all]'         # transports + postgres + mysql + skills + pdf + observability + mcp
 
 # From GitHub (development)
 pip install "power-loop[openai] @ git+https://github.com/PL-play/power-loop.git"
@@ -38,7 +44,7 @@ pip install -e ".[dev]"
 
 ```python
 from power_loop import StatefulAgentLoop, AgentLoopConfig, __version__
-print(__version__)  # → "0.14.0"
+print(__version__)  # → "1.0.0"
 ```
 
 ## Next

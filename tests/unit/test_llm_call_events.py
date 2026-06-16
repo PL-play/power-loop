@@ -66,7 +66,7 @@ def _collect(bus: AgentEventBus) -> dict[AgentEventType, list]:
 
 @pytest.mark.asyncio
 async def test_single_call_emits_paired_started_completed_with_usage() -> None:
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         bus = AgentEventBus()
         seen = _collect(bus)
@@ -74,7 +74,7 @@ async def test_single_call_emits_paired_started_completed_with_usage() -> None:
             llm=_UsageLLM(), store=store, event_bus=bus,
             config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
         )
-        await loop.send("hi", session_id=loop.new_session())
+        await loop.send("hi", session_id=await loop.new_session())
 
         started = seen[AgentEventType.LLM_CALL_STARTED]
         completed = seen[AgentEventType.LLM_CALL_COMPLETED]
@@ -85,14 +85,14 @@ async def test_single_call_emits_paired_started_completed_with_usage() -> None:
         assert c.duration_ms >= 0.0
         assert (c.prompt_tokens, c.completion_tokens, c.total_tokens) == (11, 7, 18)  # PER-CALL usage
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_retries_are_individually_visible() -> None:
     """Two transient failures then success → three STARTED + three COMPLETED with
     distinct call_ids; the two failures are success=False."""
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         bus = AgentEventBus()
         seen = _collect(bus)
@@ -103,7 +103,7 @@ async def test_retries_are_individually_visible() -> None:
                 retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0.0, backoff_max=0.0),
             ),
         )
-        await loop.send("hi", session_id=loop.new_session())
+        await loop.send("hi", session_id=await loop.new_session())
 
         completed = seen[AgentEventType.LLM_CALL_COMPLETED]
         assert len(seen[AgentEventType.LLM_CALL_STARTED]) == 3
@@ -112,4 +112,4 @@ async def test_retries_are_individually_visible() -> None:
         assert [c.success for c in completed] == [False, False, True]
         assert [c.error_type for c in completed[:2]] == ["RuntimeError", "RuntimeError"]
     finally:
-        store.close()
+        await store.close()

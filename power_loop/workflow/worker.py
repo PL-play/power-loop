@@ -132,8 +132,8 @@ async def run_spec_isolated(
     """
     from power_loop.agent.stateful_loop import StatefulAgentLoop
     from power_loop.agent.types import AgentLoopConfig
-    from power_loop.runtime.session_store import MAX_SPAWN_DEPTH
     from power_loop.runtime.spec import AgentSpec
+    from power_loop.runtime.store.store import MAX_SPAWN_DEPTH
 
     spec = spec if isinstance(spec, AgentSpec) else AgentSpec.from_json(spec)
 
@@ -167,7 +167,7 @@ async def run_spec_isolated(
         max_spawn_depth=max_spawn_depth if max_spawn_depth is not None else MAX_SPAWN_DEPTH,
     )
     try:
-        sid = loop.new_session(metadata={"spec_name": spec.name, "isolated": True})
+        sid = await loop.new_session(metadata={"spec_name": spec.name, "isolated": True})
         result = await loop.send(user_input, session_id=sid)
         return {
             "session_id": sid,
@@ -180,7 +180,7 @@ async def run_spec_isolated(
         }
     finally:
         # Close the connection but keep the file: the supervisor inspects it later.
-        loop.close()
+        await loop.aclose()
 
 
 # ── serialization: bootstrap + job + result framing (Phase 1 IPC contract) ────

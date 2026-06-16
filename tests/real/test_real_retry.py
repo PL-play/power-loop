@@ -63,7 +63,7 @@ async def test_real_llm_retries_through_transient_then_completes() -> None:
     events: list = []
     bus.subscribe(None, lambda e: events.append(e))
 
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=llm, store=store, event_bus=bus,
@@ -77,7 +77,7 @@ async def test_real_llm_retries_through_transient_then_completes() -> None:
                 ),
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("Reply with the single word OK.", session_id=sid)
         assert r.status == "completed", r
         assert llm.calls == 3
@@ -86,7 +86,7 @@ async def test_real_llm_retries_through_transient_then_completes() -> None:
         # Sanity: the real LLM call returned non-empty text.
         assert r.final_text.strip()
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -98,7 +98,7 @@ async def test_real_llm_path_degrades_when_all_attempts_fail() -> None:
     events: list = []
     bus.subscribe(None, lambda e: events.append(e))
 
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=llm, store=store, event_bus=bus,
@@ -111,7 +111,7 @@ async def test_real_llm_path_degrades_when_all_attempts_fail() -> None:
                 ),
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("anything", session_id=sid)
         assert r.status == "degraded"
         assert "degraded" in r.final_text
@@ -119,4 +119,4 @@ async def test_real_llm_path_degrades_when_all_attempts_fail() -> None:
         # Real network was never reached past our wrap.
         assert llm.calls == 2
     finally:
-        store.close()
+        await store.close()

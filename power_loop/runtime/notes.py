@@ -30,7 +30,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from power_loop.runtime.memory import LoopMessage
-from power_loop.runtime.session_store import NoteRow, SessionStore
+from power_loop.runtime.store.store import SessionStore
+from power_loop.runtime.store.types import NoteRow
 
 
 class NotesFullError(ValueError):
@@ -60,7 +61,7 @@ class NotesPolicy:
 DEFAULT_NOTES_POLICY = NotesPolicy()
 
 
-def add_note_checked(
+async def add_note_checked(
     store: SessionStore,
     session_id: str,
     content: str,
@@ -77,11 +78,11 @@ def add_note_checked(
             f"note too long ({len(content)} chars > {policy.max_note_chars}); "
             "keep notes short — store details in a file instead"
         )
-    if store.count_notes(session_id) >= policy.max_notes:
+    if await store.count_notes(session_id) >= policy.max_notes:
         if policy.eviction == "fifo":
-            for note in store.list_notes(session_id):
+            for note in await store.list_notes(session_id):
                 if not note.pinned:
-                    store.delete_note(session_id, note.note_id)
+                    await store.delete_note(session_id, note.note_id)
                     break
             else:
                 raise NotesFullError(
@@ -93,10 +94,10 @@ def add_note_checked(
                 f"notes are full ({policy.max_notes}); delete stale notes with "
                 "note_delete or merge related ones with note_update first"
             )
-    return store.add_note(session_id, content, pinned=pinned)
+    return await store.add_note(session_id, content, pinned=pinned)
 
 
-def update_note_checked(
+async def update_note_checked(
     store: SessionStore,
     session_id: str,
     note_id: int,
@@ -115,7 +116,7 @@ def update_note_checked(
             )
     if content is None and pinned is None:
         raise ValueError("nothing to update — pass content and/or pinned")
-    if not store.update_note(session_id, note_id, content=content, pinned=pinned):
+    if not await store.update_note(session_id, note_id, content=content, pinned=pinned):
         raise ValueError(f"note #{note_id} does not exist")
 
 
@@ -184,7 +185,7 @@ class SQLiteNoteMemory:
     ) -> list[LoopMessage]:
         if session_id is None:
             return []
-        notes = self._store.list_notes(session_id)
+        notes = await self._store.list_notes(session_id)
         text = render_notes(notes, policy=self._policy)
         if not text:
             return []

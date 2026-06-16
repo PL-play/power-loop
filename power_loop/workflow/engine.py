@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import Any, Protocol
@@ -112,11 +112,11 @@ class InProcessExecutor:
             reset_session_id(token)
         # run_agent_spec now surfaces usage; fall back to persisted session stats.
         if not raw.get("usage"):
-            raw["usage"] = _usage_for(parent_loop, raw.get("session_id"))
+            raw["usage"] = await _usage_for(parent_loop, raw.get("session_id"))
         return raw
 
 
-def _usage_for(parent_loop: Any, session_id: str | None) -> dict[str, int]:
+async def _usage_for(parent_loop: Any, session_id: str | None) -> dict[str, int]:
     """Best-effort token usage for a finished child session.
 
     ``run_agent_spec`` drops ``result.usage`` today, so we read it back from the
@@ -126,7 +126,7 @@ def _usage_for(parent_loop: Any, session_id: str | None) -> dict[str, int]:
     if not session_id:
         return {}
     try:
-        stats = parent_loop.get_session_stats(session_id)
+        stats = await parent_loop.get_session_stats(session_id)
     except Exception:
         return {}
     if stats is None:
@@ -147,7 +147,7 @@ class WorkflowEngine:
         *,
         executor: Executor | None = None,
         budget: SharedBudget | None = None,
-        on_step: Callable[[AgentResult], None] | None = None,
+        on_step: Callable[[AgentResult], Awaitable[None]] | None = None,
         stop_event: CancellationLike = None,
         replay: dict[str, AgentResult] | None = None,
         run_id: str | None = None,
@@ -196,7 +196,7 @@ class WorkflowEngine:
         if self._budget is not None and self._replay:
             for r in self._replay.values():
                 self._budget.commit(r.usage)
-        driver_sid = self._loop.new_session(metadata={"kind": "wf_driver", "workflow": spec.name})
+        driver_sid = await self._loop.new_session(metadata={"kind": "wf_driver", "workflow": spec.name})
         env: dict[str, Any] = {"input": spec.input}
         status = "completed"
         guard = _IN_WORKFLOW.set(True)
@@ -250,7 +250,7 @@ class WorkflowEngine:
             res = AgentResult(node_id=node.id, status="cancelled", text="",
                               error="workflow cancelled before this step started")
             self._results[node.id] = res
-            self._emit_step(res)
+            await self._emit_step(res)
             return res
 
         if self._budget is not None and not self._budget.can_spawn():
@@ -258,7 +258,7 @@ class WorkflowEngine:
             res = AgentResult(node_id=node.id, status="budget_exceeded", text="",
                               error="shared token budget exhausted")
             self._results[node.id] = res
-            self._emit_step(res)
+            await self._emit_step(res)
             return res
 
         user_input = _render(node.input, env)
@@ -311,7 +311,7 @@ class WorkflowEngine:
         self._add_usage(res.usage)
         if self._budget is not None:
             self._budget.commit(res.usage)
-        self._emit_step(res)
+        await self._emit_step(res)
         return res
 
     def _add_usage(self, usage: dict[str, int] | None) -> None:
@@ -329,13 +329,13 @@ class WorkflowEngine:
             "idempotency_key": f"{self._run_id}:{node_id}",
         }
 
-    def _emit_step(self, res: AgentResult) -> None:
+    async def _emit_step(self, res: AgentResult) -> None:
         # Inside a foreach body, per-iteration leaves are not journaled (they
         # share one id and aren't individually replayable); the aggregate is.
         if self._on_step is None or self._emit_suppressed > 0:
             return
         try:
-            self._on_step(res)
+            await self._on_step(res)
         except Exception:  # noqa: BLE001 — observer must never break the run
             pass
 
@@ -467,7 +467,7 @@ class WorkflowEngine:
             )
             self._results[node.id] = agg
             # Journal the aggregate so resume can skip the whole foreach.
-            self._emit_step(agg)
+            await self._emit_step(agg)
             return agg
         return leaves[-1] if leaves else None
 

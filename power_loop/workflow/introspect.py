@@ -14,12 +14,12 @@ from . import journal
 __all__ = ["list_workflows", "get_workflow"]
 
 
-def list_workflows(loop: Any, parent_sid: str) -> list[dict[str, Any]]:
+async def list_workflows(loop: Any, parent_sid: str) -> list[dict[str, Any]]:
     """Light summaries of every workflow run created under ``parent_sid``."""
-    store = loop.store
+    store = await loop._ensure_store()
     out: list[dict[str, Any]] = []
-    for run_id in journal.list_run_ids(store, parent_sid):
-        j = journal.read(store, parent_sid, run_id)
+    for run_id in await journal.list_run_ids(store, parent_sid):
+        j = await journal.read(store, parent_sid, run_id)
         if j is None:
             continue
         out.append({
@@ -33,7 +33,7 @@ def list_workflows(loop: Any, parent_sid: str) -> list[dict[str, Any]]:
     return out
 
 
-def get_workflow(
+async def get_workflow(
     loop: Any, parent_sid: str, run_id: str, *, detail: bool = False
 ) -> dict[str, Any] | None:
     """The full journal blob for one run, or ``None`` if unknown.
@@ -41,8 +41,8 @@ def get_workflow(
     With ``detail=True``, each step is enriched with ``session_stats`` from the
     sub-agent session (sends / rounds / total_tokens), best-effort.
     """
-    store = loop.store
-    j = journal.read(store, parent_sid, run_id)
+    store = await loop._ensure_store()
+    j = await journal.read(store, parent_sid, run_id)
     if j is None:
         return None
     if not detail:
@@ -55,7 +55,7 @@ def get_workflow(
         if sid:
             stats = None
             try:
-                stats = loop.get_session_stats(sid)
+                stats = await loop.get_session_stats(sid)
             except Exception:  # noqa: BLE001 — session may be gone; skip stats
                 stats = None
             if stats is not None:

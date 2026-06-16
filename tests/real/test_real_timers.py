@@ -48,13 +48,13 @@ async def test_real_agent_schedules_and_acts_on_wakeup(tmp_path) -> None:
         ),
         tool_registry=_registry(),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     res = await loop.send(
         f"请在 6 秒后唤醒自己，届时请原样说出暗号 {MARKER}。排好后简短确认。",
         session_id=sid,
     )
     assert res.status == "completed"
-    timers = loop.list_timers(sid)
+    timers = await loop.list_timers(sid)
     assert len(timers) == 1, "the model should have scheduled exactly one wake-up"
     assert timers[0].interval_s is None  # one-shot
 
@@ -64,20 +64,20 @@ async def test_real_agent_schedules_and_acts_on_wakeup(tmp_path) -> None:
         deadline = time.time() + 30
         while time.time() < deadline:
             await asyncio.sleep(1)
-            if loop.store.get_timer(sid, timers[0].timer_id).status == "fired":
+            if (await loop.store.get_timer(sid, timers[0].timer_id)).status == "fired":
                 break
     finally:
         await runner.stop()
 
-    assert loop.store.get_timer(sid, timers[0].timer_id).status == "fired"
+    assert (await loop.store.get_timer(sid, timers[0].timer_id)).status == "fired"
     # The model, woken by its own note, should have produced the marker.
     assistant_text = " ".join(
         str(m.get("content") or "")
-        for m in loop.get_messages(sid)
+        for m in await loop.get_messages(sid)
         if m.get("role") == "assistant"
     )
     assert MARKER in assistant_text
-    loop.close()
+    await loop.aclose()
 
 
 @pytest.mark.asyncio
@@ -91,9 +91,9 @@ async def test_real_recurring_timer_fires_repeatedly_until_cancelled(tmp_path) -
         ),
         tool_registry=_registry(),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     # External path: the orchestrator declares recurrence at creation.
-    timer = loop.schedule_timer(sid, delay_s=1, note="心跳打卡", interval_s=2)
+    timer = await loop.schedule_timer(sid, delay_s=1, note="心跳打卡", interval_s=2)
     assert timer.interval_s == 2
 
     runner = TimerRunner(loop, scan_interval_s=1.0)
@@ -102,22 +102,22 @@ async def test_real_recurring_timer_fires_repeatedly_until_cancelled(tmp_path) -
         deadline = time.time() + 60
         while time.time() < deadline:
             await asyncio.sleep(1)
-            row = loop.store.get_timer(sid, timer.timer_id)
+            row = await loop.store.get_timer(sid, timer.timer_id)
             if row.fire_count >= 2:
                 break
     finally:
         await runner.stop()
 
-    row = loop.store.get_timer(sid, timer.timer_id)
+    row = await loop.store.get_timer(sid, timer.timer_id)
     assert row.fire_count >= 2, "recurring timer should have fired at least twice"
     assert row.status == "armed", "recurring timer re-arms after each fire"
     # Cancel terminates the cycle.
-    assert loop.cancel_timer(sid, timer.timer_id) is True
-    assert loop.store.get_timer(sid, timer.timer_id).status == "cancelled"
+    assert await loop.cancel_timer(sid, timer.timer_id) is True
+    assert (await loop.store.get_timer(sid, timer.timer_id)).status == "cancelled"
     # Two real deliveries reached the conversation.
     user_timer_msgs = [
-        m for m in loop.get_messages(sid)
+        m for m in await loop.get_messages(sid)
         if m.get("role") == "user" and "<timer" in str(m.get("content"))
     ]
     assert len(user_timer_msgs) >= 2
-    loop.close()
+    await loop.aclose()

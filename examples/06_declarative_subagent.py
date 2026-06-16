@@ -86,7 +86,7 @@ def _build_parent_registry() -> ToolRegistry:
 async def via_meta_tool() -> str:
     """让父 LLM 自己拼 AgentSpec 调 run_agent。
     / Let the parent LLM build AgentSpec and call run_agent itself."""
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=512, temperature=0),
@@ -104,7 +104,7 @@ async def via_meta_tool() -> str:
                 compactor=None,
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send(
             "Delegate this to a sub-agent and report back: "
             "what is (17 + 25) × 3?",
@@ -115,7 +115,7 @@ async def via_meta_tool() -> str:
         print(f"  reply  : {r.final_text}\n")
         return r.final_text
     finally:
-        store.close()
+        await store.close()
 
 
 # ── 3. 直接调 run_agent_spec：绕过 LLM 驱动，自己拼 spec ──────────────────
@@ -125,7 +125,7 @@ async def via_meta_tool() -> str:
 async def direct_call() -> str:
     """从 Python 代码直接拼 AgentSpec 并跑——适合测试 / 编排框架。
     / Build AgentSpec from Python code and run — ideal for tests / orchestration."""
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         parent_loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=256, temperature=0),
@@ -137,7 +137,7 @@ async def direct_call() -> str:
         )
         # 先跑一轮父，建立 parent_session_id 给后面 run_agent_spec 用
         # Run one parent turn to establish parent_session_id for run_agent_spec
-        parent_sid = parent_loop.new_session()
+        parent_sid = await parent_loop.new_session()
         pr = await parent_loop.send("hi", session_id=parent_sid)
 
         spec = AgentSpec(
@@ -163,10 +163,10 @@ async def direct_call() -> str:
         print(f"  status    : {result['status']}")
         print(f"  reply     : {result['final_text']}\n")
         print(f"  surviving children of parent: "
-              f"{[c.session_id for c in store.list_children(pr.session_id)]}")
+              f"{[c.session_id for c in await store.list_children(pr.session_id)]}")
         return result["final_text"]
     finally:
-        store.close()
+        await store.close()
 
 
 # ── 4. AgentSpec strict-schema 演示 / Strict-schema demo ────────────────

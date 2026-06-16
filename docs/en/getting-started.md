@@ -58,7 +58,7 @@ async def main():
         ),
     )
 
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("What does HTTP stand for?", session_id=sid)
     print(result.final_text)
 
@@ -92,7 +92,7 @@ flowchart LR
 ## 5. Keep talking — multi-turn
 
 ```python
-sid = loop.new_session()
+sid = await loop.new_session()
 result1 = await loop.send("My name is Alan.", session_id=sid)
 print(result1.final_text)
 
@@ -103,7 +103,7 @@ result2 = await loop.send(
 print(result2.final_text)   # "Your name is Alan."
 ```
 
-The library loads the full history from the SQLite store automatically. You never manage `messages` by hand.
+The library loads the full history from the store automatically. You never manage `messages` by hand. The default store is a single zero-infra SQLite file; point `dsn=` at PostgreSQL or MySQL when you outgrow it — see [Storage backends](user-guide/storage-backends.md). And because the loop itself holds no authoritative state, a fresh process resumes any session from the same `dsn` + `session_id`.
 
 ## 6. Next steps
 

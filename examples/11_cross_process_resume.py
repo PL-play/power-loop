@@ -64,7 +64,7 @@ async def phase1(db_path: str) -> str:
         config=AgentLoopConfig(system_prompt=SYSTEM, max_rounds=1, compactor=None),
     )
     try:
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send(
             "Remember: my name is Alan and my favorite number is 37. Confirm briefly.",
             session_id=sid,
@@ -73,7 +73,7 @@ async def phase1(db_path: str) -> str:
         print(f"[phase1] reply={r.final_text}")
         return sid
     finally:
-        loop.close()
+        await loop.aclose()
 
 
 async def phase2(db_path: str, sid: str) -> str:
@@ -91,7 +91,7 @@ async def phase2(db_path: str, sid: str) -> str:
         print(f"[phase2] reply={r.final_text}")
         return r.final_text
     finally:
-        loop.close()
+        await loop.aclose()
 
 
 async def _run_parent() -> None:

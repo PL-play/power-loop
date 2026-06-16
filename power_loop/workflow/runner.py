@@ -47,11 +47,12 @@ def make_on_step(store: Any, parent_sid: str, run_id: str):
     """Build the per-step journaling callback the engine fires as nodes settle.
 
     Captures the step's output (``text`` / ``payload``) too, so a completed step
-    can be replayed (not re-run) when the run is resumed.
+    can be replayed (not re-run) when the run is resumed. Async: the engine awaits
+    it as each node settles, and the journal write hits the async store.
     """
 
-    def _on_step(res: AgentResult) -> None:
-        journal.record_step(
+    async def _on_step(res: AgentResult) -> None:
+        await journal.record_step(
             store, parent_sid, run_id,
             node_id=res.node_id, status=res.status,
             session_id=res.session_id, usage=res.usage, error=res.error,
@@ -90,9 +91,9 @@ def _publish(loop: Any, parent_sid: str, run_id: str, event: str, status: str, *
         pass
 
 
-def _wake(loop: Any, parent_sid: str, note: str) -> None:
+async def _wake(loop: Any, parent_sid: str, note: str) -> None:
     try:
-        loop.schedule_timer(parent_sid, delay_s=0, note=note)
+        await loop.schedule_timer(parent_sid, delay_s=0, note=note)
     except Exception:  # noqa: BLE001 — parent may have been closed; journal is the source of truth
         pass
 
@@ -108,12 +109,12 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
     if not parent_sid:
         raise WorkflowRunError("detached run requires a parent_session_id on the workflow")
     loop = workflow._loop
-    store = loop.store
-    if store.get_session(parent_sid) is None:
+    store = await loop._ensure_store()
+    if await store.get_session(parent_sid) is None:
         raise WorkflowRunError("parent session not found; cannot start detached run")
 
     run_id = secrets.token_hex(8)
-    journal.seed(store, parent_sid, run_id, workflow.spec.name, spec=workflow.spec.to_dict())
+    await journal.seed(store, parent_sid, run_id, workflow.spec.name, spec=workflow.spec.to_dict())
 
     def _build_engine() -> WorkflowEngine:
         return WorkflowEngine(
@@ -151,17 +152,17 @@ def spawn_background(
     async def _bg() -> None:
         try:
             result = await build_engine().run(run_spec)
-            await asyncio.to_thread(journal.finalize, store, parent_sid, run_id, result)
+            await journal.finalize(store, parent_sid, run_id, result)
             note = _wake_note(run_id, result.status)
             _publish(loop, parent_sid, run_id, "completed", result.status,
                      level=("error" if result.status == "failed" else "info"))
         except Exception as exc:  # noqa: BLE001 — capture everything; the task must not die silently
-            await asyncio.to_thread(journal.fail, store, parent_sid, run_id, exc)
+            await journal.fail(store, parent_sid, run_id, exc)
             note = _wake_note(run_id, "failed", repr(exc))
             _publish(loop, parent_sid, run_id, "failed", "failed", level="error")
-        _wake(loop, parent_sid, note)
+        await _wake(loop, parent_sid, note)
         if eager_wake:
-            _eager_wake(loop, store, parent_sid, run_id, note, task_set)
+            await _eager_wake(loop, store, parent_sid, run_id, note, task_set)
 
     task = asyncio.create_task(_bg(), name=f"workflow-{run_id}")
     task_set.add(task)
@@ -169,7 +170,7 @@ def spawn_background(
     return WorkflowRunHandle(run_id=run_id, task=task, cancel_token=cancel_token)
 
 
-def _eager_wake(
+async def _eager_wake(
     loop: Any, store: Any, parent_sid: str, run_id: str, note: str, task_set: set[Any]
 ) -> None:
     """Non-durable fast-path layered on the durable timer (already armed above).
@@ -185,63 +186,90 @@ def _eager_wake(
     RETAIN the task in ``task_set`` and, if it fails/cancels, re-open the claim and
     re-arm a durable timer (see :func:`_recover_eager_wake`).
     """
-    j = journal.read(store, parent_sid, run_id)
+    j = await journal.read(store, parent_sid, run_id)
     if j is None or j.get("woke"):
         return
-    journal.update(store, parent_sid, run_id, allow_terminal=True, woke=True)
+    await journal.update(store, parent_sid, run_id, allow_terminal=True, woke=True)
     eager = asyncio.create_task(
         loop.follow_up(note, parent_sid), name=f"workflow-eagerwake-{run_id}"
     )
     task_set.add(eager)
     eager.add_done_callback(task_set.discard)
     eager.add_done_callback(
-        lambda t: _recover_eager_wake(loop, store, parent_sid, run_id, note, t)
+        lambda t: _recover_eager_wake(loop, store, parent_sid, run_id, note, t, task_set)
     )
 
 
 def _recover_eager_wake(
-    loop: Any, store: Any, parent_sid: str, run_id: str, note: str, task: Any
+    loop: Any, store: Any, parent_sid: str, run_id: str, note: str, task: Any, task_set: set[Any]
 ) -> None:
     """Done-callback for the eager follow_up.
 
     On success, leave ``woke=True`` (the durable timer stays suppressed). On failure
     or cancellation the parent was never woken yet the durable timer is suppressed —
-    so re-open the claim and re-arm a fresh durable timer. The wake-guard dedupes if
-    the original timer is also still pending, so the parent still wakes exactly once.
-    A done-callback must never raise, hence the broad guards.
+    so schedule an async recovery that re-opens the claim and re-arms a fresh durable
+    timer. The wake-guard dedupes if the original timer is also still pending, so the
+    parent still wakes exactly once. A done-callback must never raise (and cannot
+    await), so the real work runs on a retained recovery task.
     """
     if not task.cancelled() and task.exception() is None:
         return  # eager delivery succeeded
     try:
-        j = journal.read(store, parent_sid, run_id)
+        recovery = asyncio.create_task(
+            _recover_eager_wake_async(loop, store, parent_sid, run_id, note),
+            name=f"workflow-eagerwake-recover-{run_id}",
+        )
+        task_set.add(recovery)
+        recovery.add_done_callback(task_set.discard)
+    except Exception:  # noqa: BLE001 — recovery scheduling must not raise inside a callback
+        return
+
+
+async def _recover_eager_wake_async(
+    loop: Any, store: Any, parent_sid: str, run_id: str, note: str
+) -> None:
+    """Re-open a failed eager-wake claim and re-arm the durable timer (off the
+    done-callback so it can await the async store)."""
+    try:
+        j = await journal.read(store, parent_sid, run_id)
         if j is None or not j.get("woke"):
             return  # already re-opened, or the run is gone
-        journal.update(store, parent_sid, run_id, allow_terminal=True, woke=False)
-    except Exception:  # noqa: BLE001 — recovery must not raise inside a callback
+        await journal.update(store, parent_sid, run_id, allow_terminal=True, woke=False)
+    except Exception:  # noqa: BLE001 — recovery must not raise
         return
-    _wake(loop, parent_sid, note)
+    await _wake(loop, parent_sid, note)
 
 
 def make_wake_guard(store: Any):
     """A ``HookPoint.TIMER_FIRE`` guard that delivers each workflow wake exactly
-    once (timers are at-least-once). Ignores non-workflow timers."""
+    once (timers are at-least-once). Ignores non-workflow timers. Async because the
+    store is async; ``run_typed_async`` awaits it."""
 
-    def guard(ctx: TimerFireCtx) -> None:
+    async def guard(ctx: TimerFireCtx) -> None:
         run_id = _parse_run_id(ctx.note)
         if run_id is None:
             return  # not a workflow timer → CONTINUE
-        j = store.get_runtime_state(ctx.session_id, journal.run_key(run_id), default=None)
+        j = await store.get_runtime_state(ctx.session_id, journal.run_key(run_id), default=None)
         if j is None:
             return
         if j.get("woke"):
             ctx.directive = HookDirective.SKIP  # already delivered once
             return
         j["woke"] = True
-        store.set_runtime_state(ctx.session_id, journal.run_key(run_id), j)
+        await store.set_runtime_state(ctx.session_id, journal.run_key(run_id), j)
 
     return guard
 
 
 def register_wake_guard(loop: Any) -> None:
-    """Install the workflow wake-dedupe guard on ``loop``'s hooks (call once)."""
-    loop.hooks.register(HookPoint.TIMER_FIRE, make_wake_guard(loop.store))
+    """Install the workflow wake-dedupe guard on ``loop``'s hooks (call once).
+
+    Resolves the loop's (lazily-opened) async store at fire time, so it is safe
+    to register before the first session is created.
+    """
+
+    async def guard(ctx: TimerFireCtx) -> None:
+        store = await loop._ensure_store()
+        await make_wake_guard(store)(ctx)
+
+    loop.hooks.register(HookPoint.TIMER_FIRE, guard)

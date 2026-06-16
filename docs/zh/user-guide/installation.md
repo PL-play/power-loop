@@ -5,7 +5,9 @@
 ## 环境要求
 
 - **Python 3.10+** — 需要 `str | None` 语法和 `asyncio` 改进。
-- **SQLite 3.35+** — 所有主流平台 Python 自带。
+- **一个存储后端。** SQLite 是零基础设施的默认值（3.35+，所有主流平台 Python 自带——无需额外
+  依赖）。要用多写者服务器，安装 `[postgres]`（asyncpg）或 `[mysql]`（aiomysql），并把 `dsn=`
+  指向它。见 [存储后端](storage-backends.md)。
 - 一个 **OpenAI 兼容的 LLM 端点**（或 Anthropic Messages API 端点）—— 以及对应的 transport
   extra（`[openai]` 或 `[anthropic]`）；核心本身 SDK-free。
 
@@ -18,9 +20,12 @@
 # 选一个 transport extra：
 pip install 'power-loop[openai]'      # OpenAI 兼容 /chat/completions（DashScope、DeepSeek、Ollama/vLLM 等）
 pip install 'power-loop[anthropic]'   # Anthropic Messages API 端点
+# 可选存储后端（SQLite 已内置——无需 extra）：
+pip install 'power-loop[postgres]'    # PostgreSQL 后端（asyncpg）
+pip install 'power-loop[mysql]'       # MySQL 后端（aiomysql，纯 Python）
 pip install 'power-loop[skills]'      # load_skill 的 YAML frontmatter
 pip install 'power-loop[pdf]'         # multimodal helper 的 PDF 输入
-pip install 'power-loop[all]'         # 两家 transport + skills + pdf
+pip install 'power-loop[all]'         # 两家 transport + postgres + mysql + skills + pdf + observability + mcp
 
 # 从 GitHub（开发版）
 pip install "power-loop[openai] @ git+https://github.com/PL-play/power-loop.git"
@@ -38,7 +43,7 @@ pip install -e ".[dev]"
 
 ```python
 from power_loop import StatefulAgentLoop, AgentLoopConfig, __version__
-print(__version__)  # → "0.7.2"
+print(__version__)  # → "1.0.0"
 ```
 
 ## 下一步

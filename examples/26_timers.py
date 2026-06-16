@@ -79,7 +79,7 @@ async def main() -> None:
             tool_registry=registry,
             hooks=hooks,
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
 
         # 1) 模型自己排闹钟（也可以用 loop.schedule_timer 从外部排）。
         res = await loop.send(
@@ -87,7 +87,7 @@ async def main() -> None:
             session_id=sid,
         )
         print(f"reply: {res.final_text[:80]}")
-        print("armed timers:", [(t.timer_id, t.note) for t in loop.list_timers(sid)])
+        print("armed timers:", [(t.timer_id, t.note) for t in await loop.list_timers(sid)])
 
         # 2) 启动 TimerRunner，等闹钟响。
         runner = TimerRunner(loop, scan_interval_s=1.0)
@@ -98,14 +98,14 @@ async def main() -> None:
             await runner.stop()
 
         # 3) 看看醒来后它说了什么。
-        msgs = loop.get_messages(sid)
+        msgs = await loop.get_messages(sid)
         last_assistant = next(
             (m for m in reversed(msgs) if m.get("role") == "assistant" and m.get("content")), None
         )
         print(f"after wake-up: {str(last_assistant.get('content'))[:100] if last_assistant else '(none)'}")
-        print("timer status:", loop.store.get_timer(sid, 1).status)
+        print("timer status:", (await loop.store.get_timer(sid, 1)).status)
 
-        loop.close()
+        await loop.aclose()
 
 
 if __name__ == "__main__":

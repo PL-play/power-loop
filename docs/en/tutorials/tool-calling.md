@@ -71,7 +71,7 @@ loop = StatefulAgentLoop(
 ## 3. Run
 
 ```python
-sid = loop.new_session()
+sid = await loop.new_session()
 
 result = await loop.send("What's the weather in Tokyo?", session_id=sid)
 print(result.final_text)
@@ -175,7 +175,7 @@ async def main():
         ),
     )
     try:
-        sid = loop.new_session()
+        sid = await loop.new_session()
         result = await loop.send("What's the weather in Tokyo?", session_id=sid)
         print(f"Bot: {result.final_text}")
     finally:

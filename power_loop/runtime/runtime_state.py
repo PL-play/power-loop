@@ -52,9 +52,12 @@ class RuntimeProjector(Protocol):
     are sent to the next LLM call but are not persisted in the conversation
     log. This is the extension point for tools whose state must survive
     compaction, process restarts, and custom agent loop instances.
+
+    ``project`` is async because the store is async (its backend offloads I/O);
+    the pipeline awaits each projector once per round.
     """
 
-    def project(
+    async def project(
         self,
         *,
         store: Any,
@@ -68,7 +71,7 @@ class RuntimeProjector(Protocol):
 class TodoRuntimeProjector(RuntimeProjector):
     state_key: str = "todo"
 
-    def project(
+    async def project(
         self,
         *,
         store: Any,
@@ -76,7 +79,7 @@ class TodoRuntimeProjector(RuntimeProjector):
         round_index: int,
         context: Any,
     ) -> list[RuntimeMessage]:
-        todo_state = store.get_runtime_state(session_id, self.state_key, default={}) or {}
+        todo_state = await store.get_runtime_state(session_id, self.state_key, default={}) or {}
         rendered = todo_state.get("rendered") if isinstance(todo_state, dict) else None
         if not isinstance(rendered, str) or not rendered.strip():
             return []
@@ -93,7 +96,7 @@ class TodoRuntimeProjector(RuntimeProjector):
 class BackgroundRuntimeProjector(RuntimeProjector):
     mark_seen: bool = True
 
-    def project(
+    async def project(
         self,
         *,
         store: Any,
@@ -101,7 +104,7 @@ class BackgroundRuntimeProjector(RuntimeProjector):
         round_index: int,
         context: Any,
     ) -> list[RuntimeMessage]:
-        updates = store.list_unseen_background_updates(session_id)
+        updates = await store.list_unseen_background_updates(session_id)
         if not updates:
             return []
         chunks: list[str] = ["<background_updates>"]
@@ -120,7 +123,7 @@ class BackgroundRuntimeProjector(RuntimeProjector):
             )
         chunks.append("</background_updates>")
         if self.mark_seen:
-            store.mark_background_seen(session_id, [task.task_id for task in updates])
+            await store.mark_background_seen(session_id, [task.task_id for task in updates])
         return [
             {
                 "role": "user",

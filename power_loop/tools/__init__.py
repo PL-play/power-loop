@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from collections.abc import Sequence
 from dataclasses import replace
 from functools import wraps
@@ -108,22 +109,36 @@ def _bind_handlers(handlers: dict[str, Any], runtime_env: RuntimeEnv) -> dict[st
 
 
 def _bind_handler(handler: Any, runtime_env: RuntimeEnv) -> Any:
-    @wraps(handler)
-    def _wrapped(**kwargs: Any) -> Any:
-        # H5.1: bind the registry's PATHS (workspace/home/skills) but do NOT clobber
-        # an outer runtime_env_context's injected ShellBackend/Blackboard. A host that
-        # wraps a send() in `runtime_env_context(shell_backend=sandbox, ...)` must still
-        # have its sandbox honored; previously the bind reset the contextvar to a
-        # path-only snapshot (shell_backend=None), silently defeating the injection.
-        # The bound env wins only where it set a value explicitly.
+    # H5.1: bind the registry's PATHS (workspace/home/skills) but do NOT clobber an
+    # outer runtime_env_context's injected ShellBackend/Blackboard. A host that wraps a
+    # send() in `runtime_env_context(shell_backend=sandbox, ...)` must still have its
+    # sandbox honored; previously the bind reset the contextvar to a path-only snapshot
+    # (shell_backend=None), silently defeating the injection. The bound env wins only
+    # where it set a value explicitly.
+    def _merged() -> RuntimeEnv:
         outer = get_runtime_env()
-        merged = replace(
+        return replace(
             runtime_env,
             shell_backend=runtime_env.shell_backend or outer.shell_backend,
             blackboard=runtime_env.blackboard or outer.blackboard,
             blackboard_id=runtime_env.blackboard_id or outer.blackboard_id,
         )
-        with runtime_env_context(merged):
+
+    # An async handler returns a coroutine — the env context MUST be held across its
+    # await, not just while the coroutine object is constructed (else the contextvar is
+    # reset before the body runs and the handler sees an empty env). So bind async and
+    # sync handlers with matching wrappers.
+    if inspect.iscoroutinefunction(handler):
+        @wraps(handler)
+        async def _wrapped_async(**kwargs: Any) -> Any:
+            with runtime_env_context(_merged()):
+                return await handler(**kwargs)
+
+        return _wrapped_async
+
+    @wraps(handler)
+    def _wrapped(**kwargs: Any) -> Any:
+        with runtime_env_context(_merged()):
             return handler(**kwargs)
 
     return _wrapped

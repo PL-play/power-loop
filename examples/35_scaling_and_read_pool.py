@@ -1,15 +1,19 @@
-"""35 · 扩展与读连接池 / Scaling & the read pool (0.16.0 — SCALE-1/2/3)
+"""35 · 扩展与并发会话 / Scaling & concurrent sessions (0.16.0 — SCALE-1/3)
 
 What you learn / 你将学到
 --------------------------
-- power-loop 是单进程内核:一个写者(单连接+RLock 串行,保证 next_seq 与写原子),一个事件循环
-  可驱动任意多并发会话。读路径已卸载出事件循环,读可用**只读连接池**与写者并发。
-  / Single-process kernel: one writer (single connection + RLock), one event loop driving
-  many concurrent sessions; reads are offloaded off the loop and can run on a read pool.
-- `SessionStore.open(read_pool_size=N)`(SCALE-2,文件库,opt-in)让读不再排在写锁后面;
-  每次 send 的历史加载走 `to_thread`(SCALE-3),不阻塞其它会话。
-  / ``read_pool_size=N`` keeps reads off the writer's lock; the per-send history load runs
-  in a thread so it doesn't stall other sessions.
+- power-loop 是单进程内核:一个写者(单连接 + 一把 asyncio.Lock 串行写,保证 next_seq 与写
+  原子),一个事件循环可驱动任意多并发会话。store 的每条语句都卸载到工作线程执行,因此读不
+  会阻塞事件循环。
+  / Single-process kernel: one writer (a single connection serialized behind one
+  ``asyncio.Lock``, so ``next_seq`` and the write stay atomic) and one event loop driving
+  many concurrent sessions. Every store statement is offloaded to a worker thread, so reads
+  never block the event loop.
+- 异步 store 没有单独的「读连接池」可配:并发性来自语句级 ``to_thread`` 卸载 + 写者锁的细
+  粒度持有,而不是预开一组连接。多个 ``loop.send`` 并发跑时,各自的历史加载互不串行化。
+  / The async store has no separate read pool to configure: concurrency comes from per-statement
+  ``to_thread`` offload plus a finely-held writer lock, not from a pre-opened pool of connections.
+  Concurrent ``loop.send`` calls don't serialize on each other's history loads.
 - 用自带压测台把"推理出的"上限变成"测出来的"(SCALE-1):``python -m bench [--smoke]``。
   / Turn the reasoned ceiling into measured numbers with the bundled harness.
 
@@ -35,9 +39,9 @@ async def main() -> str:
     tmp = Path(tempfile.mkdtemp(prefix="pl_scaling_"))
     db = str(tmp / "agent.db")
 
-    # SCALE-2: a read pool (file DB only; :memory: would decline it). Default is 0 (off);
-    # enable it under read-heavy fan-out so reads run concurrently with the writer.
-    store = SessionStore.open(db, read_pool_size=4)
+    # The async store offloads each statement to a worker thread and serializes writers
+    # behind one asyncio.Lock — there is no read-pool knob; concurrency is built in.
+    store = await SessionStore.open(db)
     loop = StatefulAgentLoop(
         llm=make_llm(max_tokens=128),
         store=store,
@@ -47,14 +51,14 @@ async def main() -> str:
     )
 
     # One event loop, several concurrent sessions. Each send's history read is offloaded
-    # (SCALE-3) and may use a pooled connection (SCALE-2) — they don't serialize on reads.
+    # to a worker thread (SCALE-3), so the sessions don't serialize on reads.
     questions = [
         "What is the capital of France?",
         "Name a primary color.",
         "What is 2 + 2?",
     ]
     async with loop:  # aclose() on exit: drain in-flight sends, checkpoint, close store
-        sids = [loop.new_session() for _ in questions]
+        sids = [await loop.new_session() for _ in questions]
         t0 = time.perf_counter()
         results = await asyncio.gather(
             *(loop.send(q, session_id=sid) for q, sid in zip(questions, sids))
@@ -64,7 +68,7 @@ async def main() -> str:
     ok = sum(1 for r in results if r.status == "completed")
     summary = (
         f"{ok}/{len(questions)} concurrent sessions completed in {wall*1000:.0f} ms "
-        f"(read_pool_size=4). For measured ceilings run: python -m bench --smoke"
+        f"on the async store. For measured ceilings run: python -m bench --smoke"
     )
     print(summary)
     return summary

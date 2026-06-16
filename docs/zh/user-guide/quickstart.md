@@ -24,7 +24,7 @@ async def main():
             max_rounds=1,
         ),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("你好！", session_id=sid)
     print(result.final_text)
     # → "你好！有什么可以帮你的？"
@@ -39,7 +39,7 @@ asyncio.run(main())
 ## 2. 多轮对话 — 让对话持续
 
 ```python
-sid = loop.new_session()
+sid = await loop.new_session()
 r1 = await loop.send("我叫阿岚。", session_id=sid)
 print(sid)  # 例如 "sess_abc123..."
 
@@ -50,7 +50,7 @@ print(r2.final_text)  # → "你叫阿岚。"
 **要点**：
 - 传入同一个 `session_id` 继续同一会话。
 - 库自动从 SQLite 加载完整历史——你永远不需要手动管理 `messages`。
-- `loop.get_messages(sid)` 可以查看活跃历史。
+- `await loop.get_messages(sid)` 可以查看活跃历史。
 
 ## 3. 工具调用 — 给 Agent 能力
 
@@ -83,7 +83,7 @@ loop = StatefulAgentLoop(
     ),
 )
 
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send("东京天气怎么样？", session_id=sid)
 # LLM 调用 get_weather(city="东京") → result.final_text 提到 "晴，22°C"
 ```
@@ -113,7 +113,7 @@ loop = StatefulAgentLoop(
     ),
 )
 
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send(
     "研究一下：东京的人口是多少？比伦敦多吗？",
     session_id=sid,
@@ -173,21 +173,22 @@ loop = StatefulAgentLoop(llm=llm, event_bus=bus, ...)
 
 ```python
 # 进程 1
-loop = StatefulAgentLoop(llm=llm, db_path="./chat.db", ...)
-sid = loop.new_session()
+loop = StatefulAgentLoop(llm=llm, dsn="./chat.db", ...)
+sid = await loop.new_session()
 r1 = await loop.send("记住：我叫阿岚。", session_id=sid)
 loop.close()
 
 # 进程 2（几小时后，不同的 Python 进程）
-loop2 = StatefulAgentLoop(llm=llm, db_path="./chat.db", ...)
+loop2 = StatefulAgentLoop(llm=llm, dsn="./chat.db", ...)
 r2 = await loop2.send("我叫什么？", session_id=sid)
 print(r2.final_text)  # → "你叫阿岚。"
 ```
 
 **要点**：
-- `db_path` 指向真实文件（默认 `./power_loop_sessions.db`）；`":memory:"` 用于测试。
-- 会话活在 SQLite 里——新进程打开同一文件，传入相同 `session_id`，LLM 看到完整历史。
+- `dsn` 按 scheme 选后端：裸路径或 `sqlite://…` 是 SQLite（默认文件 `./power_loop_sessions.db`；`":memory:"` 用于测试），`postgresql://…` 是 PostgreSQL，`mysql://…` 是 MySQL。（`db_path=` 是 `dsn=` 的别名。）
+- 会话活在 store 里——新进程用相同 `dsn` 重建 loop，传入相同 `session_id`，LLM 看到完整历史。loop 本身不持有任何权威状态。
 - 跨子进程、容器、重启都可用。
+- 选 SQLite 还是 PostgreSQL/MySQL、以及 schema 配置，见 [存储后端](storage-backends.md)。
 
 ## 8. 下一步
 

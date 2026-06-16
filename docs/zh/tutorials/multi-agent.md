@@ -23,7 +23,7 @@ loop = StatefulAgentLoop(
     ),
 )
 
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send("找到项目中的认证逻辑代码。", session_id=sid)
 # LLM: spawn_agent(task="搜索认证代码", preset="explore")
 # → 子代理用 explore 工具集搜索 → 父代理拿到结果
@@ -81,7 +81,7 @@ async def main():
         config=AgentLoopConfig(system_prompt="用 spawn_agent 委托。简洁。", max_rounds=8),
     )
     try:
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r1 = await loop.send("研究：read_file 返回什么？", session_id=sid)
         print(f"命令式: {r1.final_text[:200]}")
 

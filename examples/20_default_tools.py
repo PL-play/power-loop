@@ -18,6 +18,7 @@ Run / 运行
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from pathlib import Path
@@ -31,7 +32,7 @@ def show(title: str, value: object) -> None:
     print(value)
 
 
-def main() -> str:
+async def main() -> str:
     with TemporaryDirectory(prefix="power_loop_default_tools_") as tmp:
         workspace = Path(tmp)
         skills_dir = workspace / "skills"
@@ -46,12 +47,12 @@ def main() -> str:
         rel_root = root.relative_to(workspace).as_posix()
         target = f"{rel_root}/notes.txt"
 
-        show("write_file", registry.invoke("write_file", {"path": target, "content": "alpha\nbeta\ngamma\n"}))
-        show("read_file", registry.invoke("read_file", {"path": target, "limit": 20}))
+        show("write_file", await registry.invoke_async("write_file", {"path": target, "content": "alpha\nbeta\ngamma\n"}))
+        show("read_file", await registry.invoke_async("read_file", {"path": target, "limit": 20}))
 
         show(
             "edit_file",
-            registry.invoke(
+            await registry.invoke_async(
                 "edit_file",
                 {"path": target, "old_text": "beta", "new_text": "BETA"},
             ),
@@ -59,7 +60,7 @@ def main() -> str:
 
         show(
             "apply_patch",
-            registry.invoke(
+            await registry.invoke_async(
                 "apply_patch",
                 {
                     "path": target,
@@ -74,13 +75,13 @@ def main() -> str:
         )
 
         (root / "code.py").write_text("VALUE = 'delta'\nprint(VALUE)\n", encoding="utf-8")
-        show("glob", registry.invoke("glob", {"path": rel_root, "pattern": "*.py"}))
-        show("grep", registry.invoke("grep", {"path": rel_root, "pattern": "VALUE", "include": "*.py"}))
-        show("bash", registry.invoke("bash", {"command": f"python -m py_compile {rel_root}/code.py", "timeout": 10}))
+        show("glob", await registry.invoke_async("glob", {"path": rel_root, "pattern": "*.py"}))
+        show("grep", await registry.invoke_async("grep", {"path": rel_root, "pattern": "VALUE", "include": "*.py"}))
+        show("bash", await registry.invoke_async("bash", {"command": f"python -m py_compile {rel_root}/code.py", "timeout": 10}))
 
         show(
             "todo",
-            registry.invoke(
+            await registry.invoke_async(
                 "todo",
                 {
                     "items": [
@@ -91,15 +92,15 @@ def main() -> str:
             ),
         )
 
-        background = str(registry.invoke("background_run", {"command": "printf 'background finished\\n'"}))
+        background = str(await registry.invoke_async("background_run", {"command": "printf 'background finished\\n'"}))
         show("background_run", background)
         task_id = background.split()[2]
         time.sleep(0.1)
-        show("check_background", registry.invoke("check_background", {"task_id": task_id}))
+        show("check_background", await registry.invoke_async("check_background", {"task_id": task_id}))
 
-        show("load_skill", registry.invoke("load_skill", {"name": "example-missing-skill"}))
+        show("load_skill", await registry.invoke_async("load_skill", {"name": "example-missing-skill"}))
         return str(Path(target))
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

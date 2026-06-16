@@ -48,7 +48,7 @@ All examples share `_helpers.py` which loads `.env` and builds an LLM client. To
 from power_loop import StatefulAgentLoop
 
 loop = StatefulAgentLoop(llm=make_llm(), db_path=":memory:")
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send("In one sentence: what is HTTP?", session_id=sid)
 print(result.final_text)
 ```
@@ -84,7 +84,7 @@ loop = StatefulAgentLoop(
         max_rounds=1, compactor=None,
     ),
 )
-sid = loop.new_session()
+sid = await loop.new_session()
 
 # Turn 1: establish a fact
 r1 = await loop.send("My favorite color is teal.", session_id=sid)
@@ -93,11 +93,11 @@ r1 = await loop.send("My favorite color is teal.", session_id=sid)
 r2 = await loop.send("What did I just tell you my favorite color was?", session_id=sid)
 
 # Inspect persisted history
-msgs = loop.get_messages(sid)
+msgs = await loop.get_messages(sid)
 print(f"history has {len(msgs)} messages: roles = {[m['role'] for m in msgs]}")
 
 # Clean up
-loop.close_session(sid)
+await loop.close_session(sid)
 ```
 
 ### Key Points
@@ -157,7 +157,7 @@ loop = StatefulAgentLoop(
         compactor=None,
     ),
 )
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send("What is Bangkok's signature dish?", session_id=sid)
 ```
 
@@ -207,12 +207,12 @@ loop = StatefulAgentLoop(
         max_rounds=5, compactor=None,
     ),
 )
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send(
     "Delegate this and report back: what is the capital of Japan?",
     session_id=sid,
 )
-print(f"surviving subs: {store.list_children(result.session_id)}")
+print(f"surviving subs: {await store.list_children(result.session_id)}")
 ```
 
 ### Key Points
@@ -244,8 +244,8 @@ surviving subs: []
 ```python
 # Seed fat history
 for i in range(4):
-    store.append_message(sid, role="user", content="filler " + "u" * 400, round_index=i)
-    store.append_message(sid, role="assistant", content="filler ack " + "a" * 400, round_index=i)
+    await store.append_message(sid, role="user", content="filler " + "u" * 400, round_index=i)
+    await store.append_message(sid, role="assistant", content="filler ack " + "a" * 400, round_index=i)
 
 # Force low threshold to guarantee trigger
 os.environ["CONTEXT_COMPACT_THRESHOLD"] = "500"
@@ -261,8 +261,8 @@ loop = StatefulAgentLoop(
 r = await loop.send("Name the largest planet in our solar system.", session_id=sid)
 
 # Inspect compaction traces
-comps = store.list_compactions(sid)
-all_rows = store.load_all_messages(sid)
+comps = await store.list_compactions(sid)
+all_rows = await store.load_all_messages(sid)
 folded = sum(1 for m in all_rows if m.state is MessageState.COMPACTED_OUT)
 notes = [m for m in all_rows if m.name == "compact_note"]
 ```
@@ -297,14 +297,14 @@ compact_note preview : 'The transcript contains only repeated filler/keep-alive 
 ### Code
 
 ```python
-def _simulate_crash_pending(store, sid):
+async def _simulate_crash_pending(store, sid):
     """Simulate: LLM returned but process crashed before tool calls finished."""
-    asst_seq = store.append_message(
+    asst_seq = await store.append_message(
         sid, role="assistant",
         tool_calls=[{"id": "tc-stuck", "function": {"name": "echo", "arguments": '{"text":"x"}'}}],
         round_index=0,
     )
-    store.set_pending(sid, {
+    await store.set_pending(sid, {
         "assistant_seq": asst_seq, "round_index": 0,
         "tool_call_ids": ["tc-stuck"],
         "tool_calls": [{"id": "tc-stuck", "function": {"name": "echo", "arguments": '{"text":"x"}'}}],
@@ -317,7 +317,7 @@ except SessionPendingError as exc:
     print(f"[blocked] pending tool_calls: {[tc['id'] for tc in exc.pending_tool_calls]}")
 
 # Choose abort_pending (or alternatively: await loop.resume(sid))
-n = loop.abort_pending(sid, reason="user_cancelled")
+n = await loop.abort_pending(sid, reason="user_cancelled")
 
 # Now send proceeds normally
 r = await loop.send("In one sentence: what does HTML stand for?", session_id=sid)
@@ -603,7 +603,7 @@ await queue.put(_STOP)
 # Phase 1: parent creates session, stores a fact, exits
 async def phase1(db_path: str) -> str:
     loop = StatefulAgentLoop(llm=make_llm(), db_path=db_path, ...)
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send("Remember: my name is Alan, favorite number is 37.", session_id=sid)
     loop.close()
     return sid
@@ -1128,7 +1128,7 @@ registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
 ```python
 waiting = []
 for label, request in REQUESTS.items():
-    sid = loop.new_session(metadata={"label": label})
+    sid = await loop.new_session(metadata={"label": label})
     result = await loop.send(request, session_id=sid)
     print(result.status, result.pending_interactions)
     waiting.append((label, sid, result.pending_interactions[0]))
@@ -1211,9 +1211,9 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 
 ---
 
-## 24–33 · Newer examples
+## 24–39 · Newer examples
 
-These cover the capabilities added in 0.11–0.14. Each links to the runnable file and to the User Guide page that explains it in depth.
+These cover the capabilities added since 0.11 (durability, scaling, pluggable backends, observability, MCP). Each links to the runnable file and to the User Guide page that explains it in depth.
 
 ### 24 · Agent Notes
 The agent writes durable notes to itself (`note_add` / `note_update` / `note_delete`), persisted via `SQLiteNoteMemory` and re-injected each turn under a `NotesPolicy`. → [example](../../../examples/24_agent_notes.py) · [Memory](../user-guide/memory.md)
@@ -1244,6 +1244,24 @@ Compaction folds old turns into a `compact_note` and marks them `compacted_out` 
 
 ### 33 · Coordinating Compactor
 `Compactor.maybe_compact` can optionally receive a `CompactionContext` (injected `MemoryProvider` + session_id + read accessor) so a custom compactor can `remember` must-keep detail before folding; `DefaultCompactor` and old-signature compactors are unchanged. → [example](../../../examples/33_coordinating_compactor.py) · [Compaction](../user-guide/compaction.md) · [Memory](../user-guide/memory.md)
+
+### 34 · Durability Lifecycle
+The on-disk store is operable for the long haul: opt-in retention/prune of folded-out originals, `vacuum()`/`checkpoint()` to reclaim disk, lossless `export_session`/`import_session`, and graceful `aclose()` via `async with loop:` (drain in-flight sends, then close). → [example](../../../examples/34_durability_lifecycle.py) · [Sessions](../user-guide/sessions.md)
+
+### 35 · Scaling & Concurrent Sessions
+One single-process kernel — a single writer behind one `asyncio.Lock` plus one event loop — drives many concurrent sessions. The async store offloads each blocking statement to a worker thread (there is **no** separate read-connection pool to configure); scale further by choosing a server backend or sharding SQLite files across processes. Includes a bundled `python -m bench` harness. → [example](../../../examples/35_scaling_and_read_pool.py) · [Scaling](../user-guide/scaling.md)
+
+### 36 · Observability
+The event bus is the observability seam: `attach_jsonl_sink` persists the full `ts`/`seq`/`mono` envelope (and `replay(path)` reads it back), `attach_metrics_sink` maps events to counters/histograms (Prometheus/StatsD shipped). → [example](../../../examples/36_observability.py) · [Observability](../user-guide/observability.md)
+
+### 37 · Custom Retrieval Tool
+A retrieval/RAG tool registered through the normal `ToolRegistry` seam — the agent calls it like any other tool; power-loop bundles no vector store, you bring your own. → [example](../../../examples/37_custom_retrieval_tool.py) · [Extending tools](../user-guide/extending-tools.md)
+
+### 38 · MCP Tools
+Surface a Model Context Protocol server's tools as power-loop `ToolDefinition`s via one adapter (`register_mcp_tools`); the `mcp` SDK is an optional extra. → [example](../../../examples/38_mcp_tools.py) · [Extending tools](../user-guide/extending-tools.md)
+
+### 39 · Pluggable Backends + Resume
+The loop is a **stateless** handle — all session state lives in the store — so a brand-new cold loop resumes any session from just a `dsn` + `session_id`. The store is **pluggable**: `dsn=` picks SQLite (default, zero-infra), `postgresql://` (`power-loop[postgres]`), or `mysql://` (`power-loop[mysql]`). `SchemaPolicy.AUTO_CREATE` (default) provisions tables; `VERIFY` only checks and raises `StoreSchemaError` carrying the exact DDL. `loop.cache_stats` exposes the per-session active-window cache (a pure accelerator). → [example](../../../examples/39_pluggable_backends_and_resume.py) · [Storage backends](../user-guide/storage-backends.md)
 
 ---
 
@@ -1278,5 +1296,11 @@ Compaction folds old turns into a `compact_note` and marks them `compacted_out` 
 | Sandbox model-authored bash | [28](#28-docker-shell-backend) |
 | Coordinate peer agents on a shared board | [29](#29-shared-blackboard) |
 | Isolate workflow leaves per process | [30](#30-subprocess-isolation) |
+| Operate a long-lived store (prune/vacuum/export) | [34](#34-durability-lifecycle) |
+| Scale concurrent sessions | [35](#35-scaling--concurrent-sessions) |
+| Export events / wire up metrics | [36](#36-observability) |
+| Add retrieval / RAG | [37](#37-custom-retrieval-tool) |
+| Connect an MCP server | [38](#38-mcp-tools) |
+| Pick a backend (SQLite/PG/MySQL) and resume cold | [39](#39-pluggable-backends--resume) |
 | Build runtime-bound tools | [Advanced Runtime](../../../examples/advanced_runtime/) |
 | See everything together | [19](#19-full-chatbot) |

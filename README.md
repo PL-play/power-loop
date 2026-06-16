@@ -7,25 +7,33 @@
 
 **English** · [中文](README.zh.md) · [Docs](docs/en/index.md) · [Examples](examples/README.md) · [Changelog](CHANGELOG.md)
 
-> **The agent runtime that disappears into your app.** One class, one SQLite file, zero infrastructure — and you get durable multi-turn sessions, tool calling, sub-agents, deterministic multi-agent **workflows that resume across a crash**, durable timers, and process-level sandboxing. No service to run, no framework to adopt, no Redis/Postgres/queue to stand up.
+> **Loop engineering, not framework adoption.** power-loop is an embeddable **agent execution kernel**: you engineer the agent *loop* — hooks at every lifecycle point, pluggable storage, sandbox seams, compaction, deterministic workflows — instead of building your app *inside* a framework. The loop itself is a **lightweight, stateless handle** over a **pluggable store** (SQLite by default — zero infrastructure — or PostgreSQL/MySQL by DSN). Out of it you get durable multi-turn sessions, tool calling, sub-agents, crash-resumable multi-agent workflows, durable timers, and process-level sandboxing. No service to run, no graph DSL to learn.
 
 ```python
 from power_loop import StatefulAgentLoop, create_llm_service_from_env
 
-loop = StatefulAgentLoop(llm=create_llm_service_from_env(), db_path="app.db")
-sid = loop.new_session()
+# The loop is a thin, stateless handle over a store. Default = one SQLite file (zero infra);
+# swap dsn= to "postgresql://…/app" or "mysql://…/app" and nothing else changes.
+loop = StatefulAgentLoop(llm=create_llm_service_from_env(), dsn="app.db")
+sid = await loop.new_session()
 await loop.send("Remember my favorite color is teal.", session_id=sid)
 print((await loop.send("What's my favorite color?", session_id=sid)).final_text)
-# → "Your favorite color is teal."   (persisted in app.db; survives restarts)
+# → "Your favorite color is teal."   (durable; survives restarts)
 ```
 
-That's the whole setup. The conversation is already durable, resumable, and tool-capable.
+The conversation is already durable, resumable, and tool-capable. And because the loop holds **no authoritative state**, a fresh process resumes it from nothing but a DSN + the session id:
+
+```python
+# Cold start, another process — reconstruct the loop and continue. No state to serialize/carry.
+loop = StatefulAgentLoop(llm=create_llm_service_from_env(), dsn="app.db")
+print((await loop.send("And my second-favorite?", session_id=sid)).final_text)
+```
 
 ```bash
-pip install 'power-loop[openai]'      # or [anthropic], or [all]
+pip install 'power-loop[openai]'      # or [anthropic] · add [postgres] / [mysql] for those backends
 ```
 
-> **1.0 — stable.** The public API is frozen under SemVer (a breaking change requires a major bump), machine-enforced by a baseline guard in CI. The **core has zero runtime dependencies** (pure stdlib; verified by a CI job that imports it with nothing else installed). See [Stability](#stability--semver) and the [honest caveats](#honest-scope) — a young, single-maintainer project says so plainly.
+> **1.0 — stable.** The public API is frozen under SemVer (a breaking change requires a major bump), machine-enforced by a baseline guard in CI. The **core has zero runtime dependencies** (pure stdlib; verified by a CI job that imports it with nothing else installed) — LLM transports *and database drivers* are optional extras. See [Stability](#stability--semver) and the [honest caveats](#honest-scope) — a young, single-maintainer project says so plainly.
 
 ---
 
@@ -35,26 +43,27 @@ pip install 'power-loop[openai]'      # or [anthropic], or [all]
 |---|---|
 | 🚀 **New** — show me the 5-minute version | [Getting Started](docs/en/getting-started.md) |
 | 🛠️ **Learning by building** | [Tutorials](docs/en/tutorials/index.md) — chatbot · tools · human-in-the-loop · multi-agent |
-| 🧩 **Browsing runnable code** | [39 examples](examples/README.md) — `00_hello_world.py` → full chatbot |
+| 🧩 **Browsing runnable code** | [40 examples](examples/README.md) — `00_hello_world.py` → full chatbot |
 | 📚 **Looking something up** | [User Guide](docs/en/user-guide/index.md) · [API reference](docs/en/api/index.md) |
 | 🤔 **Deciding if it fits** | [How it compares](#how-it-compares) · [Honest scope](#honest-scope) |
 
-**Find your way by goal:** persist across restarts → [Sessions](docs/en/user-guide/sessions.md) · give it tools → [Tools](docs/en/user-guide/tools.md) / [Extending](docs/en/user-guide/extending-tools.md) · multi-agent → [Workflows](docs/en/user-guide/workflows.md) · sandbox untrusted code → [Sandboxing](docs/en/user-guide/sandboxing.md) · run long-term (backup/retention) → [Sessions](docs/en/user-guide/sessions.md) · monitor (logs/metrics/traces) → [Observability](docs/en/user-guide/observability.md) · measure & scale → [Scaling](docs/en/user-guide/scaling.md) · connect an MCP server → [Extending](docs/en/user-guide/extending-tools.md) · survive crashes → [Pending recovery](docs/en/user-guide/sessions.md#pending-recovery).
+**Find your way by goal:** persist & resume across restarts → [Sessions](docs/en/user-guide/sessions.md) · pick a backend (SQLite/PG/MySQL) → [Storage backends](docs/en/user-guide/storage-backends.md) · give it tools → [Tools](docs/en/user-guide/tools.md) / [Extending](docs/en/user-guide/extending-tools.md) · multi-agent → [Workflows](docs/en/user-guide/workflows.md) · sandbox untrusted code → [Sandboxing](docs/en/user-guide/sandboxing.md) · monitor → [Observability](docs/en/user-guide/observability.md) · scale → [Scaling](docs/en/user-guide/scaling.md) · survive crashes → [Pending recovery](docs/en/user-guide/sessions.md#pending-recovery).
 
 ---
 
-## Why power-loop
+## Why power-loop — "loop engineering"
 
-Most "agent frameworks" ask you to build your app *inside* them. power-loop is the opposite: a **library you embed**. You keep your HTTP layer, your auth, your queues, your RAG, your UI, your deploy. It just runs the agent loop — well, and durably.
+Most "agent frameworks" ask you to build your app *inside* them. power-loop is the opposite: a **library you embed**. You keep your HTTP layer, your auth, your queues, your RAG, your UI, your deploy. It runs the agent loop — and lets you *engineer* it.
 
-- 🪶 **Featherweight & zero-dependency.** No `pydantic`, no LangChain, no graph DSL. A compact, pure-stdlib core (~17k lines) whose public surface is essentially one class — and **zero runtime dependencies**. The OpenAI/Anthropic transport is pulled in only by the extra you install.
-- 💾 **Zero infrastructure.** Sessions, timers, sub-agent trees, workflow journals, the shared blackboard — all in **one SQLite file**. Copy the file, you've copied the state. Scale by sharding files across processes.
-- ⏱️ **Durable by default.** Crash mid-run and `resume()`. Agents schedule their own **durable timers** that survive restarts. Workflows **replay finished steps and re-run only the unfinished tail** after a process death. The store **survives version upgrades** (a real schema-migration ladder) and can be **pruned, VACUUMed, and exported**.
+- 🪶 **Featherweight & zero-dependency.** No `pydantic`, no LangChain, no graph DSL. A compact, pure-stdlib core (~20k lines) whose public surface is essentially one class — and **zero runtime dependencies**. LLM transports *and* the Postgres/MySQL drivers are pulled in only by the extra you install.
+- 🗄️ **Pluggable storage, zero-infra default.** Sessions, timers, sub-agent trees, workflow journals, the shared blackboard — one backend-neutral store written once against a tiny `Database`/`Dialect` port. The default is **one SQLite file** (copy the file, you've copied the state); point a DSN at **PostgreSQL or MySQL** when you want a real multi-writer server — same code, same conformance suite. Tables are auto-created, or **provisioned out-of-band** with a printed DDL script (see [Storage backends](docs/en/user-guide/storage-backends.md)).
+- ♻️ **Stateless, resumable loops.** A `StatefulAgentLoop` carries no authoritative state — all of it lives in the store. So a loop is cheap to create and trivially **restored from a DSN + a session id** (ideal for web handlers, workers, cold starts). It self-caches each session's active window (a rebuildable accelerator that never changes what the model sees) to skip re-reads on hot paths.
+- ⏱️ **Durable by default.** Crash mid-run and `resume()`. Agents schedule their own **durable timers** that survive restarts. Workflows **replay finished steps and re-run only the unfinished tail** after a process death. The store survives version upgrades (a portable, backend-neutral migration-version table) and can be **pruned, VACUUMed, and exported**.
 - 🧩 **Composable from one loop to a fleet.** Start with `send()`. Add tools. Spawn sub-agents. Fan out a deterministic **workflow** (`sequence`/`parallel`/`foreach`/`branch`). Run each leaf in its **own process and DB** behind a sandbox. Same primitives all the way up.
 - 🛡️ **Isolation seams where it counts.** Tool-level sandboxing via a `ShellBackend` (drop in gVisor/Docker for `bash`); process-level via a `WorkerLauncher` (wrap a whole sub-agent worker per leaf). power-loop stays sandbox-agnostic; you choose the policy.
 - 🔬 **Built to be observed.** Typed events for every stream chunk, tool call, round, and **individual LLM call** — each `seq`-ordered + monotonic-clock stamped. Pluggable sinks behind extras: durable **JSONL** (with `replay`), **Prometheus/StatsD** metrics, an **OpenTelemetry** span tree. Per-run + per-session token accounting and hard per-run budgets.
 - 🔌 **Open ecosystem.** Provider-agnostic (any OpenAI-compatible endpoint or native Anthropic, by env var). Bring any tool via the `ToolRegistry`, or connect a **Model Context Protocol** server with one adapter.
-- ✅ **Real-LLM tested.** A dedicated `tests/real/` suite runs the library — workflows, resume, sandboxed subprocess agents, structured output, compaction, a live MCP server — against a real model, not just mocks.
+- ✅ **Real-tested.** A dedicated `tests/real/` suite runs the library — workflows, resume, sandboxed subprocess agents, structured output, compaction, a live MCP server — against a real model; the storage layer has a **backend-agnostic conformance suite** run against SQLite, PostgreSQL, and MySQL.
 
 ---
 
@@ -62,7 +71,9 @@ Most "agent frameworks" ask you to build your app *inside* them. power-loop is t
 
 | Capability | One-liner | Docs |
 |---|---|---|
-| **Stateful sessions** | Durable multi-turn memory + cross-process resume, in one SQLite file | [Sessions](docs/en/user-guide/sessions.md) |
+| **Stateful sessions** | Durable multi-turn memory + resume by id, in SQLite/PG/MySQL | [Sessions](docs/en/user-guide/sessions.md) |
+| **Pluggable backends** | One store, `dsn=` picks SQLite (default) / PostgreSQL / MySQL; configurable schema provisioning | [Storage backends](docs/en/user-guide/storage-backends.md) |
+| **Stateless / resumable loop** | Loop holds no state; reconstruct from `dsn` + `session_id`; cheap to create | [Sessions](docs/en/user-guide/sessions.md) |
 | **Tool calling** | JSON-Schema-validated tools; built-in `bash`/file/search/skills presets | [Tools](docs/en/user-guide/tools.md) · [Extending](docs/en/user-guide/extending-tools.md) |
 | **Sub-agents** | Delegate to a child loop via `AgentSpec` (own prompt/tools/model) | [Sub-agents](docs/en/user-guide/subagents.md) |
 | **Dynamic workflows** | JSON DSL (`sequence`/`parallel`/`foreach`/`branch`) the LLM can author; deterministic engine | [Workflows](docs/en/user-guide/workflows.md) |
@@ -70,9 +81,8 @@ Most "agent frameworks" ask you to build your app *inside* them. power-loop is t
 | **Process sandboxing** | Each workflow leaf in its own OS process + own DB; wrap each in gVisor/Docker per leaf | [Sandboxing](docs/en/user-guide/sandboxing.md) |
 | **Durable timers** | Agents schedule their own wake-ups; survive restarts; one-shot or recurring | [Timers](docs/en/user-guide/timers.md) |
 | **Context compaction** | Auto-summarize old turns (never splits a tool-call pair); `recall_compacted` to pull originals back | [Compaction](docs/en/user-guide/compaction.md) |
-| **Durability ops** | Schema-migration ladder, retention/prune, VACUUM, `export_session`/`import_session`, graceful `aclose()` | [Sessions](docs/en/user-guide/sessions.md) |
-| **Observability** | Typed `seq`-ordered events → durable JSONL + `replay`, Prometheus/StatsD metrics, OpenTelemetry spans; opt-in backpressure | [Observability](docs/en/user-guide/observability.md) |
-| **Scale, measured** | A `bench/` harness with real numbers; opt-in read-only WAL connection pool; honest single-process ceiling | [Scaling](docs/en/user-guide/scaling.md) |
+| **Durability ops** | Portable migration-version table, retention/prune, VACUUM, `export_session`/`import_session`, graceful `aclose()` | [Sessions](docs/en/user-guide/sessions.md) |
+| **Observability** | Typed `seq`-ordered events → durable JSONL + `replay`, Prometheus/StatsD metrics, OpenTelemetry spans | [Observability](docs/en/user-guide/observability.md) |
 | **MCP tools** | Surface a Model Context Protocol server's tools as power-loop tools | [Extending](docs/en/user-guide/extending-tools.md) |
 | **Hooks & events** | Veto/observe at every lifecycle point; strongly-typed event payloads | [Hooks](docs/en/user-guide/hooks.md) · [Events](docs/en/user-guide/events.md) |
 | **Structured output** | `output_schema` → provider `response_format` → parsed & validated | [Structured](docs/en/user-guide/structured-output.md) |
@@ -84,6 +94,37 @@ Most "agent frameworks" ask you to build your app *inside* them. power-loop is t
 ---
 
 ## Highlights
+
+### Pluggable storage — SQLite by default, PostgreSQL/MySQL by DSN
+
+The whole store (sessions, messages, timers, compaction journals, sub-agent trees, the blackboard) is written **once** against a tiny async `Database` + `Dialect` port. Pick the backend with a DSN; the code above it never changes.
+
+```python
+from power_loop import StatefulAgentLoop, SchemaPolicy
+
+StatefulAgentLoop(llm=llm, dsn="app.db")                                  # SQLite (zero infra, default)
+StatefulAgentLoop(llm=llm, dsn="postgresql://u:p@host/app")               # PostgreSQL  → pip install 'power-loop[postgres]'
+StatefulAgentLoop(llm=llm, dsn="mysql://u:p@host/app", table_prefix="pl_")  # MySQL    → pip install 'power-loop[mysql]'
+
+# Schema provisioning is a policy. AUTO_CREATE (default) creates tables if missing; VERIFY only
+# checks and, if the schema is absent, raises with the EXACT DDL to run as a privileged user.
+StatefulAgentLoop(llm=llm, dsn="postgresql://readonly@host/app", schema=SchemaPolicy.VERIFY)
+```
+
+SQLite is a single-writer file (zero infra, shard across processes). PostgreSQL/MySQL are real **multi-writer** servers — per-session sequence allocation is correct across processes via a `SELECT … FOR UPDATE` row lock. The same backend-agnostic **conformance suite** runs against all three. See [Storage backends](docs/en/user-guide/storage-backends.md) for the per-backend DDL and provisioning options.
+
+### Stateless, resumable loops
+
+A `StatefulAgentLoop` is a *handle*, not a session. It owns no conversation state — that all lives in the store — so it's cheap to create and you resume any session by id from a cold process:
+
+```python
+# Web handler / worker: build a loop per request, resume the user's session, done.
+loop = StatefulAgentLoop(llm=create_llm_service_from_env(), dsn=DSN)
+await loop.prewarm(session_id)                       # optional: pre-load the active window
+result = await loop.send(user_text, session_id=session_id)
+```
+
+Under the hood the loop keeps a per-session **active-window cache** — but it caches only the *durable* projection, validated by a monotonic `next_seq` token, so it's a pure accelerator: a cold loop with an empty cache produces byte-for-byte the same prompts (proven by a warm-vs-cold conformance test, including the recall/compaction/prompt-edit edge cases).
 
 ### Deterministic multi-agent workflows — that the model can author, and that survive a crash
 
@@ -131,17 +172,17 @@ await create_workflow(spec, parent_loop=loop, executor=ex).run()
 
 ### Durable, operable storage — the part most "agent libraries" skip
 
-The on-disk store is the product, so it's built to run for the long haul:
+The store is the product, so it's built to run for the long haul:
 
 ```python
-store.export_session(sid)                 # full session → a JSON archive (incl. compacted turns)
-store.prune_compacted_messages(sid)       # opt-in retention of folded-out originals
-store.vacuum(); store.checkpoint()        # reclaim disk
-async with StatefulAgentLoop(...) as loop:  # graceful aclose(): drain in-flight sends, then close
+await store.export_session(sid)                 # full session → a JSON archive (incl. compacted turns)
+await store.prune_compacted_messages(sid)       # opt-in retention of folded-out originals
+await store.vacuum(); await store.checkpoint()  # reclaim disk (SQLite; no-op where N/A)
+async with StatefulAgentLoop(...) as loop:      # graceful aclose(): drain in-flight sends, then close
     ...
 ```
 
-It survives upgrades (a `PRAGMA user_version` migration ladder refuses a newer-than-code DB rather than corrupting it), and reads can run on an opt-in read-only WAL pool so they don't queue behind the writer.
+It survives upgrades — a portable `pl_schema_migrations` version table (not a SQLite-only `PRAGMA`) refuses a newer-than-code DB rather than corrupting it, and works identically on every backend.
 
 ### Observe everything, export anywhere
 
@@ -166,7 +207,7 @@ await register_mcp_tools(registry, client, prefix="fs.")   # MCP tools → power
 
 The seam is a tiny `MCPToolSource` Protocol, so the `mcp` SDK is optional and any client works.
 
-> More: hard token budgets, structured output, crash recovery, memory, the blackboard — see [`examples/`](examples/README.md) (39 runnable programs) and the [docs](docs/en/index.md).
+> More: hard token budgets, structured output, crash recovery, memory, the blackboard — see [`examples/`](examples/README.md) (40 runnable programs) and the [docs](docs/en/index.md).
 
 ---
 
@@ -174,11 +215,11 @@ The seam is a tiny `MCPToolSource` Protocol, so the `mcp` SDK is optional and an
 
 power-loop is a **kernel**, not a platform — that's the whole trade-off.
 
-- **vs. LangChain / LangGraph / LlamaIndex / CrewAI / AutoGen** — those are batteries-included frameworks with large ecosystems (connectors, vector stores, integrations) and heavy dependency trees. power-loop deliberately ships **none of that**: a compact (~17k-line) pure-stdlib core with zero dependencies, and you bring your own tools (or an MCP server). You get durable sessions, crash-resumable workflows, and real sandbox seams out of the box; you do **not** get a bundled RAG stack or 100 connectors.
-- **Choose power-loop** when you want to *embed* an agent in an existing app, keep your dependency surface tiny, and care about durability + isolation + a stable contract.
+- **vs. LangChain / LangGraph / LlamaIndex / CrewAI / AutoGen** — those are batteries-included frameworks with large ecosystems (connectors, vector stores, integrations) and heavy dependency trees. power-loop deliberately ships **none of that**: a compact (~20k-line) pure-stdlib core with zero runtime dependencies, and you bring your own tools (or an MCP server). You get durable sessions across SQLite/PG/MySQL, crash-resumable workflows, and real sandbox seams out of the box; you do **not** get a bundled RAG stack or 100 connectors.
+- **Choose power-loop** when you want to *embed* an agent in an existing app, keep your dependency surface tiny, pick your own database, and care about durability + isolation + a stable contract.
 - **Choose a framework** when you want batteries included, a big integration catalog, and don't mind the weight.
 
-Honestly: power-loop is **behind on ecosystem breadth** (integrations, community, age) and **ahead on embeddability, durability, and a machine-guarded stable API**. Pick accordingly.
+Honestly: power-loop is **behind on ecosystem breadth** (integrations, community, age) and **ahead on embeddability, durability, storage flexibility, and a machine-guarded stable API**. Pick accordingly.
 
 ---
 
@@ -187,7 +228,9 @@ Honestly: power-loop is **behind on ecosystem breadth** (integrations, community
 ```bash
 pip install 'power-loop[openai]'      # any OpenAI-compatible endpoint
 pip install 'power-loop[anthropic]'   # native Anthropic Messages API
-pip install 'power-loop[all]'         # both transports + skills/pdf/observability/mcp extras
+pip install 'power-loop[postgres]'    # PostgreSQL backend (asyncpg)
+pip install 'power-loop[mysql]'       # MySQL backend (aiomysql)
+pip install 'power-loop[all]'         # transports + postgres + mysql + skills/pdf/observability/mcp
 ```
 
 Point it at any OpenAI-compatible endpoint (or `POWER_LOOP_PROVIDER=anthropic`):
@@ -198,19 +241,19 @@ POWER_LOOP_API_KEY=sk-...
 POWER_LOOP_MODEL=gpt-4o-mini
 ```
 
-Python 3.10+. See [Getting Started](docs/en/getting-started.md). Optional extras: `skills`, `pdf`, `prometheus`, `statsd`, `otel`, `mcp`.
+Python 3.10+. See [Getting Started](docs/en/getting-started.md). Optional extras: `postgres`, `mysql`, `skills`, `pdf`, `prometheus`, `statsd`, `otel`, `mcp`.
 
 ---
 
 ## Stability & SemVer
 
-As of **1.0**, the **STABLE** API (listed in `power_loop.STABLE_API`) is under SemVer: a breaking change requires a major bump (`2.0.0`), enforced by a frozen-baseline test in CI — including the flagship `StatefulAgentLoop` *and the LLM contract needed to construct it* (so you can build, use, and implement a custom provider from STABLE-only symbols). Error `.code` strings are frozen too.
+As of **1.0**, the **STABLE** API (listed in `power_loop.STABLE_API`) is under SemVer: a breaking change requires a major bump (`2.0.0`), enforced by a frozen-baseline test in CI — including the flagship `StatefulAgentLoop` *and the LLM contract needed to construct it*. Error `.code` strings are frozen too.
 
 | Tier | Meaning |
 |---|---|
 | **Stable** | Backward-compatible within a major version; in `power_loop.STABLE_API`. |
-| **Provisional** | Re-exported from the top level; may change in a future minor. |
-| **Internal** | `power_loop.core.*` etc.; no compatibility promise. |
+| **Provisional** | Re-exported from the top level (e.g. `open_store`, `SchemaPolicy`); may change in a future minor. |
+| **Internal** | `power_loop.core.*`, `power_loop.runtime.store.*` internals; no compatibility promise. |
 
 See the [API reference](docs/en/api/index.md).
 
@@ -220,7 +263,7 @@ See the [API reference](docs/en/api/index.md).
 
 power-loop **orchestrates; it does not, by itself, isolate.** The built-in `bash`/file tools run in-process and inherit the host environment — convenient for trusted, local use, **not a security boundary**. For untrusted/model-authored commands, inject a sandbox via the `ShellBackend` seam (tool-level) or run leaves through `SubprocessExecutor` + `WorkerLauncher` (process-level). Keep secrets in your orchestrator. See [SECURITY.md](SECURITY.md).
 
-**One store file = one writer process.** Per-session ordering is an in-process `asyncio.Lock`; two processes calling `send()` on the same session bypass it. Run one process per store file (shard sessions across files) — the [scaling guide](docs/en/user-guide/scaling.md) has measured numbers and the multi-process pattern. Multi-writer horizontal scale is out of scope.
+**Single-writer-per-session.** Per-session ordering is an in-process `asyncio.Lock`; it gives no cross-process mutual exclusion. With **SQLite**, run one writer process per file (shard sessions across files). With **PostgreSQL/MySQL**, sequence allocation is multi-writer-safe (`SELECT … FOR UPDATE`), but the *pending-state machine* still assumes one writer drives a given session at a time (the dispatcher/queue layer above is yours). Concurrent first-boot of a fresh server schema should provision out-of-band (`SchemaPolicy.VERIFY`). See the [scaling guide](docs/en/user-guide/scaling.md).
 
 **Maturity.** A 1.0 tag here is a confidence statement about the **API/durability contract** — not a claim of years of field-hardening. power-loop is young, primarily a single maintainer, with limited public production track record. The contract is machine-guarded and the project is MIT + forkable; weigh the bus factor for your use.
 
@@ -229,5 +272,5 @@ power-loop **orchestrates; it does not, by itself, isolate.** The built-in `bash
 ## Project & links
 
 - **Used by:** DeepTalk — the agent runtime for a 1-on-1 relationship-IM product's in-conversation agents. *(Using it in production? PR a line here.)*
-- **Develop:** `pip install -e ".[dev]"` · `ruff check .` · `pytest -q --no-real` (drop `--no-real` for the live-LLM suite).
-- [Docs](docs/en/index.md) · [Architecture](docs/en/architecture.md) · [Roadmap to 1.0](ROADMAP_1.0.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [License](LICENSE)
+- **Develop:** `pip install -e ".[dev]"` · `ruff check .` · `pytest -q --no-real` (drop `--no-real` for the live-LLM suite; set a `POWER_LOOP_TEST_PG_DSN` / `POWER_LOOP_TEST_MYSQL_DSN` to run the server-backend conformance suites).
+- [Docs](docs/en/index.md) · [Architecture](docs/en/architecture.md) · [Storage backends](docs/en/user-guide/storage-backends.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [License](LICENSE)

@@ -48,7 +48,7 @@
 from power_loop import StatefulAgentLoop
 
 loop = StatefulAgentLoop(llm=make_llm(), db_path=":memory:")
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send("In one sentence: what is HTTP?", session_id=sid)
 print(result.final_text)
 ```
@@ -84,7 +84,7 @@ loop = StatefulAgentLoop(
         max_rounds=1, compactor=None,
     ),
 )
-sid = loop.new_session()
+sid = await loop.new_session()
 
 # 第 1 轮：建立事实
 r1 = await loop.send("My favorite color is teal.", session_id=sid)
@@ -93,10 +93,10 @@ r1 = await loop.send("My favorite color is teal.", session_id=sid)
 r2 = await loop.send("What did I just tell you my favorite color was?", session_id=sid)
 
 # 查看持久化的 history
-msgs = loop.get_messages(sid)
+msgs = await loop.get_messages(sid)
 
 # 用完即删
-loop.close_session(sid)
+await loop.close_session(sid)
 ```
 
 ### 要点
@@ -202,7 +202,7 @@ loop = StatefulAgentLoop(
 result = await loop.send(
     "Delegate this: what is the capital of Japan?", session_id=sid,
 )
-print(f"surviving subs: {store.list_children(result.session_id)}")
+print(f"surviving subs: {await store.list_children(result.session_id)}")
 ```
 
 ### 要点
@@ -234,8 +234,8 @@ surviving subs: []
 ```python
 # 灌入大量填充消息
 for i in range(4):
-    store.append_message(sid, role="user", content="filler " + "u" * 400, round_index=i)
-    store.append_message(sid, role="assistant", content="filler ack " + "a" * 400, round_index=i)
+    await store.append_message(sid, role="user", content="filler " + "u" * 400, round_index=i)
+    await store.append_message(sid, role="assistant", content="filler ack " + "a" * 400, round_index=i)
 
 # 强制低阈值保证触发
 os.environ["CONTEXT_COMPACT_THRESHOLD"] = "500"
@@ -285,13 +285,13 @@ compact_note preview : 'The transcript contains only repeated filler/keep-alive 
 ### 代码
 
 ```python
-def _simulate_crash_pending(store, sid):
+async def _simulate_crash_pending(store, sid):
     """模拟：LLM 已返回但 tool 调用还没跑完进程就挂了。"""
-    asst_seq = store.append_message(
+    asst_seq = await store.append_message(
         sid, role="assistant",
         tool_calls=[{"id": "tc-stuck", "function": {"name": "echo", "arguments": '{"text":"x"}'}}],
     )
-    store.set_pending(sid, {"assistant_seq": asst_seq, ...})
+    await store.set_pending(sid, {"assistant_seq": asst_seq, ...})
 
 # 直接 send 会抛——协议禁止把悬挂态丢给 LLM
 try:
@@ -300,7 +300,7 @@ except SessionPendingError as exc:
     print(f"[blocked] pending: {[tc['id'] for tc in exc.pending_tool_calls]}")
 
 # 选择 abort_pending（也可以 await loop.resume(sid)）
-n = loop.abort_pending(sid, reason="user_cancelled")
+n = await loop.abort_pending(sid, reason="user_cancelled")
 
 # 现在 send 可以正常往下走
 r = await loop.send("What does HTML stand for?", session_id=sid)
@@ -576,7 +576,7 @@ await queue.put(_STOP)
 # Phase 1：父进程建 session、塞事实、退出
 async def phase1(db_path: str) -> str:
     loop = StatefulAgentLoop(llm=make_llm(), db_path=db_path, ...)
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send("Remember: my name is Alan, favorite number is 37.", session_id=sid)
     loop.close()
     return sid
@@ -1079,7 +1079,7 @@ registry.invoke("bash", {"command": "python -m py_compile path/to/code.py"})
 ```python
 waiting = []
 for label, request in REQUESTS.items():
-    sid = loop.new_session(metadata={"label": label})
+    sid = await loop.new_session(metadata={"label": label})
     result = await loop.send(request, session_id=sid)
     print(result.status, result.pending_interactions)
     waiting.append((label, sid, result.pending_interactions[0]))
@@ -1162,9 +1162,9 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 
 ---
 
-## 24–33 · 较新示例
+## 24–39 · 较新示例
 
-覆盖 0.11–0.14 新增的能力。每条都链接到可运行文件，以及深入讲解它的用户手册页面。
+覆盖 0.11 之后新增的能力（持久化、扩展、可插拔后端、可观测性、MCP）。每条都链接到可运行文件，以及深入讲解它的用户手册页面。
 
 ### 24 · Agent 笔记
 Agent 给自己写持久化笔记（`note_add` / `note_update` / `note_delete`），经 `SQLiteNoteMemory` 持久化，并按 `NotesPolicy` 在每轮重新注入。→ [示例](../../../examples/24_agent_notes.py) · [记忆](../user-guide/memory.md)
@@ -1195,6 +1195,9 @@ Agent 给自己排定唤醒（`schedule_wakeup`），由 `TimerRunner` 当作普
 
 ### 33 · 联动记忆的压缩器
 `Compactor.maybe_compact` 可选接收 `CompactionContext`（注入的 `MemoryProvider` + session_id + 只读读取器），自定义压缩器可在折叠前把要点 `remember` 进记忆；`DefaultCompactor` 与老签名压缩器不受影响。→ [示例](../../../examples/33_coordinating_compactor.py) · [压缩](../user-guide/compaction.md) · [记忆](../user-guide/memory.md)
+
+### 39 · 可插拔后端 + 恢复
+循环是**无状态**句柄——会话状态全在存储里——所以全新的冷启动循环凭 `dsn` + `session_id` 即可恢复任意会话。存储是**可插拔**的：`dsn=` 选 SQLite（默认，零基础设施）、`postgresql://`（`power-loop[postgres]`）或 `mysql://`（`power-loop[mysql]`）。`SchemaPolicy.AUTO_CREATE`（默认）建表；`VERIFY` 只检查，并抛出携带精确 DDL 的 `StoreSchemaError`。`loop.cache_stats` 暴露每会话活动窗口缓存（一个纯加速器）。→ [示例](../../../examples/39_pluggable_backends_and_resume.py) · [存储后端](../user-guide/storage-backends.md)
 
 ---
 
@@ -1227,5 +1230,6 @@ Agent 给自己排定唤醒（`schedule_wakeup`），由 `TimerRunner` 当作普
 | 沙箱化模型写的 bash | [28](#28--docker-shell-后端) |
 | 多个 agent 在共享黑板上协作 | [29](#29--共享黑板) |
 | 按进程隔离工作流叶子 | [30](#30--子进程隔离) |
+| 选后端（SQLite/PG/MySQL）并冷启动恢复 | [39](#39--可插拔后端--恢复) |
 | 构建运行时绑定工具 | [高级运行时](../../../examples/advanced_runtime/) |
 | 看全部功能 | [19](#19-旗舰示例) |

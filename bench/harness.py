@@ -92,17 +92,16 @@ async def run_fanout(
     sessions: int,
     latency_s: float = 0.0,
     db_path: str = ":memory:",
-    read_pool_size: int = 0,
 ) -> dict[str, Any]:
     """N concurrent sessions, one send each. Measures wall-clock throughput
-    (sessions/sec) and per-send latency under single-RLock contention.
+    (sessions/sec) and per-send latency under the async store's single-writer model.
 
-    Pass a file ``db_path`` + ``read_pool_size>0`` to measure the SCALE-2 read pool
-    (the pool is declined for the default ``:memory:`` store)."""
-    store = SessionStore.open(db_path, read_pool_size=read_pool_size)
+    (The legacy SCALE-2 read pool is gone — the async SQLite backend offloads each
+    statement to a worker thread and serializes writers with one ``asyncio.Lock``.)"""
+    store = await SessionStore.open(db_path)
     try:
         loop = _new_loop(store, latency_s)
-        sids = [loop.new_session() for _ in range(sessions)]
+        sids = [await loop.new_session() for _ in range(sessions)]
         latencies: list[float] = []
 
         async def _one(sid: str) -> None:
@@ -117,13 +116,12 @@ async def run_fanout(
             "scenario": "fanout",
             "sessions": sessions,
             "latency_s": latency_s,
-            "read_pool_size": read_pool_size,
             "wall_s": round(wall, 4),
             "sessions_per_sec": round(sessions / wall, 1) if wall > 0 else None,
             "send_latency": _summarize_latencies(latencies),
         }
     finally:
-        store.close()
+        await store.close()
 
 
 async def run_big_history(
@@ -132,12 +130,12 @@ async def run_big_history(
     """One session pre-seeded with ``history_size`` active messages, then ``sends``
     sequential sends. Per-send latency exposes the O(active-history) read + token-scan
     cost that runs each round."""
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = _new_loop(store, latency_s)
-        sid = loop.new_session()
+        sid = await loop.new_session()
         for i in range(history_size):
-            store.append_message(
+            await store.append_message(
                 sid,
                 role="user" if i % 2 == 0 else "assistant",
                 content="x" * 200,
@@ -156,16 +154,16 @@ async def run_big_history(
             "send_latency": _summarize_latencies(latencies),
         }
     finally:
-        store.close()
+        await store.close()
 
 
 async def run_throughput(*, total_sends: int, latency_s: float = 0.0) -> dict[str, Any]:
     """Sustained sequential sends on one session. Reports sends/sec — a steady-state
     write-path number without fan-out contention."""
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = _new_loop(store, latency_s)
-        sid = loop.new_session()
+        sid = await loop.new_session()
         latencies: list[float] = []
         wall_t0 = time.perf_counter()
         for _ in range(total_sends):
@@ -182,4 +180,4 @@ async def run_throughput(*, total_sends: int, latency_s: float = 0.0) -> dict[st
             "send_latency": _summarize_latencies(latencies),
         }
     finally:
-        store.close()
+        await store.close()

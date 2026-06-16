@@ -38,7 +38,7 @@ async def main() -> str:
         ),
     )
 
-    sid = loop.new_session()
+    sid = await loop.new_session()
 
     # 第 1 轮：建立事实 / Turn 1: establish a fact
     r1 = await loop.send("My favorite color is teal. Acknowledge briefly.", session_id=sid)
@@ -53,11 +53,11 @@ async def main() -> str:
     print(f"turn 2: {r2.final_text}\n")
 
     # 检查持久化的 history / Check persisted history
-    msgs = loop.get_messages(sid)
+    msgs = await loop.get_messages(sid)
     print(f"history has {len(msgs)} messages: roles = {[m['role'] for m in msgs]}")
 
     # 用完即删（生产里通常不删）/ Delete when done (usually not in production)
-    deleted = loop.close_session(sid)
+    deleted = await loop.close_session(sid)
     print(f"deleted {deleted} session row(s)")
 
     return r2.final_text

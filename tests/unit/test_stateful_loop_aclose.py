@@ -65,22 +65,22 @@ def _cfg() -> AgentLoopConfig:
 async def test_async_context_manager_closes_owned_store() -> None:
     loop = StatefulAgentLoop(llm=_SlowLLM(delay=0.0), db_path=":memory:", config=_cfg())
     async with loop:
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("hi", sid)
         assert r.status == "completed"
     assert loop._closing is True
     # owned store was closed → using its connection now raises
     with pytest.raises(sqlite3.ProgrammingError):
-        loop.store._conn.execute("SELECT 1")
+        loop.store._db._conn.execute("SELECT 1")
 
 
 async def test_aclose_waits_for_inflight_send_and_rejects_new() -> None:
     """The race fix: aclose blocks new sends immediately but lets the in-flight one
     finish cleanly (no ProgrammingError), then returns."""
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     llm = _SlowLLM(delay=0.2)
     loop = StatefulAgentLoop(llm=llm, store=store, config=_cfg())
-    sid = loop.new_session()
+    sid = await loop.new_session()
 
     send_task = asyncio.create_task(loop.send("hi", sid))
     await asyncio.wait_for(llm.started.wait(), timeout=1)  # send now holds the lock
@@ -97,19 +97,19 @@ async def test_aclose_waits_for_inflight_send_and_rejects_new() -> None:
     await asyncio.wait_for(close_task, timeout=2)      # aclose returns after it drained
 
     # store was NOT owned by the loop → aclose left it open and consistent
-    assert store.get_session(sid) is not None
-    store.close()
+    assert await store.get_session(sid) is not None
+    await store.close()
 
 
 async def test_aclose_leaves_unowned_store_open() -> None:
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     loop = StatefulAgentLoop(llm=_SlowLLM(delay=0.0), store=store, config=_cfg())
-    sid = loop.new_session()
+    sid = await loop.new_session()
     await loop.send("hi", sid)
     await loop.aclose()
     # not owned → still usable
-    assert store.get_session(sid) is not None
-    store.close()
+    assert await store.get_session(sid) is not None
+    await store.close()
 
 
 async def test_aclose_is_idempotent() -> None:
@@ -121,7 +121,7 @@ async def test_aclose_is_idempotent() -> None:
 
 async def test_send_and_follow_up_after_aclose_raise() -> None:
     loop = StatefulAgentLoop(llm=_SlowLLM(delay=0.0), db_path=":memory:", config=_cfg())
-    sid = loop.new_session()
+    sid = await loop.new_session()
     await loop.aclose()
     with pytest.raises(RuntimeError, match="closing"):
         await loop.send("x", sid)

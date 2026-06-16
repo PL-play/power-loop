@@ -119,11 +119,11 @@ async def main() -> None:
         config=AgentLoopConfig(system_prompt=prompt_a, max_rounds=1, compactor=None),
     )
     try:
-        sid = loop_a.new_session()
+        sid = await loop_a.new_session()
         r = await loop_a.send("How do I read a JSON file?", session_id=sid)
         print(f"[Python Expert]\n{r.final_text}\n")
     finally:
-        loop_a.close()
+        await loop_a.aclose()
 
     # Scenario B: Python expert + Security reviewer
     prompt_b = build_system_prompt(SKILL_PYTHON, SKILL_SECURITY)
@@ -132,14 +132,14 @@ async def main() -> None:
         config=AgentLoopConfig(system_prompt=prompt_b, max_rounds=1, compactor=None),
     )
     try:
-        sid = loop_b.new_session()
+        sid = await loop_b.new_session()
         r = await loop_b.send(
             "Review this code: `query = f\"SELECT * FROM users WHERE name='{name}'\"`",
             session_id=sid,
         )
         print(f"[Python Expert + Security]\n{r.final_text}")
     finally:
-        loop_b.close()
+        await loop_b.aclose()
 
 
 if __name__ == "__main__":

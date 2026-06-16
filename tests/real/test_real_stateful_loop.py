@@ -16,7 +16,7 @@ from .judge import assert_passes
 
 @pytest.mark.asyncio
 async def test_single_send_returns_meaningful_reply() -> None:
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=256, temperature=0.2),
@@ -28,7 +28,7 @@ async def test_single_send_returns_meaningful_reply() -> None:
             ),
         )
         q = "In one sentence, explain what HTTP stands for."
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send(q, session_id=sid)
         assert r.status == "completed"
         assert r.final_text.strip()
@@ -42,14 +42,14 @@ async def test_single_send_returns_meaningful_reply() -> None:
             ),
         )
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_multi_turn_carries_session_history() -> None:
     """Second send must see the first turn — model is told a fact, then
     asked about it implicitly. The judge checks coherence."""
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=256, temperature=0),
@@ -63,7 +63,7 @@ async def test_multi_turn_carries_session_history() -> None:
                 compactor=None,
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r1 = await loop.send("My favorite color is teal. Acknowledge briefly.", session_id=sid)
         assert r1.status == "completed"
 
@@ -79,12 +79,12 @@ async def test_multi_turn_carries_session_history() -> None:
             ),
         )
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_close_session_removes_history_from_store() -> None:
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=128, temperature=0),
@@ -95,11 +95,11 @@ async def test_close_session_removes_history_from_store() -> None:
                 compactor=None,
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("Say OK.", session_id=sid)
-        assert store.get_session(r.session_id) is not None
-        deleted = loop.close_session(r.session_id)
+        assert await store.get_session(r.session_id) is not None
+        deleted = await loop.close_session(r.session_id)
         assert deleted >= 1
-        assert store.get_session(r.session_id) is None
+        assert await store.get_session(r.session_id) is None
     finally:
-        store.close()
+        await store.close()

@@ -54,19 +54,21 @@ class StaticMemory:
         return None  # this demo's memory is static
 
 
-def _seed_fat_history(store: SessionStore, sid: str, turns: int = 4) -> None:
+async def _seed_fat_history(store: SessionStore, sid: str, turns: int = 4) -> None:
     for i in range(turns):
-        store.append_message(sid, role="user", content="filler " + ("u" * 400), round_index=i)
-        store.append_message(sid, role="assistant", content="filler ack " + ("a" * 400), round_index=i)
+        await store.append_message(sid, role="user", content="filler " + ("u" * 400), round_index=i)
+        await store.append_message(
+            sid, role="assistant", content="filler ack " + ("a" * 400), round_index=i
+        )
 
 
 async def main() -> str:
     os.environ["CONTEXT_COMPACT_THRESHOLD"] = "500"  # force compaction every round
 
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
-        sid = store.create_session(system_prompt="S")
-        _seed_fat_history(store, sid, turns=4)
+        sid = await store.create_session(system_prompt="S")
+        await _seed_fat_history(store, sid, turns=4)
 
         loop = StatefulAgentLoop(
             llm=make_llm(),
@@ -89,11 +91,11 @@ async def main() -> str:
         print(f"reply    : {r.final_text}")
 
         # ── invariants the C1 fix guarantees ──
-        all_rows = store.load_all_messages(sid)
+        all_rows = await store.load_all_messages(sid)
         memory_rows = [m for m in all_rows if (m.name or "").startswith("memory_")]
         folded = {m.seq for m in all_rows if m.state is MessageState.COMPACTED_OUT}
         active = {m.seq for m in all_rows if m.state is MessageState.ACTIVE}
-        comps = store.list_compactions(sid)
+        comps = await store.list_compactions(sid)
 
         print(f"compactions recorded : {len(comps)}")
         print(f"recalled memory rows persisted : {len(memory_rows)} (expect 0)")
@@ -104,7 +106,7 @@ async def main() -> str:
         assert folded and folded.isdisjoint(active), "compacted rows must be a clean, disjoint set"
         return r.final_text
     finally:
-        store.close()
+        await store.close()
 
 
 if __name__ == "__main__":

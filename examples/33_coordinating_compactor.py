@@ -77,26 +77,26 @@ class CoordinatingCompactor(DefaultCompactor):
         return plan
 
 
-def _seed_with_codename(store: SessionStore, sid: str) -> None:
-    store.append_message(
+async def _seed_with_codename(store: SessionStore, sid: str) -> None:
+    await store.append_message(
         sid, role="user",
         content=f"For the record, the project codename is {CODENAME}. " + ("context " * 80),
         round_index=0,
     )
-    store.append_message(sid, role="assistant", content="Noted. " + ("ok " * 80), round_index=0)
+    await store.append_message(sid, role="assistant", content="Noted. " + ("ok " * 80), round_index=0)
     for i in range(1, 5):
-        store.append_message(sid, role="user", content="(work) " + ("filler " * 120), round_index=i)
-        store.append_message(sid, role="assistant", content="done " + ("ok " * 120), round_index=i)
+        await store.append_message(sid, role="user", content="(work) " + ("filler " * 120), round_index=i)
+        await store.append_message(sid, role="assistant", content="done " + ("ok " * 120), round_index=i)
 
 
 async def main() -> dict:
     os.environ["CONTEXT_COMPACT_THRESHOLD"] = "500"
     memory = CapturingMemory()
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         # ── Session A: long convo → compaction → compactor captures the slice ──
-        sid_a = store.create_session(system_prompt="S")
-        _seed_with_codename(store, sid_a)
+        sid_a = await store.create_session(system_prompt="S")
+        await _seed_with_codename(store, sid_a)
         loop_a = StatefulAgentLoop(
             llm=make_llm(max_tokens=200), store=store,
             config=AgentLoopConfig(
@@ -110,7 +110,7 @@ async def main() -> dict:
         print(f"[A] captured snippets: {len(memory.captured)}; has codename: {captured_has_codename}")
 
         # ── Session B: brand-new session — the codename comes back via recall ──
-        sid_b = store.create_session(system_prompt="S")
+        sid_b = await store.create_session(system_prompt="S")
         loop_b = StatefulAgentLoop(
             llm=make_llm(max_tokens=200), store=store,
             config=AgentLoopConfig(
@@ -129,7 +129,7 @@ async def main() -> dict:
             "answer_has_codename": answer_has_codename,
         }
     finally:
-        store.close()
+        await store.close()
 
 
 if __name__ == "__main__":

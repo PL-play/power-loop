@@ -52,7 +52,7 @@ async def judge_async(
     state with the system under test.
     """
     llm = make_llm(max_tokens=256, temperature=0, model=model)
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=llm,
@@ -70,11 +70,11 @@ async def judge_async(
             f"ANSWER:\n{answer}\n\n"
             f"RUBRIC (all must hold):\n{rubric}"
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         result = await loop.send(user_msg, session_id=sid)
         return _parse_verdict(result.final_text)
     finally:
-        store.close()
+        await store.close()
 
 
 def judge_sync(**kwargs) -> Verdict:

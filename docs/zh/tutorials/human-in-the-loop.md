@@ -101,7 +101,7 @@ async def main():
     )
     worker = asyncio.create_task(approval_worker())
     try:
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send("列出当前目录文件。", session_id=sid)
         print(f"Bot: {r.final_text}")
     finally:

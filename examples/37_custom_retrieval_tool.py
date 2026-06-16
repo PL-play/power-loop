@@ -76,7 +76,7 @@ async def main() -> str:
             max_rounds=4,
         ),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("How many runtime dependencies does the power-loop core have?",
                              session_id=sid, tools=["search_docs"])
     print(result.final_text)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Generator
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import pytest
@@ -31,10 +31,10 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.fixture
-def store() -> Generator[SessionStore, None, None]:
-    s = SessionStore.open(":memory:")
+async def store() -> AsyncIterator[SessionStore]:
+    s = await SessionStore.open(":memory:")
     yield s
-    s.close()
+    await s.close()
 
 
 # ── default SqliteBlackboard ──────────────────────────────────────────────────
@@ -127,7 +127,7 @@ def _tools() -> ToolRegistry:
 async def test_board_tools_end_to_end() -> None:
     loop = StatefulAgentLoop(llm=_LLM(), db_path=":memory:",
                              config=AgentLoopConfig(system_prompt="o", compactor=None))
-    sid = loop.new_session(metadata={"spec_name": "alice"})
+    sid = await loop.new_session(metadata={"spec_name": "alice"})
     bb = SqliteBlackboard(loop.store)
     reg = _tools()
     post = reg.get("board_post").handler
@@ -162,7 +162,7 @@ async def test_board_tools_error_when_no_board_configured() -> None:
 async def test_board_post_validates_kind() -> None:
     loop = StatefulAgentLoop(llm=_LLM(), db_path=":memory:",
                              config=AgentLoopConfig(system_prompt="o", compactor=None))
-    sid = loop.new_session()
+    sid = await loop.new_session()
     reg = _tools()
     post = reg.get("board_post").handler
     with runtime_env_context(RuntimeEnv(blackboard=SqliteBlackboard(loop.store), blackboard_id="b")):

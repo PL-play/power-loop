@@ -142,15 +142,15 @@ async def main() -> str:
 #   from power_loop import TimerRunner
 #   from power_loop.workflow import create_workflow, register_wake_guard, get_workflow
 #
-#   register_wake_guard(loop)                 # dedupe at-least-once wake timers
+#   register_wake_guard(loop)                 # SYNC: dedupe at-least-once wake timers
 #   await TimerRunner(loop).start()           # REQUIRED: delivers the wake
-#   parent_sid = loop.new_session()
+#   parent_sid = await loop.new_session()
 #   wf = create_workflow(SPEC, parent_loop=loop, parent_session_id=parent_sid)
 #   handle = await wf.start(detached=True)    # returns immediately; runs in background
 #   # ... the parent agent can pass_turn now; it is woken with the result when done.
-#   # Inspect any time:
-#   #   get_workflow(loop, parent_sid, handle.run_id, detail=True)  -> status + steps + usage
-#   #   list_workflows(loop, parent_sid)                            -> all runs
+#   # Inspect any time (introspection helpers are async):
+#   #   await get_workflow(loop, parent_sid, handle.run_id, detail=True)  -> status + steps + usage
+#   #   await list_workflows(loop, parent_sid)                            -> all runs
 
 
 # ── Resume across a process restart (full tier) ──────────────────────────────
@@ -163,8 +163,8 @@ async def main() -> str:
 #   from power_loop.workflow import resume_run, resume_detached, get_workflow
 #
 #   # ... new process, same db_path; parent_sid + run_id known (persisted by you)
-#   info = get_workflow(loop, parent_sid, run_id)        # status == "failed"/"running"?
-#   result = await resume_run(loop, parent_sid, run_id)  # sync; replays + finishes tail
+#   info = await get_workflow(loop, parent_sid, run_id)  # status == "failed"/"running"?
+#   result = await resume_run(loop, parent_sid, run_id)  # replays + finishes tail
 #   #   or, to resume in the background and wake the parent on completion:
 #   #   handle = await resume_detached(loop, parent_sid, run_id)
 #   #

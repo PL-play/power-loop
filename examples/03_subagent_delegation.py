@@ -39,7 +39,7 @@ async def main() -> str:
     registry = ToolRegistry()
     register_spawn_agent(registry)        # ← spawn_agent + run_agent 都注册 / both registered
 
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=make_llm(),
@@ -56,7 +56,7 @@ async def main() -> str:
                 compactor=None,
             ),
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
         result = await loop.send(
             "Delegate this and report back: what is the capital of Japan?",
             session_id=sid,
@@ -65,10 +65,10 @@ async def main() -> str:
         print(f"reply         : {result.final_text}")
         # EPHEMERAL：子会话已删，list_children 返回空
         # EPHEMERAL: child session deleted, list_children returns empty
-        print(f"surviving subs: {store.list_children(result.session_id)}")
+        print(f"surviving subs: {await store.list_children(result.session_id)}")
         return result.final_text
     finally:
-        store.close()
+        await store.close()
 
 
 if __name__ == "__main__":

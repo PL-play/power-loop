@@ -65,7 +65,7 @@ def _loop() -> StatefulAgentLoop:
 async def test_run_agent_spec_honors_pre_cancelled_token():
     """A pre-cancelled stop_event reaches the child loop, which stops at round 0."""
     loop = _loop()
-    sid = loop.new_session()
+    sid = await loop.new_session()
     token = CancellationToken()
     token.cancel("stop now")
 

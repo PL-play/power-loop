@@ -156,7 +156,7 @@ async def main() -> dict | None:
             ),
         )
         env = RuntimeEnv(workspace_dir=host_ws, shell_backend=backend)
-        sid = loop.new_session()
+        sid = await loop.new_session()
         with runtime_env_context(env):
             res = await loop.send(
                 "Two things, using bash: (1) print the PRETTY_NAME line from "
@@ -169,7 +169,7 @@ async def main() -> dict | None:
         # model's prose) must show the CONTAINER's OS and the bind-mounted file.
         bash_outputs = "\n".join(
             str(m.get("content", ""))
-            for m in loop.get_messages(sid)
+            for m in await loop.get_messages(sid)
             if m.get("role") == "tool"
         )
         print("Final answer:\n", res.final_text)

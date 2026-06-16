@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Generator
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -99,10 +99,10 @@ def _echo_registry() -> ToolRegistry:
 
 
 @pytest.fixture
-def store() -> Generator[SessionStore, None, None]:
-    s = SessionStore.open(":memory:")
+async def store() -> AsyncIterator[SessionStore]:
+    s = await SessionStore.open(":memory:")
     yield s
-    s.close()
+    await s.close()
 
 
 @pytest.mark.asyncio
@@ -119,7 +119,7 @@ async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore) -> N
         config=AgentLoopConfig(system_prompt="S", max_rounds=4),
         tool_registry=_echo_registry(),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     send_task = asyncio.create_task(loop.send("start", sid))
 
     for _ in range(200):
@@ -140,7 +140,7 @@ async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore) -> N
     result = await send_task
     assert result.status == "completed"
 
-    rows = store.load_active_messages(sid)
+    rows = await store.load_active_messages(sid)
     follow_rows = [r for r in rows if r.name == FOLLOW_UP_MESSAGE_NAME]
     assert len(follow_rows) == 1
     assert "focus on feelings" in follow_rows[0].content

@@ -24,7 +24,7 @@ async def main():
             max_rounds=1,
         ),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("Hello!", session_id=sid)
     print(result.final_text)
     # → "Hello! How can I help?"
@@ -39,7 +39,7 @@ asyncio.run(main())
 ## 2. Multi-Turn — Keep the Conversation Going
 
 ```python
-sid = loop.new_session()
+sid = await loop.new_session()
 r1 = await loop.send("My name is Alan.", session_id=sid)
 print(sid)  # e.g., "sess_abc123..."
 
@@ -49,8 +49,8 @@ print(r2.final_text)  # → "Your name is Alan."
 
 **Key points**:
 - Pass the same `session_id` to continue the same conversation.
-- The library loads the full history from SQLite — you never manage `messages` yourself.
-- `loop.get_messages(sid)` returns the active history if you need it.
+- The library loads the full history from the store — you never manage `messages` yourself.
+- `await loop.get_messages(sid)` returns the active history if you need it.
 
 ## 3. Tool Calling — Give the Agent Abilities
 
@@ -83,7 +83,7 @@ loop = StatefulAgentLoop(
     ),
 )
 
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send("What's the weather in Tokyo?", session_id=sid)
 # LLM calls get_weather(city="Tokyo") → result.final_text mentions "sunny, 22°C"
 ```
@@ -113,7 +113,7 @@ loop = StatefulAgentLoop(
     ),
 )
 
-sid = loop.new_session()
+sid = await loop.new_session()
 result = await loop.send(
     "Research: find the population of Tokyo, then tell me if it's "
     "larger than London's population.",
@@ -125,7 +125,7 @@ result = await loop.send(
 **Key points**:
 - `spawn_agent` is a tool the LLM calls; the library runs a child `StatefulAgentLoop`.
 - `AgentSpec` (declarative) gives you explicit control: tool whitelist, model, max_rounds.
-- Sub-agents get their own SQLite rows, linked to the parent via `parent_session_id`.
+- Sub-agents get their own rows in the store, linked to the parent via `parent_session_id`.
 
 ## 5. Hooks — Intercept the Loop
 
@@ -174,21 +174,22 @@ loop = StatefulAgentLoop(llm=llm, event_bus=bus, ...)
 
 ```python
 # Process 1
-loop = StatefulAgentLoop(llm=llm, db_path="./chat.db", ...)
-sid = loop.new_session()
+loop = StatefulAgentLoop(llm=llm, dsn="./chat.db", ...)
+sid = await loop.new_session()
 r1 = await loop.send("Remember: my name is Alan.", session_id=sid)
 loop.close()
 
 # Process 2 (hours later, different Python process)
-loop2 = StatefulAgentLoop(llm=llm, db_path="./chat.db", ...)
+loop2 = StatefulAgentLoop(llm=llm, dsn="./chat.db", ...)
 r2 = await loop2.send("What is my name?", session_id=sid)
 print(r2.final_text)  # → "Your name is Alan."
 ```
 
 **Key points**:
-- `db_path` points to a real file (default: `./power_loop_sessions.db`); `":memory:"` for tests.
-- The session lives in SQLite — open the same file in a new process, pass the same `session_id`, and the LLM sees the full history.
+- `dsn` picks the backend by scheme: a bare path or `sqlite://…` is SQLite (default file: `./power_loop_sessions.db`; `":memory:"` for tests), `postgresql://…` is PostgreSQL, `mysql://…` is MySQL. (`db_path=` is an accepted alias for `dsn=`.)
+- The session lives in the store — reconstruct the loop from the same `dsn` in a new process, pass the same `session_id`, and the LLM sees the full history. The loop itself holds no authoritative state.
 - Works across subprocesses, containers, and restarts.
+- See [Storage backends](storage-backends.md) for picking SQLite vs PostgreSQL/MySQL and provisioning the schema.
 
 ## 8. What's Next?
 

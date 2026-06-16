@@ -139,11 +139,11 @@ async def _handle_workflow_status(**kwargs: Any) -> str:
         return "Error: no active session."
     run_id = kwargs.get("run_id")
     if run_id:
-        j = get_workflow(loop, parent_sid, str(run_id), detail=bool(kwargs.get("detail")))
+        j = await get_workflow(loop, parent_sid, str(run_id), detail=bool(kwargs.get("detail")))
         if j is None:
             return f"No workflow run '{run_id}' found."
         return json.dumps(j, ensure_ascii=False, indent=2)
-    runs = list_workflows(loop, parent_sid)
+    runs = await list_workflows(loop, parent_sid)
     if not runs:
         return "No workflow runs."
     return "\n".join(f"{r['run_id']}  {r['status']:<14} {r['workflow']} ({r['steps']} steps)" for r in runs)

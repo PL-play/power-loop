@@ -65,13 +65,13 @@ async def run_with_provider(label: str, config: LLMProviderConfig, question: str
         ),
     )
     try:
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send(question, session_id=sid)
         print(f"[{label}] model={config.model}")
         print(f"[{label}] reply: {r.final_text[:120]}")
         return r.final_text
     finally:
-        loop.close()
+        await loop.aclose()
 
 
 async def main() -> None:
