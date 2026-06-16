@@ -35,7 +35,7 @@ async def test_parent_can_spawn_subagent_via_tool() -> None:
     """End-to-end: parent LLM should choose to call spawn_agent and surface
     the child's answer. We verify that a child session was created and
     cleaned up (EPHEMERAL default = delete on completed)."""
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         registry = ToolRegistry()
         register_spawn_agent(registry)
@@ -56,11 +56,11 @@ async def test_parent_can_spawn_subagent_via_tool() -> None:
             tool_registry=registry,
         )
         q = "Delegate this and report back: what is the capital of Japan?"
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send(q, session_id=sid)
         assert r.status == "completed"
         # All EPHEMERAL children should be cleaned up by now.
-        assert store.list_children(r.session_id) == []
+        assert await store.list_children(r.session_id) == []
         await assert_passes(
             question=q,
             answer=r.final_text,
@@ -70,14 +70,14 @@ async def test_parent_can_spawn_subagent_via_tool() -> None:
             ),
         )
     finally:
-        store.close()
+        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_run_agent_spec_with_linked_lifecycle_persists_child() -> None:
     """Direct `run_agent_spec` call with LINKED lifecycle: the child session
     should survive past return so the parent can audit it."""
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         parent_loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=128, temperature=0),
@@ -89,7 +89,7 @@ async def test_run_agent_spec_with_linked_lifecycle_persists_child() -> None:
             ),
         )
         # Run one parent turn to get a parent session id in place.
-        parent_sid = parent_loop.new_session()
+        parent_sid = await parent_loop.new_session()
         pr = await parent_loop.send("hi", session_id=parent_sid)
         assert pr.session_id == parent_sid
 
@@ -115,7 +115,7 @@ async def test_run_agent_spec_with_linked_lifecycle_persists_child() -> None:
 
         assert result["status"] == "completed"
         assert result["session_id"] is not None  # LINKED → preserved
-        children = store.list_children(parent_sid)
+        children = await store.list_children(parent_sid)
         assert len(children) == 1
         assert children[0].lifecycle is SubagentLifecycle.LINKED
 
@@ -125,4 +125,4 @@ async def test_run_agent_spec_with_linked_lifecycle_persists_child() -> None:
             rubric="Answer contains the number 42.",
         )
     finally:
-        store.close()
+        await store.close()

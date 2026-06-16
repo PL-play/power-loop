@@ -80,7 +80,7 @@ async def main() -> None:
     )
 
     # Run A: only expose get_weather — the model cannot call get_stock at all.
-    sid_a = loop.new_session()
+    sid_a = await loop.new_session()
     res_a = await loop.send(
         "What's the weather in Tokyo, and the price of AAPL?",
         session_id=sid_a,
@@ -89,7 +89,7 @@ async def main() -> None:
     print("A (weather only):", res_a.final_text)
 
     # Run B: only expose get_stock + a per-run system prompt override.
-    sid_b = loop.new_session()
+    sid_b = await loop.new_session()
     res_b = await loop.send(
         "What's the weather in Tokyo, and the price of AAPL?",
         session_id=sid_b,

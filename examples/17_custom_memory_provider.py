@@ -141,7 +141,7 @@ async def main() -> None:
         ),
     )
     try:
-        sid1 = loop.new_session()
+        sid1 = await loop.new_session()
         r1 = await loop.send(
             "My name is Alan and I work at Acme Corp. One sentence reply.",
             session_id=sid1,
@@ -149,7 +149,7 @@ async def main() -> None:
         print(f"[Session A] reply: {r1.final_text}")
         print(f"[Session A] events: {events}")
     finally:
-        loop.close()
+        await loop.aclose()
 
     # Verify: facts stored in mock API
     assert "alan" in str(api._store.get("user_42", {})).lower()
@@ -170,7 +170,7 @@ async def main() -> None:
         ),
     )
     try:
-        sid2 = loop2.new_session()
+        sid2 = await loop2.new_session()
         r2 = await loop2.send(
             "What is my name and where do I work? One sentence.",
             session_id=sid2,
@@ -178,7 +178,7 @@ async def main() -> None:
         print(f"[Session B] reply: {r2.final_text}")
         print(f"[Session B] events: {events}")
     finally:
-        loop2.close()
+        await loop2.aclose()
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ def _build_registry(call_log: list[str]) -> ToolRegistry:
 @pytest.mark.asyncio
 async def test_tool_round_routes_through_registry_and_judges_answer() -> None:
     call_log: list[str] = []
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=512, temperature=0),
@@ -66,7 +66,7 @@ async def test_tool_round_routes_through_registry_and_judges_answer() -> None:
             tool_registry=_build_registry(call_log),
         )
         q = "What is Lima's signature dish? Be brief."
-        sid = loop.new_session()
+        sid = await loop.new_session()
         r = await loop.send(q, session_id=sid)
         assert r.status == "completed"
         assert "lima" in call_log, (
@@ -74,11 +74,11 @@ async def test_tool_round_routes_through_registry_and_judges_answer() -> None:
         )
 
         # Verify pending is cleared after every tool resolves.
-        assert loop.get_pending(r.session_id) is None
+        assert await loop.get_pending(r.session_id) is None
 
         # Verify persistence: the store records the assistant(tool_calls)
         # and the matching tool message.
-        msgs = loop.get_messages(r.session_id)
+        msgs = await loop.get_messages(r.session_id)
         roles = [m["role"] for m in msgs]
         assert "tool" in roles, f"no tool message persisted; roles={roles}"
 
@@ -91,4 +91,4 @@ async def test_tool_round_routes_through_registry_and_judges_answer() -> None:
             ),
         )
     finally:
-        store.close()
+        await store.close()

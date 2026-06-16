@@ -159,7 +159,7 @@ async def drive_session(
     label: str,
     user_input: str,
 ) -> dict[str, Any]:
-    sid = loop.new_session(metadata={"label": label})
+    sid = await loop.new_session(metadata={"label": label})
     r = await loop.send(user_input, session_id=sid)
     print(f"[{label}] done: status={r.status}, rounds={r.rounds}")
     return {"label": label, "sid": r.session_id, "text": r.final_text}

@@ -131,13 +131,13 @@ async def main() -> dict:
     # the histories live in separate stores, not one shared one.
     inspected_assistant = False
     if fr and fr.db_path and os.path.exists(fr.db_path):
-        store = SessionStore.open(fr.db_path)
+        store = await SessionStore.open(fr.db_path)
         try:
             inspected_assistant = any(
-                m.role == "assistant" for m in store.load_all_messages(fr.session_id)
+                m.role == "assistant" for m in await store.load_all_messages(fr.session_id)
             )
         finally:
-            store.close()
+            await store.close()
 
     out = {
         "status": result.status,

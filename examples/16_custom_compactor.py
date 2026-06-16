@@ -115,7 +115,7 @@ async def main() -> None:
             "My hobby is hiking.",
             "I drink coffee every morning.",
         ]
-        sid = loop.new_session()
+        sid = await loop.new_session()
         for fact in facts:
             r = await loop.send(f"Remember: {fact}", session_id=sid)
 
@@ -128,7 +128,7 @@ async def main() -> None:
         print(f"Reply: {r.final_text}")
         print(f"Rounds: {r.rounds}")
     finally:
-        loop.close()
+        await loop.aclose()
 
 
 if __name__ == "__main__":

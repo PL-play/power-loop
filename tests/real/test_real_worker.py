@@ -37,10 +37,10 @@ async def test_isolated_worker_real_llm_from_env() -> None:
     assert result["usage"].get("total_tokens", 0) > 0  # real provider was used
 
     # The private ledger is inspectable after the fact.
-    store = SessionStore.open(db)
+    store = await SessionStore.open(db)
     try:
-        msgs = store.load_all_messages(result["session_id"])
+        msgs = await store.load_all_messages(result["session_id"])
         assert any(m.role == "assistant" for m in msgs)
     finally:
-        store.close()
+        await store.close()
     os.remove(db)

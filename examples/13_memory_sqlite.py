@@ -130,7 +130,7 @@ async def main() -> None:
 
         # ── Session A：教 Agent 一个事实 / Teach the agent a fact ────────
         print("\n── Session A: teach the agent a fact ──")
-        store = SessionStore.open(sess_path)
+        store = await SessionStore.open(sess_path)
         try:
             bus_a = AgentEventBus()
             seen_a = _print_events(bus_a, "A")
@@ -141,7 +141,7 @@ async def main() -> None:
                     memory=memory,
                 ),
             )
-            sid1 = loop.new_session()
+            sid1 = await loop.new_session()
             r1 = await loop.send(
                 "My name is Alan and my favorite number is 37. Reply in one sentence.",
                 session_id=sid1,
@@ -149,7 +149,7 @@ async def main() -> None:
             print(f"[A] reply={r1.final_text}")
             print(f"[A] memory events: {[e.type.value for e in seen_a]}")
         finally:
-            store.close()
+            await store.close()
 
         # 验：直接看 SQLite，事实已经入库
         # Verify: check SQLite directly — facts are stored
@@ -160,7 +160,7 @@ async def main() -> None:
         # ── Session B：完全新 session，靠 recall 把事实带回来 ──────────
         #    Brand new session — facts come back via recall
         print("\n── Session B: new session — does the agent remember? ──")
-        store = SessionStore.open(sess_path)
+        store = await SessionStore.open(sess_path)
         try:
             bus_b = AgentEventBus()
             seen_b = _print_events(bus_b, "B")
@@ -171,7 +171,7 @@ async def main() -> None:
                     memory=memory,
                 ),
             )
-            sid2 = loop.new_session()
+            sid2 = await loop.new_session()
             r2 = await loop.send(
                 "What is my name? What is my favorite number? One sentence.",
                 session_id=sid2,
@@ -180,7 +180,7 @@ async def main() -> None:
             print(f"[B] memory events: {[e.type.value for e in seen_b]}")
             assert r2.session_id != r1.session_id, "should be different sessions"
         finally:
-            store.close()
+            await store.close()
 
 
 if __name__ == "__main__":

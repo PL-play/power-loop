@@ -154,7 +154,7 @@ async def run_with_policy(confirm_fn: ConfirmFn, prompt: str) -> str:
             compactor=None,
         ),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send(prompt, session_id=sid)
     print(f"\n[reply] status={r.status}, rounds={r.rounds}")
     print(f"[reply] {r.final_text}")

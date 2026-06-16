@@ -51,7 +51,7 @@ async def main(answers: Sequence[str] | None = None) -> list[dict[str, Any]]:
     provided_answers = list(answers or [])
 
     with tempfile.TemporaryDirectory(prefix="power-loop-input-") as tmp:
-        store = SessionStore.open(f"{tmp}/sessions.sqlite3")
+        store = await SessionStore.open(f"{tmp}/sessions.sqlite3")
         loop = StatefulAgentLoop(
             llm=llm,
             store=store,
@@ -62,7 +62,7 @@ async def main(answers: Sequence[str] | None = None) -> list[dict[str, Any]]:
         try:
             waiting: list[dict[str, Any]] = []
             for label, request in REQUESTS.items():
-                sid = loop.new_session(metadata={"label": label})
+                sid = await loop.new_session(metadata={"label": label})
                 result = await loop.send(request, session_id=sid)
                 if result.status != "waiting_for_input" or not result.pending_interactions:
                     raise RuntimeError(f"session {label} did not pause for input: {result!r}")
@@ -98,7 +98,7 @@ async def main(answers: Sequence[str] | None = None) -> list[dict[str, Any]]:
             return completed
         finally:
             await llm.close()
-            store.close()
+            await store.close()
 
 
 def _next_answer(provided_answers: list[str], interaction: dict[str, Any]) -> str:

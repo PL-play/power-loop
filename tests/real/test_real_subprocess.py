@@ -53,8 +53,8 @@ async def test_leaf_runs_real_model_in_subprocess() -> None:
     # The leaf ran in its own db file, inspectable afterward.
     db_path = leaf.session_id and next(iter(os.listdir(os.path.join(runs, "real1"))), None)
     assert db_path is not None
-    store = SessionStore.open(os.path.join(runs, "real1", db_path))
+    store = await SessionStore.open(os.path.join(runs, "real1", db_path))
     try:
-        assert any(m.role == "assistant" for m in store.load_all_messages(leaf.session_id))
+        assert any(m.role == "assistant" for m in await store.load_all_messages(leaf.session_id))
     finally:
-        store.close()
+        await store.close()

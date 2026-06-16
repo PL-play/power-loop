@@ -36,12 +36,12 @@ from power_loop import (
     StatefulAgentLoop,
     create_default_tool_registry,
 )
-from power_loop.runtime.session_store import SessionStore
+from power_loop.runtime.store.store import SessionStore
 
 
 async def main() -> None:
     with TemporaryDirectory() as tmp:
-        store = SessionStore.open(f"{tmp}/sessions.db")
+        store = await SessionStore.open(f"{tmp}/sessions.db")
         policy = NotesPolicy(max_notes=20)  # eviction="reject" 是默认
 
         loop = StatefulAgentLoop(
@@ -58,7 +58,7 @@ async def main() -> None:
             ),
         )
 
-        sid = loop.new_session()
+        sid = await loop.new_session()
 
         # 第一轮：让模型记点东西 / round 1: ask the model to take a note
         r1 = await loop.send(
@@ -67,15 +67,15 @@ async def main() -> None:
             sid,
         )
         print("R1:", r1.final_text)
-        for n in store.list_notes(sid):
+        for n in await store.list_notes(sid):
             print(f"  note #{n.note_id} pinned={n.pinned}: {n.content}")
 
         # 第二轮：新的 send 自动注入笔记 / round 2: notes are injected automatically
         r2 = await loop.send("我的项目代号和部署区域是什么？", sid)
         print("R2:", r2.final_text)
 
-        loop.close_session(sid)  # notes 级联删除 / notes cascade-delete
-        loop.close()
+        await loop.close_session(sid)  # notes 级联删除 / notes cascade-delete
+        await loop.aclose()
 
 
 if __name__ == "__main__":

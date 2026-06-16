@@ -64,7 +64,7 @@ async def main() -> None:
             tool_registry=create_default_tool_registry(preset="core", bind=False),
             event_bus=bus,
         )
-        sid = loop.new_session()
+        sid = await loop.new_session()
 
         # 让模型用一次工具，制造"一个 run 多次 LLM 调用"的真实形态。
         res = await loop.send(
@@ -88,7 +88,7 @@ async def main() -> None:
         )
 
         # ── 累计记账：session_stats（store 持久化，跨 send 累加） ────────
-        stats = loop.get_session_stats(sid)
+        stats = await loop.get_session_stats(sid)
         print(
             f"session stats: sends={stats.sends} rounds={stats.rounds} "
             f"llm_calls={stats.llm_calls} tool_calls={stats.tool_calls} "
@@ -98,7 +98,7 @@ async def main() -> None:
         # ── 预算护栏：max_tokens_per_run（这里演示配置位置，真实值按需设） ──
         # AgentLoopConfig(max_tokens_per_run=50_000) → 越界后 status="budget_exceeded"
 
-        loop.close()
+        await loop.aclose()
 
 
 if __name__ == "__main__":

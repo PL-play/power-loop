@@ -62,7 +62,7 @@ async def main() -> str:
         event_bus=bus,
         config=AgentLoopConfig(system_prompt="Answer in one short sentence.", max_rounds=1),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("Name a primary color.", session_id=sid)
     sink.close()
 

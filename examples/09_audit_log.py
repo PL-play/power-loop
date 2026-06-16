@@ -110,7 +110,7 @@ async def main() -> Path:
             compactor=None,
         ),
     )
-    sid = loop.new_session()
+    sid = await loop.new_session()
     r = await loop.send("Echo back the phrase: 'audit log demo'.", session_id=sid)
     print(f"\n[reply] {r.final_text}\n")
 

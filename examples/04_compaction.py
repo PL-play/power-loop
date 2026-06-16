@@ -40,12 +40,12 @@ from power_loop import (
 from power_loop.runtime.compact import DefaultCompactor
 
 
-def _seed_fat_history(store: SessionStore, sid: str, turns: int = 4) -> None:
+async def _seed_fat_history(store: SessionStore, sid: str, turns: int = 4) -> None:
     """灌入若干轮 user/assistant，让 history 远超阈值。
     / Seed several user/assistant turns so history far exceeds the threshold."""
     for i in range(turns):
-        store.append_message(sid, role="user", content="filler " + ("u" * 400), round_index=i)
-        store.append_message(
+        await store.append_message(sid, role="user", content="filler " + ("u" * 400), round_index=i)
+        await store.append_message(
             sid, role="assistant",
             content="filler ack " + ("a" * 400),
             round_index=i,
@@ -56,10 +56,10 @@ async def main() -> str:
     # 强制低阈值，保证每次都触发 / Force low threshold to guarantee trigger
     os.environ["CONTEXT_COMPACT_THRESHOLD"] = "500"
 
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
-        sid = store.create_session(system_prompt="S")
-        _seed_fat_history(store, sid, turns=4)
+        sid = await store.create_session(system_prompt="S")
+        await _seed_fat_history(store, sid, turns=4)
 
         loop = StatefulAgentLoop(
             llm=make_llm(),
@@ -78,8 +78,8 @@ async def main() -> str:
         print(f"reply    : {r.final_text}")
 
         # ── 查看压缩痕迹 / Inspect compaction traces ──
-        comps = store.list_compactions(sid)
-        all_rows = store.load_all_messages(sid)
+        comps = await store.list_compactions(sid)
+        all_rows = await store.load_all_messages(sid)
         folded = sum(1 for m in all_rows if m.state is MessageState.COMPACTED_OUT)
         notes = [m for m in all_rows if m.name == "compact_note"]
         print(f"compactions recorded : {len(comps)}")
@@ -87,7 +87,7 @@ async def main() -> str:
         print(f"compact_note preview : {(notes[0].content or '')[:80]!r}")
         return r.final_text
     finally:
-        store.close()
+        await store.close()
 
 
 if __name__ == "__main__":

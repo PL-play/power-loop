@@ -27,7 +27,7 @@ from power_loop import StatefulAgentLoop
 
 async def main() -> str:
     loop = StatefulAgentLoop(llm=make_llm(), db_path=":memory:")
-    sid = loop.new_session()
+    sid = await loop.new_session()
     result = await loop.send("In one sentence: what is HTTP?", session_id=sid)
     print(result.final_text)
     return result.final_text

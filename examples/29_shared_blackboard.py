@@ -79,7 +79,7 @@ async def main() -> dict:
     async def run_agent(spec_name: str, instruction: str) -> str:
         # New session per agent → independent private histories. spec_name becomes
         # the board author. We PROJECT the live board into this turn's prompt.
-        sid = loop.new_session(metadata={"spec_name": spec_name})
+        sid = await loop.new_session(metadata={"spec_name": spec_name})
         snapshot = render_entries(
             await board.read(BOARD_ID), header="Shared team board:", empty="(the board is empty)"
         )

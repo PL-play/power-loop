@@ -24,13 +24,15 @@ async def test_compaction_triggers_persists_and_loop_still_coherent(monkeypatch)
     # Low env threshold so the heuristic estimator definitely fires on the
     # seeded fat history.
     monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "500")
-    store = SessionStore.open(":memory:")
+    store = await SessionStore.open(":memory:")
     try:
-        sid = store.create_session(system_prompt="S")
+        sid = await store.create_session(system_prompt="S")
         # Seed several fat turns that the compactor must fold.
         for i in range(4):
-            store.append_message(sid, role="user", content="filler " + ("u" * 400), round_index=i)
-            store.append_message(
+            await store.append_message(
+                sid, role="user", content="filler " + ("u" * 400), round_index=i
+            )
+            await store.append_message(
                 sid, role="assistant",
                 content="filler ack " + ("a" * 400),
                 round_index=i,
@@ -55,9 +57,9 @@ async def test_compaction_triggers_persists_and_loop_still_coherent(monkeypatch)
         assert r.status == "completed"
 
         # Compaction must have been recorded + rows marked.
-        compactions = store.list_compactions(sid)
+        compactions = await store.list_compactions(sid)
         assert len(compactions) >= 1, "compactor never fired despite low threshold"
-        all_rows = store.load_all_messages(sid)
+        all_rows = await store.load_all_messages(sid)
         assert any(row.state is MessageState.COMPACTED_OUT for row in all_rows)
         assert any(row.name == "compact_note" for row in all_rows)
 
@@ -70,4 +72,4 @@ async def test_compaction_triggers_persists_and_loop_still_coherent(monkeypatch)
             ),
         )
     finally:
-        store.close()
+        await store.close()
