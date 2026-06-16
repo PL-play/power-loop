@@ -340,30 +340,130 @@ async def test_prewarm_makes_first_send_a_hit():
     assert fresh.cache_stats["hits"] >= 1  # prewarm primed the window → first send hits
 
 
-# ── tests: cache must not be served on the resume/abort paths ────────────────
+# ── tests: out-of-band durable appends must NOT serve a stale cached window ──
+# (regression for the review's confirmed blocker: resume/submit_input/abort/heal and other
+#  store writers append rows the cache never saw; the next plain send must reload, not HIT a
+#  stale window — guaranteed by the _cache_append contiguity guard.)
 
 
-async def test_abort_then_send_does_not_serve_stale_cache():
-    """abort_pending appends <aborted> tool rows via its OWN sink (bumping next_seq). A later
-    plain send must NOT reuse the pre-abort cached window."""
+async def _pending_then_resume_then_send(loop, sid, tools):
+    # send 1: model emits a tool_call but the loop has NO registry → goes pending (warms cache
+    # with user + assistant(tool_calls)); resume() then appends an error-tool + assistant
+    # OUT-OF-BAND of the cache; send 2 must see those rows.
+    await loop.send("u1", session_id=sid)
+    await loop.resume(sid)
+    await loop.send("u2", session_id=sid)
+
+
+async def test_resume_after_warm_send_warm_equals_cold():
+    await _assert_warm_equals_cold(
+        lambda: _SeqLLM(responses=[
+            _tool_resp("c1", "echo"), LLMResponse(raw_text="after-resume"), LLMResponse(raw_text="fin"),
+        ]),
+        _pending_then_resume_then_send,
+        config_factory=lambda: AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
+        expect_hits=False,  # resume invalidates → send 2 reloads (the correct, non-stale path)
+    )
+
+
+async def _pending_then_abort_then_send(loop, sid, tools):
+    await loop.send("u1", session_id=sid)                       # tool_call, no registry → pending (warms)
+    await loop.abort_pending(sid)                               # <aborted> tool row, out-of-band
+    await loop.send("u2", session_id=sid, heal_pending=True)    # must reload
+
+
+async def test_abort_after_warm_send_warm_equals_cold():
+    await _assert_warm_equals_cold(
+        lambda: _SeqLLM(responses=[_tool_resp("c1", "echo"), LLMResponse(raw_text="fin")]),
+        _pending_then_abort_then_send,
+        config_factory=lambda: AgentLoopConfig(system_prompt="S", max_rounds=3, compactor=None),
+        expect_hits=False,
+    )
+
+
+async def test_cross_writer_shared_store_forces_reload():
+    """Two loops share one store (the supported shared-store path). When loop B appends to a
+    session, loop A's cached window is stale; A's next send must reload (contiguity guard), not
+    serve a window missing B's rows — the cross-process data-safety guarantee."""
     store = await SessionStore.open(":memory:")
-    # seed a pending assistant(tool_calls) with no tool replies
-    sid = await store.create_session(system_prompt="S")
-    await store.append_message(sid, role="user", content="kick")
-    aseq = await store.append_message(sid, role="assistant", tool_calls=[
-        {"id": "tc1", "type": "function", "function": {"name": "echo", "arguments": "{}"}}])
-    await store.set_pending(sid, {"assistant_seq": aseq, "tool_call_ids": ["tc1"],
-                                  "tool_calls": [{"id": "tc1"}], "round_index": 0})
-    loop = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="ok")]), store=store,
-                             config=AgentLoopConfig(system_prompt="S", max_rounds=2, compactor=None),
-                             tool_registry=_echo_registry())
-    n = await loop.abort_pending(sid)
-    assert n == 1
-    r = await loop.send("next", session_id=sid, heal_pending=True)
-    assert r.status == "completed"
-    # the aborted tool row is present and the send proceeded on the correct (reloaded) history
-    roles = [m.get("role") for m in await loop.get_messages(sid)]
-    assert roles == ["user", "assistant", "tool", "user", "assistant"]
+
+    def cfg():
+        return AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None)
+
+    a_llm = _SeqLLM(responses=[LLMResponse(raw_text="a1"), LLMResponse(raw_text="a2")])
+    a = StatefulAgentLoop(llm=a_llm, store=store, config=cfg())
+    b = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="b1")]), store=store, config=cfg())
+    sid = await a.new_session()
+    await a.send("u1", session_id=sid)          # loop A warms its window
+    await b.send("u2", session_id=sid)          # loop B appends out-of-band of A's cache
+    await a.send("u3", session_id=sid)          # A's window is stale → must reload
+    # The bug shows in the PROMPT A's third send fed the LLM (its final stored history is always
+    # correct since get_messages reads the store): a stale-cache HIT would omit B's u2/b1.
+    last_prompt = [(m.get("role"), m.get("content")) for m in a_llm.calls[-1]["messages"]]
+    assert last_prompt == [("user", "u1"), ("assistant", "a1"), ("user", "u2"),
+                           ("assistant", "b1"), ("user", "u3")], last_prompt
+
+
+async def test_fold_then_recache_then_reuse(monkeypatch):
+    """After a fold invalidates the window, a later plain send must reload+recache and a
+    further send must REUSE — proving the post-fold recache token is correct (warm == cold AND
+    a real cache hit, which the always-fold regime can't show)."""
+    monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "100")
+
+    class _OneShot:
+        def __init__(self):
+            self._done = False
+
+        async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
+            if self._done or len(messages) < 4:
+                return None
+            self._done = True
+            return CompactionPlan(fold_start_idx=0, fold_end_idx=len(messages) - 3,
+                                  summary_text="folded", before_tokens=100, after_tokens=10)
+
+    async def scenario(loop, sid, tools):
+        await loop.send("s1", session_id=sid, tools=["blob"])   # multi-round → folds once → invalidate
+        await loop.send("s2", session_id=sid, tools=["blob"])   # reload + recache
+        await loop.send("s3", session_id=sid, tools=["blob"])   # reuse → HIT
+
+    await _assert_warm_equals_cold(
+        lambda: _FoldLLM(tool_rounds=2),
+        scenario,
+        config_factory=lambda: AgentLoopConfig(
+            system_prompt="S", max_rounds=8, max_tokens=4000, compactor=_OneShot()),
+        registry_factory=_blob_registry,
+        tools=["blob"],
+        expect_hits=True,  # s3 reuses the post-fold recached window
+    )
+
+
+async def test_followup_drain_warm_equals_cold():
+    """A follow-up drained mid-run appends an extra user row; the post-run delta must fold it
+    into the warm window so the NEXT send's prompt equals a cold reload."""
+    from power_loop.agent.follow_up import FollowUpQueued
+
+    async def scenario(loop, sid, tools):
+        # queue a follow-up while a send holds the session lock, so it drains mid-run
+        async def _send_with_followup():
+            return await loop.send("first", session_id=sid)
+        import asyncio as _aio
+        task = _aio.create_task(_send_with_followup())
+        await _aio.sleep(0)  # let the send acquire the lock + start
+        # best-effort: if the lock is held, this enqueues; if not, it sends (either way the
+        # next send below validates warm==cold)
+        res = await loop.follow_up("steer", session_id=sid)
+        await task
+        if not isinstance(res, FollowUpQueued):
+            # it ran as a plain send; that's fine — still a multi-send warm/cold comparison
+            pass
+        await loop.send("second", session_id=sid)
+
+    await _assert_warm_equals_cold(
+        lambda: _SeqLLM(responses=[LLMResponse(raw_text=f"r{i}") for i in range(6)]),
+        scenario,
+        config_factory=lambda: AgentLoopConfig(system_prompt="S", max_rounds=2, compactor=None),
+        expect_hits=False,
+    )
 
 
 # ── tests: cache disabled ────────────────────────────────────────────────────

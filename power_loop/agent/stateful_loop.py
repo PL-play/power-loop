@@ -220,11 +220,24 @@ class StatefulAgentLoop:
 
     def _cache_append(self, sid: str, row: MessageRow, *, new_next_seq: int) -> None:
         """Extend a live cache entry with one row the loop itself just appended (keeping the
-        durable projection current without a reload). No-op if there's no live entry."""
+        durable projection current without a reload). No-op if there's no live entry.
+
+        CONTIGUITY GUARD: ``row.seq`` is the store's pre-append ``next_seq``, which equals the
+        cached token ONLY if the cache saw every write since it was built. A mismatch means some
+        out-of-band writer advanced the durable ``next_seq`` past our window —
+        ``resume()`` / ``submit_input()`` / ``abort_pending()`` / ``heal_pending`` (which append
+        via their own sink), or another loop/process sharing the store. Re-syncing the token
+        then would paper over the gap and let the next ``_cache_get`` HIT a row-missing window
+        (the bug the code review caught); instead we drop the entry so the next send MISSes and
+        full-reloads. This is what makes the validity check sound across ALL writers."""
         entry = self._session_cache.get(sid)
-        if entry is not None:
-            entry.rows.append(row)
-            entry.next_seq = new_next_seq
+        if entry is None:
+            return
+        if entry.next_seq != row.seq:
+            self._cache_invalidate(sid)
+            return
+        entry.rows.append(row)
+        entry.next_seq = new_next_seq
 
     def _cache_invalidate(self, sid: str) -> None:
         self._session_cache.pop(sid, None)
@@ -603,6 +616,10 @@ class StatefulAgentLoop:
                 },
                 round_index=round_index,
             )
+        if tool_calls:
+            # The <aborted> rows were appended out-of-band of the window cache; drop any live
+            # entry so a later plain send full-reloads instead of serving a row-missing window.
+            self._cache_invalidate(session_id)
         return len(tool_calls)
 
     # ── timers (durable wake-ups; fired by runtime.timers.TimerRunner) ────
@@ -1007,6 +1024,11 @@ class StatefulAgentLoop:
                         delta = await store.load_active_messages(sid, after_seq=entry.next_seq)
                         entry.rows.extend(delta)
                         entry.next_seq = post_state.next_seq
+        else:
+            # A pre-primed sink (resume()/submit_input()) durably appended rows out-of-band of
+            # the cache; drop any live entry now so it can't be served stale. (The contiguity
+            # guard in _cache_append is the correctness backstop; this is prompt cleanup.)
+            self._cache_invalidate(sid)
         try:
             # The async store offloads its own blocking I/O, so this no longer
             # needs an explicit thread hop (H1.9/C8).
