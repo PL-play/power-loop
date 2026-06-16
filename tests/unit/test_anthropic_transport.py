@@ -153,3 +153,26 @@ async def test_openai_tools_and_tool_results_are_converted() -> None:
             "function": {"name": "lookup", "arguments": '{"q": "teal"}'},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_multimodal_content_is_translated_not_silently_dropped() -> None:
+    """U2 guard: image blocks in multimodal content are translated to Anthropic image
+    blocks (data-URL → base64, http(s) → url); an unknown non-text block becomes a
+    VISIBLE marker — never a silent drop."""
+    svc, client = _service(SimpleNamespace(content=[{"type": "text", "text": "ok"}],
+                                           usage={"input_tokens": 1, "output_tokens": 1}))
+    await svc.complete(LLMRequest(messages=[{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+        {"type": "widget", "data": 123},  # unknown non-text block
+    ]}]))
+
+    blocks = client.messages.calls[0]["messages"][0]["content"]
+    assert {"type": "text", "text": "what is this?"} in blocks
+    assert {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}} in blocks
+    assert {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}} in blocks
+    # the unknown block is surfaced, not dropped
+    assert any(b.get("type") == "text" and "unsupported content block dropped" in b.get("text", "")
+               for b in blocks)

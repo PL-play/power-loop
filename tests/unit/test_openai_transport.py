@@ -192,3 +192,27 @@ async def test_reason_flag_sent_when_explicitly_enabled() -> None:
     await svc.complete(LLMRequest(messages=[{"role": "user", "content": "go"}], reason=True))
     sent = client.chat.completions.calls[0]
     assert (sent.get("extra_body") or {}).get("reason") is True
+
+
+@pytest.mark.asyncio
+async def test_stream_resume_discards_partial_tool_call() -> None:
+    """U3 guard: a tool call only partially streamed before a mid-stream error must
+    NOT survive into the resumed attempt's result — otherwise the final tool_calls
+    carries both the truncated (invalid-args) call and the resume's complete one."""
+    streams = [
+        # attempt 1: a tool call streamed only halfway (args cut off), then the stream drops
+        [_tool_event(0, call_id="call_partial", type_="function", name="write", args='{"path":"a"'),
+         RuntimeError("stream dropped")],
+        # resume: the model re-issues the call in full (a fresh id) + usage
+        [_tool_event(0, call_id="call_full", type_="function", name="write",
+                     args='{"path":"a","content":"b"}'),
+         _usage_event(5, 3, 8)],
+    ]
+    svc, client = _service(streams, stream_resume_on_error=True, stream_max_restarts=1)
+
+    result = await svc.complete(LLMRequest(messages=[{"role": "user", "content": "go"}]))
+
+    # exactly ONE tool call survives — the resume's complete one, not the partial
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0]["id"] == "call_full"
+    assert json.loads(result.tool_calls[0]["function"]["arguments"]) == {"path": "a", "content": "b"}
