@@ -581,6 +581,10 @@ class AgentPipeline:
         # Microcompact (legacy: dump large tool outputs to disk and replace
         # with a short pointer — orthogonal to LLM-based compaction).
         self.ctx.microcompact(self.history)
+        # microcompact mutates message CONTENT in place (shrinks it) without
+        # changing len(self.history), so the SCALE-4 incremental estimate would
+        # stay stale-high and over-trigger LLM-summary compaction. Invalidate it.
+        self._tok_len = -1
 
         compactor = self.config.compactor
         if compactor is None:
@@ -628,6 +632,11 @@ class AgentPipeline:
             + [note_msg]
             + self.history[plan.fold_end_idx + 1 :]
         )
+        # SCALE-4: a fold reassigns history; invalidate the incremental estimate
+        # like the other reassignment sites. A single-message fold (start==end)
+        # keeps len() unchanged, so without this the cache returns a stale (too-high)
+        # count and the next round's trigger decision is made on it.
+        self._tok_len = -1
         # Persist (no-op for NullSink). Pass the pre-fold history length so the
         # sink can refuse to persist if its index↔seq map ever drifts out of
         # alignment (H1.1 safety net), rather than mark the wrong rows.
@@ -794,13 +803,19 @@ class AgentPipeline:
 
         return response
 
-    async def execute_tool(self, tool_name: str, tool_args: dict[str, Any]) -> tuple[str, bool]:
-        self.ctx.tool_calls += 1
+    async def execute_tool(
+        self, tool_name: str, tool_args: dict[str, Any], *, count: bool = True
+    ) -> tuple[str, bool]:
         """Execute a single tool and return ``(output_string, failed)``.
 
         Catches :class:`ToolNotFound` / :class:`ToolValidationError` from
         the registry and returns them as error strings (failed=True), making
         them visible to the LLM so it can self-correct.
+
+        ``count`` increments ``ctx.tool_calls`` only for a real, validated
+        dispatch. A rejected (unknown/invalid) call never ran, and the
+        SHORT_CIRCUIT retry passes ``count=False`` so one logical tool call is
+        not counted twice.
         """
         if self.tool_registry is None:
             return (f"Error: tool '{tool_name}' requested but no tool registry configured", True)
@@ -809,6 +824,8 @@ class AgentPipeline:
             if validation_err is not None:
                 return (validation_err, True)
 
+            if count:
+                self.ctx.tool_calls += 1
             result = await self.tool_registry.invoke_async(tool_name, tool_args)
         except (ToolNotFound, ToolValidationError) as exc:
             return (str(exc), True)
@@ -1061,6 +1078,13 @@ class AgentPipeline:
                 continue
 
             if self.tool_registry is None:
+                # Drive the terminal lifecycle before returning: every other terminal
+                # return funnels through _finalize (SESSION_ENDED after SESSION_STARTED
+                # + the end-of-run memory snapshot). Skipping it here stranded any
+                # event subscriber and dropped the memory snapshot. _finalize is
+                # idempotent, so this is safe.
+                await self._finalize("pending_tools", final_text=assistant_text,
+                                     rounds=round_idx + 1)
                 return self._make_result("pending_tools", final_text=assistant_text,
                                          rounds=round_idx + 1, pending_tool_calls=tool_calls)
 
@@ -1151,7 +1175,11 @@ class AgentPipeline:
                         output = err_ctx.output or f"Error: {exc}"
                     elif err_ctx.directive == HookDirective.SHORT_CIRCUIT:
                         try:
-                            output, failed = await self.execute_tool(tool_name, tool_args)
+                            # count=False: this is a retry of the SAME logical tool
+                            # call, already counted on the first dispatch.
+                            output, failed = await self.execute_tool(
+                                tool_name, tool_args, count=False
+                            )
                         except Exception as retry_exc:
                             output = f"Error (retry failed): {retry_exc}"
                             failed = True
@@ -1182,7 +1210,8 @@ class AgentPipeline:
                                round_index=round_idx)
 
                 self._emit(AgentEventType.TOOL_CALL_COMPLETED,
-                           ToolCallCompletedPayload(name=tool_name, output=output, tool_input=tool_args, tool_call_id=call_id),
+                           ToolCallCompletedPayload(name=tool_name, output=output, tool_input=tool_args,
+                                                    tool_call_id=call_id, failed=failed),
                            round_index=round_idx)
 
                 await self._append_message(

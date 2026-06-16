@@ -169,3 +169,26 @@ async def test_stream_error_propagates_when_resume_disabled() -> None:
 
     with pytest.raises(RuntimeError, match="boom"):
         await svc.complete(LLMRequest(messages=[{"role": "user", "content": "go"}]))
+
+
+# ── C17: `reason` is opt-in, not injected by default ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reason_flag_not_injected_by_default() -> None:
+    """A default LLMRequest must NOT carry extra_body={"reason": ...} — it's a
+    non-standard flag that strict OpenAI-compatible servers reject and reasoning
+    gateways silently honor."""
+    svc, client = _service([[_content_event("hi"), _usage_event(1, 1, 2)]])
+    await svc.complete(LLMRequest(messages=[{"role": "user", "content": "go"}]))
+    sent = client.chat.completions.calls[0]
+    assert "reason" not in (sent.get("extra_body") or {})
+
+
+@pytest.mark.asyncio
+async def test_reason_flag_sent_when_explicitly_enabled() -> None:
+    """Opt-in still works: reason=True injects extra_body={"reason": True}."""
+    svc, client = _service([[_content_event("hi"), _usage_event(1, 1, 2)]])
+    await svc.complete(LLMRequest(messages=[{"role": "user", "content": "go"}], reason=True))
+    sent = client.chat.completions.calls[0]
+    assert (sent.get("extra_body") or {}).get("reason") is True

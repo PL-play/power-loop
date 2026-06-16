@@ -68,7 +68,12 @@ def attach_metrics_sink(
         elif t is AgentEventType.LLM_RETRY_ATTEMPTED:
             backend.incr(f"{prefix}_llm_retries")
         elif t is AgentEventType.TOOL_CALL_COMPLETED:
-            backend.incr(f"{prefix}_tool_calls", labels={"tool": str(p.get("name") or ""), "success": "true"})
+            # The pipeline emits TOOL_CALL_FAILED *then* an unconditional
+            # TOOL_CALL_COMPLETED for a failed call. Counting COMPLETED here would
+            # double-count the failure AND label it success=true; skip it when the
+            # payload marks the call failed (the FAILED branch already counted it).
+            if not p.get("failed"):
+                backend.incr(f"{prefix}_tool_calls", labels={"tool": str(p.get("name") or ""), "success": "true"})
         elif t is AgentEventType.TOOL_CALL_FAILED:
             backend.incr(f"{prefix}_tool_calls", labels={"tool": str(p.get("name") or ""), "success": "false"})
         elif t is AgentEventType.ROUND_COMPLETED:
