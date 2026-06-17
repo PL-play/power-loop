@@ -214,6 +214,28 @@ async def scn_export_import(st: Any) -> list[Any]:
     return [new_id, sorted(blob["tables"].keys()), msgs, sess.parent_session_id, sess.kind.value]
 
 
+async def scn_prune(st: Any) -> list[Any]:
+    """Retention with a keep-N bound. This exercises the ORDER BY/LIMIT-in-subquery DELETE
+    that MySQL rejects (err 1235/1093) unless the subquery is materialized in a derived
+    table — a backend-divergent SQL path that the other scenarios never touch, so it must
+    run on EVERY backend (this is what makes the PG/MySQL conformance suites catch it)."""
+    await st.create_session(session_id="s")
+    out: list[Any] = []
+    # usage rounds: keep the 2 most recent of 5 → 3 deleted
+    for i in range(5):
+        await st.record_usage("s", round_index=i, prompt_tokens=i, completion_tokens=i,
+                              total_tokens=2 * i, model="m")
+    out.append(await st.prune_usage_rounds("s", keep_last=2))
+    # compacted-out messages: fold 4 of 6, keep the 2 most recent compacted rows → 2 deleted
+    for i in range(6):
+        await st.append_message("s", role="user", content=f"m{i}", round_index=i)
+    await st.record_compaction("s", from_seq=1, to_seq=4, note_content="sum", before_tokens=9,
+                               after_tokens=1, round_index=4, fold_seqs=[1, 2, 3, 4], order_key=1)
+    out.append(await st.prune_compacted_messages("s", keep_recent=2))
+    out.append(sorted(m.seq for m in await st.load_all_messages("s")))
+    return out
+
+
 #: (id, scenario, snapshot_sid|None) — reused by every backend's conformance suite.
 SCENARIOS: list[tuple[str, Callable[[Any], Awaitable[list[Any]]], str | None]] = [
     ("messages", scn_messages, "s"),
@@ -224,6 +246,7 @@ SCENARIOS: list[tuple[str, Callable[[Any], Awaitable[list[Any]]], str | None]] =
     ("bgtasks", scn_bgtasks, "s"),
     ("cascade", scn_cascade, None),
     ("export_import", scn_export_import, None),
+    ("prune", scn_prune, "s"),
 ]
 
 

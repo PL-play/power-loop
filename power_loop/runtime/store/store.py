@@ -873,9 +873,13 @@ class SessionStore:
             sql += " AND created_at < ?"
             params.append(_now_ms() - int(older_than_ms))
         if keep_last and keep_last > 0:
+            # Wrap the ORDER BY/LIMIT subquery in a derived table: MySQL rejects both a
+            # LIMIT inside IN(...) (err 1235) and modifying a table referenced in its own
+            # subquery (err 1093); materializing it first is accepted by SQLite/PG/MySQL.
             sql += (
-                f" AND round_index NOT IN (SELECT round_index FROM {self.t.usage_rounds} "
-                "WHERE session_id=? ORDER BY round_index DESC LIMIT ?)"
+                f" AND round_index NOT IN (SELECT r FROM (SELECT round_index AS r "
+                f"FROM {self.t.usage_rounds} "
+                "WHERE session_id=? ORDER BY round_index DESC LIMIT ?) AS _keep)"
             )
             params += [session_id, int(keep_last)]
         async with self._db.transaction() as tx:
@@ -1118,9 +1122,11 @@ class SessionStore:
             sql += " AND created_at < ?"
             params.append(_now_ms() - int(older_than_ms))
         if keep_recent and keep_recent > 0:
+            # Derived table (see prune_usage_rounds): MySQL rejects LIMIT-in-IN (1235) and
+            # self-referential DELETE subqueries (1093); materializing first is portable.
             sql += (
-                f" AND seq NOT IN (SELECT seq FROM {self.t.messages} "
-                "WHERE session_id=? AND state=? ORDER BY seq DESC LIMIT ?)"
+                f" AND seq NOT IN (SELECT s FROM (SELECT seq AS s FROM {self.t.messages} "
+                "WHERE session_id=? AND state=? ORDER BY seq DESC LIMIT ?) AS _keep)"
             )
             params += [session_id, MessageState.COMPACTED_OUT.value, int(keep_recent)]
         async with self._db.transaction() as tx:

@@ -74,11 +74,16 @@ class _SessionCache:
     ``rows`` is EXACTLY what ``store.load_active_messages(session_id)`` returns at the moment
     ``next_seq`` was observed — the DURABLE projection, never the pipeline's mutated working
     copy (recall placeholders / microcompacted content are re-applied fresh each send, never
-    cached). ``next_seq`` is the validity token: a send reuses ``rows`` iff the live
-    ``session_state.next_seq`` still matches; any mismatch (another writer, or a fold) forces a
-    reload. So a cold loop with an empty cache reproduces identical behavior."""
+    cached). The validity token is the PAIR ``(next_seq, last_compact_seq)``: a send reuses
+    ``rows`` iff BOTH still match the live ``session_state``. ``next_seq`` alone is insufficient
+    — a fold (compaction) reshuffles the OLDER active set into ``compacted_out`` while only
+    bumping ``next_seq`` by the note, so an out-of-band fold during a send could leave a stale
+    delta-extended window whose ``next_seq`` happens to match. ``last_compact_seq`` advances on
+    every fold, so pairing it in makes any fold — this loop's or another writer/process's —
+    invalidate the window. A cold loop with an empty cache reproduces identical behavior."""
 
     next_seq: int
+    last_compact_seq: int
     rows: list[MessageRow]
 
 
@@ -234,22 +239,29 @@ class StatefulAgentLoop:
 
     # ── per-session active-window cache helpers ─────────────────────────────
 
-    def _cache_get(self, sid: str, next_seq: int) -> list[MessageRow] | None:
-        """Return the cached active rows iff the validity token still matches; else None."""
+    def _cache_get(self, sid: str, next_seq: int, last_compact_seq: int) -> list[MessageRow] | None:
+        """Return the cached active rows iff the ``(next_seq, last_compact_seq)`` token still
+        matches; else None. The fold counter must match too — a fold reshuffles the older
+        active set, so a matching ``next_seq`` alone can still front a stale window."""
         if self._session_cache_size <= 0:
             return None
         entry = self._session_cache.get(sid)
-        if entry is not None and entry.next_seq == next_seq:
+        if entry is not None and entry.next_seq == next_seq \
+                and entry.last_compact_seq == last_compact_seq:
             self._session_cache.move_to_end(sid)  # LRU touch
             self._cache_hits += 1
             return entry.rows
         self._cache_misses += 1
         return None
 
-    def _cache_put(self, sid: str, next_seq: int, rows: list[MessageRow]) -> None:
+    def _cache_put(
+        self, sid: str, next_seq: int, rows: list[MessageRow], last_compact_seq: int
+    ) -> None:
         if self._session_cache_size <= 0:
             return
-        self._session_cache[sid] = _SessionCache(next_seq=next_seq, rows=list(rows))
+        self._session_cache[sid] = _SessionCache(
+            next_seq=next_seq, last_compact_seq=last_compact_seq, rows=list(rows)
+        )
         self._session_cache.move_to_end(sid)
         while len(self._session_cache) > self._session_cache_size:
             self._session_cache.popitem(last=False)  # evict LRU
@@ -278,6 +290,31 @@ class StatefulAgentLoop:
 
     def _cache_invalidate(self, sid: str) -> None:
         self._session_cache.pop(sid, None)
+
+    async def _refresh_window_cache_after_send(self, sid: str, store: SessionStore) -> None:
+        """Fold this send's appended tail into the live window entry — UNLESS a fold
+        reshuffled the older active set, in which case drop the entry so the next send
+        full-reloads.
+
+        The fold check compares the durable ``last_compact_seq`` against the entry's, so it
+        fires for ANY fold since the entry was built — this send's own compaction OR an
+        out-of-band one by another writer/process. A bare ``next_seq`` delta-extend would
+        otherwise keep the now-``compacted_out`` rows in the window and, because a fold also
+        advances ``next_seq`` (the note), leave the entry's token matching the live state —
+        so the next send would HIT a corrupt window mixing folded-out rows with the note."""
+        entry = self._session_cache.get(sid)
+        if entry is None:
+            return
+        post_state = await store.get_state(sid)
+        if post_state is None:
+            return
+        if post_state.last_compact_seq != entry.last_compact_seq:
+            self._cache_invalidate(sid)
+        elif post_state.next_seq != entry.next_seq:
+            # Pure append tail (incl. follow-ups drained mid-run): cheap O(delta) extend.
+            delta = await store.load_active_messages(sid, after_seq=entry.next_seq)
+            entry.rows.extend(delta)
+            entry.next_seq = post_state.next_seq
 
     @property
     def cache_stats(self) -> dict[str, int]:
@@ -448,7 +485,7 @@ class StatefulAgentLoop:
             state = await store.get_state(session_id)
             rows = await store.load_active_messages(session_id)
             if state is not None:
-                self._cache_put(session_id, state.next_seq, rows)
+                self._cache_put(session_id, state.next_seq, rows, state.last_compact_seq)
         return True
 
     async def send(
@@ -1050,16 +1087,16 @@ class StatefulAgentLoop:
         # already advanced by the just-persisted user input), reuse it and skip the O(active-
         # history) load entirely; otherwise load in full and (re)populate the cache.
         active_rows: list[MessageRow] | None = None
-        cache_token: int | None = None
+        cache_token: tuple[int, int] | None = None
         if cache_eligible:
             state = await store.get_state(sid)
             if state is not None:
-                cache_token = state.next_seq
-                active_rows = self._cache_get(sid, state.next_seq)
+                cache_token = (state.next_seq, state.last_compact_seq)
+                active_rows = self._cache_get(sid, state.next_seq, state.last_compact_seq)
         if active_rows is None:
             active_rows = await store.load_active_messages(sid)
             if cache_eligible and cache_token is not None:
-                self._cache_put(sid, cache_token, active_rows)
+                self._cache_put(sid, cache_token[0], active_rows, cache_token[1])
         history = [_row_to_loop_message(r) for r in active_rows]
         # Mirror loaded seqs into the sink so the compactor can translate
         # in-memory indices back to store rows when it folds messages. Pass the
@@ -1120,16 +1157,7 @@ class StatefulAgentLoop:
         # extend with the active tail this send appended (a cheap O(delta) read, incl. any
         # follow-up rows drained mid-run) so back-to-back sends stay on the fast path. ──
         if cache_eligible:
-            if sink.compactions_applied > 0:
-                self._cache_invalidate(sid)
-            else:
-                entry = self._session_cache.get(sid)
-                post_state = await store.get_state(sid)
-                if entry is not None and post_state is not None:
-                    if post_state.next_seq != entry.next_seq:
-                        delta = await store.load_active_messages(sid, after_seq=entry.next_seq)
-                        entry.rows.extend(delta)
-                        entry.next_seq = post_state.next_seq
+            await self._refresh_window_cache_after_send(sid, store)
         else:
             # A pre-primed sink (resume()/submit_input()) durably appended rows out-of-band of
             # the cache; drop any live entry now so it can't be served stale. (The contiguity

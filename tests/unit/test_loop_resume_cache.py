@@ -612,3 +612,63 @@ async def test_loop_binds_postgres_via_dsn():
 async def test_loop_binds_mysql_via_dsn():
     pytest.importorskip("aiomysql")
     await _loop_binds_and_resumes(_MYSQL_DSN)
+
+
+# ── G8: an out-of-band fold must invalidate the window cache (never serve folded-out rows) ──
+# A fold reshuffles the OLDER active set into compacted_out while only bumping next_seq by the
+# note. Pre-fix, the post-send maintenance only invalidated on THIS send's compactions, so a
+# fold by another writer/process left the entry delta-extended past the fold — a later send
+# then HIT a window mixing folded-out rows with the note. The validity token now pairs in
+# last_compact_seq, so ANY fold invalidates.
+
+
+async def test_window_cache_token_includes_last_compact_seq():
+    store = await SessionStore.open(":memory:")
+    loop = StatefulAgentLoop(
+        llm=_SeqLLM(), store=store, config=AgentLoopConfig(system_prompt="S"), session_cache_size=8
+    )
+    try:
+        sid = await loop.new_session()
+        for i in range(3):
+            await store.append_message(sid, role="user", content=f"m{i}")
+        assert await loop.prewarm(sid)
+        st = await store.get_state(sid)
+        # exact token → HIT
+        assert loop._cache_get(sid, st.next_seq, st.last_compact_seq) is not None
+        # same next_seq but a fold advanced last_compact_seq → MISS (the G8 guarantee)
+        assert loop._cache_get(sid, st.next_seq, st.last_compact_seq + 1) is None
+    finally:
+        await loop.aclose()
+
+
+async def test_out_of_band_fold_invalidates_window_not_delta_extend():
+    store = await SessionStore.open(":memory:")
+    loop = StatefulAgentLoop(
+        llm=_SeqLLM(), store=store, config=AgentLoopConfig(system_prompt="S"), session_cache_size=8
+    )
+    try:
+        sid = await loop.new_session()
+        for i in range(4):
+            await store.append_message(sid, role="user", content=f"m{i}")
+        assert await loop.prewarm(sid)  # window built at last_compact_seq=0, rows m0..m3
+
+        # Another writer/process folds m1,m2 out-of-band (advances last_compact_seq + next_seq).
+        await store.record_compaction(
+            sid, from_seq=2, to_seq=3, note_content="sum", before_tokens=9, after_tokens=1,
+            round_index=0, fold_seqs=[2, 3], order_key=2,
+        )
+
+        # Post-send maintenance must DROP the entry (fold reshuffled the older set) — NOT
+        # delta-extend it (which would keep folded-out m1/m2 and front a corrupt window).
+        await loop._refresh_window_cache_after_send(sid, store)
+        # The entry must be DROPPED (not delta-extended past the fold): assert removal directly,
+        # since the _cache_get token would also mask a buggy delta-extend.
+        assert sid not in loop._session_cache
+        st = await store.get_state(sid)
+        assert loop._cache_get(sid, st.next_seq, st.last_compact_seq) is None
+
+        # Durable truth after the fold: m1/m2 are folded out, the note is active.
+        active = [m.content for m in await store.load_active_messages(sid)]
+        assert "m1" not in active and "m2" not in active and "sum" in active
+    finally:
+        await loop.aclose()
