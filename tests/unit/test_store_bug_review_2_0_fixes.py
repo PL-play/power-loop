@@ -6,6 +6,7 @@ additionally covered by the parity suites against real servers when available.
 
 from __future__ import annotations
 
+import asyncio
 import operator
 import sqlite3
 
@@ -18,8 +19,10 @@ from power_loop.runtime.store.schema import (
     StoreSchemaError,
     ensure_schema,
     provisioning_ddl,
+    validate_table_prefix,
 )
 from power_loop.runtime.store.store import SessionStore
+from power_loop.runtime.store.types import SubagentLifecycle
 
 pytestmark = pytest.mark.unit
 
@@ -200,3 +203,100 @@ def test_mysql_args_always_tuple():
     # the `%%` that dialect.translate emits back to a single literal `%`. With the old
     # `None` return that pass was skipped and `%%` leaked verbatim.
     assert operator.mod("LIKE 'pl\\_%%'", _args(())) == "LIKE 'pl\\_%'"
+
+
+# ── C1: table_prefix is validated (interpolated into SQL identifiers) ────────
+
+
+def test_validate_table_prefix_accepts_safe_and_empty():
+    for ok in ("", "pl_", "Pl_2", "_x", "tenant42_"):
+        assert validate_table_prefix(ok) == ok
+
+
+def test_validate_table_prefix_rejects_unsafe():
+    for bad in ('x"; DROP TABLE t; --', "a b", "1abc", "a-b", "pl_;", "pl_%"):
+        with pytest.raises(ValueError, match="table_prefix"):
+            validate_table_prefix(bad)
+
+
+async def test_open_with_malicious_prefix_raises():
+    with pytest.raises(ValueError, match="table_prefix"):
+        await SessionStore.open(":memory:", table_prefix='x"; DROP TABLE pl_sessions; --')
+
+
+# ── C4: cascade close returns every deleted id (loop clears their state) ─────
+
+
+async def test_close_session_tree_returns_linked_subtree_ids():
+    s = await SessionStore.open(":memory:")
+    p = await s.create_session(session_id="p")
+    c1 = await s.create_session(
+        session_id="c1", parent_session_id="p", lifecycle=SubagentLifecycle.LINKED
+    )
+    gc = await s.create_session(
+        session_id="gc", parent_session_id="c1", lifecycle=SubagentLifecycle.LINKED
+    )
+    det = await s.create_session(
+        session_id="det", parent_session_id="p", lifecycle=SubagentLifecycle.DETACHED
+    )
+    deleted = await s.close_session_tree("p", cascade=True)
+    # parent + LINKED descendants are deleted (and returned); DETACHED is re-parented, not.
+    assert set(deleted) == {p, c1, gc}
+    assert det not in deleted
+    assert await s.get_session("det") is not None  # survived, re-parented
+    assert await s.get_session("p") is None
+    await s.close()
+
+
+async def test_close_session_count_unchanged_by_id_collection():
+    s = await SessionStore.open(":memory:")
+    await s.create_session(session_id="p")
+    await s.create_session(
+        session_id="c1", parent_session_id="p", lifecycle=SubagentLifecycle.LINKED
+    )
+    n = await s.close_session("p", cascade=True)  # still returns an int count
+    assert n == 2
+    await s.close()
+
+
+# ── C5: maintenance ops raise a clear error after close (no opaque driver err) ──
+
+
+async def test_maintenance_ops_raise_after_close(tmp_path):
+    db = SqliteDatabase.open(str(tmp_path / "m.db"))
+    await db.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await db.checkpoint()
+    with pytest.raises(RuntimeError, match="closed"):
+        await db.vacuum()
+    with pytest.raises(RuntimeError, match="closed"):
+        await db.backup(str(tmp_path / "dest.db"))
+
+
+# ── C3: two file handles serialize via BEGIN IMMEDIATE (no 'database is locked') ──
+
+
+async def test_concurrent_file_handles_serialize_not_deadlock(tmp_path):
+    path = str(tmp_path / "c3.db")
+    seed = await SessionStore.open(path, schema=SchemaPolicy.AUTO_CREATE)
+    sid = await seed.create_session(session_id="s")
+    await seed.close()
+
+    # Two independent handles to the SAME file → independent in-process write locks, so they
+    # actually contend at the SQLite file level. A DEFERRED BEGIN would deadlock on the
+    # SELECT→write lock upgrade ('database is locked'); BEGIN IMMEDIATE serializes them.
+    a = await SessionStore.open(path, schema=SchemaPolicy.VERIFY)
+    b = await SessionStore.open(path, schema=SchemaPolicy.VERIFY)
+    try:
+        results = await asyncio.gather(
+            *(a.append_message(sid, role="user", content=f"a{i}") for i in range(10)),
+            *(b.append_message(sid, role="user", content=f"b{i}") for i in range(10)),
+            return_exceptions=True,
+        )
+        errs = [r for r in results if isinstance(r, BaseException)]
+        assert not errs, f"writes failed (expected serialized success): {errs[:3]}"
+        seqs = [r for r in results if not isinstance(r, BaseException)]
+        assert len(set(seqs)) == 20  # every append got a unique seq
+    finally:
+        await a.close()
+        await b.close()

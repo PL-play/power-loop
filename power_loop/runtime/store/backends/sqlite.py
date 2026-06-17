@@ -3,10 +3,12 @@
 Wraps a single stdlib ``sqlite3`` connection (``check_same_thread=False``, autocommit
 so transaction boundaries are explicit) and runs every statement in a worker thread via
 ``asyncio.to_thread`` so the async store never blocks the event loop. An ``asyncio.Lock``
-serializes writers — preserving SQLite's one-writer model — so a transaction's
-``SELECT next_seq → … → UPDATE`` is atomic without DB row locks. WAL keeps readers
-non-blocking. (A dedicated read pool can be layered later; for now reads share the write
-connection under the lock.)
+serializes writers IN-PROCESS — preserving SQLite's one-writer model — so a transaction's
+``SELECT next_seq → … → UPDATE`` is atomic without DB row locks. ACROSS processes (two
+handles to one file) ``transaction()`` uses ``BEGIN IMMEDIATE`` so the RESERVED write lock
+is taken up front and ``busy_timeout`` serializes contenders instead of deadlocking on a
+lock upgrade. WAL keeps readers non-blocking. (A dedicated read pool can be layered later;
+for now reads share the write connection under the lock.)
 """
 
 from __future__ import annotations
@@ -107,7 +109,15 @@ class SqliteDatabase:
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[_SqliteTransaction]:
         async with self._lock:
-            await self._exec("BEGIN")
+            # BEGIN IMMEDIATE (not plain/DEFERRED BEGIN): every store transaction is a
+            # read-modify-write (e.g. append_message's SELECT next_seq → INSERT), so take the
+            # RESERVED write lock up front. A DEFERRED BEGIN takes only a SHARED lock at the
+            # leading SELECT and upgrades at the first write — and SQLite returns SQLITE_BUSY
+            # *immediately* on a lock-UPGRADE conflict (busy_timeout does NOT retry upgrades),
+            # so two processes sharing the file deadlock ('database is locked'). IMMEDIATE makes
+            # busy_timeout WAIT and serialize them instead. In-process the asyncio.Lock already
+            # serializes, so this only adds the cross-process guarantee the store advertises.
+            await self._exec("BEGIN IMMEDIATE")
             try:
                 yield _SqliteTransaction(self)
             except BaseException:
@@ -145,15 +155,23 @@ class SqliteDatabase:
             self._closed = True
             await asyncio.to_thread(self._conn.close)
 
+    def _check_open(self) -> None:
+        # Guard maintenance ops the way close()/the read path are guarded: a statement on a
+        # closed sqlite3 connection raises an opaque ProgrammingError; surface a clear one.
+        if self._closed:
+            raise RuntimeError("operation on a closed SQLite store")
+
     # ── Maintenance capability (SQLite-only; see store/capabilities.py) ─────────
     async def checkpoint(self, *, mode: str = "TRUNCATE") -> None:
         if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
             raise ValueError(f"invalid checkpoint mode: {mode!r}")
         async with self._lock:
+            self._check_open()
             await asyncio.to_thread(self._conn.execute, f"PRAGMA wal_checkpoint({mode})")
 
     async def vacuum(self, *, incremental: bool = True) -> None:
         async with self._lock:
+            self._check_open()
             # VACUUM cannot run inside a transaction; this conn is in autocommit mode.
             sql = "PRAGMA incremental_vacuum" if incremental else "VACUUM"
             await asyncio.to_thread(self._conn.execute, sql)
@@ -167,6 +185,7 @@ class SqliteDatabase:
                 dest.close()
 
         async with self._lock:
+            self._check_open()
             await asyncio.to_thread(_backup)
 
 

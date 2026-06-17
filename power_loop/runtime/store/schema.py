@@ -26,12 +26,32 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from enum import Enum
 
 from power_loop.runtime.store.db import Database, Row, Transaction
 
 logger = logging.getLogger(__name__)
+
+#: A table_prefix is concatenated into raw SQL identifiers (CREATE/SELECT/INSERT/…) with no
+#: quoting, so it MUST be a safe bare identifier — empty (the 1.x layout) or a leading
+#: letter/underscore then word chars. Validated at the entry points to keep the prefix from
+#: ever reaching the SQL builders unchecked (injection / malformed-DDL on a tenant-derived value).
+_TABLE_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def validate_table_prefix(prefix: str) -> str:
+    """Return ``prefix`` if it is a safe table-name prefix (empty or ``[A-Za-z_]\\w*``);
+    raise :class:`ValueError` otherwise."""
+    if prefix == "":
+        return prefix
+    if not isinstance(prefix, str) or not _TABLE_PREFIX_RE.match(prefix):
+        raise ValueError(
+            f"invalid table_prefix {prefix!r}: must be empty or match [A-Za-z_][A-Za-z0-9_]* "
+            "(it is interpolated into SQL identifiers without quoting)"
+        )
+    return prefix
 
 #: Bump + append a migration step for ANY schema change.
 CURRENT_SCHEMA_VERSION = 1
@@ -215,6 +235,7 @@ async def ensure_schema(
     (True→AUTO_CREATE, False→VERIFY); an explicit ``policy`` takes precedence.
     """
     eff = _coerce_policy(policy, create_schema)
+    validate_table_prefix(prefix)
     vtable = f"{prefix}schema_migrations"
 
     if eff is SchemaPolicy.VERIFY:

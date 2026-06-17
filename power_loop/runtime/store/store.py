@@ -23,7 +23,12 @@ from typing import Any
 
 from power_loop.runtime.store.capabilities import Maintenance
 from power_loop.runtime.store.db import Database, Row
-from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION, SchemaPolicy, ensure_schema
+from power_loop.runtime.store.schema import (
+    CURRENT_SCHEMA_VERSION,
+    SchemaPolicy,
+    ensure_schema,
+    validate_table_prefix,
+)
 from power_loop.runtime.store.types import (
     BackgroundTaskRow,
     CompactionRow,
@@ -154,8 +159,8 @@ class SessionStore:
     ) -> None:
         self._db = db
         self.max_spawn_depth = max_spawn_depth  # validated by the property setter
-        self.table_prefix = table_prefix
-        self.t = _Tables(table_prefix)
+        self.table_prefix = validate_table_prefix(table_prefix)
+        self.t = _Tables(self.table_prefix)
 
     @property
     def max_spawn_depth(self) -> int:
@@ -487,11 +492,21 @@ class SessionStore:
         lifecycle is ``LINKED``. ``DETACHED`` descendants are preserved and
         re-parented to ``NULL``. Returns the number of sessions removed.
         """
-        async with self._db.transaction() as tx:
-            return await self._delete_session_tree(tx, session_id, cascade=cascade)
+        return len(await self.close_session_tree(session_id, cascade=cascade))
 
-    async def _delete_session_tree(self, tx: Any, session_id: str, *, cascade: bool) -> int:
-        deleted = 0
+    async def close_session_tree(self, session_id: str, *, cascade: bool = True) -> list[str]:
+        """Like :meth:`close_session`, but return the id of EVERY session deleted (the named
+        session plus any cascaded ``LINKED`` descendants), so a caller can drop per-session
+        in-memory bookkeeping (caches/locks/queues) for each. Re-parented ``DETACHED``
+        descendants are NOT deleted and are NOT included."""
+        async with self._db.transaction() as tx:
+            deleted: list[str] = []
+            await self._delete_session_tree(tx, session_id, cascade=cascade, deleted=deleted)
+            return deleted
+
+    async def _delete_session_tree(
+        self, tx: Any, session_id: str, *, cascade: bool, deleted: list[str]
+    ) -> None:
         if cascade:
             children = await tx.fetchall(
                 f"SELECT session_id, lifecycle FROM {self.t.sessions} WHERE parent_session_id=?",
@@ -504,8 +519,8 @@ class SessionStore:
                         (child["session_id"],),
                     )
                 else:
-                    deleted += await self._delete_session_tree(
-                        tx, child["session_id"], cascade=True
+                    await self._delete_session_tree(
+                        tx, child["session_id"], cascade=True, deleted=deleted
                     )
         await tx.execute(f"DELETE FROM {self.t.messages} WHERE session_id=?", (session_id,))
         await tx.execute(f"DELETE FROM {self.t.compactions} WHERE session_id=?", (session_id,))
@@ -523,8 +538,8 @@ class SessionStore:
         affected = await tx.execute(
             f"DELETE FROM {self.t.sessions} WHERE session_id=?", (session_id,)
         )
-        deleted += affected
-        return deleted
+        if affected:  # the session row existed → count it as removed
+            deleted.append(session_id)
 
     async def update_session_prompt(self, session_id: str, system_prompt: str | None) -> None:
         async with self._db.transaction() as tx:

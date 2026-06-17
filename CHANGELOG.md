@@ -10,9 +10,9 @@
 
 ### Fixed
 
-The remaining confirmed findings from `BUG_REVIEW_2.0.md` (G9–G18), plus two
-contested items addressed because their fix sat in the same lines (C2, C6). Each has a
-regression test; the backend-specific ones run against the real PG/MySQL test servers.
+The remaining confirmed findings from `BUG_REVIEW_2.0.md` (G9–G18) and all six contested
+items (C1–C6). Each has a regression test; the backend-specific ones run against the real
+PG/MySQL test servers.
 
 - **G9** (`store.py`) — `create_timer` / `add_note` allocated the per-session id with an
   unlocked `SELECT MAX(id)+1`, so two concurrent allocators on PG/MySQL could collide on
@@ -48,6 +48,22 @@ regression test; the backend-specific ones run against the real PG/MySQL test se
   `StatefulAgentLoop.ensure_store()` accessor; the shared-blackboard example used
   `loop.store` (now `None` until lazily opened) and crashed at startup. Host integrations
   that need the store up front should `await loop.ensure_store()`.
+- **C1** (`schema.py`, `store.py`) — `table_prefix` is now validated (`[A-Za-z_]\w*` or
+  empty) at `SessionStore`/`ensure_schema`, since it is concatenated into SQL identifiers
+  without quoting; a tenant/config-derived prefix can no longer inject DDL or silently
+  produce malformed SQL.
+- **C3** (`backends/sqlite.py`) — `transaction()` uses `BEGIN IMMEDIATE` instead of a
+  DEFERRED `BEGIN`. Every store transaction is a read-modify-write, so taking the RESERVED
+  lock up front lets `busy_timeout` serialize cross-process writers instead of deadlocking on
+  a lock upgrade (`database is locked`). The multi-writer correctness the docs advertise now
+  actually holds for the default backend.
+- **C4** (`store.py`, `stateful_loop.py`) — new `SessionStore.close_session_tree()` returns
+  every deleted session id (named + cascaded LINKED descendants); the loop now drops the
+  cache/lock/queue bookkeeping for each, not just the directly-closed session, so a long-lived
+  loop that closes subtrees no longer leaks per-descendant state.
+- **C5** (`backends/sqlite.py`) — `checkpoint`/`vacuum`/`backup` raise a clear
+  "operation on a closed SQLite store" error instead of an opaque driver `ProgrammingError`
+  when called after `close()`.
 
 ## [2.0.0] — 2026-06-16
 
