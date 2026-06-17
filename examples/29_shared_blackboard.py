@@ -74,7 +74,8 @@ async def main() -> dict:
         config=AgentLoopConfig(system_prompt=SYSTEM_PROMPT, max_rounds=6, compactor=None),
     )
     # One board, shared by both agents because they use the same blackboard_id.
-    board = SqliteBlackboard(loop.store)
+    # The owned store opens lazily, so resolve it explicitly (loop.store is None until then).
+    board = SqliteBlackboard(await loop.ensure_store())
 
     async def run_agent(spec_name: str, instruction: str) -> str:
         # New session per agent → independent private histories. spec_name becomes

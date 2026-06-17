@@ -30,11 +30,14 @@ from power_loop.runtime.store.db import Params, Row
 from power_loop.runtime.store.dialect import Dialect, MySQLDialect
 
 
-def _args(params: Params) -> tuple[Any, ...] | None:
-    # Pass None for a parameterless statement so the driver skips its ``query % args``
-    # %-formatting pass entirely (our DDL has no ``%`` literals, and dialect.translate
-    # already doubled any that a parameterized statement might carry).
-    return tuple(params) if params else None
+def _args(params: Params) -> tuple[Any, ...]:
+    # Always hand the driver a tuple (empty when there are no binds) so PyMySQL/aiomysql
+    # ALWAYS run their ``query % escaped_args`` pass — that pass is what collapses the
+    # ``%%`` that ``dialect.translate`` doubles back down to a single literal ``%``. If we
+    # returned None for a parameterless statement, the driver would SKIP that pass and a
+    # ``%`` literal would reach MySQL as a stray ``%%`` (e.g. ``LIKE 'pl\_%'`` → ``'pl\_%%'``).
+    # ``query % ()`` is a no-op for SQL with no ``%`` and collapses ``%%`` otherwise.
+    return tuple(params)
 
 
 class _MyTransaction:

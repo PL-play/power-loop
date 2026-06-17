@@ -198,6 +198,9 @@ class StatefulAgentLoop:
         # the store pool stays bound to ONE loop across send_sync/follow_up_sync/close calls.
         self._sync_runner: _SyncLoopRunner | None = None
         self._sync_runner_lock = threading.Lock()
+        # Strong ref to a best-effort store.close() scheduled when sync close() is called
+        # from inside a running loop (keeps the task from being GC'd before it runs).
+        self._orphaned_close_task: asyncio.Future[None] | None = None
         self.config = config if config is not None else AgentLoopConfig()
         self.tool_registry = tool_registry
         self._runner = AgentRunner(event_bus=event_bus, hooks=hooks)
@@ -211,6 +214,17 @@ class StatefulAgentLoop:
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_evictions = 0
+
+    async def ensure_store(self) -> SessionStore:
+        """Public accessor: return this loop's store, opening an owned one on first use.
+
+        Construction is sync but the store opens lazily on first async use, so ``loop.store``
+        is ``None`` until then. Host integrations that need the store up front — e.g. building
+        a :class:`~power_loop.runtime.blackboard.SqliteBlackboard` to share with the loop —
+        must ``await loop.ensure_store()`` rather than reading ``loop.store`` directly (which
+        would capture ``None``).
+        """
+        return await self._ensure_store()
 
     async def _ensure_store(self) -> SessionStore:
         """Return the loop's store, opening an owned one on first use.
@@ -369,7 +383,11 @@ class StatefulAgentLoop:
                         "StatefulAgentLoop.close() called inside a running event loop; "
                         "use 'await loop.aclose()' for graceful async shutdown"
                     )
-                    asyncio.ensure_future(store.close())
+                    # Keep a strong reference: a bare ensure_future() returns a task nothing
+                    # holds, which the GC can collect mid-flight ('Task was destroyed but it
+                    # is pending') so store.close() never runs and the connection/pool leaks.
+                    self._orphaned_close_task = asyncio.ensure_future(store.close())
+                    self.store = None
         if runner is not None:
             runner.close()
             self._sync_runner = None

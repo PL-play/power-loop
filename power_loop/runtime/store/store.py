@@ -292,7 +292,9 @@ class SessionStore:
         async with self._db.transaction() as tx:
             await tx.execute(
                 f"UPDATE {self.t.session_state} SET pending_json=? WHERE session_id=?",
-                (_dumps(pending), session_id),
+                # Normalize a falsy-but-non-None pending ({}) to SQL NULL, matching the
+                # legacy oracle so get_state(...).pending round-trips to None, not {}.
+                (_dumps(pending) if pending else None, session_id),
             )
 
     # ── messages ──────────────────────────────────────────────────────────────
@@ -539,10 +541,16 @@ class SessionStore:
         now = _now_ms()
         ivl = int(interval_s) if interval_s else None
         async with self._db.transaction() as tx:
-            # Per-session MAX+1 id alloc. Safe under SQLite's single writer; the
-            # composite PK (session_id, timer_id) is the backstop. A server backend
-            # would need a row/range lock (or a per-session sequence) so two concurrent
-            # create_timer calls can't read the same MAX and collide on the PK.
+            # Per-session MAX+1 id alloc. Serialize it against concurrent writers the
+            # same way append_message does — take the session_state row lock (FOR UPDATE
+            # on a server backend) so two concurrent create_timer calls can't read the
+            # same MAX and collide on the (session_id, timer_id) PK. Legacy tolerated
+            # timers without a session row, so a missing state row is not fatal here:
+            # there is simply nothing to lock (single-writer SQLite is gap-free anyway).
+            try:
+                await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            except ValueError:
+                pass
             row = await tx.fetchone(
                 f"SELECT COALESCE(MAX(timer_id), 0) + 1 AS tid FROM {self.t.timers} "
                 "WHERE session_id=?",
@@ -686,12 +694,17 @@ class SessionStore:
     # ── notes (agent-authored persistent memory) ──────────────────────────
     async def add_note(self, session_id: str, content: str, *, pinned: bool = False) -> NoteRow:
         """Insert a note with the next per-session ``note_id`` and return it. The
-        ``COALESCE(MAX(note_id),0)+1`` allocation and the INSERT run in ONE transaction
-        so the per-session id is gap-free under SQLite's single writer; the
-        ``(session_id, note_id)`` composite PK is the backstop. (Legacy does NOT
-        check session existence here, so neither do we.)"""
+        ``COALESCE(MAX(note_id),0)+1`` allocation and the INSERT run in ONE transaction,
+        serialized against concurrent writers by the session_state row lock (FOR UPDATE on
+        a server backend) so two concurrent add_note calls can't read the same MAX and
+        collide on the ``(session_id, note_id)`` composite PK. (Legacy does NOT check
+        session existence here, so a missing state row is tolerated — nothing to lock.)"""
         now = _now_ms()
         async with self._db.transaction() as tx:
+            try:
+                await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            except ValueError:
+                pass
             row = await tx.fetchone(
                 f"SELECT COALESCE(MAX(note_id), 0) + 1 AS nid FROM {self.t.notes} "
                 "WHERE session_id=?",

@@ -12,12 +12,15 @@ connection under the lock.)
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from power_loop.runtime.store.db import Params, Row
 from power_loop.runtime.store.dialect import Dialect, SqliteDialect
+
+logger = logging.getLogger(__name__)
 
 
 class _SqliteTransaction:
@@ -58,9 +61,14 @@ class SqliteDatabase:
         conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         conn.row_factory = sqlite3.Row
         if path != ":memory:":
+            # auto_vacuum MUST be chosen before the db header is initialized — i.e. before
+            # WAL touches it / before the first table is created — otherwise the PRAGMA is a
+            # silent no-op (mode stays NONE) and incremental_vacuum reclaims nothing. So it
+            # has to run BEFORE journal_mode=WAL. (DBs created by an older build where the
+            # order was reversed need a one-time full VACUUM to switch the mode.)
+            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
         return cls(conn, path=path)
@@ -86,6 +94,16 @@ class SqliteDatabase:
         return await asyncio.to_thread(self._b_fetchall, sql, params)
 
     # ── transaction ────────────────────────────────────────────────────────────
+    async def _safe_rollback(self) -> None:
+        """Return the shared connection to a no-open-transaction state without letting a
+        failing ROLLBACK mask the original error. Leaving an open transaction here would
+        wedge the one shared writer permanently ('cannot start a transaction within a
+        transaction') for the rest of the process."""
+        try:
+            await self._exec("ROLLBACK")
+        except Exception:
+            logger.warning("sqlite: ROLLBACK during transaction recovery failed", exc_info=True)
+
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[_SqliteTransaction]:
         async with self._lock:
@@ -93,10 +111,19 @@ class SqliteDatabase:
             try:
                 yield _SqliteTransaction(self)
             except BaseException:
-                await self._exec("ROLLBACK")
+                # Roll back, but never let a failed ROLLBACK replace the caller's
+                # exception (callers pattern-match on IntegrityError / domain ValueError).
+                await self._safe_rollback()
                 raise
             else:
-                await self._exec("COMMIT")
+                try:
+                    await self._exec("COMMIT")
+                except BaseException:
+                    # A failed COMMIT (disk full / I/O error / SQLITE_BUSY on a write
+                    # upgrade) leaves the transaction open; roll it back so the connection
+                    # isn't wedged for every subsequent transaction, then surface the error.
+                    await self._safe_rollback()
+                    raise
 
     # ── autocommit reads / single writes (lock-guarded) ────────────────────────
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:

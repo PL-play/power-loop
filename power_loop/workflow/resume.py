@@ -214,7 +214,7 @@ async def resume_detached(
         )
 
     return spawn_background(
-        loop, parent_sid, run_id,
+        loop, parent_sid, run_id, store=store,
         build_engine=_build_engine, run_spec=spec,
         cancel_token=cancel_token, eager_wake=eager_wake, task_set=_RESUME_TASKS,
     )

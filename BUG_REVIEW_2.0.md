@@ -4,6 +4,22 @@ Scope: the new code since the 1.0 baseline `b2a64ed` — the async `power_loop/r
 
 **18 confirmed bugs** (1 critical, 7 high, 4 medium, 6 low) + **6 contested** (need a human call).
 
+---
+
+### Fix status (updated 2026-06-17)
+
+**All 18 confirmed bugs are FIXED**, each with a regression test (the backend-specific ones
+run against the real PG :5433 / MySQL :3307 test servers):
+
+- G1–G8 — fixed earlier (commits `348042e`, `71f2e3a`, `ec01ddd`).
+- G9–G18 — fixed in this pass. New tests: `tests/unit/test_store_bug_review_2_0_fixes.py`
+  (backend-agnostic) and `tests/unit/test_store_bug_review_2_0_server_fixes.py` (real PG/MySQL:
+  G9 id-race, G14 concurrent first-boot, G18 parameterless `%`).
+
+**Contested:** **C2** (SQLite COMMIT/ROLLBACK wedge) and **C6** (`spawn_background` reads
+`loop.store`) were fixed alongside G11/G18 since the fix sat in the same lines. **C1, C3, C4,
+C5 remain open for a human call** (see notes per item below).
+
 
 ## Confirmed
 

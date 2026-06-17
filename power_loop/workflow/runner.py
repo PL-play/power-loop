@@ -124,7 +124,7 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
         )
 
     return spawn_background(
-        loop, parent_sid, run_id,
+        loop, parent_sid, run_id, store=store,
         build_engine=_build_engine, run_spec=workflow.spec,
         cancel_token=workflow._cancel, eager_wake=eager_wake, task_set=workflow._tasks,
     )
@@ -135,6 +135,7 @@ def spawn_background(
     parent_sid: str,
     run_id: str,
     *,
+    store: Any,
     build_engine: Any,
     run_spec: Any,
     cancel_token: Any,
@@ -146,8 +147,11 @@ def spawn_background(
     Shared by first-run (``run_detached``) and ``resume_detached``. The engine is
     built lazily inside the task so its construction happens on the run's own
     task. Returns a handle immediately.
+
+    ``store`` is the caller's already-resolved store (this fn is sync and cannot
+    ``await loop._ensure_store()`` itself; reading ``loop.store`` here would capture
+    ``None`` if a future caller hadn't pre-opened it).
     """
-    store = loop.store
 
     async def _bg() -> None:
         try:

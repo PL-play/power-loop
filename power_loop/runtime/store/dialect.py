@@ -267,8 +267,10 @@ class MySQLDialect:
 
     def translate(self, sql: str) -> str:
         # The driver (aiomysql/PyMySQL) uses ``%s`` and runs ``query % args``, so a literal
-        # ``%`` must be doubled. Our SQL contains no ``%`` literals today, but escape first
-        # to stay correct if one is ever added, then map qmark → ``%s``.
+        # ``%`` must be doubled here and is collapsed back by that pass. This is only correct
+        # because backends/mysql.py:_args ALWAYS passes a tuple (never None), so the
+        # ``query % args`` collapse runs even for parameterless statements — otherwise a
+        # doubled ``%%`` would leak to MySQL verbatim. Escape ``%`` first, then qmark → ``%s``.
         return sql.replace("%", "%%").replace("?", "%s")
 
     def ddl(self, prefix: str) -> list[str]:

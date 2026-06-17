@@ -8,6 +8,47 @@
 
 ## [Unreleased]
 
+### Fixed
+
+The remaining confirmed findings from `BUG_REVIEW_2.0.md` (G9–G18), plus two
+contested items addressed because their fix sat in the same lines (C2, C6). Each has a
+regression test; the backend-specific ones run against the real PG/MySQL test servers.
+
+- **G9** (`store.py`) — `create_timer` / `add_note` allocated the per-session id with an
+  unlocked `SELECT MAX(id)+1`, so two concurrent allocators on PG/MySQL could collide on
+  the composite PK. They now take the `session_state` row lock (`lock_state` → `FOR UPDATE`)
+  first, like `append_message`; a missing state row is tolerated (legacy behaviour).
+- **G10** (`schema.py`) — the printed `provisioning_ddl` version stamp is now the
+  dialect-aware idempotent form (`ON CONFLICT DO NOTHING` / `INSERT IGNORE`), so re-applying
+  the script (Terraform/Ansible/CI) no longer fails on a duplicate-key error.
+- **G11 / C2** (`backends/sqlite.py`) — a failed `ROLLBACK` no longer masks the caller's
+  original exception, and a failed `COMMIT` now rolls back instead of leaving the shared
+  connection wedged in an open transaction for the rest of the process.
+- **G12** (`backends/sqlite.py`) — `PRAGMA auto_vacuum=INCREMENTAL` now runs *before*
+  `journal_mode=WAL`, so it actually takes (it was a silent no-op, leaving incremental
+  `vacuum()` unable to reclaim space). DBs created by an older build need a one-time full
+  `VACUUM` to switch the mode.
+- **G13** (`store.py`) — `set_pending({})` now normalizes an empty dict to SQL `NULL`
+  (round-trips to `None`), matching the legacy oracle.
+- **G14** (`schema.py`) — concurrent first-boot `AUTO_CREATE` now serializes across
+  processes with a cross-process provisioning lock (PG `pg_advisory_xact_lock`, MySQL named
+  `GET_LOCK`, SQLite no-op), so N instances racing on a fresh DB converge instead of all but
+  one crashing with a raw duplicate-object error (verified: 7/8 fail without it).
+- **G15 / G16** (`schema.py`) — `VERIFY` probes the catalog instead of swallowing every
+  exception, so a transient connection/permission failure surfaces as itself rather than as
+  "schema not initialized"; and it now checks every data table exists, not just the version
+  row, so a partially-dropped schema fails at open time rather than on the first write.
+- **G17** (`stateful_loop.py`) — sync `close()` called inside a running loop keeps a strong
+  reference to the scheduled `store.close()` task so it can't be GC'd mid-flight.
+- **G18 / C6** (`backends/mysql.py`, `workflow/runner.py`) — MySQL `_args` always returns a
+  tuple so the driver's `%`-collapse pass runs even for parameterless statements (a literal
+  `%` no longer leaks as `%%`); and `spawn_background` takes the caller's resolved store
+  instead of reading the lazily-opened `loop.store` (which is `None` until first async use).
+- **Loop** (`stateful_loop.py`, `examples/29_shared_blackboard.py`) — added a public
+  `StatefulAgentLoop.ensure_store()` accessor; the shared-blackboard example used
+  `loop.store` (now `None` until lazily opened) and crashed at startup. Host integrations
+  that need the store up front should `await loop.ensure_store()`.
+
 ## [2.0.0] — 2026-06-16
 
 **Pluggable storage + an async, stateless, resumable loop.** The store became a
