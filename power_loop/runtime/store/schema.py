@@ -24,9 +24,13 @@ follow-up.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
 from enum import Enum
 
-from power_loop.runtime.store.db import Database
+from power_loop.runtime.store.db import Database, Row
+
+logger = logging.getLogger(__name__)
 
 #: Bump + append a migration step for ANY schema change.
 CURRENT_SCHEMA_VERSION = 1
@@ -83,6 +87,36 @@ class StoreSchemaError(RuntimeError):
         )
 
 
+_FetchOne = Callable[..., Awaitable["Row | None"]]
+
+
+async def _legacy_unprefixed_present(fetch: _FetchOne, dialect_name: str, prefix: str) -> bool:
+    """True iff this looks like a PRE-2.0 power-loop SQLite database: legacy UNPREFIXED tables
+    exist but the prefixed 2.0 schema does not. 1.x was SQLite-only and used no table prefix,
+    so on upgrade the 2.0 ``pl_`` schema would open as an empty store while the old sessions
+    sit (intact) under the unprefixed names. Only meaningful for SQLite with a non-empty prefix."""
+    if not prefix or dialect_name != "sqlite":
+        return False
+    try:
+        legacy = await fetch("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
+        prefixed = await fetch(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (f"{prefix}sessions",)
+        )
+    except Exception:  # pragma: no cover - detection is best-effort, never fatal
+        return False
+    return legacy is not None and prefixed is None
+
+
+def _legacy_message(prefix: str) -> str:
+    return (
+        f"found a pre-2.0 power-loop database (legacy UNPREFIXED tables) but no '{prefix}' "
+        f"schema at this path. power-loop 2.0 uses the '{prefix}' table prefix, so prior "
+        "sessions are NOT visible under it — they are intact, just under the old unprefixed "
+        "tables. To read the legacy data open the store with table_prefix='' (the 1.x layout); "
+        f"otherwise a fresh '{prefix}' schema is used and the old sessions are ignored."
+    )
+
+
 def _version_stamp_sql(db: Database, vtable: str) -> str:
     """An idempotent 'insert the version row only if absent' (best-effort guard against a
     concurrent first-boot double-stamp; the full cross-process lock is a follow-up)."""
@@ -112,6 +146,8 @@ async def ensure_schema(
         except Exception:
             row = None
         if row is None:
+            if await _legacy_unprefixed_present(db.fetchone, db.dialect.name, prefix):
+                raise StoreSchemaError(_legacy_message(prefix), ddl=provisioning_ddl(db, prefix))
             raise StoreSchemaError(
                 f"store schema not initialized ({vtable} missing). Open with "
                 "schema=SchemaPolicy.AUTO_CREATE or provision the schema first.",
@@ -134,6 +170,11 @@ async def ensure_schema(
         )
         row = await tx.fetchone(f"SELECT version FROM {vtable} WHERE id=1")
         if row is None:
+            # Pre-2.0 DB at this path? Warn loudly (the prefix change is accepted-breaking, but
+            # silently fronting an empty store would strand the user's old sessions). Then
+            # proceed to create the fresh prefixed schema.
+            if await _legacy_unprefixed_present(tx.fetchone, db.dialect.name, prefix):
+                logger.warning("power-loop store: %s", _legacy_message(prefix))
             # Fresh store: create every table (only on first init — a no-op CREATE IF NOT
             # EXISTS otherwise, but it warns per-table on MySQL), then stamp. Wrap the DDL so
             # a permission failure surfaces the full provisioning script instead of a raw
