@@ -8,6 +8,21 @@
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-06-17
+
+A correctness-and-robustness release: it resolves every confirmed and contested finding from
+`BUG_REVIEW_2.0.md` for the 2.0 pluggable store. No breaking changes to the STABLE API; two
+small backward-compatible public additions.
+
+### Added
+
+- `StatefulAgentLoop.ensure_store()` — public accessor that opens the lazily-bound store and
+  returns it. Host integrations that need the store before the first `send` (e.g. wiring up a
+  `SqliteBlackboard`) should `await loop.ensure_store()` instead of reading `loop.store`,
+  which is `None` until the store is first opened.
+- `SessionStore.close_session_tree()` — like `close_session`, but returns the id of every
+  deleted session (the named session plus any cascaded LINKED descendants).
+
 ### Fixed
 
 The remaining confirmed findings from `BUG_REVIEW_2.0.md` (G9–G18) and all six contested
