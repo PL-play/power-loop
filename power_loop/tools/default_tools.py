@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import fnmatch
+import logging
 import os
 import queue
 import re
@@ -22,6 +23,8 @@ from power_loop.runtime.exec_backend import DEFAULT_SHELL_BACKEND, ShellBackend
 from power_loop.runtime.human_input import request_user_input
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
+
+logger = logging.getLogger(__name__)
 
 RESULT_MAX_CHARS = 50000
 TEXT_FILE_MAX_BYTES = 5 * 1024 * 1024
@@ -1100,6 +1103,11 @@ class BackgroundManager:
     def __init__(self) -> None:
         self.tasks: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        # Live daemon threads (so shutdown can drain them) and terminal write-backs that
+        # could not be delivered to their owning loop (so a later check / shutdown can
+        # still persist them instead of leaving the row stuck at 'running' forever).
+        self._threads: dict[str, threading.Thread] = {}
+        self._orphaned: list[dict[str, Any]] = []
 
     async def run(self, command: str) -> str:
         reason = _dangerous_command_reason(command)
@@ -1145,7 +1153,10 @@ class BackgroundManager:
                 "shell_backend": shell_backend,
             }
 
-        threading.Thread(target=self._execute, args=(task_id, command), daemon=True).start()
+        thread = threading.Thread(target=self._execute, args=(task_id, command), daemon=True)
+        with self._lock:
+            self._threads[task_id] = thread
+        thread.start()
         return f"Background task {task_id} started: {command[:80]}"
 
     def _execute(self, task_id: str, command: str) -> None:
@@ -1198,29 +1209,102 @@ class BackgroundManager:
             if task is not None:
                 task["status"] = status
                 task["result"] = output or "(no output)"
-        if store is not None and sid is not None and event_loop is not None:
-            # Drive the async store write on the owning event loop from this daemon
-            # thread (the store's lock/transaction are loop-bound). Best-effort: the
-            # loop may be closed during shutdown.
-            try:
-                fut = asyncio.run_coroutine_threadsafe(
-                    store.upsert_background_task(
-                        sid,
-                        task_id=task_id,
-                        command=command,
-                        status=status,
-                        return_code=return_code,
-                        output_tail=output or "(no output)",
-                    ),
-                    event_loop,
+        if store is not None and sid is not None:
+            payload = {
+                "store": store,
+                "sid": sid,
+                "task_id": task_id,
+                "command": command,
+                "status": status,
+                "return_code": return_code,
+                "output_tail": output or "(no output)",
+            }
+            # Drive the async store write on the OWNING event loop from this daemon thread
+            # (the store's lock/transaction — and a PG/MySQL pool — are loop-bound, so we
+            # cannot just spin a fresh loop here). If that loop is gone (closed during
+            # shutdown / a per-call asyncio.run that already returned), the write can't be
+            # delivered now: stash it so a later check()/aclose persists it instead of
+            # leaving the durable row stuck at 'running'. Never silently swallow.
+            delivered = False
+            if event_loop is not None and not event_loop.is_closed():
+                try:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        store.upsert_background_task(
+                            sid,
+                            task_id=task_id,
+                            command=command,
+                            status=status,
+                            return_code=return_code,
+                            output_tail=output or "(no output)",
+                        ),
+                        event_loop,
+                    )
+                    fut.result(timeout=30)
+                    delivered = True
+                except Exception:
+                    logger.warning(
+                        "background task %s: terminal status write-back failed on its "
+                        "owning event loop; deferring for recovery", task_id, exc_info=True
+                    )
+            if not delivered:
+                with self._lock:
+                    self._orphaned.append(payload)
+                logger.warning(
+                    "background task %s (session %s) finished as %s but its owning event "
+                    "loop was unavailable; status deferred (recovered on next "
+                    "check_background or aclose)", task_id, sid, status,
                 )
-                fut.result(timeout=30)
-            except Exception:
-                pass
+        with self._lock:
+            self._threads.pop(task_id, None)
+
+    async def flush_orphaned(self, store: Any, sid: str | None = None) -> None:
+        """Persist deferred terminal write-backs via the (live) ``store`` — for one ``sid``
+        (``check``) or all sessions on that store (``aclose``).
+
+        Runs on the caller's loop with a store that is valid there (``check`` is invoked
+        mid-turn, ``aclose`` before the store closes), so it sidesteps the loop-binding
+        that defeated the daemon thread's original write-back."""
+        with self._lock:
+            pending: list[dict[str, Any]] = []
+            rest: list[dict[str, Any]] = []
+            for o in self._orphaned:
+                mine = o["store"] is store and (sid is None or o["sid"] == sid)
+                (pending if mine else rest).append(o)
+            self._orphaned = rest
+        for o in pending:
+            try:
+                await store.upsert_background_task(
+                    o["sid"], task_id=o["task_id"], command=o["command"],
+                    status=o["status"], return_code=o["return_code"],
+                    output_tail=o["output_tail"],
+                )
+            except Exception:  # pragma: no cover - keep for a later retry
+                logger.warning(
+                    "failed to flush deferred background status for task %s",
+                    o["task_id"], exc_info=True,
+                )
+                with self._lock:
+                    self._orphaned.append(o)
+
+    def join_pending(self, timeout: float | None = None) -> int:
+        """Wait (up to ``timeout`` total) for in-flight background threads to finish so a
+        finishing task's terminal write-back lands before the owning store/loop is torn
+        down. Returns the count still running afterward (best-effort drain)."""
+        with self._lock:
+            threads = list(self._threads.values())
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for t in threads:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            t.join(timeout=remaining)
+        with self._lock:
+            return sum(1 for t in self._threads.values() if t.is_alive())
 
     async def check(self, task_id: str | None = None) -> str:
         store, sid = _current_store_and_session()
         if store is not None and sid is not None:
+            # Recover any terminal status a daemon thread couldn't deliver to a now-gone
+            # loop, so a stuck 'running' row self-heals on the next read.
+            await self.flush_orphaned(store, sid)
             if task_id:
                 row = await store.get_background_task(sid, task_id)
                 if row is None:

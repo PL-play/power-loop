@@ -21,8 +21,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -99,6 +100,38 @@ class StatefulResult:
     tool_calls: int = 0
 
 
+class _SyncLoopRunner:
+    """A persistent event loop on a daemon thread that drives the blocking sync API.
+
+    ``send_sync`` / ``follow_up_sync`` / ``close`` must NOT spin a fresh ``asyncio.run`` per
+    call: an asyncpg/aiomysql connection pool binds to the event loop it was created on, so
+    a second ``asyncio.run`` (a new loop) finds the loop's cached store pool bound to the
+    now-closed first loop and raises ``InterfaceError`` / ``Event loop is closed``. One
+    long-lived loop keeps the pool valid for the whole lifetime of the StatefulAgentLoop —
+    matching the legacy synchronous store's "call it as often as you like" contract. (SQLite
+    is loop-agnostic but shares this path for uniformity.)
+    """
+
+    def __init__(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._serve, name="power-loop-sync", daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def run(self, coro: Coroutine[Any, Any, Any]) -> Any:
+        """Submit a coroutine to the dedicated loop and block until it completes."""
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    def close(self) -> None:
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5.0)
+        if not self._thread.is_alive():
+            self._loop.close()
+
+
 class StatefulAgentLoop:
     """The only public entry point for running an agent loop.
 
@@ -156,6 +189,10 @@ class StatefulAgentLoop:
             store.max_spawn_depth = max_spawn_depth
         self._owns_store = store is None
         self._store_open_lock = asyncio.Lock()
+        # Dedicated event loop (daemon thread) for the blocking sync API; opened lazily so
+        # the store pool stays bound to ONE loop across send_sync/follow_up_sync/close calls.
+        self._sync_runner: _SyncLoopRunner | None = None
+        self._sync_runner_lock = threading.Lock()
         self.config = config if config is not None else AgentLoopConfig()
         self.tool_registry = tool_registry
         self._runner = AgentRunner(event_bus=event_bus, hooks=hooks)
@@ -257,27 +294,48 @@ class StatefulAgentLoop:
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Close the underlying store (if owned). Does NOT delete sessions.
+        """Close the underlying store (if owned) and the dedicated sync event loop.
 
         Synchronous and abrupt: it does NOT wait for in-flight sends or pending async
-        event-bus tasks. The store is async, so this can only close cleanly when no
-        event loop is running (it drives ``store.close()`` via ``asyncio.run``); when
-        called from inside a running loop it schedules the close and warns. Prefer
-        :meth:`aclose` (or ``async with loop:``) for graceful shutdown.
+        event-bus tasks. Prefer :meth:`aclose` (or ``async with loop:``) for graceful
+        shutdown. When the sync API was used, the store/pool live on the dedicated sync
+        loop and are torn down on it (a fresh ``asyncio.run`` could not close a pool bound
+        to another loop — the bug this avoids); otherwise the close is driven via
+        ``asyncio.run``. Called from inside a running loop it only schedules + warns.
         """
-        if not self._owns_store or self.store is None:
-            return
-        store = self.store
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            asyncio.run(store.close())
-        else:
-            logger.warning(
-                "StatefulAgentLoop.close() called inside a running event loop; "
-                "use 'await loop.aclose()' for graceful async shutdown"
-            )
-            asyncio.ensure_future(store.close())
+        runner = self._sync_runner
+        # Let in-flight background tasks finish + persist their terminal status before the
+        # store/loop is torn down (a finishing task's write-back targets the runner loop,
+        # which is still alive here); then recover any already-deferred ones.
+        if self.store is not None and runner is not None:
+            from power_loop.tools.default_tools import BG
+
+            try:
+                BG.join_pending(timeout=5.0)
+                runner.run(BG.flush_orphaned(self.store))
+            except Exception:  # pragma: no cover - drain must never block teardown
+                logger.warning("close: background-task drain failed; continuing", exc_info=True)
+        store = self.store if self._owns_store else None
+        if store is not None:
+            if runner is not None:
+                # Store/pool were opened on the dedicated loop; close them there.
+                runner.run(store.close())
+                self.store = None
+            else:
+                try:
+                    asyncio.get_running_loop()
+                except RuntimeError:
+                    asyncio.run(store.close())
+                    self.store = None
+                else:
+                    logger.warning(
+                        "StatefulAgentLoop.close() called inside a running event loop; "
+                        "use 'await loop.aclose()' for graceful async shutdown"
+                    )
+                    asyncio.ensure_future(store.close())
+        if runner is not None:
+            runner.close()
+            self._sync_runner = None
 
     async def aclose(self, *, drain_timeout_s: float = 30.0) -> None:
         """Graceful, async shutdown: quiesce, then stop.
@@ -318,7 +376,18 @@ class StatefulAgentLoop:
             await self.event_bus.drain(timeout=drain_timeout_s)
         except Exception:  # pragma: no cover - drain must never block teardown
             logger.warning("aclose: event-bus drain raised; continuing", exc_info=True)
-        # (4) checkpoint + close the owned store (only if it was ever opened).
+        # (4) let in-flight background tasks finish so their terminal status write-back
+        # lands on the still-open store/loop, then recover any that were already deferred —
+        # otherwise closing the store here would strand them at 'running' forever.
+        if self.store is not None:
+            from power_loop.tools.default_tools import BG
+
+            try:
+                await asyncio.to_thread(BG.join_pending, drain_timeout_s)
+                await BG.flush_orphaned(self.store)
+            except Exception:  # pragma: no cover - drain must never block teardown
+                logger.warning("aclose: background-task drain failed; continuing", exc_info=True)
+        # (5) checkpoint + close the owned store (only if it was ever opened).
         if self._owns_store and self.store is not None:
             try:
                 await self.store.checkpoint(mode="TRUNCATE")
@@ -462,6 +531,29 @@ class StatefulAgentLoop:
             user_input, sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt
         )
 
+    def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
+        """Drive ``coro`` to completion on the loop's dedicated sync event loop.
+
+        All blocking sync entry points funnel through here so an owned PG/MySQL pool stays
+        bound to a single, long-lived loop (see :class:`_SyncLoopRunner`). Raises if called
+        from within a running event loop — use the async methods (``await loop.send(...)``)
+        in that case.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            coro.close()  # avoid "coroutine was never awaited"
+            raise RuntimeError(
+                "sync API (send_sync/follow_up_sync) called from within a running event "
+                "loop; await the async method (loop.send / loop.follow_up) instead"
+            )
+        with self._sync_runner_lock:
+            if self._sync_runner is None:
+                self._sync_runner = _SyncLoopRunner()
+        return self._sync_runner.run(coro)
+
     def follow_up_sync(
         self,
         user_input: str | LoopMessage,
@@ -471,7 +563,7 @@ class StatefulAgentLoop:
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
     ) -> StatefulResult | FollowUpQueued:
-        return asyncio.run(
+        return self._run_sync(
             self.follow_up(
                 user_input,
                 session_id,
@@ -479,6 +571,20 @@ class StatefulAgentLoop:
                 tools=tools,
                 system_prompt=system_prompt,
             )
+        )
+
+    def new_session_sync(
+        self,
+        *,
+        metadata: dict[str, Any] | None = None,
+        system_prompt: str | None = None,
+    ) -> str:
+        """Synchronous :meth:`new_session`. Use this (not ``asyncio.run(loop.new_session())``)
+        to bootstrap a session for the sync API: it runs on the loop's dedicated sync event
+        loop, so an owned PG/MySQL pool opens on the SAME loop that ``send_sync`` later uses
+        (a throwaway ``asyncio.run`` would bind the pool to a loop that is then closed)."""
+        return self._run_sync(
+            self.new_session(metadata=metadata, system_prompt=system_prompt)
         )
 
     def send_sync(
@@ -491,7 +597,7 @@ class StatefulAgentLoop:
         system_prompt: str | None = None,
         heal_pending: bool = False,
     ) -> StatefulResult:
-        return asyncio.run(
+        return self._run_sync(
             self.send(
                 user_input,
                 session_id,

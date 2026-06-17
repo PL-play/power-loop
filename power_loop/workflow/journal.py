@@ -18,15 +18,20 @@ Caveats baked in here:
 * ``get_runtime_state`` cannot tell "absent" from a stored JSON ``null`` — so we
   never store a meaningful ``null`` (status is always a string, lists default to
   ``[]``).
-* ``set_runtime_state`` is last-write-wins with no CAS — callers must funnel all
-  writes of a given run's blob through a single coroutine (the detached task);
-  the only other writer is the wake-guard, which touches a disjoint field.
+* Every blob mutation (status/steps/index) is a read-modify-write. Bare
+  ``get_runtime_state`` + ``set_runtime_state`` is NOT safe here: the async store yields
+  the event loop between the read and the write, so concurrent parallel-branch steps (one
+  run) or concurrent ``seed`` calls (the shared index) would lose updates. We therefore
+  funnel every mutation through the store's atomic ``mutate_runtime_state`` (row-locked
+  read-modify-write), which serializes them correctly even across coroutines/processes.
 """
 
 from __future__ import annotations
 
 import time
 from typing import TYPE_CHECKING, Any
+
+from power_loop.runtime.store.store import MUTATE_SKIP
 
 if TYPE_CHECKING:
     from power_loop.runtime.store.store import SessionStore
@@ -109,10 +114,15 @@ async def seed(
 
 
 async def _append_index(store: SessionStore, parent_sid: str, run_id: str) -> None:
-    idx = await store.get_runtime_state(parent_sid, INDEX_KEY, default=[]) or []
-    if run_id not in idx:
-        idx.append(run_id)
-        await store.set_runtime_state(parent_sid, INDEX_KEY, idx)
+    def _add(idx: Any) -> list[str]:
+        idx = list(idx or [])
+        if run_id not in idx:
+            idx.append(run_id)
+        return idx
+
+    # Atomic RMW: concurrent seed() calls for different runs all mutate this one shared
+    # index blob; a plain get+set would drop run_ids (lost-update). See module docstring.
+    await store.mutate_runtime_state(parent_sid, INDEX_KEY, _add, default=[])
 
 
 async def read(store: SessionStore, parent_sid: str, run_id: str) -> dict[str, Any] | None:
@@ -135,15 +145,18 @@ async def update(
     legitimately mutate a finished run pass ``allow_terminal=True``: the completion
     wake's ``woke`` flag, and resume flipping a finished run back to ``running``.
     """
-    j = await store.get_runtime_state(parent_sid, run_key(run_id), default=None)
-    if j is None:
-        return None
-    if _is_terminal(j.get("status")) and not allow_terminal:
-        return j  # frozen — ignore the late write, first finalize wins
-    j.update(fields)
-    j["updated_at_ms"] = _now_ms()
-    await store.set_runtime_state(parent_sid, run_key(run_id), j)
-    return j
+    def _apply(j: Any) -> Any:
+        if j is None:
+            return MUTATE_SKIP  # gone
+        if _is_terminal(j.get("status")) and not allow_terminal:
+            return MUTATE_SKIP  # frozen — ignore the late write, first finalize wins
+        j.update(fields)
+        j["updated_at_ms"] = _now_ms()
+        return j
+
+    # Atomic RMW; on skip mutate_runtime_state returns the unchanged current blob
+    # (None when absent, the frozen journal when terminal) — matching the old contract.
+    return await store.mutate_runtime_state(parent_sid, run_key(run_id), _apply, default=None)
 
 
 async def record_step(
@@ -167,12 +180,6 @@ async def record_step(
     ``items_from`` / ``branch.on`` references. ``db_path`` records an
     out-of-process leaf's private db so it can be inspected after the fact.
     """
-    j = await store.get_runtime_state(parent_sid, run_key(run_id), default=None)
-    if j is None or _is_terminal(j.get("status")):
-        # Gone, or already finalized: a step settling this late (an orphaned sibling
-        # under on_error='halt', H1.2) must not clobber the terminal status/result
-        # via its stale full-blob write.
-        return
     step = {
         "node_id": node_id,
         "status": status,
@@ -183,17 +190,23 @@ async def record_step(
         "payload": payload,
         "db_path": db_path,
     }
-    # Re-read immediately before writing so the step merges onto the freshest blob
-    # (preserving a status/result a concurrent finalize just wrote) and bail if the
-    # run finalized in between — shrinks the un-CAS'd read-modify-write window.
-    fresh = await store.get_runtime_state(parent_sid, run_key(run_id), default=None)
-    if fresh is None or _is_terminal(fresh.get("status")):
-        return
-    steps = [s for s in fresh.get("steps", []) if s.get("node_id") != node_id]
-    steps.append(step)
-    fresh["steps"] = steps
-    fresh["updated_at_ms"] = _now_ms()
-    await store.set_runtime_state(parent_sid, run_key(run_id), fresh)
+
+    def _merge(j: Any) -> Any:
+        # Gone, or already finalized: a step settling this late (an orphaned sibling
+        # under on_error='halt', H1.2) must not clobber the terminal status/result.
+        if j is None or _is_terminal(j.get("status")):
+            return MUTATE_SKIP
+        # Replace-or-append this node's record (idempotent on replay), merging onto the
+        # freshest blob so a concurrent finalize's status/result is preserved.
+        steps = [s for s in j.get("steps", []) if s.get("node_id") != node_id]
+        steps.append(step)
+        j["steps"] = steps
+        j["updated_at_ms"] = _now_ms()
+        return j
+
+    # Atomic, row-locked RMW: parallel branches of one run record concurrently, so a
+    # plain get+set would let siblings clobber each other (lost-update). See docstring.
+    await store.mutate_runtime_state(parent_sid, run_key(run_id), _merge, default=None)
 
 
 async def finalize(store: SessionStore, parent_sid: str, run_id: str, result: WorkflowResult) -> None:

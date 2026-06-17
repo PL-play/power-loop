@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import secrets
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from power_loop.runtime.store.capabilities import Maintenance
@@ -46,6 +46,19 @@ DEFAULT_MAX_SPAWN_DEPTH = 3
 # import). The async store is the canonical source for these now.
 MAX_SPAWN_DEPTH = DEFAULT_MAX_SPAWN_DEPTH
 DEFAULT_DB_PATH = "./power_loop_sessions.db"
+
+
+class _NoWrite:
+    """Sentinel: a :meth:`SessionStore.mutate_runtime_state` callback returns this to
+    leave the row untouched (no write, no ``updated_at`` bump)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "MUTATE_SKIP"
+
+
+MUTATE_SKIP = _NoWrite()
 
 
 def _coerce_max_spawn_depth(value: int) -> int:
@@ -898,6 +911,56 @@ class SessionStore:
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?",
                 (now, session_id),
             )
+
+    async def mutate_runtime_state(
+        self,
+        session_id: str,
+        key: str,
+        fn: Callable[[Any], Any],
+        *,
+        default: Any = None,
+    ) -> Any:
+        """Atomically read-modify-write a ``session_runtime_state`` value.
+
+        ``fn(current)`` receives the deserialized current value (``default`` when the key
+        is absent) and returns the new value to persist, or :data:`MUTATE_SKIP` to leave
+        the row untouched. The whole read → ``fn`` → write runs under the session's row
+        lock (``dialect.lock_state`` → ``SELECT … FOR UPDATE`` on a server engine; the
+        SQLite backend already serializes writers), so concurrent mutators of the same key
+        never clobber one another — unlike a bare ``get_runtime_state`` + ``set_runtime_state``
+        pair, whose two awaits yield the event loop between read and write and so lose
+        updates when parallel coroutines interleave.
+
+        Locking the always-present ``session_state`` row (not the possibly-absent
+        runtime-state row) also serializes the *first* writer of a brand-new key. ``fn``
+        must be a plain (non-coroutine) callable. Returns the persisted new value, or the
+        unchanged current value when ``fn`` skips. Raises ``ValueError`` for an unknown
+        session."""
+        now = _now_ms()
+        async with self._db.transaction() as tx:
+            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            row = await tx.fetchone(
+                f"SELECT value_json FROM {self.t.session_runtime_state} "
+                "WHERE session_id=? AND state_key=?",
+                (session_id, key),
+            )
+            current = default if row is None else _loads(row["value_json"])
+            if current is None:
+                current = default
+            new_value = fn(current)
+            if new_value is MUTATE_SKIP:
+                return current
+            sql = self._db.dialect.upsert(
+                self.t.session_runtime_state,
+                ("session_id", "state_key"),
+                ("value_json", "updated_at"),
+            )
+            await tx.execute(sql, (session_id, key, _dumps(new_value), now))
+            await tx.execute(
+                f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?",
+                (now, session_id),
+            )
+        return new_value
 
     async def delete_runtime_state(self, session_id: str, key: str) -> None:
         async with self._db.transaction() as tx:
