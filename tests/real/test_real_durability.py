@@ -25,7 +25,10 @@ from power_loop import (
     StatefulAgentLoop,
 )
 from power_loop.runtime.compact import DefaultCompactor
-from power_loop.runtime.session_store import CURRENT_SCHEMA_VERSION
+
+# The durability test exercises the NEW async store (power_loop.SessionStore), so it must
+# assert against that store's schema version, not the legacy SQLite store's constant.
+from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION
 
 from ._llm import make_llm
 

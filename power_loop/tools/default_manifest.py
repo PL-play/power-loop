@@ -297,6 +297,23 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=(),
     ),
     ToolDefinition(
+        name="recall_send",
+        description=(
+            "Re-expand an earlier send shown in your context only as a compact summary. When you "
+            "need the EXACT original detail of a specific past send — its tool calls, their "
+            "results, files touched, full text — call this with that send's index (the #N shown "
+            "in the summary). Read-only, current session."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "send_index": {"type": "integer", "description": "The #N of the past send to expand."},
+            },
+            "required": ["send_index"],
+        },
+        required_params=("send_index",),
+    ),
+    ToolDefinition(
         name="background_run",
         description="Run a shell command in a private background worker (non-interactive).",
         input_schema={

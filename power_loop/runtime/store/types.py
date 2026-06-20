@@ -29,6 +29,7 @@ __all__ = [
     "CompactionRow",
     "BackgroundTaskRow",
     "NoteRow",
+    "ProjectMessageRow",
 ]
 
 
@@ -172,3 +173,27 @@ class NoteRow:
     pinned: bool
     created_at: int
     updated_at: int
+
+
+@dataclass
+class ProjectMessageRow:
+    """One row of the send-context PROJECTION layer (``{prefix}project_messages``), the
+    derived per-send view fed to the LLM — distinct from ``MessageRow`` (the immutable
+    ``pl_messages`` loop-internal audit). ``kind`` is ``user`` / ``project`` / ``compact``;
+    ``content`` is the parsed ``content_json`` (a structured, re-renderable summary).
+    For ``compact`` rows, ``compact_from_send``/``compact_to_send`` bound the folded send
+    range (``compact_to_send`` doubles as the read cursor). ``source_seq_lo``/``_hi`` point
+    back to the ``pl_messages`` rows this projection covers (traceability + recall)."""
+
+    session_id: str
+    send_index: int
+    kind: str
+    content: Any
+    rendered_text: str | None
+    source_seq_lo: int | None
+    source_seq_hi: int | None
+    compact_from_send: int | None
+    compact_to_send: int | None
+    projector_version: int
+    token_estimate: int | None
+    created_at: int

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from power_loop.runtime.compact import Compactor
+    from power_loop.runtime.history_projector import HistoryProjector
     from power_loop.runtime.memory import MemoryProvider
     from power_loop.runtime.notes import NotesPolicy
     from power_loop.runtime.retry import LLMRetryPolicy
@@ -49,6 +50,13 @@ class AgentLoopConfig:
     #: status="budget_exceeded". ``None`` disables.
     max_tokens_per_run: int | None = None
     compactor: Compactor | None = field(default_factory=_default_compactor)
+    #: Opt-in send-context projection (v2). When set, the loop feeds the LLM a per-send
+    #: PLAIN-TEXT projection of FINISHED sends (from pl_project_messages) plus the in-flight
+    #: send verbatim, instead of the full verbatim history; finished sends are projected at
+    #: end-of-send into pl_project_messages (pl_messages stays the immutable audit log).
+    #: MUTUALLY EXCLUSIVE with ``compactor`` (set ``compactor=None``) — see __post_init__.
+    #: ``None`` (default) → today's behavior (verbatim history + in-place compactor).
+    history_projector: HistoryProjector | None = None
     retry_policy: LLMRetryPolicy | None = None
     memory: MemoryProvider | None = None
     memory_budget_tokens: int = 1500
@@ -72,6 +80,17 @@ class AgentLoopConfig:
     # compactor never touches it.
     inject_tool_descriptions: bool = True
     tool_catalog_header: str = "# Available Tools"
+
+    def __post_init__(self) -> None:
+        # The projection layer REPLACES in-place compaction; running both would let the
+        # compactor insert compact_note rows whose logical-ord reordering breaks the
+        # reader's send_index partitioning. Force the caller to disable one.
+        if self.history_projector is not None and self.compactor is not None:
+            raise ValueError(
+                "AgentLoopConfig: history_projector and compactor are mutually exclusive — "
+                "the projection layer replaces in-place compaction. Set compactor=None when "
+                "using a history_projector."
+            )
 
 
 @dataclass

@@ -43,7 +43,7 @@ pytestmark = [
 _DATA_TABLES = (
     "sessions", "messages", "compactions", "usage_rounds", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
-    "timers", "notes",
+    "timers", "notes", "project_messages",
 )
 
 
@@ -62,3 +62,10 @@ async def mysql_store():
 @pytest.mark.parametrize("name,scn,snap", SCENARIOS, ids=[s[0] for s in SCENARIOS])
 async def test_mysql_parity(mysql_store, name: str, scn, snap) -> None:
     await run_parity(scn, snap, new_store=mysql_store)
+
+
+async def test_mysql_project_messages(mysql_store) -> None:
+    # v2 send-context projection table: DDL/upsert/load conformance on real MySQL.
+    from tests.unit.test_project_messages_store import exercise_project_messages_crud
+
+    await exercise_project_messages_crud(mysql_store)

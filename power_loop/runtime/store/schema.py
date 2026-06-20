@@ -54,7 +54,8 @@ def validate_table_prefix(prefix: str) -> str:
     return prefix
 
 #: Bump + append a migration step for ANY schema change.
-CURRENT_SCHEMA_VERSION = 1
+#: v2 (2026-06): adds the ``{prefix}project_messages`` table (send-context projection).
+CURRENT_SCHEMA_VERSION = 2
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -62,8 +63,19 @@ CURRENT_SCHEMA_VERSION = 1
 _STORE_TABLES: tuple[str, ...] = (
     "sessions", "messages", "compactions", "usage_rounds", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
-    "timers", "notes",
+    "timers", "notes", "project_messages",
 )
+
+
+def _migration_steps(db: Database, prefix: str, *, from_version: int) -> list[str]:
+    """Idempotent DDL to migrate an existing store from ``from_version`` to
+    :data:`CURRENT_SCHEMA_VERSION`. Each step is CREATE TABLE/INDEX … IF NOT EXISTS so a
+    half-applied or re-run migration is safe."""
+    steps: list[str] = []
+    if from_version < 2:
+        # v1 → v2: add the project_messages (send-context projection) table + index.
+        steps += db.dialect.project_messages_ddl(prefix)
+    return steps
 
 
 class SchemaPolicy(str, Enum):
@@ -320,7 +332,22 @@ async def ensure_schema(
                     f"store schema version {version} is newer than this power_loop build "
                     f"supports (max {CURRENT_SCHEMA_VERSION})"
                 )
-            # (No migration steps exist at v1; future steps run here, per dialect, then stamp.)
+            if version < CURRENT_SCHEMA_VERSION:
+                # Run the idempotent migration ladder under the provision lock, then bump the
+                # stamp. Wrap so a permission failure surfaces the full provisioning script.
+                try:
+                    for stmt in _migration_steps(db, prefix, from_version=version):
+                        await tx.execute(stmt)
+                except Exception as exc:
+                    raise StoreSchemaError(
+                        f"failed to migrate the store schema from v{version} to "
+                        f"v{CURRENT_SCHEMA_VERSION}. If this is a permission error, run the "
+                        "DDL below as a user with CREATE rights and reopen with "
+                        f"schema=SchemaPolicy.VERIFY. Underlying error: {exc!r}",
+                        ddl=provisioning_ddl(db, prefix),
+                    ) from exc
+                await tx.execute(f"UPDATE {vtable} SET version=? WHERE id=1", (CURRENT_SCHEMA_VERSION,))
+                return CURRENT_SCHEMA_VERSION
             return version
         finally:
             await _release_provision_lock(tx, db, prefix)

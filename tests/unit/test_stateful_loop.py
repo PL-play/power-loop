@@ -594,6 +594,51 @@ async def test_resume_executes_pending_tools(store: SessionStore) -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_index_stamped_on_every_row_and_never_leaks_to_llm(store: SessionStore) -> None:
+    """Each send allocates a monotonic, never-resetting send_index; every persisted
+    row of that send (user trigger + assistant(tool_calls) + tool result + final
+    assistant) carries it in meta — but it is stamped on the PERSISTED copy only, so
+    the LLM request and the LLM-shaped get_messages() output never carry a 'meta' key.
+    This is the authoritative send boundary the transcript/compactor rely on."""
+    llm = _Scripted(responses=[
+        _tool_resp("c1", "echo", '{"text": "a"}'),
+        LLMResponse(raw_text="done1"),
+        _tool_resp("c2", "echo", '{"text": "b"}'),
+        LLMResponse(raw_text="done2"),
+    ])
+    loop = StatefulAgentLoop(
+        llm=llm, store=store, tool_registry=_echo_registry(),
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4, compactor=None),
+    )
+    sid = await loop.new_session()
+    await loop.send("first", session_id=sid)
+    await loop.send("second", session_id=sid)
+
+    # Every persisted row carries send_index, and it partitions rows by send.
+    rows = await store.load_active_messages(sid)
+    by_send: dict[int, list[str]] = {}
+    for r in rows:
+        si = r.meta.get("send_index")
+        assert si is not None, f"row seq={r.seq} role={r.role} missing send_index"
+        by_send.setdefault(si, []).append(r.role)
+    assert set(by_send) == {1, 2}, by_send
+    assert by_send[1] == ["user", "assistant", "tool", "assistant"]
+    assert by_send[2] == ["user", "assistant", "tool", "assistant"]
+
+    # Monotonic high-water persisted in runtime_state (never resets like round_index).
+    assert await store.get_runtime_state(sid, "send_index") == 2
+
+    # send_index must NOT reach the model: neither the captured LLM request messages
+    # nor the LLM-shaped get_messages() output may carry a 'meta' key.
+    assert llm.calls, "expected at least one LLM call"
+    for call in llm.calls:
+        for m in call:
+            assert "meta" not in m, f"send_index leaked into LLM message: {m!r}"
+    for m in await loop.get_messages(sid):
+        assert "meta" not in m, f"meta leaked into get_messages output: {m!r}"
+
+
+@pytest.mark.asyncio
 async def test_close_session_wipes_data(store: SessionStore) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text="x")])
     loop = StatefulAgentLoop(llm=llm, store=store)

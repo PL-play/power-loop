@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from power_loop.runtime.session_store import SessionStore as LegacyStore
-from power_loop.runtime.store.schema import StoreSchemaError
+from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION, StoreSchemaError
 from power_loop.runtime.store.store import SessionStore
 
 pytestmark = pytest.mark.unit
@@ -81,7 +81,7 @@ async def test_create_schema_false_on_fresh_db_raises(tmp_path) -> None:
     s = await SessionStore.open(db_path, create_schema=True)
     await s.close()
     s2 = await SessionStore.open(db_path, create_schema=False)
-    assert s2.schema_version == 1
+    assert s2.schema_version == CURRENT_SCHEMA_VERSION
     await s2.close()
 
 

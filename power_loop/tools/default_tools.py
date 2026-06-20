@@ -1536,6 +1536,58 @@ async def run_recall_compacted(
     return header + ":\n\n" + "\n\n".join(blocks)
 
 
+# ── recall_send: re-expand a send the projection layer summarized ──────────────
+
+RECALL_SEND_CONTENT_CHARS = 2000
+
+
+async def run_recall_send(send_index: int) -> str:
+    """Re-expand one past send the send-context projection summarized.
+
+    When ``AgentLoopConfig.history_projector`` is set, finished sends appear in context as a
+    compact projected summary while their FULL detail stays in ``pl_messages`` (the immutable
+    audit). This returns that send's original messages — assistant text, tool calls (by name)
+    and their results — read-only, current session, by the ``send_index`` (the ``#N`` the
+    summary shows).
+    """
+    ctx = get_tool_runtime_context(required=True)
+    store, sid = ctx.store, ctx.session_id
+    assert store is not None and sid is not None  # required=True guarantees this
+
+    try:
+        target = int(send_index)
+    except (TypeError, ValueError):
+        return f"Invalid send_index: {send_index!r} (expected an integer)."
+
+    rows = [
+        r for r in await store.load_all_messages(sid)
+        if (r.meta or {}).get("send_index") == target
+    ]
+    if not rows:
+        return f"No messages found for send #{target} in this session."
+
+    blocks: list[str] = []
+    for r in rows:
+        body = r.content or ""
+        if r.tool_calls:
+            names = ", ".join(
+                (tc.get("function") or {}).get("name") or tc.get("name") or "?"
+                for tc in r.tool_calls
+            )
+            suffix = f"[tool_calls: {names}]"
+            body = f"{body}\n{suffix}" if body else suffix
+        if len(body) > RECALL_SEND_CONTENT_CHARS:
+            body = body[:RECALL_SEND_CONTENT_CHARS] + " …[truncated]"
+        head = f"[seq {r.seq} · {r.role}"
+        if r.name:
+            head += f" · {r.name}"
+        if r.round_index is not None:
+            head += f" · round {r.round_index}"
+        head += "]"
+        blocks.append(f"{head}\n{body}")
+    return f"send #{target} — {len(rows)} message(s):\n\n" + "\n\n".join(blocks)
+
+
 # Async tool handlers are registered as ``async def`` adapters (NOT sync lambdas that
 # merely return a coroutine): the registry uses ``inspect.iscoroutinefunction`` to decide
 # sync-vs-async dispatch and to keep the per-call ``runtime_env_context`` held across the
@@ -1572,6 +1624,10 @@ async def _h_recall_compacted(**kw: Any) -> Any:
     return await run_recall_compacted(
         kw.get("query"), kw.get("from_seq"), kw.get("to_seq"), kw.get("limit", 20)
     )
+
+
+async def _h_recall_send(**kw: Any) -> Any:
+    return await run_recall_send(kw["send_index"])
 
 
 async def _h_background_run(**kw: Any) -> Any:
@@ -1613,6 +1669,7 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "cancel_wakeup": _h_cancel_wakeup,
     "current_time": lambda **kw: run_current_time(),
     "recall_compacted": _h_recall_compacted,
+    "recall_send": _h_recall_send,
     "background_run": _h_background_run,
     "check_background": _h_check_background,
     "request_user_input": lambda **kw: request_user_input(

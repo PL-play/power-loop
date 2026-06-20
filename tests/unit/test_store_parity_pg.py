@@ -43,7 +43,7 @@ pytestmark = [
 _DATA_TABLES = (
     "sessions", "messages", "compactions", "usage_rounds", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
-    "timers", "notes",
+    "timers", "notes", "project_messages",
 )
 
 
@@ -61,3 +61,10 @@ async def pg_store():
 @pytest.mark.parametrize("name,scn,snap", SCENARIOS, ids=[s[0] for s in SCENARIOS])
 async def test_pg_parity(pg_store, name: str, scn, snap) -> None:
     await run_parity(scn, snap, new_store=pg_store)
+
+
+async def test_pg_project_messages(pg_store) -> None:
+    # v2 send-context projection table: DDL/upsert/load conformance on real Postgres.
+    from tests.unit.test_project_messages_store import exercise_project_messages_crud
+
+    await exercise_project_messages_crud(pg_store)

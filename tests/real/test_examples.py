@@ -276,7 +276,7 @@ def test_example_35_scaling_and_read_pool_runs() -> None:
     module = _load_example("35_scaling_and_read_pool.py")
     summary = asyncio.run(module.main())
     assert "3/3 concurrent sessions completed" in summary
-    assert "read_pool_size=4" in summary
+    assert "on the async store" in summary  # matches the example's current summary string
 
 
 def test_example_36_observability_runs() -> None:

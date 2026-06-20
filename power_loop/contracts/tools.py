@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -11,6 +11,14 @@ class ToolDefinition:
     description: str
     input_schema: dict[str, Any] = field(default_factory=lambda: {"type": "object", "properties": {}})
     required_params: tuple[str, ...] = ()
+    #: Optional self-projection for the send-context layer: ``project(args, result)`` returns
+    #: a compact summary (dict or str) of one tool call for the projected history, so each
+    #: tool decides what matters (a file tool → its path, bash → exit+head, …). A
+    #: ``HistoryProjector`` calls it when present and falls back to truncation otherwise.
+    #: ``compare=False`` keeps ToolDefinition equality/hash independent of the callable.
+    project: Callable[[Mapping[str, Any], str], dict[str, Any] | str] | None = field(
+        default=None, compare=False
+    )
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {

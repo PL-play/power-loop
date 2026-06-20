@@ -35,6 +35,7 @@ from power_loop.runtime.store.types import (
     MessageRow,
     MessageState,
     NoteRow,
+    ProjectMessageRow,
     SessionKind,
     SessionRow,
     SessionStateRow,
@@ -113,11 +114,13 @@ class _Tables:
         self.session_stats = f"{prefix}session_stats"
         self.timers = f"{prefix}timers"
         self.notes = f"{prefix}notes"
+        self.project_messages = f"{prefix}project_messages"
 
 
 # Logical export schema: (logical_name, physical(t)->table, explicit_columns). Explicit
 # column lists (no SELECT *) keep the export wire format backend-neutral; background_tasks
-# (transient) and shared_state (not session-scoped) are intentionally excluded.
+# (transient), shared_state (not session-scoped), and project_messages (a DERIVED projection
+# rebuildable from messages) are intentionally excluded.
 _EXPORT_TABLES: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
     ("sessions", lambda t: t.sessions, (
         "session_id", "created_at", "updated_at", "system_prompt", "model", "config_json",
@@ -469,6 +472,78 @@ class SessionStore:
             for r in rows
         ]
 
+    # ── project_messages (send-context projection layer) ──────────────────────
+    # The DERIVED per-send view fed to the LLM, kept entirely separate from the immutable
+    # pl_messages audit log. Append-only / idempotent-upsert; rebuildable from pl_messages.
+    async def upsert_project_message(
+        self,
+        session_id: str,
+        *,
+        send_index: int,
+        kind: str,
+        content: Any,
+        rendered_text: str | None = None,
+        source_seq_lo: int | None = None,
+        source_seq_hi: int | None = None,
+        compact_from_send: int | None = None,
+        compact_to_send: int | None = None,
+        projector_version: int = 0,
+        token_estimate: int | None = None,
+    ) -> None:
+        """Insert (or replace, by ``(session_id, send_index, kind)``) one projection row.
+        Idempotent so a resume/re-finalize of the same send is a no-op-equivalent rewrite;
+        ``created_at`` is preserved across re-finalize (insert-only)."""
+        now = _now_ms()
+        sql = self._db.dialect.upsert(
+            self.t.project_messages,
+            ("session_id", "send_index", "kind"),
+            (
+                "content_json", "rendered_text", "source_seq_lo", "source_seq_hi",
+                "compact_from_send", "compact_to_send", "projector_version", "token_estimate",
+            ),
+            insert_only_cols=("created_at",),
+        )
+        async with self._db.transaction() as tx:
+            await tx.execute(
+                sql,
+                (
+                    session_id, int(send_index), kind,
+                    _dumps(content if content is not None else {}), rendered_text,
+                    source_seq_lo, source_seq_hi, compact_from_send, compact_to_send,
+                    int(projector_version), token_estimate, now,
+                ),
+            )
+
+    async def load_project_messages(
+        self, session_id: str, *, after_send_index: int | None = None
+    ) -> list[ProjectMessageRow]:
+        """All projection rows for a session in ``(send_index, kind)`` order. ``after_send_index``
+        (exclusive) returns only rows with ``send_index > after_send_index`` — the read cursor a
+        ``compact`` row's ``compact_to_send`` provides (everything newer than the latest fold)."""
+        if after_send_index is None:
+            rows = await self._db.fetchall(
+                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? "
+                "ORDER BY send_index ASC, kind ASC",
+                (session_id,),
+            )
+        else:
+            rows = await self._db.fetchall(
+                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? AND send_index>? "
+                "ORDER BY send_index ASC, kind ASC",
+                (session_id, int(after_send_index)),
+            )
+        return [_row_to_project_message(r) for r in rows]
+
+    async def latest_project_compact(self, session_id: str) -> ProjectMessageRow | None:
+        """The most recent ``compact`` projection row (highest ``send_index``), or None.
+        Its ``compact_to_send`` is the cursor for :meth:`load_project_messages`."""
+        row = await self._db.fetchone(
+            f"SELECT * FROM {self.t.project_messages} WHERE session_id=? AND kind='compact' "
+            "ORDER BY send_index DESC LIMIT 1",
+            (session_id,),
+        )
+        return _row_to_project_message(row) if row is not None else None
+
 
     # ── session lifecycle ─────────────────────────────────────────────────────
     async def list_children(self, parent_session_id: str) -> list[SessionRow]:
@@ -534,6 +609,9 @@ class SessionStore:
             f"DELETE FROM {self.t.background_tasks} WHERE session_id=?", (session_id,)
         )
         await tx.execute(f"DELETE FROM {self.t.notes} WHERE session_id=?", (session_id,))
+        await tx.execute(
+            f"DELETE FROM {self.t.project_messages} WHERE session_id=?", (session_id,)
+        )
         await tx.execute(f"DELETE FROM {self.t.session_state} WHERE session_id=?", (session_id,))
         affected = await tx.execute(
             f"DELETE FROM {self.t.sessions} WHERE session_id=?", (session_id,)
@@ -1258,6 +1336,17 @@ def _row_to_message(row: Row) -> MessageRow:
         content=row["content"], tool_calls=_loads(row["tool_calls_json"]),
         tool_call_id=row["tool_call_id"], round_index=row["round_index"],
         state=MessageState(row["state"]), meta=_loads(row["meta_json"]) or {},
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_project_message(row: Row) -> ProjectMessageRow:
+    return ProjectMessageRow(
+        session_id=row["session_id"], send_index=row["send_index"], kind=row["kind"],
+        content=_loads(row["content_json"]), rendered_text=row["rendered_text"],
+        source_seq_lo=row["source_seq_lo"], source_seq_hi=row["source_seq_hi"],
+        compact_from_send=row["compact_from_send"], compact_to_send=row["compact_to_send"],
+        projector_version=row["projector_version"], token_estimate=row["token_estimate"],
         created_at=row["created_at"],
     )
 

@@ -25,7 +25,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from power_loop._vendor.llm_client.interface import LLMService
 from power_loop.agent.follow_up import FollowUpQueued, merge_follow_up_inputs
@@ -60,9 +60,13 @@ from power_loop.runtime.store.store import (
 from power_loop.runtime.store.types import (
     MessageRow,
     MessageState,
+    SessionRow,
     SubagentLifecycle,
 )
 from power_loop.tools.registry import ToolRegistry
+
+if TYPE_CHECKING:
+    from power_loop.runtime.history_projector import HistoryProjector
 
 logger = logging.getLogger(__name__)
 
@@ -1014,7 +1018,16 @@ class StatefulAgentLoop:
             role = str(user_input.get("role", "user"))
             content = _as_text(user_input.get("content"))
             name = user_input.get("name")
-        seq = await store.append_message(sid, role=role, content=content, name=name)
+        # Allocate the next monotonic SEND index for this session (atomic RMW under the
+        # session_state row lock — never resets, unlike round_index). This is the single
+        # send-begin point (exactly one user row per send; resume()/follow-up drains do
+        # NOT pass through here, so they correctly inherit the in-flight send's index).
+        # Stamped into meta so the transcript can delimit sends authoritatively.
+        send_index = await store.mutate_runtime_state(
+            sid, "send_index", lambda v: int(v or 0) + 1, default=0
+        )
+        meta = {"send_index": send_index}
+        seq = await store.append_message(sid, role=role, content=content, name=name, meta=meta)
         # Keep a live cache entry current with the loop's OWN append (no reload): the next
         # send's next_seq token will then match and reuse the cached window. No-op if this
         # session isn't cached. The row mirrors what append_message persisted (only
@@ -1024,7 +1037,7 @@ class StatefulAgentLoop:
             MessageRow(
                 session_id=sid, seq=seq, role=role, name=name, content=content,
                 tool_calls=None, tool_call_id=None, round_index=None,
-                state=MessageState.ACTIVE, meta={}, created_at=0,
+                state=MessageState.ACTIVE, meta=meta, created_at=0,
             ),
             new_next_seq=seq + 1,
         )
@@ -1096,41 +1109,74 @@ class StatefulAgentLoop:
         system_prompt: str | None = None,
     ) -> StatefulResult:
         store = await self._ensure_store()
+        projector = self.config.history_projector
+        # The current send's authoritative index (set by _persist_user_input; inherited by
+        # resume()/follow-up). Read up-front so projection mode can partition history by it.
+        si = await store.get_runtime_state(sid, "send_index", default=0)
+        current_send_index = int(si) if si else None
         # Cache only the plain-send path: resume()/submit_input() pass a pre-primed sink built
         # from pending state (NOT a full init_history_seqs), so they must neither read from nor
         # write to the window cache — they self-invalidate via the next_seq bump from their own
-        # appended tool rows. Capture eligibility BEFORE constructing the default sink.
-        cache_eligible = sink is None and self._session_cache_size > 0
+        # appended tool rows. Projection mode bypasses the window cache too (it caches verbatim
+        # rows, but projected history != verbatim). Capture eligibility BEFORE the default sink.
+        cache_eligible = sink is None and self._session_cache_size > 0 and projector is None
         sink = sink if sink is not None else SQLiteSink(store, sid)
-        # The async store offloads its own blocking I/O (SQLite → threadpool; PG/MySQL → real
-        # async). When this session's window cache is current (token = session_state.next_seq,
-        # already advanced by the just-persisted user input), reuse it and skip the O(active-
-        # history) load entirely; otherwise load in full and (re)populate the cache.
-        active_rows: list[MessageRow] | None = None
-        cache_token: tuple[int, int] | None = None
-        if cache_eligible:
-            state = await store.get_state(sid)
-            if state is not None:
-                cache_token = (state.next_seq, state.last_compact_seq)
-                active_rows = self._cache_get(sid, state.next_seq, state.last_compact_seq)
-        if active_rows is None:
+        if projector is not None:
+            # ── Projection mode (v2): history = rendered projections of FINISHED sends + the
+            # in-flight send's structured rows. pl_messages is NEVER compacted here (compactor
+            # is None, enforced by AgentLoopConfig), so it stays in seq order and we partition
+            # it by the meta.send_index stamped on every row. ──
             active_rows = await store.load_active_messages(sid)
-            if cache_eligible and cache_token is not None:
-                self._cache_put(sid, cache_token[0], active_rows, cache_token[1])
-        history = [_row_to_loop_message(r) for r in active_rows]
-        # Mirror loaded seqs into the sink so the compactor can translate
-        # in-memory indices back to store rows when it folds messages. Pass the
-        # parallel logical positions too: a compact_note's identity seq is high,
-        # but it sits at its logical ``ord`` (set when it was folded) — load order
-        # and the sink's index map must agree on that, or the next fold mis-maps.
-        sink.init_history_seqs(
-            [r.seq for r in active_rows],
-            [
-                int(r.meta["ord"]) if r.name == "compact_note" and r.meta.get("ord") is not None
-                else r.seq
-                for r in active_rows
-            ],
-        )
+            current_rows = (
+                [r for r in active_rows if r.meta.get("send_index", -1) == current_send_index]
+                if current_send_index is not None
+                else list(active_rows)
+            )
+            compact = await store.latest_project_compact(sid)
+            cutoff = compact.compact_to_send if compact is not None else None
+            proj_rows = await store.load_project_messages(sid, after_send_index=cutoff)
+            if current_send_index is not None:
+                proj_rows = [r for r in proj_rows if r.send_index < current_send_index]
+            prefix_rows = ([compact] if compact is not None else []) + proj_rows
+            prefix_msgs = projector.render(prefix_rows)
+            current_msgs = [_row_to_loop_message(r) for r in current_rows]
+            history = prefix_msgs + current_msgs
+            # Sink index↔seq map: the rendered prefix has no DB rows (None placeholders); the
+            # in-flight send carries its real seqs. (Compaction is off, so this map is only kept
+            # aligned for the appends, never used to fold.)
+            placeholders: list[int | None] = [None] * len(prefix_msgs)
+            cur_seqs: list[int | None] = [r.seq for r in current_rows]
+            sink.init_history_seqs(placeholders + cur_seqs, placeholders + cur_seqs)
+        else:
+            # ── Default mode: verbatim history (+ optional window cache + in-place compactor). ──
+            # The async store offloads its own blocking I/O (SQLite → threadpool; PG/MySQL → real
+            # async). When this session's window cache is current (token = session_state.next_seq,
+            # already advanced by the just-persisted user input), reuse it and skip the O(active-
+            # history) load entirely; otherwise load in full and (re)populate the cache.
+            active_rows = None
+            cache_token: tuple[int, int] | None = None
+            if cache_eligible:
+                state = await store.get_state(sid)
+                if state is not None:
+                    cache_token = (state.next_seq, state.last_compact_seq)
+                    active_rows = self._cache_get(sid, state.next_seq, state.last_compact_seq)
+            if active_rows is None:
+                active_rows = await store.load_active_messages(sid)
+                if cache_eligible and cache_token is not None:
+                    self._cache_put(sid, cache_token[0], active_rows, cache_token[1])
+            history = [_row_to_loop_message(r) for r in active_rows]
+            # Mirror loaded seqs into the sink so the compactor can translate in-memory indices
+            # back to store rows when it folds messages. Pass the parallel logical positions too:
+            # a compact_note's identity seq is high, but it sits at its logical ``ord`` (set when
+            # it was folded) — load order and the sink's index map must agree on that.
+            sink.init_history_seqs(
+                [r.seq for r in active_rows],
+                [
+                    int(r.meta["ord"]) if r.name == "compact_note" and r.meta.get("ord") is not None
+                    else r.seq
+                    for r in active_rows
+                ],
+            )
         session_row = await store.get_session(sid)
         # System prompt precedence: per-call > session > config.
         effective_sp = system_prompt
@@ -1160,6 +1206,11 @@ class StatefulAgentLoop:
                     store=store,
                     drain_follow_ups=_drain_follow_ups,
                 )
+                # Every row this run appends (assistant/tool/system, plus follow-up and
+                # trailing-notice rows drained mid-run) inherits the current send index, so
+                # the whole send shares one index. _persist_user_input bumped it for a fresh
+                # send; resume()/submit_input() leave it, correctly attaching to the prior send.
+                pipeline.send_index = current_send_index
                 try:
                     result: AgentLoopResult = await pipeline.run(history)
                 except Exception as exc:
@@ -1191,6 +1242,17 @@ class StatefulAgentLoop:
             )
         except Exception:
             logger.exception("session_stats bump failed for %s (continuing)", sid)
+        # Send-context projection (v2): at end-of-send, project the finished send's pl_messages
+        # rows into pl_project_messages so the NEXT send reads them as plain-text history. Derived
+        # + best-effort: a failure never affects the send result (pl_messages is the source of truth).
+        if projector is not None and current_send_index is not None:
+            try:
+                await self._write_send_projection(
+                    store, sid, send_index=current_send_index, status=result.status,
+                    session_row=session_row, projector=projector, tool_registry=effective_registry,
+                )
+            except Exception:
+                logger.exception("send-context projection write failed for %s (continuing)", sid)
         return StatefulResult(
             session_id=sid,
             status=result.status,
@@ -1200,6 +1262,92 @@ class StatefulAgentLoop:
             pending_interactions=result.pending_interactions,
             usage=result.usage,
             tool_calls=result.tool_calls,
+        )
+
+    async def _write_send_projection(
+        self,
+        store: SessionStore,
+        sid: str,
+        *,
+        send_index: int,
+        status: str,
+        session_row: SessionRow | None,
+        projector: HistoryProjector,
+        tool_registry: ToolRegistry | None,
+    ) -> None:
+        """Project the just-finished send's ``pl_messages`` rows into ``pl_project_messages`` (v2).
+
+        Skips sub-agent CHILD sessions (their transcript lives in their own pl_session) by
+        ``parent_session_id`` — NOT ``scope``, which ``_finalize`` hardcodes to ``'main'`` even
+        for children. Defers on a still-in-flight status (the resume re-finalizes under the SAME
+        ``send_index``; the idempotent UPSERT then overwrites). Best-effort — the caller swallows
+        failures, since ``pl_messages`` remains the source of truth."""
+        if session_row is not None and session_row.parent_session_id is not None:
+            return  # a spawned sub-agent run, not a top-level send
+        if status in ("waiting_for_input", "pending_tools"):
+            return  # send not finished; the resume will re-finalize under the same send_index
+        rows = [
+            r
+            for r in await store.load_active_messages(sid)
+            if r.meta.get("send_index", -1) == send_index
+        ]
+        if not rows:
+            return
+        projected = projector.project_send(rows, send_index=send_index, tool_registry=tool_registry)
+        version = int(getattr(projector, "version", 0) or 0)
+        for pr in projected.rows:
+            await store.upsert_project_message(
+                sid,
+                send_index=send_index,
+                kind=pr.kind,
+                content=pr.content,
+                rendered_text=pr.rendered_text,
+                source_seq_lo=projected.source_seq_lo,
+                source_seq_hi=projected.source_seq_hi,
+                projector_version=version,
+            )
+        await self._maybe_compact_projection(store, sid, projector=projector, version=version)
+
+    async def _maybe_compact_projection(
+        self, store: SessionStore, sid: str, *, projector: HistoryProjector, version: int
+    ) -> None:
+        """Projection-layer compaction (append-only, never touches pl_messages): when more than
+        ``projector.keep_last_sends`` finished sends sit uncompacted, fold the OLDEST ones into a
+        single ``compact`` row, rolling any prior compact forward so nothing is lost. The reader's
+        ``latest compact + after compact_to_send`` window then serves the bounded prefix; the
+        folded user/project rows REMAIN (recoverable via recall_send)."""
+        keep = int(getattr(projector, "keep_last_sends", 0) or 0)
+        if keep <= 0:
+            return
+        prior = await store.latest_project_compact(sid)
+        cutoff = prior.compact_to_send if prior is not None else None
+        rows = await store.load_project_messages(sid, after_send_index=cutoff)
+        live_sends = sorted({r.send_index for r in rows if r.kind in ("user", "project")})
+        if len(live_sends) <= keep:
+            return
+        fold_sends = set(live_sends[: len(live_sends) - keep])
+        fold_rows = [
+            r for r in rows if r.kind in ("user", "project") and r.send_index in fold_sends
+        ]
+        to_compact = ([prior] if prior is not None else []) + fold_rows  # roll prior forward
+        folded = projector.compact(to_compact)
+        if folded is None:
+            return
+        from_send = (
+            prior.compact_from_send
+            if (prior is not None and prior.compact_from_send is not None)
+            else min(fold_sends)
+        )
+        to_send = max(fold_sends)
+        await store.upsert_project_message(
+            sid,
+            send_index=to_send,
+            kind="compact",
+            content=folded.content,
+            rendered_text=folded.rendered_text,
+            compact_from_send=from_send,
+            compact_to_send=to_send,
+            projector_version=version,
         )
 
     async def _prime_sink_from_pending(self, sid: str, sink: SQLiteSink) -> None:

@@ -29,6 +29,12 @@ class Dialect(Protocol):
         index names carrying ``prefix`` (e.g. ``pl_``). One statement per item."""
         ...
 
+    def project_messages_ddl(self, prefix: str) -> list[str]:
+        """DDL for the ``project_messages`` table + index, split out so the v1→v2
+        schema migration can add just this table to an existing store. Included in
+        :meth:`ddl` for fresh provisioning. Idempotent (CREATE … IF NOT EXISTS)."""
+        ...
+
     def upsert(
         self,
         table: str,
@@ -124,6 +130,21 @@ class SqliteDialect:
                 session_id TEXT NOT NULL, note_id INTEGER NOT NULL, content TEXT NOT NULL,
                 pinned INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL, PRIMARY KEY (session_id, note_id))""",
+            *self.project_messages_ddl(p),
+        ]
+
+    def project_messages_ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}project_messages (
+                session_id TEXT NOT NULL, send_index INTEGER NOT NULL, kind TEXT NOT NULL,
+                content_json TEXT NOT NULL, rendered_text TEXT,
+                source_seq_lo INTEGER, source_seq_hi INTEGER,
+                compact_from_send INTEGER, compact_to_send INTEGER,
+                projector_version INTEGER NOT NULL DEFAULT 0, token_estimate INTEGER,
+                created_at INTEGER NOT NULL, PRIMARY KEY (session_id, send_index, kind))""",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_project_messages_session_kind "
+            f"ON {p}project_messages(session_id, kind, send_index)",
         ]
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
@@ -238,6 +259,21 @@ class PostgresDialect:
                 session_id TEXT NOT NULL, note_id BIGINT NOT NULL, content TEXT NOT NULL,
                 pinned SMALLINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id))""",
+            *self.project_messages_ddl(p),
+        ]
+
+    def project_messages_ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}project_messages (
+                session_id TEXT NOT NULL, send_index BIGINT NOT NULL, kind TEXT NOT NULL,
+                content_json TEXT NOT NULL, rendered_text TEXT,
+                source_seq_lo BIGINT, source_seq_hi BIGINT,
+                compact_from_send BIGINT, compact_to_send BIGINT,
+                projector_version BIGINT NOT NULL DEFAULT 0, token_estimate BIGINT,
+                created_at BIGINT NOT NULL, PRIMARY KEY (session_id, send_index, kind))""",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_project_messages_session_kind "
+            f"ON {p}project_messages(session_id, kind, send_index)",
         ]
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
@@ -339,6 +375,21 @@ class MySQLDialect:
                 session_id VARCHAR(255) NOT NULL, note_id BIGINT NOT NULL, content TEXT NOT NULL,
                 pinned TINYINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id)) {opts}""",
+            *self.project_messages_ddl(p),
+        ]
+
+    def project_messages_ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        opts = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}project_messages (
+                session_id VARCHAR(255) NOT NULL, send_index BIGINT NOT NULL, kind VARCHAR(32) NOT NULL,
+                content_json TEXT NOT NULL, rendered_text TEXT,
+                source_seq_lo BIGINT, source_seq_hi BIGINT,
+                compact_from_send BIGINT, compact_to_send BIGINT,
+                projector_version BIGINT NOT NULL DEFAULT 0, token_estimate BIGINT,
+                created_at BIGINT NOT NULL, PRIMARY KEY (session_id, send_index, kind),
+                KEY {p}idx_project_messages_session_kind (session_id, kind, send_index)) {opts}""",
         ]
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):

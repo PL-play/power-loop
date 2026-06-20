@@ -263,6 +263,11 @@ class AgentPipeline:
 
         self.system_prompt = base_prompt
         self.history: list[LoopMessage] = []
+        # Monotonic per-session SEND index, set by the loop before run() (None when
+        # unset, e.g. in tests). Stamped into each appended row's PERSISTED meta only
+        # (never the in-memory/LLM message) so the transcript can delimit sends
+        # authoritatively instead of heuristically. See _append_message.
+        self.send_index: int | None = None
         # SCALE-4: self-invalidating running token estimate of self.history.
         # ``_tok_len`` is the history length ``_tok_total`` was computed for, or -1 when
         # dirty. The append path bumps it incrementally (O(1)/round); every wholesale
@@ -329,7 +334,17 @@ class AgentPipeline:
         if self._tok_len == len(self.history) - 1:
             self._tok_total += estimate_message_tokens(ctx.message)
             self._tok_len = len(self.history)
-        await self._emit_sink(self.sink.on_message_appended, ctx.message, round_index=round_index)
+        # Persist the send_index in the row's meta — but ONLY on the copy handed to the
+        # sink, never on ctx.message (which lives in self.history and is sent verbatim to
+        # the LLM; an unknown 'meta' field would leak / break the provider). On reload
+        # _row_to_loop_message drops meta, so the LLM never sees it either way.
+        sink_msg = ctx.message
+        if self.send_index is not None:
+            sink_msg = {
+                **ctx.message,
+                "meta": {**(ctx.message.get("meta") or {}), "send_index": self.send_index},
+            }
+        await self._emit_sink(self.sink.on_message_appended, sink_msg, round_index=round_index)
 
     async def _resolve_skipped_tool_calls(
         self, skipped: Sequence[Mapping[str, Any]], *, reason: str, round_idx: int
