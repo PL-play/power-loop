@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from power_loop.runtime.store.capabilities import Maintenance
-from power_loop.runtime.store.db import Database, Row
+from power_loop.runtime.store.db import Database, Row, Transaction
 from power_loop.runtime.store.schema import (
     CURRENT_SCHEMA_VERSION,
     SchemaPolicy,
@@ -134,7 +134,7 @@ _EXPORT_TABLES: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
         "session_id", "next_seq", "round_index", "last_compact_seq", "pending_json")),
     ("messages", lambda t: t.messages, (
         "session_id", "seq", "role", "name", "content", "tool_calls_json", "tool_call_id",
-        "round_index", "state", "meta_json", "created_at")),
+        "round_index", "state", "meta_json", "send_index", "created_at")),
     ("compactions", lambda t: t.compactions, (
         "session_id", "compact_seq", "note_seq", "from_seq", "to_seq", "before_tokens",
         "after_tokens", "round_index", "created_at")),
@@ -482,6 +482,44 @@ class SessionStore:
     # ── project_messages (send-context projection layer) ──────────────────────
     # The DERIVED per-send view fed to the LLM, kept entirely separate from the immutable
     # pl_messages audit log. Append-only / idempotent-upsert; rebuildable from pl_messages.
+    async def _upsert_project_message_tx(
+        self,
+        tx: Transaction,
+        session_id: str,
+        *,
+        send_index: int,
+        kind: str,
+        content: Any,
+        now: int,
+        rendered_text: str | None = None,
+        source_seq_lo: int | None = None,
+        source_seq_hi: int | None = None,
+        compact_from_send: int | None = None,
+        compact_to_send: int | None = None,
+        projector_version: int = 0,
+        token_estimate: int | None = None,
+    ) -> None:
+        """Upsert one projection row on an OPEN transaction (so several rows + a compact fold can
+        share one atomic, lockable transaction). See :meth:`upsert_project_message`."""
+        sql = self._db.dialect.upsert(
+            self.t.project_messages,
+            ("session_id", "send_index", "kind"),
+            (
+                "content_json", "rendered_text", "source_seq_lo", "source_seq_hi",
+                "compact_from_send", "compact_to_send", "projector_version", "token_estimate",
+            ),
+            insert_only_cols=("created_at",),
+        )
+        await tx.execute(
+            sql,
+            (
+                session_id, int(send_index), kind,
+                _dumps(content if content is not None else {}), rendered_text,
+                source_seq_lo, source_seq_hi, compact_from_send, compact_to_send,
+                int(projector_version), token_estimate, now,
+            ),
+        )
+
     async def upsert_project_message(
         self,
         session_id: str,
@@ -500,26 +538,32 @@ class SessionStore:
         """Insert (or replace, by ``(session_id, send_index, kind)``) one projection row.
         Idempotent so a resume/re-finalize of the same send is a no-op-equivalent rewrite;
         ``created_at`` is preserved across re-finalize (insert-only)."""
-        now = _now_ms()
-        sql = self._db.dialect.upsert(
-            self.t.project_messages,
-            ("session_id", "send_index", "kind"),
-            (
-                "content_json", "rendered_text", "source_seq_lo", "source_seq_hi",
-                "compact_from_send", "compact_to_send", "projector_version", "token_estimate",
-            ),
-            insert_only_cols=("created_at",),
-        )
         async with self._db.transaction() as tx:
-            await tx.execute(
-                sql,
-                (
-                    session_id, int(send_index), kind,
-                    _dumps(content if content is not None else {}), rendered_text,
-                    source_seq_lo, source_seq_hi, compact_from_send, compact_to_send,
-                    int(projector_version), token_estimate, now,
-                ),
+            await self._upsert_project_message_tx(
+                tx, session_id, send_index=send_index, kind=kind, content=content,
+                rendered_text=rendered_text, source_seq_lo=source_seq_lo,
+                source_seq_hi=source_seq_hi, compact_from_send=compact_from_send,
+                compact_to_send=compact_to_send, projector_version=projector_version,
+                token_estimate=token_estimate, now=_now_ms(),
             )
+
+    async def _query_project_messages(
+        self, fetchall: Callable[..., Any], session_id: str, after_send_index: int | None
+    ) -> list[ProjectMessageRow]:
+        if after_send_index is None:
+            rows = await fetchall(
+                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? ORDER BY send_index ASC",
+                (session_id,),
+            )
+        else:
+            rows = await fetchall(
+                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? AND send_index>? "
+                "ORDER BY send_index ASC",
+                (session_id, int(after_send_index)),
+            )
+        out = [_row_to_project_message(r) for r in rows]
+        out.sort(key=lambda m: (m.send_index, _PROJECT_KIND_ORDER.get(m.kind, 9)))
+        return out
 
     async def load_project_messages(
         self, session_id: str, *, after_send_index: int | None = None
@@ -529,30 +573,77 @@ class SessionStore:
         before the user turn — reversed). ``after_send_index`` (exclusive) returns only rows with
         ``send_index > after_send_index`` — the read cursor a ``compact`` row's ``compact_to_send``
         provides (everything newer than the latest fold)."""
-        if after_send_index is None:
-            rows = await self._db.fetchall(
-                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? ORDER BY send_index ASC",
-                (session_id,),
-            )
-        else:
-            rows = await self._db.fetchall(
-                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? AND send_index>? "
-                "ORDER BY send_index ASC",
-                (session_id, int(after_send_index)),
-            )
-        out = [_row_to_project_message(r) for r in rows]
-        out.sort(key=lambda m: (m.send_index, _PROJECT_KIND_ORDER.get(m.kind, 9)))
-        return out
+        return await self._query_project_messages(self._db.fetchall, session_id, after_send_index)
 
-    async def latest_project_compact(self, session_id: str) -> ProjectMessageRow | None:
-        """The most recent ``compact`` projection row (highest ``send_index``), or None.
-        Its ``compact_to_send`` is the cursor for :meth:`load_project_messages`."""
-        row = await self._db.fetchone(
+    async def _query_latest_project_compact(
+        self, fetchone: Callable[..., Any], session_id: str
+    ) -> ProjectMessageRow | None:
+        row = await fetchone(
             f"SELECT * FROM {self.t.project_messages} WHERE session_id=? AND kind='compact' "
             "ORDER BY send_index DESC LIMIT 1",
             (session_id,),
         )
         return _row_to_project_message(row) if row is not None else None
+
+    async def latest_project_compact(self, session_id: str) -> ProjectMessageRow | None:
+        """The most recent ``compact`` projection row (highest ``send_index``), or None.
+        Its ``compact_to_send`` is the cursor for :meth:`load_project_messages`."""
+        return await self._query_latest_project_compact(self._db.fetchone, session_id)
+
+    async def write_send_projection_locked(
+        self,
+        session_id: str,
+        *,
+        send_index: int,
+        rows: list[tuple[str, Any, str | None]],
+        source_seq_lo: int | None,
+        source_seq_hi: int | None,
+        projector_version: int,
+        plan_compaction: Callable[
+            [ProjectMessageRow | None, list[ProjectMessageRow]],
+            tuple[Any, str | None, int, int] | None,
+        ],
+    ) -> None:
+        """Persist a finished send's projection ``rows`` AND an optional compact fold in ONE
+        transaction, under the ``session_state`` row lock.
+
+        Two guarantees:
+
+        * **Atomic multi-row write** — all of a send's projection rows (user + project) commit
+          together, so a crash can't leave the next-send reader a half-projected send.
+        * **Serialized compaction across loops** — the lock makes two ``StatefulAgentLoop``
+          instances sharing this store on the same session take turns; without it both could
+          read the same pre-fold state, compute the same fold, and have the second UPSERT clobber
+          the first (benign for the deterministic projector, divergent for a non-idempotent one).
+
+        ``rows`` is ``(kind, content, rendered_text)`` per projection row. ``plan_compaction`` is
+        called INSIDE the lock with ``(prior_compact, project_rows_after_prior)`` — a consistent
+        snapshot taken after this send's rows are written — and returns
+        ``(content, rendered_text, from_send, to_send)`` to fold, or ``None`` to skip. It MUST be
+        pure (no I/O): it only runs the projector's in-memory trigger + ``compact()`` logic.
+        """
+        now = _now_ms()
+        async with self._db.transaction() as tx:
+            # Lock the session row first (PG/MySQL FOR UPDATE; SQLite's single-writer connection
+            # already serializes) so the read-decide-write below is atomic against a concurrent loop.
+            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            for kind, content, rendered_text in rows:
+                await self._upsert_project_message_tx(
+                    tx, session_id, send_index=send_index, kind=kind, content=content,
+                    rendered_text=rendered_text, source_seq_lo=source_seq_lo,
+                    source_seq_hi=source_seq_hi, projector_version=projector_version, now=now,
+                )
+            prior = await self._query_latest_project_compact(tx.fetchone, session_id)
+            cutoff = prior.compact_to_send if prior is not None else None
+            proj_rows = await self._query_project_messages(tx.fetchall, session_id, cutoff)
+            plan = plan_compaction(prior, proj_rows)
+            if plan is not None:
+                content, rendered_text, from_send, to_send = plan
+                await self._upsert_project_message_tx(
+                    tx, session_id, send_index=to_send, kind="compact", content=content,
+                    rendered_text=rendered_text, compact_from_send=from_send,
+                    compact_to_send=to_send, projector_version=projector_version, now=now,
+                )
 
 
     # ── session lifecycle ─────────────────────────────────────────────────────

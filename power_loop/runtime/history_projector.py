@@ -23,6 +23,7 @@ replacement supplies domain rendering (e.g. extracting a chat tool's delivered t
 from __future__ import annotations
 
 import json
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -32,6 +33,11 @@ if TYPE_CHECKING:
     from power_loop.tools.registry import ToolRegistry
 
 LoopMessage = dict[str, Any]
+
+#: Sentinel for "this tool call had NO result row at all" — distinct from a tool that
+#: produced an empty (``""``) or null result. Kept private so it never leaks into stored
+#: projection content (the projector turns it into an explicit ``<missing>`` marker).
+_NO_RESULT = object()
 
 __all__ = [
     "HistoryProjector",
@@ -63,7 +69,13 @@ class ProjectedSend:
 
 @dataclass
 class ProjectedCompact:
-    """A projector's fold of several projection rows into one ``compact`` row."""
+    """A projector's fold of several projection rows into one ``compact`` row.
+
+    ``from_send``/``to_send`` describe the span of the *newly folded* user/project sends
+    ONLY — they intentionally do NOT extend over a rolled-forward prior ``compact`` row's
+    own range. The loop is the authority on the persisted compact's full span: it computes
+    ``compact_from_send`` from the prior compact (so nothing is lost) and ignores these
+    fields. They exist for a standalone caller of ``compact()`` that has no prior context."""
 
     content: dict[str, Any]
     from_send: int
@@ -76,10 +88,14 @@ class HistoryProjector(Protocol):
     """Strategy for the send-context projection layer. ``version`` is stamped on every row
     so a later projector change leaves prior rows intact (and is auditable). ``keep_last_sends``
     is how many most-recent finished sends stay individually projected before older ones are
-    folded into a ``compact`` row (0 = never compact)."""
+    folded into a ``compact`` row (0 = never compact). ``trigger_ratio`` is the fraction of the
+    loop's ``max_tokens`` the rendered projected prefix must reach before older sends fold
+    (the token-driven fold trigger; the loop reads it via ``getattr(..., 0.75)`` so a custom
+    projector that omits it still works, but declaring it keeps the contract explicit)."""
 
     version: int
     keep_last_sends: int
+    trigger_ratio: float
 
     def project_send(
         self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None
@@ -141,6 +157,7 @@ class IdentityProjector:
 
     version: int = 1
     keep_last_sends: int = 0  # verbatim mode never folds
+    trigger_ratio: float = 0.75  # unused (keep_last_sends==0 short-circuits folding); for Protocol parity
 
     def project_send(
         self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None
@@ -185,12 +202,15 @@ class DefaultDeterministicProjector:
         self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None
     ) -> ProjectedSend:
         users = [r for r in send_rows if r.role == "user"]
-        # tool result by tool_call_id, to pair with each assistant tool_call
-        results = {
-            r.tool_call_id: r.content
-            for r in send_rows
-            if r.role == "tool" and r.tool_call_id
-        }
+        # Tool results keyed by tool_call_id, preserving ORDER and DUPLICATES (a multimap of
+        # FIFO queues): a malformed/imported/resumed transcript can repeat or omit an id, so a
+        # plain dict would silently collapse two results onto one id (and drop the other). Each
+        # assistant tool_call consumes the front of its id's queue; an empty/absent id falls
+        # back to the "" bucket so positionally-paired empty-id calls still match.
+        results: dict[str, deque[str | None]] = {}
+        for r in send_rows:
+            if r.role == "tool":
+                results.setdefault(r.tool_call_id or "", deque()).append(r.content)
         tools: list[dict[str, Any]] = []
         final_text: str | None = None
         for r in send_rows:
@@ -199,12 +219,15 @@ class DefaultDeterministicProjector:
             if r.content:
                 final_text = r.content  # last non-empty assistant text is the send's output
             for tc in (r.tool_calls or []):
-                fn = tc.get("function") or {}
+                fn = tc.get("function")
+                fn = fn if isinstance(fn, dict) else {}
                 name = fn.get("name") or tc.get("name")
                 args = _parse_args(fn.get("arguments"))
-                tools.append(
-                    self._project_tool(name, args, results.get(tc.get("id")), tool_registry)
-                )
+                bucket = results.get(str(tc.get("id") or ""))
+                # _NO_RESULT (no row) is distinct from a real None/"" result, so the projection
+                # can show "<missing>" instead of masking an unfinished/failed call as empty.
+                result = bucket.popleft() if bucket else _NO_RESULT
+                tools.append(self._project_tool(name, args, result, tool_registry))
         seqs = [r.seq for r in send_rows]
         rows: list[ProjectedRow] = []
         if users:
@@ -222,20 +245,28 @@ class DefaultDeterministicProjector:
         )
 
     def _project_tool(
-        self, name: str | None, args: Any, result: str | None, tool_registry: ToolRegistry | None
+        self, name: str | None, args: Any, result: Any, tool_registry: ToolRegistry | None
     ) -> dict[str, Any]:
+        # ``result`` is _NO_RESULT (no tool row found), or the real tool output (``str``/None/"").
+        missing = result is _NO_RESULT
+        result_str: str | None = None if missing else result
         rt = tool_registry.get(name) if (tool_registry is not None and name) else None
         proj = getattr(rt.definition, "project", None) if rt is not None else None
         if proj is not None:
             try:
-                out = proj(args if isinstance(args, dict) else {}, result or "")
+                # Pass the result THROUGH (None when missing/null) so the hook can tell a
+                # produced-but-empty result from one that never arrived. (Signature widened to
+                # ``str | None``; the truncating fallback below handles None either way.)
+                out = proj(args if isinstance(args, dict) else {}, result_str)
             except Exception:
                 out = None  # a misbehaving tool projector must never break projection
             if isinstance(out, dict):
                 return {"name": name, **out}
             if out is not None:
                 return {"name": name, "summary": _truncate(out, self.max_chars)}
-        return {"name": name, "result": _truncate(result, self.max_chars)}
+        if missing:
+            return {"name": name, "result": "<missing>"}  # no result row — unfinished/failed call
+        return {"name": name, "result": _truncate(result_str, self.max_chars)}
 
     # rendering ----------------------------------------------------------------
     def render(self, rows: list[ProjectMessageRow]) -> list[LoopMessage]:

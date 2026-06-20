@@ -125,7 +125,7 @@ write_file = ToolDefinition(
 )
 ```
 
-The `project` callable is excluded from `ToolDefinition` equality/hash (`compare=False`).
+`result` is `str | None`: `None` means the call produced **no result row** (an unfinished/failed call) — distinct from a produced-but-empty `""`, so your hook can tell them apart. The default fallback renders a missing result as `tool(result=<missing>)` and an empty one as `tool(result=)`. Duplicate or empty `tool_call_id`s are paired in order (a repeated id never collapses two results onto one), and a malformed tool-call never breaks projection. The `project` callable is excluded from `ToolDefinition` equality/hash (`compare=False`).
 
 ## Compaction inside the projection layer
 
@@ -150,10 +150,14 @@ create_default_tool_registry(include=["recall_send"])   # also in the "full" pre
 from power_loop import HistoryProjector, ProjectedSend, ProjectedRow  # to write your own
 ```
 
+A custom projector satisfies the `HistoryProjector` Protocol by declaring `version: int`, `keep_last_sends: int`, and `trigger_ratio: float` (the token-fold fraction) plus the `project_send` / `render` / `compact` methods. `keep_last_sends == 0` disables folding entirely (what `IdentityProjector` does).
+
 ## Behavior notes
 
 - **Sub-agent child sessions are not projected** — they're skipped by `parent_session_id`; a child's transcript lives in its own session.
 - **Incomplete sends defer** — a send that ends `waiting_for_input` / `pending_tools` is not projected until a resume reaches a terminal status (idempotent upsert on `(session_id, send_index, kind)`).
+- **Pre-projection (legacy) rows render verbatim, never dropped** — rows written before a projector was attached (or before v2, or restored via export→import) have `send_index = NULL`. Enabling projection on such a session does **not** erase them: they render verbatim as a prefix that precedes every projected send (temporally first). New v2 sessions never have NULL rows, so this only matters for migration/import.
+- **Atomic & concurrency-safe** — each finished send's projection rows and any fold commit in one transaction under the session lock, so a crash can't leave a half-projected send, and two loops sharing a store can't double-write a fold.
 - **Tokens**: a verbatim projection (Identity) does not reduce tokens; real reduction comes from `DefaultDeterministicProjector`'s per-field truncation and the `compact` fold. Stored content is structured JSON, rendered to compact text at assembly time.
 - **Prompt caching**: the projected prefix grows append-only (one row group per send), so it's friendlier to a provider's implicit prefix cache than the in-place compactor (which rewrites a span on each fold).
 

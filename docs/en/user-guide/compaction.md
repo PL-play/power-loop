@@ -128,5 +128,6 @@ See also `trim_history()` in [budget.py](../../../power_loop/runtime/budget.py) 
 
 ## Next
 
+- [Send-context projection](send-context-projection.md) — the opt-in alternative: project finished sends to plain text in a derived table instead of rewriting history in place (mutually exclusive with this compactor)
 - [Memory](memory.md) — cross-session recall via `MemoryProvider`
 - [Sessions](sessions.md) — understand the session lifecycle

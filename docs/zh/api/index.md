@@ -54,7 +54,7 @@
 | `MemoryProvider` | `recall` / `remember` 协议 | [记忆](../user-guide/memory.md)、[源码](../../../power_loop/runtime/memory.py) |
 | `LLMProviderConfig` | provider/env 配置 | [Providers](../user-guide/providers.md)、[源码](../../../power_loop/runtime/provider.py) |
 | `DefaultCompactor` | 上下文摘要压缩 | [压缩](../user-guide/compaction.md)、[源码](../../../power_loop/runtime/compact.py) |
-| `HistoryProjector`、`DefaultDeterministicProjector`、`IdentityProjector` | Send 上下文投影(派生 `pl_project_messages`、`ProjectMessageRow`) | [Send 上下文投影](../user-guide/send-context-projection.md)、[源码](../../../power_loop/runtime/history_projector.py) |
+| `HistoryProjector`、`DefaultDeterministicProjector`、`IdentityProjector` | Send 上下文投影协议 + 内置实现(`trigger_ratio` token 折叠);把已结束 send 投影进派生表 `pl_project_messages`(`ProjectMessageRow`);`ToolDefinition.project` 钩子 + `recall_send` 工具取回明细 | [Send 上下文投影](../user-guide/send-context-projection.md)、[源码](../../../power_loop/runtime/history_projector.py) |
 | `RuntimeEnv`, `runtime_env_context` | 每次调用的 workspace/home/skills 与 shell backend | [工具](../user-guide/tools.md)、[源码](../../../power_loop/runtime/env.py) |
 | `ShellBackend`, `LocalShellBackend` | 持久 shell 启动方式与执行目标标识 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/runtime/exec_backend.py) |
 | `PowerLoopError` 及子类 | 通用异常层级；每个子类带稳定的点分 `code`（类属性）—— 按 `exc.code` 分支，而非类身份 | [错误码](#错误码), [源码](../../../power_loop/contracts/errors.py) |

@@ -69,3 +69,10 @@ async def test_mysql_project_messages(mysql_store) -> None:
     from tests.unit.test_project_messages_store import exercise_project_messages_crud
 
     await exercise_project_messages_crud(mysql_store)
+
+
+async def test_mysql_export_import_send_index(mysql_store) -> None:
+    # send_index (BIGINT on MySQL) round-trips through export/import on real MySQL.
+    from tests.unit.test_project_messages_store import exercise_export_import_send_index
+
+    await exercise_export_import_send_index(mysql_store)

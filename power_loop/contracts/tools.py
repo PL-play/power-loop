@@ -15,8 +15,10 @@ class ToolDefinition:
     #: a compact summary (dict or str) of one tool call for the projected history, so each
     #: tool decides what matters (a file tool → its path, bash → exit+head, …). A
     #: ``HistoryProjector`` calls it when present and falls back to truncation otherwise.
-    #: ``compare=False`` keeps ToolDefinition equality/hash independent of the callable.
-    project: Callable[[Mapping[str, Any], str], dict[str, Any] | str] | None = field(
+    #: ``result`` is ``None`` when the call produced no result row (unfinished/failed) — distinct
+    #: from a produced-but-empty ``""``. ``compare=False`` keeps ToolDefinition equality/hash
+    #: independent of the callable.
+    project: Callable[[Mapping[str, Any], str | None], dict[str, Any] | str] | None = field(
         default=None, compare=False
     )
 

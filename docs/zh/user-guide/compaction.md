@@ -106,5 +106,6 @@ class CoordinatingCompactor(DefaultCompactor):
 
 ## 下一步
 
+- [Send 上下文投影](send-context-projection.md) — 可选的替代方案:把已结束 send 投影成纯文本存进派生表,而非原地改写历史(与本压缩器互斥)
 - [记忆](memory.md) — 通过 `MemoryProvider` 跨会话召回
 - [会话](sessions.md) — 理解会话生命周期

@@ -89,6 +89,65 @@ async def test_recall_send_missing_send(store: SessionStore) -> None:
     assert "No messages found for send #99" in out
 
 
+@pytest.mark.asyncio
+async def test_recall_send_truncation_keeps_tool_calls_suffix(store: SessionStore) -> None:
+    # A long body must not eat the [tool_calls: …] suffix — else a tool-bearing send looks
+    # tool-free in the inspector (regression for #13: truncate body THEN append suffix).
+    from power_loop.tools.default_tools import RECALL_SEND_CONTENT_CHARS
+    sid = await store.create_session()
+    await store.append_message(
+        sid, role="assistant", content="x" * (RECALL_SEND_CONTENT_CHARS + 500),
+        tool_calls=[{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
+        send_index=1,
+    )
+    with _active(store, sid):
+        out = await run_recall_send(1)
+    assert "[tool_calls: bash]" in out and "…[truncated]" in out
+
+
+@pytest.mark.asyncio
+async def test_recall_send_tolerates_malformed_tool_calls(store: SessionStore) -> None:
+    # A non-dict "function" must not raise (recall_send always returns a string).
+    sid = await store.create_session()
+    await store.append_message(
+        sid, role="assistant", content="hmm",
+        tool_calls=[{"id": "c1", "function": "not-a-dict", "name": "weird"}], send_index=1,
+    )
+    with _active(store, sid):
+        out = await run_recall_send(1)
+    assert "[tool_calls: weird]" in out
+
+
+@pytest.mark.asyncio
+async def test_recall_send_truncation_multiple_tool_calls(store: SessionStore) -> None:
+    # The [tool_calls: a, b, c] suffix must list ALL tool names (comma-joined) and survive
+    # truncation of a long body.
+    from power_loop.tools.default_tools import RECALL_SEND_CONTENT_CHARS
+    sid = await store.create_session()
+    await store.append_message(
+        sid, role="assistant", content="y" * (RECALL_SEND_CONTENT_CHARS + 200),
+        tool_calls=[
+            {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "python", "arguments": "{}"}},
+            {"id": "c3", "type": "function", "function": {"name": "node", "arguments": "{}"}},
+        ],
+        send_index=1,
+    )
+    with _active(store, sid):
+        out = await run_recall_send(1)
+    assert "[tool_calls: bash, python, node]" in out and "…[truncated]" in out
+
+
+def test_session_pending_error_tolerates_malformed_function() -> None:
+    # SessionPendingError name extraction must guard a non-dict "function" (always builds a msg).
+    from power_loop.contracts.errors import SessionPendingError
+    exc = SessionPendingError(
+        "sid", assistant_seq=1,
+        pending_tool_calls=[{"id": "c1", "function": "not-a-dict", "name": "weird"}],
+    )
+    assert "weird" in str(exc)
+
+
 def test_recall_send_registered_in_default_tools() -> None:
     reg = create_default_tool_registry(include=["recall_send"], bind=False)
     assert reg.get("recall_send") is not None

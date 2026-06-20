@@ -87,6 +87,38 @@ async def test_close_session_cascades_project_messages(store: SessionStore) -> N
     assert await store.load_project_messages(sid) == []
 
 
+async def exercise_export_import_send_index(store: SessionStore) -> None:
+    """Backend-agnostic (regression for #7): a v2 session round-trips with its send_index column
+    intact (incl. a NULL legacy row), so projection still partitions by send after a restore.
+    Distinct session ids → safe against a shared, freshly-truncated DB (run on PG/MySQL too)."""
+    sid = "ei_si_src"
+    await store.create_session(session_id=sid, system_prompt="S")
+    await store.append_message(sid, role="user", content="u1", send_index=1)
+    await store.append_message(sid, role="assistant", content="a1", send_index=1)
+    await store.append_message(sid, role="user", content="u2", send_index=2)
+    await store.append_message(sid, role="user", content="legacy")  # NULL send_index
+    blob = await store.export_session(sid)
+    new_id = await store.import_session(blob, new_session_id="ei_si_restored")
+    rows = await store.load_active_messages(new_id)
+    assert [(r.content, r.send_index) for r in rows] == [
+        ("u1", 1), ("a1", 1), ("u2", 2), ("legacy", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_export_import_preserves_send_index(store: SessionStore) -> None:
+    await exercise_export_import_send_index(store)
+
+
+@pytest.mark.asyncio
+async def test_migration_ddl_for_display_includes_alter(store: SessionStore) -> None:
+    # The migration-FAILURE error must surface the ACTUAL steps incl. the ADD COLUMN that
+    # provisioning_ddl omits (regression for #4).
+    from power_loop.runtime.store.schema import migration_ddl_for_display
+    joined = " ".join(migration_ddl_for_display(store._db, "pl_", from_version=1))
+    assert "ADD COLUMN send_index" in joined and "project_messages" in joined
+
+
 @pytest.mark.asyncio
 async def test_v1_to_v2_migration_adds_project_messages_and_send_index(tmp_path) -> None:
     path = str(tmp_path / "m.db")

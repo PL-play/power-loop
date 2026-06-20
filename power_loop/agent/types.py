@@ -82,6 +82,13 @@ class AgentLoopConfig:
     tool_catalog_header: str = "# Available Tools"
 
     def __post_init__(self) -> None:
+        self._validate_projector_compactor_exclusion()
+        # Mark init complete so __setattr__ starts re-validating reassignments (the dataclass
+        # is mutable; the reader at _run_loop assumes compactor is None whenever a projector is
+        # set, so a post-hoc reassignment of either field must not silently break that).
+        object.__setattr__(self, "_initialized", True)
+
+    def _validate_projector_compactor_exclusion(self) -> None:
         # The projection layer REPLACES in-place compaction; running both would let the
         # compactor insert compact_note rows whose logical-ord reordering breaks the
         # reader's send_index partitioning. Force the caller to disable one.
@@ -91,6 +98,11 @@ class AgentLoopConfig:
                 "the projection layer replaces in-place compaction. Set compactor=None when "
                 "using a history_projector."
             )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name in ("history_projector", "compactor") and getattr(self, "_initialized", False):
+            self._validate_projector_compactor_exclusion()
 
 
 @dataclass

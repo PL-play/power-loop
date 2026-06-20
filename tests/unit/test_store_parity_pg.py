@@ -68,3 +68,10 @@ async def test_pg_project_messages(pg_store) -> None:
     from tests.unit.test_project_messages_store import exercise_project_messages_crud
 
     await exercise_project_messages_crud(pg_store)
+
+
+async def test_pg_export_import_send_index(pg_store) -> None:
+    # send_index (BIGINT on PG) round-trips through export/import on real Postgres.
+    from tests.unit.test_project_messages_store import exercise_export_import_send_index
+
+    await exercise_export_import_send_index(pg_store)

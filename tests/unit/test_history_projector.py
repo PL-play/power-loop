@@ -71,6 +71,111 @@ def test_tool_project_hook_used_over_fallback() -> None:
     assert tools == [{"name": "write_file", "file": "x.py"}]  # hook output, not the raw result
 
 
+def test_duplicate_tool_call_id_preserves_both_results() -> None:
+    # Two tool calls share id "c1" (malformed/imported transcript). A plain dict[id]->result
+    # would collapse both onto the SECOND result; the multimap must keep them paired in order.
+    p = DefaultDeterministicProjector()
+    rows = [
+        _mr(1, "user", "go"),
+        _mr(2, "assistant", tool_calls=[_tc("c1", "bash", '{"c":"a"}'), _tc("c1", "bash", '{"c":"b"}')]),
+        _mr(3, "tool", "RESULT-A", tool_call_id="c1", name="bash"),
+        _mr(4, "tool", "RESULT-B", tool_call_id="c1", name="bash"),
+        _mr(5, "assistant", "done"),
+    ]
+    tools = next(r.content for r in p.project_send(rows, send_index=1, tool_registry=None).rows
+                 if r.kind == "project")["tools"]
+    assert [t["result"] for t in tools] == ["RESULT-A", "RESULT-B"]
+
+
+def test_missing_tool_result_distinct_from_empty() -> None:
+    # A call with NO tool row renders "<missing>"; a produced-but-empty ("") result stays "".
+    p = DefaultDeterministicProjector()
+    rows = [
+        _mr(1, "user", "go"),
+        _mr(2, "assistant", tool_calls=[_tc("c1", "gone"), _tc("c2", "empty")]),
+        _mr(3, "tool", "", tool_call_id="c2", name="empty"),
+        _mr(4, "assistant", "done"),
+    ]
+    tools = next(r.content for r in p.project_send(rows, send_index=1, tool_registry=None).rows
+                 if r.kind == "project")["tools"]
+    assert tools[0] == {"name": "gone", "result": "<missing>"}
+    assert tools[1] == {"name": "empty", "result": ""}
+
+
+def test_project_hook_receives_none_for_missing_result() -> None:
+    # The hook must be able to tell "no result produced" (None) from a produced-but-empty result.
+    seen: list[object] = []
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(name="t", description="t",
+                       project=lambda args, result: (seen.append(result), {"k": "v"})[1]),
+        lambda **kw: "",
+    )
+    p = DefaultDeterministicProjector()
+    rows = [_mr(1, "user", "go"), _mr(2, "assistant", tool_calls=[_tc("c1", "t")]), _mr(3, "assistant", "x")]
+    p.project_send(rows, send_index=1, tool_registry=reg)
+    assert seen == [None]  # missing result → None passed through (not "")
+
+
+def test_malformed_function_field_does_not_raise() -> None:
+    # A tool_call whose "function" is a non-dict (bare string) must not crash name extraction.
+    p = DefaultDeterministicProjector()
+    rows = [
+        _mr(1, "user", "go"),
+        _mr(2, "assistant", tool_calls=[{"id": "c1", "function": "not-a-dict", "name": "weird"}]),
+        _mr(3, "tool", "r", tool_call_id="c1"),
+        _mr(4, "assistant", "ok"),
+    ]
+    tools = next(r.content for r in p.project_send(rows, send_index=1, tool_registry=None).rows
+                 if r.kind == "project")["tools"]
+    assert tools[0]["name"] == "weird"
+
+
+def test_duplicate_tool_call_id_three_results_fifo() -> None:
+    # The multimap deque must preserve FIFO order for 3+ results sharing one id.
+    p = DefaultDeterministicProjector()
+    rows = [
+        _mr(1, "user", "go"),
+        _mr(2, "assistant", tool_calls=[_tc("c1", "bash"), _tc("c1", "bash"), _tc("c1", "bash")]),
+        _mr(3, "tool", "R1", tool_call_id="c1"),
+        _mr(4, "tool", "R2", tool_call_id="c1"),
+        _mr(5, "tool", "R3", tool_call_id="c1"),
+        _mr(6, "assistant", "done"),
+    ]
+    tools = next(r.content for r in p.project_send(rows, send_index=1, tool_registry=None).rows
+                 if r.kind == "project")["tools"]
+    assert [t["result"] for t in tools] == ["R1", "R2", "R3"]
+
+
+def test_missing_result_hook_exception_falls_back_to_missing() -> None:
+    # A hook that raises on a MISSING result must still yield "<missing>" (not crash, not "").
+    def boom(args, result):
+        raise ValueError("misbehaving hook")
+    reg = ToolRegistry()
+    reg.register(ToolDefinition(name="broken", description="b", project=boom), lambda **kw: "")
+    p = DefaultDeterministicProjector()
+    rows = [_mr(1, "user", "go"), _mr(2, "assistant", tool_calls=[_tc("c1", "broken")]),
+            _mr(3, "assistant", "done")]
+    tools = next(r.content for r in p.project_send(rows, send_index=1, tool_registry=reg).rows
+                 if r.kind == "project")["tools"]
+    assert tools[0] == {"name": "broken", "result": "<missing>"}
+
+
+def test_identity_projector_declares_trigger_ratio() -> None:
+    # IdentityProjector satisfies the Protocol's trigger_ratio; a custom projector that OMITS it
+    # still works via the loop's getattr(..., 0.75) fallback.
+    assert IdentityProjector().trigger_ratio == 0.75
+
+    class _MinimalProjector:
+        version = 1
+        keep_last_sends = 0  # no trigger_ratio attribute on purpose
+        def project_send(self, send_rows, *, send_index, tool_registry): ...  # noqa: E704
+        def render(self, rows): return []  # noqa: E704
+        def compact(self, rows): return None  # noqa: E704
+
+    assert getattr(_MinimalProjector(), "trigger_ratio", 0.75) == 0.75
+
+
 def test_default_fallback_truncates_result() -> None:
     p = DefaultDeterministicProjector(max_chars=5)
     rows = [

@@ -67,21 +67,48 @@ _STORE_TABLES: tuple[str, ...] = (
 )
 
 
+def _send_index_column_type(dialect_name: str) -> str:
+    return "INTEGER" if dialect_name == "sqlite" else "BIGINT"
+
+
 async def _migration_steps(
     tx: Transaction, db: Database, prefix: str, *, from_version: int
 ) -> list[str]:
     """DDL to migrate an existing store from ``from_version`` to :data:`CURRENT_SCHEMA_VERSION`.
     CREATE statements are ``IF NOT EXISTS`` (idempotent); the ``ALTER … ADD COLUMN`` (no portable
     ``IF NOT EXISTS`` across SQLite/MySQL) is guarded by a catalog probe (on the open ``tx``) so a
-    half-applied or re-run migration is safe."""
+    half-applied or re-run migration is safe.
+
+    On SQLite/PostgreSQL this whole ladder runs inside one transaction (atomic — a failure rolls
+    back). On MySQL each DDL auto-commits, so a mid-ladder failure leaves a half-applied schema
+    with the version NOT bumped; because every step is idempotent, simply reopening with
+    AUTO_CREATE once the cause (permissions/disk) is fixed completes it (see the migration-failure
+    error in :func:`ensure_schema`, which surfaces these exact steps)."""
     steps: list[str] = []
     if from_version < 2:
         # v1 → v2: add the project_messages (send-context projection) table + index, and the
         # authoritative send_index column on messages (NULL on pre-existing rows).
         steps += db.dialect.project_messages_ddl(prefix)
         if not await _column_exists(tx, db.dialect.name, f"{prefix}messages", "send_index"):
-            int_type = "INTEGER" if db.dialect.name == "sqlite" else "BIGINT"
-            steps.append(f"ALTER TABLE {prefix}messages ADD COLUMN send_index {int_type}")
+            steps.append(
+                f"ALTER TABLE {prefix}messages ADD COLUMN send_index "
+                f"{_send_index_column_type(db.dialect.name)}"
+            )
+    return steps
+
+
+def migration_ddl_for_display(db: Database, prefix: str, *, from_version: int) -> list[str]:
+    """The migration DDL as a human-runnable script for an error message — NO catalog probe (the
+    ``ALTER`` is shown unconditionally so an operator running it by hand sees every step). Unlike
+    :func:`provisioning_ddl` (which only CREATEs fresh tables and would silently SKIP the
+    ``ALTER … ADD COLUMN`` on an existing table), this is what actually completes the migration."""
+    steps: list[str] = []
+    if from_version < 2:
+        steps += db.dialect.project_messages_ddl(prefix)
+        steps.append(
+            f"ALTER TABLE {prefix}messages ADD COLUMN send_index "
+            f"{_send_index_column_type(db.dialect.name)}"
+        )
     return steps
 
 
@@ -366,12 +393,24 @@ async def ensure_schema(
                     for stmt in await _migration_steps(tx, db, prefix, from_version=version):
                         await tx.execute(stmt)
                 except Exception as exc:
+                    # On MySQL DDL auto-commits, so the failed migration is half-applied and the
+                    # version stays at the old value; the steps are idempotent, so reopening with
+                    # AUTO_CREATE once the cause is fixed finishes it. Surface the MIGRATION steps
+                    # (incl. the ALTER) — NOT provisioning_ddl, which would skip the ADD COLUMN on
+                    # the existing messages table and so never actually complete the migration.
+                    mysql_note = (
+                        " (on MySQL the migration is non-atomic — DDL auto-commits — so this may "
+                        "be half-applied; the steps are idempotent, so once the cause is fixed "
+                        "simply reopen with AUTO_CREATE to finish.)"
+                        if db.dialect.name == "mysql" else ""
+                    )
                     raise StoreSchemaError(
                         f"failed to migrate the store schema from v{version} to "
-                        f"v{CURRENT_SCHEMA_VERSION}. If this is a permission error, run the "
-                        "DDL below as a user with CREATE rights and reopen with "
-                        f"schema=SchemaPolicy.VERIFY. Underlying error: {exc!r}",
-                        ddl=provisioning_ddl(db, prefix),
+                        f"v{CURRENT_SCHEMA_VERSION}.{mysql_note} If this is a permission error, run "
+                        "the migration step(s) below as a user with the needed rights, then reopen "
+                        "with schema=SchemaPolicy.AUTO_CREATE (it re-runs the idempotent steps and "
+                        f"stamps the version). Underlying error: {exc!r}",
+                        ddl=migration_ddl_for_display(db, prefix, from_version=version),
                     ) from exc
                 await tx.execute(f"UPDATE {vtable} SET version=? WHERE id=1", (CURRENT_SCHEMA_VERSION,))
                 return CURRENT_SCHEMA_VERSION

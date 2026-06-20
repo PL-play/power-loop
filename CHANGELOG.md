@@ -16,8 +16,8 @@ default nothing changes (`history_projector=None` → verbatim history + the exi
 - **`AgentLoopConfig.history_projector: HistoryProjector | None`** (default `None`). When set,
   the loop feeds the LLM a per-send **plain-text projection of FINISHED sends** plus the
   in-flight send verbatim, instead of the full verbatim history. Mutually exclusive with
-  `compactor` (set `compactor=None`; enforced in `__post_init__`) — the projection layer
-  replaces in-place compaction.
+  `compactor` (set `compactor=None`; enforced at construction **and** re-validated on
+  post-construction reassignment) — the projection layer replaces in-place compaction.
 - **`HistoryProjector` Protocol** + two implementations (new module `power_loop.runtime.history_projector`):
   - `IdentityProjector` — stores/renders each send verbatim (history identical to the default;
     useful to verify the seam introduces no change).
@@ -45,6 +45,38 @@ New public exports: `HistoryProjector`, `IdentityProjector`, `DefaultDeterminist
 `ProjectedSend`, `ProjectedRow`, `ProjectedCompact`, `ProjectMessageRow` (PROVISIONAL — in
 `__all__`, not yet in `STABLE_API`). Example: `examples/40_send_context_projection.py`. No
 breaking changes to the STABLE API.
+
+### Fixed — projection pre-release hardening (deep-review remediation)
+
+A multi-agent review of the projection layer surfaced these; all fixed with regression tests
+(the feature is still unreleased, so these refine the additions above rather than ship a patch):
+
+- **Pre-projection / legacy rows are no longer silently dropped from context.** Rows written
+  before projection was enabled — or before v2, or restored via export→import — carry
+  `send_index = NULL`. The reader now renders them **verbatim as a temporally-first prefix**
+  (instead of excluding everything that doesn't equal the current send index), and a session
+  resumed in projection mode with no allocated send index fails loudly rather than feeding all
+  rows as one pseudo-send. The `send_index` coercion is `>= 1`-explicit (no longer treats `0` as
+  unset by accident).
+- **Tool results pair correctly under duplicate / missing / empty `tool_call_id`.** Results are
+  matched to assistant tool-calls via an order-preserving multimap (duplicate ids no longer
+  collapse onto one result), and a missing result (no tool row) is rendered as `<missing>`,
+  distinct from a produced-but-empty `""`. `ToolDefinition.project`'s `result` is now `str | None`
+  (`None` = no result produced). Malformed `tool_calls` (a non-dict `function`) no longer raise in
+  the projector, `recall_send`, or `SessionPendingError`.
+- **Atomic, concurrency-safe projection write.** A finished send's projection rows and any
+  compaction fold are written in **one transaction under the session-state row lock** (new
+  internal `SessionStore.write_send_projection_locked`), so a crash can't leave a half-projected
+  send and two `StatefulAgentLoop`s sharing a store can't double-write a fold.
+- **`send_index` survives export/import** (added to the messages export columns) so a v2 session
+  round-trips with projection intact.
+- **`HistoryProjector` Protocol now declares `trigger_ratio`** (the token-fold fraction), matching
+  what the loop reads and the built-ins provide.
+- **MySQL migration failure is actionable** — the error now surfaces the actual migration steps
+  (including the `ALTER … ADD COLUMN`, which `provisioning_ddl` omits) and explains the
+  DDL-auto-commit / re-run-with-AUTO_CREATE recovery.
+- **`recall_send`** truncates the message body before appending the `[tool_calls: …]` summary, so
+  a long message no longer hides that it made tool calls.
 
 ## [2.1.0] — 2026-06-17
 

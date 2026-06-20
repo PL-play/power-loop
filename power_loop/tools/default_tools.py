@@ -1563,18 +1563,28 @@ async def run_recall_send(send_index: int) -> str:
     if not rows:
         return f"No messages found for send #{target} in this session."
 
+    def _tc_name(tc: dict[str, Any]) -> str:
+        # ``function`` is normally a dict, but a malformed/imported tool_call can carry a
+        # non-dict (e.g. a bare string); guard so name extraction never raises (the tool
+        # must always return a string).
+        fn = tc.get("function")
+        name = fn.get("name") if isinstance(fn, dict) else None
+        return str(name or tc.get("name") or "?")
+
     blocks: list[str] = []
     for r in rows:
         body = r.content or ""
+        suffix = ""
         if r.tool_calls:
-            names = ", ".join(
-                (tc.get("function") or {}).get("name") or tc.get("name") or "?"
-                for tc in r.tool_calls
-            )
+            names = ", ".join(_tc_name(tc) for tc in r.tool_calls)
             suffix = f"[tool_calls: {names}]"
-            body = f"{body}\n{suffix}" if body else suffix
+        # Truncate the CONTENT first (the body is the unbounded part), THEN append the
+        # tool-calls suffix — otherwise a ~2000-char message would have its suffix cut, making
+        # a tool-bearing send look tool-free in the inspector.
         if len(body) > RECALL_SEND_CONTENT_CHARS:
             body = body[:RECALL_SEND_CONTENT_CHARS] + " …[truncated]"
+        if suffix:
+            body = f"{body}\n{suffix}" if body else suffix
         head = f"[seq {r.seq} · {r.role}"
         if r.name:
             head += f" · {r.name}"

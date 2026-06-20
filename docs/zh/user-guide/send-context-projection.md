@@ -125,7 +125,7 @@ write_file = ToolDefinition(
 )
 ```
 
-`project` 不参与 `ToolDefinition` 的相等/哈希(`compare=False`)。
+`result` 类型为 `str | None`:`None` 表示这次调用**没有结果行**(未完成/失败的调用)——与「产生了但为空」的 `""` 区分开,钩子因此能分辨二者。默认兜底把缺失结果渲染为 `tool(result=<missing>)`,空结果渲染为 `tool(result=)`。重复或为空的 `tool_call_id` 会按顺序配对(重复 id 绝不把两个结果折叠成一个),畸形的 tool_call 也不会让投影崩溃。`project` 不参与 `ToolDefinition` 的相等/哈希(`compare=False`)。
 
 ## 投影层内的压缩
 
@@ -150,10 +150,14 @@ create_default_tool_registry(include=["recall_send"])   # 也在 "full" 预设�
 from power_loop import HistoryProjector, ProjectedSend, ProjectedRow  # 写自己的 projector
 ```
 
+自定义 projector 满足 `HistoryProjector` 协议需声明 `version: int`、`keep_last_sends: int`、`trigger_ratio: float`(token 折叠比例),以及 `project_send` / `render` / `compact` 方法。`keep_last_sends == 0` 完全关闭折叠(`IdentityProjector` 就是如此)。
+
 ## 行为说明
 
 - **子 agent 子 session 不投影** —— 按 `parent_session_id` 跳过;子 session 的明细在它自己的 session 里。
 - **未完成的 send 延迟投影** —— 以 `waiting_for_input` / `pending_tools` 结束的 send,等 resume 走到终态才投影(按 `(session_id, send_index, kind)` 幂等 upsert)。
+- **投影前(遗留)的行逐字渲染,绝不丢弃** —— 在挂上 projector 之前(或 v2 之前、或经 export→import 恢复)写入的行 `send_index = NULL`。在这种 session 上开启投影**不会**抹掉它们:它们作为前缀逐字渲染,排在所有已投影 send 之前(时间上最早)。全新的 v2 session 不会有 NULL 行,所以这只对迁移/导入场景有意义。
+- **原子且并发安全** —— 每个已结束 send 的投影行与任何折叠在**同一事务、持会话锁**内提交,所以崩溃不会留下半投影的 send,两个共享 store 的 loop 也不会重复写同一条 compact。
 - **token**:逐字投影(Identity)不省 token;真正的削减来自 `DefaultDeterministicProjector` 的按字段截断 + `compact` 折叠。存的是结构化 JSON,装配时渲染成紧凑文本。
 - **前缀缓存**:投影前缀是 append-only 增长(每 send 一组行),比就地压缩器(每次折叠重写一段)对厂商的隐式前缀缓存更友好。
 

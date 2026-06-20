@@ -57,10 +57,14 @@ class SessionPendingError(PowerLoopError):
         self.session_id = session_id
         self.assistant_seq = assistant_seq
         self.pending_tool_calls = pending_tool_calls
-        names = ",".join(
-            str((tc.get("function") or {}).get("name") or tc.get("name") or "?")
-            for tc in pending_tool_calls
-        )
+        def _tc_name(tc: dict[str, Any]) -> str:
+            # ``function`` is normally a dict, but a malformed/imported tool_call can carry a
+            # non-dict (e.g. a bare string) — guard so name extraction never raises here.
+            fn = tc.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else None
+            return str(name or tc.get("name") or "?")
+
+        names = ",".join(_tc_name(tc) for tc in pending_tool_calls)
         super().__init__(
             f"session {session_id} has {len(pending_tool_calls)} unresolved tool_calls"
             f" from round (assistant_seq={assistant_seq}): {names}."
