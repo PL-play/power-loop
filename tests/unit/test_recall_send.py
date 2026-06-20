@@ -46,18 +46,18 @@ async def store() -> AsyncIterator[SessionStore]:
 
 
 async def _seed_two_sends(store: SessionStore, sid: str) -> None:
-    await store.append_message(sid, role="user", content="do X", meta={"send_index": 1})
+    await store.append_message(sid, role="user", content="do X", send_index=1)
     await store.append_message(
         sid, role="assistant",
         tool_calls=[{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
-        meta={"send_index": 1},
+        send_index=1,
     )
     await store.append_message(
         sid, role="tool", content="exit 0\nthe-result", tool_call_id="c1", name="bash",
-        meta={"send_index": 1},
+        send_index=1,
     )
-    await store.append_message(sid, role="assistant", content="all done", meta={"send_index": 1})
-    await store.append_message(sid, role="user", content="next thing", meta={"send_index": 2})
+    await store.append_message(sid, role="assistant", content="all done", send_index=1)
+    await store.append_message(sid, role="user", content="next thing", send_index=2)
 
 
 @pytest.mark.asyncio

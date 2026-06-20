@@ -48,6 +48,7 @@ from power_loop.core.pipeline import (
     _truncate_result,
 )
 from power_loop.core.runner import AgentRunner
+from power_loop.runtime.budget import estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike
 from power_loop.runtime.skills import SkillLoader
 from power_loop.runtime.store.schema import SchemaPolicy
@@ -1026,18 +1027,19 @@ class StatefulAgentLoop:
         send_index = await store.mutate_runtime_state(
             sid, "send_index", lambda v: int(v or 0) + 1, default=0
         )
-        meta = {"send_index": send_index}
-        seq = await store.append_message(sid, role=role, content=content, name=name, meta=meta)
+        seq = await store.append_message(
+            sid, role=role, content=content, name=name, send_index=send_index
+        )
         # Keep a live cache entry current with the loop's OWN append (no reload): the next
         # send's next_seq token will then match and reuse the cached window. No-op if this
         # session isn't cached. The row mirrors what append_message persisted (only
-        # seq/role/content/name are consumed when rebuilding the working history).
+        # seq/role/content/name/send_index are consumed when rebuilding the working history).
         self._cache_append(
             sid,
             MessageRow(
                 session_id=sid, seq=seq, role=role, name=name, content=content,
                 tool_calls=None, tool_call_id=None, round_index=None,
-                state=MessageState.ACTIVE, meta=meta, created_at=0,
+                state=MessageState.ACTIVE, meta={}, created_at=0, send_index=send_index,
             ),
             new_next_seq=seq + 1,
         )
@@ -1128,7 +1130,7 @@ class StatefulAgentLoop:
             # it by the meta.send_index stamped on every row. ──
             active_rows = await store.load_active_messages(sid)
             current_rows = (
-                [r for r in active_rows if r.meta.get("send_index", -1) == current_send_index]
+                [r for r in active_rows if r.send_index == current_send_index]
                 if current_send_index is not None
                 else list(active_rows)
             )
@@ -1287,9 +1289,7 @@ class StatefulAgentLoop:
         if status in ("waiting_for_input", "pending_tools"):
             return  # send not finished; the resume will re-finalize under the same send_index
         rows = [
-            r
-            for r in await store.load_active_messages(sid)
-            if r.meta.get("send_index", -1) == send_index
+            r for r in await store.load_active_messages(sid) if r.send_index == send_index
         ]
         if not rows:
             return
@@ -1311,11 +1311,13 @@ class StatefulAgentLoop:
     async def _maybe_compact_projection(
         self, store: SessionStore, sid: str, *, projector: HistoryProjector, version: int
     ) -> None:
-        """Projection-layer compaction (append-only, never touches pl_messages): when more than
-        ``projector.keep_last_sends`` finished sends sit uncompacted, fold the OLDEST ones into a
-        single ``compact`` row, rolling any prior compact forward so nothing is lost. The reader's
-        ``latest compact + after compact_to_send`` window then serves the bounded prefix; the
-        folded user/project rows REMAIN (recoverable via recall_send)."""
+        """Projection-layer compaction (append-only, never touches pl_messages): once the rendered
+        projected prefix reaches ``max_tokens × trigger_ratio`` (mirrors DefaultCompactor's
+        token-driven policy), fold the OLDEST uncompacted sends — always keeping the most-recent
+        ``projector.keep_last_sends`` — into a single ``compact`` row, rolling any prior compact
+        forward so nothing is lost. The reader's ``latest compact + after compact_to_send`` window
+        then serves the bounded prefix; the folded user/project rows REMAIN (recoverable via
+        recall_send)."""
         keep = int(getattr(projector, "keep_last_sends", 0) or 0)
         if keep <= 0:
             return
@@ -1324,6 +1326,13 @@ class StatefulAgentLoop:
         rows = await store.load_project_messages(sid, after_send_index=cutoff)
         live_sends = sorted({r.send_index for r in rows if r.kind in ("user", "project")})
         if len(live_sends) <= keep:
+            return  # nothing foldable beyond the keep-recent floor
+        # Token-driven trigger (reuse the default compactor's policy): only fold once the rendered
+        # prefix is actually large. Below the threshold, small per-send projections just accumulate.
+        trigger_ratio = float(getattr(projector, "trigger_ratio", 0.75) or 0.75)
+        threshold = int((self.config.max_tokens or 8000) * trigger_ratio)
+        rendered_prefix = projector.render(([prior] if prior is not None else []) + rows)
+        if estimate_tokens(rendered_prefix) < threshold:
             return
         fold_sends = set(live_sends[: len(live_sends) - keep])
         fold_rows = [

@@ -145,6 +145,14 @@ from power_loop.runtime.exec_backend import (
     LocalShellBackend,
     ShellBackend,
 )
+from power_loop.runtime.history_projector import (
+    DefaultDeterministicProjector,
+    HistoryProjector,
+    IdentityProjector,
+    ProjectedCompact,
+    ProjectedRow,
+    ProjectedSend,
+)
 from power_loop.runtime.human_input import HumanInputRequired, request_user_input
 from power_loop.runtime.memory import MemoryProvider, MemorySnapshot, tag_as_memory
 from power_loop.runtime.notes import (
@@ -186,6 +194,7 @@ from power_loop.runtime.store.store import (
 from power_loop.runtime.store.types import (
     MessageRow,
     MessageState,
+    ProjectMessageRow,
     SessionKind,
     SessionRow,
     SessionStatsRow,
@@ -311,6 +320,13 @@ __all__ = [
 	"BackgroundRuntimeProjector",
 	"default_runtime_projectors",
 	"get_tool_runtime_context",
+	"HistoryProjector",
+	"IdentityProjector",
+	"DefaultDeterministicProjector",
+	"ProjectedSend",
+	"ProjectedRow",
+	"ProjectedCompact",
+	"ProjectMessageRow",
 	"CancellationToken",
 	"CancellationLike",
 	"RuntimeEnv",

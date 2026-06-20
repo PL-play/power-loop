@@ -81,6 +81,7 @@ pip install 'power-loop[openai]'      # 或 [anthropic] · 要那两个后端就
 | **进程沙箱** | 每个工作流叶子在自己的 OS 进程 + 自己的 DB;每叶子套 gVisor/Docker | [沙箱](docs/zh/user-guide/sandboxing.md) |
 | **持久定时器** | Agent 自排唤醒;重启存活;一次性或循环 | [定时器](docs/zh/user-guide/timers.md) |
 | **上下文压缩** | 自动摘要旧轮次(绝不拆开工具调用对);`recall_compacted` 取回原文 | [压缩](docs/zh/user-guide/compaction.md) |
+| **Send 上下文投影** | 可选:把已结束 send 投影成纯文本(派生表 `pl_project_messages`)喂给模型,而非逐字历史;`pl_messages` 保持不可变;`recall_send` 取回明细 | [投影](docs/zh/user-guide/send-context-projection.md) |
 | **持久化运维** | 可移植迁移版本表、保留/裁剪、VACUUM、`export_session`/`import_session`、优雅 `aclose()` | [会话](docs/zh/user-guide/sessions.md) |
 | **可观测性** | 带类型、`seq` 有序的事件 → 持久 JSONL + `replay`、Prometheus/StatsD 指标、OpenTelemetry span | [可观测性](docs/zh/user-guide/observability.md) |
 | **MCP 工具** | 把 Model Context Protocol server 的工具接成 power-loop 工具 | [扩展](docs/zh/user-guide/extending-tools.md) |

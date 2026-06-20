@@ -305,3 +305,16 @@ def test_example_38_mcp_tools_runs() -> None:
     module = _load_example("38_mcp_tools.py")
     summary = asyncio.run(module.main())
     assert "mcp.add" in summary and "42" in summary
+
+
+def test_example_40_send_context_projection_runs() -> None:
+    """The send-context projection example: finished sends are projected to plain text in
+    pl_project_messages, older sends fold into a compact row, pl_messages stays intact, and
+    recall_send re-expands a folded send. Deterministic (no model-behavior dependence)."""
+    module = _load_example("40_send_context_projection.py")
+    out = asyncio.run(module.main())
+    assert set(out["projected_kinds"]) >= {"user", "project"}, out
+    assert out["has_compact"] is True and out["compact_from_send"] == 1, out
+    assert out["pl_messages_intact"] is True, out          # immutable audit kept in full
+    assert out["projection_is_plain_text"] is True, out     # no tool-call protocol in history
+    assert out["recall_recovers_send1"] is True, out        # recall_send recovers the folded send

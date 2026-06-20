@@ -43,11 +43,14 @@ def _two_send_script() -> _Scripted:
     ])
 
 
-def _projector_loop(store: SessionStore, llm: _Scripted, projector) -> StatefulAgentLoop:
+def _projector_loop(
+    store: SessionStore, llm: _Scripted, projector, *, max_tokens: int = 8000
+) -> StatefulAgentLoop:
     return StatefulAgentLoop(
         llm=llm, store=store, tool_registry=_echo_registry(),
         config=AgentLoopConfig(
             system_prompt="S", max_rounds=4, compactor=None, history_projector=projector,
+            max_tokens=max_tokens,
         ),
     )
 
@@ -140,7 +143,8 @@ async def test_waiting_for_input_defers_projection(store: SessionStore) -> None:
 @pytest.mark.asyncio
 async def test_projection_compaction_keeps_last_n(store: SessionStore) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text=f"d{i}") for i in range(1, 6)])
-    loop = _projector_loop(store, llm, DefaultDeterministicProjector(keep_last_sends=2))
+    # tiny max_tokens so the token-driven fold trigger fires on these short sends
+    loop = _projector_loop(store, llm, DefaultDeterministicProjector(keep_last_sends=2), max_tokens=10)
     sid = await loop.new_session()
     for i in range(1, 4):  # 3 sends → send 1 folded (keep last 2)
         await loop.send(f"m{i}", session_id=sid)
@@ -158,7 +162,7 @@ async def test_projection_compaction_keeps_last_n(store: SessionStore) -> None:
 @pytest.mark.asyncio
 async def test_projection_compaction_rolls_prior_forward(store: SessionStore) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text=f"d{i}") for i in range(1, 7)])
-    loop = _projector_loop(store, llm, DefaultDeterministicProjector(keep_last_sends=2))
+    loop = _projector_loop(store, llm, DefaultDeterministicProjector(keep_last_sends=2), max_tokens=10)
     sid = await loop.new_session()
     for i in range(1, 5):  # 4 sends → compact now spans 1-2, nothing lost
         await loop.send(f"m{i}", session_id=sid)

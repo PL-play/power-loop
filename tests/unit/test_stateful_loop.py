@@ -597,9 +597,9 @@ async def test_resume_executes_pending_tools(store: SessionStore) -> None:
 async def test_send_index_stamped_on_every_row_and_never_leaks_to_llm(store: SessionStore) -> None:
     """Each send allocates a monotonic, never-resetting send_index; every persisted
     row of that send (user trigger + assistant(tool_calls) + tool result + final
-    assistant) carries it in meta — but it is stamped on the PERSISTED copy only, so
-    the LLM request and the LLM-shaped get_messages() output never carry a 'meta' key.
-    This is the authoritative send boundary the transcript/compactor rely on."""
+    assistant) carries it in the messages.send_index COLUMN — stamped on the PERSISTED
+    copy only, so the LLM request and the LLM-shaped get_messages() output never carry a
+    'send_index' (or 'meta') key. This is the authoritative send boundary."""
     llm = _Scripted(responses=[
         _tool_resp("c1", "echo", '{"text": "a"}'),
         LLMResponse(raw_text="done1"),
@@ -614,13 +614,12 @@ async def test_send_index_stamped_on_every_row_and_never_leaks_to_llm(store: Ses
     await loop.send("first", session_id=sid)
     await loop.send("second", session_id=sid)
 
-    # Every persisted row carries send_index, and it partitions rows by send.
+    # Every persisted row carries the send_index COLUMN, and it partitions rows by send.
     rows = await store.load_active_messages(sid)
     by_send: dict[int, list[str]] = {}
     for r in rows:
-        si = r.meta.get("send_index")
-        assert si is not None, f"row seq={r.seq} role={r.role} missing send_index"
-        by_send.setdefault(si, []).append(r.role)
+        assert r.send_index is not None, f"row seq={r.seq} role={r.role} missing send_index"
+        by_send.setdefault(r.send_index, []).append(r.role)
     assert set(by_send) == {1, 2}, by_send
     assert by_send[1] == ["user", "assistant", "tool", "assistant"]
     assert by_send[2] == ["user", "assistant", "tool", "assistant"]
@@ -629,13 +628,13 @@ async def test_send_index_stamped_on_every_row_and_never_leaks_to_llm(store: Ses
     assert await store.get_runtime_state(sid, "send_index") == 2
 
     # send_index must NOT reach the model: neither the captured LLM request messages
-    # nor the LLM-shaped get_messages() output may carry a 'meta' key.
+    # nor the LLM-shaped get_messages() output may carry a 'send_index' (or 'meta') key.
     assert llm.calls, "expected at least one LLM call"
     for call in llm.calls:
         for m in call:
-            assert "meta" not in m, f"send_index leaked into LLM message: {m!r}"
+            assert "send_index" not in m and "meta" not in m, f"leaked into LLM message: {m!r}"
     for m in await loop.get_messages(sid):
-        assert "meta" not in m, f"meta leaked into get_messages output: {m!r}"
+        assert "send_index" not in m and "meta" not in m, f"leaked into get_messages: {m!r}"
 
 
 @pytest.mark.asyncio

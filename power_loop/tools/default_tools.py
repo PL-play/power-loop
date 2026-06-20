@@ -1559,10 +1559,7 @@ async def run_recall_send(send_index: int) -> str:
     except (TypeError, ValueError):
         return f"Invalid send_index: {send_index!r} (expected an integer)."
 
-    rows = [
-        r for r in await store.load_all_messages(sid)
-        if (r.meta or {}).get("send_index") == target
-    ]
+    rows = [r for r in await store.load_all_messages(sid) if r.send_index == target]
     if not rows:
         return f"No messages found for send #{target} in this session."
 

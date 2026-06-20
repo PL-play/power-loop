@@ -56,6 +56,7 @@ inspect the source modules linked below.
 | `MemoryProvider` | recall and remember protocol | [Memory](../user-guide/memory.md), [source](../../../power_loop/runtime/memory.py) |
 | `LLMProviderConfig` | provider/env configuration | [Providers](../user-guide/providers.md), [source](../../../power_loop/runtime/provider.py) |
 | `DefaultCompactor` | context summary compaction | [Compaction](../user-guide/compaction.md), [source](../../../power_loop/runtime/compact.py) |
+| `HistoryProjector`, `DefaultDeterministicProjector`, `IdentityProjector` | send-context projection (derived `pl_project_messages`, `ProjectMessageRow`) | [Projection](../user-guide/send-context-projection.md), [source](../../../power_loop/runtime/history_projector.py) |
 | `RuntimeEnv`, `runtime_env_context` | per-invocation workspace/home/skills and shell backend | [Tools](../user-guide/tools.md), [source](../../../power_loop/runtime/env.py) |
 | `ShellBackend`, `LocalShellBackend` | persistent-shell launch and execution-target identity | [Tools](../user-guide/tools.md), [source](../../../power_loop/runtime/exec_backend.py) |
 | `PowerLoopError` and subclasses | common exception hierarchy; every subclass carries a stable dotted `code` (class attribute) — branch on `exc.code`, not class identity | [Error codes](#error-codes), [source](../../../power_loop/contracts/errors.py) |

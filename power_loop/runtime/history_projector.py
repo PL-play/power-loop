@@ -175,7 +175,11 @@ class DefaultDeterministicProjector:
 
     version: int = 1
     max_chars: int = 200  # per-field truncation budget
-    keep_last_sends: int = 4  # most-recent sends kept individually; older folded into a compact
+    keep_last_sends: int = 4  # most-recent sends ALWAYS kept individually (never folded)
+    #: Fold older sends into a compact row once the rendered projected prefix reaches
+    #: ``loop max_tokens × trigger_ratio`` (mirrors DefaultCompactor's policy) — token-driven,
+    #: not send-count-driven. The most-recent ``keep_last_sends`` are always preserved.
+    trigger_ratio: float = 0.75
 
     def project_send(
         self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None

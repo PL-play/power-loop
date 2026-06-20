@@ -159,6 +159,7 @@ class SQLiteSink:
                 name=message.get("name"),
                 round_index=round_index,
                 meta=message.get("meta"),
+                send_index=message.get("send_index"),
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)
@@ -201,6 +202,7 @@ class SQLiteSink:
                 tool_calls=list(tool_calls) if tool_calls else None,
                 round_index=round_index,
                 meta=message.get("meta"),
+                send_index=message.get("send_index"),
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)
@@ -215,6 +217,7 @@ class SQLiteSink:
             name=message.get("name"),
             round_index=round_index,
             meta=message.get("meta"),
+            send_index=message.get("send_index"),
         )
         self._history_seqs.append(seq)
         self._history_ord.append(seq)

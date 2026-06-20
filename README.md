@@ -81,6 +81,7 @@ Most "agent frameworks" ask you to build your app *inside* them. power-loop is t
 | **Process sandboxing** | Each workflow leaf in its own OS process + own DB; wrap each in gVisor/Docker per leaf | [Sandboxing](docs/en/user-guide/sandboxing.md) |
 | **Durable timers** | Agents schedule their own wake-ups; survive restarts; one-shot or recurring | [Timers](docs/en/user-guide/timers.md) |
 | **Context compaction** | Auto-summarize old turns (never splits a tool-call pair); `recall_compacted` to pull originals back | [Compaction](docs/en/user-guide/compaction.md) |
+| **Send-context projection** | Opt-in: feed a per-send plain-text projection of finished sends (derived `pl_project_messages`) instead of verbatim history; `pl_messages` stays immutable; `recall_send` to re-expand | [Projection](docs/en/user-guide/send-context-projection.md) |
 | **Durability ops** | Portable migration-version table, retention/prune, VACUUM, `export_session`/`import_session`, graceful `aclose()` | [Sessions](docs/en/user-guide/sessions.md) |
 | **Observability** | Typed `seq`-ordered events → durable JSONL + `replay`, Prometheus/StatsD metrics, OpenTelemetry spans | [Observability](docs/en/user-guide/observability.md) |
 | **MCP tools** | Surface a Model Context Protocol server's tools as power-loop tools | [Extending](docs/en/user-guide/extending-tools.md) |

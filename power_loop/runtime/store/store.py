@@ -66,6 +66,10 @@ class _NoWrite:
 
 MUTATE_SKIP = _NoWrite()
 
+# Conversation order WITHIN one send for projection rows: the user turn before the assistant
+# (project) summary; a compact row (keyed at its own send_index) sorts last at that index.
+_PROJECT_KIND_ORDER = {"user": 0, "project": 1, "compact": 2}
+
 
 def _coerce_max_spawn_depth(value: int) -> int:
     """Validate a spawn-depth ceiling: a positive int (≥1). Raises ValueError."""
@@ -317,9 +321,11 @@ class SessionStore:
         name: str | None = None,
         round_index: int | None = None,
         meta: dict[str, Any] | None = None,
+        send_index: int | None = None,
     ) -> int:
         """Append one message and return its allocated per-session ``seq`` (allocated +
-        inserted atomically in one transaction)."""
+        inserted atomically in one transaction). ``send_index`` is the authoritative per-session
+        send index (a real column, NULL outside a send)."""
         now = _now_ms()
         async with self._db.transaction() as tx:
             st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
@@ -327,11 +333,12 @@ class SessionStore:
             await tx.execute(
                 f"INSERT INTO {self.t.messages} ("
                 "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
-                "round_index, state, meta_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "round_index, state, meta_json, send_index, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     session_id, seq, role, name, content,
                     _dumps(tool_calls) if tool_calls else None, tool_call_id, round_index,
-                    MessageState.ACTIVE.value, _dumps(meta or {}), now,
+                    MessageState.ACTIVE.value, _dumps(meta or {}),
+                    (int(send_index) if send_index is not None else None), now,
                 ),
             )
             await tx.execute(
@@ -517,22 +524,25 @@ class SessionStore:
     async def load_project_messages(
         self, session_id: str, *, after_send_index: int | None = None
     ) -> list[ProjectMessageRow]:
-        """All projection rows for a session in ``(send_index, kind)`` order. ``after_send_index``
-        (exclusive) returns only rows with ``send_index > after_send_index`` — the read cursor a
-        ``compact`` row's ``compact_to_send`` provides (everything newer than the latest fold)."""
+        """Projection rows for a session in CONVERSATION order: by ``send_index``, and WITHIN a
+        send ``user`` before ``project`` (a kind-alphabetical sort would put the assistant reply
+        before the user turn — reversed). ``after_send_index`` (exclusive) returns only rows with
+        ``send_index > after_send_index`` — the read cursor a ``compact`` row's ``compact_to_send``
+        provides (everything newer than the latest fold)."""
         if after_send_index is None:
             rows = await self._db.fetchall(
-                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? "
-                "ORDER BY send_index ASC, kind ASC",
+                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? ORDER BY send_index ASC",
                 (session_id,),
             )
         else:
             rows = await self._db.fetchall(
                 f"SELECT * FROM {self.t.project_messages} WHERE session_id=? AND send_index>? "
-                "ORDER BY send_index ASC, kind ASC",
+                "ORDER BY send_index ASC",
                 (session_id, int(after_send_index)),
             )
-        return [_row_to_project_message(r) for r in rows]
+        out = [_row_to_project_message(r) for r in rows]
+        out.sort(key=lambda m: (m.send_index, _PROJECT_KIND_ORDER.get(m.kind, 9)))
+        return out
 
     async def latest_project_compact(self, session_id: str) -> ProjectMessageRow | None:
         """The most recent ``compact`` projection row (highest ``send_index``), or None.
@@ -1336,7 +1346,7 @@ def _row_to_message(row: Row) -> MessageRow:
         content=row["content"], tool_calls=_loads(row["tool_calls_json"]),
         tool_call_id=row["tool_call_id"], round_index=row["round_index"],
         state=MessageState(row["state"]), meta=_loads(row["meta_json"]) or {},
-        created_at=row["created_at"],
+        created_at=row["created_at"], send_index=row["send_index"],
     )
 
 

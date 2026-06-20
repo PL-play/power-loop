@@ -39,6 +39,8 @@ async def test_real_projection_compaction_and_recall() -> None:
             config=AgentLoopConfig(
                 system_prompt="You are terse. Reply with one short sentence.",
                 max_rounds=3, compactor=None,
+                # small max_tokens so the token-driven fold (max_tokens × trigger_ratio) fires
+                max_tokens=40,
                 history_projector=DefaultDeterministicProjector(keep_last_sends=2),
             ),
         )

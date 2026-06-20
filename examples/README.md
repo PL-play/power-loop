@@ -50,6 +50,7 @@ A representative subset is validated by `tests/real/test_examples.py` against a 
 | 37 | [`37_custom_retrieval_tool.py`](37_custom_retrieval_tool.py) | **Extending**: register a custom (retrieval) tool — the no-bundled-connectors recipe | `ToolDefinition`, `ToolRegistry`, `tools=` allowlist |
 | 38 | [`38_mcp_tools.py`](38_mcp_tools.py) | **MCP**: wire a real MCP server's tools into the agent | `StdioMCPClient`, `register_mcp_tools` (`power-loop[mcp]`) |
 | 39 | [`39_pluggable_backends_and_resume.py`](39_pluggable_backends_and_resume.py) | **Storage**: pick a backend by DSN (SQLite/PG/MySQL), resume a session from a cold loop, schema policy | `dsn=`, `SchemaPolicy`, `StoreSchemaError`, `prewarm()`, `cache_stats` |
+| 40 | [`40_send_context_projection.py`](40_send_context_projection.py) | **Projection**: feed finished sends as plain text (`pl_project_messages`) instead of verbatim history; fold + `recall_send` | `HistoryProjector`, `DefaultDeterministicProjector`, `history_projector=`, `recall_send` |
 
 ## Running
 

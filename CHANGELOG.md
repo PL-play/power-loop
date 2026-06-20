@@ -8,6 +8,44 @@
 
 ## [Unreleased]
 
+### Added — Send-context projection (opt-in; PROVISIONAL public API)
+
+A new way to control what each send feeds the LLM, separate from in-place compaction. By
+default nothing changes (`history_projector=None` → verbatim history + the existing compactor).
+
+- **`AgentLoopConfig.history_projector: HistoryProjector | None`** (default `None`). When set,
+  the loop feeds the LLM a per-send **plain-text projection of FINISHED sends** plus the
+  in-flight send verbatim, instead of the full verbatim history. Mutually exclusive with
+  `compactor` (set `compactor=None`; enforced in `__post_init__`) — the projection layer
+  replaces in-place compaction.
+- **`HistoryProjector` Protocol** + two implementations (new module `power_loop.runtime.history_projector`):
+  - `IdentityProjector` — stores/renders each send verbatim (history identical to the default;
+    useful to verify the seam introduces no change).
+  - `DefaultDeterministicProjector` — generic, no-LLM structured summary: each tool call is
+    summarized via the tool's optional `project()` hook else a truncating fallback, rendered to
+    terse plain text with **no OpenAI tool-call protocol fields** (so a projected past send can't
+    dangle a tool pair and is provider-agnostic). Older sends fold into an append-only `compact`
+    row **once the rendered prefix reaches `max_tokens × trigger_ratio`** (token-driven, mirroring
+    `DefaultCompactor`'s policy); `keep_last_sends` is the always-kept-recent floor.
+- **`ToolDefinition.project`** — optional `(args, result) -> dict|str` self-projection hook so
+  each tool decides how it appears in projected history (`compare=False`, doesn't affect equality).
+- **`recall_send(send_index)` default tool** — re-expand one finished send's FULL `pl_messages`
+  detail (original tool calls + results) on demand.
+- **Store: new `{prefix}project_messages` table (schema v1 → v2)** — the derived projection layer
+  (`pl_messages` stays an immutable, append-only audit log; this table is rebuildable and excluded
+  from session export). `SessionStore.upsert_project_message` / `load_project_messages` /
+  `latest_project_compact`; new row type `ProjectMessageRow`. The v1→v2 migration is idempotent
+  (`CREATE TABLE IF NOT EXISTS`) and runs under the provisioning lock on SQLite/PostgreSQL/MySQL.
+- **`pl_messages.send_index` column** — a monotonic, never-resetting per-session send index
+  written on every row (a real, queryable column — NULL on pre-v2 rows; never sent to the LLM);
+  the authoritative send boundary the projection layer and transcript tooling use. The v1→v2
+  migration adds it via a guarded `ALTER TABLE … ADD COLUMN`.
+
+New public exports: `HistoryProjector`, `IdentityProjector`, `DefaultDeterministicProjector`,
+`ProjectedSend`, `ProjectedRow`, `ProjectedCompact`, `ProjectMessageRow` (PROVISIONAL — in
+`__all__`, not yet in `STABLE_API`). Example: `examples/40_send_context_projection.py`. No
+breaking changes to the STABLE API.
+
 ## [2.1.0] — 2026-06-17
 
 A correctness-and-robustness release: it resolves every confirmed and contested finding from

@@ -84,7 +84,7 @@ class SqliteDialect:
                 session_id TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT NOT NULL,
                 name TEXT, content TEXT, tool_calls_json TEXT, tool_call_id TEXT,
                 round_index INTEGER, state TEXT NOT NULL DEFAULT 'active', meta_json TEXT,
-                created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq))""",
+                send_index INTEGER, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq))""",
             f"CREATE INDEX IF NOT EXISTS {p}idx_messages_session_state "
             f"ON {p}messages(session_id, state, seq)",
             f"""CREATE TABLE IF NOT EXISTS {p}compactions (
@@ -213,7 +213,7 @@ class PostgresDialect:
                 session_id TEXT NOT NULL, seq BIGINT NOT NULL, role TEXT NOT NULL,
                 name TEXT, content TEXT, tool_calls_json TEXT, tool_call_id TEXT,
                 round_index BIGINT, state TEXT NOT NULL DEFAULT 'active', meta_json TEXT,
-                created_at BIGINT NOT NULL, PRIMARY KEY (session_id, seq))""",
+                send_index BIGINT, created_at BIGINT NOT NULL, PRIMARY KEY (session_id, seq))""",
             f"CREATE INDEX IF NOT EXISTS {p}idx_messages_session_state "
             f"ON {p}messages(session_id, state, seq)",
             f"""CREATE TABLE IF NOT EXISTS {p}compactions (
@@ -330,7 +330,7 @@ class MySQLDialect:
                 session_id VARCHAR(255) NOT NULL, seq BIGINT NOT NULL, role VARCHAR(32) NOT NULL,
                 name VARCHAR(255), content TEXT, tool_calls_json TEXT, tool_call_id VARCHAR(255),
                 round_index BIGINT, state VARCHAR(32) NOT NULL DEFAULT 'active', meta_json TEXT,
-                created_at BIGINT NOT NULL, PRIMARY KEY (session_id, seq),
+                send_index BIGINT, created_at BIGINT NOT NULL, PRIMARY KEY (session_id, seq),
                 KEY {p}idx_messages_session_state (session_id, state, seq)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}compactions (
                 session_id VARCHAR(255) NOT NULL, compact_seq BIGINT NOT NULL, note_seq BIGINT NOT NULL,

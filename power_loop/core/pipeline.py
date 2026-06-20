@@ -334,16 +334,13 @@ class AgentPipeline:
         if self._tok_len == len(self.history) - 1:
             self._tok_total += estimate_message_tokens(ctx.message)
             self._tok_len = len(self.history)
-        # Persist the send_index in the row's meta — but ONLY on the copy handed to the
-        # sink, never on ctx.message (which lives in self.history and is sent verbatim to
-        # the LLM; an unknown 'meta' field would leak / break the provider). On reload
-        # _row_to_loop_message drops meta, so the LLM never sees it either way.
+        # Carry the send_index to the sink — but ONLY on the copy handed to the sink, never on
+        # ctx.message (which lives in self.history and is sent verbatim to the LLM; an unknown
+        # field would leak / break the provider). The sink persists it into the messages.send_index
+        # column; it never reaches the LLM.
         sink_msg = ctx.message
         if self.send_index is not None:
-            sink_msg = {
-                **ctx.message,
-                "meta": {**(ctx.message.get("meta") or {}), "send_index": self.send_index},
-            }
+            sink_msg = {**ctx.message, "send_index": self.send_index}
         await self._emit_sink(self.sink.on_message_appended, sink_msg, round_index=round_index)
 
     async def _resolve_skipped_tool_calls(

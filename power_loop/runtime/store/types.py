@@ -124,6 +124,10 @@ class MessageRow:
     state: MessageState
     meta: dict[str, Any]
     created_at: int
+    #: Authoritative, monotonic per-session SEND index (one value per loop.send(); never
+    #: resets). NULL on rows written before schema v2 / outside a send. Default keeps legacy
+    #: constructors (and the SQLite-only store) working.
+    send_index: int | None = None
 
 
 @dataclass

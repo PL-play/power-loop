@@ -67,14 +67,21 @@ _STORE_TABLES: tuple[str, ...] = (
 )
 
 
-def _migration_steps(db: Database, prefix: str, *, from_version: int) -> list[str]:
-    """Idempotent DDL to migrate an existing store from ``from_version`` to
-    :data:`CURRENT_SCHEMA_VERSION`. Each step is CREATE TABLE/INDEX … IF NOT EXISTS so a
+async def _migration_steps(
+    tx: Transaction, db: Database, prefix: str, *, from_version: int
+) -> list[str]:
+    """DDL to migrate an existing store from ``from_version`` to :data:`CURRENT_SCHEMA_VERSION`.
+    CREATE statements are ``IF NOT EXISTS`` (idempotent); the ``ALTER … ADD COLUMN`` (no portable
+    ``IF NOT EXISTS`` across SQLite/MySQL) is guarded by a catalog probe (on the open ``tx``) so a
     half-applied or re-run migration is safe."""
     steps: list[str] = []
     if from_version < 2:
-        # v1 → v2: add the project_messages (send-context projection) table + index.
+        # v1 → v2: add the project_messages (send-context projection) table + index, and the
+        # authoritative send_index column on messages (NULL on pre-existing rows).
         steps += db.dialect.project_messages_ddl(prefix)
+        if not await _column_exists(tx, db.dialect.name, f"{prefix}messages", "send_index"):
+            int_type = "INTEGER" if db.dialect.name == "sqlite" else "BIGINT"
+            steps.append(f"ALTER TABLE {prefix}messages ADD COLUMN send_index {int_type}")
     return steps
 
 
@@ -194,6 +201,26 @@ async def _table_exists(db: Database, table: str) -> bool:
             "SELECT 1 AS present FROM information_schema.tables "
             "WHERE table_schema=DATABASE() AND table_name=?",
             (table,),
+        )
+        return row is not None
+    return False  # pragma: no cover - unknown dialect
+
+
+async def _column_exists(tx: Transaction, dialect_name: str, table: str, column: str) -> bool:
+    """Catalog probe — True iff ``table`` has ``column``. Runs on the OPEN transaction ``tx``
+    (NOT a fresh ``db`` query, which would deadlock waiting on the single SQLite connection the
+    migration's transaction already holds). Makes ``ALTER … ADD COLUMN`` migration steps
+    idempotent (no portable ``ADD COLUMN IF NOT EXISTS`` across SQLite/MySQL)."""
+    if dialect_name == "sqlite":
+        # table is the store's own prefixed name (validated prefix); PRAGMA can't be parameterized.
+        rows = await tx.fetchall(f"PRAGMA table_info({table})")
+        return any(r["name"] == column for r in rows)
+    if dialect_name in ("postgres", "mysql"):
+        scope = "AND table_schema=DATABASE() " if dialect_name == "mysql" else ""
+        row = await tx.fetchone(
+            "SELECT 1 AS present FROM information_schema.columns "
+            f"WHERE table_name=? {scope}AND column_name=?",
+            (table, column),
         )
         return row is not None
     return False  # pragma: no cover - unknown dialect
@@ -336,7 +363,7 @@ async def ensure_schema(
                 # Run the idempotent migration ladder under the provision lock, then bump the
                 # stamp. Wrap so a permission failure surfaces the full provisioning script.
                 try:
-                    for stmt in _migration_steps(db, prefix, from_version=version):
+                    for stmt in await _migration_steps(tx, db, prefix, from_version=version):
                         await tx.execute(stmt)
                 except Exception as exc:
                     raise StoreSchemaError(

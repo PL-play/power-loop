@@ -34,7 +34,8 @@ async def exercise_project_messages_crud(store: SessionStore) -> None:
         projector_version=3, token_estimate=12,
     )
     rows = await store.load_project_messages(sid)
-    assert [(r.send_index, r.kind) for r in rows] == [(1, "project"), (1, "user")]
+    # conversation order: user before project within a send
+    assert [(r.send_index, r.kind) for r in rows] == [(1, "user"), (1, "project")]
     assert next(r for r in rows if r.kind == "user").content == {
         "at": "12:00", "human": ["hi", "still me"]
     }
@@ -87,17 +88,31 @@ async def test_close_session_cascades_project_messages(store: SessionStore) -> N
 
 
 @pytest.mark.asyncio
-async def test_v1_to_v2_migration_adds_project_messages(tmp_path) -> None:
+async def test_v1_to_v2_migration_adds_project_messages_and_send_index(tmp_path) -> None:
     path = str(tmp_path / "m.db")
-    s = await SessionStore.open(path)  # fresh → v2 (table present)
+    s = await SessionStore.open(path)  # fresh → v2
     assert s.schema_version == CURRENT_SCHEMA_VERSION == 2
-    # Simulate a pre-existing v1 store: drop the v2 table and roll the stamp back to 1.
+    # Simulate a true pre-existing v1 store: drop the v2 table AND the v2 send_index column,
+    # then roll the version stamp back to 1.
     async with s._db.transaction() as tx:
         await tx.execute("DROP TABLE pl_project_messages")
+        await tx.execute("ALTER TABLE pl_messages DROP COLUMN send_index")
         await tx.execute("UPDATE pl_schema_migrations SET version=1 WHERE id=1")
     await s.close()
+
     s2 = await SessionStore.open(path)  # AUTO_CREATE runs the v1→v2 migration ladder
     assert s2.schema_version == 2
+    # (a) the project_messages table is back
     await s2.upsert_project_message("sess_m", send_index=1, kind="project", content={"ok": True})
     assert (await s2.load_project_messages("sess_m"))[0].content == {"ok": True}
+    # (b) the send_index column was re-added by the ALTER (write + read it back)
+    sid = await s2.create_session()
+    await s2.append_message(sid, role="user", content="hi", send_index=7)
+    assert (await s2.load_active_messages(sid))[0].send_index == 7
     await s2.close()
+
+    # idempotent: reopening (already v2) is a no-op and the column survives
+    s3 = await SessionStore.open(path)
+    assert s3.schema_version == 2
+    assert (await s3.load_active_messages(sid))[0].send_index == 7
+    await s3.close()
