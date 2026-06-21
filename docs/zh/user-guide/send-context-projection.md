@@ -66,9 +66,10 @@ loop = StatefulAgentLoop(
         compactor=None,                                  # 配 projector 时必须置 None
         max_tokens=8000,          # 折叠阈值 = max_tokens × trigger_ratio
         history_projector=DefaultDeterministicProjector(
-            max_chars=200,        # 工具参数/结果按字段截断
-            keep_last_sends=4,    # 最近 N 个 send 始终单独保留(不折叠)
-            trigger_ratio=0.75,   # 投影前缀达到 max_tokens 的 75% 时才折叠更早的 send
+            max_chars=300,          # 工具参数/结果按字段截断
+            keep_last_sends=4,      # 最近 N 个 send 始终单独保留(不折叠)
+            trigger_ratio=0.75,     # 投影前缀达到 max_tokens 的 75% 时才折叠更早的 send
+            max_compact_chars=4000, # 折叠后 compact 行的硬上限(0 = 不限)
         ),
     ),
 )
@@ -131,6 +132,8 @@ write_file = ToolDefinition(
 
 折叠是**按 token 触发**的(复用 `DefaultCompactor` 的策略):当渲染后的投影前缀达到 `max_tokens × trigger_ratio`(默认 `0.75`)时,最老的 send 折成一条 **append-only** 的 `compact` 行——**始终**单独保留最近 `keep_last_sends` 个,并把之前的 compact 滚动并入(不丢内容)。低于阈值时,这些小小的逐 send 投影只是累积。reader 之后读"最新 compact + 其游标之后的 send"。被折叠的 `user`/`project` 行**保留**(可恢复)。默认折叠是确定性的(不调 LLM);`pl_messages` 不受影响。
 
+因为默认 projector 是**拼接**式的(没有 LLM 去"摘要变短"),滚动并入的 compact 在长会话里本会无限增长——让 token 折叠形同虚设。`max_compact_chars`(默认 `4000`;`0` = 不限)给它封顶:超过上限时丢弃**最老**的折叠行并留下标记(`…[older folded sends omitted — use recall_send(#N) for full detail]`)。被丢的 send 仍在 `pl_messages` 里,`recall_send` 永远能找回。注意**当前进行中的 send 与最近 `keep_last_sends` 个 send 始终逐字/单独**保留,所以单个超过预算的 send 是固有限制(任何上下文窗口都如此)——超长这一轮请调小 `max_chars`/`keep_last_sends`,或换一个会用 LLM 摘要的 projector。
+
 ## 找回完整明细:`recall_send`
 
 因为投影是有损的(工具明细被截断/丢弃),模型可以按需把任意已结束 send 的**原始** `pl_messages` 明细取回:
@@ -150,16 +153,44 @@ create_default_tool_registry(include=["recall_send"])   # 也在 "full" 预设�
 from power_loop import HistoryProjector, ProjectedSend, ProjectedRow  # 写自己的 projector
 ```
 
-自定义 projector 满足 `HistoryProjector` 协议需声明 `version: int`、`keep_last_sends: int`、`trigger_ratio: float`(token 折叠比例),以及 `project_send` / `render` / `compact` 方法。`keep_last_sends == 0` 完全关闭折叠(`IdentityProjector` 就是如此)。
+自定义 projector 满足 `HistoryProjector` 协议需声明 `version: int`、`keep_last_sends: int`、`trigger_ratio: float`(token 折叠比例),以及 `project_send` / `render` / `compact` 方法。`keep_last_sends == 0` 完全关闭折叠(`IdentityProjector` 就是如此)。内置 projector 在构造时校验参数(`trigger_ratio ∈ (0, 1]`——拒绝 `NaN`;`keep_last_sends ≥ 0`;`version ≥ 1`;`max_chars > 0`;`max_compact_chars ≥ 0`),配 projector 时 `AgentLoopConfig` 也拒绝 `max_tokens ≤ 0`。
 
 ## 行为说明
 
 - **子 agent 子 session 不投影** —— 按 `parent_session_id` 跳过;子 session 的明细在它自己的 session 里。
 - **未完成的 send 延迟投影** —— 以 `waiting_for_input` / `pending_tools` 结束的 send,等 resume 走到终态才投影(按 `(session_id, send_index, kind)` 幂等 upsert)。
 - **投影前(遗留)的行逐字渲染,绝不丢弃** —— 在挂上 projector 之前(或 v2 之前、或经 export→import 恢复)写入的行 `send_index = NULL`。在这种 session 上开启投影**不会**抹掉它们:它们作为前缀逐字渲染,排在所有已投影 send 之前(时间上最早)。全新的 v2 session 不会有 NULL 行,所以这只对迁移/导入场景有意义。
+- **缺失或版本不符的投影回退逐字,绝不丢弃** —— 投影在 send 结束时是 best-effort;若它写失败/崩溃,该历史 send 在 `pl_messages` 里有行、投影表里没有,reader 会**用 `pl_messages` 逐字渲染**这个 send,而不是把它漏掉。投影行的 `version` 与当前 projector 不一致时同样回退逐字(换实现请升 `version`)。这也是为什么恢复/导入的 session(投影不入导出)能正确渲染,并在下一次 send 时重新折叠。
+- **projector 出错只降级,不会污染 send** —— 若 `project_send`/`render`/`compact` 抛异常,则跳过折叠,但该 send 的逐 send 行照常提交;`pl_messages` 仍是事实源。逐工具的 `project()` 钩子同样有异常保护(回退到截断默认)。
 - **原子且并发安全** —— 每个已结束 send 的投影行与任何折叠在**同一事务、持会话锁**内提交,所以崩溃不会留下半投影的 send,两个共享 store 的 loop 也不会重复写同一条 compact。
 - **token**:逐字投影(Identity)不省 token;真正的削减来自 `DefaultDeterministicProjector` 的按字段截断 + `compact` 折叠。存的是结构化 JSON,装配时渲染成紧凑文本。
 - **前缀缓存**:投影前缀是 append-only 增长(每 send 一组行),比就地压缩器(每次折叠重写一段)对厂商的隐式前缀缓存更友好。
+
+## 在已有会话上切换模式
+
+模式(`history_projector` vs 默认就地压缩器)是**按 loop** 选的。会话**首次运行**时把**原始模式 + projector 配置**(`history_mode`、`projector_version`、`projector_trigger_ratio`、`projector_keep_last_sends`)记到**会话元数据**(`SessionRow.metadata`,供检视与切换检测),但用**不同模式**重开一个已有会话**绝不抛异常**——而是降级为尽力的逐字渲染并打日志警告。`send_index` 无论哪种模式每次 send 都分配,所以默认模式的会话本就带 send 边界。
+
+| 从 → 到 | 行为 |
+|---|---|
+| **默认 → 投影**,*尚未触发压缩* | **迁移(默认)。** 首次投影 send 时,把旧历史**一次性**折进投影表——一条 `compact` 覆盖旧 send + 最近 `keep_last_sends` 作为 project 行——会话变为 projection-native。设 `migrate_history_on_projection_switch=False` 时,旧 send 改为用 `pl_messages` **逐字渲染**(不折叠)。 |
+| **默认 → 投影**,*已触发过压缩* | **迁移(默认)。** 用就地 `compact_note` **种子**化投影 compact,并投影活动尾段,会话变为 projection-native 且不丢 note。迁移关闭时则**降级**为逐字(默认风格)——压缩但连贯——并跳过本次投影。绝不抛。 |
+| **resume()/submit_input() 在任何 send() 之前** | **降级,不抛。** 没有可切分的 `send_index`,逐字渲染、尽力运行,打警告。 |
+| **投影 → 默认** | **安全。** 投影从不把 `pl_messages` 行标 inactive,所以默认模式看到完整逐字历史;过时的投影行被忽略。 |
+| **改 `projector.version` / 实现** | 不同 `version` 写的行逐 send 回退逐字(见行为说明)。换实现/内容结构时请**升 `version`**,让旧行干净回退。 |
+
+**迁移**(`migrate_history_on_projection_switch`,默认 `True`)每会话只跑**一次**——尽力(失败则回退逐字、下次 send 再试)、幂等(以 `projection_migrated` 记在会话元数据)、且仅当投影表为空(真正的切换/就地压缩过的会话;已投影会话上偶发缺一行则交给逐 send 逐字回退)。它通过 `projector.compact()` 折叠,因此用的是当前配置的 projector。
+
+**建议**:在创建会话时定好模式。切换总是可生还的(迁移或降级,绝不抛异常);要最干净的投影,仍建议用**全新 session**。
+
+## 鲁棒性:自愈错乱的历史
+
+`pl_messages` 里一条错乱的行(assistant 工具调用行与其结果之间崩溃、导入坏数据、手工改坏、投影不匹配)本会让厂商拒绝整个 prompt,而且每次加载都复现,**永久毁掉这个会话**。为兜底,装配好的 prompt 在**每次** LLM 调用前都过一遍工具调用/结果对齐器(`align_tool_calls`):
+
+- **孤儿工具结果**(没有对应 assistant 调用)→ **丢弃**;
+- **历史中段未应答的 assistant 调用**(后面还有别的消息)→ **合成占位结果**,让配对合法;
+- **末尾**待执行的调用(当前进行中 send 的工具,loop 正要在 resume 里执行)→ **不动**。
+
+它始终开启、与模式无关、对健康历史是 no-op;每次修复打一条警告。默认不动审计日志(仅每次净化 prompt)。设 **`AgentLoopConfig.repair_corrupt_history=True`** 可把丢弃的孤儿行**持久停用**(`state="dropped"`)——仍留在完整审计里,只是从活动历史中排除,不必每次再净化。
 
 ## 参见
 

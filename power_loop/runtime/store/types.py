@@ -54,6 +54,10 @@ class SubagentLifecycle(str, Enum):
 class MessageState(str, Enum):
     ACTIVE = "active"
     COMPACTED_OUT = "compacted_out"
+    #: Deactivated by the history-repair backstop (an orphan tool-result row that would make the
+    #: provider reject the prompt). Excluded from the active history like ``compacted_out``, but
+    #: distinct so it is auditable as a repair, not a compaction.
+    DROPPED = "dropped"
 
 
 @dataclass

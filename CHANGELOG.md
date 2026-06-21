@@ -8,6 +8,22 @@
 
 ## [Unreleased]
 
+### Added — Agentic memory-aware compactor (opt-in)
+
+- **`AgenticMemoryCompactor`** (`power_loop.runtime.compact`) — an opt-in `Compactor` that runs a
+  **bounded, memory-aware agent loop** at the compaction boundary: it lets the model use memory
+  tools (by default the existing `note_add` / `note_update`) to persist durable facts into the
+  **current session's notes** *before* folding the rest into the `compact_note` summary. Subclasses
+  `DefaultCompactor` (reuses its trigger + span selection unchanged); only the summarize step is
+  agentic. **Default behavior is unchanged** — construct it and pass it as
+  `AgentLoopConfig.compactor` to opt in.
+  - Safe: the loop is a FLAT, bounded (`max_rounds`, default 4) tool-use loop — not a nested
+    `StatefulAgentLoop`, so it can never recurse into another compaction. On ANY failure (no tool
+    support, malformed output, exception) it **falls back to the plain single-call summary**, so it
+    never blocks a fold.
+  - Customizable: `memory_tools` (a `ToolRegistry`; defaults to the note tools), `system_prompt`
+    (defaults to the planned `DEFAULT_COMPACTION_AGENT_PROMPT`), `max_rounds`.
+
 ### Added — Send-context projection (opt-in; PROVISIONAL public API)
 
 A new way to control what each send feeds the LLM, separate from in-place compaction. By
@@ -77,6 +93,64 @@ A multi-agent review of the projection layer surfaced these; all fixed with regr
   DDL-auto-commit / re-run-with-AUTO_CREATE recovery.
 - **`recall_send`** truncates the message body before appending the `[tool_calls: …]` summary, so
   a long message no longer hides that it made tool calls.
+
+A second review round (config/validation, unsafe mutations, max-length, fallbacks) added:
+
+- **A missing or stale-version projection no longer drops a send from context.** If a send's
+  end-of-send projection write failed/crashed (it is best-effort), or its rows were written by a
+  **different `projector.version`** (the user changed the projector), the reader now renders that
+  send **verbatim from the immutable `pl_messages`** instead of silently omitting it. As a side
+  benefit, an imported session (projection excluded from export) renders correctly and re-folds on
+  the next send. A stale-version `compact` row likewise falls back to its covered range verbatim.
+- **A misbehaving projector degrades instead of losing the send.** The fold decision
+  (`render`/`compact`/trigger) is wrapped: an exception skips the fold (**rows still commit**)
+  rather than aborting the whole locked write. The tool `project()` hook was already exception-guarded.
+- **Projector params are validated at construction.** `IdentityProjector` /
+  `DefaultDeterministicProjector` now reject `trigger_ratio ∉ (0, 1]` (incl. `NaN`, which would
+  otherwise crash `int(max_tokens × NaN)`), `keep_last_sends < 0`, `version < 1`, `max_chars ≤ 0`,
+  and `max_compact_chars < 0`. `AgentLoopConfig` rejects `max_tokens ≤ 0` when a projector is set,
+  and a rejected post-construction reassignment now **rolls back** (no half-applied invalid config).
+- **`DefaultDeterministicProjector` bounds the folded `compact` row** via a new
+  **`max_compact_chars` (default 4000; `0` = unbounded)**. The no-LLM projector concatenates, so
+  without a cap the compact — and the rendered context — grew without bound over a long session;
+  it now keeps the most-recent tail plus a drop marker (dropped detail stays in `pl_messages`,
+  recoverable via `recall_send`).
+- **Per-session projector/compactor exclusion.** A session with in-place compaction history
+  (`compact_note` rows) is refused in projection mode (a cross-run mode switch the config-level
+  check can't catch). `send_index` coercion is also exception-guarded against a corrupted
+  `runtime_state` value (non-numeric / inf / nan → treated as unallocated, never a crash).
+- **`DefaultDeterministicProjector.max_chars` default raised 200 → 300** (per-field projection
+  truncation budget; it was already a configurable field).
+
+A third round (mode-switch robustness + corruption self-heal) made the loop never brick a session:
+
+- **Switching a session's history mode never throws.** The previous round *refused* (raised) when a
+  projection-mode session had in-place compaction history, and when `resume()` ran before any
+  `send()`. Both now **degrade to a best-effort verbatim render and log a warning** instead. The
+  session's **original mode is recorded** (`runtime_state["history_mode"]`) on first run, for
+  inspection and switch detection. (`history_projector`/`compactor` remain mutually exclusive *per
+  config*; this is the cross-run, per-session story.)
+- **Self-healing malformed history (new `power_loop.runtime.history_sanitize.align_tool_calls`).**
+  A corrupt row in `pl_messages` (a crash between an assistant tool-call row and its result, a bad
+  import, a manual edit) would make the provider reject the whole prompt and **repeat on every load
+  — bricking the session forever**. The assembled prompt is now realigned before **every** LLM call:
+  an orphan tool result is dropped, a mid-history unanswered call gets a synthesized placeholder
+  result, and a trailing pending call is left untouched. Always-on, mode-agnostic, a no-op on a
+  healthy history; each repair logs a warning.
+- **Opt-in durable repair: `AgentLoopConfig.repair_corrupt_history` (default `False`).** When `True`,
+  the orphan rows the sanitizer drops are also deactivated in the store (new `MessageState.DROPPED`
+  + `SessionStore.deactivate_messages`) so they aren't re-sanitized every load — kept in the full
+  audit, excluded from the active history.
+- **The original history mode + projector config is recorded in `SessionRow.metadata`** (`history_mode`,
+  `projector_version`, `projector_trigger_ratio`, `projector_keep_last_sends`) on first run — inspectable,
+  and the baseline the switch-warning compares against (new `SessionStore.merge_session_metadata`).
+- **One-time history migration on a mode switch** (`AgentLoopConfig.migrate_history_on_projection_switch`,
+  default `True`). When a session with prior NON-projection history is first opened in projection mode,
+  its prior history is folded into the projection table once — a `compact` (seeded from an in-place
+  `compact_note` if present) plus the most-recent `keep_last_sends` as project rows — so the session
+  becomes projection-native instead of rendering prior sends verbatim forever. Best-effort (falls back
+  to verbatim on failure), idempotent (`projection_migrated` marker in metadata), runs only when the
+  projection table is empty, and folds via `projector.compact()`. New `SessionStore.write_projection_migration`.
 
 ## [2.1.0] — 2026-06-17
 

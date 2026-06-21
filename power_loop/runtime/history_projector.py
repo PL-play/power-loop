@@ -146,6 +146,24 @@ def _row_to_loop_dict(row: MessageRow) -> LoopMessage:
     return msg
 
 
+def _validate_projector_params(
+    *, version: int, keep_last_sends: int, trigger_ratio: float
+) -> None:
+    """Fail-fast on the params shared by the shipped projectors, at construction (not deep in a
+    later run). ``version`` >= 1 because it is the projection-compatibility key the reader uses
+    to decide whether a stored row is faithfully renderable by the current projector (else it
+    falls back to verbatim). A NaN ``trigger_ratio`` fails both comparisons → rejected, so it can
+    never reach ``int(max_tokens * nan)`` (which would crash the fold)."""
+    if version < 1:
+        raise ValueError(
+            f"projector version must be >= 1 (the projection-compatibility key); got {version!r}"
+        )
+    if keep_last_sends < 0:
+        raise ValueError(f"projector keep_last_sends must be >= 0; got {keep_last_sends!r}")
+    if not (trigger_ratio > 0 and trigger_ratio <= 1):
+        raise ValueError(f"projector trigger_ratio must be in (0, 1]; got {trigger_ratio!r}")
+
+
 # ── Identity (verbatim; for testing the seam) ──────────────────────────────────
 
 
@@ -158,6 +176,13 @@ class IdentityProjector:
     version: int = 1
     keep_last_sends: int = 0  # verbatim mode never folds
     trigger_ratio: float = 0.75  # unused (keep_last_sends==0 short-circuits folding); for Protocol parity
+
+    def __post_init__(self) -> None:
+        _validate_projector_params(
+            version=self.version,
+            keep_last_sends=self.keep_last_sends,
+            trigger_ratio=self.trigger_ratio,
+        )
 
     def project_send(
         self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None
@@ -191,12 +216,31 @@ class DefaultDeterministicProjector:
     terse plain text with NO tool-protocol structure."""
 
     version: int = 1
-    max_chars: int = 200  # per-field truncation budget
+    max_chars: int = 300  # per-field truncation budget
     keep_last_sends: int = 4  # most-recent sends ALWAYS kept individually (never folded)
     #: Fold older sends into a compact row once the rendered projected prefix reaches
     #: ``loop max_tokens × trigger_ratio`` (mirrors DefaultCompactor's policy) — token-driven,
     #: not send-count-driven. The most-recent ``keep_last_sends`` are always preserved.
     trigger_ratio: float = 0.75
+    #: Hard cap (chars) on a rolled-forward ``compact`` row's rendered summary. This projector
+    #: CONCATENATES (no LLM to summarize-to-shrink), so without a cap the compact — and thus the
+    #: rendered context — would grow without bound over a long session, defeating the token fold.
+    #: When the summary exceeds this, the OLDEST folded lines are dropped (their full detail stays
+    #: in pl_messages, recoverable via recall_send). 0 disables the cap (unbounded — old behavior).
+    max_compact_chars: int = 4000
+
+    def __post_init__(self) -> None:
+        _validate_projector_params(
+            version=self.version,
+            keep_last_sends=self.keep_last_sends,
+            trigger_ratio=self.trigger_ratio,
+        )
+        if self.max_chars <= 0:
+            raise ValueError(f"max_chars must be > 0; got {self.max_chars!r}")
+        if self.max_compact_chars < 0:
+            raise ValueError(
+                f"max_compact_chars must be >= 0 (0 = unbounded); got {self.max_compact_chars!r}"
+            )
 
     def project_send(
         self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None
@@ -325,8 +369,17 @@ class DefaultDeterministicProjector:
                 folded_sends.append(r.send_index)
         if not folded_sends:
             return None
+        summary = "\n".join(lines)
+        if self.max_compact_chars and len(summary) > self.max_compact_chars:
+            # No LLM to compress — bound the rolled-forward compact by keeping the most-recent
+            # tail and marking the drop. The dropped sends remain in pl_messages (recall_send
+            # recovers full detail), so this caps context size without losing the audit trail.
+            summary = (
+                "…[older folded sends omitted — use recall_send(#N) for full detail]\n"
+                + summary[-self.max_compact_chars:]
+            )
         return ProjectedCompact(
-            content={"summary": "\n".join(lines)},
+            content={"summary": summary},
             from_send=min(folded_sends),
             to_send=max(folded_sends),
         )

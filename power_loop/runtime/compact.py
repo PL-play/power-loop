@@ -23,6 +23,8 @@ Design contract (from ROADMAP §M1.7a / README §1):
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -33,6 +35,9 @@ from power_loop.runtime.budget import estimate_tokens
 
 if TYPE_CHECKING:
     from power_loop.runtime.memory import MemoryProvider
+    from power_loop.tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -321,12 +326,7 @@ class DefaultCompactor(Compactor):
             or getattr(response, "content_text", "")
             or ""
         ).strip()
-        if not text:
-            return None
-        # Strip <summary>…</summary> if present.
-        if text.startswith("<summary>") and "</summary>" in text:
-            text = text[len("<summary>") :].split("</summary>")[0].strip()
-        return text or None
+        return _strip_summary(text)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
@@ -350,4 +350,146 @@ def _note(text: str) -> dict[str, Any]:
     return {"role": "system", "name": "compact_note", "content": text}
 
 
-__all__ = ["Compactor", "CompactionContext", "CompactionPlan", "DefaultCompactor"]
+def _strip_summary(text: str | None) -> str | None:
+    """Pull the ``<summary>…</summary>`` body if present, else return the trimmed text (or None)."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if "<summary>" in text and "</summary>" in text:
+        text = text.split("<summary>", 1)[1].split("</summary>", 1)[0].strip()
+    return text or None
+
+
+# ── agentic, memory-aware compactor (opt-in) ────────────────────────────
+
+
+#: System prompt for the compaction agent. Two-phase: extract durable facts to memory (notes)
+#: via tools, THEN write a faithful compact summary. Planned so the model knows it is compacting
+#: (not answering the user), what to keep, and to output the summary last without tool calls.
+DEFAULT_COMPACTION_AGENT_PROMPT = (
+    "You are the memory & compaction agent for a long-running AI assistant. You are given a "
+    "SLICE of the assistant's working transcript that is about to be REMOVED from the live "
+    "context window to save space. You are NOT answering the user — you are preserving what "
+    "matters.\n\n"
+    "Do this in order:\n"
+    "1. EXTRACT durable facts worth remembering AFTER this slice leaves context — decisions "
+    "made, stable user preferences/constraints, established facts, unresolved commitments, and "
+    "hard-won fixes to errors — and SAVE each as a concise note via the `note_add` tool (one "
+    "fact per note). Use `note_update` to refine an existing note instead of duplicating. Save "
+    "ONLY what will matter later; skip transient chatter and anything obvious from the system "
+    "prompt. If nothing is worth remembering, save nothing.\n"
+    "2. THEN write a faithful, compact summary of the slice for the context window. Preserve: "
+    "(1) decisions, (2) facts established, (3) errors and how they were handled, (4) any pending "
+    "intent the assistant was about to act on. Merge any prior compact-note content you see so "
+    "there is one coherent summary. Do not invent. Keep it tight.\n\n"
+    "Output the summary LAST, wrapped in <summary>…</summary>, in a message with NO tool calls."
+)
+
+
+class AgenticMemoryCompactor(DefaultCompactor):
+    """Opt-in compactor that runs a bounded, memory-aware agent loop to compact a slice.
+
+    Instead of one summarization call, it lets the model use memory tools (by default the
+    existing ``note_add`` / ``note_update``) to persist durable facts into the **current
+    session's notes** BEFORE compressing the rest into the ``compact_note`` summary. Reuses
+    :class:`DefaultCompactor`'s trigger + span selection unchanged; only the summarize step is
+    agentic.
+
+    Safety: the agent loop is a FLAT, bounded tool-use loop (``max_rounds``) — not a nested
+    ``StatefulAgentLoop`` — so it can never recurse into another compaction. Notes are written via
+    the tool handlers, which resolve the active session/store from the loop's contextvars (set for
+    the whole run, so they are live during compaction). On ANY failure (no tool support, malformed
+    output, exception) it falls back to the plain single-call summary, so it never blocks a fold.
+
+    Default-OFF: construct it explicitly and pass it as ``AgentLoopConfig.compactor`` to opt in.
+    """
+
+    def __init__(
+        self,
+        *,
+        memory_tools: ToolRegistry | None = None,
+        system_prompt: str | None = None,
+        max_rounds: int = 4,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._memory_tools = memory_tools
+        self._system_prompt = system_prompt or DEFAULT_COMPACTION_AGENT_PROMPT
+        self._max_rounds = max(1, int(max_rounds))
+
+    def _registry(self) -> ToolRegistry:
+        if self._memory_tools is not None:
+            return self._memory_tools
+        # Lazy (avoids an import cycle: tools → runtime). Default to the existing note tools.
+        from power_loop.tools import create_default_tool_registry
+
+        self._memory_tools = create_default_tool_registry(include=["note_add", "note_update"])
+        return self._memory_tools
+
+    async def _summarize_async(self, slice_msgs: list[dict[str, Any]], *, llm: Any) -> str | None:
+        if not slice_msgs:
+            return None
+        try:
+            summary = await self._agentic_summarize(slice_msgs, llm=llm)
+            if summary:
+                return summary
+        except Exception:
+            logger.exception("agentic compaction failed; falling back to single-call summary")
+        return await super()._summarize_async(slice_msgs, llm=llm)
+
+    async def _agentic_summarize(self, slice_msgs: list[dict[str, Any]], *, llm: Any) -> str | None:
+        registry = self._registry()
+        tools = registry.to_openai_tools()
+        convo: list[dict[str, Any]] = [
+            {"role": "user", "content": "--- transcript slice to compact ---\n" + _stringify_slice(slice_msgs)}
+        ]
+        summary_llm = self.summary_llm or llm
+        for _ in range(self._max_rounds):
+            resp = await summary_llm.complete(
+                LLMRequest(
+                    messages=convo,
+                    system_prompt=self._system_prompt,
+                    tools=tools,
+                    max_tokens=self.summary_max_tokens,
+                    temperature=0.0,
+                )
+            )
+            text = (getattr(resp, "raw_text", "") or getattr(resp, "content_text", "") or "").strip()
+            tool_calls = resp.get_tool_calls()
+            if not tool_calls:
+                return _strip_summary(text)  # model finished (summary, or nudge-then-retry below)
+            # Replay the assistant tool-call turn + execute each tool, feeding results back.
+            convo.append({"role": "assistant", "content": text or None, "tool_calls": tool_calls})
+            for tc in tool_calls:
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                name = (fn or {}).get("name") or tc.get("name")
+                raw_args = (fn or {}).get("arguments")
+                try:
+                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                except (TypeError, ValueError):
+                    args = {}
+                try:
+                    result = await registry.invoke_async(str(name), args if isinstance(args, dict) else {})
+                except Exception as exc:  # a bad tool call must not abort compaction
+                    result = f"error: {exc}"
+                convo.append({"role": "tool", "tool_call_id": tc.get("id"), "content": str(result)})
+        # Rounds exhausted while still tool-calling — one final, tool-free summary request.
+        resp = await summary_llm.complete(
+            LLMRequest(
+                messages=[*convo, {"role": "user", "content": "Now output ONLY the <summary>…</summary>."}],
+                system_prompt=self._system_prompt,
+                max_tokens=self.summary_max_tokens,
+                temperature=0.0,
+            )
+        )
+        return _strip_summary(getattr(resp, "raw_text", "") or "")
+
+
+__all__ = [
+    "Compactor",
+    "CompactionContext",
+    "CompactionPlan",
+    "DefaultCompactor",
+    "AgenticMemoryCompactor",
+    "DEFAULT_COMPACTION_AGENT_PROMPT",
+]

@@ -57,6 +57,18 @@ class AgentLoopConfig:
     #: MUTUALLY EXCLUSIVE with ``compactor`` (set ``compactor=None``) — see __post_init__.
     #: ``None`` (default) → today's behavior (verbatim history + in-place compactor).
     history_projector: HistoryProjector | None = None
+    #: When a session with prior NON-projection history is first opened in projection mode, fold
+    #: that prior history into the projection table ONCE (a compact + the most-recent
+    #: keep_last_sends as project rows) so the session becomes projection-native instead of
+    #: rendering the prior sends verbatim forever. Best-effort: on failure it falls back to the
+    #: verbatim rendering. Default True. Only relevant when ``history_projector`` is set.
+    migrate_history_on_projection_switch: bool = True
+    #: History-repair backstop (the always-on prompt sanitizer in `align_tool_calls` realigns
+    #: tool-call/result pairing before every LLM call regardless). When True, the orphan
+    #: tool-result rows that sanitizer drops are ALSO physically deactivated in the store
+    #: (state=DROPPED), so the corruption is repaired durably and not re-sanitized every load.
+    #: Default False to keep `pl_messages` immutable; the prompt is kept valid either way.
+    repair_corrupt_history: bool = False
     retry_policy: LLMRetryPolicy | None = None
     memory: MemoryProvider | None = None
     memory_budget_tokens: int = 1500
@@ -82,11 +94,26 @@ class AgentLoopConfig:
     tool_catalog_header: str = "# Available Tools"
 
     def __post_init__(self) -> None:
-        self._validate_projector_compactor_exclusion()
+        self._validate_projection_config()
         # Mark init complete so __setattr__ starts re-validating reassignments (the dataclass
         # is mutable; the reader at _run_loop assumes compactor is None whenever a projector is
         # set, so a post-hoc reassignment of either field must not silently break that).
         object.__setattr__(self, "_initialized", True)
+
+    def _validate_projection_config(self) -> None:
+        self._validate_projector_compactor_exclusion()
+        # max_tokens drives the token-fold threshold (max_tokens × trigger_ratio); a non-positive
+        # value would make the fold misbehave (always/never fold), so reject it up front rather
+        # than discover it deep in a run.
+        if (
+            self.history_projector is not None
+            and self.max_tokens is not None
+            and self.max_tokens <= 0
+        ):
+            raise ValueError(
+                "AgentLoopConfig: max_tokens must be > 0 when history_projector is set "
+                f"(it drives the token-fold threshold); got {self.max_tokens!r}"
+            )
 
     def _validate_projector_compactor_exclusion(self) -> None:
         # The projection layer REPLACES in-place compaction; running both would let the
@@ -100,9 +127,20 @@ class AgentLoopConfig:
             )
 
     def __setattr__(self, name: str, value: Any) -> None:
-        super().__setattr__(name, value)
-        if name in ("history_projector", "compactor") and getattr(self, "_initialized", False):
-            self._validate_projector_compactor_exclusion()
+        if name in ("history_projector", "compactor", "max_tokens") and getattr(
+            self, "_initialized", False
+        ):
+            old = getattr(self, name)
+            super().__setattr__(name, value)
+            try:
+                self._validate_projection_config()
+            except Exception:
+                # A rejected reassignment must not leave the config in the invalid state it was
+                # about to enter (mutate-then-validate would otherwise corrupt it) — roll back.
+                super().__setattr__(name, old)
+                raise
+        else:
+            super().__setattr__(name, value)
 
 
 @dataclass

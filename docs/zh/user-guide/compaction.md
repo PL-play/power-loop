@@ -104,6 +104,27 @@ class CoordinatingCompactor(DefaultCompactor):
 
 `context` 参数**可选且向后兼容**:pipeline 只会把它传给签名接受它的压缩器(按签名判断),所以老签名的压缩器照常工作,`DefaultCompactor` 也直接忽略它。记忆始终是注入的 seam——库不会替你持久化。`status="compaction"` 是个约定,让 provider 区分「折叠时捕获」和「会话结束快照」。参见 [`examples/33_coordinating_compactor.py`](../../../examples/33_coordinating_compactor.py)。
 
+## 记忆感知的 agentic 压缩(可选)
+
+`DefaultCompactor` 用**一次** LLM 调用摘要一段切片。`AgenticMemoryCompactor` 改为在折叠时跑一个**有界、记忆感知的 agent 循环**:模型先用 memory 工具(默认是现有的 `note_add` / `note_update`)把**持久事实写入会话笔记**,再写 `compact_note` 摘要。这把*长期记忆*(留作笔记、后续轮次注入)和*工作上下文摘要*(压缩掉)分开,多次折叠后更不易遗忘。
+
+```python
+from power_loop.runtime.compact import AgenticMemoryCompactor
+
+config = AgentLoopConfig(
+    compactor=AgenticMemoryCompactor(
+        trigger_ratio=0.75, keep_last_n=4,   # 继承自 DefaultCompactor(触发 + 折叠区间)
+        max_rounds=4,                        # 压缩 agent 的工具轮数上限
+        # memory_tools=my_registry,          # 默认:note_add / note_update 的注册表
+        # system_prompt=...,                 # 默认:DEFAULT_COMPACTION_AGENT_PROMPT
+    ),
+)
+```
+
+- **默认行为不变** —— 这是可选项;默认仍是 `DefaultCompactor`(单次调用)。
+- **安全**:该循环是扁平、有界的工具循环(不是嵌套的 `StatefulAgentLoop`),绝不会递归进另一次压缩。note 工具从 loop 的 contextvars(整次 run 有效)解析当前会话,所以笔记落到正确会话。**任何**失败(无工具支持、输出畸形、异常)都**回退到单次摘要**——绝不阻塞折叠。
+- **成本**:每次折叠会做多次 LLM 调用(抽取 + 摘要)而非一次,这是换取更丰富记忆的代价。用 `summary_llm` 参数可让压缩 agent 走更便宜的模型。
+
 ## 下一步
 
 - [Send 上下文投影](send-context-projection.md) — 可选的替代方案:把已结束 send 投影成纯文本存进派生表,而非原地改写历史(与本压缩器互斥)

@@ -262,3 +262,61 @@ def test_default_compact_rolls_prior_compact_forward() -> None:
     assert c.from_send == 3 and c.to_send == 3  # derived from the NEW user/project sends only
     # nothing lost: prior summary rolled in + the newly folded send
     assert "#1 agent: hi" in c.content["summary"] and "#3 agent: yo" in c.content["summary"]
+
+
+# ── pre-release hardening: param validation, bounded compact, max_chars default ──
+
+
+def test_default_max_chars_default_is_300() -> None:
+    # The per-field truncation budget bumped 200 → 300 (it was already the `max_chars` field).
+    assert DefaultDeterministicProjector().max_chars == 300
+    p = DefaultDeterministicProjector()
+    big = "x" * 500
+    out = p.project_send([_mr(1, "user", big)], send_index=1, tool_registry=None)
+    human = next(r for r in out.rows if r.kind == "user").content["human"][0]
+    assert len(human) == 301 and human.endswith("…")  # 300 chars + the ellipsis
+
+
+def test_projector_params_validated_on_construction() -> None:
+    import math
+
+    import pytest
+
+    # trigger_ratio must be in (0, 1] — 0, >1, and NaN all rejected (NaN would crash int(max_tokens*nan)).
+    for bad in (0.0, 1.5, -0.1, math.nan):
+        with pytest.raises(ValueError, match="trigger_ratio"):
+            DefaultDeterministicProjector(trigger_ratio=bad)
+        with pytest.raises(ValueError, match="trigger_ratio"):
+            IdentityProjector(trigger_ratio=bad)
+    with pytest.raises(ValueError, match="keep_last_sends"):
+        DefaultDeterministicProjector(keep_last_sends=-1)
+    with pytest.raises(ValueError, match="version"):
+        DefaultDeterministicProjector(version=0)
+    with pytest.raises(ValueError, match="max_chars"):
+        DefaultDeterministicProjector(max_chars=0)
+    with pytest.raises(ValueError, match="max_compact_chars"):
+        DefaultDeterministicProjector(max_compact_chars=-1)
+    # valid edge values are accepted (ratio==1, keep==0, max_compact_chars==0 = unbounded)
+    DefaultDeterministicProjector(trigger_ratio=1.0, keep_last_sends=0, max_compact_chars=0)
+
+
+def test_compact_bounded_by_max_compact_chars() -> None:
+    # The no-LLM compact concatenates; without a cap it grows unbounded. With max_compact_chars set,
+    # it keeps the most-recent tail + a drop marker (dropped detail stays in pl_messages → recall_send).
+    p = DefaultDeterministicProjector(max_compact_chars=80)
+    rows = [_pm(n, "project", {"tools": [], "final_text": "Z" * 60}) for n in range(1, 9)]
+    c = p.compact(rows)
+    assert c is not None
+    summary = c.content["summary"]
+    assert len(summary) <= 80 + 80  # marker + the kept tail, bounded
+    assert "recall_send" in summary  # the drop marker is present
+    assert "#8 agent" in summary  # the most-recent folded send is kept (tail), not the oldest
+
+
+def test_compact_unbounded_when_cap_disabled() -> None:
+    # max_compact_chars=0 → no cap (the pre-fix behavior), so a long fold is fully retained.
+    p = DefaultDeterministicProjector(max_compact_chars=0)
+    rows = [_pm(n, "project", {"tools": [], "final_text": "Z" * 60}) for n in range(1, 9)]
+    c = p.compact(rows)
+    assert c is not None and "recall_send" not in c.content["summary"]
+    assert "#1 agent" in c.content["summary"]  # oldest retained too

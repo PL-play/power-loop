@@ -110,6 +110,27 @@ class CoordinatingCompactor(DefaultCompactor):
 
 The `context` parameter is **opt-in and back-compatible**: the pipeline only passes it to compactors whose `maybe_compact` accepts it (signature-checked), so existing compactors with the old signature keep working unchanged, and `DefaultCompactor` ignores it. Memory stays an injected seam — the library never persists it for you. The `status="compaction"` value is a convention so providers can distinguish a fold-time capture from a session-end snapshot. See [`examples/33_coordinating_compactor.py`](../../../examples/33_coordinating_compactor.py).
 
+## Agentic memory-aware compaction (opt-in)
+
+`DefaultCompactor` summarizes a slice in **one** LLM call. `AgenticMemoryCompactor` instead runs a **bounded, memory-aware agent loop** at the fold: the model first uses memory tools (by default the existing `note_add` / `note_update`) to **persist durable facts into the session's notes**, then writes the `compact_note` summary. This separates *long-term memory* (kept as notes, surfaced on later turns) from the *working-context summary* (compressed), so the agent forgets less across many folds.
+
+```python
+from power_loop.runtime.compact import AgenticMemoryCompactor
+
+config = AgentLoopConfig(
+    compactor=AgenticMemoryCompactor(
+        trigger_ratio=0.75, keep_last_n=4,   # inherited from DefaultCompactor (trigger + span)
+        max_rounds=4,                        # cap on the compaction agent's tool rounds
+        # memory_tools=my_registry,          # default: a registry of note_add / note_update
+        # system_prompt=...,                 # default: DEFAULT_COMPACTION_AGENT_PROMPT
+    ),
+)
+```
+
+- **Default behavior is unchanged** — this is opt-in; the default stays `DefaultCompactor` (single call).
+- **Safe**: the loop is a flat, bounded tool-use loop (not a nested `StatefulAgentLoop`), so it can never recurse into another compaction. The note tools resolve the live session from the loop's contextvars (set for the whole run), so notes land on the right session. On **any** failure (no tool support, malformed output, exception) it **falls back to the single-call summary** — it never blocks a fold.
+- **Cost**: it makes several LLM calls per fold (extract + summarize) instead of one — the trade for richer memory. Reuse the `summary_llm` arg to point the compaction agent at a cheaper model.
+
 ## Events
 
 Subscribe to compaction events for observability:

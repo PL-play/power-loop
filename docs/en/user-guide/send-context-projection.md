@@ -66,9 +66,10 @@ loop = StatefulAgentLoop(
         compactor=None,                                  # REQUIRED with a projector
         max_tokens=8000,          # fold threshold = max_tokens × trigger_ratio
         history_projector=DefaultDeterministicProjector(
-            max_chars=200,        # per-field truncation of tool args/results
-            keep_last_sends=4,    # most-recent sends ALWAYS kept individually
-            trigger_ratio=0.75,   # fold older sends once the prefix reaches 75% of max_tokens
+            max_chars=300,          # per-field truncation of tool args/results
+            keep_last_sends=4,      # most-recent sends ALWAYS kept individually
+            trigger_ratio=0.75,     # fold older sends once the prefix reaches 75% of max_tokens
+            max_compact_chars=4000, # hard cap on the folded compact row (0 = unbounded)
         ),
     ),
 )
@@ -131,6 +132,8 @@ write_file = ToolDefinition(
 
 Folding is **token-driven**, mirroring `DefaultCompactor`'s policy: once the rendered projected prefix reaches `max_tokens × trigger_ratio` (default `0.75`), the oldest sends fold into a single **append-only** `compact` row — always keeping the most-recent `keep_last_sends` individually, and rolling any prior compact forward so nothing is lost. Below the threshold, the small per-send projections just accumulate. The reader then reads `latest compact + sends after its cursor`. The folded `user`/`project` rows are **kept** (recoverable). Folding is deterministic (no LLM call) by default; `pl_messages` is never touched.
 
+Because the default projector **concatenates** (it has no LLM to summarize-to-shrink), the rolled-forward compact would otherwise grow without bound over a long session — defeating the token fold. `max_compact_chars` (default `4000`; `0` = unbounded) caps it: when the compact exceeds the cap, the **oldest** folded lines are dropped and a marker is left (`…[older folded sends omitted — use recall_send(#N) for full detail]`). The dropped sends remain in `pl_messages`, so `recall_send` always recovers them. Note the **in-flight send and the `keep_last_sends` recent sends are always verbatim/individual**, so a single send larger than the budget is an inherent limit (as with any context window) — lower `max_chars`/`keep_last_sends` or supply an LLM-summarizing projector for very long turns.
+
 ## Recovering full detail: `recall_send`
 
 Because the projection is lossy (tool detail truncated/dropped), the model can re-expand any finished send's **original** `pl_messages` detail on demand:
@@ -150,16 +153,45 @@ create_default_tool_registry(include=["recall_send"])   # also in the "full" pre
 from power_loop import HistoryProjector, ProjectedSend, ProjectedRow  # to write your own
 ```
 
-A custom projector satisfies the `HistoryProjector` Protocol by declaring `version: int`, `keep_last_sends: int`, and `trigger_ratio: float` (the token-fold fraction) plus the `project_send` / `render` / `compact` methods. `keep_last_sends == 0` disables folding entirely (what `IdentityProjector` does).
+A custom projector satisfies the `HistoryProjector` Protocol by declaring `version: int`, `keep_last_sends: int`, and `trigger_ratio: float` (the token-fold fraction) plus the `project_send` / `render` / `compact` methods. `keep_last_sends == 0` disables folding entirely (what `IdentityProjector` does). The shipped projectors validate their params at construction (`trigger_ratio ∈ (0, 1]` — `NaN` rejected; `keep_last_sends ≥ 0`; `version ≥ 1`; `max_chars > 0`; `max_compact_chars ≥ 0`), and `AgentLoopConfig` rejects `max_tokens ≤ 0` when a projector is set.
 
 ## Behavior notes
 
 - **Sub-agent child sessions are not projected** — they're skipped by `parent_session_id`; a child's transcript lives in its own session.
 - **Incomplete sends defer** — a send that ends `waiting_for_input` / `pending_tools` is not projected until a resume reaches a terminal status (idempotent upsert on `(session_id, send_index, kind)`).
 - **Pre-projection (legacy) rows render verbatim, never dropped** — rows written before a projector was attached (or before v2, or restored via export→import) have `send_index = NULL`. Enabling projection on such a session does **not** erase them: they render verbatim as a prefix that precedes every projected send (temporally first). New v2 sessions never have NULL rows, so this only matters for migration/import.
+- **A missing or stale projection falls back to verbatim, never dropped** — projection is best-effort at end-of-send; if its write failed/crashed, the past send has rows in `pl_messages` but none in the projection table, and the reader renders that send **verbatim from `pl_messages`** instead of omitting it. The same fallback fires for a send whose projection rows carry a **different `version`** than the configured projector. This is also why a restored/imported session (projection excluded from export) renders correctly and re-folds on its next send.
+- **A misbehaving projector degrades, never poisons the send** — if `project_send`/`render`/`compact` raises, the fold is skipped but the send's per-send rows still commit; `pl_messages` stays the source of truth. The per-tool `project()` hook is likewise exception-guarded (falls back to the truncating default).
 - **Atomic & concurrency-safe** — each finished send's projection rows and any fold commit in one transaction under the session lock, so a crash can't leave a half-projected send, and two loops sharing a store can't double-write a fold.
+
 - **Tokens**: a verbatim projection (Identity) does not reduce tokens; real reduction comes from `DefaultDeterministicProjector`'s per-field truncation and the `compact` fold. Stored content is structured JSON, rendered to compact text at assembly time.
 - **Prompt caching**: the projected prefix grows append-only (one row group per send), so it's friendlier to a provider's implicit prefix cache than the in-place compactor (which rewrites a span on each fold).
+
+## Switching modes on an existing session
+
+The mode (a `history_projector` vs the default in-place compactor) is chosen **per loop**. The **original** mode + projector config (`history_mode`, `projector_version`, `projector_trigger_ratio`, `projector_keep_last_sends`) is recorded in the **session metadata** (`SessionRow.metadata`) the first time it runs, for inspection and switch-detection — but reopening a session in a *different* mode **never throws**: it degrades to a best-effort verbatim render and logs a warning. `send_index` is allocated on every send regardless of mode, so a default-mode session already carries send boundaries.
+
+| From → To | What happens |
+|---|---|
+| **default → projection**, *no compaction had fired yet* | **Migrated (default).** On the first projection send, the prior history is folded into the projection table **once** — a `compact` covering the old sends plus the most-recent `keep_last_sends` as project rows — so the session becomes projection-native. With `migrate_history_on_projection_switch=False`, the prior sends instead render **verbatim from `pl_messages`** (never folded). |
+| **default → projection**, *compaction had already fired* | **Migrated (default).** The in-place `compact_note` **seeds** the projection compact and the active tail is projected, so the session becomes projection-native without losing the note. With migration off, it **degrades** to verbatim (default-style) rendering — compressed but coherent — and skips projecting this send. Never throws. |
+| **resume()/submit_input() before any send()** | **Degrades, never throws.** No `send_index` is allocated to partition by, so it renders verbatim and runs best-effort, with a warning. |
+| **projection → default** | **Safe.** Projection never marks `pl_messages` rows inactive, so default mode sees the full verbatim history; the now-stale projection rows are ignored. |
+| **change `projector.version` / implementation** | Rows written by a *different* `version` fall back to verbatim per send (see Behavior notes). **Bump `version`** whenever you change the implementation/content shape so old rows fall back cleanly. |
+
+**Migration** (`migrate_history_on_projection_switch`, default `True`) runs **once** per session — best-effort (on failure it falls back to verbatim and retries next send), idempotent (recorded as `projection_migrated` in the session metadata), and only when the projection table is empty (a genuine switch / in-place-compacted session; an incidental missing row on an already-projected session is left to the per-send verbatim fallback). It folds via `projector.compact()`, so it uses whatever projector is configured.
+
+**Recommendation:** pick the mode at session creation. A switch is always survivable (best-effort + warning, never an exception), but for clean, fully-foldable projection start a **fresh session**.
+
+## Robustness: self-healing a malformed history
+
+A corrupt row in `pl_messages` (a crash between an assistant tool-call row and its result, a bad import, a manual edit, a projection mismatch) would otherwise make the provider reject the whole prompt — and repeat on every load, **bricking the session forever**. To prevent that, the assembled prompt is run through a tool-call/result aligner (`align_tool_calls`) before **every** LLM call:
+
+- an **orphan tool result** (no matching assistant call) is **dropped**;
+- a **mid-history assistant call left unanswered** before the next message gets a **synthesized placeholder** result, so the pairing is valid;
+- a **trailing** pending call (the in-flight send's tools, which the loop is about to run on a resume) is **left untouched**.
+
+It is always-on, mode-agnostic, and a **no-op on a healthy history**; each repair logs a warning. By default the audit log is unchanged (the prompt is just sanitized each load). Set **`AgentLoopConfig.repair_corrupt_history=True`** to additionally deactivate the dropped orphan rows durably (`state="dropped"`) — still kept in the full audit, just excluded from the active history so they aren't re-sanitized every time.
 
 ## See also
 

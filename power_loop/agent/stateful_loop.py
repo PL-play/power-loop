@@ -50,6 +50,7 @@ from power_loop.core.pipeline import (
 from power_loop.core.runner import AgentRunner
 from power_loop.runtime.budget import estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike
+from power_loop.runtime.history_sanitize import align_tool_calls
 from power_loop.runtime.skills import SkillLoader
 from power_loop.runtime.store.schema import SchemaPolicy
 from power_loop.runtime.store.store import (
@@ -1119,8 +1120,14 @@ class StatefulAgentLoop:
         # send_index is allocated >= 1 by _persist_user_input and persists across resume();
         # 0 is the unallocated/legacy default. Treat ONLY a real allocation (>= 1) as the current
         # send — explicit (matches the `is not None` convention used below), never conflating the
-        # unallocated 0 with a (hypothetical) explicit send 0.
-        current_send_index = int(si) if (si and int(si) >= 1) else None
+        # unallocated 0 with a (hypothetical) explicit send 0. Coerce defensively: a corrupted
+        # runtime_state value (non-numeric / inf / nan) must degrade to "unallocated", never crash
+        # the reader with int()'s ValueError/OverflowError.
+        try:
+            si_int = int(si)
+        except (TypeError, ValueError, OverflowError):
+            si_int = 0
+        current_send_index = si_int if si_int >= 1 else None
         # Cache only the plain-send path: resume()/submit_input() pass a pre-primed sink built
         # from pending state (NOT a full init_history_seqs), so they must neither read from nor
         # write to the window cache — they self-invalidate via the next_seq bump from their own
@@ -1128,52 +1135,181 @@ class StatefulAgentLoop:
         # rows, but projected history != verbatim). Capture eligibility BEFORE the default sink.
         cache_eligible = sink is None and self._session_cache_size > 0 and projector is None
         sink = sink if sink is not None else SQLiteSink(store, sid)
-        if projector is not None:
-            # ── Projection mode (v2): history = rendered projections of FINISHED sends + the
-            # in-flight send's structured rows. pl_messages is NEVER compacted here (compactor
-            # is None, enforced by AgentLoopConfig), so it stays in seq order and we partition
-            # it by the send_index stamped on every row. ──
-            active_rows = await store.load_active_messages(sid)
-            if current_send_index is None:
-                # The only way here is resume()/submit_input() on a session that never completed
-                # a send() (no allocated send_index). There is no coherent in-flight send to
-                # partition by — fail loudly rather than silently feeding ALL rows (incl.
-                # orphaned/legacy ones) verbatim as one pseudo-send.
-                raise RuntimeError(
-                    f"projection mode requires an allocated send_index for session {sid!r} "
-                    "(no send started — call send() before resume()/submit_input())"
+        # Record the session's ORIGINAL history mode + projector config ONCE, in the session
+        # METADATA (inspectable, and the baseline for switch-detection). A later mode switch never
+        # fails the run — it logs a warning and renders best-effort (the config-level
+        # projector/compactor exclusion can't catch a cross-RUN switch). Loaded here once and
+        # reused below for the system-prompt precedence.
+        session_row = await store.get_session(sid)
+        current_mode = "projection" if projector is not None else "default"
+        try:
+            recorded = session_row.metadata.get("history_mode") if session_row is not None else None
+            if recorded is None:
+                await store.merge_session_metadata(sid, {
+                    "history_mode": current_mode,
+                    "projector_version": int(getattr(projector, "version", 0) or 0) if projector else None,
+                    "projector_trigger_ratio": (
+                        float(getattr(projector, "trigger_ratio", 0) or 0) if projector else None
+                    ),
+                    "projector_keep_last_sends": (
+                        int(getattr(projector, "keep_last_sends", 0) or 0) if projector else None
+                    ),
+                })
+            elif recorded != current_mode:
+                logger.warning(
+                    "session %s: running in %r history mode but it was originally %r — rendering "
+                    "best-effort (prior-mode history shown verbatim or compacted).",
+                    sid, current_mode, recorded,
                 )
-            # Rows predating the projection era (pre-v2 migration / export→import) carry
-            # send_index=NULL. Never drop them (that would silently erase prior history at the
-            # moment projection is enabled): render them VERBATIM as a temporally-first prefix —
-            # they precede every projected/in-flight send in seq order — instead of lumping them
-            # into the current send (which would invert their order relative to the projections).
-            legacy_rows = [r for r in active_rows if r.send_index is None]
+        except Exception:
+            logger.exception("session %s: history-mode bookkeeping failed (continuing)", sid)
+
+        projection_active = projector is not None
+        active_rows: list[Any] | None = None
+        if projection_active:
+            active_rows = await store.load_active_messages(sid)
+            migrated = (
+                session_row is not None and session_row.metadata.get("projection_migrated") is not None
+            )
+            if current_send_index is None:
+                # resume()/submit_input() before any send() — no in-flight send to partition by.
+                logger.warning(
+                    "session %s: projection mode degrading to verbatim rendering (no allocated "
+                    "send_index — resume before any send); best-effort.", sid,
+                )
+                projection_active = False
+            elif not migrated and self.config.migrate_history_on_projection_switch:
+                # One-time migration: a session with prior NON-projection history opened in
+                # projection mode. Fold that prior history into the projection table so it becomes
+                # projection-native (a compact + the recent keep_last_sends as project rows) rather
+                # than rendering it verbatim forever. Only when the projection table is EMPTY (a
+                # genuine switch / in-place-compacted / never-projected session) — an incidental
+                # missing/stale row on an already-projected session is left to the verbatim
+                # fallback below.
+                has_note = any(r.name == "compact_note" for r in active_rows)
+                has_prior = any(
+                    r.send_index is not None and r.send_index < current_send_index
+                    and r.name != "compact_note"
+                    for r in active_rows
+                )
+                if has_note or has_prior:
+                    if await store.load_project_messages(sid):
+                        # Already projection-native (normal session, or a version bump handled by
+                        # the verbatim fallback) — mark resolved so we don't re-check every send.
+                        try:
+                            await store.merge_session_metadata(sid, {"projection_migrated": 0})
+                        except Exception:
+                            logger.exception("session %s: migration bookkeeping failed", sid)
+                        migrated = True
+                    else:
+                        try:
+                            await self._migrate_prior_history_to_projection(
+                                store, sid, projector,
+                                current_send_index=current_send_index, active_rows=active_rows,
+                            )
+                            await store.merge_session_metadata(
+                                sid, {"projection_migrated": current_send_index}
+                            )
+                            migrated = True
+                            logger.info(
+                                "session %s: migrated prior history into the projection table "
+                                "(mode switch).", sid,
+                            )
+                        except Exception:
+                            # Best-effort: fall back to verbatim this send (and retry next send).
+                            logger.exception(
+                                "session %s: projection migration failed (continuing best-effort)",
+                                sid,
+                            )
+            # A compact_note that migration did NOT fold in (migration off/failed) can't be
+            # send_index-partitioned → degrade to verbatim. Once migrated, the note is represented
+            # by the projection compact and is excluded from the partition below.
+            if (
+                projection_active
+                and not migrated
+                and any(r.name == "compact_note" for r in active_rows)
+            ):
+                logger.warning(
+                    "session %s: projection mode degrading to verbatim rendering (in-place "
+                    "compaction history present, not migrated); best-effort.", sid,
+                )
+                projection_active = False
+
+        if projection_active:
+            # ── Projection mode (v2): history = rendered projections of FINISHED sends + the
+            # in-flight send's structured rows. pl_messages is NEVER compacted here (compactor is
+            # None, enforced by AgentLoopConfig), so it stays in seq order; we partition by the
+            # send_index stamped on every row. (active_rows loaded above; current_send_index set.)
+            assert current_send_index is not None and active_rows is not None
+            # Rows predating the projection era (pre-v2 / export→import) carry send_index=NULL —
+            # render them VERBATIM as a temporally-first prefix (never dropped, never lumped into
+            # the current send). compact_note rows are in-place-compactor artifacts: in projection
+            # mode they are represented by the projection compact (after migration) and must never
+            # be rendered verbatim, so they are excluded from both the prefix and the partition.
+            legacy_rows = [
+                r for r in active_rows if r.send_index is None and r.name != "compact_note"
+            ]
             current_rows = [r for r in active_rows if r.send_index == current_send_index]
+            # pl_messages is the immutable audit log and is NEVER compacted in projection mode, so
+            # every past send's rows are still present here — the FALLBACK source whenever a send's
+            # projection row is missing (a best-effort end-of-send projection write failed/crashed)
+            # or was written by a DIFFERENT projector version (the user changed the projector).
+            # Without this fallback such a send would be silently dropped from context forever.
+            version = int(getattr(projector, "version", 0) or 0)
+            active_by_send: dict[int, list[Any]] = {}
+            for r in active_rows:
+                if r.send_index is not None and r.name != "compact_note":
+                    active_by_send.setdefault(r.send_index, []).append(r)
+
+            def _verbatim(send_idx: int) -> list[LoopMessage]:
+                return [_row_to_loop_message(m) for m in active_by_send.get(send_idx, [])]
+
             compact = await store.latest_project_compact(sid)
             cutoff = compact.compact_to_send if compact is not None else None
-            proj_rows = await store.load_project_messages(sid, after_send_index=cutoff)
-            proj_rows = [r for r in proj_rows if r.send_index < current_send_index]
-            prefix_rows = ([compact] if compact is not None else []) + proj_rows
+            proj_rows = [
+                r
+                for r in await store.load_project_messages(sid, after_send_index=cutoff)
+                if r.send_index < current_send_index
+            ]
+            # Only rows written by the CURRENT projector version are faithfully renderable by it;
+            # rows from another version fall back to verbatim (below), keyed per send.
+            cur_proj_by_send: dict[int, list[Any]] = {}
+            for r in proj_rows:
+                if int(r.projector_version or 0) == version:
+                    cur_proj_by_send.setdefault(r.send_index, []).append(r)
+
+            prefix_msgs: list[LoopMessage] = []
+            # (1) folded-history compact: render via the projector when it matches the current
+            # version, else render its covered send range verbatim from the audit log.
+            if compact is not None:
+                if int(compact.projector_version or 0) == version:
+                    prefix_msgs.extend(projector.render([compact]))
+                else:
+                    for si2 in range(compact.compact_from_send or 0, (compact.compact_to_send or 0) + 1):
+                        prefix_msgs.extend(_verbatim(si2))
+            # (2) each uncompacted past send in order: projected when a current-version row exists,
+            # else verbatim fallback (missing or stale projection).
+            lo = cutoff or 0
+            for si2 in sorted(s for s in active_by_send if lo < s < current_send_index):
+                rows_for_send = cur_proj_by_send.get(si2)
+                prefix_msgs.extend(projector.render(rows_for_send) if rows_for_send else _verbatim(si2))
+
             legacy_msgs = [_row_to_loop_message(r) for r in legacy_rows]
-            prefix_msgs = projector.render(prefix_rows)
             current_msgs = [_row_to_loop_message(r) for r in current_rows]
             history = legacy_msgs + prefix_msgs + current_msgs
-            # Sink index↔seq map: legacy + in-flight rows carry real seqs; the rendered projection
-            # prefix has no DB rows (None placeholders). (Compaction is off, so this map is only
-            # kept aligned for the appends, never used to fold.)
-            legacy_seqs: list[int | None] = [r.seq for r in legacy_rows]
-            placeholders: list[int | None] = [None] * len(prefix_msgs)
-            cur_seqs: list[int | None] = [r.seq for r in current_rows]
-            idx_map = legacy_seqs + placeholders + cur_seqs
-            sink.init_history_seqs(idx_map, idx_map)
+            # Sink index↔seq map: legacy + in-flight rows carry real seqs; the rendered prefix
+            # (projected OR verbatim-fallback) has no foldable DB row (None). Compaction is off in
+            # projection mode, so this map is only kept aligned for the appends, never used to fold.
+            hist_seqs: list[int | None] = (
+                [r.seq for r in legacy_rows]
+                + [None] * len(prefix_msgs)
+                + [r.seq for r in current_rows]
+            )
+            hist_ords: list[int | None] = list(hist_seqs)
         else:
-            # ── Default mode: verbatim history (+ optional window cache + in-place compactor). ──
-            # The async store offloads its own blocking I/O (SQLite → threadpool; PG/MySQL → real
-            # async). When this session's window cache is current (token = session_state.next_seq,
-            # already advanced by the just-persisted user input), reuse it and skip the O(active-
-            # history) load entirely; otherwise load in full and (re)populate the cache.
-            active_rows = None
+            # ── Default / degraded-verbatim mode: full verbatim history (+ window cache + in-place
+            # compactor). When degrading from projection, active_rows is already loaded above and
+            # the cache is bypassed (cache_eligible is False whenever a projector is configured). ──
             cache_token: tuple[int, int] | None = None
             if cache_eligible:
                 state = await store.get_state(sid)
@@ -1186,19 +1322,36 @@ class StatefulAgentLoop:
                     self._cache_put(sid, cache_token[0], active_rows, cache_token[1])
             history = [_row_to_loop_message(r) for r in active_rows]
             # Mirror loaded seqs into the sink so the compactor can translate in-memory indices
-            # back to store rows when it folds messages. Pass the parallel logical positions too:
-            # a compact_note's identity seq is high, but it sits at its logical ``ord`` (set when
-            # it was folded) — load order and the sink's index map must agree on that.
-            sink.init_history_seqs(
-                [r.seq for r in active_rows],
-                [
-                    int(r.meta["ord"]) if r.name == "compact_note" and r.meta.get("ord") is not None
-                    else r.seq
-                    for r in active_rows
-                ],
+            # back to store rows when it folds. Pass the parallel logical positions too: a
+            # compact_note's identity seq is high, but it sits at its logical ``ord``.
+            hist_seqs = [r.seq for r in active_rows]
+            hist_ords = [
+                int(r.meta["ord"]) if r.name == "compact_note" and r.meta.get("ord") is not None
+                else r.seq
+                for r in active_rows
+            ]
+
+        # ── Robustness backstop (mode-agnostic, always on): repair tool-call/result misalignment
+        # in the assembled prompt so a corrupt row (crash mid-tool, bad import/edit, projection
+        # mismatch) can't make the provider reject the history and brick the session forever. No-op
+        # on a healthy history. With repair_corrupt_history=True, the dropped orphan rows are also
+        # deactivated in the store so the fix is durable (else the prompt is just re-sanitized). ──
+        history, hist_seqs, hist_ords, dropped_seqs, synthesized = align_tool_calls(
+            history, hist_seqs, hist_ords
+        )
+        if dropped_seqs or synthesized:
+            logger.warning(
+                "session %s: repaired malformed tool-call pairing in the prompt "
+                "(dropped %d orphan result(s) seqs=%s, synthesized %d placeholder result(s))",
+                sid, len(dropped_seqs), dropped_seqs, synthesized,
             )
-        session_row = await store.get_session(sid)
-        # System prompt precedence: per-call > session > config.
+        if dropped_seqs and self.config.repair_corrupt_history:
+            try:
+                await store.deactivate_messages(sid, dropped_seqs)
+            except Exception:
+                logger.exception("session %s: durable history repair (deactivate) failed", sid)
+        sink.init_history_seqs(hist_seqs, hist_ords)
+        # System prompt precedence: per-call > session > config. (session_row loaded above.)
         effective_sp = system_prompt
         if effective_sp is None and session_row is not None and session_row.system_prompt:
             effective_sp = session_row.system_prompt
@@ -1265,7 +1418,8 @@ class StatefulAgentLoop:
         # Send-context projection (v2): at end-of-send, project the finished send's pl_messages
         # rows into pl_project_messages so the NEXT send reads them as plain-text history. Derived
         # + best-effort: a failure never affects the send result (pl_messages is the source of truth).
-        if projector is not None and current_send_index is not None:
+        # Skipped when projection degraded to verbatim this run (projection_active=False).
+        if projection_active and current_send_index is not None:
             try:
                 await self._write_send_projection(
                     store, sid, send_index=current_send_index, status=result.status,
@@ -1282,6 +1436,83 @@ class StatefulAgentLoop:
             pending_interactions=result.pending_interactions,
             usage=result.usage,
             tool_calls=result.tool_calls,
+        )
+
+    async def _migrate_prior_history_to_projection(
+        self,
+        store: SessionStore,
+        sid: str,
+        projector: HistoryProjector,
+        *,
+        current_send_index: int,
+        active_rows: list[Any],
+    ) -> None:
+        """One-time best-effort migration: fold a session's prior NON-projection history into the
+        projection table so it becomes projection-native (starts with a ``compact`` covering the
+        old sends, plus the most-recent ``keep_last_sends`` as individual project rows). Handles
+        both a clean default→projection switch (no projection rows yet) and a session the in-place
+        compactor had folded (its ``compact_note`` summary seeds the projection compact). Uses
+        ``projector.compact`` for the fold, so it auto-uses whatever projector is configured. Never
+        raises (the caller swallows + sets the migrated marker only on success)."""
+        from power_loop.runtime.store.types import ProjectMessageRow
+
+        keep = max(int(getattr(projector, "keep_last_sends", 0) or 0), 0)
+        version = int(getattr(projector, "version", 0) or 0)
+        note = next((r for r in active_rows if r.name == "compact_note"), None)
+        by_send: dict[int, list[Any]] = {}
+        for r in active_rows:
+            if r.send_index is not None and r.send_index < current_send_index and r.name != "compact_note":
+                by_send.setdefault(r.send_index, []).append(r)
+        prior = sorted(by_send)
+        if not prior and note is None:
+            return  # nothing to migrate
+
+        projected = {si: projector.project_send(by_send[si], send_index=si, tool_registry=None) for si in prior}
+        # Fold all but the most-recent `keep` prior sends; keep the rest as individual project rows.
+        if keep > 0 and len(prior) > keep:
+            fold, recent = prior[:-keep], prior[-keep:]
+        elif keep == 0:
+            fold, recent = prior, []
+        else:
+            fold, recent = [], prior
+
+        def _pm(si: int, kind: str, content: Any) -> ProjectMessageRow:
+            return ProjectMessageRow(
+                session_id=sid, send_index=si, kind=kind, content=content, rendered_text=None,
+                source_seq_lo=None, source_seq_hi=None, compact_from_send=None,
+                compact_to_send=None, projector_version=version, token_estimate=None, created_at=0,
+            )
+
+        # Build the seed compact: the in-place compactor's note (if any) rolled forward + the
+        # folded sends, via projector.compact (deterministic for the default projector).
+        to_compact: list[ProjectMessageRow] = []
+        if note is not None:
+            to_compact.append(_pm(0, "compact", {"summary": note.content or ""}))
+        for si in fold:
+            for pr in projected[si].rows:
+                to_compact.append(_pm(si, pr.kind, pr.content))
+        compact_tuple: tuple[Any, str | None, int, int] | None = None
+        folded = (
+            projector.compact(to_compact)
+            if any(r.kind in ("user", "project") for r in to_compact)
+            else None
+        )
+        if folded is not None:
+            from_send = 0 if note is not None else (min(fold) if fold else 0)
+            compact_tuple = (folded.content, folded.rendered_text, from_send, max(fold))
+        elif note is not None:
+            # Only the note, nothing foldable beyond keep → preserve the note as a standalone
+            # compact sitting just before the kept tail (or the current send).
+            to_send = (min(recent) - 1) if recent else (current_send_index - 1)
+            compact_tuple = ({"summary": note.content or ""}, None, 0, max(0, to_send))
+
+        project_rows = [
+            (si, pr.kind, pr.content, pr.rendered_text)
+            for si in recent
+            for pr in projected[si].rows
+        ]
+        await store.write_projection_migration(
+            sid, project_rows=project_rows, compact=compact_tuple, projector_version=version,
         )
 
     async def _write_send_projection(
@@ -1323,32 +1554,49 @@ class StatefulAgentLoop:
             trigger_ratio`` (mirrors DefaultCompactor's token-driven policy), fold the OLDEST
             uncompacted sends — always keeping the most-recent ``keep_last_sends`` — into one
             ``compact`` row, rolling any prior compact forward so nothing is lost. The folded
-            user/project rows REMAIN (recoverable via recall_send); pl_messages is untouched."""
-            keep = int(getattr(projector, "keep_last_sends", 0) or 0)
-            if keep <= 0:
+            user/project rows REMAIN (recoverable via recall_send); pl_messages is untouched.
+
+            Wrapped so a misbehaving projector (render/compact/trigger raising) degrades to
+            "rows written, NO fold" instead of aborting the whole locked write — the send's
+            per-send projection rows still commit, and pl_messages stays the source of truth."""
+            try:
+                keep = int(getattr(projector, "keep_last_sends", 0) or 0)
+                if keep <= 0:
+                    return None
+                live_sends = sorted(
+                    {r.send_index for r in after_rows if r.kind in ("user", "project")}
+                )
+                if len(live_sends) <= keep:
+                    return None  # nothing foldable beyond the keep-recent floor
+                trigger_ratio = float(getattr(projector, "trigger_ratio", 0.75) or 0.75)
+                threshold = int((self.config.max_tokens or 8000) * trigger_ratio)
+                rendered_prefix = projector.render(
+                    ([prior] if prior is not None else []) + after_rows
+                )
+                if estimate_tokens(rendered_prefix) < threshold:
+                    return None  # below threshold — small per-send projections just accumulate
+                fold_sends = set(live_sends[: len(live_sends) - keep])
+                fold_rows = [
+                    r
+                    for r in after_rows
+                    if r.kind in ("user", "project") and r.send_index in fold_sends
+                ]
+                to_compact = ([prior] if prior is not None else []) + fold_rows  # roll prior fwd
+                folded = projector.compact(to_compact)
+                if folded is None:
+                    return None
+                from_send = (
+                    prior.compact_from_send
+                    if (prior is not None and prior.compact_from_send is not None)
+                    else min(fold_sends)
+                )
+                return (folded.content, folded.rendered_text, from_send, max(fold_sends))
+            except Exception:
+                logger.exception(
+                    "projection fold planning failed for %s (skipping fold; rows still written)",
+                    sid,
+                )
                 return None
-            live_sends = sorted({r.send_index for r in after_rows if r.kind in ("user", "project")})
-            if len(live_sends) <= keep:
-                return None  # nothing foldable beyond the keep-recent floor
-            trigger_ratio = float(getattr(projector, "trigger_ratio", 0.75) or 0.75)
-            threshold = int((self.config.max_tokens or 8000) * trigger_ratio)
-            rendered_prefix = projector.render(([prior] if prior is not None else []) + after_rows)
-            if estimate_tokens(rendered_prefix) < threshold:
-                return None  # below threshold — small per-send projections just accumulate
-            fold_sends = set(live_sends[: len(live_sends) - keep])
-            fold_rows = [
-                r for r in after_rows if r.kind in ("user", "project") and r.send_index in fold_sends
-            ]
-            to_compact = ([prior] if prior is not None else []) + fold_rows  # roll prior forward
-            folded = projector.compact(to_compact)
-            if folded is None:
-                return None
-            from_send = (
-                prior.compact_from_send
-                if (prior is not None and prior.compact_from_send is not None)
-                else min(fold_sends)
-            )
-            return (folded.content, folded.rendered_text, from_send, max(fold_sends))
 
         # One atomic, session-locked write: all of this send's projection rows + the optional fold
         # commit together (no half-projected send), and the read-decide-write of the fold is

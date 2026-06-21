@@ -465,6 +465,22 @@ class SessionStore:
             )
         return compact_seq, note_seq
 
+    async def deactivate_messages(self, session_id: str, seqs: list[int]) -> int:
+        """Mark the given message rows ``DROPPED`` so they no longer load into the active history.
+        Used by the history-repair backstop to physically remove an orphan tool-result row that
+        would make the provider reject the prompt — distinct from ``compacted_out`` so it stays
+        auditable as a repair. Idempotent; returns the number of rows affected (best-effort)."""
+        uniq = [int(s) for s in dict.fromkeys(seqs)]
+        if not uniq:
+            return 0
+        placeholders = ",".join("?" for _ in uniq)
+        async with self._db.transaction() as tx:
+            await tx.execute(
+                f"UPDATE {self.t.messages} SET state=? WHERE session_id=? AND seq IN ({placeholders})",
+                (MessageState.DROPPED.value, session_id, *uniq),
+            )
+        return len(uniq)
+
     async def list_compactions(self, session_id: str) -> list[CompactionRow]:
         rows = await self._db.fetchall(
             f"SELECT * FROM {self.t.compactions} WHERE session_id=? ORDER BY compact_seq",
@@ -646,6 +662,34 @@ class SessionStore:
                 )
 
 
+    async def write_projection_migration(
+        self,
+        session_id: str,
+        *,
+        project_rows: list[tuple[int, str, Any, str | None]],
+        compact: tuple[Any, str | None, int, int] | None,
+        projector_version: int,
+    ) -> None:
+        """Atomically seed the projection table for a one-time mode-switch migration: write the
+        per-send ``project_rows`` (``(send_index, kind, content, rendered_text)``) and an optional
+        ``compact`` (``(content, rendered_text, from_send, to_send)``) in ONE transaction under the
+        session lock, so a crash can't leave a half-migrated projection."""
+        now = _now_ms()
+        async with self._db.transaction() as tx:
+            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            for send_index, kind, content, rendered_text in project_rows:
+                await self._upsert_project_message_tx(
+                    tx, session_id, send_index=send_index, kind=kind, content=content,
+                    rendered_text=rendered_text, projector_version=projector_version, now=now,
+                )
+            if compact is not None:
+                c_content, c_rendered, from_send, to_send = compact
+                await self._upsert_project_message_tx(
+                    tx, session_id, send_index=to_send, kind="compact", content=c_content,
+                    rendered_text=c_rendered, compact_from_send=from_send, compact_to_send=to_send,
+                    projector_version=projector_version, now=now,
+                )
+
     # ── session lifecycle ─────────────────────────────────────────────────────
     async def list_children(self, parent_session_id: str) -> list[SessionRow]:
         rows = await self._db.fetchall(
@@ -725,6 +769,27 @@ class SessionStore:
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET system_prompt=?, updated_at=? WHERE session_id=?",
                 (system_prompt, _now_ms(), session_id),
+            )
+
+    async def merge_session_metadata(self, session_id: str, patch: dict[str, Any]) -> None:
+        """Shallow-merge ``patch`` into the session's ``metadata_json`` (read-modify-write under
+        the session-state row lock so concurrent merges don't clobber each other). No-op if the
+        session is gone. Used to record the projection/history mode + projector config for
+        inspection and switch-detection."""
+        if not patch:
+            return
+        async with self._db.transaction() as tx:
+            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            row = await tx.fetchone(
+                f"SELECT metadata_json FROM {self.t.sessions} WHERE session_id=?", (session_id,)
+            )
+            if row is None:
+                return
+            current = _loads(row["metadata_json"]) or {}
+            current.update(patch)
+            await tx.execute(
+                f"UPDATE {self.t.sessions} SET metadata_json=?, updated_at=? WHERE session_id=?",
+                (_dumps(current), _now_ms(), session_id),
             )
 
     # ── timers (durable wake-ups; see runtime/timers.py) ──────────────────
