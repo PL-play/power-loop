@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [2.2.0] — 2026-06-21
+
 ### Added — Agentic memory-aware compactor (opt-in)
 
 - **`AgenticMemoryCompactor`** (`power_loop.runtime.compact`) — an opt-in `Compactor` that runs a

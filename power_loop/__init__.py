@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
