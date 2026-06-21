@@ -1203,12 +1203,10 @@ class StatefulAgentLoop:
                         migrated = True
                     else:
                         try:
+                            # Writes the rows AND the projection_migrated marker in one tx (atomic).
                             await self._migrate_prior_history_to_projection(
                                 store, sid, projector,
                                 current_send_index=current_send_index, active_rows=active_rows,
-                            )
-                            await store.merge_session_metadata(
-                                sid, {"projection_migrated": current_send_index}
                             )
                             migrated = True
                             logger.info(
@@ -1249,7 +1247,10 @@ class StatefulAgentLoop:
             legacy_rows = [
                 r for r in active_rows if r.send_index is None and r.name != "compact_note"
             ]
-            current_rows = [r for r in active_rows if r.send_index == current_send_index]
+            current_rows = [
+                r for r in active_rows
+                if r.send_index == current_send_index and r.name != "compact_note"
+            ]
             # pl_messages is the immutable audit log and is NEVER compacted in projection mode, so
             # every past send's rows are still present here — the FALLBACK source whenever a send's
             # projection row is missing (a best-effort end-of-send projection write failed/crashed)
@@ -1511,8 +1512,11 @@ class StatefulAgentLoop:
             for si in recent
             for pr in projected[si].rows
         ]
+        # Mark migrated in the SAME transaction as the rows (atomic): a crash can't leave the
+        # migration written with an unset marker.
         await store.write_projection_migration(
             sid, project_rows=project_rows, compact=compact_tuple, projector_version=version,
+            metadata_patch={"projection_migrated": current_send_index},
         )
 
     async def _write_send_projection(

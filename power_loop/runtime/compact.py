@@ -468,10 +468,15 @@ class AgenticMemoryCompactor(DefaultCompactor):
                     args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
                 except (TypeError, ValueError):
                     args = {}
-                try:
-                    result = await registry.invoke_async(str(name), args if isinstance(args, dict) else {})
-                except Exception as exc:  # a bad tool call must not abort compaction
-                    result = f"error: {exc}"
+                if not name:  # malformed tool_call with no name — answer it so the pair stays valid
+                    result: Any = "error: tool call had no name"
+                else:
+                    try:
+                        result = await registry.invoke_async(
+                            str(name), args if isinstance(args, dict) else {}
+                        )
+                    except Exception as exc:  # a bad tool call must not abort compaction
+                        result = f"error: {exc}"
                 convo.append({"role": "tool", "tool_call_id": tc.get("id"), "content": str(result)})
         # Rounds exhausted while still tool-calling — one final, tool-free summary request.
         resp = await summary_llm.complete(
@@ -482,7 +487,9 @@ class AgenticMemoryCompactor(DefaultCompactor):
                 temperature=0.0,
             )
         )
-        return _strip_summary(getattr(resp, "raw_text", "") or "")
+        return _strip_summary(
+            getattr(resp, "raw_text", "") or getattr(resp, "content_text", "") or ""
+        )
 
 
 __all__ = [

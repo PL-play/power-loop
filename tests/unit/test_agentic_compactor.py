@@ -159,6 +159,34 @@ async def test_exhausted_rounds_makes_final_toolfree_call():
     assert not llm.calls[-1].tools  # the final call offered no tools
 
 
+@pytest.mark.asyncio
+async def test_final_tool_free_call_uses_content_text():
+    # The forced final summary call (after rounds exhausted) must accept the summary from
+    # content_text, not just raw_text (regression for the review's AGENTIC-001).
+    recorded: list = []
+    reg = _note_registry(recorded)
+    llm = _ScriptLLM([
+        LLMResponse(raw_text="", tool_calls=[_tc("1", "note_add", '{"content": "x"}')]),
+        LLMResponse(raw_text="", content_text="<summary>from content_text</summary>"),  # final call
+    ])
+    comp = AgenticMemoryCompactor(memory_tools=reg, max_rounds=1)
+    out = await comp._summarize_async(SLICE, llm=llm)
+    assert out == "from content_text"
+    assert not llm.calls[-1].tools  # final call offered no tools
+
+
+@pytest.mark.asyncio
+async def test_tool_call_with_no_name_is_answered_not_crashed():
+    reg = _note_registry([])
+    llm = _ScriptLLM([
+        LLMResponse(raw_text="", tool_calls=[{"id": "1", "type": "function", "function": {}}]),  # no name
+        LLMResponse(raw_text="<summary>ok</summary>"),
+    ])
+    comp = AgenticMemoryCompactor(memory_tools=reg, max_rounds=4)
+    out = await comp._summarize_async(SLICE, llm=llm)
+    assert out == "ok"  # nameless tool call answered with an error result, loop continued
+
+
 def test_default_registry_is_note_tools():
     comp = AgenticMemoryCompactor()
     reg = comp._registry()

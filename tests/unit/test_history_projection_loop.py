@@ -621,6 +621,53 @@ async def test_projection_mode_records_projector_config_in_metadata(store: Sessi
     assert meta["projector_keep_last_sends"] == 2
 
 
+@pytest.mark.asyncio
+async def test_migration_failure_falls_back_to_verbatim(store: SessionStore, monkeypatch) -> None:
+    # If the one-time migration raises, the run must NOT crash: it falls back to the per-send
+    # verbatim rendering, leaves the marker unset (retry-able), and still projects new sends.
+    base = StatefulAgentLoop(
+        llm=_two_send_script(), store=store, tool_registry=_echo_registry(),
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4),
+    )
+    sid = await base.new_session()
+    await base.send("first", session_id=sid)
+
+    proj_llm = _Scripted(responses=[LLMResponse(raw_text="done2")])
+    proj = _projector_loop(store, proj_llm, DefaultDeterministicProjector())
+
+    async def _boom(*a, **k):
+        raise RuntimeError("migration boom")
+
+    monkeypatch.setattr(proj, "_migrate_prior_history_to_projection", _boom)
+    r = await proj.send("second", session_id=sid)
+    assert r.status == "completed"  # migration failure did not crash the send
+    joined = "\n".join(str(m.get("content", "")) for m in proj_llm.calls[0])
+    assert "first" in joined and any("tool_calls" in m for m in proj_llm.calls[0])  # verbatim fallback
+    assert (await store.get_session(sid)).metadata.get("projection_migrated") is None  # not marked
+    assert 2 in {r.send_index for r in await store.load_project_messages(sid)}  # send 2 still projects
+
+
+@pytest.mark.asyncio
+async def test_migration_skipped_when_projection_rows_already_exist(store: SessionStore) -> None:
+    # If the projection table is already non-empty (a prior migration/projection, marker lost to a
+    # crash), the reader must NOT re-migrate — it marks resolved and leaves the existing rows alone.
+    base = StatefulAgentLoop(
+        llm=_two_send_script(), store=store, tool_registry=_echo_registry(),
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4),
+    )
+    sid = await base.new_session()
+    await base.send("first", session_id=sid)
+    # Simulate a pre-existing projection row for the prior send (no marker set).
+    await store.upsert_project_message(
+        sid, send_index=1, kind="project", content={"tools": [], "final_text": "x"}, projector_version=1
+    )
+    proj = _projector_loop(store, _Scripted(responses=[LLMResponse(raw_text="done2")]),
+                           DefaultDeterministicProjector())
+    await proj.send("second", session_id=sid)
+    assert (await store.get_session(sid)).metadata.get("projection_migrated") == 0  # resolved, not migrated
+    assert not any(p.kind == "compact" for p in await store.load_project_messages(sid))  # no migration fold
+
+
 def test_config_rejects_nonpositive_max_tokens_with_projector() -> None:
     for bad in (0, -10):
         with pytest.raises(ValueError, match="max_tokens"):
