@@ -51,6 +51,7 @@ A representative subset is validated by `tests/real/test_examples.py` against a 
 | 38 | [`38_mcp_tools.py`](38_mcp_tools.py) | **MCP**: wire a real MCP server's tools into the agent | `StdioMCPClient`, `register_mcp_tools` (`power-loop[mcp]`) |
 | 39 | [`39_pluggable_backends_and_resume.py`](39_pluggable_backends_and_resume.py) | **Storage**: pick a backend by DSN (SQLite/PG/MySQL), resume a session from a cold loop, schema policy | `dsn=`, `SchemaPolicy`, `StoreSchemaError`, `prewarm()`, `cache_stats` |
 | 40 | [`40_send_context_projection.py`](40_send_context_projection.py) | **Projection**: feed finished sends as plain text (`pl_project_messages`) instead of verbatim history; fold + `recall_send` | `HistoryProjector`, `DefaultDeterministicProjector`, `history_projector=`, `recall_send` |
+| 41 | [`41_custom_async_tool.py`](41_custom_async_tool.py) | **Custom async-wake tool**: start async work, return immediately, wake the agent when done — the extension recipe | `ToolDefinition`, `get_tool_runtime_context`, `loop.schedule_timer`, `TimerRunner`, `follow_up` |
 
 ## Running
 

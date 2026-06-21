@@ -318,3 +318,14 @@ def test_example_40_send_context_projection_runs() -> None:
     assert out["pl_messages_intact"] is True, out          # immutable audit kept in full
     assert out["projection_is_plain_text"] is True, out     # no tool-call protocol in history
     assert out["recall_recovers_send1"] is True, out        # recall_send recovers the folded send
+
+
+def test_example_41_custom_async_tool_runs() -> None:
+    """The custom async-wake tool example: a tool starts async work + returns immediately, a
+    TimerRunner fires the durable wake via follow_up, and the agent re-checks the result — the
+    host-driven 'no daemon' loop end-to-end. Model-driven, so assertions stay phrasing-independent."""
+    module = _load_example("41_custom_async_tool.py")
+    out = asyncio.run(module.main())
+    assert out["job_started"] is True, out          # agent kicked off the async job
+    assert out["job_done"] is True, out             # the async work finished
+    assert out["checked_after_wake"] is True, out   # the wake re-entered → agent re-checked

@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+### Added — Async orchestration docs, example & cross-cutting tests (no API change)
+
+- **New guide [Async orchestration](docs/en/user-guide/async-orchestration.md)** (+ 中文) — the
+  cohesive model the per-feature pages (background tasks / sub-agents / workflows / timers) assume:
+  power-loop is **host-driven** (no daemon); the `send` / `resume` / `submit_input` / `follow_up`
+  wake API and when to use each; how every async result re-enters (background → `RuntimeProjector`
+  `<background_updates>`; timer → `follow_up`; sub-agent → inline; pending → `resume`; input →
+  `submit_input`); persistence, `send_index` & crash recovery (`SessionPendingError` →
+  `resume`/`abort_pending`/`heal_pending`); the projection/compaction interaction; a copy-pasteable
+  **custom async-wake tool recipe** (public seams only); and a troubleshooting section.
+- **Example `41_custom_async_tool.py`** — a custom tool that starts async work, returns immediately,
+  and wakes the agent via `schedule_timer` + `TimerRunner` + `follow_up` (verified against a live LLM).
+- **`tests/unit/test_async_projection_interaction.py`** — covers the previously-untested cross-cut:
+  a `follow_up` on an idle session opens its own projected send (own `send_index`); background
+  updates re-enter once via `BackgroundRuntimeProjector` and are then marked seen (`mark_seen=False`
+  keeps re-injecting).
+
 ## [2.2.0] — 2026-06-21
 
 ### Added — Agentic memory-aware compactor (opt-in)

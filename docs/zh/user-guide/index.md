@@ -36,6 +36,7 @@
 
 | 页面 | 你会学到 |
 |---|---|
+| [异步编排](async-orchestration.md) | **任何异步问题先看这里。** 宿主驱动模型（无守护进程）、`send`/`resume`/`submit_input`/`follow_up` 唤醒 API、各类异步结果如何回到循环、持久化与崩溃恢复、与投影/压缩的配合、如何写自定义异步唤醒工具、问题排查 |
 | [动态工作流](workflows.md) | `WorkflowSpec` DSL、确定性引擎、detached 执行、跨重启 resume |
 | [共享黑板](blackboard.md) | `SqliteBlackboard`、`board_*` 工具、多代理协作 |
 | [沙箱与隔离](sandboxing.md) | `ShellBackend`（沙箱化 bash）、`WorkerLauncher`（沙箱化叶子进程） |
