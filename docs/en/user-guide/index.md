@@ -20,6 +20,7 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 | [Storage backends](storage-backends.md) | `dsn=` picks SQLite (default) / PostgreSQL / MySQL; `SchemaPolicy` provisioning, per-backend DDL, preconditions |
 | [Tools](tools.md) | `ToolRegistry`, `ToolDefinition`, JSON Schema validation, sync vs async handlers |
 | [Extending with tools](extending-tools.md) | The custom-tool recipe, per-call allowlisting, MCP (`contrib.mcp`), why no bundled connectors |
+| [Build your own tools](build-your-own-tools.md) | Recreate each built-in (background / sub-agent / timer / human-input / blackboard / memory / mini-workflow) as a custom tool from public primitives — code + parity + gaps per feature |
 | [Sub-agents](subagents.md) | `spawn_agent`, `AgentSpec`, `run_agent_spec`, lifecycle (EPHEMERAL / LINKED / DETACHED) |
 | [Hooks](hooks.md) | All 17 `HookPoint`s, typed Ctx, directives, common patterns |
 | [Events](events.md) | All `AgentEventType`s, typed payloads, subscriber patterns |

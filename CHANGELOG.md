@@ -8,6 +8,21 @@
 
 ## [Unreleased]
 
+### Added — "Build your own tools" guide, example & parity tests (no API change)
+
+- **New guide [Build your own tools](docs/en/user-guide/build-your-own-tools.md)** (+ 中文) —
+  recreates every "special" built-in (background task / sub-agent / mini-workflow / durable timer /
+  human-input / blackboard / memory) as a plain custom tool using ONLY public primitives, with the
+  exact seams, parity, and honest gaps per feature. Grounded in a per-feature design+adversarial-verify
+  pass over the built-in source.
+- **Example `42_build_your_own_tools.py`** — all seven reimplementations in one runnable file
+  (`run_agent_spec`, `HumanInputRequired`, a custom `RuntimeProjector`, a `MemoryProvider`,
+  `get/set_runtime_state`, `add_note`), with a real-LLM demo (verified) using the custom
+  remember/board/delegate as drop-ins.
+- **`tests/unit/test_byo_tools.py`** — deterministic parity tests for all seven (scripted-LLM),
+  loading the canonical code from the example so docs/example/test never drift; plus the real
+  `test_example_42`. Surfaces the gotcha that a custom `RuntimeProjector` must *replace* the default.
+
 ### Added — Async orchestration docs, example & cross-cutting tests (no API change)
 
 - **New guide [Async orchestration](docs/en/user-guide/async-orchestration.md)** (+ 中文) — the

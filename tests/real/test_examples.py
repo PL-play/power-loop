@@ -329,3 +329,14 @@ def test_example_41_custom_async_tool_runs() -> None:
     assert out["job_started"] is True, out          # agent kicked off the async job
     assert out["job_done"] is True, out             # the async work finished
     assert out["checked_after_wake"] is True, out   # the wake re-entered → agent re-checked
+
+
+def test_example_42_build_your_own_tools_runs() -> None:
+    """The build-your-own example: the agent uses the from-primitives custom remember / board_write
+    / delegate tools as drop-ins. Asserts the observable effects (a note persisted, a board entry,
+    a sub-agent reply) — phrasing-independent."""
+    module = _load_example("42_build_your_own_tools.py")
+    out = asyncio.run(module.main())
+    assert out["notes_count"] >= 1, out          # custom remember → store note
+    assert out["board_entries"] >= 1, out        # custom board_write → runtime_state
+    assert out["delegate_replied"] is True, out  # custom delegate → child agent ran

@@ -20,6 +20,7 @@
 | [存储后端](storage-backends.md) | `dsn=` 选 SQLite（默认）/ PostgreSQL / MySQL；`SchemaPolicy` 置备、各后端 DDL、前置条件 |
 | [工具](tools.md) | `ToolRegistry`、`ToolDefinition`、JSON Schema 校验、sync vs async |
 | [扩展工具](extending-tools.md) | 自定义工具配方、按调用白名单、MCP(`contrib.mcp`)、为什么不捆绑连接器 |
+| [自己造内置工具](build-your-own-tools.md) | 用公开原语把每个内置（后台/子代理/定时器/人类输入/黑板/记忆/迷你工作流）重写成自定义工具——每个特性的代码 + parity + gaps |
 | [子代理](subagents.md) | `spawn_agent`、`AgentSpec`、`run_agent_spec`、生命周期 |
 | [Hooks](hooks.md) | 17 个 `HookPoint`、类型化 Ctx、directive、常见模式 |
 | [Events](events.md) | 各种 `AgentEventType`、类型化 payload、订阅模式 |
