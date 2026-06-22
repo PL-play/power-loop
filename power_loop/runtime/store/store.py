@@ -606,7 +606,7 @@ class SessionStore:
         Its ``compact_to_send`` is the cursor for :meth:`load_project_messages`."""
         return await self._query_latest_project_compact(self._db.fetchone, session_id)
 
-    async def write_send_projection_locked(
+    async def write_send_projection_rows(
         self,
         session_id: str,
         *,
@@ -615,33 +615,20 @@ class SessionStore:
         source_seq_lo: int | None,
         source_seq_hi: int | None,
         projector_version: int,
-        plan_compaction: Callable[
-            [ProjectMessageRow | None, list[ProjectMessageRow]],
-            tuple[Any, str | None, int, int] | None,
-        ],
-    ) -> None:
-        """Persist a finished send's projection ``rows`` AND an optional compact fold in ONE
-        transaction, under the ``session_state`` row lock.
+    ) -> tuple[ProjectMessageRow | None, list[ProjectMessageRow]]:
+        """Persist a finished send's projection ``rows`` under a SHORT session-locked transaction
+        (no I/O beyond the writes) and return a CONSISTENT snapshot for the caller to decide + run a
+        fold OUTSIDE the lock: ``(latest prior compact, the live user/project rows after its
+        cursor)``. Keeping the (possibly multi-second / hung) LLM-or-agentic fold OUT of the
+        transaction is essential — holding the session row lock / a pooled DB connection / SQLite's
+        single connection across a provider call would stall the whole store. The fold is committed
+        separately via :meth:`commit_projection_fold` under optimistic concurrency.
 
-        Two guarantees:
-
-        * **Atomic multi-row write** — all of a send's projection rows (user + project) commit
-          together, so a crash can't leave the next-send reader a half-projected send.
-        * **Serialized compaction across loops** — the lock makes two ``StatefulAgentLoop``
-          instances sharing this store on the same session take turns; without it both could
-          read the same pre-fold state, compute the same fold, and have the second UPSERT clobber
-          the first (benign for the deterministic projector, divergent for a non-idempotent one).
-
-        ``rows`` is ``(kind, content, rendered_text)`` per projection row. ``plan_compaction`` is
-        called INSIDE the lock with ``(prior_compact, project_rows_after_prior)`` — a consistent
-        snapshot taken after this send's rows are written — and returns
-        ``(content, rendered_text, from_send, to_send)`` to fold, or ``None`` to skip. It MUST be
-        pure (no I/O): it only runs the projector's in-memory trigger + ``compact()`` logic.
+        Guarantee: all of a send's projection rows (user + project) commit together, so a crash can't
+        leave the next-send reader a half-projected send. ``rows`` is ``(kind, content, rendered_text)``.
         """
         now = _now_ms()
         async with self._db.transaction() as tx:
-            # Lock the session row first (PG/MySQL FOR UPDATE; SQLite's single-writer connection
-            # already serializes) so the read-decide-write below is atomic against a concurrent loop.
             await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
             for kind, content, rendered_text in rows:
                 await self._upsert_project_message_tx(
@@ -651,15 +638,49 @@ class SessionStore:
                 )
             prior = await self._query_latest_project_compact(tx.fetchone, session_id)
             cutoff = prior.compact_to_send if prior is not None else None
-            proj_rows = await self._query_project_messages(tx.fetchall, session_id, cutoff)
-            plan = plan_compaction(prior, proj_rows)
-            if plan is not None:
-                content, rendered_text, from_send, to_send = plan
-                await self._upsert_project_message_tx(
-                    tx, session_id, send_index=to_send, kind="compact", content=content,
-                    rendered_text=rendered_text, compact_from_send=from_send,
-                    compact_to_send=to_send, projector_version=projector_version, now=now,
-                )
+            snapshot = await self._query_project_messages(tx.fetchall, session_id, cutoff)
+        return prior, snapshot
+
+    async def commit_projection_fold(
+        self,
+        session_id: str,
+        *,
+        content: Any,
+        rendered_text: str | None,
+        from_send: int,
+        to_send: int,
+        projector_version: int,
+        expected_prior_to_send: int | None,
+    ) -> bool:
+        """Persist a ``compact`` fold computed OUTSIDE the lock, under OPTIMISTIC CONCURRENCY: re-take
+        the session lock, re-read the latest compact, and UPSERT the new compact ONLY if the cursor
+        still equals ``expected_prior_to_send`` (the value the fold's snapshot was taken at). If a
+        concurrent loop folded first (cursor advanced), this snapshot/fold is stale → skip (return
+        False) rather than clobber the newer compact. Returns True iff the compact was written. This
+        replaces the old "hold the lock across the fold" serialization without any in-tx network call.
+        """
+        now = _now_ms()
+        async with self._db.transaction() as tx:
+            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            cur = await self._query_latest_project_compact(tx.fetchone, session_id)
+            cur_to = cur.compact_to_send if cur is not None else None
+            if cur_to != expected_prior_to_send:
+                return False  # a concurrent fold advanced the cursor; our snapshot/fold is stale
+            # Delete any SUPERSEDED compact rows (send_index < the new compact): a rolled-forward
+            # fold folds the prior compact's content INTO the new one, so older compacts are never
+            # read again (the reader uses the latest compact + after-cursor rows). Without this they
+            # accumulate one-per-fold over a long session (storage leak / audit clutter).
+            await tx.execute(
+                f"DELETE FROM {self.t.project_messages} "
+                "WHERE session_id=? AND kind='compact' AND send_index<?",
+                (session_id, int(to_send)),
+            )
+            await self._upsert_project_message_tx(
+                tx, session_id, send_index=to_send, kind="compact", content=content,
+                rendered_text=rendered_text, compact_from_send=from_send,
+                compact_to_send=to_send, projector_version=projector_version, now=now,
+            )
+        return True
 
 
     async def write_projection_migration(

@@ -69,7 +69,7 @@ from power_loop.runtime.store.types import (
 from power_loop.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
-    from power_loop.runtime.history_projector import HistoryProjector
+    from power_loop.runtime.representation import Representation
 
 logger = logging.getLogger(__name__)
 
@@ -1113,7 +1113,10 @@ class StatefulAgentLoop:
         system_prompt: str | None = None,
     ) -> StatefulResult:
         store = await self._ensure_store()
-        projector = self.config.history_projector
+        # 3.0: projection-style representation drives the derived-layer path; verbatim → None
+        # (in-place compactor path). The fold trigger/keep come from config.fold_strategy.
+        projector = self.config.projection_representation
+        fold_strategy = self.config.fold_strategy
         # The current send's authoritative index (set by _persist_user_input; inherited by
         # resume()/follow-up). Read up-front so projection mode can partition history by it.
         si = await store.get_runtime_state(sid, "send_index", default=0)
@@ -1149,10 +1152,10 @@ class StatefulAgentLoop:
                     "history_mode": current_mode,
                     "projector_version": int(getattr(projector, "version", 0) or 0) if projector else None,
                     "projector_trigger_ratio": (
-                        float(getattr(projector, "trigger_ratio", 0) or 0) if projector else None
+                        float(getattr(fold_strategy, "trigger_ratio", 0) or 0) if projector else None
                     ),
                     "projector_keep_last_sends": (
-                        int(getattr(projector, "keep_last_sends", 0) or 0) if projector else None
+                        int(getattr(fold_strategy, "keep_last_sends", 0) or 0) if projector else None
                     ),
                 })
             elif recorded != current_mode:
@@ -1178,7 +1181,7 @@ class StatefulAgentLoop:
                     "send_index — resume before any send); best-effort.", sid,
                 )
                 projection_active = False
-            elif not migrated and self.config.migrate_history_on_projection_switch:
+            elif not migrated and self.config.migrate_history_on_switch:
                 # One-time migration: a session with prior NON-projection history opened in
                 # projection mode. Fold that prior history into the projection table so it becomes
                 # projection-native (a compact + the recent keep_last_sends as project rows) rather
@@ -1443,7 +1446,7 @@ class StatefulAgentLoop:
         self,
         store: SessionStore,
         sid: str,
-        projector: HistoryProjector,
+        projector: Representation,
         *,
         current_send_index: int,
         active_rows: list[Any],
@@ -1452,12 +1455,12 @@ class StatefulAgentLoop:
         projection table so it becomes projection-native (starts with a ``compact`` covering the
         old sends, plus the most-recent ``keep_last_sends`` as individual project rows). Handles
         both a clean default→projection switch (no projection rows yet) and a session the in-place
-        compactor had folded (its ``compact_note`` summary seeds the projection compact). Uses
-        ``projector.compact`` for the fold, so it auto-uses whatever projector is configured. Never
-        raises (the caller swallows + sets the migrated marker only on success)."""
+        compactor had folded (its ``compact_note`` summary seeds the projection compact). Folds via
+        the configured ``fold_strategy`` (bounded by ``fold_timeout_s``, OUTSIDE the migration write
+        lock). Never raises (the caller swallows + sets the migrated marker only on success)."""
         from power_loop.runtime.store.types import ProjectMessageRow
 
-        keep = max(int(getattr(projector, "keep_last_sends", 0) or 0), 0)
+        keep = max(int(getattr(self.config.fold_strategy, "keep_last_sends", 0) or 0), 0)
         version = int(getattr(projector, "version", 0) or 0)
         note = next((r for r in active_rows if r.name == "compact_note"), None)
         by_send: dict[int, list[Any]] = {}
@@ -1485,7 +1488,7 @@ class StatefulAgentLoop:
             )
 
         # Build the seed compact: the in-place compactor's note (if any) rolled forward + the
-        # folded sends, via projector.compact (deterministic for the default projector).
+        # folded sends, via the configured fold_strategy (run below with the fold timeout).
         to_compact: list[ProjectMessageRow] = []
         if note is not None:
             to_compact.append(_pm(0, "compact", {"summary": note.content or ""}))
@@ -1493,14 +1496,25 @@ class StatefulAgentLoop:
             for pr in projected[si].rows:
                 to_compact.append(_pm(si, pr.kind, pr.content))
         compact_tuple: tuple[Any, str | None, int, int] | None = None
-        folded = (
-            projector.compact(to_compact)
-            if any(r.kind in ("user", "project") for r in to_compact)
-            else None
-        )
+        migration_note_ops: list[Any] = []
+        folded = None
+        if any(r.kind in ("user", "project") for r in to_compact):
+            from power_loop.runtime.fold import FoldContext
+
+            # Same fold-timeout guard as the end-of-send path (this runs OUTSIDE the migration's
+            # write lock — write_projection_migration is called afterwards with the result).
+            folded = await self._run_fold_with_timeout(
+                self.config.fold_strategy,
+                to_compact,
+                FoldContext(
+                    session_id=sid, round_index=0, representation=projector,
+                    llm=self.llm, max_tokens=self.config.max_tokens,
+                ),
+            )
         if folded is not None:
             from_send = 0 if note is not None else (min(fold) if fold else 0)
-            compact_tuple = (folded.content, folded.rendered_text, from_send, max(fold))
+            compact_tuple = (folded.content, folded.rendered_text, from_send, folded.folded_to_send)
+            migration_note_ops = list(folded.note_ops)
         elif note is not None:
             # Only the note, nothing foldable beyond keep → preserve the note as a standalone
             # compact sitting just before the kept tail (or the current send).
@@ -1518,6 +1532,14 @@ class StatefulAgentLoop:
             sid, project_rows=project_rows, compact=compact_tuple, projector_version=version,
             metadata_patch={"projection_migrated": current_send_index},
         )
+        for op in migration_note_ops:  # agentic-fold facts from the migrated history (best-effort)
+            try:
+                if getattr(op, "op", None) == "add":
+                    await store.add_note(sid, op.content or "", pinned=bool(op.pinned))
+                elif getattr(op, "op", None) == "update":
+                    await store.update_note(sid, op.note_id, content=op.content, pinned=op.pinned)
+            except Exception:
+                logger.exception("session %s: migration note op failed (continuing)", sid)
 
     async def _write_send_projection(
         self,
@@ -1527,7 +1549,7 @@ class StatefulAgentLoop:
         send_index: int,
         status: str,
         session_row: SessionRow | None,
-        projector: HistoryProjector,
+        projector: Representation,
         tool_registry: ToolRegistry | None,
     ) -> None:
         """Project the just-finished send's ``pl_messages`` rows into ``pl_project_messages`` (v2).
@@ -1550,70 +1572,105 @@ class StatefulAgentLoop:
         version = int(getattr(projector, "version", 0) or 0)
         proj_rows_to_write = [(pr.kind, pr.content, pr.rendered_text) for pr in projected.rows]
 
-        def plan_compaction(
-            prior: ProjectMessageRow | None, after_rows: list[ProjectMessageRow]
-        ) -> tuple[Any, str | None, int, int] | None:
-            """Projection-layer compaction decision — PURE (no I/O); runs inside the store's
-            locked transaction. Once the rendered projected prefix reaches ``max_tokens ×
-            trigger_ratio`` (mirrors DefaultCompactor's token-driven policy), fold the OLDEST
-            uncompacted sends — always keeping the most-recent ``keep_last_sends`` — into one
-            ``compact`` row, rolling any prior compact forward so nothing is lost. The folded
-            user/project rows REMAIN (recoverable via recall_send); pl_messages is untouched.
-
-            Wrapped so a misbehaving projector (render/compact/trigger raising) degrades to
-            "rows written, NO fold" instead of aborting the whole locked write — the send's
-            per-send projection rows still commit, and pl_messages stays the source of truth."""
-            try:
-                keep = int(getattr(projector, "keep_last_sends", 0) or 0)
-                if keep <= 0:
-                    return None
-                live_sends = sorted(
-                    {r.send_index for r in after_rows if r.kind in ("user", "project")}
-                )
-                if len(live_sends) <= keep:
-                    return None  # nothing foldable beyond the keep-recent floor
-                trigger_ratio = float(getattr(projector, "trigger_ratio", 0.75) or 0.75)
-                threshold = int((self.config.max_tokens or 8000) * trigger_ratio)
-                rendered_prefix = projector.render(
-                    ([prior] if prior is not None else []) + after_rows
-                )
-                if estimate_tokens(rendered_prefix) < threshold:
-                    return None  # below threshold — small per-send projections just accumulate
-                fold_sends = set(live_sends[: len(live_sends) - keep])
-                fold_rows = [
-                    r
-                    for r in after_rows
-                    if r.kind in ("user", "project") and r.send_index in fold_sends
-                ]
-                to_compact = ([prior] if prior is not None else []) + fold_rows  # roll prior fwd
-                folded = projector.compact(to_compact)
-                if folded is None:
-                    return None
-                from_send = (
-                    prior.compact_from_send
-                    if (prior is not None and prior.compact_from_send is not None)
-                    else min(fold_sends)
-                )
-                return (folded.content, folded.rendered_text, from_send, max(fold_sends))
-            except Exception:
-                logger.exception(
-                    "projection fold planning failed for %s (skipping fold; rows still written)",
-                    sid,
-                )
-                return None
-
-        # One atomic, session-locked write: all of this send's projection rows + the optional fold
-        # commit together (no half-projected send), and the read-decide-write of the fold is
-        # serialized against a concurrent loop sharing this store (no double-compaction clobber).
-        await store.write_send_projection_locked(
-            sid,
-            send_index=send_index,
-            rows=proj_rows_to_write,
-            source_seq_lo=projected.source_seq_lo,
-            source_seq_hi=projected.source_seq_hi,
+        # power-loop 3.0, THREE phases so the (multi-second / possibly-hung) LLM fold never runs
+        # inside a DB transaction or under the session lock:
+        #   1) write this send's projection rows under a SHORT lock + snapshot the live rows;
+        #   2) decide + run the fold OUTSIDE the lock (bounded by fold_timeout_s, soft-fails);
+        #   3) commit the compact under a SHORT lock with optimistic concurrency (skip if a
+        #      concurrent loop already advanced the compact cursor).
+        prior, snapshot = await store.write_send_projection_rows(
+            sid, send_index=send_index, rows=proj_rows_to_write,
+            source_seq_lo=projected.source_seq_lo, source_seq_hi=projected.source_seq_hi,
             projector_version=version,
-            plan_compaction=plan_compaction,
         )
+        plan, note_ops = await self._plan_and_run_projection_fold(sid, projector, prior, snapshot)
+        if plan is None:
+            return
+        content, rendered_text, from_send, to_send = plan
+        committed = await store.commit_projection_fold(
+            sid, content=content, rendered_text=rendered_text, from_send=from_send,
+            to_send=to_send, projector_version=version,
+            expected_prior_to_send=(prior.compact_to_send if prior is not None else None),
+        )
+        if committed:
+            await self._apply_fold_notes(store, sid, note_ops)
+
+    async def _plan_and_run_projection_fold(
+        self, sid: str, projector: Representation,
+        prior: ProjectMessageRow | None, snapshot: list[ProjectMessageRow],
+    ) -> tuple[tuple[Any, str | None, int, int] | None, tuple[Any, ...]]:
+        """Decide whether to fold (token threshold + keep-recent floor) and, if so, run the
+        configured ``fold_strategy`` OUTSIDE any lock (bounded by ``fold_timeout_s``). Always keeps
+        the most-recent ``keep_last_sends`` whole sends (never splits an atomic tool pair). Rolls any
+        prior compact forward so nothing is lost; the folded rows REMAIN (recall_send). Returns
+        ``((content, rendered_text, from_send, to_send), note_ops)`` or ``(None, ())``. Soft-fails
+        (no fold, rows already written) on any error/timeout — pl_messages stays the source of truth."""
+        fold_strategy = self.config.fold_strategy
+        try:
+            keep = int(getattr(fold_strategy, "keep_last_sends", 0) or 0)
+            if keep <= 0:
+                return None, ()
+            live_sends = sorted({r.send_index for r in snapshot if r.kind in ("user", "project")})
+            if len(live_sends) <= keep:
+                return None, ()  # nothing foldable beyond the keep-recent floor
+            trigger_ratio = float(getattr(fold_strategy, "trigger_ratio", 0.75) or 0.75)
+            threshold = int((self.config.max_tokens or 8000) * trigger_ratio)
+            rendered_prefix = projector.render(([prior] if prior is not None else []) + snapshot)
+            if estimate_tokens(rendered_prefix) < threshold:
+                return None, ()  # below threshold — small per-send projections just accumulate
+            fold_sends = set(live_sends[: len(live_sends) - keep])
+            fold_rows = [
+                r for r in snapshot
+                if r.kind in ("user", "project") and r.send_index in fold_sends
+            ]
+            to_compact = ([prior] if prior is not None else []) + fold_rows  # roll prior fwd
+            from_send = (
+                prior.compact_from_send
+                if (prior is not None and prior.compact_from_send is not None)
+                else min(fold_sends)
+            )
+            from power_loop.runtime.fold import FoldContext
+
+            ctx = FoldContext(
+                session_id=sid, round_index=0, representation=projector,
+                llm=self.llm, max_tokens=self.config.max_tokens,
+            )
+            fr = await self._run_fold_with_timeout(fold_strategy, to_compact, ctx)
+            if fr is None:
+                return None, ()
+            return (fr.content, fr.rendered_text, from_send, fr.folded_to_send), tuple(fr.note_ops)
+        except Exception:
+            logger.exception(
+                "projection fold planning failed for %s (skipping fold; rows still written)", sid,
+            )
+            return None, ()
+
+    async def _run_fold_with_timeout(self, fold_strategy: Any, rows: Any, ctx: Any) -> Any | None:
+        """Await ``fold_strategy.fold`` bounded by ``config.fold_timeout_s`` (None disables). A
+        timeout soft-fails to None (no fold this send; rows already committed)."""
+        timeout = self.config.fold_timeout_s
+        try:
+            if timeout is not None and timeout > 0:
+                return await asyncio.wait_for(fold_strategy.fold(rows, context=ctx), timeout)
+            return await fold_strategy.fold(rows, context=ctx)
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning(
+                "projection fold timed out after %ss for %s (skipping fold this send)",
+                timeout, ctx.session_id,
+            )
+            return None
+
+    async def _apply_fold_notes(self, store: SessionStore, sid: str, note_ops: tuple[Any, ...]) -> None:
+        """Apply an agentic fold's captured NoteOps (best-effort, additive memory — NOT
+        transactional with the compact; a rare crash here loses a note, never corrupts context)."""
+        for op in note_ops:
+            try:
+                if getattr(op, "op", None) == "add":
+                    await store.add_note(sid, op.content or "", pinned=bool(op.pinned))
+                elif getattr(op, "op", None) == "update":
+                    await store.update_note(sid, op.note_id, content=op.content, pinned=op.pinned)
+            except Exception:
+                logger.exception("session %s: applying fold note op failed (continuing)", sid)
 
     async def _prime_sink_from_pending(self, sid: str, sink: SQLiteSink) -> None:
         store = await self._ensure_store()

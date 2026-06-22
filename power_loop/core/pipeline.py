@@ -589,7 +589,9 @@ class AgentPipeline:
         # stay stale-high and over-trigger LLM-summary compaction. Invalidate it.
         self._tok_len = -1
 
-        compactor = self.config.compactor
+        # 3.0: verbatim mode → an in-place Compactor mapped from config.fold_strategy; projection
+        # mode → None (it folds at end-of-send in the derived layer).
+        compactor = self.config.resolve_compactor()
         if compactor is None:
             return
 

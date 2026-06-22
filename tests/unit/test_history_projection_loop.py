@@ -18,6 +18,7 @@ from power_loop import create_default_tool_registry
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.agent.stateful_loop import StatefulAgentLoop
 from power_loop.agent.types import AgentLoopConfig
+from power_loop.runtime.fold import FoldResult
 from power_loop.runtime.history_projector import (
     DefaultDeterministicProjector,
     IdentityProjector,
@@ -34,6 +35,27 @@ async def store() -> AsyncIterator[SessionStore]:
     await s.close()
 
 
+@dataclass
+class _DeterministicFold:
+    """Test-only FoldStrategy (no LLM): delegates to the deterministic projector's ``compact()``
+    so the loop's fold WIRING (span selection, keep_last_sends, roll-forward, migration) is
+    assertable deterministically. The real LLMSummaryFold/AgenticFold are covered in tests/real."""
+
+    keep_last_sends: int = 4
+    trigger_ratio: float = 0.75
+    fold_id: str = "test_deterministic"
+
+    async def fold(self, rows, *, context):
+        folded = [r.send_index for r in rows if r.kind in ("user", "project")]
+        if not folded:
+            return None
+        rep = context.representation
+        pc = rep.compact(rows) if hasattr(rep, "compact") else None  # raises propagate → degrade
+        if pc is None:
+            return None
+        return FoldResult(content=pc.content, rendered_text=pc.rendered_text, folded_to_send=max(folded))
+
+
 def _two_send_script() -> _Scripted:
     # send 1: echo tool then "done1"; send 2: "done2"
     return _Scripted(responses=[
@@ -44,13 +66,20 @@ def _two_send_script() -> _Scripted:
 
 
 def _projector_loop(
-    store: SessionStore, llm: _Scripted, projector, *, max_tokens: int = 8000, migrate: bool = True
+    store: SessionStore, llm: _Scripted, projector, *, max_tokens: int = 8000, migrate: bool = True,
+    fold_strategy=None,
 ) -> StatefulAgentLoop:
+    # 3.0 API: representation = the (projection) projector; fold = a deterministic test fold seeded
+    # with the projector's keep/trigger so fold mechanics match the old deterministic behavior.
+    fs = fold_strategy or _DeterministicFold(
+        keep_last_sends=int(getattr(projector, "keep_last_sends", 4)),
+        trigger_ratio=float(getattr(projector, "trigger_ratio", 0.75) or 0.75),
+    )
     return StatefulAgentLoop(
         llm=llm, store=store, tool_registry=_echo_registry(),
         config=AgentLoopConfig(
-            system_prompt="S", max_rounds=4, compactor=None, history_projector=projector,
-            max_tokens=max_tokens, migrate_history_on_projection_switch=migrate,
+            system_prompt="S", max_rounds=4, representation=projector, fold_strategy=fs,
+            max_tokens=max_tokens, migrate_history_on_switch=migrate,
         ),
     )
 
@@ -231,8 +260,8 @@ async def test_two_loops_sharing_store_project_consistently(store: SessionStore)
     loop_a = _projector_loop(store, llm_a, p, max_tokens=10)
     loop_b = StatefulAgentLoop(
         llm=llm_b, store=store, tool_registry=_echo_registry(),
-        config=AgentLoopConfig(system_prompt="S", max_rounds=4, compactor=None,
-                               history_projector=p, max_tokens=10),
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4, representation=p,
+                               fold_strategy=_DeterministicFold(keep_last_sends=2), max_tokens=10),
     )
     sid = await loop_a.new_session()
     await loop_a.send("m1", session_id=sid)
@@ -247,29 +276,27 @@ async def test_two_loops_sharing_store_project_consistently(store: SessionStore)
     assert await store.latest_project_compact(sid) is not None  # folded into one coherent compact
 
 
-def test_config_revalidates_mutual_exclusion() -> None:
-    # Construction rejects both, AND a post-construction reassignment re-validates (the dataclass
-    # is mutable; the reader assumes compactor is None whenever a projector is set).
-    from power_loop.runtime.compact import DefaultCompactor
+def test_config_legacy_kwargs_map_onto_axes() -> None:
+    # 3.0: the old projector⊻compactor exclusion is GONE. Legacy history_projector/compactor map
+    # onto representation × fold_strategy (deprecated, warned). A legacy projector → the projection
+    # representation; a legacy compactor=None (no in-place fold) is preserved exactly.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        cfg = AgentLoopConfig(history_projector=DefaultDeterministicProjector(), compactor=None)
+    assert cfg.projection_representation is not None  # projector → projection representation
+    assert cfg.resolve_compactor() is None            # compactor=None preserved (no in-place fold)
+
+
+def test_config_max_tokens_revalidates_on_reassignment() -> None:
+    # max_tokens drives the fold trigger, so a non-positive reassignment is rejected + rolled back.
+    cfg = AgentLoopConfig()
+    assert cfg.representation is not None and cfg.fold_strategy is not None
     with pytest.raises(ValueError):
-        AgentLoopConfig(history_projector=DefaultDeterministicProjector(), compactor=DefaultCompactor())
-    cfg = AgentLoopConfig(history_projector=DefaultDeterministicProjector(), compactor=None)
-    with pytest.raises(ValueError):
-        cfg.compactor = DefaultCompactor()
-    # The rejected assignment rolled back — the config is still valid (compactor stays None), so a
-    # subsequent valid reassignment of a re-validated field succeeds.
-    assert cfg.compactor is None
+        cfg.max_tokens = 0
+    assert cfg.max_tokens != 0  # rolled back to the prior valid value
     cfg.max_tokens = 4242
     assert cfg.max_tokens == 4242
-
-
-def test_config_revalidates_projector_when_compactor_present() -> None:
-    # Inverse direction: starting from the default (compactor present, no projector), setting a
-    # projector must also re-validate and raise.
-    cfg = AgentLoopConfig()  # default compactor, no projector
-    assert cfg.compactor is not None and cfg.history_projector is None
-    with pytest.raises(ValueError):
-        cfg.history_projector = DefaultDeterministicProjector()
 
 
 @pytest.mark.asyncio

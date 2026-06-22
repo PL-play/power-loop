@@ -30,7 +30,8 @@ from _helpers import make_llm
 
 from power_loop import (
     AgentLoopConfig,
-    DefaultDeterministicProjector,
+    LLMSummaryFold,
+    ProjectedRepresentation,
     SessionStore,
     StatefulAgentLoop,
 )
@@ -53,18 +54,20 @@ def _has_tool_protocol(msgs: list[dict]) -> bool:
 async def main() -> dict:
     store = await SessionStore.open(":memory:")
     try:
-        projector = DefaultDeterministicProjector(keep_last_sends=2)
+        # 3.0: representation (HOW sends are recorded) × fold_strategy (HOW older history compacts)
+        # are orthogonal. Projection representation + an LLM-summary fold keeping the last 2 sends.
+        representation = ProjectedRepresentation()
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=64),
             store=store,
             config=AgentLoopConfig(
                 system_prompt="You are terse. Reply with one short sentence.",
                 max_rounds=3,
-                compactor=None,                 # REQUIRED with a projector (mutually exclusive)
                 # small max_tokens so the token-driven projection fold (threshold =
                 # max_tokens × trigger_ratio) demonstrably fires over a few short sends.
                 max_tokens=40,
-                history_projector=projector,
+                representation=representation,
+                fold_strategy=LLMSummaryFold(keep_last_sends=2),
             ),
         )
         sid = await loop.new_session()
@@ -92,7 +95,7 @@ async def main() -> dict:
         prefix_rows = ([compact] if compact else []) + [
             r for r in await store.load_project_messages(sid, after_send_index=cutoff)
         ]
-        projected_ctx = projector.render(prefix_rows)
+        projected_ctx = representation.render(prefix_rows)
 
         # 5) recall_send re-expands a folded send's ORIGINAL detail (from pl_messages).
         t_loop, t_sid = set_current_loop(loop), set_session_id(sid)

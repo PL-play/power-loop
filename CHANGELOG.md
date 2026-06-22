@@ -8,6 +8,49 @@
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-06-22
+
+> **MAJOR — orthogonal context axes.** Message **representation** (how each finished send is
+> recorded/rendered) and **fold strategy** (how older history is compacted once over budget) are now
+> two independent, fully config-driven axes. Any representation composes with any fold strategy, and
+> both accept custom implementations of their Protocol. The 2.x `compactor` / `history_projector`
+> kwargs still work (mapped onto the new axes with a `DeprecationWarning`); a future major drops them.
+
+### BREAKING — Public API (STABLE)
+
+- **Removed public exports** `HistoryProjector`, `IdentityProjector`, `DefaultDeterministicProjector`,
+  `ProjectedCompact`. Their roles are replaced by the new `Representation` Protocol and its
+  implementations. The `power_loop.runtime.history_projector` module still exists for one transition
+  release (deep-import only; not in `power_loop.__all__`).
+- **Removed the deterministic / no-LLM fold.** Concatenation/truncation is not compaction; folds are
+  now always LLM-backed. Projection-mode compaction is therefore LLM-backed too, consistent with
+  verbatim mode (previously projection folded via a deterministic concat).
+
+### Added — STABLE
+
+- **`Representation` axis**: `VerbatimRepresentation` (full messages, byte-identical history) and
+  `ProjectedRepresentation` (per-send terse projection; original detail kept in `pl_messages`,
+  `recall_send` re-expands). Custom representations implement the `Representation` Protocol
+  (`kind` / `version` / `project_send` / `render`). Helper types `ProjectedSend`, `ProjectedRow`.
+- **`FoldStrategy` axis**: `LLMSummaryFold` (default — one summary call, no side effects) and
+  `AgenticFold` (LLM + a bounded tool loop that persists durable facts as notes). Custom strategies
+  implement the `FoldStrategy` Protocol; helper types `FoldContext`, `FoldResult`, `NoteOp`. Trigger
+  (`trigger_ratio`) and keep-recent floor (`keep_last_sends`) live on the strategy; a fold always
+  keeps whole sends (never splits an atomic tool-call/result pair).
+- **`AgentLoopConfig` fields**: `representation`, `fold_strategy`, `fold_timeout_s` (default 120s;
+  the fold runs OUTSIDE the store lock, soft-fails on timeout), `migrate_history_on_switch`
+  (default True — fold prior history into the new form once on a representation/fold change),
+  `repair_corrupt_history` (default False — durably deactivate the orphan tool rows the always-on
+  `align_tool_calls` sanitizer drops).
+
+### Changed
+
+- `AgentLoopConfig.compactor` / `history_projector` / `migrate_history_on_projection_switch` are
+  **deprecated** and mapped onto `representation` / `fold_strategy` / `migrate_history_on_switch` in
+  `__post_init__` (a legacy projector's `keep_last_sends` / `trigger_ratio` seed the mapped fold; a
+  legacy `compactor`, including `None` = no compaction, is preserved exactly under verbatim). Emits
+  `DeprecationWarning`. No behavior change for existing call sites.
+
 ### Added — "Build your own tools" guide, example & parity tests (no API change)
 
 - **New guide [Build your own tools](docs/en/user-guide/build-your-own-tools.md)** (+ 中文) —

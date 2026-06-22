@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -145,13 +145,13 @@ from power_loop.runtime.exec_backend import (
     LocalShellBackend,
     ShellBackend,
 )
-from power_loop.runtime.history_projector import (
-    DefaultDeterministicProjector,
-    HistoryProjector,
-    IdentityProjector,
-    ProjectedCompact,
-    ProjectedRow,
-    ProjectedSend,
+from power_loop.runtime.fold import (
+    AgenticFold,
+    FoldContext,
+    FoldResult,
+    FoldStrategy,
+    LLMSummaryFold,
+    NoteOp,
 )
 from power_loop.runtime.human_input import HumanInputRequired, request_user_input
 from power_loop.runtime.memory import MemoryProvider, MemorySnapshot, tag_as_memory
@@ -166,6 +166,13 @@ from power_loop.runtime.provider import (
     LLMProviderConfig,
     create_llm_service_from_config,
     create_llm_service_from_env,
+)
+from power_loop.runtime.representation import (
+    ProjectedRepresentation,
+    ProjectedRow,
+    ProjectedSend,
+    Representation,
+    VerbatimRepresentation,
 )
 from power_loop.runtime.retry import LLMRetryPolicy, with_retry
 from power_loop.runtime.runtime_state import (
@@ -320,12 +327,17 @@ __all__ = [
 	"BackgroundRuntimeProjector",
 	"default_runtime_projectors",
 	"get_tool_runtime_context",
-	"HistoryProjector",
-	"IdentityProjector",
-	"DefaultDeterministicProjector",
+	"Representation",
+	"VerbatimRepresentation",
+	"ProjectedRepresentation",
+	"FoldStrategy",
+	"FoldContext",
+	"FoldResult",
+	"NoteOp",
+	"LLMSummaryFold",
+	"AgenticFold",
 	"ProjectedSend",
 	"ProjectedRow",
-	"ProjectedCompact",
 	"ProjectMessageRow",
 	"CancellationToken",
 	"CancellationLike",
