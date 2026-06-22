@@ -260,15 +260,32 @@ class ProjectedRepresentation:
 
     # rendering ----------------------------------------------------------------
     def render(self, rows: list[ProjectMessageRow]) -> list[LoopMessage]:
+        # Each rendered send is tagged with its ``#N`` send_index so the model can call
+        # recall_send(send_index=N) on a folded/compacted earlier turn — the tool docstring and the
+        # host's RECALL_SEND_NOTE both tell it to use "the #N the summary shows", so render MUST
+        # actually emit them (else recall_send is undiscoverable). The folded compact carries its
+        # covered range.
         out: list[LoopMessage] = []
         for r in rows:
+            si = r.send_index
             if r.kind == "user":
                 humans = (r.content or {}).get("human") or []
-                out.append({"role": "user", "content": "\n".join(str(h) for h in humans)})
+                tag = f"[#{si}] " if si is not None else ""
+                out.append({"role": "user", "content": tag + "\n".join(str(h) for h in humans)})
             elif r.kind == "project":
-                out.append({"role": "assistant", "content": self._render_project(r.content)})
+                tag = f"#{si} " if si is not None else ""
+                out.append({"role": "assistant", "content": tag + self._render_project(r.content)})
             elif r.kind == "compact":
-                out.append(_render_compact_row(r))
+                msg = _render_compact_row(r)
+                lo, hi = r.compact_from_send, r.compact_to_send
+                if lo is not None and hi is not None and hi >= lo > 0:
+                    rng = f"#{lo}" if lo == hi else f"#{lo}–#{hi}"
+                    msg = {
+                        "role": "user",
+                        "content": f"[older sends {rng} folded — recall_send(send_index=N) to "
+                        f"expand]\n{msg['content']}",
+                    }
+                out.append(msg)
         return out
 
     def _render_tool(self, t: dict[str, Any]) -> str:

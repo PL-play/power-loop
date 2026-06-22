@@ -104,8 +104,9 @@ def test_projection_project_send_and_render():
     assert project_row.content["final_text"] == "ok"
     assert project_row.content["tools"] == [{"name": "grep", "result": "3 hits"}]
     rendered = rep.render([_pmr(1, "user", user_row.content), _pmr(1, "project", project_row.content)])
-    assert rendered[0] == {"role": "user", "content": "do a search"}
-    assert rendered[1]["role"] == "assistant"
+    # each send is tagged with its #N so recall_send(send_index=N) is discoverable
+    assert rendered[0] == {"role": "user", "content": "[#1] do a search"}
+    assert rendered[1]["role"] == "assistant" and rendered[1]["content"].startswith("#1 ")
     assert "grep(result=3 hits)" in rendered[1]["content"] and "ok" in rendered[1]["content"]
 
 

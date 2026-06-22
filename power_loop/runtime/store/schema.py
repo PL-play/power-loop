@@ -243,7 +243,16 @@ async def _column_exists(tx: Transaction, dialect_name: str, table: str, column:
         rows = await tx.fetchall(f"PRAGMA table_info({table})")
         return any(r["name"] == column for r in rows)
     if dialect_name in ("postgres", "mysql"):
-        scope = "AND table_schema=DATABASE() " if dialect_name == "mysql" else ""
+        # Scope to the CURRENT schema — otherwise a same-named table in ANOTHER schema (PG
+        # search_path / multi-schema deployments) makes the probe return True for a column the
+        # current-schema table lacks, so the ALTER … ADD COLUMN is skipped but the version is still
+        # stamped → every subsequent append referencing that column crashes. Mirrors _table_exists
+        # (PG to_regclass honors search_path; MySQL DATABASE()).
+        scope = (
+            "AND table_schema=current_schema() "
+            if dialect_name == "postgres"
+            else "AND table_schema=DATABASE() "
+        )
         row = await tx.fetchone(
             "SELECT 1 AS present FROM information_schema.columns "
             f"WHERE table_name=? {scope}AND column_name=?",

@@ -111,3 +111,25 @@ def test_scope_allows_commands_not_touching_home() -> None:
     with runtime_env_context(_home_env()):
         assert _validate_bash_command_scope("cat /tmp/pl_ws_test/file.txt") is None
         assert _validate_bash_command_scope("ls -la") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        f"awk '{{print}}' {_HOME}/secret.txt",
+        f"base64 {_HOME}/secret.txt",
+        f"od -c {_HOME}/secret.txt",
+        f"xxd {_HOME}/secret.txt",
+        f"python -c \"print(open('{_HOME}/secret.txt').read())\"",
+        f"dd if=/dev/zero of={_HOME}/payload bs=1 count=1",
+        f"truncate -s 0 {_HOME}/notes.txt",
+        f"ln -s {_HOME}/secret.txt /tmp/leak",
+    ],
+)
+def test_scope_default_deny_blocks_unlisted_verbs_touching_home(command: str) -> None:
+    # B6 (deep-review): the read/write verb hint lists are NOT exhaustive — these commands all reach
+    # un-allowlisted agent-home but matched no hint, so the pre-fix guard fell through to "allow".
+    # They must now be denied by default (the home path is provably un-allowlisted).
+    with runtime_env_context(_home_env()):
+        err = _validate_bash_command_scope(command)
+        assert err is not None and "POWER_LOOP_HOME" in err

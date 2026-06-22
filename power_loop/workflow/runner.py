@@ -249,18 +249,33 @@ def make_wake_guard(store: Any):
     once (timers are at-least-once). Ignores non-workflow timers. Async because the
     store is async; ``run_typed_async`` awaits it."""
 
+    from power_loop.runtime.store.store import MUTATE_SKIP
+
     async def guard(ctx: TimerFireCtx) -> None:
         run_id = _parse_run_id(ctx.note)
         if run_id is None:
             return  # not a workflow timer → CONTINUE
-        j = await store.get_runtime_state(ctx.session_id, journal.run_key(run_id), default=None)
-        if j is None:
-            return
-        if j.get("woke"):
-            ctx.directive = HookDirective.SKIP  # already delivered once
-            return
-        j["woke"] = True
-        await store.set_runtime_state(ctx.session_id, journal.run_key(run_id), j)
+        # Claim the wake ATOMICALLY: a bare get→set RMW races a concurrent journal write
+        # (journal.update / record_step funnel through mutate_runtime_state on the SAME run key) —
+        # the guard's set would clobber that write, and two concurrent fires could both observe
+        # woke=False → double-wake. mutate_runtime_state is row-locked, so the claim is exclusive.
+        seen = {"woke": False}
+
+        def _claim(cur: Any) -> Any:
+            if cur is None:
+                return MUTATE_SKIP  # no journal → CONTINUE (nothing to dedupe)
+            if cur.get("woke"):
+                seen["woke"] = True
+                return MUTATE_SKIP  # already delivered once
+            return {**cur, "woke": True}  # first delivery — set woke, preserve every other key
+
+        try:
+            await store.mutate_runtime_state(ctx.session_id, journal.run_key(run_id), _claim, default=None)
+        except ValueError:
+            return  # session/state row gone (a stale timer firing on a deleted session) → CONTINUE,
+            # matching the old get_runtime_state(default=None) tolerance; nothing to dedupe.
+        if seen["woke"]:
+            ctx.directive = HookDirective.SKIP
 
     return guard
 

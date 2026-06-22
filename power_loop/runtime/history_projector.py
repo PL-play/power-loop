@@ -173,6 +173,7 @@ class IdentityProjector:
     with this projector sees byte-identical history to the no-projector default. Useful to
     prove the projection seam itself introduces no behavior change."""
 
+    kind: str = "verbatim"  # routes to the safe in-place (verbatim) path, never the projection fold
     version: int = 1
     keep_last_sends: int = 0  # verbatim mode never folds
     trigger_ratio: float = 0.75  # unused (keep_last_sends==0 short-circuits folding); for Protocol parity
@@ -197,6 +198,14 @@ class IdentityProjector:
     def render(self, rows: list[ProjectMessageRow]) -> list[LoopMessage]:
         out: list[LoopMessage] = []
         for r in rows:
+            # Defensive: even though this projector never folds, a compact row could reach render
+            # via a mode switch / legacy mapping — render its summary instead of silently dropping it
+            # (the 3.0 invariant: every representation's render MUST handle kind=='compact').
+            if getattr(r, "kind", None) == "compact":
+                summary = (r.content or {}).get("summary")
+                if summary:
+                    out.append({"role": "user", "content": str(summary)})
+                continue
             out.extend((r.content or {}).get("messages") or [])
         return out
 

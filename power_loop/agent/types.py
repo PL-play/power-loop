@@ -35,7 +35,11 @@ def _fold_from_legacy_projector(proj: Any) -> FoldStrategy:
     admin-configured projection settings). Without this the mapped fold would silently use
     ``LLMSummaryFold`` defaults (4 / 0.75) and ignore the operator's config."""
     from power_loop.runtime.fold import LLMSummaryFold
-    keep = max(1, int(getattr(proj, "keep_last_sends", 4) or 4))
+    # Only a MISSING/None keep falls back to 4; an explicit 0 means "keep ~none" (fold aggressively)
+    # → clamp to the validator's floor of 1, NOT silently to 4 (B10). (A verbatim keep==0 projector is
+    # routed to never-fold in _map_legacy_axes and never reaches here.)
+    keep_raw = getattr(proj, "keep_last_sends", None)
+    keep = 4 if keep_raw is None else max(1, int(keep_raw))
     trigger = float(getattr(proj, "trigger_ratio", 0.75) or 0.75)
     return LLMSummaryFold(keep_last_sends=keep, trigger_ratio=trigger)
 
@@ -172,6 +176,17 @@ class AgentLoopConfig:
         # stray legacy compactor= must NOT silently disable it.
         if legacy_comp is not _UNSET and legacy_proj in (_UNSET, None) and fold_was_unset:
             object.__setattr__(self, "_legacy_verbatim_compactor", legacy_comp)
+        elif (
+            legacy_proj not in (_UNSET, None)
+            and fold_was_unset
+            and getattr(legacy_proj, "kind", None) == "verbatim"
+            and getattr(legacy_proj, "keep_last_sends", 1) == 0  # exact 0 (NOT `or 1`, which 0 defeats)
+        ):
+            # A legacy NEVER-FOLD projector (IdentityProjector: kind='verbatim', keep_last_sends==0)
+            # maps to never-fold (compactor=None) — NOT a folding fold_strategy. Else it would fold
+            # (the seeder coerces keep 0→positive) and, on the old projection path, drop the compact
+            # (B7 data loss). Routes via resolve_compactor's verbatim branch (kind=='verbatim').
+            object.__setattr__(self, "_legacy_verbatim_compactor", None)
         else:
             object.__setattr__(self, "_legacy_verbatim_compactor", _UNSET)
         if self.migrate_history_on_projection_switch is not _UNSET:

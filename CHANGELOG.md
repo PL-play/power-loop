@@ -8,6 +8,54 @@
 
 ## [Unreleased]
 
+## [3.0.1] — 2026-06-22
+
+> Bug-fix release from a deep adversarial review (16 confirmed findings; see `BUG_REVIEW_3.0.md`).
+> No public API changes. Each fix has a red-before/green-after regression test
+> (`tests/unit/test_deep_review_3_0_fixes.py`, `tests/unit/test_deep_review_3_0_server_fixes.py`).
+
+### Fixed
+
+- **[high] Postgres v1→v2 `send_index` migration is now schema-scoped.** `_column_exists` probed
+  `information_schema.columns` across ALL schemas, so a same-named `pl_messages` (with `send_index`)
+  in another schema made the `ALTER … ADD COLUMN` get skipped while v2 was stamped → every
+  `append_message` crashed. Now scoped to `current_schema()` (mirrors `_table_exists`).
+- **[high] Workflow wake-guard claims atomically.** `make_wake_guard` did a bare
+  `get_runtime_state`→mutate→`set_runtime_state`, clobbering a concurrent `journal` write on the same
+  run key and risking a double-wake. Now routed through the row-locked `mutate_runtime_state`
+  (tolerates a stale timer on a deleted session).
+- **[high] `abort_pending` primes the sink's tool_calls** so a crash mid-abort persists a
+  *consistent* intermediate pending (was `{tool_call_ids:[…], tool_calls:[]}`); and `resume()` /
+  `_execute_pending` now self-heals an ids-only pending instead of returning `completed` while the
+  session stays permanently stranded.
+- **[high] Projection migration no longer drops history on a fold soft-fail.** When the one-time
+  switch-to-projection fold timed out / errored, the fallback wrote a `compact` whose `to_send`
+  *covered* sends it never merged (reader excluded them = silent permanent data loss), or dropped the
+  fold sends while poisoning the done-marker. It now never claims an unfolded range — it preserves
+  the would-be-folded sends as individual project rows (a later end-of-send fold compresses them).
+- **[medium] `recall_send` is usable under `ProjectedRepresentation`.** `render` now tags each
+  projected send with its `#N` send-index (and the folded compact with its covered range), matching
+  the tool docstring / host note that tell the model to call `recall_send(send_index=N)`.
+- **[medium] `POWER_LOOP_HOME` bash scope guard is default-deny.** It only blocked ~9 hardcoded
+  read/write verbs and fell through to *allow* for everything else (`awk`/`base64`/`od`/`python -c`/
+  `dd of=`/`truncate`/`ln -s` reached agent-home undetected). A command that references
+  un-allowlisted home is now refused regardless of verb.
+- **[medium] Legacy `IdentityProjector` no longer silently drops folded history.** It had no `kind`,
+  so it was mis-routed onto the projection-fold path and its `render` returned `[]` for compact rows.
+  It now declares `kind="verbatim"` (routes to the safe in-place path, never folds) and its `render`
+  handles `kind=="compact"`.
+- **[low] Legacy projector `keep_last_sends=0`** is no longer silently coerced to 4 (`0 or 4`); a
+  verbatim never-fold projector maps to never-fold, a projection one folds at the floor of 1.
+- **[low] MySQL `background_tasks` index** renamed to the canonical
+  `{prefix}idx_background_tasks_session_status` (was `idx_bgtasks_…`), matching SQLite/PG.
+
+### Known / deferred (documented in `BUG_REVIEW_3.0.md`)
+
+- [medium] Verbatim `keep_last_sends` is still counted as `keep_last_n` exchanges (a fix needs
+  `send_index` threaded into the in-place compactor; no correctness/data-loss — atomic tool pairs are
+  preserved). [low] projection→verbatim degrade rendering, resume-before-send `send_index=NULL` rows,
+  verbatim-fallback prefix seq mapping — narrow, non-default.
+
 ## [3.0.0] — 2026-06-22
 
 > **MAJOR — orthogonal context axes.** Message **representation** (how each finished send is

@@ -310,7 +310,14 @@ def _validate_bash_command_scope(command: str) -> str | None:
             "Error: Reading agent-home internals is blocked outside allowlisted paths (.cache/logs/skills). "
             "Use load_skill(name) for skill content instead of direct file reads."
         )
-    return None
+    # DEFAULT-DENY: the command references POWER_LOOP_HOME, is NOT under an allowlisted path, and
+    # matched none of the verb hints above — but the hint lists are not exhaustive (awk / base64 / od
+    # / python -c / dd of= / truncate / ln -s all reach agent-home undetected). Refuse rather than
+    # fall through to "allow", since the resolved target is provably an un-allowlisted home path.
+    return (
+        "Error: Accessing POWER_LOOP_HOME is blocked outside allowlisted paths (.cache/logs/skills). "
+        "Use workspace files or allowlisted agent paths only."
+    )
 
 
 def _dangerous_command_reason(command: str) -> str | None:

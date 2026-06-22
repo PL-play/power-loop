@@ -356,7 +356,7 @@ class MySQLDialect:
                 status VARCHAR(32) NOT NULL, return_code BIGINT, output_tail TEXT, output_path TEXT,
                 last_seen_at BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, task_id),
-                KEY {p}idx_bgtasks_session_status (session_id, status, updated_at)) {opts}""",
+                KEY {p}idx_background_tasks_session_status (session_id, status, updated_at)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_stats (
                 session_id VARCHAR(255) NOT NULL, sends BIGINT NOT NULL DEFAULT 0,
                 rounds BIGINT NOT NULL DEFAULT 0, llm_calls BIGINT NOT NULL DEFAULT 0,

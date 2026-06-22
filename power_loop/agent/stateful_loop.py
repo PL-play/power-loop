@@ -774,6 +774,11 @@ class StatefulAgentLoop:
         sink = SQLiteSink(store, session_id)
         sink._unresolved = {str(tc.get("id") or "") for tc in tool_calls}
         sink._assistant_seq = pending.get("assistant_seq")
+        # Prime _tool_calls so a crash mid-abort (after some but not all <aborted> rows land)
+        # persists a CONSISTENT intermediate pending — on_message_appended rebuilds the still-pending
+        # tool_calls from self._tool_calls (sink.py:171-174); left empty it would write
+        # {tool_call_ids:[…], tool_calls:[]}, a self-inconsistent pending.
+        sink._tool_calls = list(tool_calls)
         for tc in tool_calls:
             cid = str(tc.get("id") or "")
             name = _tool_call_name(tc) if "function" in tc or "name" in tc else None
@@ -1056,7 +1061,13 @@ class StatefulAgentLoop:
         if pending.get("pending_interactions"):
             return
         round_index = int(pending.get("round_index") or 0)
-        tool_calls = pending.get("tool_calls") or []
+        # Fall back to tool_call_ids (as abort_pending / _prime_sink_from_pending do): a pending that
+        # carries only ids (e.g. a crash mid-abort left {tool_call_ids:[…], tool_calls:[]}) must
+        # still be resolved here, else resume() returns "completed" while the pending stays set and
+        # the session is permanently stranded.
+        tool_calls = pending.get("tool_calls") or [
+            {"id": cid} for cid in (pending.get("tool_call_ids") or [])
+        ]
         if not tool_calls:
             return
         # Initialize sink's in-memory unresolved set so auto-resolve works.
@@ -1064,6 +1075,19 @@ class StatefulAgentLoop:
         for tc in tool_calls:
             cid = str(tc.get("id") or "")
             name = _tool_call_name(tc)
+            if name is None:
+                # Reconstructed from ids only — no name/args to replay. Resolve the protocol with an
+                # aborted marker (clears unresolved → pending cleared) instead of stranding.
+                await sink.on_message_appended(
+                    {
+                        "role": "tool",
+                        "tool_call_id": cid,
+                        "name": None,
+                        "content": "<aborted: unrecoverable tool_call on resume>",
+                    },
+                    round_index=round_index,
+                )
+                continue
             args = _tool_call_args(tc)
             if self.tool_registry is None:
                 output, failed = (
@@ -1511,19 +1535,26 @@ class StatefulAgentLoop:
                     llm=self.llm, max_tokens=self.config.max_tokens,
                 ),
             )
+        fold_as_project: list[int] = []
         if folded is not None:
             from_send = 0 if note is not None else (min(fold) if fold else 0)
             compact_tuple = (folded.content, folded.rendered_text, from_send, folded.folded_to_send)
             migration_note_ops = list(folded.note_ops)
-        elif note is not None:
-            # Only the note, nothing foldable beyond keep → preserve the note as a standalone
-            # compact sitting just before the kept tail (or the current send).
-            to_send = (min(recent) - 1) if recent else (current_send_index - 1)
-            compact_tuple = ({"summary": note.content or ""}, None, 0, max(0, to_send))
+        else:
+            # The fold soft-failed (LLM error/timeout/empty) OR nothing was foldable. Do NOT write a
+            # compact that claims to COVER sends it never merged — the reader uses compact_to_send as
+            # the exclusion cutoff, so an over-claiming range silently drops real history (B4), and a
+            # marker-set no-op drops compression forever (B13). Instead preserve everything: keep the
+            # note as a standalone compact that covers NO real send (to_send=0), and write the
+            # would-be-folded sends as individual project rows. A later end-of-send fold compresses
+            # them (rolling this note compact forward) once over budget.
+            if note is not None:
+                compact_tuple = ({"summary": note.content or ""}, None, 0, 0)
+            fold_as_project = fold
 
         project_rows = [
             (si, pr.kind, pr.content, pr.rendered_text)
-            for si in recent
+            for si in (fold_as_project + recent)
             for pr in projected[si].rows
         ]
         # Mark migrated in the SAME transaction as the rows (atomic): a crash can't leave the
