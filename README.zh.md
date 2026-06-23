@@ -33,7 +33,7 @@ print((await loop.send("那第二喜欢的呢?", session_id=sid)).final_text)
 pip install 'power-loop[openai]'      # 或 [anthropic] · 要那两个后端就加 [postgres] / [mysql]
 ```
 
-> **1.0 —— 稳定版。** 公共 API 已在 SemVer 下冻结(破坏性变更需要大版本升级),由 CI 里的基线守卫机器化强制。**核心零运行时依赖**(纯标准库;由一个"不装任何 extra 也能 import"的 CI job 验证)——LLM transport *以及数据库驱动*都是可选 extra。见 [稳定性](#稳定性与-semver) 与 [诚实声明](#诚实声明)——一个年轻、单维护者的项目,会直说。
+> **自 1.0 起稳定;现已 3.x。** 公共 API 已在 SemVer 下冻结,由 CI 里的基线守卫机器化强制——而自那以来的两次大版本升级恰恰印证了这份纪律,而非削弱它:**2.0** 把存储换成可插拔的异步后端,**3.0** 把上下文处理变成两条正交的轴。两者都是真正的破坏性变更,所以都吃了一次大版本升级。**核心零运行时依赖**(纯标准库;由一个"不装任何 extra 也能 import"的 CI job 验证)——LLM transport *以及数据库驱动*都是可选 extra。背后有 **900+ 单元测试**、一套**真机 LLM** 套件,以及一套**三后端一致性套件**(SQLite/PostgreSQL/MySQL)。见 [稳定性](#稳定性与-semver) 与 [诚实声明](#诚实声明)——一个年轻、单维护者的项目,会直说。
 
 ---
 
@@ -43,7 +43,7 @@ pip install 'power-loop[openai]'      # 或 [anthropic] · 要那两个后端就
 |---|---|
 | 🚀 **新手** —— 给我 5 分钟上手版 | [快速开始](docs/zh/getting-started.md) |
 | 🛠️ **边做边学** | [教程](docs/zh/tutorials/index.md) —— 聊天机器人 · 工具 · 人在回路 · 多 Agent |
-| 🧩 **想看可运行代码** | [40 个示例](examples/README.md) —— `00_hello_world.py` → 完整聊天机器人 |
+| 🧩 **想看可运行代码** | [43 个示例](examples/README.md) —— `00_hello_world.py` → 完整聊天机器人 |
 | 📚 **查阅参考** | [用户指南](docs/zh/user-guide/index.md) · [API 参考](docs/zh/api/index.md) |
 | 🤔 **判断是否适合** | [横向对比](#横向对比) · [诚实声明](#诚实声明) |
 
@@ -55,10 +55,11 @@ pip install 'power-loop[openai]'      # 或 [anthropic] · 要那两个后端就
 
 大多数"Agent 框架"要你把应用建在它们**里面**。power-loop 相反:它是一个你**嵌入**的库。你保留自己的 HTTP 层、鉴权、队列、RAG、UI、部署。它负责把 Agent 循环跑好——并让你*工程化*它。
 
-- 🪶 **羽量级 & 零依赖。** 没有 `pydantic`、没有 LangChain、没有要学的图 DSL。一个紧凑的纯标准库内核(约 2 万行),公共面基本就是一个类——而且**零运行时依赖**。LLM transport *以及* Postgres/MySQL 驱动,只在你装对应 extra 时才被拉入。
+- 🪶 **羽量级 & 零依赖。** 没有 `pydantic`、没有 LangChain、没有要学的图 DSL。一个紧凑的纯标准库内核(约 2.4 万行),公共面基本就是一个类——而且**零运行时依赖**。LLM transport *以及* Postgres/MySQL 驱动,只在你装对应 extra 时才被拉入。
 - 🗄️ **可插拔存储,零基础设施为默认。** 会话、定时器、子代理树、工作流日志、共享黑板——全部由一份后端无关的存储,基于一个极小的 `Database`/`Dialect` 端口写就。默认是**一个 SQLite 文件**(拷贝文件就是拷贝状态);想要真正的多写者服务时,把 DSN 指向 **PostgreSQL 或 MySQL**——同一份代码、同一套一致性测试。表自动创建,或**带外预置**并打印出 DDL 脚本(见 [存储后端](docs/zh/user-guide/storage-backends.md))。
 - ♻️ **无状态、可恢复的循环。** `StatefulAgentLoop` 不携带任何权威状态——全在存储里。所以循环创建廉价,仅凭一个 **DSN + 会话 id** 就能轻易**恢复**(适合 web handler、worker、冷启动)。它会自缓存每个会话的活动窗口(一个可重建的加速器,绝不改变模型看到的内容),在热路径上免去重复读取。
 - ⏱️ **默认持久。** 跑到一半崩了就 `resume()`。Agent 给自己排**持久定时器**,重启不丢。工作流在进程死亡后**重放已完成步骤、只重跑未完成的尾巴**。存储**能跨版本升级**(一个可移植、后端无关的迁移版本表),还能**裁剪、VACUUM、导出**。
+- 🧠 **上下文工程,而非一种固定策略。** 每个已结束的 send 如何被*记录/渲染*(**representation**:完整**逐字**,或每个 send 一份简短**投影**),以及历史超预算后如何被*压缩*(**fold strategy**:一次 **LLM 摘要**,或一次还会写下持久笔记的 **agentic** 处理)——是两条**正交、由配置驱动**的轴:任意 representation 都能与任意 fold strategy 组合,且两者都接受你自己的 `Representation` / `FoldStrategy` 实现。折叠永远保留整个 send(绝不拆开工具调用对);`recall_send` / `recall_compacted` 从不可变审计日志里取回原始明细。
 - 🧩 **从一个循环到一支舰队都可组合。** 从 `send()` 开始。加工具。派生子代理。展开确定性**工作流**(`sequence`/`parallel`/`foreach`/`branch`)。让每个叶子跑在**自己的进程和 DB**里、套上沙箱。一路上都是同一套原语。
 - 🛡️ **隔离接缝用在刀刃上。** 工具级沙箱用 `ShellBackend`(给 `bash` 套 gVisor/Docker);进程级用 `WorkerLauncher`(每个叶子包一整个子代理 worker)。power-loop 对沙箱无关;策略你定。
 - 🔬 **为可观测而生。** 每个流式分片、工具调用、轮次、**单次 LLM 调用**都有带类型的事件——每个都带 `seq` 与单调时钟。出厂 sink 在 extras 之后可插:持久 **JSONL**(带 `replay`)、**Prometheus/StatsD** 指标、**OpenTelemetry** span 树。每运行 + 每会话的 token 计量,以及硬性每运行预算。
@@ -80,8 +81,8 @@ pip install 'power-loop[openai]'      # 或 [anthropic] · 要那两个后端就
 | **工作流恢复** | 每步入账;崩溃后重放已完成步骤、只重跑尾巴 | [工作流](docs/zh/user-guide/workflows.md) |
 | **进程沙箱** | 每个工作流叶子在自己的 OS 进程 + 自己的 DB;每叶子套 gVisor/Docker | [沙箱](docs/zh/user-guide/sandboxing.md) |
 | **持久定时器** | Agent 自排唤醒;重启存活;一次性或循环 | [定时器](docs/zh/user-guide/timers.md) |
-| **上下文压缩** | 自动摘要旧轮次(绝不拆开工具调用对);`recall_compacted` 取回原文 | [压缩](docs/zh/user-guide/compaction.md) |
-| **Send 上下文投影** | 可选:把已结束 send 投影成纯文本(派生表 `pl_project_messages`)喂给模型,而非逐字历史;`pl_messages` 保持不可变;`recall_send` 取回明细 | [投影](docs/zh/user-guide/send-context-projection.md) |
+| **上下文 — representation** | 把每个已结束的 send 以**逐字**记录/渲染,或记成每个 send 一份简短**投影**(派生表 `pl_project_messages`);`pl_messages` 保持不可变;`recall_send` 重新展开 | [投影](docs/zh/user-guide/send-context-projection.md) |
+| **上下文 — fold strategy** | 历史超预算后压缩较旧部分:**LLM 摘要**或 **agentic**(还会写下笔记);可插拔 `FoldStrategy`;绝不拆开工具调用对;`recall_compacted` 重新展开 | [压缩](docs/zh/user-guide/compaction.md) |
 | **持久化运维** | 可移植迁移版本表、保留/裁剪、VACUUM、`export_session`/`import_session`、优雅 `aclose()` | [会话](docs/zh/user-guide/sessions.md) |
 | **可观测性** | 带类型、`seq` 有序的事件 → 持久 JSONL + `replay`、Prometheus/StatsD 指标、OpenTelemetry span | [可观测性](docs/zh/user-guide/observability.md) |
 | **MCP 工具** | 把 Model Context Protocol server 的工具接成 power-loop 工具 | [扩展](docs/zh/user-guide/extending-tools.md) |
@@ -126,6 +127,28 @@ result = await loop.send(user_text, session_id=session_id)
 ```
 
 底层循环为每个会话保留一份**活动窗口缓存**——但它只缓存*持久*投影,由一个单调的 `next_seq` 令牌校验,所以它是一个纯加速器:一个缓存为空的冷循环会产出逐字节相同的 prompt(由 warm-vs-cold 一致性测试证明,含 recall/压缩/prompt 编辑等边界场景)。
+
+### 上下文工程——你来选的两条正交轴(也能自己实现)
+
+长对话迟早撑爆窗口。多数库只给你*一种*固定的压缩行为;power-loop(3.0)把它拆成两条独立、由配置驱动的轴:
+
+- **Representation** —— 每个*已结束的 send* 如何被记录与渲染:`VerbatimRepresentation`(完整、逐字节一致的历史)或 `ProjectedRepresentation`(每个 send 一份简短的纯文本投影)。原始明细始终留在不可变的 `pl_messages` 审计日志里。
+- **Fold strategy** —— 当渲染出的前缀越过预算后,*较旧*的历史如何被压缩:`LLMSummaryFold`(一次摘要调用)或 `AgenticFold`(一段有界的工具循环,还会把持久事实落成笔记)。
+
+```python
+from power_loop import (
+    StatefulAgentLoop, AgentLoopConfig,
+    ProjectedRepresentation, AgenticFold,   # 两条轴随意搭配——或传入你自己的实现
+)
+
+cfg = AgentLoopConfig(
+    representation=ProjectedRepresentation(max_chars=300),  # 简短投影(或 VerbatimRepresentation)
+    fold_strategy=AgenticFold(keep_last_sends=4),           # 摘要较旧的 send + 写笔记
+)
+loop = StatefulAgentLoop(llm=llm, dsn="app.db", config=cfg)
+```
+
+任意 representation 都能与任意 fold strategy 组合,而每条轴都是一个你可以自己实现的小 `Protocol`。折叠永远保留**整个 send**(绝不拆开原子的工具调用/结果对),模型可以调用 `recall_send(send_index=N)` / `recall_compacted()` 从审计日志取回完整原始明细。(上面两个类是公开但**暂定的**——3.0 新增,尚未冻结进 `STABLE_API`;`AgentLoopConfig` 本身是 Stable。)
 
 ### 确定性多 Agent 工作流——模型能编写,且能跨崩溃存活
 
@@ -208,7 +231,7 @@ await register_mcp_tools(registry, client, prefix="fs.")   # MCP 工具 → powe
 
 接入点是一个极小的 `MCPToolSource` Protocol,所以 `mcp` SDK 是可选的,任意客户端都能用。
 
-> 还有:硬性 token 预算、结构化输出、崩溃恢复、记忆、黑板——见 [`examples/`](examples/README.md)(40 个可运行程序)与 [文档](docs/zh/index.md)。
+> 还有:硬性 token 预算、结构化输出、崩溃恢复、记忆、黑板——见 [`examples/`](examples/README.md)(43 个可运行程序)与 [文档](docs/zh/index.md)。
 
 ---
 
@@ -216,7 +239,7 @@ await register_mcp_tools(registry, client, prefix="fs.")   # MCP 工具 → powe
 
 power-loop 是**内核**,不是平台——这就是全部取舍。
 
-- **对比 LangChain / LangGraph / LlamaIndex / CrewAI / AutoGen** —— 那些是开箱即用的框架,生态庞大(连接器、向量库、集成)、依赖树很重。power-loop 刻意**一概不带**:一个紧凑(约 2 万行)的纯标准库内核、核心零运行时依赖,工具你自带(或接一个 MCP server)。你开箱得到跨 SQLite/PG/MySQL 的持久会话、可跨崩溃恢复的工作流、真正的沙箱接缝;你**不会**得到捆绑的 RAG 栈或上百个连接器。
+- **对比 LangChain / LangGraph / LlamaIndex / CrewAI / AutoGen** —— 那些是开箱即用的框架,生态庞大(连接器、向量库、集成)、依赖树很重。power-loop 刻意**一概不带**:一个紧凑(约 2.4 万行)的纯标准库内核、核心零运行时依赖,工具你自带(或接一个 MCP server)。你开箱得到跨 SQLite/PG/MySQL 的持久会话、可跨崩溃恢复的工作流、真正的沙箱接缝;你**不会**得到捆绑的 RAG 栈或上百个连接器。
 - **选 power-loop**:当你想把 Agent *嵌入*现有应用、把依赖面压到最小、自选数据库,并在意持久化 + 隔离 + 稳定契约。
 - **选框架**:当你想要开箱即用、庞大的集成目录,且不介意重量。
 
@@ -248,7 +271,7 @@ Python 3.10+。见 [快速开始](docs/zh/getting-started.md)。可选 extras:`p
 
 ## 稳定性与 SemVer
 
-自 **1.0** 起,**STABLE** API(列在 `power_loop.STABLE_API`)处于 SemVer 之下:破坏性变更需要大版本升级(`2.0.0`),由 CI 里的冻结基线测试强制——包括旗舰 `StatefulAgentLoop` *以及构造它所需的 LLM 契约*。错误 `.code` 字符串同样被冻结。
+自 **1.0** 起,**STABLE** API(列在 `power_loop.STABLE_API`)处于 SemVer 之下:破坏性变更需要大版本升级,由 CI 里的冻结基线测试强制——包括旗舰 `StatefulAgentLoop` *以及构造它所需的 LLM 契约*。错误 `.code` 字符串同样被冻结。自那以来的两次大版本升级(2.0 可插拔异步存储、3.0 正交的上下文轴)正是这条策略在起作用——破坏性变更换来一次大版本升级,各自记录在 [更新日志](CHANGELOG.md) 里。
 
 | 层级 | 含义 |
 |---|---|

@@ -25,8 +25,8 @@
 | [Hooks](hooks.md) | 17 个 `HookPoint`、类型化 Ctx、directive、常见模式 |
 | [Events](events.md) | 各种 `AgentEventType`、类型化 payload、订阅模式 |
 | [可观测性](observability.md) | 持久化 JSONL sink + `replay`、指标(Prometheus/StatsD)、OpenTelemetry span、背压 |
-| [压缩](compaction.md) | `DefaultCompactor`、`trigger_ratio`、保留最后 N 轮、自定义 `Compactor` |
-| [Send 上下文投影](send-context-projection.md) | 可选 `HistoryProjector`;每-send 纯文本投影(`pl_project_messages`);`ToolDefinition.project`;`recall_send` |
+| [压缩](compaction.md) | `fold_strategy` 轴：`LLMSummaryFold`（默认）/ `AgenticFold`、`trigger_ratio`、保留最后 N 个 send、自定义 `FoldStrategy` |
+| [Send 上下文投影](send-context-projection.md) | `representation` 轴：`VerbatimRepresentation`（默认）/ `ProjectedRepresentation`;每-send 纯文本投影(`pl_project_messages`);`ToolDefinition.project`;`recall_send` |
 | [记忆](memory.md) | `MemoryProvider` 协议、`recall` / `remember`、注入位置 |
 | [重试与取消](retry-cancel.md) | `LLMRetryPolicy`、指数退避、`CancellationToken` |
 | [结构化输出](structured-output.md) | `StructuredOutputSpec`、`parse_structured`、JSON 修复链 |

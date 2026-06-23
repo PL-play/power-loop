@@ -88,15 +88,17 @@ Because the store is the source of truth, a session **resumes cross-process from
 note. So an async result that arrives mid-send is part of **that send**, not a new one. A timer that
 wakes an idle session via `follow_up` becomes a fresh `send` (its own `send_index`).
 
-- In **[projection](send-context-projection.md) mode**, a send is projected at end-of-send. The
+- Under a **[projecting representation](send-context-projection.md)**
+  (`representation=ProjectedRepresentation(...)`), a send is projected at end-of-send. The
   reason-gate **defers** projecting a send that yielded `waiting_for_input` / `pending_tools` (it
   re-finalizes under the same `send_index` when the resume completes), so an interrupted async turn
   isn't projected twice or half-projected. A missing or stale-version projection row falls back to
-  rendering that send **verbatim** from `pl_messages` (never dropped); the projector never throws —
+  rendering that send **verbatim** from `pl_messages` (never dropped); the representation never throws —
   it degrades. Folded sends remain recoverable via `recall_send`.
-- In **[compaction](compaction.md) mode** (the default), async rows are ordinary history and fold
-  normally. Projection and compaction are **mutually exclusive** (`history_projector` ⇒
-  `compactor=None`).
+- Under the **default `VerbatimRepresentation`**, async rows are ordinary history and the
+  **[fold_strategy](compaction.md)** folds them normally. `representation` and `fold_strategy` are
+  two **orthogonal** axes — both apply at once (a projected representation is still folded by the
+  configured `fold_strategy` once `trigger_ratio` is hit).
 - `BackgroundRuntimeProjector`'s `<background_updates>` injection is a **transient per-round**
   message (it is not persisted as a normal turn) — it surfaces results without bloating the audit log.
 

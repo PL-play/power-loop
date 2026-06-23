@@ -1,8 +1,14 @@
-# Compaction
+# Compaction (the fold axis)
 
 [中文](../../zh/user-guide/compaction.md) | [User Guide](../index.md)
 
-Context compaction prevents long sessions from hitting the LLM's context window limit. It summarizes old messages and replaces them with a compact system note — **default-on**.
+Context compaction prevents long sessions from hitting the LLM's context-window limit. It summarizes old history once the rendered prefix crosses the budget — **default-on**.
+
+> **power-loop 3.0 — two orthogonal context axes.** Context handling is now two independent, config-driven axes on `AgentLoopConfig`:
+> - **`representation`** — *how each finished send is recorded & rendered*: `VerbatimRepresentation` (default, full history) or `ProjectedRepresentation` (a terse per-send projection). See [Send-context projection](send-context-projection.md).
+> - **`fold_strategy`** — *how older history is compacted once over budget* (this page): `LLMSummaryFold` (default) or `AgenticFold`.
+>
+> Any representation composes with any fold strategy. The 2.x `compactor=` / `history_projector=` kwargs still work (mapped onto the two axes with a `DeprecationWarning`); prefer `representation=` / `fold_strategy=`.
 
 ## How It Works
 
@@ -23,20 +29,26 @@ flowchart TD
 ## Configuration
 
 ```python
-from power_loop.runtime.compact import DefaultCompactor
-from power_loop import AgentLoopConfig
+from power_loop import AgentLoopConfig, LLMSummaryFold
 
-compactor = DefaultCompactor(
-    trigger_ratio=0.75,        # compact when > 75% of max_tokens
-    keep_last_n=4,             # always keep last 4 exchanges
-    summary_max_tokens=512,    # max tokens for the summary
+config = AgentLoopConfig(
+    max_tokens=8000,                       # the budget; fold trigger = max_tokens × trigger_ratio
+    fold_strategy=LLMSummaryFold(
+        trigger_ratio=0.75,                # fold when the rendered prefix > 75% of max_tokens
+        keep_last_sends=4,                 # always keep the most recent 4 sends unfolded
+        summary_max_tokens=5000,           # token budget for the summary call
+        # summary_llm=cheaper_llm,         # optional: run the fold on a cheaper model
+    ),
 )
-
-config = AgentLoopConfig(compactor=compactor)
-
-# Disable compaction
-config_no_compaction = AgentLoopConfig(compactor=None)
 ```
+
+The default (`fold_strategy` unset) is `LLMSummaryFold()` — compaction is on out of the box. To run a
+dedicated, memory-aware fold instead, use `AgenticFold` (see [below](#agentic-memory-aware-fold)).
+
+> **Legacy (deprecated).** `AgentLoopConfig(compactor=DefaultCompactor(...))` and `compactor=None` (no
+> compaction) still work — they map onto `fold_strategy` and emit a `DeprecationWarning`. There is no
+> public "never fold" on the new axis; if you genuinely want no compaction, keep the legacy
+> `compactor=None` for now (verbatim only).
 
 ### Absolute Threshold
 
@@ -68,68 +80,68 @@ See [`examples/31_memory_with_compaction.py`](../../../examples/31_memory_with_c
 
 Folded messages are not deleted — they remain `compacted_out` rows in the store. The optional **`recall_compacted`** tool lets the agent pull them back when the `compact_note` lacks a specific detail (an exact value, path, decision). It reads only the current session's folded rows (read-only), filtered by keyword or seq range. Add it to the agent's tools (`include=["recall_compacted", ...]` or the `full` preset). See [`examples/32_recall_compacted.py`](../../../examples/32_recall_compacted.py) and the [Tools guide](tools.md).
 
-## Custom Compactor
+## Custom fold strategy
 
-Implement the `Compactor` protocol to plug in your own strategy:
+Implement the `FoldStrategy` Protocol to plug in your own compaction — it works under **either**
+representation (verbatim or projection):
 
 ```python
-from power_loop.runtime.compact import Compactor, CompactionPlan
+from power_loop import AgentLoopConfig, FoldStrategy, FoldContext, FoldResult
 
-class MyCompactor:
-    async def maybe_compact(
-        self, messages, *, llm, max_tokens, round_index
-    ) -> CompactionPlan | None:
-        # Your logic here
-        # Return CompactionPlan(fold_start_idx, fold_end_idx, summary_text, ...)
-        # Return None to skip
+class MyFold:
+    keep_last_sends = 4          # most-recent sends kept unfolded
+    trigger_ratio = 0.75         # fold when the rendered prefix > max_tokens × this
+    fold_id = "my_fold"          # stamped on compact rows (lets a strategy switch be detected)
+
+    async def fold(self, rows, *, context: FoldContext) -> FoldResult | None:
+        # `rows` = the foldable span (oldest sends + an optional prior compact rolled forward).
+        # Re-render to text with context.representation.render(rows); summarize via context.llm.
+        # Return None to decline (soft-fail), or:
+        #   FoldResult(content={"summary": ...}, folded_to_send=<last folded send_index>,
+        #              note_ops=(...))   # note_ops are applied best-effort after the compact commits
         return None
 
-config = AgentLoopConfig(compactor=MyCompactor())
+config = AgentLoopConfig(fold_strategy=MyFold())
 ```
 
-### Coordinating with memory (capture before folding)
+A fold MUST NOT touch the store directly — it returns a `FoldResult` and the loop persists the compact
+(optimistic-concurrency commit) and applies any `note_ops`. `FoldContext` carries everything it needs
+(`session_id`, `representation`, `llm`, optional cheaper `summary_llm`, `tool_registry`, `memory`,
+`max_tokens`). Because a fold always operates on **whole sends**, it can never split a tool-call/result
+pair.
 
-`maybe_compact` may take an **optional** `context: CompactionContext` — the configured `MemoryProvider`, the `session_id`, and a read-only `fetch_messages(from_seq, to_seq)` accessor. A custom compactor can use it to persist must-keep detail into [memory](memory.md) *before* the fold drops it from the active window:
+> **Legacy `Compactor`.** The 2.x `Compactor` Protocol (`maybe_compact(...) -> CompactionPlan`) and its
+> optional `CompactionContext` (capture-to-memory before folding) still work via the deprecated
+> `compactor=` for verbatim mode — see [`examples/16_custom_compactor.py`](../../../examples/16_custom_compactor.py)
+> and [`examples/33_coordinating_compactor.py`](../../../examples/33_coordinating_compactor.py). The 3.0
+> `AgenticFold` (below) covers the same "remember before you forget" need natively via `note_ops`.
 
-```python
-from power_loop import MemorySnapshot
-from power_loop.runtime.compact import DefaultCompactor
+## Agentic memory-aware fold
 
-class CoordinatingCompactor(DefaultCompactor):
-    async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
-        plan = await super().maybe_compact(
-            messages, llm=llm, max_tokens=max_tokens, round_index=round_index)
-        if plan and context and context.memory:
-            slice_ = messages[plan.fold_start_idx : plan.fold_end_idx + 1]
-            await context.memory.remember(
-                snapshot=MemorySnapshot(session_id=context.session_id or "",
-                                        messages=slice_, status="compaction"),
-                session_id=context.session_id)
-        return plan
-```
-
-The `context` parameter is **opt-in and back-compatible**: the pipeline only passes it to compactors whose `maybe_compact` accepts it (signature-checked), so existing compactors with the old signature keep working unchanged, and `DefaultCompactor` ignores it. Memory stays an injected seam — the library never persists it for you. The `status="compaction"` value is a convention so providers can distinguish a fold-time capture from a session-end snapshot. See [`examples/33_coordinating_compactor.py`](../../../examples/33_coordinating_compactor.py).
-
-## Agentic memory-aware compaction (opt-in)
-
-`DefaultCompactor` summarizes a slice in **one** LLM call. `AgenticMemoryCompactor` instead runs a **bounded, memory-aware agent loop** at the fold: the model first uses memory tools (by default the existing `note_add` / `note_update`) to **persist durable facts into the session's notes**, then writes the `compact_note` summary. This separates *long-term memory* (kept as notes, surfaced on later turns) from the *working-context summary* (compressed), so the agent forgets less across many folds.
+`LLMSummaryFold` summarizes a slice in **one** LLM call. `AgenticFold` instead runs a **bounded,
+memory-aware agent loop** at the fold: the model first uses note tools (`note_add` / `note_update`) to
+**persist durable facts into the session's notes**, then writes the summary. This separates *long-term
+memory* (kept as notes, surfaced on later turns) from the *working-context summary* (compressed), so the
+agent forgets less across many folds. The note writes are captured as `note_ops` and applied by the loop
+after the compact commits (so the strategy stays side-effect-free + testable); on any failure it falls
+back to a plain single-call summary, so it never blocks a fold.
 
 ```python
-from power_loop.runtime.compact import AgenticMemoryCompactor
+from power_loop import AgentLoopConfig, AgenticFold
 
 config = AgentLoopConfig(
-    compactor=AgenticMemoryCompactor(
-        trigger_ratio=0.75, keep_last_n=4,   # inherited from DefaultCompactor (trigger + span)
-        max_rounds=4,                        # cap on the compaction agent's tool rounds
-        # memory_tools=my_registry,          # default: a registry of note_add / note_update
-        # system_prompt=...,                 # default: DEFAULT_COMPACTION_AGENT_PROMPT
+    fold_strategy=AgenticFold(
+        trigger_ratio=0.75, keep_last_sends=4,   # trigger + how many recent sends to keep
+        summary_max_tokens=5000,
+        max_rounds=4,                            # cap on the fold agent's tool rounds
+        # system_prompt=...,                     # default: DEFAULT_FOLD_AGENT_PROMPT
     ),
 )
 ```
 
-- **Default behavior is unchanged** — this is opt-in; the default stays `DefaultCompactor` (single call).
-- **Safe**: the loop is a flat, bounded tool-use loop (not a nested `StatefulAgentLoop`), so it can never recurse into another compaction. The note tools resolve the live session from the loop's contextvars (set for the whole run), so notes land on the right session. On **any** failure (no tool support, malformed output, exception) it **falls back to the single-call summary** — it never blocks a fold.
-- **Cost**: it makes several LLM calls per fold (extract + summarize) instead of one — the trade for richer memory. Reuse the `summary_llm` arg to point the compaction agent at a cheaper model.
+- **Default behavior is unchanged** — this is opt-in; the default stays `LLMSummaryFold` (single call).
+- **Safe**: the loop is a flat, bounded tool-use loop (not a nested `StatefulAgentLoop`), so it can never recurse into another fold. The note writes are captured as `note_ops` and applied after the compact commits. On **any** failure (no tool support, malformed output, exception) it **falls back to the single-call summary** — it never blocks a fold.
+- **Cost**: it makes several LLM calls per fold (extract + summarize) instead of one — the trade for richer memory. Pass `summary_llm=` to point the fold at a cheaper model.
 
 ## Events
 
@@ -149,6 +161,6 @@ See also `trim_history()` in [budget.py](../../../power_loop/runtime/budget.py) 
 
 ## Next
 
-- [Send-context projection](send-context-projection.md) — the opt-in alternative: project finished sends to plain text in a derived table instead of rewriting history in place (mutually exclusive with this compactor)
+- [Send-context projection](send-context-projection.md) — the **representation** axis: render finished sends as terse plain text in a derived table. It composes *with* a fold strategy (the two axes are orthogonal), it does not replace one.
 - [Memory](memory.md) — cross-session recall via `MemoryProvider`
 - [Sessions](sessions.md) — understand the session lifecycle

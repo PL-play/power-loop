@@ -1,8 +1,14 @@
-# 压缩
+# 压缩（fold 轴）
 
 [English](../../en/user-guide/compaction.md) | [用户手册](../index.md)
 
-上下文压缩防止长会话超出 LLM 上下文窗口限制。它把旧消息摘要为一条紧凑的系统注释——**默认开启**。
+上下文压缩防止长会话超出 LLM 上下文窗口限制。它在渲染后的前缀超出预算时，把旧历史摘要一次——**默认开启**。
+
+> **power-loop 3.0 —— 两条正交的上下文轴。** 上下文处理现在是 `AgentLoopConfig` 上两条相互独立、由配置驱动的轴：
+> - **`representation`** —— *每个已结束的 send 如何被记录与渲染*：`VerbatimRepresentation`（默认，完整历史）或 `ProjectedRepresentation`（每个 send 的简短投影）。见[Send 上下文投影](send-context-projection.md)。
+> - **`fold_strategy`** —— *超预算后旧历史如何被压缩*（本页）：`LLMSummaryFold`（默认）或 `AgenticFold`。
+>
+> 任意 representation 都能与任意 fold strategy 组合。2.x 的 `compactor=` / `history_projector=` 参数仍然可用（映射到这两条轴上，并带一个 `DeprecationWarning`）；请优先使用 `representation=` / `fold_strategy=`。
 
 ## 工作原理
 
@@ -16,45 +22,49 @@ flowchart TD
 ```
 
 1. 每轮开始前，`estimate_tokens(messages)` 与 `max_tokens × trigger_ratio`（默认 0.75）比较。
-2. 超阈值时，压缩器识别最旧可安全折叠的消息。
-3. 摘要 LLM 调用生成压缩注释（`role=system, name=compact_note`）。
-4. 旧消息标记 `compacted_out`；注释插入。
+2. 超阈值时，fold strategy 识别出可安全折叠的**最旧消息**。
+3. 一次摘要 LLM 调用生成一条压缩注释（`role=system, name=compact_note`）。
+4. 旧消息在 store 里标记 `compacted_out`；注释被插入。
 
 ## 配置
 
 ```python
-from power_loop.runtime.compact import DefaultCompactor
-from power_loop import AgentLoopConfig
+from power_loop import AgentLoopConfig, LLMSummaryFold
 
-compactor = DefaultCompactor(
-    trigger_ratio=0.75,        # token > max_tokens 的 75% 时触发
-    keep_last_n=4,             # 始终保留最后 4 轮
-    summary_max_tokens=512,    # 摘要的最大 token 数
+config = AgentLoopConfig(
+    max_tokens=8000,                       # 预算；折叠触发点 = max_tokens × trigger_ratio
+    fold_strategy=LLMSummaryFold(
+        trigger_ratio=0.75,                # 渲染前缀 > max_tokens 的 75% 时折叠
+        keep_last_sends=4,                 # 始终保留最近 4 个 send 不折叠
+        summary_max_tokens=5000,           # 摘要调用的 token 预算
+        # summary_llm=cheaper_llm,         # 可选：用更便宜的模型跑折叠
+    ),
 )
-
-config = AgentLoopConfig(compactor=compactor)
-
-# 关闭压缩
-config_no = AgentLoopConfig(compactor=None)
 ```
+
+默认值（不设 `fold_strategy`）即 `LLMSummaryFold()` —— 压缩开箱即开。若想改用一个专门的、记忆感知的折叠，请用 `AgenticFold`（见[下文](#记忆感知的-agentic-折叠)）。
+
+> **遗留（已弃用）。** `AgentLoopConfig(compactor=DefaultCompactor(...))` 和 `compactor=None`（不压缩）仍然可用 —— 它们会映射到 `fold_strategy` 并发出 `DeprecationWarning`。新轴上没有公开的「永不折叠」开关；若你确实想要不压缩，暂时保留遗留的 `compactor=None`（仅逐字）。
 
 ### 绝对阈值
 
-环境变量 `CONTEXT_COMPACT_THRESHOLD=6000` 设置绝对 token 数。当模型有已知上下文窗口时有用。
+环境变量 `CONTEXT_COMPACT_THRESHOLD=6000` 可用绝对 token 数代替 `trigger_ratio`。当模型有已知上下文窗口（如 gpt-4o-mini 的 8192）时有用。
 
 ## 不变量
+
+fold strategy 强制一组严格规则，以保持消息协议合法：
 
 | 规则 | 原因 |
 |---|---|
 | **系统消息保留** | `role=system` 消息（含先前的 `compact_note`）永不折叠 |
-| **最后 N 轮保留** | 最近的 `keep_last_n` 轮始终保留 |
-| **工具调用对原子性** | `assistant(tool_calls) ↔ tool` 永不拆分 |
-| **每轮最多一次** | `round_compacted=True` 防重复 |
+| **最后 N 轮保留** | 最近的 `keep_last_n` 个以 user 为界的交互始终保留 |
+| **工具调用对原子性** | `assistant(tool_calls) ↔ tool(tool_call_id=...)` 对永不拆分 —— 折叠会回溯以保持其完整 |
+| **每轮最多一次** | `round_compacted=True` 标志防重复压缩 |
 | **软失败** | 摘要 LLM 调用失败 → 用原（未压缩）历史继续 |
 
 ## 持久化与记忆召回
 
-挂了 `SQLiteSink`（带 store 的 `StatefulAgentLoop` 默认如此）时，折叠会同时落库：被折叠行标 `compacted_out`，追加一条 `compact_note` 行，`compactions` 表加一条审计行。sink 通过一张与 `pipeline.history` 对齐的「内存索引 → store seq」映射，把压缩器给出的**内存索引**翻译成**store 行 seq**。
+挂了 `SQLiteSink`（带 store 的 `StatefulAgentLoop` 默认如此）时，折叠会同时落库：被折叠行标 `compacted_out`，追加一条 `compact_note` 行，`compactions` 表加一条审计行。sink 通过一张与 `pipeline.history` 对齐的「内存历史索引 → store 行 seq」映射，把折叠给出的**内存历史索引**翻译成**store 行 seq**。
 
 开了[记忆召回](memory.md)时这点尤其关键：召回的 `memory_*` 消息被插到历史**最前端**（system 区），但**永不落库**——它们归 `MemoryProvider` 所有。sink 为每条召回消息记一个占位，保持映射对齐；否则后续折叠会把索引映射到**错误的行**，把不该压的消息标成 `compacted_out`。两者干净共存：召回的事实躲过折叠（system 区天然保留），也不会泄漏进 store。
 
@@ -64,69 +74,74 @@ config_no = AgentLoopConfig(compactor=None)
 
 ### 按需取回被折叠的细节
 
-被折叠的消息没有删——它们仍是 store 里 `compacted_out` 的行。可选的 **`recall_compacted`** 工具让 agent 在 `compact_note` 缺某个具体细节(精确数值/路径/决策)时把原文捞回来。它只读**当前会话**被折叠的行,可按关键词或 seq 区间过滤。把它加进 agent 的工具集(`include=["recall_compacted", ...]` 或 `full` preset)。参见 [`examples/32_recall_compacted.py`](../../../examples/32_recall_compacted.py) 与[工具指南](tools.md)。
+被折叠的消息没有删——它们仍是 store 里 `compacted_out` 的行。可选的 **`recall_compacted`** 工具让 agent 在 `compact_note` 缺某个具体细节（精确数值/路径/决策）时把原文捞回来。它只读**当前会话**被折叠的行，可按关键词或 seq 区间过滤。把它加进 agent 的工具集（`include=["recall_compacted", ...]` 或 `full` preset）。参见 [`examples/32_recall_compacted.py`](../../../examples/32_recall_compacted.py) 与[工具指南](tools.md)。
 
-## 自定义压缩器
+## 自定义 fold strategy
 
-实现 `Compactor` 协议：
+实现 `FoldStrategy` 协议即可接入你自己的压缩——它在**任一** representation（逐字或投影）下都能工作：
 
 ```python
-from power_loop.runtime.compact import Compactor, CompactionPlan
+from power_loop import AgentLoopConfig, FoldStrategy, FoldContext, FoldResult
 
-class MyCompactor:
-    async def maybe_compact(self, messages, *, llm, max_tokens, round_index) -> CompactionPlan | None:
-        # 你的逻辑
-        return None  # None = 跳过
+class MyFold:
+    keep_last_sends = 4          # 最近这些 send 保持不折叠
+    trigger_ratio = 0.75         # 渲染前缀 > max_tokens × 此值时折叠
+    fold_id = "my_fold"          # 盖在 compact 行上（用于检测策略切换）
 
-config = AgentLoopConfig(compactor=MyCompactor())
+    async def fold(self, rows, *, context: FoldContext) -> FoldResult | None:
+        # `rows` = 可折叠的区段（最老的若干 send + 一条可选的、滚动并入的先前 compact）。
+        # 用 context.representation.render(rows) 重渲染成文本；用 context.llm 摘要。
+        # 返回 None 表示放弃（软失败），或：
+        #   FoldResult(content={"summary": ...}, folded_to_send=<最后被折叠的 send_index>,
+        #              note_ops=(...))   # note_ops 在 compact 提交后尽力应用
+        return None
+
+config = AgentLoopConfig(fold_strategy=MyFold())
 ```
 
-### 联动记忆（折叠前先捕获）
+折叠**绝不能**直接动 store —— 它返回一个 `FoldResult`，由 loop 持久化 compact（乐观并发提交）并应用任何 `note_ops`。`FoldContext` 携带它所需的一切（`session_id`、`representation`、`llm`、可选的更便宜的 `summary_llm`、`tool_registry`、`memory`、`max_tokens`）。因为折叠永远以**整个 send** 为单位操作，它绝不会拆开一个工具调用/结果对。
 
-`maybe_compact` 可**选**接收一个 `context: CompactionContext`——注入的 `MemoryProvider`、`session_id`，以及只读的 `fetch_messages(from_seq, to_seq)` 读取器。自定义压缩器可以在折叠把内容移出活跃窗口**之前**,把要点 `remember` 进[记忆](memory.md):
+> **遗留 `Compactor`。** 2.x 的 `Compactor` 协议（`maybe_compact(...) -> CompactionPlan`）及其可选的 `CompactionContext`（折叠前先 capture-to-memory）在逐字模式下仍可通过弃用的 `compactor=` 使用 —— 见 [`examples/16_custom_compactor.py`](../../../examples/16_custom_compactor.py) 与 [`examples/33_coordinating_compactor.py`](../../../examples/33_coordinating_compactor.py)。3.0 的 `AgenticFold`（下文）通过 `note_ops` 原生覆盖了同样的「遗忘之前先记住」需求。
 
-```python
-from power_loop import MemorySnapshot
-from power_loop.runtime.compact import DefaultCompactor
+## 记忆感知的 agentic 折叠
 
-class CoordinatingCompactor(DefaultCompactor):
-    async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
-        plan = await super().maybe_compact(
-            messages, llm=llm, max_tokens=max_tokens, round_index=round_index)
-        if plan and context and context.memory:
-            slice_ = messages[plan.fold_start_idx : plan.fold_end_idx + 1]
-            await context.memory.remember(
-                snapshot=MemorySnapshot(session_id=context.session_id or "",
-                                        messages=slice_, status="compaction"),
-                session_id=context.session_id)
-        return plan
-```
-
-`context` 参数**可选且向后兼容**:pipeline 只会把它传给签名接受它的压缩器(按签名判断),所以老签名的压缩器照常工作,`DefaultCompactor` 也直接忽略它。记忆始终是注入的 seam——库不会替你持久化。`status="compaction"` 是个约定,让 provider 区分「折叠时捕获」和「会话结束快照」。参见 [`examples/33_coordinating_compactor.py`](../../../examples/33_coordinating_compactor.py)。
-
-## 记忆感知的 agentic 压缩(可选)
-
-`DefaultCompactor` 用**一次** LLM 调用摘要一段切片。`AgenticMemoryCompactor` 改为在折叠时跑一个**有界、记忆感知的 agent 循环**:模型先用 memory 工具(默认是现有的 `note_add` / `note_update`)把**持久事实写入会话笔记**,再写 `compact_note` 摘要。这把*长期记忆*(留作笔记、后续轮次注入)和*工作上下文摘要*(压缩掉)分开,多次折叠后更不易遗忘。
+`LLMSummaryFold` 用**一次** LLM 调用摘要一段切片。`AgenticFold` 改为在折叠时跑一个**有界、记忆感知的 agent 循环**：模型先用 note 工具（`note_add` / `note_update`）把**持久事实写入会话笔记**，再写摘要。这把*长期记忆*（留作笔记、后续轮次浮现）和*工作上下文摘要*（压缩掉）分开，多次折叠后更不易遗忘。这些 note 写入被捕获为 `note_ops`，由 loop 在 compact 提交后应用（让策略保持无副作用、可测试）；任何失败都回退到普通的单次摘要，所以它绝不阻塞折叠。
 
 ```python
-from power_loop.runtime.compact import AgenticMemoryCompactor
+from power_loop import AgentLoopConfig, AgenticFold
 
 config = AgentLoopConfig(
-    compactor=AgenticMemoryCompactor(
-        trigger_ratio=0.75, keep_last_n=4,   # 继承自 DefaultCompactor(触发 + 折叠区间)
-        max_rounds=4,                        # 压缩 agent 的工具轮数上限
-        # memory_tools=my_registry,          # 默认:note_add / note_update 的注册表
-        # system_prompt=...,                 # 默认:DEFAULT_COMPACTION_AGENT_PROMPT
+    fold_strategy=AgenticFold(
+        trigger_ratio=0.75, keep_last_sends=4,   # 触发 + 保留多少最近 send
+        summary_max_tokens=5000,
+        max_rounds=4,                            # 折叠 agent 的工具轮数上限
+        # system_prompt=...,                     # 默认：DEFAULT_FOLD_AGENT_PROMPT
     ),
 )
 ```
 
-- **默认行为不变** —— 这是可选项;默认仍是 `DefaultCompactor`(单次调用)。
-- **安全**:该循环是扁平、有界的工具循环(不是嵌套的 `StatefulAgentLoop`),绝不会递归进另一次压缩。note 工具从 loop 的 contextvars(整次 run 有效)解析当前会话,所以笔记落到正确会话。**任何**失败(无工具支持、输出畸形、异常)都**回退到单次摘要**——绝不阻塞折叠。
-- **成本**:每次折叠会做多次 LLM 调用(抽取 + 摘要)而非一次,这是换取更丰富记忆的代价。用 `summary_llm` 参数可让压缩 agent 走更便宜的模型。
+- **默认行为不变** —— 这是可选项；默认仍是 `LLMSummaryFold`（单次调用）。
+- **安全**：该循环是扁平、有界的工具循环（不是嵌套的 `StatefulAgentLoop`），绝不会递归进另一次折叠。note 写入被捕获为 `note_ops`，在 compact 提交后应用。**任何**失败（无工具支持、输出畸形、异常）都**回退到单次摘要**——绝不阻塞折叠。
+- **成本**：每次折叠会做多次 LLM 调用（抽取 + 摘要）而非一次，这是换取更丰富记忆的代价。用 `summary_llm=` 可让折叠走更便宜的模型。
+
+## 事件
+
+订阅压缩事件以做观测：
+
+```python
+bus.subscribe(AgentEventType.STATUS_CHANGED, lambda e: print(
+    f"Compacted: {e.data.before_tokens} → {e.data.after_tokens} tokens"
+) if getattr(e.data, "kind", None) == "auto_compact" else None)
+```
+
+## Token 估算
+
+折叠使用一个启发式 token 估算器（约 4 字符/token），定义在 `power_loop/runtime/budget.py`。它不是计费级精确，但与内容大小单调相关——对触发判定足够好。
+
+另见 [budget.py](../../../power_loop/runtime/budget.py) 里的 `trim_history()`，一个纯裁剪（不调 LLM）的替代方案。
 
 ## 下一步
 
-- [Send 上下文投影](send-context-projection.md) — 可选的替代方案:把已结束 send 投影成纯文本存进派生表,而非原地改写历史(与本压缩器互斥)
-- [记忆](memory.md) — 通过 `MemoryProvider` 跨会话召回
-- [会话](sessions.md) — 理解会话生命周期
+- [Send 上下文投影](send-context-projection.md) —— **representation** 轴：把已结束的 send 渲染成派生表里的简短纯文本。它与 fold strategy *组合*使用（两条轴正交），而非取代它。
+- [记忆](memory.md) —— 通过 `MemoryProvider` 跨会话召回
+- [会话](sessions.md) —— 理解会话生命周期

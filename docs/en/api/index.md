@@ -55,11 +55,19 @@ inspect the source modules linked below.
 | `StructuredOutputSpec` | response-format schema | [Structured Output](../user-guide/structured-output.md), [source](../../../power_loop/runtime/structured.py) |
 | `MemoryProvider` | recall and remember protocol | [Memory](../user-guide/memory.md), [source](../../../power_loop/runtime/memory.py) |
 | `LLMProviderConfig` | provider/env configuration | [Providers](../user-guide/providers.md), [source](../../../power_loop/runtime/provider.py) |
-| `DefaultCompactor` | context summary compaction | [Compaction](../user-guide/compaction.md), [source](../../../power_loop/runtime/compact.py) |
-| `HistoryProjector`, `DefaultDeterministicProjector`, `IdentityProjector` | send-context projection Protocol + built-ins (`trigger_ratio` token fold); per-send projection of finished sends into the derived `pl_project_messages` (`ProjectMessageRow`); `ToolDefinition.project` hook + the `recall_send` tool re-expand detail | [Projection](../user-guide/send-context-projection.md), [source](../../../power_loop/runtime/history_projector.py) |
+| `FoldStrategy`, `LLMSummaryFold`, `AgenticFold` | the `fold_strategy` axis: fold Protocol + built-ins (`keep_last_sends`, `trigger_ratio`, async `fold`); context summary compaction | [Compaction](../user-guide/compaction.md), [source](../../../power_loop/runtime/fold.py) |
+| `Representation`, `VerbatimRepresentation`, `ProjectedRepresentation` | the `representation` axis: representation Protocol + built-ins (verbatim default / `ProjectedRepresentation(max_chars=...)`); per-send projection of finished sends into the derived `pl_project_messages` (`ProjectMessageRow`); `ToolDefinition.project` hook + the `recall_send` tool re-expand detail | [Projection](../user-guide/send-context-projection.md), [source](../../../power_loop/runtime/representation.py) |
 | `RuntimeEnv`, `runtime_env_context` | per-invocation workspace/home/skills and shell backend | [Tools](../user-guide/tools.md), [source](../../../power_loop/runtime/env.py) |
 | `ShellBackend`, `LocalShellBackend` | persistent-shell launch and execution-target identity | [Tools](../user-guide/tools.md), [source](../../../power_loop/runtime/exec_backend.py) |
 | `PowerLoopError` and subclasses | common exception hierarchy; every subclass carries a stable dotted `code` (class attribute) — branch on `exc.code`, not class identity | [Error codes](#error-codes), [source](../../../power_loop/contracts/errors.py) |
+
+> **3.0 rename.** The pre-3.0 names `HistoryProjector` / `IdentityProjector` /
+> `DefaultDeterministicProjector` (projection) and `Compactor` / `DefaultCompactor` /
+> `AgenticMemoryCompactor` (compaction) were **removed from `power_loop.__all__`** in favour of
+> the two-axis `Representation` × `FoldStrategy` model. The old `compactor=` / `history_projector=`
+> constructor kwargs still work (mapped to `fold_strategy=` / `representation=` with a
+> `DeprecationWarning`); the old classes remain importable via deep-import only. See
+> [Compaction](../user-guide/compaction.md) and [Projection](../user-guide/send-context-projection.md).
 
 ## LLM Contract
 

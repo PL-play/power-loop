@@ -1,4 +1,4 @@
-"""40 · Send 上下文投影 / Send-context projection with a HistoryProjector
+"""40 · Send 上下文投影 / Send-context projection (ProjectedRepresentation × fold)
 
 What you learn / 你将学到
 --------------------------
@@ -6,9 +6,9 @@ What you learn / 你将学到
   `pl_messages` 既是审计、又被直接当上下文。/ by default each send feeds the model the
   ENTIRE verbatim history (full tool-call structure + long tool results); pl_messages is
   both the audit log and the context.
-- 配一个 ``history_projector``(并把 ``compactor`` 设为 None)后,**已结束的 send** 被投影成
+- 把 ``representation`` 设为 ``ProjectedRepresentation`` 后,**已结束的 send** 被投影成
   紧凑纯文本,存进派生表 ``pl_project_messages``;下一次 send 的历史 = 这些投影 + **当前 send
-  逐字**。``pl_messages`` 永不被改写。/ with a ``history_projector`` (and ``compactor=None``),
+  逐字**。``pl_messages`` 永不被改写。/ with ``representation=ProjectedRepresentation()``,
   FINISHED sends are projected to compact plain text into the derived ``pl_project_messages``
   table; the next send's history = those projections + the IN-FLIGHT send verbatim.
   ``pl_messages`` is never rewritten.

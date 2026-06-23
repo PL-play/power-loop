@@ -24,7 +24,7 @@ power-loop 是一个**可嵌入的 Agent 执行内核**——不是框架，不�
 - **Hooks** — 17 个挂载点拦截循环每个阶段
 - **事件总线** — 30 种类型化事件，覆盖观测/审计/流式
 - **声明式子代理** — `AgentSpec` → 一次性子代理，工具白名单
-- **上下文压缩** — LLM 摘要压缩，默认开启
+- **上下文工程，而非单一固定策略** — 每个 send 如何**记录/渲染**（`representation` 轴：逐字 `VerbatimRepresentation` 默认，或精简的每-send `ProjectedRepresentation` 投影）与超预算后旧历史如何**折叠**（`fold_strategy` 轴：`LLMSummaryFold` 单次摘要，或 `AgenticFold` 同时写持久笔记）是两条**正交、可配置**的轴，任意 representation 可与任意 fold strategy 组合，也可传入自定义 `Representation` / `FoldStrategy`（旧 `compactor=` / `history_projector=` 参数仍映射兼容，带 DeprecationWarning）
 - **可插拔存储 + 无状态循环** — 默认零基础设施的单 SQLite 文件，`dsn=` 即可换 PostgreSQL / MySQL（见 [存储后端](user-guide/storage-backends.md)）；`StatefulAgentLoop` 不持有权威状态，冷进程凭 `dsn` + `session_id` 即可恢复任意会话
 - **重试 + 取消** — `LLMRetryPolicy` 指数退避；`CancellationToken` 统一取消形状
 - **结构化输出** — `StructuredOutputSpec` + 四级 JSON 修复链

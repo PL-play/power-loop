@@ -10,7 +10,7 @@
 
 ### 和 LangChain / CrewAI / AutoGen 有什么区别？
 
-power-loop 是**内核**，不是框架。不预设 workflow DAG、记忆后端或 prompt 模板。你自带 LLM、工具和记忆——库提供执行循环、hooks 和持久化。约 1.7 万行 Python，不是 100k 行的依赖树。
+power-loop 是**内核**，不是框架。不预设 workflow DAG、记忆后端或 prompt 模板。你自带 LLM、工具和记忆——库提供执行循环、hooks 和持久化。约 2.4 万行 Python（不含 vendored transport），不是 100k 行的依赖树。
 
 ### 支持流式输出吗？
 
@@ -30,11 +30,13 @@ power-loop 是**内核**，不是框架。不预设 workflow DAG、记忆后端�
 
 可以。设置 `POWER_LOOP_BASE_URL=http://localhost:11434/v1`，`POWER_LOOP_API_KEY=anything`。
 
-### 怎么关闭压缩？
+### 怎么关闭压缩（折叠）？
 
 ```python
-config = AgentLoopConfig(compactor=None)
+config = AgentLoopConfig(fold_strategy=None)
 ```
+
+（旧的 `compactor=None` 参数仍兼容，会映射到 `fold_strategy=None` 并带 DeprecationWarning。）
 
 ### 怎么用程序区分不同错误？
 

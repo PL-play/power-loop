@@ -25,8 +25,8 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 | [Hooks](hooks.md) | All 17 `HookPoint`s, typed Ctx, directives, common patterns |
 | [Events](events.md) | All `AgentEventType`s, typed payloads, subscriber patterns |
 | [Observability](observability.md) | Durable JSONL sink + `replay`, metrics (Prometheus/StatsD), OpenTelemetry spans, backpressure |
-| [Compaction](compaction.md) | `DefaultCompactor`, `trigger_ratio`, keep-last-N, custom `Compactor` |
-| [Send-context projection](send-context-projection.md) | Opt-in `HistoryProjector`; per-send plain-text projection (`pl_project_messages`); `ToolDefinition.project`; `recall_send` |
+| [Compaction](compaction.md) | The `fold_strategy` axis: `LLMSummaryFold` (default) / `AgenticFold`, `trigger_ratio`, keep-last-N, custom `FoldStrategy` |
+| [Send-context projection](send-context-projection.md) | The `representation` axis: `VerbatimRepresentation` (default) / `ProjectedRepresentation`; per-send plain-text projection (`pl_project_messages`); `ToolDefinition.project`; `recall_send` |
 | [Memory](memory.md) | `MemoryProvider` protocol, `recall` / `remember`, injection position |
 | [Retry & Cancel](retry-cancel.md) | `LLMRetryPolicy`, exponential backoff, `CancellationToken` |
 | [Structured Output](structured-output.md) | `StructuredOutputSpec`, `parse_structured`, JSON repair chain |

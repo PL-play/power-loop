@@ -82,8 +82,9 @@ session 状态会丢。你要处理的是：
   `send_index` 下重新定稿），所以被打断的异步轮不会被投两次或投一半。缺失或版本过期的投影行会回退到
   从 `pl_messages` **逐字**渲染那次 send（绝不丢）；投影器从不抛异常——它降级。被折叠的 send 仍可
   用 `recall_send` 取回。
-- **[压缩](compaction.md)模式**（默认）下，异步行就是普通历史，正常折叠。投影与压缩**互斥**
-  （`history_projector` ⇒ `compactor=None`）。
+- **默认 `VerbatimRepresentation`** 下，异步行就是普通历史，由 **[fold_strategy](compaction.md)**
+  正常折叠。`representation` 与 `fold_strategy` 是两条**正交**的轴——同时生效（投影表示法在达到
+  `trigger_ratio` 后仍会被配置的 `fold_strategy` 折叠）。
 - `BackgroundRuntimeProjector` 注入的 `<background_updates>` 是**每轮临时**消息（不作为正常一轮
   持久化）——既能让结果浮现，又不撑大审计日志。
 

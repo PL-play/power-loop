@@ -53,11 +53,19 @@
 | `StructuredOutputSpec` | response-format schema | [结构化输出](../user-guide/structured-output.md)、[源码](../../../power_loop/runtime/structured.py) |
 | `MemoryProvider` | `recall` / `remember` 协议 | [记忆](../user-guide/memory.md)、[源码](../../../power_loop/runtime/memory.py) |
 | `LLMProviderConfig` | provider/env 配置 | [Providers](../user-guide/providers.md)、[源码](../../../power_loop/runtime/provider.py) |
-| `DefaultCompactor` | 上下文摘要压缩 | [压缩](../user-guide/compaction.md)、[源码](../../../power_loop/runtime/compact.py) |
-| `HistoryProjector`、`DefaultDeterministicProjector`、`IdentityProjector` | Send 上下文投影协议 + 内置实现(`trigger_ratio` token 折叠);把已结束 send 投影进派生表 `pl_project_messages`(`ProjectMessageRow`);`ToolDefinition.project` 钩子 + `recall_send` 工具取回明细 | [Send 上下文投影](../user-guide/send-context-projection.md)、[源码](../../../power_loop/runtime/history_projector.py) |
+| `FoldStrategy`、`LLMSummaryFold`、`AgenticFold` | `fold_strategy` 轴：fold 协议 + 内置实现(`keep_last_sends`、`trigger_ratio`、async `fold`)；上下文摘要压缩 | [压缩](../user-guide/compaction.md)、[源码](../../../power_loop/runtime/fold.py) |
+| `Representation`、`VerbatimRepresentation`、`ProjectedRepresentation` | `representation` 轴：representation 协议 + 内置实现(逐字默认 / `ProjectedRepresentation(max_chars=...)`);把已结束 send 投影进派生表 `pl_project_messages`(`ProjectMessageRow`);`ToolDefinition.project` 钩子 + `recall_send` 工具取回明细 | [Send 上下文投影](../user-guide/send-context-projection.md)、[源码](../../../power_loop/runtime/representation.py) |
 | `RuntimeEnv`, `runtime_env_context` | 每次调用的 workspace/home/skills 与 shell backend | [工具](../user-guide/tools.md)、[源码](../../../power_loop/runtime/env.py) |
 | `ShellBackend`, `LocalShellBackend` | 持久 shell 启动方式与执行目标标识 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/runtime/exec_backend.py) |
 | `PowerLoopError` 及子类 | 通用异常层级；每个子类带稳定的点分 `code`（类属性）—— 按 `exc.code` 分支，而非类身份 | [错误码](#错误码), [源码](../../../power_loop/contracts/errors.py) |
+
+> **3.0 重命名。** 3.0 之前的名字 `HistoryProjector` / `IdentityProjector` /
+> `DefaultDeterministicProjector`（投影）和 `Compactor` / `DefaultCompactor` /
+> `AgenticMemoryCompactor`（压缩）已**从 `power_loop.__all__` 移除**，取而代之的是
+> `Representation` × `FoldStrategy` 两轴模型。旧的 `compactor=` / `history_projector=`
+> 构造参数仍可用（映射到 `fold_strategy=` / `representation=`，带 `DeprecationWarning`）；
+> 旧类仅可通过深层 import 导入。见
+> [压缩](../user-guide/compaction.md) 与 [Send 上下文投影](../user-guide/send-context-projection.md)。
 
 ## LLM 契约
 
