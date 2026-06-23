@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+## [3.0.2] — 2026-06-23
+
+### Docs (no code/API change)
+
+- Refreshed README (en + zh), the user guide, and examples for the 3.0 two-axis context model:
+  `representation` (`VerbatimRepresentation` / `ProjectedRepresentation`) × `fold_strategy`
+  (`LLMSummaryFold` / `AgenticFold`) presented as the primary, orthogonal API. Removed the
+  now-incorrect "projection and compaction are mutually exclusive" claim and the removed
+  deterministic-fold / `max_compact_chars` material; documented the `Representation` / `FoldStrategy`
+  protocols, `recall_send` `#N` tags, and `migrate_history_on_switch`, with legacy/deprecated notes
+  for the 2.x `compactor=` / `history_projector=` kwargs. Corrected stale facts (example count, LOC,
+  test counts). No runtime behavior change from 3.0.1.
+
 ## [3.0.1] — 2026-06-22
 
 > Bug-fix release from a deep adversarial review (16 confirmed findings; see `BUG_REVIEW_3.0.md`).
