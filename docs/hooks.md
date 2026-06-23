@@ -24,6 +24,7 @@ event 只读、用于观测；hook 可以改 messages、改 LLM 请求、改工�
   - [3.8 Message](#38-message)
   - [3.9 Memory](#39-memory)
 - [4. 注册 hook](#4-注册-hook)
+  - [4.1 命名 hook 与内置 hook](#41-命名-hook-与内置-hook)
 - [5. 常见模式](#5-常见模式)
 
 ---
@@ -134,6 +135,7 @@ LLM 请求构造完毕、调用前触发。**最常用的 hook**——改请求�
 | `tools` | `list[dict] \| None` | OpenAI tool schemas，可改 |
 | `max_tokens` | `int` | 可改 |
 | `temperature` | `float` | 可改 |
+| `session_id` | `str \| None` | 当前会话 id（可据此分会话决策） |
 | `output` | `LLMResponse \| None` | SHORT_CIRCUIT 时必须填 |
 
 **支持的 directive**：
@@ -345,6 +347,44 @@ loop = StatefulAgentLoop(llm=..., db_path="...", hooks=hooks, ...)
 ```
 
 支持 `def` 和 `async def`；pipeline 自动判断并 await。
+
+### 4.1 命名 hook 与内置 hook
+
+`register()` 还接受可选的 `name=`（稳定标识）和 `replace=`（两者同时设置时，先删掉该 hook
+点上同名旧条目，再注册）。围绕它有三个便捷方法：
+
+- `replace(point, handler, *, name)` —— 替换（或新增）该 hook 点上的同名条目。
+- `remove(name[, point])` —— 按名移除条目；不带 `point` 时移除所有 hook 点上的同名条目，
+  返回移除数量。
+- `has(name[, point])` —— 该名字是否已注册，返回 `bool`。
+
+```python
+hooks.register(HookPoint.LLM_BEFORE, h, name="my.cache")   # 命名条目
+hooks.replace(HookPoint.LLM_BEFORE, h2, name="my.cache")   # 替换（或新增）
+hooks.remove("my.cache")                                   # 按名移除（所有 hook 点）
+hooks.has("my.cache", HookPoint.LLM_BEFORE)                # -> bool
+```
+
+**内置 hook（`builtin.*`）。** power-loop 自带的 hook 会由循环以保留的 `builtin.*` 命名
+**自动注册**。例如只要设置了 `AgentLoopConfig.memory`，`MemoryRecallHook` 就会以
+`MemoryRecallHook.NAME == "builtin.memory_recall"` 注册到 `HookPoint.LLM_BEFORE`。业务方
+可以按名接管或关闭它：
+
+```python
+from power_loop.runtime.memory import MemoryRecallHook
+
+# 用自己的记忆注入 handler 替换
+hooks.replace(HookPoint.LLM_BEFORE, my_handler, name=MemoryRecallHook.NAME)
+
+# 或者整个禁用（比如自己注入记忆）
+hooks.remove(MemoryRecallHook.NAME)
+```
+
+也可以在构造循环**之前**就用该名字**预注册**——循环不会覆盖已经以 `builtin.*` 名字存在的
+条目。（`AgentLoopConfig.builtin_memory_hook=False` 是关掉记忆 hook 的专用开关。）
+
+`LlmBeforeCtx` 带有 `session_id`，因此 `llm.before` handler（无论内置还是自定义）都能按会话
+区分行为。
 
 ## 5. 常见模式
 

@@ -44,6 +44,8 @@ config = AgentLoopConfig(
 
 默认值（不设 `fold_strategy`）即 `LLMSummaryFold()` —— 压缩开箱即开。若想改用一个专门的、记忆感知的折叠，请用 `AgenticFold`（见[下文](#记忆感知的-agentic-折叠)）。
 
+> **为尾部记忆预留余量。** 开了[记忆召回](memory.md)时，召回块会被*瞬态地*注入到每次请求的**尾部**，且**不**在 `self.history` 里，因此折叠触发判定看不到它。为把 `history + memory` 控制在模型窗口内，折叠阈值瞄准 `config.effective_context_budget()`——即设了 `memory` 时的 `max_tokens − memory_budget_tokens`——好让折叠提前触发，给尾部块留出空间。
+
 > **遗留（已弃用）。** `AgentLoopConfig(compactor=DefaultCompactor(...))` 和 `compactor=None`（不压缩）仍然可用 —— 它们会映射到 `fold_strategy` 并发出 `DeprecationWarning`。新轴上没有公开的「永不折叠」开关；若你确实想要不压缩，暂时保留遗留的 `compactor=None`（仅逐字）。
 
 ### 绝对阈值
@@ -123,6 +125,23 @@ config = AgentLoopConfig(
 - **默认行为不变** —— 这是可选项；默认仍是 `LLMSummaryFold`（单次调用）。
 - **安全**：该循环是扁平、有界的工具循环（不是嵌套的 `StatefulAgentLoop`），绝不会递归进另一次折叠。note 写入被捕获为 `note_ops`，在 compact 提交后应用。**任何**失败（无工具支持、输出畸形、异常）都**回退到单次摘要**——绝不阻塞折叠。
 - **成本**：每次折叠会做多次 LLM 调用（抽取 + 摘要）而非一次，这是换取更丰富记忆的代价。用 `summary_llm=` 可让折叠走更便宜的模型。
+
+## Microcompact（把旧的大体积工具输出溢写到磁盘）
+
+**Microcompact** 是一种独立、廉价、**无 LLM** 的机制，与上文的折叠不同。它每轮把**旧的、超大体积的工具输出**（早于热尾的部分）替换成一个简短的磁盘指针——文件写到磁盘，消息内容变为 `[tool output saved to <路径>, <工具>, <n> chars]`。它**逐字**裁剪工作上下文 token（不摘要），且只适用于**逐字模式**（投影模式从投影 store 渲染已结束的 send）。
+
+**自 3.1.0 起它是可选项 —— 默认关闭。** 它只在那些旧输出再也不会被用到时才有帮助；否则这个指针只是换来后续的一次重读。投影模式、折叠、以及厂商的前缀缓存已覆盖大部分上下文预算需求。对于读了很多大文件、却极少回看旧文件的长逐字会话，可以开启它。
+
+它通过 `AgentLoopConfig` 配置（此前仅环境变量 —— 下面的环境变量仍作为兜底默认值，但配置字段优先）：
+
+```python
+config = AgentLoopConfig(
+    microcompact_enabled=True,    # 默认 False —— 显式开启
+    microcompact_size_limit=1000, # 溢写超过此长度（字符）的工具输出；环境变量 CONTEXT_MICRO_SIZE_LIMIT
+    microcompact_hot_tail=10,     # 保留最近 N 个大体积工具输出为热；环境变量 CONTEXT_MICRO_HOT_TAIL
+    microcompact_spill_dir=None,  # 指针对应的文件写到哪里；None → 运行时 home 的 .cache
+)
+```
 
 ## 事件
 

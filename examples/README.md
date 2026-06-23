@@ -34,7 +34,7 @@ A representative subset is validated by `tests/real/test_examples.py` against a 
 | 21 | [`request_user_input.py`](21_request_user_input.py) | Resumable human input | `request_user_input`, `submit_input()` |
 | 22 | [`follow_up_steering.py`](22_follow_up_steering.py) | In-flight steering | `follow_up()`, `FollowUpQueued`, `<follow_up>` |
 | 23 | [`23_per_send_overrides.py`](23_per_send_overrides.py) | Per-call tool/prompt overrides | `send(tools=, system_prompt=)`, `ToolRegistry.subset` |
-| 24 | [`24_agent_notes.py`](24_agent_notes.py) | Agent-authored notes | `note_add/update/delete`, `SQLiteNoteMemory`, `NotesPolicy` |
+| 24 | [`24_agent_notes.py`](24_agent_notes.py) | Agent-authored notes | `note_add/update/delete`, `NoteMemory`, `NotesPolicy` |
 | 25 | [`25_token_usage.py`](25_token_usage.py) | Token usage accounting | `result.usage`, `get_session_stats`, `max_tokens_per_run`, `usage_updated` |
 | 26 | [`26_timers.py`](26_timers.py) | Durable timers / self wake-ups | `schedule_wakeup`, `TimerRunner`, `HookPoint.TIMER_FIRE` |
 | 27 | [`27_dynamic_workflow.py`](27_dynamic_workflow.py) | Declarative multi-agent workflow | `power_loop.workflow`, `WorkflowSpec`, `create_workflow`, `register_workflow_tools` |
@@ -53,6 +53,7 @@ A representative subset is validated by `tests/real/test_examples.py` against a 
 | 40 | [`40_send_context_projection.py`](40_send_context_projection.py) | **Context axes (3.0)**: `ProjectedRepresentation` × `LLMSummaryFold` — feed finished sends as plain text (`pl_project_messages`) instead of verbatim history; fold + `recall_send` | `AgentLoopConfig(representation=, fold_strategy=)`, `ProjectedRepresentation`, `LLMSummaryFold`, `recall_send` |
 | 41 | [`41_custom_async_tool.py`](41_custom_async_tool.py) | **Custom async-wake tool**: start async work, return immediately, wake the agent when done — the extension recipe | `ToolDefinition`, `get_tool_runtime_context`, `loop.schedule_timer`, `TimerRunner`, `follow_up` |
 | 42 | [`42_build_your_own_tools.py`](42_build_your_own_tools.py) | **Build your own**: recreate the built-ins (background / sub-agent / timer / human-input / blackboard / memory / mini-workflow) from public primitives | `run_agent_spec`, `HumanInputRequired`, `RuntimeProjector`, `MemoryProvider`, `get/set_runtime_state`, `add_note` |
+| 43 | [`43_memory_hook_override.py`](43_memory_hook_override.py) | **Memory hook**: the auto-registered built-in `MemoryRecallHook` (ephemeral tail injection) — and how to disable or override it by name | `MemoryRecallHook`, `NoteMemory`, `hooks.remove`/`replace`/`has` |
 
 ## Running
 

@@ -31,6 +31,12 @@ config = AgentLoopConfig(
 | `retry_policy` | `LLMRetryPolicy \| None` | `None` | Retry on transient LLM errors |
 | `memory` | `MemoryProvider \| None` | `None` | Cross-session memory provider |
 | `memory_budget_tokens` | `int` | `1500` | Token budget passed to `memory.recall()` |
+| `memory_position` | `str` | `"tail"` | Where the built-in hook injects recalled memory: `"tail"` (after history; keeps the prior-history prefix byte-stable and prefix-cacheable) or `"front"` (legacy; after leading system messages) |
+| `builtin_memory_hook` | `bool` | `True` | Auto-register the built-in `MemoryRecallHook` when `memory` is set; `False` to inject memory yourself via an `LLM_BEFORE` hook |
+| `microcompact_enabled` | `bool` | `False` | Opt in to microcompact: spill OLD oversized tool outputs to disk + leave a short pointer (verbatim mode only; orthogonal to the LLM-summary fold) |
+| `microcompact_size_limit` | `int` | `1000` | Byte size above which an old tool output is spilled (env `CONTEXT_MICRO_SIZE_LIMIT`) |
+| `microcompact_hot_tail` | `int` | `10` | Number of most-recent rounds kept verbatim, never spilled (env `CONTEXT_MICRO_HOT_TAIL`) |
+| `microcompact_spill_dir` | `str \| None` | `None` | Directory for spilled outputs; `None` → the runtime home's `.cache` |
 
 ## Environment Variables
 

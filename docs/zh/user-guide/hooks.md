@@ -43,6 +43,42 @@ loop = StatefulAgentLoop(llm=llm, hooks=hooks, config=config)
 | `message.append` | 消息存储前 | PII 脱敏，metadata 注入 |
 | `memory.recalled` | 记忆召回后 | 过滤/脱敏记忆；`SKIP` 丢弃整批 |
 
+## 命名 hook：register / replace / remove / has
+
+`register()` 接受可选的 `name=`（一个稳定标识）和 `replace=`（两者同时设置时，会先删掉
+该 hook 点上同名的旧条目）。便捷方法都基于它：
+
+```python
+hooks.register(HookPoint.LLM_BEFORE, h, name="my.cache")   # 命名条目
+hooks.replace(HookPoint.LLM_BEFORE, h2, name="my.cache")   # 替换（或新增）该命名条目
+hooks.remove("my.cache")                                   # 按名移除（所有 hook 点）
+hooks.remove("my.cache", HookPoint.LLM_BEFORE)             # 限定单个 hook 点
+hooks.has("my.cache")                                      # -> bool
+```
+
+## 内置 hook（`builtin.*`）与覆盖方式
+
+power-loop 自带的 hook 会由循环以保留的 `builtin.*` 命名**自动注册**。例如只要设置了
+`AgentLoopConfig.memory`，`MemoryRecallHook` 就会以 `MemoryRecallHook.NAME ==
+"builtin.memory_recall"` 注册到 `HookPoint.LLM_BEFORE`。业务方可以按名接管或关闭某个内置
+hook：
+
+```python
+from power_loop.runtime.memory import MemoryRecallHook
+
+# 用你自己的记忆注入 handler 替换
+hooks.replace(HookPoint.LLM_BEFORE, my_handler, name=MemoryRecallHook.NAME)
+
+# 或者整个禁用（比如你想自己注入记忆）
+hooks.remove(MemoryRecallHook.NAME)
+```
+
+也可以在构造循环**之前**就用该名字**预注册**——循环不会覆盖已经以 `builtin.*` 名字存在的
+条目。（`AgentLoopConfig.builtin_memory_hook=False` 是关掉记忆 hook 的专用开关。）
+
+`LlmBeforeCtx` 带有 `session_id`，因此 `llm.before` handler——无论内置还是自定义——都能按
+会话区分行为。
+
 ## Hook vs Event
 
 | | Hook | Event |

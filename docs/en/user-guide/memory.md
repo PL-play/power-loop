@@ -9,18 +9,22 @@
 ```mermaid
 flowchart TD
     A[send user_input] --> B[session.start]
-    B --> C{memory configured?}
-    C -->|No| G[Round loop]
-    C -->|Yes| D[memory.recall]
-    D --> E[tag_as_memory then system region]
+    B --> G[Round loop]
+    G --> P[LLM_BEFORE: MemoryRecallHook]
+    P --> D[memory.recall once per send]
+    D --> E[tag_as_memory]
     E --> F[MEMORY_RECALLED hook]
-    F --> G
+    F --> Q[append at request tail ephemerally]
+    Q --> R[LLM call]
+    R --> G
     G --> H[session.end]
     H --> I[memory.remember]
 ```
 
-1. **Recall** — at `session.start`, before the first round. Recalled messages are injected after the leading `role=system` block (same region as `compact_note`, so the compactor preserves them).
+1. **Recall** — runs in the built-in **`MemoryRecallHook`** at `HookPoint.LLM_BEFORE`. The recalled block is computed **once per send** (memoized on the first round / session change) and appended **ephemerally** to the per-call message list. It never enters `self.history` or the store — it is re-appended each round and gone after the run.
 2. **Remember** — at `session.end`. Receives a `MemorySnapshot` with the full final history, final text, status, and round count.
+
+The hook is **auto-registered** when `AgentLoopConfig.memory` is set. Set `builtin_memory_hook=False` to inject memory yourself instead (see [Built-in Hook & Overriding](#built-in-hook--overriding)).
 
 ## Quick Start
 
@@ -54,19 +58,23 @@ Passed to `remember()` at session end:
 
 ## Injection Position
 
-Recalled messages are tagged `role=system, name=memory_*` and inserted **after** the leading system block (which includes the `system_prompt` and any `compact_note`):
+Recalled messages are tagged `role=system, name=memory_*` and, by default (`memory_position="tail"`), appended at the **tail** of the per-call request — after the whole prior history:
 
 ```
 [system_prompt]          ← from AgentLoopConfig
 [compact_note]           ← from compactor (if any)
-[memory_0]               ← from recall
-[memory_1]               ← from recall
 [user msg 1]             ← conversation begins here
 [assistant msg 1]
 ...
+[memory_0]               ← from recall (ephemeral, request tail)
+[memory_1]               ← from recall
 ```
 
-This position means memory messages share the compactor's system-region protection — they are never folded.
+The tail position keeps the **prior-history prefix byte-identical across sends** even as recalled memory changes, so the provider's prefix cache stays warm. Because the block is appended only to the per-call message list (never `self.history` / the store), it is invisible to compaction and reset each round — there is no system-region folding concern.
+
+Set `memory_position="front"` to restore the legacy position (after the leading system block, before the conversation). This breaks prefix caching whenever recalled memory changes, so `"tail"` is preferred.
+
+To keep `history + memory` inside the model window, the fold/compaction trigger reserves headroom for the tail memory via `config.effective_context_budget()` — `max_tokens − memory_budget_tokens` when `memory` is set — so folding fires early enough.
 
 ## Failure Model
 
@@ -93,6 +101,37 @@ async def gate_memory(ctx: MemoryRecalledCtx) -> None:
 
 hooks.register(HookPoint.MEMORY_RECALLED, gate_memory)
 ```
+
+## Built-in Hook & Overriding
+
+Recall is implemented by the built-in `MemoryRecallHook` (an `LLM_BEFORE` hook) and registered under the stable name `MemoryRecallHook.NAME == "builtin.memory_recall"`. The `LlmBeforeCtx` passed to `LLM_BEFORE` hooks carries `session_id`.
+
+A host can take over injection without disabling memory:
+
+```python
+from power_loop import MemoryRecallHook
+from power_loop.contracts.hooks import HookPoint
+
+# Override: replace the built-in with your own LLM_BEFORE handler
+hooks.replace(HookPoint.LLM_BEFORE, my_handler, name=MemoryRecallHook.NAME)
+
+# Disable: drop it entirely (recall won't run)
+hooks.remove(MemoryRecallHook.NAME)
+```
+
+Pre-registering a handler under that name before constructing the loop also works — the loop won't clobber an entry that already exists under `MemoryRecallHook.NAME`. Alternatively set `builtin_memory_hook=False` on `AgentLoopConfig` to suppress auto-registration entirely and wire your own `LLM_BEFORE` injection.
+
+## Session Notes: NoteMemory
+
+`NoteMemory` is the built-in `MemoryProvider` that recalls the session's **own notes** (written by the agent's note tools). It is backend-agnostic — it reads from whatever `SessionStore` you configured (SQLite / Postgres / MySQL):
+
+```python
+from power_loop import NoteMemory, AgentLoopConfig
+
+config = AgentLoopConfig(memory=NoteMemory(store))
+```
+
+> `NoteMemory` was previously named `SQLiteNoteMemory`; that name is kept as a back-compat alias, so existing `from power_loop import SQLiteNoteMemory` imports keep working.
 
 ## Example: SQLite Fact Memory
 

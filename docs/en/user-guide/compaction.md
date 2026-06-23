@@ -45,6 +45,12 @@ config = AgentLoopConfig(
 The default (`fold_strategy` unset) is `LLMSummaryFold()` — compaction is on out of the box. To run a
 dedicated, memory-aware fold instead, use `AgenticFold` (see [below](#agentic-memory-aware-fold)).
 
+> **Headroom for tail memory.** When [memory recall](memory.md) is on, the recalled block is injected
+> *ephemerally* at the per-call **tail** and is **not** in `self.history`, so the fold trigger can't see
+> it. To keep `history + memory` inside the model window, the fold threshold targets
+> `config.effective_context_budget()` — i.e. `max_tokens − memory_budget_tokens` when `memory` is set —
+> so folding fires early enough to leave room for the tail block.
+
 > **Legacy (deprecated).** `AgentLoopConfig(compactor=DefaultCompactor(...))` and `compactor=None` (no
 > compaction) still work — they map onto `fold_strategy` and emit a `DeprecationWarning`. There is no
 > public "never fold" on the new axis; if you genuinely want no compaction, keep the legacy
@@ -142,6 +148,31 @@ config = AgentLoopConfig(
 - **Default behavior is unchanged** — this is opt-in; the default stays `LLMSummaryFold` (single call).
 - **Safe**: the loop is a flat, bounded tool-use loop (not a nested `StatefulAgentLoop`), so it can never recurse into another fold. The note writes are captured as `note_ops` and applied after the compact commits. On **any** failure (no tool support, malformed output, exception) it **falls back to the single-call summary** — it never blocks a fold.
 - **Cost**: it makes several LLM calls per fold (extract + summarize) instead of one — the trade for richer memory. Pass `summary_llm=` to point the fold at a cheaper model.
+
+## Microcompact (spill old large tool outputs)
+
+**Microcompact** is a separate, cheap, **no-LLM** mechanism distinct from the fold above. Each round it
+replaces **OLD oversized tool outputs** (older than a hot tail) with a short on-disk pointer — the file is
+written to disk and the message content becomes `[tool output saved to <path>, <tool>, <n> chars]`. It
+trims working-context tokens **verbatim** (no summarization), and applies to **verbatim mode only**
+(projection renders finished sends from the projection store).
+
+**As of 3.1.0 it is opt-in — default OFF.** It only helps when those old outputs are never needed again;
+otherwise the pointer just trades for a later re-read. Projection mode, the fold, and provider
+prefix-caching already cover most context-budget needs. Turn it on for long verbatim sessions that read
+many large files and rarely revisit the old ones.
+
+It is configured via `AgentLoopConfig` (previously env-only — the env vars below remain as fallback
+defaults, but the config fields take precedence):
+
+```python
+config = AgentLoopConfig(
+    microcompact_enabled=True,    # default False — opt in
+    microcompact_size_limit=1000, # spill tool outputs longer than this (chars); env CONTEXT_MICRO_SIZE_LIMIT
+    microcompact_hot_tail=10,     # keep the most recent N large tool outputs hot; env CONTEXT_MICRO_HOT_TAIL
+    microcompact_spill_dir=None,  # where pointers' files are written; None → the runtime home's .cache
+)
+```
 
 ## Events
 

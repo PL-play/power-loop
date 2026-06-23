@@ -31,6 +31,12 @@ config = AgentLoopConfig(
 | `retry_policy` | `LLMRetryPolicy \| None` | `None` | LLM 瞬时错误重试 |
 | `memory` | `MemoryProvider \| None` | `None` | 跨会话记忆 provider |
 | `memory_budget_tokens` | `int` | `1500` | 传给 `memory.recall()` 的 token 预算 |
+| `memory_position` | `str` | `"tail"` | 内置 hook 把召回的记忆注入到何处：`"tail"`（历史之后；保持先前历史前缀逐字节稳定、可做前缀缓存）或 `"front"`（旧位置；置于前导 system 消息之后） |
+| `builtin_memory_hook` | `bool` | `True` | 设置了 `memory` 时自动注册内置 `MemoryRecallHook`；设为 `False` 则由你自己通过 `LLM_BEFORE` hook 注入记忆 |
+| `microcompact_enabled` | `bool` | `False` | 启用 microcompact：把较旧的超大工具输出溢写到磁盘 + 留一个简短指针（仅逐字模式；与 LLM 摘要折叠正交） |
+| `microcompact_size_limit` | `int` | `1000` | 超过此字节数的旧工具输出会被溢写（环境变量 `CONTEXT_MICRO_SIZE_LIMIT`） |
+| `microcompact_hot_tail` | `int` | `10` | 最近多少轮保持逐字、绝不溢写（环境变量 `CONTEXT_MICRO_HOT_TAIL`） |
+| `microcompact_spill_dir` | `str \| None` | `None` | 溢写输出的目录；`None` → 运行时 home 的 `.cache` |
 
 ## 环境变量
 

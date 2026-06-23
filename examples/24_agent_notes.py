@@ -4,7 +4,7 @@ What you learn / 你将学到
 --------------------------
 - ``note_add`` / ``note_update`` / ``note_delete`` 默认工具：模型自己决定记什么
   / default tools — the model decides what to remember
-- ``SQLiteNoteMemory``：把笔记作为 system 消息在每次 send 注入
+- ``NoteMemory``：把笔记作为 system 消息在每次 send 注入
   / a MemoryProvider that injects the session's notes every send
 - ``NotesPolicy``：容量上限、单条长度、注入预算；默认 **reject**（满了必须先删/合并），
   可选 ``eviction="fifo"`` / capacity bounds; default **reject** when full, optional fifo
@@ -14,7 +14,7 @@ What you learn / 你将学到
 和 MemoryProvider 的关系 / Relationship to MemoryProvider
 ---------------------------------------------------------
 ``MemoryProvider`` 是被动记忆（边界自动 recall/remember）；笔记是**自主记忆**——
-模型在对话中途用工具增删改，``SQLiteNoteMemory.recall()`` 只负责"让模型每轮都看到
+模型在对话中途用工具增删改，``NoteMemory.recall()`` 只负责"让模型每轮都看到
 自己的笔记"，``remember()`` 是 no-op（写入早已实时发生）。
 
 Run / 运行
@@ -32,7 +32,7 @@ from _helpers import make_llm
 from power_loop import (
     AgentLoopConfig,
     NotesPolicy,
-    SQLiteNoteMemory,
+    NoteMemory,
     StatefulAgentLoop,
     create_default_tool_registry,
 )
@@ -49,7 +49,7 @@ async def main() -> None:
             store=store,  # 关键：provider 和 loop 共享同一个 store
             config=AgentLoopConfig(
                 system_prompt="You are a helpful assistant with persistent notes.",
-                memory=SQLiteNoteMemory(store, policy=policy),
+                memory=NoteMemory(store, policy=policy),
                 notes_policy=policy,
             ),
             tool_registry=create_default_tool_registry(

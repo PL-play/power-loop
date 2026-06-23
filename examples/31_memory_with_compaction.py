@@ -2,21 +2,23 @@
 
 What you learn / 你将学到
 --------------------------
-- 召回的 ``memory_*`` 消息注入在 system 区，**天然躲过压缩折叠**；同一会话里
-  长历史照常触发 ``DefaultCompactor``，两者互不干扰。
-  / recalled ``memory_*`` messages live in the system region and are NOT folded;
-  a long history still triggers ``DefaultCompactor`` in the same session — the two
-  coexist cleanly.
+- 召回由内置的 ``MemoryRecallHook``（``LLM_BEFORE`` hook）完成：把召回的 ``memory_*``
+  消息**临时拼到请求末尾**（不进 ``self.history``、不落库），**天然躲过压缩折叠**；
+  同一会话里长历史照常触发 ``DefaultCompactor``，两者互不干扰。
+  / recall is done by the built-in ``MemoryRecallHook`` (an ``LLM_BEFORE`` hook): it
+  appends the recalled ``memory_*`` messages EPHEMERALLY at the request TAIL (never
+  into ``self.history`` or the store), so they are NOT folded; a long history still
+  triggers ``DefaultCompactor`` in the same session — the two coexist cleanly.
 - 召回的记忆**永不落库**（MemoryProvider 自己拥有它），所以 store 里不会出现
   ``name=memory_*`` 的行；而压缩会精确地把**真实对话行**标 ``compacted_out``。
   / recalled memory is NEVER persisted (the provider owns it), so the store has no
   ``name=memory_*`` rows; compaction marks exactly the REAL conversation rows
   ``compacted_out``.
-- 这正是 C1 修复要守住的不变量：召回在 history 前端插入消息后，sink 的
-  index↔seq 映射必须保持对齐，否则压缩会把**错误的行**标记 compacted_out。
-  / this is the invariant the C1 fix guards: after recall splices messages at the
-  front of history, the sink's index↔seq map must stay aligned, or compaction marks
-  the WRONG rows compacted_out.
+- 因为记忆从不进入 history，压缩只看真实持久行——无需任何 index↔seq 对齐补偿
+  （3.1 起，旧的前端插入 + ``on_messages_inserted`` 路径已移除）。
+  / because memory never enters history, compaction sees only real persisted rows —
+  no index↔seq realignment needed (3.1 removed the old front-splice +
+  ``on_messages_inserted`` path).
 
 Run / 运行
 ----------

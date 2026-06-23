@@ -128,6 +128,44 @@ loop = StatefulAgentLoop(llm=llm, hooks=hooks, ...)
 
 Handlers run in registration order. If any handler sets a non-`CONTINUE` directive, subsequent handlers for the same hook point are **not** executed.
 
+### Named hooks: register / replace / remove / has
+
+`register()` takes an optional `name=` (a stable identity) and `replace=` (when both are
+set, any existing entry of the same name at that point is dropped first). The convenience
+methods build on it:
+
+```python
+hooks.register(HookPoint.LLM_BEFORE, h, name="my.cache")   # named entry
+hooks.replace(HookPoint.LLM_BEFORE, h2, name="my.cache")   # replace (or add) the named entry
+hooks.remove("my.cache")                                   # remove by name (all points)
+hooks.remove("my.cache", HookPoint.LLM_BEFORE)             # scoped to one point
+hooks.has("my.cache")                                      # -> bool
+```
+
+### Built-in hooks (`builtin.*`) and overriding them
+
+power-loop ships hooks that are **auto-registered** by the loop under reserved `builtin.*`
+names. For example, `MemoryRecallHook` registers at `HookPoint.LLM_BEFORE` under
+`MemoryRecallHook.NAME == "builtin.memory_recall"` whenever `AgentLoopConfig.memory` is set.
+A host can take over or turn off a built-in hook by its name:
+
+```python
+from power_loop.runtime.memory import MemoryRecallHook
+
+# Replace with your own memory-injection handler
+hooks.replace(HookPoint.LLM_BEFORE, my_handler, name=MemoryRecallHook.NAME)
+
+# Or disable it entirely (e.g. you inject memory yourself)
+hooks.remove(MemoryRecallHook.NAME)
+```
+
+You can also **pre-register** under the name before constructing the loop — the loop won't
+clobber an entry that already exists under a `builtin.*` name. (Setting
+`AgentLoopConfig.builtin_memory_hook=False` is the dedicated switch for the memory hook.)
+
+`LlmBeforeCtx` carries `session_id`, so an `llm.before` handler — built-in or your own —
+can key behavior on the session.
+
 ## Hook vs Event
 
 | | Hook | Event |

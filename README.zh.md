@@ -88,7 +88,7 @@ pip install 'power-loop[openai]'      # 或 [anthropic] · 要那两个后端就
 | **MCP 工具** | 把 Model Context Protocol server 的工具接成 power-loop 工具 | [扩展](docs/zh/user-guide/extending-tools.md) |
 | **Hooks & 事件** | 在每个生命周期点否决/观测;强类型事件 payload | [Hooks](docs/zh/user-guide/hooks.md) · [Events](docs/zh/user-guide/events.md) |
 | **结构化输出** | `output_schema` → provider `response_format` → 解析并校验 | [结构化](docs/zh/user-guide/structured-output.md) |
-| **可插拔记忆** | 通过 `MemoryProvider` Protocol 做跨会话召回 | [记忆](docs/zh/user-guide/memory.md) |
+| **可插拔记忆** | 通过 `MemoryProvider` Protocol 做跨会话召回；默认开启的内置 hook 在请求尾部临时注入(可做前缀缓存) | [记忆](docs/zh/user-guide/memory.md) |
 | **重试/取消/预算** | Provider 感知的重试、统一取消令牌、硬性每运行 token 上限 | [重试与取消](docs/zh/user-guide/retry-cancel.md) |
 | **稳定错误码** | 每个 `PowerLoopError` 带冻结的机器可读 `code`——按 `exc.code` 分支 | [API:错误码](docs/zh/api/index.md#错误码) |
 | **崩溃恢复** | `heal_pending` / `resume` / `abort_pending` 处理工具调用中途被杀的运行 | [Pending 恢复](docs/zh/user-guide/sessions.md) |
