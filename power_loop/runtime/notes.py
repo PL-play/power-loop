@@ -9,10 +9,11 @@ Complements :mod:`power_loop.runtime.memory`:
   ``note_delete`` default tools, persisted in the session store's ``notes``
   table.
 
-The two meet in :class:`SQLiteNoteMemory`: a ``MemoryProvider`` whose
-``recall()`` renders the session's notes into one system message injected at
-every send (so the model always sees its own notes), and whose ``remember()``
-is a no-op (writes already happened through the tools, in real time).
+The two meet in :class:`NoteMemory` (formerly ``SQLiteNoteMemory``; alias kept):
+a ``MemoryProvider`` whose ``recall()`` renders the session's notes into one
+system message injected at every send (so the model always sees its own notes),
+and whose ``remember()`` is a no-op (writes already happened through the tools,
+in real time).
 
 Capacity model
 --------------
@@ -159,15 +160,19 @@ def render_notes(notes: list[NoteRow], *, policy: NotesPolicy = DEFAULT_NOTES_PO
     return "\n".join(lines)
 
 
-class SQLiteNoteMemory:
+class NoteMemory:
     """``MemoryProvider`` that injects the session's own notes every send.
+
+    Backend-agnostic: it reads notes from whatever :class:`SessionStore` the
+    loop uses (SQLite / Postgres / MySQL — the store owns the ``*notes`` table),
+    so the name carries no storage implication.
 
     ``remember()`` is a no-op: the notes table is mutated in real time by the
     note tools, so there is nothing to persist at session end.
 
     Pass the **same** :class:`SessionStore` the loop uses (or rely on the loop
     sharing its store): ``StatefulAgentLoop(store=store,
-    config=AgentLoopConfig(memory=SQLiteNoteMemory(store)))``.
+    config=AgentLoopConfig(memory=NoteMemory(store)))``.
     """
 
     def __init__(
@@ -198,3 +203,9 @@ class SQLiteNoteMemory:
         session_id: str | None = None,
     ) -> None:
         return None
+
+
+# Backwards-compatible alias. The class was misleadingly named after SQLite even
+# though it is backend-agnostic (it reads from whatever SessionStore is passed).
+# Kept so existing imports (`from power_loop import SQLiteNoteMemory`) keep working.
+SQLiteNoteMemory = NoteMemory

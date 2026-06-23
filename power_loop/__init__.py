@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "3.0.2"
+__version__ = "3.1.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -154,9 +154,15 @@ from power_loop.runtime.fold import (
     NoteOp,
 )
 from power_loop.runtime.human_input import HumanInputRequired, request_user_input
-from power_loop.runtime.memory import MemoryProvider, MemorySnapshot, tag_as_memory
+from power_loop.runtime.memory import (
+    MemoryProvider,
+    MemoryRecallHook,
+    MemorySnapshot,
+    tag_as_memory,
+)
 from power_loop.runtime.notes import (
     DEFAULT_NOTES_POLICY,
+    NoteMemory,
     NotesFullError,
     NotesPolicy,
     SQLiteNoteMemory,
@@ -361,10 +367,12 @@ __all__ = [
 	"LlmDegradedPayload",
 	"LoopCancelledPayload",
 	"MemoryProvider",
+	"MemoryRecallHook",
 	"MemorySnapshot",
 	"tag_as_memory",
 	"NotesPolicy",
 	"NotesFullError",
+	"NoteMemory",
 	"SQLiteNoteMemory",
 	"DEFAULT_NOTES_POLICY",
 	"render_notes",

@@ -122,7 +122,9 @@ class LlmBeforeCtx(BaseHookCtx):
     """Context for :pyattr:`HookPoint.LLM_BEFORE`.
 
     Directives: SHORT_CIRCUIT (set ``output`` to an ``LLMResponse``), BREAK.
-    Handler may modify any input field.
+    Handler may modify any input field. ``messages`` is the fresh per-call list
+    actually sent to the LLM — mutating it (e.g. appending an ephemeral memory
+    block) never touches the loop's persisted history.
     """
 
     messages: list[LoopMessage] = field(default_factory=list)
@@ -130,6 +132,7 @@ class LlmBeforeCtx(BaseHookCtx):
     tools: list[dict[str, Any]] | None = None
     max_tokens: int = 8000
     temperature: float = 0.0
+    session_id: str | None = None
     # Handler output (for SHORT_CIRCUIT)
     output: LLMResponse | None = None
 

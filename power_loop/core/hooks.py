@@ -26,6 +26,7 @@ Legacy handlers that receive ``HookContext`` and return
 class _HookEntry:
     handler: HookHandlerFn
     order: int
+    name: str | None = None
 
 
 class AgentHooks:
@@ -45,10 +46,57 @@ class AgentHooks:
     def __init__(self) -> None:
         self._handlers: dict[str, list[_HookEntry]] = {}
 
-    def register(self, hook_point: HookPoint | str, handler: HookHandlerFn, *, order: int = 0) -> None:
+    def register(
+        self,
+        hook_point: HookPoint | str,
+        handler: HookHandlerFn,
+        *,
+        order: int = 0,
+        name: str | None = None,
+        replace: bool = False,
+    ) -> None:
+        """Register a handler at ``hook_point``.
+
+        ``name`` gives the entry a stable identity so it can later be
+        :meth:`remove`-d or :meth:`replace`-d — used by built-in hooks
+        (``builtin.*``) so hosts can override them. ``replace=True`` (with a
+        ``name``) drops any existing entry of the same name at this point first,
+        so re-registering is idempotent.
+        """
         key = str(hook_point)
-        self._handlers.setdefault(key, []).append(_HookEntry(handler=handler, order=order))
-        self._handlers[key].sort(key=lambda e: e.order)
+        entries = self._handlers.setdefault(key, [])
+        if name is not None and replace:
+            entries[:] = [e for e in entries if e.name != name]
+        entries.append(_HookEntry(handler=handler, order=order, name=name))
+        entries.sort(key=lambda e: e.order)
+
+    def replace(
+        self, hook_point: HookPoint | str, handler: HookHandlerFn, *, name: str, order: int = 0
+    ) -> None:
+        """Replace (or add) the named handler at ``hook_point``."""
+        self.register(hook_point, handler, order=order, name=name, replace=True)
+
+    def remove(self, name: str, hook_point: HookPoint | str | None = None) -> int:
+        """Remove every entry with ``name`` (optionally scoped to one point).
+
+        Returns the number of entries removed. Used to disable a built-in hook:
+        ``hooks.remove("builtin.memory_recall")``.
+        """
+        keys = [str(hook_point)] if hook_point is not None else list(self._handlers)
+        removed = 0
+        for key in keys:
+            entries = self._handlers.get(key)
+            if not entries:
+                continue
+            before = len(entries)
+            entries[:] = [e for e in entries if e.name != name]
+            removed += before - len(entries)
+        return removed
+
+    def has(self, name: str, hook_point: HookPoint | str | None = None) -> bool:
+        """Whether a named entry is registered (optionally scoped to one point)."""
+        keys = [str(hook_point)] if hook_point is not None else list(self._handlers)
+        return any(e.name == name for key in keys for e in self._handlers.get(key, []))
 
     def clear(self, hook_point: HookPoint | str | None = None) -> None:
         if hook_point is None:

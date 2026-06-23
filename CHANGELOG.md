@@ -8,6 +8,52 @@
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-06-23
+
+### Changed — memory recall is now a built-in, overridable hook (ephemeral tail injection)
+
+Memory recall moved from a hardcoded pipeline step that spliced recalled messages
+into `self.history` at the **front** (index 0) to a **built-in `LLM_BEFORE` hook**
+(`MemoryRecallHook`) that injects them **ephemerally at the request tail** — never
+into `self.history`, the store, or the window cache.
+
+Why: front injection put volatile content (notes change as the agent writes them)
+ahead of all history, so any change invalidated the entire prompt prefix for
+provider prefix-caching. Tail injection keeps `system + prior history` byte-stable
+and prefix-cacheable; only the small memory block + new turn are uncached. It also
+removes the `self.history`↔seq realignment footgun (no more `on_messages_inserted`).
+
+- **Added** `AgentHooks.replace(...)`, `.remove(name)`, `.has(name)`, and `name=` /
+  `replace=` kwargs on `.register(...)` so built-in (`builtin.*`) hooks can be
+  overridden or disabled by hosts.
+- **Added** `MemoryRecallHook` (public) — the built-in recall hook. Auto-registered
+  by `StatefulAgentLoop` when `config.memory` is set (skipped if the host already
+  registered one under `MemoryRecallHook.NAME`, or `config.builtin_memory_hook=False`).
+  Recall runs **once per send** (memoized on the first round; re-injected each round
+  so the within-send tail stays stable) — same cadence as before.
+- **Added** `AgentLoopConfig.memory_position` (`"tail"` default | `"front"`),
+  `AgentLoopConfig.builtin_memory_hook` (default `True`), and
+  `AgentLoopConfig.effective_context_budget()` — the fold/compaction trigger now
+  reserves `memory_budget_tokens` of headroom (the tail memory isn't counted by the
+  fold trigger, so fold a little earlier to keep `history + memory` within budget).
+- **Added** `session_id` to `LlmBeforeCtx`.
+- **Changed (behavior)** default memory injection position is now the **tail** (was
+  the front). Output prompts for hosts using `config.memory` change accordingly.
+- **Renamed** `SQLiteNoteMemory` → `NoteMemory` (it was always backend-agnostic — it
+  reads from whatever `SessionStore` is passed: SQLite / Postgres / MySQL). The old
+  name is kept as a back-compat alias.
+- **Removed** `MessageSink.on_messages_inserted` (Protocol + `NullSink` + `SQLiteSink`):
+  it existed only to realign the index↔seq map after the front `self.history` splice,
+  which no longer happens. **Breaking for external `MessageSink` implementers** (a
+  niche, non-STABLE surface). The `on_compaction` `None`-placeholder handling and
+  `list[int | None]` seq maps are unchanged — still load-bearing for projection mode
+  and corrupt-history repair.
+
+Note: prefix-stability only converts to real cost savings where the transport hits a
+prompt cache. OpenAI-compatible transports auto-cache prefixes (benefits immediately);
+Anthropic requires explicit `cache_control` breakpoints, which power-loop does not yet
+emit — a separate follow-up.
+
 ## [3.0.2] — 2026-06-23
 
 ### Docs (no code/API change)

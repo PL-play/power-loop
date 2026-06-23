@@ -222,13 +222,14 @@ async def test_reload_then_fold_consistent(store: SessionStore) -> None:
     await _assert_consistent(store, sid, sink2)
 
 
-async def test_leading_note_refold_across_memory_placeholders(store: SessionStore) -> None:
+async def test_leading_note_refold_across_none_placeholders(store: SessionStore) -> None:
     """C7 persistence path: after a fold the compact_note leads the active set; on a
-    resumed run, recalled memory_* placeholders are injected AFTER it, and a SECOND
-    fold (with the C7 fix) now starts at index 0 — the leading note. The note's REAL
-    seq is the span's start boundary (never a None), the memory placeholders sit
-    strictly inside the span and are skipped when marking, and exactly ONE active note
-    survives with the in-memory map consistent with the reloaded DB."""
+    resumed run, in-memory-only ``None`` placeholders sit AFTER it (e.g.
+    repair-synthesized rows from align_tool_calls), and a SECOND fold (with the C7
+    fix) now starts at index 0 — the leading note. The note's REAL seq is the span's
+    start boundary (never a None), the placeholders sit strictly inside the span and
+    are skipped when marking, and exactly ONE active note survives with the in-memory
+    map consistent with the reloaded DB."""
     sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
     sink.init_history_seqs([])
@@ -238,8 +239,10 @@ async def test_leading_note_refold_across_memory_placeholders(store: SessionStor
     # simulate a restart: reseed from DB (note lands at index 0 with real seq + ord)
     sink2 = await _reseed_sink(store, sid)
     assert (await store.load_active_messages(sid))[0].name == "compact_note"
-    # _maybe_recall injects memory_* AFTER leading system rows → placeholders at index 1
-    sink2.on_messages_inserted(index=1, count=2)
+    # synthesized None placeholders sitting AFTER the leading note (repair path).
+    # on_messages_inserted is gone, so splice them into the maps directly (white-box).
+    sink2._history_seqs[1:1] = [None, None]
+    sink2._history_ord[1:1] = [None, None]
     await _append(sink2, 4, start_round=10)  # cold turns + a kept tail
 
     # fold from index 0 (the leading note) ACROSS the memory placeholders + cold turns
@@ -254,14 +257,18 @@ async def test_leading_note_refold_across_memory_placeholders(store: SessionStor
 
 
 async def test_fold_over_only_placeholders_keeps_maps_aligned(store: SessionStore) -> None:
-    """A fold whose span is entirely in-memory-only (recalled ``None``) placeholders
-    persists nothing, but must still mirror the pipeline's in-memory fold so the
-    index maps stay length-aligned — and a subsequent real fold stays consistent."""
+    """A fold whose span is entirely in-memory-only (``None``) placeholders persists
+    nothing, but must still mirror the pipeline's in-memory fold so the index maps
+    stay length-aligned — and a subsequent real fold stays consistent.
+
+    ``None`` placeholders no longer come from memory recall (now an ephemeral
+    tail-injection that never enters the maps); they are seeded by projection mode
+    (a None-prefix) and corrupt-history repair (align_tool_calls). Here we seed two
+    leading None placeholders the way projection does (init_history_seqs)."""
     sid = await store.create_session(session_id="s")
     sink = SQLiteSink(store, sid)
-    sink.init_history_seqs([])
-    # two recalled placeholders at the front, then two real messages
-    sink.on_messages_inserted(index=0, count=2)
+    # two synthesized None placeholders at the front, then two real messages
+    sink.init_history_seqs([None, None], [None, None])
     await _append(sink, 2)
     assert len(sink._history_seqs) == len(sink._history_ord) == 4
 

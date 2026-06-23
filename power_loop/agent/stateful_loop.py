@@ -210,7 +210,13 @@ class StatefulAgentLoop:
         self._orphaned_close_task: asyncio.Future[None] | None = None
         self.config = config if config is not None else AgentLoopConfig()
         self.tool_registry = tool_registry
-        self._runner = AgentRunner(event_bus=event_bus, hooks=hooks)
+        # Own a FRESH AgentHooks when the caller supplies none — NOT the shared
+        # module-level DEFAULT_HOOKS singleton — so per-loop built-in hooks (e.g.
+        # the memory recall hook) don't stack across loops or leak config.
+        self._runner = AgentRunner(
+            event_bus=event_bus, hooks=hooks if hooks is not None else AgentHooks()
+        )
+        self._register_builtin_hooks()
         self._locks: dict[str, asyncio.Lock] = {}
         self._follow_up_queues: dict[str, list[str | LoopMessage]] = {}
         self._follow_up_queue_locks: dict[str, asyncio.Lock] = {}
@@ -221,6 +227,33 @@ class StatefulAgentLoop:
         self._cache_hits = 0
         self._cache_misses = 0
         self._cache_evictions = 0
+
+    def _register_builtin_hooks(self) -> None:
+        """Register power-loop's default functional hooks on this loop's own
+        AgentHooks. They carry a ``builtin.*`` name so a host can override them
+        (``hooks.replace(..., name=...)``) or disable them (``hooks.remove(...)``).
+        """
+        cfg = self.config
+        if cfg.memory is not None and getattr(cfg, "builtin_memory_hook", True):
+            from power_loop.contracts.hooks import HookPoint
+            from power_loop.runtime.memory import MemoryRecallHook
+
+            hook = MemoryRecallHook(
+                cfg.memory,
+                budget_tokens=int(cfg.memory_budget_tokens or 0),
+                position=getattr(cfg, "memory_position", "tail"),
+                hooks=self._runner.hooks,
+                event_bus=self._runner.event_bus,
+            )
+            # order=100 → runs AFTER host LLM_BEFORE hooks (default order 0) so
+            # memory lands at the true request tail. Skip if the host already
+            # registered one under this name (their override wins); a host can
+            # also override/disable post-construction via loop.hooks.replace /
+            # .remove(MemoryRecallHook.NAME).
+            if not self._runner.hooks.has(MemoryRecallHook.NAME):
+                self._runner.hooks.register(
+                    HookPoint.LLM_BEFORE, hook, order=100, name=MemoryRecallHook.NAME,
+                )
 
     async def ensure_store(self) -> SessionStore:
         """Public accessor: return this loop's store, opening an owned one on first use.
@@ -1645,7 +1678,9 @@ class StatefulAgentLoop:
             if len(live_sends) <= keep:
                 return None, ()  # nothing foldable beyond the keep-recent floor
             trigger_ratio = float(getattr(fold_strategy, "trigger_ratio", 0.75) or 0.75)
-            threshold = int((self.config.max_tokens or 8000) * trigger_ratio)
+            # Reserve headroom for the ephemeral tail-injected memory block (not
+            # part of the projected snapshot, so invisible here) — fold earlier.
+            threshold = int((self.config.effective_context_budget() or 8000) * trigger_ratio)
             rendered_prefix = projector.render(([prior] if prior is not None else []) + snapshot)
             if estimate_tokens(rendered_prefix) < threshold:
                 return None, ()  # below threshold — small per-send projections just accumulate

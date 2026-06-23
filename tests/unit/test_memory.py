@@ -2,8 +2,9 @@
 
 Covers the four invariants from the ROADMAP §M1.9 "测试" block:
 
-1. Fake provider injects messages in the correct position (after the
-   leading system block, tagged ``role=system, name=memory_*``).
+1. Fake provider injects messages in the correct position — at the TAIL of the
+   per-call request (after the user/history), tagged ``role=system,
+   name=memory_*`` — via the built-in MemoryRecallHook, ephemerally.
 2. ``recall`` raise → empty injection + ``MEMORY_FAILED`` event, loop
    continues normally.
 3. ``remember`` raise → does not affect the returned ``StatefulResult``;
@@ -89,7 +90,7 @@ def _new_loop(*, llm, store, bus, memory=None, hooks=None) -> StatefulAgentLoop:
 
 
 @pytest.mark.asyncio
-async def test_recalled_messages_injected_after_leading_system_and_tagged() -> None:
+async def test_recalled_messages_injected_at_tail_and_tagged() -> None:
     store = await SessionStore.open(":memory:")
     try:
         llm = _RecordingLLM()
@@ -112,10 +113,14 @@ async def test_recalled_messages_injected_after_leading_system_and_tagged() -> N
         assert len(mem_msgs) == 2
         assert all(m["role"] == "system" for m in mem_msgs)
         assert "Chinese" in mem_msgs[0]["content"]
-        # The user's actual message must come AFTER all memory_* messages.
+        # Default position is TAIL: memory comes AFTER the user message so the
+        # prior-history prefix stays byte-stable / prefix-cacheable.
         first_user_idx = next(i for i, m in enumerate(sent) if m.get("role") == "user")
-        last_mem_idx = max(i for i, m in enumerate(sent) if str(m.get("name") or "").startswith("memory_"))
-        assert last_mem_idx < first_user_idx
+        first_mem_idx = min(i for i, m in enumerate(sent) if str(m.get("name") or "").startswith("memory_"))
+        assert first_user_idx < first_mem_idx
+        # Memory must NOT leak into persisted history (ephemeral injection).
+        rows = await store.load_active_messages(sid)
+        assert not any(str(getattr(r, "name", "") or "").startswith("memory_") for r in rows)
 
         recall_events = [e for e in events if e.type == AgentEventType.MEMORY_RECALLED]
         assert len(recall_events) == 1

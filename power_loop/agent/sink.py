@@ -32,7 +32,6 @@ class MessageSink(Protocol):
 
     async def on_round_started(self, round_index: int) -> None: ...
     async def on_message_appended(self, message: LoopMessage, *, round_index: int | None) -> None: ...
-    def on_messages_inserted(self, *, index: int, count: int) -> None: ...  # pure (no I/O) → sync
     async def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None: ...
@@ -57,7 +56,6 @@ class NullSink:
 
     async def on_round_started(self, round_index: int) -> None: ...
     async def on_message_appended(self, message: LoopMessage, *, round_index: int | None) -> None: ...
-    def on_messages_inserted(self, *, index: int, count: int) -> None: ...
     async def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None: ...
@@ -129,16 +127,12 @@ class SQLiteSink:
         self._history_seqs = list(seqs)
         self._history_ord = list(ords) if ords is not None else list(seqs)
 
-    def on_messages_inserted(self, *, index: int, count: int) -> None:
-        """Record that ``count`` in-memory-only messages were spliced into
-        ``pipeline.history`` at ``index`` without being persisted (recalled
-        ``memory_*``). Insert matching ``None`` placeholders so ``_history_seqs``
-        stays index-aligned with ``history`` and later folds map to the right rows."""
-        if count <= 0:
-            return
-        idx = max(0, min(index, len(self._history_seqs)))
-        self._history_seqs[idx:idx] = [None] * count
-        self._history_ord[idx:idx] = [None] * count
+    # NOTE: on_messages_inserted was removed when memory recall moved to the
+    # ephemeral tail-injection LLM_BEFORE hook (it never enters self.history, so
+    # there is no in-memory-only row to align). The _history_seqs/_history_ord
+    # maps stay `list[int | None]` and on_compaction keeps its None-guards: those
+    # remain load-bearing for projection mode (seeds None prefixes) and for
+    # corrupt-history repair (align_tool_calls synthesizes placeholders).
 
     # ── messages ───────────────────────────────────────────────
 

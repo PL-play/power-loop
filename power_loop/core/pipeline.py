@@ -47,7 +47,6 @@ from power_loop.contracts.event_payloads import (
     LlmRetryAttemptedPayload,
     LoopCancelledPayload,
     MemoryFailedPayload,
-    MemoryRecalledPayload,
     RoundCompletedPayload,
     RoundStartedPayload,
     RoundToolsPresentPayload,
@@ -68,7 +67,6 @@ from power_loop.contracts.hook_contexts import (
     CompactBeforeCtx,
     LlmAfterCtx,
     LlmBeforeCtx,
-    MemoryRecalledCtx,
     MessageAppendCtx,
     RoundDecideCtx,
     RoundEndCtx,
@@ -89,7 +87,7 @@ from power_loop.runtime.budget import estimate_message_tokens, estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.compact import CompactionContext
 from power_loop.runtime.human_input import HumanInputRequired
-from power_loop.runtime.memory import MemorySnapshot, tag_as_memory
+from power_loop.runtime.memory import MemorySnapshot
 from power_loop.runtime.retry import with_retry
 from power_loop.runtime.skills import SkillLoader
 from power_loop.tools.registry import ToolRegistry
@@ -411,73 +409,14 @@ class AgentPipeline:
             except Exception:  # noqa: BLE001
                 pass
 
-    # ── Memory: recall at start, remember at end (M1.9) ──
-
-    async def _maybe_recall(self) -> None:
-        """Call ``config.memory.recall`` and inject results into ``self.history``.
-
-        Injection position: after any leading ``role=system`` messages
-        (which includes a ``compact_note`` if one is present). Recalled
-        messages are tagged ``role=system, name=memory_*`` so they share
-        the system region's compactor protection.
-
-        Soft-fails on any exception by emitting ``MEMORY_FAILED`` and
-        continuing with no injection.
-        """
-        provider = self.config.memory
-        if provider is None:
-            return
-        budget = int(self.config.memory_budget_tokens or 0)
-        try:
-            recalled = await provider.recall(
-                messages=self.history, session_id=self.session_id, budget_tokens=budget,
-            )
-        except Exception as exc:
-            self._emit(
-                AgentEventType.MEMORY_FAILED,
-                MemoryFailedPayload(
-                    phase="recall", error_type=type(exc).__name__,
-                    error_message=str(exc)[:500],
-                ),
-            )
-            return
-
-        recalled = list(recalled or [])
-        returned = len(recalled)
-        hook_ctx = MemoryRecalledCtx(
-            recalled=recalled, session_id=self.session_id, budget_tokens=budget,
-        )
-        await self.hooks.run_typed_async(HookPoint.MEMORY_RECALLED, hook_ctx)
-        if hook_ctx.directive == HookDirective.SKIP:
-            self._emit(
-                AgentEventType.MEMORY_RECALLED,
-                MemoryRecalledPayload(returned=returned, injected=0, budget_tokens=budget),
-            )
-            return
-
-        tagged = tag_as_memory(list(hook_ctx.recalled or []))
-        if not tagged:
-            self._emit(
-                AgentEventType.MEMORY_RECALLED,
-                MemoryRecalledPayload(returned=returned, injected=0, budget_tokens=budget),
-            )
-            return
-
-        insert_at = 0
-        n = len(self.history)
-        while insert_at < n and self.history[insert_at].get("role") == "system":
-            insert_at += 1
-        self.history[insert_at:insert_at] = tagged
-        # These memory_* messages are injected into history but never persisted
-        # (the MemoryProvider owns them). Tell the sink so it can keep its
-        # index↔seq map aligned — otherwise a later compaction marks the WRONG
-        # DB rows compacted_out (H1.1 / C1).
-        self.sink.on_messages_inserted(index=insert_at, count=len(tagged))
-
-        self._emit(
-            AgentEventType.MEMORY_RECALLED,
-            MemoryRecalledPayload(returned=returned, injected=len(tagged), budget_tokens=budget),
-        )
+    # ── Memory: remember at end (M1.9) ──
+    #
+    # Recall is no longer a hardcoded step here. It is the built-in
+    # ``MemoryRecallHook`` (an LLM_BEFORE hook registered by StatefulAgentLoop)
+    # which injects recalled memory EPHEMERALLY at the per-call request tail —
+    # never into ``self.history`` / the store — so the prompt prefix stays
+    # append-only and prefix-cacheable, and there is no index↔seq realignment
+    # (``sink.on_messages_inserted`` is therefore gone). See runtime.memory.
 
     async def _maybe_remember(self, *, reason: str, final_text: str) -> None:
         provider = self.config.memory
@@ -605,7 +544,10 @@ class AgentPipeline:
 
         compact_kwargs: dict[str, Any] = dict(
             llm=self.llm,
-            max_tokens=int(self.config.max_tokens or 0),
+            # Reserve headroom for the ephemeral tail-injected memory block (it
+            # isn't in self.history so the compactor can't see it) — fold a bit
+            # earlier so history + memory stays within the window.
+            max_tokens=self.config.effective_context_budget(),
             round_index=round_index,
         )
         # Back-compat: only hand the optional CompactionContext to compactors whose
@@ -858,8 +800,9 @@ class AgentPipeline:
         self._emit(AgentEventType.SESSION_STARTED, SessionStartedPayload(scope="main"))
         self._session_started = True
 
-        # ── Memory recall (M1.9) ──
-        await self._maybe_recall()
+        # Memory recall happens per-round in the built-in MemoryRecallHook
+        # (LLM_BEFORE), injected ephemerally into the request tail — see run()'s
+        # LLM_BEFORE block and runtime.memory.MemoryRecallHook.
 
         # ── Round loop ──
         for round_idx in range(int(self.config.max_rounds)):
@@ -931,6 +874,7 @@ class AgentPipeline:
                 tools=self.runtime_tools,
                 max_tokens=int(self.config.max_tokens or 8000),
                 temperature=float(self.config.temperature or 0),
+                session_id=self.session_id,
             )
             await self.hooks.run_typed_async(HookPoint.LLM_BEFORE, llm_before)
 

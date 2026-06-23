@@ -111,6 +111,14 @@ class AgentLoopConfig:
     retry_policy: LLMRetryPolicy | None = None
     memory: MemoryProvider | None = None
     memory_budget_tokens: int = 1500
+    #: Where the built-in MemoryRecallHook injects recalled memory into the
+    #: per-call request: "tail" (default — after history, keeps the prior-history
+    #: prefix byte-stable and prefix-cacheable) or "front" (after leading system
+    #: messages — legacy position; breaks prefix caching when memory changes).
+    memory_position: str = "tail"
+    #: Auto-register the built-in MemoryRecallHook when ``memory`` is set. Turn
+    #: off to inject memory yourself via an LLM_BEFORE hook.
+    builtin_memory_hook: bool = True
     # Bounds for the note_add/note_update/note_delete tools (agent-authored
     # notes). None → DEFAULT_NOTES_POLICY. See power_loop.runtime.notes.
     notes_policy: NotesPolicy | None = None
@@ -131,6 +139,24 @@ class AgentLoopConfig:
     # compactor never touches it.
     inject_tool_descriptions: bool = True
     tool_catalog_header: str = "# Available Tools"
+
+    def effective_context_budget(self) -> int:
+        """Fold/compaction budget after reserving headroom for the ephemeral
+        memory block.
+
+        Memory is injected at the per-call tail by the built-in hook and is NOT
+        counted by the fold trigger (it isn't in ``self.history``). To keep
+        ``history + memory`` within the model window, the fold threshold targets
+        ``max_tokens − memory_budget_tokens`` so folding fires early enough.
+        ``0``/``None`` max_tokens means "no explicit budget" → returned
+        unchanged.
+        """
+        mt = int(self.max_tokens or 0)
+        if mt <= 0:
+            return mt
+        if self.memory is not None and self.builtin_memory_hook:
+            return max(1, mt - int(self.memory_budget_tokens or 0))
+        return mt
 
     def __post_init__(self) -> None:
         self._map_legacy_axes()
