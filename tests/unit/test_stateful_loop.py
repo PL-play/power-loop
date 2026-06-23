@@ -884,6 +884,62 @@ async def test_resolve_system_prompt_matches_live_prompt(store: SessionStore) ->
     assert "- **calc**:" in preview
 
 
+@pytest.mark.asyncio
+async def test_resolve_system_prompt_matches_live_prompt_with_skills(tmp_path, store: SessionStore) -> None:
+    """Dedup equivalence must hold on the SKILL branch too (not just the catalog):
+    with a skills_dir configured, the preview's skill section must be byte-identical
+    to the live prompt's."""
+
+    @dataclass
+    class _CapturingLLM(LLMService):
+        seen_system: list[str] = field(default_factory=list)
+
+        async def complete(self, request, *, on_chunk_delta_text=None,
+                            on_chunk_think=None, on_stream_end=None):
+            self.seen_system.append(request.system_prompt or "")
+            return LLMResponse(raw_text="ok")
+
+        def stream(self, request):
+            async def _e():
+                if False:
+                    yield LLMStreamChunk()
+            return _e()
+
+        async def close(self):
+            return None
+
+    skill_root = tmp_path / "skills"
+    (skill_root / "runtime-skill").mkdir(parents=True)
+    (skill_root / "runtime-skill" / "SKILL.md").write_text(
+        "---\ndescription: Runtime test skill\n---\nUse the runtime skill.", encoding="utf-8",
+    )
+    llm = _CapturingLLM()
+    loop = StatefulAgentLoop(
+        llm=llm, store=store,
+        tool_registry=create_default_tool_registry(include=["load_skill"]),
+        config=AgentLoopConfig(
+            system_prompt="You are a bot.", skills_dir=str(skill_root),
+            max_rounds=1, compactor=None,
+        ),
+    )
+    sid = await loop.new_session()
+    preview = await loop.resolve_system_prompt(session_id=sid)
+    await loop.send("hi", session_id=sid)
+
+    assert llm.seen_system[0] == preview  # skill-branch equivalence
+    assert "Runtime test skill" in preview  # the skill section is actually present
+
+
+def test_build_skill_section_failure_paths_return_empty() -> None:
+    """build_skill_section swallows missing/invalid skills_dir → "" (so the shared
+    helper degrades identically on both the live and preview paths)."""
+    from power_loop.agent.system_prompt import build_skill_section
+
+    assert build_skill_section(None) == ""
+    assert build_skill_section("") == ""
+    assert build_skill_section("/nonexistent/path/xyz-does-not-exist") == ""
+
+
 class _GateLLM(_Scripted):
     """Blocks the first LLM call until released — simulates a long in-flight run."""
 

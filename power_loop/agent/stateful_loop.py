@@ -935,9 +935,14 @@ class StatefulAgentLoop:
         Returns
         -------
         str
-            The fully resolved prompt string — exactly what the LLM
-            will see as the system message on the next :meth:`send`
-            call.
+            The fully resolved prompt for a :meth:`send` with **no per-call
+            overrides** — base (session/config) + auto-injected tool catalog
+            (full registry) + skill section, via the same
+            ``resolve_runtime_system_prompt`` helper the live pipeline uses.
+
+            A per-call ``send(system_prompt=...)`` or ``send(tools=[...])`` is
+            applied at send time and is NOT reflected here (this previews the
+            no-override case; pass nothing at ``send`` for a byte-identical match).
         """
         # Session-level prompt wins over config-level prompt.
         base: str | None = None

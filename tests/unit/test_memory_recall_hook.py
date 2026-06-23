@@ -233,3 +233,70 @@ async def test_builtin_memory_hook_flag_off_skips_registration() -> None:
         assert not loop.hooks.has(MemoryRecallHook.NAME)
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_builtin_memory_hook_runs_after_host_llm_before_hook() -> None:
+    """P1: order=100 makes the builtin memory hook run AFTER a host's default-order
+    LLM_BEFORE hook, so memory lands at the TRUE tail (after host-appended content)."""
+    from power_loop import HookPoint, SessionStore, StatefulAgentLoop
+
+    store = await SessionStore.open(":memory:")
+    try:
+        llm = _RecLLM()
+        loop = StatefulAgentLoop(
+            llm=llm, store=store,
+            config=AgentLoopConfig(
+                max_rounds=1, compactor=None,
+                memory=_FakeProvider(to_recall=[{"content": "the-note"}]),
+            ),
+        )
+
+        def host_hook(ctx):  # default order 0 → runs before the builtin (order 100)
+            ctx.messages.append({"role": "system", "name": "host_sentinel", "content": "HOST"})
+
+        loop.hooks.register(HookPoint.LLM_BEFORE, host_hook, name="host.sentinel")
+        await _run(loop)
+
+        sent = llm.seen[0]
+        host_idx = next(i for i, m in enumerate(sent) if m.get("name") == "host_sentinel")
+        mem_idx = next(i for i, m in enumerate(sent) if str(m.get("name") or "").startswith("memory_"))
+        assert host_idx < mem_idx  # memory appended AFTER the host hook's content
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_host_can_preregister_under_builtin_name_and_loop_does_not_clobber() -> None:
+    """P1: if the host already registered a handler under MemoryRecallHook.NAME, the
+    loop's has()-guard must NOT overwrite it — the host's override wins."""
+    from power_loop import AgentHooks, HookPoint, SessionStore, StatefulAgentLoop
+
+    store = await SessionStore.open(":memory:")
+    try:
+        hooks = AgentHooks()
+
+        def host_override(ctx):
+            ctx.messages.append({"role": "system", "name": "memory_host_override", "content": "HOST-MEM"})
+
+        hooks.register(HookPoint.LLM_BEFORE, host_override, name=MemoryRecallHook.NAME)
+
+        llm = _RecLLM()
+        loop = StatefulAgentLoop(
+            llm=llm, store=store, hooks=hooks,
+            config=AgentLoopConfig(
+                max_rounds=1, compactor=None,
+                memory=_FakeProvider(to_recall=[{"content": "builtin-note"}]),
+            ),
+        )
+        # exactly one handler under the name (loop didn't add the builtin alongside)
+        entries = [e for e in loop.hooks._handlers[str(HookPoint.LLM_BEFORE)]
+                   if e.name == MemoryRecallHook.NAME]
+        assert len(entries) == 1 and entries[0].handler is host_override
+
+        await _run(loop)
+        sent = llm.seen[0]
+        assert any(m.get("name") == "memory_host_override" for m in sent)  # host's ran
+        assert not any(m.get("content") == "builtin-note" for m in sent)  # builtin did NOT
+    finally:
+        await store.close()

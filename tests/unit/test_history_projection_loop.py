@@ -200,6 +200,54 @@ async def test_projection_compaction_rolls_prior_forward(store: SessionStore) ->
     assert "d1" in compact.content["summary"] and "d2" in compact.content["summary"]
 
 
+class _CountingMem:
+    async def recall(self, *, messages, session_id, budget_tokens=1500):
+        return [{"content": "a persistent note"}]
+
+    async def remember(self, *, snapshot, session_id):
+        return None
+
+
+def _mem_projector_loop(store, *, memory, memory_budget_tokens, max_tokens):
+    return StatefulAgentLoop(
+        llm=_Scripted(responses=[LLMResponse(raw_text=f"d{i}") for i in range(1, 6)]),
+        store=store, tool_registry=_echo_registry(),
+        config=AgentLoopConfig(
+            system_prompt="S", max_rounds=4,
+            representation=DefaultDeterministicProjector(keep_last_sends=2),
+            fold_strategy=_DeterministicFold(keep_last_sends=2, trigger_ratio=0.75),
+            max_tokens=max_tokens, memory=memory, memory_budget_tokens=memory_budget_tokens,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_headroom_lowers_projection_fold_trigger(store: SessionStore) -> None:
+    """P0: the projection fold trigger uses config.effective_context_budget(), so
+    configuring memory (which reserves memory_budget_tokens) LOWERS the threshold
+    and makes folding fire earlier on identical sends. Guards stateful_loop.py
+    against a regression that reverts the trigger to raw max_tokens."""
+    # No memory: threshold = 200 * 0.75 = 150 → 3 tiny sends stay under → NO fold.
+    loop_a = _mem_projector_loop(store, memory=None, memory_budget_tokens=0, max_tokens=200)
+    sid_a = await loop_a.new_session()
+    for i in range(1, 4):
+        await loop_a.send(f"m{i}", session_id=sid_a)
+    assert await store.latest_project_compact(sid_a) is None  # no headroom reserved → no fold
+
+    # Memory + large budget: effective = max(1, 200-190) = 10 → threshold ≈ 7 →
+    # the SAME 3 sends now exceed it → fold fires. (memory is injected at the LLM
+    # tail, not the projection snapshot, so only the THRESHOLD changes.)
+    store_b = await SessionStore.open(":memory:")
+    try:
+        loop_b = _mem_projector_loop(store_b, memory=_CountingMem(), memory_budget_tokens=190, max_tokens=200)
+        sid_b = await loop_b.new_session()
+        for i in range(1, 4):
+            await loop_b.send(f"m{i}", session_id=sid_b)
+        assert await store_b.latest_project_compact(sid_b) is not None  # headroom → folds earlier
+    finally:
+        await store_b.close()
+
+
 @pytest.mark.asyncio
 async def test_identity_projector_never_compacts(store: SessionStore) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text=f"d{i}") for i in range(1, 6)])

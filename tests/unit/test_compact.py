@@ -388,6 +388,47 @@ async def _run_compaction(store: SessionStore, *, memory=None, hooks=None, compa
     return sid, rows, compacted
 
 
+class _RecordMaxTokens(DefaultCompactor):
+    """Records the max_tokens the pipeline passes into maybe_compact."""
+
+    def __init__(self) -> None:
+        super().__init__(keep_last_n=1)
+        self.seen: list[int] = []
+
+    async def maybe_compact(self, messages, *, llm, max_tokens, round_index, context=None):
+        self.seen.append(max_tokens)
+        return await super().maybe_compact(
+            messages, llm=llm, max_tokens=max_tokens, round_index=round_index, context=context
+        )
+
+
+class _EmptyMem:
+    async def recall(self, *, messages, session_id, budget_tokens=1500):
+        return []
+
+    async def remember(self, *, snapshot, session_id):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_verbatim_compactor_gets_effective_budget_with_memory(store: SessionStore) -> None:
+    """P1: the verbatim compactor's max_tokens is config.effective_context_budget()
+    — reserved by memory_budget_tokens when memory is configured. Guards pipeline.py
+    against reverting to raw config.max_tokens. (_run_compaction sets max_tokens=4000;
+    default memory_budget_tokens=1500 → effective 2500.)"""
+    cmp = _RecordMaxTokens()
+    await _run_compaction(store, memory=_EmptyMem(), compactor=cmp)
+    assert cmp.seen and all(mt == 2500 for mt in cmp.seen), cmp.seen
+
+    store2 = await SessionStore.open(":memory:")
+    try:
+        cmp2 = _RecordMaxTokens()
+        await _run_compaction(store2, memory=None, compactor=cmp2)
+        assert cmp2.seen and all(mt == 4000 for mt in cmp2.seen), cmp2.seen  # no memory → full budget
+    finally:
+        await store2.close()
+
+
 # ── H7 Phase 2: optional CompactionContext + back-compat ───────────────────
 
 

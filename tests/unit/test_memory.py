@@ -236,6 +236,47 @@ async def test_memory_recalled_hook_skip_drops_injection() -> None:
         await store.close()
 
 
+# ── 4b. MEMORY_RECALLED hook FILTER (subset, not full SKIP) ─────────────
+
+
+@pytest.mark.asyncio
+async def test_memory_recalled_hook_filter_subset_injects_remainder() -> None:
+    """A MEMORY_RECALLED handler that MUTATES ctx.recalled to a subset (drops some
+    entries) without SKIP → only the remaining entries are injected, and the
+    'injected' telemetry reflects the filtered count."""
+    store = await SessionStore.open(":memory:")
+    try:
+        llm = _RecordingLLM()
+        bus = AgentEventBus()
+        events: list = []
+        bus.subscribe(None, lambda e: events.append(e))
+        hooks = AgentHooks()
+
+        async def drop_last(ctx: MemoryRecalledCtx) -> None:
+            ctx.recalled.pop()  # redact the last entry; do NOT set SKIP
+
+        hooks.register(HookPoint.MEMORY_RECALLED, drop_last)
+
+        mem = _FakeMemory(to_recall=[
+            {"content": "keep this one"},
+            {"content": "redact this one"},
+        ])
+        loop = _new_loop(llm=llm, store=store, bus=bus, memory=mem, hooks=hooks)
+        sid = await loop.new_session()
+        await loop.send("hi", session_id=sid)
+
+        mem_msgs = [m for m in llm.seen[0] if str(m.get("name") or "").startswith("memory_")]
+        assert len(mem_msgs) == 1
+        assert "keep this one" in mem_msgs[0]["content"]
+        assert all("redact this one" not in (m.get("content") or "") for m in llm.seen[0])
+
+        recall_events = [e for e in events if e.type == AgentEventType.MEMORY_RECALLED]
+        assert recall_events[0].payload["returned"] == 2
+        assert recall_events[0].payload["injected"] == 1  # filtered down to 1
+    finally:
+        await store.close()
+
+
 # ── 5. tag_as_memory utility ─────────────────────────────────────────────
 
 

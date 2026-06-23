@@ -118,10 +118,12 @@ class MemoryRecallHook:
     * sits at the TAIL (default) so the whole prior-history prefix stays
       byte-identical across sends and is prefix-cacheable.
 
-    Recall runs once per send (memoized at ``round_index == 0`` or on a session
-    change) and the SAME block is re-appended every round, matching the historic
-    once-per-send semantics — notes the agent writes mid-send surface on the
-    NEXT send, keeping the within-send tail stable.
+    Recall runs once per pipeline run (memoized at ``round_index == 0`` or on a
+    session change) and the SAME block is re-appended every round, matching the
+    historic once-per-send semantics — notes the agent writes mid-run surface on
+    the NEXT run, keeping the tail stable within a run. NOTE: a ``resume()`` /
+    ``submit_input()`` continuation is a FRESH run (round_index resets to 0), so
+    it re-recalls — updated notes surface on resume too.
 
     Registered by ``StatefulAgentLoop`` under the name
     :pydata:`MemoryRecallHook.NAME`; a host can override it via

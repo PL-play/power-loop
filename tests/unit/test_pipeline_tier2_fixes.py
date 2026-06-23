@@ -157,24 +157,79 @@ async def test_prepare_round_invalidates_estimate_after_microcompact(tmp_path) -
     assert recomputed < primed  # content actually shrank
 
 
-@pytest.mark.asyncio
-async def test_microcompact_off_by_default_does_not_spill(tmp_path) -> None:
-    """3.1.x: microcompact is OFF by default — prepare_round must NOT spill or
-    rewrite content when config.microcompact_enabled is False."""
-    ctx = ContextManager(micro_hot_tail=0, micro_size_limit=100)
-    ctx.cache_dir = tmp_path
-    p = _pipeline(config=AgentLoopConfig(compactor=None), tool_registry=ToolRegistry(), ctx=ctx)
+async def _seed_big_tool_output(p) -> None:
     await p._append_message({"role": "user", "content": "hi"})
     await p._append_message({"role": "assistant", "content": "",
                              "tool_calls": [{"id": "t", "type": "function",
                                              "function": {"name": "x", "arguments": "{}"}}]})
     await p._append_message({"role": "tool", "tool_call_id": "t", "name": "x", "content": "Z" * 5000})
 
+
+@pytest.mark.asyncio
+async def test_microcompact_off_by_default_does_not_spill(tmp_path) -> None:
+    """3.1.x: microcompact is OFF by default — prepare_round must NOT spill or
+    rewrite content (and must NOT invalidate the token estimate) when
+    config.microcompact_enabled is False."""
+    ctx = ContextManager(micro_hot_tail=0, micro_size_limit=100)
+    ctx.cache_dir = tmp_path
+    p = _pipeline(config=AgentLoopConfig(compactor=None), tool_registry=ToolRegistry(), ctx=ctx)
+    await _seed_big_tool_output(p)
+    primed = p._estimate_history_tokens()
+    assert p._tok_len == len(p.history)  # sanity: in sync after priming
+
     await p.prepare_round(1)
 
     tool_msg = next(m for m in p.history if m.get("role") == "tool")
     assert tool_msg["content"] == "Z" * 5000  # untouched — no spill
     assert not any(tmp_path.iterdir())  # nothing written to disk
+    # _tok_len invalidation moved INSIDE the enabled-guard (d5c0192): OFF → not
+    # invalidated, so the primed estimate stays in sync (no over-fold churn).
+    assert p._tok_len == len(p.history)
+    assert p._estimate_history_tokens() == primed
+
+
+@pytest.mark.asyncio
+async def test_microcompact_uses_config_knobs_not_ctx_fields(tmp_path) -> None:
+    """P0: the gated call must thread the CONFIG knobs into microcompact, not
+    fall back to the ContextManager's (env-defaulted) instance fields. Build the
+    ctx with DIVERGENT instance fields that would NOT spill, and config knobs that
+    WOULD — the spill proves config wins."""
+    # Instance fields say: only spill when >10 outputs each >99999 chars → never.
+    ctx = ContextManager(micro_hot_tail=10, micro_size_limit=99999)
+    ctx.cache_dir = tmp_path
+    cfg = AgentLoopConfig(
+        compactor=None, microcompact_enabled=True,
+        microcompact_hot_tail=0, microcompact_size_limit=100,  # config WOULD spill
+    )
+    p = _pipeline(config=cfg, tool_registry=ToolRegistry(), ctx=ctx)
+    await _seed_big_tool_output(p)
+
+    await p.prepare_round(1)
+
+    tool_msg = next(m for m in p.history if m.get("role") == "tool")
+    assert tool_msg["content"].startswith("[tool output saved to")  # spilled per CONFIG knobs
+    assert any(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_microcompact_spill_dir_config_overrides_cache_dir(tmp_path) -> None:
+    """P1: microcompact_spill_dir routes the spill to the configured directory
+    (not the runtime home's .cache)."""
+    spill = tmp_path / "spill_here"
+    ctx = ContextManager(micro_hot_tail=0, micro_size_limit=100)  # cache_dir left None
+    cfg = AgentLoopConfig(
+        compactor=None, microcompact_enabled=True,
+        microcompact_hot_tail=0, microcompact_size_limit=100,
+        microcompact_spill_dir=str(spill),
+    )
+    p = _pipeline(config=cfg, tool_registry=ToolRegistry(), ctx=ctx)
+    await _seed_big_tool_output(p)
+
+    await p.prepare_round(1)
+
+    assert spill.exists() and any(spill.iterdir())  # spilled to the configured dir
+    tool_msg = next(m for m in p.history if m.get("role") == "tool")
+    assert str(spill) in tool_msg["content"]
 
 
 # ── C22: a single-message fold invalidates the estimate ──────────────────────
