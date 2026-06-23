@@ -520,13 +520,20 @@ class AgentPipeline:
     async def prepare_round(self, round_index: int) -> None:
         """Prepare a new round: todo reminders, then run the pluggable
         compactor if one is configured on the loop config."""
-        # Microcompact (legacy: dump large tool outputs to disk and replace
-        # with a short pointer — orthogonal to LLM-based compaction).
-        self.ctx.microcompact(self.history)
-        # microcompact mutates message CONTENT in place (shrinks it) without
-        # changing len(self.history), so the SCALE-4 incremental estimate would
-        # stay stale-high and over-trigger LLM-summary compaction. Invalidate it.
-        self._tok_len = -1
+        # Microcompact (dump old large tool outputs to disk + leave a short
+        # pointer — orthogonal to LLM-based compaction). OFF by default as of
+        # 3.1.x; opt in via config.microcompact_enabled. See AgentLoopConfig.
+        if self.config.microcompact_enabled:
+            self.ctx.microcompact(
+                self.history,
+                size_limit=self.config.microcompact_size_limit,
+                hot_tail=self.config.microcompact_hot_tail,
+                spill_dir=self.config.microcompact_spill_dir,
+            )
+            # microcompact mutates message CONTENT in place (shrinks it) without
+            # changing len(self.history), so the SCALE-4 incremental estimate would
+            # stay stale-high and over-trigger LLM-summary compaction. Invalidate it.
+            self._tok_len = -1
 
         # 3.0: verbatim mode → an in-place Compactor mapped from config.fold_strategy; projection
         # mode → None (it folds at end-of-send in the derived layer).

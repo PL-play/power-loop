@@ -54,6 +54,26 @@ prompt cache. OpenAI-compatible transports auto-cache prefixes (benefits immedia
 Anthropic requires explicit `cache_control` breakpoints, which power-loop does not yet
 emit — a separate follow-up.
 
+### Changed — microcompact is now opt-in (default OFF) + fully configurable
+
+`microcompact` (the cheap per-round mechanism that spills OLD oversized tool outputs to
+disk and leaves a short pointer, distinct from the LLM-summary fold) is now **OFF by
+default** and exposed through `AgentLoopConfig` instead of env-only knobs.
+
+- **Changed (behavior)** microcompact no longer runs unless `microcompact_enabled=True`.
+  It only helps when those old outputs are never needed again; otherwise the pointer
+  just trades for a re-read. Projection mode (it's verbatim-only anyway) + fold + provider
+  prefix-caching already cover the context budget. Long verbatim sessions that read many
+  large files and rarely revisit them can opt back in.
+- **Added** `AgentLoopConfig.microcompact_enabled` (default `False`),
+  `microcompact_size_limit` (default from `CONTEXT_MICRO_SIZE_LIMIT`, else 1000),
+  `microcompact_hot_tail` (default from `CONTEXT_MICRO_HOT_TAIL`, else 10), and
+  `microcompact_spill_dir` (default `None` → the runtime home's `.cache`). Config takes
+  precedence; the `CONTEXT_MICRO_*` env vars remain as defaults for back-compat.
+- `ContextManager.microcompact()` gained optional `size_limit` / `hot_tail` / `spill_dir`
+  kwargs (fall back to the instance's env-defaulted fields, so direct callers are
+  unaffected). Object-store / custom spill backends (`SpillSink`) are a deferred follow-up.
+
 ## [3.0.2] — 2026-06-23
 
 ### Docs (no code/API change)

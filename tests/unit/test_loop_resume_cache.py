@@ -277,7 +277,8 @@ async def test_microcompact_warm_equals_cold(tmp_path, monkeypatch):
     from power_loop.runtime.env import RuntimeEnv, runtime_env_context
 
     def cfg():
-        return AgentLoopConfig(system_prompt="S", max_rounds=6, compactor=None)
+        return AgentLoopConfig(system_prompt="S", max_rounds=6, compactor=None,
+                               microcompact_enabled=True)
 
     async def scenario(loop, sid, tools):
         await loop.send("a", session_id=sid, tools=["blob"])

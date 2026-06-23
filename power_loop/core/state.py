@@ -187,22 +187,34 @@ class ContextManager:
             totals[key] = totals.get(key, 0) + usage_out[key]
         return usage_out
 
-    def microcompact(self, messages: list[dict[str, Any]]) -> None:
+    def microcompact(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        size_limit: int | None = None,
+        hot_tail: int | None = None,
+        spill_dir: str | None = None,
+    ) -> None:
+        # Knobs come from the caller (AgentLoopConfig) when provided; otherwise
+        # fall back to this context's own fields (env-defaulted) — keeps direct
+        # ``ctx.microcompact(msgs)`` callers (tests) working.
+        size_limit = self.micro_size_limit if size_limit is None else size_limit
+        hot_tail = self.micro_hot_tail if hot_tail is None else hot_tail
         # Keep hot tail tool outputs; summarize/cached replace for old tool outputs.
         tool_output_indices: list[int] = []
         for i, msg in enumerate(messages):
             if msg.get("role") == "tool":
                 content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > self.micro_size_limit:
+                if isinstance(content, str) and len(content) > size_limit:
                     tool_output_indices.append(i)
 
-        if len(tool_output_indices) <= self.micro_hot_tail:
+        if len(tool_output_indices) <= hot_tail:
             return
 
-        # Keep the last ``micro_hot_tail`` tool outputs hot; spill the rest. Avoid
-        # ``[:-n]`` — it is ``[:0]`` (spills NOTHING) when micro_hot_tail==0, the
-        # opposite of "keep zero hot". CONTEXT_MICRO_HOT_TAIL=0 is a valid config.
-        cold = tool_output_indices[: len(tool_output_indices) - self.micro_hot_tail]
+        # Keep the last ``hot_tail`` tool outputs hot; spill the rest. Avoid
+        # ``[:-n]`` — it is ``[:0]`` (spills NOTHING) when hot_tail==0, the
+        # opposite of "keep zero hot". hot_tail=0 is a valid config.
+        cold = tool_output_indices[: len(tool_output_indices) - hot_tail]
         for i in cold:
             msg = messages[i]
             content = msg.get("content", "")
@@ -212,7 +224,10 @@ class ContextManager:
                 continue
             self._file_counter += 1
             if self.cache_dir is None:
-                self.cache_dir = get_runtime_env().require_home_dir() / ".cache"
+                self.cache_dir = (
+                    Path(spill_dir) if spill_dir
+                    else get_runtime_env().require_home_dir() / ".cache"
+                )
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             cache_path = self.cache_dir / f"tool_{self._file_counter:05d}.md"
             tool_name = str(msg.get("name") or "tool")

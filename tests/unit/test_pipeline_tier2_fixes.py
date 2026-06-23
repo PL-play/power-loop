@@ -138,7 +138,11 @@ async def test_tool_calls_counter_excludes_rejected_and_retry() -> None:
 async def test_prepare_round_invalidates_estimate_after_microcompact(tmp_path) -> None:
     ctx = ContextManager(micro_hot_tail=0, micro_size_limit=100)
     ctx.cache_dir = tmp_path
-    p = _pipeline(config=AgentLoopConfig(compactor=None), tool_registry=ToolRegistry(), ctx=ctx)
+    p = _pipeline(
+        config=AgentLoopConfig(compactor=None, microcompact_enabled=True, microcompact_hot_tail=0,
+                               microcompact_size_limit=100),
+        tool_registry=ToolRegistry(), ctx=ctx,
+    )
     await p._append_message({"role": "user", "content": "hi"})
     await p._append_message({"role": "assistant", "content": "",
                              "tool_calls": [{"id": "t", "type": "function",
@@ -151,6 +155,26 @@ async def test_prepare_round_invalidates_estimate_after_microcompact(tmp_path) -
     recomputed = estimate_tokens(p.history)
     assert p._estimate_history_tokens() == recomputed  # cache must match (was stale-high)
     assert recomputed < primed  # content actually shrank
+
+
+@pytest.mark.asyncio
+async def test_microcompact_off_by_default_does_not_spill(tmp_path) -> None:
+    """3.1.x: microcompact is OFF by default — prepare_round must NOT spill or
+    rewrite content when config.microcompact_enabled is False."""
+    ctx = ContextManager(micro_hot_tail=0, micro_size_limit=100)
+    ctx.cache_dir = tmp_path
+    p = _pipeline(config=AgentLoopConfig(compactor=None), tool_registry=ToolRegistry(), ctx=ctx)
+    await p._append_message({"role": "user", "content": "hi"})
+    await p._append_message({"role": "assistant", "content": "",
+                             "tool_calls": [{"id": "t", "type": "function",
+                                             "function": {"name": "x", "arguments": "{}"}}]})
+    await p._append_message({"role": "tool", "tool_call_id": "t", "name": "x", "content": "Z" * 5000})
+
+    await p.prepare_round(1)
+
+    tool_msg = next(m for m in p.history if m.get("role") == "tool")
+    assert tool_msg["content"] == "Z" * 5000  # untouched — no spill
+    assert not any(tmp_path.iterdir())  # nothing written to disk
 
 
 # ── C22: a single-message fold invalidates the estimate ──────────────────────

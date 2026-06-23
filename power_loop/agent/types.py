@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -119,6 +120,29 @@ class AgentLoopConfig:
     #: Auto-register the built-in MemoryRecallHook when ``memory`` is set. Turn
     #: off to inject memory yourself via an LLM_BEFORE hook.
     builtin_memory_hook: bool = True
+
+    # ── Microcompact (large tool-output spill-to-disk) ──
+    #
+    # A cheap, no-LLM per-round mechanism that replaces OLD oversized tool
+    # outputs (older than the hot tail) with a short on-disk pointer, to save
+    # context tokens — orthogonal to the LLM-summary fold/compactor. Verbatim
+    # mode only (projection renders finished sends from the projection store).
+    #
+    # DEFAULT OFF as of 3.1.x: it only helps when those old outputs are never
+    # needed again; otherwise the pointer just trades for a re-read. Projection
+    # mode + fold + provider prefix-caching already cover context budget. Turn it
+    # on for long verbatim sessions that read many large files and rarely revisit
+    # the old ones. The thresholds default from the legacy CONTEXT_MICRO_* env
+    # vars for back-compat; the config fields take precedence.
+    microcompact_enabled: bool = False
+    microcompact_size_limit: int = field(
+        default_factory=lambda: int(os.getenv("CONTEXT_MICRO_SIZE_LIMIT", "1000"))
+    )
+    microcompact_hot_tail: int = field(
+        default_factory=lambda: int(os.getenv("CONTEXT_MICRO_HOT_TAIL", "10"))
+    )
+    #: Where spilled outputs are written. None → the runtime home's ``.cache``.
+    microcompact_spill_dir: str | None = None
     # Bounds for the note_add/note_update/note_delete tools (agent-authored
     # notes). None → DEFAULT_NOTES_POLICY. See power_loop.runtime.notes.
     notes_policy: NotesPolicy | None = None
