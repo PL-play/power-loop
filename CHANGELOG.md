@@ -74,6 +74,19 @@ default** and exposed through `AgentLoopConfig` instead of env-only knobs.
   kwargs (fall back to the instance's env-defaulted fields, so direct callers are
   unaffected). Object-store / custom spill backends (`SpillSink`) are a deferred follow-up.
 
+### Fixed — system-prompt assembly deduplicated (preview can no longer drift from the live prompt)
+
+The runtime system-prompt assembly (`base → tool catalog → skill section`) was
+**duplicated** in `AgentPipeline.__init__` (the live prompt) and
+`StatefulAgentLoop.resolve_system_prompt` (the preview, whose contract is "exactly
+what the LLM will see"). Editing one without the other would silently diverge.
+
+- Extracted into one shared `resolve_runtime_system_prompt(...)` helper (in
+  `agent/system_prompt.py`, alongside `build_skill_section`); both sites now call it,
+  so the preview is byte-identical to the live prompt by construction. Pure refactor,
+  no behavior change. New regression test asserts `resolve_system_prompt == ` the
+  prompt the LLM actually receives.
+
 ## [3.0.2] — 2026-06-23
 
 ### Docs (no code/API change)

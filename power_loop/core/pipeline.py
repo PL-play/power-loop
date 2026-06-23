@@ -21,12 +21,7 @@ from typing import Any
 
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.sink import MessageSink, NullSink
-from power_loop.agent.system_prompt import (
-    DEFAULT_AGENT_SYSTEM_PROMPT,
-    SystemPromptContext,
-    format_tool_catalog,
-    section_skills,
-)
+from power_loop.agent.system_prompt import resolve_runtime_system_prompt
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
     CancellationRequested,
@@ -89,7 +84,6 @@ from power_loop.runtime.compact import CompactionContext
 from power_loop.runtime.human_input import HumanInputRequired
 from power_loop.runtime.memory import MemorySnapshot
 from power_loop.runtime.retry import with_retry
-from power_loop.runtime.skills import SkillLoader
 from power_loop.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -242,24 +236,20 @@ class AgentPipeline:
         self.store = store
         self._drain_follow_ups = drain_follow_ups
 
-        base_prompt = (config.system_prompt or DEFAULT_AGENT_SYSTEM_PROMPT).strip()
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
-
-        # Auto-inject tool catalog into system prompt (M1.10).
-        # The catalog lives on self.system_prompt (a plain string attribute),
-        # NOT in self.history — the compactor never touches it.
-        if config.inject_tool_descriptions and tool_registry is not None:
-            catalog = format_tool_catalog(
-                tool_registry, header=config.tool_catalog_header,
-            )
-            if catalog:
-                base_prompt = f"{base_prompt}\n\n{catalog}"
-
-        skill_section = self._build_skill_prompt_section()
-        if skill_section:
-            base_prompt = f"{base_prompt}\n\n{skill_section}"
-
-        self.system_prompt = base_prompt
+        # Auto-inject tool catalog + skill section (M1.10). Built ONCE here and
+        # frozen into self.system_prompt (a plain string — NOT self.history, so
+        # the compactor never touches it). The assembly is shared with
+        # StatefulAgentLoop.resolve_system_prompt (the preview) via this helper
+        # so the live prompt and the preview can never drift. The session-level
+        # prompt override is already resolved into config.system_prompt upstream.
+        self.system_prompt = resolve_runtime_system_prompt(
+            config.system_prompt,
+            inject_tool_descriptions=config.inject_tool_descriptions,
+            tool_catalog_header=config.tool_catalog_header,
+            tool_registry=tool_registry,
+            skills_dir=config.skills_dir,
+        )
         self.history: list[LoopMessage] = []
         # Monotonic per-session SEND index, set by the loop before run() (None when
         # unset, e.g. in tests). Stamped into each appended row's PERSISTED meta only
@@ -280,21 +270,6 @@ class AgentPipeline:
         # or strand subscribers.
         self._session_started = False
         self._finalized = False
-
-    def _build_skill_prompt_section(self) -> str:
-        if not self.config.skills_dir:
-            return ""
-        try:
-            loader = SkillLoader(self.config.skills_dir)
-        except Exception:
-            return ""
-        section = section_skills(
-            SystemPromptContext(
-                skills_dir=str(loader.skills_dir),
-                skill_descriptions=loader.get_descriptions(),
-            )
-        )
-        return section or ""
 
     # ── Helper: emit event ──
 

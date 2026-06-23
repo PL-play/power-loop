@@ -417,6 +417,56 @@ DEFAULT_EXPLORE_SUBAGENT_SYSTEM_PROMPT = (
 ).build(SystemPromptContext())
 
 
+def build_skill_section(skills_dir: str | None) -> str:
+    """Render the auto-injected skill-catalog section for ``skills_dir``.
+
+    Returns ``""`` when no skills_dir is set or loading fails. Lazy-imports
+    SkillLoader to avoid a core↔runtime import cycle.
+    """
+    if not skills_dir:
+        return ""
+    try:
+        from power_loop.runtime.skills import SkillLoader
+
+        loader = SkillLoader(skills_dir)
+        section = section_skills(
+            SystemPromptContext(
+                skills_dir=str(loader.skills_dir),
+                skill_descriptions=loader.get_descriptions(),
+            )
+        )
+        return section or ""
+    except Exception:
+        return ""
+
+
+def resolve_runtime_system_prompt(
+    base: str | None,
+    *,
+    inject_tool_descriptions: bool,
+    tool_catalog_header: str,
+    tool_registry: Any,
+    skills_dir: str | None,
+) -> str:
+    """Single source of truth for runtime system-prompt assembly:
+    ``base → tool catalog → skill section`` (each joined by ``"\\n\\n"``).
+
+    Shared by :meth:`AgentPipeline.__init__` (the live prompt) and
+    :meth:`StatefulAgentLoop.resolve_system_prompt` (the preview), so the two
+    can never drift. Callers resolve ``base`` themselves (config vs session
+    override) and pass it in; everything after is computed here once.
+    """
+    out = (base or DEFAULT_AGENT_SYSTEM_PROMPT).strip()
+    if inject_tool_descriptions and tool_registry is not None:
+        catalog = format_tool_catalog(tool_registry, header=tool_catalog_header)
+        if catalog:
+            out = f"{out}\n\n{catalog}"
+    skill = build_skill_section(skills_dir)
+    if skill:
+        out = f"{out}\n\n{skill}"
+    return out
+
+
 def build_agent_system_prompt(
     ctx: SystemPromptContext,
     extra: str | None = None,

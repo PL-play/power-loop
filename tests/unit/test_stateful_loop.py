@@ -838,6 +838,52 @@ async def test_resolve_system_prompt_session_override(store: SessionStore) -> No
     assert "# Available Tools" in resolved
 
 
+@pytest.mark.asyncio
+async def test_resolve_system_prompt_matches_live_prompt(store: SessionStore) -> None:
+    """The preview (resolve_system_prompt) must be BYTE-IDENTICAL to the system
+    prompt the LLM actually receives — they share one assembly helper, so they
+    can't drift. Guards the dedup of pipeline.__init__ vs resolve_system_prompt."""
+
+    @dataclass
+    class _CapturingLLM(LLMService):
+        seen_system: list[str] = field(default_factory=list)
+
+        async def complete(self, request, *, on_chunk_delta_text=None,
+                            on_chunk_think=None, on_stream_end=None):
+            self.seen_system.append(request.system_prompt or "")
+            return LLMResponse(raw_text="ok")
+
+        def stream(self, request):
+            async def _e():
+                if False:
+                    yield LLMStreamChunk()
+            return _e()
+
+        async def close(self):
+            return None
+
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="calc", description="Calculate",
+            input_schema={"type": "object", "properties": {"x": {"type": "string"}}},
+            required_params=("x",),
+        ),
+        lambda **kw: "42",
+    )
+    llm = _CapturingLLM()
+    cfg = AgentLoopConfig(system_prompt="You are a bot.", max_rounds=1)
+    loop = StatefulAgentLoop(llm=llm, store=store, config=cfg, tool_registry=reg)
+    sid = await loop.new_session(system_prompt="Session bot.")
+
+    preview = await loop.resolve_system_prompt(session_id=sid)
+    await loop.send("hi", session_id=sid)
+
+    assert llm.seen_system[0] == preview  # preview == what the LLM saw
+    assert preview.startswith("Session bot.")
+    assert "- **calc**:" in preview
+
+
 class _GateLLM(_Scripted):
     """Blocks the first LLM call until released — simulates a long in-flight run."""
 

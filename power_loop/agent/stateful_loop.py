@@ -31,10 +31,7 @@ from power_loop._vendor.llm_client.interface import LLMService
 from power_loop.agent.follow_up import FollowUpQueued, merge_follow_up_inputs
 from power_loop.agent.sink import SQLiteSink
 from power_loop.agent.system_prompt import (
-    DEFAULT_AGENT_SYSTEM_PROMPT,
-    SystemPromptContext,
-    format_tool_catalog,
-    section_skills,
+    resolve_runtime_system_prompt,
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import SessionNotFoundError, SessionPendingError
@@ -51,7 +48,6 @@ from power_loop.core.runner import AgentRunner
 from power_loop.runtime.budget import estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike
 from power_loop.runtime.history_sanitize import align_tool_calls
-from power_loop.runtime.skills import SkillLoader
 from power_loop.runtime.store.schema import SchemaPolicy
 from power_loop.runtime.store.store import (
     DEFAULT_DB_PATH,
@@ -950,36 +946,18 @@ class StatefulAgentLoop:
             row = await store.get_session(session_id)
             if row is not None:
                 base = row.system_prompt
-
         if base is None or not base.strip():
-            base = self.config.system_prompt or DEFAULT_AGENT_SYSTEM_PROMPT
+            base = self.config.system_prompt
 
-        base = base.strip()
-
-        if self.config.inject_tool_descriptions and self.tool_registry is not None:
-            catalog = format_tool_catalog(
-                self.tool_registry,
-                header=self.config.tool_catalog_header,
-            )
-            if catalog:
-                base = f"{base}\n\n{catalog}"
-
-        skills = None
-        if self.config.skills_dir:
-            try:
-                loader = SkillLoader(self.config.skills_dir)
-                skills = section_skills(
-                    SystemPromptContext(
-                        skills_dir=str(loader.skills_dir),
-                        skill_descriptions=loader.get_descriptions(),
-                    )
-                )
-            except Exception:
-                skills = None
-        if skills:
-            base = f"{base}\n\n{skills}"
-
-        return base
+        # Shared assembly — the SAME helper AgentPipeline.__init__ uses — so this
+        # preview is byte-identical to what the LLM actually receives.
+        return resolve_runtime_system_prompt(
+            base,
+            inject_tool_descriptions=self.config.inject_tool_descriptions,
+            tool_catalog_header=self.config.tool_catalog_header,
+            tool_registry=self.tool_registry,
+            skills_dir=self.config.skills_dir,
+        )
 
     # ── internals ─────────────────────────────────────────────────────────
 
