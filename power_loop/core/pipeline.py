@@ -310,12 +310,17 @@ class AgentPipeline:
             return None
         injected_set = set(injected_idx)
         orig_idx = [i for i in range(len(final_messages)) if i not in injected_set]
-        # Rebind fail-safe: an LLM_BEFORE hook may REPLACE ctx.messages with fresh copies (legal per
-        # LlmBeforeCtx, though the builtin memory hook mutates in place). Then every message is
-        # id-novel and the identity diff can't isolate the real injection — it would mislabel the
-        # whole prompt. Detect that (a prior prefix existed but NOTHING survived id-stable) and
-        # record a small truthful marker instead of dumping the entire conversation into the audit.
-        if pre_hook_ids and not orig_idx:
+        # Rebind fail-safe: an LLM_BEFORE hook may REPLACE all or PART of ctx.messages with fresh
+        # copies (legal per LlmBeforeCtx, though the builtin memory hook mutates in place). Those
+        # copies are id-novel, so the identity diff would mislabel pre-existing turns as "injected"
+        # — in `full` mode that would dump the conversation into the audit. A genuine injection is a
+        # small minority of the request; so treat it as a rebind (record a small truthful marker, no
+        # content) when NOTHING survived id-stable OR the id-novel messages are an implausible
+        # majority. The >3 floor keeps short, legitimately memory-heavy sends from tripping it.
+        rebound = (not orig_idx) or (
+            len(injected_idx) > len(final_messages) / 2 and len(injected_idx) > 3
+        )
+        if pre_hook_ids and rebound:
             return {
                 "hook_point": "LLM_BEFORE", "hook": "llm_before", "position": "unknown",
                 "kind": "inject_unresolved",

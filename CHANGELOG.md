@@ -27,6 +27,11 @@ written only onto the sink copy of the assistant message, exactly like `send_ind
   (`close_session_tree`). The table is NOT exported by `export_session` (audit-only).
 - Capture is an identity-diff of the post-`LLM_BEFORE` message list against a pre-hook snapshot, so it
   records both tail- and front-positioned injection. Nothing is written to `pl_project_messages`.
+- Scope/limitations: captures only **appended** injection (not in-place edits of existing messages);
+  one row **per round** (the canonical degraded / `LLM_AFTER`-BREAK rounds are recorded too; an
+  `LLM_BEFORE`-BREAK round writes no assistant message so it records nothing). A hook that replaces
+  all or most of `ctx.messages` with fresh copies yields a small `inject_unresolved` marker (no
+  content) instead of mislabeling the conversation.
 
 ## [3.1.0] — 2026-06-23
 

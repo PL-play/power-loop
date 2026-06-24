@@ -31,8 +31,8 @@ from _helpers import make_llm
 
 from power_loop import (
     AgentLoopConfig,
-    NotesPolicy,
     NoteMemory,
+    NotesPolicy,
     StatefulAgentLoop,
     create_default_tool_registry,
 )

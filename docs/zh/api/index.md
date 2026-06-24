@@ -20,7 +20,8 @@
 | `StatefulResult` | `session_id`、`status`、`final_text`、`rounds`、`pending_tool_calls`、`pending_interactions` | [源码](../../../power_loop/agent/stateful_loop.py) |
 | `FollowUpQueued` | `session_id`、`queue_depth` — `follow_up()` 在运行中入队时返回，表示下一轮会注入指引 | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/agent/follow_up.py) |
 | `AgentLoopConfig` | loop 限制、temperature、压缩、重试、记忆 | [配置](../user-guide/configuration.md)、[源码](../../../power_loop/agent/types.py) |
-| `SessionStore` | SQLite 会话、消息、压缩、usage、pending 状态 | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/runtime/session_store.py) |
+| `SessionStore` | 可插拔异步存储（SQLite / Postgres / MySQL）：会话、消息、压缩、usage、pending 状态、投影（`pl_project_messages`）、hook 注入审计（`pl_hook_events`，`list_hook_events`） | [会话](../user-guide/sessions.md)、[源码](../../../power_loop/runtime/store/store.py) |
+| `HookEventRow` | 一条 `LLM_BEFORE` hook 临时注入的审计行（`pl_hook_events`）；见 `AgentLoopConfig.record_hook_events` / `SessionStore.list_hook_events` | [Hook 注入审计](../user-guide/hook-events-audit.md)、[源码](../../../power_loop/runtime/store/types.py) |
 
 ## 工具与子代理
 

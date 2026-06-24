@@ -54,6 +54,7 @@ A representative subset is validated by `tests/real/test_examples.py` against a 
 | 41 | [`41_custom_async_tool.py`](41_custom_async_tool.py) | **Custom async-wake tool**: start async work, return immediately, wake the agent when done — the extension recipe | `ToolDefinition`, `get_tool_runtime_context`, `loop.schedule_timer`, `TimerRunner`, `follow_up` |
 | 42 | [`42_build_your_own_tools.py`](42_build_your_own_tools.py) | **Build your own**: recreate the built-ins (background / sub-agent / timer / human-input / blackboard / memory / mini-workflow) from public primitives | `run_agent_spec`, `HumanInputRequired`, `RuntimeProjector`, `MemoryProvider`, `get/set_runtime_state`, `add_note` |
 | 43 | [`43_memory_hook_override.py`](43_memory_hook_override.py) | **Memory hook**: the auto-registered built-in `MemoryRecallHook` (ephemeral tail injection) — and how to disable or override it by name | `MemoryRecallHook`, `NoteMemory`, `hooks.remove`/`replace`/`has` |
+| 44 | [`44_hook_events_audit.py`](44_hook_events_audit.py) | **Hook-injection audit**: `record_hook_events="full"` records the ephemeral context `LLM_BEFORE` hooks inject (e.g. recalled memory) into `pl_hook_events` — observability only, never re-enters history/the request | `AgentLoopConfig(record_hook_events=)`, `store.list_hook_events`, `HookEventRow` |
 
 ## Running
 

@@ -85,3 +85,55 @@ async def test_note_added_midsession_surfaces_on_next_send() -> None:
         )
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_hook_events_audits_real_memory_injection() -> None:
+    """End-to-end against a LIVE provider: with record_hook_events="full", the ephemeral memory the
+    MemoryRecallHook injects into the real LLM call is captured into pl_hook_events — and the model
+    still actually used it. Validates the capture path on a real recall + real round, not a stub."""
+    store = await SessionStore.open(":memory:")
+    try:
+        loop = StatefulAgentLoop(
+            llm=make_llm(max_tokens=256, temperature=0),
+            store=store,
+            config=AgentLoopConfig(
+                system_prompt=(
+                    "You are a concise assistant. You are given persistent notes about the "
+                    "user — use them when answering. Reply in English."
+                ),
+                max_rounds=1,
+                temperature=0,
+                max_tokens=256,
+                compactor=None,
+                memory=NoteMemory(store),
+                record_hook_events="full",
+            ),
+        )
+        sid = await loop.new_session()
+        await store.add_note(sid, "The user's project codename is 'Seahawk-9'.")
+
+        q = "What is my project's codename?"
+        r = await loop.send(q, session_id=sid)
+        assert r.status == "completed"
+
+        # The audit captured the REAL recalled memory that was injected into the live call.
+        events = await store.list_hook_events(sid)
+        assert len(events) == 1, f"expected one hook_event, got {len(events)}"
+        ev = events[0]
+        assert ev.hook_point == "LLM_BEFORE" and ev.hook == "builtin.memory_recall"
+        assert ev.kind == "inject" and ev.position == "tail"
+        injected_text = " ".join(str(it.get("content") or "") for it in ev.payload["items"])
+        assert "Seahawk-9" in injected_text, f"recalled note not in audit: {injected_text!r}"
+        # and it is linked to a real assistant message of this session
+        asst = {m.seq for m in await store.load_all_messages(sid) if m.role == "assistant"}
+        assert ev.message_seq in asst
+
+        # ...and the model actually used it (the whole point of recall).
+        await assert_passes(
+            question=q,
+            answer=r.final_text,
+            rubric="The answer states the project codename is 'Seahawk-9' (case-insensitive).",
+        )
+    finally:
+        await store.close()

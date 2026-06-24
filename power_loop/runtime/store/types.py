@@ -30,6 +30,7 @@ __all__ = [
     "BackgroundTaskRow",
     "NoteRow",
     "ProjectMessageRow",
+    "HookEventRow",
 ]
 
 

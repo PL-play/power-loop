@@ -22,7 +22,8 @@ inspect the source modules linked below.
 | `StatefulResult` | `session_id`, `status`, `final_text`, `rounds`, `pending_tool_calls`, `pending_interactions` | [source](../../../power_loop/agent/stateful_loop.py) |
 | `FollowUpQueued` | `session_id`, `queue_depth` — returned when `follow_up()` enqueues steering input for the next round | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/agent/follow_up.py) |
 | `AgentLoopConfig` | loop limits, temperature, compaction, retry, memory | [Configuration](../user-guide/configuration.md), [source](../../../power_loop/agent/types.py) |
-| `SessionStore` | SQLite sessions, messages, compactions, usage, pending state | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/runtime/session_store.py) |
+| `SessionStore` | Pluggable async store (SQLite / Postgres / MySQL): sessions, messages, compactions, usage, pending state, projection (`pl_project_messages`), hook-injection audit (`pl_hook_events` via `list_hook_events`) | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/runtime/store/store.py) |
+| `HookEventRow` | One audit row of an ephemeral `LLM_BEFORE` hook injection (`pl_hook_events`); see `AgentLoopConfig.record_hook_events` / `SessionStore.list_hook_events` | [Hook-events audit](../user-guide/hook-events-audit.md), [source](../../../power_loop/runtime/store/types.py) |
 
 ## Tools and Sub-Agents
 

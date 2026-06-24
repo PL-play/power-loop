@@ -154,9 +154,11 @@ class AgentLoopConfig:
     #                volume is a concern.
     # ONE row is written per ROUND (the LLM_BEFORE hook runs each round; the builtin memory block is
     # memoized once per send but re-injected every round), so a multi-round send yields one audit row
-    # per round. Assumes LLM_BEFORE handlers MUTATE ctx.messages in place (the builtin contract); a
-    # handler that REPLACES ctx.messages with copies makes the per-injection diff unresolvable — the
-    # row is then a small "inject_unresolved" marker (still never affects context/cache).
+    # per round. Assumes LLM_BEFORE handlers MUTATE ctx.messages in place (the builtin contract) and
+    # captures only APPENDED injection, not in-place edits of existing messages. A handler that
+    # REPLACES all or most of ctx.messages with fresh copies makes the per-injection diff
+    # unresolvable — the row is then a small "inject_unresolved" marker (still never affects
+    # context/cache).
     record_hook_events: str = "off"
     # Bounds for the note_add/note_update/note_delete tools (agent-authored
     # notes). None → DEFAULT_NOTES_POLICY. See power_loop.runtime.notes.

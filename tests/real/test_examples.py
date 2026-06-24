@@ -340,3 +340,15 @@ def test_example_42_build_your_own_tools_runs() -> None:
     assert out["notes_count"] >= 1, out          # custom remember → store note
     assert out["board_entries"] >= 1, out        # custom board_write → runtime_state
     assert out["delegate_replied"] is True, out  # custom delegate → child agent ran
+
+
+def test_example_44_hook_events_audit_runs() -> None:
+    """The hook-events audit example: record_hook_events='full' captures the ephemeral memory
+    injection into pl_hook_events, linked to the assistant message, WITHOUT it entering history."""
+    module = _load_example("44_hook_events_audit.py")
+    out = asyncio.run(module.main())
+    assert out["event_count"] == 1, out
+    assert out["hook"] == "builtin.memory_recall" and out["kind"] == "inject", out
+    assert out["captured_codename"] is True, out          # the recalled note was audited
+    assert out["linked_to_assistant"] is True, out        # row links to the assistant message
+    assert out["audit_text_not_in_history"] is True, out  # leak-guard: audit never in history

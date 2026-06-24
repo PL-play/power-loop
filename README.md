@@ -89,6 +89,7 @@ Most "agent frameworks" ask you to build your app *inside* them. power-loop is t
 | **Hooks & events** | Veto/observe at every lifecycle point; strongly-typed event payloads | [Hooks](docs/en/user-guide/hooks.md) · [Events](docs/en/user-guide/events.md) |
 | **Structured output** | `output_schema` → provider `response_format` → parsed & validated | [Structured](docs/en/user-guide/structured-output.md) |
 | **Pluggable memory** | Cross-session recall via a `MemoryProvider` Protocol; a default-on built-in hook injects it ephemerally at the request tail (prefix-cacheable) | [Memory](docs/en/user-guide/memory.md) |
+| **Hook-injection audit** | Optionally record the ephemeral context `LLM_BEFORE` hooks inject each round (e.g. recalled memory) into `pl_hook_events` — observability only, never re-enters history/the request | [Hook-events audit](docs/en/user-guide/hook-events-audit.md) |
 | **Retry / cancel / budgets** | Provider-aware retry, a unified cancellation token, hard per-run token caps | [Retry & Cancel](docs/en/user-guide/retry-cancel.md) |
 | **Stable error codes** | Every `PowerLoopError` carries a frozen machine-readable `code` — branch on `exc.code` | [API: error codes](docs/en/api/index.md#error-codes) |
 | **Crash recovery** | `heal_pending` / `resume` / `abort_pending` for runs killed mid tool-call | [Pending recovery](docs/en/user-guide/sessions.md#pending-recovery) |

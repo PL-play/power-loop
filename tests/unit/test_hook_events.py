@@ -299,6 +299,127 @@ async def test_loop_records_one_event_per_round_in_multi_round_send() -> None:
         await store.close()
 
 
+@pytest.mark.asyncio
+async def test_degraded_round_records_the_injection_that_fed_the_failed_call() -> None:
+    """The injection fed a real (failed) LLM call, so the degraded assistant row must carry its
+    audit (pins the commit-claimed behavior)."""
+    from power_loop import LLMTimeout
+
+    class _RaisingLLM:
+        async def complete(self, request, **kwargs):
+            raise LLMTimeout(elapsed=0.0, attempts=1, total_timeout=1.0)
+
+        async def stream(self, request):  # pragma: no cover
+            raise NotImplementedError
+
+        async def close(self):  # pragma: no cover
+            pass
+
+    store = await SessionStore.open(":memory:")
+    try:
+        loop = StatefulAgentLoop(
+            llm=_RaisingLLM(), store=store,
+            config=AgentLoopConfig(
+                max_rounds=1, compactor=None,
+                memory=_FakeProvider(to_recall=[{"content": "M"}]),
+                record_hook_events="full",
+            ),
+        )
+        sid = await loop.new_session()
+        r = await loop.send("hi", session_id=sid)
+        assert r.status == "degraded"
+        evs = await store.list_hook_events(sid)
+        assert len(evs) == 1
+        # linked to the degraded assistant row
+        asst = next(m for m in await store.load_all_messages(sid)
+                    if m.role == "assistant" and "degraded" in (m.content or ""))
+        assert evs[0].message_seq == asst.seq
+        assert evs[0].payload["items"][0]["content"] == "M"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_llm_after_break_round_records_the_injection() -> None:
+    from power_loop import HookPoint
+    from power_loop.contracts.hooks import HookDirective
+
+    store = await SessionStore.open(":memory:")
+    try:
+        loop = StatefulAgentLoop(
+            llm=_RecLLM(), store=store,
+            config=AgentLoopConfig(
+                max_rounds=2, compactor=None,
+                memory=_FakeProvider(to_recall=[{"content": "M"}]),
+                record_hook_events="full",
+            ),
+        )
+
+        def _brk(ctx):
+            ctx.directive = HookDirective.BREAK
+
+        loop.hooks.register(HookPoint.LLM_AFTER, _brk, name="t.break")
+        sid = await loop.new_session()
+        await loop.send("hi", session_id=sid)
+        evs = await store.list_hook_events(sid)
+        assert len(evs) == 1 and evs[0].payload["items"][0]["content"] == "M"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_loop_custom_hook_total_rebind_records_unresolved_marker() -> None:
+    """End-to-end: a custom LLM_BEFORE hook that REPLACES ctx.messages with fresh copies must yield
+    an inject_unresolved marker with NO conversation text captured (the privacy fail-safe)."""
+    from power_loop import HookPoint
+
+    store = await SessionStore.open(":memory:")
+    try:
+        loop = StatefulAgentLoop(
+            llm=_RecLLM(), store=store,
+            config=AgentLoopConfig(max_rounds=1, compactor=None, record_hook_events="full"),
+        )
+
+        def _rebind(ctx):
+            ctx.messages = [{**m} for m in ctx.messages] + [
+                {"role": "system", "name": "x", "content": "SENSITIVE-INJECT"}
+            ]
+
+        loop.hooks.register(HookPoint.LLM_BEFORE, _rebind, name="t.rebind")
+        sid = await loop.new_session()
+        await loop.send("SENSITIVE-USER-TEXT", session_id=sid)
+        evs = await store.list_hook_events(sid)
+        assert len(evs) == 1 and evs[0].kind == "inject_unresolved"
+        assert evs[0].payload["rebound"] is True and evs[0].payload["items"] == []
+        # no conversation/injected text leaked into the audit
+        assert "SENSITIVE" not in str(evs[0].payload)
+    finally:
+        await store.close()
+
+
+def test_summarize_partial_rebind_failsafe() -> None:
+    # Partial rebind (copy all-but-one, then append) must ALSO trip the fail-safe, not dump the
+    # near-whole conversation as "injected". Distinctive tokens (no collision with payload keys).
+    orig = [{"role": "system", "content": "ALPHA"}, {"role": "user", "content": "BRAVO"},
+            {"role": "assistant", "content": "CHARLIE"}, {"role": "user", "content": "DELTA"}]
+    pre = {id(m) for m in orig}
+    # keep the first message id-stable, copy the rest, append one injection → 4 of 5 are id-novel
+    final = [orig[0]] + [dict(m) for m in orig[1:]] + [{"role": "system", "name": "memory_0", "content": "ECHO"}]
+    audit = _summarize(final, pre, "full")
+    assert audit["kind"] == "inject_unresolved" and audit["payload"]["rebound"] is True
+    assert audit["payload"]["items"] == []
+    for tok in ("ALPHA", "BRAVO", "CHARLIE", "DELTA", "ECHO"):
+        assert tok not in str(audit)
+
+
+def test_summarize_in_place_edit_is_not_captured() -> None:
+    # Capture is append-only: an in-place rewrite of an existing message is NOT flagged as injected.
+    orig = [{"role": "system", "content": "sp"}, {"role": "user", "content": "hi"}]
+    pre = {id(m) for m in orig}
+    orig[1]["content"] = "REWRITTEN"  # mutate existing object in place
+    assert _summarize(orig, pre, "full") is None  # nothing appended → no audit
+
+
 def test_config_rejects_invalid_record_hook_events() -> None:
     import pytest as _pytest
 
