@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+### Added — hook-injected context audit log (`pl_hook_events`, schema v3)
+
+The ephemeral context that `LLM_BEFORE` hooks inject per round (e.g. recalled memory) used to
+vanish after the LLM call, recorded nowhere. A new **opt-in audit table** `{prefix}hook_events`
+captures it for observability — linked to the round's assistant message — **without ever re-entering
+history or the LLM request** (so context construction and prefix-caching are unchanged). The audit is
+written only onto the sink copy of the assistant message, exactly like `send_index`.
+
+- **Added** `AgentLoopConfig.record_hook_events`: `"off"` (default — zero overhead), `"metadata"`
+  (name/source/char-count/position per injected item), or `"full"` (also the injected text).
+- **Added** the `{prefix}hook_events` store table (schema **v2→v3**, an idempotent `CREATE TABLE`
+  migration — no `ALTER` on the hot `messages` table) with a per-session monotonic `event_id`,
+  `message_seq` link, `hook_point`/`hook`/`position`/`kind`, and a JSON `payload`
+  (`{v, items:[{role,name,source,chars,content?}], item_count, total_chars}`).
+- **Added** `SessionStore.list_hook_events(session_id, *, message_seq=None)` and the `HookEventRow`
+  type (PROVISIONAL — not in `STABLE_API`). Rows are deleted with the session
+  (`close_session_tree`). The table is NOT exported by `export_session` (audit-only).
+- Capture is an identity-diff of the post-`LLM_BEFORE` message list against a pre-hook snapshot, so it
+  records both tail- and front-positioned injection. Nothing is written to `pl_project_messages`.
+
 ## [3.1.0] — 2026-06-23
 
 ### Changed — memory recall is now a built-in, overridable hook (ephemeral tail injection)

@@ -28,6 +28,7 @@
 | [压缩](compaction.md) | `fold_strategy` 轴：`LLMSummaryFold`（默认）/ `AgenticFold`、`trigger_ratio`、保留最后 N 个 send、自定义 `FoldStrategy` |
 | [Send 上下文投影](send-context-projection.md) | `representation` 轴：`VerbatimRepresentation`（默认）/ `ProjectedRepresentation`;每-send 纯文本投影(`pl_project_messages`);`ToolDefinition.project`;`recall_send` |
 | [记忆](memory.md) | `MemoryProvider` 协议、`recall` / `remember`、注入位置 |
+| [Hook 注入审计](hook-events-audit.md) | `record_hook_events`（off/metadata/full）：把 `LLM_BEFORE` hook 每轮注入的临时上下文（如召回的记忆）记入 `pl_hook_events`，仅审计、绝不影响上下文/缓存 |
 | [重试与取消](retry-cancel.md) | `LLMRetryPolicy`、指数退避、`CancellationToken` |
 | [结构化输出](structured-output.md) | `StructuredOutputSpec`、`parse_structured`、JSON 修复链 |
 | [定时器](timers.md) | 持久化自我唤醒、`TimerRunner`、循环定时器、`TIMER_FIRE` |

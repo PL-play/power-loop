@@ -43,7 +43,7 @@ pytestmark = [
 _DATA_TABLES = (
     "sessions", "messages", "compactions", "usage_rounds", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
-    "timers", "notes", "project_messages",
+    "timers", "notes", "project_messages", "hook_events",
 )
 
 
@@ -76,3 +76,10 @@ async def test_mysql_export_import_send_index(mysql_store) -> None:
     from tests.unit.test_project_messages_store import exercise_export_import_send_index
 
     await exercise_export_import_send_index(mysql_store)
+
+
+async def test_mysql_hook_events(mysql_store) -> None:
+    # v3 hook-events audit table: DDL/insert/list/cleanup conformance on real MySQL.
+    from tests.unit.test_project_messages_store import exercise_hook_events_crud
+
+    await exercise_hook_events_crud(mysql_store)

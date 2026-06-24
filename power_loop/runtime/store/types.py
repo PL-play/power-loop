@@ -205,3 +205,31 @@ class ProjectMessageRow:
     projector_version: int
     token_estimate: int | None
     created_at: int
+
+
+@dataclass
+class HookEventRow:
+    """One audit row of an EPHEMERAL hook augmentation (``{prefix}hook_events``) — e.g. the memory
+    block an ``LLM_BEFORE`` hook injected into a single LLM call's request. It is observability ONLY:
+    written alongside the message it fed into, NEVER read back into history or the LLM request. So
+    the injected context (which today vanishes after the call) is recoverable for audit.
+
+    ``event_id`` is a per-session monotonic id. ``message_seq`` links to the ``messages`` row this
+    augmentation fed into (the assistant response of that round); ``round_index``/``send_index``
+    locate the round/send. ``hook_point`` is the hook phase (``LLM_BEFORE``); ``hook`` a coarse
+    source label (``builtin.memory_recall`` / ``llm_before``); ``position`` is where the items landed
+    in the request (``tail``/``front``); ``kind`` the effect (``inject``). ``payload`` is the parsed
+    ``payload_json`` — ``{v, items:[{role,name,source,chars,content?}], item_count, total_chars}``
+    (``content`` present only when captured in ``full`` mode)."""
+
+    session_id: str
+    event_id: int
+    message_seq: int | None
+    round_index: int | None
+    send_index: int | None
+    hook_point: str
+    hook: str | None
+    position: str | None
+    kind: str
+    payload: Any
+    created_at: int

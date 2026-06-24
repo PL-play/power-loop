@@ -143,6 +143,21 @@ class AgentLoopConfig:
     )
     #: Where spilled outputs are written. None → the runtime home's ``.cache``.
     microcompact_spill_dir: str | None = None
+    # Audit the EPHEMERAL context that LLM_BEFORE hooks inject per round (e.g. recalled memory),
+    # which otherwise vanishes after the call. Recorded into the {prefix}hook_events store table,
+    # linked to the round's assistant message; observability ONLY — never read back into history or
+    # the LLM request, so it can't change context or prefix-caching.
+    #   "off"      — do not capture (default; zero overhead).
+    #   "metadata" — record name/source/char-count/position per injected item, NOT the text.
+    #   "full"     — also record the injected content text. NOTE: stored VERBATIM with no per-item
+    #                cap, so the audit table grows with large RAG/memory blocks — use "metadata" if
+    #                volume is a concern.
+    # ONE row is written per ROUND (the LLM_BEFORE hook runs each round; the builtin memory block is
+    # memoized once per send but re-injected every round), so a multi-round send yields one audit row
+    # per round. Assumes LLM_BEFORE handlers MUTATE ctx.messages in place (the builtin contract); a
+    # handler that REPLACES ctx.messages with copies makes the per-injection diff unresolvable — the
+    # row is then a small "inject_unresolved" marker (still never affects context/cache).
+    record_hook_events: str = "off"
     # Bounds for the note_add/note_update/note_delete tools (agent-authored
     # notes). None → DEFAULT_NOTES_POLICY. See power_loop.runtime.notes.
     notes_policy: NotesPolicy | None = None
@@ -185,6 +200,15 @@ class AgentLoopConfig:
     def __post_init__(self) -> None:
         self._map_legacy_axes()
         self._validate_context_config()
+        # record_hook_events is a closed enum; normalize case and reject typos loudly (consistent
+        # with the file's loud-config convention) rather than silently capturing nothing.
+        rhe = str(self.record_hook_events or "off").strip().lower()
+        if rhe not in ("off", "metadata", "full"):
+            raise ValueError(
+                "AgentLoopConfig: record_hook_events must be 'off' | 'metadata' | 'full'; "
+                f"got {self.record_hook_events!r}"
+            )
+        object.__setattr__(self, "record_hook_events", rhe)
         # Mark init complete so __setattr__ starts re-validating reassignments (the dataclass
         # is mutable; a post-hoc reassignment of an axis or max_tokens must stay valid).
         object.__setattr__(self, "_initialized", True)

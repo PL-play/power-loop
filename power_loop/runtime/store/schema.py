@@ -55,7 +55,8 @@ def validate_table_prefix(prefix: str) -> str:
 
 #: Bump + append a migration step for ANY schema change.
 #: v2 (2026-06): adds the ``{prefix}project_messages`` table (send-context projection).
-CURRENT_SCHEMA_VERSION = 2
+#: v3 (2026-06): adds the ``{prefix}hook_events`` table (ephemeral hook-augmentation audit log).
+CURRENT_SCHEMA_VERSION = 3
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -63,7 +64,7 @@ CURRENT_SCHEMA_VERSION = 2
 _STORE_TABLES: tuple[str, ...] = (
     "sessions", "messages", "compactions", "usage_rounds", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
-    "timers", "notes", "project_messages",
+    "timers", "notes", "project_messages", "hook_events",
 )
 
 
@@ -94,6 +95,11 @@ async def _migration_steps(
                 f"ALTER TABLE {prefix}messages ADD COLUMN send_index "
                 f"{_send_index_column_type(db.dialect.name)}"
             )
+    if from_version < 3:
+        # v2 → v3: add the hook_events (ephemeral hook-augmentation audit) table + index. A new
+        # CREATE TABLE IF NOT EXISTS — no ALTER on the hot messages table, so no _column_exists
+        # probe needed (the CREATE is itself idempotent).
+        steps += db.dialect.hook_events_ddl(prefix)
     return steps
 
 
@@ -109,6 +115,8 @@ def migration_ddl_for_display(db: Database, prefix: str, *, from_version: int) -
             f"ALTER TABLE {prefix}messages ADD COLUMN send_index "
             f"{_send_index_column_type(db.dialect.name)}"
         )
+    if from_version < 3:
+        steps += db.dialect.hook_events_ddl(prefix)
     return steps
 
 

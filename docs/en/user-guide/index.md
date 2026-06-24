@@ -28,6 +28,7 @@ Deep-dive into each feature. These are reference-style pages — for step-by-ste
 | [Compaction](compaction.md) | The `fold_strategy` axis: `LLMSummaryFold` (default) / `AgenticFold`, `trigger_ratio`, keep-last-N, custom `FoldStrategy` |
 | [Send-context projection](send-context-projection.md) | The `representation` axis: `VerbatimRepresentation` (default) / `ProjectedRepresentation`; per-send plain-text projection (`pl_project_messages`); `ToolDefinition.project`; `recall_send` |
 | [Memory](memory.md) | `MemoryProvider` protocol, `recall` / `remember`, injection position |
+| [Hook-injected context audit](hook-events-audit.md) | `record_hook_events` (off/metadata/full): record the ephemeral context `LLM_BEFORE` hooks inject each round (e.g. recalled memory) into `pl_hook_events` — audit-only, never affects context/caching |
 | [Retry & Cancel](retry-cancel.md) | `LLMRetryPolicy`, exponential backoff, `CancellationToken` |
 | [Structured Output](structured-output.md) | `StructuredOutputSpec`, `parse_structured`, JSON repair chain |
 | [Timers](timers.md) | Durable self-wake-ups, `TimerRunner`, recurring timers, `TIMER_FIRE` |

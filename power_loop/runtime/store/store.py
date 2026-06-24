@@ -32,6 +32,7 @@ from power_loop.runtime.store.schema import (
 from power_loop.runtime.store.types import (
     BackgroundTaskRow,
     CompactionRow,
+    HookEventRow,
     MessageRow,
     MessageState,
     NoteRow,
@@ -119,12 +120,16 @@ class _Tables:
         self.timers = f"{prefix}timers"
         self.notes = f"{prefix}notes"
         self.project_messages = f"{prefix}project_messages"
+        self.hook_events = f"{prefix}hook_events"
 
 
 # Logical export schema: (logical_name, physical(t)->table, explicit_columns). Explicit
-# column lists (no SELECT *) keep the export wire format backend-neutral; background_tasks
-# (transient), shared_state (not session-scoped), and project_messages (a DERIVED projection
-# rebuildable from messages) are intentionally excluded.
+# column lists (no SELECT *) keep the export wire format backend-neutral. Intentionally excluded:
+# background_tasks (transient), shared_state (not session-scoped), project_messages (a DERIVED
+# projection rebuildable from messages), and hook_events (an audit-only sidecar — observability,
+# not session state). NOTE: hook_events is NOT rebuildable, so an export-then-prune / cross-store
+# move does NOT carry the hook-injection audit; that is a deliberate scope choice (the audit lives in
+# the live store where it is written), not an oversight.
 _EXPORT_TABLES: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
     ("sessions", lambda t: t.sessions, (
         "session_id", "created_at", "updated_at", "system_prompt", "model", "config_json",
@@ -322,10 +327,17 @@ class SessionStore:
         round_index: int | None = None,
         meta: dict[str, Any] | None = None,
         send_index: int | None = None,
+        hook_injected: dict[str, Any] | None = None,
     ) -> int:
         """Append one message and return its allocated per-session ``seq`` (allocated +
         inserted atomically in one transaction). ``send_index`` is the authoritative per-session
-        send index (a real column, NULL outside a send)."""
+        send index (a real column, NULL outside a send).
+
+        ``hook_injected`` (audit-only) records the EPHEMERAL context an ``LLM_BEFORE`` hook injected
+        into this round's LLM call (e.g. recalled memory) as a child ``hook_events`` row in the SAME
+        transaction — linked to this message's ``seq``. It NEVER touches the ``messages`` row itself,
+        so it can't reach history or the LLM request. Shape:
+        ``{hook_point, hook, position, kind, payload}``."""
         now = _now_ms()
         async with self._db.transaction() as tx:
             st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
@@ -348,7 +360,45 @@ class SessionStore:
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
             )
+            if hook_injected:
+                # Per-session monotonic event_id; MAX+1 is race-free here because we hold the
+                # session_state lock for the whole append (serializes same-session writers).
+                ev = await tx.fetchone(
+                    f"SELECT COALESCE(MAX(event_id), 0) + 1 AS nid FROM {self.t.hook_events} "
+                    "WHERE session_id=?",
+                    (session_id,),
+                )
+                await tx.execute(
+                    f"INSERT INTO {self.t.hook_events} ("
+                    "session_id, event_id, message_seq, round_index, send_index, hook_point, hook, "
+                    "position, kind, payload_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        session_id, int(ev["nid"]), seq, round_index,
+                        (int(send_index) if send_index is not None else None),
+                        str(hook_injected.get("hook_point") or ""), hook_injected.get("hook"),
+                        hook_injected.get("position"), str(hook_injected.get("kind") or ""),
+                        _dumps(hook_injected.get("payload") or {}), now,
+                    ),
+                )
         return seq
+
+    async def list_hook_events(
+        self, session_id: str, *, message_seq: int | None = None
+    ) -> list[HookEventRow]:
+        """Audit rows of hook augmentations for a session (chronological by ``event_id``).
+        ``message_seq`` filters to the augmentations that fed into one specific message."""
+        if message_seq is None:
+            rows = await self._db.fetchall(
+                f"SELECT * FROM {self.t.hook_events} WHERE session_id=? ORDER BY event_id ASC",
+                (session_id,),
+            )
+        else:
+            rows = await self._db.fetchall(
+                f"SELECT * FROM {self.t.hook_events} WHERE session_id=? AND message_seq=? "
+                "ORDER BY event_id ASC",
+                (session_id, int(message_seq)),
+            )
+        return [_row_to_hook_event(r) for r in rows]
 
     async def load_active_messages(
         self, session_id: str, *, after_seq: int | None = None
@@ -793,6 +843,7 @@ class SessionStore:
         await tx.execute(
             f"DELETE FROM {self.t.project_messages} WHERE session_id=?", (session_id,)
         )
+        await tx.execute(f"DELETE FROM {self.t.hook_events} WHERE session_id=?", (session_id,))
         await tx.execute(f"DELETE FROM {self.t.session_state} WHERE session_id=?", (session_id,))
         affected = await tx.execute(
             f"DELETE FROM {self.t.sessions} WHERE session_id=?", (session_id,)
@@ -1550,6 +1601,17 @@ def _row_to_project_message(row: Row) -> ProjectMessageRow:
         compact_from_send=row["compact_from_send"], compact_to_send=row["compact_to_send"],
         projector_version=row["projector_version"], token_estimate=row["token_estimate"],
         created_at=row["created_at"],
+    )
+
+
+def _row_to_hook_event(row: Row) -> HookEventRow:
+    return HookEventRow(
+        session_id=row["session_id"], event_id=int(row["event_id"]),
+        message_seq=(int(row["message_seq"]) if row["message_seq"] is not None else None),
+        round_index=(int(row["round_index"]) if row["round_index"] is not None else None),
+        send_index=(int(row["send_index"]) if row["send_index"] is not None else None),
+        hook_point=row["hook_point"], hook=row["hook"], position=row["position"],
+        kind=row["kind"], payload=_loads(row["payload_json"]), created_at=row["created_at"],
     )
 
 

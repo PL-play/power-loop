@@ -205,6 +205,7 @@ from power_loop.runtime.store.store import (
     SessionStore,
 )
 from power_loop.runtime.store.types import (
+    HookEventRow,
     MessageRow,
     MessageState,
     ProjectMessageRow,
@@ -311,6 +312,7 @@ __all__ = [
 	"SessionKind",
 	"SubagentLifecycle",
 	"MessageRow",
+	"HookEventRow",
 	"MessageState",
 	"MAX_SPAWN_DEPTH",
 	"DEFAULT_DB_PATH",

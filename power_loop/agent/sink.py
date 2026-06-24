@@ -197,6 +197,7 @@ class SQLiteSink:
                 round_index=round_index,
                 meta=message.get("meta"),
                 send_index=message.get("send_index"),
+                hook_injected=message.get("hook_injected"),
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)

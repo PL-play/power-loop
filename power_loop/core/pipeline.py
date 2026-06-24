@@ -292,9 +292,74 @@ class AgentPipeline:
         ordering is preserved; the loop runs other sessions during the I/O."""
         await fn(*args, **kwargs)
 
+    # ── Helper: audit ephemeral LLM_BEFORE hook injections ──
+
+    @staticmethod
+    def _summarize_hook_injection(
+        final_messages: list[Any], pre_hook_ids: set[int] | None, mode: str
+    ) -> dict[str, Any] | None:
+        """Diff the post-LLM_BEFORE message list against the pre-hook identity snapshot to recover
+        exactly the messages a hook injected this round, and summarize them for the hook_events
+        audit. Returns None when auditing is off or nothing was injected. ``mode``: ``metadata``
+        (no text) or ``full`` (include injected ``content``). Identity-diff (not a tail slice) so it
+        captures both tail- and front-positioned injection."""
+        if mode not in ("metadata", "full") or pre_hook_ids is None:
+            return None
+        injected_idx = [i for i, m in enumerate(final_messages) if id(m) not in pre_hook_ids]
+        if not injected_idx:
+            return None
+        injected_set = set(injected_idx)
+        orig_idx = [i for i in range(len(final_messages)) if i not in injected_set]
+        # Rebind fail-safe: an LLM_BEFORE hook may REPLACE ctx.messages with fresh copies (legal per
+        # LlmBeforeCtx, though the builtin memory hook mutates in place). Then every message is
+        # id-novel and the identity diff can't isolate the real injection — it would mislabel the
+        # whole prompt. Detect that (a prior prefix existed but NOTHING survived id-stable) and
+        # record a small truthful marker instead of dumping the entire conversation into the audit.
+        if pre_hook_ids and not orig_idx:
+            return {
+                "hook_point": "LLM_BEFORE", "hook": "llm_before", "position": "unknown",
+                "kind": "inject_unresolved",
+                "payload": {
+                    "v": 1, "items": [], "item_count": len(injected_idx), "total_chars": 0,
+                    "rebound": True,
+                },
+            }
+        items: list[dict[str, Any]] = []
+        sources: set[str] = set()
+        for i in injected_idx:
+            m = final_messages[i]
+            name = m.get("name") if isinstance(m, dict) else None
+            content = m.get("content") if isinstance(m, dict) else None
+            text = content if isinstance(content, str) else ("" if content is None else str(content))
+            source = "builtin.memory_recall" if str(name or "").startswith("memory_") else "llm_before"
+            sources.add(source)
+            item: dict[str, Any] = {
+                "role": (m.get("role") if isinstance(m, dict) else None),
+                "name": name, "source": source, "chars": len(text),
+            }
+            if mode == "full":
+                item["content"] = text
+            items.append(item)
+        # Tail when every injected item sits after every pre-existing message; else front/mixed.
+        position = "tail" if (not orig_idx or min(injected_idx) > max(orig_idx)) else "front"
+        hook = next(iter(sources)) if len(sources) == 1 else "llm_before"
+        return {
+            "hook_point": "LLM_BEFORE", "hook": hook, "position": position, "kind": "inject",
+            "payload": {
+                "v": 1, "items": items, "item_count": len(items),
+                "total_chars": sum(int(it["chars"]) for it in items),
+            },
+        }
+
     # ── Helper: append message (with MESSAGE_APPEND hook) ──
 
-    async def _append_message(self, msg: LoopMessage, *, round_index: int | None = None) -> None:
+    async def _append_message(
+        self,
+        msg: LoopMessage,
+        *,
+        round_index: int | None = None,
+        hook_injected: dict[str, Any] | None = None,
+    ) -> None:
         ctx = MessageAppendCtx(
             round_index=round_index or 0,
             message=dict(msg),
@@ -307,13 +372,16 @@ class AgentPipeline:
         if self._tok_len == len(self.history) - 1:
             self._tok_total += estimate_message_tokens(ctx.message)
             self._tok_len = len(self.history)
-        # Carry the send_index to the sink — but ONLY on the copy handed to the sink, never on
-        # ctx.message (which lives in self.history and is sent verbatim to the LLM; an unknown
-        # field would leak / break the provider). The sink persists it into the messages.send_index
-        # column; it never reaches the LLM.
+        # Carry the send_index (and hook-injection audit) to the sink — but ONLY on the copy handed
+        # to the sink, never on ctx.message (which lives in self.history and is sent verbatim to the
+        # LLM; an unknown field would leak / break the provider). The sink persists send_index into
+        # the messages.send_index column and hook_injected into the hook_events table; neither
+        # reaches the LLM.
         sink_msg = ctx.message
         if self.send_index is not None:
-            sink_msg = {**ctx.message, "send_index": self.send_index}
+            sink_msg = {**sink_msg, "send_index": self.send_index}
+        if hook_injected is not None:
+            sink_msg = {**sink_msg, "hook_injected": hook_injected}
         await self._emit_sink(self.sink.on_message_appended, sink_msg, round_index=round_index)
 
     async def _resolve_skipped_tool_calls(
@@ -848,6 +916,16 @@ class AgentPipeline:
             runtime_messages = await self._runtime_messages_for_round(round_idx)
             llm_messages = [*self.history, *runtime_messages]
 
+            # Audit (opt-in): snapshot the message identities BEFORE LLM_BEFORE hooks run, so we can
+            # later diff out exactly what they ephemerally injected (e.g. recalled memory) for this
+            # round's LLM call — by identity, so it works regardless of inject position (tail/front).
+            _hook_audit_mode = self.config.record_hook_events
+            _pre_hook_ids = (
+                {id(m) for m in llm_messages}
+                if _hook_audit_mode in ("metadata", "full")
+                else None
+            )
+
             # ── Hook: LLM_BEFORE ──
             llm_before = LlmBeforeCtx(
                 round_index=round_idx,
@@ -859,6 +937,9 @@ class AgentPipeline:
                 session_id=self.session_id,
             )
             await self.hooks.run_typed_async(HookPoint.LLM_BEFORE, llm_before)
+            hook_audit = self._summarize_hook_injection(
+                llm_before.messages, _pre_hook_ids, _hook_audit_mode
+            )
 
             if llm_before.directive == HookDirective.SHORT_CIRCUIT:
                 response = llm_before.output
@@ -902,7 +983,10 @@ class AgentPipeline:
                         round_index=round_idx,
                     )
                     msg = f"[degraded: LLM {reason} — {type(inner).__name__}: {str(inner)[:200]}]"
-                    await self._append_message({"role": "assistant", "content": msg}, round_index=round_idx)
+                    await self._append_message(
+                        {"role": "assistant", "content": msg},
+                        round_index=round_idx, hook_injected=hook_audit,
+                    )
                     await self._finalize("degraded", final_text=msg, rounds=round_idx + 1)
                     return self._make_result("degraded", final_text=msg, rounds=round_idx + 1)
 
@@ -915,7 +999,10 @@ class AgentPipeline:
                 await self.hooks.run_typed_async(HookPoint.LLM_AFTER, llm_after)
                 if llm_after.directive == HookDirective.BREAK:
                     text = (getattr(response, "raw_text", "") or "").strip()
-                    await self._append_message({"role": "assistant", "content": text}, round_index=round_idx)
+                    await self._append_message(
+                        {"role": "assistant", "content": text},
+                        round_index=round_idx, hook_injected=hook_audit,
+                    )
                     await self._finalize("hook_break", final_text=text, rounds=round_idx + 1)
                     return self._make_result("completed", final_text=text, rounds=round_idx + 1)
                 # After hook may replace the response
@@ -939,7 +1026,7 @@ class AgentPipeline:
             if tool_calls:
                 sanitized_tool_calls = _sanitize_tool_calls(tool_calls)
                 assistant_msg["tool_calls"] = sanitized_tool_calls
-            await self._append_message(assistant_msg, round_index=round_idx)
+            await self._append_message(assistant_msg, round_index=round_idx, hook_injected=hook_audit)
             # Mark pending IMMEDIATELY so a crash here leaves a recoverable state.
             if sanitized_tool_calls:
                 assistant_seq = len(self.history)  # 1-based position in history

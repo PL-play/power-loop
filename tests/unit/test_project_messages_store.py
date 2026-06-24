@@ -17,6 +17,30 @@ from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION
 from power_loop.runtime.store.store import SessionStore
 
 
+async def exercise_hook_events_crud(store: SessionStore) -> None:
+    """Backend-agnostic CRUD conformance for the hook_events audit table: append a message with a
+    hook injection → it lands as a linked event; per-session monotonic event_id; filter by
+    message_seq; cleanup via close_session_tree. create_session mints a fresh id (shared-DB safe)."""
+    sid = await store.create_session()
+    hi = {"hook_point": "LLM_BEFORE", "hook": "builtin.memory_recall", "position": "tail",
+          "kind": "inject", "payload": {"v": 1, "items": [{"name": "memory_0", "chars": 5}]}}
+    seq1 = await store.append_message(
+        sid, role="assistant", content="a", round_index=0, send_index=1, hook_injected=hi
+    )
+    await store.append_message(sid, role="user", content="next")  # no event
+    seq2 = await store.append_message(
+        sid, role="assistant", content="b", round_index=1, send_index=1, hook_injected=hi
+    )
+    evs = await store.list_hook_events(sid)
+    assert [e.event_id for e in evs] == [1, 2]  # per-session monotonic
+    assert [e.message_seq for e in evs] == [seq1, seq2]
+    assert evs[0].hook == "builtin.memory_recall" and evs[0].position == "tail"
+    assert evs[0].payload["items"][0]["name"] == "memory_0"
+    assert len(await store.list_hook_events(sid, message_seq=seq1)) == 1
+    await store.close_session_tree(sid)
+    assert await store.list_hook_events(sid) == []
+
+
 async def exercise_project_messages_crud(store: SessionStore) -> None:
     """Backend-agnostic CRUD conformance: upsert/load round-trip (incl. a follow_up human
     list), idempotent re-finalize (preserve created_at), and the compact read cursor.
@@ -117,23 +141,25 @@ async def test_migration_ddl_for_display_includes_alter(store: SessionStore) -> 
     from power_loop.runtime.store.schema import migration_ddl_for_display
     joined = " ".join(migration_ddl_for_display(store._db, "pl_", from_version=1))
     assert "ADD COLUMN send_index" in joined and "project_messages" in joined
+    assert "hook_events" in joined  # v2→v3 step is in the full ladder from v1
 
 
 @pytest.mark.asyncio
-async def test_v1_to_v2_migration_adds_project_messages_and_send_index(tmp_path) -> None:
+async def test_v1_to_current_migration_adds_all_tables_and_columns(tmp_path) -> None:
     path = str(tmp_path / "m.db")
-    s = await SessionStore.open(path)  # fresh → v2
-    assert s.schema_version == CURRENT_SCHEMA_VERSION == 2
-    # Simulate a true pre-existing v1 store: drop the v2 table AND the v2 send_index column,
-    # then roll the version stamp back to 1.
+    s = await SessionStore.open(path)  # fresh → current
+    assert s.schema_version == CURRENT_SCHEMA_VERSION
+    # Simulate a true pre-existing v1 store: drop every post-v1 artifact (the v2 project_messages
+    # table + send_index column, the v3 hook_events table), then roll the version stamp back to 1.
     async with s._db.transaction() as tx:
         await tx.execute("DROP TABLE pl_project_messages")
+        await tx.execute("DROP TABLE pl_hook_events")
         await tx.execute("ALTER TABLE pl_messages DROP COLUMN send_index")
         await tx.execute("UPDATE pl_schema_migrations SET version=1 WHERE id=1")
     await s.close()
 
-    s2 = await SessionStore.open(path)  # AUTO_CREATE runs the v1→v2 migration ladder
-    assert s2.schema_version == 2
+    s2 = await SessionStore.open(path)  # AUTO_CREATE runs the full v1→current migration ladder
+    assert s2.schema_version == CURRENT_SCHEMA_VERSION
     # (a) the project_messages table is back
     await s2.upsert_project_message("sess_m", send_index=1, kind="project", content={"ok": True})
     assert (await s2.load_project_messages("sess_m"))[0].content == {"ok": True}
@@ -141,10 +167,45 @@ async def test_v1_to_v2_migration_adds_project_messages_and_send_index(tmp_path)
     sid = await s2.create_session()
     await s2.append_message(sid, role="user", content="hi", send_index=7)
     assert (await s2.load_active_messages(sid))[0].send_index == 7
+    # (c) the hook_events table is back and writable
+    seq = await s2.append_message(
+        sid, role="assistant", content="a", round_index=0, send_index=7,
+        hook_injected={"hook_point": "LLM_BEFORE", "hook": "x", "position": "tail",
+                       "kind": "inject", "payload": {"v": 1, "items": []}},
+    )
+    evs = await s2.list_hook_events(sid)
+    assert len(evs) == 1 and evs[0].message_seq == seq
     await s2.close()
 
-    # idempotent: reopening (already v2) is a no-op and the column survives
+    # idempotent: reopening (already current) is a no-op and everything survives
     s3 = await SessionStore.open(path)
-    assert s3.schema_version == 2
+    assert s3.schema_version == CURRENT_SCHEMA_VERSION
     assert (await s3.load_active_messages(sid))[0].send_index == 7
+    assert len(await s3.list_hook_events(sid)) == 1
     await s3.close()
+
+
+@pytest.mark.asyncio
+async def test_v2_to_v3_migration_adds_hook_events(tmp_path) -> None:
+    path = str(tmp_path / "h.db")
+    s = await SessionStore.open(path)  # fresh → current (v3)
+    # Simulate a pre-existing v2 store: drop the v3 hook_events table, roll the stamp back to 2.
+    async with s._db.transaction() as tx:
+        await tx.execute("DROP TABLE pl_hook_events")
+        await tx.execute("UPDATE pl_schema_migrations SET version=2 WHERE id=1")
+    await s.close()
+
+    s2 = await SessionStore.open(path)  # AUTO_CREATE runs just the v2→v3 step
+    assert s2.schema_version == CURRENT_SCHEMA_VERSION
+    sid = await s2.create_session()
+    seq = await s2.append_message(
+        sid, role="assistant", content="a", round_index=0,
+        hook_injected={"hook_point": "LLM_BEFORE", "hook": "builtin.memory_recall",
+                       "position": "tail", "kind": "inject",
+                       "payload": {"v": 1, "items": [{"name": "memory_0", "chars": 3}]}},
+    )
+    evs = await s2.list_hook_events(sid)
+    assert len(evs) == 1
+    assert evs[0].message_seq == seq and evs[0].hook == "builtin.memory_recall"
+    assert evs[0].payload["items"][0]["name"] == "memory_0"
+    await s2.close()

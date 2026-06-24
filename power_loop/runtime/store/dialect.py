@@ -35,6 +35,13 @@ class Dialect(Protocol):
         :meth:`ddl` for fresh provisioning. Idempotent (CREATE … IF NOT EXISTS)."""
         ...
 
+    def hook_events_ddl(self, prefix: str) -> list[str]:
+        """DDL for the ``hook_events`` table + index (audit log of ephemeral hook
+        augmentations, e.g. LLM_BEFORE memory injection), split out so the v2→v3
+        migration can add just this table. Included in :meth:`ddl` for fresh
+        provisioning. Idempotent (CREATE … IF NOT EXISTS)."""
+        ...
+
     def upsert(
         self,
         table: str,
@@ -131,6 +138,7 @@ class SqliteDialect:
                 pinned INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL, PRIMARY KEY (session_id, note_id))""",
             *self.project_messages_ddl(p),
+            *self.hook_events_ddl(p),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -145,6 +153,18 @@ class SqliteDialect:
                 created_at INTEGER NOT NULL, PRIMARY KEY (session_id, send_index, kind))""",
             f"CREATE INDEX IF NOT EXISTS {p}idx_project_messages_session_kind "
             f"ON {p}project_messages(session_id, kind, send_index)",
+        ]
+
+    def hook_events_ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}hook_events (
+                session_id TEXT NOT NULL, event_id INTEGER NOT NULL, message_seq INTEGER,
+                round_index INTEGER, send_index INTEGER, hook_point TEXT NOT NULL, hook TEXT,
+                position TEXT, kind TEXT NOT NULL, payload_json TEXT, created_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, event_id))""",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_hook_events_session_msg "
+            f"ON {p}hook_events(session_id, message_seq)",
         ]
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
@@ -260,6 +280,7 @@ class PostgresDialect:
                 pinned SMALLINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id))""",
             *self.project_messages_ddl(p),
+            *self.hook_events_ddl(p),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -274,6 +295,18 @@ class PostgresDialect:
                 created_at BIGINT NOT NULL, PRIMARY KEY (session_id, send_index, kind))""",
             f"CREATE INDEX IF NOT EXISTS {p}idx_project_messages_session_kind "
             f"ON {p}project_messages(session_id, kind, send_index)",
+        ]
+
+    def hook_events_ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}hook_events (
+                session_id TEXT NOT NULL, event_id BIGINT NOT NULL, message_seq BIGINT,
+                round_index BIGINT, send_index BIGINT, hook_point TEXT NOT NULL, hook TEXT,
+                position TEXT, kind TEXT NOT NULL, payload_json TEXT, created_at BIGINT NOT NULL,
+                PRIMARY KEY (session_id, event_id))""",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_hook_events_session_msg "
+            f"ON {p}hook_events(session_id, message_seq)",
         ]
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
@@ -376,6 +409,7 @@ class MySQLDialect:
                 pinned TINYINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id)) {opts}""",
             *self.project_messages_ddl(p),
+            *self.hook_events_ddl(p),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -390,6 +424,18 @@ class MySQLDialect:
                 projector_version BIGINT NOT NULL DEFAULT 0, token_estimate BIGINT,
                 created_at BIGINT NOT NULL, PRIMARY KEY (session_id, send_index, kind),
                 KEY {p}idx_project_messages_session_kind (session_id, kind, send_index)) {opts}""",
+        ]
+
+    def hook_events_ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        opts = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}hook_events (
+                session_id VARCHAR(255) NOT NULL, event_id BIGINT NOT NULL, message_seq BIGINT,
+                round_index BIGINT, send_index BIGINT, hook_point VARCHAR(32) NOT NULL, hook VARCHAR(255),
+                position VARCHAR(32), kind VARCHAR(32) NOT NULL, payload_json TEXT, created_at BIGINT NOT NULL,
+                PRIMARY KEY (session_id, event_id),
+                KEY {p}idx_hook_events_session_msg (session_id, message_seq)) {opts}""",
         ]
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
