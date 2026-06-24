@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [3.2.0] — 2026-06-24
+
 ### Added — hook-injected context audit log (`pl_hook_events`, schema v3)
 
 The ephemeral context that `LLM_BEFORE` hooks inject per round (e.g. recalled memory) used to
