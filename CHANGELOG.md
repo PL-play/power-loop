@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [3.4.0] — 2026-06-25
+
 ### Added — `ProjectedRepresentation` render is now a first-class extension point
 
 Projection-mode rendering (stored rows → LLM messages) was a single monolithic `render()` you could
