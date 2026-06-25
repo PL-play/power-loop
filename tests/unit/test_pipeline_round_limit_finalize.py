@@ -75,6 +75,27 @@ async def test_round_limit_final_call_routes_through_call_llm() -> None:
     assert starts == 2 and completes == 2
 
 
+async def test_round_limit_summary_is_persisted_to_transcript() -> None:
+    # M-stateful-loop-2: the wrap-up summary returned to the caller must ALSO be recorded as the
+    # assistant turn, so the next send's history isn't a dangling "summarize…" prompt with no answer.
+    reg = ToolRegistry()
+    reg.register(ToolDefinition(name="echo", description="e",
+                 input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
+    llm = _Scripted(responses=[_tool_call("c1", "echo"),
+                               LLMResponse(raw_text="here is my summary", content_text="here is my summary")])
+    store = await SessionStore.open(":memory:")
+    loop = StatefulAgentLoop(
+        llm=llm, store=store, tool_registry=reg,
+        config=AgentLoopConfig(system_prompt="o", max_rounds=1, compactor=None),
+    )
+    sid = await loop.new_session()
+    res = await loop.send("go", session_id=sid)
+    assert res.status == "hit_round_limit"
+    msgs = await loop.get_messages(sid)
+    assert any(m["role"] == "assistant" and m.get("content") == "here is my summary" for m in msgs), msgs
+    await store.close()
+
+
 @dataclass
 class _FailLLM(LLMService):
     async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,

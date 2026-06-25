@@ -75,6 +75,15 @@ async def test_compactor_does_not_trigger_below_threshold() -> None:
     assert plan is None
 
 
+def test_malformed_compact_threshold_env_is_fail_soft(monkeypatch) -> None:
+    # compaction-1: a malformed CONTEXT_COMPACT_THRESHOLD must NOT crash the send — fall back to the
+    # configured trigger instead of raising ValueError from int().
+    monkeypatch.setenv("CONTEXT_COMPACT_THRESHOLD", "not-a-number")
+    cp = DefaultCompactor(trigger_ratio=0.5, keep_last_n=1)
+    assert cp._should_trigger(before_tokens=6000, max_tokens=10_000) is True   # ratio path: >= 5000
+    assert cp._should_trigger(before_tokens=4000, max_tokens=10_000) is False
+
+
 @pytest.mark.asyncio
 async def test_compactor_triggers_above_threshold(monkeypatch) -> None:
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)

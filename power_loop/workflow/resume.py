@@ -38,7 +38,7 @@ from power_loop.runtime.cancellation import CancellationToken
 from . import journal
 from .engine import WorkflowEngine, WorkflowRunError
 from .result import AgentResult, WorkflowResult
-from .runner import make_on_step, spawn_background
+from .runner import _LIVE_RUN_IDS, is_run_live, make_on_step, spawn_background
 from .spec import (
     AgentNode,
     BranchNode,
@@ -136,6 +136,20 @@ async def rehydrate(
     return spec, replay, j
 
 
+def _guard_resumable(run_id: str, force: bool) -> None:
+    """Refuse to resume a run whose engine is still executing IN THIS PROCESS unless ``force``
+    (workflow-durability-3): a second engine for the same run would race the journal. Liveness is
+    tracked by the in-process registry (set while a detached/sync run's task is alive), so a CRASHED
+    run — the normal resume case — is not blocked (its task already discarded the id). Cross-process
+    liveness can't be detected from here; ``force=True`` overrides if you've confirmed it's dead."""
+    if not force and is_run_live(run_id):
+        raise WorkflowRunError(
+            f"run {run_id} is still executing in this process — resuming would start a second "
+            f"concurrent engine and race the journal. Wait for it to finish (or cancel it), or pass "
+            f"force=True if you've confirmed it is no longer running."
+        )
+
+
 async def _mark_resuming(store: SessionStore, parent_sid: str, run_id: str, j: dict[str, Any]) -> None:
     """Flip a finished/failed journal back to running and bump the attempt count."""
     await journal.update(
@@ -156,6 +170,7 @@ async def resume_run(
     *,
     executor: Any | None = None,
     budget: Any | None = None,
+    force: bool = False,
 ) -> WorkflowResult:
     """Resume a run synchronously (in-process), returning the final result.
 
@@ -169,16 +184,21 @@ async def resume_run(
     """
     store = await loop._ensure_store()
     spec, replay, j = await rehydrate(store, parent_sid, run_id)
+    _guard_resumable(run_id, force)
     await _mark_resuming(store, parent_sid, run_id, j)
     engine = WorkflowEngine(
         loop, executor=executor, budget=budget,
         on_step=make_on_step(store, parent_sid, run_id), replay=replay, run_id=run_id,
     )
+    # Mark live so a concurrent resume of the same run is refused; discard in finally.
+    _LIVE_RUN_IDS.add(run_id)
     try:
         result = await engine.run(spec)
     except Exception as exc:  # noqa: BLE001 — mirror detached: journal then re-raise
         await journal.fail(store, parent_sid, run_id, exc)
         raise
+    finally:
+        _LIVE_RUN_IDS.discard(run_id)
     await journal.finalize(store, parent_sid, run_id, result)
     return result
 
@@ -191,6 +211,7 @@ async def resume_detached(
     executor: Any | None = None,
     budget: Any | None = None,
     eager_wake: bool = False,
+    force: bool = False,
 ) -> WorkflowRunHandle:
     """Resume a run on a background task; wake the parent on completion.
 
@@ -203,6 +224,7 @@ async def resume_detached(
     if await store.get_session(parent_sid) is None:
         raise WorkflowRunError("parent session not found; cannot resume detached run")
     spec, replay, j = await rehydrate(store, parent_sid, run_id)
+    _guard_resumable(run_id, force)
     await _mark_resuming(store, parent_sid, run_id, j)
     cancel_token = CancellationToken()
 

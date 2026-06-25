@@ -17,6 +17,7 @@ provides ``get_descriptions()`` (for system prompts) and ``get_content()``
 
 from __future__ import annotations
 
+import logging
 import re
 from importlib import import_module
 from importlib.util import find_spec
@@ -27,6 +28,7 @@ from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.env import get_runtime_env
 
 _yaml = import_module("yaml") if find_spec("yaml") else None
+logger = logging.getLogger(__name__)
 
 LOAD_SKILL_DEFINITION = ToolDefinition(
     name="load_skill",
@@ -83,7 +85,14 @@ class SkillLoader:
             return
         for f in sorted(self.skills_dir.glob("*/SKILL.md")):
             name = f.parent.name
-            text = f.read_text(encoding="utf-8")
+            # Read defensively (M-exec-skills-structured-1): a single non-UTF-8 SKILL.md (a binary
+            # blob committed by mistake, a Latin-1/UTF-16 file) must not raise out of _load_all and
+            # take down EVERY skill. errors="replace" tolerates bad bytes; OSError skips the file.
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                logger.warning("skipping unreadable skill %s: %s", f, exc)
+                continue
             meta, body = self._parse_frontmatter(text)
             self.skills[name] = {"meta": meta, "body": body, "path": str(f.resolve())}
 

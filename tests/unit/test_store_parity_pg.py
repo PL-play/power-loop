@@ -82,3 +82,10 @@ async def test_pg_hook_events(pg_store) -> None:
     from tests.unit.test_project_messages_store import exercise_hook_events_crud
 
     await exercise_hook_events_crud(pg_store)
+
+
+async def test_pg_large_payload(pg_store) -> None:
+    # H2: >64 KiB free-text/JSON round-trips on real Postgres (TEXT is unbounded — the oracle).
+    from tests.unit.test_store_parity import exercise_large_payload
+
+    await exercise_large_payload(pg_store)

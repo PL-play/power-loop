@@ -230,11 +230,11 @@ async def test_eager_wake_failure_rearms_durable_timer():
     orig_follow_up = loop.follow_up
     calls = {"n": 0}
 
-    async def flaky_follow_up(note, sid):
+    async def flaky_follow_up(note, sid, **kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("eager delivery boom")  # only the eager call fails
-        return await orig_follow_up(note, sid)
+        return await orig_follow_up(note, sid, **kwargs)
 
     loop.follow_up = flaky_follow_up  # type: ignore[assignment]
 

@@ -29,6 +29,7 @@ from typing import Any
 # (``anthropic`` / ``openai``) and are imported lazily inside
 # :func:`create_llm_service_from_config`, so ``import power_loop`` stays
 # featherweight and works with neither SDK installed (H3.1).
+from power_loop._vendor.llm_client.capabilities import capability_overrides_from_env
 from power_loop._vendor.llm_client.interface import AnthropicChatConfig, LLMService, OpenAICompatibleChatConfig
 
 DEFAULT_PREFIX = "POWER_LOOP"
@@ -56,6 +57,10 @@ class LLMProviderConfig:
     temperature: float = 0.0
     max_retries: int = 3
     extra: dict[str, Any] = field(default_factory=dict)
+    # POWER_LOOP_SUPPORTS_* / OPENAI_COMPAT_SUPPORTS_* env overrides of the model's detected
+    # capabilities (image/pdf/data-url/tools/stream). Populated by from_env, carried into the
+    # OpenAI-compatible transport (M-llm-transport-1: previously parsed but never wired anywhere).
+    capability_overrides: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Fail fast at config build time, not on the first complete() call.
@@ -146,6 +151,7 @@ class LLMProviderConfig:
             temperature=temperature,
             max_retries=max_retries,
             extra=extra,
+            capability_overrides=capability_overrides_from_env(src),
         )
 
     # ── Adaptation ──────────────────────────────────────────────────────
@@ -160,6 +166,7 @@ class LLMProviderConfig:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
             max_retries=self.max_retries,
+            capability_overrides=dict(self.capability_overrides),
         )
 
     def to_anthropic(self) -> AnthropicChatConfig:

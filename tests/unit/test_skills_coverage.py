@@ -7,6 +7,30 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
+def test_one_non_utf8_skill_does_not_abort_the_loader(tmp_path):
+    # M-exec-skills-structured-1: a single non-UTF-8 SKILL.md must not raise out of _load_all and
+    # lose EVERY skill. The good skill still loads; the bad one degrades (errors="replace").
+    from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+    from power_loop.runtime.skills import SkillLoader
+
+    skills_root = tmp_path / "skills"
+    (skills_root / "good").mkdir(parents=True)
+    (skills_root / "good" / "SKILL.md").write_text(
+        "---\ndescription: Good\n---\nGood body", encoding="utf-8"
+    )
+    (skills_root / "bad").mkdir(parents=True)
+    # Invalid UTF-8 bytes (a lone 0xFF / 0xFE, e.g. a binary blob committed by mistake).
+    (skills_root / "bad" / "SKILL.md").write_bytes(b"\xff\xfe\x00\x01not utf-8")
+    (tmp_path / "ws").mkdir()
+    (tmp_path / "home").mkdir()
+    env = RuntimeEnv(workspace_dir=tmp_path / "ws", home_dir=tmp_path / "home", skills_dir=skills_root)
+
+    with runtime_env_context(env):
+        loader = SkillLoader()  # pre-fix: UnicodeDecodeError here took down ALL skills
+        assert "good" in loader.skills
+        assert "Good body" in loader.handle_load_skill("good")
+
+
 def test_skill_name_path_traversal_is_blocked(tmp_path):
     from power_loop.runtime.env import RuntimeEnv, runtime_env_context
     from power_loop.runtime.skills import SkillLoader

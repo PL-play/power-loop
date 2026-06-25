@@ -44,5 +44,13 @@ class HookManagerProtocol(Protocol):
 
 
 class ToolArgsValidator(Protocol):
+    """Pre-execution tool-argument validator: return an error string to reject the call, or ``None``
+    to allow it (may be async).
+
+    RESERVED / PROVISIONAL (exec-skills-structured-6): this is a typed seam published for forward
+    compatibility, but the runtime does NOT yet consume it — there is currently no
+    ``ToolRegistry`` / ``AgentLoopConfig`` hook that calls a ToolArgsValidator. Validate tool args
+    inside the tool handler itself for now. (Tracked for a future wiring; not STABLE_API.)"""
+
     def __call__(self, tool_name: str, args: dict[str, Any]) -> str | None | Awaitable[str | None]:
         ...

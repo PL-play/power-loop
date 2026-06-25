@@ -183,4 +183,20 @@ def trim_history(
         body.append(messages[i])
         spent += cost
 
+    # Atomicity (H5): the front-fill appends a contiguous prefix of the body, so it can stop right
+    # AFTER an assistant(tool_calls) but BEFORE its tool result — leaving a dangling tool_call
+    # immediately before the tail's user boundary. Both OpenAI and Anthropic reject a request where
+    # an assistant tool_call has no matching tool result, so drop any trailing assistant(tool_calls)
+    # whose results aren't all present in the kept body+tail. (Mirrors the tail-boundary and
+    # last-resort paths, which already protect this invariant.)
+    answered = {
+        m.get("tool_call_id")
+        for m in (*body, *messages[tail_start:])
+        if m.get("role") == "tool" and m.get("tool_call_id")
+    }
+    while body and body[-1].get("role") == "assistant" and body[-1].get("tool_calls"):
+        if all(tc.get("id") in answered for tc in (body[-1].get("tool_calls") or [])):
+            break
+        body.pop()
+
     return list(messages[:sys_end]) + body + list(messages[tail_start:])

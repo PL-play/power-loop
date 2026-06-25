@@ -95,3 +95,20 @@ def test_home_allowlist_and_restriction(tmp_path: Path) -> None:
     # other home paths are restricted
     with pytest.raises(ValueError, match="POWER_LOOP_HOME is restricted"):
         safe_path("@home/secret/z", env=env)
+
+
+def test_read_file_with_limit_still_enforces_size_cap(tmp_path: Path) -> None:
+    # M-default-tools-1: passing a `limit` no longer disables the size cap (which used to load the
+    # WHOLE multi-GB file into memory). offset/limit page OUTPUT within a readable (<=cap) file.
+    from power_loop.runtime.env import runtime_env_context
+    from power_loop.tools.default_tools import TEXT_FILE_MAX_BYTES, run_read
+
+    big = tmp_path / "big.txt"
+    big.write_bytes(b"x\n" * (TEXT_FILE_MAX_BYTES // 2 + 16))  # > cap
+    small = tmp_path / "small.txt"
+    small.write_text("\n".join(f"line{i}" for i in range(20)), encoding="utf-8")
+    with runtime_env_context(_ws(tmp_path)):
+        out = run_read("big.txt", offset=1, limit=10)
+        assert "too large" in out.lower()             # capped even with a limit set
+        ok = run_read("small.txt", offset=1, limit=5)  # paging a <=cap file still works
+        assert "line0" in ok and "line4" in ok and "line5" not in ok

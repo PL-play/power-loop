@@ -18,12 +18,15 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.core.events import AgentEventBus
 
 __all__ = ["attach_otel_sink", "OtelSpanBridge"]
+
+logger = logging.getLogger(__name__)
 
 
 class OtelSpanBridge:
@@ -44,6 +47,16 @@ class OtelSpanBridge:
         return self._tracer.start_span(name, context=ctx, attributes=attrs)
 
     def handle(self, event: AgentEvent) -> None:
+        # Observability must NEVER break the loop (M-contrib-observability-2): span CREATION
+        # (start_span) and set_attribute were unguarded, unlike _end/_error — a tracer that raises
+        # there would unwind through publish() on a non-suppressing bus and abort the agent run.
+        # Wrap the whole dispatch in a log-and-swallow guard.
+        try:
+            self._handle(event)
+        except Exception:  # noqa: BLE001 — a tracing hiccup is a dropped span, not a failed run
+            logger.exception("otel sink failed; dropping this span event and continuing")
+
+    def _handle(self, event: AgentEvent) -> None:
         t = event.type
         sid = event.session_id
         p = event.payload or {}

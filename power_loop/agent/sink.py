@@ -26,8 +26,13 @@ logger = logging.getLogger(__name__)
 class MessageSink(Protocol):
     """Persistence callbacks invoked by :class:`AgentPipeline`.
 
-    Every method MUST be safe to call multiple times and MUST NOT raise on
-    normal paths — sinks degrade gracefully and log internally if needed.
+    Every method MUST be safe to call multiple times.
+
+    Raising contract (prompt-sink-provider-2): an OBSERVABILITY sink (logging / metrics) MUST NOT
+    raise on normal paths — it degrades gracefully and logs internally. A PERSISTENCE sink (e.g.
+    :class:`SQLiteSink`, the durable source of truth) MAY raise on a genuine store I/O failure, and
+    the pipeline treats that as a FATAL send error (it does not swallow it): the send aborts and the
+    durable store stays authoritative. Callers that want best-effort persistence must wrap the sink.
     """
 
     async def on_round_started(self, round_index: int) -> None: ...
@@ -145,14 +150,15 @@ class SQLiteSink:
         role = message.get("role")
         if role == "tool":
             tool_call_id = str(message.get("tool_call_id") or "")
+            text, structured = _encode_content(message.get("content"))
             seq = await self.store.append_message(
                 self.session_id,
                 role="tool",
-                content=_as_text(message.get("content")),
+                content=text,
                 tool_call_id=tool_call_id,
                 name=message.get("name"),
                 round_index=round_index,
-                meta=message.get("meta"),
+                meta=_meta_with_content_encoding(message.get("meta"), structured=structured),
                 send_index=message.get("send_index"),
             )
             self._history_seqs.append(seq)
@@ -189,13 +195,14 @@ class SQLiteSink:
             return
         if role == "assistant":
             tool_calls = message.get("tool_calls")
+            text, structured = _encode_content(message.get("content"))
             seq = await self.store.append_message(
                 self.session_id,
                 role="assistant",
-                content=_as_text(message.get("content")),
+                content=text,
                 tool_calls=list(tool_calls) if tool_calls else None,
                 round_index=round_index,
-                meta=message.get("meta"),
+                meta=_meta_with_content_encoding(message.get("meta"), structured=structured),
                 send_index=message.get("send_index"),
                 hook_injected=message.get("hook_injected"),
             )
@@ -205,13 +212,14 @@ class SQLiteSink:
                 self._assistant_seq = seq
             return
         # user / system / anything else
+        text, structured = _encode_content(message.get("content"))
         seq = await self.store.append_message(
             self.session_id,
             role=str(role or "user"),
-            content=_as_text(message.get("content")),
+            content=text,
             name=message.get("name"),
             round_index=round_index,
-            meta=message.get("meta"),
+            meta=_meta_with_content_encoding(message.get("meta"), structured=structured),
             send_index=message.get("send_index"),
         )
         self._history_seqs.append(seq)
@@ -224,12 +232,18 @@ class SQLiteSink:
     ) -> None:
         ids = [str(tc.get("id") or "") for tc in tool_calls if tc.get("id")]
         self._unresolved = set(ids)
-        self._assistant_seq = assistant_seq
+        # Prefer the DB seq captured when the assistant row was appended (on_message_appended set
+        # self._assistant_seq to the store seq) over the caller's in-memory history INDEX, which
+        # diverges from the store seq once history is compacted/projected/rebuilt — persisting the
+        # index as assistant_seq would point resume at the wrong row (pipeline-runner-4). Fall back
+        # to the passed value only if no row seq was captured.
+        seq = self._assistant_seq if self._assistant_seq is not None else assistant_seq
+        self._assistant_seq = seq
         self._tool_calls = list(tool_calls)
         await self.store.set_pending(
             self.session_id,
             {
-                "assistant_seq": assistant_seq,
+                "assistant_seq": seq,
                 "round_index": round_index,
                 "tool_call_ids": ids,
                 "tool_calls": list(tool_calls),
@@ -262,6 +276,13 @@ class SQLiteSink:
         rows ``compacted_out``. The in-memory fold still stands; the un-persisted
         compaction simply re-triggers next round (active rows are untouched, so a
         resume is correct), trading a missed optimization for zero corruption.
+
+        RESIDUAL (compaction-2): this guard is LENGTH-only. A hook that replaces history with a
+        list of the SAME length but DIFFERENT identities (a length-preserving swap) passes the
+        check, so the fold indices would map through ``_history_seqs`` onto the wrong rows. INVARIANT
+        for hosts: a SESSION_START/ROUND_START hook that rewrites history must NOT preserve length
+        while changing message identities — change the length (so this guard skips persistence), or
+        keep identities stable. (A future fix can pass per-message identity, not just the length.)
         """
         if expected_history_len is not None and len(self._history_seqs) != expected_history_len:
             logger.warning(
@@ -357,6 +378,36 @@ class SQLiteSink:
                 ),
                 total_tokens=_int_or_none(usage.get("total_tokens")),
             )
+
+
+# Meta marker recording that a row's text column holds JSON-encoded *structured* content
+# (a multimodal list / dict), so the reload path can losslessly reconstruct it instead of
+# handing the model a literal JSON string. (H6 — BUG_REVIEW_3.4.) The marker lives in meta
+# (jsonb, already round-trips) because the content column alone can't distinguish a
+# stringified list from a user string that merely looks like JSON.
+CONTENT_ENCODING_META_KEY = "content_encoding"
+CONTENT_ENCODING_JSON = "json"
+
+
+def _encode_content(content: Any) -> tuple[str | None, bool]:
+    """Return ``(text, structured)``. ``str``/``None`` pass through unflagged; a non-string
+    (multimodal list/dict) is JSON-encoded and flagged so reload reconstructs the original."""
+    if content is None or isinstance(content, str):
+        return content, False
+    import json
+
+    return json.dumps(content, ensure_ascii=False), True
+
+
+def _meta_with_content_encoding(
+    meta: dict[str, Any] | None, *, structured: bool
+) -> dict[str, Any] | None:
+    """Stamp the structured-content marker into ``meta`` (copy-on-write) when needed."""
+    if not structured:
+        return meta
+    out = dict(meta or {})
+    out[CONTENT_ENCODING_META_KEY] = CONTENT_ENCODING_JSON
+    return out
 
 
 def _as_text(content: Any) -> str | None:

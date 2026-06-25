@@ -39,6 +39,7 @@ from power_loop.contracts.event_payloads import TimerFiredPayload
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hook_contexts import TimerFireCtx
 from power_loop.contracts.hooks import HookDirective, HookPoint
+from power_loop.runtime.cancellation import CancellationToken
 from power_loop.runtime.store.types import TimerRow
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -90,12 +91,18 @@ class TimerRunner:
         # cadence so a slow-but-live delivery stays comfortably fresh before the
         # stale cutoff. A quarter of the stale window by default (floored at 1s to
         # avoid hammering sqlite); overridable for tests / unusual configs.
+        # Floor the override at a small positive value (async-control-4): heartbeat_interval_s=0
+        # would make _heartbeat_firing spin a busy re-stamp loop (sleep(0)) on the firing row.
         self._heartbeat_interval_s = (
-            float(heartbeat_interval_s) if heartbeat_interval_s is not None
+            max(0.01, float(heartbeat_interval_s)) if heartbeat_interval_s is not None
             else max(1.0, stale_firing_s / 4.0)
         )
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
+        # Owned cancellation token threaded into the timer-fired follow_up/send so stop() can
+        # abort an in-flight (idle-session → full agent run) delivery at its next checkpoint,
+        # rather than blocking for the whole run to finish (M-async-control-2).
+        self._cancel = CancellationToken()
 
     async def start(self) -> None:
         store = await self._loop._ensure_store()
@@ -105,11 +112,16 @@ class TimerRunner:
         if recovered:
             logger.warning("timers: re-armed %d stale 'firing' row(s)", recovered)
         self._stop.clear()
+        self._cancel = CancellationToken()  # fresh token (a prior stop() cancelled the old one)
         if self._task is None:
             self._task = asyncio.create_task(self._scan_loop(), name="power-loop-timers")
 
     async def stop(self) -> None:
         self._stop.set()
+        # Cancel an in-flight timer-fired delivery so awaiting the scan task returns promptly
+        # instead of blocking for a full agent run to complete. An aborted delivery leaves the
+        # row re-armed (scan_once's handler), so it re-fires when a runner restarts.
+        self._cancel.cancel("timer runner stopped")
         if self._task is not None:
             await self._task
             self._task = None
@@ -238,7 +250,7 @@ class TimerRunner:
         # ── Deliver: follow_up = queued when mid-run, plain send when idle ──
         from power_loop.agent.follow_up import FollowUpQueued
 
-        result = await self._loop.follow_up(ctx.message, timer.session_id)
+        result = await self._loop.follow_up(ctx.message, timer.session_id, stop_event=self._cancel)
         outcome = "queued" if isinstance(result, FollowUpQueued) else "delivered"
         # One-shot -> fired; recurring -> re-armed at fire-time + interval
         # (fixed-delay: periods missed while the process was down collapse).

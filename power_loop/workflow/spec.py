@@ -38,11 +38,16 @@ orchestration-level resume.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 from power_loop.contracts.errors import SpecValidationError
 from power_loop.runtime.spec import AgentSpec, AgentSpecError
+
+# Template variable identifier grammar — must match engine._VAR_RE's capture (`[a-zA-Z_]\w*`), so a
+# foreach `as` name validated here is guaranteed substitutable as {{name}} in the body.
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*$")
 
 __all__ = [
     "WorkflowSpecError",
@@ -242,6 +247,12 @@ class WorkflowSpec:
             body_ids: set[str] = set()
             _collect_foreach_body_ids(data["root"], body_ids, in_body=False)
             root = _parse_node(data["root"], "root", problems, referenceable_ids, body_ids)
+            # Beyond id-existence: a reference must target a node guaranteed to have COMPLETED
+            # before the referencing node runs on the same execution path (M-workflow-engine-4).
+            # Forward refs, parallel-sibling refs, and cross-branch-case refs pass existence but
+            # fail/silently-drop at runtime. Only meaningful when the tree parsed.
+            if root is not None:
+                _reach_pass(root, set(), referenceable_ids, problems, "root")
 
         if problems:
             raise WorkflowSpecError(problems)
@@ -458,6 +469,65 @@ def _ref_target(ref: str) -> str:
     return ref.split(".", 1)[0]
 
 
+def _reach_pass(
+    node: WorkflowNode, available: set[str], refset: set[str], problems: list[str], path: str
+) -> set[str]:
+    """Reachability/ordering check (M-workflow-engine-4). Validate that every reference in ``node``
+    targets a referenceable id that is guaranteed COMPLETED before ``node`` runs, given ``available``
+    (the ids that complete earlier on this execution path). Returns the set of ids ``node`` makes
+    guaranteed-available to nodes that run strictly AFTER it.
+
+    Only refs whose target is a real referenceable id (``refset``) are ordering-checked here;
+    unknown ids / foreach-body ids are reported by the existing existence/body-scope checks, so
+    guarding on ``refset`` avoids double-reporting.
+
+    Execution-order semantics (mirrors the engine):
+    - sequence: steps run in order → each step sees the prior steps' outputs.
+    - parallel: branches run concurrently → a branch can't see a sibling; after the parallel all
+      branch outputs are available downstream.
+    - branch: exactly one case runs (runtime-chosen) → cases can't see each other AND nothing a case
+      produces is guaranteed available downstream.
+    - foreach: the body runs isolated per item (its ids aren't externally referenceable); the
+      foreach's own aggregate id becomes available afterward.
+    """
+    def _need(ref: str, where: str) -> None:
+        target = _ref_target(ref)
+        if target in refset and target not in available:
+            problems.append(
+                f"{where} references '{target}', which is not guaranteed to have completed before "
+                f"this node runs — it appears later in execution order, or in a parallel sibling / "
+                f"another branch case. Reference only ids that complete earlier on the same path."
+            )
+
+    if isinstance(node, AgentNode):
+        for ref in node.inputs_from or ():
+            _need(ref, f"{path}: inputs_from")
+        return {node.id} if node.id else set()
+    if isinstance(node, SequenceNode):
+        avail = set(available)
+        for i, step in enumerate(node.steps):
+            avail |= _reach_pass(step, avail, refset, problems, f"{path}.steps[{i}]")
+        return avail - available
+    if isinstance(node, ParallelNode):
+        produced: set[str] = set()
+        for i, branch in enumerate(node.branches):
+            produced |= _reach_pass(branch, set(available), refset, problems, f"{path}.branches[{i}]")
+        return produced
+    if isinstance(node, BranchNode):
+        _need(node.on, f"{path}: on")
+        for key, case in node.cases.items():
+            _reach_pass(case, set(available), refset, problems, f"{path}.cases[{key!r}]")
+        if node.default is not None:
+            _reach_pass(node.default, set(available), refset, problems, f"{path}.default")
+        return set()  # only one case runs → nothing it produces is guaranteed available downstream
+    if isinstance(node, ForeachNode):
+        if node.items_from:
+            _need(node.items_from, f"{path}: items_from")
+        _reach_pass(node.body, set(available), refset, problems, f"{path}.body")  # body is isolated
+        return {node.id} if node.id else set()
+    return set()
+
+
 def _parse_node(
     data: Any, path: str, problems: list[str], ids: set[str], body_ids: set[str]
 ) -> WorkflowNode | None:
@@ -526,9 +596,23 @@ def _parse_agent(
             _check_not_body_ref(ref, path, "inputs_from", body_ids, problems)
 
     out_schema = data.get("output_schema")
-    if out_schema is not None and not isinstance(out_schema, dict):
-        problems.append(f"{path}: 'output_schema' must be an object {{name, schema}}")
-        out_schema = None
+    if out_schema is not None:
+        # Validate the {name, schema} shape, not just object-ness (workflow-engine-5): a malformed
+        # output_schema otherwise passes parse and only blows up at runtime (structured output +
+        # downstream `.key` references). Mirrors the strict-schema philosophy used elsewhere.
+        if not isinstance(out_schema, dict):
+            problems.append(f"{path}: 'output_schema' must be an object {{name, schema}}")
+            out_schema = None
+        else:
+            extra = set(out_schema) - {"name", "schema"}
+            name_val = out_schema.get("name")
+            schema_val = out_schema.get("schema")
+            if not isinstance(name_val, str) or not name_val.strip():
+                problems.append(f"{path}: output_schema.name must be a non-empty string")
+            if not isinstance(schema_val, dict):
+                problems.append(f"{path}: output_schema.schema must be an object")
+            if extra:
+                problems.append(f"{path}: output_schema has unknown key(s): {sorted(extra)}")
 
     if spec_obj is None:
         return None
@@ -567,7 +651,9 @@ def _parse_parallel(
     if not isinstance(branches_raw, list) or not branches_raw:
         problems.append(f"{path}: 'branches' must be a non-empty list")
         return None
-    mc = _int_ge1(data.get("max_concurrency", 5), f"{path}.max_concurrency", problems)
+    mc = _int_ge1(
+        data.get("max_concurrency", 5), f"{path}.max_concurrency", problems, hi=MAX_FANOUT_CONCURRENCY
+    )
     on_err = _on_error(data.get("on_error", "halt"), path, problems)
     branches = [
         _parse_node(b, f"{path}.branches[{i}]", problems, ids, body_ids)
@@ -597,6 +683,15 @@ def _parse_foreach(
     if not isinstance(as_var, str) or not as_var.strip():
         problems.append(f"{path}: foreach requires a non-empty string 'as'")
         as_var = "item"
+    elif not _IDENTIFIER_RE.match(as_var):
+        # The engine binds child_env[as_var]=item, but _render only substitutes {{name}} where
+        # name matches the identifier grammar. An 'as' like "my var" / "1x" / "x-y" would never be
+        # substituted into the body — silent per-iteration input corruption (M-workflow-engine-3).
+        problems.append(
+            f"{path}: foreach 'as' must be a valid identifier (letters/digits/_, not starting "
+            f"with a digit) to be usable as {{{{{as_var}}}}} (got {as_var!r})"
+        )
+        as_var = "item"
 
     items_from = data.get("items_from")
     items = data.get("items")
@@ -618,8 +713,15 @@ def _parse_foreach(
     if items is not None and not isinstance(items, list):
         problems.append(f"{path}: 'items' must be a list")
         items = None
+    if isinstance(items, list) and len(items) > MAX_FOREACH_ITEMS:
+        problems.append(
+            f"{path}: 'items' has {len(items)} entries (max {MAX_FOREACH_ITEMS})"
+        )
+        items = items[:MAX_FOREACH_ITEMS]
 
-    mc = _int_ge1(data.get("max_concurrency", 5), f"{path}.max_concurrency", problems)
+    mc = _int_ge1(
+        data.get("max_concurrency", 5), f"{path}.max_concurrency", problems, hi=MAX_FANOUT_CONCURRENCY
+    )
     par = data.get("parallel", True)
     if not isinstance(par, bool):
         problems.append(f"{path}: 'parallel' must be a boolean")
@@ -678,10 +780,21 @@ def _parse_branch(
     return BranchNode(type="branch", id=data.get("id"), on=on, cases=cases, default=default)
 
 
-def _int_ge1(value: Any, path: str, problems: list[str]) -> int:
+#: Fanout safety caps (H3 — BUG_REVIEW_3.4). ``create_workflow`` is an LLM-facing tool, so a spec
+#: is model-authored (possibly hallucinated/adversarial). Without ceilings, a foreach/parallel can
+#: explode into millions of sub-agent sessions + real LLM calls. These bound the STATIC spec; the
+#: engine additionally enforces a runtime leaf ceiling for dynamic ``items_from`` and nested fanout.
+MAX_FANOUT_CONCURRENCY = 64
+MAX_FOREACH_ITEMS = 4096
+
+
+def _int_ge1(value: Any, path: str, problems: list[str], *, hi: int | None = None) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         problems.append(f"{path} must be an integer >= 1 (got {value!r})")
         return 1
+    if hi is not None and value > hi:
+        problems.append(f"{path} must be <= {hi} (got {value!r})")
+        return hi
     return value
 
 

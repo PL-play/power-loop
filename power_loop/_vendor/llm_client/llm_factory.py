@@ -624,7 +624,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             if not isinstance(items, list):
                 items = [items]
 
-            for pos, it in enumerate(items):
+            for it in items:
                 d = _as_dict(it)
                 if not isinstance(d, dict):
                     continue
@@ -641,8 +641,18 @@ class OpenAICompatibleChatLLMService(LLMService):
                 elif delta_index is not None:
                     call_key = f"index_{delta_index}"
                 else:
-                    # fall back to position inside this delta event
-                    call_key = f"event_pos_{pos}"
+                    # Ambiguous: neither id nor index (non-standard provider). Keying purely by this
+                    # event's position collided sequential DISTINCT calls (both arriving at pos 0 in
+                    # separate events) into one entry, merging their arguments (llm-transport-5).
+                    # OpenAI-style streaming starts a call with a function NAME and continues it with
+                    # arguments-only deltas: a name-bearing (or first-ever) ambiguous delta opens a
+                    # NEW slot; an arguments-only one continues the most-recent call.
+                    fn_obj = d.get("function")
+                    fn_obj = fn_obj if isinstance(fn_obj, dict) else (_as_dict(fn_obj) or {})
+                    if fn_obj.get("name") or not tool_call_order:
+                        call_key = f"ambiguous_{len(tool_call_order)}"
+                    else:
+                        call_key = tool_call_order[-1]
 
                 if call_key not in tool_call_store:
                     tool_call_store[call_key] = {

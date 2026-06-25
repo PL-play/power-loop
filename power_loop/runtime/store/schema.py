@@ -41,8 +41,14 @@ logger = logging.getLogger(__name__)
 _TABLE_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+#: Cap on table_prefix length (store-dialect-3). The longest derived identifier is
+#: ``{prefix}idx_background_tasks_session_status`` (~35 chars after the prefix); MySQL caps
+#: identifiers at 64, so a long prefix would overflow index/table names there. 24 leaves margin.
+_MAX_TABLE_PREFIX_LEN = 24
+
+
 def validate_table_prefix(prefix: str) -> str:
-    """Return ``prefix`` if it is a safe table-name prefix (empty or ``[A-Za-z_]\\w*``);
+    """Return ``prefix`` if it is a safe table-name prefix (empty or ``[A-Za-z_]\\w*``, ≤24 chars);
     raise :class:`ValueError` otherwise."""
     if prefix == "":
         return prefix
@@ -51,12 +57,17 @@ def validate_table_prefix(prefix: str) -> str:
             f"invalid table_prefix {prefix!r}: must be empty or match [A-Za-z_][A-Za-z0-9_]* "
             "(it is interpolated into SQL identifiers without quoting)"
         )
+    if len(prefix) > _MAX_TABLE_PREFIX_LEN:
+        raise ValueError(
+            f"table_prefix {prefix!r} is too long ({len(prefix)} > {_MAX_TABLE_PREFIX_LEN}): the "
+            "longest derived index name must stay within MySQL's 64-char identifier limit"
+        )
     return prefix
 
 #: Bump + append a migration step for ANY schema change.
 #: v2 (2026-06): adds the ``{prefix}project_messages`` table (send-context projection).
 #: v3 (2026-06): adds the ``{prefix}hook_events`` table (ephemeral hook-augmentation audit log).
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -100,6 +111,13 @@ async def _migration_steps(
         # CREATE TABLE IF NOT EXISTS — no ALTER on the hot messages table, so no _column_exists
         # probe needed (the CREATE is itself idempotent).
         steps += db.dialect.hook_events_ddl(prefix)
+    if from_version < 4:
+        # v3 → v4: widen the MySQL free-text/JSON columns TEXT(64 KiB)→LONGTEXT so large LLM
+        # content/tool output/system prompts no longer fail the write (H2). MySQL-only — SQLite/
+        # Postgres TEXT is already unbounded, so this is a pure version bump there. MODIFY is
+        # idempotent. (Fresh stores already provision LONGTEXT via Dialect.ddl.)
+        if db.dialect.name == "mysql":
+            steps += db.dialect.widen_text_columns_ddl(prefix)
     return steps
 
 
@@ -117,6 +135,8 @@ def migration_ddl_for_display(db: Database, prefix: str, *, from_version: int) -
         )
     if from_version < 3:
         steps += db.dialect.hook_events_ddl(prefix)
+    if from_version < 4 and db.dialect.name == "mysql":
+        steps += db.dialect.widen_text_columns_ddl(prefix)
     return steps
 
 

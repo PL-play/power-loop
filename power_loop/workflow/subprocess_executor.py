@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -43,6 +44,9 @@ __all__ = [
     "cleanup_run",
     "reap_runs",
 ]
+
+# SIGKILL is POSIX-only; degrade to SIGTERM where it's absent (Windows) so import never fails.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 @runtime_checkable
@@ -121,6 +125,12 @@ def reap_runs(runs_dir: str, *, older_than_s: float, now: float | None = None) -
     Age is mtime-based (no run bookkeeping needed). Returns the run dir names
     removed. Use as a periodic GC so kept-for-inspection dbs don't accumulate
     forever.
+
+    WARNING (workflow-durability-4): liveness is inferred purely from file mtime, so
+    ``older_than_s`` MUST exceed the longest possible single-leaf runtime. A leaf that runs longer
+    than ``older_than_s`` without writing to its db (a long, quiet LLM/tool call) looks "stale" and
+    its still-live db can be deleted mid-run. Set ``older_than_s`` generously (well above your max
+    leaf timeout), and prefer driving GC off run completion (``cleanup_run``) where possible.
     """
     base = Path(runs_dir)
     if not base.is_dir():
@@ -242,25 +252,31 @@ class SubprocessExecutor:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                # Own process group/session (POSIX) so terminate can signal the WHOLE group: a
+                # grandchild the worker spawned (e.g. an exec/bash tool) that inherited stdout/stderr
+                # would otherwise keep the pipe open after the worker dies → communicate() never sees
+                # EOF and the leaf hangs forever. (H4 — BUG_REVIEW_3.4.)
+                start_new_session=(os.name == "posix"),
             )
         except Exception as exc:  # noqa: BLE001 — fail closed: a launch/sandbox error is a failed leaf, not a hang
             return {**base, "status": "failed", "error": f"worker launch failed: {exc}",
                     "final_text": f"[worker launch failed] {type(exc).__name__}: {exc}"}
+        # Capture the worker's process-group id NOW, while it's alive: once the worker exits and
+        # asyncio reaps it, os.getpgid(pid) raises, so we couldn't find the group to kill leaked
+        # grandchildren. start_new_session makes the worker a group leader (pgid == pid). (H4)
+        pgid = self._capture_pgid(proc)
         comm = asyncio.ensure_future(proc.communicate(input=job.to_json().encode()))
         try:
-            outcome, stdout_b, stderr_b = await self._await_proc(proc, comm, token)
+            outcome, stdout_b, stderr_b = await self._await_proc(proc, comm, token, pgid)
         except asyncio.CancelledError:
             # The engine cancelled this leaf's TASK (host shutdown, an enclosing
             # halt, or WorkflowRunHandle teardown). The cooperative token path in
             # _await_proc handles its own cancel, but a task-level CancelledError
             # raised at the await would unwind WITHOUT killing the child — orphaning
-            # the worker process + its 3 pipes (C3). Signal it to die synchronously
-            # (a signal send can't hang or be re-cancelled) and drop the pipe future.
+            # the worker process + its 3 pipes (C3). Signal the whole group to die
+            # synchronously (a signal send can't hang or be re-cancelled) and drop the future.
             if proc.returncode is None:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
+                self._signal_group(proc, pgid, _SIGKILL, proc.kill)
             comm.cancel()
             raise
         stdout = (stdout_b or b"").decode(errors="replace")
@@ -274,39 +290,82 @@ class SubprocessExecutor:
         return result
 
     async def _await_proc(
-        self, proc: asyncio.subprocess.Process, comm: asyncio.Future, token: CancellationToken
+        self, proc: asyncio.subprocess.Process, comm: asyncio.Future,
+        token: CancellationToken, pgid: int | None,
     ) -> tuple[str, bytes | None, bytes | None]:
         loop = asyncio.get_event_loop()
         deadline = (loop.time() + self._timeout_s) if self._timeout_s else None
+        exited_at: float | None = None  # when the direct child's returncode was first seen
         while True:
             done, _ = await asyncio.wait({comm}, timeout=0.1)
             if comm in done:
                 stdout_b, stderr_b = comm.result()
                 return "ok", stdout_b, stderr_b
             if token.is_cancelled():
-                out = await self._terminate(proc, comm)
+                out = await self._terminate(proc, comm, pgid)
                 return ("cancelled", *out)
             if deadline is not None and loop.time() > deadline:
-                out = await self._terminate(proc, comm)
+                out = await self._terminate(proc, comm, pgid)
                 return ("timeout", *out)
+            # The direct child exited but communicate() hasn't returned: a grandchild inherited the
+            # stdout/stderr pipe and holds it open, so this poll loop would spin forever (esp. with
+            # no timeout_s). After a bounded grace, force the whole group down and settle. (H4)
+            if proc.returncode is not None:
+                if exited_at is None:
+                    exited_at = loop.time()
+                elif loop.time() - exited_at > self._term_grace_s:
+                    out = await self._terminate(proc, comm, pgid)
+                    return ("ok", *out)
+
+    @staticmethod
+    def _capture_pgid(proc: asyncio.subprocess.Process) -> int | None:
+        """The worker's process-group id while it is still alive (None on non-POSIX / if gone)."""
+        try:
+            return os.getpgid(proc.pid)
+        except (AttributeError, ProcessLookupError, OSError):
+            return None
+
+    @staticmethod
+    def _signal_group(
+        proc: asyncio.subprocess.Process, pgid: int | None, sig: int, fallback: Any
+    ) -> None:
+        """Signal the worker's whole process group (``pgid`` captured at spawn) so grandchildren
+        that inherited the stdout/stderr pipes die too (else communicate() never observes EOF).
+        Falls back to signalling just the direct process where the group isn't available
+        (non-POSIX, or the group already reaped)."""
+        if pgid is not None:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            fallback()
+        except ProcessLookupError:
+            pass
 
     async def _terminate(
-        self, proc: asyncio.subprocess.Process, comm: asyncio.Future
+        self, proc: asyncio.subprocess.Process, comm: asyncio.Future, pgid: int | None
     ) -> tuple[bytes | None, bytes | None]:
-        """SIGTERM then SIGKILL, draining the (shielded) communicate() each time."""
-        for stop in (proc.terminate, proc.kill):
+        """SIGTERM then SIGKILL the worker's process GROUP, draining the (shielded) communicate()
+        within a bounded grace each time. The final drain is also bounded (H4): a leaked grandchild
+        holding the pipe must never block this leaf — and the whole run — forever."""
+        for sig, fallback in ((signal.SIGTERM, proc.terminate), (_SIGKILL, proc.kill)):
             if proc.returncode is not None:
                 break
-            try:
-                stop()
-            except ProcessLookupError:
-                break
+            self._signal_group(proc, pgid, sig, fallback)
             try:
                 return await asyncio.wait_for(asyncio.shield(comm), self._term_grace_s)
             except asyncio.TimeoutError:
                 continue
+        # The direct child is dead but a leaked grandchild may still hold the pipe — bound this
+        # final drain too (and kill the group again in case the child died before we signalled it).
+        self._signal_group(proc, pgid, _SIGKILL, proc.kill)
         try:
-            return await asyncio.shield(comm)
+            return await asyncio.wait_for(asyncio.shield(comm), self._term_grace_s)
+        except asyncio.TimeoutError:
+            comm.cancel()  # grandchild still holding the pipe — give up draining, don't hang
+            return None, None
         except Exception:  # noqa: BLE001
             return None, None
 

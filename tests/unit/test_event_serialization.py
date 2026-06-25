@@ -93,6 +93,40 @@ def test_jsonl_sink_redacts_secrets(tmp_path: Path) -> None:
     assert "sk-secret" not in line and "***" in line and '"n": 1' in line
 
 
+def test_jsonl_sink_value_secret_scrubbing_is_opt_in(tmp_path: Path) -> None:
+    # M-contrib-observability-6: a secret embedded in a VALUE under a benign key is NOT scrubbed by
+    # the default (key-name) policy, but IS scrubbed with redact_value_secrets=True.
+    bus = AgentEventBus(suppress_subscriber_errors=True)
+    payload = {"command": "curl -H 'Authorization: Bearer sk-abcdEFGH1234567890zzz' https://x"}
+
+    default_path = tmp_path / "default.jsonl"
+    sink = attach_jsonl_sink(bus, default_path)
+    bus.publish(AgentEvent(type=AgentEventType.SYSTEM_LOG, payload=dict(payload)))
+    sink.close()
+    assert "Bearer sk-abcdEFGH1234567890zzz" in default_path.read_text()  # default: leaks
+
+    scrub_path = tmp_path / "scrub.jsonl"
+    sink2 = attach_jsonl_sink(bus, scrub_path, redact_value_secrets=True)
+    bus.publish(AgentEvent(type=AgentEventType.SYSTEM_LOG, payload=dict(payload)))
+    sink2.close()
+    line = scrub_path.read_text()
+    assert "sk-abcdEFGH1234567890zzz" not in line and "***" in line  # opt-in: scrubbed
+    assert "curl" in line  # surrounding text preserved
+
+
+def test_jsonl_sink_backup_count_zero_does_not_discard(tmp_path: Path) -> None:
+    # contrib-observability-5: max_bytes>0 + backup_count=0 used to truncate the file on rotation,
+    # silently discarding ALL events. Now backup_count<=0 disables rotation (file grows).
+    path = tmp_path / "nb.jsonl"
+    sink = JsonlSink(path, max_bytes=200, backup_count=0)
+    for i in range(50):
+        sink.write_line(f'{{"i": {i}, "pad": "{"x" * 50}"}}')  # far exceeds max_bytes total
+    sink.close()
+    lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 50  # every event retained (no truncation)
+    assert not (tmp_path / "nb.jsonl.1").exists()  # and no backup rotation happened
+
+
 def test_jsonl_sink_rotates(tmp_path: Path) -> None:
     path = tmp_path / "r.jsonl"
     sink = JsonlSink(path, max_bytes=200, backup_count=2)

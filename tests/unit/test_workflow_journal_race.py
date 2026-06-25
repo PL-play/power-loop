@@ -20,6 +20,23 @@ from power_loop.workflow.result import WorkflowResult
 pytestmark = pytest.mark.unit
 
 
+async def test_budget_exceeded_run_journal_is_frozen() -> None:
+    # M-workflow-durability-2: budget_exceeded is a terminal status, so a late/orphaned step
+    # settling after the run exhausted its budget must NOT mutate the frozen journal.
+    async with await SessionStore.open(":memory:") as store:
+        parent = await store.create_session(system_prompt="parent")
+        run_id = "run-budget"
+        await journal.seed(store, parent, run_id, "wf", spec={})
+        await journal.record_step(store, parent, run_id, node_id="a", status="completed")
+        await journal.update(store, parent, run_id, status="budget_exceeded")
+
+        await journal.record_step(store, parent, run_id, node_id="late", status="completed")
+
+        rec = await journal.read(store, parent, run_id)
+        assert {s["node_id"] for s in rec["steps"]} == {"a"}  # 'late' frozen out
+        assert rec["status"] == "budget_exceeded"
+
+
 async def test_concurrent_record_step_keeps_every_step() -> None:
     async with await SessionStore.open(":memory:") as store:
         parent = await store.create_session(system_prompt="parent")

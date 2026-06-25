@@ -393,3 +393,35 @@ async def test_agent_node_model_and_output_schema_reach_llm_request():
     assert captured["response_format"].get("type") == "json_schema"
     assert res.results["a"].payload == {"x": 1}  # parsed structured output
     assert res.results["a"].usage is not None  # usage surfaced (B2)
+
+
+@pytest.mark.asyncio
+async def test_driver_and_leaf_sessions_cleaned_up_after_run() -> None:
+    # M-workflow-engine-2: run() must close its driver session + linked leaf subtree, so each run
+    # doesn't leak a driver row + one leaf row per node. close_driver=False opts into retention.
+    from power_loop.runtime.store.store import SessionStore
+
+    store = await SessionStore.open(":memory:")
+    loop = StatefulAgentLoop(
+        llm=_FakeLLM(), store=store,
+        config=AgentLoopConfig(system_prompt="o", max_rounds=2, compactor=None),
+    )
+
+    async def _count() -> int:
+        row = await store._db.fetchone(f"SELECT COUNT(*) AS n FROM {store.t.sessions}")
+        return int(row["n"])
+
+    spec = WorkflowSpec.from_json({"name": "w", "root": {"type": "sequence", "steps": [
+        {"type": "agent", "id": "a", "spec": {"name": "a", "system_prompt": "p"}},
+        {"type": "agent", "id": "b", "spec": {"name": "b", "system_prompt": "p"}},
+    ]}})
+
+    base = await _count()
+    res = await WorkflowEngine(loop, run_id="t1").run(spec)
+    assert res.status == "completed"
+    assert await _count() == base  # driver + 2 leaves cleaned up
+
+    res2 = await WorkflowEngine(loop, run_id="t2", close_driver=False).run(spec)
+    assert res2.status == "completed"
+    assert await _count() == base + 3  # driver + 2 leaves retained for inspection
+    await store.close()

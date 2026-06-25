@@ -253,3 +253,39 @@ SCENARIOS: list[tuple[str, Callable[[Any], Awaitable[list[Any]]], str | None]] =
 @pytest.mark.parametrize("name,scn,snap", SCENARIOS, ids=[s[0] for s in SCENARIOS])
 async def test_sqlite_parity(name: str, scn: Any, snap: str | None) -> None:
     await run_parity(scn, snap)
+
+
+# ── H2 (BUG_REVIEW_3.4): large (>64 KiB) free-text/JSON payloads must round-trip on every
+# backend. MySQL's old TEXT columns capped at 64 KiB (DataError 1406); SQLite/PG TEXT is
+# unbounded. Shared so the PG/MySQL conformance suites import and run it against real servers.
+async def exercise_large_payload(store: Any) -> None:
+    big = "A" * 100_000          # 100 KiB — comfortably past MySQL's 64 KiB TEXT cap
+    big_prompt = "P" * 100_000
+    big_args = '{"text":"' + ("x" * 100_000) + '"}'
+    await store.create_session(session_id="big", system_prompt=big_prompt)
+    await store.append_message(
+        "big", role="assistant", content=big,
+        tool_calls=[{"id": "c1", "function": {"name": "echo", "arguments": big_args}}],
+        round_index=0,
+    )
+    await store.append_message("big", role="tool", content=big, tool_call_id="c1", round_index=0)
+    await store.add_note("big", "N" * 100_000)
+
+    rows = await store.load_active_messages("big")
+    asst = next(r for r in rows if r.role == "assistant")
+    tool = next(r for r in rows if r.role == "tool")
+    assert asst.content == big and len(asst.content) == 100_000          # not truncated
+    assert asst.tool_calls[0]["function"]["arguments"] == big_args
+    assert tool.content == big
+    sess = await store.get_session("big")
+    assert sess.system_prompt == big_prompt
+    notes = await store.list_notes("big")
+    assert notes and len(notes[0].content) == 100_000
+
+
+async def test_sqlite_large_payload() -> None:
+    store = await AsyncStore.open(":memory:")
+    try:
+        await exercise_large_payload(store)
+    finally:
+        await store.close()

@@ -28,6 +28,7 @@ driver session id **inside each leaf coroutine**, so concurrent fan-out tasks
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
@@ -41,6 +42,7 @@ from power_loop.runtime.structured import StructuredOutputError, parse_structure
 
 from .result import AgentResult, SharedBudget, WorkflowResult
 from .spec import (
+    MAX_FOREACH_ITEMS,
     AgentNode,
     BranchNode,
     ForeachNode,
@@ -51,6 +53,13 @@ from .spec import (
 )
 
 __all__ = ["Executor", "InProcessExecutor", "WorkflowEngine", "WorkflowRunError", "in_workflow"]
+
+logger = logging.getLogger(__name__)
+
+#: Hard ceiling on the total number of real leaf executions in one run (H3 — BUG_REVIEW_3.4). A
+#: backstop independent of the optional budget: caps nested fanout (foreach-in-foreach) and any
+#: programmatically-built spec that bypasses the static validation caps. Fail-closed when exceeded.
+MAX_TOTAL_LEAVES = 10_000
 
 _VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_]\w*)\s*\}\}")
 
@@ -151,10 +160,16 @@ class WorkflowEngine:
         stop_event: CancellationLike = None,
         replay: dict[str, AgentResult] | None = None,
         run_id: str | None = None,
+        close_driver: bool = True,
     ) -> None:
         self._loop = parent_loop
         self._executor = executor or InProcessExecutor()
         self._budget = budget
+        # M-workflow-engine-2: close the driver session (+ its linked leaf subtree) when run()
+        # finishes so each run doesn't leak a driver row + one linked leaf row per node. Nothing
+        # reads those sessions after the result is built (outputs/usage are already in `results`).
+        # Set False to retain leaf sessions for post-hoc inspection.
+        self._close_driver = close_driver
         # Optional per-step observer fired when each agent node settles
         # (completed / failed / budget_exceeded). Used by the detached runner to
         # journal live progress. Must not raise; errors are swallowed.
@@ -177,6 +192,11 @@ class WorkflowEngine:
         self._last: AgentResult | None = None
         self._budget_hit = False
         self._cancelled = False
+        # H3: hard backstop on total real leaf executions per run, independent of the optional
+        # budget. Guards nested fanout (foreach-in-foreach) and specs built programmatically
+        # (bypassing the parse-time caps). Counted in _exec_agent; fail-closed past the ceiling.
+        self._leaves_run = 0
+        self._leaf_cap_hit = False
         # Token usage accumulated exactly once per real leaf execution (and once
         # per replayed result on resume). Robust against the foreach-body id
         # collision, which would double/under-count if summed from _results.
@@ -197,20 +217,38 @@ class WorkflowEngine:
             for r in self._replay.values():
                 self._budget.commit(r.usage)
         driver_sid = await self._loop.new_session(metadata={"kind": "wf_driver", "workflow": spec.name})
-        env: dict[str, Any] = {"input": spec.input}
-        status = "completed"
-        guard = _IN_WORKFLOW.set(True)
         try:
-            await self._exec(spec.root, env, driver_sid)
-        except WorkflowRunError as exc:
-            status = "failed"
-            self._errors.append(str(exc))
+            env: dict[str, Any] = {"input": spec.input}
+            status = "completed"
+            guard = _IN_WORKFLOW.set(True)
+            try:
+                await self._exec(spec.root, env, driver_sid)
+            except WorkflowRunError as exc:
+                status = "failed"
+                self._errors.append(str(exc))
+            finally:
+                _IN_WORKFLOW.reset(guard)
+            if self._cancelled or self._cancel.is_cancelled():
+                status = "cancelled"
+            elif self._budget_hit:
+                status = "budget_exceeded"
+            elif self._leaf_cap_hit and status == "completed":
+                # The leaf ceiling fail-closes individual leaves (status=failed); surface it at the
+                # run level so a truncated fanout isn't reported as a clean "completed". (H3)
+                status = "failed"
+                self._errors.append(
+                    f"workflow leaf ceiling ({MAX_TOTAL_LEAVES}) exceeded; fanout truncated")
+            return self._build_result(spec, status)
         finally:
-            _IN_WORKFLOW.reset(guard)
-        if self._cancelled or self._cancel.is_cancelled():
-            status = "cancelled"
-        elif self._budget_hit:
-            status = "budget_exceeded"
+            # M-workflow-engine-2: clean up the driver + its linked leaf subtree (best-effort —
+            # a cleanup failure must not fail an otherwise-successful run).
+            if self._close_driver:
+                try:
+                    await self._loop.close_session(driver_sid, cascade=True)
+                except Exception:  # noqa: BLE001
+                    logger.debug("workflow driver session cleanup failed", exc_info=True)
+
+    def _build_result(self, spec: WorkflowSpec, status: str) -> WorkflowResult:
         return WorkflowResult(
             name=spec.name,
             status=status,
@@ -260,6 +298,15 @@ class WorkflowEngine:
             self._results[node.id] = res
             await self._emit_step(res)
             return res
+
+        if self._leaves_run >= MAX_TOTAL_LEAVES:
+            self._leaf_cap_hit = True
+            res = AgentResult(node_id=node.id, status="failed", text="",
+                              error=f"workflow leaf ceiling ({MAX_TOTAL_LEAVES}) exceeded")
+            self._results[node.id] = res
+            await self._emit_step(res)
+            return res
+        self._leaves_run += 1
 
         user_input = _render(node.input, env)
         if node.inputs_from:
@@ -490,6 +537,14 @@ class WorkflowEngine:
         if not isinstance(value, list):
             raise WorkflowRunError(
                 f"foreach items_from '{node.items_from}' did not resolve to a list (got {type(value).__name__})"
+            )
+        # H3: cap a DYNAMIC items_from list before _exec_foreach eagerly creates one task per item
+        # (the static `items` literal is already capped at parse time). Fail-closed — a runaway
+        # upstream node can't fan out into millions of leaves/LLM calls.
+        if len(value) > MAX_FOREACH_ITEMS:
+            raise WorkflowRunError(
+                f"foreach items_from '{node.items_from}' resolved to {len(value)} items "
+                f"(max {MAX_FOREACH_ITEMS})"
             )
         return value
 

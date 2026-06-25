@@ -45,8 +45,11 @@ class AgentMessage:
         }
         if self.role == "assistant" and self.tool_calls:
             payload["tool_calls"] = [call.to_openai_tool_call() for call in self.tool_calls]
-        if self.role == "tool" and self.tool_call_id:
-            payload["tool_call_id"] = self.tool_call_id
+        if self.role == "tool":
+            # A tool-role message MUST carry tool_call_id — emit it unconditionally (empty string if
+            # unset) so we never produce a structurally-invalid tool message a provider rejects with
+            # an opaque error (exec-skills-structured-7).
+            payload["tool_call_id"] = self.tool_call_id or ""
         if self.name:
             payload["name"] = self.name
         return payload

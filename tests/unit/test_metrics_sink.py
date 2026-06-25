@@ -37,6 +37,28 @@ def test_fake_backend_satisfies_protocol() -> None:
     assert isinstance(_FakeBackend(), MetricsBackend)
 
 
+def test_backend_failure_never_aborts_the_loop() -> None:
+    """H7 (BUG_REVIEW_3.4): a raising backend on a non-suppressing bus (the default, incl.
+    DEFAULT_EVENT_BUS) must NOT propagate out of publish() and abort the agent run."""
+
+    class _BoomBackend:
+        def incr(self, *a, **k):
+            raise RuntimeError("statsd socket down")
+
+        def observe(self, *a, **k):
+            raise RuntimeError("statsd socket down")
+
+        def gauge(self, *a, **k):
+            raise RuntimeError("statsd socket down")
+
+    bus = AgentEventBus()  # default suppress_subscriber_errors=False
+    attach_metrics_sink(bus, _BoomBackend())
+    # Pre-fix this re-raised RuntimeError out of publish(); now it's logged and swallowed.
+    bus.publish(AgentEvent(type=AgentEventType.ROUND_COMPLETED, payload={}))
+    bus.publish(AgentEvent(type=AgentEventType.LLM_CALL_COMPLETED,
+                           payload={"model": "m", "success": True, "duration_ms": 1.0}))
+
+
 def test_event_to_metric_mapping() -> None:
     bus = AgentEventBus(suppress_subscriber_errors=True)
     be = _FakeBackend()

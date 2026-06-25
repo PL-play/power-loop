@@ -15,6 +15,7 @@ backends that lack it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import secrets
 import time
@@ -890,13 +891,13 @@ class SessionStore:
             # Per-session MAX+1 id alloc. Serialize it against concurrent writers the
             # same way append_message does — take the session_state row lock (FOR UPDATE
             # on a server backend) so two concurrent create_timer calls can't read the
-            # same MAX and collide on the (session_id, timer_id) PK. Legacy tolerated
-            # timers without a session row, so a missing state row is not fatal here:
-            # there is simply nothing to lock (single-writer SQLite is gap-free anyway).
-            try:
+            # same MAX and collide on the (session_id, timer_id) PK. create_session always
+            # inserts a session_state row, so real sessions ARE serialized. RESIDUAL
+            # (store-core-3): a legacy/hand-made session with NO state row has nothing to lock,
+            # so on a server backend two concurrent allocs for that orphan can still race; SQLite
+            # is single-writer (gap-free) regardless. Give orphan sessions a state row to serialize.
+            with contextlib.suppress(ValueError):
                 await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
-            except ValueError:
-                pass
             row = await tx.fetchone(
                 f"SELECT COALESCE(MAX(timer_id), 0) + 1 AS tid FROM {self.t.timers} "
                 "WHERE session_id=?",
@@ -1379,6 +1380,10 @@ class SessionStore:
             )
             if exists is None:
                 raise ValueError(f"unknown session: {session_id}")
+            # Serialize the last_seen_at read→bump→write against concurrent mark_background_seen on
+            # the session_state row lock (store-core-2). Orphan sessions: nothing to lock.
+            with contextlib.suppress(ValueError):
+                await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
             existing = await tx.fetchone(
                 f"SELECT last_seen_at, created_at FROM {self.t.background_tasks} "
                 "WHERE session_id=? AND task_id=?",
@@ -1448,6 +1453,12 @@ class SessionStore:
         now = _now_ms()
         placeholders = ",".join("?" for _ in task_ids)
         async with self._db.transaction() as tx:
+            # Serialize against upsert_background_task's last_seen_at read-modify-write on the SAME
+            # session_state row lock (store-core-2), so the reader's cursor advance and the writer's
+            # monotonic bump can't interleave and lose an update. Orphan sessions (no state row) have
+            # nothing to lock — single-writer SQLite is gap-free anyway.
+            with contextlib.suppress(ValueError):
+                await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
             await tx.execute(
                 f"UPDATE {self.t.background_tasks} SET last_seen_at=? "
                 f"WHERE session_id=? AND task_id IN ({placeholders})",

@@ -4,6 +4,7 @@ semantics, TIMER_FIRE hook veto, restart recovery."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -390,3 +391,57 @@ async def test_timer_for_deleted_session_is_cancelled(tmp_path):
     await TimerRunner(loop).scan_once()
     assert (await loop.store.get_timer(sid, 1)).status == "cancelled"
     await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stop_aborts_inflight_timer_delivery_promptly(tmp_path) -> None:
+    # M-async-control-2: a due timer firing into an IDLE session runs a full agent send via
+    # follow_up. stop() must abort that in-flight run and return promptly. Cancellation is
+    # cooperative at ROUND boundaries, so this LLM loops (a tool call every round) and would run
+    # ~1000 rounds; stop() can only cut it short if the runner's token actually reaches the send
+    # (the fix). The LLM does NOT peek at the runner token — abortion must flow through follow_up.
+    from power_loop import ToolDefinition
+    from power_loop.tools.registry import ToolRegistry
+
+    started = asyncio.Event()
+
+    @dataclass
+    class _LoopingLLM(LLMService):
+        n: int = 0
+
+        async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,
+                           on_chunk_think=None, on_stream_end=None) -> LLMResponse:
+            started.set()
+            self.n += 1
+            await asyncio.sleep(0.02)
+            return _tool_resp(f"c{self.n}", "echo", '{"text": "x"}')  # always a tool call → next round
+
+        def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+            async def _e() -> AsyncIterator[LLMStreamChunk]:
+                if False:
+                    yield LLMStreamChunk()
+            return _e()
+
+        async def close(self) -> None:
+            return None
+
+    reg = ToolRegistry()
+    reg.register(ToolDefinition(name="echo", description="e",
+                 input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
+    loop = StatefulAgentLoop(
+        llm=_LoopingLLM(), db_path=str(tmp_path / "s.db"), tool_registry=reg,
+        config=AgentLoopConfig(system_prompt="t", max_rounds=1000, compactor=None),
+    )
+    sid = await loop.new_session()
+    await loop.schedule_timer(sid, due_at_ms=int(time.time() * 1000) - 1000, note="ping")
+    runner = TimerRunner(loop, scan_interval_s=0.05)
+
+    await runner.start()
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)  # delivery (full send) is underway
+        # ~1000 rounds × 0.02s ≈ 20s if it runs to completion; stop() must cut it short.
+        await asyncio.wait_for(runner.stop(), timeout=5)
+    finally:
+        with contextlib.suppress(Exception):
+            await runner.stop()
+        await loop.aclose()

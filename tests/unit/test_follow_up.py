@@ -106,6 +106,41 @@ async def store() -> AsyncIterator[SessionStore]:
 
 
 @pytest.mark.asyncio
+async def test_no_tools_drained_round_emits_round_completed(store: SessionStore) -> None:
+    # pipeline-runner-3: a no-tools round that drains a queued follow-up (instead of completing)
+    # must still close itself in the event stream — emit ROUND_COMPLETED + per-round usage — before
+    # steering reopens the loop. Pre-fix the drained round was left unterminated.
+    from power_loop import AgentEventBus, AgentEventType
+
+    bus = AgentEventBus()
+    completed: list = []
+    bus.subscribe(AgentEventType.ROUND_COMPLETED, lambda e: completed.append((e.payload or {}).get("round_index")))
+    llm = _GateLLM(responses=[
+        LLMResponse(raw_text="thinking, no tools"),   # round 0: NO tool calls
+        LLMResponse(raw_text="done after steering"),  # round 1: after the drained follow-up
+    ])
+    loop = StatefulAgentLoop(
+        llm=llm, store=store, event_bus=bus,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4, compactor=None),
+    )
+    sid = await loop.new_session()
+    send_task = asyncio.create_task(loop.send("start", sid))
+    for _ in range(200):
+        if loop._lock_for(sid).locked():
+            break
+        await asyncio.sleep(0.005)
+    else:
+        pytest.fail("expected session lock during send")
+
+    await loop.follow_up("steer me", sid)  # queued while round 0's LLM call is gated
+    llm.release_first.set()
+    result = await send_task
+    assert result.status == "completed"
+    # Both the drained no-tools round (0) and the final round (1) emitted ROUND_COMPLETED.
+    assert 0 in completed and 1 in completed, completed
+
+
+@pytest.mark.asyncio
 async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore) -> None:
     llm = _GateLLM(
         responses=[

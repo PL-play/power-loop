@@ -950,11 +950,20 @@ class SessionStore:
 
     def checkpoint(self, *, mode: str = "TRUNCATE") -> None:
         """Run a WAL checkpoint (default ``TRUNCATE`` — flush the -wal back into the
-        main file and shrink the -wal to zero). Cheap; safe to call periodically."""
+        main file and shrink the -wal to zero). Cheap; safe to call periodically.
+
+        ``PRAGMA wal_checkpoint`` returns ``(busy, log_pages, checkpointed_pages)``; ``busy=1`` means
+        a concurrent reader held a lock so the -wal was NOT truncated (session-store-legacy-1). We
+        surface that as a warning so a perpetually-busy checkpoint (e.g. a long-lived pooled reader)
+        doesn't silently let the -wal grow unbounded."""
         if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
             raise ValueError(f"invalid checkpoint mode: {mode!r}")
         with self._lock:
-            self._conn.execute(f"PRAGMA wal_checkpoint({mode})")
+            row = self._conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchone()
+        if row is not None and row[0] == 1:
+            logger.warning(
+                "WAL checkpoint(%s) was BUSY — a reader held a lock; -wal not truncated this pass", mode
+            )
 
     def vacuum(self, *, incremental: bool = True) -> None:
         """Reclaim free pages. ``incremental=True`` runs ``PRAGMA incremental_vacuum``
@@ -977,6 +986,12 @@ class SessionStore:
         """Serialize a session's FULL durable state (the session row + all messages
         incl. compacted, compactions, usage rounds, runtime state, timers, notes, stats)
         into a JSON-serializable dict stamped with the current ``schema_version``.
+
+        NOT PORTABLE to the new store (session-store-legacy-2): this legacy
+        ``runtime.session_store.SessionStore`` stamps its own ``schema_version`` namespace (via
+        ``PRAGMA user_version``), DISTINCT from the new ``runtime.store.store.SessionStore``'s
+        ``schema_migrations`` table. The two version numbers are unrelated — an export blob from one
+        must NOT be imported into the other; round-trip only within the same store implementation.
 
         Pairs with :meth:`import_session` for archive-then-prune and cross-store moves.
         Raises ``ValueError`` for an unknown session."""

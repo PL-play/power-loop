@@ -29,7 +29,13 @@ from typing import TYPE_CHECKING, Any
 
 from power_loop._vendor.llm_client.interface import LLMService
 from power_loop.agent.follow_up import FollowUpQueued, merge_follow_up_inputs
-from power_loop.agent.sink import SQLiteSink
+from power_loop.agent.sink import (
+    CONTENT_ENCODING_JSON,
+    CONTENT_ENCODING_META_KEY,
+    SQLiteSink,
+    _encode_content,
+    _meta_with_content_encoding,
+)
 from power_loop.agent.system_prompt import (
     resolve_runtime_system_prompt,
 )
@@ -759,12 +765,17 @@ class StatefulAgentLoop:
             sink = SQLiteSink(store, session_id)
             await self._prime_sink_from_pending(session_id, sink)
             round_index = int((pending or {}).get("round_index") or 0)
+            # Stamp the in-flight send's index so projection mode keeps this answer in the
+            # active send's current_rows (else it lands in the NULL-send_index legacy prefix,
+            # renders before its own tool_call, and is dropped as an orphan). See H1.
+            send_index = await self._current_send_index(store, session_id)
             await sink.on_message_appended(
                 {
                     "role": "tool",
                     "tool_call_id": str(interaction["tool_call_id"]),
                     "name": str(interaction.get("tool_name") or "request_user_input"),
                     "content": _as_tool_result_text(value),
+                    "send_index": send_index,
                 },
                 round_index=round_index,
             )
@@ -808,6 +819,10 @@ class StatefulAgentLoop:
         # tool_calls from self._tool_calls (sink.py:171-174); left empty it would write
         # {tool_call_ids:[…], tool_calls:[]}, a self-inconsistent pending.
         sink._tool_calls = list(tool_calls)
+        # Stamp the pending send's index (runtime_state still holds it — abort runs before the
+        # next _persist_user_input bumps it) so projection keeps these <aborted> rows paired with
+        # their assistant tool_call instead of orphaning them in the legacy prefix. See H1.
+        send_index = await self._current_send_index(store, session_id)
         for tc in tool_calls:
             cid = str(tc.get("id") or "")
             name = _tool_call_name(tc) if "function" in tc or "name" in tc else None
@@ -817,6 +832,7 @@ class StatefulAgentLoop:
                     "tool_call_id": cid,
                     "name": name,
                     "content": f"<aborted: {reason}>",
+                    "send_index": send_index,
                 },
                 round_index=round_index,
             )
@@ -1031,17 +1047,46 @@ class StatefulAgentLoop:
                 pending_tool_calls=pending.get("tool_calls", []),
             )
 
+    @staticmethod
+    def _coerce_send_index(raw: Any) -> int | None:
+        """The current send's authoritative index, or None when unallocated/legacy.
+
+        send_index is allocated >= 1 by _persist_user_input and persists across
+        resume()/submit_input()/follow-up (they inherit, never re-bump). 0 is the
+        unallocated/legacy default. A corrupted runtime_state value (non-numeric /
+        inf / nan) must degrade to "unallocated", never crash int()."""
+        try:
+            v = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return v if v >= 1 else None
+
+    async def _current_send_index(self, store: Any, sid: str) -> int | None:
+        """Read the in-flight send index from runtime state (None if unallocated).
+
+        Out-of-band tool appends (submit_input/resume/abort_pending) MUST stamp this
+        onto every row so projection mode partitions them into the active send's
+        ``current_rows`` rather than the legacy (NULL send_index) prefix — otherwise
+        the tool result renders BEFORE its own assistant tool_call and align_tool_calls
+        drops it as an orphan, silently losing the answer."""
+        raw = await store.get_runtime_state(sid, "send_index", default=0)
+        return self._coerce_send_index(raw)
+
     async def _persist_user_input(self, sid: str, user_input: str | LoopMessage) -> None:
         store = await self._ensure_store()
         role: str
         content: str | None
         name: str | None
+        # Encode multimodal (list/dict) content losslessly: JSON in the text column + a meta
+        # marker so the reload path reconstructs the original structure rather than handing the
+        # model a literal JSON string (vision would otherwise silently break). See H6.
         if isinstance(user_input, str):
-            role, content, name = "user", user_input, None
+            role, content, name, structured = "user", user_input, None, False
         else:
             role = str(user_input.get("role", "user"))
-            content = _as_text(user_input.get("content"))
+            content, structured = _encode_content(user_input.get("content"))
             name = user_input.get("name")
+        meta = _meta_with_content_encoding(None, structured=structured)
         # Allocate the next monotonic SEND index for this session (atomic RMW under the
         # session_state row lock — never resets, unlike round_index). This is the single
         # send-begin point (exactly one user row per send; resume()/follow-up drains do
@@ -1051,18 +1096,18 @@ class StatefulAgentLoop:
             sid, "send_index", lambda v: int(v or 0) + 1, default=0
         )
         seq = await store.append_message(
-            sid, role=role, content=content, name=name, send_index=send_index
+            sid, role=role, content=content, name=name, send_index=send_index, meta=meta
         )
         # Keep a live cache entry current with the loop's OWN append (no reload): the next
         # send's next_seq token will then match and reuse the cached window. No-op if this
         # session isn't cached. The row mirrors what append_message persisted (only
-        # seq/role/content/name/send_index are consumed when rebuilding the working history).
+        # seq/role/content/name/send_index/meta are consumed when rebuilding the working history).
         self._cache_append(
             sid,
             MessageRow(
                 session_id=sid, seq=seq, role=role, name=name, content=content,
                 tool_calls=None, tool_call_id=None, round_index=None,
-                state=MessageState.ACTIVE, meta={}, created_at=0, send_index=send_index,
+                state=MessageState.ACTIVE, meta=meta or {}, created_at=0, send_index=send_index,
             ),
             new_next_seq=seq + 1,
         )
@@ -1088,6 +1133,10 @@ class StatefulAgentLoop:
             return
         # Initialize sink's in-memory unresolved set so auto-resolve works.
         await self._prime_sink_from_pending(sid, sink)
+        # The in-flight send's index (inherited, not re-bumped on resume): stamp it on every
+        # replayed tool row so projection mode pairs the result with its assistant tool_call
+        # instead of orphaning it in the NULL-send_index legacy prefix. See H1.
+        send_index = await self._current_send_index(store, sid)
         for tc in tool_calls:
             cid = str(tc.get("id") or "")
             name = _tool_call_name(tc)
@@ -1100,6 +1149,7 @@ class StatefulAgentLoop:
                         "tool_call_id": cid,
                         "name": None,
                         "content": "<aborted: unrecoverable tool_call on resume>",
+                        "send_index": send_index,
                     },
                     round_index=round_index,
                 )
@@ -1124,6 +1174,7 @@ class StatefulAgentLoop:
                     "tool_call_id": cid,
                     "name": name,
                     "content": _truncate_result(output),
+                    "send_index": send_index,
                 },
                 round_index=round_index,
             )
@@ -1159,18 +1210,10 @@ class StatefulAgentLoop:
         fold_strategy = self.config.fold_strategy
         # The current send's authoritative index (set by _persist_user_input; inherited by
         # resume()/follow-up). Read up-front so projection mode can partition history by it.
-        si = await store.get_runtime_state(sid, "send_index", default=0)
-        # send_index is allocated >= 1 by _persist_user_input and persists across resume();
-        # 0 is the unallocated/legacy default. Treat ONLY a real allocation (>= 1) as the current
-        # send — explicit (matches the `is not None` convention used below), never conflating the
-        # unallocated 0 with a (hypothetical) explicit send 0. Coerce defensively: a corrupted
-        # runtime_state value (non-numeric / inf / nan) must degrade to "unallocated", never crash
-        # the reader with int()'s ValueError/OverflowError.
-        try:
-            si_int = int(si)
-        except (TypeError, ValueError, OverflowError):
-            si_int = 0
-        current_send_index = si_int if si_int >= 1 else None
+        # The current send (>= 1) or None when unallocated/legacy — same coercion the out-of-band
+        # tool appends (submit_input/resume/abort_pending) use to stamp send_index, so the reader's
+        # partition and the writer's stamp can never disagree.
+        current_send_index = await self._current_send_index(store, sid)
         # Cache only the plain-send path: resume()/submit_input() pass a pre-primed sink built
         # from pending state (NOT a full init_history_seqs), so they must neither read from nor
         # write to the window cache — they self-invalidate via the next_seq bump from their own
@@ -1776,7 +1819,16 @@ class StatefulAgentLoop:
 def _row_to_loop_message(row: MessageRow) -> LoopMessage:
     msg: LoopMessage = {"role": row.role}
     if row.content is not None:
-        msg["content"] = row.content
+        content: Any = row.content
+        # Reconstruct structured (multimodal) content that was JSON-encoded on persist, so the
+        # model receives the original list/dict — not a literal JSON string. See H6. A corrupt
+        # marker / unparseable payload degrades to the raw text rather than raising.
+        if (row.meta or {}).get(CONTENT_ENCODING_META_KEY) == CONTENT_ENCODING_JSON:
+            try:
+                content = json.loads(row.content)
+            except (ValueError, TypeError):
+                content = row.content
+        msg["content"] = content
     if row.tool_calls:
         msg["tool_calls"] = list(row.tool_calls)
     if row.tool_call_id:
@@ -1784,12 +1836,6 @@ def _row_to_loop_message(row: MessageRow) -> LoopMessage:
     if row.name:
         msg["name"] = row.name
     return msg
-
-
-def _as_text(content: Any) -> str | None:
-    if content is None or isinstance(content, str):
-        return content
-    return json.dumps(content, ensure_ascii=False)
 
 
 def _as_tool_result_text(value: Any) -> str:

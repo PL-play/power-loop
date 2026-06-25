@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -94,6 +94,12 @@ def _truncate_chars(text: str, limit: int = RESULT_MAX_CHARS) -> str:
     tail = limit - head - 80
     omitted = len(text) - head - tail
     return f"{text[:head]}\n\n... ({omitted} chars omitted) ...\n\n{text[-tail:]}"
+
+
+# In-memory caps for persistent-bash output accumulation (default-tools-4). Both exceed
+# _truncate_lines' 30+170 display window, so capping here never changes the rendered output.
+_BASH_HEAD_KEEP = 256
+_BASH_TAIL_KEEP = 2048
 
 
 def _truncate_lines(lines: list[str], head: int = 30, tail: int = 170) -> str:
@@ -280,14 +286,30 @@ _BASH_READ_HINTS = (
 )
 
 
+def _path_referenced(haystack_lower: str, target_lower: str) -> bool:
+    """True iff ``target_lower`` appears in ``haystack_lower`` as a PATH — itself or ``target/<sub>``
+    — not merely as a substring of a longer path component (default-tools-3): home ``/var/lib/agent``
+    must NOT match a sibling dir ``/var/lib/agent-extra``. A match requires the next char to be a
+    path separator or a shell delimiter (or end-of-string)."""
+    if not target_lower:
+        return False
+    idx = haystack_lower.find(target_lower)
+    while idx != -1:
+        after = haystack_lower[idx + len(target_lower): idx + len(target_lower) + 1]
+        if after == "" or after in "/\\ \t\n\r'\"`;:|&()<>":
+            return True
+        idx = haystack_lower.find(target_lower, idx + 1)
+    return False
+
+
 def _is_agent_path_allowed_for_bash(command: str) -> bool:
     runtime_env = get_runtime_env()
     if runtime_env.home_dir is None:
         return True
     lowered = command.lower()
-    if str(runtime_env.home_dir).lower() not in lowered:
+    if not _path_referenced(lowered, str(runtime_env.home_dir).lower()):
         return True
-    return any(str(path).lower() in lowered for path in runtime_env.home_rw_allowlist)
+    return any(_path_referenced(lowered, str(path).lower()) for path in runtime_env.home_rw_allowlist)
 
 
 def _validate_bash_command_scope(command: str) -> str | None:
@@ -295,7 +317,7 @@ def _validate_bash_command_scope(command: str) -> str | None:
     if runtime_env.home_dir is None:
         return None
     lowered = f" {command.lower()} "
-    if str(runtime_env.home_dir).lower() not in lowered:
+    if not _path_referenced(lowered, str(runtime_env.home_dir).lower()):
         return None
     if _is_agent_path_allowed_for_bash(command):
         return None
@@ -438,9 +460,24 @@ class BashSession:
             pass
 
     def _drain_until(self, sentinel: str, timeout: int, idle_timeout: float = 5.0) -> tuple[list[str], str | None]:
-        lines: list[str] = []
+        # Bound in-memory accumulation (default-tools-4): the displayed output keeps only
+        # head+tail (via _truncate_lines), so a command emitting millions of lines must not buffer
+        # them all. Keep the first _BASH_HEAD_KEEP fully + the last _BASH_TAIL_KEEP in a ring,
+        # dropping the middle (both bounds comfortably exceed _truncate_lines' 30+170 window).
+        head: list[str] = []
+        tail: deque[str] = deque(maxlen=_BASH_TAIL_KEEP)
+        dropped = 0
         exit_code: str | None = None
         deadline = time.monotonic() + timeout
+
+        def _accumulate(line: str) -> None:
+            nonlocal dropped
+            if len(head) < _BASH_HEAD_KEEP:
+                head.append(line)
+                return
+            if len(tail) == _BASH_TAIL_KEEP:
+                dropped += 1
+            tail.append(line)
 
         while True:
             remaining = deadline - time.monotonic()
@@ -460,7 +497,7 @@ class BashSession:
                 if match:
                     exit_code = match.group(1)
                 break
-            lines.append(line)
+            _accumulate(line)
 
         while not self._q.empty() and exit_code is None:
             try:
@@ -472,8 +509,10 @@ class BashSession:
                 if match:
                     exit_code = match.group(1)
                 break
-            lines.append(line)
-        return lines, exit_code
+            _accumulate(line)
+
+        middle = [f"... ({dropped} line(s) omitted) ..."] if dropped else []
+        return head + middle + list(tail), exit_code
 
     def execute(self, command: str, timeout: int = 120) -> str:
         reason = _dangerous_command_reason(command)
@@ -632,7 +671,10 @@ def run_read(path: str, offset: int | None = None, limit: int | None = None) -> 
         if fp.is_dir():
             return _list_directory(fp)
 
-        text = _read_text(fp, max_bytes=None if limit is not None else TEXT_FILE_MAX_BYTES)
+        # Always enforce the size cap (M-default-tools-1): passing a `limit` used to disable it
+        # (max_bytes=None), so paging a multi-GB file read the WHOLE file into memory. offset/limit
+        # page OUTPUT within a readable (<=cap) text file; files past the cap use grep/glob.
+        text = _read_text(fp, max_bytes=TEXT_FILE_MAX_BYTES)
         all_lines = text.splitlines()
         total = len(all_lines)
         start = max(0, (offset or 1) - 1)
@@ -1104,6 +1146,12 @@ def _validate_todos(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return validated
 
 
+#: Cap on retained in-memory background-task records. The durable record lives in the store; this
+#: is just a cache for `check`, so a long-lived loop must not accumulate task dicts (each pinning a
+#: store + event_loop reference) forever (default-tools-2).
+_MAX_BG_TASKS = 256
+
+
 class BackgroundManager:
     """Background command runner with task tracking."""
 
@@ -1115,6 +1163,19 @@ class BackgroundManager:
         # still persist them instead of leaving the row stuck at 'running' forever).
         self._threads: dict[str, threading.Thread] = {}
         self._orphaned: list[dict[str, Any]] = []
+
+    def _prune_locked(self) -> None:
+        """Evict oldest TERMINAL (non-running) task records beyond ``_MAX_BG_TASKS`` so the cache —
+        and the store/event_loop refs each entry pins — can't grow without bound (default-tools-2).
+        Running tasks are never evicted. Caller must hold ``self._lock``."""
+        while len(self.tasks) > _MAX_BG_TASKS:
+            for tid, t in self.tasks.items():  # insertion order = oldest first
+                if t.get("status") != "running":
+                    del self.tasks[tid]
+                    self._threads.pop(tid, None)
+                    break
+            else:
+                break  # everything still running — nothing safe to evict yet
 
     async def run(self, command: str) -> str:
         reason = _dangerous_command_reason(command)
@@ -1159,6 +1220,7 @@ class BackgroundManager:
                 "workspace_dir": workspace_dir,
                 "shell_backend": shell_backend,
             }
+            self._prune_locked()
 
         thread = threading.Thread(target=self._execute, args=(task_id, command), daemon=True)
         with self._lock:

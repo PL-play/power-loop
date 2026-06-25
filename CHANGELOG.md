@@ -8,6 +8,97 @@
 
 ## [Unreleased]
 
+### Fixed — systematic-review HIGH findings (BUG_REVIEW_3.4.md)
+
+- **Projection mode dropped the submitted answer on `submit_input()` / `resume()` / `abort_pending()`
+  (H1).** Out-of-band tool rows were persisted with `send_index=NULL`, so projection-mode rendering
+  partitioned them into the legacy prefix *before* their own assistant `tool_call` — `align_tool_calls`
+  then dropped them as orphans and the model answered blind. These rows now carry the in-flight
+  send's index, keeping the tool result paired in the active send. Verbatim/default mode was never
+  affected.
+- **MySQL `TEXT` (64 KiB) columns hard-failed large content (H2).** Every free-text/JSON column in the
+  MySQL dialect is now `LONGTEXT` (SQLite/Postgres `TEXT` is already unbounded). A >64 KiB tool
+  result / system prompt / `tool_calls_json` write that raised `DataError(1406)` now succeeds.
+  **Schema v3 → v4**: existing MySQL stores are migrated with `ALTER … MODIFY … LONGTEXT` on open
+  (AUTO_CREATE); SQLite/Postgres get a no-op version bump.
+- **Multimodal content was stringified on persist and never parsed back (H6).** Structured (list/dict)
+  message content is now JSON-encoded with a `meta.content_encoding` marker and reconstructed on
+  reload, so vision/multimodal messages reach the model as the original structure instead of a literal
+  JSON string (it broke on the very first send, since history is rebuilt from the store).
+- **`trim_history` could emit a dangling `assistant(tool_calls)` (H5).** The body front-fill now drops
+  a trailing assistant whose tool results didn't fit, so the public `trim_history` never produces a
+  tool_call without its result (both OpenAI and Anthropic 400 on that).
+- **`metrics_sink` backend exceptions aborted the agent loop (H7).** A raising backend (StatsD socket
+  error, Prometheus label error) on a non-suppressing bus (the default) propagated out of `publish()`.
+  The dispatch is now wrapped in a log-and-swallow guard, matching `otel_sink`.
+- **Workflow `foreach`/`parallel` fanout was unbounded (H3).** `max_concurrency` (≤ 64) and literal
+  `items` length (≤ 4096) are now capped at spec-validation time; a dynamic `items_from` list is
+  capped at runtime before tasks are created; and a per-run leaf ceiling (10 000) fail-closes nested
+  / programmatic fanout independent of the optional budget.
+- **A leaked grandchild process could hang a workflow leaf forever (H4).** The subprocess worker now
+  runs in its own process group (`start_new_session`), terminate signals the whole group
+  (`killpg`, pgid captured at spawn), and every `communicate()` drain is bounded — a grandchild that
+  inherited the worker's stdout/stderr can no longer keep the pipe open and stall the run.
+
+### Fixed — systematic-review MEDIUM findings (BUG_REVIEW_3.4.md)
+
+- **Round-limit wrap-up summary now persisted** to the transcript (success branch), so the next
+  send's history isn't a dangling "summarize…" prompt with no answer.
+- **Balanced stream events on LLM retry:** `STREAM_STARTED`/`STREAM_COMPLETED` are now emitted
+  per-attempt (the terminal used to fire once for N attempts).
+- **Projection recall hint restored for migration-seeded folds** (`compact_from_send==0`): the
+  `recall_send` note now shows whenever a fold covers ≥1 real send.
+- **`read_file` size cap enforced even with a `limit`** — paging a multi-GB file no longer loads the
+  whole file into memory.
+- **Workflow driver + linked leaf sessions are cleaned up** after `run()` (new `close_driver=True`
+  default; set `False` to retain for inspection) — no more session-row leak per run.
+- **`foreach` `as` validated as an identifier** so the body's `{{var}}` actually binds.
+- **Workflow reference reachability validated:** forward refs, parallel-sibling refs, and
+  cross-branch-case refs are now rejected at parse time instead of failing/silently-dropping at run.
+- **`budget_exceeded` is a terminal journal status**, freezing the run against orphaned late writes.
+- **`POWER_LOOP_SUPPORTS_*` capability overrides are now wired** from env into the OpenAI-compatible
+  transport (previously parsed but never applied).
+- **`TimerRunner.stop()` aborts an in-flight timer-fired run** (via an owned cancellation token)
+  instead of blocking for the whole agent run to finish.
+- **One bad `SKILL.md` no longer takes down the loader:** non-UTF-8 files are read with
+  `errors="replace"` / skipped, not raised.
+- **`parse_structured` tolerates an odd quote count in the LLM's prose preamble** (string-state is no
+  longer carried across prose into object detection).
+- **`otel_sink` span creation / `set_attribute` are guarded** (log-and-swallow), upholding its
+  "never break the loop" contract.
+- **Opt-in value-secret redaction** for the logging/JSONL sinks (`redact_value_secrets=True`) scrubs
+  secret-shaped substrings (Bearer/sk-/AKIA/JWT/…) inside string values; the key-name-only default is
+  now documented.
+
+### Fixed — systematic-review LOW findings (BUG_REVIEW_3.4.md)
+
+_Loop / events:_ round-limit + no-tools-drain rounds now emit `ROUND_COMPLETED`/usage and the
+`@phase` decorator pairs start/end on every error path; pending `assistant_seq` uses the durable DB
+seq, not the in-memory history index.
+_Projection / compaction:_ `ProjectionRenderConfig` coerces JSON bools, `render_user_row` tolerates a
+non-list `input`, and a malformed `CONTEXT_COMPACT_THRESHOLD` is fail-soft.
+_Tools / sandbox:_ `BackgroundManager` task cache + persistent-bash output are now bounded; the bash
+home-scope guard matches on path boundaries (no superstring false-positives).
+_Workflow:_ `output_schema` shape validated; resume refuses a still-live in-process run (`force` to
+override); `reap_runs` documents its mtime-liveness hazard; EPHEMERAL sub-agent sessions are cleaned
+up on a raised child run; sub-agent blackboard author is the spec name.
+_Store:_ MySQL `table_prefix` length capped; `upsert_background_task`/`mark_background_seen`
+serialized on the state-row lock; legacy WAL `checkpoint` logs a BUSY result; legacy-vs-new
+schema-version namespaces documented as non-portable.
+_Misc:_ timer `heartbeat_interval_s` floored (no busy loop); `MemoryRecallHook` memoizes per-session;
+`StructuredOutputSpec.examples` folded into the schema description; tool-role messages always emit
+`tool_call_id`; `JsonlSink` with `backup_count=0` no longer truncates on rotation; the OpenAI
+streaming accumulator no longer merges ambiguous (no id/index) sequential tool calls; the
+`MessageSink` raising contract and a length-preserving-history-swap compaction edge are documented.
+
+### Deferred
+
+- Anthropic extended-thinking signature blocks are still dropped (review finding M10), and the
+  Anthropic transport's `ModelCapabilities`/tool_result-image handling (LOW: llm-transport-2/4) — a
+  correct fix round-trips the thinking-block signature through `LLMResponse` + persistence + reload
+  and the Anthropic multimodal path, and needs a real Anthropic-thinking endpoint to validate.
+  Tracked for a focused follow-up.
+
 ## [3.4.0] — 2026-06-25
 
 ### Added — `ProjectedRepresentation` render is now a first-class extension point

@@ -59,6 +59,29 @@ def test_from_env_reads_primary_prefix() -> None:
     assert cfg.temperature == 0.3
 
 
+def test_capability_overrides_wired_from_env_into_transport_config() -> None:
+    # M-llm-transport-1: POWER_LOOP_SUPPORTS_* must actually reach the transport (was dead config).
+    cfg = LLMProviderConfig.from_env(env=_env(
+        POWER_LOOP_BASE_URL="https://x/v1",
+        POWER_LOOP_API_KEY="k",
+        POWER_LOOP_MODEL="m",
+        POWER_LOOP_SUPPORTS_IMAGE_INPUT="false",
+        POWER_LOOP_SUPPORTS_TOOLS="true",
+    ))
+    assert cfg.capability_overrides == {"supports_image_input": False, "supports_tools": True}
+    # …and it is carried into the OpenAI-compatible transport config (not dropped).
+    assert cfg.to_openai_compatible().capability_overrides == {
+        "supports_image_input": False, "supports_tools": True,
+    }
+
+
+def test_no_capability_env_means_empty_overrides() -> None:
+    cfg = LLMProviderConfig.from_env(env=_env(
+        POWER_LOOP_BASE_URL="https://x/v1", POWER_LOOP_API_KEY="k", POWER_LOOP_MODEL="m",
+    ))
+    assert cfg.capability_overrides == {}
+
+
 def test_from_env_falls_back_to_legacy_prefix() -> None:
     cfg = LLMProviderConfig.from_env(env=_env(
         OPENAI_COMPAT_BASE_URL="https://compat.example",

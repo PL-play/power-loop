@@ -152,6 +152,20 @@ def phase(
                     **event_meta,
                 ))
 
+            # end_event must pair start_event on EVERY exit path (success, error-return, re-raise) —
+            # else a failing/retry-exhausted phase leaks an unterminated 'started' event
+            # (pipeline-runner-5). Idempotent so the success path's explicit call never double-emits.
+            _end_emitted = [False]
+
+            def _emit_end() -> None:
+                if end_event is not None and not _end_emitted[0]:
+                    _end_emitted[0] = True
+                    bus.publish(AgentEvent(
+                        type=end_event,
+                        data=PhaseEventPayload(values=ctx.values.get("event_payload", {})),
+                        **event_meta,
+                    ))
+
             # ── execute method ──
             raw_output: Any = None
             try:
@@ -174,22 +188,20 @@ def phase(
                             raw_output = await method(self, ctx)
                         except Exception as retry_exc:
                             raw_output = f"Error (retry failed): {retry_exc}"
+                            _emit_end()
                             return PhaseResult(output=raw_output, values={**ctx.values, "failed": True})
                     else:
+                        _emit_end()
                         return PhaseResult(
                             output=f"Error: {exc}",
                             values={**ctx.values, "error": exc, "failed": True},
                         )
                 else:
+                    _emit_end()
                     raise
 
             # ── end event ──
-            if end_event is not None:
-                bus.publish(AgentEvent(
-                    type=end_event,
-                    data=PhaseEventPayload(values=ctx.values.get("event_payload", {})),
-                    **event_meta,
-                ))
+            _emit_end()
 
             # ── after hook ──
             result_directive = HookDirective.CONTINUE

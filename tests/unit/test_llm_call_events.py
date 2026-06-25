@@ -89,6 +89,31 @@ async def test_single_call_emits_paired_started_completed_with_usage() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stream_events_balanced_across_retries() -> None:
+    """M-pipeline-runner-1: STREAM_STARTED/COMPLETED must stay balanced across retries. Pre-fix the
+    terminal lived in the OUTER finally (once), so N attempts emitted N STARTED but 1 COMPLETED."""
+    store = await SessionStore.open(":memory:")
+    try:
+        bus = AgentEventBus()
+        counts = {AgentEventType.STREAM_STARTED: 0, AgentEventType.STREAM_COMPLETED: 0}
+        for et in counts:
+            bus.subscribe(et, lambda e: counts.__setitem__(e.type, counts[e.type] + 1))
+        loop = StatefulAgentLoop(
+            llm=_UsageLLM(fail_first=2), store=store, event_bus=bus,
+            config=AgentLoopConfig(
+                system_prompt="S", max_rounds=1, compactor=None,
+                retry_policy=LLMRetryPolicy(max_attempts=3, backoff_initial=0.0, backoff_max=0.0),
+            ),
+        )
+        await loop.send("hi", session_id=await loop.new_session())
+        # 2 failures + 1 success = 3 attempts → one STARTED and one COMPLETED each (pre-fix: 3 vs 1).
+        assert counts[AgentEventType.STREAM_STARTED] == 3
+        assert counts[AgentEventType.STREAM_COMPLETED] == 3
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_retries_are_individually_visible() -> None:
     """Two transient failures then success → three STARTED + three COMPLETED with
     distinct call_ids; the two failures are success=False."""

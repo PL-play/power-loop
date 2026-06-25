@@ -346,23 +346,23 @@ class MySQLDialect:
         p = prefix
         # utf8mb4 + InnoDB. INTEGER→BIGINT (epoch-ms time + counters); string PK/index
         # columns → VARCHAR(255) (≤ the 3072-byte large-prefix limit even for the 2-col
-        # composite PKs); small enum-like columns → VARCHAR(32); JSON/free text → TEXT.
+        # composite PKs); small enum-like columns → VARCHAR(32); JSON/free text → LONGTEXT.
         # Indexes are declared inline (no CREATE INDEX IF NOT EXISTS in MySQL).
         opts = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
         return [
             f"""CREATE TABLE IF NOT EXISTS {p}sessions (
                 session_id VARCHAR(255) NOT NULL, created_at BIGINT NOT NULL,
-                updated_at BIGINT NOT NULL, system_prompt TEXT, model VARCHAR(255),
-                config_json TEXT, status VARCHAR(32) NOT NULL DEFAULT 'active',
+                updated_at BIGINT NOT NULL, system_prompt LONGTEXT, model VARCHAR(255),
+                config_json LONGTEXT, status VARCHAR(32) NOT NULL DEFAULT 'active',
                 kind VARCHAR(32) NOT NULL DEFAULT 'root', parent_session_id VARCHAR(255),
                 spawn_tool_call_id VARCHAR(255), spawn_depth BIGINT NOT NULL DEFAULT 0,
-                lifecycle VARCHAR(32) NOT NULL DEFAULT 'ephemeral', metadata_json TEXT,
+                lifecycle VARCHAR(32) NOT NULL DEFAULT 'ephemeral', metadata_json LONGTEXT,
                 PRIMARY KEY (session_id),
                 KEY {p}idx_sessions_parent (parent_session_id)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}messages (
                 session_id VARCHAR(255) NOT NULL, seq BIGINT NOT NULL, role VARCHAR(32) NOT NULL,
-                name VARCHAR(255), content TEXT, tool_calls_json TEXT, tool_call_id VARCHAR(255),
-                round_index BIGINT, state VARCHAR(32) NOT NULL DEFAULT 'active', meta_json TEXT,
+                name VARCHAR(255), content LONGTEXT, tool_calls_json LONGTEXT, tool_call_id VARCHAR(255),
+                round_index BIGINT, state VARCHAR(32) NOT NULL DEFAULT 'active', meta_json LONGTEXT,
                 send_index BIGINT, created_at BIGINT NOT NULL, PRIMARY KEY (session_id, seq),
                 KEY {p}idx_messages_session_state (session_id, state, seq)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}compactions (
@@ -377,16 +377,16 @@ class MySQLDialect:
             f"""CREATE TABLE IF NOT EXISTS {p}session_state (
                 session_id VARCHAR(255) NOT NULL, next_seq BIGINT NOT NULL DEFAULT 1,
                 round_index BIGINT NOT NULL DEFAULT 0, last_compact_seq BIGINT NOT NULL DEFAULT 0,
-                pending_json TEXT, PRIMARY KEY (session_id)) {opts}""",
+                pending_json LONGTEXT, PRIMARY KEY (session_id)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
-                session_id VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json TEXT,
+                session_id VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json LONGTEXT,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, state_key)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}shared_state (
-                owner VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json TEXT,
+                owner VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json LONGTEXT,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (owner, state_key)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}background_tasks (
-                session_id VARCHAR(255) NOT NULL, task_id VARCHAR(255) NOT NULL, command TEXT NOT NULL,
-                status VARCHAR(32) NOT NULL, return_code BIGINT, output_tail TEXT, output_path TEXT,
+                session_id VARCHAR(255) NOT NULL, task_id VARCHAR(255) NOT NULL, command LONGTEXT NOT NULL,
+                status VARCHAR(32) NOT NULL, return_code BIGINT, output_tail LONGTEXT, output_path LONGTEXT,
                 last_seen_at BIGINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, task_id),
                 KEY {p}idx_background_tasks_session_status (session_id, status, updated_at)) {opts}""",
@@ -399,13 +399,13 @@ class MySQLDialect:
                 PRIMARY KEY (session_id)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}timers (
                 session_id VARCHAR(255) NOT NULL, timer_id BIGINT NOT NULL, due_at BIGINT NOT NULL,
-                note TEXT NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'armed', interval_s BIGINT,
+                note LONGTEXT NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'armed', interval_s BIGINT,
                 fire_count BIGINT NOT NULL DEFAULT 0, last_fired_at BIGINT,
                 created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
                 PRIMARY KEY (session_id, timer_id),
                 KEY {p}idx_timers_due (status, due_at)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}notes (
-                session_id VARCHAR(255) NOT NULL, note_id BIGINT NOT NULL, content TEXT NOT NULL,
+                session_id VARCHAR(255) NOT NULL, note_id BIGINT NOT NULL, content LONGTEXT NOT NULL,
                 pinned TINYINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id)) {opts}""",
             *self.project_messages_ddl(p),
@@ -418,7 +418,7 @@ class MySQLDialect:
         return [
             f"""CREATE TABLE IF NOT EXISTS {p}project_messages (
                 session_id VARCHAR(255) NOT NULL, send_index BIGINT NOT NULL, kind VARCHAR(32) NOT NULL,
-                content_json TEXT NOT NULL, rendered_text TEXT,
+                content_json LONGTEXT NOT NULL, rendered_text LONGTEXT,
                 source_seq_lo BIGINT, source_seq_hi BIGINT,
                 compact_from_send BIGINT, compact_to_send BIGINT,
                 projector_version BIGINT NOT NULL DEFAULT 0, token_estimate BIGINT,
@@ -433,10 +433,38 @@ class MySQLDialect:
             f"""CREATE TABLE IF NOT EXISTS {p}hook_events (
                 session_id VARCHAR(255) NOT NULL, event_id BIGINT NOT NULL, message_seq BIGINT,
                 round_index BIGINT, send_index BIGINT, hook_point VARCHAR(32) NOT NULL, hook VARCHAR(255),
-                position VARCHAR(32), kind VARCHAR(32) NOT NULL, payload_json TEXT, created_at BIGINT NOT NULL,
+                position VARCHAR(32), kind VARCHAR(32) NOT NULL, payload_json LONGTEXT, created_at BIGINT NOT NULL,
                 PRIMARY KEY (session_id, event_id),
                 KEY {p}idx_hook_events_session_msg (session_id, message_seq)) {opts}""",
         ]
+
+    #: Free-text / JSON columns (table → [(column, not_null)]) whose MySQL type was widened from
+    #: TEXT (64 KiB) to LONGTEXT. Used by the v3→v4 migration to ALTER pre-existing MySQL stores.
+    #: SQLite/Postgres TEXT is already unbounded, so this is MySQL-only. See H2 (BUG_REVIEW_3.4).
+    _WIDENED_TEXT_COLUMNS: tuple[tuple[str, tuple[tuple[str, bool], ...]], ...] = (
+        ("sessions", (("system_prompt", False), ("config_json", False), ("metadata_json", False))),
+        ("messages", (("content", False), ("tool_calls_json", False), ("meta_json", False))),
+        ("session_state", (("pending_json", False),)),
+        ("session_runtime_state", (("value_json", False),)),
+        ("shared_state", (("value_json", False),)),
+        ("background_tasks", (("command", True), ("output_tail", False), ("output_path", False))),
+        ("timers", (("note", True),)),
+        ("notes", (("content", True),)),
+        ("project_messages", (("content_json", True), ("rendered_text", False))),
+        ("hook_events", (("payload_json", False),)),
+    )
+
+    def widen_text_columns_ddl(self, prefix: str) -> list[str]:
+        """ALTER statements widening the free-text/JSON columns TEXT→LONGTEXT for an existing MySQL
+        store (one ALTER per table; MODIFY is idempotent — re-running on a LONGTEXT column is a
+        no-op rebuild). NOT NULL is re-stated so MODIFY doesn't silently drop the constraint."""
+        out: list[str] = []
+        for table, cols in self._WIDENED_TEXT_COLUMNS:
+            mods = ", ".join(
+                f"MODIFY {col} LONGTEXT{' NOT NULL' if not_null else ''}" for col, not_null in cols
+            )
+            out.append(f"ALTER TABLE {prefix}{table} {mods}")
+        return out
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
         # MySQL: INSERT … AS new_row ON DUPLICATE KEY UPDATE col=new_row.col; accumulate via

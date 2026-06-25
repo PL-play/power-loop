@@ -28,10 +28,15 @@ Failure model
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 LoopMessage = dict[str, Any]
+
+#: Per-session recall-memo cap for a SHARED MemoryRecallHook (memory-hooks-2): bounds the memo so a
+#: long-lived hook reused across many sessions doesn't retain a block per session forever.
+_RECALL_MEMO_MAX_SESSIONS = 64
 
 
 @dataclass
@@ -147,17 +152,21 @@ class MemoryRecallHook:
         self._position = "front" if position == "front" else "tail"
         self._hooks = hooks  # for the MEMORY_RECALLED filtering hook (optional)
         self._event_bus = event_bus  # for telemetry (falls back to contextvar bus)
-        self._memo_sid: str | None = None
-        self._memo_block: list[LoopMessage] = []
+        # Memo keyed BY session (memory-hooks-2): a single scalar pair evicted across concurrent
+        # sessions sharing one hook instance, re-running provider.recall redundantly and destabilizing
+        # the within-send tail. An LRU dict keeps each session's per-send block independently.
+        self._memo: OrderedDict[str, list[LoopMessage]] = OrderedDict()
 
     async def __call__(self, ctx: Any) -> None:
-        # Recompute once per send: first round, or whenever the session changes
-        # (a shared loop may interleave sessions). Otherwise reuse the memoized
-        # block so the within-send request tail stays stable.
-        if ctx.round_index == 0 or self._memo_sid != ctx.session_id:
-            self._memo_block = await self._recall(ctx)
-            self._memo_sid = ctx.session_id
-        block = self._memo_block
+        # Recompute once per send (first round) per session; otherwise reuse the memoized block so
+        # the within-send request tail stays stable. Concurrent sessions no longer evict each other.
+        sid = ctx.session_id
+        if ctx.round_index == 0 or sid not in self._memo:
+            self._memo[sid] = await self._recall(ctx)
+            self._memo.move_to_end(sid)
+            while len(self._memo) > _RECALL_MEMO_MAX_SESSIONS:
+                self._memo.popitem(last=False)  # evict least-recently-recalled session
+        block = self._memo.get(sid, [])
         if not block:
             return
         msgs = ctx.messages

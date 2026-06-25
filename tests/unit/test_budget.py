@@ -107,6 +107,37 @@ def test_trim_does_not_split_tool_call_pair() -> None:
     assert found_tool == found_tc  # either both present or both absent
 
 
+def _no_dangling_tool_calls(msgs: list[dict]) -> bool:
+    """Every assistant(tool_calls) id must be answered by some tool message in the result."""
+    answered = {m.get("tool_call_id") for m in msgs if m.get("role") == "tool"}
+    return all(
+        tc.get("id") in answered
+        for m in msgs
+        if m.get("role") == "assistant" and m.get("tool_calls")
+        for tc in (m.get("tool_calls") or [])
+    )
+
+
+def test_trim_body_front_drops_dangling_tool_call() -> None:
+    """H5 (BUG_REVIEW_3.4): the body front-fill keeps a contiguous prefix, so it can stop right
+    after an assistant(tool_calls) but before its (large) tool result — leaving a dangling
+    tool_call immediately before the tail. Both providers 400 on that; it must be dropped."""
+    msgs = [
+        _msg("system", "sys"),
+        _msg("user", "big"),
+        _msg("assistant", "", tool_calls=[{"id": "call_1", "function": {"name": "e", "arguments": "{}"}}]),
+        _msg("tool", "R" * 8000, tool_call_id="call_1", name="e"),  # ~2000 tok — won't fit
+        _msg("assistant", "done"),
+        _msg("user", "q1"), _msg("assistant", "a1"),
+        _msg("user", "q2"), _msg("assistant", "a2"),
+    ]
+    result = trim_history(msgs, max_tokens=70, keep_system=True, keep_last_n=2)
+    assert _no_dangling_tool_calls(result), result
+    # The call_1 assistant must be dropped (result didn't fit), not kept as a dangling tool_call.
+    kept_tc_ids = {tc.get("id") for m in result if m.get("tool_calls") for tc in m["tool_calls"]}
+    assert "call_1" not in kept_tc_ids
+
+
 def test_trim_tool_call_id_pair_preserved_when_at_boundary() -> None:
     """The assistant(tool_calls) + tool pair is the last exchange before
     a new user message. The pair must stay together."""

@@ -35,6 +35,7 @@ from typing import Any
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contrib._redact import (
     DEFAULT_REDACT_KEYS,
+    DEFAULT_VALUE_PATTERNS,
     REDACTED,
     resolve_redact,
     sanitize,
@@ -58,6 +59,7 @@ def attach_logging_sink(
     events: Iterable[AgentEventType] | None = None,
     max_field_len: int = 500,
     redact_keys: Iterable[str] | None = None,
+    redact_value_secrets: bool = False,
 ) -> None:
     """Subscribe a JSON-lines logger to ``bus``.
 
@@ -66,10 +68,14 @@ def attach_logging_sink(
     :param redact_keys: key-name substrings whose values are replaced with ``***``.
         Defaults to a common secret denylist (api_key/token/password/…); pass
         ``()`` to disable redaction, or your own iterable to override.
+    :param redact_value_secrets: also scrub secret-shaped substrings (Bearer/sk-/AKIA/JWT/…)
+        inside string VALUES, not just denylisted keys. Off by default (M-observability-6) —
+        key-name redaction alone misses secrets embedded in tool args / command strings.
     """
     log = logger if logger is not None else logging.getLogger(DEFAULT_LOGGER_NAME)
     wanted = set(events) if events is not None else None
     redact_lower = resolve_redact(redact_keys)
+    value_patterns = DEFAULT_VALUE_PATTERNS if redact_value_secrets else None
 
     def _handler(event: AgentEvent) -> None:
         if wanted is not None and event.type not in wanted:
@@ -89,7 +95,7 @@ def attach_logging_sink(
         if event.source:
             record["source"] = event.source
         payload = event.payload or {}
-        record["payload"] = sanitize(payload, max_field_len, redact_lower)
+        record["payload"] = sanitize(payload, max_field_len, redact_lower, value_patterns=value_patterns)
         log.log(level, json.dumps(record, ensure_ascii=False, default=str))
 
     if wanted is None:

@@ -133,3 +133,13 @@ async def test_load_active_after_seq_returns_only_the_tail():
     none_after = await s.load_active_messages(sid, after_seq=seqs[-1] + 1)
     assert none_after == []
     await s.close()
+
+
+def test_table_prefix_length_is_capped() -> None:
+    # store-dialect-3: a long prefix would overflow MySQL's 64-char identifier limit for derived
+    # index names; validate_table_prefix rejects it.
+    from power_loop.runtime.store.schema import _MAX_TABLE_PREFIX_LEN, validate_table_prefix
+
+    assert validate_table_prefix("a" * _MAX_TABLE_PREFIX_LEN) == "a" * _MAX_TABLE_PREFIX_LEN  # at limit
+    with pytest.raises(ValueError, match="too long"):
+        validate_table_prefix("a" * (_MAX_TABLE_PREFIX_LEN + 1))

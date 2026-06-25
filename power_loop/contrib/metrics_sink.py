@@ -24,6 +24,7 @@ Metrics emitted (prefix ``power_loop`` by default):
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from typing import Any, Protocol, runtime_checkable
 
@@ -31,6 +32,8 @@ from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.core.events import AgentEventBus
 
 __all__ = ["MetricsBackend", "attach_metrics_sink", "PrometheusBackend", "StatsDBackend"]
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -57,6 +60,17 @@ def attach_metrics_sink(
         return wanted is None or t in wanted
 
     def _handler(event: AgentEvent) -> None:
+        # Observability must NEVER break the loop: a real backend can raise (StatsD socket
+        # OSError, prometheus_client ValueError on a bad/duplicate metric or label), and on a
+        # bus with suppress_subscriber_errors=False (the default, incl. DEFAULT_EVENT_BUS) an
+        # unhandled subscriber exception unwinds through publish() and aborts the agent run.
+        # Log-and-swallow here, mirroring otel_sink's guards. See H7 (BUG_REVIEW_3.4).
+        try:
+            _dispatch(event)
+        except Exception:  # noqa: BLE001 — a metrics hiccup is a dropped data point, not a failed run
+            logger.exception("metrics sink backend failed; dropping this metric and continuing")
+
+    def _dispatch(event: AgentEvent) -> None:
         p = event.payload or {}
         t = event.type
         if not _on(t):

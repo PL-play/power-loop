@@ -35,7 +35,11 @@ class StructuredOutputError(PowerLoopError):
 
     ``raw_text`` is the original LLM output (truncated); ``reason``
     explains which check failed: ``no_json`` / ``invalid_json`` /
-    ``not_object`` / ``missing_required:<field>`` / ``wrong_type:<field>``.
+    ``not_object`` / ``missing_required:<field>``.
+
+    NOTE (exec-skills-structured-4): ``parse_structured`` validates only presence (``required``) and
+    top-level object-ness — it does NOT type-check field VALUES, so it never raises ``wrong_type``.
+    Per-field types are enforced server-side by the provider's strict ``json_schema`` mode.
     """
 
     def __init__(self, *, reason: str, raw_text: str, detail: str = "") -> None:
@@ -65,12 +69,21 @@ class StructuredOutputSpec:
     examples: list[dict[str, Any]] = field(default_factory=list)
 
     def to_openai_response_format(self) -> dict[str, Any]:
-        """Render the ``response_format`` payload OpenAI-compatible APIs accept."""
+        """Render the ``response_format`` payload OpenAI-compatible APIs accept.
+
+        ``examples`` are folded into the schema ``description`` (exec-skills-structured-5): the
+        OpenAI ``json_schema`` payload has no dedicated examples field, so previously the public
+        ``examples`` was silently dropped. Folding them into the description actually delivers them
+        to the model."""
         js: dict[str, Any] = {"name": self.name, "schema": self.schema}
         if self.strict:
             js["strict"] = True
-        if self.description:
-            js["description"] = self.description
+        description = self.description or ""
+        if self.examples:
+            rendered = "\n".join(json.dumps(ex, ensure_ascii=False) for ex in self.examples)
+            description = (f"{description}\n\nExamples:\n{rendered}").strip()
+        if description:
+            js["description"] = description
         return {"type": "json_schema", "json_schema": js}
 
 
@@ -95,6 +108,18 @@ def _extract_first_json_object(text: str) -> str | None:
     in_str = False
     esc = False
     for i, ch in enumerate(text):
+        if depth == 0:
+            # Not inside an object yet. Ignore EVERYTHING except an opening brace — in particular do
+            # NOT track string-state across the LLM's prose preamble (M-exec-skills-structured-2):
+            # an unbalanced (odd) '"' in prose used to leave in_str=True so the real '{' was read as
+            # string content and the object was never found. A stray '}' before any '{' is ignored.
+            if ch == "{":
+                start = i
+                depth = 1
+                in_str = False
+                esc = False
+            continue
+        # depth >= 1: inside the object — track strings so braces in string values don't change depth.
         if in_str:
             if esc:
                 esc = False
@@ -105,17 +130,9 @@ def _extract_first_json_object(text: str) -> str | None:
             continue
         if ch == '"':
             in_str = True
-            continue
-        if ch == "{":
-            if depth == 0:
-                start = i
+        elif ch == "{":
             depth += 1
         elif ch == "}":
-            if depth == 0:
-                # A stray '}' before any '{' (common in prose: "}}" placeholders,
-                # code snippets). Ignore it instead of going negative — otherwise
-                # the real object that follows is never balanced and we return None.
-                continue
             depth -= 1
             if depth == 0 and start >= 0:
                 return text[start : i + 1]

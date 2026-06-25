@@ -95,6 +95,29 @@ def _service(streams: list[list[Any]], **cfg_overrides: Any) -> tuple[OpenAIComp
 
 
 @pytest.mark.asyncio
+async def test_streaming_ambiguous_tool_calls_not_merged() -> None:
+    # llm-transport-5: two distinct tool calls streamed with NO id and NO index (each opened by a
+    # function NAME in a separate event) must NOT collide into one entry. An arguments-only delta
+    # continues the most-recent call.
+    stream = [
+        _tool_event(None, name="first", args='{"a": 1}'),    # call 1 (ambiguous)
+        _tool_event(None, name="second", args='{"b":'),      # call 2 — distinct, must not merge
+        _tool_event(None, args=' 2}'),                       # args-only → continues call 2
+        _usage_event(1, 1, 2),
+    ]
+    svc, _ = _service([stream])
+    result = await svc.complete(LLMRequest(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "first", "parameters": {}}}],
+    ))
+    calls = result.tool_calls
+    assert len(calls) == 2
+    assert [c["function"]["name"] for c in calls] == ["first", "second"]
+    assert json.loads(calls[0]["function"]["arguments"]) == {"a": 1}
+    assert json.loads(calls[1]["function"]["arguments"]) == {"b": 2}  # continuation appended
+
+
+@pytest.mark.asyncio
 async def test_complete_accumulates_text_tool_calls_and_usage() -> None:
     stream = [
         _content_event("Hello, "),

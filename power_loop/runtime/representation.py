@@ -24,7 +24,7 @@ import json
 from collections import deque
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from power_loop.runtime.store.types import MessageRow, ProjectMessageRow
 
@@ -122,6 +122,22 @@ def _row_to_loop_dict(row: MessageRow) -> LoopMessage:
     return msg
 
 
+def _coerce_bool(v: Any) -> bool:
+    """Strict-ish bool coercion for JSON-sourced config: 'true'/'1'/'yes'/'on' → True,
+    'false'/'0'/'no'/'off'/'' → False (case-insensitive); ints via truthiness."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in {"true", "1", "yes", "on"}:
+            return True
+        if s in {"false", "0", "no", "off", ""}:
+            return False
+    return bool(v)
+
+
 def _validate_representation_params(*, version: int, max_chars: int | None = None) -> None:
     if version < 1:
         raise ValueError(
@@ -196,13 +212,24 @@ class ProjectionRenderConfig:
     empty_project: str = "(no output)"  # a project row that renders to nothing
     fold_note: str = "[older sends {range} folded — recall_send(send_index=N) to expand]"
 
+    #: The two boolean knobs — coerced strictly from JSON so a string "false" doesn't read as True.
+    _BOOL_FIELDS: ClassVar[frozenset[str]] = frozenset({"include_tools", "include_final_text"})
+
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> ProjectionRenderConfig:
-        """Build from a plain dict (e.g. JSON config), silently ignoring unknown keys."""
+        """Build from a plain dict (e.g. JSON config), silently ignoring unknown keys. Known scalar
+        fields are coerced to their declared types (projection-2): JSON serializes a bool as `true`,
+        but a hand-written/templated config may carry the string "false", which is truthy — coerce
+        the boolean knobs via a strict parser so they behave as written."""
         if not data:
             return cls()
         names = {f.name for f in dataclass_fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in names})
+        coerced: dict[str, Any] = {}
+        for k, v in data.items():
+            if k not in names:
+                continue
+            coerced[k] = _coerce_bool(v) if k in cls._BOOL_FIELDS else str(v)
+        return cls(**coerced)
 
 
 @dataclass
@@ -336,6 +363,10 @@ class ProjectedRepresentation:
         inputs = content.get("input")
         if inputs is None:
             inputs = content.get("human") or []
+        # The projector contract makes `input` a LIST, but a corrupt / custom-projector row may
+        # carry a bare string — joining over it would iterate CHARACTER-by-character (projection-3).
+        if not isinstance(inputs, list):
+            inputs = [inputs]
         return {
             "role": "user",
             "content": self._send_tag(self.render_config.user_tag, r.send_index)
@@ -352,7 +383,11 @@ class ProjectedRepresentation:
     def render_compact_row(self, r: ProjectMessageRow) -> LoopMessage:
         msg = _render_compact_row(r)
         lo, hi = r.compact_from_send, r.compact_to_send
-        if lo is not None and hi is not None and hi >= lo > 0:
+        # Emit the recall hint whenever the compact covers at least one real send (hi >= 1),
+        # regardless of lo. The old `lo > 0` also suppressed the note for a MATURE fold whose range
+        # starts at send 0 (migration-seeded from_send=0), permanently hiding recall_send for those
+        # folds (M-projection-1). The degenerate seed (hi == 0) is still suppressed.
+        if lo is not None and hi is not None and hi >= lo and hi > 0:
             rng = f"#{lo}" if lo == hi else f"#{lo}–#{hi}"
             note = self.render_config.fold_note.replace("{range}", rng)
             return {"role": "user", "content": f"{note}\n{msg['content']}"}

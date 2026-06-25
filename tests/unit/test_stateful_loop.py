@@ -288,6 +288,63 @@ async def test_request_user_input_survives_new_loop_instance(store: SessionStore
 
 
 @pytest.mark.asyncio
+async def test_multimodal_content_round_trips_losslessly(store: SessionStore) -> None:
+    """H6 (BUG_REVIEW_3.4): structured (multimodal) content must reach the model as the original
+    list/dict, not a JSON string. It's JSON-encoded in the text column with a meta marker on
+    persist and reconstructed on reload (which is also where the CURRENT send's history is built)."""
+    llm = _Scripted(responses=[LLMResponse(raw_text="it's a logo")])
+    loop = StatefulAgentLoop(
+        llm=llm, store=store,
+        config=AgentLoopConfig(system_prompt="vision", max_rounds=2, compactor=None),
+    )
+    sid = await loop.new_session()
+    multimodal = [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    await loop.send({"role": "user", "content": multimodal}, session_id=sid)
+
+    # The LLM received the structured list (pre-fix it was a literal JSON string → vision broken).
+    user_msgs = [m for m in llm.calls[0] if m.get("role") == "user"]
+    assert user_msgs, "no user message reached the LLM"
+    assert user_msgs[0]["content"] == multimodal
+    assert isinstance(user_msgs[0]["content"], list)
+
+    # get_messages and a fresh-instance reload both reconstruct the structure.
+    assert (await loop.get_messages(sid))[0]["content"] == multimodal
+    reborn = StatefulAgentLoop(
+        llm=_Scripted(responses=[]), store=store,
+        config=AgentLoopConfig(system_prompt="vision", max_rounds=2, compactor=None),
+    )
+    assert (await reborn.get_messages(sid))[0]["content"] == multimodal
+
+    # Persisted row: JSON text in the content column + the meta marker (not a structured column).
+    rows = await store.load_active_messages(sid)
+    user_row = next(r for r in rows if r.role == "user")
+    assert isinstance(user_row.content, str) and user_row.content.startswith("[")
+    assert user_row.meta.get("content_encoding") == "json"
+
+
+@pytest.mark.asyncio
+async def test_string_content_that_looks_like_json_is_not_reparsed(store: SessionStore) -> None:
+    """The structured-content marker must gate reconstruction: a plain user STRING that merely
+    looks like JSON (e.g. "[1, 2, 3]") must round-trip as that exact string, never be json.loads'd."""
+    llm = _Scripted(responses=[LLMResponse(raw_text="ok")])
+    loop = StatefulAgentLoop(
+        llm=llm, store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=2, compactor=None),
+    )
+    sid = await loop.new_session()
+    await loop.send("[1, 2, 3]", session_id=sid)
+
+    user_msgs = [m for m in llm.calls[0] if m.get("role") == "user"]
+    assert user_msgs[0]["content"] == "[1, 2, 3]"
+    assert isinstance(user_msgs[0]["content"], str)
+    user_row = next(r for r in await store.load_active_messages(sid) if r.role == "user")
+    assert "content_encoding" not in (user_row.meta or {})
+
+
+@pytest.mark.asyncio
 async def test_background_runtime_updates_are_injected_once(store: SessionStore) -> None:
     sid = await store.create_session(system_prompt="S")
     await store.append_message(sid, role="user", content="start")

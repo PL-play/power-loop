@@ -30,6 +30,38 @@ def test_parse_structured_recovers_after_stray_brace() -> None:
     assert out == {"label": "urgent"}
 
 
+def test_examples_folded_into_response_format() -> None:
+    # exec-skills-structured-5: the public `examples` field is no longer silently dropped — it's
+    # folded into the json_schema description so it actually reaches the model.
+    spec = StructuredOutputSpec(
+        name="S", schema={"type": "object"}, description="D", examples=[{"a": 1}, {"a": 2}]
+    )
+    desc = spec.to_openai_response_format()["json_schema"]["description"]
+    assert "D" in desc and "Examples:" in desc and '{"a": 1}' in desc and '{"a": 2}' in desc
+
+
+def test_tool_message_always_emits_tool_call_id() -> None:
+    # exec-skills-structured-7: a tool-role message must always carry tool_call_id (empty if unset),
+    # never omit it (an omitted id is a structurally-invalid tool message).
+    from power_loop.contracts.messages import AgentMessage
+    assert AgentMessage(role="tool", content="r", tool_call_id=None).to_openai_message().get(
+        "tool_call_id") == ""
+    assert AgentMessage(role="tool", content="r", tool_call_id="tc1").to_openai_message()[
+        "tool_call_id"] == "tc1"
+
+
+def test_extract_handles_odd_quote_count_in_prose() -> None:
+    # M-exec-skills-structured-2: an unbalanced (odd) '"' in the prose preamble must NOT strand the
+    # scanner "in string" so the real object's '{' is read as string content and never found.
+    assert _extract_first_json_object('I used the "search tool: {"answer": 42}') == '{"answer": 42}'
+    assert _extract_first_json_object('a " b " c " d {"x": 1}') == '{"x": 1}'  # 3 stray quotes
+
+
+def test_parse_structured_recovers_after_odd_quote_prose() -> None:
+    out = parse_structured('Result for "urgent: {"label": "urgent"}', schema={"type": "object"})
+    assert out == {"label": "urgent"}
+
+
 # ── Spec ────────────────────────────────────────────────────────────────
 
 

@@ -726,82 +726,80 @@ class AgentPipeline:
         attempt_box = [0]
 
         async def _do_call() -> LLMResponse:
-            # STREAM_STARTED is emitted **per attempt** so subscribers know
-            # a fresh stream is beginning; STREAM_COMPLETED only on success
-            # of the attempt that returns.
+            # STREAM_STARTED/COMPLETED are emitted **per attempt** and paired in this call's own
+            # finally (M-pipeline-runner-1): the terminal used to live in the OUTER finally, which
+            # ran once, so N retry attempts emitted N STARTED but only 1 COMPLETED — unbalanced
+            # stream events on any LLM retry. Each attempt now opens and closes exactly one stream.
             attempt_box[0] += 1
             attempt = attempt_box[0]
             call_id = f"r{round_index}.a{attempt}"
             self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
                        round_index=round_index, stream_id="main")
-            # Per-call observability (H4.1): pair STARTED/COMPLETED by call_id so a
-            # subscriber sees per-attempt latency + per-call (not cumulative) usage,
-            # making retries individually visible.
-            self._emit(
-                AgentEventType.LLM_CALL_STARTED,
-                LlmCallStartedPayload(call_id=call_id, round_index=round_index,
-                                      attempt=attempt, model=model_name),
-                round_index=round_index, stream_id="main",
-            )
-            t0 = time.perf_counter()
             try:
-                resp = await self.llm.complete(
-                    request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
+                # Per-call observability (H4.1): pair STARTED/COMPLETED by call_id so a
+                # subscriber sees per-attempt latency + per-call (not cumulative) usage,
+                # making retries individually visible.
+                self._emit(
+                    AgentEventType.LLM_CALL_STARTED,
+                    LlmCallStartedPayload(call_id=call_id, round_index=round_index,
+                                          attempt=attempt, model=model_name),
+                    round_index=round_index, stream_id="main",
                 )
-            except BaseException as exc:
+                t0 = time.perf_counter()
+                try:
+                    resp = await self.llm.complete(
+                        request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
+                    )
+                except BaseException as exc:
+                    self._emit(
+                        AgentEventType.LLM_CALL_COMPLETED,
+                        LlmCallCompletedPayload(
+                            call_id=call_id, round_index=round_index, attempt=attempt,
+                            model=model_name, duration_ms=(time.perf_counter() - t0) * 1000.0,
+                            success=False, error_type=type(exc).__name__,
+                        ),
+                        round_index=round_index, stream_id="main",
+                    )
+                    raise
+                usage = getattr(resp, "token_usage", None)
                 self._emit(
                     AgentEventType.LLM_CALL_COMPLETED,
                     LlmCallCompletedPayload(
                         call_id=call_id, round_index=round_index, attempt=attempt,
                         model=model_name, duration_ms=(time.perf_counter() - t0) * 1000.0,
-                        success=False, error_type=type(exc).__name__,
+                        success=True,
+                        prompt_tokens=getattr(usage, "prompt_tokens", None),
+                        completion_tokens=getattr(usage, "completion_tokens", None),
+                        total_tokens=getattr(usage, "total_tokens", None),
                     ),
                     round_index=round_index, stream_id="main",
                 )
-                raise
-            usage = getattr(resp, "token_usage", None)
-            self._emit(
-                AgentEventType.LLM_CALL_COMPLETED,
-                LlmCallCompletedPayload(
-                    call_id=call_id, round_index=round_index, attempt=attempt,
-                    model=model_name, duration_ms=(time.perf_counter() - t0) * 1000.0,
-                    success=True,
-                    prompt_tokens=getattr(usage, "prompt_tokens", None),
-                    completion_tokens=getattr(usage, "completion_tokens", None),
-                    total_tokens=getattr(usage, "total_tokens", None),
-                ),
-                round_index=round_index, stream_id="main",
-            )
-            return resp
+                return resp
+            finally:
+                self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
+                           round_index=round_index, stream_id="main")
 
         policy = self.config.retry_policy
-        # STREAM_COMPLETED in a finally so it ALWAYS pairs with the STREAM_STARTED
-        # emitted in _do_call — otherwise a failed/exhausted/cancelled call left
-        # dangling 'started' events with no terminal, stranding stream subscribers.
-        try:
-            if policy is None:
-                response = await _do_call()
-            else:
-                def _on_retry(attempt: int, exc: BaseException, sleep_s: float) -> None:
-                    self._emit(
-                        AgentEventType.LLM_RETRY_ATTEMPTED,
-                        LlmRetryAttemptedPayload(
-                            attempt=attempt,
-                            max_attempts=policy.max_attempts,
-                            error_type=type(exc).__name__,
-                            error_message=str(exc)[:500],
-                            next_sleep_seconds=sleep_s,
-                        ),
-                        round_index=round_index,
-                        stream_id="main",
-                    )
-
-                response = await with_retry(
-                    _do_call, policy=policy, token=self.cancel_token, on_retry=_on_retry,
+        if policy is None:
+            response = await _do_call()
+        else:
+            def _on_retry(attempt: int, exc: BaseException, sleep_s: float) -> None:
+                self._emit(
+                    AgentEventType.LLM_RETRY_ATTEMPTED,
+                    LlmRetryAttemptedPayload(
+                        attempt=attempt,
+                        max_attempts=policy.max_attempts,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc)[:500],
+                        next_sleep_seconds=sleep_s,
+                    ),
+                    round_index=round_index,
+                    stream_id="main",
                 )
-        finally:
-            self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
-                       round_index=round_index, stream_id="main")
+
+            response = await with_retry(
+                _do_call, policy=policy, token=self.cancel_token, on_retry=_on_retry,
+            )
 
         return response
 
@@ -1067,6 +1065,16 @@ class AgentPipeline:
                 if self._drain_follow_ups is not None:
                     drained = await self._drain_follow_ups()
                     if drained:
+                        # Close THIS (no-tools) round in the event stream + usage before steering
+                        # reopens the loop — else the round is left unterminated and its per-round
+                        # usage row is never written (pipeline-runner-3). Mirrors the terminal block.
+                        self._emit(AgentEventType.ROUND_COMPLETED,
+                                   RoundCompletedPayload(round_index=round_idx, has_tools=False),
+                                   round_index=round_idx)
+                        await self.hooks.run_typed_async(HookPoint.ROUND_END, RoundEndCtx(
+                            round_index=round_idx, messages=self.history,
+                            has_tools=False, response_text=assistant_text))
+                        await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
                         for msg in drained:
                             await self._append_message(msg, round_index=round_idx)
                         continue
@@ -1318,6 +1326,11 @@ class AgentPipeline:
             return self._make_result("degraded", final_text=msg, rounds=max_rounds)
         final_text = (getattr(final_resp, "raw_text", "") or getattr(final_resp, "content_text", "") or "").strip()
         self._emit(AgentEventType.USAGE_UPDATED, UsageUpdatedPayload(usage=self.ctx.update_usage(final_resp)))
+        # Persist the wrap-up summary as the assistant turn before finalizing (M-stateful-loop-2):
+        # the success branch returned it to the caller but never recorded it, so the next send's
+        # history had a dangling "summarize…" user prompt with no answer. Mirrors the degraded branch.
+        if final_text:
+            await self._append_message({"role": "assistant", "content": final_text}, round_index=max_rounds)
         await self._finalize("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",
                              rounds=int(self.config.max_rounds))
         return self._make_result("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",

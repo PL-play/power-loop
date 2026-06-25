@@ -38,6 +38,38 @@ def _ev(t, **payload):
     return AgentEvent(type=t, session_id=sid, payload=payload)
 
 
+def test_tracer_failure_never_aborts_the_loop() -> None:
+    """M-contrib-observability-2: a tracer that raises in span CREATION or set_attribute must NOT
+    propagate out of publish() on a non-suppressing bus (the default) and abort the agent run."""
+
+    class _BadSpan:
+        def set_attribute(self, *a, **k):
+            raise RuntimeError("attr backend down")
+
+        def set_status(self, *a, **k):
+            pass
+
+        def end(self, *a, **k):
+            pass
+
+    class _BoomTracer:
+        def __init__(self):
+            self.calls = 0
+
+        def start_span(self, *a, **k):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("tracer down")  # span CREATION failure
+            return _BadSpan()                       # later: set_attribute failure
+
+    bus = AgentEventBus()  # default suppress_subscriber_errors=False
+    attach_otel_sink(bus, tracer=_BoomTracer())
+    # Pre-fix these re-raised out of publish() (start_span / set_attribute were unguarded).
+    bus.publish(_ev(AgentEventType.SESSION_STARTED, scope="main"))
+    bus.publish(_ev(AgentEventType.LLM_CALL_STARTED, round_index=0, call_id="c1", model="m"))
+    bus.publish(_ev(AgentEventType.LLM_CALL_COMPLETED, call_id="c1", success=True, duration_ms=1.0))
+
+
 def test_session_round_llm_tool_span_tree() -> None:
     bus, exporter = _bus_with_exporter()
     bus.publish(_ev(AgentEventType.SESSION_STARTED, scope="main"))

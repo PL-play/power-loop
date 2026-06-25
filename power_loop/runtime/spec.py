@@ -18,6 +18,7 @@ place.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import dataclass, field, fields
 from typing import Any
@@ -253,7 +254,9 @@ async def run_agent_spec(
         parent_session_id=parent_sid,
         spawn_tool_call_id=spawn_tool_call_id,
         lifecycle=SubagentLifecycle(spec.lifecycle),
-        metadata=dict(spec.metadata),
+        # Stamp spec_name into METADATA (not just config) so the blackboard author label is the spec
+        # name, not the raw session UUID (subagent-coordination-3): blackboard._author reads metadata.
+        metadata={**dict(spec.metadata), "spec_name": spec.name},
     )
 
     child_row = await store.get_session(child_sid)
@@ -281,7 +284,15 @@ async def run_agent_spec(
         hooks=parent_loop._runner.hooks,
         event_bus=parent_loop._runner.event_bus,
     )
-    result = await child_loop.send(user_input, session_id=child_sid, stop_event=stop_event)
+    try:
+        result = await child_loop.send(user_input, session_id=child_sid, stop_event=stop_event)
+    except BaseException:
+        # A raised child run (cancellation, provider error, bug) would otherwise leak the EPHEMERAL
+        # child session — the cleanup below is only reached on a normal return (subagent-coordination-2).
+        if spec.lifecycle == SubagentLifecycle.EPHEMERAL.value:
+            with contextlib.suppress(Exception):
+                await store.close_session(child_sid, cascade=True)
+        raise
 
     # ── Sub-agent lifecycle events (source="subagent", on the parent stream) ──
     # TEXT only when the child produced an answer; LIMIT for the round-limit

@@ -148,6 +148,46 @@ def _render(rows, rep=None):
     return [m["content"] for m in (rep or ProjectedRepresentation()).render(rows)]
 
 
+def _compact_pmr(lo, hi, summary):
+    return ProjectMessageRow(
+        session_id="s1", send_index=hi, kind="compact", content={"summary": summary},
+        rendered_text=None, source_seq_lo=None, source_seq_hi=None,
+        compact_from_send=lo, compact_to_send=hi, projector_version=1,
+        token_estimate=None, created_at=0,
+    )
+
+
+def test_compact_recall_hint_emitted_for_migration_seeded_fold():
+    # M-projection-1: a MATURE fold whose range starts at send 0 (migration-seeded from_send=0)
+    # must still show the recall_send hint. The old `lo > 0` permanently hid it for those folds.
+    out = _render([_compact_pmr(0, 5, "older stuff")])[0]
+    assert out.startswith("[older sends ")
+    assert "#0" in out and "#5" in out and "recall_send" in out
+    assert "older stuff" in out
+
+
+def test_compact_no_hint_for_degenerate_seed():
+    # The degenerate seed compact covers NO real send (from_send=0, to_send=0) → no recall note.
+    out = _render([_compact_pmr(0, 0, "seed")])[0]
+    assert "folded" not in out and out == "seed"
+
+
+def test_render_config_coerces_bools_from_json_strings():
+    # projection-2: a string "false" must read as False (JSON/templated config), not stay truthy.
+    cfg = ProjectionRenderConfig.from_dict({"include_tools": "false", "include_final_text": "0"})
+    assert cfg.include_tools is False and cfg.include_final_text is False
+    assert ProjectionRenderConfig.from_dict({"include_tools": "true"}).include_tools is True
+    # string knobs still coerced via str() and unknown keys ignored
+    cfg2 = ProjectionRenderConfig.from_dict({"user_tag": 7, "nope": "x"})
+    assert cfg2.user_tag == "7"
+
+
+def test_render_user_row_handles_non_list_input():
+    # projection-3: a bare-string `input` must not be iterated char-by-char.
+    out = _render([_pmr(1, "user", {"input": "hello world"})])
+    assert out == ["[#1] hello world"]
+
+
 def test_render_config_defaults_match_builtin():
     # The default ProjectionRenderConfig must reproduce the historical rendering byte-for-byte.
     rows = [

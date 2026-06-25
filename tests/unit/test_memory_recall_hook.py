@@ -83,6 +83,21 @@ async def test_session_change_recomputes() -> None:
     assert prov.calls == 2
 
 
+async def test_concurrent_sessions_do_not_evict_each_others_memo() -> None:
+    # memory-hooks-2: a SHARED hook interleaving sessions must memoize each independently. Pre-fix
+    # the single scalar memo was evicted on every session switch → redundant provider.recall calls.
+    prov = _FakeProvider(to_recall=[{"content": "fact"}])
+    hook = MemoryRecallHook(prov)
+    await hook(_ctx(0, "s1", [{"role": "user", "content": "a"}]))  # send s1 → recall
+    await hook(_ctx(0, "s2", [{"role": "user", "content": "b"}]))  # send s2 → recall
+    assert prov.calls == 2
+    # Interleaved later rounds reuse each session's own memo — no extra recalls (pre-fix: > 2).
+    await hook(_ctx(1, "s1", [{"role": "user", "content": "a"}]))
+    await hook(_ctx(1, "s2", [{"role": "user", "content": "b"}]))
+    await hook(_ctx(2, "s1", [{"role": "user", "content": "a"}]))
+    assert prov.calls == 2
+
+
 async def test_empty_recall_injects_nothing() -> None:
     hook = MemoryRecallHook(_FakeProvider(to_recall=[]))
     msgs = [{"role": "user", "content": "hi"}]

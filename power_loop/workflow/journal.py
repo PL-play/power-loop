@@ -55,8 +55,11 @@ __all__ = [
 JOURNAL_PREFIX = "workflow:run:"
 INDEX_KEY = "workflow:index"
 
-# A run in any of these states is FINISHED: its status/result/steps are frozen.
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+# A run in any of these states is FINISHED: its status/result/steps are frozen. budget_exceeded is
+# a settled outcome too (M-workflow-durability-2): without it the journal stayed writable, so an
+# orphaned sub-agent settling late could still mutate a budget-exhausted run. Resume is unaffected —
+# it flips a terminal run back to "running" via allow_terminal=True.
+_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "budget_exceeded"})
 
 
 def _is_terminal(status: Any) -> bool:

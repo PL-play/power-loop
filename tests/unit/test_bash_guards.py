@@ -94,6 +94,15 @@ def test_scope_blocks_read_of_home_internals() -> None:
         assert err is not None and "Reading agent-home internals is blocked" in err
 
 
+def test_scope_does_not_false_positive_on_superstring_path() -> None:
+    # default-tools-3: a sibling dir whose path is a SUPERSTRING of POWER_LOOP_HOME (…_test ⊂
+    # …_test_extra) must NOT trip the home-scope guard — match on path boundaries, not substrings.
+    with runtime_env_context(_home_env()):
+        assert _validate_bash_command_scope(f"cat {_HOME}_extra/file.txt") is None
+        # the real home (boundary = '/') is still guarded
+        assert _validate_bash_command_scope(f"cat {_HOME}/secret.txt") is not None
+
+
 def test_scope_blocks_write_under_home() -> None:
     with runtime_env_context(_home_env()):
         err = _validate_bash_command_scope(f"echo x > {_HOME}/notes.txt")
@@ -133,3 +142,20 @@ def test_scope_default_deny_blocks_unlisted_verbs_touching_home(command: str) ->
     with runtime_env_context(_home_env()):
         err = _validate_bash_command_scope(command)
         assert err is not None and "POWER_LOOP_HOME" in err
+
+
+def test_background_manager_prunes_terminal_tasks() -> None:
+    # default-tools-2: the in-memory task cache evicts oldest TERMINAL records beyond the cap so it
+    # (and the store/event_loop refs each pins) can't grow without bound; running tasks are kept.
+    from power_loop.tools.default_tools import _MAX_BG_TASKS, BackgroundManager
+
+    mgr = BackgroundManager()
+    with mgr._lock:
+        mgr.tasks["run-1"] = {"status": "running"}  # oldest, but running → never evicted
+        for i in range(_MAX_BG_TASKS + 50):
+            mgr.tasks[f"done-{i}"] = {"status": "completed"}
+        mgr._prune_locked()
+    assert len(mgr.tasks) <= _MAX_BG_TASKS
+    assert "run-1" in mgr.tasks                       # running task preserved
+    assert f"done-{_MAX_BG_TASKS + 49}" in mgr.tasks  # newest terminal preserved
+    assert "done-0" not in mgr.tasks                  # oldest terminal evicted

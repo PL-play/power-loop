@@ -28,7 +28,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
-from power_loop.contrib._redact import resolve_redact, sanitize
+from power_loop.contrib._redact import DEFAULT_VALUE_PATTERNS, resolve_redact, sanitize
 from power_loop.core.events import AgentEventBus
 
 __all__ = ["attach_jsonl_sink", "replay", "JsonlSink"]
@@ -36,7 +36,15 @@ __all__ = ["attach_jsonl_sink", "replay", "JsonlSink"]
 
 class JsonlSink:
     """A size-rotated JSON-lines writer. One ``AgentEvent.to_dict()`` per line; rotates
-    to ``path.1``, ``path.2``, … (oldest dropped past ``backup_count``). Thread-safe."""
+    to ``path.1``, ``path.2``, … (oldest dropped past ``backup_count``). Thread-safe.
+
+    ``backup_count<=0`` disables size rotation entirely (the file grows unbounded) — previously it
+    truncated the file on every rotation, silently discarding ALL history (contrib-observability-5).
+
+    PERF (contrib-observability-4): ``write_line`` writes + ``flush()`` INLINE. If attached to a bus
+    that dispatches subscribers synchronously on the agent's own thread, that disk I/O stalls the
+    loop. For durability without stalling, attach this sink to a bus configured with threaded/async
+    dispatch (so writes happen off the loop thread)."""
 
     def __init__(self, path: str | Path, *, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5) -> None:
         self.path = Path(path)
@@ -50,7 +58,10 @@ class JsonlSink:
         with self._lock:
             if self._fh.closed:
                 return
-            if self.max_bytes and self._fh.tell() > 0 and self._fh.tell() + len(line) + 1 > self.max_bytes:
+            # Only rotate when we actually keep backups — backup_count<=0 means "no rotation" (let
+            # the file grow), NOT "rotate by truncating to nothing" (contrib-observability-5).
+            if (self.max_bytes and self.backup_count > 0 and self._fh.tell() > 0
+                    and self._fh.tell() + len(line) + 1 > self.max_bytes):
                 self._rotate()
             self._fh.write(line)
             self._fh.write("\n")
@@ -84,6 +95,7 @@ def attach_jsonl_sink(
     backup_count: int = 5,
     max_field_len: int = 2000,
     redact_keys: Iterable[str] | None = None,
+    redact_value_secrets: bool = False,
 ) -> JsonlSink:
     """Persist events from ``bus`` to a rotating JSONL file at ``path``.
 
@@ -91,17 +103,20 @@ def attach_jsonl_sink(
     :param max_bytes/backup_count: rotation (``0`` disables size rotation).
     :param max_field_len: truncate long string payload values.
     :param redact_keys: secret-key denylist (``None`` = default; ``()`` = no redaction).
+    :param redact_value_secrets: also scrub secret-shaped substrings inside string VALUES
+        (off by default; key-name redaction alone misses value-embedded secrets — M-observability-6).
     Returns the :class:`JsonlSink`; call ``.close()`` to flush + release the file.
     """
     sink = JsonlSink(path, max_bytes=max_bytes, backup_count=backup_count)
     wanted = set(events) if events is not None else None
     redact_lower = resolve_redact(redact_keys)
+    value_patterns = DEFAULT_VALUE_PATTERNS if redact_value_secrets else None
 
     def _handler(event: AgentEvent) -> None:
         if wanted is not None and event.type not in wanted:
             return
         d = event.to_dict()
-        d["payload"] = sanitize(d.get("payload") or {}, max_field_len, redact_lower)
+        d["payload"] = sanitize(d.get("payload") or {}, max_field_len, redact_lower, value_patterns=value_patterns)
         sink.write_line(json.dumps(d, ensure_ascii=False, default=str))
 
     if wanted is None:

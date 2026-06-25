@@ -107,6 +107,115 @@ async def test_projection_written_and_fed_to_next_send(store: SessionStore) -> N
     assert "second" in joined                          # send 2's own user (in-flight, verbatim)
 
 
+# ── H1 (BUG_REVIEW_3.4): out-of-band tool rows must carry the in-flight send_index ──
+# submit_input / resume(_execute_pending) / abort_pending append tool rows out-of-band of the
+# pipeline. In projection mode the reader partitions active rows by send_index; a NULL-send_index
+# tool row falls into the legacy prefix and renders BEFORE its own assistant tool_call, so
+# align_tool_calls drops it as an orphan — silently losing the answer. These three tests assert the
+# rows are stamped with the active send's index (so they stay paired in current_rows) AND that the
+# answer actually reaches the resumed LLM request.
+
+
+def _projection_loop_with_tools(store, llm, tool_registry, *, max_rounds=3):
+    return StatefulAgentLoop(
+        llm=llm, store=store, tool_registry=tool_registry,
+        config=AgentLoopConfig(
+            system_prompt="S", max_rounds=max_rounds,
+            representation=DefaultDeterministicProjector(), max_tokens=8000,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_projection_submit_input_preserves_answer(store: SessionStore) -> None:
+    llm = _Scripted(responses=[
+        _tool_resp("tc-input", "request_user_input",
+                   '{"kind":"confirm","prompt":"Approve?","options":[{"id":"yes","label":"Yes"}]}'),
+        LLMResponse(raw_text="Approved."),
+    ])
+    loop = _projection_loop_with_tools(
+        store, llm, create_default_tool_registry(include=["request_user_input"]))
+    sid = await loop.new_session()
+
+    waiting = await loop.send("needs approval", session_id=sid)
+    assert waiting.status == "waiting_for_input"
+    iid = waiting.pending_interactions[0]["interaction_id"]
+
+    n = len(llm.calls)
+    resumed = await loop.submit_input(sid, iid, {"choice": "yes"})
+    assert resumed.status == "completed"
+    assert resumed.final_text == "Approved."
+
+    # The answer reaches the resumed LLM request as a paired tool result (would be DROPPED pre-fix).
+    req = llm.calls[n]
+    tool_msgs = [m for m in req if m.get("role") == "tool" and m.get("tool_call_id") == "tc-input"]
+    assert tool_msgs, "submitted answer dropped from the projected context"
+    assert "choice" in str(tool_msgs[0].get("content"))
+    # The assistant tool_call that owns it is also present and precedes the result (no orphan).
+    roles = [m.get("role") for m in req]
+    assert roles.index("assistant") < roles.index("tool")
+
+    # Store-level proof: the out-of-band tool row carries the active send's index, not NULL.
+    tool_rows = [r for r in await store.load_active_messages(sid) if r.role == "tool"]
+    assert tool_rows and all(r.send_index == 1 for r in tool_rows)
+
+
+@pytest.mark.asyncio
+async def test_projection_resume_preserves_replayed_tool_result(store: SessionStore) -> None:
+    # Seed a realistic in-flight send (send_index=1) with an unresolved echo tool_call, as a crash
+    # mid-tool would leave it, then resume() → _execute_pending replays the tool.
+    llm = _Scripted(responses=[LLMResponse(raw_text="after resume")])
+    loop = _projection_loop_with_tools(store, llm, _echo_registry())
+    sid = await store.create_session()
+    await store.mutate_runtime_state(sid, "send_index", lambda v: 1, default=0)
+    await store.append_message(sid, role="user", content="kick off", send_index=1)
+    asst_seq = await store.append_message(
+        sid, role="assistant", send_index=1,
+        tool_calls=[{"id": "tc-y", "function": {"name": "echo", "arguments": '{"text":"resumed"}'}}],
+        round_index=0,
+    )
+    await store.set_pending(sid, {
+        "assistant_seq": asst_seq, "round_index": 0, "tool_call_ids": ["tc-y"],
+        "tool_calls": [{"id": "tc-y", "function": {"name": "echo", "arguments": '{"text":"resumed"}'}}],
+    })
+
+    r = await loop.resume(sid)
+    assert r.status == "completed"
+    assert r.final_text == "after resume"
+
+    # The replayed result reaches the LLM (paired), not dropped as a legacy-prefix orphan.
+    req = llm.calls[0]
+    tool_msgs = [m for m in req if m.get("role") == "tool" and m.get("tool_call_id") == "tc-y"]
+    assert tool_msgs and tool_msgs[0].get("content") == "resumed"
+    tool_rows = [r for r in await store.load_active_messages(sid) if r.role == "tool"]
+    assert tool_rows and all(row.send_index == 1 for row in tool_rows)
+
+
+@pytest.mark.asyncio
+async def test_projection_abort_pending_stamps_send_index(store: SessionStore) -> None:
+    llm = _Scripted(responses=[LLMResponse(raw_text="recovered")])
+    loop = _projection_loop_with_tools(store, llm, _echo_registry())
+    sid = await store.create_session()
+    await store.mutate_runtime_state(sid, "send_index", lambda v: 1, default=0)
+    await store.append_message(sid, role="user", content="kick off", send_index=1)
+    seq = await store.append_message(
+        sid, role="assistant", send_index=1,
+        tool_calls=[{"id": "tc-x", "function": {"name": "echo", "arguments": "{}"}}],
+        round_index=0,
+    )
+    await store.set_pending(sid, {
+        "assistant_seq": seq, "round_index": 0, "tool_call_ids": ["tc-x"],
+        "tool_calls": [{"id": "tc-x", "function": {"name": "echo", "arguments": "{}"}}],
+    })
+
+    aborted = await loop.abort_pending(sid, reason="user_cancelled")
+    assert aborted == 1
+    # The <aborted> row is stamped with the pending send's index (paired, not orphaned in projection).
+    tool_rows = [r for r in await store.load_active_messages(sid) if r.role == "tool"]
+    assert tool_rows and all(r.send_index == 1 for r in tool_rows)
+    assert "<aborted: user_cancelled>" in str(tool_rows[0].content)
+
+
 @pytest.mark.asyncio
 async def test_default_mode_writes_no_projections(store: SessionStore) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text="hi")])

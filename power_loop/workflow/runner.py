@@ -42,6 +42,17 @@ __all__ = [
     "run_detached", "make_wake_guard", "register_wake_guard", "make_on_step", "spawn_background",
 ]
 
+#: run_ids whose engine is currently executing IN THIS PROCESS (set by spawn_background +
+#: resume_run). Lets the resume entry points refuse to start a second concurrent engine for a
+#: still-live run (workflow-durability-3) without blocking resume-after-crash (a crashed run's
+#: task already discarded its id).
+_LIVE_RUN_IDS: set[str] = set()
+
+
+def is_run_live(run_id: str) -> bool:
+    """True iff ``run_id``'s engine is currently executing in this process (workflow-durability-3)."""
+    return run_id in _LIVE_RUN_IDS
+
 
 def make_on_step(store: Any, parent_sid: str, run_id: str):
     """Build the per-step journaling callback the engine fires as nodes settle.
@@ -171,6 +182,10 @@ def spawn_background(
     task = asyncio.create_task(_bg(), name=f"workflow-{run_id}")
     task_set.add(task)
     task.add_done_callback(task_set.discard)
+    # In-process liveness (workflow-durability-3): mark live now, discard when the task settles —
+    # a crashed run is therefore NOT marked live, so resume-after-crash still works.
+    _LIVE_RUN_IDS.add(run_id)
+    task.add_done_callback(lambda _t: _LIVE_RUN_IDS.discard(run_id))
     return WorkflowRunHandle(run_id=run_id, task=task, cancel_token=cancel_token)
 
 

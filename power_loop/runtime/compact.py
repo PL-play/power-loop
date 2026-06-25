@@ -187,9 +187,17 @@ class DefaultCompactor(Compactor):
     # ── trigger ─────────────────────────────────────────────────────────
 
     def _should_trigger(self, before_tokens: int, max_tokens: int) -> bool:
-        # Env override (read lazily so monkeypatch in tests works).
+        # Env override (read lazily so monkeypatch in tests works). Parse fail-soft: a malformed
+        # value must NOT crash the whole send — fall back to the configured threshold (compaction-1).
         env = os.environ.get("CONTEXT_COMPACT_THRESHOLD")
-        absolute = int(env) if env else self.absolute_threshold
+        absolute = self.absolute_threshold
+        if env:
+            try:
+                absolute = int(env)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "ignoring malformed CONTEXT_COMPACT_THRESHOLD=%r; using configured threshold", env
+                )
         if absolute is not None:
             return before_tokens >= absolute
         if max_tokens <= 0:
