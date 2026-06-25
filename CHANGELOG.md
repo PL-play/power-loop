@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+## [3.5.0] — 2026-06-25
+
+Systematic-review remediation (BUG_REVIEW_3.4.md): 7/7 HIGH + 14/15 MEDIUM + 30/32 LOW findings
+fixed or documented, with regression tests (unit suite 1016 green; verified against live MySQL +
+the live LLM). Backward-compatible: no STABLE API removed/renamed (minor bump). The store schema
+advances **v3 → v4** — existing MySQL stores migrate (TEXT → LONGTEXT) automatically on open under
+AUTO_CREATE; SQLite/Postgres get a no-op version bump. 3 Anthropic-transport findings deferred
+(extended-thinking signatures, ModelCapabilities, tool_result images).
+
 ### Fixed — systematic-review HIGH findings (BUG_REVIEW_3.4.md)
 
 - **Projection mode dropped the submitted answer on `submit_input()` / `resume()` / `abort_pending()`
