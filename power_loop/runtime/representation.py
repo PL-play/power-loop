@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from power_loop.runtime.store.types import MessageRow, ProjectMessageRow
@@ -40,6 +41,7 @@ __all__ = [
     "Representation",
     "VerbatimRepresentation",
     "ProjectedRepresentation",
+    "ProjectionRenderConfig",
     "ProjectedRow",
     "ProjectedSend",
 ]
@@ -176,6 +178,34 @@ class VerbatimRepresentation:
 
 
 @dataclass
+class ProjectionRenderConfig:
+    """Tunable format knobs for :meth:`ProjectedRepresentation.render` — they change the SHAPE of the
+    rendered text only, never what is stored. Every field is a plain scalar so the whole config
+    round-trips through JSON (a host can surface it in an admin UI and retune the rendered context
+    live, then pass it back via ``ProjectedRepresentation(render_config=…)``). Placeholders: ``{n}`` in
+    a tag → the send_index (empty tag or ``None`` index → no tag); ``{range}`` in ``fold_note`` → the
+    folded ``#lo–#hi`` span. The defaults reproduce the built-in rendering exactly."""
+
+    user_tag: str = "[#{n}] "  # prefix on a user/input row; {n}=send_index
+    project_tag: str = "#{n} "  # prefix on a project/assistant row
+    tools_header: str = "[tools] "  # before the tool list in a project row
+    tool_sep: str = "; "  # between tools
+    tool_arg_sep: str = ", "  # between a tool's k=v fields
+    include_tools: bool = True  # render the tool list at all
+    include_final_text: bool = True  # render the project row's trailing final_text
+    empty_project: str = "(no output)"  # a project row that renders to nothing
+    fold_note: str = "[older sends {range} folded — recall_send(send_index=N) to expand]"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> ProjectionRenderConfig:
+        """Build from a plain dict (e.g. JSON config), silently ignoring unknown keys."""
+        if not data:
+            return cls()
+        names = {f.name for f in dataclass_fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in names})
+
+
+@dataclass
 class ProjectedRepresentation:
     """Generic, deterministic, no-LLM per-send projection. Each send →
     ``user`` row: ``{"input": [<user/trigger inputs, verbatim>]}`` (a LIST — folded follow-ups
@@ -183,14 +213,24 @@ class ProjectedRepresentation:
     ``project`` row: ``{"tools": [...], "final_text": ...}``. Each tool call is summarized via its
     ``ToolDefinition.project`` hook when present, else a truncating fallback. Rendered to terse
     plain text with NO tool-protocol structure. (This is the old ``DefaultDeterministicProjector``
-    MINUS its fold knobs/``compact()`` — folding now lives on :class:`FoldStrategy`.)"""
+    MINUS its fold knobs/``compact()`` — folding now lives on :class:`FoldStrategy`.)
+
+    The render is customizable two ways without copy-pasting it: pass a :class:`ProjectionRenderConfig`
+    (``render_config=`` — JSON-friendly format knobs, retunable from config/an admin UI) and/or
+    override one of the small per-row methods (``render_row`` → ``render_user_row`` /
+    ``render_project_row`` / ``render_compact_row``). Defaults reproduce the prior output exactly."""
 
     kind: str = "projection"
     version: int = 1
     max_chars: int = 300  # per-field truncation budget
+    #: Format knobs for render() — see :class:`ProjectionRenderConfig`. A plain dict is coerced (so a
+    #: host can pass JSON config straight through). Subclasses can ALSO override the render_* methods.
+    render_config: ProjectionRenderConfig = field(default_factory=ProjectionRenderConfig)
 
     def __post_init__(self) -> None:
         _validate_representation_params(version=self.version, max_chars=self.max_chars)
+        if isinstance(self.render_config, dict):
+            self.render_config = ProjectionRenderConfig.from_dict(self.render_config)
 
     def project_send(
         self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None
@@ -264,55 +304,83 @@ class ProjectedRepresentation:
         return {"name": name, "result": _truncate(result_str, self.max_chars)}
 
     # rendering ----------------------------------------------------------------
+    # Orchestration only; the per-row shapes live in small overridable methods (override exactly the
+    # one you want instead of copy-pasting render) and the format lives in render_config (retune from
+    # config, no code). Each rendered send is tagged with its ``#N`` send_index so the model can call
+    # recall_send(send_index=N) on a folded earlier turn — the tool docstring + the host's
+    # RECALL_SEND_NOTE tell it to use "the #N the summary shows", so the tags MUST be emitted (else
+    # recall_send is undiscoverable); changing user_tag/project_tag away from a ``{n}`` form is at the
+    # host's own risk.
     def render(self, rows: list[ProjectMessageRow]) -> list[LoopMessage]:
-        # Each rendered send is tagged with its ``#N`` send_index so the model can call
-        # recall_send(send_index=N) on a folded/compacted earlier turn — the tool docstring and the
-        # host's RECALL_SEND_NOTE both tell it to use "the #N the summary shows", so render MUST
-        # actually emit them (else recall_send is undiscoverable). The folded compact carries its
-        # covered range.
         out: list[LoopMessage] = []
         for r in rows:
-            si = r.send_index
-            if r.kind == "user":
-                content = r.content or {}
-                # ``input`` since 3.3; ``human`` is the pre-3.3 key — read both so old projection
-                # rows still render correctly after upgrade.
-                inputs = content.get("input")
-                if inputs is None:
-                    inputs = content.get("human") or []
-                tag = f"[#{si}] " if si is not None else ""
-                out.append({"role": "user", "content": tag + "\n".join(str(h) for h in inputs)})
-            elif r.kind == "project":
-                tag = f"#{si} " if si is not None else ""
-                out.append({"role": "assistant", "content": tag + self._render_project(r.content)})
-            elif r.kind == "compact":
-                msg = _render_compact_row(r)
-                lo, hi = r.compact_from_send, r.compact_to_send
-                if lo is not None and hi is not None and hi >= lo > 0:
-                    rng = f"#{lo}" if lo == hi else f"#{lo}–#{hi}"
-                    msg = {
-                        "role": "user",
-                        "content": f"[older sends {rng} folded — recall_send(send_index=N) to "
-                        f"expand]\n{msg['content']}",
-                    }
+            msg = self.render_row(r)
+            if msg is not None:
                 out.append(msg)
         return out
+
+    def render_row(self, r: ProjectMessageRow) -> LoopMessage | None:
+        """Dispatch one stored row to its per-kind renderer. Override to add a kind / change routing;
+        an unhandled kind returns None (skipped)."""
+        if r.kind == "user":
+            return self.render_user_row(r)
+        if r.kind == "project":
+            return self.render_project_row(r)
+        if r.kind == "compact":
+            return self.render_compact_row(r)
+        return None
+
+    def render_user_row(self, r: ProjectMessageRow) -> LoopMessage:
+        content = r.content or {}
+        # ``input`` since 3.3; ``human`` is the pre-3.3 key — read both so old rows still render.
+        inputs = content.get("input")
+        if inputs is None:
+            inputs = content.get("human") or []
+        return {
+            "role": "user",
+            "content": self._send_tag(self.render_config.user_tag, r.send_index)
+            + "\n".join(str(h) for h in inputs),
+        }
+
+    def render_project_row(self, r: ProjectMessageRow) -> LoopMessage:
+        return {
+            "role": "assistant",
+            "content": self._send_tag(self.render_config.project_tag, r.send_index)
+            + self._render_project(r.content),
+        }
+
+    def render_compact_row(self, r: ProjectMessageRow) -> LoopMessage:
+        msg = _render_compact_row(r)
+        lo, hi = r.compact_from_send, r.compact_to_send
+        if lo is not None and hi is not None and hi >= lo > 0:
+            rng = f"#{lo}" if lo == hi else f"#{lo}–#{hi}"
+            note = self.render_config.fold_note.replace("{range}", rng)
+            return {"role": "user", "content": f"{note}\n{msg['content']}"}
+        return msg
+
+    @staticmethod
+    def _send_tag(template: str, send_index: int | None) -> str:
+        """A send_index tag from a ``{n}`` template; empty template or ``None`` index → no tag."""
+        if send_index is None or not template:
+            return ""
+        return template.replace("{n}", str(send_index))
 
     def _render_tool(self, t: dict[str, Any]) -> str:
         name = t.get("name", "?")
         rest = {k: v for k, v in (t or {}).items() if k != "name"}
         if not rest:
             return str(name)
-        body = ", ".join(f"{k}={v}" for k, v in rest.items())
+        body = self.render_config.tool_arg_sep.join(f"{k}={v}" for k, v in rest.items())
         return f"{name}({body})"
 
     def _render_project(self, content: dict[str, Any] | None) -> str:
         content = content or {}
+        cfg = self.render_config
         parts: list[str] = []
         tools = content.get("tools") or []
-        if tools:
-            parts.append("[tools] " + "; ".join(self._render_tool(t) for t in tools))
+        if tools and cfg.include_tools:
+            parts.append(cfg.tools_header + cfg.tool_sep.join(self._render_tool(t) for t in tools))
         ft = content.get("final_text")
-        if ft:
+        if ft and cfg.include_final_text:
             parts.append(str(ft))
-        return "\n".join(parts) if parts else "(no output)"
+        return "\n".join(parts) if parts else cfg.empty_project

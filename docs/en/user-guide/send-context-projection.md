@@ -98,6 +98,41 @@ project {"tools": [{"name":"bash","result":"a.py b.py"}], "final_text":"有 a.py
 
 Past tool calls become `[tools] name(result=…)` plain text (no `tool_calls`/`tool_call_id`); long results are truncated to `max_chars`.
 
+## Customizing the render
+
+How stored rows render to that text is a first-class extension point (the defaults reproduce the output above byte-for-byte). Two ways:
+
+**Config — `ProjectionRenderConfig`.** A dataclass of pure-scalar format knobs, so the whole thing round-trips through JSON (drive it from config / an admin UI and retune the rendered context live):
+
+```python
+from power_loop import ProjectedRepresentation, ProjectionRenderConfig
+
+cfg = ProjectionRenderConfig(
+    user_tag="👤#{n} ",        # {n} = send_index; "" or a None index → no tag
+    project_tag="🤖#{n} ",
+    tools_header="calls: ",
+    tool_sep="; ", tool_arg_sep=", ",
+    include_tools=True,
+    include_final_text=False,   # e.g. drop the assistant's trailing text
+    empty_project="(no output)",
+    fold_note="[older sends {range} folded — recall_send(send_index=N) to expand]",
+)
+rep = ProjectedRepresentation(render_config=cfg)
+# a plain dict is coerced too (unknown keys ignored) — handy for JSON config:
+rep = ProjectedRepresentation(render_config={"project_tag": ">> "})
+```
+
+**Subclass — override one shape.** `render()` delegates to `render_row` → `render_user_row` / `render_project_row` / `render_compact_row` (plus `_render_project` / `_render_tool` / `_send_tag`). Override exactly the one you want; the rest keep the built-in render:
+
+```python
+class TerseRender(ProjectedRepresentation):
+    def render_project_row(self, r):
+        names = ", ".join(t.get("name", "?") for t in (r.content or {}).get("tools") or [])
+        return {"role": "assistant", "content": f"#{r.send_index} did: {names or '—'}"}
+```
+
+> Keep a `{n}` send_index tag in the `user_tag`/`project_tag` (or your `render_*` override): the model uses those `#N` markers to call `recall_send(send_index=N)`, so dropping them makes folded sends unrecoverable.
+
 ## Per-tool projection
 
 Each tool can supply `project(args, result) -> dict | str` so it decides what matters in projected history; otherwise a truncating fallback (`{"name", "result": <truncated>}`) is used:

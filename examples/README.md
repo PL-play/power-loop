@@ -55,6 +55,7 @@ A representative subset is validated by `tests/real/test_examples.py` against a 
 | 42 | [`42_build_your_own_tools.py`](42_build_your_own_tools.py) | **Build your own**: recreate the built-ins (background / sub-agent / timer / human-input / blackboard / memory / mini-workflow) from public primitives | `run_agent_spec`, `HumanInputRequired`, `RuntimeProjector`, `MemoryProvider`, `get/set_runtime_state`, `add_note` |
 | 43 | [`43_memory_hook_override.py`](43_memory_hook_override.py) | **Memory hook**: the auto-registered built-in `MemoryRecallHook` (ephemeral tail injection) — and how to disable or override it by name | `MemoryRecallHook`, `NoteMemory`, `hooks.remove`/`replace`/`has` |
 | 44 | [`44_hook_events_audit.py`](44_hook_events_audit.py) | **Hook-injection audit**: `record_hook_events="full"` records the ephemeral context `LLM_BEFORE` hooks inject (e.g. recalled memory) into `pl_hook_events` — observability only, never re-enters history/the request | `AgentLoopConfig(record_hook_events=)`, `store.list_hook_events`, `HookEventRow` |
+| 45 | [`45_custom_projection_render.py`](45_custom_projection_render.py) | **Custom projection render**: retune how stored projection rows render to LLM text — via `ProjectionRenderConfig` (JSON-friendly tags/separators/toggles) or by overriding one `render_*` method | `ProjectedRepresentation`, `ProjectionRenderConfig`, `render_project_row` |
 
 ## Running
 

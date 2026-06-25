@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+### Added — `ProjectedRepresentation` render is now a first-class extension point
+
+Projection-mode rendering (stored rows → LLM messages) was a single monolithic `render()` you could
+only customize by copy-pasting the whole method. It is now extensible two ways, and the **defaults
+reproduce the previous output byte-for-byte**:
+
+- **Config (`ProjectionRenderConfig`, provisional export):** a dataclass of pure-scalar format knobs
+  — `user_tag` / `project_tag` (with a `{n}` send_index placeholder), `tools_header`, `tool_sep`,
+  `tool_arg_sep`, `include_tools`, `include_final_text`, `empty_project`, `fold_note` (with a
+  `{range}` placeholder). Pass via `ProjectedRepresentation(render_config=…)`; a plain dict is coerced
+  (`ProjectionRenderConfig.from_dict`, unknown keys ignored), so the whole config round-trips through
+  JSON and a host can surface it in a UI and retune the rendered context live.
+- **Subclass override:** `render()` now delegates to small per-row methods — `render_row` →
+  `render_user_row` / `render_project_row` / `render_compact_row`, plus `_render_project` /
+  `_render_tool` / `_send_tag` — so a subclass overrides exactly the one shape it wants. A row whose
+  kind has no renderer is skipped (unchanged behavior).
+
 ## [3.3.0] — 2026-06-25
 
 ### Changed — projection keeps the input turn VERBATIM; user-row key `human` → `input`

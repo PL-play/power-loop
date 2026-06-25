@@ -177,6 +177,7 @@ from power_loop.runtime.representation import (
     ProjectedRepresentation,
     ProjectedRow,
     ProjectedSend,
+    ProjectionRenderConfig,
     Representation,
     VerbatimRepresentation,
 )
@@ -338,6 +339,7 @@ __all__ = [
 	"Representation",
 	"VerbatimRepresentation",
 	"ProjectedRepresentation",
+	"ProjectionRenderConfig",
 	"FoldStrategy",
 	"FoldContext",
 	"FoldResult",

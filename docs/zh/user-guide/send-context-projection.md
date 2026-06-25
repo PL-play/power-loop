@@ -98,6 +98,41 @@ project {"tools": [{"name":"bash","result":"a.py b.py"}], "final_text":"有 a.py
 
 历史里的工具调用变成 `[tools] name(result=…)` 纯文本（没有 `tool_calls`/`tool_call_id`），长结果按 `max_chars` 截断。
 
+## 自定义渲染
+
+「存好的行 → 这段文本」这一步是一等扩展点（默认值逐字复现上面的输出）。两种方式：
+
+**配置 —— `ProjectionRenderConfig`。** 一个纯标量字段的 dataclass，整体可经 JSON 往返（用配置 / 管理台下发，随时改了重渲染对比）：
+
+```python
+from power_loop import ProjectedRepresentation, ProjectionRenderConfig
+
+cfg = ProjectionRenderConfig(
+    user_tag="👤#{n} ",        # {n} = send_index；空串或 None index → 不加标签
+    project_tag="🤖#{n} ",
+    tools_header="calls: ",
+    tool_sep="; ", tool_arg_sep=", ",
+    include_tools=True,
+    include_final_text=False,   # 例如丢掉助手的尾随文本
+    empty_project="(no output)",
+    fold_note="[older sends {range} folded — recall_send(send_index=N) to expand]",
+)
+rep = ProjectedRepresentation(render_config=cfg)
+# 也可直接传 dict（未知键忽略）—— 方便从 JSON 配置传入：
+rep = ProjectedRepresentation(render_config={"project_tag": ">> "})
+```
+
+**子类 —— 只重写一个形状。** `render()` 委派给 `render_row` → `render_user_row` / `render_project_row` / `render_compact_row`（外加 `_render_project` / `_render_tool` / `_send_tag`）。只重写你要的那个，其余沿用内置：
+
+```python
+class TerseRender(ProjectedRepresentation):
+    def render_project_row(self, r):
+        names = ", ".join(t.get("name", "?") for t in (r.content or {}).get("tools") or [])
+        return {"role": "assistant", "content": f"#{r.send_index} did: {names or '—'}"}
+```
+
+> `user_tag`/`project_tag`（或你的 `render_*` 重写）里要保留 `{n}` 这个 send_index 标签：模型靠那些 `#N` 标记去调 `recall_send(send_index=N)`，去掉就找不回被折叠的 send 了。
+
 ## 工具自投影
 
 每个工具可提供 `project(args, result) -> dict | str`，自己决定在投影历史里呈现什么重点；没提供则用截断兜底（`{"name", "result": <截断>}`）：

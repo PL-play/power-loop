@@ -18,6 +18,7 @@ from power_loop.runtime.fold import (
 )
 from power_loop.runtime.representation import (
     ProjectedRepresentation,
+    ProjectionRenderConfig,
     VerbatimRepresentation,
 )
 from power_loop.runtime.store.types import MessageRow, MessageState, ProjectMessageRow
@@ -138,6 +139,96 @@ def test_projection_render_reads_legacy_human_key():
     rep = ProjectedRepresentation()
     out = rep.render([_pmr(1, "user", {"human": ["legacy input"]})])
     assert out == [{"role": "user", "content": "[#1] legacy input"}]
+
+
+# ── ProjectedRepresentation render extensibility (config + subclass) ─────────
+
+
+def _render(rows, rep=None):
+    return [m["content"] for m in (rep or ProjectedRepresentation()).render(rows)]
+
+
+def test_render_config_defaults_match_builtin():
+    # The default ProjectionRenderConfig must reproduce the historical rendering byte-for-byte.
+    rows = [
+        _pmr(1, "user", {"input": ["hi"]}),
+        _pmr(1, "project", {"tools": [{"name": "grep", "result": "3 hits"}], "final_text": "done"}),
+    ]
+    assert _render(rows) == ["[#1] hi", "#1 [tools] grep(result=3 hits)\ndone"]
+    assert _render(rows, ProjectedRepresentation(render_config=ProjectionRenderConfig())) == _render(rows)
+
+
+def test_render_config_tags_and_separators():
+    cfg = ProjectionRenderConfig(
+        user_tag="U#{n}: ", project_tag="A#{n}: ", tools_header="tools→ ", tool_sep=" | ",
+        tool_arg_sep=" ",
+    )
+    rows = [
+        _pmr(2, "user", {"input": ["q"]}),
+        _pmr(2, "project", {"tools": [{"name": "a", "result": "x"}, {"name": "b", "said": "y"}], "final_text": None}),
+    ]
+    assert _render(rows, ProjectedRepresentation(render_config=cfg)) == [
+        "U#2: q",
+        "A#2: tools→ a(result=x) | b(said=y)",
+    ]
+
+
+def test_render_config_include_flags():
+    rows = [_pmr(1, "project", {"tools": [{"name": "t", "result": "r"}], "final_text": "ft"})]
+    assert _render(rows, ProjectedRepresentation(render_config=ProjectionRenderConfig(include_tools=False))) == ["#1 ft"]
+    assert _render(rows, ProjectedRepresentation(render_config=ProjectionRenderConfig(include_final_text=False))) == ["#1 [tools] t(result=r)"]
+    cfg = ProjectionRenderConfig(include_tools=False, include_final_text=False, empty_project="(空)")
+    assert _render(rows, ProjectedRepresentation(render_config=cfg)) == ["#1 (空)"]
+
+
+def test_render_config_empty_tag_and_none_send_index():
+    cfg = ProjectionRenderConfig(user_tag="", project_tag="#{n} ")
+    rep = ProjectedRepresentation(render_config=cfg)
+    assert _render([_pmr(1, "user", {"input": ["x"]})], rep) == ["x"]  # empty tag → no prefix
+    # None send_index → no tag regardless of a non-empty template
+    assert _render([_pmr(None, "project", {"tools": [], "final_text": "z"})], rep) == ["z"]
+
+
+def test_render_config_fold_note():
+    cfg = ProjectionRenderConfig(fold_note="[折叠 {range}]")
+    row = ProjectMessageRow(
+        session_id="s", send_index=5, kind="compact", content={"summary": "old"}, rendered_text=None,
+        source_seq_lo=None, source_seq_hi=None, compact_from_send=1, compact_to_send=3,
+        projector_version=1, token_estimate=None, created_at=0,
+    )
+    assert ProjectedRepresentation(render_config=cfg).render([row]) == [
+        {"role": "user", "content": "[折叠 #1–#3]\nold"}
+    ]
+
+
+def test_render_config_from_dict_ignores_unknown_keys():
+    cfg = ProjectionRenderConfig.from_dict({"project_tag": ">>", "bogus": 1})
+    assert cfg.project_tag == ">>"
+    assert cfg.user_tag == "[#{n}] "  # untouched default
+    assert ProjectionRenderConfig.from_dict(None) == ProjectionRenderConfig()
+
+
+def test_render_config_dict_coerced_in_constructor():
+    rep = ProjectedRepresentation(render_config={"user_tag": "» "})
+    assert isinstance(rep.render_config, ProjectionRenderConfig)
+    assert _render([_pmr(1, "user", {"input": ["a"]})], rep) == ["» a"]
+
+
+def test_render_row_skips_unknown_kind():
+    # an unhandled kind → render_row returns None → skipped (matches the old if/elif fall-through)
+    rows = [_pmr(1, "user", {"input": ["keep"]}), _pmr(1, "weird", {"x": 1})]
+    assert _render(rows) == ["[#1] keep"]
+
+
+def test_render_subclass_overrides_one_shape():
+    # The decomposition lets a subclass override exactly ONE per-kind method (the "provide your own
+    # render" path) without copy-pasting render — the other kinds keep the built-in shape.
+    class MyRep(ProjectedRepresentation):
+        def render_project_row(self, r):
+            return {"role": "assistant", "content": f"[custom #{r.send_index}]"}
+
+    rows = [_pmr(1, "user", {"input": ["hi"]}), _pmr(1, "project", {"tools": [], "final_text": "x"})]
+    assert _render(rows, MyRep()) == ["[#1] hi", "[custom #1]"]
 
 
 # ── LLMSummaryFold ─────────────────────────────────────────────────────────
