@@ -100,7 +100,7 @@ def test_projection_project_send_and_render():
     kinds = [r.kind for r in projected.rows]
     assert kinds == ["user", "project"]
     user_row, project_row = projected.rows
-    assert user_row.content == {"human": ["do a search"]}
+    assert user_row.content == {"input": ["do a search"]}
     assert project_row.content["final_text"] == "ok"
     assert project_row.content["tools"] == [{"name": "grep", "result": "3 hits"}]
     rendered = rep.render([_pmr(1, "user", user_row.content), _pmr(1, "project", project_row.content)])
@@ -117,11 +117,27 @@ def test_projection_renders_compact_row():
     ]
 
 
-def test_projection_truncates_to_max_chars():
+def test_projection_keeps_input_full_but_truncates_tool_output():
+    # The INPUT/user turn is kept verbatim (it's the real conversation, short, high-value); only the
+    # assistant's WORK (tool result / final_text) is compressed to max_chars.
     rep = ProjectedRepresentation(max_chars=5)
-    send = [_mr(1, "user", content="abcdefghij")]
+    send = [
+        _mr(1, "user", content="abcdefghij"),
+        _mr(2, "assistant", content="ok", tool_calls=[_tc("a", "grep", "{}")]),
+        _mr(3, "tool", content="0123456789", tool_call_id="a"),
+    ]
     projected = rep.project_send(send, send_index=1, tool_registry=None)
-    assert projected.rows[0].content == {"human": ["abcde…"]}
+    user_row, project_row = projected.rows
+    assert user_row.content == {"input": ["abcdefghij"]}  # input verbatim, NOT truncated
+    assert project_row.content["tools"][0]["result"] == "01234…"  # tool output IS truncated
+
+
+def test_projection_render_reads_legacy_human_key():
+    # Pre-3.3 projection rows stored the user input under "human"; render must still emit them so a
+    # session with old rows keeps working after upgrade.
+    rep = ProjectedRepresentation()
+    out = rep.render([_pmr(1, "user", {"human": ["legacy input"]})])
+    assert out == [{"role": "user", "content": "[#1] legacy input"}]
 
 
 # ── LLMSummaryFold ─────────────────────────────────────────────────────────

@@ -8,6 +8,22 @@
 
 ## [Unreleased]
 
+## [3.3.0] — 2026-06-25
+
+### Changed — projection keeps the input turn VERBATIM; user-row key `human` → `input`
+
+`ProjectedRepresentation` (projection mode) now renders a send's INPUT/user turn **verbatim** instead
+of truncating it to `max_chars`. The input is the actual conversation content — short relative to tool
+output and high-value — so truncating it dropped context the model genuinely needs; only the
+assistant's WORK (tool args/results + `final_text`) is still compressed, which is where the token
+savings actually are.
+
+- The user row's content key is renamed `{"human": [...]}` → `{"input": [...]}`. The input turn is
+  NOT necessarily a human — a multi-agent host feeds another agent's message there — so `input` is the
+  accurate, neutral name. `render()` reads BOTH keys, so pre-3.3 projection rows render correctly
+  after upgrade (no migration / no data rewrite needed). The legacy 2.x `history_projector` path is
+  unchanged.
+
 ## [3.2.0] — 2026-06-24
 
 ### Added — hook-injected context audit log (`pl_hook_events`, schema v3)

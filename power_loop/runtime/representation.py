@@ -178,7 +178,8 @@ class VerbatimRepresentation:
 @dataclass
 class ProjectedRepresentation:
     """Generic, deterministic, no-LLM per-send projection. Each send →
-    ``user`` row: ``{"human": [<user inputs>]}`` (a LIST — folded follow-ups preserved) +
+    ``user`` row: ``{"input": [<user/trigger inputs, verbatim>]}`` (a LIST — folded follow-ups
+    preserved; pre-3.3 rows used the key ``human``) +
     ``project`` row: ``{"tools": [...], "final_text": ...}``. Each tool call is summarized via its
     ``ToolDefinition.project`` hook when present, else a truncating fallback. Rendered to terse
     plain text with NO tool-protocol structure. (This is the old ``DefaultDeterministicProjector``
@@ -220,9 +221,13 @@ class ProjectedRepresentation:
         seqs = [r.seq for r in send_rows]
         rows: list[ProjectedRow] = []
         if users:
-            rows.append(
-                ProjectedRow("user", {"human": [_truncate(u.content, self.max_chars) for u in users]})
-            )
+            # The INPUT side of a send (the user/trigger turn) is kept VERBATIM — it is the actual
+            # conversation content, it is short relative to tool output, and truncating it would drop
+            # context the model genuinely needs. Only the assistant's WORK (tool args/results +
+            # final_text) is compressed, which is where the token savings actually are. Key is
+            # ``input`` (the input turn — not necessarily a human; a multi-agent host feeds another
+            # agent's message here); pre-3.3 rows used ``human`` and are still read (see render()).
+            rows.append(ProjectedRow("user", {"input": [u.content for u in users]}))
         rows.append(
             ProjectedRow(
                 "project",
@@ -269,9 +274,14 @@ class ProjectedRepresentation:
         for r in rows:
             si = r.send_index
             if r.kind == "user":
-                humans = (r.content or {}).get("human") or []
+                content = r.content or {}
+                # ``input`` since 3.3; ``human`` is the pre-3.3 key — read both so old projection
+                # rows still render correctly after upgrade.
+                inputs = content.get("input")
+                if inputs is None:
+                    inputs = content.get("human") or []
                 tag = f"[#{si}] " if si is not None else ""
-                out.append({"role": "user", "content": tag + "\n".join(str(h) for h in humans)})
+                out.append({"role": "user", "content": tag + "\n".join(str(h) for h in inputs)})
             elif r.kind == "project":
                 tag = f"#{si} " if si is not None else ""
                 out.append({"role": "assistant", "content": tag + self._render_project(r.content)})
