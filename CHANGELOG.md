@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+## [3.6.0] — 2026-06-26
+
+Additive, backward-compatible (minor bump): no STABLE API removed/renamed, no schema change.
+
+### Added
+
+- **`note_list` default tool.** A read/list counterpart to `note_add` / `note_update` / `note_delete`:
+  returns the agent's persistent notes rendered with their `#id`, `[pinned]` flag, and content
+  (`run_note_list` → `store.list_notes` + `render_notes`). This lets an agent read its own memory —
+  and obtain the `#id`s needed for `note_update` / `note_delete` — **via an explicit, transcript-visible
+  tool call**, instead of depending on the (optional) `MemoryRecallHook` auto-injecting "YOUR NOTES"
+  every turn. Registered in `DEFAULT_TOOL_DEFINITIONS` / `DEFAULT_TOOL_HANDLERS` (so it's in the `full`
+  preset and selectable via `include=[...]`); no params. The `note_add` description no longer asserts
+  notes are "shown at the start of every turn" (that only holds when the recall hook is enabled) and
+  `note_update` / `note_delete` now point at `note_list` for the `#id`. The recall hook itself is
+  unchanged (still auto-registered when `memory` is set + `builtin_memory_hook=True`).
+
 ## [3.5.0] — 2026-06-25
 
 Systematic-review remediation (BUG_REVIEW_3.4.md): 7/7 HIGH + 14/15 MEDIUM + 30/32 LOW findings

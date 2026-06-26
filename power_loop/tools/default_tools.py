@@ -1471,6 +1471,19 @@ async def run_note_delete(note_id: int) -> str:
     return f"note #{note_id} deleted ({await store.count_notes(sid)} remaining)"
 
 
+async def run_note_list() -> str:
+    """Read back the agent's persistent notes (rendered with #id, pinned flag, content), so the
+    agent can inspect its memory and get the #ids for note_update / note_delete WITHOUT relying on
+    the (optional) memory-recall hook auto-injecting them."""
+    from power_loop.runtime.notes import render_notes
+
+    store, sid = _notes_store_and_session()
+    notes = await store.list_notes(sid)
+    if not notes:
+        return "(no notes yet — use note_add to remember durable facts, preferences, or task state)"
+    return render_notes(notes, policy=_notes_policy())
+
+
 def _timers_store_and_session() -> tuple[Any, str]:
     store, sid = _current_store_and_session()
     if store is None or sid is None:
@@ -1684,6 +1697,10 @@ async def _h_note_delete(**kw: Any) -> Any:
     return await run_note_delete(kw["note_id"])
 
 
+async def _h_note_list(**kw: Any) -> Any:
+    return await run_note_list()
+
+
 async def _h_schedule_wakeup(**kw: Any) -> Any:
     return await run_schedule_wakeup(kw["delay_seconds"], kw["note"], kw.get("every_seconds"))
 
@@ -1740,6 +1757,7 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "note_add": _h_note_add,
     "note_update": _h_note_update,
     "note_delete": _h_note_delete,
+    "note_list": _h_note_list,
     "schedule_wakeup": _h_schedule_wakeup,
     "list_wakeups": _h_list_wakeups,
     "cancel_wakeup": _h_cancel_wakeup,

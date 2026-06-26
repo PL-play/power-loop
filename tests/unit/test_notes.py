@@ -277,3 +277,50 @@ async def test_note_tool_writes_and_next_send_injects(store: SessionStore) -> No
     assert len(injected) == 1
     assert "BLUEBIRD" in injected[0]["content"]
     await loop.aclose()
+
+
+# ── note_list tool (read-back without the recall hook) ───────────────────────
+async def test_note_list_tool_reads_back_notes(store: SessionStore) -> None:
+    """note_list returns the rendered notes (with #id, [pinned], content) so an agent can read
+    its memory + get ids for update/delete WITHOUT relying on the optional recall hook."""
+    from power_loop.core.agent_context import (
+        reset_current_loop,
+        reset_session_id,
+        set_current_loop,
+        set_session_id,
+    )
+    from power_loop.tools.default_tools import run_note_list
+
+    class _FakeLoop:
+        def __init__(self, s: SessionStore) -> None:
+            self.store = s
+            self.config = None
+
+    sid = await store.create_session()
+    tok_l = set_current_loop(_FakeLoop(store))  # type: ignore[arg-type]
+    tok_s = set_session_id(sid)
+    try:
+        # No notes yet → guidance, not an empty/blank result.
+        assert "no notes yet" in await run_note_list()
+
+        await store.add_note(sid, "remember the anniversary")
+        pinned = await store.add_note(sid, "prefers tea")
+        await store.update_note(sid, pinned.note_id, pinned=True)
+
+        out = await run_note_list()
+        assert "remember the anniversary" in out
+        assert "prefers tea" in out
+        assert "#1" in out and f"#{pinned.note_id}" in out
+        assert "[pinned]" in out
+    finally:
+        reset_session_id(tok_s)
+        reset_current_loop(tok_l)
+
+
+def test_note_list_registered_as_default_tool() -> None:
+    from power_loop.tools.default_manifest import FULL_TOOL_NAMES, get_tool_definitions
+    from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+
+    assert "note_list" in DEFAULT_TOOL_HANDLERS
+    assert "note_list" in FULL_TOOL_NAMES
+    assert "note_list" in {d.name for d in get_tool_definitions(include=["note_list"])}
