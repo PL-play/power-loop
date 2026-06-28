@@ -117,7 +117,9 @@ class HistoryProjector(Protocol):
 
 def _truncate(s: Any, max_chars: int) -> str:
     t = "" if s is None else str(s)
-    return t if len(t) <= max_chars else t[:max_chars] + "…"
+    if max_chars <= 0 or len(t) <= max_chars:  # max_chars <= 0 → no truncation (unlimited)
+        return t
+    return t[:max_chars] + "…"
 
 
 def _parse_args(raw: Any) -> Any:
@@ -225,7 +227,7 @@ class DefaultDeterministicProjector:
     terse plain text with NO tool-protocol structure."""
 
     version: int = 1
-    max_chars: int = 300  # per-field truncation budget
+    max_chars: int = 300  # per-field truncation budget; <= 0 = no truncation (unlimited)
     keep_last_sends: int = 4  # most-recent sends ALWAYS kept individually (never folded)
     #: Fold older sends into a compact row once the rendered projected prefix reaches
     #: ``loop max_tokens × trigger_ratio`` (mirrors DefaultCompactor's policy) — token-driven,
@@ -244,8 +246,7 @@ class DefaultDeterministicProjector:
             keep_last_sends=self.keep_last_sends,
             trigger_ratio=self.trigger_ratio,
         )
-        if self.max_chars <= 0:
-            raise ValueError(f"max_chars must be > 0; got {self.max_chars!r}")
+        # max_chars <= 0 → no truncation (unlimited); any int is accepted.
         if self.max_compact_chars < 0:
             raise ValueError(
                 f"max_compact_chars must be >= 0 (0 = unbounded); got {self.max_compact_chars!r}"

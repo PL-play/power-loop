@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+## [3.7.0] — 2026-06-28
+
+Additive, backward-compatible (minor bump): no STABLE API removed/renamed, no schema change.
+
+### Changed
+
+- **`max_chars <= 0` now means "no truncation" (unlimited)** for `ProjectedRepresentation` and
+  `DefaultDeterministicProjector` (and the shared `_truncate` helper). Previously `max_chars <= 0` was
+  rejected at construction (`ValueError`). It is now accepted and disables the library's per-field
+  truncation entirely — so a host that does its own (e.g. a whitelist-aware, per-tool) limiting can
+  turn the library cap off cleanly instead of passing a large sentinel. Positive `max_chars` is
+  unchanged. Purely permissive: code that passed a positive value behaves identically.
+
 ## [3.6.0] — 2026-06-26
 
 Additive, backward-compatible (minor bump): no STABLE API removed/renamed, no schema change.

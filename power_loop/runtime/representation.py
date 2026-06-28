@@ -93,7 +93,9 @@ class Representation(Protocol):
 
 def _truncate(s: Any, max_chars: int) -> str:
     t = "" if s is None else str(s)
-    return t if len(t) <= max_chars else t[:max_chars] + "…"
+    if max_chars <= 0 or len(t) <= max_chars:  # max_chars <= 0 → no truncation (unlimited)
+        return t
+    return t[:max_chars] + "…"
 
 
 def _parse_args(raw: Any) -> Any:
@@ -143,8 +145,8 @@ def _validate_representation_params(*, version: int, max_chars: int | None = Non
         raise ValueError(
             f"representation version must be >= 1 (the compatibility key); got {version!r}"
         )
-    if max_chars is not None and max_chars <= 0:
-        raise ValueError(f"max_chars must be > 0; got {max_chars!r}")
+    # max_chars <= 0 is now VALID and means "no truncation" (unlimited) — let a host disable the
+    # library's per-field cap and do its own limiting. Any int is accepted.
 
 
 def _render_compact_row(row: ProjectMessageRow) -> LoopMessage:
@@ -249,7 +251,7 @@ class ProjectedRepresentation:
 
     kind: str = "projection"
     version: int = 1
-    max_chars: int = 300  # per-field truncation budget
+    max_chars: int = 300  # per-field truncation budget; <= 0 = no truncation (unlimited)
     #: Format knobs for render() — see :class:`ProjectionRenderConfig`. A plain dict is coerced (so a
     #: host can pass JSON config straight through). Subclasses can ALSO override the render_* methods.
     render_config: ProjectionRenderConfig = field(default_factory=ProjectionRenderConfig)

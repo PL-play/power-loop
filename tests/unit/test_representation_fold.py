@@ -428,5 +428,15 @@ def test_fold_rejects_bad_summary_max_tokens():
 def test_representation_rejects_bad_version():
     with pytest.raises(ValueError):
         VerbatimRepresentation(version=0)
-    with pytest.raises(ValueError):
-        ProjectedRepresentation(max_chars=0)
+
+
+def test_representation_max_chars_zero_means_unlimited():
+    # max_chars <= 0 is VALID and disables the library's per-field truncation (a host can do its own).
+    from power_loop.runtime.representation import _truncate
+
+    ProjectedRepresentation(max_chars=0)
+    ProjectedRepresentation(max_chars=-5)
+    big = "x" * 5000
+    assert _truncate(big, 0) == big  # unlimited
+    assert _truncate(big, -1) == big  # unlimited
+    assert _truncate(big, 10) == "x" * 10 + "…"  # positive cap unchanged

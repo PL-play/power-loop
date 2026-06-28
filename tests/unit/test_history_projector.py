@@ -292,12 +292,13 @@ def test_projector_params_validated_on_construction() -> None:
         DefaultDeterministicProjector(keep_last_sends=-1)
     with pytest.raises(ValueError, match="version"):
         DefaultDeterministicProjector(version=0)
-    with pytest.raises(ValueError, match="max_chars"):
-        DefaultDeterministicProjector(max_chars=0)
     with pytest.raises(ValueError, match="max_compact_chars"):
         DefaultDeterministicProjector(max_compact_chars=-1)
-    # valid edge values are accepted (ratio==1, keep==0, max_compact_chars==0 = unbounded)
-    DefaultDeterministicProjector(trigger_ratio=1.0, keep_last_sends=0, max_compact_chars=0)
+    # valid edge values are accepted (ratio==1, keep==0, max_chars<=0 = no truncation,
+    # max_compact_chars==0 = unbounded)
+    DefaultDeterministicProjector(
+        trigger_ratio=1.0, keep_last_sends=0, max_chars=0, max_compact_chars=0
+    )
 
 
 def test_compact_bounded_by_max_compact_chars() -> None:
