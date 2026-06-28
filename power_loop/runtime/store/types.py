@@ -97,6 +97,9 @@ class SessionStatsRow:
     first_send_at: int | None
     last_send_at: int | None
     updated_at: int
+    #: Prompt cache-read tokens (v5). Default 0 so the legacy SQLite store (which doesn't track it)
+    #: still constructs the row.
+    cached_tokens: int = 0
 
 
 @dataclass

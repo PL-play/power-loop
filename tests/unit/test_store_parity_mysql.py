@@ -18,6 +18,7 @@ import pytest
 pytest.importorskip("aiomysql")
 
 from power_loop.runtime.store.factory import open_store  # noqa: E402
+from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION  # noqa: E402
 from tests.unit.test_store_parity import SCENARIOS, run_parity  # noqa: E402
 
 MYSQL_DSN = os.environ.get(
@@ -124,7 +125,7 @@ async def test_mysql_v3_to_v4_widens_text_columns() -> None:
 
     store2 = await open_store(MYSQL_DSN, table_prefix=prefix)  # → runs the v3→v4 migration
     try:
-        assert store2.schema_version == 4
+        assert store2.schema_version == CURRENT_SCHEMA_VERSION
         assert await _content_data_type(store2._db, msgs) == "longtext"  # widened by migration
         await store2.create_session(session_id="m")
         await store2.append_message("m", role="assistant", content=big, round_index=0)
@@ -137,7 +138,7 @@ async def test_mysql_v3_to_v4_widens_text_columns() -> None:
 
     store3 = await open_store(MYSQL_DSN, table_prefix=prefix)  # migration re-runs cleanly
     try:
-        assert store3.schema_version == 4
+        assert store3.schema_version == CURRENT_SCHEMA_VERSION
         for n in _DATA_TABLES + ("schema_migrations",):
             await store3._db.execute(f"DROP TABLE IF EXISTS {prefix}{n}")
     finally:

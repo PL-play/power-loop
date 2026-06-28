@@ -101,7 +101,7 @@ class SqliteDialect:
                 PRIMARY KEY (session_id, compact_seq))""",
             f"""CREATE TABLE IF NOT EXISTS {p}usage_rounds (
                 session_id TEXT NOT NULL, round_index INTEGER NOT NULL, prompt_tokens INTEGER,
-                completion_tokens INTEGER, total_tokens INTEGER, model TEXT,
+                completion_tokens INTEGER, total_tokens INTEGER, cached_tokens INTEGER, model TEXT,
                 created_at INTEGER NOT NULL, PRIMARY KEY (session_id, round_index))""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_state (
                 session_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL DEFAULT 1,
@@ -125,6 +125,7 @@ class SqliteDialect:
                 rounds INTEGER NOT NULL DEFAULT 0, llm_calls INTEGER NOT NULL DEFAULT 0,
                 tool_calls INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_tokens INTEGER NOT NULL DEFAULT 0,
                 first_send_at INTEGER, last_send_at INTEGER, updated_at INTEGER NOT NULL)""",
             f"""CREATE TABLE IF NOT EXISTS {p}timers (
                 session_id TEXT NOT NULL, timer_id INTEGER NOT NULL, due_at INTEGER NOT NULL,
@@ -243,7 +244,7 @@ class PostgresDialect:
                 PRIMARY KEY (session_id, compact_seq))""",
             f"""CREATE TABLE IF NOT EXISTS {p}usage_rounds (
                 session_id TEXT NOT NULL, round_index BIGINT NOT NULL, prompt_tokens BIGINT,
-                completion_tokens BIGINT, total_tokens BIGINT, model TEXT,
+                completion_tokens BIGINT, total_tokens BIGINT, cached_tokens BIGINT, model TEXT,
                 created_at BIGINT NOT NULL, PRIMARY KEY (session_id, round_index))""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_state (
                 session_id TEXT PRIMARY KEY, next_seq BIGINT NOT NULL DEFAULT 1,
@@ -267,6 +268,7 @@ class PostgresDialect:
                 rounds BIGINT NOT NULL DEFAULT 0, llm_calls BIGINT NOT NULL DEFAULT 0,
                 tool_calls BIGINT NOT NULL DEFAULT 0, prompt_tokens BIGINT NOT NULL DEFAULT 0,
                 completion_tokens BIGINT NOT NULL DEFAULT 0, total_tokens BIGINT NOT NULL DEFAULT 0,
+                cached_tokens BIGINT NOT NULL DEFAULT 0,
                 first_send_at BIGINT, last_send_at BIGINT, updated_at BIGINT NOT NULL)""",
             f"""CREATE TABLE IF NOT EXISTS {p}timers (
                 session_id TEXT NOT NULL, timer_id BIGINT NOT NULL, due_at BIGINT NOT NULL,
@@ -372,7 +374,7 @@ class MySQLDialect:
                 PRIMARY KEY (session_id, compact_seq)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}usage_rounds (
                 session_id VARCHAR(255) NOT NULL, round_index BIGINT NOT NULL, prompt_tokens BIGINT,
-                completion_tokens BIGINT, total_tokens BIGINT, model VARCHAR(255),
+                completion_tokens BIGINT, total_tokens BIGINT, cached_tokens BIGINT, model VARCHAR(255),
                 created_at BIGINT NOT NULL, PRIMARY KEY (session_id, round_index)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_state (
                 session_id VARCHAR(255) NOT NULL, next_seq BIGINT NOT NULL DEFAULT 1,
@@ -395,6 +397,7 @@ class MySQLDialect:
                 rounds BIGINT NOT NULL DEFAULT 0, llm_calls BIGINT NOT NULL DEFAULT 0,
                 tool_calls BIGINT NOT NULL DEFAULT 0, prompt_tokens BIGINT NOT NULL DEFAULT 0,
                 completion_tokens BIGINT NOT NULL DEFAULT 0, total_tokens BIGINT NOT NULL DEFAULT 0,
+                cached_tokens BIGINT NOT NULL DEFAULT 0,
                 first_send_at BIGINT, last_send_at BIGINT, updated_at BIGINT NOT NULL,
                 PRIMARY KEY (session_id)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}timers (

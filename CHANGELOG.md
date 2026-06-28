@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+## [3.8.0] — 2026-06-28
+
+Additive, backward-compatible (minor bump): a new store schema version (4 → 5) with an automatic,
+idempotent `ALTER … ADD COLUMN` migration; no STABLE API removed or renamed.
+
+### Added
+- **Cached (prompt cache-read) token accounting.** `cached_tokens` is now captured from each LLM
+  call's usage (`cache_read_tokens`) and persisted to the store's `usage_rounds` (per round) and
+  `session_stats` (cumulative). Surfaced on `SessionStatsRow.cached_tokens` (default `0`).
+  `Store.record_usage` gained an optional `cached_tokens` parameter. The store schema bumps to v5;
+  opening an existing store runs a single `ALTER TABLE … ADD COLUMN cached_tokens` on `usage_rounds`
+  + `session_stats` across SQLite / PostgreSQL / MySQL. Real-LLM-verified (`tests/real`).
+
 ## [3.7.0] — 2026-06-28
 
 Additive, backward-compatible (minor bump): no STABLE API removed/renamed, no schema change.

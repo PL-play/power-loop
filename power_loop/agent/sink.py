@@ -377,6 +377,9 @@ class SQLiteSink:
                     usage.get("completion_tokens") or usage.get("output")
                 ),
                 total_tokens=_int_or_none(usage.get("total_tokens")),
+                cached_tokens=_int_or_none(
+                    usage.get("cache_read_tokens") or usage.get("cached_tokens")
+                ),
             )
 
 

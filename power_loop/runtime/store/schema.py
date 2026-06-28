@@ -67,7 +67,9 @@ def validate_table_prefix(prefix: str) -> str:
 #: Bump + append a migration step for ANY schema change.
 #: v2 (2026-06): adds the ``{prefix}project_messages`` table (send-context projection).
 #: v3 (2026-06): adds the ``{prefix}hook_events`` table (ephemeral hook-augmentation audit log).
-CURRENT_SCHEMA_VERSION = 4
+#: v4 (2026-06): widen MySQL free-text/JSON columns TEXT→LONGTEXT.
+#: v5 (2026-06): adds ``cached_tokens`` (prompt cache-read tokens) to usage_rounds + session_stats.
+CURRENT_SCHEMA_VERSION = 5
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -118,6 +120,16 @@ async def _migration_steps(
         # idempotent. (Fresh stores already provision LONGTEXT via Dialect.ddl.)
         if db.dialect.name == "mysql":
             steps += db.dialect.widen_text_columns_ddl(prefix)
+    if from_version < 5:
+        # v4 → v5: add cached_tokens (prompt cache-read tokens) to usage_rounds + session_stats.
+        # ALTER … ADD COLUMN has no portable IF NOT EXISTS, so probe the catalog on the open tx.
+        int_t = "INTEGER" if db.dialect.name == "sqlite" else "BIGINT"
+        if not await _column_exists(tx, db.dialect.name, f"{prefix}usage_rounds", "cached_tokens"):
+            steps.append(f"ALTER TABLE {prefix}usage_rounds ADD COLUMN cached_tokens {int_t}")
+        if not await _column_exists(tx, db.dialect.name, f"{prefix}session_stats", "cached_tokens"):
+            steps.append(
+                f"ALTER TABLE {prefix}session_stats ADD COLUMN cached_tokens {int_t} NOT NULL DEFAULT 0"
+            )
     return steps
 
 
@@ -137,6 +149,12 @@ def migration_ddl_for_display(db: Database, prefix: str, *, from_version: int) -
         steps += db.dialect.hook_events_ddl(prefix)
     if from_version < 4 and db.dialect.name == "mysql":
         steps += db.dialect.widen_text_columns_ddl(prefix)
+    if from_version < 5:
+        int_t = "INTEGER" if db.dialect.name == "sqlite" else "BIGINT"
+        steps.append(f"ALTER TABLE {prefix}usage_rounds ADD COLUMN cached_tokens {int_t}")
+        steps.append(
+            f"ALTER TABLE {prefix}session_stats ADD COLUMN cached_tokens {int_t} NOT NULL DEFAULT 0"
+        )
     return steps
 
 

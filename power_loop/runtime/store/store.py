@@ -146,7 +146,7 @@ _EXPORT_TABLES: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
         "after_tokens", "round_index", "created_at")),
     ("usage_rounds", lambda t: t.usage_rounds, (
         "session_id", "round_index", "prompt_tokens", "completion_tokens", "total_tokens",
-        "model", "created_at")),
+        "cached_tokens", "model", "created_at")),
     ("session_runtime_state", lambda t: t.session_runtime_state, (
         "session_id", "state_key", "value_json", "updated_at")),
     ("timers", lambda t: t.timers, (
@@ -156,7 +156,8 @@ _EXPORT_TABLES: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
         "session_id", "note_id", "content", "pinned", "created_at", "updated_at")),
     ("session_stats", lambda t: t.session_stats, (
         "session_id", "sends", "rounds", "llm_calls", "tool_calls", "prompt_tokens",
-        "completion_tokens", "total_tokens", "first_send_at", "last_send_at", "updated_at")),
+        "completion_tokens", "total_tokens", "cached_tokens", "first_send_at", "last_send_at",
+        "updated_at")),
 )
 
 
@@ -1143,6 +1144,7 @@ class SessionStore:
         prompt_tokens: int | None,
         completion_tokens: int | None,
         total_tokens: int | None,
+        cached_tokens: int | None = None,
         model: str | None = None,
     ) -> None:
         """Record per-round token usage. Legacy used ``INSERT OR REPLACE`` keyed on
@@ -1151,14 +1153,15 @@ class SessionStore:
         sql = self._db.dialect.upsert(
             self.t.usage_rounds,
             ("session_id", "round_index"),
-            ("prompt_tokens", "completion_tokens", "total_tokens", "model", "created_at"),
+            ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "model",
+             "created_at"),
         )
         async with self._db.transaction() as tx:
             await tx.execute(
                 sql,
                 (
                     session_id, round_index, prompt_tokens, completion_tokens,
-                    total_tokens, model, _now_ms(),
+                    total_tokens, cached_tokens, model, _now_ms(),
                 ),
             )
 
@@ -1172,7 +1175,7 @@ class SessionStore:
         tool_calls: int = 0,
     ) -> None:
         """Cumulative per-session accounting, bumped once per finished send. On conflict
-        the seven counters ACCUMULATE (``col = col + new``), ``last_send_at``/``updated_at``
+        the eight counters ACCUMULATE (``col = col + new``), ``last_send_at``/``updated_at``
         OVERWRITE, and ``first_send_at`` is INSERT-ONLY (preserved on conflict, matching
         legacy which omits it from the ON CONFLICT SET). ``sends`` accumulates by 1."""
         now = _now_ms()
@@ -1182,7 +1185,7 @@ class SessionStore:
             ("last_send_at", "updated_at"),
             add_cols=(
                 "sends", "rounds", "llm_calls", "tool_calls",
-                "prompt_tokens", "completion_tokens", "total_tokens",
+                "prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens",
             ),
             insert_only_cols=("first_send_at",),
         )
@@ -1198,6 +1201,7 @@ class SessionStore:
             int(usage.get("prompt_tokens") or 0),    # add: prompt_tokens
             int(usage.get("completion_tokens") or 0),  # add: completion_tokens
             int(usage.get("total_tokens") or 0),     # add: total_tokens
+            int(usage.get("cache_read_tokens") or usage.get("cached_tokens") or 0),  # add: cached_tokens
             now,                                     # insert-only: first_send_at
         )
         async with self._db.transaction() as tx:
@@ -1650,7 +1654,8 @@ def _row_to_stats(row: Row) -> SessionStatsRow:
         session_id=row["session_id"], sends=row["sends"], rounds=row["rounds"],
         llm_calls=row["llm_calls"], tool_calls=row["tool_calls"],
         prompt_tokens=row["prompt_tokens"], completion_tokens=row["completion_tokens"],
-        total_tokens=row["total_tokens"], first_send_at=row["first_send_at"],
+        total_tokens=row["total_tokens"], cached_tokens=row["cached_tokens"],
+        first_send_at=row["first_send_at"],
         last_send_at=row["last_send_at"], updated_at=row["updated_at"],
     )
 
