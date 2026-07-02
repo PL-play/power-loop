@@ -219,3 +219,18 @@ async def test_default_registry_contains_all_manifest_tools(tmp_path: Path) -> N
     assert task_id or checked
 
     assert FILE_READ_STATE
+
+
+def test_looks_binary_accepts_utf8_cjk_and_flags_real_binary():
+    """Regression: read_file must not refuse valid UTF-8 / CJK / emoji text as 'binary'.
+    A Chinese file's bytes are mostly >126 (each char is 3 UTF-8 bytes); the old ASCII-ratio
+    heuristic wrongly flagged it, so agents couldn't read_file the (Chinese) skill references."""
+    from power_loop.tools.default_tools import _looks_binary
+
+    cjk = ("你好，世界！这是一份中文 Markdown。\n# 全局观\n含标点、emoji ✨ 和 JSON 片段。\n").encode("utf-8") * 30
+    assert _looks_binary(cjk) is False
+    assert _looks_binary("✨🎉📋 全是 emoji 和中文".encode("utf-8") * 50) is False
+    assert _looks_binary(b"plain ascii text\nmore\n" * 50) is False
+    # Real binary still rejected.
+    assert _looks_binary(b"\x00\x01\x02 stuff") is True
+    assert _looks_binary(bytes(range(1, 32)) * 200) is True

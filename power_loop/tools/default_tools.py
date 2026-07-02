@@ -124,8 +124,21 @@ def _looks_binary(data: bytes) -> bool:
     if not data:
         return False
     sample = data[:4096]
-    textish = sum(byte in b"\n\r\t\b\f" or 32 <= byte <= 126 for byte in sample)
-    return textish / len(sample) < 0.70
+    # Fast path: mostly-ASCII text (incl. common whitespace) is clearly text.
+    ascii_ish = sum(byte in b"\n\r\t\b\f" or 32 <= byte <= 126 for byte in sample)
+    if ascii_ish / len(sample) >= 0.70:
+        return False
+    # Otherwise it may be NON-Latin UTF-8 text (CJK / emoji, whose bytes are mostly >126) —
+    # NOT binary. Decode leniently (a multibyte char truncated at the 4KB sample boundary is
+    # negligible) and flag as binary only if the text is littered with undecodable bytes
+    # (U+FFFD) or C0/C1 control chars (excluding normal whitespace), which real text lacks.
+    text = sample.decode("utf-8", errors="replace")
+    bad = sum(
+        1
+        for ch in text
+        if ch == "�" or ord(ch) == 0x7f or (ord(ch) < 32 and ch not in "\n\r\t\f\b")
+    )
+    return bad / len(text) > 0.15
 
 
 def _read_text(fp: Path, *, max_bytes: int | None = TEXT_FILE_MAX_BYTES) -> str:
