@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+## [3.8.1] — 2026-07-02
+
+Bugfix, backward-compatible (patch). No STABLE API change.
+
+### Fixed
+- **`read_file` no longer rejects valid UTF-8 / CJK text as "binary".** `_looks_binary` only
+  counted ASCII bytes (32–126), so a non-Latin UTF-8 file — e.g. a Chinese Markdown doc, whose
+  bytes are mostly >126 (3 per CJK char) — fell below the 0.70 text ratio and was refused with
+  "Refusing to read binary-looking file as text". It now keeps the ASCII fast-path, then accepts
+  non-Latin UTF-8 that decodes cleanly (few U+FFFD / control chars); genuine binary (NUL bytes,
+  control-char-heavy) is still rejected. Affects `read_file` and the attach/preview path.
+
 ## [3.8.0] — 2026-06-28
 
 Additive, backward-compatible (minor bump): a new store schema version (4 → 5) with an automatic,
