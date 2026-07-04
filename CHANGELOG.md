@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+## [3.10.0] — 2026-07-04
+
+Feature, backward-compatible (minor). No STABLE API break.
+
+### Added
+- **Per-call `max_rounds` override on `send()` / `follow_up()`** — run a single continuation with
+  a different round budget than `config.max_rounds`, without mutating the shared loop config
+  (applied via a per-run `dataclasses.replace(config, max_rounds=…)`, like the existing
+  `system_prompt` override). Use it for a short, bounded "finalize" turn (e.g. "before you stop,
+  update your memory / todo") separate from the main loop's budget. On `follow_up`'s STEERED path
+  (an in-flight loop) it is ignored — the running loop's own budget governs the drained message.
+  Adding a keyword-only param with a default to the STABLE `send`/`follow_up` is backward-compatible.
+
 ## [3.9.0] — 2026-07-04
 
 Feature, backward-compatible (minor). No STABLE API break.

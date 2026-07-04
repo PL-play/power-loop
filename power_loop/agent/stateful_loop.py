@@ -559,6 +559,7 @@ class StatefulAgentLoop:
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
         heal_pending: bool = False,
+        max_rounds: int | None = None,
     ) -> StatefulResult:
         """Append one user input to the session and run the loop.
 
@@ -596,7 +597,8 @@ class StatefulAgentLoop:
                 await self._raise_if_pending(sid)
             await self._persist_user_input(sid, user_input)
             return await self._run_loop(
-                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt
+                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+                max_rounds=max_rounds,
             )
 
     async def follow_up(
@@ -607,6 +609,7 @@ class StatefulAgentLoop:
         stop_event: CancellationLike = None,
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
+        max_rounds: int | None = None,
     ) -> StatefulResult | FollowUpQueued:
         """Steer an in-flight loop, or fall back to :meth:`send`.
 
@@ -617,6 +620,10 @@ class StatefulAgentLoop:
         clears the drained items.
 
         When the session is idle (lock not held), behaves like :meth:`send`.
+
+        ``max_rounds`` (per-call, idle path only): run this continuation with a different round
+        budget than ``config.max_rounds`` — e.g. a short bounded "finalize" turn. Ignored on the
+        STEERED path (an in-flight loop's own budget governs the drained follow-up).
         """
         sid = session_id
         self._raise_if_closing()
@@ -627,7 +634,8 @@ class StatefulAgentLoop:
             depth = await self._enqueue_follow_up(sid, user_input)
             return FollowUpQueued(session_id=sid, queue_depth=depth)
         return await self.send(
-            user_input, sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt
+            user_input, sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+            max_rounds=max_rounds,
         )
 
     def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
@@ -1202,6 +1210,7 @@ class StatefulAgentLoop:
         sink: SQLiteSink | None = None,
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
+        max_rounds: int | None = None,
     ) -> StatefulResult:
         store = await self._ensure_store()
         # 3.0: projection-style representation drives the derived-layer path; verbatim → None
@@ -1442,9 +1451,14 @@ class StatefulAgentLoop:
         effective_sp = system_prompt
         if effective_sp is None and session_row is not None and session_row.system_prompt:
             effective_sp = session_row.system_prompt
-        runtime_config = self.config
+        # Per-call config overrides (system_prompt, max_rounds) → a per-run copy; never mutate
+        # self.config (shared across concurrent sessions).
+        _overrides: dict[str, Any] = {}
         if effective_sp is not None and effective_sp != self.config.system_prompt:
-            runtime_config = replace(self.config, system_prompt=effective_sp)
+            _overrides["system_prompt"] = effective_sp
+        if max_rounds is not None and int(max_rounds) != self.config.max_rounds:
+            _overrides["max_rounds"] = max(1, int(max_rounds))
+        runtime_config = replace(self.config, **_overrides) if _overrides else self.config
         effective_registry = self._resolve_registry(tools)
 
         async with self._runner.session_async(session_id=sid):
