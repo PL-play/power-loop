@@ -944,6 +944,16 @@ class AgentPipeline:
                 llm_before.messages, _pre_hook_ids, _hook_audit_mode
             )
 
+            # Durable LLM_BEFORE injections (persist_messages): unlike the ephemeral, request-only
+            # edits to `messages` (captured by hook_audit above), each of these becomes a REAL turn —
+            # persisted to history + store with the round's send_index via the loop's own append path
+            # — and is added to this round's request tail. Used for injected turns that must survive
+            # the send (e.g. a periodic "you haven't called X in N rounds" reminder). Computed AFTER
+            # hook_audit so these durable rows don't get counted as ephemeral injections.
+            for _pm in llm_before.persist_messages:
+                await self._append_message(_pm, round_index=round_idx)
+                llm_before.messages.append(dict(_pm))
+
             if llm_before.directive == HookDirective.SHORT_CIRCUIT:
                 response = llm_before.output
                 if not isinstance(response, LLMResponse):

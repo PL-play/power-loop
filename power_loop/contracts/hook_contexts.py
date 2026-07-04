@@ -125,6 +125,13 @@ class LlmBeforeCtx(BaseHookCtx):
     Handler may modify any input field. ``messages`` is the fresh per-call list
     actually sent to the LLM — mutating it (e.g. appending an ephemeral memory
     block) never touches the loop's persisted history.
+
+    ``persist_messages`` is the durable counterpart: any message a handler appends
+    here becomes a REAL history/store row (stamped with the round's send_index, via
+    the same append path as the loop's own turns) AND is added to this round's
+    request. Use it for injected turns that must survive the send — e.g. a periodic
+    "you haven't called X in N rounds" reminder — as opposed to the ephemeral,
+    request-only edits to ``messages``. Appended in order, at the tail of the request.
     """
 
     messages: list[LoopMessage] = field(default_factory=list)
@@ -133,6 +140,8 @@ class LlmBeforeCtx(BaseHookCtx):
     max_tokens: int = 8000
     temperature: float = 0.0
     session_id: str | None = None
+    # Durable injections: persisted as real turns after LLM_BEFORE, then added to the request.
+    persist_messages: list[LoopMessage] = field(default_factory=list)
     # Handler output (for SHORT_CIRCUIT)
     output: LLMResponse | None = None
 

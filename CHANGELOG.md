@@ -8,7 +8,18 @@
 
 ## [Unreleased]
 
-## [3.8.1] — 2026-07-02
+## [3.9.0] — 2026-07-04
+
+Feature, backward-compatible (minor). No STABLE API break.
+
+### Added
+- **`LlmBeforeCtx.persist_messages`** — an `LLM_BEFORE` hook can now inject a *durable* turn, not
+  just an ephemeral one. Any message a handler appends to `ctx.persist_messages` becomes a REAL
+  history + store row (stamped with the round's `send_index`, via the loop's own append path) AND
+  is added to that round's request tail. This is the persisted counterpart to the request-only
+  edits to `ctx.messages` (which never touch history). Use it for injected turns that must survive
+  the send — e.g. a periodic "you haven't called tool X in N rounds" reminder. Adding a field with
+  a default to the STABLE `LlmBeforeCtx` dataclass is backward-compatible.
 
 Bugfix, backward-compatible (patch). No STABLE API change.
 
