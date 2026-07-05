@@ -8,6 +8,22 @@
 
 ## [Unreleased]
 
+## [3.13.0] — 2026-07-05
+
+Feature, backward-compatible (minor).
+
+### Added
+- **`ProjectedRepresentation.stamp_render_context(rows, current_send_index)` + `hot_window`** — a
+  recency-aware projection seam. The projection render is invoked PER-SEND (each send's rows in
+  isolation), so a `render_project_row` can't see recency or other sends on its own. Call this ONCE
+  over the full ordered project-row set before rendering: it stamps each row with a transient
+  `.recency` (0 = newest, keyed on ABSOLUTE `send_index` vs the cursor — so the fold's isolated
+  old-span render still classifies old sends as cold) and `.render_ctx` (`latest_key` = the newest
+  send per dedup key `k`, for cross-send read dedup; + `hot_window`). Rows without the stamp read as
+  cold (safe default). `stateful_loop` calls it in the projection context build; the base
+  `render_project_row` ignores the attrs (only a recency-aware override consumes them). `hot_window`
+  should be set == the fold's `keep_last_sends` so the recency and fold boundaries coincide.
+
 ## [3.12.0] — 2026-07-05
 
 Feature/fix, backward-compatible (minor).

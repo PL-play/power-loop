@@ -1374,6 +1374,14 @@ class StatefulAgentLoop:
                 if int(r.projector_version or 0) == version:
                     cur_proj_by_send.setdefault(r.send_index, []).append(r)
 
+            # Attach recency + cross-send-dedup context ONCE over the full ordered project-row set
+            # (the ONLY place with global send ordering + the current cursor). A recency-aware
+            # render_project_row then renders the most-recent sends richly and collapses older ones;
+            # the isolated old-span render inside the fold path is left unstamped → cold, so its
+            # summary still shrinks. No-op for representations without the method (verbatim).
+            if hasattr(projector, "stamp_render_context"):
+                projector.stamp_render_context(proj_rows, current_send_index)
+
             prefix_msgs: list[LoopMessage] = []
             # (1) folded-history compact: render via the projector when it matches the current
             # version, else render its covered send range verbatim from the audit log.

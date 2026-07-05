@@ -354,3 +354,27 @@ def test_mid_send_user_rows_interleave_into_timeline() -> None:
     pm = _pm(3, "project", proj.content)
     rendered = p.render([pm])[0]["content"]
     assert rendered.index("write_file") < rendered.index("[user] [系统] 20 轮") < rendered.index("send_message(")
+
+
+def test_stamp_render_context_recency_and_dedup() -> None:
+    """stamp_render_context sets absolute recency (0=newest) + a cross-send latest_key map so a
+    recency-aware render can classify hot/cold and drop reads superseded by a later send."""
+    from power_loop.runtime.representation import ProjectedRepresentation
+
+    rep = ProjectedRepresentation(hot_window=2)
+    rows = [
+        _pm(1, "project", {"tools": [{"name": "read_file", "s": "read a.md", "k": "read:a.md"}]}),
+        _pm(2, "project", {"tools": [{"name": "read_file", "s": "read a.md L9", "k": "read:a.md"},
+                                     {"name": "create_app", "s": "🚀 x"}]}),
+        _pm(3, "project", {"tools": [{"name": "send_message", "s": "hi"}]}),
+    ]
+    rep.stamp_render_context(rows, current_send_index=5)
+    # recency = current-1-send_index
+    assert [r.recency for r in rows] == [3, 2, 1]
+    # latest read of a.md is send 2 → send-1 row's read is superseded
+    lk = rows[0].render_ctx["latest_key"]
+    assert lk == {"read:a.md": 2}
+    assert rows[0].render_ctx["hot_window"] == 2
+    # unknown cursor → cold (safe for the fold's isolated-old-span render)
+    rep.stamp_render_context(rows, current_send_index=None)
+    assert all(r.recency >= 10**9 for r in rows)

@@ -258,6 +258,10 @@ class ProjectedRepresentation:
     #: Format knobs for render() — see :class:`ProjectionRenderConfig`. A plain dict is coerced (so a
     #: host can pass JSON config straight through). Subclasses can ALSO override the render_* methods.
     render_config: ProjectionRenderConfig = field(default_factory=ProjectionRenderConfig)
+    #: How many of the most-recent sends a recency-aware ``render_project_row`` should render richly
+    #: (older sends collapse to a stable one-liner). Set == the fold's ``keep_last_sends`` so the
+    #: recency boundary and the fold boundary coincide. Consumed by :meth:`stamp_render_context`.
+    hot_window: int = 4
 
     def __post_init__(self) -> None:
         _validate_representation_params(version=self.version, max_chars=self.max_chars)
@@ -359,6 +363,37 @@ class ProjectedRepresentation:
     # RECALL_SEND_NOTE tell it to use "the #N the summary shows", so the tags MUST be emitted (else
     # recall_send is undiscoverable); changing user_tag/project_tag away from a ``{n}`` form is at the
     # host's own risk.
+    def stamp_render_context(
+        self, rows: list[ProjectMessageRow], current_send_index: int | None
+    ) -> None:
+        """Attach transient RECENCY + cross-send-dedup context to project rows so a recency-aware
+        ``render_project_row`` can (a) render the most-recent ``hot_window`` sends richly and collapse
+        older ones, and (b) drop a stored tool entry whose dedup key ``k`` is superseded by the same
+        ``k`` in a LATER send (e.g. a file re-read; the raw original stays in pl_messages, recoverable
+        via recall_send).
+
+        Recency is keyed on ABSOLUTE ``send_index`` vs ``current_send_index`` — NOT list position —
+        so the fold's render of an ISOLATED old-span still classifies those sends as cold (else the
+        old span would look 'recent', render richly, and the fold summary would never shrink). Rows
+        are freshly hydrated per context build; these attrs never persist. Call ONCE over the full
+        ordered project-row list before per-send rendering. Base ``render_project_row`` ignores these;
+        only a recency-aware override consumes them (readers must ``getattr`` with a cold default)."""
+        latest_key: dict[str, int] = {}
+        for r in rows:
+            if r.kind != "project" or not isinstance(r.content, dict) or r.send_index is None:
+                continue
+            for t in r.content.get("tools") or []:
+                k = t.get("k") if isinstance(t, dict) else None
+                if k and r.send_index > latest_key.get(k, -1):
+                    latest_key[k] = r.send_index
+        cur = None if current_send_index is None else int(current_send_index)
+        for r in rows:
+            if r.send_index is None or cur is None:
+                r.recency = 10**9  # unknown position → cold (safe for the fold's isolated render)
+            else:
+                r.recency = max(0, cur - 1 - int(r.send_index))
+            r.render_ctx = {"latest_key": latest_key, "hot_window": int(self.hot_window)}
+
     def render(self, rows: list[ProjectMessageRow]) -> list[LoopMessage]:
         out: list[LoopMessage] = []
         for r in rows:
