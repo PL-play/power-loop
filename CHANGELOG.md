@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+## [3.12.0] — 2026-07-05
+
+Feature/fix, backward-compatible (minor).
+
+### Changed
+- **`ProjectedRepresentation` keeps mid-send user rows in chronological position** — durable
+  mid-send injections (LLM_BEFORE `persist_messages` reminders, COMPLETE_DECIDE finalize prompts,
+  drained steering follow-ups) used to be folded into the send's single `{"input": [...]}` list,
+  which rewrote history: the NEXT send's projected context showed every mid-run reminder as if it
+  arrived before the work started. Now only user rows BEFORE the first assistant turn form the
+  input; later user rows appear in the `tools` timeline as `{"name": "__user__", "text": ...}`
+  entries at their real position (rendered as `[user] …` lines). Hosts with custom save/render
+  sources see the new entries flow through the tools list; hosts aligning tool entries by index
+  must skip `__user__` entries. Existing stored project rows are unaffected (additive; only new
+  sends produce interleaved entries). The deprecated 2.x `DefaultDeterministicProjector` is
+  unchanged.
+
 ## [3.11.1] — 2026-07-05
 
 Fix, backward-compatible (patch).

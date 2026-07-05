@@ -237,10 +237,13 @@ class ProjectionRenderConfig:
 @dataclass
 class ProjectedRepresentation:
     """Generic, deterministic, no-LLM per-send projection. Each send →
-    ``user`` row: ``{"input": [<user/trigger inputs, verbatim>]}`` (a LIST — folded follow-ups
-    preserved; pre-3.3 rows used the key ``human``) +
+    ``user`` row: ``{"input": [<user/trigger inputs before the first assistant turn, verbatim>]}``
+    (a LIST; pre-3.3 rows used the key ``human``) +
     ``project`` row: ``{"tools": [...], "final_text": ...}``. Each tool call is summarized via its
-    ``ToolDefinition.project`` hook when present, else a truncating fallback. Rendered to terse
+    ``ToolDefinition.project`` hook when present, else a truncating fallback. MID-SEND user rows
+    (durable reminder/finalize injections, drained steering follow-ups) appear in the ``tools``
+    timeline as ``{"name": "__user__", "text": ...}`` entries at their chronological position
+    (3.12 — previously they were folded into the input list, rewriting history). Rendered to terse
     plain text with NO tool-protocol structure. (This is the old ``DefaultDeterministicProjector``
     MINUS its fold knobs/``compact()`` — folding now lives on :class:`FoldStrategy`.)
 
@@ -264,7 +267,6 @@ class ProjectedRepresentation:
     def project_send(
         self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None
     ) -> ProjectedSend:
-        users = [r for r in send_rows if r.role == "user"]
         # Tool results keyed by tool_call_id, preserving ORDER and DUPLICATES (a multimap of FIFO
         # queues): a malformed/imported/resumed transcript can repeat or omit an id, so a plain
         # dict would silently collapse two results onto one id (and drop the other).
@@ -273,10 +275,27 @@ class ProjectedRepresentation:
             if r.role == "tool":
                 results.setdefault(r.tool_call_id or "", deque()).append(r.content)
         tools: list[dict[str, Any]] = []
+        inputs: list[str | None] = []
         final_text: str | None = None
+        # One CHRONOLOGICAL pass: user rows BEFORE the first assistant turn are the send's
+        # input; user rows appearing MID-SEND (durable LLM_BEFORE injections like starvation
+        # reminders — 3.9.0 —, COMPLETE_DECIDE finalize prompts — 3.11.0 —, drained steering
+        # follow-ups) are interleaved into the work timeline as ``__user__`` entries at their
+        # real position. Folding them all into the input list (the pre-3.12 behavior) rewrote
+        # history: the NEXT send's context showed every mid-run reminder as if it arrived
+        # before the work started.
+        seen_assistant = False
         for r in send_rows:
+            if r.role == "user":
+                if seen_assistant:
+                    # Verbatim like the input (conversation content, not tool output).
+                    tools.append({"name": "__user__", "text": r.content})
+                else:
+                    inputs.append(r.content)
+                continue
             if r.role != "assistant":
                 continue
+            seen_assistant = True
             if r.content:
                 final_text = r.content  # last non-empty assistant text is the send's output
             for tc in (r.tool_calls or []):
@@ -289,14 +308,14 @@ class ProjectedRepresentation:
                 tools.append(self._project_tool(name, args, result, tool_registry))
         seqs = [r.seq for r in send_rows]
         rows: list[ProjectedRow] = []
-        if users:
+        if inputs:
             # The INPUT side of a send (the user/trigger turn) is kept VERBATIM — it is the actual
             # conversation content, it is short relative to tool output, and truncating it would drop
             # context the model genuinely needs. Only the assistant's WORK (tool args/results +
             # final_text) is compressed, which is where the token savings actually are. Key is
             # ``input`` (the input turn — not necessarily a human; a multi-agent host feeds another
             # agent's message here); pre-3.3 rows used ``human`` and are still read (see render()).
-            rows.append(ProjectedRow("user", {"input": [u.content for u in users]}))
+            rows.append(ProjectedRow("user", {"input": inputs}))
         rows.append(
             ProjectedRow(
                 "project",
@@ -404,6 +423,10 @@ class ProjectedRepresentation:
 
     def _render_tool(self, t: dict[str, Any]) -> str:
         name = t.get("name", "?")
+        if name == "__user__":
+            # A mid-send user injection (reminder / finalize / steering) at its
+            # chronological position in the timeline — not a tool call.
+            return f"[user] {t.get('text') or ''}"
         rest = {k: v for k, v in (t or {}).items() if k != "name"}
         if not rest:
             return str(name)

@@ -321,3 +321,36 @@ def test_compact_unbounded_when_cap_disabled() -> None:
     c = p.compact(rows)
     assert c is not None and "recall_send" not in c.content["summary"]
     assert "#1 agent" in c.content["summary"]  # oldest retained too
+
+
+def test_mid_send_user_rows_interleave_into_timeline() -> None:
+    """3.12: durable mid-send user injections (starvation reminders, finalize
+    prompts, drained steering) keep their chronological position as __user__
+    timeline entries instead of being folded into the input list (which rewrote
+    history — the next send saw every reminder as if it arrived up front)."""
+    from power_loop.runtime.representation import ProjectedRepresentation
+
+    p = ProjectedRepresentation()
+    rows = [
+        _mr(1, "user", "build the app"),
+        _mr(2, "assistant", "", tool_calls=[_tc("c1", "write_file", '{"path": "a.json"}')]),
+        _mr(3, "tool", "wrote", tool_call_id="c1", name="write_file"),
+        _mr(4, "user", "[系统] 20 轮没送达任何内容，报个进度。"),
+        _mr(5, "assistant", "", tool_calls=[_tc("c2", "send_message", '{"text": "进度"}')]),
+        _mr(6, "tool", "delivered", tool_call_id="c2", name="send_message"),
+        _mr(7, "user", "[系统] 收尾自查。"),
+        _mr(8, "assistant", "all done"),
+    ]
+    out = p.project_send(rows, send_index=3, tool_registry=None)
+    user_rows = [r for r in out.rows if r.kind == "user"]
+    proj = next(r for r in out.rows if r.kind == "project")
+    # Only the trigger turn is the input.
+    assert user_rows[0].content["input"] == ["build the app"]
+    names = [t["name"] for t in proj.content["tools"]]
+    assert names == ["write_file", "__user__", "send_message", "__user__"]
+    assert proj.content["tools"][1]["text"].startswith("[系统] 20 轮")
+    assert proj.content["tools"][3]["text"] == "[系统] 收尾自查。"
+    # Render keeps chronology and shows injections as [user] lines, not tool calls.
+    pm = _pm(3, "project", proj.content)
+    rendered = p.render([pm])[0]["content"]
+    assert rendered.index("write_file") < rendered.index("[user] [系统] 20 轮") < rendered.index("send_message(")
