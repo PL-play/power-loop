@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+## [3.13.1] — 2026-07-05
+
+Fix, backward-compatible (patch).
+
+### Fixed
+- **Fold-trigger token estimate now matches the live hot/cold render** — in projection mode
+  `_plan_and_run_projection_fold` rendered its trigger snapshot WITHOUT stamping recency, so the
+  kept-recent sends were estimated at COLD size while the real prompt renders them HOT — the
+  estimate under-counted and the fold fired late (risking context overflow before folding). It now
+  stamps the snapshot (recency keyed on the live cursor) before the estimate render, so the trigger
+  fires against the true prompt size. The isolated fold-summary render is unaffected (its span is
+  all old → cold regardless).
+
 ## [3.13.0] — 2026-07-05
 
 Feature, backward-compatible (minor).

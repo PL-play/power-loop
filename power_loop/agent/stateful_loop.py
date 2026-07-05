@@ -1729,6 +1729,11 @@ class StatefulAgentLoop:
             # Reserve headroom for the ephemeral tail-injected memory block (not
             # part of the projected snapshot, so invisible here) — fold earlier.
             threshold = int((self.config.effective_context_budget() or 8000) * trigger_ratio)
+            # Estimate against the SAME hot/cold split the real prompt uses: stamp recency so the kept
+            # recent sends render HOT (full) here too. Unstamped they'd all render cold, under-counting
+            # the live prompt (whose recent sends ARE hot) → the fold would fire late (recency-fold-1).
+            if hasattr(projector, "stamp_render_context"):
+                projector.stamp_render_context(snapshot, (max(live_sends) + 1) if live_sends else None)
             rendered_prefix = projector.render(([prior] if prior is not None else []) + snapshot)
             if estimate_tokens(rendered_prefix) < threshold:
                 return None, ()  # below threshold — small per-send projections just accumulate
