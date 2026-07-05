@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from power_loop.agent.types import AgentLoopConfig
@@ -233,6 +233,12 @@ async def run_agent_spec(
             schema=spec.output_schema.get("schema") or spec.output_schema,
         ).to_openai_response_format()
 
+    # Inherit the parent's transport resilience: the child reuses the parent's
+    # LLM client (same connection pool), and a delegation often fires after a
+    # long tool phase — right when pooled keep-alive connections have gone
+    # stale. Without the parent's retry policy a single httpx.ReadError on the
+    # child's FIRST streaming call killed the whole delegation ("Error: ").
+    parent_config = getattr(parent_loop, "config", None)
     child_config = AgentLoopConfig(
         system_prompt=spec.system_prompt,
         max_rounds=int(spec.max_rounds),
@@ -240,6 +246,7 @@ async def run_agent_spec(
         temperature=float(spec.temperature),
         model=spec.model,
         response_format=response_format,
+        retry_policy=getattr(parent_config, "retry_policy", None),
     )
 
     child_sid = await store.create_session(
@@ -293,6 +300,19 @@ async def run_agent_spec(
             with contextlib.suppress(Exception):
                 await store.close_session(child_sid, cascade=True)
         raise
+
+    # Empty-answer fallback: a child that "spoke" through tools (send_message,
+    # board posts) often ends its last round with a blank assistant text →
+    # final_text="" and the parent gets "(no text)". Recover the last non-empty
+    # assistant text from the child transcript BEFORE the ephemeral cleanup
+    # below deletes it.
+    if result.status == "completed" and not (result.final_text or "").strip():
+        with contextlib.suppress(Exception):
+            rows = await store.load_active_messages(child_sid)
+            for row in reversed(rows):
+                if row.role == "assistant" and (row.content or "").strip():
+                    result = replace(result, final_text=str(row.content).strip())
+                    break
 
     # ── Sub-agent lifecycle events (source="subagent", on the parent stream) ──
     # TEXT only when the child produced an answer; LIMIT for the round-limit

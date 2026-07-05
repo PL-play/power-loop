@@ -786,10 +786,33 @@ def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False)
         diff_output = _generate_diff(normalized, updated)
         return (
             f"Edited {_display_path(fp)} ({label}, {count} replacement{'s' if count != 1 else ''})"
+            + _json_syntax_warning(fp, updated)
             + (f"\n{diff_output}" if diff_output else "")
         )
     except Exception as e:
         return f"Error: {e}"
+
+
+def _json_syntax_warning(fp: Path, updated: str) -> str:
+    """Post-edit syntax check for .json files.
+
+    A patch/edit that leaves a dangling comma silently corrupts the file; the
+    agent then burns rounds diagnosing a downstream "not valid JSON" error.
+    The write is kept (the agent may be mid-way through multi-step edits) but
+    the result carries a loud, positioned warning. Empty string when fine.
+    """
+    if fp.suffix.lower() != ".json":
+        return ""
+    import json as _json
+
+    try:
+        _json.loads(updated)
+        return ""
+    except ValueError as exc:
+        return (
+            f"\n⚠️ WARNING: {_display_path(fp)} is NOT valid JSON after this change "
+            f"({exc}). The file was written anyway — fix the syntax before using it."
+        )
 
 
 @dataclass
@@ -926,7 +949,10 @@ def run_apply_patch(path: str, patch: str) -> str:
         fp.write_text(final, encoding="utf-8")
         _remember_read(fp)
         diff_output = _generate_diff(normalized, updated)
-        return f"Patched {_display_path(fp)} ({len(hunks)} hunk{'s' if len(hunks) != 1 else ''})\n{diff_output}"
+        return (
+            f"Patched {_display_path(fp)} ({len(hunks)} hunk{'s' if len(hunks) != 1 else ''})"
+            f"{_json_syntax_warning(fp, updated)}\n{diff_output}"
+        )
     except Exception as e:
         return f"Error: {e}"
 

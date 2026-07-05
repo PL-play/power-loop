@@ -18,6 +18,7 @@ class HookPoint(str, Enum):
     TOOL_AFTER = "tool.after"
     TOOL_ERROR = "tool.error"
     ROUND_DECIDE = "round.decide"
+    COMPLETE_DECIDE = "complete.decide"
     COMPACT_BEFORE = "compact.before"
     COMPACT_AFTER = "compact.after"
     MESSAGE_APPEND = "message.append"
@@ -36,6 +37,9 @@ class HookDirective(str, Enum):
         LLM_BEFORE         -> SHORT_CIRCUIT (use values["response"] instead of calling LLM)
         LLM_AFTER          -> BREAK (end loop, ignore tool calls)
         ROUND_DECIDE       -> SKIP (skip tool execution), BREAK (end loop)
+        COMPLETE_DECIDE    -> SHORT_CIRCUIT (set ``inject`` — append it as a durable
+                              user message and keep looping with ``extra_rounds``
+                              more rounds instead of ending)
         TOOLS_BATCH_BEFORE -> SKIP (skip all tools this round)
         TOOL_BEFORE        -> SKIP (skip this tool, use values["tool_output"] as result)
         TOOL_ERROR         -> SKIP (swallow error, use values["tool_output"]),

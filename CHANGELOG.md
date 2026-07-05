@@ -8,6 +8,46 @@
 
 ## [Unreleased]
 
+## [3.11.1] — 2026-07-05
+
+Fix, backward-compatible (patch).
+
+### Fixed
+- **Sub-agent loops inherit the parent's `retry_policy`** — `run_agent_spec` built the child
+  `AgentLoopConfig` without one, so child LLM calls ran on the NO-RETRY path. The child reuses
+  the parent's LLM client (same httpx connection pool), and a delegation typically fires right
+  after a long tool phase — exactly when pooled keep-alive connections have gone stale — so the
+  child's FIRST streaming call could die on a bare `httpx.ReadError` (empty message), killing
+  the whole delegation with an opaque "Error: ". Observed twice in production before diagnosis.
+
+## [3.11.0] — 2026-07-05
+
+Feature, backward-compatible (minor). No STABLE API break.
+
+### Added
+- **`HookPoint.COMPLETE_DECIDE` + `CompleteDecideCtx`** — a hook consulted at a send's two
+  terminal boundaries: natural completion (the model produced a round with no tool calls,
+  `reason="completed"`) and round-budget exhaustion (`reason="hit_round_limit"`, before the
+  forced wrap-up call). A handler that SHORT_CIRCUITs with a non-empty `ctx.inject` gets that
+  text appended as a **durable user message in the SAME send**, and the loop keeps running with
+  `ctx.extra_rounds` more rounds. Use it for same-send finalize turns ("before you stop, update
+  memory / todo / deliver") that previously had to be a separate `follow_up()` send.
+  `ctx.fire_count` tells the handler how many injections already happened this send — handlers
+  MUST bound themselves with it. Internally the round loop now runs against a dynamic
+  `_round_limit` instead of a fixed `range(max_rounds)`; behavior without a registered
+  COMPLETE_DECIDE handler is unchanged.
+
+### Fixed
+- **`run_agent_spec` empty-answer fallback** — a sub-agent that delivered its answer through
+  tools (send_message, board posts) and ended its last round with a blank assistant text used
+  to return `final_text=""` (surfacing as "(sub-agent returned no text)" to hosts). On a
+  `completed` child with empty final_text, the last non-empty assistant text is now recovered
+  from the child transcript before the ephemeral cleanup deletes it.
+- **`apply_patch` / `edit_file` warn on broken JSON** — editing a `.json` file into invalid
+  syntax (dangling comma after a removed line, etc.) used to succeed silently; the agent then
+  burned rounds diagnosing a downstream "not valid JSON" error. The tool result now carries a
+  loud positioned warning (the write is kept — the edit may be one step of a multi-edit).
+
 ## [3.10.0] — 2026-07-04
 
 Feature, backward-compatible (minor). No STABLE API break.

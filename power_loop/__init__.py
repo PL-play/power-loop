@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "3.10.0"
+__version__ = "3.11.1"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -105,6 +105,7 @@ from power_loop.contracts.hook_contexts import (
     BaseHookCtx,
     CompactAfterCtx,
     CompactBeforeCtx,
+    CompleteDecideCtx,
     LlmAfterCtx,
     LlmBeforeCtx,
     MemoryRecalledCtx,
@@ -414,6 +415,7 @@ __all__ = [
 	"BaseHookCtx",
 	"CompactAfterCtx",
 	"CompactBeforeCtx",
+	"CompleteDecideCtx",
 	"LlmAfterCtx",
 	"LlmBeforeCtx",
 	"MessageAppendCtx",

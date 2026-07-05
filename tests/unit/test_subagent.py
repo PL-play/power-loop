@@ -368,3 +368,95 @@ def test_spawn_agent_outside_loop_returns_clear_error() -> None:
     from power_loop.tools.spawn_agent import _handle_spawn_agent
     out = asyncio.run(_handle_spawn_agent(task="x"))
     assert "must be invoked from inside" in out
+
+
+@pytest.mark.asyncio
+async def test_subagent_empty_final_text_recovers_last_assistant_text(store: SessionStore) -> None:
+    """A child that "spoke" via tools and ended on a blank assistant turn used to
+    return final_text="" — the fallback recovers the last non-empty assistant text
+    from the transcript before the ephemeral cleanup deletes it."""
+    reg = ToolRegistry()
+    reg.register(ToolDefinition(name="echo", description="e",
+                 input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
+    spec = AgentSpec(name="quiet", system_prompt="P", max_rounds=5)
+
+    parent_llm = _Scripted(responses=[LLMResponse(raw_text="parent done")])
+    parent_loop = StatefulAgentLoop(
+        llm=parent_llm, store=store, tool_registry=reg,
+        config=AgentLoopConfig(max_rounds=1),
+    )
+    parent_created_sid = await parent_loop.new_session()
+    pr = await parent_loop.send("hi", session_id=parent_created_sid)
+    parent_sid = pr.session_id
+
+    # Child: round 0 = meaningful text + a tool call; round 1 = blank, no tools → completed("").
+    parent_loop.llm = _Scripted(responses=[
+        LLMResponse(raw_text="the real review findings", tool_calls=[{
+            "id": "c1", "type": "function",
+            "function": {"name": "echo", "arguments": "{}"},
+        }]),
+        LLMResponse(raw_text=""),
+    ])
+    from power_loop.core.agent_context import (
+        reset_current_loop,
+        reset_session_id,
+        set_current_loop,
+        set_session_id,
+    )
+    tok_loop = set_current_loop(parent_loop)
+    tok_sid = set_session_id(parent_sid)
+    try:
+        child_result = await run_agent_spec(spec, "review this", parent_loop=parent_loop)
+    finally:
+        reset_current_loop(tok_loop)
+        reset_session_id(tok_sid)
+
+    assert child_result["status"] == "completed"
+    assert child_result["final_text"] == "the real review findings"
+
+
+@pytest.mark.asyncio
+async def test_subagent_inherits_parent_retry_policy(store: SessionStore) -> None:
+    """The child loop must inherit the parent's retry_policy: without it a single
+    transient transport error (stale pooled connection → httpx.ReadError) on the
+    child's first LLM call kills the whole delegation."""
+    from power_loop import LLMRetryPolicy
+
+    spec = AgentSpec(name="resilient", system_prompt="P", max_rounds=2)
+    parent_llm = _Scripted(responses=[LLMResponse(raw_text="parent done")])
+    policy = LLMRetryPolicy(max_attempts=3, backoff_initial=0.001, backoff_max=0.002)
+    parent_loop = StatefulAgentLoop(
+        llm=parent_llm, store=store,
+        config=AgentLoopConfig(max_rounds=1, retry_policy=policy),
+    )
+    parent_created_sid = await parent_loop.new_session()
+    pr = await parent_loop.send("hi", session_id=parent_created_sid)
+    parent_sid = pr.session_id
+
+    class _FlakyOnce(_Scripted):
+        failed_once: bool = False
+
+        async def complete(self, request, *, on_chunk_delta_text=None,
+                           on_chunk_think=None, on_stream_end=None):
+            if not self.failed_once:
+                self.failed_once = True
+                raise ConnectionError()  # str() == "" like httpx.ReadError
+            return await super().complete(request)
+
+    parent_loop.llm = _FlakyOnce(responses=[LLMResponse(raw_text="child made it")])
+    from power_loop.core.agent_context import (
+        reset_current_loop,
+        reset_session_id,
+        set_current_loop,
+        set_session_id,
+    )
+    tok_loop = set_current_loop(parent_loop)
+    tok_sid = set_session_id(parent_sid)
+    try:
+        child_result = await run_agent_spec(spec, "go", parent_loop=parent_loop)
+    finally:
+        reset_current_loop(tok_loop)
+        reset_session_id(tok_sid)
+
+    assert child_result["status"] == "completed"
+    assert child_result["final_text"] == "child made it"

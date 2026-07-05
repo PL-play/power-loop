@@ -60,6 +60,7 @@ from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hook_contexts import (
     CompactAfterCtx,
     CompactBeforeCtx,
+    CompleteDecideCtx,
     LlmAfterCtx,
     LlmBeforeCtx,
     MessageAppendCtx,
@@ -837,6 +838,33 @@ class AgentPipeline:
     # Main orchestrator — loop, hooks, directive checks, events
     # ══════════════════════════════════════════════════════════════
 
+    async def _complete_decide(
+        self, *, reason: str, round_idx: int, final_text: str, next_round: int,
+    ) -> bool:
+        """Consult COMPLETE_DECIDE hooks at a send's terminal boundary.
+
+        Returns True when a hook SHORT_CIRCUITs with a non-empty ``inject``:
+        the text is appended as a durable user message (same send) and the
+        round budget is extended so at least ``extra_rounds`` more rounds run
+        starting at ``next_round``. Returns False to end the send normally.
+        """
+        ctx = CompleteDecideCtx(
+            round_index=round_idx, reason=reason, final_text=final_text,
+            fire_count=self._complete_decide_fires,
+        )
+        await self.hooks.run_typed_async(HookPoint.COMPLETE_DECIDE, ctx)
+        inject = str(ctx.inject or "").strip()
+        if ctx.directive != HookDirective.SHORT_CIRCUIT or not inject:
+            return False
+        self._complete_decide_fires += 1
+        await self._append_message({"role": "user", "content": inject}, round_index=round_idx)
+        try:
+            extra = max(1, int(ctx.extra_rounds))
+        except (TypeError, ValueError):
+            extra = 1
+        self._round_limit = max(self._round_limit, next_round + extra)
+        return True
+
     async def run(self, messages: list[LoopMessage]) -> AgentLoopResult:
         """Run the full agent loop. Returns when done, cancelled, or hit round limit."""
         self.history = [dict(m) for m in messages]
@@ -858,7 +886,26 @@ class AgentPipeline:
         # LLM_BEFORE block and runtime.memory.MemoryRecallHook.
 
         # ── Round loop ──
-        for round_idx in range(int(self.config.max_rounds)):
+        # The budget is DYNAMIC: a COMPLETE_DECIDE hook can extend it
+        # (same-send injection — see _complete_decide), so this is a while
+        # over an explicit limit rather than a range().
+        self._round_limit = int(self.config.max_rounds)
+        self._complete_decide_fires = 0
+        round_idx = -1
+        while True:
+            round_idx += 1
+            if round_idx >= self._round_limit:
+                # ── Hook: COMPLETE_DECIDE (round budget exhausted) ──
+                # A SHORT_CIRCUIT with inject extends the budget and keeps
+                # looping in the same send; otherwise fall through to the
+                # forced wrap-up below.
+                if await self._complete_decide(
+                    reason="hit_round_limit", round_idx=round_idx, final_text="",
+                    next_round=round_idx,
+                ):
+                    pass  # limit extended; run this round normally
+                else:
+                    break
             # Track for MemorySnapshot: how many round attempts we made.
             self._completed_rounds = round_idx
             if _is_cancelled(self.cancel_token):
@@ -1096,6 +1143,12 @@ class AgentPipeline:
                 )
                 await self.hooks.run_typed_async(HookPoint.ROUND_END, round_end)
                 await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
+                # ── Hook: COMPLETE_DECIDE (natural completion) ──
+                if await self._complete_decide(
+                    reason="completed", round_idx=round_idx, final_text=assistant_text,
+                    next_round=round_idx + 1,
+                ):
+                    continue
                 await self._finalize("completed", final_text=assistant_text, rounds=round_idx + 1)
                 return self._make_result("completed", final_text=assistant_text, rounds=round_idx + 1)
 
