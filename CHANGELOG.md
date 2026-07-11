@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+## [3.16.0] — 2026-07-11
+
+Feature, backward-compatible (minor).
+
+### Added
+- **`validate_workflow` 工具（dry-run 校验，不执行）**：与 `create_workflow` 完全相同的
+  检查链——严格解析/校验 + 宿主 `spec_transform` 策略钳（有装则跑）——但零执行、零会话；
+  INVALID 时一次性列出全部问题（含 `INVALID (platform policy)` 前缀区分平台拒绝），
+  VALID 时返回结构摘要（节点形状统计、叶子 id、声明了结构化输出的节点、spec 预算）。
+  「validate 通过 = create 必收」是保证（运行期失败另论）。`register_workflow_tools`
+  三件套捆绑注册；`create_workflow` 描述补一句「大/detached spec 先 dry-run」。
+  导出 `VALIDATE_WORKFLOW_DEFINITION`。
+
 ## [3.15.0] — 2026-07-11
 
 Feature, backward-compatible (minor).

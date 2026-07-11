@@ -72,6 +72,7 @@ from .subprocess_executor import (
 )
 from .tool import (
     CREATE_WORKFLOW_DEFINITION,
+    VALIDATE_WORKFLOW_DEFINITION,
     WORKFLOW_STATUS_DEFINITION,
     register_workflow_tools,
 )
@@ -126,6 +127,7 @@ __all__ = [
     "reap_runs",
     # llm-facing tools
     "CREATE_WORKFLOW_DEFINITION",
+    "VALIDATE_WORKFLOW_DEFINITION",
     "WORKFLOW_STATUS_DEFINITION",
     "register_workflow_tools",
 ]

@@ -28,6 +28,7 @@ from .spec import WorkflowSpec, WorkflowSpecError
 
 __all__ = [
     "CREATE_WORKFLOW_DEFINITION",
+    "VALIDATE_WORKFLOW_DEFINITION",
     "WORKFLOW_STATUS_DEFINITION",
     "register_workflow_tools",
 ]
@@ -119,7 +120,9 @@ def _build_create_workflow_description() -> str:
         "\"inputs_from\":[\"res\"]}]}}\n"
         "\n"
         "Validation reports ALL problems at once — fix everything in one revision "
-        "rather than retrying one error at a time."
+        "rather than retrying one error at a time. For a large or detached "
+        "workflow, dry-run the spec with validate_workflow first; a spec it "
+        "accepts is guaranteed to be accepted here."
     )
 
 
@@ -155,6 +158,31 @@ CREATE_WORKFLOW_DEFINITION = ToolDefinition(
     },
     required_params=("spec",),
 )
+
+VALIDATE_WORKFLOW_DEFINITION = ToolDefinition(
+    name="validate_workflow",
+    description=(
+        "Dry-run check a WorkflowSpec JSON WITHOUT running it: full validation "
+        "(plus the platform's policy checks, when the host installed any), "
+        "reporting ALL problems at once so you can fix everything in one "
+        "revision. On success returns a structure summary (nodes, leaves, "
+        "referenced outputs). Use it to cheaply verify a large or detached "
+        "workflow before create_workflow commits real sub-agent runs; for "
+        "small specs you may call create_workflow directly — it validates too."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "spec": {
+                "type": "object",
+                "description": "The WorkflowSpec to check — same shape create_workflow accepts.",
+            },
+        },
+        "required": ["spec"],
+    },
+    required_params=("spec",),
+)
+
 
 WORKFLOW_STATUS_DEFINITION = ToolDefinition(
     name="workflow_status",
@@ -256,6 +284,83 @@ def _make_create_workflow_handler(
 _handle_create_workflow = _make_create_workflow_handler()
 
 
+def _spec_summary(spec: WorkflowSpec) -> str:
+    """A compact structure recap for a VALID spec (validate_workflow's reply)."""
+    from .spec import AgentNode, BranchNode, ForeachNode, ParallelNode, SequenceNode
+
+    counts: dict[str, int] = {}
+    leaf_ids: list[str] = []
+    schema_ids: list[str] = []
+
+    def walk(node: Any) -> None:
+        counts[node.type] = counts.get(node.type, 0) + 1
+        if isinstance(node, AgentNode):
+            leaf_ids.append(node.id)
+            if node.output_schema is not None:
+                schema_ids.append(node.id)
+            return
+        if isinstance(node, SequenceNode):
+            for s in node.steps:
+                walk(s)
+        elif isinstance(node, ParallelNode):
+            for b in node.branches:
+                walk(b)
+        elif isinstance(node, ForeachNode):
+            walk(node.body)
+        elif isinstance(node, BranchNode):
+            for c in node.cases.values():
+                walk(c)
+            if node.default is not None:
+                walk(node.default)
+
+    walk(spec.root)
+    shape = ", ".join(f"{t}×{n}" for t, n in sorted(counts.items()))
+    out = (
+        f"workflow '{spec.name}': {sum(counts.values())} node(s) ({shape}); "
+        f"{len(leaf_ids)} leaf agent(s): {', '.join(leaf_ids)}"
+    )
+    if schema_ids:
+        out += f"; structured output declared on: {', '.join(schema_ids)}"
+    if spec.budget is not None:
+        out += f"; spec budget {spec.budget.max_tokens} tokens"
+    return out
+
+
+def _make_validate_workflow_handler(
+    *,
+    spec_transform: Callable[[WorkflowSpec], WorkflowSpec] | None = None,
+) -> Callable[..., Any]:
+    """Build the ``validate_workflow`` handler.
+
+    Runs the SAME checks ``create_workflow`` would — strict parse/validation
+    AND the host's ``spec_transform`` policy pass — but never executes anything,
+    so a "valid" verdict here is a guarantee create_workflow will accept the
+    spec (it may still fail at runtime, e.g. a leaf hitting its round limit).
+    """
+
+    async def _handle(**kwargs: Any) -> str:
+        payload = kwargs.get("spec")
+        if payload is None:
+            return "Error: validate_workflow requires 'spec'."
+        try:
+            spec = WorkflowSpec.from_json(payload)
+        except WorkflowSpecError as exc:
+            return f"INVALID — {exc}"
+        if spec_transform is not None:
+            try:
+                spec = spec_transform(spec)
+            except WorkflowSpecError as exc:
+                return f"INVALID (platform policy) — {exc}"
+            if not isinstance(spec, WorkflowSpec):
+                raise TypeError(
+                    "spec_transform must return a WorkflowSpec "
+                    f"(got {type(spec).__name__})"
+                )
+        return f"VALID. {_spec_summary(spec)}. Ready for create_workflow."
+
+    return _handle
+
+
 async def _handle_workflow_status(**kwargs: Any) -> str:
     loop = get_current_loop()
     if loop is None:
@@ -327,3 +432,10 @@ def register_workflow_tools(
         )
     registry.register(create_def, handler, overwrite=overwrite)
     registry.register(WORKFLOW_STATUS_DEFINITION, _handle_workflow_status, overwrite=overwrite)
+    # Dry-run checker: same validation + host policy pass as create_workflow,
+    # zero execution. Registered as a bundle with the other two.
+    registry.register(
+        VALIDATE_WORKFLOW_DEFINITION,
+        _make_validate_workflow_handler(spec_transform=spec_transform),
+        overwrite=overwrite,
+    )
