@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+## [3.15.0] — 2026-07-11
+
+Feature, backward-compatible (minor).
+
+### Changed
+- **`create_workflow` 默认描述重写为完整的模型作者手册**：五种节点完整语法、
+  **AgentSpec 字段表（由 `dataclasses.fields(AgentSpec)` 派生渲染）**、数据流规则
+  （items_from/branch.on 必须配 output_schema、id 全局唯一、不可引用并行兄弟 /
+  foreach body 内节点）、detached 唤醒协议、完整示例、聚合报错提示。原一行压缩
+  语法与「校验为 LLM 作者设计」的哲学不符——校验为模型优化了，说明书却没有。
+  防漂移守卫测试（`test_workflow_tool_description.py`）：`_AGENT_SPEC_FIELD_DOCS`
+  必须与 AgentSpec 字段集精确相等、描述必须覆盖每种节点类型与关键规则 token ——
+  加字段/节点忘改说明书直接红。`workflow_status` 描述补「被唤醒后先调它」。
+
+### Added
+- **`register_workflow_tools(description_suffix=...)`**：追加到 `create_workflow`
+  模型描述尾部的宿主段。默认描述只陈述 power-loop 自己的事实；宿主的
+  ``spec_transform`` 策略上限、自有唤醒协议措辞属于宿主事实，从这里注入
+  （宿主删码指引：不再需要整段覆盖描述——DeepTalk 从 78 行全量覆盖缩成一段后缀）。
+
 ## [3.14.0] — 2026-07-11
 
 Feature, backward-compatible (minor). 「宿主接缝」主题：五条 host seams（设计见
