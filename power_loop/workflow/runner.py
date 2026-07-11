@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 from power_loop.contracts.event_payloads import SystemLogPayload
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.hooks import HookDirective, HookPoint
+from power_loop.runtime.store.store import MUTATE_SKIP
 
 from . import journal
 from .engine import WorkflowEngine, WorkflowRunError
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "run_detached", "make_wake_guard", "register_wake_guard", "make_on_step", "spawn_background",
+    "claim_wake", "parse_workflow_wake",
 ]
 
 #: run_ids whose engine is currently executing IN THIS PROCESS (set by spawn_background +
@@ -78,11 +80,62 @@ def _wake_note(run_id: str, status: str, extra: str = "") -> str:
     return f"{base} — {extra}" if extra else base
 
 
-def _parse_run_id(note: str | None) -> str | None:
+def parse_workflow_wake(note: str | None) -> str | None:
+    """Extract the run id from a workflow completion-wake timer note.
+
+    Returns ``None`` for any non-workflow note, so a host
+    :data:`~power_loop.runtime.timers.TimerDelivery` can branch: workflow wakes
+    get enriched (e.g. with ``workflow_status`` detail) or routed differently
+    from ordinary timers. PROVISIONAL (3.14).
+    """
     if not note or not note.startswith(journal.JOURNAL_PREFIX):
         return None
     rest = note[len(journal.JOURNAL_PREFIX):].strip()
     return rest.split()[0] if rest else None
+
+
+async def claim_wake(store: Any, parent_sid: str, run_id: str) -> bool:
+    """Atomically claim the completion wake for ``run_id`` — True = this caller
+    delivers, False = the wake was already delivered once.
+
+    Only needed by hosts that bypass ``TimerRunner`` entirely (polling
+    ``store.due_timers()`` themselves): with a running ``TimerRunner`` +
+    :func:`register_wake_guard`, dedupe already happens in the TIMER_FIRE hook
+    — BEFORE any custom delivery — so a host delivery seam gets it for free.
+
+    A missing journal (or a deleted parent session) claims as True: there is
+    nothing to dedupe against, and dropping the wake would strand the parent.
+    PROVISIONAL (3.14).
+    """
+    outcome = await _claim_wake_state(store, parent_sid, run_id)
+    return outcome != "already"
+
+
+async def _claim_wake_state(store: Any, parent_sid: str, run_id: str) -> str:
+    """Shared atomic claim: ``"claimed"`` | ``"already"`` | ``"no_journal"``.
+
+    The claim is an atomic RMW via ``mutate_runtime_state`` (row-locked): a bare
+    get→set would race concurrent journal writes on the same run key and let two
+    concurrent fires both observe ``woke=False`` → double-wake.
+    """
+    seen = {"woke": False}
+
+    def _claim(cur: Any) -> Any:
+        if cur is None:
+            return MUTATE_SKIP  # no journal → nothing to dedupe
+        if cur.get("woke"):
+            seen["woke"] = True
+            return MUTATE_SKIP  # already delivered once
+        return {**cur, "woke": True}  # first delivery — set woke, preserve every other key
+
+    try:
+        await store.mutate_runtime_state(parent_sid, journal.run_key(run_id), _claim, default=None)
+    except ValueError:
+        # Session/state row gone (a stale timer firing on a deleted session):
+        # treat as no-journal, matching the old get_runtime_state(default=None)
+        # tolerance; nothing to dedupe.
+        return "no_journal"
+    return "already" if seen["woke"] else "claimed"
 
 
 def _publish(loop: Any, parent_sid: str, run_id: str, event: str, status: str, *, level: str = "info") -> None:
@@ -115,6 +168,11 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
     Requires ``workflow`` to carry a ``parent_session_id`` (the session that
     will be woken on completion). The parent must be live, and a ``TimerRunner``
     must be running on the host for the wake to be delivered.
+
+    ``eager_wake`` adds a non-durable instant wake that calls ``loop.follow_up``
+    DIRECTLY — it does not go through the TimerRunner, so a host that installed
+    a custom ``TimerDelivery`` should leave it False (the eager path would
+    bypass the host's pipeline; the durable timer still honors it).
     """
     parent_sid = workflow._parent_sid
     if not parent_sid:
@@ -125,13 +183,19 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
         raise WorkflowRunError("parent session not found; cannot start detached run")
 
     run_id = secrets.token_hex(8)
-    await journal.seed(store, parent_sid, run_id, workflow.spec.name, spec=workflow.spec.to_dict())
+    await journal.seed(
+        store, parent_sid, run_id, workflow.spec.name, spec=workflow.spec.to_dict(),
+        allowed_tools=(
+            sorted(workflow._allowed_tools) if workflow._allowed_tools is not None else None
+        ),
+    )
 
     def _build_engine() -> WorkflowEngine:
         return WorkflowEngine(
             loop, executor=workflow._executor, budget=workflow._budget,
             on_step=make_on_step(store, parent_sid, run_id),
             stop_event=workflow._cancel, run_id=run_id,
+            allowed_tools=workflow._allowed_tools,
         )
 
     return spawn_background(
@@ -262,34 +326,17 @@ async def _recover_eager_wake_async(
 def make_wake_guard(store: Any):
     """A ``HookPoint.TIMER_FIRE`` guard that delivers each workflow wake exactly
     once (timers are at-least-once). Ignores non-workflow timers. Async because the
-    store is async; ``run_typed_async`` awaits it."""
+    store is async; ``run_typed_async`` awaits it.
 
-    from power_loop.runtime.store.store import MUTATE_SKIP
+    Runs BEFORE the runner's delivery step, so the dedupe also covers a host
+    ``TimerDelivery`` — a custom delivery does not need to re-claim.
+    """
 
     async def guard(ctx: TimerFireCtx) -> None:
-        run_id = _parse_run_id(ctx.note)
+        run_id = parse_workflow_wake(ctx.note)
         if run_id is None:
             return  # not a workflow timer → CONTINUE
-        # Claim the wake ATOMICALLY: a bare get→set RMW races a concurrent journal write
-        # (journal.update / record_step funnel through mutate_runtime_state on the SAME run key) —
-        # the guard's set would clobber that write, and two concurrent fires could both observe
-        # woke=False → double-wake. mutate_runtime_state is row-locked, so the claim is exclusive.
-        seen = {"woke": False}
-
-        def _claim(cur: Any) -> Any:
-            if cur is None:
-                return MUTATE_SKIP  # no journal → CONTINUE (nothing to dedupe)
-            if cur.get("woke"):
-                seen["woke"] = True
-                return MUTATE_SKIP  # already delivered once
-            return {**cur, "woke": True}  # first delivery — set woke, preserve every other key
-
-        try:
-            await store.mutate_runtime_state(ctx.session_id, journal.run_key(run_id), _claim, default=None)
-        except ValueError:
-            return  # session/state row gone (a stale timer firing on a deleted session) → CONTINUE,
-            # matching the old get_runtime_state(default=None) tolerance; nothing to dedupe.
-        if seen["woke"]:
+        if await _claim_wake_state(store, ctx.session_id, run_id) == "already":
             ctx.directive = HookDirective.SKIP
 
     return guard

@@ -33,6 +33,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
 from power_loop.contracts.event_payloads import TimerFiredPayload
@@ -49,6 +50,17 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SCAN_INTERVAL_S = 2.0
 DEFAULT_STALE_FIRING_S = 120.0
+
+#: HOST delivery seam (PROVISIONAL, 3.14): replaces ONLY the final "inject into
+#: the session" step of a firing — the scan / claim / heartbeat / stale-recovery
+#: machinery and the TIMER_FIRE hook (veto/dedupe point) all run unchanged
+#: before it. Receives the post-hook :class:`TimerFireCtx` (``session_id`` /
+#: ``timer_id`` / ``note`` / ``due_at`` / ``message`` — a hook may have
+#: rewritten ``message``). A normal return marks the firing done (one-shot →
+#: fired; recurring → re-armed); an exception re-arms the row +30s and it
+#: re-fires, so deliveries must tolerate at-least-once. Use it to route wakes
+#: into the host's own run pipeline instead of ``loop.follow_up``.
+TimerDelivery = Callable[[TimerFireCtx], Awaitable[None]]
 
 
 def format_timer_message(timer: TimerRow) -> str:
@@ -83,8 +95,11 @@ class TimerRunner:
         scan_interval_s: float = DEFAULT_SCAN_INTERVAL_S,
         stale_firing_s: float = DEFAULT_STALE_FIRING_S,
         heartbeat_interval_s: float | None = None,
+        delivery: TimerDelivery | None = None,
     ) -> None:
         self._loop = loop
+        # None → the built-in loop.follow_up delivery; see TimerDelivery.
+        self._delivery = delivery
         self._scan_interval = float(scan_interval_s)
         self._stale_firing_ms = int(stale_firing_s * 1000)
         # While a claimed 'firing' row is being delivered we re-stamp it on this
@@ -247,11 +262,21 @@ class TimerRunner:
             self._emit(timer, "postponed")
             return
 
-        # ── Deliver: follow_up = queued when mid-run, plain send when idle ──
-        from power_loop.agent.follow_up import FollowUpQueued
+        # ── Deliver ──
+        if self._delivery is not None:
+            # Host delivery seam: the host routes the wake itself (e.g. into its
+            # own dispatch pipeline). A raise falls through to scan_once's
+            # handler → the row re-arms +30s and re-fires (at-least-once).
+            await self._delivery(ctx)
+            outcome = "delivered"
+        else:
+            # Built-in: follow_up = queued when mid-run, plain send when idle.
+            from power_loop.agent.follow_up import FollowUpQueued
 
-        result = await self._loop.follow_up(ctx.message, timer.session_id, stop_event=self._cancel)
-        outcome = "queued" if isinstance(result, FollowUpQueued) else "delivered"
+            result = await self._loop.follow_up(
+                ctx.message, timer.session_id, stop_event=self._cancel
+            )
+            outcome = "queued" if isinstance(result, FollowUpQueued) else "delivered"
         # One-shot -> fired; recurring -> re-armed at fire-time + interval
         # (fixed-delay: periods missed while the process was down collapse).
         await store.finish_firing_timer(timer.session_id, timer.timer_id)

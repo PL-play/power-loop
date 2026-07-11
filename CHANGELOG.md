@@ -8,6 +8,47 @@
 
 ## [Unreleased]
 
+## [3.14.0] — 2026-07-11
+
+Feature, backward-compatible (minor). 「宿主接缝」主题：五条 host seams（设计见
+`docs/design/host-seams-3.14.md`），全部可加性——不带新参数时行为不变。新符号以
+**PROVISIONAL** 发布（不进 `STABLE_API`），稳定一个迭代后再提升。
+
+### Added
+- **S1 — child-run guards**（`StatefulAgentLoop.register_child_run_guard` /
+  `remove_child_run_guard`，类型别名 `ChildRunGuard`）：宿主注册的 context-manager 工厂，
+  由 `run_agent_spec` 在**每次内联子运行**（spawn_agent / run_agent 委派、in-process
+  workflow 叶子）外围按注册序进入、逆序退出（异常亦然），并**传导给子 loop**（孙辈同样进入）。
+  用途：子运行与父共享 hooks 对象和 task-local 状态，宿主的 per-send hook 状态（提醒计数、
+  turn 标志、同 send finalize 认领）在子运行期间挂起、结束后恢复。
+  宿主删码指引：DeepTalk `agent/app/tools/subagent.py::_run_spec_isolated` 整体可删，
+  改为在 loop 构建处注册三个 guard。
+- **S2 — per-send 工具集传导**（`get_effective_tools`；`run_agent_spec(inherit_send_filter=True)`）：
+  `send/follow_up(tools=...)` 的本次运行有效工具集现在发布到 agent context（innermost-run
+  语义：无 `tools=` 的运行重置为无限制），子 agent 的 registry 默认与之**求交**——沉默父的
+  孩子不能替它说话、被禁 bash 的父的孩子不能跑 bash；`inherit_send_filter=False` 为显式逃生门。
+  workflow 在**提交时捕获**该集合（detached 下 contextvar 不可靠），引擎在 **spec 层** clamp
+  每个叶子（对任意 Executor 生效，含 subprocess），并记入 run journal（`allowed_tools` 键，
+  旧 journal 缺省 = 不限制），resume 时原样重施——resume 不会静默放宽权限。
+  宿主删码指引：DeepTalk `subagent.py::_parent_allowed` contextvar 全套可删（`tools=` 已在传）。
+- **S3 — `AgentLoopConfig.subagent_config_factory`**：`(AgentSpec, 默认子配置) -> AgentLoopConfig`
+  的宿主工厂；`run_agent_spec` 构建默认极简子配置后过它，产物按原样使用。让宿主按叶子分流
+  上下文策略（representation / fold / microcompact），不再需要 fork 建 loop 段。工厂在建
+  child session **之前**执行，抛错不泄漏会话。
+- **S4 — `register_workflow_tools` 宿主注入点**（`executor_factory` / `budget_factory` /
+  `spec_transform`，均按**每次工具调用**以 `(loop, parent_session_id)` 求值）：宿主可注入
+  能力钳制 Executor、按配置的 `SharedBudget`、策略性 spec 改写（`spec_transform` 抛
+  `WorkflowSpecError` = 聚合问题回给模型修复）。不传 = 旧行为；不再需要 fork tool handler。
+- **S5 — `TimerRunner(delivery=...)`**（类型别名 `TimerDelivery`）+
+  `power_loop.workflow.claim_wake` / `parse_workflow_wake` 公开：只替换 firing 的最后
+  「注入会话」一步——scan / CAS claim / heartbeat / stale 恢复 / TIMER_FIRE hook（veto/去重点）
+  全部照旧先行，故 `register_wake_guard` 的精确一次去重对自定义投递**免费生效**；投递抛错 →
+  重臂 +30s 重投（at-least-once）。宿主可把 wake 路由进自己的运行管道（DeepTalk：经 api 造
+  `agent.trigger`）。`claim_wake` 仅服务完全绕开 TimerRunner 自轮询 `due_timers()` 的宿主；
+  `parse_workflow_wake(note)` 从 timer note 判别/提取 workflow run id。
+  注意：`eager_wake=True` 直调 `loop.follow_up` 不经 TimerRunner——装了自定义 delivery 的
+  宿主应保持其为 False（docstring 已明示）。
+
 ## [3.13.1] — 2026-07-05
 
 Fix, backward-compatible (patch).

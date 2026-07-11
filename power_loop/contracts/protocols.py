@@ -1,12 +1,24 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
+from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
 from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.contracts.handlers import EventHandler, HookHandler
 from power_loop.contracts.hook_contexts import BaseHookCtx
 from power_loop.contracts.hooks import HookContext, HookPoint, HookResult
+
+#: Factory for a context manager entered around every INLINE child run spawned
+#: under a loop (``run_agent_spec`` — spawn_agent/run_agent delegations and
+#: in-process workflow leaves). The child shares the parent's hooks object and
+#: task-local state, so a host whose hooks keep per-send state (reminder
+#: counters, turn flags, finalize claims) registers a guard that suspends that
+#: state for the child and restores it after — see
+#: ``StatefulAgentLoop.register_child_run_guard``. Must be re-entrant: a
+#: grandchild run enters the same guards again, nested. Out-of-process leaves
+#: never enter guards (nothing is shared). PROVISIONAL (3.14).
+ChildRunGuard = Callable[[], AbstractContextManager[None]]
 
 
 class EventBusProtocol(Protocol):

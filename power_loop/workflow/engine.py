@@ -161,10 +161,16 @@ class WorkflowEngine:
         replay: dict[str, AgentResult] | None = None,
         run_id: str | None = None,
         close_driver: bool = True,
+        allowed_tools: frozenset[str] | None = None,
     ) -> None:
         self._loop = parent_loop
         self._executor = executor or InProcessExecutor()
         self._budget = budget
+        # Capability clamp: every leaf's tools are intersected with this set at
+        # the SPEC level (before the executor runs it), so it holds for any
+        # executor — including out-of-process leaves, where the parent's ambient
+        # contextvar filter can't reach. None = unrestricted.
+        self._allowed_tools = allowed_tools
         # M-workflow-engine-2: close the driver session (+ its linked leaf subtree) when run()
         # finishes so each run doesn't leak a driver row + one linked leaf row per node. Nothing
         # reads those sessions after the result is built (outputs/usage are already in `results`).
@@ -318,8 +324,19 @@ class WorkflowEngine:
         # provider via the node's output_schema so real models return JSON, not prose.
         # Thread a stable idempotency key (run_id:node_id) into the leaf's
         # metadata so side-effecting tools can dedupe if the step re-runs on resume.
+        leaf_tools = node.spec.tools
+        if self._allowed_tools is not None:
+            # inherit (None) → the clamp set becomes the explicit whitelist;
+            # explicit list → intersect. Unknown names are dropped by the
+            # registry subset downstream, so an over-broad clamp is harmless.
+            leaf_tools = (
+                sorted(self._allowed_tools)
+                if leaf_tools is None
+                else [t for t in leaf_tools if t in self._allowed_tools]
+            )
         spec = replace(
             node.spec,
+            tools=leaf_tools,
             lifecycle="linked",
             output_schema=node.output_schema,
             metadata={**node.spec.metadata, **self._step_idempotency(node.id)},

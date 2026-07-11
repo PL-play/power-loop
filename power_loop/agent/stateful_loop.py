@@ -41,7 +41,14 @@ from power_loop.agent.system_prompt import (
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import SessionNotFoundError, SessionPendingError
-from power_loop.core.agent_context import get_ctx, reset_current_loop, set_current_loop
+from power_loop.contracts.protocols import ChildRunGuard
+from power_loop.core.agent_context import (
+    get_ctx,
+    reset_current_loop,
+    reset_effective_tools,
+    set_current_loop,
+    set_effective_tools,
+)
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.pipeline import (
@@ -223,6 +230,10 @@ class StatefulAgentLoop:
         self._follow_up_queues: dict[str, list[str | LoopMessage]] = {}
         self._follow_up_queue_locks: dict[str, asyncio.Lock] = {}
         self._closing = False
+        # Host-registered guards entered around every inline child run
+        # (run_agent_spec) — see register_child_run_guard. (name, factory) pairs
+        # in registration order.
+        self._child_run_guards: list[tuple[str | None, ChildRunGuard]] = []
         # ── per-session active-window cache (rebuildable accelerator; see _SessionCache) ──
         self._session_cache_size = int(session_cache_size)
         self._session_cache: OrderedDict[str, _SessionCache] = OrderedDict()
@@ -256,6 +267,39 @@ class StatefulAgentLoop:
                 self._runner.hooks.register(
                     HookPoint.LLM_BEFORE, hook, order=100, name=MemoryRecallHook.NAME,
                 )
+
+    def register_child_run_guard(
+        self, guard: ChildRunGuard, *, name: str | None = None
+    ) -> None:
+        """Register a context-manager factory entered around every INLINE child
+        run spawned under this loop (``run_agent_spec``: spawn_agent / run_agent
+        delegations and in-process workflow leaves).
+
+        An inline child shares the parent's hooks object and runs in the same
+        task (same contextvars), so per-send hook state kept by the host —
+        reminder counters, turn flags, same-send finalize claims — would
+        otherwise tick during the child's rounds and pollute the parent (or,
+        worse, fire parent finalization INTO the child session). A guard's
+        typical body: snapshot/suspend that state on ``__enter__``, restore on
+        ``__exit__``.
+
+        Guards are entered in registration order and exited in reverse, around
+        the child's whole run (exceptions included). They must be RE-ENTRANT:
+        a grandchild run enters the same guards again, nested. Out-of-process
+        leaves (``SubprocessExecutor``) never enter guards — nothing is shared.
+
+        ``name`` enables targeted removal via :meth:`remove_child_run_guard`.
+        PROVISIONAL (3.14).
+        """
+        self._child_run_guards.append((name, guard))
+
+    def remove_child_run_guard(self, name: str) -> bool:
+        """Remove the guard registered under ``name``. Returns True if found."""
+        for i, (n, _g) in enumerate(self._child_run_guards):
+            if n == name:
+                del self._child_run_guards[i]
+                return True
+        return False
 
     async def ensure_store(self) -> SessionStore:
         """Public accessor: return this loop's store, opening an owned one on first use.
@@ -1468,9 +1512,19 @@ class StatefulAgentLoop:
             _overrides["max_rounds"] = max(1, int(max_rounds))
         runtime_config = replace(self.config, **_overrides) if _overrides else self.config
         effective_registry = self._resolve_registry(tools)
+        # Publish this run's per-send allowlist to child spawns (innermost-run
+        # semantics: always set — a run WITHOUT tools= resets to unrestricted so a
+        # nested child run doesn't inherit an outer run's filter names; its own
+        # registry is already the clamped subset). None = unrestricted.
+        _eff_tools = (
+            frozenset(effective_registry.names())
+            if tools is not None and effective_registry is not None
+            else None
+        )
 
         async with self._runner.session_async(session_id=sid):
             loop_token = set_current_loop(self)
+            tools_token = set_effective_tools(_eff_tools)
             try:
                 async def _drain_follow_ups() -> list[LoopMessage]:
                     return await self._drain_follow_up_messages(sid)
@@ -1503,6 +1557,7 @@ class StatefulAgentLoop:
                     await pipeline._emit_error_terminal(exc)
                     raise
             finally:
+                reset_effective_tools(tools_token)
                 reset_current_loop(loop_token)
         # ── Maintain the window cache from the DURABLE store, never the pipeline's mutated
         # working `history` (recall placeholders / microcompacted content would diverge). A

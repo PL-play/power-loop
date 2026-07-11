@@ -17,6 +17,14 @@ _current_session_id: ContextVar[str | None] = ContextVar("power_loop_session_id"
 _current_loop: ContextVar[StatefulAgentLoop | None] = ContextVar(
     "power_loop_current_loop", default=None
 )
+# The innermost run's per-send effective tool allowlist (None = unrestricted).
+# Set by StatefulAgentLoop._run_loop for the duration of a run: to the resolved
+# registry names when the caller passed ``send(tools=...)``, else to None. Child
+# spawns (run_agent_spec) read it to clamp their own registry so a sub-agent
+# never exceeds the parent's per-send capabilities (see ``inherit_send_filter``).
+_effective_tools: ContextVar[frozenset[str] | None] = ContextVar(
+    "power_loop_effective_tools", default=None
+)
 
 
 def get_event_bus() -> AgentEventBus:
@@ -47,6 +55,19 @@ def get_ctx() -> ContextManager:
 
 def get_session_id() -> str | None:
     return _current_session_id.get()
+
+
+def get_effective_tools() -> frozenset[str] | None:
+    """The innermost run's per-send tool allowlist; None = unrestricted."""
+    return _effective_tools.get()
+
+
+def set_effective_tools(names: frozenset[str] | None) -> Token:
+    return _effective_tools.set(names)
+
+
+def reset_effective_tools(token: Token) -> None:
+    _effective_tools.reset(token)
 
 
 def get_current_loop() -> StatefulAgentLoop | None:

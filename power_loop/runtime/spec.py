@@ -178,6 +178,7 @@ async def run_agent_spec(
     parent_loop: Any,
     spawn_tool_call_id: str | None = None,
     stop_event: CancellationLike = None,
+    inherit_send_filter: bool = True,
 ) -> dict[str, Any]:
     """Materialize ``spec`` as a child session under ``parent_loop`` and run it.
 
@@ -189,6 +190,13 @@ async def run_agent_spec(
     the child's run loop. When it fires, the child stops at the next round /
     cancellation checkpoint and returns ``status="cancelled"`` — the way an
     orchestrator (e.g. a workflow) tears down in-flight sub-agents.
+
+    ``inherit_send_filter`` (default True): when the parent's current run was
+    started with a per-call allowlist (``send(tools=...)``), the child's tools
+    are additionally intersected with it, so a sub-agent never exceeds the
+    parent's per-send capabilities (a silent parent's child can't speak; a
+    bash-denied parent's child can't run bash). Pass False as the explicit
+    escape hatch when a child must legitimately exceed the parent's filter.
 
     Lifecycle:
       * ``EPHEMERAL`` (default) → child session is deleted on success;
@@ -248,6 +256,20 @@ async def run_agent_spec(
         response_format=response_format,
         retry_policy=getattr(parent_config, "retry_policy", None),
     )
+    # HOST config seam (subagent_config_factory, PROVISIONAL 3.14): the parent's
+    # config may rewrite the child's default config — e.g. hand heavy leaves a
+    # context strategy (representation/fold/microcompact). The factory's output
+    # is used AS IS; it received the spec-derived default, so an increment via
+    # dataclasses.replace is the intended usage. A raising factory fails THIS
+    # delegation (surfaced as the tool error), never the parent loop.
+    _config_factory = getattr(parent_config, "subagent_config_factory", None)
+    if _config_factory is not None:
+        child_config = _config_factory(spec, child_config)
+        if not isinstance(child_config, AgentLoopConfig):
+            raise TypeError(
+                "subagent_config_factory must return an AgentLoopConfig "
+                f"(got {type(child_config).__name__})"
+            )
 
     child_sid = await store.create_session(
         system_prompt=spec.system_prompt,
@@ -279,6 +301,14 @@ async def run_agent_spec(
     )
 
     sub_registry = filtered_registry(parent_loop.tool_registry, spec.tools)
+    if inherit_send_filter and sub_registry is not None:
+        from power_loop.core.agent_context import get_effective_tools
+
+        _send_filter = get_effective_tools()
+        if _send_filter is not None:
+            sub_registry = sub_registry.subset(
+                n for n in sub_registry.names() if n in _send_filter
+            )
 
     # Build a sibling loop sharing the same store + registry-subset.
     from power_loop.agent.stateful_loop import StatefulAgentLoop
@@ -291,8 +321,24 @@ async def run_agent_spec(
         hooks=parent_loop._runner.hooks,
         event_bus=parent_loop._runner.event_bus,
     )
+    # Child-run guards propagate: a grandchild spawned DURING this child's run
+    # ticks the same task-local host state, so it must enter the same guards.
+    # Share (not copy) the parent's list so late registrations propagate too.
+    child_loop._child_run_guards = getattr(
+        parent_loop, "_child_run_guards", child_loop._child_run_guards
+    )
     try:
-        result = await child_loop.send(user_input, session_id=child_sid, stop_event=stop_event)
+        # Host-registered child-run guards (register_child_run_guard): suspend the
+        # parent's per-send ambient hook state for the duration of the child run —
+        # the child shares the parent's hooks object and task, so without this the
+        # child's rounds would tick the parent's counters/flags. Entered in
+        # registration order, exited in reverse, exceptions included.
+        with contextlib.ExitStack() as _guard_stack:
+            for _gname, _guard in getattr(parent_loop, "_child_run_guards", ()) or ():
+                _guard_stack.enter_context(_guard())
+            result = await child_loop.send(
+                user_input, session_id=child_sid, stop_event=stop_event
+            )
     except BaseException:
         # A raised child run (cancellation, provider error, bug) would otherwise leak the EPHEMERAL
         # child session — the cleanup below is only reached on a normal return (subagent-coordination-2).

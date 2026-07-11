@@ -13,8 +13,10 @@ shape but raises ``NotImplementedError`` for ``detached=True`` for now.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterable
 from typing import Any
 
+from power_loop.core.agent_context import get_effective_tools
 from power_loop.runtime.cancellation import CancellationToken
 
 from .engine import Executor, WorkflowEngine
@@ -22,6 +24,11 @@ from .result import SharedBudget, WorkflowResult, WorkflowRunHandle
 from .spec import WorkflowSpec
 
 __all__ = ["Workflow", "create_workflow"]
+
+#: Sentinel: capture the ambient per-send allowlist (``get_effective_tools()``)
+#: at construction time. Distinct from an explicit ``None`` (= unrestricted),
+#: which resume needs to be able to state exactly.
+_CAPTURE = object()
 
 
 class Workflow:
@@ -40,12 +47,22 @@ class Workflow:
         executor: Executor | None = None,
         budget: SharedBudget | None = None,
         parent_session_id: str | None = None,
+        allowed_tools: Iterable[str] | None | Any = _CAPTURE,
     ) -> None:
         self.spec = spec
         self._loop = parent_loop
         self._executor = executor
         self._budget = budget
         self._parent_sid = parent_session_id
+        # Per-send capability clamp, CAPTURED AT SUBMISSION (contextvars are
+        # unreliable inside a detached task): every leaf's tools are intersected
+        # with this set by the engine. None = unrestricted.
+        if allowed_tools is _CAPTURE:
+            self._allowed_tools: frozenset[str] | None = get_effective_tools()
+        else:
+            self._allowed_tools = (
+                frozenset(allowed_tools) if allowed_tools is not None else None
+            )
         self._tasks: set[asyncio.Task[None]] = set()  # retain detached tasks (GC guard)
         # Owned token, flipped by cancel(). Forwarded into the engine → every
         # in-flight sub-agent, so cancelling tears down the whole run.
@@ -65,7 +82,7 @@ class Workflow:
         """Interpret the spec to completion (in-process, synchronous) and return it."""
         engine = WorkflowEngine(
             self._loop, executor=self._executor, budget=self._budget,
-            stop_event=self._cancel,
+            stop_event=self._cancel, allowed_tools=self._allowed_tools,
         )
         return await engine.run(self.spec)
 
@@ -96,6 +113,7 @@ def create_workflow(
     executor: Executor | None = None,
     budget: SharedBudget | None = None,
     parent_session_id: str | None = None,
+    allowed_tools: Iterable[str] | None | Any = _CAPTURE,
 ) -> Workflow:
     """Validate ``spec_json`` and return a runnable :class:`Workflow`.
 
@@ -104,9 +122,16 @@ def create_workflow(
     :class:`~power_loop.workflow.spec.WorkflowSpecError` (all problems
     aggregated) if an unvalidated payload is invalid. Pass
     ``parent_session_id`` to enable detached execution.
+
+    ``allowed_tools``: capability clamp applied to every leaf (its tools are
+    intersected with this set). By default the parent run's per-send allowlist
+    (``send(tools=...)``) is captured HERE, at submission — reliable even for
+    detached runs, where contextvars are not. Pass an explicit iterable to
+    override, or ``None`` for unrestricted. Journaled with the run so a resume
+    keeps the same clamp.
     """
     spec = spec_json if isinstance(spec_json, WorkflowSpec) else WorkflowSpec.from_json(spec_json)
     return Workflow(
         spec, parent_loop=parent_loop, executor=executor, budget=budget,
-        parent_session_id=parent_session_id,
+        parent_session_id=parent_session_id, allowed_tools=allowed_tools,
     )

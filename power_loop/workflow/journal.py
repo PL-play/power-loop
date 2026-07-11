@@ -79,6 +79,7 @@ def new_journal(
     workflow: str,
     driver_sid: str | None = None,
     spec: dict[str, Any] | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> dict[str, Any]:
     now = _now_ms()
     return {
@@ -88,6 +89,11 @@ def new_journal(
         # The serialized WorkflowSpec (WorkflowSpec.to_dict()) so the run can be
         # resumed after a process restart without the caller re-supplying it.
         "spec": spec,
+        # The run's capability clamp (sorted list; null = unrestricted), persisted
+        # so a resume applies the SAME leaf-tool intersection — without it a
+        # resume would silently widen a clamped run's permissions. Absent in
+        # pre-3.14 journals → treated as null (old behavior).
+        "allowed_tools": allowed_tools,
         "status": "running",
         "created_at_ms": now,
         "updated_at_ms": now,
@@ -108,9 +114,10 @@ async def seed(
     run_id: str,
     workflow: str,
     spec: dict[str, Any] | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create the run journal and add it to the parent's run index."""
-    j = new_journal(run_id, workflow, spec=spec)
+    j = new_journal(run_id, workflow, spec=spec, allowed_tools=allowed_tools)
     await store.set_runtime_state(parent_sid, run_key(run_id), j)
     await _append_index(store, parent_sid, run_id)
     return j

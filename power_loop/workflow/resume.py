@@ -136,6 +136,16 @@ async def rehydrate(
     return spec, replay, j
 
 
+def _journaled_clamp(j: dict[str, Any]) -> frozenset[str] | None:
+    """The run's journaled capability clamp (see ``journal.new_journal``).
+
+    Reapplied on resume so a clamped run cannot silently widen its leaf tools
+    across a restart. Absent key (pre-3.14 journal) or null → unrestricted.
+    """
+    tools = j.get("allowed_tools")
+    return frozenset(tools) if tools is not None else None
+
+
 def _guard_resumable(run_id: str, force: bool) -> None:
     """Refuse to resume a run whose engine is still executing IN THIS PROCESS unless ``force``
     (workflow-durability-3): a second engine for the same run would race the journal. Liveness is
@@ -189,6 +199,7 @@ async def resume_run(
     engine = WorkflowEngine(
         loop, executor=executor, budget=budget,
         on_step=make_on_step(store, parent_sid, run_id), replay=replay, run_id=run_id,
+        allowed_tools=_journaled_clamp(j),
     )
     # Mark live so a concurrent resume of the same run is refused; discard in finally.
     _LIVE_RUN_IDS.add(run_id)
@@ -233,6 +244,7 @@ async def resume_detached(
             loop, executor=executor, budget=budget,
             on_step=make_on_step(store, parent_sid, run_id),
             replay=replay, run_id=run_id, stop_event=cancel_token,
+            allowed_tools=_journaled_clamp(j),
         )
 
     return spawn_background(

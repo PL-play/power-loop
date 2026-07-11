@@ -9,12 +9,15 @@ from typing import TYPE_CHECKING, Any, Literal
 _UNSET: Any = object()
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from power_loop.runtime.fold import FoldStrategy
     from power_loop.runtime.memory import MemoryProvider
     from power_loop.runtime.notes import NotesPolicy
     from power_loop.runtime.representation import Representation
     from power_loop.runtime.retry import LLMRetryPolicy
     from power_loop.runtime.runtime_state import RuntimeProjector
+    from power_loop.runtime.spec import AgentSpec
 
 LoopStatus = Literal["completed", "pending_tools", "waiting_for_input", "cancelled", "hit_round_limit", "budget_exceeded", "degraded"]
 LoopMessage = dict[str, Any]
@@ -120,6 +123,20 @@ class AgentLoopConfig:
     #: Auto-register the built-in MemoryRecallHook when ``memory`` is set. Turn
     #: off to inject memory yourself via an LLM_BEFORE hook.
     builtin_memory_hook: bool = True
+    #: HOST seam for child-run configs (PROVISIONAL, 3.14). When set on a PARENT
+    #: loop's config, every inline child spawned under it (``run_agent_spec``:
+    #: spawn_agent / run_agent delegations and in-process workflow leaves) builds
+    #: its default minimal AgentLoopConfig as usual, then passes it through
+    #: ``factory(spec, default_child_config)`` — the returned config is used AS
+    #: IS. Lets a host give heavy leaves its context strategy (representation /
+    #: fold / microcompact) without forking ``run_agent_spec``. The seam is
+    #: host-side by design: the LLM-authored ``AgentSpec`` cannot reach it; use
+    #: ``spec`` (name/metadata) only to ROUTE. Prefer ``dataclasses.replace`` on
+    #: the given default — it already carries the spec-derived fields
+    #: (system_prompt / model / budgets / response_format) and the parent's
+    #: retry_policy; overriding those is on you. Signature:
+    #: ``(AgentSpec, AgentLoopConfig) -> AgentLoopConfig``.
+    subagent_config_factory: Callable[[AgentSpec, AgentLoopConfig], AgentLoopConfig] | None = None
 
     # ── Microcompact (large tool-output spill-to-disk) ──
     #

@@ -51,7 +51,7 @@ from .resume import (
     resume_detached,
     resume_run,
 )
-from .runner import register_wake_guard, run_detached
+from .runner import claim_wake, parse_workflow_wake, register_wake_guard, run_detached
 from .spec import (
     AgentNode,
     BranchNode,
@@ -102,9 +102,11 @@ __all__ = [
     # host api
     "Workflow",
     "create_workflow",
-    # detached execution + wake (D3)
+    # detached execution + wake (D3; claim/parse helpers PROVISIONAL 3.14)
     "run_detached",
     "register_wake_guard",
+    "claim_wake",
+    "parse_workflow_wake",
     # orchestration-level resume across restart (full tier)
     "resume_run",
     "resume_detached",

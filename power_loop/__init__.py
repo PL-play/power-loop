@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "3.13.1"
+__version__ = "3.14.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -124,8 +124,14 @@ from power_loop.contracts.hook_contexts import (
 )
 from power_loop.contracts.hooks import HookContext, HookDirective, HookPoint, HookResult
 from power_loop.contracts.messages import AgentMessage, MessageRole, ToolCall
-from power_loop.contracts.protocols import EventBusProtocol, HookManagerProtocol, ToolArgsValidator
+from power_loop.contracts.protocols import (
+    ChildRunGuard,
+    EventBusProtocol,
+    HookManagerProtocol,
+    ToolArgsValidator,
+)
 from power_loop.contracts.tools import ToolDefinition, validate_tool_args
+from power_loop.core.agent_context import get_effective_tools
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.phase import PhaseContext, PhaseResult, phase
@@ -223,7 +229,7 @@ from power_loop.runtime.structured import (
     StructuredOutputSpec,
     parse_structured,
 )
-from power_loop.runtime.timers import TimerRunner
+from power_loop.runtime.timers import TimerDelivery, TimerRunner
 from power_loop.tools import (
     DEFAULT_TOOL_HANDLERS,
     ToolRegistry,
@@ -308,6 +314,7 @@ __all__ = [
 	"SessionStatsRow",
 	"TimerRow",
 	"TimerRunner",
+	"TimerDelivery",
 	"TimerFireCtx",
 	"TimerFiredPayload",
 	"SessionStatus",
@@ -463,6 +470,8 @@ __all__ = [
 	"EventBusProtocol",
 	"HookManagerProtocol",
 	"ToolArgsValidator",
+	"ChildRunGuard",
+	"get_effective_tools",
 	"ToolDefinition",
 	"validate_tool_args",
 	"ToolRegistry",
