@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+## [3.16.1] — 2026-07-11
+
+Fix, backward-compatible (patch — validation now rejects specs that were silently broken).
+
+### Fixed
+- **`inputs_from` 引用不存在的节点现在会被校验拒绝**（与 `items_from` / `branch.on`
+  的存在性检查对齐）。此前这类引用通过校验、运行时被引擎静默丢弃（只拼接
+  `_results` 里存在的 ref）——节点在缺上下文的情况下照跑，无人知晓。由
+  `validate_workflow` 的真机冒烟发现。
+
 ## [3.16.0] — 2026-07-11
 
 Feature, backward-compatible (minor).

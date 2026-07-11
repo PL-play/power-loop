@@ -69,3 +69,19 @@ async def test_validate_never_executes_anything():
 
 async def test_missing_spec_argument():
     assert "requires 'spec'" in await _handler()()
+
+
+async def test_unknown_inputs_from_ref_rejected():
+    """3.16.1 regression: an inputs_from ref to a nonexistent node used to pass
+    validation and be silently dropped at runtime (found via live smoke)."""
+    bad = {
+        "name": "wf",
+        "root": {"type": "sequence", "steps": [
+            {"type": "agent", "id": "a", "spec": {"name": "a", "system_prompt": "p"}},
+            {"type": "agent", "id": "b", "spec": {"name": "b", "system_prompt": "p"},
+             "inputs_from": ["nonexistent_node"]},
+        ]},
+    }
+    out = await _handler()(spec=bad)
+    assert out.startswith("INVALID")
+    assert "references unknown node 'nonexistent_node'" in out

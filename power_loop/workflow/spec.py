@@ -542,7 +542,7 @@ def _parse_node(
         return None
 
     if ntype == "agent":
-        return _parse_agent(data, path, problems, body_ids)
+        return _parse_agent(data, path, problems, ids, body_ids)
     if ntype == "sequence":
         return _parse_sequence(data, path, problems, ids, body_ids)
     if ntype == "parallel":
@@ -561,7 +561,7 @@ def _check_unknown(data: dict, allowed: set[str], path: str, problems: list[str]
 
 
 def _parse_agent(
-    data: dict, path: str, problems: list[str], body_ids: set[str]
+    data: dict, path: str, problems: list[str], ids: set[str], body_ids: set[str]
 ) -> AgentNode | None:
     _check_unknown(
         data, {"type", "id", "spec", "input", "inputs_from", "output_schema"}, path, problems
@@ -593,7 +593,18 @@ def _parse_agent(
         inputs_from = []
     else:
         for ref in inputs_from:
-            _check_not_body_ref(ref, path, "inputs_from", body_ids, problems)
+            # Existence check mirrors items_from/branch.on (3.16.1): an unknown
+            # ref used to pass validation and be SILENTLY DROPPED at runtime
+            # (the engine only appends refs present in _results) — the node ran
+            # with missing context and nobody was told.
+            if (
+                not _check_not_body_ref(ref, path, "inputs_from", body_ids, problems)
+                and _ref_target(ref) not in ids
+            ):
+                problems.append(
+                    f"{path}: 'inputs_from' references unknown node "
+                    f"'{_ref_target(ref)}' (known: {sorted(ids)})"
+                )
 
     out_schema = data.get("output_schema")
     if out_schema is not None:
