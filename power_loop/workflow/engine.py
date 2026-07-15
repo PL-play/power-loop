@@ -157,6 +157,7 @@ class WorkflowEngine:
         executor: Executor | None = None,
         budget: SharedBudget | None = None,
         on_step: Callable[[AgentResult], Awaitable[None]] | None = None,
+        on_node_start=None,
         stop_event: CancellationLike = None,
         replay: dict[str, AgentResult] | None = None,
         run_id: str | None = None,
@@ -180,6 +181,11 @@ class WorkflowEngine:
         # (completed / failed / budget_exceeded). Used by the detached runner to
         # journal live progress. Must not raise; errors are swallowed.
         self._on_step = on_step
+        # Optional observer fired when a REAL leaf execution begins (not for replays
+        # or guard short-circuits). The detached runner journals it as the run's live
+        # heartbeat — without it a single-leaf run reads as "running, steps: []" for
+        # its whole duration and looks hung. Must not raise; errors are swallowed.
+        self._on_node_start = on_node_start
         # Cooperative cancellation: forwarded into every in-flight leaf so they
         # stop at their next checkpoint, and checked before spawning new leaves
         # so a cancelled run stops fanning out.
@@ -341,6 +347,11 @@ class WorkflowEngine:
             output_schema=node.output_schema,
             metadata={**node.spec.metadata, **self._step_idempotency(node.id)},
         )
+        if self._on_node_start is not None:
+            try:
+                await self._on_node_start(node.id)
+            except Exception:  # noqa: BLE001 — observability must not fail the run
+                pass
         raw = await self._executor.run_agent(
             spec, user_input, parent_loop=self._loop, driver_sid=driver_sid,
             stop_event=self._cancel,

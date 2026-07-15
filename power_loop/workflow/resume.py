@@ -38,7 +38,7 @@ from power_loop.runtime.cancellation import CancellationToken
 from . import journal
 from .engine import WorkflowEngine, WorkflowRunError
 from .result import AgentResult, WorkflowResult
-from .runner import _LIVE_RUN_IDS, is_run_live, make_on_step, spawn_background
+from .runner import _LIVE_RUN_IDS, is_run_live, make_on_step, spawn_background, make_on_node_start
 from .spec import (
     AgentNode,
     BranchNode,
@@ -198,7 +198,9 @@ async def resume_run(
     await _mark_resuming(store, parent_sid, run_id, j)
     engine = WorkflowEngine(
         loop, executor=executor, budget=budget,
-        on_step=make_on_step(store, parent_sid, run_id), replay=replay, run_id=run_id,
+        on_step=make_on_step(store, parent_sid, run_id),
+        on_node_start=make_on_node_start(store, parent_sid, run_id),
+        replay=replay, run_id=run_id,
         allowed_tools=_journaled_clamp(j),
     )
     # Mark live so a concurrent resume of the same run is refused; discard in finally.
@@ -243,6 +245,7 @@ async def resume_detached(
         return WorkflowEngine(
             loop, executor=executor, budget=budget,
             on_step=make_on_step(store, parent_sid, run_id),
+            on_node_start=make_on_node_start(store, parent_sid, run_id),
             replay=replay, run_id=run_id, stop_event=cancel_token,
             allowed_tools=_journaled_clamp(j),
         )

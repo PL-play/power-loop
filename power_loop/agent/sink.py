@@ -98,6 +98,10 @@ class SQLiteSink:
         self._unresolved: set[str] = set()
         self._assistant_seq: int | None = None
         self._tool_calls: list[dict[str, Any]] = []
+        # The send this sink is persisting for — stamped by StatefulAgentLoop._run_loop right
+        # where pipeline.send_index is stamped, so per-round usage rows carry the real send
+        # (usage_rounds' key is (session_id, send_index, round_index) since store schema v6).
+        self.send_index: int | None = None
         # Count of compactions persisted during this sink's lifetime (one sink per send).
         # StatefulAgentLoop reads it after a run to decide whether its per-session row cache
         # can be extended with a cheap delta read (no fold this run) or must be invalidated
@@ -372,6 +376,7 @@ class SQLiteSink:
             await self.store.record_usage(
                 self.session_id,
                 round_index=round_index,
+                send_index=self.send_index,
                 prompt_tokens=_int_or_none(usage.get("prompt_tokens") or usage.get("input")),
                 completion_tokens=_int_or_none(
                     usage.get("completion_tokens") or usage.get("output")

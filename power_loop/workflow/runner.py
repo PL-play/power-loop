@@ -75,6 +75,15 @@ def make_on_step(store: Any, parent_sid: str, run_id: str):
     return _on_step
 
 
+def make_on_node_start(store: Any, parent_sid: str, run_id: str):
+    """Build the leaf-start callback: journals the node into ``live`` (the run's heartbeat)."""
+
+    async def _on_node_start(node_id: str) -> None:
+        await journal.node_start(store, parent_sid, run_id, node_id=node_id)
+
+    return _on_node_start
+
+
 def _wake_note(run_id: str, status: str, extra: str = "") -> str:
     base = f"{journal.JOURNAL_PREFIX}{run_id} {status}"
     return f"{base} — {extra}" if extra else base
@@ -194,6 +203,7 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
         return WorkflowEngine(
             loop, executor=workflow._executor, budget=workflow._budget,
             on_step=make_on_step(store, parent_sid, run_id),
+            on_node_start=make_on_node_start(store, parent_sid, run_id),
             stop_event=workflow._cancel, run_id=run_id,
             allowed_tools=workflow._allowed_tools,
         )

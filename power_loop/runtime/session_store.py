@@ -114,13 +114,14 @@ CREATE TABLE IF NOT EXISTS compactions (
 
 CREATE TABLE IF NOT EXISTS usage_rounds (
     session_id        TEXT NOT NULL,
+    send_index        INTEGER NOT NULL DEFAULT 0,
     round_index       INTEGER NOT NULL,
     prompt_tokens     INTEGER,
     completion_tokens INTEGER,
     total_tokens      INTEGER,
     model             TEXT,
     created_at        INTEGER NOT NULL,
-    PRIMARY KEY (session_id, round_index)
+    PRIMARY KEY (session_id, send_index, round_index)
 );
 
 CREATE TABLE IF NOT EXISTS session_state (
@@ -212,7 +213,7 @@ CREATE TABLE IF NOT EXISTS notes (
 #: (a new column/index/table or a backfill) so existing ``.db`` files are upgraded on
 #: open instead of silently keeping the old shape (``CREATE TABLE IF NOT EXISTS`` never
 #: alters an existing table).
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 def _migration_0001_timers_columns(conn: sqlite3.Connection) -> None:
@@ -233,8 +234,36 @@ def _migration_0001_timers_columns(conn: sqlite3.Connection) -> None:
 #: ``target_version - 1`` to ``target_version`` and MUST be idempotent (guard with
 #: ``PRAGMA table_info`` / ``sqlite_master`` checks) so a crashed/retried upgrade and a
 #: legacy ``user_version=0`` DB both converge. Append, never reorder or mutate shipped steps.
+def _migration_0002_usage_rounds_send_index(conn: sqlite3.Connection) -> None:
+    """usage_rounds PK (session_id, round_index) → (session_id, send_index, round_index).
+
+    round_index resets per send, so the old key silently overwrote earlier sends'
+    per-round rows. SQLite can't alter a PK — rebuild the table; existing rows
+    backfill send_index=0 (their true send is unrecoverable). Idempotent: guarded
+    by a column probe so a crash-then-retry re-run is safe."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(usage_rounds)").fetchall()}
+    if "send_index" in cols:
+        return
+    conn.execute(
+        """CREATE TABLE usage_rounds_v2 (
+            session_id TEXT NOT NULL, send_index INTEGER NOT NULL DEFAULT 0,
+            round_index INTEGER NOT NULL, prompt_tokens INTEGER, completion_tokens INTEGER,
+            total_tokens INTEGER, model TEXT, created_at INTEGER NOT NULL,
+            PRIMARY KEY (session_id, send_index, round_index))"""
+    )
+    conn.execute(
+        "INSERT INTO usage_rounds_v2 (session_id, send_index, round_index, prompt_tokens,"
+        " completion_tokens, total_tokens, model, created_at)"
+        " SELECT session_id, 0, round_index, prompt_tokens, completion_tokens,"
+        " total_tokens, model, created_at FROM usage_rounds"
+    )
+    conn.execute("DROP TABLE usage_rounds")
+    conn.execute("ALTER TABLE usage_rounds_v2 RENAME TO usage_rounds")
+
+
 MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
     (1, _migration_0001_timers_columns),
+    (2, _migration_0002_usage_rounds_send_index),
 )
 
 #: Per-session tables (all keyed by ``session_id``) captured by
@@ -1382,18 +1411,22 @@ class SessionStore:
         completion_tokens: int | None,
         total_tokens: int | None,
         model: str | None = None,
+        send_index: int | None = None,
     ) -> None:
+        # Keyed (session_id, send_index, round_index) since schema v2: round_index resets
+        # per send, so the old 2-column key overwrote earlier sends' rows. send_index=None
+        # (a caller that doesn't track sends) stores 0 — the legacy behavior, per send 0.
         with self._lock, self._conn:
             self._conn.execute(
                 """
                 INSERT OR REPLACE INTO usage_rounds (
-                    session_id, round_index, prompt_tokens, completion_tokens,
+                    session_id, send_index, round_index, prompt_tokens, completion_tokens,
                     total_tokens, model, created_at
-                ) VALUES (?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?)
                 """,
                 (
-                    session_id, round_index, prompt_tokens, completion_tokens,
-                    total_tokens, model, _now_ms(),
+                    session_id, int(send_index or 0), round_index, prompt_tokens,
+                    completion_tokens, total_tokens, model, _now_ms(),
                 ),
             )
 

@@ -343,3 +343,52 @@ def test_archive_session_preserves_data(store: SessionStore) -> None:
 def test_sqlite3_module_smoke() -> None:
     # Sanity: stdlib only.
     assert sqlite3.sqlite_version_info >= (3, 7, 0)
+
+
+def test_record_usage_keyed_per_send(store: SessionStore) -> None:
+    """v2 schema: same round_index in different sends must coexist (round_index
+    resets per send; the old 2-column key kept only the last send's rows)."""
+    sid = store.create_session()
+    store.record_usage(sid, round_index=1, send_index=1, prompt_tokens=1, completion_tokens=1, total_tokens=2)
+    store.record_usage(sid, round_index=1, send_index=2, prompt_tokens=3, completion_tokens=3, total_tokens=6)
+    store.record_usage(sid, round_index=1, prompt_tokens=9, completion_tokens=9, total_tokens=18)  # legacy → send 0
+    rows = store._conn.execute(
+        "SELECT send_index, total_tokens FROM usage_rounds WHERE session_id=? ORDER BY send_index",
+        (sid,),
+    ).fetchall()
+    assert [(r["send_index"], r["total_tokens"]) for r in rows] == [(0, 18), (1, 2), (2, 6)]
+
+
+def test_migration_v1_to_v2_rebuilds_usage_rounds(tmp_path: Path) -> None:
+    """A store whose usage_rounds still has the v1 shape (old 2-column PK, no send_index)
+    gets rebuilt on open: send_index backfills 0, rows survive, PK is the 3-column key."""
+    import sqlite3 as _sq
+
+    db = tmp_path / "old.db"
+    # A REAL store first (all tables present), then hand-downgrade usage_rounds to the
+    # v1 shape + stamp user_version=1 — faking the whole v1 schema by hand would miss
+    # columns other migrations touch.
+    s0 = SessionStore.open(db)
+    s0.close()
+    conn = _sq.connect(db)
+    conn.executescript(
+        """DROP TABLE usage_rounds;
+           CREATE TABLE usage_rounds (
+               session_id TEXT NOT NULL, round_index INTEGER NOT NULL, prompt_tokens INTEGER,
+               completion_tokens INTEGER, total_tokens INTEGER, model TEXT,
+               created_at INTEGER NOT NULL, PRIMARY KEY (session_id, round_index));
+           INSERT INTO usage_rounds VALUES ('s', 3, 1, 2, 3, 'm', 42);
+           PRAGMA user_version = 1;"""
+    )
+    conn.close()
+
+    s = SessionStore.open(db)   # runs the migration ladder
+    try:
+        row = s._conn.execute(
+            "SELECT send_index, total_tokens, created_at FROM usage_rounds WHERE session_id='s'"
+        ).fetchone()
+        assert (row["send_index"], row["total_tokens"], row["created_at"]) == (0, 3, 42)
+        cols = {r[1] for r in s._conn.execute("PRAGMA table_info(usage_rounds)").fetchall()}
+        assert "send_index" in cols
+    finally:
+        s.close()

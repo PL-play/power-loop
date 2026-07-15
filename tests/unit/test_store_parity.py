@@ -149,7 +149,11 @@ async def scn_usage_stats(st: Any) -> list[Any]:
     await st.record_usage("s", round_index=0, prompt_tokens=10, completion_tokens=5,
                           total_tokens=15, model="m")
     await st.record_usage("s", round_index=0, prompt_tokens=11, completion_tokens=6,
-                          total_tokens=17)  # overwrite same round
+                          total_tokens=17)  # overwrite same round (same send 0)
+    # v6: round_index resets per send — the SAME round in a LATER send must NOT clobber
+    # send 0's row (the old (session_id, round_index) key kept only the last send).
+    await st.record_usage("s", round_index=0, send_index=2, prompt_tokens=20,
+                          completion_tokens=8, total_tokens=28)
     await st.bump_session_stats("s", {"calls": 1, "prompt_tokens": 10,
                                       "completion_tokens": 5, "total_tokens": 15},
                                 rounds=2, tool_calls=3)
@@ -289,3 +293,4 @@ async def test_sqlite_large_payload() -> None:
         await exercise_large_payload(store)
     finally:
         await store.close()
+

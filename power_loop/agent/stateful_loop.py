@@ -1547,6 +1547,11 @@ class StatefulAgentLoop:
                 # the whole send shares one index. _persist_user_input bumped it for a fresh
                 # send; resume()/submit_input() leave it, correctly attaching to the prior send.
                 pipeline.send_index = current_send_index
+                # Same index onto the sink: per-round usage rows are keyed by send (store v6).
+                # Stamped HERE (the convergence point of send/resume/submit_input) so every
+                # entry path gets it without duplicating the lookup.
+                if hasattr(sink, "send_index"):
+                    sink.send_index = self._coerce_send_index(current_send_index)
                 try:
                     result: AgentLoopResult = await pipeline.run(history)
                 except Exception as exc:

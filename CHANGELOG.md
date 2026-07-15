@@ -8,6 +8,31 @@
 
 ## [Unreleased]
 
+## [3.17.0] — 2026-07-15
+
+Feature + schema migration, backward-compatible (minor; the store migrates itself on open).
+
+### Fixed
+- **`usage_rounds` 逐轮用量不再被后续 send 覆盖**：主键
+  `(session_id, round_index)` → `(session_id, send_index, round_index)`。
+  `round_index` 每个 send 从 0 重置,旧键使得同一会话每次新 send 都覆盖上一次 send
+  的逐轮明细——账面只剩最后一次 send。存量行回填 `send_index=0`(历史明细已不可恢复)。
+  异步 store schema v5→v6(SQLite 重建表;PostgreSQL/MySQL 原地换 PK,PG 语句已在
+  生产克隆表实测);旧版同步 SQLite store `user_version` 1→2 同款重建。
+  `record_usage(...)` 新增可选 `send_index`(缺省 None→0,旧调用方为兼容语义);
+  `SQLiteSink.send_index` 属性由 `StatefulAgentLoop` 在 send/resume/submit_input
+  的收敛点自动盖章——托管用法无需任何改动即获得按 send 的逐轮明细。
+
+### Added
+- **detached workflow 实时心跳（`live` / `live_nodes`）**：单叶 detached 运行期间
+  `workflow_status` 此前只有 `running` + 空 `steps`(steps 只在节点**完成**时落账),
+  一次 2 小时的真实走查被主 agent 和用户一致误判为卡死。现在:引擎新增
+  `on_node_start` 观察者(仅真实执行触发;replay/预算拒绝不触发),detached runner
+  将其journal 为 `live[node_id]=started_at_ms`,节点落账时清除;`get_workflow` 对
+  running 运行返回 `elapsed_s` + `live_nodes[{node_id, running_for_s}]` 与一行
+  「有 live_nodes 且时长在涨 = 在干活」的说明。resume(同步/detached)两路同样接线。
+  `WorkflowEngine` 新增可选构造参数 `on_node_start`(默认 None,行为不变)。
+
 ## [3.16.1] — 2026-07-11
 
 Fix, backward-compatible (patch — validation now rejects specs that were silently broken).

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import journal
+from .journal import _now_ms
 
 __all__ = ["list_workflows", "get_workflow"]
 
@@ -45,6 +46,24 @@ async def get_workflow(
     j = await journal.read(store, parent_sid, run_id)
     if j is None:
         return None
+    # A running run's ``steps`` only fills as nodes SETTLE — surface the live heartbeat
+    # (which leaves are executing right now, for how long) so a long single-leaf run is
+    # distinguishable from a hung one without waiting for it to finish.
+    if j.get("status") == "running":
+        j = dict(j)
+        now = _now_ms()
+        created = int(j.get("created_at_ms") or now)
+        j["elapsed_s"] = max(0, (now - created) // 1000)
+        live = j.get("live") or {}
+        j["live_nodes"] = [
+            {"node_id": nid, "running_for_s": max(0, (now - int(ts or now)) // 1000)}
+            for nid, ts in sorted(live.items())
+        ]
+        if not j.get("steps") and j["live_nodes"]:
+            j["note"] = (
+                "steps 只在节点完成时落账;live_nodes 是当前正在执行的叶子及其已运行时长 —— "
+                "有 live_nodes 且时长在涨 = 在干活,不是卡死。"
+            )
     if not detail:
         return j
     enriched = dict(j)

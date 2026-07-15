@@ -1146,13 +1146,17 @@ class SessionStore:
         total_tokens: int | None,
         cached_tokens: int | None = None,
         model: str | None = None,
+        send_index: int | None = None,
     ) -> None:
-        """Record per-round token usage. Legacy used ``INSERT OR REPLACE`` keyed on
-        ``(session_id, round_index)``; since every non-key column is supplied, that is
-        an overwrite-all upsert — all columns become ``val_cols``."""
+        """Record per-round token usage, keyed ``(session_id, send_index, round_index)``.
+
+        ``round_index`` RESETS per send — the pre-v6 2-column key made every new send
+        overwrite the previous send's rows, so a session's accounting kept only the last
+        send's detail. ``send_index=None`` (a caller that doesn't track sends) stores 0,
+        which preserves the legacy overwrite-within-send-0 behavior instead of erroring."""
         sql = self._db.dialect.upsert(
             self.t.usage_rounds,
-            ("session_id", "round_index"),
+            ("session_id", "send_index", "round_index"),
             ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "model",
              "created_at"),
         )
@@ -1160,8 +1164,8 @@ class SessionStore:
             await tx.execute(
                 sql,
                 (
-                    session_id, round_index, prompt_tokens, completion_tokens,
-                    total_tokens, cached_tokens, model, _now_ms(),
+                    session_id, int(send_index or 0), round_index, prompt_tokens,
+                    completion_tokens, total_tokens, cached_tokens, model, _now_ms(),
                 ),
             )
 
@@ -1241,9 +1245,10 @@ class SessionStore:
             # LIMIT inside IN(...) (err 1235) and modifying a table referenced in its own
             # subquery (err 1093); materializing it first is accepted by SQLite/PG/MySQL.
             sql += (
-                f" AND round_index NOT IN (SELECT r FROM (SELECT round_index AS r "
+                f" AND (send_index, round_index) NOT IN (SELECT s, r FROM "
+                f"(SELECT send_index AS s, round_index AS r "
                 f"FROM {self.t.usage_rounds} "
-                "WHERE session_id=? ORDER BY round_index DESC LIMIT ?) AS _keep)"
+                "WHERE session_id=? ORDER BY send_index DESC, round_index DESC LIMIT ?) AS _keep)"
             )
             params += [session_id, int(keep_last)]
         async with self._db.transaction() as tx:

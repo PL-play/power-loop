@@ -341,3 +341,81 @@ async def test_create_workflow_tool_detached_returns_runid():
                if t is not asyncio.current_task() and t.get_name().startswith("workflow-")]
     if pending:
         await asyncio.gather(*pending)
+
+
+# ── live heartbeat (v3.17): journal.live + introspect live_nodes ─────────────
+
+@pytest.mark.asyncio
+async def test_journal_live_heartbeat_set_and_cleared():
+    loop = _loop()
+    store = await loop._ensure_store()
+    psid = await loop.new_session()
+    await journal.seed(store, psid, "r1", "wf")
+
+    await journal.node_start(store, psid, "r1", node_id="walkthrough")
+    j = await journal.read(store, psid, "r1")
+    assert "walkthrough" in (j.get("live") or {})
+
+    # the node settling clears its heartbeat
+    await journal.record_step(store, psid, "r1", node_id="walkthrough", status="completed")
+    j = await journal.read(store, psid, "r1")
+    assert (j.get("live") or {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_surfaces_live_nodes_while_running():
+    from power_loop.workflow.introspect import get_workflow
+
+    loop = _loop()
+    store = await loop._ensure_store()
+    psid = await loop.new_session()
+    await journal.seed(store, psid, "r2", "wf")
+    await journal.node_start(store, psid, "r2", node_id="a")
+
+    j = await get_workflow(loop, psid, "r2")
+    assert j["status"] == "running"
+    assert isinstance(j.get("elapsed_s"), int)
+    assert [n["node_id"] for n in j["live_nodes"]] == ["a"]
+    assert j["live_nodes"][0]["running_for_s"] >= 0
+    assert "live_nodes" in (j.get("note") or "")  # the "not hung" explainer
+
+    # finished runs don't carry the running-only fields
+    res = WorkflowResult(name="wf", status="completed",
+                         results={"a": AgentResult("a", "completed", "ok")})
+    await journal.finalize(store, psid, "r2", res)
+    j2 = await get_workflow(loop, psid, "r2")
+    assert "live_nodes" not in j2
+
+
+@pytest.mark.asyncio
+async def test_detached_run_populates_live_during_execution():
+    """End-to-end: a real detached run's journal shows the leaf in `live` while the
+    leaf executes, and clears it by completion."""
+    import asyncio as _asyncio
+
+    seen_live: list[dict] = []
+
+    class _SlowLLM(_FakeLLM):
+        async def complete(self, request, **kw):
+            await _asyncio.sleep(0.15)          # give the poller a window
+            return await super().complete(request, **kw)
+
+    loop = StatefulAgentLoop(
+        llm=_SlowLLM(),
+        db_path=tempfile.mktemp(suffix=".db"),
+        config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3, compactor=None),
+    )
+    psid = await loop.new_session()
+    wf = create_workflow(SINGLE, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True)
+    store = await loop._ensure_store()
+    for _ in range(40):
+        j = await journal.read(store, psid, handle.run_id)
+        if j and j.get("live"):
+            seen_live.append(dict(j["live"]))
+        if j and j.get("status") != "running":
+            break
+        await _asyncio.sleep(0.05)
+    assert any("a" in live for live in seen_live)   # the leaf was visibly live mid-run
+    j = await journal.read(store, psid, handle.run_id)
+    assert j.get("status") == "completed" and not (j.get("live") or {})

@@ -169,6 +169,26 @@ async def update(
     return await store.mutate_runtime_state(parent_sid, run_key(run_id), _apply, default=None)
 
 
+async def node_start(
+    store: SessionStore, parent_sid: str, run_id: str, *, node_id: str
+) -> None:
+    """Mark a leaf as LIVE in the journal (``live[node_id] = started_at_ms``).
+
+    A single-leaf detached run used to be a black box: ``steps`` only fills as nodes
+    SETTLE, so a 40-minute walkthrough showed ``running, steps: []`` the whole time and
+    every observer concluded it was hung. ``live`` + elapsed is the heartbeat."""
+    def _apply(jn: Any) -> Any:
+        if jn is None or _is_terminal(jn.get("status")):
+            return MUTATE_SKIP
+        live = dict(jn.get("live") or {})
+        live[node_id] = _now_ms()
+        jn["live"] = live
+        jn["updated_at_ms"] = _now_ms()
+        return jn
+
+    await store.mutate_runtime_state(parent_sid, run_key(run_id), _apply, default=None)
+
+
 async def record_step(
     store: SessionStore,
     parent_sid: str,
@@ -211,6 +231,10 @@ async def record_step(
         steps = [s for s in j.get("steps", []) if s.get("node_id") != node_id]
         steps.append(step)
         j["steps"] = steps
+        # The node settled — drop its live heartbeat (see node_start).
+        live = dict(j.get("live") or {})
+        if live.pop(node_id, None) is not None:
+            j["live"] = live
         j["updated_at_ms"] = _now_ms()
         return j
 

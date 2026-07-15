@@ -69,7 +69,11 @@ def validate_table_prefix(prefix: str) -> str:
 #: v3 (2026-06): adds the ``{prefix}hook_events`` table (ephemeral hook-augmentation audit log).
 #: v4 (2026-06): widen MySQL free-text/JSON columns TEXT→LONGTEXT.
 #: v5 (2026-06): adds ``cached_tokens`` (prompt cache-read tokens) to usage_rounds + session_stats.
-CURRENT_SCHEMA_VERSION = 5
+#: v6 (2026-07): usage_rounds PK (session_id, round_index) → (session_id, send_index, round_index).
+#:   round_index RESETS per send, so the old key silently overwrote earlier sends' per-round rows —
+#:   a session's accounting kept only the LAST send's detail. Existing rows backfill send_index=0
+#:   (their true send is unrecoverable); new rows carry the real send index.
+CURRENT_SCHEMA_VERSION = 6
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -130,7 +134,44 @@ async def _migration_steps(
             steps.append(
                 f"ALTER TABLE {prefix}session_stats ADD COLUMN cached_tokens {int_t} NOT NULL DEFAULT 0"
             )
+    if from_version < 6:
+        # v5 → v6: usage_rounds PK gains send_index (round_index resets per send; the old
+        # 2-column key overwrote prior sends' rows). SQLite can't alter a PK → rebuild the
+        # table; PG/MySQL alter in place. The _column_exists probe makes a re-run safe on
+        # MySQL's auto-committing DDL (a half-applied ladder resumes past the done steps).
+        if not await _column_exists(tx, db.dialect.name, f"{prefix}usage_rounds", "send_index"):
+            steps += _usage_rounds_v6_ddl(db.dialect.name, prefix)
     return steps
+
+
+def _usage_rounds_v6_ddl(dialect_name: str, prefix: str) -> list[str]:
+    p = prefix
+    if dialect_name == "sqlite":
+        return [
+            f"""CREATE TABLE {p}usage_rounds_v6 (
+                session_id TEXT NOT NULL, send_index INTEGER NOT NULL DEFAULT 0,
+                round_index INTEGER NOT NULL, prompt_tokens INTEGER,
+                completion_tokens INTEGER, total_tokens INTEGER, cached_tokens INTEGER, model TEXT,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (session_id, send_index, round_index))""",
+            f"INSERT INTO {p}usage_rounds_v6 (session_id, send_index, round_index, prompt_tokens,"
+            f" completion_tokens, total_tokens, cached_tokens, model, created_at)"
+            f" SELECT session_id, 0, round_index, prompt_tokens, completion_tokens, total_tokens,"
+            f" cached_tokens, model, created_at FROM {p}usage_rounds",
+            f"DROP TABLE {p}usage_rounds",
+            f"ALTER TABLE {p}usage_rounds_v6 RENAME TO {p}usage_rounds",
+        ]
+    if dialect_name == "postgres":
+        return [
+            f"ALTER TABLE {p}usage_rounds ADD COLUMN send_index BIGINT NOT NULL DEFAULT 0",
+            f"ALTER TABLE {p}usage_rounds DROP CONSTRAINT {p}usage_rounds_pkey",
+            f"ALTER TABLE {p}usage_rounds ADD PRIMARY KEY (session_id, send_index, round_index)",
+        ]
+    # mysql: one statement so the auto-committing DDL can't leave the PK half-swapped.
+    return [
+        f"ALTER TABLE {p}usage_rounds ADD COLUMN send_index BIGINT NOT NULL DEFAULT 0, "
+        f"DROP PRIMARY KEY, ADD PRIMARY KEY (session_id, send_index, round_index)"
+    ]
 
 
 def migration_ddl_for_display(db: Database, prefix: str, *, from_version: int) -> list[str]:
@@ -155,6 +196,8 @@ def migration_ddl_for_display(db: Database, prefix: str, *, from_version: int) -
         steps.append(
             f"ALTER TABLE {prefix}session_stats ADD COLUMN cached_tokens {int_t} NOT NULL DEFAULT 0"
         )
+    if from_version < 6:
+        steps += _usage_rounds_v6_ddl(db.dialect.name, prefix)
     return steps
 
 
