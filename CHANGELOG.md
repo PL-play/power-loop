@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+## [3.17.1] — 2026-07-17
+
+Fix, backward-compatible (patch).
+
+### Fixed
+- **token 预算耗尽现在进入 `COMPLETE_DECIDE` 收尾边界**：一次 run 在干净轮边界超过
+  `max_tokens_per_run` 时，先以 `reason="budget_exceeded"` 咨询 hook；无注入时仍原样返回
+  `budget_exceeded`，有注入时则把 durable user 收尾提示放进同一 send，并允许其在正常 token
+  预算已经耗尽后运行明确授予的 `extra_rounds`。该收尾窗口是精确、有限的，不会继承主循环尚未
+  使用的轮数。`max_tokens_per_run=None` 或 `<=0` 统一表示不限制。
+
 ## [3.17.0] — 2026-07-15
 
 Feature + schema migration, backward-compatible (minor; the store migrates itself on open).

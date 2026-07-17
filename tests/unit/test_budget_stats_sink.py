@@ -18,6 +18,9 @@ from power_loop import (
     AgentEventBus,
     AgentEventType,
     AgentLoopConfig,
+    CompleteDecideCtx,
+    HookDirective,
+    HookPoint,
     StatefulAgentLoop,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
@@ -128,6 +131,66 @@ async def test_budget_disabled_by_default(tmp_path):
     sid = await loop.new_session()
     res = await loop.send("hi", session_id=sid)
     assert res.status == "completed"
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_zero_budget_means_unlimited(tmp_path):
+    llm = _Scripted(responses=[
+        _tool_resp("c1", "echo", prompt=10**6, completion=10),
+        _resp("finished", prompt=10**6, completion=10),
+    ])
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=str(tmp_path / "s.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=4, max_tokens_per_run=0),
+        tool_registry=_echo_registry(),
+    )
+    sid = await loop.new_session()
+    res = await loop.send("hi", session_id=sid)
+    assert res.status == "completed"
+    assert res.final_text == "finished"
+    assert llm._idx == 2
+    await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_budget_exceeded_complete_decide_runs_bounded_finalize(tmp_path):
+    # Round 0 crosses the normal budget. COMPLETE_DECIDE injects a durable
+    # finalizer and grants exactly one extra round; that round may run despite
+    # the exhausted budget, then the standard forced summary closes the send.
+    llm = _Scripted(responses=[
+        _tool_resp("c1", "echo", prompt=1000, completion=100),
+        _tool_resp("c2", "echo", prompt=1000, completion=100),
+        _resp("forced wrap-up", prompt=10, completion=2),
+    ])
+    reasons: list[str] = []
+
+    def finalize(ctx: CompleteDecideCtx) -> None:
+        reasons.append(ctx.reason)
+        if ctx.reason != "budget_exceeded":
+            return
+        ctx.inject = "[system] budget exhausted — finalize now"
+        ctx.extra_rounds = 1
+        ctx.directive = HookDirective.SHORT_CIRCUIT
+
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=str(tmp_path / "s.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=10, max_tokens_per_run=500),
+        tool_registry=_echo_registry(),
+    )
+    loop.hooks.register(HookPoint.COMPLETE_DECIDE, finalize)
+    sid = await loop.new_session()
+    res = await loop.send("hi", session_id=sid)
+
+    assert reasons == ["budget_exceeded", "hit_round_limit"]
+    assert res.status == "hit_round_limit"
+    assert "forced wrap-up" in res.final_text
+    # 1 normal round + exactly 1 injected round + the stock forced wrap-up.
+    # If the old main-loop allowance leaked into finalize, this would complete
+    # from _Scripted's fallback instead of reaching the forced wrap-up here.
+    assert llm._idx == 3
+    messages = await loop.get_messages(sid)
+    assert any(m.get("content") == "[system] budget exhausted — finalize now" for m in messages)
     await loop.aclose()
 
 

@@ -862,7 +862,16 @@ class AgentPipeline:
             extra = max(1, int(ctx.extra_rounds))
         except (TypeError, ValueError):
             extra = 1
-        self._round_limit = max(self._round_limit, next_round + extra)
+        # A terminal injection owns a fresh, exact allowance. In particular,
+        # budget-exceeded finalizers must not inherit all unused main-loop
+        # rounds (which could turn a 4-round finalizer into dozens of unbudgeted
+        # calls), while round-limit finalizers still extend past the old limit.
+        self._round_limit = next_round + extra
+        # The normal token budget is already a terminal condition. Once a hook
+        # elects to continue, let its explicitly bounded allowance run; checking
+        # the same exhausted budget on the next boundary would immediately stop
+        # before the injected prompt ever reached the model.
+        self._terminal_grace_active = True
         return True
 
     async def run(self, messages: list[LoopMessage]) -> AgentLoopResult:
@@ -891,6 +900,7 @@ class AgentPipeline:
         # over an explicit limit rather than a range().
         self._round_limit = int(self.config.max_rounds)
         self._complete_decide_fires = 0
+        self._terminal_grace_active = False
         round_idx = -1
         while True:
             round_idx += 1
@@ -916,7 +926,12 @@ class AgentPipeline:
             # the budget already finished cleanly, so no dangling tool_calls;
             # we stop before paying for the next LLM call). ──
             budget = self.config.max_tokens_per_run
-            if budget is not None and round_idx > 0:
+            if (
+                budget is not None
+                and int(budget) > 0
+                and round_idx > 0
+                and not self._terminal_grace_active
+            ):
                 totals = self.ctx.usage_totals
                 spent = int(totals.get("prompt_tokens", 0)) + int(totals.get("completion_tokens", 0))
                 if spent >= int(budget):
@@ -927,12 +942,20 @@ class AgentPipeline:
                         ),
                         round_index=round_idx,
                     )
-                    await self._finalize("budget_exceeded", rounds=round_idx)
-                    return self._make_result(
-                        "budget_exceeded",
-                        final_text="[budget_exceeded]",
-                        rounds=round_idx,
-                    )
+                    # COMPLETE_DECIDE gets first refusal at the same clean
+                    # boundary as the terminal result. A hook injection grants
+                    # a bounded finalization window in this send; with no hook,
+                    # preserve the historical budget_exceeded behavior.
+                    if not await self._complete_decide(
+                        reason="budget_exceeded", round_idx=round_idx, final_text="",
+                        next_round=round_idx,
+                    ):
+                        await self._finalize("budget_exceeded", rounds=round_idx)
+                        return self._make_result(
+                            "budget_exceeded",
+                            final_text="[budget_exceeded]",
+                            rounds=round_idx,
+                        )
 
             # ── Hook: ROUND_START ──
             round_ctx = RoundStartCtx(

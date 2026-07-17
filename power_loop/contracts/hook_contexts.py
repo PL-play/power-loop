@@ -183,8 +183,10 @@ class CompleteDecideCtx(BaseHookCtx):
     """Context for :pyattr:`HookPoint.COMPLETE_DECIDE`.
 
     Fired when the send is about to end: ``reason="completed"`` (the model
-    produced a round with no tool calls) or ``reason="hit_round_limit"``
-    (the round budget is exhausted, before the forced wrap-up call).
+    produced a round with no tool calls), ``reason="hit_round_limit"``
+    (the round budget is exhausted, before the forced wrap-up call), or
+    ``reason="budget_exceeded"`` (the per-run token budget was crossed at a
+    clean round boundary).
 
     Directives: SHORT_CIRCUIT — set ``inject`` to a non-empty string; it is
     appended as a DURABLE user message in the SAME send and the loop keeps
@@ -194,7 +196,9 @@ class CompleteDecideCtx(BaseHookCtx):
     ``fire_count`` is how many times a COMPLETE_DECIDE injection already
     happened in this send — handlers MUST bound themselves with it (an
     unconditional SHORT_CIRCUIT would loop forever, subject only to the
-    token budget / cancellation).
+    injected round allowance / cancellation). Once a handler injects, the
+    normal token budget is suspended for those explicitly granted rounds so
+    a budget-exhaustion finalizer can actually run.
     """
 
     reason: str = "completed"

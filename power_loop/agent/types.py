@@ -74,8 +74,10 @@ class AgentLoopConfig:
     #: Hard per-run token budget (prompt + completion summed over the whole
     #: run, real provider usage — see ``ContextManager.usage_totals``). Checked
     #: at round boundaries: the round that crosses the budget still finishes
-    #: (so no tool_calls are left dangling), then the loop stops with
-    #: status="budget_exceeded". ``None`` disables.
+    #: (so no tool_calls are left dangling), then COMPLETE_DECIDE is consulted
+    #: with reason="budget_exceeded" before the loop stops. A successful hook
+    #: injection gets its bounded extra rounds even though the normal budget is
+    #: exhausted. ``None`` or a non-positive value disables the budget.
     max_tokens_per_run: int | None = None
     #: Context handling = REPRESENTATION × FOLD_STRATEGY (power-loop 3.0), two orthogonal axes.
     #:

@@ -38,7 +38,7 @@ from power_loop.runtime.cancellation import CancellationToken
 from . import journal
 from .engine import WorkflowEngine, WorkflowRunError
 from .result import AgentResult, WorkflowResult
-from .runner import _LIVE_RUN_IDS, is_run_live, make_on_step, spawn_background, make_on_node_start
+from .runner import _LIVE_RUN_IDS, is_run_live, make_on_node_start, make_on_step, spawn_background
 from .spec import (
     AgentNode,
     BranchNode,
