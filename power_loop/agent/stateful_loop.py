@@ -682,6 +682,50 @@ class StatefulAgentLoop:
             max_rounds=max_rounds,
         )
 
+    def pending_follow_up_count(self, session_id: str) -> int:
+        """Number of queued (not yet drained) follow-up items for ``session_id``.
+
+        Steering accepted in the terminal window of a run (after the loop's last
+        round-boundary drain) stays queued on the now-idle session. Hosts use this
+        after a run returns to detect stranded steering and hand it to
+        :meth:`flush_follow_ups` instead of leaving it silently parked.
+        """
+        return len(self._follow_up_queues.get(session_id, []))
+
+    async def flush_follow_ups(
+        self,
+        session_id: str,
+        *,
+        stop_event: CancellationLike = None,
+        tools: Sequence[str] | ToolRegistry | None = None,
+        system_prompt: str | None = None,
+        max_rounds: int | None = None,
+    ) -> StatefulResult | None:
+        """Run queued follow-up steering left stranded on an IDLE session.
+
+        Returns ``None`` when there is nothing to do: the queue is empty, or the
+        session lock is held (the running owner drains the queue itself at its
+        round boundaries). Otherwise drains the queue, merges the items into one
+        ``<follow_up>`` user message and runs it via :meth:`send`, returning that
+        run's result. Call in a loop until it returns ``None`` to also cover items
+        enqueued during the flush run's own terminal window.
+        """
+        sid = session_id
+        self._raise_if_closing()
+        await self._ensure_store()
+        await self._ensure_session_or_raise(sid)
+        if self._lock_for(sid).locked():
+            return None
+        async with self._follow_up_queue_lock_for(sid):
+            pending = self._follow_up_queues.pop(sid, [])
+        merged = merge_follow_up_inputs(pending)
+        if merged is None:
+            return None
+        return await self.send(
+            merged, sid, stop_event=stop_event, tools=tools,
+            system_prompt=system_prompt, max_rounds=max_rounds,
+        )
+
     def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
         """Drive ``coro`` to completion on the loop's dedicated sync event loop.
 

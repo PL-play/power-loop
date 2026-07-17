@@ -93,10 +93,16 @@ class RoundStartCtx(BaseHookCtx):
 
     Directives: BREAK (set ``reason``), SKIP.
     Handler may modify ``messages``.
+
+    ``drained_follow_ups`` — number of queued follow-up (steering) messages drained
+    into ``messages`` at this round boundary (0 when none). The drain runs BEFORE
+    the hooks, so a break-deciding hook (e.g. a host's pass_turn hard-stop) can see
+    that fresh input arrived and reconsider a now-stale break decision.
     """
 
     messages: list[LoopMessage] = field(default_factory=list)
     stop_event: threading.Event | None = None
+    drained_follow_ups: int = 0
     # Handler output
     reason: str = ""
 

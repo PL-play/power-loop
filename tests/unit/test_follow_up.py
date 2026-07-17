@@ -189,3 +189,111 @@ async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore) -> N
         or "<follow_up>" in str(m.get("content") or "")
     ]
     assert any("focus on feelings" in c and "keep it short" in c for c in follow_contents)
+
+
+# ── 3.18.0: drain-before-ROUND_START-hooks + stranded-steering flush ──
+
+
+@pytest.mark.asyncio
+async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStore) -> None:
+    """A break-deciding ROUND_START hook (host pass_turn pattern) must observe steering
+    drained at the same boundary and be able to withdraw the break. Pre-3.18 the drain ran
+    AFTER the hooks, so a BREAK silently stranded the queued input (conv-117 incident)."""
+    from power_loop.contracts.hooks import HookDirective, HookPoint
+
+    llm = _GateLLM(
+        responses=[
+            _tool_resp("c1", "echo", '{"text":"working"}'),  # round 0: tool call
+            LLMResponse(raw_text="answered the steering"),   # round 1: runs only if un-broken
+        ]
+    )
+    loop = StatefulAgentLoop(
+        llm=llm,
+        store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4),
+        tool_registry=_echo_registry(),
+    )
+    seen: list[int] = []
+
+    def _pass_turn_like(ctx: Any) -> None:
+        # Break from round 1 on — UNLESS fresh steering was drained into this round.
+        if ctx.round_index >= 1:
+            seen.append(int(getattr(ctx, "drained_follow_ups", -1)))
+            if not getattr(ctx, "drained_follow_ups", 0):
+                ctx.reason = "pass_turn"
+                ctx.directive = HookDirective.BREAK
+
+    loop.hooks.register(HookPoint.ROUND_START, _pass_turn_like)
+    sid = await loop.new_session()
+    send_task = asyncio.create_task(loop.send("start", sid))
+    for _ in range(200):
+        if loop._lock_for(sid).locked():
+            break
+        await asyncio.sleep(0.005)
+    else:
+        pytest.fail("expected session lock during send")
+
+    queued = await loop.follow_up("please reply to the card", sid)
+    assert isinstance(queued, FollowUpQueued)
+    llm.release_first.set()
+    result = await send_task
+    # The hook saw the drained steering (1) and withdrew the break → round 1 ran.
+    assert seen and seen[0] == 1, seen
+    assert result.status == "completed"
+    assert "answered the steering" in (result.final_text or "")
+    # Nothing left stranded.
+    assert loop.pending_follow_up_count(sid) == 0
+    # The steering text actually reached the LLM.
+    assert any(
+        "please reply to the card" in str(m.get("content") or "")
+        for call in llm.calls for m in call
+    )
+
+
+@pytest.mark.asyncio
+async def test_flush_follow_ups_runs_stranded_queue(store: SessionStore) -> None:
+    """Steering accepted in a run's terminal window stays queued on the idle session;
+    the host detects it via pending_follow_up_count and flushes it as a fresh send."""
+    llm = _GateLLM(responses=[LLMResponse(raw_text="handled stranded steering")])
+    llm.release_first.set()  # no gating needed here
+    loop = StatefulAgentLoop(
+        llm=llm, store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4, compactor=None),
+    )
+    sid = await loop.new_session()
+    # Simulate the terminal-window acceptance: enqueue directly onto the idle session.
+    await loop._enqueue_follow_up(sid, "stranded card submission")
+    assert loop.pending_follow_up_count(sid) == 1
+
+    result = await loop.flush_follow_ups(sid)
+    assert result is not None and result.status == "completed"
+    assert loop.pending_follow_up_count(sid) == 0
+    assert any(
+        "stranded card submission" in str(m.get("content") or "")
+        for call in llm.calls for m in call
+    )
+    # Idempotent: nothing left → None.
+    assert await loop.flush_follow_ups(sid) is None
+
+
+@pytest.mark.asyncio
+async def test_flush_follow_ups_empty_or_busy_returns_none(store: SessionStore) -> None:
+    llm = _GateLLM(responses=[_tool_resp("c1", "echo", '{"text":"x"}'), LLMResponse(raw_text="ok")])
+    loop = StatefulAgentLoop(
+        llm=llm, store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=4),
+        tool_registry=_echo_registry(),
+    )
+    sid = await loop.new_session()
+    assert await loop.flush_follow_ups(sid) is None  # empty queue
+    send_task = asyncio.create_task(loop.send("start", sid))
+    for _ in range(200):
+        if loop._lock_for(sid).locked():
+            break
+        await asyncio.sleep(0.005)
+    else:
+        pytest.fail("expected session lock during send")
+    await loop.follow_up("steer", sid)  # queued on the busy session
+    assert await loop.flush_follow_ups(sid) is None  # busy → owner drains, not us
+    llm.release_first.set()
+    await send_task

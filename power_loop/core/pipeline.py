@@ -957,10 +957,24 @@ class AgentPipeline:
                             rounds=round_idx,
                         )
 
+            # ── In-flight steering: drain follow-up queue at round boundary ──
+            # Runs BEFORE the ROUND_START hooks so (a) a break-deciding hook (host
+            # pass_turn hard-stop) sees `drained_follow_ups` and can reconsider a
+            # stale silence decision, and (b) a hook BREAK can never strand queued
+            # steering that arrived during the previous round (the old ordering
+            # silently dropped it — the drain sat after the break check).
+            drained_count = 0
+            if self._drain_follow_ups is not None:
+                drained = await self._drain_follow_ups()
+                drained_count = len(drained)
+                for msg in drained:
+                    await self._append_message(msg, round_index=round_idx)
+
             # ── Hook: ROUND_START ──
             round_ctx = RoundStartCtx(
                 round_index=round_idx, messages=self.history,
                 stop_event=self.stop_event,
+                drained_follow_ups=drained_count,
             )
             await self.hooks.run_typed_async(HookPoint.ROUND_START, round_ctx)
             if round_ctx.directive == HookDirective.BREAK:
@@ -973,12 +987,6 @@ class AgentPipeline:
             if isinstance(round_ctx.messages, list):
                 self.history = round_ctx.messages
                 self._tok_len = -1  # SCALE-4: a ROUND_START hook may have replaced history
-
-            # ── In-flight steering: drain follow-up queue at round boundary ──
-            if self._drain_follow_ups is not None:
-                drained = await self._drain_follow_ups()
-                for msg in drained:
-                    await self._append_message(msg, round_index=round_idx)
 
             # ── Business logic: prepare round ──
             await self.prepare_round(round_idx)

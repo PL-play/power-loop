@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+## [3.18.0] — 2026-07-17
+
+Fix + additive API, backward-compatible (minor).
+
+### Fixed
+- **hook BREAK 硬停不再悬空 follow-up steering**：round 边界的 follow-up 队列排水从
+  ROUND_START hooks **之后**挪到**之前**。旧顺序下，任何 ROUND_START hook 以 BREAK 收尾
+  （宿主典型场景：pass_turn 硬停）会绕过排水，把上一轮期间折叠进来的 steering 静默丢在
+  进程内队列里（DeepTalk 会话 117 事故：用户卡片提交被吞、agent 永久沉默）。新顺序下
+  BREAK 判定发生在排水之后，排进来的消息已入 history。
+
+### Added
+- **`RoundStartCtx.drained_follow_ups`**（additive 字段）：本轮边界排入的 steering 条数。
+  break-deciding hook（如宿主的 pass_turn 硬停）可据此发现"沉默决定已过期"，撤销 BREAK。
+- **`StatefulAgentLoop.pending_follow_up_count(session_id)`**：空闲会话上仍滞留的
+  follow-up 条数（终态微窗口内被接受的 steering）。
+- **`StatefulAgentLoop.flush_follow_ups(session_id, ...)`**：把滞留在空闲会话上的
+  steering 合并成一条 `<follow_up>` 消息并以 `send` 跑掉；队列空或会话忙时返回 `None`。
+  宿主在 owner run 返回后循环调用直至 `None`，即可关闭"接受 vs 终态"竞态窗口。
+
 ## [3.17.1] — 2026-07-17
 
 Fix, backward-compatible (patch).
