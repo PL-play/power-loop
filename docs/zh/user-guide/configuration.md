@@ -37,6 +37,8 @@ config = AgentLoopConfig(
 | `microcompact_size_limit` | `int` | `1000` | 超过此字节数的旧工具输出会被溢写（环境变量 `CONTEXT_MICRO_SIZE_LIMIT`） |
 | `microcompact_hot_tail` | `int` | `10` | 最近多少轮保持逐字、绝不溢写（环境变量 `CONTEXT_MICRO_HOT_TAIL`） |
 | `microcompact_spill_dir` | `str \| None` | `None` | 溢写输出的目录；`None` → 运行时 home 的 `.cache` |
+| `distributed_sessions` | `bool` | `False` | 用数据库租约在**多进程之间**协调同一 session（仅服务端后端有意义）。默认关闭——单进程宿主已由进程内的锁覆盖。见 [伸缩](scaling.md#多进程共享一个-store) |
+| `session_lease_ttl_s` | `float` | `90.0` | 失败检测窗口：租约在不续约时能存活多久（后台任务每 TTL/3 续一次，与轮边界无关——长轮本身不构成威胁）。取值要大于 event loop 可能被饿死的最长时间；它同时决定持有者崩溃后 session 被锁住多久 |
 
 ## 环境变量
 

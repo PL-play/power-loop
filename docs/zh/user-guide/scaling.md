@@ -7,7 +7,7 @@ power-loop 是基于**可插拔 store** 的**可嵌入**内核：默认 SQLite�
 ## 模型
 
 - **每会话一个写者。** 异步 store 把阻塞的 SQLite I/O 卸载到 worker 线程，在单一写者锁下执行——这正是保证 `next_seq` 不碰撞、每个多语句写入原子的关键。（开启 WAL，`journal_mode=WAL` / `synchronous=NORMAL`，读因而不会阻塞写者。）在 PostgreSQL/MySQL 上，每会话序号分配通过 `SELECT … FOR UPDATE` 行锁做到多写者安全。
-- **每进程一个 asyncio 事件循环。** 单个 `StatefulAgentLoop` 可驱动任意数量并发会话，每个由自己的 `asyncio.Lock` 串行。SQLite 工作跑在 worker 线程，慢的写/读不会冻结循环；PostgreSQL/MySQL 的 driver 原生异步。
+- **每进程一个 asyncio 事件循环。** 单个 `StatefulAgentLoop` 可驱动任意数量并发会话，每个由**按 session** 的 `asyncio.Lock` 串行。自 3.19.0 起这把锁放在按 `session_id` 键控的**进程级**注册表里，因此即使宿主在同一个 store 上建了多个 `StatefulAgentLoop` 对象（例如配置编辑后重建缓存的 loop），这条保证依然成立。3.19.0 之前锁是按实例的，两个 loop 驱动同一 session 会拿到两把不同的锁——互斥完全失效。SQLite 工作跑在 worker 线程，慢的写/读不会冻结循环；PostgreSQL/MySQL 的 driver 原生异步。
 - **loop 不持有任何权威状态。** 状态全在 store 里，因此 loop 创建廉价，任何 session 都能从 `dsn` + `session_id` 恢复（适合 web handler / worker / 冷启动）。每会话的活动窗口缓存（`session_cache_size`，默认 256，`0` 关闭；用 `loop.cache_stats` 查看）只是对持久投影的纯加速器——它从不改变模型看到的内容。
 
 **单个 SQLite 文件**不是多写者 store。多个进程写同一个 SQLite 文件不在范围内。要越过单个写者有两条路：**把 SQLite 文件按进程分片**（见下），或**把 DSN 指向 PostgreSQL/MySQL**——真正的多写者服务器，同样的代码、同样的一致性测试套件（见 [存储后端](storage-backends.md)）。
@@ -70,11 +70,64 @@ python -m bench --smoke    # 快速子集（也是 CI 烟囱）
 
 把某个会话路由到固定进程（如对 session id 取哈希）。**不要**让两个进程写同一个 SQLite 文件——store 不协调跨进程写者（多出来的第二个写者只会被 `(session_id, seq)` 主键以 `IntegrityError` 抓到，而非被预防）。
 
-**B. 用服务器后端。** 把 DSN 指向 PostgreSQL/MySQL（`dsn="postgresql://…"` / `dsn="mysql://…"`）。现在多个进程可以并发写**同一个**逻辑 store——每会话序号分配通过 `SELECT … FOR UPDATE` 行锁做到多写者安全，因此不同 session 可以并行追加而不碰撞。某个 session 的 pending 状态机仍假设同一时刻只有一个写者，所以请在你的 dispatcher/queue 层把该 session 的 send 串行化。置备与前置条件见 [存储后端](storage-backends.md)。
+**B. 用服务器后端。** 把 DSN 指向 PostgreSQL/MySQL（`dsn="postgresql://…"` / `dsn="mysql://…"`）。现在多个进程可以并发写**同一个**逻辑 store——每会话序号分配通过 `SELECT … FOR UPDATE` 行锁做到多写者安全，因此不同 session 可以并行追加而不碰撞。某个 session 的 pending 状态机仍假设同一时刻只有一个写者。你可以在自己的 dispatcher/queue 层把该 session 的 send 串行化，也可以交给 power-loop——见下面的[多进程共享一个 store](#多进程共享一个-store)。置备与前置条件见 [存储后端](storage-backends.md)。
+
+## 多进程共享一个 store
+
+用服务端后端时，两个进程可能被派到同一个 session——重试、再平衡、蓝绿部署重叠期。进程内的锁看不见别的进程，
+所以要么你的 dispatcher 保证亲和性，要么开启：
+
+```python
+loop = StatefulAgentLoop(
+    llm=llm, store=store,                      # PostgreSQL / MySQL——SQLite 本就是单机
+    config=AgentLoopConfig(
+        system_prompt="…",
+        distributed_sessions=True,
+        session_lease_ttl_s=90.0,
+    ),
+)
+```
+
+此后每次 `send()` 都会先为该 session 取一行**租约**，运行期间由后台任务续约，结束时释放。
+取不到租约的进程会抛 `SessionBusy`：
+
+```python
+from power_loop import SessionBusy
+
+try:
+    result = await loop.send(text, session_id=sid)
+except SessionBusy:
+    ...  # 重新排期；绝不要自旋——持有者可能要跑几分钟
+```
+
+`follow_up()` 已经替你处理好了：当别的进程持有该 session 时，它把输入写进共享队列并返回 `FollowUpQueued`，
+由持有者在下一个 round 边界排水——**折叠语义跨进程保留**。
+
+需要 schema v7；`open_store` 会自动迁移（只新增表）。
+
+### TTL 怎么定
+
+TTL 是**失败检测窗口**，不是单轮的预算。续约跑在后台任务上、每 TTL/3 一次，**与轮边界无关**——
+一轮跑十分钟也不会威胁到租约。真正威胁它的是 event loop 被**饿死**（某个同步工具堵住了循环、
+一段 CPU 密集计算），或者连续几次续约都失败，所以 TTL 要大于你预期的最长停顿。
+
+同一个数字也决定了：持有者真的崩溃后，这个 session 要被锁住多久才能被别人接管。调大 →
+活着但卡顿的持有者更不容易被误判为死亡；调小 → 真崩溃后恢复更快。
+
+### 租约给不了你什么
+
+租约**不是硬互斥保证**。持有者卡顿超过 TTL 就会被推定死亡、被别人接管，而它可能还在跑——这是分布式锁的
+经典风险。`fence` 列就是为解决它预留的（单调递增令牌，可以让被夺权者的写入被拒绝），但**目前尚未启用**，
+所以请把租约理解为大幅降低概率，而不是不可能性证明。`renew_session_lease()` 返回 `False` 就是
+「你已被夺权」的信号。
+
+另外注意：租约保护的是 **session**，不是你这一轮碰到的其它东西。如果你的工具往本地文件系统的
+workspace 写东西，两台机器上的两个进程看到的根本不是同一个目录，租约救不了你——共享存储或主机亲和
+是另一个独立问题。
 
 ## 诚实声明
 
 - **上面的实测上限是单 SQLite 写者且环境敏感的。** 磁盘 fsync 延迟与 CPU 主导；请在你的参考硬件上记录权威数字。
-- **多写者横向扩展是后端选择，不是魔法。** PostgreSQL/MySQL 让多个进程写同一个逻辑 store，但单个 session 仍同一时刻串行到一个写者（其上的 dispatcher/queue 层是你的）。上面的数字是针对 SQLite 记录的。
+- **多写者横向扩展是后端选择，不是魔法。** PostgreSQL/MySQL 让多个进程写同一个逻辑 store，但单个 session 仍同一时刻只能有一个写者——要么由你的 dispatcher 保证，要么开启 `distributed_sessions`。上面的数字是针对 SQLite 记录的。
 - **压缩是长期会话的主要扩展杠杆**；不开则每次 send 成本随历史增长。
 - **上限是否"够用"由你判断**，对照你预期的并发会话负载——以及你把 DSN 指向哪个后端。

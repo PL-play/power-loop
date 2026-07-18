@@ -117,7 +117,7 @@ print(r2.final_text)  # → "Your favorite color is blue."
 
 The same applies with a server backend — point both processes at `postgresql://…` / `mysql://…` (see [Storage backends](storage-backends.md)).
 
-> **Warning**: A given session must be driven by one writer at a time. The `asyncio.Lock` only protects within one `StatefulAgentLoop` instance, so serialize a session's sends in your dispatcher/queue layer when many processes share a store. With SQLite, run one writer process per file (shard sessions across files); see [Scaling](scaling.md).
+> **Warning**: A given session must be driven by one writer at a time. The per-session `asyncio.Lock` covers the whole **process** (since 3.19.0 it is keyed on `session_id` in a process-wide registry, so several `StatefulAgentLoop` objects over one store still serialize correctly) — but it cannot see other processes. When many processes share a store, either serialize a session's sends in your dispatcher/queue layer, or set `distributed_sessions=True` to have power-loop coordinate them with a DB lease. With SQLite, run one writer process per file (shard sessions across files); see [Scaling](scaling.md).
 
 ## Pending Recovery
 

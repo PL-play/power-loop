@@ -37,6 +37,8 @@ config = AgentLoopConfig(
 | `microcompact_size_limit` | `int` | `1000` | Byte size above which an old tool output is spilled (env `CONTEXT_MICRO_SIZE_LIMIT`) |
 | `microcompact_hot_tail` | `int` | `10` | Number of most-recent rounds kept verbatim, never spilled (env `CONTEXT_MICRO_HOT_TAIL`) |
 | `microcompact_spill_dir` | `str \| None` | `None` | Directory for spilled outputs; `None` → the runtime home's `.cache` |
+| `distributed_sessions` | `bool` | `False` | Coordinate sessions across PROCESSES via a DB lease (server backends only). Off by default — a single-process host is already covered by the in-process lock. See [Scaling](scaling.md#running-several-processes-over-one-store) |
+| `session_lease_ttl_s` | `float` | `90.0` | Failure-detection window: how long a lease survives unrenewed (a background task renews every TTL/3, independent of rounds — a long round does NOT threaten it). Size it above the longest the event loop can be starved; it also sets how long a crashed holder's session stays locked |
 
 ## Environment Variables
 
