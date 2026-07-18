@@ -44,6 +44,7 @@ _DATA_TABLES = (
     "sessions", "messages", "compactions", "usage_rounds", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
     "timers", "notes", "project_messages", "hook_events",
+    "session_leases", "follow_up_queue",
 )
 
 

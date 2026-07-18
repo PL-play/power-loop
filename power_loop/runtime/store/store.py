@@ -122,6 +122,8 @@ class _Tables:
         self.notes = f"{prefix}notes"
         self.project_messages = f"{prefix}project_messages"
         self.hook_events = f"{prefix}hook_events"
+        self.session_leases = f"{prefix}session_leases"
+        self.follow_up_queue = f"{prefix}follow_up_queue"
 
 
 # Logical export schema: (logical_name, physical(t)->table, explicit_columns). Explicit
@@ -793,6 +795,114 @@ class SessionStore:
                 (SessionStatus.ARCHIVED.value, _now_ms(), session_id),
             )
 
+    # ── cross-process session leases ──────────────────────────────────────────
+    #
+    # The in-process lock in StatefulAgentLoop serializes one interpreter. When several agent
+    # processes share this database, it cannot see the others — so the lease row is the arbiter
+    # they all consult. A holder renews while it works; if it dies, the lease simply expires and
+    # the next process takes over.
+
+    async def acquire_session_lease(
+        self, session_id: str, *, owner_id: str, ttl_ms: int
+    ) -> bool:
+        """Try to take the lease on ``session_id``. Returns whether ``owner_id`` now holds it.
+
+        Steals only an EXPIRED lease; a live holder is never displaced. The take-or-steal decision
+        is a single atomic statement in the dialect (see ``Dialect.try_acquire_lease``).
+        """
+        now = _now_ms()
+        async with self._db.transaction() as tx:
+            return await self._db.dialect.try_acquire_lease(
+                tx, self.t.session_leases,
+                session_id=session_id, owner_id=owner_id,
+                now_ms=now, expires_at=now + max(1, ttl_ms),
+            )
+
+    async def renew_session_lease(
+        self, session_id: str, *, owner_id: str, ttl_ms: int
+    ) -> bool:
+        """Push out the expiry — but ONLY if ``owner_id`` still holds the lease.
+
+        Returns False when the lease was taken over (we stalled long enough to look dead). That is
+        the signal to STOP: another process is now driving this session, and continuing to write
+        would interleave with it. Callers must treat a false return as "abort the run", not as a
+        transient error to retry.
+        """
+        async with self._db.transaction() as tx:
+            cur = await tx.execute(
+                f"UPDATE {self.t.session_leases} SET expires_at=? "
+                "WHERE session_id=? AND owner_id=?",
+                (_now_ms() + max(1, ttl_ms), session_id, owner_id),
+            )
+            if getattr(cur, "rowcount", -1) > 0:
+                return True
+            # rowcount is unreliable across drivers (MySQL reports 0 when the value is unchanged),
+            # so confirm against the row itself.
+            row = await tx.fetchone(
+                f"SELECT owner_id FROM {self.t.session_leases} WHERE session_id=?", (session_id,)
+            )
+            return bool(row) and row["owner_id"] == owner_id
+
+    async def release_session_lease(self, session_id: str, *, owner_id: str) -> None:
+        """Drop our claim so the next process can start immediately (idempotent).
+
+        Scoped by ``owner_id``: if we were already dispossessed, this must not delete the NEW
+        holder's lease.
+        """
+        async with self._db.transaction() as tx:
+            await tx.execute(
+                f"DELETE FROM {self.t.session_leases} WHERE session_id=? AND owner_id=?",
+                (session_id, owner_id),
+            )
+
+    async def session_lease_holder(self, session_id: str) -> dict | None:
+        """The live lease row (owner_id / expires_at / fence), or None if unheld or expired."""
+        row = await self._db.fetchone(
+            f"SELECT owner_id, acquired_at, expires_at, fence FROM {self.t.session_leases} "
+            "WHERE session_id=? AND expires_at >= ?",
+            (session_id, _now_ms()),
+        )
+        return dict(row) if row else None
+
+    async def enqueue_follow_up(self, session_id: str, content: str) -> int:
+        """Hand steering to whichever process holds ``session_id``; returns the new queue depth.
+
+        This is what makes losing the lease race harmless: instead of starting a competing run (or
+        dropping the message), the loser parks it here and the holder picks it up at its next round
+        boundary — folding, across processes.
+        """
+        async with self._db.transaction() as tx:
+            await tx.execute(
+                f"INSERT INTO {self.t.follow_up_queue} (session_id, content, created_at) "
+                "VALUES (?, ?, ?)",
+                (session_id, content, _now_ms()),
+            )
+            row = await tx.fetchone(
+                f"SELECT COUNT(*) AS c FROM {self.t.follow_up_queue} WHERE session_id=?",
+                (session_id,),
+            )
+            return int(row["c"]) if row else 1
+
+    async def drain_follow_up_queue(self, session_id: str) -> list[str]:
+        """Claim and remove everything queued for ``session_id``, oldest first.
+
+        Read and delete run in ONE transaction so two drains can't both return the same item.
+        """
+        async with self._db.transaction() as tx:
+            rows = await self._db.dialect.claim_follow_ups(
+                tx, self.t.follow_up_queue, session_id=session_id
+            )
+            return [str(r["content"]) for r in rows]
+
+    async def pending_follow_up_depth(self, session_id: str) -> int:
+        """How many items are parked for ``session_id`` (host observability / stranded-steering
+        checks) without claiming them."""
+        row = await self._db.fetchone(
+            f"SELECT COUNT(*) AS c FROM {self.t.follow_up_queue} WHERE session_id=?",
+            (session_id,),
+        )
+        return int(row["c"]) if row else 0
+
     async def close_session(self, session_id: str, *, cascade: bool = True) -> int:
         """Physically delete the session's rows across all tables.
 
@@ -846,6 +956,10 @@ class SessionStore:
             f"DELETE FROM {self.t.project_messages} WHERE session_id=?", (session_id,)
         )
         await tx.execute(f"DELETE FROM {self.t.hook_events} WHERE session_id=?", (session_id,))
+        await tx.execute(f"DELETE FROM {self.t.session_leases} WHERE session_id=?", (session_id,))
+        await tx.execute(
+            f"DELETE FROM {self.t.follow_up_queue} WHERE session_id=?", (session_id,)
+        )
         await tx.execute(f"DELETE FROM {self.t.session_state} WHERE session_id=?", (session_id,))
         affected = await tx.execute(
             f"DELETE FROM {self.t.sessions} WHERE session_id=?", (session_id,)

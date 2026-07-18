@@ -19,16 +19,25 @@ Failure model
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import threading
+import uuid
 from collections import OrderedDict
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from power_loop._vendor.llm_client.interface import LLMService
-from power_loop.agent.follow_up import FollowUpQueued, merge_follow_up_inputs
+from power_loop.agent.follow_up import (
+    FollowUpQueued,
+    merge_follow_up_inputs,
+)
+from power_loop.agent.follow_up import (
+    follow_up_text as _follow_up_text,
+)
 from power_loop.agent.sink import (
     CONTENT_ENCODING_JSON,
     CONTENT_ENCODING_META_KEY,
@@ -40,7 +49,11 @@ from power_loop.agent.system_prompt import (
     resolve_runtime_system_prompt,
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
-from power_loop.contracts.errors import SessionNotFoundError, SessionPendingError
+from power_loop.contracts.errors import (
+    SessionBusy,
+    SessionNotFoundError,
+    SessionPendingError,
+)
 from power_loop.contracts.protocols import ChildRunGuard
 from power_loop.core.agent_context import (
     get_ctx,
@@ -153,6 +166,96 @@ class _SyncLoopRunner:
             self._loop.close()
 
 
+@dataclass
+class _SessionSync:
+    """The concurrency primitives for ONE session_id, shared by every loop driving it.
+
+    ``refs`` holds the ``id()`` of each live loop that has touched the session, so the entry can be
+    dropped once the last one closes (without it, a host that cycles loop objects — e.g. rebuilding
+    on a config edit — would leak an entry per session forever).
+    """
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    queue_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    queue: list[str | LoopMessage] = field(default_factory=list)
+    refs: set[int] = field(default_factory=set)
+
+
+# session_id -> _SessionSync. PROCESS-GLOBAL and deliberately NOT per-instance state.
+#
+# "Sends to a session are serialized" is an API promise. It must not silently depend on how many
+# StatefulAgentLoop OBJECTS the host happens to have built: with per-instance locks, two loops over
+# one session_id take two DIFFERENT locks, so the mutual exclusion evaporates and both drive the
+# same session concurrently — interleaved rounds, an interleaved workspace, and (because
+# ``follow_up`` decides to fold by testing ``lock.locked()``) a second OWNER run instead of a fold.
+# A host hits this simply by replacing a cached loop while a run is in flight, which is a legitimate
+# thing to do (config edit) and is invisible from here. Keying the primitives on the session — the
+# thing being protected — makes the guarantee hold no matter how the host manages objects.
+#
+# The follow-up queue is global for the same reason, and it is NOT optional: globalizing only the
+# lock would make the second loop enqueue into a queue that the loop actually running the session
+# never drains, turning concurrent corruption into silently stranded steering.
+#
+# Not keyed on the event loop: an ``asyncio.Lock`` binds to the loop that first awaits it, so a
+# session driven from two event loops (e.g. mixing the sync API's runner thread with direct async
+# calls) is already broken today with per-instance locks. This changes nothing there.
+_SESSION_SYNC: dict[str, _SessionSync] = {}
+# Guards only registry mutation (dict insert/delete) — instances may be constructed from several
+# threads. Never held across an await.
+_SESSION_SYNC_GUARD = threading.Lock()
+
+
+def _session_sync(sid: str, *, owner: int | None = None) -> _SessionSync:
+    """Fetch (or create) the shared primitives for ``sid``, registering ``owner`` as a user.
+
+    Lock-free on the hot path: ``_lock_for`` runs this on every send/follow_up/poll, and taking a
+    mutex there both costs time and perturbs the very interleavings this machinery exists to get
+    right. ``dict.get`` and ``set.add`` are atomic under the GIL, so the guard is needed only to
+    make CREATION single (double-checked below).
+    """
+    entry = _SESSION_SYNC.get(sid)
+    if entry is None:
+        with _SESSION_SYNC_GUARD:
+            entry = _SESSION_SYNC.get(sid)
+            if entry is None:
+                entry = _SessionSync()
+                _SESSION_SYNC[sid] = entry
+    if owner is not None:
+        entry.refs.add(owner)
+    return entry
+
+
+def _release_session_sync(sid: str, owner: int) -> None:
+    """Drop ``owner``'s claim on ``sid``; delete the entry once nobody holds it and it's idle."""
+    with _SESSION_SYNC_GUARD:
+        entry = _SESSION_SYNC.get(sid)
+        if entry is None:
+            return
+        entry.refs.discard(owner)
+        if not entry.refs and not entry.lock.locked() and not entry.queue:
+            del _SESSION_SYNC[sid]
+
+
+def _discard_session_sync(sid: str) -> None:
+    """Forget ``sid`` entirely (the session was physically deleted)."""
+    with _SESSION_SYNC_GUARD:
+        _SESSION_SYNC.pop(sid, None)
+
+
+def _drain_queue(sid: str) -> list[str | LoopMessage]:
+    """Take everything queued for ``sid``, leaving the (shared) entry in place.
+
+    Callers hold the session's queue_lock. The list is emptied IN PLACE rather than replaced so
+    every loop holding a reference to it sees the drain.
+    """
+    entry = _SESSION_SYNC.get(sid)
+    if entry is None:
+        return []
+    pending = list(entry.queue)
+    entry.queue.clear()
+    return pending
+
+
 class StatefulAgentLoop:
     """The only public entry point for running an agent loop.
 
@@ -226,10 +329,15 @@ class StatefulAgentLoop:
             event_bus=event_bus, hooks=hooks if hooks is not None else AgentHooks()
         )
         self._register_builtin_hooks()
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._follow_up_queues: dict[str, list[str | LoopMessage]] = {}
-        self._follow_up_queue_locks: dict[str, asyncio.Lock] = {}
+        # Session locks/queues are PROCESS-GLOBAL (see _SESSION_SYNC): the guarantee is per
+        # session, not per loop object. This set records which sessions THIS loop has touched, so
+        # aclose() drains only its own and teardown can release its claims.
+        self._sync_sids: set[str] = set()
         self._closing = False
+        # Identity written into the lease row. Must be unique per PROCESS *and* per loop instance,
+        # and must NOT survive a restart: a crashed process's lease has to look foreign to its
+        # replacement so the replacement can take it over once it expires.
+        self._owner_id = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
         # Host-registered guards entered around every inline child run
         # (run_agent_spec) — see register_child_run_guard. (name, factory) pairs
         # in registration order.
@@ -496,7 +604,9 @@ class StatefulAgentLoop:
         # (2) wait for in-flight sends to drain. Acquiring then releasing each lock
         # blocks until any holder (a running send) finishes; new sends are already
         # blocked by the closing flag, so no lock can be re-taken behind us.
-        locks = list(self._locks.values())
+        # Only THIS loop's sessions: the locks are shared process-wide now, so waiting on the
+        # whole registry would block teardown on runs belonging to other loops.
+        locks = [_session_sync(sid).lock for sid in list(self._sync_sids)]
         if locks:
             async def _wait_idle(lock: asyncio.Lock) -> None:
                 async with lock:
@@ -512,6 +622,12 @@ class StatefulAgentLoop:
                     "aclose: timed out after %.1fs waiting for in-flight sends to drain",
                     drain_timeout_s,
                 )
+        # Release this loop's claims on the shared per-session primitives so the registry doesn't
+        # accumulate an entry per session across loop objects. Entries still held by another live
+        # loop (or still locked / holding queued steering) survive.
+        for sid in list(self._sync_sids):
+            _release_session_sync(sid, id(self))
+        self._sync_sids.clear()
         # (3) let queued async subscribers finish (best-effort, bounded).
         try:
             await self.event_bus.drain(timeout=drain_timeout_s)
@@ -554,9 +670,8 @@ class StatefulAgentLoop:
         # loop that cycles through many sessions doesn't leak a Lock/queue/cache entry per id —
         # for the directly-closed session (C12) AND each cascade-deleted descendant (C4).
         for sid in {session_id, *deleted_ids}:
-            self._locks.pop(sid, None)
-            self._follow_up_queue_locks.pop(sid, None)
-            self._follow_up_queues.pop(sid, None)
+            _discard_session_sync(sid)
+            self._sync_sids.discard(sid)
             self._cache_invalidate(sid)
         return len(deleted_ids)
 
@@ -639,11 +754,13 @@ class StatefulAgentLoop:
                     )
             else:
                 await self._raise_if_pending(sid)
-            await self._persist_user_input(sid, user_input)
-            return await self._run_loop(
-                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                max_rounds=max_rounds,
-            )
+            # Cross-process turn: the in-process lock above only covers THIS interpreter.
+            async with self._session_lease(sid):
+                await self._persist_user_input(sid, user_input)
+                return await self._run_loop(
+                    sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+                    max_rounds=max_rounds,
+                )
 
     async def follow_up(
         self,
@@ -677,6 +794,13 @@ class StatefulAgentLoop:
         if session_lock.locked():
             depth = await self._enqueue_follow_up(sid, user_input)
             return FollowUpQueued(session_id=sid, queue_depth=depth)
+        if self.config.distributed_sessions and self.store is not None:
+            # Idle HERE, but another process may be driving this session. Park the steering in the
+            # shared queue for that holder to drain instead of starting a competing run.
+            holder = await self.store.session_lease_holder(sid)
+            if holder is not None and holder["owner_id"] != self._owner_id:
+                depth = await self.store.enqueue_follow_up(sid, _follow_up_text(user_input))
+                return FollowUpQueued(session_id=sid, queue_depth=depth)
         return await self.send(
             user_input, sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
             max_rounds=max_rounds,
@@ -690,7 +814,7 @@ class StatefulAgentLoop:
         after a run returns to detect stranded steering and hand it to
         :meth:`flush_follow_ups` instead of leaving it silently parked.
         """
-        return len(self._follow_up_queues.get(session_id, []))
+        return len(_session_sync(session_id).queue)
 
     async def flush_follow_ups(
         self,
@@ -717,7 +841,7 @@ class StatefulAgentLoop:
         if self._lock_for(sid).locked():
             return None
         async with self._follow_up_queue_lock_for(sid):
-            pending = self._follow_up_queues.pop(sid, [])
+            pending = _drain_queue(sid)
         merged = merge_follow_up_inputs(pending)
         if merged is None:
             return None
@@ -1101,29 +1225,86 @@ class StatefulAgentLoop:
             metadata=metadata,
         )
 
+    @contextlib.asynccontextmanager
+    async def _session_lease(self, sid: str):
+        """Hold the cross-process lease for the body, renewing it in the background.
+
+        A no-op unless ``config.distributed_sessions`` is on. Raises :class:`SessionBusy` when
+        another process holds the session, so the caller can park its input rather than start a
+        competing run (``follow_up`` does exactly that).
+        """
+        if not self.config.distributed_sessions or self.store is None:
+            yield
+            return
+        ttl_ms = int(max(1.0, self.config.session_lease_ttl_s) * 1000)
+        if not await self.store.acquire_session_lease(sid, owner_id=self._owner_id, ttl_ms=ttl_ms):
+            holder = await self.store.session_lease_holder(sid)
+            raise SessionBusy(
+                f"session {sid} is held by {holder['owner_id'] if holder else 'another process'}"
+            )
+        # Renew from a background task rather than at round boundaries: a single round can outlast
+        # the TTL (one long tool call), and letting the lease lapse mid-round would invite another
+        # process to take the session while this one is still writing.
+        renew = asyncio.create_task(self._renew_lease_forever(sid, ttl_ms))
+        try:
+            yield
+        finally:
+            renew.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await renew
+            with contextlib.suppress(Exception):  # teardown must never mask the run's outcome
+                await self.store.release_session_lease(sid, owner_id=self._owner_id)
+
+    async def _renew_lease_forever(self, sid: str, ttl_ms: int) -> None:
+        """Push the expiry out every third of the TTL until cancelled.
+
+        Renewing at TTL/3 leaves room for two consecutive failures (a blip, a slow write) before
+        the lease actually lapses. If the lease has been taken over we can only log: the run is
+        mid-flight and power-loop has no way to unwind it, which is why the TTL must be generous
+        enough that a live holder is never presumed dead.
+        """
+        interval = max(0.5, (ttl_ms / 1000) / 3)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                if not await self.store.renew_session_lease(
+                    sid, owner_id=self._owner_id, ttl_ms=ttl_ms
+                ):
+                    logger.error(
+                        "session %s lease LOST (another process took over) — this run is now "
+                        "racing it; raise config.session_lease_ttl_s if the host is merely slow",
+                        sid,
+                    )
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("session %s lease renewal failed; will retry", sid, exc_info=True)
+
     def _lock_for(self, sid: str) -> asyncio.Lock:
-        lock = self._locks.get(sid)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[sid] = lock
-        return lock
+        self._sync_sids.add(sid)
+        return _session_sync(sid, owner=id(self)).lock
 
     def _follow_up_queue_lock_for(self, sid: str) -> asyncio.Lock:
-        lock = self._follow_up_queue_locks.get(sid)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._follow_up_queue_locks[sid] = lock
+        self._sync_sids.add(sid)
+        lock = _session_sync(sid, owner=id(self)).queue_lock
         return lock
 
     async def _enqueue_follow_up(self, sid: str, user_input: str | LoopMessage) -> int:
         async with self._follow_up_queue_lock_for(sid):
-            queue = self._follow_up_queues.setdefault(sid, [])
+            queue = _session_sync(sid, owner=id(self)).queue
             queue.append(user_input)
             return len(queue)
 
     async def _drain_follow_up_messages(self, sid: str) -> list[LoopMessage]:
         async with self._follow_up_queue_lock_for(sid):
-            pending = self._follow_up_queues.pop(sid, [])
+            pending: list[str | LoopMessage] = _drain_queue(sid)
+        if self.config.distributed_sessions and self.store is not None:
+            # Also take what OTHER processes parked for us. Same round boundary, one merged
+            # message — from the model's side there is no difference between steering that came
+            # from this process and steering that came from another.
+            with contextlib.suppress(Exception):  # never let a DB blip abort a live round
+                pending += await self.store.drain_follow_up_queue(sid)
         merged = merge_follow_up_inputs(pending)
         return [merged] if merged is not None else []
 

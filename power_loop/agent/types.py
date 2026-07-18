@@ -162,6 +162,20 @@ class AgentLoopConfig:
     )
     #: Where spilled outputs are written. None → the runtime home's ``.cache``.
     microcompact_spill_dir: str | None = None
+    # ── Cross-process session leases (schema v7) ─────────────────────────────────────────
+    # The in-process session lock only serializes ONE interpreter. Turn this on when several
+    # processes share a store and could be handed the same session: each send takes a DB lease
+    # first, renews it while it works, and a process that loses the race parks its steering in
+    # the shared follow-up queue for the holder to drain (folding, across processes).
+    #
+    # DEFAULT OFF: it costs a lease write per send plus a renewal per round, and adds a failure
+    # mode (a stalled holder's lease expiring) that a single-process host gains nothing from.
+    # Only server-backed stores can honor it — SQLite is single-host by construction.
+    distributed_sessions: bool = False
+    #: How long a lease stays valid without renewal. Must comfortably exceed one round's wall
+    #: time: too short and a slow round lets another process take the session away mid-run; too
+    #: long and a genuinely dead holder blocks the session for that duration.
+    session_lease_ttl_s: float = 90.0
     # Audit the EPHEMERAL context that LLM_BEFORE hooks inject per round (e.g. recalled memory),
     # which otherwise vanishes after the call. Recorded into the {prefix}hook_events store table,
     # linked to the round's assistant message; observability ONLY — never read back into history or

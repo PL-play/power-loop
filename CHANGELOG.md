@@ -8,6 +8,46 @@
 
 ## [Unreleased]
 
+## [3.19.0] — 2026-07-19
+
+Fix + additive API, backward-compatible (minor)。**含 store schema v6 → v7 迁移**（新增两张表，
+无数据变更；AUTO_CREATE 自动应用）。
+
+### Fixed
+- **每 session 的锁不再依赖 loop 对象身份（严重）**：`_locks` / `_follow_up_queues` /
+  `_follow_up_queue_locks` 三个 **实例** 字典改为按 `session_id` 键控的**进程级**注册表。
+  旧实现下，同一个 `session_id` 被两个 `StatefulAgentLoop` 对象驱动时会拿到**两把不同的锁**，
+  互斥完全失效——而宿主替换缓存中的 loop（例如配置编辑触发重建）是完全合法的操作，从库这边
+  不可见。「发往同一 session 的 send 串行执行」是 API 承诺，不应取决于宿主持有几个对象。
+
+  折叠队列必须一同全局化：只全局化锁会让第二个 loop 把 steering 塞进一个**没有任何人排水**
+  的队列，把并发损坏换成消息静默丢失。
+
+  实测影响（DeepTalk 会话 119）：两个 loop 在同一 workspace 上交替编辑同一批文件约 6 分钟、
+  互相撤销对方的修改；`last_dispatched_seq` 由后完成者写入，导致投影的 send 区间重叠、
+  历史被重复灌进后续 send 的上下文。
+
+### Added
+- **跨进程 session 租约（`distributed_sessions`，默认关闭）**：进程内的锁只能串行化**一个**
+  解释器。多个进程共享同一个 store 时，`{prefix}session_leases` 行成为共同裁判：`send` 先取
+  租约、运行期间按 TTL/3 后台续约、结束释放；抢不到则抛 `SessionBusy`。
+  - 输给竞争的一方不会丢消息也不会另起一轮：`follow_up` 把 steering 存进
+    `{prefix}follow_up_queue`，由持有者在下一个 round 边界排水——**折叠语义跨进程保留**。
+  - 崩溃的持有者停止续约，租约到期后可被接管；`fence` 列单调递增，为将来的写路径围栏预留。
+  - 默认关闭：单进程宿主得不到收益，却要为每次 send 多付一次租约写、每轮一次续约，并引入
+    「持有者卡顿导致租约过期」这一新失败模式。仅服务端 store 有意义（SQLite 本就是单机）。
+  - 新配置：`AgentLoopConfig.distributed_sessions`、`session_lease_ttl_s`（默认 90s）。
+  - 新 STABLE 符号：`SessionBusy`。
+  - 新 store API：`acquire_session_lease` / `renew_session_lease` / `release_session_lease` /
+    `session_lease_holder` / `enqueue_follow_up` / `drain_follow_up_queue` /
+    `pending_follow_up_depth`。
+
+### Notes
+- 排水的「领取即删除」是方言接缝（`Dialect.claim_follow_ups`）。首版实现是 `SELECT` 后
+  `DELETE`，在 SQLite 上全绿，但在 PostgreSQL 的 READ COMMITTED 下两个并发排水会读到同一批行、
+  各自把同一条用户消息投给自己的模型。SQLite 的串行写掩盖了它——因此新增
+  `tests/unit/test_session_leases_pg.py`，这类性质必须在服务端后端上验证。
+
 ## [3.18.0] — 2026-07-17
 
 Fix + additive API, backward-compatible (minor).

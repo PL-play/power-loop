@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "3.18.0"
+__version__ = "3.19.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -56,6 +56,7 @@ from power_loop.contracts.errors import (
     LLMRetryExhausted,
     LLMTimeout,
     PowerLoopError,
+    SessionBusy,
     SessionNotFoundError,
     SessionPendingError,
     SpecValidationError,
@@ -266,6 +267,7 @@ STABLE_API = (
     "SessionStore",
     "SubagentLifecycle",
     "PowerLoopError",
+    "SessionBusy",
     "SessionPendingError",
     "SessionNotFoundError",
     "LLMTimeout",
@@ -326,6 +328,7 @@ __all__ = [
 	"MAX_SPAWN_DEPTH",
 	"DEFAULT_DB_PATH",
 	"PowerLoopError",
+	"SessionBusy",
 	"SessionPendingError",
 	"SessionNotFoundError",
 	"ToolNotFound",

@@ -73,7 +73,12 @@ def validate_table_prefix(prefix: str) -> str:
 #:   round_index RESETS per send, so the old key silently overwrote earlier sends' per-round rows —
 #:   a session's accounting kept only the LAST send's detail. Existing rows backfill send_index=0
 #:   (their true send is unrecoverable); new rows carry the real send index.
-CURRENT_SCHEMA_VERSION = 6
+#: v7 (2026-07): adds ``{prefix}session_leases`` + ``{prefix}follow_up_queue`` — cross-PROCESS
+#:   session mutual exclusion. The in-process lock only serializes one interpreter; with several
+#:   agent processes on one database, two of them could drive a session concurrently. The lease row
+#:   is the shared arbiter, and the queue lets a process that loses the race hand its steering to
+#:   the holder instead of starting a competing run.
+CURRENT_SCHEMA_VERSION = 7
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -82,6 +87,7 @@ _STORE_TABLES: tuple[str, ...] = (
     "sessions", "messages", "compactions", "usage_rounds", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
     "timers", "notes", "project_messages", "hook_events",
+    "session_leases", "follow_up_queue",
 )
 
 
@@ -141,6 +147,11 @@ async def _migration_steps(
         # MySQL's auto-committing DDL (a half-applied ladder resumes past the done steps).
         if not await _column_exists(tx, db.dialect.name, f"{prefix}usage_rounds", "send_index"):
             steps += _usage_rounds_v6_ddl(db.dialect.name, prefix)
+    if from_version < 7:
+        # v6 → v7: add the session_leases + follow_up_queue tables (cross-process session mutual
+        # exclusion). Both are new CREATE TABLE IF NOT EXISTS — idempotent, no ALTER, so no
+        # catalog probe is needed.
+        steps += db.dialect.leases_ddl(prefix)
     return steps
 
 

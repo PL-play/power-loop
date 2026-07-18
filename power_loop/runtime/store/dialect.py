@@ -42,6 +42,42 @@ class Dialect(Protocol):
         provisioning. Idempotent (CREATE … IF NOT EXISTS)."""
         ...
 
+    def leases_ddl(self, prefix: str) -> list[str]:
+        """DDL for the ``session_leases`` + ``follow_up_queue`` tables, split out so the
+        v6→v7 migration can add just these. Included in :meth:`ddl` for fresh provisioning.
+        Idempotent (CREATE … IF NOT EXISTS)."""
+        ...
+
+    async def try_acquire_lease(
+        self,
+        tx: Transaction,
+        table: str,
+        *,
+        session_id: str,
+        owner_id: str,
+        now_ms: int,
+        expires_at: int,
+    ) -> bool:
+        """Take the lease on ``session_id`` for ``owner_id``, stealing it only if the incumbent
+        has EXPIRED. Returns whether we now hold it.
+
+        Like :meth:`lock_state`, this is a dialect seam because its correctness depends on the
+        engine's concurrency model: the take-or-steal decision MUST be one atomic statement. A
+        ``SELECT`` then ``INSERT`` would let two processes both observe "expired" and both claim
+        it — precisely the race the lease exists to prevent."""
+        ...
+
+    async def claim_follow_ups(
+        self, tx: Transaction, table: str, *, session_id: str
+    ) -> list[Row]:
+        """Atomically take every queued follow-up for ``session_id`` (claim AND remove).
+
+        A dialect seam because a plain ``SELECT`` then ``DELETE`` is NOT safe under PostgreSQL's
+        READ COMMITTED: two drains both read the same rows before either deletes, and each hands
+        the same steering to its model — the user's message replayed twice. SQLite's serialized
+        writer hides this, so it must be tested on a server backend."""
+        ...
+
     def upsert(
         self,
         table: str,
@@ -142,6 +178,7 @@ class SqliteDialect:
                 updated_at INTEGER NOT NULL, PRIMARY KEY (session_id, note_id))""",
             *self.project_messages_ddl(p),
             *self.hook_events_ddl(p),
+            *self.leases_ddl(p),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -170,6 +207,34 @@ class SqliteDialect:
             f"ON {p}hook_events(session_id, message_seq)",
         ]
 
+    def leases_ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}session_leases (
+                session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
+                acquired_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+                fence INTEGER NOT NULL DEFAULT 1)""",
+            f"""CREATE TABLE IF NOT EXISTS {p}follow_up_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                content TEXT NOT NULL, created_at INTEGER NOT NULL)""",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_follow_up_queue_session "
+            f"ON {p}follow_up_queue(session_id, id)",
+        ]
+
+    async def try_acquire_lease(self, tx, table, *, session_id, owner_id, now_ms, expires_at):
+        return await _onconflict_try_acquire_lease(
+            tx, table, session_id=session_id, owner_id=owner_id,
+            now_ms=now_ms, expires_at=expires_at,
+        )
+
+    async def claim_follow_ups(self, tx, table, *, session_id):
+        # DELETE … RETURNING is a single atomic claim: rows this statement returns are, by
+        # construction, rows no concurrent drain can also return.
+        rows = await tx.fetchall(
+            f"DELETE FROM {table} WHERE session_id=? RETURNING id, content", (session_id,)
+        )
+        return sorted(rows, key=lambda r: r["id"])  # RETURNING order is not guaranteed
+
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
         return _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols)
 
@@ -180,6 +245,28 @@ class SqliteDialect:
         if row is None:
             raise ValueError(f"unknown session: {session_id}")
         return row
+
+
+async def _onconflict_try_acquire_lease(
+    tx, table, *, session_id: str, owner_id: str, now_ms: int, expires_at: int
+) -> bool:
+    """Atomic take-or-steal-if-expired, shared by SQLite and Postgres.
+
+    Both support a ``WHERE`` on ``DO UPDATE``, which is what makes this a SINGLE statement: insert
+    when nobody holds the lease, overwrite only when the incumbent's ``expires_at`` has passed, and
+    do nothing at all while a live holder owns it. The row is then read back rather than trusting
+    rowcount, so "did I get it" is answered by the durable state either way.
+    """
+    await tx.execute(
+        f"INSERT INTO {table} (session_id, owner_id, acquired_at, expires_at, fence) "
+        "VALUES (?, ?, ?, ?, 1) ON CONFLICT (session_id) DO UPDATE SET "
+        "owner_id=excluded.owner_id, acquired_at=excluded.acquired_at, "
+        f"expires_at=excluded.expires_at, fence={table}.fence + 1 "
+        f"WHERE {table}.expires_at < ?",
+        (session_id, owner_id, now_ms, expires_at, now_ms),
+    )
+    row = await tx.fetchone(f"SELECT owner_id FROM {table} WHERE session_id=?", (session_id,))
+    return bool(row) and row["owner_id"] == owner_id
 
 
 def _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols) -> str:
@@ -287,6 +374,7 @@ class PostgresDialect:
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id))""",
             *self.project_messages_ddl(p),
             *self.hook_events_ddl(p),
+            *self.leases_ddl(p),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -314,6 +402,34 @@ class PostgresDialect:
             f"CREATE INDEX IF NOT EXISTS {p}idx_hook_events_session_msg "
             f"ON {p}hook_events(session_id, message_seq)",
         ]
+
+    def leases_ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}session_leases (
+                session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
+                acquired_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
+                fence BIGINT NOT NULL DEFAULT 1)""",
+            f"""CREATE TABLE IF NOT EXISTS {p}follow_up_queue (
+                id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL,
+                content TEXT NOT NULL, created_at BIGINT NOT NULL)""",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_follow_up_queue_session "
+            f"ON {p}follow_up_queue(session_id, id)",
+        ]
+
+    async def try_acquire_lease(self, tx, table, *, session_id, owner_id, now_ms, expires_at):
+        return await _onconflict_try_acquire_lease(
+            tx, table, session_id=session_id, owner_id=owner_id,
+            now_ms=now_ms, expires_at=expires_at,
+        )
+
+    async def claim_follow_ups(self, tx, table, *, session_id):
+        # DELETE … RETURNING is a single atomic claim: rows this statement returns are, by
+        # construction, rows no concurrent drain can also return.
+        rows = await tx.fetchall(
+            f"DELETE FROM {table} WHERE session_id=? RETURNING id, content", (session_id,)
+        )
+        return sorted(rows, key=lambda r: r["id"])  # RETURNING order is not guaranteed
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
         return _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols)
@@ -419,6 +535,7 @@ class MySQLDialect:
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, note_id)) {opts}""",
             *self.project_messages_ddl(p),
             *self.hook_events_ddl(p),
+            *self.leases_ddl(p),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -446,6 +563,55 @@ class MySQLDialect:
                 PRIMARY KEY (session_id, event_id),
                 KEY {p}idx_hook_events_session_msg (session_id, message_seq)) {opts}""",
         ]
+
+    def leases_ddl(self, prefix: str) -> list[str]:
+        p = prefix
+        opts = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {p}session_leases (
+                session_id VARCHAR(255) PRIMARY KEY, owner_id VARCHAR(255) NOT NULL,
+                acquired_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
+                fence BIGINT NOT NULL DEFAULT 1) {opts}""",
+            f"""CREATE TABLE IF NOT EXISTS {p}follow_up_queue (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                session_id VARCHAR(255) NOT NULL, content LONGTEXT NOT NULL,
+                created_at BIGINT NOT NULL,
+                KEY {p}idx_follow_up_queue_session (session_id, id)) {opts}""",
+        ]
+
+    async def try_acquire_lease(self, tx, table, *, session_id, owner_id, now_ms, expires_at):
+        # MySQL has no conditional ON DUPLICATE KEY UPDATE, so each assignment carries its own
+        # IF() guard on the INCUMBENT's expires_at. Order matters: MySQL evaluates the SET list
+        # left to right, so expires_at must be assigned LAST — updating it first would make the
+        # later guards test the value we just wrote and always take the steal branch.
+        await tx.execute(
+            f"INSERT INTO {table} (session_id, owner_id, acquired_at, expires_at, fence) "
+            "VALUES (?, ?, ?, ?, 1) AS new ON DUPLICATE KEY UPDATE "
+            f"fence = IF({table}.expires_at < ?, {table}.fence + 1, {table}.fence), "
+            f"owner_id = IF({table}.expires_at < ?, new.owner_id, {table}.owner_id), "
+            f"acquired_at = IF({table}.expires_at < ?, new.acquired_at, {table}.acquired_at), "
+            f"expires_at = IF({table}.expires_at < ?, new.expires_at, {table}.expires_at)",
+            (session_id, owner_id, now_ms, expires_at, now_ms, now_ms, now_ms, now_ms),
+        )
+        # Don't trust rowcount: MySQL reports 1 for an insert and 2 for an update, and 0 when the
+        # guards left every column unchanged. Read back who actually holds it.
+        row = await tx.fetchone(f"SELECT owner_id FROM {table} WHERE session_id=?", (session_id,))
+        return bool(row) and row["owner_id"] == owner_id
+
+    async def claim_follow_ups(self, tx, table, *, session_id):
+        # MySQL has no DELETE … RETURNING, so lock the rows for the rest of the transaction
+        # (FOR UPDATE) before deleting — a concurrent drain blocks on the lock instead of
+        # reading the same rows and delivering them a second time.
+        rows = await tx.fetchall(
+            f"SELECT id, content FROM {table} WHERE session_id=? ORDER BY id FOR UPDATE",
+            (session_id,),
+        )
+        if rows:
+            await tx.execute(
+                f"DELETE FROM {table} WHERE session_id=? AND id<=?",
+                (session_id, rows[-1]["id"]),
+            )
+        return list(rows)
 
     #: Free-text / JSON columns (table → [(column, not_null)]) whose MySQL type was widened from
     #: TEXT (64 KiB) to LONGTEXT. Used by the v3→v4 migration to ALTER pre-existing MySQL stores.

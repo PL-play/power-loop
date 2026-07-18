@@ -125,12 +125,17 @@ async def test_no_tools_drained_round_emits_round_completed(store: SessionStore)
     )
     sid = await loop.new_session()
     send_task = asyncio.create_task(loop.send("start", sid))
+    # Wait for round 0's LLM call to START, not merely for send() to take the session lock.
+    # send() locks BEFORE the pipeline's round-0 follow-up drain, so gating on the lock leaves a
+    # window where steering queued here is drained into round 0 instead of round 1 — delivered,
+    # but not to the round these tests assert about. _GateLLM records `calls` from inside
+    # complete(), which the pipeline only reaches after that drain.
     for _ in range(200):
-        if loop._lock_for(sid).locked():
+        if llm.calls:
             break
         await asyncio.sleep(0.005)
     else:
-        pytest.fail("expected session lock during send")
+        pytest.fail("expected round 0 to reach the LLM during send")
 
     await loop.follow_up("steer me", sid)  # queued while round 0's LLM call is gated
     llm.release_first.set()
@@ -157,12 +162,17 @@ async def test_multiple_follow_ups_merge_at_next_round(store: SessionStore) -> N
     sid = await loop.new_session()
     send_task = asyncio.create_task(loop.send("start", sid))
 
+    # Wait for round 0's LLM call to START, not merely for send() to take the session lock.
+    # send() locks BEFORE the pipeline's round-0 follow-up drain, so gating on the lock leaves a
+    # window where steering queued here is drained into round 0 instead of round 1 — delivered,
+    # but not to the round these tests assert about. _GateLLM records `calls` from inside
+    # complete(), which the pipeline only reaches after that drain.
     for _ in range(200):
-        if loop._lock_for(sid).locked():
+        if llm.calls:
             break
         await asyncio.sleep(0.005)
     else:
-        pytest.fail("expected session lock during send")
+        pytest.fail("expected round 0 to reach the LLM during send")
 
     first = await loop.follow_up("focus on feelings", sid)
     second = await loop.follow_up("keep it short", sid)
@@ -226,12 +236,17 @@ async def test_round_start_break_hook_sees_drained_follow_ups(store: SessionStor
     loop.hooks.register(HookPoint.ROUND_START, _pass_turn_like)
     sid = await loop.new_session()
     send_task = asyncio.create_task(loop.send("start", sid))
+    # Wait for round 0's LLM call to START, not merely for send() to take the session lock.
+    # send() locks BEFORE the pipeline's round-0 follow-up drain, so gating on the lock leaves a
+    # window where steering queued here is drained into round 0 instead of round 1 — delivered,
+    # but not to the round these tests assert about. _GateLLM records `calls` from inside
+    # complete(), which the pipeline only reaches after that drain.
     for _ in range(200):
-        if loop._lock_for(sid).locked():
+        if llm.calls:
             break
         await asyncio.sleep(0.005)
     else:
-        pytest.fail("expected session lock during send")
+        pytest.fail("expected round 0 to reach the LLM during send")
 
     queued = await loop.follow_up("please reply to the card", sid)
     assert isinstance(queued, FollowUpQueued)
@@ -287,12 +302,17 @@ async def test_flush_follow_ups_empty_or_busy_returns_none(store: SessionStore) 
     sid = await loop.new_session()
     assert await loop.flush_follow_ups(sid) is None  # empty queue
     send_task = asyncio.create_task(loop.send("start", sid))
+    # Wait for round 0's LLM call to START, not merely for send() to take the session lock.
+    # send() locks BEFORE the pipeline's round-0 follow-up drain, so gating on the lock leaves a
+    # window where steering queued here is drained into round 0 instead of round 1 — delivered,
+    # but not to the round these tests assert about. _GateLLM records `calls` from inside
+    # complete(), which the pipeline only reaches after that drain.
     for _ in range(200):
-        if loop._lock_for(sid).locked():
+        if llm.calls:
             break
         await asyncio.sleep(0.005)
     else:
-        pytest.fail("expected session lock during send")
+        pytest.fail("expected round 0 to reach the LLM during send")
     await loop.follow_up("steer", sid)  # queued on the busy session
     assert await loop.flush_follow_ups(sid) is None  # busy → owner drains, not us
     llm.release_first.set()

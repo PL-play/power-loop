@@ -43,6 +43,16 @@ def merge_follow_up_inputs(items: list[str | LoopMessage]) -> LoopMessage | None
     return format_follow_up_user_message("\n\n".join(parts))
 
 
+def follow_up_text(item: str | LoopMessage) -> str:
+    """Flatten one queued payload to plain text.
+
+    Needed because the cross-process queue is a TEXT column: a LoopMessage cannot be stored as-is,
+    and ``merge_follow_up_inputs`` accepts strings anyway, so the round trip is lossless for the
+    only field that reaches the model.
+    """
+    return item if isinstance(item, str) else _content_as_text(item.get("content"))
+
+
 def _content_as_text(content: Any) -> str:
     if content is None:
         return ""
@@ -56,6 +66,7 @@ def _content_as_text(content: Any) -> str:
 __all__ = [
     "FOLLOW_UP_MESSAGE_NAME",
     "FollowUpQueued",
+    "follow_up_text",
     "format_follow_up_user_message",
     "merge_follow_up_inputs",
 ]

@@ -30,6 +30,18 @@ class SessionNotFoundError(PowerLoopError):
         self.session_id = session_id
 
 
+class SessionBusy(PowerLoopError):
+    """Raised when another PROCESS holds the session's lease (distributed_sessions only).
+
+    Not an error condition so much as a routing signal: the session is legitimately being driven
+    elsewhere. ``follow_up`` catches it and parks the input in the shared queue for the holder to
+    drain; a host calling ``send`` directly should either do the same or retry later, never spin
+    (the holder may work for minutes).
+    """
+
+    code = "session.busy"
+
+
 class SessionPendingError(PowerLoopError):
     """Raised when a session has unresolved tool_calls from a previous run.
 

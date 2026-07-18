@@ -1120,11 +1120,77 @@ async def test_close_session_clears_per_session_locks(store: SessionStore) -> No
         llm=_Scripted(responses=[LLMResponse(raw_text="ok")]), store=store,
         config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
     )
+    from power_loop.agent.stateful_loop import _SESSION_SYNC
+
     sid = await loop.new_session()
     await loop.send("hi", session_id=sid)
-    assert sid in loop._locks  # populated on send
+    assert sid in _SESSION_SYNC  # populated on send
+    assert sid in loop._sync_sids
 
     await loop.close_session(sid)
-    assert sid not in loop._locks
-    assert sid not in loop._follow_up_queue_locks
-    assert sid not in loop._follow_up_queues
+    assert sid not in _SESSION_SYNC
+    assert sid not in loop._sync_sids
+
+
+@pytest.mark.asyncio
+async def test_two_loop_objects_serialize_on_one_session(store: SessionStore) -> None:
+    """The per-session lock must be per SESSION, not per loop object.
+
+    Hosts legitimately replace a cached loop (e.g. a config edit) while a run is in flight. With
+    per-instance locks the two objects took two different locks for one session_id, so both drove
+    it concurrently — interleaved rounds on a shared workspace, and a second OWNER run because
+    ``follow_up`` decides to fold by testing ``lock.locked()``.
+    """
+    from power_loop.agent.stateful_loop import _SESSION_SYNC
+
+    first = StatefulAgentLoop(
+        llm=_Scripted(responses=[LLMResponse(raw_text="a")]), store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+    )
+    sid = await first.new_session()
+
+    # A second, independently-built loop over the SAME store and session.
+    second = StatefulAgentLoop(
+        llm=_Scripted(responses=[LLMResponse(raw_text="b")]), store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+    )
+
+    assert first._lock_for(sid) is second._lock_for(sid), "one session ⇒ one lock"
+    assert len(_SESSION_SYNC[sid].refs) == 2, "both loops registered as users"
+
+    # While one holds the session, the other must SEE it as busy — that is exactly the signal
+    # follow_up uses to fold instead of starting a competing owner run.
+    async with first._lock_for(sid):
+        assert second._lock_for(sid).locked()
+        depth = await second._enqueue_follow_up(sid, "steer")
+        assert depth == 1
+        # …and the loop that is actually running the session drains what the other enqueued,
+        # instead of it being stranded in a queue nobody reads.
+        drained = await first._drain_follow_up_messages(sid)
+        assert len(drained) == 1 and "steer" in str(drained[0].get("content"))
+        assert second.pending_follow_up_count(sid) == 0
+
+
+@pytest.mark.asyncio
+async def test_session_sync_entry_released_when_last_loop_closes(store: SessionStore) -> None:
+    """Registry entries must not outlive the loops using them (hosts that rebuild loops per
+    config edit would otherwise leak one entry per session, forever)."""
+    from power_loop.agent.stateful_loop import _SESSION_SYNC
+
+    first = StatefulAgentLoop(
+        llm=_Scripted(responses=[LLMResponse(raw_text="a")]), store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+    )
+    sid = await first.new_session()
+    second = StatefulAgentLoop(
+        llm=_Scripted(responses=[LLMResponse(raw_text="b")]), store=store,
+        config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+    )
+    first._lock_for(sid)
+    second._lock_for(sid)
+
+    await first.aclose()
+    assert sid in _SESSION_SYNC, "still claimed by the second loop"
+
+    await second.aclose()
+    assert sid not in _SESSION_SYNC, "last claim released ⇒ entry dropped"
