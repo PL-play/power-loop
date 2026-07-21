@@ -38,7 +38,14 @@ from power_loop.runtime.cancellation import CancellationToken
 from . import journal
 from .engine import WorkflowEngine, WorkflowRunError
 from .result import AgentResult, WorkflowResult
-from .runner import _LIVE_RUN_IDS, is_run_live, make_on_node_start, make_on_step, spawn_background
+from .runner import (
+    _LIVE_RUN_IDS,
+    OnComplete,
+    is_run_live,
+    make_on_node_start,
+    make_on_step,
+    spawn_background,
+)
 from .spec import (
     AgentNode,
     BranchNode,
@@ -225,13 +232,16 @@ async def resume_detached(
     budget: Any | None = None,
     eager_wake: bool = False,
     force: bool = False,
+    on_complete: OnComplete | None = None,
 ) -> WorkflowRunHandle:
     """Resume a run on a background task; wake the parent on completion.
 
-    Mirror of :func:`run_detached` for the resume path. Requires a live parent
-    session and (for the wake to land) a running ``TimerRunner`` +
-    ``register_wake_guard``. Re-supply ``executor`` / ``budget`` if the original
-    run used non-default ones.
+    Mirror of :func:`run_detached` for the resume path. Re-supply ``executor`` /
+    ``budget`` if the original run used non-default ones.
+
+    Default wake needs a running ``TimerRunner`` + ``register_wake_guard``. Pass
+    ``on_complete`` to take over the wake in-process (timer-free); it supersedes
+    ``eager_wake`` and skips the durable timer (see :func:`run_detached`).
     """
     store = await loop._ensure_store()
     if await store.get_session(parent_sid) is None:
@@ -254,4 +264,5 @@ async def resume_detached(
         loop, parent_sid, run_id, store=store,
         build_engine=_build_engine, run_spec=spec,
         cancel_token=cancel_token, eager_wake=eager_wake, task_set=_RESUME_TASKS,
+        on_complete=on_complete,
     )

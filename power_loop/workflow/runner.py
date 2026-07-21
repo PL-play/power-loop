@@ -14,6 +14,16 @@ The timer is the durable, "one path into the conversation" wake. A non-durable
 ``eager_wake`` fast-path is available; the :func:`make_wake_guard` TIMER_FIRE
 hook dedupes the at-least-once timer so the parent wakes exactly once.
 
+**Host wake seam (``on_complete``).** A host may pass ``on_complete`` to
+:func:`run_detached` / :func:`resume_detached`, taking over the parent wake
+entirely: the durable timer and the ``eager_wake`` fast-path are BOTH skipped,
+and a :class:`WorkflowCompletion` is handed to the callback instead. This is the
+in-process, timer-free wake — the host typically re-resolves the parent's current
+loop and calls ``loop.follow_up``. It lives and dies with the process (no durable
+backstop): a raising callback is logged and swallowed (the run is journal-final,
+so a lost wake means the caller must re-request), and it never falls back to a
+timer. ``on_complete`` supersedes ``eager_wake``.
+
 Everything here uses an EXPLICITLY captured ``loop`` / ``parent_sid`` — never the
 contextvars (which are unreliable inside a detached task).
 """
@@ -22,7 +32,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 from power_loop.contracts.event_payloads import SystemLogPayload
@@ -32,12 +44,18 @@ from power_loop.runtime.store.store import MUTATE_SKIP
 
 from . import journal
 from .engine import WorkflowEngine, WorkflowRunError
-from .result import AgentResult, WorkflowRunHandle
+from .result import AgentResult, WorkflowCompletion, WorkflowRunHandle
 
 if TYPE_CHECKING:
     from power_loop.contracts.hook_contexts import TimerFireCtx
 
     from .api import Workflow
+
+logger = logging.getLogger(__name__)
+
+#: Host completion-wake seam (see module docstring). Receives a
+#: :class:`WorkflowCompletion`; when supplied it replaces the durable-timer wake.
+OnComplete = Callable[["WorkflowCompletion"], Awaitable[None]]
 
 __all__ = [
     "run_detached", "make_wake_guard", "register_wake_guard", "make_on_step", "spawn_background",
@@ -171,17 +189,50 @@ async def _wake(loop: Any, parent_sid: str, note: str) -> None:
         pass
 
 
-async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> WorkflowRunHandle:
+async def _run_on_complete(
+    on_complete: OnComplete, parent_sid: str, run_id: str, status: str, note: str
+) -> None:
+    """Invoke the host completion callback in place of the durable-timer wake.
+
+    The host owns delivery (die-with-process, no timer fallback). A raising
+    callback is logged and swallowed: the run is already journal-final, so a lost
+    wake means the caller must re-request — it must NOT crash the detached task
+    (which would leave the run marked live-but-dead) or fall back to a timer.
+    """
+    try:
+        await on_complete(
+            WorkflowCompletion(
+                parent_session_id=parent_sid, run_id=run_id, status=status, note=note,
+            )
+        )
+    except Exception:  # noqa: BLE001 — a lost wake is recoverable by re-request; a crash is not
+        logger.warning(
+            "workflow %s on_complete callback failed (wake lost; caller must re-request)",
+            run_id, exc_info=True,
+        )
+
+
+async def run_detached(
+    workflow: Workflow,
+    *,
+    eager_wake: bool = False,
+    on_complete: OnComplete | None = None,
+) -> WorkflowRunHandle:
     """Start ``workflow`` as a background task; return a handle immediately.
 
     Requires ``workflow`` to carry a ``parent_session_id`` (the session that
-    will be woken on completion). The parent must be live, and a ``TimerRunner``
-    must be running on the host for the wake to be delivered.
+    will be woken on completion).
 
+    Default wake (``on_complete=None``): a durable timer — the parent must be
+    live and a ``TimerRunner`` must be running on the host for it to be delivered.
     ``eager_wake`` adds a non-durable instant wake that calls ``loop.follow_up``
     DIRECTLY — it does not go through the TimerRunner, so a host that installed
     a custom ``TimerDelivery`` should leave it False (the eager path would
     bypass the host's pipeline; the durable timer still honors it).
+
+    Host wake seam (``on_complete``): supply a callback to take over the wake
+    (in-process, timer-free). It receives a :class:`WorkflowCompletion`; the
+    durable timer and ``eager_wake`` are both skipped. See the module docstring.
     """
     parent_sid = workflow._parent_sid
     if not parent_sid:
@@ -212,6 +263,7 @@ async def run_detached(workflow: Workflow, *, eager_wake: bool = False) -> Workf
         loop, parent_sid, run_id, store=store,
         build_engine=_build_engine, run_spec=workflow.spec,
         cancel_token=workflow._cancel, eager_wake=eager_wake, task_set=workflow._tasks,
+        on_complete=on_complete,
     )
 
 
@@ -226,6 +278,7 @@ def spawn_background(
     cancel_token: Any,
     eager_wake: bool,
     task_set: set[Any],
+    on_complete: OnComplete | None = None,
 ) -> WorkflowRunHandle:
     """Drive a workflow engine on a background task; journal + wake on finish.
 
@@ -236,22 +289,33 @@ def spawn_background(
     ``store`` is the caller's already-resolved store (this fn is sync and cannot
     ``await loop._ensure_store()`` itself; reading ``loop.store`` here would capture
     ``None`` if a future caller hadn't pre-opened it).
+
+    ``on_complete`` (host wake seam): when supplied, it OWNS the parent wake — the
+    durable timer and ``eager_wake`` are both skipped and a
+    :class:`WorkflowCompletion` is handed to it instead (in-process, timer-free).
     """
 
     async def _bg() -> None:
+        status = "failed"
         try:
             result = await build_engine().run(run_spec)
             await journal.finalize(store, parent_sid, run_id, result)
-            note = _wake_note(run_id, result.status)
-            _publish(loop, parent_sid, run_id, "completed", result.status,
-                     level=("error" if result.status == "failed" else "info"))
+            status = result.status
+            note = _wake_note(run_id, status)
+            _publish(loop, parent_sid, run_id, "completed", status,
+                     level=("error" if status == "failed" else "info"))
         except Exception as exc:  # noqa: BLE001 — capture everything; the task must not die silently
             await journal.fail(store, parent_sid, run_id, exc)
+            status = "failed"
             note = _wake_note(run_id, "failed", repr(exc))
             _publish(loop, parent_sid, run_id, "failed", "failed", level="error")
-        await _wake(loop, parent_sid, note)
-        if eager_wake:
-            await _eager_wake(loop, store, parent_sid, run_id, note, task_set)
+        if on_complete is not None:
+            # Host owns delivery (timer-free, die-with-process). Supersedes eager_wake.
+            await _run_on_complete(on_complete, parent_sid, run_id, status, note)
+        else:
+            await _wake(loop, parent_sid, note)
+            if eager_wake:
+                await _eager_wake(loop, store, parent_sid, run_id, note, task_set)
 
     task = asyncio.create_task(_bg(), name=f"workflow-{run_id}")
     task_set.add(task)

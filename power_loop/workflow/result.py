@@ -151,6 +151,28 @@ class SharedBudget:
 
 
 @dataclass
+class WorkflowCompletion:
+    """Handed to a host ``on_complete`` callback when a detached run settles.
+
+    When a host supplies ``on_complete`` to :func:`run_detached` /
+    :func:`resume_detached`, it OWNS the parent wake: the built-in durable-timer
+    wake (and the ``eager_wake`` fast-path) are skipped entirely, and this record
+    is passed to the callback instead. The callback typically re-resolves the
+    parent's current loop and calls ``loop.follow_up(note, parent_session_id)``
+    — an in-process, timer-free wake that lives and dies with the process.
+
+    ``note`` is the same pointer string the timer wake would have carried
+    (``run_id`` + status); the full result lives in the durable journal, keyed by
+    ``run_id`` — the callback reads it there rather than receiving it inline.
+    """
+
+    parent_session_id: str
+    run_id: str
+    status: str  # "completed" | "failed" | "cancelled"
+    note: str
+
+
+@dataclass
 class WorkflowRunHandle:
     """Handle for a detached workflow run.
 

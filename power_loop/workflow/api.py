@@ -87,7 +87,11 @@ class Workflow:
         return await engine.run(self.spec)
 
     async def start(
-        self, *, detached: bool = False, eager_wake: bool = False
+        self,
+        *,
+        detached: bool = False,
+        eager_wake: bool = False,
+        on_complete: Any | None = None,
     ) -> WorkflowResult | WorkflowRunHandle:
         """Run the workflow.
 
@@ -95,14 +99,16 @@ class Workflow:
           :class:`WorkflowResult`.
         * ``detached=True``: run in the background, return a
           :class:`WorkflowRunHandle` immediately; the parent agent (identified by
-          ``parent_session_id``) is woken on completion via a durable timer.
-          Requires a ``parent_session_id`` and a running ``TimerRunner`` on the
-          host. ``eager_wake=True`` adds a non-durable instant wake on top.
+          ``parent_session_id``) is woken on completion. Default wake is a durable
+          timer (needs a running ``TimerRunner`` on the host); ``eager_wake=True``
+          adds a non-durable instant wake on top. Pass ``on_complete`` (a
+          ``WorkflowCompletion`` callback) to take the wake over in-process,
+          timer-free — it supersedes both the timer and ``eager_wake``.
         """
         if detached:
             from .runner import run_detached  # local import avoids import cycle
 
-            return await run_detached(self, eager_wake=eager_wake)
+            return await run_detached(self, eager_wake=eager_wake, on_complete=on_complete)
         return await self.run()
 
 

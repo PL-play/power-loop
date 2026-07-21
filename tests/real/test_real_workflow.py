@@ -73,3 +73,31 @@ async def test_real_workflow_sequence_foreach_structured():
     assert result.results["synthesize"].ok and result.results["synthesize"].text.strip()
     # B2: token usage was recorded and rolled up
     assert result.usage.get("total_tokens", 0) > 0
+
+
+async def test_real_detached_on_complete_seam():
+    """3.21 host wake seam, end-to-end against a real provider: a detached run fires
+    ``on_complete`` with a ``completed`` WorkflowCompletion and arms NO durable timer."""
+    from power_loop.workflow import WorkflowCompletion
+
+    loop = StatefulAgentLoop(
+        llm=create_llm_service_from_env(),
+        db_path=tempfile.mktemp(suffix=".db"),
+        config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3),
+    )
+    psid = await loop.new_session()
+    seen: list[WorkflowCompletion] = []
+
+    async def on_complete(c: WorkflowCompletion) -> None:
+        seen.append(c)
+
+    spec = {"name": "one", "root": {"type": "agent", "id": "a",
+            "spec": {"name": "a", "system_prompt": "Reply with the single word: ok."}}}
+    wf = create_workflow(spec, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True, on_complete=on_complete)
+    await handle.task
+
+    assert len(seen) == 1
+    assert seen[0].status == "completed"
+    assert seen[0].run_id == handle.run_id
+    assert not await loop.list_timers(psid)   # in-process wake, no durable timer

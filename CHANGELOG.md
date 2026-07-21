@@ -8,6 +8,22 @@
 
 ## [Unreleased]
 
+## [3.21.0] — 2026-07-21
+
+Additive, backward-compatible (minor)。无 schema 变更，无 STABLE API 破坏
+（`run_detached` / `spawn_background` / `resume_detached` / `Workflow.start` 均非 STABLE）。
+
+### Added
+- **detached workflow 的完成唤醒可插拔:`on_complete` host seam。** `run_detached` /
+  `resume_detached` / `spawn_background` / `Workflow.start(detached=True)` 新增 kw-only
+  `on_complete: Callable[[WorkflowCompletion], Awaitable[None]] | None = None`。**提供时它接管父
+  唤醒**——内置的 durable timer 与 `eager_wake` 快路**双双跳过**,转而把一个新的 `WorkflowCompletion`
+  (`parent_session_id` / `run_id` / `status` / `note`)交给回调。用于**进程内、无定时器**的唤醒
+  (host 通常据此重解析父的当前 loop 再 `follow_up`),与进程共存亡:回调抛错只记 `warning` 并吞掉
+  (run 已 journal 定稿,丢失的唤醒由调用方重发),**绝不**回退到定时器、**绝不**让后台任务崩溃。
+  `on_complete=None`(默认)行为完全不变。新导出 `WorkflowCompletion`
+  (`power_loop.workflow.WorkflowCompletion`)。
+
 ## [3.20.0] — 2026-07-21
 
 Behavior fix, backward-compatible (minor)。无 schema 变更，无 STABLE API 变更。

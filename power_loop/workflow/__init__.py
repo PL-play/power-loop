@@ -44,7 +44,13 @@ from .engine import (
     in_workflow,
 )
 from .introspect import get_workflow, list_workflows
-from .result import AgentResult, SharedBudget, WorkflowResult, WorkflowRunHandle
+from .result import (
+    AgentResult,
+    SharedBudget,
+    WorkflowCompletion,
+    WorkflowResult,
+    WorkflowRunHandle,
+)
 from .resume import (
     rehydrate,
     replayable_node_ids,
@@ -100,6 +106,7 @@ __all__ = [
     "WorkflowResult",
     "SharedBudget",
     "WorkflowRunHandle",
+    "WorkflowCompletion",
     # host api
     "Workflow",
     "create_workflow",

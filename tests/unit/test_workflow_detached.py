@@ -21,6 +21,7 @@ from power_loop.core.agent_context import (
     set_session_id,
 )
 from power_loop.workflow import (
+    WorkflowCompletion,
     WorkflowRunError,
     WorkflowRunHandle,
     create_workflow,
@@ -284,6 +285,101 @@ async def test_wake_guard_ignores_non_workflow_timer():
     ctx = TimerFireCtx(session_id=psid, note="just a normal reminder")
     await guard(ctx)
     assert ctx.directive == HookDirective.CONTINUE
+
+
+# ── D3: on_complete host wake seam (3.21, timer-free) ────────────────────────
+
+
+async def test_on_complete_replaces_timer_wake():
+    """When on_complete is supplied it OWNS the wake: the callback fires once with a
+    correct WorkflowCompletion, and NO durable timer is armed."""
+    loop = _loop()
+    psid = await loop.new_session()
+    seen: list[WorkflowCompletion] = []
+
+    async def on_complete(c: WorkflowCompletion) -> None:
+        seen.append(c)
+
+    wf = create_workflow(SINGLE, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True, on_complete=on_complete)
+    await handle.task
+
+    assert len(seen) == 1
+    c = seen[0]
+    assert c.parent_session_id == psid
+    assert c.run_id == handle.run_id
+    assert c.status == "completed"
+    assert handle.run_id in c.note                      # note is the run_id+status pointer
+    assert not await loop.list_timers(psid)             # NO durable timer (timer-free)
+    assert (await get_workflow(loop, psid, handle.run_id))["status"] == "completed"  # journal final
+
+
+async def test_on_complete_receives_failure_status():
+    loop = _loop()
+    psid = await loop.new_session()
+    seen: list[WorkflowCompletion] = []
+
+    async def on_complete(c: WorkflowCompletion) -> None:
+        seen.append(c)
+
+    wf = create_workflow(BAD_REF, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True, on_complete=on_complete)
+    await handle.task
+
+    assert len(seen) == 1 and seen[0].status == "failed"
+    assert not await loop.list_timers(psid)
+
+
+async def test_on_complete_supersedes_eager_wake():
+    """on_complete + eager_wake=True → on_complete wins: no timer, and the eager
+    follow_up path is NOT taken (parent is not woken by the runner itself)."""
+    loop = _loop()
+    psid = await loop.new_session()
+    register_wake_guard(loop)
+    seen: list[WorkflowCompletion] = []
+
+    async def on_complete(c: WorkflowCompletion) -> None:
+        seen.append(c)  # deliberately does NOT wake the parent
+
+    wf = create_workflow(SINGLE, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True, eager_wake=True, on_complete=on_complete)
+    await handle.task
+    # give any (erroneously scheduled) eager follow_up a chance to run
+    for _ in range(10):
+        await asyncio.sleep(0.02)
+
+    assert len(seen) == 1
+    assert not await loop.list_timers(psid)              # eager's durable timer skipped too
+    assert await loop.get_session_stats(psid) is None    # eager follow_up NOT taken
+
+
+async def test_on_complete_error_swallowed_no_timer_fallback():
+    """A raising on_complete must not crash the detached task nor fall back to a
+    timer (die-with-process): the run stays journal-final and the wake is simply
+    lost (caller re-requests)."""
+    loop = _loop()
+    psid = await loop.new_session()
+
+    async def boom(c: WorkflowCompletion) -> None:
+        raise RuntimeError("delivery boom")
+
+    wf = create_workflow(SINGLE, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True, on_complete=boom)
+    await handle.task                                   # must NOT raise
+
+    assert handle.task.done() and handle.task.exception() is None
+    assert not await loop.list_timers(psid)             # no fallback timer
+    assert (await get_workflow(loop, psid, handle.run_id))["status"] == "completed"
+
+
+async def test_default_wake_unchanged_without_on_complete():
+    """Sanity: omitting on_complete keeps the durable-timer wake (backward-compat)."""
+    loop = _loop()
+    psid = await loop.new_session()
+    wf = create_workflow(SINGLE, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True)
+    await handle.task
+    assert await loop.list_timers(psid), "default path still arms a durable timer"
 
 
 # ── events: reuse SYSTEM_LOG, no new enum ────────────────────────────────────
