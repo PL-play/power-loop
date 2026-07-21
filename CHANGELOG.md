@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+## [3.20.0] — 2026-07-21
+
+Behavior fix, backward-compatible (minor)。无 schema 变更，无 STABLE API 变更。
+
+### Fixed
+- **空 LLM 响应不再被当作「完成」（严重）**：一轮 LLM 返回**既无文本又无工具调用**时，
+  `AgentPipeline.run()` 过去直接 `_finalize("completed", final_text="")` —— 把一次 provider
+  空返回（实测 deepseek 偶发）当成了「我做完了」，整个 send 的成果塌成空白终稿。现在纯空返回
+  被视为 provider 抖动：有界重试（`_EMPTY_RESPONSE_MAX_RETRIES=3`，每次重试推进 round，故仍受
+  `max_rounds` 封顶），重试期间打 `logger.warning`；连续空超过上限才收尾（final_text 仍为空，
+  但此时是「重试耗尽后的显式放弃」而非「首次空即静默完成」）。有文本或有工具调用的轮次一律
+  清零 streak，正常完成路径完全不受影响。与子 agent 层「final 空时从 transcript 捞回最后非空
+  assistant 文本」的 fallback 串联：pipeline 层先治抖动，子 agent 层再兜底。
+
 ## [3.19.0] — 2026-07-19
 
 Fix + additive API, backward-compatible (minor)。**含 store schema v6 → v7 迁移**（新增两张表，

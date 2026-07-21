@@ -89,6 +89,11 @@ from power_loop.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+# How many consecutive empty LLM responses (no text, no tool call) to retry before giving up.
+# An empty turn is a provider hiccup, not a completion signal; a couple of retries clears a
+# transient blank, while the cap keeps a persistently-broken provider from spinning to max_rounds.
+_EMPTY_RESPONSE_MAX_RETRIES = 3
+
 RESULT_MAX_CHARS = 50000
 
 
@@ -901,6 +906,10 @@ class AgentPipeline:
         self._round_limit = int(self.config.max_rounds)
         self._complete_decide_fires = 0
         self._terminal_grace_active = False
+        # A provider hiccup — a round with NO text and NO tool call — is not a
+        # completion signal (see the no-tools block below). Count consecutive
+        # empties so we retry a bounded number of times before giving up.
+        self._empty_response_streak = 0
         round_idx = -1
         while True:
             round_idx += 1
@@ -1111,6 +1120,10 @@ class AgentPipeline:
             tool_calls = response.get_tool_calls()
             self._emit(AgentEventType.ROUND_TOOLS_PRESENT, RoundToolsPresentPayload(has_tools=bool(tool_calls)), round_index=round_idx)
 
+            # Any productive round (said something OR called a tool) clears the empty streak.
+            if assistant_text or tool_calls:
+                self._empty_response_streak = 0
+
             # Append assistant message
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
             sanitized_tool_calls: list[dict[str, Any]] | None = None
@@ -1130,6 +1143,41 @@ class AgentPipeline:
 
             # ── No tools → completed (unless a follow-up is waiting) ──
             if not tool_calls:
+                # A round with NO text AND NO tool call is a provider hiccup, not a
+                # completion signal. A finishing agent either says something (non-empty
+                # text, handled below) or calls a terminal tool (pass_turn → tool_calls).
+                # A truly empty turn means the model produced nothing; treating it as
+                # "done" silently discards the send — observed in production as 29 rounds
+                # of real work collapsing to a blank final answer. Retry a bounded number
+                # of times (each retry advances round_idx, so max_rounds still caps it),
+                # then fall through to close the send rather than spin.
+                if not assistant_text:
+                    self._empty_response_streak += 1
+                    if self._empty_response_streak <= _EMPTY_RESPONSE_MAX_RETRIES:
+                        logger.warning(
+                            "empty LLM response (no text, no tool call) at round %d "
+                            "streak=%d/%d — retrying (session=%s)",
+                            round_idx, self._empty_response_streak,
+                            _EMPTY_RESPONSE_MAX_RETRIES, self.session_id,
+                        )
+                        # Close this round's stream/usage bookkeeping before looping again,
+                        # mirroring the follow-up drain path — else the round is left
+                        # unterminated and its per-round usage row is never written.
+                        self._emit(AgentEventType.ROUND_COMPLETED,
+                                   RoundCompletedPayload(round_index=round_idx, has_tools=False),
+                                   round_index=round_idx)
+                        await self.hooks.run_typed_async(HookPoint.ROUND_END, RoundEndCtx(
+                            round_index=round_idx, messages=self.history,
+                            has_tools=False, response_text=""))
+                        await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
+                        continue
+                    # Streak exhausted: stop retrying and let the normal completion path
+                    # below close the send. final_text stays "" — but now it's an explicit
+                    # give-up after N retries, not a silent first-empty completion.
+                    logger.warning(
+                        "empty LLM response persisted %d rounds — closing send (session=%s)",
+                        self._empty_response_streak, self.session_id,
+                    )
                 # In-flight steering arriving during this (otherwise terminal)
                 # round would never be drained at a later round-start, so it
                 # would be silently dropped. Drain here: if anything is queued,

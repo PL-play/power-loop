@@ -372,9 +372,14 @@ def test_spawn_agent_outside_loop_returns_clear_error() -> None:
 
 @pytest.mark.asyncio
 async def test_subagent_empty_final_text_recovers_last_assistant_text(store: SessionStore) -> None:
-    """A child that "spoke" via tools and ended on a blank assistant turn used to
-    return final_text="" — the fallback recovers the last non-empty assistant text
-    from the transcript before the ephemeral cleanup deletes it."""
+    """A child that "spoke" via tools and then went permanently blank still returns its
+    real content, via TWO chained defenses:
+      1. pipeline layer: an empty turn (no text, no tool call) is a provider hiccup, so it
+         is retried up to _EMPTY_RESPONSE_MAX_RETRIES rounds instead of completing at "".
+      2. subagent layer: once retries are exhausted and final_text is genuinely still "",
+         the fallback recovers the last non-empty assistant text from the transcript
+         before the ephemeral cleanup deletes it.
+    So the child must stay blank past the retry cap for the transcript fallback to engage."""
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="echo", description="e",
                  input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
@@ -389,12 +394,18 @@ async def test_subagent_empty_final_text_recovers_last_assistant_text(store: Ses
     pr = await parent_loop.send("hi", session_id=parent_created_sid)
     parent_sid = pr.session_id
 
-    # Child: round 0 = meaningful text + a tool call; round 1 = blank, no tools → completed("").
+    # Child: round 0 = meaningful text + a tool call; rounds 1..4 = blank. The blanks exhaust
+    # the pipeline's empty-retry budget (3), so round 4 finally completes with final_text="" —
+    # and the subagent fallback then recovers "the real review findings" from the transcript.
+    # max_rounds=5 leaves room for round 0 + four blank rounds without hitting the round cap.
     parent_loop.llm = _Scripted(responses=[
         LLMResponse(raw_text="the real review findings", tool_calls=[{
             "id": "c1", "type": "function",
             "function": {"name": "echo", "arguments": "{}"},
         }]),
+        LLMResponse(raw_text=""),
+        LLMResponse(raw_text=""),
+        LLMResponse(raw_text=""),
         LLMResponse(raw_text=""),
     ])
     from power_loop.core.agent_context import (
