@@ -1651,31 +1651,59 @@ class StatefulAgentLoop:
             if hasattr(projector, "stamp_render_context"):
                 projector.stamp_render_context(proj_rows, current_send_index)
 
-            prefix_msgs: list[LoopMessage] = []
             # (1) folded-history compact: render via the projector when it matches the current
-            # version, else render its covered send range verbatim from the audit log.
+            # version, else render its covered send range verbatim from the audit log. Kept in its
+            # OWN list — the recent-rows cap below must never drop the compact summary.
+            compact_msgs: list[LoopMessage] = []
             if compact is not None:
                 if int(compact.projector_version or 0) == version:
-                    prefix_msgs.extend(projector.render([compact]))
+                    compact_msgs.extend(projector.render([compact]))
                 else:
                     for si2 in range(compact.compact_from_send or 0, (compact.compact_to_send or 0) + 1):
-                        prefix_msgs.extend(_verbatim(si2))
+                        compact_msgs.extend(_verbatim(si2))
             # (2) each uncompacted past send in order: projected when a current-version row exists,
-            # else verbatim fallback (missing or stale projection).
+            # else verbatim fallback (missing or stale projection). Collected as PER-SEND chunks so
+            # the cap can drop whole sends only (a verbatim-fallback send carries raw tool-protocol
+            # rows — cutting inside one would orphan tool results).
             lo = cutoff or 0
+            send_chunks: list[list[LoopMessage]] = []
             for si2 in sorted(s for s in active_by_send if lo < s < current_send_index):
                 rows_for_send = cur_proj_by_send.get(si2)
-                prefix_msgs.extend(projector.render(rows_for_send) if rows_for_send else _verbatim(si2))
+                send_chunks.append(
+                    list(projector.render(rows_for_send)) if rows_for_send else _verbatim(si2)
+                )
 
             legacy_msgs = [_row_to_loop_message(r) for r in legacy_rows]
             current_msgs = [_row_to_loop_message(r) for r in current_rows]
-            history = legacy_msgs + prefix_msgs + current_msgs
+            # ── Recent-rows context cap (3.23, max_context_rows, default 300) ──
+            # History used to run from the compact all the way to the newest message; a session
+            # whose fold lags (or whose sends are tiny and numerous) grew without bound. Keep the
+            # most-recent ≤N rows: the compact (if any) is ALWAYS kept, the current send is always
+            # kept in full, and older material drops in whole chunks from the oldest end (legacy
+            # first, then whole sends) until the total fits. A single over-budget chunk is kept
+            # whole rather than split.
+            kept_legacy_rows = legacy_rows
+            cap = getattr(self.config, "max_context_rows", None)
+            if cap and int(cap) > 0:
+                # chunks[0] = the legacy prefix (oldest), then one chunk per past send.
+                chunks: list[list[LoopMessage]] = [legacy_msgs, *send_chunks]
+                total = sum(len(c) for c in chunks) + len(current_msgs)
+                drop = 0
+                while drop < len(chunks) and total > int(cap):
+                    total -= len(chunks[drop])
+                    drop += 1
+                if drop > 0:
+                    legacy_msgs, kept_legacy_rows = [], []
+                    send_chunks = chunks[drop:]
+
+            prefix_msgs = [m for chunk in send_chunks for m in chunk]
+            history = legacy_msgs + compact_msgs + prefix_msgs + current_msgs
             # Sink index↔seq map: legacy + in-flight rows carry real seqs; the rendered prefix
             # (projected OR verbatim-fallback) has no foldable DB row (None). Compaction is off in
             # projection mode, so this map is only kept aligned for the appends, never used to fold.
             hist_seqs: list[int | None] = (
-                [r.seq for r in legacy_rows]
-                + [None] * len(prefix_msgs)
+                [r.seq for r in kept_legacy_rows]
+                + [None] * (len(compact_msgs) + len(prefix_msgs))
                 + [r.seq for r in current_rows]
             )
             hist_ords: list[int | None] = list(hist_seqs)

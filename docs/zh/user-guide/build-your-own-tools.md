@@ -186,9 +186,9 @@ async def _board_write(text: str) -> str:
 
 ---
 
-## 7. 记忆 / 笔记 — `note_add` + 召回 → `remember` + `CustomNotesMemory`
+## 7. 记忆 / 笔记 — 内置 `note` + 召回 → `remember` + `CustomNotesMemory`
 
-**内置：** `note_add` 写持久笔记；`SQLiteNoteMemory`（一个 `MemoryProvider`）在每次 send 开头把它们召回。
+**内置：** `note(action=add)` 写持久笔记；`SQLiteNoteMemory`（一个 `MemoryProvider`）在每次 send 开头把它们召回。
 
 **原语：** 工具侧用 `store.add_note` / `list_notes`；召回用 `MemoryProvider` 协议（`config.memory`）+
 `render_notes(...)`：

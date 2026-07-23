@@ -34,7 +34,7 @@ A representative subset is validated by `tests/real/test_examples.py` against a 
 | 21 | [`request_user_input.py`](21_request_user_input.py) | Resumable human input | `request_user_input`, `submit_input()` |
 | 22 | [`follow_up_steering.py`](22_follow_up_steering.py) | In-flight steering | `follow_up()`, `FollowUpQueued`, `<follow_up>` |
 | 23 | [`23_per_send_overrides.py`](23_per_send_overrides.py) | Per-call tool/prompt overrides | `send(tools=, system_prompt=)`, `ToolRegistry.subset` |
-| 24 | [`24_agent_notes.py`](24_agent_notes.py) | Agent-authored notes | `note_add/update/delete`, `NoteMemory`, `NotesPolicy` |
+| 24 | [`24_agent_notes.py`](24_agent_notes.py) | Agent-authored notes | `note(action=...)`, `NoteMemory`, `NotesPolicy` |
 | 25 | [`25_token_usage.py`](25_token_usage.py) | Token usage accounting | `result.usage`, `get_session_stats`, `max_tokens_per_run`, `usage_updated` |
 | 26 | [`26_timers.py`](26_timers.py) | Durable timers / self wake-ups | `schedule_wakeup`, `TimerRunner`, `HookPoint.TIMER_FIRE` |
 | 27 | [`27_dynamic_workflow.py`](27_dynamic_workflow.py) | Declarative multi-agent workflow | `power_loop.workflow`, `WorkflowSpec`, `create_workflow`, `register_workflow_tools` |

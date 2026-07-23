@@ -160,7 +160,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir="/srv/tenant-a")):
 |---|---|
 | `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill`, `request_user_input` |
 | `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill`, `request_user_input` |
-| `full` | `core` 加上 `todo`、`note_add`/`note_update`/`note_delete`、`schedule_wakeup`/`list_wakeups`/`cancel_wakeup`、`current_time`、`recall_compacted`、`background_run`、`check_background` |
+| `full` | `core` 加上 `todo`、`note`、`schedule_wakeup`/`list_wakeups`/`cancel_wakeup`、`current_time`、`recall_compacted`、`background_run`、`check_background` |
 
 推荐系统提示词：
 

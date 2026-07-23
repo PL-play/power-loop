@@ -106,11 +106,13 @@ def test_agent_spec_rejects_bad_lifecycle() -> None:
         AgentSpec(name="n", system_prompt="p", lifecycle="forever")
 
 
-def test_agent_spec_rejects_out_of_range_rounds() -> None:
+def test_agent_spec_rejects_nonpositive_rounds() -> None:
     with pytest.raises(AgentSpecError):
         AgentSpec(name="n", system_prompt="p", max_rounds=0)
     with pytest.raises(AgentSpecError):
-        AgentSpec(name="n", system_prompt="p", max_rounds=999)
+        AgentSpec(name="n", system_prompt="p", max_rounds=-1)
+    # No upper cap: a large round budget is allowed (was previously rejected at >50).
+    assert AgentSpec(name="n", system_prompt="p", max_rounds=999).max_rounds == 999
 
 
 def test_agent_spec_accepts_minimal() -> None:

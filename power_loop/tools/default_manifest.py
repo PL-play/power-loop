@@ -186,67 +186,39 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=("items",),
     ),
     ToolDefinition(
-        name="note_add",
+        name="note",
         description=(
-            "Save a short persistent note to your own memory. Notes survive context compaction; read "
-            "them back with note_list (and, when the memory-recall hook is enabled, they are also shown "
-            "at the start of each turn). Use for durable facts, preferences, ongoing task state — not "
-            "for transcripts or long content (put those in files). When notes are full you must delete "
-            "or merge old ones first. Set pinned=true for notes that must never be hidden or auto-evicted."
+            "Manage your persistent notes with one action: add, update, delete, or list. Notes "
+            "survive context compaction. Use action=add with content for a durable fact, preference, "
+            "or ongoing task state; action=list to read notes and obtain their #ids; action=update "
+            "with note_id plus content and/or pinned to keep memory current; action=delete with "
+            "note_id for stale memory. Keep notes short and self-contained; use pinned=true only for "
+            "notes that must never be hidden or auto-evicted."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "content": {"type": "string", "description": "The note text. Keep it short and self-contained."},
-                "pinned": {"type": "boolean", "description": "Pinned notes are always visible and never auto-evicted. Default false."},
+                "action": {
+                    "type": "string",
+                    "enum": ["add", "update", "delete", "list"],
+                    "description": "Operation to perform.",
+                },
+                "note_id": {
+                    "type": "integer",
+                    "description": "Required for update/delete; obtain it with action=list.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Required for add; optional replacement text for update.",
+                },
+                "pinned": {
+                    "type": "boolean",
+                    "description": "Optional pin state for add/update.",
+                },
             },
-            "required": ["content"],
+            "required": ["action"],
         },
-        required_params=("content",),
-    ),
-    ToolDefinition(
-        name="note_update",
-        description=(
-            "Rewrite or (un)pin one of your existing notes by its #id. Use to keep memory current "
-            "instead of piling up near-duplicates, and to merge related notes into one."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "note_id": {"type": "integer", "description": "The #id from note_list (or YOUR NOTES)."},
-                "content": {"type": "string", "description": "New text replacing the old content."},
-                "pinned": {"type": "boolean", "description": "Set or clear the pinned flag."},
-            },
-            "required": ["note_id"],
-        },
-        required_params=("note_id",),
-    ),
-    ToolDefinition(
-        name="note_delete",
-        description=(
-            "Delete one of your notes by its #id (from note_list) when it is stale or no longer "
-            "worth remembering."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "note_id": {"type": "integer", "description": "The #id from note_list (or YOUR NOTES)."},
-            },
-            "required": ["note_id"],
-        },
-        required_params=("note_id",),
-    ),
-    ToolDefinition(
-        name="note_list",
-        description=(
-            "List your persistent notes — each note's #id, pinned flag, and content — so you can "
-            "read back what you remember and get the #id needed to note_update / note_delete. These "
-            "are the same notes you maintain with note_add / note_update / note_delete; they survive "
-            "context compaction. Call this when you want to check your memory (e.g. at the start of a "
-            "task) rather than relying on it being auto-shown."
-        ),
-        input_schema={"type": "object", "properties": {}},
-        required_params=(),
+        required_params=("action",),
     ),
     ToolDefinition(
         name="schedule_wakeup",

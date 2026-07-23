@@ -38,25 +38,28 @@ class _ScriptLLM:
 def _note_registry(recorded: list[tuple[str, dict]]) -> ToolRegistry:
     reg = ToolRegistry()
 
-    async def fake_note_add(content: str, pinned: bool = False):
-        recorded.append(("note_add", {"content": content, "pinned": pinned}))
-        return f"noted: {content}"
-
-    async def fake_note_update(note_id: int, content: str | None = None):
-        recorded.append(("note_update", {"note_id": note_id, "content": content}))
-        return "updated"
+    async def fake_note(
+        action: str,
+        note_id: int | None = None,
+        content: str | None = None,
+        pinned: bool | None = None,
+    ):
+        recorded.append(
+            (
+                "note",
+                {"action": action, "note_id": note_id, "content": content, "pinned": pinned},
+            )
+        )
+        return f"note action complete: {action}"
 
     reg.register(
-        ToolDefinition(name="note_add", description="save a durable fact",
-                       input_schema={"type": "object", "properties": {"content": {"type": "string"}}},
-                       required_params=("content",)),
-        fake_note_add,
-    )
-    reg.register(
-        ToolDefinition(name="note_update", description="refine a note",
-                       input_schema={"type": "object", "properties": {"note_id": {"type": "integer"}}},
-                       required_params=("note_id",)),
-        fake_note_update,
+        ToolDefinition(
+            name="note",
+            description="manage durable notes",
+            input_schema={"type": "object", "properties": {"action": {"type": "string"}}},
+            required_params=("action",),
+        ),
+        fake_note,
     )
     return reg
 
@@ -78,16 +81,26 @@ async def test_extracts_facts_to_notes_then_summarizes():
     recorded: list = []
     reg = _note_registry(recorded)
     llm = _ScriptLLM([
-        LLMResponse(raw_text="saving facts", tool_calls=[_tc("1", "note_add", '{"content": "lives in Berlin"}')]),
+        LLMResponse(raw_text="saving facts", tool_calls=[_tc("1", "note", '{"action": "add", "content": "lives in Berlin"}')]),
         LLMResponse(raw_text="<summary>User in Berlin; prefers terse replies.</summary>"),
     ])
     comp = AgenticMemoryCompactor(memory_tools=reg, max_rounds=4)
     out = await comp._summarize_async(SLICE, llm=llm)
     assert out == "User in Berlin; prefers terse replies."
-    assert recorded == [("note_add", {"content": "lives in Berlin", "pinned": False})]
+    assert recorded == [
+        (
+            "note",
+            {
+                "action": "add",
+                "note_id": None,
+                "content": "lives in Berlin",
+                "pinned": None,
+            },
+        )
+    ]
     # the compaction call carried the planned compaction system prompt + the note tools
     assert llm.calls[0].system_prompt == DEFAULT_COMPACTION_AGENT_PROMPT
-    assert {t["function"]["name"] for t in (llm.calls[0].tools or [])} == {"note_add", "note_update"}
+    assert {t["function"]["name"] for t in (llm.calls[0].tools or [])} == {"note"}
 
 
 @pytest.mark.asyncio
@@ -95,8 +108,8 @@ async def test_multiple_tool_rounds_then_summary():
     recorded: list = []
     reg = _note_registry(recorded)
     llm = _ScriptLLM([
-        LLMResponse(raw_text="", tool_calls=[_tc("1", "note_add", '{"content": "fact A"}')]),
-        LLMResponse(raw_text="", tool_calls=[_tc("2", "note_add", '{"content": "fact B"}')]),
+        LLMResponse(raw_text="", tool_calls=[_tc("1", "note", '{"action": "add", "content": "fact A"}')]),
+        LLMResponse(raw_text="", tool_calls=[_tc("2", "note", '{"action": "add", "content": "fact B"}')]),
         LLMResponse(raw_text="<summary>two facts saved</summary>"),
     ])
     comp = AgenticMemoryCompactor(memory_tools=reg, max_rounds=5)
@@ -112,7 +125,7 @@ async def test_bad_tool_call_does_not_abort_compaction():
     # malformed arguments JSON → coerced to {} → handler raises on missing required → recorded as error,
     # but the loop continues and still returns the summary.
     llm = _ScriptLLM([
-        LLMResponse(raw_text="", tool_calls=[_tc("1", "note_add", "not-json")]),
+        LLMResponse(raw_text="", tool_calls=[_tc("1", "note", "not-json")]),
         LLMResponse(raw_text="<summary>done anyway</summary>"),
     ])
     comp = AgenticMemoryCompactor(memory_tools=reg, max_rounds=4)
@@ -149,8 +162,8 @@ async def test_exhausted_rounds_makes_final_toolfree_call():
     # Always tool-calls → never volunteers a summary; after max_rounds the compactor issues one
     # final tool-free request, which returns the summary.
     llm = _ScriptLLM([
-        LLMResponse(raw_text="", tool_calls=[_tc("1", "note_add", '{"content": "x"}')]),
-        LLMResponse(raw_text="", tool_calls=[_tc("2", "note_add", '{"content": "y"}')]),
+        LLMResponse(raw_text="", tool_calls=[_tc("1", "note", '{"action": "add", "content": "x"}')]),
+        LLMResponse(raw_text="", tool_calls=[_tc("2", "note", '{"action": "add", "content": "y"}')]),
         LLMResponse(raw_text="<summary>final forced</summary>"),  # the tool-free final call
     ])
     comp = AgenticMemoryCompactor(memory_tools=reg, max_rounds=2)
@@ -166,7 +179,7 @@ async def test_final_tool_free_call_uses_content_text():
     recorded: list = []
     reg = _note_registry(recorded)
     llm = _ScriptLLM([
-        LLMResponse(raw_text="", tool_calls=[_tc("1", "note_add", '{"content": "x"}')]),
+        LLMResponse(raw_text="", tool_calls=[_tc("1", "note", '{"action": "add", "content": "x"}')]),
         LLMResponse(raw_text="", content_text="<summary>from content_text</summary>"),  # final call
     ])
     comp = AgenticMemoryCompactor(memory_tools=reg, max_rounds=1)
@@ -190,4 +203,4 @@ async def test_tool_call_with_no_name_is_answered_not_crashed():
 def test_default_registry_is_note_tools():
     comp = AgenticMemoryCompactor()
     reg = comp._registry()
-    assert set(reg.names()) == {"note_add", "note_update"}
+    assert set(reg.names()) == {"note"}

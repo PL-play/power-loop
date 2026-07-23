@@ -125,7 +125,7 @@ pair.
 ## Agentic memory-aware fold
 
 `LLMSummaryFold` summarizes a slice in **one** LLM call. `AgenticFold` instead runs a **bounded,
-memory-aware agent loop** at the fold: the model first uses note tools (`note_add` / `note_update`) to
+memory-aware agent loop** at the fold: the model first uses the unified `note` tool (`action=add|update`) to
 **persist durable facts into the session's notes**, then writes the summary. This separates *long-term
 memory* (kept as notes, surfaced on later turns) from the *working-context summary* (compressed), so the
 agent forgets less across many folds. The note writes are captured as `note_ops` and applied by the loop

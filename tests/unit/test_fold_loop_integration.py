@@ -67,7 +67,7 @@ async def test_projection_loop_agentic_fold_writes_notes(store: SessionStore) ->
     llm = _Scripted(responses=[
         LLMResponse(raw_text="d1"), LLMResponse(raw_text="d2"), LLMResponse(raw_text="d3"),
         # the fold's agentic loop: round 1 saves a note, round 2 emits the summary
-        LLMResponse(raw_text="", tool_calls=[_tc("n1", "note_add", '{"content": "FACT-X"}')]),
+        LLMResponse(raw_text="", tool_calls=[_tc("n1", "note", '{"action": "add", "content": "FACT-X"}')]),
         LLMResponse(raw_text="<summary>folded</summary>"),
     ])
     loop = _proj_loop(store, llm, AgenticFold(keep_last_sends=2, max_rounds=3))

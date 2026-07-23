@@ -167,7 +167,7 @@ Presets:
 |---|---|
 | `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill`, `request_user_input` |
 | `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill`, `request_user_input` |
-| `full` | `core` plus `todo`, `note_add`/`note_update`/`note_delete`, `schedule_wakeup`/`list_wakeups`/`cancel_wakeup`, `current_time`, `recall_compacted`, `background_run`, `check_background` |
+| `full` | `core` plus `todo`, `note`, `schedule_wakeup`/`list_wakeups`/`cancel_wakeup`, `current_time`, `recall_compacted`, `background_run`, `check_background` |
 
 Recommended system prompt guidance:
 

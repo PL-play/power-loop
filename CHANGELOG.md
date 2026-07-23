@@ -8,6 +8,35 @@
 
 ## [Unreleased]
 
+## [3.24.0] — 2026-07-23
+
+Feature release。Tool catalog UI now supports category fold/select-all, and the built-in note tools were consolidated
+into a single parameterized `note` tool. No `STABLE` API break.
+
+### Added
+- Tool catalog categories can be collapsed and selected in one shot.
+- `note_add` / `note_update` / `note_delete` / `note_list` were merged into `note(action=...)`.
+
+## [3.23.0] — 2026-07-22
+
+Additive, backward-compatible (minor)。无 schema 变更,无 STABLE API 破坏(AgentLoopConfig 新增带默认值字段)。
+
+### Added
+- **`AgentLoopConfig.max_context_rows`（默认 300,投影模式）——最近行数上下文上限。** 投影模式的
+  history 原本从 fold 压缩点一路铺到最新消息;fold 迟迟不触发或 send 细碎众多时无上界。现在组装
+  history 时最多保留 N 行:压缩摘要行(如有)**始终保留**在最前,当前 in-flight send 始终完整保留,
+  更早的内容从最旧端**整块**丢弃(先 legacy 前缀,再整个旧 send)直到装下——绝不切开一个块,
+  verbatim-fallback send 的 tool 协议对不会被拆散。`None`/`<=0` 关闭。verbatim 模式不受影响
+  (其窗口由就地 compactor 约束)。
+
+## [3.22.0] — 2026-07-21
+
+Additive, backward-compatible (minor)。无 schema 变更,无 STABLE API 破坏(校验放宽,原有 spec 仍合法)。
+
+### Changed
+- **`AgentSpec.max_rounds` 去掉 50 的上限**:校验由 `1 <= max_rounds <= 50` 放宽为 `>= 1`(下限保留,
+  0/负仍拒)。子 agent / workflow 叶子可申请超过 50 轮。`spawn_agent` 工具的 max_rounds 描述同步(min 1)。
+
 ## [3.21.0] — 2026-07-21
 
 Additive, backward-compatible (minor)。无 schema 变更，无 STABLE API 破坏

@@ -225,8 +225,9 @@ DEFAULT_FOLD_AGENT_PROMPT = (
     "Do this in order:\n"
     "1. EXTRACT durable facts worth remembering AFTER this slice leaves context — decisions made, "
     "stable user preferences/constraints, established facts, unresolved commitments, and hard-won "
-    "fixes to errors — and SAVE each as a concise note via the `note_add` tool (one fact per "
-    "note). Use `note_update` to refine an existing note instead of duplicating. Save ONLY what "
+    "fixes to errors — and SAVE each as a concise note via `note(action=add, ...)` (one fact per "
+    "note). Use `note(action=update, ...)` to refine an existing note instead of duplicating. "
+    "Save ONLY what "
     "will matter later; skip transient chatter. If nothing is worth remembering, save nothing.\n"
     "2. THEN write a faithful, compact summary of the slice for the context window. Preserve: "
     "(1) decisions, (2) facts established, (3) errors and how they were handled, (4) any pending "
@@ -235,37 +236,23 @@ DEFAULT_FOLD_AGENT_PROMPT = (
     "Output the summary LAST, wrapped in <summary>…</summary>, in a message with NO tool calls."
 )
 
-#: The two memory tools the agentic fold offers the model. Calls are CAPTURED into NoteOps (not
+#: The unified memory tool the agentic fold offers the model. Calls are CAPTURED into NoteOps (not
 #: written here), so the strategy stays side-effect-free until the loop applies them best-effort.
 _CAPTURE_NOTE_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "note_add",
-            "description": "Save a durable fact as a persistent note (one fact per note).",
+            "name": "note",
+            "description": "Add or update a durable persistent note.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "action": {"type": "string", "enum": ["add", "update"]},
+                    "note_id": {"type": "integer", "description": "Required for update."},
                     "content": {"type": "string", "description": "The note text."},
                     "pinned": {"type": "boolean", "description": "Pin so it is never auto-evicted."},
                 },
-                "required": ["content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "note_update",
-            "description": "Refine an existing note by its #id instead of duplicating.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "note_id": {"type": "integer"},
-                    "content": {"type": "string"},
-                    "pinned": {"type": "boolean"},
-                },
-                "required": ["note_id"],
+                "required": ["action"],
             },
         },
     },
@@ -274,8 +261,8 @@ _CAPTURE_NOTE_TOOLS = [
 
 @dataclass
 class AgenticFold:
-    """Fold strategy that runs a bounded, memory-aware agent loop: the model issues note_add /
-    note_update calls to persist durable facts, THEN writes the compact summary. Note calls are
+    """Fold strategy that runs a bounded, memory-aware agent loop: the model issues unified note
+    add/update actions to persist durable facts, THEN writes the compact summary. Note calls are
     CAPTURED as :class:`NoteOp`\\ s (returned in ``FoldResult.note_ops``) and applied by the loop
     best-effort after the compact commits — so the strategy is side-effect-free + testable in
     isolation. On ANY failure it falls back to a plain single-call summary (KEEPING any notes
@@ -371,16 +358,19 @@ class AgenticFold:
 
     @staticmethod
     def _capture(name: str | None, args: dict[str, Any], captured: list[NoteOp]) -> str:
-        if name == "note_add":
+        if name != "note":
+            return f"error: unknown tool {name!r}"
+        action = str(args.get("action") or "").strip().lower()
+        if action == "add":
             content = args.get("content")
             if not content:
-                return "error: note_add requires content"
+                return "error: note action=add requires content"
             captured.append(NoteOp(op="add", content=str(content), pinned=bool(args.get("pinned"))))
             return "ok: note captured"
-        if name == "note_update":
+        if action == "update":
             note_id = args.get("note_id")
             if note_id is None:
-                return "error: note_update requires note_id"
+                return "error: note action=update requires note_id"
             try:
                 nid = int(note_id)
             except (TypeError, ValueError):
@@ -396,7 +386,7 @@ class AgenticFold:
                 )
             )
             return "ok: note update captured"
-        return f"error: unknown tool {name!r}"
+        return f"error: unsupported note action {action!r}"
 
 
 def _validate_fold_params(

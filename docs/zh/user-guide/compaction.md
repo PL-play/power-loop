@@ -107,7 +107,7 @@ config = AgentLoopConfig(fold_strategy=MyFold())
 
 ## 记忆感知的 agentic 折叠
 
-`LLMSummaryFold` 用**一次** LLM 调用摘要一段切片。`AgenticFold` 改为在折叠时跑一个**有界、记忆感知的 agent 循环**：模型先用 note 工具（`note_add` / `note_update`）把**持久事实写入会话笔记**，再写摘要。这把*长期记忆*（留作笔记、后续轮次浮现）和*工作上下文摘要*（压缩掉）分开，多次折叠后更不易遗忘。这些 note 写入被捕获为 `note_ops`，由 loop 在 compact 提交后应用（让策略保持无副作用、可测试）；任何失败都回退到普通的单次摘要，所以它绝不阻塞折叠。
+`LLMSummaryFold` 用**一次** LLM 调用摘要一段切片。`AgenticFold` 改为在折叠时跑一个**有界、记忆感知的 agent 循环**：模型先用统一的 `note` 工具（`action=add|update`）把**持久事实写入会话笔记**，再写摘要。这把*长期记忆*（留作笔记、后续轮次浮现）和*工作上下文摘要*（压缩掉）分开，多次折叠后更不易遗忘。这些 note 写入被捕获为 `note_ops`，由 loop 在 compact 提交后应用（让策略保持无副作用、可测试）；任何失败都回退到普通的单次摘要，所以它绝不阻塞折叠。
 
 ```python
 from power_loop import AgentLoopConfig, AgenticFold

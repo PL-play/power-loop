@@ -9,7 +9,7 @@ Features recreated (built-in → custom):
   2. schedule_wakeup    → remind_me         (loop.schedule_timer + a host TimerRunner)
   3. request_user_input → ask_human         (raise HumanInputRequired → waiting_for_input → submit_input)
   4. board_*            → board_write/read   (store.get_runtime_state / set_runtime_state)
-  5. note_add + recall  → remember + CustomNotesMemory (store.add_note/list_notes + MemoryProvider)
+  5. note add + recall  → remember + CustomNotesMemory (store.add_note/list_notes + MemoryProvider)
   6. WorkflowSpec       → run_pipeline       (a fixed run_agent_spec sequence — the orchestration PRIMITIVE)
   7. background_run     → bg_run + CustomBackgroundProjector (daemon + pl_background_tasks + RuntimeProjector re-entry)
 
@@ -161,7 +161,7 @@ BOARD_READ_TOOL = ToolDefinition(
 )
 
 
-# ── 5. MEMORY — recreate note_add + recall via store notes + a MemoryProvider ───────────────
+# ── 5. MEMORY — recreate note add + recall via store notes + a MemoryProvider ──────────────
 # Parity: durable per-session notes the agent writes, recalled into context each send. The built-in
 # adds policy-checked add/update helpers (NotesPolicy enforcement); replicate inline if you need it.
 

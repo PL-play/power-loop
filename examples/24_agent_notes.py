@@ -2,7 +2,7 @@
 
 What you learn / 你将学到
 --------------------------
-- ``note_add`` / ``note_update`` / ``note_delete`` 默认工具：模型自己决定记什么
+- ``note(action=add|update|delete|list)`` 默认工具：模型自己决定记什么
   / default tools — the model decides what to remember
 - ``NoteMemory``：把笔记作为 system 消息在每次 send 注入
   / a MemoryProvider that injects the session's notes every send
@@ -53,7 +53,7 @@ async def main() -> None:
                 notes_policy=policy,
             ),
             tool_registry=create_default_tool_registry(
-                include=["note_add", "note_update", "note_delete"],
+                include=["note"],
                 workspace_dir=tmp,
             ),
         )

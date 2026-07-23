@@ -89,8 +89,8 @@ class AgentSpec:
         if self.tools is not None:
             if not isinstance(self.tools, list) or not all(isinstance(x, str) for x in self.tools):
                 raise AgentSpecError("AgentSpec.tools must be a list[str] or None")
-        if not 1 <= int(self.max_rounds) <= 50:
-            raise AgentSpecError("AgentSpec.max_rounds must be in [1, 50]")
+        if int(self.max_rounds) < 1:
+            raise AgentSpecError("AgentSpec.max_rounds must be >= 1")
         try:
             SubagentLifecycle(self.lifecycle)
         except ValueError as exc:

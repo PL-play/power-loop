@@ -382,8 +382,9 @@ DEFAULT_COMPACTION_AGENT_PROMPT = (
     "Do this in order:\n"
     "1. EXTRACT durable facts worth remembering AFTER this slice leaves context — decisions "
     "made, stable user preferences/constraints, established facts, unresolved commitments, and "
-    "hard-won fixes to errors — and SAVE each as a concise note via the `note_add` tool (one "
-    "fact per note). Use `note_update` to refine an existing note instead of duplicating. Save "
+    "hard-won fixes to errors — and SAVE each as a concise note via `note(action=add, ...)` (one "
+    "fact per note). Use `note(action=update, ...)` to refine an existing note instead of "
+    "duplicating. Save "
     "ONLY what will matter later; skip transient chatter and anything obvious from the system "
     "prompt. If nothing is worth remembering, save nothing.\n"
     "2. THEN write a faithful, compact summary of the slice for the context window. Preserve: "
@@ -397,8 +398,8 @@ DEFAULT_COMPACTION_AGENT_PROMPT = (
 class AgenticMemoryCompactor(DefaultCompactor):
     """Opt-in compactor that runs a bounded, memory-aware agent loop to compact a slice.
 
-    Instead of one summarization call, it lets the model use memory tools (by default the
-    existing ``note_add`` / ``note_update``) to persist durable facts into the **current
+    Instead of one summarization call, it lets the model use a memory tool (by default the
+    unified ``note`` tool) to persist durable facts into the **current
     session's notes** BEFORE compressing the rest into the ``compact_note`` summary. Reuses
     :class:`DefaultCompactor`'s trigger + span selection unchanged; only the summarize step is
     agentic.
@@ -428,10 +429,10 @@ class AgenticMemoryCompactor(DefaultCompactor):
     def _registry(self) -> ToolRegistry:
         if self._memory_tools is not None:
             return self._memory_tools
-        # Lazy (avoids an import cycle: tools → runtime). Default to the existing note tools.
+        # Lazy (avoids an import cycle: tools → runtime). Default to the unified note tool.
         from power_loop.tools import create_default_tool_registry
 
-        self._memory_tools = create_default_tool_registry(include=["note_add", "note_update"])
+        self._memory_tools = create_default_tool_registry(include=["note"])
         return self._memory_tools
 
     async def _summarize_async(self, slice_msgs: list[dict[str, Any]], *, llm: Any) -> str | None:

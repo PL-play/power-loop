@@ -1216,7 +1216,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 These cover the capabilities added since 0.11 (durability, scaling, pluggable backends, observability, MCP). Each links to the runnable file and to the User Guide page that explains it in depth.
 
 ### 24 · Agent Notes
-The agent writes durable notes to itself (`note_add` / `note_update` / `note_delete`), persisted via `SQLiteNoteMemory` and re-injected each turn under a `NotesPolicy`. → [example](../../../examples/24_agent_notes.py) · [Memory](../user-guide/memory.md)
+The agent manages durable notes through `note(action=add|update|delete|list)`, persisted via `SQLiteNoteMemory` and re-injected each turn under a `NotesPolicy`. → [example](../../../examples/24_agent_notes.py) · [Memory](../user-guide/memory.md)
 
 ### 25 · Token Usage
 Account for tokens with `result.usage`, `get_session_stats`, and the `usage_updated` event; cap a run with `max_tokens_per_run`. → [example](../../../examples/25_token_usage.py) · [Configuration](../user-guide/configuration.md)

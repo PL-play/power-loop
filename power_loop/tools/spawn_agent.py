@@ -57,7 +57,7 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(
             },
             "max_rounds": {
                 "type": "integer",
-                "description": f"Maximum rounds (default {DEFAULT_MAX_ROUNDS}, clamp 1-50).",
+                "description": f"Maximum rounds (default {DEFAULT_MAX_ROUNDS}, min 1).",
             },
         },
         "required": ["task"],

@@ -1479,48 +1479,47 @@ def _notes_policy() -> Any:
 def _notes_store_and_session() -> tuple[Any, str]:
     store, sid = _current_store_and_session()
     if store is None or sid is None:
-        raise RuntimeError("note tools need an active session (StatefulAgentLoop)")
+        raise RuntimeError("note tool needs an active session (StatefulAgentLoop)")
     return store, sid
 
 
-async def run_note_add(content: str, pinned: bool = False) -> str:
-    from power_loop.runtime.notes import add_note_checked
+async def run_note(
+    action: str,
+    note_id: int | None = None,
+    content: str | None = None,
+    pinned: bool | None = None,
+) -> str:
+    """Execute one action of the model-facing persistent-note tool."""
+    from power_loop.runtime.notes import add_note_checked, render_notes, update_note_checked
 
+    operation = str(action or "").strip().lower()
     store, sid = _notes_store_and_session()
     policy = _notes_policy()
-    note = await add_note_checked(store, sid, content, pinned=pinned, policy=policy)
-    count = await store.count_notes(sid)
-    return f"noted as #{note.note_id} ({count}/{policy.max_notes} notes used)"
-
-
-async def run_note_update(note_id: int, content: str | None = None, pinned: bool | None = None) -> str:
-    from power_loop.runtime.notes import update_note_checked
-
-    store, sid = _notes_store_and_session()
-    await update_note_checked(
-        store, sid, int(note_id), content=content, pinned=pinned, policy=_notes_policy()
-    )
-    return f"note #{note_id} updated"
-
-
-async def run_note_delete(note_id: int) -> str:
-    store, sid = _notes_store_and_session()
-    if not await store.delete_note(sid, int(note_id)):
-        raise ValueError(f"note #{note_id} does not exist")
-    return f"note #{note_id} deleted ({await store.count_notes(sid)} remaining)"
-
-
-async def run_note_list() -> str:
-    """Read back the agent's persistent notes (rendered with #id, pinned flag, content), so the
-    agent can inspect its memory and get the #ids for note_update / note_delete WITHOUT relying on
-    the (optional) memory-recall hook auto-injecting them."""
-    from power_loop.runtime.notes import render_notes
-
-    store, sid = _notes_store_and_session()
-    notes = await store.list_notes(sid)
-    if not notes:
-        return "(no notes yet — use note_add to remember durable facts, preferences, or task state)"
-    return render_notes(notes, policy=_notes_policy())
+    if operation == "add":
+        if content is None:
+            raise ValueError("note action=add requires content")
+        row = await add_note_checked(store, sid, content, pinned=bool(pinned), policy=policy)
+        count = await store.count_notes(sid)
+        return f"noted as #{row.note_id} ({count}/{policy.max_notes} notes used)"
+    if operation == "update":
+        if note_id is None:
+            raise ValueError("note action=update requires note_id")
+        await update_note_checked(
+            store, sid, int(note_id), content=content, pinned=pinned, policy=policy
+        )
+        return f"note #{note_id} updated"
+    if operation == "delete":
+        if note_id is None:
+            raise ValueError("note action=delete requires note_id")
+        if not await store.delete_note(sid, int(note_id)):
+            raise ValueError(f"note #{note_id} does not exist")
+        return f"note #{note_id} deleted ({await store.count_notes(sid)} remaining)"
+    if operation == "list":
+        notes = await store.list_notes(sid)
+        if not notes:
+            return "(no notes yet — use note(action=add, content=...) to remember durable facts)"
+        return render_notes(notes, policy=policy)
+    raise ValueError("note action must be one of: add, update, delete, list")
 
 
 def _timers_store_and_session() -> tuple[Any, str]:
@@ -1724,20 +1723,10 @@ async def _h_todo(**kw: Any) -> Any:
     return await run_todo(kw["items"])
 
 
-async def _h_note_add(**kw: Any) -> Any:
-    return await run_note_add(kw["content"], kw.get("pinned", False))
-
-
-async def _h_note_update(**kw: Any) -> Any:
-    return await run_note_update(kw["note_id"], kw.get("content"), kw.get("pinned"))
-
-
-async def _h_note_delete(**kw: Any) -> Any:
-    return await run_note_delete(kw["note_id"])
-
-
-async def _h_note_list(**kw: Any) -> Any:
-    return await run_note_list()
+async def _h_note(**kw: Any) -> Any:
+    return await run_note(
+        kw["action"], kw.get("note_id"), kw.get("content"), kw.get("pinned")
+    )
 
 
 async def _h_schedule_wakeup(**kw: Any) -> Any:
@@ -1793,10 +1782,7 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     ),
     "load_skill": lambda **kw: run_load_skill(kw["name"]),
     "todo": _h_todo,
-    "note_add": _h_note_add,
-    "note_update": _h_note_update,
-    "note_delete": _h_note_delete,
-    "note_list": _h_note_list,
+    "note": _h_note,
     "schedule_wakeup": _h_schedule_wakeup,
     "list_wakeups": _h_list_wakeups,
     "cancel_wakeup": _h_cancel_wakeup,

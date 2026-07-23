@@ -341,7 +341,7 @@ async def test_agentic_fold_captures_notes_then_summarizes():
     rows = [_pmr(1, "user", {"human": ["I live in Berlin, terse please"]}),
             _pmr(1, "project", {"tools": [], "final_text": "ok"})]
     llm = _ScriptLLM([
-        LLMResponse(raw_text="saving", tool_calls=[_tc("1", "note_add", '{"content": "lives in Berlin"}')]),
+        LLMResponse(raw_text="saving", tool_calls=[_tc("1", "note", '{"action": "add", "content": "lives in Berlin"}')]),
         LLMResponse(raw_text="<summary>Berlin; terse.</summary>"),
     ])
     ctx = FoldContext(session_id="s1", round_index=0, representation=rep, llm=llm, max_tokens=8000)
@@ -350,7 +350,7 @@ async def test_agentic_fold_captures_notes_then_summarizes():
     assert out.folded_to_send == 1
     assert out.note_ops == (NoteOp(op="add", content="lives in Berlin", pinned=False),)
     # the agentic call carried the note tools
-    assert {t["function"]["name"] for t in (llm.calls[0].tools or [])} == {"note_add", "note_update"}
+    assert {t["function"]["name"] for t in (llm.calls[0].tools or [])} == {"note"}
 
 
 @pytest.mark.asyncio
@@ -377,12 +377,12 @@ async def test_agentic_fold_falls_back_to_single_call():
 
 @pytest.mark.asyncio
 async def test_agentic_fold_bad_note_id_does_not_abort():
-    # A note_update with a non-integer note_id must be answered with an error (NOT raise), so the
+    # A note update action with a non-integer note_id must be answered with an error (NOT raise), so the
     # round continues and the summary is still produced. Review #17.
     rep = ProjectedRepresentation()
     rows = [_pmr(1, "user", {"human": ["q"]}), _pmr(1, "project", {"tools": [], "final_text": "a"})]
     llm = _ScriptLLM([
-        LLMResponse(raw_text="", tool_calls=[_tc("1", "note_update", '{"note_id": "abc"}')]),
+        LLMResponse(raw_text="", tool_calls=[_tc("1", "note", '{"action": "update", "note_id": "abc"}')]),
         LLMResponse(raw_text="<summary>ok</summary>"),
     ])
     ctx = FoldContext(session_id="s1", round_index=0, representation=rep, llm=llm, max_tokens=8000)
@@ -398,7 +398,7 @@ async def test_agentic_fold_preserves_notes_on_empty_final_summary():
     rep = ProjectedRepresentation()
     rows = [_pmr(1, "user", {"human": ["q"]}), _pmr(1, "project", {"tools": [], "final_text": "a"})]
     llm = _ScriptLLM([
-        LLMResponse(raw_text="", tool_calls=[_tc("1", "note_add", '{"content": "KEEP-ME"}')]),
+        LLMResponse(raw_text="", tool_calls=[_tc("1", "note", '{"action": "add", "content": "KEEP-ME"}')]),
         LLMResponse(raw_text=""),  # rounds exhausted → forced final summary is empty → None
         LLMResponse(raw_text="<summary>fallback-summary</summary>"),  # plain-summary fallback
     ])

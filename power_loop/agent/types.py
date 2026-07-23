@@ -87,6 +87,15 @@ class AgentLoopConfig:
     #:     projection), original detail kept in ``pl_messages`` (recall_send re-expands).
     #: Custom representations implement the ``Representation`` Protocol.
     representation: Representation = _UNSET  # resolved in __post_init__ (default or legacy-mapped)
+    #: Recent-rows context cap (3.23, PROJECTION mode only). History normally runs from the fold
+    #: compact to the newest message; a session whose fold lags — or whose sends are tiny and
+    #: numerous — grows without bound. When set, the assembled history keeps at most this many
+    #: rows: the compact summary (if any) is ALWAYS kept on top, the in-flight send is always kept
+    #: in full, and older material drops in whole chunks from the oldest end (the legacy prefix
+    #: first, then whole past sends) until the total fits — a chunk is never split, so a
+    #: verbatim-fallback send can't orphan its tool rows. ``None``/``<=0`` disables the cap.
+    #: Verbatim mode is unaffected (its window is bounded by the in-place compactor).
+    max_context_rows: int | None = 300
     #: ``fold_strategy`` — how older history is compacted (N records → 1 compact) once over budget:
     #:   * ``LLMSummaryFold`` (default): one LLM summary call, no side effects.
     #:   * ``AgenticFold``: LLM + a bounded tool loop that persists durable facts as notes.
@@ -193,7 +202,7 @@ class AgentLoopConfig:
     # unresolvable — the row is then a small "inject_unresolved" marker (still never affects
     # context/cache).
     record_hook_events: str = "off"
-    # Bounds for the note_add/note_update/note_delete tools (agent-authored
+    # Bounds for the unified note tool (agent-authored
     # notes). None → DEFAULT_NOTES_POLICY. See power_loop.runtime.notes.
     notes_policy: NotesPolicy | None = None
     skills_dir: str | None = None

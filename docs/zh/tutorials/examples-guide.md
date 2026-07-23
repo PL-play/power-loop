@@ -1167,7 +1167,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 覆盖 0.11 之后新增的能力（持久化、扩展、可插拔后端、可观测性、MCP）。每条都链接到可运行文件，以及深入讲解它的用户手册页面。
 
 ### 24 · Agent 笔记
-Agent 给自己写持久化笔记（`note_add` / `note_update` / `note_delete`），经 `SQLiteNoteMemory` 持久化，并按 `NotesPolicy` 在每轮重新注入。→ [示例](../../../examples/24_agent_notes.py) · [记忆](../user-guide/memory.md)
+Agent 通过 `note(action=add|update|delete|list)` 管理持久化笔记，经 `SQLiteNoteMemory` 持久化，并按 `NotesPolicy` 在每轮重新注入。→ [示例](../../../examples/24_agent_notes.py) · [记忆](../user-guide/memory.md)
 
 ### 25 · Token 用量
 用 `result.usage`、`get_session_stats` 和 `usage_updated` 事件统计 token；用 `max_tokens_per_run` 给单次运行设上限。→ [示例](../../../examples/25_token_usage.py) · [配置](../user-guide/configuration.md)

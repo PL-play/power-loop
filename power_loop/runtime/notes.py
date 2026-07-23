@@ -5,9 +5,8 @@ Complements :mod:`power_loop.runtime.memory`:
 * ``MemoryProvider`` is the *passive* seam — recall/remember at session
   boundaries, the provider decides what to keep (summaries, facts, RAG).
 * Notes are *agent-driven* memory — the model itself decides mid-conversation
-  what is worth keeping, via the ``note_add`` / ``note_update`` /
-  ``note_delete`` default tools, persisted in the session store's ``notes``
-  table.
+  what is worth keeping, via the unified ``note`` default tool, persisted in
+  the session store's ``notes`` table.
 
 The two meet in :class:`NoteMemory` (formerly ``SQLiteNoteMemory``; alias kept):
 a ``MemoryProvider`` whose ``recall()`` renders the session's notes into one
@@ -18,8 +17,8 @@ in real time).
 Capacity model
 --------------
 ``NotesPolicy`` bounds everything. The default eviction mode is **reject**:
-when the table is full, ``note_add`` fails with an instructive error telling
-the model to delete or merge first. Silent loss is the worst failure mode for
+when the table is full, ``note(action=add)`` fails with an instructive error
+telling the model to delete or merge first. Silent loss is the worst failure mode for
 an agent's memory — being forced to curate beats quietly forgetting.
 ``eviction="fifo"`` switches to queue semantics: the oldest unpinned note is
 dropped to make room (pinned notes are never auto-evicted).
@@ -36,7 +35,7 @@ from power_loop.runtime.store.types import NoteRow
 
 
 class NotesFullError(ValueError):
-    """note_add was refused because the session is at max_notes (reject mode)."""
+    """A note add was refused because the session is at max_notes (reject mode)."""
 
 
 @dataclass(frozen=True)
@@ -49,7 +48,7 @@ class NotesPolicy:
     inject_max_chars : budget for the rendered recall message; oldest unpinned
                        notes are elided first, and the rendering says how many
                        were hidden so the model knows its memory view is partial.
-    eviction         : "reject" (default) — note_add errors when full;
+    eviction         : "reject" (default) — note(action=add) errors when full;
                        "fifo" — drop the oldest unpinned note to make room.
     """
 
@@ -70,7 +69,7 @@ async def add_note_checked(
     pinned: bool = False,
     policy: NotesPolicy = DEFAULT_NOTES_POLICY,
 ) -> NoteRow:
-    """Policy-enforcing insert used by the ``note_add`` tool handler."""
+    """Policy-enforcing insert used by the unified ``note`` tool handler."""
     content = content.strip()
     if not content:
         raise ValueError("note content is empty")
@@ -88,12 +87,12 @@ async def add_note_checked(
             else:
                 raise NotesFullError(
                     f"notes are full ({policy.max_notes}) and all are pinned; "
-                    "unpin or delete (note_delete) before adding"
+                    "unpin or delete with note(action=delete) before adding"
                 )
         else:
             raise NotesFullError(
                 f"notes are full ({policy.max_notes}); delete stale notes with "
-                "note_delete or merge related ones with note_update first"
+                "note(action=delete) or merge related ones with note(action=update) first"
             )
     return await store.add_note(session_id, content, pinned=pinned)
 
@@ -110,7 +109,7 @@ async def update_note_checked(
     if content is not None:
         content = content.strip()
         if not content:
-            raise ValueError("note content is empty; use note_delete to remove a note")
+            raise ValueError("note content is empty; use note(action=delete) to remove a note")
         if len(content) > policy.max_note_chars:
             raise ValueError(
                 f"note too long ({len(content)} chars > {policy.max_note_chars})"
@@ -151,8 +150,8 @@ def render_notes(notes: list[NoteRow], *, policy: NotesPolicy = DEFAULT_NOTES_PO
 
     shown = sorted(pinned + kept_unpinned, key=lambda n: n.note_id)
     lines = [
-        "YOUR NOTES (persistent memory you maintain with note_add / note_update / "
-        "note_delete; survives context compaction):"
+        "YOUR NOTES (persistent memory you maintain with the note tool; "
+        "survives context compaction):"
     ]
     lines.extend(line(n) for n in shown)
     if hidden > 0:

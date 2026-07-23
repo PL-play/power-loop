@@ -78,7 +78,7 @@ async def test_reject_when_full(store: SessionStore) -> None:
     policy = NotesPolicy(max_notes=2)
     await add_note_checked(store, SID, "one", policy=policy)
     await add_note_checked(store, SID, "two", policy=policy)
-    with pytest.raises(NotesFullError, match="note_delete"):
+    with pytest.raises(NotesFullError, match="action=delete"):
         await add_note_checked(store, SID, "three", policy=policy)
     assert await store.count_notes(SID) == 2
 
@@ -187,7 +187,7 @@ def test_default_policy_sane() -> None:
 
 
 async def test_note_tool_writes_and_next_send_injects(store: SessionStore) -> None:
-    """The model calls note_add via the default tool; the following send sees
+    """The model calls note(action=add) via the default tool; the following send sees
     its note injected as a memory_notes system message."""
     from collections.abc import Callable
     from dataclasses import dataclass, field
@@ -240,8 +240,8 @@ async def test_note_tool_writes_and_next_send_injects(store: SessionStore) -> No
                         "id": "tc-1",
                         "type": "function",
                         "function": {
-                            "name": "note_add",
-                            "arguments": '{"content": "project codename is BLUEBIRD"}',
+                            "name": "note",
+                            "arguments": '{"action": "add", "content": "project codename is BLUEBIRD"}',
                         },
                     }
                 ],
@@ -253,9 +253,7 @@ async def test_note_tool_writes_and_next_send_injects(store: SessionStore) -> No
     loop = StatefulAgentLoop(
         llm=llm,
         store=store,
-        tool_registry=create_default_tool_registry(
-            include=["note_add", "note_update", "note_delete"], bind=False
-        ),
+        tool_registry=create_default_tool_registry(include=["note"], bind=False),
         config=AgentLoopConfig(
             system_prompt="S",
             max_rounds=3,
@@ -279,9 +277,9 @@ async def test_note_tool_writes_and_next_send_injects(store: SessionStore) -> No
     await loop.aclose()
 
 
-# ── note_list tool (read-back without the recall hook) ───────────────────────
-async def test_note_list_tool_reads_back_notes(store: SessionStore) -> None:
-    """note_list returns the rendered notes (with #id, [pinned], content) so an agent can read
+# ── note list action (read-back without the recall hook) ─────────────────────
+async def test_note_list_action_reads_back_notes(store: SessionStore) -> None:
+    """note(action=list) returns rendered notes so an agent can read
     its memory + get ids for update/delete WITHOUT relying on the optional recall hook."""
     from power_loop.core.agent_context import (
         reset_current_loop,
@@ -289,7 +287,7 @@ async def test_note_list_tool_reads_back_notes(store: SessionStore) -> None:
         set_current_loop,
         set_session_id,
     )
-    from power_loop.tools.default_tools import run_note_list
+    from power_loop.tools.default_tools import run_note
 
     class _FakeLoop:
         def __init__(self, s: SessionStore) -> None:
@@ -301,26 +299,51 @@ async def test_note_list_tool_reads_back_notes(store: SessionStore) -> None:
     tok_s = set_session_id(sid)
     try:
         # No notes yet → guidance, not an empty/blank result.
-        assert "no notes yet" in await run_note_list()
+        assert "no notes yet" in await run_note("list")
 
         await store.add_note(sid, "remember the anniversary")
         pinned = await store.add_note(sid, "prefers tea")
         await store.update_note(sid, pinned.note_id, pinned=True)
 
-        out = await run_note_list()
+        out = await run_note("list")
         assert "remember the anniversary" in out
         assert "prefers tea" in out
         assert "#1" in out and f"#{pinned.note_id}" in out
         assert "[pinned]" in out
+
+        assert "updated" in await run_note(
+            "update", note_id=pinned.note_id, content="prefers coffee", pinned=False
+        )
+        assert "prefers coffee" in await run_note("list")
+        assert "deleted" in await run_note("delete", note_id=pinned.note_id)
+        assert "prefers coffee" not in await run_note("list")
+
+        with pytest.raises(ValueError, match="requires content"):
+            await run_note("add")
+        with pytest.raises(ValueError, match="requires note_id"):
+            await run_note("update", content="missing id")
+        with pytest.raises(ValueError, match="must be one of"):
+            await run_note("unknown")
     finally:
         reset_session_id(tok_s)
         reset_current_loop(tok_l)
 
 
-def test_note_list_registered_as_default_tool() -> None:
+def test_note_registered_as_single_default_tool() -> None:
     from power_loop.tools.default_manifest import FULL_TOOL_NAMES, get_tool_definitions
     from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
 
-    assert "note_list" in DEFAULT_TOOL_HANDLERS
-    assert "note_list" in FULL_TOOL_NAMES
-    assert "note_list" in {d.name for d in get_tool_definitions(include=["note_list"])}
+    assert "note" in DEFAULT_TOOL_HANDLERS
+    assert "note" in FULL_TOOL_NAMES
+    assert {d.name for d in get_tool_definitions(include=["note"])} == {"note"}
+    assert not {"note_add", "note_update", "note_delete", "note_list"}.intersection(
+        DEFAULT_TOOL_HANDLERS
+    )
+    definition = get_tool_definitions(include=["note"])[0]
+    assert definition.required_params == ("action",)
+    assert definition.input_schema["properties"]["action"]["enum"] == [
+        "add",
+        "update",
+        "delete",
+        "list",
+    ]

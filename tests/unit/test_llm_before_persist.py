@@ -59,7 +59,7 @@ async def test_persist_message_is_durable_and_joins_request(tmp_path) -> None:
 
     def inject(ctx: LlmBeforeCtx) -> None:
         if ctx.round_index == 0:
-            ctx.persist_messages.append({"role": "user", "content": "REMINDER: call note_add"})
+            ctx.persist_messages.append({"role": "user", "content": "REMINDER: call note(action=add)"})
 
     hooks.register(HookPoint.LLM_BEFORE, inject, name="test.persist")
     llm = _Capturing()

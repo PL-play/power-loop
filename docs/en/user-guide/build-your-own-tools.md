@@ -198,9 +198,9 @@ cross-process sharing, inject a board backend via `runtime_env_context` instead.
 
 ---
 
-## 7. Memory / notes — `note_add` + recall → `remember` + `CustomNotesMemory`
+## 7. Memory / notes — built-in `note` + recall → `remember` + `CustomNotesMemory`
 
-**Built-in:** `note_add` writes durable notes; `SQLiteNoteMemory` (a `MemoryProvider`) recalls them
+**Built-in:** `note(action=add)` writes durable notes; `SQLiteNoteMemory` (a `MemoryProvider`) recalls them
 into context at the start of every send.
 
 **Primitives:** `store.add_note` / `list_notes` for the tool, and the `MemoryProvider` protocol

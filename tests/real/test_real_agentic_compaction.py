@@ -1,7 +1,7 @@
 """Real-LLM end-to-end for the opt-in AgenticMemoryCompactor.
 
 Verifies the differentiator vs DefaultCompactor: at the compaction boundary the agent runs a
-bounded tool-loop that EXTRACTS durable facts into the session's notes (via the real note_add
+bounded tool-loop that EXTRACTS durable facts into the session's notes (via the real note action
 tool, resolving the live session from the loop's contextvars) BEFORE folding the slice into the
 compact_note — and the loop stays coherent afterwards.
 """

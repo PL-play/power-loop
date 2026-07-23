@@ -126,7 +126,7 @@ class FoldContext:
     representation: Representation        # re-render rows to text to summarize (substrate-agnostic)
     llm: Any | None = None               # main loop LLM; None only in a no-LLM unit harness
     summary_llm: Any | None = None       # optional cheaper dedicated summary model
-    tool_registry: ToolRegistry | None = None   # agentic side effects (note_add/note_update/...)
+    tool_registry: ToolRegistry | None = None   # agentic side effects (note action add/update/...)
     memory: MemoryProvider | None = None        # agentic memory side effects
     max_tokens: int | None = None        # the budget (drives self-bounding of summary length)
     current_tokens: int | None = None    # loop's incremental rendered-prefix estimate (SCALE-4)
@@ -184,7 +184,7 @@ All in `fold.py`; all usable under verbatim OR projection (requirement 3).
 
 - **`LLMSummaryFold`** (`keep_last_sends=4`, `trigger_ratio=0.75`, `summary_max_tokens=5000`, `is_pure=False`, `fold_id="llm_summary"`). Single LLM call, no tools. `DefaultCompactor._summarize_async` re-homed: render the span via `context.representation.render(rows)` + `_stringify`, send ONE `LLMRequest` (no tools, no system_prompt) to `context.summary_llm or context.llm`, `_strip_summary` the `<summary>…</summary>` body. Soft-fail (`return None`) on any exception → loop keeps the span unfolded this send. Rolls a prior compact's summary into the prompt.
 
-- **`AgenticFold`** (`keep_last_sends=4`, `trigger_ratio=0.75`, `max_rounds=4`, `is_pure=False`, `fold_id="agentic"`). LLM + tools + notes/memory side effects. `AgenticMemoryCompactor._agentic_summarize` re-homed onto `FoldContext`: a FLAT bounded tool-use loop (NOT a nested `StatefulAgentLoop`) that issues `note_add`/`note_update`. **Side-effect channel:** the strategy collects note operations into `FoldResult.note_ops` (preferred) which the loop applies transactionally with the compact UPSERT; if a strategy instead calls the tools directly, that now resolves because the fold runs inside the session/contextvar scope (§3.2). On ANY failure it falls back to `LLMSummaryFold` semantics, so it never blocks a fold. The side effects are an explicit, documented property of THIS strategy (requirement 3).
+- **`AgenticFold`** (`keep_last_sends=4`, `trigger_ratio=0.75`, `max_rounds=4`, `is_pure=False`, `fold_id="agentic"`). LLM + tools + notes/memory side effects. `AgenticMemoryCompactor._agentic_summarize` re-homed onto `FoldContext`: a FLAT bounded tool-use loop (NOT a nested `StatefulAgentLoop`) that issues `note(action=add|update)`. **Side-effect channel:** the strategy collects note operations into `FoldResult.note_ops` (preferred) which the loop applies transactionally with the compact UPSERT; if a strategy instead calls the tools directly, that now resolves because the fold runs inside the session/contextvar scope (§3.2). On ANY failure it falls back to `LLMSummaryFold` semantics, so it never blocks a fold. The side effects are an explicit, documented property of THIS strategy (requirement 3).
 
 `keep_last_sends >= 1` on every strategy (a strategy must keep the in-flight context coherent). There is no public `keep_last_sends=0` "never fold" path — see §5.5.
 
@@ -215,7 +215,7 @@ This is the heart of requirement 2.
 
 ### 2.1 Why side effects live on the strategy, not the interface contract
 
-Requirement 3: compaction's essence is "large text → small text"; side effects are strategy-dependent. So `FoldStrategy.fold` is conceptually a function from `(rows, context) → result`, and persistence of facts is a strategy's own privilege exercised through capabilities `FoldContext` hands it. `DeterministicFold` is provably side-effect-free (ignores tools); `AgenticFold` writes notes. **Atomicity (review §med):** note writes are collected into `FoldResult.note_ops` and applied **in the same transaction** as the compact UPSERT (§3.2), each note stamped with `(from_send, to_send)`; `note_add`/`note_update` no-op if a note for that span already exists. So a discarded/retried fold never leaves orphan or duplicate notes. The audit-trail invariant is unaffected (notes are additive; folded detail stays recoverable in `pl_messages`).
+Requirement 3: compaction's essence is "large text → small text"; side effects are strategy-dependent. So `FoldStrategy.fold` is conceptually a function from `(rows, context) → result`, and persistence of facts is a strategy's own privilege exercised through capabilities `FoldContext` hands it. `DeterministicFold` is provably side-effect-free (ignores tools); `AgenticFold` writes notes. **Atomicity (review §med):** note writes are collected into `FoldResult.note_ops` and applied **in the same transaction** as the compact UPSERT (§3.2), each note stamped with `(from_send, to_send)`; note add/update operations no-op if a note for that span already exists. So a discarded/retried fold never leaves orphan or duplicate notes. The audit-trail invariant is unaffected (notes are additive; folded detail stays recoverable in `pl_messages`).
 
 ### 2.2 Rolling a prior compact forward (nothing lost)
 
@@ -256,7 +256,7 @@ _run_loop(sid):
     # crash-recovery: a "needs_fold" marker (§3.2) left by a prior interrupted run is retried here
 ```
 
-> **Move (review §C2):** in today's code `_write_send_projection` runs at `stateful_loop.py:1423` — AFTER `reset_current_loop(loop_token)` (line 1398) and AFTER the `async with self._runner.session_async` block exits. `AgenticFold`'s `note_add` resolves store+session via `get_current_loop()/get_session_id()` contextvars (`runtime_state.py:35-41`, `default_tools.py:1374`), which are None there → it would always hit its except-fallback and silently degrade `(agentic) → (llm_summary)`. **3.0 moves the projection-write + fold INSIDE the `async with session_async(...)` / `set_current_loop` block** so the contextvars are live. Required integration test: `AgenticFold` actually writes a note (`count_notes` increases), not just returns a summary.
+> **Move (review §C2):** in today's code `_write_send_projection` runs at `stateful_loop.py:1423` — AFTER `reset_current_loop(loop_token)` (line 1398) and AFTER the `async with self._runner.session_async` block exits. `AgenticFold`'s `note(action=add)` resolves store+session via `get_current_loop()/get_session_id()` contextvars (`runtime_state.py:35-41`, `default_tools.py:1374`), which are None there → it would always hit its except-fallback and silently degrade `(agentic) → (llm_summary)`. **3.0 moves the projection-write + fold INSIDE the `async with session_async(...)` / `set_current_loop` block** so the contextvars are live. Required integration test: `AgenticFold` actually writes a note (`count_notes` increases), not just returns a summary.
 
 ### 3.2 The end-of-send writer + fold (where the token trigger lives)
 
