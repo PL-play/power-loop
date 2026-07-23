@@ -35,7 +35,7 @@ inspect the source modules linked below.
 | `DEFAULT_TOOL_HANDLERS` | public handler mapping for custom registry composition | [Tools](../user-guide/tools.md), [source](../../../power_loop/tools/default_tools.py) |
 | `AgentSpec` | declarative child-agent spec | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/runtime/spec.py) |
 | `run_agent_spec` | direct sub-agent execution | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/runtime/spec.py) |
-| `register_spawn_agent` | `spawn_agent` and `run_agent` meta-tools | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/tools/spawn_agent.py) |
+| `register_spawn_agent` | `spawn_agent` meta-tool (the former `run_agent` is merged in since 4.0) | [Sub-agents](../user-guide/subagents.md), [source](../../../power_loop/tools/spawn_agent.py) |
 
 ## Hooks and Events
 

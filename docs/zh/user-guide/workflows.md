@@ -2,7 +2,7 @@
 
 [English](../../en/user-guide/workflows.md) | [用户手册](../index.md)
 
-`power_loop.workflow` 是一个**可选**子模块，用于*代码驱动*的确定性多 Agent 编排：一份声明式的 `WorkflowSpec` JSON，其叶子节点是普通的子 Agent，由一个确定性引擎解释执行。它是对 `spawn_agent` / `run_agent`（[子代理](subagents.md)）那种*模型驱动*的即兴委托的补充，而非替代。
+`power_loop.workflow` 是一个**可选**子模块，用于*代码驱动*的确定性多 Agent 编排：一份声明式的 `WorkflowSpec` JSON，其叶子节点是普通的子 Agent，由一个确定性引擎解释执行。它是对 `spawn_agent`（[子代理](subagents.md)）那种*模型驱动*的即兴委托的补充，而非替代。
 
 当你（开发者）预先就知道控制流（一条流水线、一次扇出、一个分支）时，使用工作流。当应该由*模型*决定调用谁时，使用即兴委托。
 

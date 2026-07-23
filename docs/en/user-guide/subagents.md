@@ -8,8 +8,10 @@ Sub-agents let the parent agent delegate tasks to specialized child agents. Each
 
 | Path | Trigger | Control |
 |---|---|---|
-| **Imperative** (`spawn_agent`) | LLM calls the `spawn_agent` tool | LLM decides what to delegate |
-| **Declarative** (`run_agent` / `AgentSpec`) | LLM submits a JSON spec | You control system prompt, tools, model, max_rounds |
+| **LLM-facing** (`spawn_agent`) | LLM calls the `spawn_agent` tool (optional `system_prompt` / `tools` / `max_rounds` overrides) | LLM decides what to delegate |
+| **Declarative** (`run_agent_spec` / `AgentSpec`) | Host code calls the Python API directly | You control system prompt, tools, model, max_rounds |
+
+> Since 4.0 the former `run_agent` meta-tool is merged into `spawn_agent`: the LLM sees a single meta-tool, and hosts that need a fully declarative `AgentSpec` call `run_agent_spec()` from code.
 
 ## Imperative: spawn_agent
 
@@ -24,7 +26,7 @@ loop = StatefulAgentLoop(
     config=AgentLoopConfig(
         system_prompt=(
             "You can delegate research tasks using spawn_agent. "
-            "Use preset='explore' for file/code searches."
+            "Use the tools whitelist to scope the child's capabilities."
         ),
         max_rounds=6,
     ),
@@ -32,7 +34,7 @@ loop = StatefulAgentLoop(
 
 sid = await loop.new_session()
 result = await loop.send("Find where authentication logic is defined in this project.", session_id=sid)
-# LLM: spawn_agent(task="search for auth code", preset="explore")
+# LLM: spawn_agent(task="search for auth code", tools=["grep", "read_file", "glob"])
 # → child runs its own loop → parent gets the result
 ```
 

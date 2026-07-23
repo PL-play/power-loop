@@ -2,8 +2,8 @@
 
 What you learn / 你将学到
 --------------------------
-- ``note(action=add|update|delete|list)`` 默认工具：模型自己决定记什么
-  / default tools — the model decides what to remember
+- ``note(action=add|update|delete)`` 写入，``note(action=list)`` 读回：模型自己决定记什么
+  / write with ``note(action=add|update|delete)``, read back explicitly with ``note(action=list)``; the model decides what to remember
 - ``NoteMemory``：把笔记作为 system 消息在每次 send 注入
   / a MemoryProvider that injects the session's notes every send
 - ``NotesPolicy``：容量上限、单条长度、注入预算；默认 **reject**（满了必须先删/合并），

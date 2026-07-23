@@ -160,7 +160,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir="/srv/tenant-a")):
 |---|---|
 | `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill`, `request_user_input` |
 | `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill`, `request_user_input` |
-| `full` | `core` 加上 `todo`、`note`、`schedule_wakeup`/`list_wakeups`/`cancel_wakeup`、`current_time`、`recall_compacted`、`background_run`、`check_background` |
+| `full` | `core` 加上 `todo`、`note`、`schedule_wakeup`、`current_time`、`recall_compacted`、`background_run` |
 
 推荐系统提示词：
 
@@ -179,7 +179,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir="/srv/tenant-a")):
 | `glob` | 用 glob 模式查找路径。 | 裸文件名会递归搜索。默认跳过常见大目录。隐藏路径需要 `include_hidden=true` 或显式隐藏模式。 |
 | `grep` | 用正则或字面量搜索文本内容。 | 优先使用 ripgrep，缺失时回退 Python 实现。限制结果数，跳过疑似二进制文件和常见大目录。 |
 | `bash` | 运行测试、构建、包管理器和 git 命令。 | 在工作区根目录的持久 bash 会话中运行。超时会重启 shell，避免残留命令。特权/设备级命令（`sudo`、`dd`、`mkfs` 等）以及对 根/家目录/系统目录 的递归 `rm -rf` 会被拦截；`/tmp` 与相对路径允许。 |
-| `background_run` / `check_background` | 运行并查看非交互式长命令。 | 使用私有后台任务表，并复用 `bash` 的基础危险命令检查。 |
+| `background_run` | 运行并查看非交互式长命令：`action="run"` 启动并立即返回 `task_id`；`action="check"` 按 `task_id` 查看单个任务，省略 `task_id` 列出全部。 | 使用私有后台任务表，并复用 `bash` 的基础危险命令检查。 |
 | `todo` | 维护 Agent 可见任务列表。 | 同一时间只允许一个条目为 `in_progress`。 |
 | `load_skill` | 加载指定 skill 的详细说明。 | 未知 skill 会返回错误和可用 skill 名称。 |
 | `request_user_input` | 暂停等待调用方/用户输入。 | 返回 `status="waiting_for_input"` 和 `pending_interactions`；用 `submit_input()` 恢复。 |
@@ -192,7 +192,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir="/srv/tenant-a")):
 有些默认工具不只是普通函数，它们会参与 agent loop：
 
 - `todo` 会把当前任务列表持久化到 session SQLite 数据库。每轮 LLM 调用前，power-loop 会把这个权威状态投影成临时 `<current_todos>` user 消息。这个投影不会写入 `messages`，所以不会被压缩重复或污染。
-- `background_run` 会把任务状态记录到 SQLite。任务从未读变为更新或完成后，下一轮 LLM 会收到临时 `<background_updates>` 消息。`check_background` 读取同一张持久化任务表。
+- `background_run` 会把任务状态记录到 SQLite。任务从未读变为更新或完成后，下一轮 LLM 会收到临时 `<background_updates>` 消息。`background_run(action="check")` 读取同一张持久化任务表。
 - `load_skill` 在配置了 `AgentLoopConfig.skills_dir` 时会使用该目录。设置 `skills_dir` 后，解析后的系统提示词会包含技能目录和可用 skill 描述。
 - `request_user_input` 是控制流工具，不会在 Python 进程里 await 等人。它会把待确认/待输入项持久化，然后返回 `StatefulResult(status="waiting_for_input")`。业务方把 `pending_interactions` 展示给用户或 API 调用方，收集结果后调用 `await loop.submit_input(session_id, interaction_id, value)`，loop 会补上对应 tool result 并继续执行。
 
@@ -253,18 +253,18 @@ result = registry.invoke("get_weather", {"city": "Tokyo"})
 result = await registry.invoke_async("search_web", {"query": "Python"})
 ```
 
-## 元工具：spawn_agent 和 run_agent
+## 元工具：spawn_agent
 
 ```python
 from power_loop import register_spawn_agent
 
 register_spawn_agent(registry)
 # 现在 LLM 可以调用：
-#   spawn_agent(task="研究 X", preset="explore")
-#   run_agent(spec='{"name":"researcher", "system_prompt":"...", ...}')
+#   spawn_agent(task="研究 X", tools=["grep", "read_file", "glob"])
+#   spawn_agent(task="审查 Y", system_prompt="你是代码审查员...", max_rounds=10)
 ```
 
-详见 [子代理](subagents.md)。
+4.0 起原 `run_agent` meta-tool 已并入 `spawn_agent`（其 `system_prompt` / `tools` / `max_rounds` 覆盖能力保留为 `spawn_agent` 的可选参数）；需要完整声明式 `AgentSpec` 的场景，由宿主代码直接调用 `run_agent_spec()`（Python API，未变）。详见 [子代理](subagents.md)。
 
 ## 下一步
 

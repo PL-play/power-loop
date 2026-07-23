@@ -223,39 +223,30 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="schedule_wakeup",
         description=(
-            "Schedule a durable wake-up for yourself: after the delay you receive your note "
-            "back as a message and can act on it (check a long task, follow up on a promise). "
-            "Set every_seconds to make it RECURRING (fires repeatedly until you cancel_wakeup). "
-            "Survives restarts. Requires the host to run a TimerRunner; if the host documented "
-            "no timer support, don't rely on this firing."
+            "Manage your durable wake-up timers with one action: schedule, list, or cancel. "
+            "action=schedule arms a wake-up — after delay_seconds you receive your note back as "
+            "a message and can act on it (check a long task, follow up on a promise); set "
+            "every_seconds to make it RECURRING (fires repeatedly until cancelled). action=list "
+            "shows your wake-ups (#id, seconds until due, note). action=cancel disarms one by "
+            "timer_id. Timers survive restarts. Requires the host to run a TimerRunner; if the "
+            "host documented no timer support, don't rely on wake-ups firing."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "delay_seconds": {"type": "integer", "description": "Seconds until the FIRST fire (min 5, max 30 days)."},
-                "note": {"type": "string", "description": "What future-you should do when woken. Be specific."},
-                "every_seconds": {"type": "integer", "description": "Optional: repeat every N seconds after each fire (fixed-delay) until cancelled. Omit for one-shot."},
+                "action": {
+                    "type": "string",
+                    "enum": ["schedule", "list", "cancel"],
+                    "description": "Operation to perform.",
+                },
+                "delay_seconds": {"type": "integer", "description": "Required for action=schedule: seconds until the FIRST fire (min 5, max 30 days)."},
+                "note": {"type": "string", "description": "Required for action=schedule: what future-you should do when woken. Be specific."},
+                "every_seconds": {"type": "integer", "description": "Optional for action=schedule: repeat every N seconds after each fire (fixed-delay) until cancelled. Omit for one-shot."},
+                "timer_id": {"type": "integer", "description": "Required for action=cancel: the #id from action=list or the schedule confirmation."},
             },
-            "required": ["delay_seconds", "note"],
+            "required": ["action"],
         },
-        required_params=("delay_seconds", "note"),
-    ),
-    ToolDefinition(
-        name="list_wakeups",
-        description="List your scheduled wake-ups (#id, seconds until due, note).",
-        input_schema={"type": "object", "properties": {}},
-    ),
-    ToolDefinition(
-        name="cancel_wakeup",
-        description="Cancel one of your scheduled wake-ups by its #id.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "timer_id": {"type": "integer", "description": "The #id from list_wakeups / schedule_wakeup."},
-            },
-            "required": ["timer_id"],
-        },
-        required_params=("timer_id",),
+        required_params=("action",),
     ),
     ToolDefinition(
         name="current_time",
@@ -302,26 +293,26 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="background_run",
-        description="Run a shell command in a private background worker (non-interactive).",
+        description=(
+            "Manage private background shell tasks with one action: run or check. action=run "
+            "starts a command in a private non-interactive background worker and returns its "
+            "task_id immediately. action=check reports a task's status/output by task_id, or "
+            "lists all your tasks when task_id is omitted."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "command": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": ["run", "check"],
+                    "description": "Operation to perform.",
+                },
+                "command": {"type": "string", "description": "Required for action=run: shell command to execute."},
+                "task_id": {"type": "string", "description": "For action=check: task to inspect; omit to list all tasks."},
             },
-            "required": ["command"],
+            "required": ["action"],
         },
-        required_params=("command",),
-    ),
-    ToolDefinition(
-        name="check_background",
-        description="Check your private background tasks. If task_id is omitted, list all tasks.",
-        input_schema={
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "string"},
-            },
-        },
-        required_params=(),
+        required_params=("action",),
     ),
     ToolDefinition(
         name="request_user_input",

@@ -2,9 +2,10 @@
 
 What you learn / 你将学到
 --------------------------
-- ``schedule_wakeup`` / ``list_wakeups`` / ``cancel_wakeup`` / ``current_time``
+- ``schedule_wakeup``（单工具，action=schedule/list/cancel）+ ``current_time``
   默认工具：模型给**自己**排闹钟，到点收到自己的 note
-  / the agent schedules its own durable wake-ups
+  / the agent schedules its own durable wake-ups via one tool
+  (action=schedule/list/cancel)
 - ``loop.schedule_timer(...)``：外部（编排层）也能给 session 排定时
   / the external path writes the same rows
 - ``TimerRunner``：扫描 store、到点把 note 经 ``follow_up`` 注入会话——
@@ -52,10 +53,12 @@ async def main() -> None:
     llm = make_llm()
 
     registry = create_default_tool_registry(preset="core", bind=False)
-    for d in get_tool_definitions(
-        include=["schedule_wakeup", "list_wakeups", "cancel_wakeup", "current_time"]
-    ):
+    for d in get_tool_definitions(include=["schedule_wakeup", "current_time"]):
         registry.register(d, DEFAULT_TOOL_HANDLERS[d.name], overwrite=True)
+    # 现在模型可以调用 / now the model can call:
+    #   schedule_wakeup(action="schedule", delay_seconds=6, note="...")
+    #   schedule_wakeup(action="list")
+    #   schedule_wakeup(action="cancel", timer_id=1)
 
     # 可选：投递前的编排否决点。这里只做审计日志（CONTINUE = 照常投递）。
     hooks = AgentHooks()

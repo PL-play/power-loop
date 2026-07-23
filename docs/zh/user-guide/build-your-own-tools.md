@@ -164,7 +164,7 @@ async def _ask_human(prompt: str, options: list[str] | None = None) -> str:
 
 ---
 
-## 6. 黑板 — `board_*` → `board_write` / `board_read`
+## 6. 黑板 — 内置 `board` → 自定义 `board_write` / `board_read`
 
 **内置：** `board_*` 是多个 agent 读写以协作的共享便笺。
 
@@ -188,7 +188,7 @@ async def _board_write(text: str) -> str:
 
 ## 7. 记忆 / 笔记 — 内置 `note` + 召回 → `remember` + `CustomNotesMemory`
 
-**内置：** `note(action=add)` 写持久笔记；`SQLiteNoteMemory`（一个 `MemoryProvider`）在每次 send 开头把它们召回。
+**内置：** `note(action=add|update|delete)` 写持久笔记；`note(action=list)` 显式读回；`SQLiteNoteMemory`（一个 `MemoryProvider`）在每次 send 开头把它们重新注入。
 
 **原语：** 工具侧用 `store.add_note` / `list_notes`；召回用 `MemoryProvider` 协议（`config.memory`）+
 `render_notes(...)`：

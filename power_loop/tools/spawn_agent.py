@@ -1,18 +1,16 @@
-"""spawn_agent + run_agent — meta-tools the LLM uses to delegate work.
+"""spawn_agent — the meta-tool the LLM uses to delegate work.
 
-Two flavours of subagent invocation sit on the same plumbing
-(:func:`power_loop.runtime.spec.run_agent_spec`):
+A single imperative flavour of subagent invocation on top of
+:func:`power_loop.runtime.spec.run_agent_spec`: simple kwargs
+(``task`` plus optional ``name`` / ``system_prompt`` / ``tools`` /
+``max_rounds``), the library builds an :class:`AgentSpec` with sensible
+defaults. The former declarative ``run_agent`` (full AgentSpec JSON) was
+merged into this tool in 4.0.0 — ``system_prompt`` was its only capability
+that mattered in practice; hosts that need a fully declarative spec call
+:func:`run_agent_spec` directly.
 
-* ``spawn_agent(task, preset=…)`` — *imperative*. Simple kwargs, the library
-  builds an :class:`AgentSpec` with sensible defaults for ``system_prompt`` and
-  the default tool preset. Designed for the common "go do this" case.
-* ``run_agent(spec_json, input)`` — *declarative*. The LLM provides a full
-  :class:`AgentSpec` JSON (custom system prompt, explicit tool whitelist,
-  max_rounds, etc). Designed for dynamic-workflow patterns where the parent
-  agent reasons about what a child should look like.
-
-Both tools require an active :class:`StatefulAgentLoop` context (set by
-:meth:`StatefulAgentLoop._run_loop`). Calling them outside one returns a
+The tool requires an active :class:`StatefulAgentLoop` context (set by
+:meth:`StatefulAgentLoop._run_loop`). Calling it outside one returns a
 clear error string.
 """
 
@@ -22,16 +20,18 @@ from typing import Any
 
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_current_loop
-from power_loop.runtime.spec import AgentSpec, AgentSpecError, run_agent_spec
+from power_loop.runtime.spec import AgentSpec, run_agent_spec
 
 DEFAULT_MAX_ROUNDS = 20
 
 SPAWN_AGENT_DEFINITION = ToolDefinition(
     name="spawn_agent",
     description=(
-        "Spawn a sub-agent to handle a delegated task in an isolated session. "
-        "The sub-agent inherits the parent's tool registry (filterable via "
-        "the 'tools' arg). Returns the sub-agent's final text."
+        "Spawn a sub-agent to handle a delegated task in an isolated session "
+        "and return its final text. The sub-agent inherits the parent's tool "
+        "registry (filterable via the 'tools' arg); give it a custom persona "
+        "via 'system_prompt' when the default task-completion prompt isn't "
+        "enough."
     ),
     input_schema={
         "type": "object",
@@ -39,6 +39,10 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(
             "task": {
                 "type": "string",
                 "description": "The task description / instructions for the sub-agent.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Optional short label for the sub-agent (cosmetic only).",
             },
             "system_prompt": {
                 "type": "string",
@@ -65,33 +69,8 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(
     required_params=("task",),
 )
 
-RUN_AGENT_DEFINITION = ToolDefinition(
-    name="run_agent",
-    description=(
-        "Materialize a full AgentSpec JSON as a one-shot sub-agent. Use when "
-        "you want explicit control over name / system_prompt / tools / "
-        "max_rounds / max_tokens / temperature / lifecycle. Strict schema: "
-        "unknown fields are rejected."
-    ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "spec": {
-                "type": "object",
-                "description": "AgentSpec object (or JSON string).",
-            },
-            "input": {
-                "type": "string",
-                "description": "The initial user message sent to the sub-agent.",
-            },
-        },
-        "required": ["spec", "input"],
-    },
-    required_params=("spec", "input"),
-)
 
-
-# ── handlers ──────────────────────────────────────────────────────────────
+# ── handler ───────────────────────────────────────────────────────────────
 
 
 _DEFAULT_SUB_SYSTEM_PROMPT = (
@@ -121,28 +100,6 @@ async def _handle_spawn_agent(**kwargs: Any) -> str:
     return _format_subagent_result(result)
 
 
-async def _handle_run_agent(**kwargs: Any) -> str:
-    loop = get_current_loop()
-    if loop is None:
-        return (
-            "Error: run_agent must be invoked from inside an active "
-            "StatefulAgentLoop run."
-        )
-    spec_payload = kwargs.get("spec")
-    user_input = str(kwargs.get("input") or "")
-    if spec_payload is None:
-        return "Error: run_agent requires 'spec'."
-    if not user_input:
-        return "Error: run_agent requires 'input'."
-    try:
-        spec = AgentSpec.from_json(spec_payload) if not isinstance(spec_payload, AgentSpec) else spec_payload
-    except AgentSpecError as exc:
-        return f"Error: invalid AgentSpec — {exc}"
-
-    result = await run_agent_spec(spec, user_input, parent_loop=loop)
-    return _format_subagent_result(result)
-
-
 def _format_subagent_result(result: dict[str, Any]) -> str:
     text = result.get("final_text") or "(no output)"
     status = result.get("status")
@@ -154,8 +111,8 @@ def _format_subagent_result(result: dict[str, Any]) -> str:
 # ── registration helpers ──────────────────────────────────────────────────
 
 
-def register_spawn_agent(registry, *, include_run_agent: bool = True, overwrite: bool = False) -> None:
-    """Register the spawn_agent (and optionally run_agent) tools on ``registry``.
+def register_spawn_agent(registry, *, overwrite: bool = False) -> None:
+    """Register the spawn_agent tool on ``registry``.
 
     Usage::
 
@@ -164,12 +121,9 @@ def register_spawn_agent(registry, *, include_run_agent: bool = True, overwrite:
         register_spawn_agent(registry)
     """
     registry.register(SPAWN_AGENT_DEFINITION, _handle_spawn_agent, overwrite=overwrite)
-    if include_run_agent:
-        registry.register(RUN_AGENT_DEFINITION, _handle_run_agent, overwrite=overwrite)
 
 
 __all__ = [
     "SPAWN_AGENT_DEFINITION",
-    "RUN_AGENT_DEFINITION",
     "register_spawn_agent",
 ]

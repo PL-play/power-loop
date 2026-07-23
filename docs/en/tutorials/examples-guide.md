@@ -18,7 +18,7 @@ All examples share `_helpers.py` which loads `.env` and builds an LLM client. To
 | [03](#03-sub-agent-delegation) | `subagent_delegation.py` | Imperative sub-agent via `spawn_agent` |
 | [04](#04-compaction) | `compaction.py` | Auto context compaction |
 | [05](#05-pending-recovery) | `pending_recovery.py` | Crash recovery mid-tool-call |
-| [06](#06-declarative-sub-agent) | `declarative_subagent.py` | Declarative sub-agent via AgentSpec |
+| [06](#06-sub-agent-overrides-and-declarative-spec) | `declarative_subagent.py` | spawn_agent overrides + declarative run_agent_spec |
 | [07](#07-human-approval) | `human_approval.py` | User confirmation gate via hooks |
 | [08](#08-streaming) | `streaming.py` | Real-time token streaming |
 | [09](#09-audit-log) | `audit_log.py` | Full event audit → JSONL |
@@ -194,7 +194,7 @@ Nothing remains! Your question has been fully answered.
 
 ```python
 registry = ToolRegistry()
-register_spawn_agent(registry)   # injects spawn_agent + run_agent meta-tools
+register_spawn_agent(registry)   # injects the spawn_agent meta-tool (run_agent merged in since 4.0)
 
 loop = StatefulAgentLoop(
     llm=make_llm(), store=store, tool_registry=registry,
@@ -217,7 +217,7 @@ print(f"surviving subs: {await store.list_children(result.session_id)}")
 
 ### Key Points
 
-- `register_spawn_agent(registry)` injects two meta-tools: `spawn_agent` and `run_agent`
+- `register_spawn_agent(registry)` injects the `spawn_agent` meta-tool (the former `run_agent` is merged in since 4.0)
 - Parent LLM autonomously calls `spawn_agent` → creates child session with independent sub-loop
 - Child result is fed back as a `tool` message to the parent
 - **EPHEMERAL** lifecycle: child session physically deleted on success (failures preserved for debugging)
@@ -341,14 +341,14 @@ r = await loop.send("In one sentence: what does HTML stand for?", session_id=sid
 
 ---
 
-## 06 · Declarative Sub-agent
+## 06 · Sub-agent Overrides and Declarative Spec
 
-**Concept**: Parent LLM submits a full `AgentSpec` JSON for precise control over child agents.
+**Concept**: On the LLM side, `spawn_agent`'s `system_prompt` / `tools` / `max_rounds` overrides give precise control over child agents; host code takes the declarative path via `run_agent_spec(AgentSpec, ...)`.
 
 ### Code
 
 ```python
-# Direct call — build AgentSpec in code, bypass LLM driver
+# Declarative — host code builds AgentSpec and calls run_agent_spec (bypass LLM driver)
 spec = AgentSpec(
     name="math-helper",
     system_prompt="Compute the expression. Reply with the number only.",
@@ -359,18 +359,16 @@ spec = AgentSpec(
 )
 result = await run_agent_spec(spec, "What is 12 * 11?", parent_loop=parent_loop)
 
-# Via meta-tool — let parent LLM build AgentSpec and call run_agent itself
-# (parent LLM autonomously constructs the spec JSON)
+# LLM side — parent LLM calls spawn_agent with system_prompt / tools / max_rounds overrides
 ```
 
 ### Key Points
 
-- **Two subagent entry points**:
-  - `spawn_agent` — imperative (kwargs, library builds AgentSpec), see [example 03](#03-sub-agent-delegation)
-  - `run_agent` — declarative (parent LLM submits full AgentSpec JSON), this example
+- **Since 4.0 the LLM sees a single meta-tool**: `spawn_agent` (the former `run_agent` is merged into it)
+  - Basic usage (just `task`) in [example 03](#03-sub-agent-delegation); this example demonstrates the `system_prompt` / `tools` / `max_rounds` overrides
+- The declarative path = host code calls `run_agent_spec()` directly (Python API, bypasses the LLM, good for tests/orchestration)
 - `AgentSpec` is **strict-schema**: unknown fields → `AgentSpecError`
 - `tools` is a whitelist of parent registry — limits child's visible capabilities
-- `run_agent_spec()` can be called directly (bypass LLM, good for tests/orchestration)
 
 ### Output
 
@@ -1216,7 +1214,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 These cover the capabilities added since 0.11 (durability, scaling, pluggable backends, observability, MCP). Each links to the runnable file and to the User Guide page that explains it in depth.
 
 ### 24 · Agent Notes
-The agent manages durable notes through `note(action=add|update|delete|list)`, persisted via `SQLiteNoteMemory` and re-injected each turn under a `NotesPolicy`. → [example](../../../examples/24_agent_notes.py) · [Memory](../user-guide/memory.md)
+The agent manages durable notes through `note(action=add|update|delete)` and reads them back explicitly with `note(action=list)`, persisted via `SQLiteNoteMemory` and re-injected each turn under a `NotesPolicy`. → [example](../../../examples/24_agent_notes.py) · [Memory](../user-guide/memory.md)
 
 ### 25 · Token Usage
 Account for tokens with `result.usage`, `get_session_stats`, and the `usage_updated` event; cap a run with `max_tokens_per_run`. → [example](../../../examples/25_token_usage.py) · [Configuration](../user-guide/configuration.md)
@@ -1274,7 +1272,7 @@ The loop is a **stateless** handle — all session state lives in the store — 
 | Send one message, get one reply | [00](#00-hello-world) |
 | Build a multi-turn chat | [01](#01-multi-turn-chat) |
 | Add custom tools | [02](#02-tool-calling) |
-| Delegate to sub-agents | [03](#03-sub-agent-delegation), [06](#06-declarative-sub-agent) |
+| Delegate to sub-agents | [03](#03-sub-agent-delegation), [06](#06-sub-agent-overrides-and-declarative-spec) |
 | Handle long conversations | [04](#04-compaction), [16](#16-custom-compactor) |
 | Survive crashes | [05](#05-pending-recovery), [11](#11-cross-process-resume) |
 | Add user confirmation gates | [07](#07-human-approval), [10](#10-concurrent-sessions) |

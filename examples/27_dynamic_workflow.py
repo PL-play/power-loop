@@ -14,10 +14,10 @@ What you learn / 你将学到
   引用它做 ``foreach`` 扇出
   / an upstream agent's ``output_schema`` lets a downstream ``foreach`` fan out over
   ``items_from: "plan.subtopics"``
-- 这是 **code-driven** 确定性编排，区别于 ``spawn_agent``/``run_agent`` 的
+- 这是 **code-driven** 确定性编排，区别于 ``spawn_agent`` 的
   **model-driven** 即兴委派
   / this is *code-driven* deterministic orchestration, vs the *model-driven*
-  ad-hoc delegation of ``spawn_agent`` / ``run_agent``
+  ad-hoc delegation of ``spawn_agent``
 
 也可把 ``create_workflow`` 注册成 LLM 工具（``register_workflow_tools``），让主
 agent 自己产出 WorkflowSpec JSON 提交执行——见文件末尾注释。

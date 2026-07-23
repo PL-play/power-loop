@@ -33,7 +33,7 @@
 | `DEFAULT_TOOL_HANDLERS` | 用于自定义 registry 组合的公开 handler 映射 | [工具](../user-guide/tools.md)、[源码](../../../power_loop/tools/default_tools.py) |
 | `AgentSpec` | 声明式子代理规格 | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/runtime/spec.py) |
 | `run_agent_spec` | 直接执行子代理 | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/runtime/spec.py) |
-| `register_spawn_agent` | `spawn_agent` 和 `run_agent` meta-tool | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/tools/spawn_agent.py) |
+| `register_spawn_agent` | `spawn_agent` meta-tool（4.0 起 `run_agent` 已并入） | [子代理](../user-guide/subagents.md)、[源码](../../../power_loop/tools/spawn_agent.py) |
 
 ## Hooks 与 Events
 

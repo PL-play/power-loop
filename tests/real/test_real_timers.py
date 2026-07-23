@@ -26,9 +26,7 @@ MARKER = "TIMER_PROOF_4242"
 
 def _registry():
     reg = create_default_tool_registry(preset="core", bind=False)
-    for d in get_tool_definitions(
-        include=["schedule_wakeup", "list_wakeups", "cancel_wakeup", "current_time"]
-    ):
+    for d in get_tool_definitions(include=["schedule_wakeup", "current_time"]):
         reg.register(d, DEFAULT_TOOL_HANDLERS[d.name], overwrite=True)
     return reg
 

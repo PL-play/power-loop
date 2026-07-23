@@ -2,8 +2,8 @@
 
 What you learn / 你将学到
 --------------------------
-- ``register_spawn_agent`` 一行注入两个 meta-tool：``spawn_agent`` 和 ``run_agent``
-  / injects two meta-tools in one line: ``spawn_agent`` and ``run_agent``
+- ``register_spawn_agent`` 一行注入 ``spawn_agent`` meta-tool（4.0 起 ``run_agent`` 已并入）
+  / injects the ``spawn_agent`` meta-tool in one line (``run_agent`` merged in since 4.0)
 - 父 LLM 自主决定 ``spawn_agent`` → 自动新建子 session，跑独立的小循环
   / parent LLM autonomously calls ``spawn_agent`` → creates child session, runs
   independent sub-loop
@@ -37,7 +37,7 @@ from power_loop import (
 
 async def main() -> str:
     registry = ToolRegistry()
-    register_spawn_agent(registry)        # ← spawn_agent + run_agent 都注册 / both registered
+    register_spawn_agent(registry)        # ← 注册 spawn_agent meta-tool / registers spawn_agent
 
     store = await SessionStore.open(":memory:")
     try:

@@ -2,7 +2,7 @@
 
 [中文](../../zh/user-guide/workflows.md) | [User Guide](../index.md)
 
-`power_loop.workflow` is an **optional** submodule for *code-driven* deterministic multi-agent orchestration: a declarative `WorkflowSpec` JSON whose leaves are ordinary sub-agents, interpreted by a deterministic engine. This complements — it does not replace — the *model-driven* ad-hoc delegation of `spawn_agent` / `run_agent` ([Sub-agents](subagents.md)).
+`power_loop.workflow` is an **optional** submodule for *code-driven* deterministic multi-agent orchestration: a declarative `WorkflowSpec` JSON whose leaves are ordinary sub-agents, interpreted by a deterministic engine. This complements — it does not replace — the *model-driven* ad-hoc delegation of `spawn_agent` ([Sub-agents](subagents.md)).
 
 Use a workflow when you (the developer) know the control flow up front (a pipeline, a fan-out, a branch). Use ad-hoc delegation when the *model* should decide whom to call.
 

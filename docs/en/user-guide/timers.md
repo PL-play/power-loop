@@ -8,16 +8,20 @@ Timers let an agent (or your host) say *"wake this session at time T with this n
 
 Two ways, both writing the same rows.
 
-**The agent schedules its own wake-ups** via the default tools (`schedule_wakeup`, `cancel_wakeup`, `list_wakeups`):
+**The agent schedules its own wake-ups** via the default tool `schedule_wakeup` (a single tool whose `action` selects schedule / list / cancel):
 
 ```python
 from power_loop import create_default_tool_registry, get_tool_definitions
 from power_loop.tools import DEFAULT_TOOL_HANDLERS
 
 registry = create_default_tool_registry(preset="core", workspace_dir=ws)
-for d in get_tool_definitions(include=["schedule_wakeup", "cancel_wakeup", "list_wakeups"]):
+for d in get_tool_definitions(include=["schedule_wakeup"]):   # optionally add "current_time"
     registry.register(d, DEFAULT_TOOL_HANDLERS[d.name], overwrite=True)
-# Now the model can call schedule_wakeup(delay_seconds=3600, note="check the build").
+# Now the model can call:
+#   schedule_wakeup(action="schedule", delay_seconds=3600, note="check the build")
+#   schedule_wakeup(action="schedule", delay_seconds=60, note="heartbeat", every_seconds=300)
+#   schedule_wakeup(action="list")
+#   schedule_wakeup(action="cancel", timer_id=1)
 ```
 
 **The host schedules externally** via the loop API:

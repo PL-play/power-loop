@@ -1,18 +1,22 @@
-"""06 · 声明式子代理 / Declarative sub-agent: parent submits AgentSpec JSON
+"""06 · 子代理覆盖与声明式 spec / Sub-agent overrides & declarative spec
 
 What you learn / 你将学到
 --------------------------
-- 区分两种 subagent 入口 / Two subagent entry points:
-    * ``spawn_agent`` — 命令式 / imperative (kwargs, library builds AgentSpec), see example 03
-    * ``run_agent``   — 声明式 / declarative (parent LLM submits full AgentSpec JSON), this example
+- 4.0 起 LLM 侧只有一个 meta-tool：``spawn_agent``（原 ``run_agent`` 已并入）
+  / since 4.0 the LLM sees a single meta-tool: ``spawn_agent`` (the former
+  ``run_agent`` was merged into it)
+- ``spawn_agent`` 的可选覆盖参数：``system_prompt`` / ``tools`` / ``max_rounds``
+  / optional per-call overrides: ``system_prompt`` / ``tools`` / ``max_rounds``
+- ``tools`` 字段是父 registry 的白名单：父限定子可见的能力集，防过权
+  / ``tools`` is a whitelist of parent registry: limits child's visible capabilities
+- 声明式路径 = 宿主代码直接调 ``run_agent_spec(AgentSpec, ...)``（Python API，
+  绕过 LLM-as-driver，适合测试 / 编排框架）
+  / the declarative path = host code calls ``run_agent_spec(AgentSpec, ...)``
+  directly (bypass LLM-as-driver, good for tests / orchestration)
 - ``AgentSpec`` 是 strict-schema：未知字段 / 非法 lifecycle / max_rounds 越界
   → ``AgentSpecError``，调用直接报错而非静默忽略
   / strict-schema: unknown fields / invalid lifecycle / out-of-range max_rounds
   → ``AgentSpecError`` (raises, not silently ignored)
-- ``tools`` 字段是父 registry 的白名单：父限定子可见的能力集，防过权
-  / ``tools`` is a whitelist of parent registry: limits child's visible capabilities
-- 直接调 ``run_agent_spec`` 也行（绕过 LLM-as-driver，适合测试 / 编排框架）
-  / can also call ``run_agent_spec`` directly (bypass LLM-as-driver, good for tests / orchestration)
 
 Run / 运行
 ----------
@@ -44,8 +48,8 @@ from power_loop.core.agent_context import (
 )
 from power_loop.runtime.spec import run_agent_spec
 
-# ── 1. 父 registry：提供 calculator + spawn meta-tools ────────────────────
-#    Parent registry: calculator + spawn meta-tools
+# ── 1. 父 registry：提供 calculator + spawn meta-tool ─────────────────────
+#    Parent registry: calculator + spawn meta-tool
 
 
 def calculator(**kwargs) -> str:
@@ -73,19 +77,20 @@ def _build_parent_registry() -> ToolRegistry:
         ),
         calculator,
     )
-    # 注入 spawn_agent + run_agent 两个 meta-tool
-    # Inject spawn_agent + run_agent meta-tools
+    # 注入 spawn_agent meta-tool（4.0 起 LLM 侧唯一的子代理入口）
+    # Inject the spawn_agent meta-tool (the only LLM-facing entry since 4.0)
     register_spawn_agent(reg)
     return reg
 
 
-# ── 2. 父 LLM 通过 run_agent meta-tool 自动驱动子代理 ─────────────────────
-#    Parent LLM drives child agent via run_agent meta-tool
+# ── 2. 父 LLM 通过 spawn_agent meta-tool 委托（带覆盖参数）────────────────
+#    Parent LLM delegates via the spawn_agent meta-tool (with overrides)
 
 
 async def via_meta_tool() -> str:
-    """让父 LLM 自己拼 AgentSpec 调 run_agent。
-    / Let the parent LLM build AgentSpec and call run_agent itself."""
+    """让父 LLM 调 spawn_agent，并传 system_prompt / tools / max_rounds 覆盖。
+    / Let the parent LLM call spawn_agent with system_prompt / tools /
+    max_rounds overrides."""
     store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
@@ -94,11 +99,11 @@ async def via_meta_tool() -> str:
             tool_registry=_build_parent_registry(),
             config=AgentLoopConfig(
                 system_prompt=(
-                    "You are an orchestrator. For math sub-tasks you can: "
-                    "(a) call the local `calc` tool directly, OR "
-                    "(b) call `run_agent` with an AgentSpec whose `tools` "
-                    "field whitelists ['calc']. Prefer (b) when delegating "
-                    "multi-step work."
+                    "You are an orchestrator. For math sub-tasks, call "
+                    "`spawn_agent` with: a `system_prompt` telling the "
+                    "sub-agent to compute and reply with the number only, "
+                    "a `tools` list whitelisting ['calc'], and "
+                    "`max_rounds` set to 3. Report the sub-agent's answer."
                 ),
                 max_rounds=6,
                 compactor=None,
@@ -118,8 +123,8 @@ async def via_meta_tool() -> str:
         await store.close()
 
 
-# ── 3. 直接调 run_agent_spec：绕过 LLM 驱动，自己拼 spec ──────────────────
-#    Direct run_agent_spec call: bypass LLM driver, build spec in code
+# ── 3. 声明式：宿主代码直接调 run_agent_spec，自己拼 AgentSpec ────────────
+#    Declarative: host code calls run_agent_spec with its own AgentSpec
 
 
 async def direct_call() -> str:

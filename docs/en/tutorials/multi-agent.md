@@ -26,7 +26,7 @@ registry.register(
     read_file,
 )
 
-# Register both meta-tools: spawn_agent and run_agent
+# Register the spawn_agent meta-tool (the former run_agent is merged in since 4.0)
 register_spawn_agent(registry)
 ```
 
@@ -41,8 +41,8 @@ loop = StatefulAgentLoop(
     config=AgentLoopConfig(
         system_prompt=(
             "You are a project manager. You can delegate research tasks "
-            "to sub-agents using spawn_agent. Use preset='explore' for "
-            "code/file searches. For simple tasks, answer directly."
+            "to sub-agents using spawn_agent. Whitelist tools via the "
+            "'tools' arg for code/file searches. For simple tasks, answer directly."
         ),
         max_rounds=8,
     ),
@@ -54,8 +54,8 @@ result = await loop.send(
     "Then tell me if it uses JWT or session tokens.",
     session_id=sid,
 )
-# LLM: spawn_agent(task="search for auth code", preset="explore")
-# → child runs with explore tools (grep, read, glob)
+# LLM: spawn_agent(task="search for auth code", tools=["grep", "read_file", "glob"])
+# → child runs with the whitelisted tools (grep, read_file, glob)
 # → parent gets result, synthesizes answer
 ```
 
@@ -91,11 +91,11 @@ print(result["final_text"])
 
 ## 4. Two Approaches Compared
 
-| | spawn_agent | AgentSpec |
+| | spawn_agent | AgentSpec + run_agent_spec |
 |---|---|---|
-| Who decides | LLM | You |
-| Tool whitelist | Via preset | Explicit `tools` list |
-| Max rounds | Default | You set |
+| Who decides | LLM (optional `system_prompt` / `tools` / `max_rounds` overrides) | You (host code) |
+| Tool whitelist | Optional `tools` arg | Explicit `tools` list |
+| Max rounds | Default (overridable) | You set |
 | Model | Parent's | Override per spec |
 | Use case | Dynamic delegation | Controlled, auditable sub-tasks |
 

@@ -167,7 +167,7 @@ Presets:
 |---|---|
 | `core` | `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `glob`, `grep`, `load_skill`, `request_user_input` |
 | `explore` | `bash`, `read_file`, `glob`, `grep`, `load_skill`, `request_user_input` |
-| `full` | `core` plus `todo`, `note`, `schedule_wakeup`/`list_wakeups`/`cancel_wakeup`, `current_time`, `recall_compacted`, `background_run`, `check_background` |
+| `full` | `core` plus `todo`, `note`, `schedule_wakeup`, `current_time`, `recall_compacted`, `background_run` |
 
 Recommended system prompt guidance:
 
@@ -186,7 +186,7 @@ Tool behavior:
 | `glob` | Find paths by glob pattern. | Bare names search recursively. Common bulky directories are skipped. Hidden paths require `include_hidden=true` or an explicit hidden pattern. |
 | `grep` | Search text content by regex or literal string. | Uses ripgrep when available, with Python fallback. Results are capped, binary-looking files and bulky directories are skipped. |
 | `bash` | Run tests, builds, package managers, and git commands. | Runs in a persistent workspace-rooted bash session. Timeouts restart the shell to avoid leftover commands. Privileged/device-level commands (`sudo`, `dd`, `mkfs`, …) and recursive `rm -rf` of root/home/system directories are blocked; `/tmp` and relative paths are allowed. |
-| `background_run` / `check_background` | Run and inspect non-interactive long commands. | Uses a private background task table and the same basic dangerous-command checks as `bash`. |
+| `background_run` | Run and inspect non-interactive long commands: `action="run"` starts a command and returns a `task_id` immediately; `action="check"` inspects one task by `task_id`, or lists all tasks when `task_id` is omitted. | Uses a private background task table and the same basic dangerous-command checks as `bash`. |
 | `todo` | Maintain an agent-visible task list. | Only one item can be `in_progress`. |
 | `load_skill` | Load a named skill's detailed instructions. | Unknown skills return an error listing available skill names. |
 | `request_user_input` | Pause for caller/user input. | Returns `status="waiting_for_input"` with `pending_interactions`; resume with `submit_input()`. |
@@ -199,7 +199,7 @@ See [`examples/20_default_tools.py`](../../../examples/20_default_tools.py) for 
 Some default tools are not just functions. They participate in the agent loop:
 
 - `todo` persists its current item list in the session SQLite database. Before each LLM round, power-loop projects that authoritative state into a transient `<current_todos>` user message. The projection is not saved into `messages`, so compaction cannot duplicate or corrupt it.
-- `background_run` records task status in SQLite. When a task changes from unseen to updated or completed, the next LLM round receives a transient `<background_updates>` message. `check_background` reads the same persisted task table.
+- `background_run` records task status in SQLite. When a task changes from unseen to updated or completed, the next LLM round receives a transient `<background_updates>` message. `background_run(action="check")` reads the same persisted task table.
 - `load_skill` uses `AgentLoopConfig.skills_dir` when configured. When `skills_dir` is set, the resolved system prompt includes the skills directory and available skill descriptions.
 - `request_user_input` is a control-flow tool. It does not wait inside the Python process. Instead, it persists a pending interaction and returns `StatefulResult(status="waiting_for_input")`. The caller shows `pending_interactions` to a user or API client, then calls `await loop.submit_input(session_id, interaction_id, value)` to append the matching tool result and continue.
 - `recall_compacted` reads the current session's `compacted_out` rows via `get_tool_runtime_context()`. Compaction summarizes old turns into a `compact_note` and marks the originals `compacted_out` — they leave the active window but are not deleted. This tool surfaces them on demand (read-only, session-scoped) when the note lacks a specific detail. See [Compaction](compaction.md).
@@ -261,18 +261,18 @@ result = registry.invoke("get_weather", {"city": "Tokyo"})
 result = await registry.invoke_async("search_web", {"query": "Python"})
 ```
 
-## Meta-Tools: spawn_agent and run_agent
+## Meta-Tool: spawn_agent
 
 ```python
 from power_loop import register_spawn_agent
 
 register_spawn_agent(registry)
 # Now the LLM can call:
-#   spawn_agent(task="Research X", preset="explore")
-#   run_agent(spec='{"name":"researcher", "system_prompt":"...", ...}')
+#   spawn_agent(task="Research X", tools=["grep", "read_file", "glob"])
+#   spawn_agent(task="Review Y", system_prompt="You are a code reviewer...", max_rounds=10)
 ```
 
-See [Sub-agents](subagents.md) for details.
+Since 4.0 the former `run_agent` meta-tool is merged into `spawn_agent` (its `system_prompt` / `tools` / `max_rounds` overrides survive as optional `spawn_agent` parameters); hosts that need a fully declarative `AgentSpec` call `run_agent_spec()` directly (Python API, unchanged). See [Sub-agents](subagents.md) for details.
 
 ## Next
 

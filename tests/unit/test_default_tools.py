@@ -212,10 +212,12 @@ async def test_default_registry_contains_all_manifest_tools(tmp_path: Path) -> N
     skill = await registry.invoke_async("load_skill", {"name": "missing-skill-for-test"})
     assert "Unknown skill" in str(skill)
 
-    started = await registry.invoke_async("background_run", {"command": "printf 'background-ok\\n'"})
+    started = await registry.invoke_async(
+        "background_run", {"action": "run", "command": "printf 'background-ok\\n'"}
+    )
     assert "Background task" in str(started)
     task_id = str(started).split()[2]
-    checked = await registry.invoke_async("check_background", {"task_id": task_id})
+    checked = await registry.invoke_async("background_run", {"action": "check", "task_id": task_id})
     assert task_id or checked
 
     assert FILE_READ_STATE

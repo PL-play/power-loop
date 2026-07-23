@@ -12,7 +12,7 @@
 |---|---|
 | `Blackboard` (Protocol) | 异步 `read` / `post` / `update` / `remove`——按条目（per-entry）合并，绝不整文档覆盖 |
 | `SqliteBlackboard` | 默认实现，持久化在 `SessionStore` 的 sqlite 中（黑板*并不*绑定到某个 session） |
-| `register_blackboard_tools(registry)` | 注册面向 agent 的 `board_read` / `board_post` / `board_update` / `board_remove` 工具 |
+| `register_blackboard_tools(registry)` | 注册面向 agent 的单个 `board` 工具（`action=post|read|update|remove`，5.0 起由四个 `board_*` 工具合并而来） |
 | `RuntimeEnv(blackboard=, blackboard_id=)` | 每次运行时注入实时的黑板 + 该 agent 的 board id |
 | `render_entries(entries, header=)` | 将黑板快照格式化以注入到 prompt 中 |
 
@@ -63,10 +63,10 @@ for e in await board.read(BOARD_ID):
 
 | 工具 | 动作 |
 |---|---|
-| `board_read` | 拍下黑板快照（通常在每轮开始时自动展示；调用它可重新检查） |
-| `board_post` | 添加一条条目（`text`，可选 `kind`、`status`） |
-| `board_update` | 按 `entry_id` 编辑某条条目的 `text` / `status` |
-| `board_remove` | 按 `entry_id` 删除某条条目 |
+| `board(action="read")` | 拍下黑板快照（通常在每轮开始时自动展示；调用它可重新检查） |
+| `board(action="post", text=..., kind?, status?)` | 添加一条条目 |
+| `board(action="update", entry_id=..., text?, status?)` | 按 `entry_id` 编辑某条条目 |
+| `board(action="remove", entry_id=...)` | 按 `entry_id` 删除某条条目 |
 
 条目是仅追加（append-only）的，使用单调递增的整数 id。写入按条目进行（post / update 单行），而非整文档的“最后写入者胜出”——因此并发的作者不会相互覆盖。`SqliteBlackboard` 强制执行 `max_entries` 与 `max_text_len` 上限，违反时抛出 `BlackboardError`。
 

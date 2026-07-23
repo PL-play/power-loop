@@ -8,8 +8,10 @@
 
 | 路径 | 触发方式 | 控制程度 |
 |---|---|---|
-| **命令式** (`spawn_agent`) | LLM 调用 `spawn_agent` 工具 | LLM 决定委托什么 |
-| **声明式** (`run_agent` / `AgentSpec`) | LLM 提交 JSON spec | 你控制 system prompt、工具、model、max_rounds |
+| **LLM 侧** (`spawn_agent`) | LLM 调用 `spawn_agent` 工具（可选覆盖 `system_prompt` / `tools` / `max_rounds`） | LLM 决定委托什么 |
+| **声明式** (`run_agent_spec` / `AgentSpec`) | 宿主代码直接调用 Python API | 你控制 system prompt、工具、model、max_rounds |
+
+> 4.0 起原 `run_agent` meta-tool 已并入 `spawn_agent`：LLM 侧只有 `spawn_agent` 一个 meta-tool；需要完整声明式 `AgentSpec` 的场景由宿主代码调 `run_agent_spec()`。
 
 ## 命令式：spawn_agent
 
@@ -24,7 +26,7 @@ loop = StatefulAgentLoop(
     config=AgentLoopConfig(
         system_prompt=(
             "你可以用 spawn_agent 委托研究任务。"
-            "使用 preset='explore' 进行文件/代码搜索。"
+            "用 tools 白名单限定子代理的能力集。"
         ),
         max_rounds=6,
     ),
@@ -32,7 +34,7 @@ loop = StatefulAgentLoop(
 
 sid = await loop.new_session()
 result = await loop.send("找到项目中的认证逻辑代码。", session_id=sid)
-# LLM: spawn_agent(task="搜索认证代码", preset="explore")
+# LLM: spawn_agent(task="搜索认证代码", tools=["grep", "read_file", "glob"])
 # → 子代理跑自己的循环 → 父代理拿到结果
 ```
 

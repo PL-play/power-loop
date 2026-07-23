@@ -31,8 +31,8 @@ async def test_real_agent_posts_to_shared_board() -> None:
             llm=make_llm(max_tokens=512, temperature=0), store=store, tool_registry=reg,
             config=AgentLoopConfig(
                 system_prompt=("You coordinate with a teammate through a shared board. To record "
-                               "anything, you MUST call the board_post tool — that is the only way "
-                               "to write to the board."),
+                               "anything, you MUST call the board tool with action='post' — that "
+                               "is the only way to write to the board."),
                 max_rounds=4, max_tokens=512, temperature=0, compactor=None),
         )
         bb = SqliteBlackboard(store)

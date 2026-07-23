@@ -18,7 +18,7 @@
 | [03](#03-子代理委托) | `subagent_delegation.py` | 命令式子代理 spawn_agent |
 | [04](#04-上下文压缩) | `compaction.py` | 自动上下文压缩 |
 | [05](#05-悬挂态恢复) | `pending_recovery.py` | 工具调用中途崩溃恢复 |
-| [06](#06-声明式子代理) | `declarative_subagent.py` | AgentSpec 声明式子代理 |
+| [06](#06-子代理覆盖与声明式-spec) | `declarative_subagent.py` | spawn_agent 覆盖 + 声明式 run_agent_spec |
 | [07](#07-用户确认) | `human_approval.py` | Hook 实现用户确认门 |
 | [08](#08-流式渲染) | `streaming.py` | 实时 token 流 |
 | [09](#09-审计日志) | `audit_log.py` | 全量事件审计 → JSONL |
@@ -189,7 +189,7 @@ for Bangkok, which is **Pad Thai**.
 
 ```python
 registry = ToolRegistry()
-register_spawn_agent(registry)   # 注入 spawn_agent + run_agent 两个 meta-tool
+register_spawn_agent(registry)   # 注入 spawn_agent meta-tool（4.0 起 run_agent 已并入）
 
 loop = StatefulAgentLoop(
     llm=make_llm(), store=store, tool_registry=registry,
@@ -207,7 +207,7 @@ print(f"surviving subs: {await store.list_children(result.session_id)}")
 
 ### 要点
 
-- `register_spawn_agent(registry)` 注入两个 meta-tool：`spawn_agent` 和 `run_agent`
+- `register_spawn_agent(registry)` 注入 `spawn_agent` meta-tool（4.0 起 `run_agent` 已并入）
 - 父 LLM 自主决定调用 `spawn_agent` → 自动新建子 session，跑独立小循环
 - 子结果作为 `tool` 消息回灌父 session
 - **EPHEMERAL** 生命周期：成功后子 session 物理删除（失败者保留供调试）
@@ -324,14 +324,14 @@ r = await loop.send("What does HTML stand for?", session_id=sid)
 
 ---
 
-## 06 · 声明式子代理
+## 06 · 子代理覆盖与声明式 spec
 
-**概念**：父 LLM 提交完整 `AgentSpec` JSON，精确控制子代理。
+**概念**：LLM 侧用 `spawn_agent` 的 `system_prompt` / `tools` / `max_rounds` 覆盖参数精确控制子代理；宿主代码用 `run_agent_spec(AgentSpec, ...)` 走声明式路径。
 
 ### 代码
 
 ```python
-# 直接调用——代码拼 AgentSpec，绕过 LLM 驱动
+# 声明式——宿主代码拼 AgentSpec，直接调 run_agent_spec（绕过 LLM 驱动）
 spec = AgentSpec(
     name="math-helper",
     system_prompt="Compute the expression. Reply with the number only.",
@@ -341,17 +341,16 @@ spec = AgentSpec(
 )
 result = await run_agent_spec(spec, "What is 12 * 11?", parent_loop=parent_loop)
 
-# 通过 meta-tool——让父 LLM 自己拼 AgentSpec 调 run_agent
+# LLM 侧——父 LLM 调 spawn_agent，带 system_prompt / tools / max_rounds 覆盖
 ```
 
 ### 要点
 
-- **两种子代理入口**：
-  - `spawn_agent` — 命令式（kwargs，库构造 AgentSpec），见 [03](#03-子代理委托)
-  - `run_agent` — 声明式（父 LLM 提交完整 AgentSpec JSON），本例
+- **4.0 起 LLM 侧只有一个 meta-tool**：`spawn_agent`（原 `run_agent` 已并入）
+  - 基础用法（只给 `task`）见 [03](#03-子代理委托)；本例演示 `system_prompt` / `tools` / `max_rounds` 覆盖
+- 声明式路径 = 宿主代码直接调 `run_agent_spec()`（Python API，绕过 LLM，适合测试/编排框架）
 - `AgentSpec` 是 **strict-schema**：未知字段 → `AgentSpecError`
 - `tools` 是父 registry 的白名单——限制子的可见能力
-- `run_agent_spec()` 可直接调用（绕过 LLM，适合测试/编排框架）
 
 ### 输出
 
@@ -1167,7 +1166,7 @@ with runtime_env_context(RuntimeEnv(workspace_dir=tenant_workspace)):
 覆盖 0.11 之后新增的能力（持久化、扩展、可插拔后端、可观测性、MCP）。每条都链接到可运行文件，以及深入讲解它的用户手册页面。
 
 ### 24 · Agent 笔记
-Agent 通过 `note(action=add|update|delete|list)` 管理持久化笔记，经 `SQLiteNoteMemory` 持久化，并按 `NotesPolicy` 在每轮重新注入。→ [示例](../../../examples/24_agent_notes.py) · [记忆](../user-guide/memory.md)
+Agent 通过 `note(action=add|update|delete)` 写入持久化笔记，并用 `note(action=list)` 显式读回；经 `SQLiteNoteMemory` 持久化，并按 `NotesPolicy` 在每轮重新注入。→ [示例](../../../examples/24_agent_notes.py) · [记忆](../user-guide/memory.md)
 
 ### 25 · Token 用量
 用 `result.usage`、`get_session_stats` 和 `usage_updated` 事件统计 token；用 `max_tokens_per_run` 给单次运行设上限。→ [示例](../../../examples/25_token_usage.py) · [配置](../user-guide/configuration.md)
@@ -1208,7 +1207,7 @@ Agent 给自己排定唤醒（`schedule_wakeup`），由 `TimerRunner` 当作普
 | 发一条消息拿一条回复 | [00](#00-最简示例) |
 | 多轮聊天 | [01](#01-多轮对话) |
 | 加自定义工具 | [02](#02-工具调用) |
-| 委托给子代理 | [03](#03-子代理委托)、[06](#06-声明式子代理) |
+| 委托给子代理 | [03](#03-子代理委托)、[06](#06-子代理覆盖与声明式-spec) |
 | 处理长对话 | [04](#04-上下文压缩)、[16](#16-自定义压缩器) |
 | 应对崩溃 | [05](#05-悬挂态恢复)、[11](#11-跨进程恢复) |
 | 加用户确认门 | [07](#07-用户确认)、[10](#10-并发会话) |

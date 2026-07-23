@@ -98,7 +98,7 @@ result = await loop.send("What's the weather in Tokyo?", session_id=sid)
 ```python
 from power_loop import register_spawn_agent
 
-# Register both meta-tools: spawn_agent (imperative) and run_agent (declarative)
+# Register the spawn_agent meta-tool (the former run_agent is merged in since 4.0)
 register_spawn_agent(registry)
 
 loop = StatefulAgentLoop(

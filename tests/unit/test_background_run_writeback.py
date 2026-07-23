@@ -71,7 +71,7 @@ def test_orphaned_writeback_recovered_on_check(tmp_path) -> None:
     assert row is not None and row.status == "running"
     assert any(o["task_id"] == task_id for o in mgr._orphaned)
 
-    # A later check_background on a live loop self-heals the durable row.
+    # A later background_run action=check on a live loop self-heals the durable row.
     async def chk() -> str:
         tok_l = set_current_loop(_FakeLoop(store))
         tok_s = set_session_id(sid)

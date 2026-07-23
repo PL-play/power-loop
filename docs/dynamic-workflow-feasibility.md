@@ -21,7 +21,7 @@
 
 | 模型 | 谁决定控制流 | power-loop 现状 | 本报告立场 |
 |---|---|---|---|
-| **A. Model-driven 委派** | 主 LLM 用 `spawn_agent` / `run_agent` meta-tool **即时**决定 spawn 谁 | **已支持**（`register_spawn_agent`，`SPAWN_AGENT_DEFINITION` / `RUN_AGENT_DEFINITION`） | 保留，但**不是**本能力；它是 workflow agent 内部 ad-hoc 委派的便利退路 |
+| **A. Model-driven 委派** | 主 LLM 用 `spawn_agent` meta-tool **即时**决定 spawn 谁 | **已支持**（`register_spawn_agent`，`SPAWN_AGENT_DEFINITION`；4.0 起原 `run_agent` 已并入 `spawn_agent`） | 保留，但**不是**本能力；它是 workflow agent 内部 ad-hoc 委派的便利退路 |
 | **B. 静态 DAG / Planner** | 宿主预先写死的图 | 无 | 维护者明确**不要**这个 |
 | **C. 确定性编排（本能力）** | **确定性代码**解释执行一份**声明式 WorkflowSpec**；其中 `foreach/while/branch` 在运行时动态展开 | 无（缺组合子层） | **目标形态** |
 
@@ -47,7 +47,7 @@
 | **hooks（策略/否决/回调）** | `AgentHooks`（`register/run_typed`）+ `HookPoint`（SESSION/ROUND/LLM/TOOL/COMPACT/`TIMER_FIRE`…）+ `HookDirective`（CONTINUE/SKIP/BREAK/SHORT_CIRCUIT）+ typed `*Ctx` | **高** | 跑在热路径（handler 要小）；同一 `AgentHooks` 传给子 loop，**无 main/sub 角色判别字段**。**无编排级 hook**（无 BEFORE_SPAWN/AFTER_JOIN/PHASE_BOUNDARY）——否决 spawn 只能 hook `TOOL_BEFORE` 在 `spawn_agent` 上，间接 |
 | **events（观察）** | 同 `log` 行；另 `Subagent*Payload`/`SUBAGENT_*` 事件类型 | **中** | ⚠️ **SUBAGENT_\* 已定义/导出/文档化但从不 publish**（grep 零 publish site）；子 loop 还**硬编码 `scope="main"`**；文档的 `source="subagent:<sid>"` 约定**从未被任何 producer 赋值**（但 `logging_sink` 消费侧已就绪）。fan-out 进度树**今天无法从 events 建**，须从 `SessionStore.parent_session_id` 重建，或 workflow 层自己 wire 这些发射（廉价，consumer 已在） |
 | **background projector（后台投影）** | `RuntimeProjector` 协议 + `TodoRuntimeProjector` + `BackgroundRuntimeProjector`（每 round 从 `session_runtime_state` 注入）+ `ToolRuntimeContext`/`get_tool_runtime_context` | **高** | projector 是把状态注入**给 LLM**，非投影**给 UI**；真正的进度 source-of-truth 是 `SessionStore.get_runtime_state`/`list_unseen_background_updates`（UI 须订阅 `TODO_UPDATED` 或轮询）。**无 subagent-tree projector**——进度树须写自定义 poller over `parent_session_id` |
-| **动态工具注册** | `ToolRegistry.register/unregister/subset` + `build_registry` + `create_default_tool_registry`（preset core/explore/full）+ `invoke_async`（sync 工具走 `to_thread`，不阻塞并发会话） | **高** | **仅程序化**——**无 LLM-facing `register_tool` meta-tool**（grep 确认；唯一 meta-tool 是 spawn/run_agent）。LLM 不能自定义工具。`subset` 共享同一 handler 实例（绑定的 workspace/runtime-env 不随委派 re-scope） |
+| **动态工具注册** | `ToolRegistry.register/unregister/subset` + `build_registry` + `create_default_tool_registry`（preset core/explore/full）+ `invoke_async`（sync 工具走 `to_thread`，不阻塞并发会话） | **高** | **仅程序化**——**无 LLM-facing `register_tool` meta-tool**（grep 确认；唯一 meta-tool 是 spawn_agent）。LLM 不能自定义工具。`subset` 共享同一 handler 实例（绑定的 workspace/runtime-env 不随委派 re-scope） |
 | **skills** | `SkillLoader` / `register_skill_tools` / `load_skill` 工具 / `build_system_prompt_section` | **中** | 注入**知识/指令**（Markdown），**不注册可执行工具**；filesystem-only（需磁盘 `skills_dir`，无 in-memory 源）；无 per-skill tool-allowlist/sandbox |
 | **human-input（审批门）** | `request_user_input`（raise `HumanInputRequired`）+ `submit_input` + `StatefulResult.status=='waiting_for_input'`/`pending_interactions` | **高** | per-tool-call 暂停、可跨重启/进程；但**无 workflow 级门**（无 "wait N of M approvals"、无超时/过期、无 approve/deny→确定性分支——分支由 LLM 看到答案后决定，非代码决定）。无内建 expiry（须配 timer） |
 | **resume / 跨进程** | pending 状态机（`SQLiteSink` 即时写 `pending_json`，`SessionPendingError`/`resume`/`abort_pending`/`heal_pending`）+ 共享 db 文件跨进程续跑（`examples/11`） | **中** | 粒度=**单 session 的在途 tool_calls**，**不是**"pipeline 第 3 阶段、fan-out 2/5 完成"。`resume` **重跑** leftover tool_calls，**无幂等键**——非幂等工具（spawn/send/写文件）会**双发**。EPHEMERAL 子仅 `status=='completed'` 删除→成功 fan-out **不留持久痕迹**（要审计/恢复须用 LINKED） |

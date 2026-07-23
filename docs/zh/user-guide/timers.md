@@ -8,16 +8,20 @@
 
 两种方式，写入的是同一批记录。
 
-**Agent 自行安排唤醒**，通过默认工具（`schedule_wakeup`、`cancel_wakeup`、`list_wakeups`）：
+**Agent 自行安排唤醒**，通过默认工具 `schedule_wakeup`（单工具，用 `action` 区分 schedule / list / cancel）：
 
 ```python
 from power_loop import create_default_tool_registry, get_tool_definitions
 from power_loop.tools import DEFAULT_TOOL_HANDLERS
 
 registry = create_default_tool_registry(preset="core", workspace_dir=ws)
-for d in get_tool_definitions(include=["schedule_wakeup", "cancel_wakeup", "list_wakeups"]):
+for d in get_tool_definitions(include=["schedule_wakeup"]):   # 可加 "current_time"
     registry.register(d, DEFAULT_TOOL_HANDLERS[d.name], overwrite=True)
-# Now the model can call schedule_wakeup(delay_seconds=3600, note="check the build").
+# 现在模型可以调用：
+#   schedule_wakeup(action="schedule", delay_seconds=3600, note="check the build")
+#   schedule_wakeup(action="schedule", delay_seconds=60, note="heartbeat", every_seconds=300)
+#   schedule_wakeup(action="list")
+#   schedule_wakeup(action="cancel", timer_id=1)
 ```
 
 **宿主程序从外部安排**，通过 loop API：

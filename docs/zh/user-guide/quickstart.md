@@ -98,7 +98,7 @@ result = await loop.send("东京天气怎么样？", session_id=sid)
 ```python
 from power_loop import register_spawn_agent
 
-# 注册两个 meta-tool：spawn_agent（命令式）和 run_agent（声明式）
+# 注册 spawn_agent meta-tool（4.0 起 run_agent 已并入其中）
 register_spawn_agent(registry)
 
 loop = StatefulAgentLoop(

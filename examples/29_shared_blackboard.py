@@ -11,8 +11,8 @@ What you learn / 你将学到
   seam as the sandbox ``ShellBackend``. Agents with the **same id** share a board;
   different ids are isolated.
   / 用 ``runtime_env_context`` 按次注入黑板与 id：相同 id 共享，不同 id 隔离。
-- The ``board_*`` tools (``board_read`` / ``board_post`` / ``board_update`` /
-  ``board_remove``) are the agent-facing API; the author is stamped from session
+- The single ``board`` tool (``action=read|post|update|remove``) is the
+  agent-facing API; the author is stamped from session
   metadata (``spec_name``), not supplied by the model.
   / ``board_*`` 工具是 agent 侧 API；作者由会话元数据决定，模型无法伪造。
 - The host **projects** the current board into each turn's prompt (the "pull"
@@ -53,7 +53,7 @@ BOARD_ID = "project-onboarding"
 SYSTEM_PROMPT = (
     "You are one of two agents collaborating through a small SHARED BOARD. "
     "The board's current contents are shown at the top of your message. Use the "
-    "board_post / board_update / board_read tools to coordinate with your "
+    "board tool (action=post/update/read) to coordinate with your "
     "teammate — keep entries short. Do exactly what you're asked, then stop "
     "(don't keep posting)."
 )
@@ -91,7 +91,7 @@ async def main() -> dict:
     # 1) The planner posts two tasks onto the shared board.
     await run_agent(
         "planner",
-        "You are the planner. Using board_post (kind=task, status=open), add exactly two "
+        "You are the planner. Using board action=post (kind=task, status=open), add exactly two "
         "tasks for your teammate: (1) 'write the welcome email', (2) 'set up the calendar "
         "invite'. Post them, then stop.",
     )
@@ -99,8 +99,8 @@ async def main() -> dict:
     await run_agent(
         "worker",
         "You are the worker. The shared board above lists the planner's open tasks. Use "
-        "board_update to set the 'write the welcome email' task to status=done, then "
-        "board_post a short note (kind=note) saying the welcome email has been sent. Then stop.",
+        "board action=update to set the 'write the welcome email' task to status=done, then "
+        "board action=post a short note (kind=note) saying the welcome email has been sent. Then stop.",
     )
 
     entries = await board.read(BOARD_ID)

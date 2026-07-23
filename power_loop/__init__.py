@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "3.24.0"
+__version__ = "5.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -247,7 +247,6 @@ from power_loop.tools.default_manifest import (
 )
 from power_loop.tools.registry import AsyncToolInSyncContext
 from power_loop.tools.spawn_agent import (
-    RUN_AGENT_DEFINITION,
     SPAWN_AGENT_DEFINITION,
     register_spawn_agent,
 )
@@ -500,7 +499,6 @@ __all__ = [
 	"format_tool_catalog",
 	"register_spawn_agent",
 	"SPAWN_AGENT_DEFINITION",
-	"RUN_AGENT_DEFINITION",
 	"LOAD_SKILL_DEFINITION",
 	"SkillLoader",
 	"get_default_loader",

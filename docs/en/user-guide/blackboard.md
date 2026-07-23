@@ -12,7 +12,7 @@ It's the same abstraction whether the scope is a chat conversation or a workflow
 |---|---|
 | `Blackboard` (Protocol) | async `read` / `post` / `update` / `remove` — per-entry merge, never whole-doc overwrite |
 | `SqliteBlackboard` | the default impl, persisted in the `SessionStore` sqlite (a board is *not* tied to a session) |
-| `register_blackboard_tools(registry)` | adds the agent-facing `board_read` / `board_post` / `board_update` / `board_remove` tools |
+| `register_blackboard_tools(registry)` | adds the single agent-facing `board` tool (`action=post|read|update|remove`; merged from the four `board_*` tools in 5.0) |
 | `RuntimeEnv(blackboard=, blackboard_id=)` | injects the live board + this agent's board id per run |
 | `render_entries(entries, header=)` | format a board snapshot for prompt injection |
 
@@ -63,10 +63,10 @@ See [example 29](../../../examples/29_shared_blackboard.py) for the full planner
 
 | Tool | Action |
 |---|---|
-| `board_read` | snapshot the board (usually auto-shown at turn start; call to re-check) |
-| `board_post` | add an entry (`text`, optional `kind`, `status`) |
-| `board_update` | edit an entry's `text` / `status` by `entry_id` |
-| `board_remove` | delete an entry by `entry_id` |
+| `board(action="read")` | snapshot the board (usually auto-shown at turn start; call to re-check) |
+| `board(action="post", text=..., kind?, status?)` | add an entry |
+| `board(action="update", entry_id=..., text?, status?)` | edit an entry by `entry_id` |
+| `board(action="remove", entry_id=...)` | delete an entry by `entry_id` |
 
 Entries are append-only with monotonic integer ids. Writes are per-entry (post / update one row), not whole-document last-write-wins — so concurrent authors don't clobber each other. `SqliteBlackboard` enforces `max_entries` and `max_text_len` caps and raises `BlackboardError` on violations.
 

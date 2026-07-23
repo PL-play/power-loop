@@ -174,7 +174,7 @@ stable part of the framework, but it is an architectural dependency to be aware 
 
 ---
 
-## 6. Blackboard — `board_*` → `board_write` / `board_read`
+## 6. Blackboard — built-in `board` → custom `board_write` / `board_read`
 
 **Built-in:** `board_*` is a shared scratchpad agents read/write to coordinate.
 
@@ -200,7 +200,7 @@ cross-process sharing, inject a board backend via `runtime_env_context` instead.
 
 ## 7. Memory / notes — built-in `note` + recall → `remember` + `CustomNotesMemory`
 
-**Built-in:** `note(action=add)` writes durable notes; `SQLiteNoteMemory` (a `MemoryProvider`) recalls them
+**Built-in:** `note(action=add|update|delete)` writes durable notes; `note(action=list)` reads them back explicitly; `SQLiteNoteMemory` (a `MemoryProvider`) re-injects them
 into context at the start of every send.
 
 **Primitives:** `store.add_note` / `list_notes` for the tool, and the `MemoryProvider` protocol

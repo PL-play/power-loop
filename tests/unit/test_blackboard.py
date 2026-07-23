@@ -99,7 +99,7 @@ def test_render_entries() -> None:
     assert render_entries([], header="Board:", empty="(empty)").endswith("(empty)")
 
 
-# ── board_* tools (resolve board + author from RuntimeEnv / session) ──────────
+# ── board tool (resolve board + author from RuntimeEnv / session) ─────────────
 
 
 @dataclass
@@ -130,18 +130,16 @@ async def test_board_tools_end_to_end() -> None:
     sid = await loop.new_session(metadata={"spec_name": "alice"})
     bb = SqliteBlackboard(loop.store)
     reg = _tools()
-    post = reg.get("board_post").handler
-    read = reg.get("board_read").handler
-    update = reg.get("board_update").handler
+    board = reg.get("board").handler
 
     with runtime_env_context(RuntimeEnv(blackboard=bb, blackboard_id="conv-7")):
         tl = set_current_loop(loop)
         ts = set_session_id(sid)
         try:
-            out = await post(text="claim the intro", kind="task", status="open")
+            out = await board(action="post", text="claim the intro", kind="task", status="open")
             assert "task·open" in out and "alice" in out and "claim the intro" in out
-            await update(entry_id=1, status="done")
-            snap = await read()
+            await board(action="update", entry_id=1, status="done")
+            snap = await board(action="read")
         finally:
             reset_current_loop(tl)
             reset_session_id(ts)
@@ -153,10 +151,12 @@ async def test_board_tools_end_to_end() -> None:
 
 async def test_board_tools_error_when_no_board_configured() -> None:
     reg = _tools()
-    post = reg.get("board_post").handler
+    board = reg.get("board").handler
     with runtime_env_context(RuntimeEnv()):  # no blackboard / id
-        out = await post(text="hi")
+        out = await board(action="post", text="hi")
     assert "no shared board is configured" in out
+    out = await board(action="bogus")
+    assert "action must be one of" in out
 
 
 async def test_board_post_validates_kind() -> None:
@@ -164,12 +164,12 @@ async def test_board_post_validates_kind() -> None:
                              config=AgentLoopConfig(system_prompt="o", compactor=None))
     sid = await loop.new_session()
     reg = _tools()
-    post = reg.get("board_post").handler
+    board = reg.get("board").handler
     with runtime_env_context(RuntimeEnv(blackboard=SqliteBlackboard(loop.store), blackboard_id="b")):
         tl = set_current_loop(loop)
         ts = set_session_id(sid)
         try:
-            out = await post(text="x", kind="bogus")
+            out = await board(action="post", text="x", kind="bogus")
         finally:
             reset_current_loop(tl)
             reset_session_id(ts)

@@ -70,9 +70,7 @@ def _loop(tmp_path, responses=None, hooks=None, bus=None, with_tools=False):
     registry = None
     if with_tools:
         registry = create_default_tool_registry(preset="core", bind=False)
-        for d in get_tool_definitions(
-            include=["schedule_wakeup", "list_wakeups", "cancel_wakeup", "current_time"]
-        ):
+        for d in get_tool_definitions(include=["schedule_wakeup", "current_time"]):
             registry.register(d, DEFAULT_TOOL_HANDLERS[d.name], overwrite=True)
     return StatefulAgentLoop(
         llm=_Scripted(responses=responses or []),
@@ -121,8 +119,8 @@ async def test_agent_schedules_and_lists_wakeups_via_tools(tmp_path):
         tmp_path,
         responses=[
             _tool_resp("c1", "schedule_wakeup",
-                       '{"delay_seconds": 60, "note": "ping the build"}'),
-            _tool_resp("c2", "list_wakeups", "{}"),
+                       '{"action": "schedule", "delay_seconds": 60, "note": "ping the build"}'),
+            _tool_resp("c2", "schedule_wakeup", '{"action": "list"}'),
             LLMResponse(raw_text="scheduled", content_text="scheduled"),
         ],
         with_tools=True,

@@ -16,7 +16,7 @@ A representative subset is validated by `tests/real/test_examples.py` against a 
 | 03 | [`subagent_delegation.py`](03_subagent_delegation.py) | Imperative sub-agent | `spawn_agent`, `EPHEMERAL` |
 | 04 | [`compaction.py`](04_compaction.py) | Auto context compaction | `DefaultCompactor`, `SessionStore` |
 | 05 | [`pending_recovery.py`](05_pending_recovery.py) | Crash recovery mid-tool | `SessionPendingError`, `resume()`, `abort_pending()` |
-| 06 | [`declarative_subagent.py`](06_declarative_subagent.py) | Declarative sub-agent | `AgentSpec`, `run_agent_spec()` |
+| 06 | [`declarative_subagent.py`](06_declarative_subagent.py) | `spawn_agent` overrides + declarative spec | `spawn_agent(system_prompt=, tools=, max_rounds=)`, `AgentSpec`, `run_agent_spec()` |
 | 07 | [`human_approval.py`](07_human_approval.py) | User confirmation gate | `TOOL_BEFORE` hook, `HookDirective.SKIP` |
 | 08 | [`streaming.py`](08_streaming.py) | Real-time token streaming | `STREAM_DELTA` event |
 | 09 | [`audit_log.py`](09_audit_log.py) | Subscribe to all events | `bus.subscribe(None, …)` |

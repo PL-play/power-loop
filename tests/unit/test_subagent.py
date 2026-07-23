@@ -66,7 +66,7 @@ def _spawn_call(call_id: str, task: str) -> LLMResponse:
     )
 
 
-def _run_agent_call(call_id: str, spec: dict, user_input: str) -> LLMResponse:
+def _spawn_call_kwargs(call_id: str, args: dict) -> LLMResponse:
     import json
     return LLMResponse(
         raw_text="",
@@ -74,8 +74,8 @@ def _run_agent_call(call_id: str, spec: dict, user_input: str) -> LLMResponse:
             "id": call_id,
             "type": "function",
             "function": {
-                "name": "run_agent",
-                "arguments": json.dumps({"spec": spec, "input": user_input}),
+                "name": "spawn_agent",
+                "arguments": json.dumps(args),
             },
         }],
     )
@@ -191,16 +191,14 @@ async def test_spawn_agent_creates_child_session_and_returns_text(store: Session
 
 
 @pytest.mark.asyncio
-async def test_run_agent_meta_tool_uses_strict_spec(store: SessionStore) -> None:
-    spec = {
-        "name": "summarizer",
-        "system_prompt": "You summarize.",
-        "max_rounds": 2,
-        "max_tokens": 1000,
-        "temperature": 0.0,
-    }
+async def test_spawn_agent_honors_name_and_system_prompt_override(store: SessionStore) -> None:
     parent_llm = _Scripted(responses=[
-        _run_agent_call("tc2", spec, "summarize this"),
+        _spawn_call_kwargs("tc2", {
+            "task": "summarize this",
+            "name": "summarizer",
+            "system_prompt": "You summarize.",
+            "max_rounds": 2,
+        }),
         LLMResponse(raw_text="child output: ok"),  # child round 1
         LLMResponse(raw_text="parent wraps up"),    # parent round 2
     ])
@@ -218,9 +216,9 @@ async def test_run_agent_meta_tool_uses_strict_spec(store: SessionStore) -> None
 
 
 @pytest.mark.asyncio
-async def test_run_agent_with_invalid_spec_returns_error(store: SessionStore) -> None:
+async def test_spawn_agent_with_missing_task_returns_error(store: SessionStore) -> None:
     parent_llm = _Scripted(responses=[
-        _run_agent_call("tc3", {"name": "x"}, "go"),  # missing system_prompt → spec error
+        _spawn_call_kwargs("tc3", {"name": "x"}),  # missing task → tool error string
         LLMResponse(raw_text="parent recovered"),
     ])
     registry = ToolRegistry()

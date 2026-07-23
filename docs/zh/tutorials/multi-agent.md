@@ -25,8 +25,8 @@ loop = StatefulAgentLoop(
 
 sid = await loop.new_session()
 result = await loop.send("找到项目中的认证逻辑代码。", session_id=sid)
-# LLM: spawn_agent(task="搜索认证代码", preset="explore")
-# → 子代理用 explore 工具集搜索 → 父代理拿到结果
+# LLM: spawn_agent(task="搜索认证代码", tools=["grep", "read_file", "glob"])
+# → 子代理用白名单工具集搜索 → 父代理拿到结果
 ```
 
 ## 声明式：AgentSpec
@@ -50,10 +50,10 @@ print(result["final_text"])
 
 ## 两种方式对比
 
-| | spawn_agent | AgentSpec |
+| | spawn_agent | AgentSpec + run_agent_spec |
 |---|---|---|
-| 谁决定 | LLM | 你 |
-| 工具白名单 | 通过 preset | 显式 `tools` 列表 |
+| 谁决定 | LLM（可选 `system_prompt` / `tools` / `max_rounds` 覆盖） | 你（宿主代码） |
+| 工具白名单 | 可选 `tools` 参数 | 显式 `tools` 列表 |
 | 使用场景 | 动态委托 | 受控、可审计的子任务 |
 
 ## 完整代码

@@ -72,7 +72,7 @@ def create_default_tool_registry(
 
         # Full minus background tasks
         reg = create_default_tool_registry(
-            exclude=["background_run", "check_background"],
+            exclude=["background_run"],
             workspace_dir="/path/to/project",
         )
     """

@@ -1360,7 +1360,7 @@ class BackgroundManager:
                 logger.warning(
                     "background task %s (session %s) finished as %s but its owning event "
                     "loop was unavailable; status deferred (recovered on next "
-                    "check_background or aclose)", task_id, sid, status,
+                    "background_run action=check or aclose)", task_id, sid, status,
                 )
         with self._lock:
             self._threads.pop(task_id, None)
@@ -1438,12 +1438,18 @@ class BackgroundManager:
 BG = BackgroundManager()
 
 
-async def run_background(command: str) -> str:
-    return await BG.run(command)
-
-
-async def check_background(task_id: str | None = None) -> str:
-    return await BG.check(task_id)
+async def run_background(
+    action: str, command: str | None = None, task_id: str | None = None
+) -> str:
+    """Execute one action of the merged ``background_run`` tool."""
+    operation = str(action or "").strip().lower()
+    if operation == "run":
+        if not (command or "").strip():
+            raise ValueError("background_run action=run requires command")
+        return await BG.run(str(command))
+    if operation == "check":
+        return await BG.check(task_id)
+    raise ValueError("background_run action must be one of: run, check")
 
 
 async def run_todo(items: list[dict[str, Any]]) -> str:
@@ -1534,7 +1540,31 @@ WAKEUP_MAX_DELAY_S = 30 * 86400
 WAKEUP_MAX_LIVE = 10  # live (armed) timers per session
 
 
-async def run_schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | None = None) -> str:
+async def run_schedule_wakeup(
+    action: str,
+    delay_seconds: int | None = None,
+    note: str | None = None,
+    every_seconds: int | None = None,
+    timer_id: int | None = None,
+) -> str:
+    """Execute one action of the merged ``schedule_wakeup`` tool."""
+    operation = str(action or "").strip().lower()
+    if operation == "schedule":
+        if delay_seconds is None:
+            raise ValueError("schedule_wakeup action=schedule requires delay_seconds")
+        if note is None:
+            raise ValueError("schedule_wakeup action=schedule requires note")
+        return await _schedule_wakeup(int(delay_seconds), note, every_seconds)
+    if operation == "list":
+        return await _list_wakeups()
+    if operation == "cancel":
+        if timer_id is None:
+            raise ValueError("schedule_wakeup action=cancel requires timer_id")
+        return await _cancel_wakeup(int(timer_id))
+    raise ValueError("schedule_wakeup action must be one of: schedule, list, cancel")
+
+
+async def _schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | None = None) -> str:
     import time as _time
 
     store, sid = _timers_store_and_session()
@@ -1554,7 +1584,7 @@ async def run_schedule_wakeup(delay_seconds: int, note: str, every_seconds: int 
     if len(live) >= WAKEUP_MAX_LIVE:
         return (
             f"Budget exceeded: {len(live)} wake-ups already scheduled. "
-            "Cancel or merge some first (list_wakeups / cancel_wakeup)."
+            "Cancel or merge some first (schedule_wakeup action=list / action=cancel)."
         )
     timer = await store.create_timer(
         sid, due_at=int(_time.time() * 1000 + delay * 1000), note=note.strip(),
@@ -1568,7 +1598,7 @@ async def run_schedule_wakeup(delay_seconds: int, note: str, every_seconds: int 
     return f"Wake-up #{timer.timer_id} scheduled in {delay}s. You'll receive your note."
 
 
-async def run_list_wakeups() -> str:
+async def _list_wakeups() -> str:
     import time as _time
 
     store, sid = _timers_store_and_session()
@@ -1585,7 +1615,7 @@ async def run_list_wakeups() -> str:
     return "\n".join(lines)
 
 
-async def run_cancel_wakeup(timer_id: int) -> str:
+async def _cancel_wakeup(timer_id: int) -> str:
     store, sid = _timers_store_and_session()
     if await store.transition_timer(sid, int(timer_id), from_status="armed", to_status="cancelled"):
         return f"Wake-up #{timer_id} cancelled."
@@ -1730,15 +1760,13 @@ async def _h_note(**kw: Any) -> Any:
 
 
 async def _h_schedule_wakeup(**kw: Any) -> Any:
-    return await run_schedule_wakeup(kw["delay_seconds"], kw["note"], kw.get("every_seconds"))
-
-
-async def _h_list_wakeups(**kw: Any) -> Any:
-    return await run_list_wakeups()
-
-
-async def _h_cancel_wakeup(**kw: Any) -> Any:
-    return await run_cancel_wakeup(kw["timer_id"])
+    return await run_schedule_wakeup(
+        kw["action"],
+        kw.get("delay_seconds"),
+        kw.get("note"),
+        kw.get("every_seconds"),
+        kw.get("timer_id"),
+    )
 
 
 async def _h_recall_compacted(**kw: Any) -> Any:
@@ -1752,11 +1780,7 @@ async def _h_recall_send(**kw: Any) -> Any:
 
 
 async def _h_background_run(**kw: Any) -> Any:
-    return await run_background(kw["command"])
-
-
-async def _h_check_background(**kw: Any) -> Any:
-    return await check_background(kw.get("task_id"))
+    return await run_background(kw["action"], kw.get("command"), kw.get("task_id"))
 
 
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
@@ -1784,13 +1808,10 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "todo": _h_todo,
     "note": _h_note,
     "schedule_wakeup": _h_schedule_wakeup,
-    "list_wakeups": _h_list_wakeups,
-    "cancel_wakeup": _h_cancel_wakeup,
     "current_time": lambda **kw: run_current_time(),
     "recall_compacted": _h_recall_compacted,
     "recall_send": _h_recall_send,
     "background_run": _h_background_run,
-    "check_background": _h_check_background,
     "request_user_input": lambda **kw: request_user_input(
         kind=kw.get("kind", "text"),
         prompt=kw["prompt"],

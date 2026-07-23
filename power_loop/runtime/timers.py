@@ -22,8 +22,8 @@ Design (one store file = one process, like everything else here):
   cancels the timer, ``postpone_s`` re-arms it later. No hook registered =
   deliver. Use it to dedupe after re-fires, hold off a busy system, audit.
 
-Timers are created by the agent itself (``schedule_wakeup`` /
-``cancel_wakeup`` / ``list_wakeups`` default tools) or externally via
+Timers are created by the agent itself (the ``schedule_wakeup`` default tool,
+``action=schedule|list|cancel``) or externally via
 ``StatefulAgentLoop.schedule_timer`` — both write the same rows.
 """
 

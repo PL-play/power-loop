@@ -8,8 +8,8 @@ What you learn / 你将学到
   / safe read-before-write editing flow
 - ``glob`` / ``grep`` 用于代码定位，``bash`` 用于测试和构建命令
   / search with dedicated tools, use bash for CLI-only work
-- ``background_run`` / ``check_background``、``todo``、``load_skill`` 的基础调用
-  / background tasks, todo updates, and skill loading
+- ``background_run``（action=run / action=check）、``todo``、``load_skill`` 的基础调用
+  / background tasks (single tool, action=run / action=check), todo updates, and skill loading
 
 Run / 运行
 ----------
@@ -92,11 +92,11 @@ async def main() -> str:
             ),
         )
 
-        background = str(await registry.invoke_async("background_run", {"command": "printf 'background finished\\n'"}))
-        show("background_run", background)
+        background = str(await registry.invoke_async("background_run", {"action": "run", "command": "printf 'background finished\\n'"}))
+        show("background_run (action=run)", background)
         task_id = background.split()[2]
         time.sleep(0.1)
-        show("check_background", await registry.invoke_async("check_background", {"task_id": task_id}))
+        show("background_run (action=check)", await registry.invoke_async("background_run", {"action": "check", "task_id": task_id}))
 
         show("load_skill", await registry.invoke_async("load_skill", {"name": "example-missing-skill"}))
         return str(Path(target))

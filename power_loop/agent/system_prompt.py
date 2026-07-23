@@ -119,8 +119,10 @@ def section_tool_guide(ctx: SystemPromptContext) -> str | None:
             "track multi-step tasks. Keep exactly one item in_progress at a time. "
             "Mark in_progress BEFORE starting, completed IMMEDIATELY when done."
         ),
-        "background_run": "run a shell command asynchronously in a background worker.",
-        "check_background": "inspect status/output of background tasks by task_id or list all.",
+        "background_run": (
+            "action=run starts a shell command asynchronously in a background worker; "
+            "action=check inspects status/output by task_id or lists all tasks."
+        ),
     }
 
     names = ctx.tool_names if ctx.tool_names else list(catalog.keys())

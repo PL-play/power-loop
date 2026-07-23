@@ -8,6 +8,47 @@
 
 ## [Unreleased]
 
+## [5.0.0] — 2026-07-23
+
+**Major：黑板工具合并（破坏性）。** 与 4.0.0 的内置工具合并同一思路的收尾。
+
+### Changed（破坏性）
+- **`board_read` / `board_post` / `board_update` / `board_remove` 合并为单个 `board` 工具**：
+  `board(action=post|read|update|remove, text?, kind?, status?, entry_id?)`。
+  `register_blackboard_tools(registry, kinds=..., statuses=..., default_kind=..., overwrite=...)`
+  签名不变，但现在只注册一个 `board` 工具；按旧四名注册/勾选/过滤的宿主需同步
+  （DeepTalk 侧：loop_cache 勾选名、board 注入头文案、admin_tool_catalog、投影蒸馏已同步）。
+
+### Migration
+- 工具调用侧：`board_post(text=...)` → `board(action="post", text=...)`，其余同理。
+- 宿主按名过滤/取消注册 `board_*` 的逻辑改为单名 `board`。
+
+## [4.0.0] — 2026-07-23
+
+**Major：内置工具合并（破坏性）。** 默认工具集的工具名/参数契约变化；未升级的 `include=[...]`
+列表会在 `get_tool_definitions` 处直接 `ValueError`，宿主需同步更新（DeepTalk 侧：agent 定义
+include、admin_tool_catalog、投影蒸馏、文档一并更新）。
+
+### Changed（破坏性）
+- **`background_run` 吸收 `check_background`**：`background_run(action="run", command=...)` 启动，
+  `background_run(action="check", task_id?)` 查询/列表。`check_background` 工具名删除。
+  `DEFAULT_REQUIRED_PARAMS["background_run"]` 由 `("command",)` 改为 `("action",)`。
+- **`schedule_wakeup` 吸收 `list_wakeups` / `cancel_wakeup`**：
+  `schedule_wakeup(action="schedule"|"list"|"cancel", delay_seconds?, note?, every_seconds?, timer_id?)`。
+  `list_wakeups`、`cancel_wakeup` 工具名删除。
+- **`run_agent` meta-tool 删除，仅保留 `spawn_agent`**：`spawn_agent(task, name?, system_prompt?,
+  tools?, max_rounds?)` —— 原 run_agent 的唯一实际增量（自定义 system_prompt）并入 spawn_agent；
+  完整声明式 spec 场景请在宿主代码直接调 `run_agent_spec()`（Python API 不变）。
+  受影响 Public API：`RUN_AGENT_DEFINITION` 符号删除；`register_spawn_agent` 移除
+  `include_run_agent` 参数（现在只注册 spawn_agent 一个工具）。
+- `python -m power_loop` 内置 system prompt 的 tool_guide、各工具确认/错误文案中的旧工具名
+  同步为新调用形态。
+
+### Migration
+- `include`/`exclude` 列表：`check_background`→删；`list_wakeups`/`cancel_wakeup`→删
+  （功能并入 `background_run` / `schedule_wakeup`）；`run_agent`→删（用 `spawn_agent`）。
+- 工具调用侧：给 `background_run`、`schedule_wakeup` 补 `action` 参数。
+
 ## [3.24.0] — 2026-07-23
 
 Feature release。Tool catalog UI now supports category fold/select-all, and the built-in note tools were consolidated
