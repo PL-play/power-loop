@@ -908,7 +908,11 @@ class SessionStore:
 
         With ``cascade=True`` (default), also deletes every descendant whose
         lifecycle is ``LINKED``. ``DETACHED`` descendants are preserved and
-        re-parented to ``NULL``. Returns the number of sessions removed.
+        re-parented to ``NULL``. With ``cascade=False``, ONLY the named session
+        is deleted and ALL surviving children (any lifecycle) are re-parented to
+        ``NULL`` — no dangling parent refs. Use this to close a scaffold session
+        (e.g. a workflow driver) while keeping its subtree as an audit trail.
+        Returns the number of sessions removed.
         """
         return len(await self.close_session_tree(session_id, cascade=cascade))
 
@@ -940,6 +944,13 @@ class SessionStore:
                     await self._delete_session_tree(
                         tx, child["session_id"], cascade=True, deleted=deleted
                     )
+        else:
+            # Keep the whole subtree, but never leave dangling parent refs: every direct
+            # child (any lifecycle) is re-parented to NULL, same as DETACHED under cascade.
+            await tx.execute(
+                f"UPDATE {self.t.sessions} SET parent_session_id=NULL WHERE parent_session_id=?",
+                (session_id,),
+            )
         await tx.execute(f"DELETE FROM {self.t.messages} WHERE session_id=?", (session_id,))
         await tx.execute(f"DELETE FROM {self.t.compactions} WHERE session_id=?", (session_id,))
         await tx.execute(f"DELETE FROM {self.t.usage_rounds} WHERE session_id=?", (session_id,))

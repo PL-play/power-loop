@@ -252,11 +252,15 @@ class WorkflowEngine:
                     f"workflow leaf ceiling ({MAX_TOTAL_LEAVES}) exceeded; fanout truncated")
             return self._build_result(spec, status)
         finally:
-            # M-workflow-engine-2: clean up the driver + its linked leaf subtree (best-effort —
-            # a cleanup failure must not fail an otherwise-successful run).
+            # Close ONLY the synthetic driver session; the LINKED leaf sessions survive
+            # (re-parented to NULL by cascade=False) as the run's audit trail — their
+            # transcripts are the only tool-by-tool record of what each role actually did.
+            # (Formerly M-workflow-engine-2 cascaded the whole subtree away, which erased
+            # every leaf transcript the moment a run finished.) Best-effort — a cleanup
+            # failure must not fail an otherwise-successful run.
             if self._close_driver:
                 try:
-                    await self._loop.close_session(driver_sid, cascade=True)
+                    await self._loop.close_session(driver_sid, cascade=False)
                 except Exception:  # noqa: BLE001
                     logger.debug("workflow driver session cleanup failed", exc_info=True)
 

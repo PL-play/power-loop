@@ -8,6 +8,22 @@
 
 ## [Unreleased]
 
+## [5.0.1] — 2026-07-24
+
+**Patch：workflow 叶子会话不再随 run 结束被抹掉（审计留档）。**
+
+### Fixed
+- **`WorkflowEngine.run()` 的收尾不再级联删除 LINKED 叶子会话**：原实现在 finally 里
+  `close_session(driver, cascade=True)`，把每个角色叶子的逐工具 transcript 连同 driver
+  一起删掉——run 一结束，叶子做过什么就无从审计（真实的对抗验证 run 因此不可回放）。
+  现在只关 driver（`cascade=False`），LINKED 叶子存活并被重新挂到 NULL 父节点，
+  按 metadata（`workflow_run_id` / `workflow_node_id` / `spec_name`）仍可精确定位。
+  `close_driver=False` 语义不变（driver 也保留）。
+- **`close_session(cascade=False)` 语义补齐**（此前无人使用）：只删指定会话，
+  所有直接子会话（不限 lifecycle）重新挂到 NULL——不再留悬空 parent 引用。
+  async store 与 legacy 同步 store 行为一致。
+
+
 ## [5.0.0] — 2026-07-23
 
 **Major：黑板工具合并（破坏性）。** 与 4.0.0 的内置工具合并同一思路的收尾。

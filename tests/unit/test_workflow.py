@@ -396,9 +396,12 @@ async def test_agent_node_model_and_output_schema_reach_llm_request():
 
 
 @pytest.mark.asyncio
-async def test_driver_and_leaf_sessions_cleaned_up_after_run() -> None:
-    # M-workflow-engine-2: run() must close its driver session + linked leaf subtree, so each run
-    # doesn't leak a driver row + one leaf row per node. close_driver=False opts into retention.
+async def test_driver_closed_but_linked_leaves_survive_as_audit_trail() -> None:
+    # run() closes ONLY the synthetic driver session; the LINKED leaf sessions survive
+    # (re-parented to NULL) as the run's tool-by-tool audit trail. The old
+    # M-workflow-engine-2 behavior cascaded the subtree away, erasing every leaf
+    # transcript the moment a run finished (a real adversarial-verification run's
+    # findings became unauditable). close_driver=False retains the driver too.
     from power_loop.runtime.store.store import SessionStore
 
     store = await SessionStore.open(":memory:")
@@ -419,9 +422,14 @@ async def test_driver_and_leaf_sessions_cleaned_up_after_run() -> None:
     base = await _count()
     res = await WorkflowEngine(loop, run_id="t1").run(spec)
     assert res.status == "completed"
-    assert await _count() == base  # driver + 2 leaves cleaned up
+    assert await _count() == base + 2  # driver closed, 2 leaves survive
+    # Survivors are the leaves, re-parented to NULL, transcripts intact.
+    for step in res.results.values():
+        row = await store.get_session(step.session_id)
+        assert row is not None and row.parent_session_id is None
+        assert await store.load_all_messages(step.session_id)
 
     res2 = await WorkflowEngine(loop, run_id="t2", close_driver=False).run(spec)
     assert res2.status == "completed"
-    assert await _count() == base + 3  # driver + 2 leaves retained for inspection
+    assert await _count() == base + 2 + 3  # driver + 2 leaves all retained
     await store.close()

@@ -623,7 +623,9 @@ class SessionStore:
 
         With ``cascade=True`` (default), also deletes every descendant whose
         lifecycle is ``LINKED``. ``DETACHED`` descendants are preserved and
-        re-parented to ``NULL``. Returns the number of sessions removed.
+        re-parented to ``NULL``. With ``cascade=False``, ONLY the named session
+        is deleted and ALL surviving children are re-parented to ``NULL``.
+        Returns the number of sessions removed.
         """
         with self._lock, self._conn:
             return self._delete_session_tree(session_id, cascade=cascade)
@@ -643,6 +645,13 @@ class SessionStore:
                     )
                 else:
                     deleted += self._delete_session_tree(child["session_id"], cascade=True)
+        else:
+            # cascade=False keeps the subtree as an audit trail; re-parent every direct
+            # child (any lifecycle) to NULL so no dangling parent refs remain.
+            self._conn.execute(
+                "UPDATE sessions SET parent_session_id=NULL WHERE parent_session_id=?",
+                (session_id,),
+            )
         self._conn.execute("DELETE FROM messages WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM compactions WHERE session_id=?", (session_id,))
         self._conn.execute("DELETE FROM usage_rounds WHERE session_id=?", (session_id,))

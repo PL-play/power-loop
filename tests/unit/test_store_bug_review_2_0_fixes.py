@@ -300,3 +300,29 @@ async def test_concurrent_file_handles_serialize_not_deadlock(tmp_path):
     finally:
         await a.close()
         await b.close()
+
+
+# ── cascade=False: audit-trail close (workflow driver keeps its leaves) ──────
+
+
+async def test_close_session_no_cascade_keeps_children_and_reparents():
+    s = await SessionStore.open(":memory:")
+    await s.create_session(session_id="driver")
+    await s.create_session(
+        session_id="leaf1", parent_session_id="driver", lifecycle=SubagentLifecycle.LINKED
+    )
+    await s.create_session(
+        session_id="leaf2", parent_session_id="driver", lifecycle=SubagentLifecycle.LINKED
+    )
+    await s.append_message("leaf1", role="assistant", content="finding A")
+
+    deleted = await s.close_session_tree("driver", cascade=False)
+    assert deleted == ["driver"]
+    assert await s.get_session("driver") is None
+    # LINKED leaves survive as the audit trail, re-parented to NULL (no dangling refs).
+    for leaf in ("leaf1", "leaf2"):
+        row = await s.get_session(leaf)
+        assert row is not None and row.parent_session_id is None
+    msgs = await s.load_all_messages("leaf1")
+    assert [m.content for m in msgs] == ["finding A"]
+    await s.close()
