@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+## [5.1.0] — 2026-08-11
+
+**Minor：`send()` 支持 per-send 的 `response_format`（结构化输出不再只能在构造期定死）。**
+
+### Added
+- **`StatefulAgentLoop.send(..., response_format=...)`** —— OpenAI 兼容的结构化输出规格
+  （`{"type": "json_object"}`，或 `StructuredOutputSpec.to_openai_response_format()` 产出的
+  json_schema），**只作用于这一次 run**。
+
+  为什么必须是 per-send：`response_format` 原本只有 `AgentLoopConfig` 一条路（构造期），而
+  一个 loop 常常被**多个调用方共用** —— 宿主按 agent 定义缓存一个 loop，很多会话同时跑在
+  上面。想要 JSON 的那一次 send 如果去改 loop 的 config，会把所有并发的 send 一起翻进 JSON
+  模式。实现沿用既有的 per-call 覆盖机制（和 `system_prompt` / `max_rounds` 同一条路：
+  `dataclasses.replace` 出一份 per-run config，绝不改动 `self.config`）。
+
+  不传时行为完全不变：配置里的 `response_format` 照常生效。
+
 ## [5.0.1] — 2026-07-24
 
 **Patch：workflow 叶子会话不再随 run 结束被抹掉（审计留档）。**

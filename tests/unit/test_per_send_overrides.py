@@ -28,6 +28,7 @@ class _Recorder(LLMService):
 
     seen_tools: list[list[str]] = field(default_factory=list)
     seen_system: list[str | None] = field(default_factory=list)
+    seen_format: list[Any] = field(default_factory=list)
 
     async def complete(self, request: LLMRequest, **_: Any) -> LLMResponse:
         names = [
@@ -36,6 +37,7 @@ class _Recorder(LLMService):
         ]
         self.seen_tools.append([n for n in names if n])
         self.seen_system.append(request.system_prompt)
+        self.seen_format.append(request.response_format)
         return LLMResponse(raw_text="ok")
 
     def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
@@ -215,3 +217,50 @@ def test_bash_sessions_are_cached_by_execution_target(tmp_path, monkeypatch):
             session.close()
         sessions.clear()
         sessions.update(saved)
+
+
+# ── per-send response_format ──────────────────────────────────────────────
+#
+# 一个 loop 常常被**多个调用方共用**（宿主按 agent 定义缓存一个 loop，很多会话跑在上面）。
+# 想要 JSON 的那一次 send 如果去改 loop 的 config，就会把所有并发的 send 一起翻成 JSON 模式。
+# 所以这必须是 per-run 覆盖，且不能污染 self.config。
+
+
+async def test_send_response_format_reaches_the_request():
+    llm = _Recorder()
+    loop = _loop(llm)
+    sid = await loop.new_session()
+    await loop.send("hi", sid, response_format={"type": "json_object"})
+    assert llm.seen_format[-1] == {"type": "json_object"}
+
+
+async def test_send_without_response_format_sends_none():
+    llm = _Recorder()
+    loop = _loop(llm)
+    sid = await loop.new_session()
+    await loop.send("hi", sid)
+    assert llm.seen_format[-1] is None
+
+
+async def test_response_format_does_not_leak_into_shared_config():
+    """下一次不带它的 send 必须干净 —— 否则一次 JSON 请求会污染整个 loop。"""
+    llm = _Recorder()
+    loop = _loop(llm)
+    a, b = await loop.new_session(), await loop.new_session()
+    await loop.send("hi", a, response_format={"type": "json_object"})
+    await loop.send("hi", b)
+    assert llm.seen_format == [{"type": "json_object"}, None]
+    assert loop.config.response_format is None
+
+
+async def test_config_level_response_format_still_applies():
+    """没传 per-send 时,配置里的那份照常生效（不许被覆盖成 None）。"""
+    llm = _Recorder()
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=":memory:", tool_registry=_registry(),
+        config=AgentLoopConfig(system_prompt="B", max_rounds=1, compactor=None,
+                               response_format={"type": "json_object"}),
+    )
+    sid = await loop.new_session()
+    await loop.send("hi", sid)
+    assert llm.seen_format[-1] == {"type": "json_object"}

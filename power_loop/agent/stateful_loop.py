@@ -719,6 +719,7 @@ class StatefulAgentLoop:
         system_prompt: str | None = None,
         heal_pending: bool = False,
         max_rounds: int | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> StatefulResult:
         """Append one user input to the session and run the loop.
 
@@ -732,6 +733,12 @@ class StatefulAgentLoop:
           ``ToolRegistry`` to use directly. The model only *sees* these tools.
         - ``system_prompt``: override the system prompt for this run only
           (precedence: this arg > session system_prompt > config).
+        - ``response_format``: OpenAI-compatible structured-output spec for this
+          run only (e.g. ``{"type": "json_object"}`` or a ``json_schema`` dict
+          from :meth:`StructuredOutputSpec.to_openai_response_format`). Needed
+          because a loop is often **shared across callers** — a host that wants
+          JSON from one send must not flip the whole loop into JSON mode for
+          every other session using it. ``None`` = whatever the config says.
 
         Raises :class:`SessionPendingError` if the session has unresolved
         tool_calls (a previous run died mid tool-call); the caller must call
@@ -759,7 +766,7 @@ class StatefulAgentLoop:
                 await self._persist_user_input(sid, user_input)
                 return await self._run_loop(
                     sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                    max_rounds=max_rounds,
+                    max_rounds=max_rounds, response_format=response_format,
                 )
 
     async def follow_up(
@@ -1480,6 +1487,7 @@ class StatefulAgentLoop:
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
         max_rounds: int | None = None,
+        response_format: dict[str, Any] | None = None,
     ) -> StatefulResult:
         store = await self._ensure_store()
         # 3.0: projection-style representation drives the derived-layer path; verbatim → None
@@ -1763,6 +1771,12 @@ class StatefulAgentLoop:
             _overrides["system_prompt"] = effective_sp
         if max_rounds is not None and int(max_rounds) != self.config.max_rounds:
             _overrides["max_rounds"] = max(1, int(max_rounds))
+        # Per-call structured output. Must be a per-run copy, never a mutation of self.config:
+        # one loop object commonly serves many sessions concurrently (a host keyed by agent
+        # definition, say), and flipping the shared config into JSON mode would silently force
+        # every other in-flight send to answer in JSON too.
+        if response_format is not None and response_format != self.config.response_format:
+            _overrides["response_format"] = response_format
         runtime_config = replace(self.config, **_overrides) if _overrides else self.config
         effective_registry = self._resolve_registry(tools)
         # Publish this run's per-send allowlist to child spawns (innermost-run
