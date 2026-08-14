@@ -92,6 +92,9 @@ class WorkflowSpecError(SpecValidationError):
 #: ``empty`` = 完成了但没有正文（模型空转收尾）。
 RETRY_TRIGGERS = frozenset({"failed", "empty"})
 _MAX_ATTEMPTS_CAP = 5
+_MAX_BACKOFF_FACTOR = 10.0
+#: 单次重试等待的封顶秒数。
+MAX_BACKOFF_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -105,7 +108,11 @@ class RetryPolicy:
 
     max_attempts: int = 1
     on: tuple[str, ...] = ("failed", "empty")
+    #: 第一次重试前等多久。第 N 次重试等 ``backoff_s * backoff_factor**(N-1)``，
+    #: 单次等待封顶 :data:`MAX_BACKOFF_S`（等太久等于把整个 run 挂在那儿）。
     backoff_s: float = 0.0
+    #: 1.0 = 固定间隔；2.0 = 指数退避（2s → 4s → 8s）。provider 限流时才真正需要它。
+    backoff_factor: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -346,6 +353,7 @@ def _node_to_dict(node: WorkflowNode) -> dict[str, Any]:
                 "max_attempts": node.retry.max_attempts,
                 "on": list(node.retry.on),
                 "backoff_s": node.retry.backoff_s,
+                "backoff_factor": node.retry.backoff_factor,
             }
         if node.continue_on_error:
             out["continue_on_error"] = True
@@ -719,7 +727,7 @@ def _parse_retry(raw: Any, path: str, problems: list[str]) -> RetryPolicy | None
     if not isinstance(raw, dict):
         problems.append(f"{path}: 'retry' must be an object {{max_attempts, on?, backoff_s?}}")
         return None
-    extra = set(raw) - {"max_attempts", "on", "backoff_s"}
+    extra = set(raw) - {"max_attempts", "on", "backoff_s", "backoff_factor"}
     if extra:
         problems.append(f"{path}.retry: unknown key(s): {sorted(extra)}")
     attempts = raw.get("max_attempts", 1)
@@ -748,7 +756,17 @@ def _parse_retry(raw: Any, path: str, problems: list[str]) -> RetryPolicy | None
     if isinstance(backoff, bool) or not isinstance(backoff, (int, float)) or backoff < 0:
         problems.append(f"{path}.retry: 'backoff_s' must be a number >= 0")
         backoff = 0.0
-    return RetryPolicy(max_attempts=attempts, on=tuple(on_raw), backoff_s=float(backoff))
+    factor = raw.get("backoff_factor", 1.0)
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)) or factor < 1.0:
+        problems.append(f"{path}.retry: 'backoff_factor' must be a number >= 1.0 (1.0 = fixed delay)")
+        factor = 1.0
+    elif factor > _MAX_BACKOFF_FACTOR:
+        problems.append(f"{path}.retry: 'backoff_factor' is capped at {_MAX_BACKOFF_FACTOR}")
+        factor = _MAX_BACKOFF_FACTOR
+    return RetryPolicy(
+        max_attempts=attempts, on=tuple(on_raw), backoff_s=float(backoff),
+        backoff_factor=float(factor),
+    )
 
 
 def _parse_sequence(

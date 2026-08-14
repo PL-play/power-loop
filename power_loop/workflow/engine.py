@@ -42,6 +42,7 @@ from power_loop.runtime.structured import StructuredOutputError, parse_structure
 
 from .result import AgentResult, SharedBudget, WorkflowResult
 from .spec import (
+    MAX_BACKOFF_S,
     MAX_FOREACH_ITEMS,
     AgentNode,
     BranchNode,
@@ -151,6 +152,9 @@ async def _usage_for(parent_loop: Any, session_id: str | None) -> dict[str, int]
 #: 引擎只认**语法**（在哪、指哪个文件、切片表达式原样是什么）；读文件与渲染文案由 host 的
 #: :class:`WorkflowFileIO` 实现——那部分带语言和产品口径，不该焊进库里。
 FILEREF_RE = re.compile(r"@@FILEREF:([^\[\]@]+)(\[[^\]]*\])?@@")
+
+#: foreach 把当前迭代序号放进 body 的 env（保留键），供 FileIO 端口分配 per-iteration 产出文件。
+ITERATION_ENV_KEY = "__iteration__"
 
 
 class WorkflowFileIO(Protocol):
@@ -392,7 +396,7 @@ class WorkflowEngine:
         if self._file_io is not None:
             try:
                 output_file = node.output_file or self._file_io.output_path(
-                    node.id, iteration=env.get("__iteration__")
+                    node.id, iteration=env.get(ITERATION_ENV_KEY)
                 )
             except Exception:  # noqa: BLE001 — 产出文件是增益,不该让整个叶子起不来
                 logger.debug("file_io.output_path failed for %s", node.id, exc_info=True)
@@ -448,7 +452,9 @@ class WorkflowEngine:
                     except Exception:  # noqa: BLE001 — 归档失败不该毁掉这次重试
                         logger.debug("file_io.before_attempt failed", exc_info=True)
                 if policy is not None and policy.backoff_s > 0:
-                    await asyncio.sleep(policy.backoff_s)
+                    # 第 N 次重试等 backoff_s * factor**(N-1)；factor=1 就是固定间隔。
+                    delay = policy.backoff_s * (policy.backoff_factor ** (attempt - 2))
+                    await asyncio.sleep(min(delay, MAX_BACKOFF_S))
             raw = await self._executor.run_agent(
                 replace(spec, metadata={**spec.metadata, "attempt": attempt}),
                 user_input, parent_loop=self._loop, driver_sid=driver_sid,
@@ -646,8 +652,10 @@ class WorkflowEngine:
         items = self._resolve_items(node)
         sem = asyncio.Semaphore(node.max_concurrency)
 
-        async def one(item: Any) -> AgentResult | None:
-            child_env = {**env, node.as_var: item}
+        async def one(item: Any, index: int) -> AgentResult | None:
+            # ITERATION_ENV_KEY：body 的所有迭代共享同一个 node_id，宿主的 FileIO 端口靠它
+            # 给每次迭代分不同的产出文件——不区分的话 N 个并发迭代会追加进同一个文件，互相搅乱。
+            child_env = {**env, node.as_var: item, ITERATION_ENV_KEY: index}
             if node.parallel:
                 async with sem:
                     return await self._exec(node.body, child_env, driver_sid)
@@ -659,13 +667,13 @@ class WorkflowEngine:
         try:
             if node.parallel:
                 gathered = await self._gather_branches(
-                    [one(it) for it in items], on_error=node.on_error
+                    [one(it, i) for i, it in enumerate(items)], on_error=node.on_error
                 )
             else:
                 gathered = []
-                for it in items:
+                for i, it in enumerate(items):
                     try:
-                        gathered.append(await one(it))
+                        gathered.append(await one(it, i))
                     except Exception as exc:  # noqa: BLE001
                         if node.on_error == "halt":
                             raise

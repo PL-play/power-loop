@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+## [5.2.1] — 2026-08-15
+
+### Added
+
+* `RetryPolicy.backoff_factor`（默认 1.0 = 固定间隔）。第 N 次重试等
+  `backoff_s * backoff_factor**(N-1)`，单次等待封顶 `MAX_BACKOFF_S`（60s）——provider 限流时
+  才真正需要指数退避；等太久等于把整个 run 挂在那儿。
+
+### Fixed
+
+* `foreach` 现在把当前迭代序号放进 body 的 env（保留键 `ITERATION_ENV_KEY = "__iteration__"`），
+  宿主的 `WorkflowFileIO.output_path(..., iteration=)` 才拿得到它。**不修的话 N 个并发迭代会
+  追加进同一个产出文件，互相搅乱**——5.2.0 的文件产出端口对 foreach 实际上是坏的。
+
 ## [5.2.0] — 2026-08-14
 
 ### Added

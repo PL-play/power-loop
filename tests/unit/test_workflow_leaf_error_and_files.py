@@ -284,3 +284,56 @@ async def test_a_broken_fileio_never_takes_down_the_leaf():
     res = await _run(_leaf("a", input="ref @@FILEREF:x.md@@"), ex, file_io=_Broken())
     assert res.status == "completed"
     assert "无法读取上游产物 x.md" in ex.calls[0]["input"]
+
+
+# ── 指数退避 + foreach 迭代序号（5.2.1） ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_backoff_is_exponential_when_a_factor_is_given(monkeypatch):
+    slept: list[float] = []
+
+    async def _fake_sleep(d):
+        slept.append(d)
+
+    monkeypatch.setattr("power_loop.workflow.engine.asyncio.sleep", _fake_sleep)
+    ex = _ScriptedExecutor(script={"a": [{"status": "failed"}] * 3 + [{"status": "completed"}]})
+    await _run(_leaf("a", retry={"max_attempts": 4, "backoff_s": 2, "backoff_factor": 2}), ex)
+    assert slept == [2.0, 4.0, 8.0]          # 第 N 次重试等 backoff_s * factor**(N-1)
+
+
+@pytest.mark.asyncio
+async def test_default_backoff_factor_is_a_fixed_delay(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(
+        "power_loop.workflow.engine.asyncio.sleep",
+        lambda d: slept.append(d) or _noop(),
+    )
+
+    async def _noop():
+        return None
+
+    ex = _ScriptedExecutor(script={"a": [{"status": "failed"}] * 2 + [{"status": "completed"}]})
+    await _run(_leaf("a", retry={"max_attempts": 3, "backoff_s": 1.5}), ex)
+    assert slept == [1.5, 1.5]
+
+
+@pytest.mark.asyncio
+async def test_a_single_backoff_wait_is_capped():
+    from power_loop.workflow.spec import MAX_BACKOFF_S
+
+    assert MAX_BACKOFF_S == 60.0     # 等太久等于把整个 run 挂在那儿
+
+
+@pytest.mark.asyncio
+async def test_foreach_iterations_get_distinct_output_files():
+    """body 的所有迭代共享一个 node_id——不区分的话 N 个并发迭代会追加进同一个文件。"""
+    ex, fio = _ScriptedExecutor(), _FakeFileIO()
+    root = {
+        "type": "foreach", "id": "fan", "as": "item", "items": ["x", "y", "z"],
+        "body": _leaf("worker", input="做 {{item}}"),
+    }
+    await _run(root, ex, file_io=fio)
+    files = sorted(c["output_file"] for c in ex.calls)
+    assert files == ["outputs/worker.0.md", "outputs/worker.1.md", "outputs/worker.2.md"]
+    assert sorted(c["input"].split("做 ")[1].split("\n")[0] for c in ex.calls) == ["x", "y", "z"]
