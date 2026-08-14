@@ -8,6 +8,39 @@
 
 ## [Unreleased]
 
+## [5.2.0] — 2026-08-14
+
+### Added
+
+* **叶子级错误语义**（`AgentNode`）。容器节点的 `on_error` 管的是「兄弟分支要不要被取消」，
+  这三个管的是「这个叶子失败了怎么办」——两者正交：
+  * `retry: {max_attempts, on: [failed|empty], backoff_s}` —— 重试**起新的叶子会话**（失败会话
+    的上下文可能已被半截的工具调用污染）。`idempotency_key`（`run_id:node_id`）跨 attempt
+    **保持不变**（变了工具就没法去重），attempt 号单独进 leaf metadata 供工具区分第几次。
+    `max_attempts` 上限 5（重试烧的是真钱，无上限是个跑飞入口）；取消与预算耗尽不触发重试。
+  * `continue_on_error: bool` —— 本叶子失败不算 run 失败。
+  * `fallback: <node>` —— 所有 attempt 用尽后跑的替代节点；成功则**顶替**主节点的结果供下游
+    `inputs_from` 引用（下游引用的是主节点 id）。兜底节点不得再带 `fallback`，解析期拒绝。
+* **叶子文件产出端口** `WorkflowFileIO`（`output_path` / `render_ref` / `before_attempt`）+
+  `AgentNode.output_file`。引擎自己不碰文件系统：它只决定「哪个节点有产出文件」「输入里的引用
+  占位符在哪」，读写与文案渲染由 host 实现。输入里的 `@@FILEREF:<path>[<slice>]@@`
+  （`FILEREF_RE`）在派发前就地渲染；重试前调 `before_attempt`，host 可归档上一次的产出，
+  免得重跑内容追加到旧证据后面分不清哪次。
+
+### Changed
+
+* **BREAKING（行为）**：任一叶子 `failed` 现在会让 run 终态变成 `failed`。此前只要没抛异常
+  就报 `completed`——哪怕汇总节点整个失败了。要保留旧的容忍行为，给该节点加
+  `continue_on_error: true`。（叶子上限触顶时仍以 "leaf ceiling" 作为根因诊断。）
+* 上游节点失败时，下游 `inputs_from` 拿到的不再是空字符串，而是一段**显式的失败说明**——
+  空字符串会让下游模型把「没说话」读成「没意见」，进而在缺证据的情况下下结论。
+
+### Notes
+
+* 新字段全部参与 `to_dict()` 序列化：resume 从 journal 的 spec 重建，不序列化就等于恢复后
+  悄悄丢掉重试/兜底/产出文件配置。
+
+
 ## [5.1.0] — 2026-08-11
 
 **Minor：`send()` 支持 per-send 的 `response_format`（结构化输出不再只能在构造期定死）。**

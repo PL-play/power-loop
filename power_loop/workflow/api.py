@@ -48,12 +48,15 @@ class Workflow:
         budget: SharedBudget | None = None,
         parent_session_id: str | None = None,
         allowed_tools: Iterable[str] | None | Any = _CAPTURE,
+        file_io: Any | None = None,
     ) -> None:
         self.spec = spec
         self._loop = parent_loop
         self._executor = executor
         self._budget = budget
         self._parent_sid = parent_session_id
+        # 叶子产出文件 / 文件引用的宿主端口（5.2.0）。透传给引擎；None = 不启用。
+        self._file_io = file_io
         # Per-send capability clamp, CAPTURED AT SUBMISSION (contextvars are
         # unreliable inside a detached task): every leaf's tools are intersected
         # with this set by the engine. None = unrestricted.
@@ -83,6 +86,7 @@ class Workflow:
         engine = WorkflowEngine(
             self._loop, executor=self._executor, budget=self._budget,
             stop_event=self._cancel, allowed_tools=self._allowed_tools,
+            file_io=self._file_io,
         )
         return await engine.run(self.spec)
 
@@ -120,6 +124,7 @@ def create_workflow(
     budget: SharedBudget | None = None,
     parent_session_id: str | None = None,
     allowed_tools: Iterable[str] | None | Any = _CAPTURE,
+    file_io: Any | None = None,
 ) -> Workflow:
     """Validate ``spec_json`` and return a runnable :class:`Workflow`.
 
@@ -140,4 +145,5 @@ def create_workflow(
     return Workflow(
         spec, parent_loop=parent_loop, executor=executor, budget=budget,
         parent_session_id=parent_session_id, allowed_tools=allowed_tools,
+        file_io=file_io,
     )

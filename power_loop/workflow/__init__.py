@@ -37,9 +37,11 @@ from __future__ import annotations
 
 from .api import Workflow, create_workflow
 from .engine import (
+    FILEREF_RE,
     Executor,
     InProcessExecutor,
     WorkflowEngine,
+    WorkflowFileIO,
     WorkflowRunError,
     in_workflow,
 )
@@ -63,6 +65,7 @@ from .spec import (
     BranchNode,
     ForeachNode,
     ParallelNode,
+    RetryPolicy,
     SequenceNode,
     WorkflowBudget,
     WorkflowNode,
@@ -91,12 +94,15 @@ __all__ = [
     "WorkflowBudget",
     "WorkflowNode",
     "AgentNode",
+    "RetryPolicy",
     "SequenceNode",
     "ParallelNode",
     "ForeachNode",
     "BranchNode",
     # engine
     "WorkflowEngine",
+    "WorkflowFileIO",
+    "FILEREF_RE",
     "Executor",
     "InProcessExecutor",
     "WorkflowRunError",

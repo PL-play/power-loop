@@ -188,6 +188,7 @@ async def resume_run(
     executor: Any | None = None,
     budget: Any | None = None,
     force: bool = False,
+    file_io: Any | None = None,
 ) -> WorkflowResult:
     """Resume a run synchronously (in-process), returning the final result.
 
@@ -209,6 +210,7 @@ async def resume_run(
         on_node_start=make_on_node_start(store, parent_sid, run_id),
         replay=replay, run_id=run_id,
         allowed_tools=_journaled_clamp(j),
+        file_io=file_io,
     )
     # Mark live so a concurrent resume of the same run is refused; discard in finally.
     _LIVE_RUN_IDS.add(run_id)
@@ -233,6 +235,7 @@ async def resume_detached(
     eager_wake: bool = False,
     force: bool = False,
     on_complete: OnComplete | None = None,
+    file_io: Any | None = None,
 ) -> WorkflowRunHandle:
     """Resume a run on a background task; wake the parent on completion.
 
@@ -258,6 +261,7 @@ async def resume_detached(
             on_node_start=make_on_node_start(store, parent_sid, run_id),
             replay=replay, run_id=run_id, stop_event=cancel_token,
             allowed_tools=_journaled_clamp(j),
+            file_io=file_io,
         )
 
     return spawn_background(

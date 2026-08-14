@@ -257,6 +257,7 @@ async def run_detached(
             on_node_start=make_on_node_start(store, parent_sid, run_id),
             stop_event=workflow._cancel, run_id=run_id,
             allowed_tools=workflow._allowed_tools,
+            file_io=getattr(workflow, "_file_io", None),
         )
 
     return spawn_background(

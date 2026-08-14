@@ -51,6 +51,8 @@ _IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*$")
 
 __all__ = [
     "WorkflowSpecError",
+    "RetryPolicy",
+    "RETRY_TRIGGERS",
     "AgentNode",
     "SequenceNode",
     "ParallelNode",
@@ -86,6 +88,26 @@ class WorkflowSpecError(SpecValidationError):
 # (so construction stays cheap and the public surface is ``WorkflowSpec``).
 
 
+#: retry.on 的合法取值：``failed`` = executor 返回的 status 不是 completed；
+#: ``empty`` = 完成了但没有正文（模型空转收尾）。
+RETRY_TRIGGERS = frozenset({"failed", "empty"})
+_MAX_ATTEMPTS_CAP = 5
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """叶子重试策略。
+
+    重试**起新的叶子会话**，不续跑失败那个：失败会话的上下文可能已被半截的工具调用污染。
+    🔴 重试会重跑工具——引擎的 ``idempotency_key``（run_id:node_id）在各次 attempt 之间
+    **保持不变**（变了工具就没法去重），另在 metadata 里带 ``attempt`` 供工具区分第几次。
+    """
+
+    max_attempts: int = 1
+    on: tuple[str, ...] = ("failed", "empty")
+    backoff_s: float = 0.0
+
+
 @dataclass(frozen=True)
 class AgentNode:
     """Run a single sub-agent.
@@ -104,6 +126,17 @@ class AgentNode:
     input: str = "{{input}}"
     inputs_from: tuple[str, ...] = ()
     output_schema: dict[str, Any] | None = None
+    #: 叶子级错误语义（design/64 §1）。容器节点的 ``on_error`` 管的是「兄弟分支要不要被取消」，
+    #: 这三个管的是「这个叶子失败了怎么办」——两者正交。
+    retry: RetryPolicy | None = None
+    #: True = 本叶子失败不算 run 失败（下游仍会拿到一个**显式的失败说明**，不是空字符串——
+    #: 空字符串会让下游模型以为上游「没意见」，进而在缺证据的情况下下结论）。
+    continue_on_error: bool = False
+    #: 所有 attempt 用尽后跑的替代节点；它成功则顶替本节点的结果供下游引用。
+    #: 兜底节点自身不得再带 fallback（防递归），解析期拒绝。
+    fallback: WorkflowNode | None = None
+    #: 本叶子的产出文件（相对 run 工作区）。None = 由 host 的 FileIO 端口按 node_id 默认命名。
+    output_file: str | None = None
 
 
 @dataclass(frozen=True)
@@ -306,6 +339,20 @@ def _node_to_dict(node: WorkflowNode) -> dict[str, Any]:
             out["inputs_from"] = list(node.inputs_from)
         if node.output_schema is not None:
             out["output_schema"] = node.output_schema
+        # 🔴 resume 从 journal 里的 to_dict() 重建 spec：这几个字段不序列化，
+        # 恢复后的 run 就会悄悄丢掉重试/兜底/产出文件配置。
+        if node.retry is not None:
+            out["retry"] = {
+                "max_attempts": node.retry.max_attempts,
+                "on": list(node.retry.on),
+                "backoff_s": node.retry.backoff_s,
+            }
+        if node.continue_on_error:
+            out["continue_on_error"] = True
+        if node.fallback is not None:
+            out["fallback"] = _node_to_dict(node.fallback)
+        if node.output_file is not None:
+            out["output_file"] = node.output_file
         return out
     if isinstance(node, SequenceNode):
         out = {"type": "sequence", "steps": [_node_to_dict(s) for s in node.steps]}
@@ -564,7 +611,10 @@ def _parse_agent(
     data: dict, path: str, problems: list[str], ids: set[str], body_ids: set[str]
 ) -> AgentNode | None:
     _check_unknown(
-        data, {"type", "id", "spec", "input", "inputs_from", "output_schema"}, path, problems
+        data,
+        {"type", "id", "spec", "input", "inputs_from", "output_schema",
+         "retry", "continue_on_error", "fallback", "output_file"},
+        path, problems,
     )
     node_id = data.get("id")
     if not isinstance(node_id, str) or not node_id.strip():
@@ -625,6 +675,27 @@ def _parse_agent(
             if extra:
                 problems.append(f"{path}: output_schema has unknown key(s): {sorted(extra)}")
 
+    retry = _parse_retry(data.get("retry"), path, problems)
+
+    cont = data.get("continue_on_error", False)
+    if not isinstance(cont, bool):
+        problems.append(f"{path}: 'continue_on_error' must be a boolean")
+        cont = False
+
+    out_file = data.get("output_file")
+    if out_file is not None and (not isinstance(out_file, str) or not out_file.strip()):
+        problems.append(f"{path}: 'output_file' must be a non-empty string")
+        out_file = None
+
+    fallback = None
+    if data.get("fallback") is not None:
+        fb_raw = data["fallback"]
+        if isinstance(fb_raw, dict) and isinstance(fb_raw.get("fallback"), dict):
+            # 兜底的兜底 = 一条没人能推理的失败链;拒绝而不是默默展开(strict-schema 同款立场)。
+            problems.append(f"{path}.fallback: a fallback node must not declare its own 'fallback'")
+        else:
+            fallback = _parse_node(fb_raw, f"{path}.fallback", problems, ids, body_ids)
+
     if spec_obj is None:
         return None
     return AgentNode(
@@ -634,7 +705,50 @@ def _parse_agent(
         input=inp,
         inputs_from=tuple(inputs_from),
         output_schema=out_schema,
+        retry=retry,
+        continue_on_error=cont,
+        fallback=fallback,
+        output_file=out_file,
     )
+
+
+def _parse_retry(raw: Any, path: str, problems: list[str]) -> RetryPolicy | None:
+    """``{"max_attempts": 3, "on": ["failed"], "backoff_s": 2}`` → RetryPolicy。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append(f"{path}: 'retry' must be an object {{max_attempts, on?, backoff_s?}}")
+        return None
+    extra = set(raw) - {"max_attempts", "on", "backoff_s"}
+    if extra:
+        problems.append(f"{path}.retry: unknown key(s): {sorted(extra)}")
+    attempts = raw.get("max_attempts", 1)
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+        problems.append(f"{path}.retry: 'max_attempts' must be an integer >= 1")
+        attempts = 1
+    elif attempts > _MAX_ATTEMPTS_CAP:
+        # 重试烧的是真钱(每次都是一整个叶子 run);无上限的 max_attempts 是个跑飞的入口。
+        problems.append(
+            f"{path}.retry: 'max_attempts' is capped at {_MAX_ATTEMPTS_CAP} (got {attempts})"
+        )
+        attempts = _MAX_ATTEMPTS_CAP
+    on_raw = raw.get("on", ["failed", "empty"])
+    if isinstance(on_raw, str):
+        on_raw = [on_raw]
+    if not isinstance(on_raw, list) or not all(isinstance(x, str) for x in on_raw):
+        problems.append(f"{path}.retry: 'on' must be a list of {sorted(RETRY_TRIGGERS)}")
+        on_raw = ["failed", "empty"]
+    unknown = [x for x in on_raw if x not in RETRY_TRIGGERS]
+    if unknown:
+        problems.append(
+            f"{path}.retry: unknown trigger(s) {unknown}; allowed: {sorted(RETRY_TRIGGERS)}"
+        )
+        on_raw = [x for x in on_raw if x in RETRY_TRIGGERS]
+    backoff = raw.get("backoff_s", 0.0)
+    if isinstance(backoff, bool) or not isinstance(backoff, (int, float)) or backoff < 0:
+        problems.append(f"{path}.retry: 'backoff_s' must be a number >= 0")
+        backoff = 0.0
+    return RetryPolicy(max_attempts=attempts, on=tuple(on_raw), backoff_s=float(backoff))
 
 
 def _parse_sequence(

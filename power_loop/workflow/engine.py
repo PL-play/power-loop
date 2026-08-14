@@ -147,6 +147,27 @@ async def _usage_for(parent_loop: Any, session_id: str | None) -> dict[str, int]
     }
 
 
+#: 叶子输入里的文件引用占位符：``@@FILEREF:outputs/static.md[-50:]@@``。
+#: 引擎只认**语法**（在哪、指哪个文件、切片表达式原样是什么）；读文件与渲染文案由 host 的
+#: :class:`WorkflowFileIO` 实现——那部分带语言和产品口径，不该焊进库里。
+FILEREF_RE = re.compile(r"@@FILEREF:([^\[\]@]+)(\[[^\]]*\])?@@")
+
+
+class WorkflowFileIO(Protocol):
+    """叶子产出文件与文件引用的宿主端口（design/64 §2）。引擎自己不碰文件系统。"""
+
+    def output_path(self, node_id: str, *, iteration: int | None = None) -> str:
+        """该节点产出文件的路径（相对 run 工作区）。foreach 的每次迭代给不同的 ``iteration``——
+        body 节点共享一个 node_id，不区分就会互相覆盖。"""
+
+    def render_ref(self, path: str, slice_expr: str) -> str:
+        """把一处文件引用渲染成要注入叶子输入的文本（路径 + 片段 + **截断留痕**）。"""
+
+    def before_attempt(self, node_id: str, path: str, attempt: int) -> None:
+        """第 2 次及以后的 attempt 开始前调用：host 可以把上一次的产出归档，
+        免得重跑的内容追加到旧证据后面分不清哪次。"""
+
+
 class WorkflowEngine:
     """Interpret a :class:`WorkflowSpec` to completion (in-process)."""
 
@@ -163,6 +184,7 @@ class WorkflowEngine:
         run_id: str | None = None,
         close_driver: bool = True,
         allowed_tools: frozenset[str] | None = None,
+        file_io: WorkflowFileIO | None = None,
     ) -> None:
         self._loop = parent_loop
         self._executor = executor or InProcessExecutor()
@@ -209,6 +231,12 @@ class WorkflowEngine:
         # (bypassing the parse-time caps). Counted in _exec_agent; fail-closed past the ceiling.
         self._leaves_run = 0
         self._leaf_cap_hit = False
+        # 叶子产出文件与文件引用的宿主端口（design/64 §2）。引擎不碰文件系统：它只决定
+        # 「哪个节点有产出文件」「输入里的引用占位符在哪」，读写与文案渲染都由 host 实现。
+        # None = 不启用（老行为）。
+        self._file_io = file_io
+        # 明知会失败仍放行的节点（continue_on_error）——run 终态判定要跳过它们。
+        self._tolerated: set[str] = set()
         # Token usage accumulated exactly once per real leaf execution (and once
         # per replayed result on resume). Robust against the foreach-body id
         # collision, which would double/under-count if summed from _results.
@@ -244,7 +272,22 @@ class WorkflowEngine:
                 status = "cancelled"
             elif self._budget_hit:
                 status = "budget_exceeded"
-            elif self._leaf_cap_hit and status == "completed":
+            elif status == "completed" and not self._leaf_cap_hit:
+                # 以前只要没抛异常就报 completed——哪怕 judge 节点整个失败了。
+                # 现在:任一叶子 failed 即 run failed,除非它显式 continue_on_error(或被兜底救回,
+                # 那种情况结果已被顶替成 completed)。这是 continue_on_error 得以有意义的前提。
+                # (叶子上限触顶时跳过:那时下面那条「ceiling」才是准确的根因诊断。)
+                broken = [
+                    nid for nid, r in self._results.items()
+                    if r.status == "failed" and nid not in self._tolerated
+                ]
+                if broken:
+                    status = "failed"
+                    self._errors.append(
+                        "failed node(s): " + ", ".join(sorted(broken))
+                        + "（如果这些失败是可接受的，给对应节点加 continue_on_error: true）"
+                    )
+            if self._leaf_cap_hit and status == "completed":
                 # The leaf ceiling fail-closes individual leaves (status=failed); surface it at the
                 # run level so a truncated fanout isn't reported as a clean "completed". (H3)
                 status = "failed"
@@ -326,9 +369,36 @@ class WorkflowEngine:
 
         user_input = _render(node.input, env)
         if node.inputs_from:
-            extras = [self._results[r].text for r in node.inputs_from if r in self._results]
+            extras = []
+            for ref in node.inputs_from:
+                up = self._results.get(ref)
+                if up is None:
+                    continue
+                if up.status != "completed":
+                    # 🔴 上游失败时**绝不能**给空字符串:下游模型会把「没说话」读成「没意见」,
+                    # 进而在缺证据的情况下下结论。给一个显式的失败说明。
+                    extras.append(
+                        f"[上游节点 '{ref}' 未产出结果：{up.error or up.status}。"
+                        f"本次没有它的证据——不要把「没有发现」当成「没有问题」。]"
+                    )
+                else:
+                    extras.append(up.text)
             if extras:
                 user_input = user_input + "\n\n--- context ---\n" + "\n\n".join(extras)
+
+        # 文件产出与文件引用（design/64 §2）：产出路径进 metadata 供 host/叶子使用；
+        # 输入里的 @@FILEREF:…@@ 就地换成「路径 + 片段 + 截断留痕」。
+        output_file: str | None = None
+        if self._file_io is not None:
+            try:
+                output_file = node.output_file or self._file_io.output_path(
+                    node.id, iteration=env.get("__iteration__")
+                )
+            except Exception:  # noqa: BLE001 — 产出文件是增益,不该让整个叶子起不来
+                logger.debug("file_io.output_path failed for %s", node.id, exc_info=True)
+            user_input = FILEREF_RE.sub(
+                lambda m: self._render_fileref(m.group(1), m.group(2) or ""), user_input
+            )
 
         # keep trace + readable usage (linked); enforce structured output at the
         # provider via the node's output_schema so real models return JSON, not prose.
@@ -349,17 +419,52 @@ class WorkflowEngine:
             tools=leaf_tools,
             lifecycle="linked",
             output_schema=node.output_schema,
-            metadata={**node.spec.metadata, **self._step_idempotency(node.id)},
+            metadata={
+                **node.spec.metadata,
+                **self._step_idempotency(node.id),
+                **({"output_file": output_file} if output_file else {}),
+            },
         )
         if self._on_node_start is not None:
             try:
                 await self._on_node_start(node.id)
             except Exception:  # noqa: BLE001 — observability must not fail the run
                 pass
-        raw = await self._executor.run_agent(
-            spec, user_input, parent_loop=self._loop, driver_sid=driver_sid,
-            stop_event=self._cancel,
-        )
+
+        # ── 重试循环（design/64 §1）──────────────────────────────────────────────
+        # 每次 attempt 都起**新的叶子会话**（失败会话的上下文可能已被半截的工具调用污染）。
+        # idempotency_key 跨 attempt 不变（变了工具就没法去重），attempt 号单独进 metadata。
+        policy = node.retry
+        max_attempts = policy.max_attempts if policy is not None else 1
+        triggers = set(policy.on) if policy is not None else set()
+        raw: dict[str, Any] = {}
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                # 重跑会把产出**追加**到已有文件里,证据混在一起分不清哪次——交给 host 处理
+                # (DeepTalk:改名成 .attempt<N>.md 留证据但不混淆)。
+                if self._file_io is not None and output_file:
+                    try:
+                        self._file_io.before_attempt(node.id, output_file, attempt)
+                    except Exception:  # noqa: BLE001 — 归档失败不该毁掉这次重试
+                        logger.debug("file_io.before_attempt failed", exc_info=True)
+                if policy is not None and policy.backoff_s > 0:
+                    await asyncio.sleep(policy.backoff_s)
+            raw = await self._executor.run_agent(
+                replace(spec, metadata={**spec.metadata, "attempt": attempt}),
+                user_input, parent_loop=self._loop, driver_sid=driver_sid,
+                stop_event=self._cancel,
+            )
+            if attempt >= max_attempts or not self._should_retry(raw, triggers):
+                break
+            # 取消/预算耗尽时不再重试:那不是「这次没跑好」,是整个 run 该停了。
+            if self._cancel.is_cancelled() or (
+                self._budget is not None and not self._budget.can_spawn()
+            ):
+                break
+            logger.info(
+                "workflow leaf %s attempt %d/%d failed (%s); retrying",
+                node.id, attempt, max_attempts, raw.get("status"),
+            )
         if str(raw.get("status")) == "cancelled":
             self._cancelled = True
         payload: dict[str, Any] | None = None
@@ -391,7 +496,46 @@ class WorkflowEngine:
         if self._budget is not None:
             self._budget.commit(res.usage)
         await self._emit_step(res)
+
+        # ── 兜底节点：所有 attempt 用尽仍失败时跑，成功则**顶替**本节点的结果供下游引用 ──
+        if res.status != "completed" and node.fallback is not None and not self._cancelled:
+            logger.info("workflow leaf %s failed; running fallback", node.id)
+            fb = await self._exec(node.fallback, env, driver_sid)
+            if fb is not None and fb.status == "completed":
+                # 下游引用的是主节点 id,所以结果要挂在主节点上;兜底自己的记录也留着(它有自己的 id)。
+                res = replace(
+                    fb, node_id=node.id,
+                    error=f"primary failed ({res.error or res.status}); recovered by fallback "
+                          f"'{node.fallback.id}'",
+                )
+                self._results[node.id] = res
+                self._last = res
+                await self._emit_step(res)
+                return res
+
+        # continue_on_error:失败但明确放行——记下来,run 终态判定跳过它。
+        if res.status == "failed" and node.continue_on_error:
+            self._tolerated.add(node.id)
         return res
+
+    def _render_fileref(self, path: str, slice_expr: str) -> str:
+        if self._file_io is None:
+            return ""
+        try:
+            return self._file_io.render_ref(path, slice_expr)
+        except Exception:  # noqa: BLE001 — 引用渲染失败要说出来,不能悄悄注入空串
+            logger.debug("file_io.render_ref failed for %s", path, exc_info=True)
+            return f"[无法读取上游产物 {path}]"
+
+    @staticmethod
+    def _should_retry(raw: dict[str, Any], triggers: set[str]) -> bool:
+        """这次 attempt 该不该重试。``failed``=状态不是 completed;``empty``=完成但没正文。"""
+        status = str(raw.get("status") or "")
+        if status == "cancelled":
+            return False          # 取消不是「没跑好」
+        if status != "completed":
+            return "failed" in triggers
+        return "empty" in triggers and not str(raw.get("final_text") or "").strip()
 
     def _add_usage(self, usage: dict[str, int] | None) -> None:
         for k in self._usage_acc:
