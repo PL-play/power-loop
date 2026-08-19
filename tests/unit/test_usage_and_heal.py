@@ -114,6 +114,42 @@ async def test_send_result_carries_summed_usage(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tool_rounds_also_persist_per_round_usage_rows(tmp_path):
+    """每一轮都要有 usage_rounds 行——包括带工具调用的回合。
+
+    5.2.2 之前 on_round_ended(usage=…) 只在无工具回合的收尾路径上发：agent 会话里几乎
+    每轮都带工具，于是一个 34 轮的叶子在表里只剩最后一轮那一行（2026-08-19 线上实锤）。
+    总量从来没错（session_stats 用 send 结束时的内存聚合 bump），丢的是这张表存在的
+    唯一意义——逐轮明细。"""
+    import sqlite3
+
+    from power_loop import AgentLoopConfig, create_default_tool_registry
+
+    llm = _Scripted(responses=[
+        _tool_resp("c1", "todo_write", prompt=100, completion=10),  # round 1: tool round
+        _tool_resp("c2", "todo_write", prompt=120, completion=12),  # round 2: tool round
+        _resp("final answer", prompt=150, completion=5),            # round 3: text
+    ])
+    reg = create_default_tool_registry(preset="core", bind=False)
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=str(tmp_path / "s.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=6),
+        tool_registry=reg,
+    )
+    sid = await loop.new_session()
+    res = await loop.send("hi", session_id=sid)
+    assert res.status == "completed"
+    loop.close()
+    rows = sqlite3.connect(str(tmp_path / "s.db")).execute(
+        "SELECT round_index, prompt_tokens, completion_tokens FROM pl_usage_rounds "
+        "WHERE session_id=? ORDER BY round_index", (sid,)
+    ).fetchall()
+    assert [r[0] for r in rows] == [0, 1, 2], f"每轮一行，含工具回合；实际 {rows}"
+    assert [r[1] for r in rows] == [100, 120, 150]
+    assert [r[2] for r in rows] == [10, 12, 5]
+
+
+@pytest.mark.asyncio
 async def test_each_send_gets_its_own_usage(tmp_path):
     from power_loop import AgentLoopConfig
 

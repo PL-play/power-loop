@@ -1420,6 +1420,13 @@ class AgentPipeline:
                 used_todo=used_todo,
             )
             await self.hooks.run_typed_async(HookPoint.ROUND_END, round_end)
+            # Per-round usage row for TOOL rounds too. This was only emitted on the
+            # no-tools paths above, so an agent session (where nearly every round calls
+            # tools) persisted usage for just its final round — a 34-round leaf showed
+            # exactly one usage_rounds row. Totals were never wrong (session_stats bumps
+            # from the run's in-memory aggregate at end-of-send); what was missing is the
+            # per-round breakdown this table exists for.
+            await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
 
             if not used_todo:
                 self.rounds_since_todo += 1
