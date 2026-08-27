@@ -34,11 +34,12 @@ dependencies = []
 # transport when you actually construct that provider. Pick the one(s) you use:
 #   pip install 'power-loop[openai]'      # OpenAI-compatible endpoints
 #   pip install 'power-loop[anthropic]'   # Anthropic Messages API endpoints
-#   pip install 'power-loop[all]'         # both transports + skills + pdf
+#   pip install 'power-loop[all]'         # both transports + skills + pdf + images
 anthropic = ["anthropic>=0.42.0"]
 openai = ["openai>=1.52.0"]
 skills = ["pyyaml>=6.0"]          # YAML frontmatter parsing in load_skill (degrades to none without it)
 pdf = ["pypdf>=5.3.0"]            # PDF input parsing in the multimodal helper
+images = ["Pillow>=10"]           # enforce ModelCapabilities.max_image_edge (without it an oversized image is sent at original size, with a warning)
 prometheus = ["prometheus-client>=0.19"]  # contrib.metrics_sink PrometheusBackend (OBS-4)
 statsd = ["statsd>=4.0"]                   # contrib.metrics_sink StatsDBackend (OBS-4)
 otel = ["opentelemetry-sdk>=1.20"]         # contrib.otel_sink span bridge (OBS-5)
@@ -46,7 +47,7 @@ mcp = ["mcp>=1.0"]                         # contrib.mcp StdioMCPClient (ECO-1)
 postgres = ["asyncpg>=0.29"]               # runtime.store PostgreSQL backend
 mysql = ["aiomysql>=0.2"]                   # runtime.store MySQL backend (pure-Python driver)
 all = [
-    "anthropic>=0.42.0", "openai>=1.52.0", "pyyaml>=6.0", "pypdf>=5.3.0",
+    "anthropic>=0.42.0", "openai>=1.52.0", "pyyaml>=6.0", "pypdf>=5.3.0", "Pillow>=10",
     "prometheus-client>=0.19", "statsd>=4.0", "opentelemetry-sdk>=1.20", "mcp>=1.0",
     "asyncpg>=0.29", "aiomysql>=0.2",
 ]

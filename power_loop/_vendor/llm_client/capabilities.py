@@ -58,6 +58,15 @@ class ModelCapabilities:
     #: Accepts images inline in a chat message (as a base64 ``data:`` URL — the only image
     #: transport this library implements).
     supports_image_input: bool | None = None
+    #: Longest edge, in pixels, of an image sent to this model. ``None`` = send as-is.
+    #:
+    #: This is the ONE knob that actually reduces cost: image tokens are billed by PIXEL
+    #: DIMENSIONS, not by bytes — a 787 KB noise PNG and a 1.8 KB flat-colour PNG of the same
+    #: size cost exactly the same (measured). Re-encoding at lower JPEG quality saves bandwidth
+    #: and not one token; halving the longest edge saves ~43%. Enforced at the single render
+    #: point, so every path in (a fresh send, a recalled image, anything a host builds) is
+    #: covered by construction.
+    max_image_edge: int | None = None
 
     def require_image_input(self, *, what: str) -> None:
         """Raise unless image input is DECLARED supported. ``what`` names the offending
@@ -87,17 +96,21 @@ def coerce_capabilities(value: Any, *, model: str = "") -> ModelCapabilities:
     that declared nothing gets a model that can do nothing beyond plain text, loudly.
     """
     if isinstance(value, ModelCapabilities):
-        return value if value.model or not model else ModelCapabilities(
-            model=model, supports_image_input=value.supports_image_input
+        if value.model or not model:
+            return value
+        return ModelCapabilities(
+            model=model,
+            supports_image_input=value.supports_image_input,
+            max_image_edge=value.max_image_edge,
         )
     fields: dict[str, Any] = dict(value or {})
-    unknown = set(fields) - {"model", "supports_image_input"}
+    unknown = set(fields) - {"model", "supports_image_input", "max_image_edge"}
     if unknown:
         # A typo'd or retired key (supports_tools, supports_stream, api_family, provider,
         # supports_pdf_input_* — all removed as dead config) must not read as "declared".
         raise ValueError(
             f"Unknown model capability key(s): {sorted(unknown)}. "
-            "Supported keys: 'supports_image_input'."
+            "Supported keys: 'supports_image_input', 'max_image_edge'."
         )
     fields.setdefault("model", model)
     return ModelCapabilities(**fields)

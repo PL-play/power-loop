@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,8 @@ try:
 except Exception:  # pragma: no cover
     PdfReader = None  # type: ignore[assignment,misc]
 
+
+logger = logging.getLogger(__name__)
 
 MAX_PDF_TEXT_CHARS = 24_000
 
@@ -111,6 +114,44 @@ def _extract_pdf_text(path: Path) -> str:
     return "\n\n".join(pages)[:MAX_PDF_TEXT_CHARS]
 
 
+def _downscale_to_data_url(path: Path, mime_type: str, max_edge: int | None) -> str:
+    """Data URL for ``path``, downscaled so its longest edge is at most ``max_edge``.
+
+    A file already within the limit is streamed through UNTOUCHED — no decode, no re-encode —
+    so the common case (a host that already sized the image) costs nothing. Pillow is optional;
+    without it the image is sent at its original size rather than not at all, with one warning.
+    """
+    if not max_edge or max_edge <= 0:
+        return _file_to_data_url(path, mime_type)
+    try:
+        import io
+
+        from PIL import Image
+    except ImportError:
+        logger.warning(
+            "max_image_edge=%s requested but Pillow is not installed; sending %s at its "
+            "original size. Install power-loop[images] (or Pillow) to enforce the limit.",
+            max_edge, path.name,
+        )
+        return _file_to_data_url(path, mime_type)
+    try:
+        with Image.open(path) as img:
+            if max(img.width, img.height) <= max_edge:
+                return _file_to_data_url(path, mime_type)  # already within budget
+            scale = max_edge / float(max(img.width, img.height))
+            resized = img.convert("RGB").resize(
+                (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+            )
+            buf = io.BytesIO()
+            resized.save(buf, format="JPEG", quality=85, optimize=True)
+        payload = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{payload}"
+    except Exception:  # noqa: BLE001 — a decode failure must not lose the image entirely
+        logger.warning("could not downscale %s; sending it at original size", path.name,
+                       exc_info=True)
+        return _file_to_data_url(path, mime_type)
+
+
 def _render_image_attachment(ref: AttachmentRef, path: Path, capabilities: ModelCapabilities) -> PreparedAttachment:
     # Raises unless the model DECLARED image support. There is deliberately no text-downgrade
     # branch here any more: swapping the picture for "[Attached image: foo.png] the model does
@@ -119,7 +160,9 @@ def _render_image_attachment(ref: AttachmentRef, path: Path, capabilities: Model
     capabilities.require_image_input(what=f"image {ref.filename!r}")
     part = {
         "type": "image_url",
-        "image_url": {"url": _file_to_data_url(path, ref.mime_type)},
+        "image_url": {
+            "url": _downscale_to_data_url(path, ref.mime_type, capabilities.max_image_edge)
+        },
     }
     return PreparedAttachment(ref=ref, rendered_parts=(part,), strategy="native-image")
 

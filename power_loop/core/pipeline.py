@@ -83,6 +83,7 @@ from power_loop.runtime.budget import estimate_message_tokens, estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.compact import CompactionContext
 from power_loop.runtime.human_input import HumanInputRequired
+from power_loop.runtime.image_recall import drain_queued_images
 from power_loop.runtime.memory import MemorySnapshot
 from power_loop.runtime.retry import with_retry
 from power_loop.tools.registry import ToolRegistry
@@ -1040,6 +1041,14 @@ class AgentPipeline:
             for _pm in llm_before.persist_messages:
                 await self._append_message(_pm, round_index=round_idx)
                 llm_before.messages.append(dict(_pm))
+
+            # EPHEMERAL image recall: a tool (e.g. recall_send hitting an image row) can put a
+            # picture back in front of the model for exactly ONE round. Appended to the request
+            # only — never persisted, so it does not enter history or the projection. Durable
+            # would mean an agent that recalled three times carries three images forever, which
+            # is the unbounded growth the projection exists to prevent.
+            for _img in drain_queued_images(self.session_id):
+                llm_before.messages.append(_img)
 
             if llm_before.directive == HookDirective.SHORT_CIRCUIT:
                 response = llm_before.output

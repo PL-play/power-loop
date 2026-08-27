@@ -8,9 +8,25 @@
 
 ## [Unreleased]
 
+## [6.0.0] — 2026-08-28
+
 ### Added
 
-* 顶层导出 `create_attachment_ref()`：构造多模态输入的必需件，宿主不该为此 import `_vendor` 内部路径。（未进 `STABLE_API`——多模态输入面仍在演进。）
+* **`ModelCapabilities.max_image_edge`：图片长边上限，在渲染的唯一汇点生效。** 因此「新发的图」
+  「recall 回取放回眼前的图」「宿主自己塞的图」一律受限——不靠每条入口各自记得裁一次。
+  已在限内的文件**原样直通**（不解码、不重编码），所以常见情况零开销。Pillow 是可选依赖
+  （`power-loop[images]`，已并入 `[all]`）；缺席时按原尺寸发送并告警一次，而不是把图丢掉。
+  为什么是这个旋钮：图片按**像素**计费而非字节——787KB 的噪点图与 1.8KB 的同尺寸纯色图 token
+  完全相同（实测），所以降 JPEG 质量一个 token 都不省，缩边长省 43%。
+
+* **按需图片回取**：`recall_send(send_index, seq=…)` 命中一行含图片的记录时，把图放回模型眼前
+  **一轮**（`runtime/image_recall.py`）。图不能从工具返回——OpenAI 兼容协议的 `tool` 消息
+  是纯文本类型——所以它作为独立 user 消息进入本轮请求，工具返回值只说明「图已放到你眼前」。
+  刻意是 **ephemeral**：只进请求、不落库、不进投影，否则回取三次就永久携带三张图，正是投影
+  要避免的无界增长。
+
+* 顶层导出 `create_attachment_ref()`：构造多模态输入的必需件，宿主不该为此 import `_vendor`
+  内部路径。（未进 `STABLE_API`——多模态输入面仍在演进。）
 
 ### Changed — BREAKING
 
@@ -47,6 +63,10 @@
   刚刚被消灭的那种「无中生有的答案」。不支持的附件类型同理，不再降级成占位文字。
 
 ### Fixed
+
+* **`recall_send` 会把序列化的多模态记录原样吐给模型。** 它直接返回 `content` 文本列，而多模态
+  行存的是 JSON——内联 data URL 的话就是整个 base64。现在文本侧走与投影同一个蒸馏
+  （`[image: shot.png]`），图片侧改为放回眼前（见 Added）。纯文本记录不受影响。
 
 * **steering 会丢掉图片。** 进程内 follow-up 队列保留的是原始对象，但 `merge_follow_up_inputs`
   用 `json.dumps` 把 content 压成一坨文本——图片只以「序列化后的块」形式活下来，模型看不见。

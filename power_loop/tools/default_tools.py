@@ -1747,7 +1747,10 @@ async def run_recall_send(send_index: int, seq: int | None = None) -> str:
 
     blocks: list[str] = []
     for r in rows:
-        body = r.content or ""
+        # 蒸馏（而不是原样吐 content）：多模态行的 content 是 JSON，原样返回等于把序列化的
+        # 块列表——内联 data URL 的话就是整个 base64——塞给模型。列整个 send 时不注入图片：
+        # 一次注入十几张会失控；要看某一行，recall 那一行（带 seq）。
+        body, _ = _recall_row_body(r)
         suffix = ""
         if r.tool_calls:
             names = ", ".join(_tc_name(tc) for tc in r.tool_calls)
@@ -1769,6 +1772,30 @@ async def run_recall_send(send_index: int, seq: int | None = None) -> str:
     return f"send #{target} — {len(rows)} message(s):\n\n" + "\n\n".join(blocks)
 
 
+def _recall_row_body(row: Any) -> tuple[str, list[str]]:
+    """One stored row → (text a tool may return, local paths of any images in it).
+
+    A multimodal row's ``content`` column holds JSON, and returning it raw hands the model a
+    serialized block list — with an inlined data URL that is the whole base64 payload. So the
+    text side is DISTILLED (same helper the projection uses), and the images are reported
+    separately for the caller to put back in front of the model.
+    """
+    from power_loop.runtime.representation import distill_multimodal_text
+    from power_loop.runtime.store.types import decode_row_content
+
+    text = distill_multimodal_text(getattr(row, "content", None), getattr(row, "meta", None)) or ""
+    decoded = decode_row_content(getattr(row, "content", None), getattr(row, "meta", None))
+    paths: list[str] = []
+    if isinstance(decoded, list):
+        for block in decoded:
+            if not isinstance(block, dict) or block.get("type") != "attachment":
+                continue
+            att = block.get("attachment") or {}
+            if att.get("kind") == "image" and att.get("path"):
+                paths.append(str(att["path"]))
+    return text, paths
+
+
 def _render_recall_row(hit: Any, rows: list[Any], *, cap: int, head: str) -> str:
     """One original row in full (capped at ``cap`` chars, remainder counted), preceded by the
     assistant call that produced it when the row is a tool result."""
@@ -1784,12 +1811,34 @@ def _render_recall_row(hit: Any, rows: list[Any], *, cap: int, head: str) -> str
                         f"{fn.get('arguments') or ''}"
                     )
                     break
-    body = hit.content or ""
+    body, image_paths = _recall_row_body(hit)
     total = len(body)
     if total > cap:
         body = body[:cap] + f" …[truncated: {total - cap} more chars of {total}]"
     label = f"[seq {hit.seq} · {hit.role}" + (f" · {hit.name}" if hit.name else "") + "]"
     blocks.append(f"{label}\n{body}")
+    # This row held image(s): put them back in front of the model for ONE round. A tool result
+    # cannot carry an image (OpenAI-compatible `tool` messages are text-only), so the picture
+    # arrives as its own user message and this text just says it is there.
+    if image_paths:
+        from power_loop.core.agent_context import get_session_id
+        from power_loop.runtime.image_recall import queue_image_for_next_round
+
+        sid = get_session_id()
+        shown = [
+            p for p in image_paths
+            if queue_image_for_next_round(sid, path=p, note=f"（{head} 里的图，已放回你眼前）")
+        ]
+        if shown:
+            blocks.append(
+                f"[{len(shown)} 张图已放到你眼前——它们只在这一轮可见，看完就没了；"
+                "还要再看就再 recall 一次。]"
+            )
+        else:
+            blocks.append(
+                "[这一行有图，但没能放进上下文（会话不可用或本轮排队已满）；"
+                "可以用 see_image 直接看它的路径。]"
+            )
     return f"{head} — original row ({total} chars):\n\n" + "\n\n".join(blocks)
 
 
