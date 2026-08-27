@@ -82,6 +82,19 @@ def _format_messages_for_debug(messages: Sequence[dict[str, Any]]) -> str:
 
 
 
+def merge_request_extra(base: dict[str, Any] | None, override: dict[str, Any] | None) -> dict[str, Any]:
+    """Config-level ``request_extra`` under a request's ``extra`` (request wins; ``extra_body`` merged)."""
+    out: dict[str, Any] = dict(base or {})
+    for k, v in dict(override or {}).items():
+        if k == "extra_body" and isinstance(v, dict) and isinstance(out.get("extra_body"), dict):
+            out["extra_body"] = {**out["extra_body"], **v}
+        else:
+            out[k] = v
+    if isinstance(out.get("extra_body"), dict):
+        out["extra_body"] = dict(out["extra_body"])
+    return out
+
+
 class OpenAICompatibleChatLLMService(LLMService):
     """
     Minimal OpenAI-compatible chat completion client.
@@ -445,12 +458,12 @@ class OpenAICompatibleChatLLMService(LLMService):
                 await asyncio.sleep(delay)
         raise cast(Exception, last_err)
 
-    def _request_kwargs(self, request: LLMRequest) -> dict[str, Any]:
+    def _request_kwargs(self, request: LLMRequest) -> dict[str, Any]:  # noqa: C901
         """
         Map `LLMRequest` into kwargs for OpenAI-compatible chat.completions.create.
         Falls back to self._cfg for default settings.
         """
-        out: dict[str, Any] = dict(request.extra or {})
+        out: dict[str, Any] = merge_request_extra(getattr(self._cfg, "request_extra", None), request.extra)
         out["model"] = request.model if request.model else self._cfg.model
         
         req_temp = request.temperature if request.temperature is not None else self._cfg.temperature

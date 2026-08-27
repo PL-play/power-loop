@@ -35,6 +35,10 @@ class RuntimeEnv:
     # conversation-scoped / cross-process board. See runtime.blackboard.
     blackboard: Blackboard | None = None
     blackboard_id: str | None = None
+    # Command categories the host forbids for `bash` / `background_run` (see
+    # tools.command_policy): "package_install" | "download" | "daemon". "pipe_to_shell"
+    # is always blocked. Empty (default) = only the always-blocked set applies.
+    blocked_command_categories: frozenset[str] = frozenset()
 
     @classmethod
     def from_env(

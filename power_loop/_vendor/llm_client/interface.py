@@ -467,6 +467,11 @@ class OpenAICompatibleChatConfig:
     stream_max_restarts: int = 0
     stream_resume_instruction: str = "继续，从你上次中断的位置继续输出。不要重复已经输出的内容。"
     capability_overrides: dict[str, Any] = field(default_factory=dict)
+    # Config-level request kwargs merged under every request's ``extra`` (request wins; nested
+    # ``extra_body`` dicts are merged key-by-key). This is how a host turns a per-model switch
+    # (e.g. DashScope ``extra_body.enable_thinking``) on for a whole loop without touching the
+    # pipeline's per-call LLMRequest.
+    request_extra: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_ready(self) -> bool:

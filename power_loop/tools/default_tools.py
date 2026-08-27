@@ -23,6 +23,7 @@ from power_loop.runtime.exec_backend import DEFAULT_SHELL_BACKEND, ShellBackend
 from power_loop.runtime.human_input import request_user_input
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
+from power_loop.tools.command_policy import command_policy_reason
 
 logger = logging.getLogger(__name__)
 
@@ -531,6 +532,9 @@ class BashSession:
         reason = _dangerous_command_reason(command)
         if reason:
             return f"Error: Dangerous command blocked ({reason}). Run it manually if you really intend it."
+        policy_err = command_policy_reason(command, get_runtime_env().blocked_command_categories)
+        if policy_err:
+            return policy_err
 
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
@@ -1220,6 +1224,9 @@ class BackgroundManager:
         reason = _dangerous_command_reason(command)
         if reason:
             return f"Error: Dangerous command blocked ({reason}). Run it manually if you really intend it."
+        policy_err = command_policy_reason(command, get_runtime_env().blocked_command_categories)
+        if policy_err:
+            return policy_err
 
         scope_err = _validate_bash_command_scope(command)
         if scope_err:
@@ -1689,16 +1696,21 @@ async def run_recall_compacted(
 # ── recall_send: re-expand a send the projection layer summarized ──────────────
 
 RECALL_SEND_CONTENT_CHARS = 2000
+# Single-row recall (``recall_send(send_index, seq=…)``) returns the ORIGINAL body — a skill file,
+# a read file, a vision answer — so its cap is generous. The send-level view keeps the small cap
+# because it lists every row of the send.
+RECALL_SEND_ROW_CHARS = 40_000
 
 
-async def run_recall_send(send_index: int) -> str:
+async def run_recall_send(send_index: int, seq: int | None = None) -> str:
     """Re-expand one past send the send-context projection summarized.
 
     When ``AgentLoopConfig.history_projector`` is set, finished sends appear in context as a
     compact projected summary while their FULL detail stays in ``pl_messages`` (the immutable
     audit). This returns that send's original messages — assistant text, tool calls (by name)
     and their results — read-only, current session, by the ``send_index`` (the ``#N`` the
-    summary shows).
+    summary shows). With ``seq`` it returns just THAT row (the ``sS`` coordinate a projected
+    tool line carries) with a much larger body cap — plus the assistant call that produced it.
     """
     ctx = get_tool_runtime_context(required=True)
     store, sid = ctx.store, ctx.session_id
@@ -1712,6 +1724,18 @@ async def run_recall_send(send_index: int) -> str:
     rows = [r for r in await store.load_all_messages(sid) if r.send_index == target]
     if not rows:
         return f"No messages found for send #{target} in this session."
+
+    if seq is not None:
+        try:
+            want = int(seq)
+        except (TypeError, ValueError):
+            return f"Invalid seq: {seq!r} (expected an integer)."
+        hit = next((r for r in rows if r.seq == want), None)
+        if hit is None:
+            lo, hi = min(r.seq for r in rows), max(r.seq for r in rows)
+            return (f"No row seq {want} in send #{target} (its rows span seq {lo}–{hi}). "
+                    "Use the exact «sS» coordinate from the summary line, or omit seq to list the whole send.")
+        return _render_recall_row(hit, rows, cap=RECALL_SEND_ROW_CHARS, head=f"send #{target} · seq {want}")
 
     def _tc_name(tc: dict[str, Any]) -> str:
         # ``function`` is normally a dict, but a malformed/imported tool_call can carry a
@@ -1745,6 +1769,30 @@ async def run_recall_send(send_index: int) -> str:
     return f"send #{target} — {len(rows)} message(s):\n\n" + "\n\n".join(blocks)
 
 
+def _render_recall_row(hit: Any, rows: list[Any], *, cap: int, head: str) -> str:
+    """One original row in full (capped at ``cap`` chars, remainder counted), preceded by the
+    assistant call that produced it when the row is a tool result."""
+    blocks: list[str] = []
+    if hit.role == "tool" and hit.tool_call_id:
+        for a in rows:
+            for tc in (a.tool_calls or []) if a.role == "assistant" else []:
+                if str(tc.get("id") or "") == str(hit.tool_call_id):
+                    fn = tc.get("function")
+                    fn = fn if isinstance(fn, dict) else {}
+                    blocks.append(
+                        f"[seq {a.seq} · assistant call · {fn.get('name') or tc.get('name') or '?'}]\n"
+                        f"{fn.get('arguments') or ''}"
+                    )
+                    break
+    body = hit.content or ""
+    total = len(body)
+    if total > cap:
+        body = body[:cap] + f" …[truncated: {total - cap} more chars of {total}]"
+    label = f"[seq {hit.seq} · {hit.role}" + (f" · {hit.name}" if hit.name else "") + "]"
+    blocks.append(f"{label}\n{body}")
+    return f"{head} — original row ({total} chars):\n\n" + "\n\n".join(blocks)
+
+
 # Async tool handlers are registered as ``async def`` adapters (NOT sync lambdas that
 # merely return a coroutine): the registry uses ``inspect.iscoroutinefunction`` to decide
 # sync-vs-async dispatch and to keep the per-call ``runtime_env_context`` held across the
@@ -1776,7 +1824,7 @@ async def _h_recall_compacted(**kw: Any) -> Any:
 
 
 async def _h_recall_send(**kw: Any) -> Any:
-    return await run_recall_send(kw["send_index"])
+    return await run_recall_send(kw["send_index"], kw.get("seq"))
 
 
 async def _h_background_run(**kw: Any) -> Any:

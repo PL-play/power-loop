@@ -277,15 +277,18 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="recall_send",
         description=(
-            "Re-expand an earlier send shown in your context only as a compact summary. When you "
-            "need the EXACT original detail of a specific past send — its tool calls, their "
-            "results, files touched, full text — call this with that send's index (the #N shown "
-            "in the summary). Read-only, current session."
+            "Re-expand an earlier send shown in your context only as a compact summary. Each "
+            "summarized tool line carries a coordinate «#N·sS» (send_index N, row seq S). To get "
+            "ONE original tool result in full (a file you read, a skill you loaded, a vision answer, "
+            "a command's output), call recall_send(send_index=N, seq=S) — that returns just that row "
+            "with a large cap. Without seq it lists every row of send #N (each body cut at 2000 "
+            "chars) — use that only to see what happened, not to fetch a body. Read-only, current session."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "send_index": {"type": "integer", "description": "The #N of the past send to expand."},
+                "send_index": {"type": "integer", "description": "The #N of the past send."},
+                "seq": {"type": "integer", "description": "Optional: the sS row coordinate from a summary line → return that single row in full."},
             },
             "required": ["send_index"],
         },

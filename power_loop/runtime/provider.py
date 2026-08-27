@@ -167,6 +167,7 @@ class LLMProviderConfig:
             temperature=self.temperature,
             max_retries=self.max_retries,
             capability_overrides=dict(self.capability_overrides),
+            request_extra=dict(self.extra.get("request_extra") or {}),
         )
 
     def to_anthropic(self) -> AnthropicChatConfig:

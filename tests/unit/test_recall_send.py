@@ -154,3 +154,47 @@ def test_recall_send_registered_in_default_tools() -> None:
     # and it is part of the "full" preset (manifest-driven)
     full = create_default_tool_registry(preset="full", bind=False)
     assert "recall_send" in full.names()
+
+
+# ── 5.4.0: seq-level recall ────────────────────────────────────────────────
+
+
+async def test_recall_send_seq_returns_single_row_in_full_with_its_call(store):
+    sid = await store.create_session()
+    await store.append_message(sid, role="user", content="do X", send_index=1)
+    await store.append_message(
+        sid, role="assistant",
+        tool_calls=[{"id": "c1", "type": "function", "function": {"name": "load_skill", "arguments": '{"name": "x"}'}}],
+        send_index=1,
+    )
+    big = "SKILL-BODY " * 1000  # 11k chars — past the 2000-char send-level cap
+    await store.append_message(sid, role="tool", content=big, tool_call_id="c1", name="load_skill", send_index=1)
+    await store.append_message(sid, role="user", content="next", send_index=2)
+    rows = await store.load_all_messages(sid)
+    tool_seq = next(r.seq for r in rows if r.role == "tool")
+    with _active(store, sid):
+        out = await run_recall_send(1, tool_seq)
+        assert out.startswith(f"send #1 · seq {tool_seq} — original row ({len(big)} chars)")
+        assert "[seq 2 · assistant call · load_skill]" in out and '{"name": "x"}' in out
+        assert big in out  # NOT cut at 2000
+        # send-level view still caps each body
+        whole = await run_recall_send(1)
+        assert big not in whole and "…[truncated]" in whole
+        # wrong seq → says the span, doesn't guess
+        bad = await run_recall_send(1, 999)
+        assert bad.startswith("No row seq 999 in send #1") and "span seq" in bad
+        assert (await run_recall_send(1, "zz")).startswith("Invalid seq")
+
+
+async def test_recall_send_seq_caps_huge_row_and_counts_remainder(store, monkeypatch):
+    import power_loop.tools.default_tools as dt
+
+    monkeypatch.setattr(dt, "RECALL_SEND_ROW_CHARS", 50)
+    sid = await store.create_session()
+    await store.append_message(sid, role="user", content="go", send_index=1)
+    await store.append_message(sid, role="assistant", content="x" * 200, send_index=1)
+    rows = await store.load_all_messages(sid)
+    seq = rows[-1].seq
+    with _active(store, sid):
+        out = await run_recall_send(1, seq)
+    assert "…[truncated: 150 more chars of 200]" in out

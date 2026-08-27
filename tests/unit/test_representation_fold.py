@@ -103,7 +103,9 @@ def test_projection_project_send_and_render():
     user_row, project_row = projected.rows
     assert user_row.content == {"input": ["do a search"]}
     assert project_row.content["final_text"] == "ok"
-    assert project_row.content["tools"] == [{"name": "grep", "result": "3 hits"}]
+    # 5.4.0: every tool entry carries its ROW COORDINATES — the result row's seq and the
+    # issuing assistant row's seq — so a host renderer can print recall_send(send_index, seq).
+    assert project_row.content["tools"] == [{"name": "grep", "result": "3 hits", "seq": 3, "call_seq": 2}]
     rendered = rep.render([_pmr(1, "user", user_row.content), _pmr(1, "project", project_row.content)])
     # each send is tagged with its #N so recall_send(send_index=N) is discoverable
     assert rendered[0] == {"role": "user", "content": "[#1] do a search"}

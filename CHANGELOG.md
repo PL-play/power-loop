@@ -8,6 +8,33 @@
 
 ## [Unreleased]
 
+## [5.4.0] — 2026-08-27
+
+### Added
+
+* 投影条目带**行坐标**：`ProjectedRepresentation.project_send` 给每个工具条目记 `seq`（结果行的
+  pl_messages seq）与 `call_seq`（发起调用的 assistant 行），mid-send `__user__` 注入也带 `seq`。
+  宿主渲染时每行可以自带 `recall_send(send_index=N, seq=S)` 坐标——模型不必跨 send 找。
+* `recall_send(send_index, seq=None)`：带 `seq` 时只回**那一行原文**（上限 `RECALL_SEND_ROW_CHARS`
+  = 40000 字符，超出部分计数），并附上发起它的 assistant 调用；不带 seq 仍是整 send 列表
+  （每行 2000 字）。起因：整 send 回取对 155 行的 send 是几十万字符，而一份 14KB 的技能文件
+  被截到 2000 字——「回取原文」名不副实。
+
+## [5.3.0] — 2026-08-27
+
+### Added
+
+* `tools.command_policy`：`bash` / `background_run` 之上的**类目级命令策略**（规则层）。把命令按
+  `package_install` / `download` / `pipe_to_shell` / `daemon` 分类，宿主通过
+  `RuntimeEnv.blocked_command_categories` 决定哪些类目被拒；`pipe_to_shell`（`curl … | sh`）永远拒。
+  库默认只拒 `pipe_to_shell`，向后兼容。拒绝是**工具结果**（带出口文案），不是异常。
+  起因：DeepTalk 会话 194 的设计师 agent 在沙箱里 `npm i playwright-core` + 下载 chromium 绕了 20 分钟
+  ——沙箱本身没被打穿，但"装软件"应当是运营授予的能力而不是 egress 白名单的副作用。
+  `RuntimeEnv` 新字段 `blocked_command_categories: frozenset[str]`（默认空）。
+* `OpenAICompatibleChatConfig.request_extra`：配置级请求参数，合并到每次请求的 `extra` 之下（请求优先，
+  `extra_body` 逐键合并）；`LLMProviderConfig.extra["request_extra"]` 直通。用途：宿主按模型开
+  DashScope `extra_body.enable_thinking` 这类开关，而不必碰 pipeline 的每次 LLMRequest。
+
 ## [5.2.2] — 2026-08-19
 
 ### Fixed

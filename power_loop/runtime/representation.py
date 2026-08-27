@@ -274,10 +274,10 @@ class ProjectedRepresentation:
         # Tool results keyed by tool_call_id, preserving ORDER and DUPLICATES (a multimap of FIFO
         # queues): a malformed/imported/resumed transcript can repeat or omit an id, so a plain
         # dict would silently collapse two results onto one id (and drop the other).
-        results: dict[str, deque[str | None]] = {}
+        results: dict[str, deque[tuple[str | None, int | None]]] = {}
         for r in send_rows:
             if r.role == "tool":
-                results.setdefault(r.tool_call_id or "", deque()).append(r.content)
+                results.setdefault(r.tool_call_id or "", deque()).append((r.content, r.seq))
         tools: list[dict[str, Any]] = []
         inputs: list[str | None] = []
         final_text: str | None = None
@@ -293,7 +293,7 @@ class ProjectedRepresentation:
             if r.role == "user":
                 if seen_assistant:
                     # Verbatim like the input (conversation content, not tool output).
-                    tools.append({"name": "__user__", "text": r.content})
+                    tools.append({"name": "__user__", "text": r.content, "seq": r.seq})
                 else:
                     inputs.append(r.content)
                 continue
@@ -308,8 +308,17 @@ class ProjectedRepresentation:
                 name = fn.get("name") or tc.get("name")
                 args = _parse_args(fn.get("arguments"))
                 bucket = results.get(str(tc.get("id") or ""))
-                result = bucket.popleft() if bucket else _NO_RESULT
-                tools.append(self._project_tool(name, args, result, tool_registry))
+                result, result_seq = bucket.popleft() if bucket else (_NO_RESULT, None)
+                entry = self._project_tool(name, args, result, tool_registry)
+                # Row coordinates (5.4.0): every projected tool entry carries the pl_messages seq of
+                # its RESULT row (``seq``) and of the assistant row that issued the call
+                # (``call_seq``), so a host renderer can print a self-contained
+                # "recall_send(send_index=N, seq=S)" pointer on each line — the model should never
+                # have to scan other sends to find where a dropped body lives.
+                if isinstance(entry, dict):
+                    entry.setdefault("seq", result_seq)
+                    entry.setdefault("call_seq", r.seq)
+                tools.append(entry)
         seqs = [r.seq for r in send_rows]
         rows: list[ProjectedRow] = []
         if inputs:
@@ -462,7 +471,9 @@ class ProjectedRepresentation:
             # A mid-send user injection (reminder / finalize / steering) at its
             # chronological position in the timeline — not a tool call.
             return f"[user] {t.get('text') or ''}"
-        rest = {k: v for k, v in (t or {}).items() if k != "name"}
+        # Row coordinates (seq / call_seq, 5.4.0) are bookkeeping for host renderers, not part of
+        # the generic "name(k=v, …)" line — a host that wants a recall pointer overrides the render.
+        rest = {k: v for k, v in (t or {}).items() if k not in ("name", "seq", "call_seq")}
         if not rest:
             return str(name)
         body = self.render_config.tool_arg_sep.join(f"{k}={v}" for k, v in rest.items())
