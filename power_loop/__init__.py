@@ -25,6 +25,7 @@ __version__ = "5.4.0"
 # "power_loop.*" subtree (getLogger(__name__)), so one handler routes the whole tree.
 import logging as _logging
 
+from power_loop._vendor.llm_client.capabilities import ModelCapabilities, ModelCapabilityError
 from power_loop._vendor.llm_client.interface import (
     AnthropicChatConfig,
     LLMRequest,
@@ -288,6 +289,8 @@ STABLE_API = (
     "LLMResponse",
     "LLMStreamChunk",
     "LLMProviderConfig",
+    "ModelCapabilities",
+    "ModelCapabilityError",
     "create_llm_service_from_env",
     "create_llm_service_from_config",
 )
@@ -400,6 +403,8 @@ __all__ = [
 	"estimate_text_tokens",
 	"trim_history",
 	"LLMProviderConfig",
+	"ModelCapabilities",
+	"ModelCapabilityError",
 	"create_llm_service_from_config",
 	"create_llm_service_from_env",
 	"MessageSink",

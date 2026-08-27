@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .capabilities import ModelCapabilities
+from .capabilities import ModelCapabilities, ModelCapabilityError
 
 try:
     from pypdf import PdfReader
@@ -112,62 +112,45 @@ def _extract_pdf_text(path: Path) -> str:
 
 
 def _render_image_attachment(ref: AttachmentRef, path: Path, capabilities: ModelCapabilities) -> PreparedAttachment:
-    if capabilities.supports_image_input and capabilities.supports_data_url:
-        part = {
-            "type": "image_url",
-            "image_url": {
-                "url": _file_to_data_url(path, ref.mime_type),
-            },
-        }
-        return PreparedAttachment(ref=ref, rendered_parts=(part,), strategy="native-image")
-
-    text = (
-        f"[Attached image: {ref.filename}]\n"
-        "The current model does not support image input, so the image was not sent natively."
-    )
-    return PreparedAttachment(
-        ref=ref,
-        text_fallback=text,
-        rendered_parts=({"type": "text", "text": text},),
-        strategy="image-unsupported",
-    )
+    # Raises unless the model DECLARED image support. There is deliberately no text-downgrade
+    # branch here any more: swapping the picture for "[Attached image: foo.png] the model does
+    # not support image input" still produced an answer, and callers had no way to tell that
+    # answer was made without ever seeing the image. Loud beats plausible.
+    capabilities.require_image_input(what=f"image {ref.filename!r}")
+    part = {
+        "type": "image_url",
+        "image_url": {"url": _file_to_data_url(path, ref.mime_type)},
+    }
+    return PreparedAttachment(ref=ref, rendered_parts=(part,), strategy="native-image")
 
 
 def _render_pdf_attachment(ref: AttachmentRef, path: Path, capabilities: ModelCapabilities) -> PreparedAttachment:
+    """PDFs are always delivered as EXTRACTED TEXT.
+
+    Native PDF transmission is not implemented by this library on any transport, so a
+    ``supports_pdf_input_*`` capability field would be a promise nothing keeps — it was
+    removed rather than left as decoration. Text extraction is a faithful path for a text
+    PDF (the content really does reach the model), so it is not a silent downgrade and does
+    not raise.
+
+    What DOES raise: a PDF no text can be extracted from (a scan, an image-only export, an
+    encrypted file). Feeding the model "[Attached PDF: x.pdf] no readable text" invites the
+    same unfounded-answer failure the image path just eliminated.
+    """
     extracted_text = _extract_pdf_text(path)
-
-    if capabilities.supports_pdf_input_chat:
-        text = (
-            f"[Attached PDF: {ref.filename}]\n"
-            "Native PDF chat transmission is not enabled in this build, so extracted text fallback was used instead."
+    if not extracted_text:
+        raise ModelCapabilityError(
+            f"Cannot send PDF {ref.filename!r}: no text could be extracted from it "
+            "(scanned/image-only or encrypted PDF), and native PDF input is not implemented "
+            "on any transport. Convert its pages to images and send those to a model that "
+            "declares supports_image_input, or extract the text yourself."
         )
-        if extracted_text:
-            text = f"{text}\n\n{extracted_text}"
-        return PreparedAttachment(
-            ref=ref,
-            text_fallback=text,
-            rendered_parts=({"type": "text", "text": text},),
-            strategy="pdf-fallback-text",
-        )
-
-    if extracted_text:
-        text = f"[Attached PDF: {ref.filename}]\n\n{extracted_text}"
-        return PreparedAttachment(
-            ref=ref,
-            text_fallback=text,
-            rendered_parts=({"type": "text", "text": text},),
-            strategy="pdf-extracted-text",
-        )
-
-    text = (
-        f"[Attached PDF: {ref.filename}]\n"
-        "No readable text could be extracted from this PDF, and the current model/path does not support native PDF input."
-    )
+    text = f"[Attached PDF: {ref.filename}]\n\n{extracted_text}"
     return PreparedAttachment(
         ref=ref,
         text_fallback=text,
         rendered_parts=({"type": "text", "text": text},),
-        strategy="pdf-unreadable",
+        strategy="pdf-extracted-text",
     )
 
 
@@ -185,12 +168,11 @@ def prepare_attachment(ref_payload: dict[str, Any], capabilities: ModelCapabilit
     if ref.kind == "pdf":
         return _render_pdf_attachment(ref, path, capabilities)
 
-    text = f"[Attached file: {ref.filename}] Unsupported attachment type: {ref.mime_type}"
-    return PreparedAttachment(
-        ref=ref,
-        text_fallback=text,
-        rendered_parts=({"type": "text", "text": text},),
-        strategy="unsupported-file",
+    raise ModelCapabilityError(
+        f"Cannot send attachment {ref.filename!r}: unsupported type {ref.mime_type!r}. "
+        "This library renders images (declared models only) and text-extractable PDFs; "
+        "anything else must be converted by the caller. It is not summarised into a "
+        "placeholder line — a placeholder reads to the model as if the file had been read."
     )
 
 

@@ -76,20 +76,27 @@ class LLMRequest:
     def to_messages(self, capabilities: Any = None) -> list[dict[str, Any]]:
         """
         Normalize messages for OpenAI-compatible APIs.
+
+        ``capabilities`` omitted means "nothing declared", NOT "skip rendering": rendering
+        used to be skipped entirely when it was None, which passed ``attachment`` blocks
+        through verbatim into the provider payload. Now an undeclared caller gets the same
+        loud :class:`ModelCapabilityError` as an explicitly-unsupported one.
         """
+        from .capabilities import coerce_capabilities
+        from .multimodal import render_message_content
+
+        caps = coerce_capabilities(capabilities, model=self.model or "")
         msgs: list[dict[str, Any]] = []
         if self.system_prompt:
             msgs.append({"role": "system", "content": self.system_prompt})
 
         for raw_msg in self.messages or []:
             msg = dict(raw_msg)
-            if capabilities is not None and "content" in msg:
-                from .multimodal import render_message_content
-
+            if "content" in msg:
                 msg["content"] = render_message_content(
                     msg.get("content"),
                     role=str(msg.get("role") or "user"),
-                    capabilities=capabilities,
+                    capabilities=caps,
                 )
             msgs.append(msg)
         return msgs
@@ -466,7 +473,10 @@ class OpenAICompatibleChatConfig:
     stream_resume_on_error: bool = False
     stream_max_restarts: int = 0
     stream_resume_instruction: str = "继续，从你上次中断的位置继续输出。不要重复已经输出的内容。"
-    capability_overrides: dict[str, Any] = field(default_factory=dict)
+    # DECLARED model capabilities (see capabilities.ModelCapabilities). Config-level, so a
+    # host with many models in one process declares each one independently — the retired
+    # POWER_LOOP_SUPPORTS_* env vars could only lie process-wide.
+    capabilities: dict[str, Any] = field(default_factory=dict)
     # Config-level request kwargs merged under every request's ``extra`` (request wins; nested
     # ``extra_body`` dicts are merged key-by-key). This is how a host turns a per-model switch
     # (e.g. DashScope ``extra_body.enable_thinking``) on for a whole loop without touching the
@@ -487,6 +497,10 @@ class AnthropicChatConfig:
     max_tokens: int = 8000
     temperature: float = 0.0
     max_retries: int = 3
+    #: DECLARED model capabilities — same contract as the OpenAI-compatible transport. This
+    #: transport used to carry none at all, which is how ``attachment`` blocks reached it
+    #: unrendered and got dropped as "unsupported content block".
+    capabilities: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_ready(self) -> bool:

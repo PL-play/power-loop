@@ -21,12 +21,17 @@ Custom representations implement the :class:`Representation` Protocol (kind/vers
 from __future__ import annotations
 
 import json
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
-from power_loop.runtime.store.types import MessageRow, ProjectMessageRow
+from power_loop.runtime.store.types import (
+    MessageRow,
+    ProjectMessageRow,
+    decode_row_content,
+)
 
 if TYPE_CHECKING:
     from power_loop.tools.registry import ToolRegistry
@@ -111,10 +116,16 @@ def _parse_args(raw: Any) -> Any:
 
 def _row_to_loop_dict(row: MessageRow) -> LoopMessage:
     """Verbatim MessageRow → LoopMessage (mirrors stateful_loop._row_to_loop_message; kept local
-    to avoid an agent→runtime import cycle)."""
+    to avoid an agent→runtime import cycle).
+
+    Structured (multimodal) content is decoded back into its original list/dict. Without this
+    the verbatim path replayed a row's content as the LITERAL JSON STRING it was stored as —
+    the model got ``'[{"type": "image_url", ...}]'`` as prose instead of an image, silently.
+    The docstring above claimed to mirror ``_row_to_loop_message``; this is the part it did
+    not mirror."""
     msg: LoopMessage = {"role": row.role}
     if row.content is not None:
-        msg["content"] = row.content
+        msg["content"] = decode_row_content(row.content, row.meta)
     if row.tool_calls:
         msg["tool_calls"] = list(row.tool_calls)
     if row.tool_call_id:
@@ -122,6 +133,64 @@ def _row_to_loop_dict(row: MessageRow) -> LoopMessage:
     if row.name:
         msg["name"] = row.name
     return msg
+
+
+#: Any ``data:<mime>;base64,…`` payload. As TEXT this is unreadable to the model and unbounded
+#: in size, yet it is billed on every send that carries the projection row. It must never reach
+#: a projection, whatever route put it in the message.
+_DATA_URL_RE = re.compile(r"data:[\w.+-]+/[\w.+-]+;base64,[A-Za-z0-9+/=\s]{32,}")
+
+
+def _strip_data_urls(text: str | None) -> str | None:
+    return text if text is None else _DATA_URL_RE.sub("<image data omitted>", text)
+
+
+def _distill_block(block: Any) -> str:
+    """One multimodal content block → a short textual reference for the projection."""
+    if isinstance(block, str):
+        return block
+    if not isinstance(block, dict):
+        return str(block)
+    btype = block.get("type")
+    if btype == "text":
+        return str(block.get("text") or "")
+    if btype == "attachment":
+        att = block.get("attachment") or {}
+        # The reference that survives distillation: filename/path, never the bytes. A host that
+        # wants the image back re-reads it from here (recall) rather than from the projection.
+        name = att.get("filename") or att.get("path") or "file"
+        kind = att.get("kind") or "file"
+        return f"[{kind}: {name}]"
+    if btype == "image_url":
+        url = block.get("image_url")
+        url = url.get("url") if isinstance(url, dict) else url
+        url = str(url or "")
+        # A data: URL carries no reference at all — there is nothing to point back to, which is
+        # exactly why callers should send `attachment` blocks instead.
+        return "[image]" if url.startswith("data:") else f"[image: {url}]"
+    if btype == "image":  # Anthropic-shaped block
+        return "[image]"
+    return f"[{btype or 'block'}]"
+
+
+def distill_multimodal_text(content: str | None, meta: dict[str, Any] | None) -> str | None:
+    """Stored row ``content`` → text a projection row can hold.
+
+    Plain text passes through (minus any stray data URL). A JSON-encoded MULTIMODAL payload is
+    reduced to one short reference per block instead of being kept verbatim.
+
+    Why: ``project_send`` deliberately keeps a send's INPUT side verbatim — correct for text,
+    which is short next to tool output. A multimodal turn breaks that assumption: an
+    `attachment` block is small (a path), but an inlined ``image_url`` data URL is not, and
+    kept verbatim it becomes unreadable text that is re-billed on every later send.
+    """
+    decoded = decode_row_content(content, meta)
+    if decoded is None or isinstance(decoded, str):
+        return _strip_data_urls(decoded)
+    if not isinstance(decoded, list):
+        return _strip_data_urls(str(decoded))
+    parts = [p for p in (_distill_block(b) for b in decoded) if p]
+    return _strip_data_urls("\n".join(parts))
 
 
 def _coerce_bool(v: Any) -> bool:
@@ -293,9 +362,11 @@ class ProjectedRepresentation:
             if r.role == "user":
                 if seen_assistant:
                     # Verbatim like the input (conversation content, not tool output).
-                    tools.append({"name": "__user__", "text": r.content, "seq": r.seq})
+                    tools.append({"name": "__user__",
+                                  "text": distill_multimodal_text(r.content, r.meta),
+                                  "seq": r.seq})
                 else:
-                    inputs.append(r.content)
+                    inputs.append(distill_multimodal_text(r.content, r.meta))
                 continue
             if r.role != "assistant":
                 continue

@@ -1,169 +1,103 @@
+"""Model capabilities — **declared, never guessed**.
+
+History (why this file looks the way it does): capabilities used to be *inferred* from the
+model NAME via a table of ~15 vendor regexes, with an env-var escape hatch
+(``POWER_LOOP_SUPPORTS_*``) for models the table didn't recognise. Both are gone, because
+both were wrong in the same way — they made the library decide, silently, whether your
+model could see an image:
+
+* **Name-guessing fails open-endedly.** Any model outside the table (a new release, a
+  vendor's experimental endpoint, a proxy that renames models) was judged
+  ``supports_image_input=False``. Real case: ``deepseek-v4-flash-vision-exp`` — a model
+  that demonstrably accepts ``image_url`` — was classified blind, and every image sent to
+  it was silently replaced with the sentence "the current model does not support image
+  input". The model then answered from the filename and the caller saw a plausible reply.
+  Nothing errored. That is the worst possible failure mode: a green light over a
+  capability that never ran.
+* **Env vars are the wrong scope.** ``POWER_LOOP_SUPPORTS_IMAGE_INPUT`` is process-wide. A
+  host running many agent definitions against different models in one process cannot say
+  "this one sees images, that one doesn't" — it can only lie for all of them at once.
+
+So: capabilities are **configuration on the LLM config object** (hence per-loop /
+per-definition, see :class:`power_loop.runtime.provider.LLMProviderConfig`), every field is
+tri-state, and asking for a capability that was not declared **raises**. The library never
+infers, never falls back, never downgrades your input behind your back.
+"""
+
 from __future__ import annotations
 
-import re
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 
+class ModelCapabilityError(RuntimeError):
+    """Raised when a request needs a capability the model has not DECLARED.
+
+    Covers both "declared unsupported" and "never declared". Both are caller bugs, and both
+    must be loud: the alternative — quietly dropping the image and sending the text — yields
+    an answer that looks fine and is unfounded.
+    """
+
+
 @dataclass(frozen=True)
 class ModelCapabilities:
-    provider: str
-    model: str
-    api_family: str = "chat"
-    supports_image_input: bool = False
-    supports_pdf_input_chat: bool = False
-    supports_pdf_input_responses: bool = False
-    supports_data_url: bool = True
-    supports_tools: bool = True
-    supports_stream: bool = True
+    """What a model accepts. Every capability field is **tri-state**:
+
+    ``True``
+        Declared supported. Used natively.
+    ``False``
+        Declared unsupported. Sending input that needs it raises.
+    ``None`` (the default)
+        **Undeclared** — *not* a synonym for ``False``. Nothing guesses on your behalf;
+        input that needs the capability raises, and the error tells you where to declare it.
+
+    ``model`` is carried only so errors can name the model that lacks the declaration.
+    """
+
+    model: str = ""
+    #: Accepts images inline in a chat message (as a base64 ``data:`` URL — the only image
+    #: transport this library implements).
+    supports_image_input: bool | None = None
+
+    def require_image_input(self, *, what: str) -> None:
+        """Raise unless image input is DECLARED supported. ``what`` names the offending
+        attachment so the error points at a file, not just at a config field."""
+        if self.supports_image_input is True:
+            return
+        model = self.model or "<unnamed model>"
+        if self.supports_image_input is False:
+            reason = f"model {model!r} is declared NOT to support image input"
+        else:
+            reason = (
+                f"model {model!r} has not declared image support "
+                "(capabilities are declared, never inferred from the model name)"
+            )
+        raise ModelCapabilityError(
+            f"Cannot send {what}: {reason}. Either declare it — "
+            "LLMProviderConfig(..., capabilities={'supports_image_input': True}) — "
+            "or stop sending images to this model. It is NOT downgraded to text: an answer "
+            "produced without the image would look valid and be unfounded."
+        )
 
 
-def _caps(provider: str, model: str, **kwargs: Any) -> ModelCapabilities:
-    return ModelCapabilities(provider=provider, model=model, **kwargs)
+def coerce_capabilities(value: Any, *, model: str = "") -> ModelCapabilities:
+    """Build a :class:`ModelCapabilities` from config (a dict, an instance, or ``None``).
 
-
-CAPABILITY_OVERRIDE_ENV_MAP: dict[str, str] = {
-    "POWER_LOOP_SUPPORTS_IMAGE_INPUT": "supports_image_input",
-    "POWER_LOOP_SUPPORTS_PDF_INPUT_CHAT": "supports_pdf_input_chat",
-    "POWER_LOOP_SUPPORTS_PDF_INPUT_RESPONSES": "supports_pdf_input_responses",
-    "POWER_LOOP_SUPPORTS_DATA_URL": "supports_data_url",
-    "POWER_LOOP_SUPPORTS_TOOLS": "supports_tools",
-    "POWER_LOOP_SUPPORTS_STREAM": "supports_stream",
-    # Legacy fallback (deprecated, use POWER_LOOP_* instead)
-    "OPENAI_COMPAT_SUPPORTS_IMAGE_INPUT": "supports_image_input",
-    "OPENAI_COMPAT_SUPPORTS_PDF_INPUT_CHAT": "supports_pdf_input_chat",
-    "OPENAI_COMPAT_SUPPORTS_PDF_INPUT_RESPONSES": "supports_pdf_input_responses",
-    "OPENAI_COMPAT_SUPPORTS_DATA_URL": "supports_data_url",
-    "OPENAI_COMPAT_SUPPORTS_TOOLS": "supports_tools",
-    "OPENAI_COMPAT_SUPPORTS_STREAM": "supports_stream",
-}
-
-
-def _parse_optional_bool(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if not normalized:
-            return None
-        if normalized in {"1", "true", "yes", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "off"}:
-            return False
-    return None
-
-
-def capability_overrides_from_env(env: Mapping[str, Any]) -> dict[str, Any]:
-    overrides: dict[str, Any] = {}
-    for env_name, field_name in CAPABILITY_OVERRIDE_ENV_MAP.items():
-        parsed = _parse_optional_bool(env.get(env_name))
-        if parsed is not None:
-            overrides[field_name] = parsed
-    return overrides
-
-
-PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
-    "openai": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-    "openai-compatible": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-    "deepseek": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-    "zhipu": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-    "moonshot": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-    "minimax": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-    "dashscope": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-    "volcengine": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-    "google": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-    "anthropic": {"api_family": "chat", "supports_data_url": True, "supports_tools": True, "supports_stream": True},
-}
-
-
-MODEL_PATTERNS: list[tuple[re.Pattern[str], dict[str, Any]]] = [
-    (re.compile(r"^(gpt-4o|gpt-4\.1|gpt-4\.5|o1|o3)", re.IGNORECASE), {
-        "provider": "openai",
-        "supports_image_input": True,
-        "supports_pdf_input_responses": True,
-    }),
-    (re.compile(r"^(qwen3-vl|qwen-vl|qwen2(\.5)?-vl|qwen-vl-max|qwen-vl-plus|qvq|max-vl|internvl|qwen-omni)", re.IGNORECASE), {
-        "provider": "dashscope",
-        "supports_image_input": True,
-    }),
-    (re.compile(r"^(glm-4v|glm-4\.1v|glm-4\.5v|glm-4v-plus|glm-4v-thinking|cogvlm)", re.IGNORECASE), {
-        "provider": "zhipu",
-        "supports_image_input": True,
-    }),
-    (re.compile(r"^(glm-4|glm-4-plus|glm-4-air|glm-zero-preview)", re.IGNORECASE), {
-        "provider": "zhipu",
-    }),
-    (re.compile(r"^(deepseek-vl|deepseek-vl2)", re.IGNORECASE), {
-        "provider": "deepseek",
-        "supports_image_input": True,
-    }),
-    (re.compile(r"^(deepseek-chat|deepseek-reasoner|deepseek-coder|deepseek-r1)", re.IGNORECASE), {
-        "provider": "deepseek",
-    }),
-    (re.compile(r"^(kimi-vl|moonshot-v1-vision|moonshot-vision)", re.IGNORECASE), {
-        "provider": "moonshot",
-        "supports_image_input": True,
-    }),
-    (re.compile(r"^(kimi-k2|kimi-latest|moonshot-v1-(8k|32k|128k)|moonshot-kimi)", re.IGNORECASE), {
-        "provider": "moonshot",
-    }),
-    (re.compile(r"^(minimax-vl|minimax-vl-01|abab[\-_]vision|minimax-vision)", re.IGNORECASE), {
-        "provider": "minimax",
-        "supports_image_input": True,
-    }),
-    (re.compile(r"^(abab6(\.5)?-chat|minimax-text|minimax-m1)", re.IGNORECASE), {
-        "provider": "minimax",
-    }),
-    (re.compile(r"^(doubao-vision|doubao-1\.5-vision|doubao-seed-vision)", re.IGNORECASE), {
-        "provider": "volcengine",
-        "supports_image_input": True,
-    }),
-    (re.compile(r"^(doubao|doubao-1\.5|seed)", re.IGNORECASE), {
-        "provider": "volcengine",
-    }),
-    (re.compile(r"^(gemini|gemini-1\.5|gemini-2\.0)", re.IGNORECASE), {
-        "provider": "google",
-        "supports_image_input": True,
-        "supports_pdf_input_responses": True,
-    }),
-    (re.compile(r"^(claude-3|claude-3\.5|claude-3\.7|claude-sonnet|claude-opus|claude-4)", re.IGNORECASE), {
-        "provider": "anthropic",
-        "supports_image_input": True,
-        "supports_pdf_input_responses": True,
-    }),
-]
-
-
-def resolve_model_capabilities(model: str, base_url: str, overrides: dict[str, Any] | None = None) -> ModelCapabilities:
-    normalized_model = (model or "").strip()
-    provider = "openai-compatible"
-    caps = _caps(provider=provider, model=normalized_model, **PROVIDER_DEFAULTS.get(provider, {}))
-
-    for pattern, payload in MODEL_PATTERNS:
-        if pattern.search(normalized_model):
-            merged = {
-                "provider": payload.get("provider", provider),
-                "model": normalized_model,
-                "api_family": payload.get("api_family", caps.api_family),
-                "supports_image_input": payload.get("supports_image_input", caps.supports_image_input),
-                "supports_pdf_input_chat": payload.get("supports_pdf_input_chat", caps.supports_pdf_input_chat),
-                "supports_pdf_input_responses": payload.get("supports_pdf_input_responses", caps.supports_pdf_input_responses),
-                "supports_data_url": payload.get("supports_data_url", caps.supports_data_url),
-                "supports_tools": payload.get("supports_tools", caps.supports_tools),
-                "supports_stream": payload.get("supports_stream", caps.supports_stream),
-            }
-            caps = ModelCapabilities(**merged)
-            break
-
-    if overrides:
-        merged = caps.__dict__ | dict(overrides)
-        merged.setdefault("provider", caps.provider)
-        merged.setdefault("model", normalized_model)
-        caps = ModelCapabilities(**merged)
-
-    return caps
+    ``None`` / ``{}`` yields an all-undeclared instance — which is exactly right: a caller
+    that declared nothing gets a model that can do nothing beyond plain text, loudly.
+    """
+    if isinstance(value, ModelCapabilities):
+        return value if value.model or not model else ModelCapabilities(
+            model=model, supports_image_input=value.supports_image_input
+        )
+    fields: dict[str, Any] = dict(value or {})
+    unknown = set(fields) - {"model", "supports_image_input"}
+    if unknown:
+        # A typo'd or retired key (supports_tools, supports_stream, api_family, provider,
+        # supports_pdf_input_* — all removed as dead config) must not read as "declared".
+        raise ValueError(
+            f"Unknown model capability key(s): {sorted(unknown)}. "
+            "Supported keys: 'supports_image_input'."
+        )
+    fields.setdefault("model", model)
+    return ModelCapabilities(**fields)

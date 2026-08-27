@@ -8,6 +8,63 @@
 
 ## [Unreleased]
 
+### Changed — BREAKING
+
+* **模型能力改为「声明」，不再从模型名推断。** 原先 `resolve_model_capabilities()` 用一张约 15 条
+  厂商正则的表按**模型名**猜 `supports_image_input` 等能力，猜不中就判定为不支持，并**静默**把图片
+  换成一句「当前模型不支持图片输入」再照常发出去。真实后果：`deepseek-v4-flash-vision-exp`（一个
+  实测能吃 `image_url` 的模型）不在表里，发给它的每张图都被悄悄丢掉，模型照样给出通顺答案，调用方
+  完全看不出这个答案是在没看见图的情况下编的——绿灯罩着一个从未发生过的能力。
+
+  现在：能力是 `LLMProviderConfig(capabilities={"supports_image_input": True})` 上的**配置**，
+  三态（`True` 支持 / `False` 明确不支持 / `None` 未声明，且 `None` **不等于** `False`）。
+  未声明或声明为不支持时发图 → 抛 `ModelCapabilityError`，绝不降级。
+
+  **受影响的 Public API：**
+  - 删除 `resolve_model_capabilities()`、`capability_overrides_from_env()`、`PROVIDER_DEFAULTS`、
+    `MODEL_PATTERNS`、`CAPABILITY_OVERRIDE_ENV_MAP`。
+  - 删除环境变量 `POWER_LOOP_SUPPORTS_*` / `OPENAI_COMPAT_SUPPORTS_*`（进程级作用域无法表达
+    「同一进程里这个定义的模型能看图、那个不能」，而这正是多 agent 宿主的常态）。
+  - `LLMProviderConfig.capability_overrides` → `LLMProviderConfig.capabilities`；
+    `OpenAICompatibleChatConfig.capability_overrides` → `.capabilities`。
+  - `ModelCapabilities` 只保留 `model` 与 `supports_image_input`。删除 `provider` / `api_family` /
+    `supports_tools` / `supports_stream` / `supports_data_url` / `supports_pdf_input_chat` /
+    `supports_pdf_input_responses`——它们**没有任何代码读取**，是纯装饰。传入这些键现在直接 `ValueError`，
+    以免一份配置声称拥有一个永远不会被兑现的能力。
+  - 新增导出 `ModelCapabilities` / `ModelCapabilityError`。
+
+* **`LLMRequest.to_messages()` 不传 capabilities 不再等于「跳过渲染」。** 以前 `capabilities=None`
+  会整个跳过多模态渲染，把 `{"type": "attachment"}` 原样塞进 provider 请求体；现在等同「什么都没声明」，
+  同样抛 `ModelCapabilityError`。
+
+* **PDF 一律走文本抽取。** 任何 transport 都没有实现原生 PDF 传输，所以 `supports_pdf_input_*` 是一个
+  没人兑现的承诺，直接删掉而不是留着当摆设。文本 PDF 抽取是忠实路径（内容确实到达模型），不抛异常；
+  **抽不出文本**的 PDF（扫描件 / 纯图导出 / 加密）改为抛异常——塞一句「未能读取内容」给模型，会复现
+  刚刚被消灭的那种「无中生有的答案」。不支持的附件类型同理，不再降级成占位文字。
+
+### Fixed
+
+* **verbatim 重放不还原结构化内容（多模态静默失效）。** `runtime/representation.py` 的
+  `_row_to_loop_dict` docstring 声称 "mirrors `stateful_loop._row_to_loop_message`"，却恰恰没有镜像
+  其中的 JSON 还原那段——`CONTENT_ENCODING_META_KEY` 在整个 `representation.py` 里一次都没出现过。
+  于是 `VerbatimRepresentation` 模式下，一条多模态消息重放时 content 是**字面 JSON 字符串**而不是
+  数组：模型收到一段 prose，图片彻底失效，全程无报错。
+  常量与新的 `decode_row_content()` 移到 `runtime/store/types.py`（中立位置，避免 runtime→agent
+  循环导入），写入侧与读取侧共用同一份定义。`power_loop.agent.sink` 继续 re-export，下游 import 不变。
+
+* **投影会把内联 base64 当文本逐字保留。** `project_send` 对 send 的输入侧刻意 verbatim（注释理由：
+  "it is short relative to tool output"）——对文本成立，对 `data:` URL 崩塌：图片变成不可读的文本，
+  却在**之后每一个 send** 上被重复计费。新增 `distill_multimodal_text()` 把每个内容块蒸馏为一行引用
+  （`attachment` → `[image: shot.png]`，保留可回取的文件名；内联 data URL → `[image]`），并以
+  `_strip_data_urls()` 兜底：无论哪条路径（含未打编码标记的老行）塞进来的 data URL 都不会进投影。
+  send 输入与 send 中途注入（`__user__`）两个入口都已接上。
+
+* **Anthropic transport 会丢弃 `attachment` 块。** 该 transport 自己翻译消息、不走
+  `LLMRequest.to_messages()`，因此从未执行过多模态渲染：附件块原封不动到达 `_non_text_blocks`，
+  被当作 `[unsupported content block dropped: attachment]` 扔掉。现在它先跑同一套渲染与能力判定，
+  再把 `image_url` 翻成原生 Anthropic image block。`AnthropicChatConfig` 随之新增 `capabilities`
+  字段（此前它根本收不到任何能力信息）。
+
 ## [5.4.0] — 2026-08-27
 
 ### Added
