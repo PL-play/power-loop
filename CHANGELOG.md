@@ -8,6 +8,10 @@
 
 ## [Unreleased]
 
+### Added
+
+* 顶层导出 `create_attachment_ref()`：构造多模态输入的必需件，宿主不该为此 import `_vendor` 内部路径。（未进 `STABLE_API`——多模态输入面仍在演进。）
+
 ### Changed — BREAKING
 
 * **模型能力改为「声明」，不再从模型名推断。** 原先 `resolve_model_capabilities()` 用一张约 15 条
@@ -43,6 +47,12 @@
   刚刚被消灭的那种「无中生有的答案」。不支持的附件类型同理，不再降级成占位文字。
 
 ### Fixed
+
+* **steering 会丢掉图片。** 进程内 follow-up 队列保留的是原始对象，但 `merge_follow_up_inputs`
+  用 `json.dumps` 把 content 压成一坨文本——图片只以「序列化后的块」形式活下来，模型看不见。
+  同一张用户照片，会话恰好空闲时看得见、恰好在忙时看不见。现在文本合进 `<follow_up>` 信封，
+  **非文本块（图片）作为独立内容块带过去**。跨进程队列是 TEXT 列、图片本就无法穿越，但
+  `follow_up_text()` 也不再把整个 data URL 粘进去（改为 `[image_url]` 标记）。
 
 * **verbatim 重放不还原结构化内容（多模态静默失效）。** `runtime/representation.py` 的
   `_row_to_loop_dict` docstring 声称 "mirrors `stateful_loop._row_to_loop_message`"，却恰恰没有镜像

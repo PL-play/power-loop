@@ -35,6 +35,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMTokenUsage,
     OpenAICompatibleChatConfig,
 )
+from power_loop._vendor.llm_client.multimodal import create_attachment_ref
 from power_loop.agent.follow_up import FollowUpQueued
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
@@ -405,6 +406,7 @@ __all__ = [
 	"LLMProviderConfig",
 	"ModelCapabilities",
 	"ModelCapabilityError",
+	"create_attachment_ref",
 	"create_llm_service_from_config",
 	"create_llm_service_from_env",
 	"MessageSink",
