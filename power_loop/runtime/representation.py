@@ -125,7 +125,7 @@ def _row_to_loop_dict(row: MessageRow) -> LoopMessage:
     not mirror."""
     msg: LoopMessage = {"role": row.role}
     if row.content is not None:
-        msg["content"] = decode_row_content(row.content, row.meta)
+        msg["content"] = decode_row_content(row.content, getattr(row, "meta", None))
     if row.tool_calls:
         msg["tool_calls"] = list(row.tool_calls)
     if row.tool_call_id:
@@ -365,11 +365,13 @@ class ProjectedRepresentation:
             if r.role == "user":
                 if seen_assistant:
                     # Verbatim like the input (conversation content, not tool output).
-                    tools.append({"name": "__user__",
-                                  "text": distill_multimodal_text(r.content, r.meta),
-                                  "seq": r.seq})
+                    tools.append({
+                        "name": "__user__",
+                        "text": distill_multimodal_text(r.content, getattr(r, "meta", None)),
+                        "seq": r.seq,
+                    })
                 else:
-                    inputs.append(distill_multimodal_text(r.content, r.meta))
+                    inputs.append(distill_multimodal_text(r.content, getattr(r, "meta", None)))
                 continue
             if r.role != "assistant":
                 continue
