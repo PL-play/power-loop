@@ -13,10 +13,16 @@ on which vendor the definition happens to point at, and definitions switch model
 So the image travels as its own **user** message instead, and the tool returns only a line
 saying it is there.
 
-Why EPHEMERAL: the queued message is appended to the round's request, never to the store. A
-durable injection would write the image into history and the projection, so an agent that
-recalled three times would carry three images forever — exactly the unbounded growth the
-projection exists to prevent. One round, then gone; recall again if you need another look.
+DURABLE by default, and that default was reversed on purpose. The first cut was ephemeral —
+request-only, gone next round — out of a fear that "recall three times and you carry three
+images forever". Measurement killed that fear: the provider's prefix cache serves a stable
+history at ~99% hit rate, so an image sitting in the prefix costs about a tenth of its face
+value every later round. Meanwhile the SEMANTICS clearly favour durable: an agent that looked
+at a UI screenshot and then spends fifteen rounds coding against it should still have the
+picture in front of it, not have to ask for it again. Across sends the projection distils the
+row down to `[image: shot.png · file_uuid=…]`, so nothing accumulates without bound.
+
+Pass ``durable=False`` for the look-once case (request-only, never stored).
 """
 
 from __future__ import annotations
@@ -38,9 +44,14 @@ MAX_PENDING_PER_SESSION = 8
 
 
 def queue_image_for_next_round(
-    session_id: str | None, *, path: str, note: str = "", ref: str = ""
+    session_id: str | None, *, path: str, note: str = "", ref: str = "",
+    durable: bool = True,
 ) -> bool:
-    """Queue one image (by local path) to be shown to the model on the next round.
+    """Queue one image (by local path) to be shown to the model from the next round on.
+
+    ``durable=True`` (default) stores it as a real ``user`` row, so it stays in front of the
+    model for the rest of the send and is distilled to a text reference across sends.
+    ``durable=False`` puts it in the request only — visible for exactly one round.
 
     Returns False when there is no session to queue against, or the queue is full — the caller
     should then say so in its own return value rather than pretend the image was delivered.
@@ -62,16 +73,27 @@ def queue_image_for_next_round(
         queue = _pending.setdefault(session_id, [])
         if len(queue) >= MAX_PENDING_PER_SESSION:
             return False
-        queue.append({"role": "user", "content": blocks})
+        queue.append({"role": "user", "content": blocks, "__durable__": durable})
     return True
 
 
-def drain_queued_images(session_id: str | None) -> list[LoopMessage]:
-    """Take everything queued for this session (and clear it)."""
+def drain_queued_images(session_id: str | None) -> tuple[list[LoopMessage], list[LoopMessage]]:
+    """Take everything queued for this session (and clear it).
+
+    Returns ``(durable, ephemeral)`` — the caller persists the first group and appends the
+    second to this round's request only. The marker key is stripped so neither ever reaches
+    a provider payload.
+    """
     if not session_id:
-        return []
+        return [], []
     with _lock:
-        return _pending.pop(session_id, [])
+        queued = _pending.pop(session_id, [])
+    durable: list[LoopMessage] = []
+    ephemeral: list[LoopMessage] = []
+    for item in queued:
+        keep = bool(item.pop("__durable__", True))
+        (durable if keep else ephemeral).append(item)
+    return durable, ephemeral
 
 
 def discard_queued_images(session_id: str | None) -> None:

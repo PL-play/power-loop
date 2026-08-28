@@ -97,7 +97,7 @@ def test_limit_applies_to_a_recalled_image_too(tmp_path) -> None:
     p.write_bytes(_png(2000, 1000))
     discard_queued_images("s-size")
     assert queue_image_for_next_round("s-size", path=str(p), note="回取的图")
-    queued = drain_queued_images("s-size")
+    queued, _ = drain_queued_images("s-size")
     caps = coerce_capabilities(
         {"supports_image_input": True, "max_image_edge": 512}, model="m"
     )
@@ -112,7 +112,7 @@ def test_recalled_image_degrades_when_the_model_cannot_see(tmp_path) -> None:
     p.write_bytes(_png(64, 64))
     discard_queued_images("s-caps")
     queue_image_for_next_round("s-caps", path=str(p), ref="file_uuid=abc-1")
-    queued = drain_queued_images("s-caps")
+    queued, _ = drain_queued_images("s-caps")
     out = render_message_content(
         queued[0]["content"], role="user", capabilities=coerce_capabilities(None, model="m")
     )
@@ -128,10 +128,10 @@ def test_queue_is_drained_once_and_then_empty(tmp_path) -> None:
     p.write_bytes(_png(8, 8))
     discard_queued_images("s1")
     assert queue_image_for_next_round("s1", path=str(p), note="看这个")
-    first = drain_queued_images("s1")
+    first, _ = drain_queued_images("s1")
     assert [b["type"] for b in first[0]["content"]] == ["text", "attachment"]
     # 只活一轮：下一轮就没了，要再看得再 recall 一次。
-    assert drain_queued_images("s1") == []
+    assert drain_queued_images("s1") == ([], [])
 
 
 def test_queue_refuses_without_a_session(tmp_path) -> None:
@@ -159,8 +159,8 @@ def test_sessions_do_not_leak_into_each_other(tmp_path) -> None:
     discard_queued_images("s-a")
     discard_queued_images("s-b")
     queue_image_for_next_round("s-a", path=str(p))
-    assert drain_queued_images("s-b") == []
-    assert len(drain_queued_images("s-a")) == 1
+    assert drain_queued_images("s-b") == ([], [])
+    assert len(drain_queued_images("s-a")[0]) == 1
 
 
 # ── recall 一行：文本蒸馏，两种记录都要对 ──────────────────────────────────
@@ -270,3 +270,22 @@ def test_switching_to_a_text_only_model_does_not_break_a_verbatim_replay(tmp_pat
     assert "image_url" not in blob          # 没有图片被硬发出去
     assert "file_uuid=u-9" in blob          # 但找回原图的坐标还在
     assert "没有看到" in blob                # 且模型知道自己没看到
+
+def test_durable_and_ephemeral_are_separated(tmp_path) -> None:
+    """默认 durable：图留在这个 send 里，别在看一眼之后就消失。
+
+    最初选 ephemeral 是怕「回取三次就永久带三张图」。实测把这个顾虑推翻了——provider 的
+    prefix cache 命中率约 99%，图待在稳定前缀里每轮只花约十分之一价；而语义上 durable 明显
+    更自然：看完一张 UI 图要基于它写十几轮代码，图该一直在眼前。跨 send 由投影蒸馏成
+    `[image: … · file_uuid=…]`，不会无界累积。
+    """
+    p = tmp_path / "a.png"
+    p.write_bytes(_png(8, 8))
+    discard_queued_images("s-mix")
+    assert queue_image_for_next_round("s-mix", path=str(p), ref="file_uuid=u1")
+    assert queue_image_for_next_round("s-mix", path=str(p), durable=False)
+    durable, ephemeral = drain_queued_images("s-mix")
+    assert len(durable) == 1 and len(ephemeral) == 1
+    # 标记键绝不能漏进 provider 载荷
+    assert "__durable__" not in durable[0] and "__durable__" not in ephemeral[0]
+    assert durable[0]["role"] == "user"

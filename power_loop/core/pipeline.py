@@ -1044,12 +1044,18 @@ class AgentPipeline:
                 await self._append_message(_pm, round_index=round_idx)
                 llm_before.messages.append(dict(_pm))
 
-            # EPHEMERAL image recall: a tool (e.g. recall_send hitting an image row) can put a
-            # picture back in front of the model for exactly ONE round. Appended to the request
-            # only — never persisted, so it does not enter history or the projection. Durable
-            # would mean an agent that recalled three times carries three images forever, which
-            # is the unbounded growth the projection exists to prevent.
-            for _img in drain_queued_images(self.session_id):
+            # Image recall: a tool (see_image / recall_send / an image generator) can put
+            # pictures in front of the model. DURABLE ones become real `user` rows — the image
+            # stays in view for the rest of the send (cheap: it sits in the provider's cached
+            # prefix) and is distilled to `[image: … · file_uuid=…]` across sends, so nothing
+            # accumulates without bound. EPHEMERAL ones go into this request only.
+            # Appended AFTER the hook's own persist_messages so a tool's picture lands below
+            # the tool result that announced it — which is exactly where the model expects it.
+            _durable_imgs, _ephemeral_imgs = drain_queued_images(self.session_id)
+            for _img in _durable_imgs:
+                await self._append_message(_img, round_index=round_idx)
+                llm_before.messages.append(dict(_img))
+            for _img in _ephemeral_imgs:
                 llm_before.messages.append(_img)
 
             if llm_before.directive == HookDirective.SHORT_CIRCUIT:

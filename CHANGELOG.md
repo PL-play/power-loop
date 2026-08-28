@@ -8,6 +8,22 @@
 
 ## [Unreleased]
 
+## [6.3.0] — 2026-08-28
+
+### Changed
+
+* **图片注入默认改为 DURABLE**（落库成真实 ``user`` 行），`queue_image_for_next_round(durable=False)`
+  保留原来的「只活一轮」语义。默认之所以反转：第一版选 ephemeral 是怕「回取三次就永久带三张图」，
+  实测把这个顾虑推翻了——provider 的 prefix cache 对稳定前缀命中率约 99%，图待在前缀里每轮只花
+  约十分之一价；而语义上 durable 明显更自然：看完一张 UI 图要基于它写十几轮代码，图该一直在
+  眼前，而不是看一眼就消失、想再看得重新调一次。跨 send 由投影蒸馏成
+  ``[image: shot.png · file_uuid=…]``，不会无界累积。
+
+  ``drain_queued_images()`` 相应返回 ``(durable, ephemeral)`` 两组（**签名变更**，但这是 6.1.0
+  才引入的内部面，未进 ``STABLE_API``）。注入位置在 hook 自己的 ``persist_messages`` **之后**——
+  一张图应该落在宣告它的那条工具结果下面，这正是模型预期它出现的地方。
+
+
 ## [6.2.0] — 2026-08-28
 
 ### Added
