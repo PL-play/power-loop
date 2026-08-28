@@ -778,6 +778,8 @@ class AgentPipeline:
                         prompt_tokens=getattr(usage, "prompt_tokens", None),
                         completion_tokens=getattr(usage, "completion_tokens", None),
                         total_tokens=getattr(usage, "total_tokens", None),
+                        prompt_cached_tokens=getattr(usage, "prompt_cached_tokens", None),
+                        prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
                     ),
                     round_index=round_index, stream_id="main",
                 )

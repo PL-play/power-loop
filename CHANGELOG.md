@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+## [6.2.0] — 2026-08-28
+
+### Added
+
+* **`LlmCallCompletedPayload` 带上 prompt-cache 拆分**（`prompt_cached_tokens` /
+  `prompt_cache_miss_tokens`）。transport 早就把这两个数从 provider 响应里解析进
+  `LLMTokenUsage` 了，但**逐次调用的事件把它们丢掉了**：宿主只能看到「这一轮花了 44k prompt
+  token」，**无从判断**那是 44k 全价、还是 99% 命中缓存只按十分之一计。
+  没有这个拆分，任何关于上下文成本的判断都是猜——它决定了「精简历史」是一次大胜还是 20 倍的
+  亏损（改动历史中段会让该点之后的缓存全部失效）。累计口径的 `USAGE_UPDATED.usage` 早有
+  `cache_read_tokens`；这里补的是**逐轮精度**，用来定位是哪一轮击穿了缓存。
+  `None` 表示 provider 没报（与真实的 0 区分开）。
+
+
 ## [6.1.1] — 2026-08-28
 
 ### Fixed
