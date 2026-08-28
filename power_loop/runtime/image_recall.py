@@ -38,7 +38,7 @@ MAX_PENDING_PER_SESSION = 8
 
 
 def queue_image_for_next_round(
-    session_id: str | None, *, path: str, note: str = ""
+    session_id: str | None, *, path: str, note: str = "", ref: str = ""
 ) -> bool:
     """Queue one image (by local path) to be shown to the model on the next round.
 
@@ -54,7 +54,9 @@ def queue_image_for_next_round(
     # model's declared size limit and encodes it at request time.
     blocks.append({
         "type": "attachment",
-        "attachment": _attachment_ref(path),
+        # Carry the host's recall coordinate through: if the definition has meanwhile switched to
+        # a model that cannot see images, this is what the placeholder text will point at.
+        "attachment": _attachment_ref(path, ref=ref),
     })
     with _lock:
         queue = _pending.setdefault(session_id, [])
@@ -79,7 +81,7 @@ def discard_queued_images(session_id: str | None) -> None:
             _pending.pop(session_id, None)
 
 
-def _attachment_ref(path: str) -> dict[str, Any]:
+def _attachment_ref(path: str, *, ref: str = "") -> dict[str, Any]:
     from power_loop._vendor.llm_client.multimodal import create_attachment_ref
 
-    return create_attachment_ref(path)
+    return create_attachment_ref(path, ref=ref)

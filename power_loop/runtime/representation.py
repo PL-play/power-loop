@@ -156,11 +156,14 @@ def _distill_block(block: Any) -> str:
         return str(block.get("text") or "")
     if btype == "attachment":
         att = block.get("attachment") or {}
-        # The reference that survives distillation: filename/path, never the bytes. A host that
-        # wants the image back re-reads it from here (recall) rather than from the projection.
+        # What survives distillation: filename + the host's recall coordinate (`ref`), never the
+        # bytes. This line is ALL a later model has to go on — in particular a model that cannot
+        # see images at all (the definition switched), for which it is the only way back to the
+        # original. DeepTalk puts `file_uuid=…` here, which see_image takes directly.
         name = att.get("filename") or att.get("path") or "file"
         kind = att.get("kind") or "file"
-        return f"[{kind}: {name}]"
+        ref = str(att.get("ref") or "").strip()
+        return f"[{kind}: {name} · {ref}]" if ref else f"[{kind}: {name}]"
     if btype == "image_url":
         url = block.get("image_url")
         url = url.get("url") if isinstance(url, dict) else url

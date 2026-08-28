@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from power_loop._vendor.llm_client.capabilities import ModelCapabilityError, coerce_capabilities
+from power_loop._vendor.llm_client.capabilities import coerce_capabilities
 from power_loop._vendor.llm_client.multimodal import create_attachment_ref, render_message_content
 from power_loop.runtime.image_recall import (
     MAX_PENDING_PER_SESSION,
@@ -106,17 +106,18 @@ def test_limit_applies_to_a_recalled_image_too(tmp_path) -> None:
     assert _dims(payload) == (512, 256)
 
 
-def test_recalled_image_still_needs_a_declared_capability(tmp_path) -> None:
-    # 回取不是绕过声明的后门。
+def test_recalled_image_degrades_when_the_model_cannot_see(tmp_path) -> None:
+    # 回取不是绕过声明的后门；但定义换到看不了图的模型后也不能因此炸掉——降级并带出路。
     p = tmp_path / "r.png"
     p.write_bytes(_png(64, 64))
     discard_queued_images("s-caps")
-    queue_image_for_next_round("s-caps", path=str(p))
+    queue_image_for_next_round("s-caps", path=str(p), ref="file_uuid=abc-1")
     queued = drain_queued_images("s-caps")
-    with pytest.raises(ModelCapabilityError):
-        render_message_content(
-            queued[0]["content"], role="user", capabilities=coerce_capabilities(None, model="m")
-        )
+    out = render_message_content(
+        queued[0]["content"], role="user", capabilities=coerce_capabilities(None, model="m")
+    )
+    assert isinstance(out, str)
+    assert "没有看到" in out and "file_uuid=abc-1" in out
 
 
 # ── 回取队列：只活一轮 ──────────────────────────────────────────────────────
@@ -195,7 +196,7 @@ def test_recall_body_distils_multimodal_and_reports_images(tmp_path) -> None:
 
     text, images = _recall_row_body(_Row(content, {"content_encoding": "json"}))
     assert text == "配色如何？\n[image: shot.png]"
-    assert images == [str(p)]
+    assert images == [(str(p), "")]
 
 
 def test_recall_body_never_returns_an_inlined_base64_payload() -> None:
@@ -217,3 +218,55 @@ def test_recall_body_survives_a_corrupt_payload() -> None:
     text, images = _recall_row_body(_Row("{not json", {"content_encoding": "json"}))
     assert text == "{not json"
     assert images == []
+
+def test_recall_carries_the_hosts_ref_through(tmp_path) -> None:
+    import json
+
+    p = tmp_path / "shot.png"
+    p.write_bytes(_png(8, 8))
+    content = json.dumps([{
+        "type": "attachment",
+        "attachment": create_attachment_ref(str(p), ref="file_uuid=491b-abc"),
+    }], ensure_ascii=False)
+    from power_loop.tools.default_tools import _recall_row_body
+
+    text, images = _recall_row_body(_Row(content, {"content_encoding": "json"}))
+    # 蒸馏行与回取坐标都带着 ref：换到看不了图的模型时，这是唯一的出路。
+    assert text == "[image: shot.png · file_uuid=491b-abc]"
+    assert images == [(str(p), "file_uuid=491b-abc")]
+
+
+def test_switching_to_a_text_only_model_does_not_break_a_verbatim_replay(tmp_path) -> None:
+    """回归：换模型后 verbatim 重放历史里的图，曾让整个 send 抛异常、会话彻底不可用。"""
+    import json
+
+    from power_loop.agent.sink import _encode_content
+    from power_loop.runtime.representation import ProjectMessageRow, VerbatimRepresentation
+    from power_loop.runtime.store.types import MessageRow
+
+    p = tmp_path / "hist.png"
+    p.write_bytes(_png(16, 16))
+    stored, _ = _encode_content([
+        {"type": "text", "text": "看这张图"},
+        {"type": "attachment", "attachment": create_attachment_ref(str(p), ref="file_uuid=u-9")},
+    ])
+    row = MessageRow(session_id="s", seq=1, role="user", name=None, content=stored,
+                     tool_calls=None, tool_call_id=None, round_index=0, state="active",
+                     meta={"content_encoding": "json"}, created_at=0, send_index=1)
+    rep = VerbatimRepresentation()
+    ps = rep.project_send([row], send_index=1, tool_registry=None)
+    stored_rows = [ProjectMessageRow(
+        session_id="s", send_index=1, kind=r.kind, content=r.content, rendered_text=None,
+        source_seq_lo=1, source_seq_hi=1, compact_from_send=None, compact_to_send=None,
+        projector_version=1, token_estimate=None, created_at=0) for r in ps.rows]
+
+    from power_loop._vendor.llm_client.interface import LLMRequest
+
+    replayed = rep.render(stored_rows)
+    out = LLMRequest(messages=replayed, model="m").to_messages(
+        coerce_capabilities(None, model="deepseek-v4-flash")  # 换成看不了图的模型
+    )
+    blob = json.dumps(out, ensure_ascii=False)
+    assert "image_url" not in blob          # 没有图片被硬发出去
+    assert "file_uuid=u-9" in blob          # 但找回原图的坐标还在
+    assert "没有看到" in blob                # 且模型知道自己没看到

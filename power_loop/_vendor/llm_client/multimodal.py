@@ -26,6 +26,9 @@ class AttachmentRef:
     filename: str
     mime_type: str
     kind: str
+    #: 宿主给的「怎么把这张图找回来」坐标，原样带进蒸馏与降级文案（DeepTalk 放
+    #: ``file_uuid=…``，模型可直接拿去 see_image）。空字符串 = 没有。
+    ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -41,7 +44,9 @@ def _guess_mime_type(path: Path) -> str:
     return mime_type or "application/octet-stream"
 
 
-def create_attachment_ref(path: str | Path) -> dict[str, Any]:
+def create_attachment_ref(path: str | Path, *, ref: str = "") -> dict[str, Any]:
+    """``ref`` 是可选的回取坐标，会跟着这张图走到蒸馏与降级文案里——**换到看不了图的模型
+    之后**，那行文本就是模型唯一能据以把原图找回来的东西。"""
     file_path = Path(path).expanduser().resolve()
     mime_type = _guess_mime_type(file_path)
     kind = "other"
@@ -49,13 +54,14 @@ def create_attachment_ref(path: str | Path) -> dict[str, Any]:
         kind = "image"
     elif mime_type == "application/pdf":
         kind = "pdf"
-    ref = AttachmentRef(
+    attachment = AttachmentRef(
         path=str(file_path),
         filename=file_path.name,
         mime_type=mime_type,
         kind=kind,
+        ref=ref,
     )
-    return ref.__dict__.copy()
+    return attachment.__dict__.copy()
 
 
 def extract_text_from_content(content: Any) -> str:
@@ -153,18 +159,46 @@ def _downscale_to_data_url(path: Path, mime_type: str, max_edge: int | None) -> 
 
 
 def _render_image_attachment(ref: AttachmentRef, path: Path, capabilities: ModelCapabilities) -> PreparedAttachment:
-    # Raises unless the model DECLARED image support. There is deliberately no text-downgrade
-    # branch here any more: swapping the picture for "[Attached image: foo.png] the model does
-    # not support image input" still produced an answer, and callers had no way to tell that
-    # answer was made without ever seeing the image. Loud beats plausible.
-    capabilities.require_image_input(what=f"image {ref.filename!r}")
-    part = {
-        "type": "image_url",
-        "image_url": {
-            "url": _downscale_to_data_url(path, ref.mime_type, capabilities.max_image_edge)
-        },
-    }
-    return PreparedAttachment(ref=ref, rendered_parts=(part,), strategy="native-image")
+    """图片 → 原生 image 块；模型没声明看图能力时 → **明确的**文本占位。
+
+    为什么不抛：一次 render 同时渲染**历史**和本轮输入。一个定义换到看不了图的模型之后，
+    历史里的图会让整个 send 抛异常、会话彻底不可用——而历史是既成事实，不是调用方的错。
+
+    为什么降级不等于回到老毛病：老实现塞的是一句含糊的
+    "The current model does not support image input"，混在附件描述里，模型读过去照样按
+    「我看过这张图」的语气编答案。这里的占位必须做到两件事——**说清楚模型没有看到**，并且
+    **给出把图找回来的坐标**（``ref``，DeepTalk 放 file_uuid，可直接喂给 see_image）。
+    调用方想要「发图给看不了图的模型就报错」，用 ``capabilities.require_image_input()`` 自查。
+    """
+    if capabilities.supports_image_input is True:
+        part = {
+            "type": "image_url",
+            "image_url": {
+                "url": _downscale_to_data_url(path, ref.mime_type, capabilities.max_image_edge)
+            },
+        }
+        return PreparedAttachment(ref=ref, rendered_parts=(part,), strategy="native-image")
+
+    logger.warning(
+        "image %s not sent: model %r has not declared image support (supports_image_input=%r); "
+        "surfaced as a text placeholder instead",
+        ref.filename, capabilities.model or "<unnamed>", capabilities.supports_image_input,
+    )
+    text = (
+        f"[图片 {describe_attachment_ref(ref)}——**当前模型看不了图片，你没有看到它的内容**。"
+        "不要凭空描述这张图；需要看就用 see_image 之类的视觉工具，按上面的坐标取它。]"
+    )
+    return PreparedAttachment(
+        ref=ref,
+        text_fallback=text,
+        rendered_parts=({"type": "text", "text": text},),
+        strategy="image-unsupported",
+    )
+
+
+def describe_attachment_ref(ref: AttachmentRef) -> str:
+    """``shot.png · file_uuid=491b…`` —— 蒸馏与降级共用的一行标识。"""
+    return f"{ref.filename} · {ref.ref}" if ref.ref else ref.filename
 
 
 def _render_pdf_attachment(ref: AttachmentRef, path: Path, capabilities: ModelCapabilities) -> PreparedAttachment:
@@ -203,6 +237,7 @@ def prepare_attachment(ref_payload: dict[str, Any], capabilities: ModelCapabilit
         filename=str(ref_payload.get("filename") or Path(str(ref_payload.get("path") or "attachment")).name),
         mime_type=str(ref_payload.get("mime_type") or "application/octet-stream"),
         kind=str(ref_payload.get("kind") or "other"),
+        ref=str(ref_payload.get("ref") or ""),
     )
     path = Path(ref.path)
 

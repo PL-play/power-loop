@@ -8,6 +8,28 @@
 
 ## [Unreleased]
 
+## [6.1.0] — 2026-08-28
+
+### Fixed
+
+* 🔴 **换到看不了图的模型会让整个会话崩掉。** 一次 render 同时渲染**历史**与本轮输入，所以
+  6.0.0 那条「未声明发图直接抛」在 `VerbatimRepresentation` 下会被历史里的图触发：定义换模型
+  后，每一个 send 都抛 `ModelCapabilityError`，会话彻底不可用。而历史是既成事实，不是调用方
+  的错。现在渲染层**降级**而不抛。
+
+  降级不等于回到 5.x 那个静默毛病——区别全在文案。旧实现塞的是一句含糊的 "The current model
+  does not support image input"，混在附件描述里，模型照样按「我看过这张图」的语气编答案。新的
+  占位必须做到两件事：**说清模型没有看到**，并**给出把图找回来的坐标**。
+  想要「发图给看不了图的模型就报错」的调用方，用 `capabilities.require_image_input()` 自查。
+
+### Added
+
+* **`AttachmentRef.ref`：宿主给的回取坐标**，由 `create_attachment_ref(path, ref=…)` 传入，
+  跟着这张图走进**蒸馏行**（`[image: shot.png · file_uuid=…]`）与**降级占位**。换到看不了图的
+  模型之后，这行文本是模型唯一能据以找回原图的东西——DeepTalk 放 `file_uuid=…`，可直接喂给
+  see_image。`recall_send` 与 `queue_image_for_next_round(ref=…)` 全程携带。
+
+
 ## [6.0.0] — 2026-08-28
 
 ### Added
