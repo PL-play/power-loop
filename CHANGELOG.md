@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+### Fixed
+
+* **图片文件读不到时降级，不再抛异常**。`_render_image_attachment` 过去让 `FileNotFoundError`
+  穿出渲染层，代价与「模型不支持看图」那一路完全一样：一次 render 同时渲染历史与本轮输入，
+  一个读不到的附件会让**每一次** send 都失败，重试耗尽后整个 run 终止。DeepTalk conv-198 真实
+  发生——宿主把相对路径交给渲染器，两张刚生成的图按进程 cwd 解析而找不到，agent 就此停在半路，
+  图既没进上下文也没发给用户。现在与能力不匹配同款处理：降级成占位文本，**说清模型没有看到**，
+  并带上 `ref` 坐标供找回。宿主的路径 bug 该自己修，但渲染器不该把「一个附件读不到」放大成
+  「会话不可用」。
+* `_downscale_to_data_url` 遇到 `OSError` 不再吞掉后重试读同一个文件——那会打出
+  "could not downscale …; sending it at original size" 这句**误导性**日志（毛病在路径，不在
+  图像解码），现在直接上抛交由降级处理。
+
 ## [6.4.0] — 2026-08-28
 
 ### Added

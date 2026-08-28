@@ -156,3 +156,23 @@ def test_unsupported_attachment_type_raises(tmp_path) -> None:
     content = [{"type": "attachment", "attachment": create_attachment_ref(str(p))}]
     with pytest.raises(ModelCapabilityError, match="unsupported type"):
         render_message_content(content, role="user", capabilities=caps)
+
+
+def test_missing_file_degrades_instead_of_killing_the_send(tmp_path) -> None:
+    """图片文件读不到 → 占位文本，**不抛**。
+
+    回归自 DeepTalk conv-198：宿主把一个相对路径交给渲染器，它按进程 cwd 解析，两张刚生成
+    的图找不到。当时这里让 FileNotFoundError 穿了出去，于是**每一次** send 都失败——图在
+    历史里，重试三次全抛，整个 run 降级终止。agent 停在半路，图既没被模型看到，也没发给用户。
+
+    宿主的路径 bug 该修（那是根因），但渲染器不能把「一个附件读不到」放大成「会话不可用」。
+    降级文案同样必须说清模型没有看到，并留下坐标。
+    """
+    content = [{"type": "attachment",
+                "attachment": create_attachment_ref(str(tmp_path / "gone.png"),
+                                                    ref="file_uuid=491b-abc")}]
+    caps = coerce_capabilities({"supports_image_input": True}, model="vision-model")
+    out = render_message_content(content, role="user", capabilities=caps)
+    assert isinstance(out, str)                 # 没有任何 image_url 块发出去
+    assert "读不到" in out and "没有看到" in out  # 模型不会以为自己看过
+    assert "file_uuid=491b-abc" in out          # 还能把图找回来

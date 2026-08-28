@@ -152,6 +152,10 @@ def _downscale_to_data_url(path: Path, mime_type: str, max_edge: int | None) -> 
             resized.save(buf, format="JPEG", quality=85, optimize=True)
         payload = base64.b64encode(buf.getvalue()).decode("ascii")
         return f"data:image/jpeg;base64,{payload}"
+    except OSError:
+        # 文件读不到不是「缩放失败」——报 "sending it at original size" 会把调用方引到
+        # 图像解码上，而真正的毛病在路径。交给上层按「读不到」降级。
+        raise
     except Exception:  # noqa: BLE001 — a decode failure must not lose the image entirely
         logger.warning("could not downscale %s; sending it at original size", path.name,
                        exc_info=True)
@@ -171,12 +175,27 @@ def _render_image_attachment(ref: AttachmentRef, path: Path, capabilities: Model
     调用方想要「发图给看不了图的模型就报错」，用 ``capabilities.require_image_input()`` 自查。
     """
     if capabilities.supports_image_input is True:
-        part = {
-            "type": "image_url",
-            "image_url": {
-                "url": _downscale_to_data_url(path, ref.mime_type, capabilities.max_image_edge)
-            },
-        }
+        try:
+            url = _downscale_to_data_url(path, ref.mime_type, capabilities.max_image_edge)
+        except OSError as exc:
+            # 文件读不到（路径解析错、被清理、权限）——**降级，不抛**。抛出去的代价与
+            # 能力不匹配那一路完全一样：一次 render 同时渲染历史与本轮，一个读不到的
+            # 附件会让每一次 send 都失败，重试耗尽后整个 run 终止。DeepTalk conv-198
+            # 真实发生过：两张刚生成的图因相对路径被按进程 cwd 解析而找不到，agent 就此
+            # 停在半路，图既没被看到也没发出去。占位文本同样必须说清「你没有看到」。
+            logger.warning("image %s could not be read (%s); surfaced as a text placeholder",
+                           ref.filename, exc)
+            text = (
+                f"[图片 {describe_attachment_ref(ref)}——**这个文件读不到，你没有看到它的内容**。"
+                "不要凭空描述这张图；需要看就按上面的坐标用视觉工具重新取它。]"
+            )
+            return PreparedAttachment(
+                ref=ref,
+                text_fallback=text,
+                rendered_parts=({"type": "text", "text": text},),
+                strategy="image-unreadable",
+            )
+        part = {"type": "image_url", "image_url": {"url": url}}
         return PreparedAttachment(ref=ref, rendered_parts=(part,), strategy="native-image")
 
     logger.warning(
