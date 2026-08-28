@@ -28,6 +28,7 @@ Pass ``durable=False`` for the look-once case (request-only, never stored).
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from typing import Any
 
 LoopMessage = dict[str, Any]
@@ -75,6 +76,43 @@ def queue_image_for_next_round(
             return False
         queue.append({"role": "user", "content": blocks, "__durable__": durable})
     return True
+
+
+def queue_images_for_next_round(
+    session_id: str | None,
+    images: Sequence[tuple[str, str]],
+    *,
+    note: str = "",
+    durable: bool = True,
+) -> int:
+    """Queue a BATCH as ONE user message: a single note + one attachment block per image.
+
+    Queuing them one by one produces N separate user turns, each repeating the note — three
+    screenshots asked about with one question became three copies of that question in the
+    transcript. A batch is one turn, which is also what the provider APIs expect.
+
+    ``images`` is ``[(path, ref)]``. Returns how many were accepted (0 = nothing queued, so the
+    caller must say so rather than claim the pictures were delivered).
+    """
+    if not session_id:
+        return 0
+    blocks: list[dict[str, Any]] = []
+    if note:
+        blocks.append({"type": "text", "text": note})
+    accepted = 0
+    for path, ref in images:
+        if not path:
+            continue
+        blocks.append({"type": "attachment", "attachment": _attachment_ref(path, ref=ref)})
+        accepted += 1
+    if not accepted:
+        return 0
+    with _lock:
+        queue = _pending.setdefault(session_id, [])
+        if len(queue) >= MAX_PENDING_PER_SESSION:
+            return 0
+        queue.append({"role": "user", "content": blocks, "__durable__": durable})
+    return accepted
 
 
 def drain_queued_images(session_id: str | None) -> tuple[list[LoopMessage], list[LoopMessage]]:

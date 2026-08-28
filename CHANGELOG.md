@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+## [6.4.0] — 2026-08-28
+
+### Added
+
+* **`queue_images_for_next_round()`：一批图入队成 ONE user 消息**（一个说明 + 每张一个
+  attachment 块）。逐张调 `queue_image_for_next_round` 会产生 N 条独立 user 轮次、**每条都
+  重复一遍同样的说明**——真实会话里「三张截图配一个问题」就在 transcript 里留下三份那个问题。
+  一批一条也正是 provider API 期望的形状。
+
+
 ## [6.3.0] — 2026-08-28
 
 ### Changed

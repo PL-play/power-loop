@@ -289,3 +289,36 @@ def test_durable_and_ephemeral_are_separated(tmp_path) -> None:
     # 标记键绝不能漏进 provider 载荷
     assert "__durable__" not in durable[0] and "__durable__" not in ephemeral[0]
     assert durable[0]["role"] == "user"
+
+
+def test_a_batch_becomes_one_turn_not_n_turns(tmp_path) -> None:
+    """一批图必须是**一条** user 消息。
+
+    逐张入队会产生 N 条独立 user 轮次、每条都重复一遍同样的问题——真实会话里三张截图配一个
+    问题，就在 transcript 里留下三份那个问题。批量也正是 provider API 期望的形状。
+    """
+    from power_loop.runtime.image_recall import queue_images_for_next_round
+
+    a, b = tmp_path / "a.png", tmp_path / "b.png"
+    for p in (a, b):
+        p.write_bytes(_png(8, 8))
+    discard_queued_images("s-batch")
+    n = queue_images_for_next_round(
+        "s-batch", [(str(a), "file_uuid=1"), (str(b), "file_uuid=2")], note="这两张有什么区别"
+    )
+    durable, _ = drain_queued_images("s-batch")
+    assert n == 2
+    assert len(durable) == 1                                   # 一条，不是两条
+    kinds = [x["type"] for x in durable[0]["content"]]
+    assert kinds == ["text", "attachment", "attachment"]        # 问题只出现一次
+    assert durable[0]["content"][0]["text"] == "这两张有什么区别"
+
+
+def test_empty_batch_is_refused(tmp_path) -> None:
+    from power_loop.runtime.image_recall import queue_images_for_next_round
+
+    discard_queued_images("s-empty")
+    assert queue_images_for_next_round("s-empty", [], note="x") == 0
+    assert queue_images_for_next_round("s-empty", [("", "")], note="x") == 0
+    assert queue_images_for_next_round(None, [("/tmp/a.png", "")]) == 0
+    assert drain_queued_images("s-empty") == ([], [])
