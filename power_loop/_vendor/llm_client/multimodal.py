@@ -39,8 +39,25 @@ class PreparedAttachment:
     strategy: str = "text"
 
 
+#: 扩展名 → MIME 的**内置**兜底表。不能只靠 `mimetypes`：它读的是系统的 mime.types，
+#: 不同镜像装的不一样。真实事故（DeepTalk conv-201）：宿主 Python 认得 `.webp`，
+#: 生产容器里 `guess_type(".webp")` 返回 None → 落到 application/octet-stream →
+#: 渲染层判定「这不是图片」抛 ModelCapabilityError → 重试耗尽 → 整个 run 降级终止。
+#: agent 刚把配图处理成 webp、正要看一眼，会话就死在这里。本地全绿、生产炸掉的典型。
+_EXT_MIME_FALLBACK = {
+    ".webp": "image/webp", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".bmp": "image/bmp", ".tif": "image/tiff", ".tiff": "image/tiff",
+    ".avif": "image/avif", ".heic": "image/heic", ".heif": "image/heif", ".svg": "image/svg+xml",
+    ".pdf": "application/pdf",
+}
+
+
 def _guess_mime_type(path: Path) -> str:
+    """文件的 MIME。系统表优先，认不出来再查内置表 —— 顺序不能反：
+    系统表更全，内置表只补它在某些镜像里缺的那几个。"""
     mime_type, _ = mimetypes.guess_type(str(path))
+    if not mime_type:
+        mime_type = _EXT_MIME_FALLBACK.get(path.suffix.lower())
     return mime_type or "application/octet-stream"
 
 
@@ -265,11 +282,24 @@ def prepare_attachment(ref_payload: dict[str, Any], capabilities: ModelCapabilit
     if ref.kind == "pdf":
         return _render_pdf_attachment(ref, path, capabilities)
 
-    raise ModelCapabilityError(
-        f"Cannot send attachment {ref.filename!r}: unsupported type {ref.mime_type!r}. "
-        "This library renders images (declared models only) and text-extractable PDFs; "
-        "anything else must be converted by the caller. It is not summarised into a "
-        "placeholder line — a placeholder reads to the model as if the file had been read."
+    # 认不出的类型：降级成**明说没读到**的占位，不抛。
+    #
+    # 原先这里抛 ModelCapabilityError，理由是「占位符读起来像文件已经被读过」——那个理由
+    # 对含糊的占位成立，对下面这句不成立：它明确写着模型没有拿到内容，并给出回取坐标。
+    # 而抛出去的代价是整个会话不可用：一次 render 同时渲染历史与本轮，历史里躺着一个认不出
+    # 类型的附件，之后**每一次** send 都失败。DeepTalk conv-201 就是这么断的——容器里
+    # `.webp` 猜不出 MIME（见 _EXT_MIME_FALLBACK），agent 处理完配图正要看一眼，会话就死了。
+    logger.warning("attachment %s has unsupported type %r; surfaced as a text placeholder",
+                   ref.filename, ref.mime_type)
+    text = (
+        f"[附件 {describe_attachment_ref(ref)}（类型 {ref.mime_type}）——**这个类型发不进上下文，"
+        "你没有读到它的内容**。不要凭空描述它；需要的话先把它转成图片或可提取文本的 PDF。]"
+    )
+    return PreparedAttachment(
+        ref=ref,
+        text_fallback=text,
+        rendered_parts=({"type": "text", "text": text},),
+        strategy="unsupported-type",
     )
 
 

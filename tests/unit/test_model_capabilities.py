@@ -149,13 +149,38 @@ def test_unreadable_pdf_raises(tmp_path) -> None:
         render_message_content(content, role="user", capabilities=caps)
 
 
-def test_unsupported_attachment_type_raises(tmp_path) -> None:
+def test_unsupported_attachment_type_degrades(tmp_path) -> None:
+    """认不出的类型 → 明说没读到的占位，**不抛**。
+
+    原先抛 ModelCapabilityError，理由是「占位读起来像文件被读过」——那对含糊的占位成立，
+    对这句不成立（它明说模型没拿到内容）。而抛出去的代价是整个会话不可用：历史里躺着一个
+    认不出类型的附件，之后每一次 send 都失败。
+    """
     p = tmp_path / "clip.mp3"
     p.write_bytes(b"\x00\x01")
     caps = coerce_capabilities({"supports_image_input": True}, model="m")
     content = [{"type": "attachment", "attachment": create_attachment_ref(str(p))}]
-    with pytest.raises(ModelCapabilityError, match="unsupported type"):
-        render_message_content(content, role="user", capabilities=caps)
+    out = render_message_content(content, role="user", capabilities=caps)
+    assert isinstance(out, str)
+    assert "clip.mp3" in out and "没有读到" in out
+
+
+def test_webp_is_recognised_even_when_the_system_mime_table_is_not(tmp_path, monkeypatch) -> None:
+    """回归 DeepTalk conv-201：容器里 `guess_type('.webp')` 返回 None。
+
+    宿主 Python 认得 webp，生产镜像不认——于是 MIME 落到 application/octet-stream，
+    渲染层判定「这不是图片」，agent 刚把配图处理成 webp、正要看一眼，会话就死在那里。
+    本地全绿、生产炸掉，只能靠内置兜底表挡住。
+    """
+    import mimetypes as _mt
+
+    from power_loop._vendor.llm_client.multimodal import create_attachment_ref as _mk
+
+    monkeypatch.setattr(_mt, "guess_type", lambda *a, **k: (None, None))
+    p = tmp_path / "shot.webp"
+    p.write_bytes(_PNG)                       # 字节是什么不重要，这里验的是类型判定
+    ref = _mk(str(p))                          # create_attachment_ref 返回的是 dict 负载
+    assert ref["mime_type"] == "image/webp" and ref["kind"] == "image"
 
 
 def test_missing_file_degrades_instead_of_killing_the_send(tmp_path) -> None:

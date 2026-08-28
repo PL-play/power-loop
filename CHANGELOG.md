@@ -8,7 +8,22 @@
 
 ## [Unreleased]
 
+## [6.5.0] — 2026-08-28
+
 ### Fixed
+
+* 🔴 **`.webp` 在某些镜像里猜不出 MIME，会拖垮整个会话**。`mimetypes` 读的是系统的
+  mime.types，不同镜像装的不一样：宿主 Python 认得 `.webp`，DeepTalk 的生产容器里
+  `guess_type(".webp")` 返回 `None` → 落到 `application/octet-stream` → 渲染层判定
+  「这不是图片」抛 `ModelCapabilityError` → 重试耗尽 → run 降级终止（真实事故 conv-201：
+  agent 刚把配图处理成 webp、正要看一眼，会话就断在那里，用户说「继续」才接上）。
+  现在 `_guess_mime_type` 在系统表认不出时查一张**内置**扩展名表兜底
+  （webp/avif/heic/heif/png/jpg/gif/bmp/tiff/svg/pdf）。本地全绿、生产炸掉的典型，
+  只能靠内置表挡。
+* **认不出类型的附件降级，不再抛**。原先 `prepare_attachment` 对非 image/pdf 抛
+  `ModelCapabilityError`，理由是「占位读起来像文件已经被读过」——那对含糊的占位成立，对
+  现在这句不成立：它明说模型没拿到内容并给出回取坐标。而抛出去的代价是整个会话不可用
+  （历史里躺着一个认不出类型的附件，之后每一次 send 都失败）。
 
 * **图片文件读不到时降级，不再抛异常**。`_render_image_attachment` 过去让 `FileNotFoundError`
   穿出渲染层，代价与「模型不支持看图」那一路完全一样：一次 render 同时渲染历史与本轮输入，
