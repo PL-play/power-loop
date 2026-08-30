@@ -95,6 +95,48 @@ logger = logging.getLogger(__name__)
 # transient blank, while the cap keeps a persistently-broken provider from spinning to max_rounds.
 _EMPTY_RESPONSE_MAX_RETRIES = 3
 
+# 截断（provider 因 max_tokens 硬切）与「空响应打嗝」是两回事，处置也必须不同：
+# 打嗝重试一次就好了；截断**原样重试必然再次截断**——同一个 prompt、同一个模型、
+# 同样写超。真实事故（conv-213）：模型一轮里写一个 25KB 的 CSS 文件，输出打到
+# max_tokens=20000 被切在工具调用的 JSON 中间 → 解析不出工具调用、正文也是空的 →
+# 被判成打嗝 → 重试 → 再截断。两轮各约 8 分钟、产出为零，用户看到的是 16 分钟沉默。
+_TRUNCATED_MAX_RETRIES = 2
+_TRUNCATION_FINISH_REASONS = frozenset({"length", "max_tokens", "model_length"})
+_TRUNCATION_NOTICE = (
+    "[系统] 你上一轮的输出**超过了单轮长度上限，被从中间截断了**——所以那一轮什么都没生效"
+    "（工具调用的 JSON 断在半路，解析不出来）。原样再写一遍只会再被截断一次。\n"
+    "把它拆小再来：一次只写一个文件；单个文件很大就先写骨架、再用 edit_file/apply_patch "
+    "分几次补内容；不要在一轮里同时写多个大文件。"
+)
+
+
+def _finish_reason(response: Any) -> str:
+    """尽力从 provider 的原始响应里取 finish_reason（取不到就返回空串，绝不猜）。
+
+    各家形状不同：OpenAI 兼容在 ``choices[0].finish_reason``，Anthropic 在
+    ``stop_reason``（截断是 ``"max_tokens"``），流式聚合的放在最后一个 chunk 里。
+    """
+    for obj in (getattr(response, "raw_completion", None),
+                getattr(response, "raw_message", None)):
+        if obj is None:
+            continue
+        reason = getattr(obj, "stop_reason", None)
+        if isinstance(reason, str) and reason:
+            return reason.lower()
+        choices = getattr(obj, "choices", None)
+        if isinstance(choices, (list, tuple)) and choices:
+            reason = getattr(choices[0], "finish_reason", None)
+            if isinstance(reason, str) and reason:
+                return reason.lower()
+        if isinstance(obj, dict):
+            reason = obj.get("stop_reason") or (
+                (obj.get("choices") or [{}])[0].get("finish_reason")
+                if isinstance(obj.get("choices"), list) and obj["choices"] else None
+            )
+            if isinstance(reason, str) and reason:
+                return reason.lower()
+    return ""
+
 RESULT_MAX_CHARS = 50000
 
 
@@ -152,8 +194,16 @@ def _tool_call_args(tool_call: Mapping[str, Any]) -> dict[str, Any]:
             return {}
 
 
-def _sanitize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _sanitize_tool_calls(
+    tool_calls: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """消毒后的 tool_calls + 「有参数解析不了」的标志。
+
+    标志走**返回值**而不是塞进 call 里：这些 dict 会原样进 assistant 消息、下一轮发回给
+    供应商，多一个非标准字段可能直接把请求打挂。
+    """
     out: list[dict[str, Any]] = []
+    unparseable = False
     for tc in tool_calls:
         tc2: dict[str, Any] = dict(tc)
         fn = tc2.get("function")
@@ -171,12 +221,20 @@ def _sanitize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any
                         json.loads(repaired)
                         fn2["arguments"] = repaired
                     except Exception:
+                        # 参数解析不了，最常见的原因是**输出超长被截断**（JSON 断在半路）。
+                        # 这里不做 json 修复：补全出来的 `content` 就是那半个文件，
+                        # write_file 会当成功写下去、agent 继续往前走，交付一份残缺的稿子——
+                        # 那是静默损坏，比报错严重得多。降成 {} 让必填校验去报，
+                        # 同时留个标记，管线据此告诉模型「你是被截断了」而不是「你忘了填参数」
+                        # （conv-213 实测：一条 "missing required parameter" 背后是
+                        #  completion_tokens=20000 打满上限）。
                         fn2["arguments"] = "{}"
+                        unparseable = True
             elif args is None:
                 fn2["arguments"] = "{}"
             tc2["function"] = fn2
         out.append(tc2)
-    return out
+    return out, unparseable
 
 
 def _is_cancelled(token: CancellationToken | None) -> bool:
@@ -913,6 +971,7 @@ class AgentPipeline:
         # completion signal (see the no-tools block below). Count consecutive
         # empties so we retry a bounded number of times before giving up.
         self._empty_response_streak = 0
+        self._truncated_streak = 0
         round_idx = -1
         while True:
             round_idx += 1
@@ -1140,14 +1199,31 @@ class AgentPipeline:
             # Any productive round (said something OR called a tool) clears the empty streak.
             if assistant_text or tool_calls:
                 self._empty_response_streak = 0
+            if tool_calls:
+                self._truncated_streak = 0
 
             # Append assistant message
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
             sanitized_tool_calls: list[dict[str, Any]] | None = None
+            _args_cut = False
             if tool_calls:
-                sanitized_tool_calls = _sanitize_tool_calls(tool_calls)
+                sanitized_tool_calls, _args_cut = _sanitize_tool_calls(tool_calls)
                 assistant_msg["tool_calls"] = sanitized_tool_calls
             await self._append_message(assistant_msg, round_index=round_idx, hook_injected=hook_audit)
+            # 截断的第二种表现：工具调用本身在，但它的 arguments JSON 断在半路 → 降成 {} →
+            # 必填校验报「缺参数」，模型据此以为自己忘了填，于是原样再写一遍、再被截断。
+            # 真实事故（conv-213）：一条 "missing required parameter" 背后是 20000 token 打满。
+            # 这里补一句实话，让它知道该拆小而不是补参数。
+            if sanitized_tool_calls and _args_cut:
+                logger.warning(
+                    "tool-call arguments were unparseable at round %d (likely truncation; "
+                    "finish_reason=%r, completion_tokens=%s) — telling the model to write smaller "
+                    "(session=%s)",
+                    round_idx, _finish_reason(response),
+                    (usage or {}).get("completion_tokens"), self.session_id,
+                )
+                await self._append_message(
+                    {"role": "user", "content": _TRUNCATION_NOTICE}, round_index=round_idx)
             # Mark pending IMMEDIATELY so a crash here leaves a recoverable state.
             if sanitized_tool_calls:
                 assistant_seq = len(self.history)  # 1-based position in history
@@ -1157,6 +1233,38 @@ class AgentPipeline:
                     tool_calls=sanitized_tool_calls,
                     round_index=round_idx,
                 )
+
+            # ── 截断优先判定：它和「空响应打嗝」长得像，但重试方式必须相反 ──
+            # provider 因 max_tokens 硬切时，工具调用的 JSON 断在半路 → 解析不出 tool_calls，
+            # 正文往往也是空的（内容全在那段 JSON 里）。**原样重试必然再次截断**，
+            # 每次烧满一个 max_tokens（conv-213：两轮各约 8 分钟、产出为零）。
+            # 所以这里不重试，而是把「你被截断了，拆小再来」作为一条 user 消息落进历史——
+            # 改变了输入，模型才有可能给出不一样的输出。
+            if not tool_calls:
+                reason = _finish_reason(response)
+                cap = self.config.max_tokens
+                out_tokens = int((usage or {}).get("completion_tokens") or 0)
+                truncated = (reason in _TRUNCATION_FINISH_REASONS
+                             or (bool(cap) and out_tokens >= int(cap)))
+                if truncated and self._truncated_streak < _TRUNCATED_MAX_RETRIES:
+                    self._truncated_streak += 1
+                    logger.warning(
+                        "truncated LLM response at round %d (finish_reason=%r, "
+                        "completion_tokens=%d/%s) streak=%d/%d — nudging to write smaller "
+                        "(session=%s)",
+                        round_idx, reason, out_tokens, cap, self._truncated_streak,
+                        _TRUNCATED_MAX_RETRIES, self.session_id,
+                    )
+                    await self._append_message(
+                        {"role": "user", "content": _TRUNCATION_NOTICE}, round_index=round_idx)
+                    self._emit(AgentEventType.ROUND_COMPLETED,
+                               RoundCompletedPayload(round_index=round_idx, has_tools=False),
+                               round_index=round_idx)
+                    await self.hooks.run_typed_async(HookPoint.ROUND_END, RoundEndCtx(
+                        round_index=round_idx, messages=self.history,
+                        has_tools=False, response_text=assistant_text))
+                    await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
+                    continue
 
             # ── No tools → completed (unless a follow-up is waiting) ──
             if not tool_calls:

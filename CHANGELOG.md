@@ -8,6 +8,38 @@
 
 ## [Unreleased]
 
+## [6.6.0] — 2026-08-30
+
+### 修复
+
+- **被 max_tokens 截断的一轮不再当成「供应商打嗝」原样重试。** 真实事故
+  （DeepTalk conv-213，glm-5.3-flash）：模型想在一轮里写一个 25KB 的 CSS 文件，输出打到
+  `max_tokens=20000` 被切在工具调用的 JSON 中间 → 解析不出 `tool_calls`、正文也是空的
+  （内容全在那段 JSON 里）→ 命中「空响应 = 打嗝」的重试路径 → **原样重试** → 同一个
+  prompt、同一个模型、写出同样长的东西、同样被切断。两轮各约 8 分钟、产出为零，
+  用户那边看到的是 16 分钟沉默。
+
+  区分两者的信号一直都在：provider 的 `finish_reason`（截断是 `length` / `max_tokens`）。
+  现在按它判定（取不到时以 `completion_tokens` 打满 `max_tokens` 兜底），
+  处置不是重试而是**改变输入**——把「你上一轮被从中间截断了，把它拆小再来」作为一条
+  user 消息落进历史。输入变了，模型才可能给出不一样的输出。最多提示 2 次。
+
+- **截断的第二种表现也说实话**：工具调用在、但它的 `arguments` JSON 断在半路时，
+  参数会被降成 `{}`，必填校验于是报「缺参数」——模型据此以为自己忘了填，原样再写一遍、
+  再被截断（conv-213 实测：一条 `missing required parameter` 背后是
+  `completion_tokens=20000`）。现在同样补一句实话。
+
+  🔴 **这里刻意不做 JSON 修复**：把截断的 `{"path":"a.css","content":"body{co` 补成合法
+  JSON，`content` 就是那半个文件——`write_file` 会当成功写下去、agent 继续往前走，
+  交付一份残缺的稿子。静默损坏比报错严重得多。（结构化输出那条路的
+  `runtime/structured._try_repair_json` 不受影响：补全一个只读的 JSON 结果无害。）
+
+### 内部
+
+- `_sanitize_tool_calls` 返回 `(calls, 有参数解析不了)`。标志走返回值而不是塞进 call 里：
+  那些 dict 会原样进 assistant 消息、下一轮发回给供应商，多一个非标准字段可能把请求打挂。
+
+
 ## [6.5.0] — 2026-08-28
 
 ### Fixed
