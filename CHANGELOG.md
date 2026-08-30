@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+## [6.6.1] — 2026-08-31
+
+### Fixed
+
+- **截断提示的位置**：6.6.0 引入的「工具调用 arguments 被截断」提示，被追加在
+  `assistant(tool_calls)` 与它的 `tool` 结果**之间**，造出非法历史
+  `assistant(tool_calls) → user → tool`。下一次请求供应商直接回 400
+  （"An assistant message with 'tool_calls' must be followed by tool messages responding to
+  each 'tool_call_id'"）→ 重试耗尽 → 整个 run 降级。
+  真实事故：一个会话在**第一次发交互卡片**时就死在这（提示内容是对的，位置错了）。
+  现在提示补在**该轮所有 tool 结果之后**。
+  同一条不变量在 `TOOL_AFTER` BREAK 分支本来就守着（被跳过的工具也要补 tool 结果），
+  6.6.0 在新分支上漏了。新增单测直接钉住**消息序列合法性**本身，而不是「提示在不在」。
+
 ## [6.6.0] — 2026-08-30
 
 ### 修复

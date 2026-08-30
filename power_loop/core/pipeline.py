@@ -1213,17 +1213,15 @@ class AgentPipeline:
             # 截断的第二种表现：工具调用本身在，但它的 arguments JSON 断在半路 → 降成 {} →
             # 必填校验报「缺参数」，模型据此以为自己忘了填，于是原样再写一遍、再被截断。
             # 真实事故（conv-213）：一条 "missing required parameter" 背后是 20000 token 打满。
-            # 这里补一句实话，让它知道该拆小而不是补参数。
+            # 提示要补，但**不能在这里补**——见工具循环之后那一处。
             if sanitized_tool_calls and _args_cut:
                 logger.warning(
                     "tool-call arguments were unparseable at round %d (likely truncation; "
-                    "finish_reason=%r, completion_tokens=%s) — telling the model to write smaller "
-                    "(session=%s)",
+                    "finish_reason=%r, completion_tokens=%s) — will tell the model to write smaller "
+                    "after this round's tool results (session=%s)",
                     round_idx, _finish_reason(response),
                     (usage or {}).get("completion_tokens"), self.session_id,
                 )
-                await self._append_message(
-                    {"role": "user", "content": _TRUNCATION_NOTICE}, round_index=round_idx)
             # Mark pending IMMEDIATELY so a crash here leaves a recoverable state.
             if sanitized_tool_calls:
                 assistant_seq = len(self.history)  # 1-based position in history
@@ -1526,6 +1524,17 @@ class AgentPipeline:
                         round_idx=round_idx,
                     )
                     break
+
+            # 🔴 截断提示只能补在**所有 tool 结果都落完之后**。
+            # 补在 assistant(tool_calls) 与它的 tool 结果之间，会造出
+            # `assistant(tool_calls) → user → tool` 这种非法序列，下一次请求直接 400：
+            # "An assistant message with 'tool_calls' must be followed by tool messages
+            #  responding to each 'tool_call_id'" → 重试耗尽 → 整个 run 降级。
+            # 真实事故 conv-215：第一次发卡片就死在这（提示本身是对的，位置错了）。
+            # 同一条不变量在上面 TOOL_AFTER BREAK 处也写着——那里守住了，这里当初漏了。
+            if _args_cut:
+                await self._append_message(
+                    {"role": "user", "content": _TRUNCATION_NOTICE}, round_index=round_idx)
 
             # ── Hook: TOOLS_BATCH_AFTER ──
             batch_after_ctx = ToolsBatchAfterCtx(
