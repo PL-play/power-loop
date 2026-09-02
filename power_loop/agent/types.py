@@ -112,6 +112,10 @@ class AgentLoopConfig:
     #: 且永远不动最近 ``hot_tail`` 条。触发依据优先用上一轮供应商返回的真实 prompt_tokens。
     insend_distill_batch: int = 10
     insend_distill_hot_tail: int = 8
+    #: 6.11.0 同轮并发：同一轮里 ≥2 个 ``async_capable`` 工具调用并发执行（上限 = 本值），结果仍按
+    #: 原顺序回填；TOOL_BEFORE 仍按序先跑完（闸类 hook 语义不变）。非 async_capable 工具永远串行。
+    #: 0/1 = 关。
+    tool_batch_concurrency: int = 4
     #: ``fold_strategy`` — how older history is compacted (N records → 1 compact) once over budget:
     #:   * ``LLMSummaryFold`` (default): one LLM summary call, no side effects.
     #:   * ``AgenticFold``: LLM + a bounded tool loop that persists durable facts as notes.

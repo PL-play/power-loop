@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+## [6.11.0] — 2026-09-03
+
+### Added
+
+- **同轮并发**（design/86 修订）：同一轮里 ≥2 个 ``async_capable`` 工具调用并发执行
+  （``AgentLoopConfig.tool_batch_concurrency``，默认 4；0/1 关）。模型面对「三张图」的直觉是同轮批量
+  发调用而不是先起 background_run，之前逐个排队（conv-224 三张图 3 分钟）。不变量：TOOL_BEFORE 仍按
+  原顺序先跑完（闸类 hook 语义不变，判 SKIP 的不起任务）；结果按原顺序回填；TOOL_AFTER / 事件 /
+  落库串行；非 async_capable 工具永远串行；取消 / HumanInputRequired / TOOL_AFTER BREAK 会取消未完成
+  的并发任务。
+
 ## [6.10.0] — 2026-09-02
 
 ### Added

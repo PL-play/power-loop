@@ -9,6 +9,7 @@ wrapper that delegates to ``AgentPipeline.run()``.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import json
@@ -954,6 +955,31 @@ class AgentPipeline:
 
         return response
 
+    def _is_async_capable(self, tool_name: str) -> bool:
+        reg = self.tool_registry
+        rt = reg.get(tool_name) if reg is not None else None
+        return bool(rt is not None and getattr(rt.definition, "async_capable", False))
+
+    def _spawn_tool_task(
+        self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore
+    ) -> asyncio.Future:
+        """同轮并发的一个成员：受信号量限流地跑 execute_tool。contextvars 随 task 自动拷贝
+        （PEP 567），计费 / 活动打标 / 运行时上下文零处理。异常原样留在 task 里，轮到它时
+        再由串行路径的 HumanInputRequired / TOOL_ERROR 分支处理。"""
+
+        async def _run() -> tuple[str, bool]:
+            async with sem:
+                return await self.execute_tool(tool_name, tool_args)
+
+        return asyncio.ensure_future(_run())
+
+    @staticmethod
+    def _cancel_pre_tasks(pre: dict[int, tuple[asyncio.Future, Any]]) -> None:
+        for task, _ in pre.values():
+            if not task.done():
+                task.cancel()
+        pre.clear()
+
     async def execute_tool(
         self, tool_name: str, tool_args: dict[str, Any], *, count: bool = True
     ) -> tuple[str, bool]:
@@ -1510,9 +1536,25 @@ class AgentPipeline:
             skip_batch = batch_ctx.directive == HookDirective.SKIP
 
             # ── Execute tools ──
+            # 6.11.0 同轮并发（design/86 修订）：模型面对「三张图」的直觉是同一轮批量发调用，
+            # 而不是先起 background_run 再回头查（conv-224：三次 design_pack_image 同轮发出、
+            # 逐个排队 3 分钟）。所以顺着它：同一轮 ≥2 个 async_capable 调用并发执行。
+            # 不变量：TOOL_BEFORE 仍按原顺序先跑（闸类 hook 语义不变）；结果按原顺序回填；
+            # TOOL_AFTER / 事件 / 落库全部串行；非 async_capable 工具永远串行。
             used_todo = False
+            _conc = int(self.config.tool_batch_concurrency or 0)
+            _eligible: list[int] = (
+                [j for j, tc in enumerate(tool_calls) if self._is_async_capable(_tool_call_name(tc))]
+                if (_conc > 1 and not skip_batch) else []
+            )
+            if len(_eligible) < 2:
+                _eligible = []
+            _pre: dict[int, tuple[asyncio.Future, Any]] = {}   # 已起任务：index → (task, tb_ctx)
+            _pre_skip: dict[int, Any] = {}                       # TOOL_BEFORE 判 SKIP 的 hoisted 调用
+            _pre_sem: asyncio.Semaphore | None = None
             for i, tool_call in enumerate(tool_calls):
                 if _is_cancelled(self.cancel_token):
+                    self._cancel_pre_tasks(_pre)
                     await self._finalize("cancelled")
                     return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx + 1)
 
@@ -1528,33 +1570,74 @@ class AgentPipeline:
                     )
                     continue
 
-                # ── Hook: TOOL_BEFORE ──
-                tb_ctx = ToolBeforeCtx(
-                    round_index=round_idx,
-                    tool_call=tool_call,
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                )
-                await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_ctx)
-                tool_name = tb_ctx.tool_name
-                tool_args = tb_ctx.tool_args
-
-                if tb_ctx.directive == HookDirective.SKIP:
+                pre_task: asyncio.Future | None = None
+                if i in _pre_skip:
+                    tb_ctx = _pre_skip.pop(i)
                     await self._append_message(
-                        {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": tb_ctx.output},
+                        {"role": "tool", "tool_call_id": call_id, "name": tb_ctx.tool_name,
+                         "content": tb_ctx.output},
                         round_index=round_idx,
                     )
                     continue
+                if i in _pre:
+                    pre_task, tb_ctx = _pre.pop(i)
+                    tool_name = tb_ctx.tool_name
+                    tool_args = tb_ctx.tool_args
+                else:
+                    # ── Hook: TOOL_BEFORE ──
+                    tb_ctx = ToolBeforeCtx(
+                        round_index=round_idx,
+                        tool_call=tool_call,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                    )
+                    await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_ctx)
+                    tool_name = tb_ctx.tool_name
+                    tool_args = tb_ctx.tool_args
 
-                self._emit(AgentEventType.TOOL_CALL_STARTED,
-                           ToolCallStartedPayload(name=tool_name, tool_input=tool_args, tool_call_id=call_id),
-                           round_index=round_idx)
+                    if tb_ctx.directive == HookDirective.SKIP:
+                        await self._append_message(
+                            {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": tb_ctx.output},
+                            round_index=round_idx,
+                        )
+                        continue
+
+                    self._emit(AgentEventType.TOOL_CALL_STARTED,
+                               ToolCallStartedPayload(name=tool_name, tool_input=tool_args, tool_call_id=call_id),
+                               round_index=round_idx)
+
+                    if i in _eligible and any(j > i for j in _eligible):
+                        # 起批：本调用 + 后面所有 eligible 调用一起起任务。后者的 TOOL_BEFORE 在这里
+                        # 按序先跑（保序），判 SKIP 的不起任务，轮到它时直接落 SKIP 结果。
+                        _pre_sem = _pre_sem or asyncio.Semaphore(_conc)
+                        pre_task = self._spawn_tool_task(tool_name, tool_args, _pre_sem)
+                        for j in _eligible:
+                            if j <= i or j in _pre or j in _pre_skip:
+                                continue
+                            tc_j = tool_calls[j]
+                            tb_j = ToolBeforeCtx(
+                                round_index=round_idx, tool_call=tc_j,
+                                tool_name=_tool_call_name(tc_j), tool_args=_tool_call_args(tc_j),
+                            )
+                            await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_j)
+                            if tb_j.directive == HookDirective.SKIP:
+                                _pre_skip[j] = tb_j
+                                continue
+                            self._emit(AgentEventType.TOOL_CALL_STARTED,
+                                       ToolCallStartedPayload(name=tb_j.tool_name, tool_input=tb_j.tool_args,
+                                                              tool_call_id=str(tc_j.get("id") or "")),
+                                       round_index=round_idx)
+                            _pre[j] = (self._spawn_tool_task(tb_j.tool_name, tb_j.tool_args, _pre_sem), tb_j)
 
                 # ── Business logic: execute tool ──
                 failed = False
                 try:
-                    output, failed = await self.execute_tool(tool_name, tool_args)
+                    if pre_task is not None:
+                        output, failed = await pre_task
+                    else:
+                        output, failed = await self.execute_tool(tool_name, tool_args)
                 except HumanInputRequired as exc:
+                    self._cancel_pre_tasks(_pre)
                     interaction = exc.to_pending(tool_call_id=call_id, tool_name=tool_name)
                     await self._persist_pending_interaction(interaction=interaction, round_index=round_idx)
                     # The model batched request_user_input with later tool_calls;
@@ -1635,6 +1718,7 @@ class AgentPipeline:
                 # the next round's request isn't an invalid sequence (assistant
                 # with tool_calls that have no matching tool responses).
                 if ta_ctx.directive == HookDirective.BREAK:
+                    self._cancel_pre_tasks(_pre)
                     await self._resolve_skipped_tool_calls(
                         tool_calls[i + 1 :], reason="tool.after hook stopped the batch",
                         round_idx=round_idx,
