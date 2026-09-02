@@ -531,7 +531,7 @@ class WorkflowEngine:
         cont = node.continuation
         if cont is not None:
             for c_i in range(1, cont.max_continuations + 1):
-                if str(raw.get("status")) != "hit_round_limit" or not raw.get("session_id"):
+                if str(raw.get("status")) not in ("hit_round_limit", "context_checkpoint") or not raw.get("session_id"):
                     break
                 if self._cancel.is_cancelled() or (
                     self._budget is not None and not self._budget.can_spawn()
@@ -653,7 +653,7 @@ class WorkflowEngine:
         （耗尽单列——它有自己的触发名与 ContinuationPolicy 原会话续跑，新会话重跑只会同预算
         再耗尽一次）;``empty``=完成但没正文;``hit_round_limit``=显式要旧行为时用。"""
         status = str(raw.get("status") or "")
-        if status == "hit_round_limit":
+        if status in ("hit_round_limit", "context_checkpoint"):
             return "hit_round_limit" in triggers
         if status == "cancelled":
             return False          # 取消不是「没跑好」

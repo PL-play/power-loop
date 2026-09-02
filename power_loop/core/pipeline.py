@@ -35,6 +35,7 @@ from power_loop.contracts.event_payloads import (
     AutoCompactStatusPayload,
     BaseEventPayload,
     BudgetExceededStatusPayload,
+    ContextCheckpointStatusPayload,
     HitRoundLimitStatusPayload,
     LlmCallCompletedPayload,
     LlmCallStartedPayload,
@@ -589,6 +590,70 @@ class AgentPipeline:
     # Hook orchestration is handled entirely by run().
     # ══════════════════════════════════════════════════════════════
 
+    _DISTILL_MARK = "[distilled #"
+
+    def _distill_oldest_tool_rows(self, batch: int, hot_tail: int) -> int:
+        """把当前 send 里**最早的 batch 条**尚未蒸馏的工具结果在内存里替换成投影行（6.10.0）。
+
+        投影行 = 与 end-of-send 投影**同一套** ``ToolDefinition.project`` 蒸馏（找不到钩子就截断），
+        带 ``recall_send(send_index, seq)`` 坐标——原文永远在 pl_messages，要用就回取。不落盘、不改
+        数据库、不改行数（sink 的 index↔seq 对齐不受影响）。最近 ``hot_tail`` 条永不动。verbatim
+        模式不做（那边有就地压缩器）。返回本批释放的估算 token（≈字符/4）。"""
+        rep = self.config.representation
+        if getattr(rep, "kind", "projection") == "verbatim":
+            return 0
+        project_tool = getattr(rep, "_project_tool", None)
+        seqs = getattr(self.sink, "_history_seqs", None) or []
+        tool_idx = [
+            i for i, m in enumerate(self.history)
+            if m.get("role") == "tool" and isinstance(m.get("content"), str)
+        ]
+        protected = set(tool_idx[len(tool_idx) - max(0, hot_tail):]) if hot_tail > 0 else set()
+        candidates = [
+            i for i in tool_idx
+            if i not in protected
+            and not str(self.history[i].get("content")).startswith(self._DISTILL_MARK)
+            and len(self.history[i].get("content") or "") > 300
+        ]
+        picked = candidates[: max(1, batch)]
+        if not picked:
+            return 0
+        # tool_call_id → (name, args) 从前面的 assistant(tool_calls) 行反查
+        call_meta: dict[str, tuple[str, Any]] = {}
+        for m in self.history:
+            if m.get("role") == "assistant":
+                for tc in m.get("tool_calls") or []:
+                    fn = (tc or {}).get("function") or {}
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (TypeError, ValueError):
+                            args = {"raw": args[:200]}
+                    call_meta[str((tc or {}).get("id") or "")] = (str(fn.get("name") or "tool"), args)
+        freed = 0
+        for i in picked:
+            m = self.history[i]
+            name, args = call_meta.get(str(m.get("tool_call_id") or ""), ("tool", {}))
+            content = str(m.get("content") or "")
+            if project_tool is not None:
+                try:
+                    d = project_tool(name, args, content, getattr(self, "tool_registry", None))
+                    parts = [f"{k}={v}" for k, v in (d or {}).items() if k != "name" and v not in (None, "")]
+                    line = f"{name}(" + ", ".join(str(x)[:200] for x in parts) + ")"
+                except Exception:  # noqa: BLE001 — 蒸馏钩子出错就退回截断
+                    line = f"{name}: {content[:200]}…"
+            else:
+                line = f"{name}: {content[:200]}…"
+            seq = seqs[i] if i < len(seqs) else None
+            coord = (f"recall_send(send_index={self.send_index}, seq={seq})"
+                     if (self.send_index is not None and seq is not None) else "recall_send")
+            new_content = (f"{self._DISTILL_MARK}{self.send_index} seq={seq} — 原文已从上下文移出，"
+                           f"需要时 {coord} 回取] {line}")
+            freed += max(0, (len(content) - len(new_content)) // 4)
+            m["content"] = new_content
+        return freed
+
     def _estimate_history_tokens(self) -> int:
         """Current history token estimate, maintained incrementally (SCALE-4).
 
@@ -636,6 +701,25 @@ class AgentPipeline:
         # Microcompact (dump old large tool outputs to disk + leave a short
         # pointer — orthogonal to LLM-based compaction). OFF by default as of
         # 3.1.x; opt in via config.microcompact_enabled. See AgentLoopConfig.
+        # ── 6.10.0 send 内保险丝：最早的 n 条工具结果 → 投影行（内存替换，pl_messages 不动）──
+        # 触发依据 = 上一轮供应商返回的真实 prompt_tokens（就是当前上下文的真实大小；第一轮
+        # 还没有就用估算）。每轮最多蒸馏一批（最早的 n 条、跳过已蒸馏的、不动最近 hot_tail 条）；
+        # 下一轮真实 prompt 仍超阈值就再蒸馏下一批——逐轮递进，只蒸馏到够用为止。
+        dt = self.config.insend_distill_tokens
+        if dt is not None and int(dt) > 0:
+            real = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0) if round_index > 0 else 0
+            basis = real if real > 0 else self._estimate_history_tokens()
+            if basis >= int(dt):
+                freed = self._distill_oldest_tool_rows(
+                    int(self.config.insend_distill_batch or 10),
+                    int(self.config.insend_distill_hot_tail or 0),
+                )
+                if freed:
+                    self._tok_len = -1  # content shrank in place; force a fresh estimate
+                    logger.info(
+                        "insend distill: context %d tokens >= %d; freed ~%d tokens this round "
+                        "(send %s, round %d)", basis, int(dt), freed, self.send_index, round_index,
+                    )
         if self.config.microcompact_enabled:
             self.ctx.microcompact(
                 self.history,
@@ -1025,6 +1109,38 @@ class AgentPipeline:
                         return self._make_result(
                             "budget_exceeded",
                             final_text="[budget_exceeded]",
+                            rounds=round_idx,
+                        )
+
+            # ── 6.10.0 上下文检查点（轮边界）：上一轮供应商返回的真实 prompt_tokens 就是当前上下文的
+            # 真实大小。达到阈值 → 宿主 COMPLETE_DECIDE 先拿收尾窗口（总结做了什么/还剩什么），否则
+            # 以 context_checkpoint 结束本 send → 正常投影 → 宿主续接机制在新 send 里接着干。
+            # 与 max_tokens_per_run 不同：那是累计费用（Σ prompt+completion，随轮数平方增长），
+            # 量不出「上下文有多大」；这里量的正是它。
+            ckpt = self.config.context_checkpoint_tokens
+            if (
+                ckpt is not None
+                and int(ckpt) > 0
+                and round_idx > 0
+                and not self._terminal_grace_active
+            ):
+                last_prompt = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0)
+                if last_prompt >= int(ckpt):
+                    self._emit(
+                        AgentEventType.STATUS_CHANGED,
+                        ContextCheckpointStatusPayload(
+                            budget_tokens=int(ckpt), spent_tokens=last_prompt, rounds=round_idx,
+                        ),
+                        round_index=round_idx,
+                    )
+                    if not await self._complete_decide(
+                        reason="context_checkpoint", round_idx=round_idx, final_text="",
+                        next_round=round_idx,
+                    ):
+                        await self._finalize("context_checkpoint", rounds=round_idx)
+                        return self._make_result(
+                            "context_checkpoint",
+                            final_text="[context_checkpoint]",
                             rounds=round_idx,
                         )
 

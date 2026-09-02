@@ -260,6 +260,18 @@ class BudgetExceededStatusPayload(StatusChangedPayload):
 # ── Usage ──
 
 
+
+@dataclass
+class ContextCheckpointStatusPayload(StatusChangedPayload):
+    kind: str = "context_checkpoint"
+    budget_tokens: int = 0
+    spent_tokens: int = 0
+    rounds: int = 0
+
+
+# ── Usage ──
+
+
 @dataclass
 class UsageUpdatedPayload(BaseEventPayload):
     usage: dict[str, Any] = field(default_factory=dict)

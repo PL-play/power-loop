@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from power_loop.runtime.runtime_state import RuntimeProjector
     from power_loop.runtime.spec import AgentSpec
 
-LoopStatus = Literal["completed", "pending_tools", "waiting_for_input", "cancelled", "hit_round_limit", "budget_exceeded", "degraded"]
+LoopStatus = Literal["completed", "pending_tools", "waiting_for_input", "cancelled", "hit_round_limit", "budget_exceeded", "context_checkpoint", "degraded"]
 LoopMessage = dict[str, Any]
 
 
@@ -96,6 +96,22 @@ class AgentLoopConfig:
     #: verbatim-fallback send can't orphan its tool rows. ``None``/``<=0`` disables the cap.
     #: Verbatim mode is unaffected (its window is bounded by the in-place compactor).
     max_context_rows: int | None = 300
+    #: 6.10.0 上下文三旋钮（互相独立，都不再借用 ``max_tokens``——那是**每次请求的输出上限**）：
+    #: ``context_budget_tokens``：折叠预算——投影前缀估算 token（≈字符/4）达到它就折叠更早的 send。
+    #: None → 回退到 ``max_tokens``（历史行为，兼容）。
+    context_budget_tokens: int | None = None
+    #: ``context_checkpoint_tokens``：轮边界检查**上一轮供应商返回的真实 prompt_tokens**（=当前上下文
+    #: 真实大小）≥ 它 → 以 ``context_checkpoint`` 优雅收尾本 send（COMPLETE_DECIDE 先给宿主收尾窗口）
+    #: → 正常投影 → 宿主的续接机制在新 send 里接着干。与 ``max_tokens_per_run``（累计费用上限）正交。
+    context_checkpoint_tokens: int | None = None
+    #: ``insend_distill_tokens``：send 内保险丝——历史估算 token ≥ 它时，把当前 send 里热尾之外的
+    #: 冷工具结果**在内存里替换成它的投影行**（同一套 ToolDefinition.project 蒸馏 + ``recall_send``
+    #: 坐标），不落盘、不改 pl_messages。None → 关。
+    insend_distill_tokens: int | None = None
+    #: 每次触发只蒸馏**最早**的 n 条尚未蒸馏的工具结果（逐轮递进：下一轮仍超阈值就再蒸馏下 n 条），
+    #: 且永远不动最近 ``hot_tail`` 条。触发依据优先用上一轮供应商返回的真实 prompt_tokens。
+    insend_distill_batch: int = 10
+    insend_distill_hot_tail: int = 8
     #: ``fold_strategy`` — how older history is compacted (N records → 1 compact) once over budget:
     #:   * ``LLMSummaryFold`` (default): one LLM summary call, no side effects.
     #:   * ``AgenticFold``: LLM + a bounded tool loop that persists durable facts as notes.
@@ -234,7 +250,8 @@ class AgentLoopConfig:
         ``0``/``None`` max_tokens means "no explicit budget" → returned
         unchanged.
         """
-        mt = int(self.max_tokens or 0)
+        cb = int(self.context_budget_tokens or 0)
+        mt = cb if cb > 0 else int(self.max_tokens or 0)   # 6.10.0：独立折叠预算优先
         if mt <= 0:
             return mt
         if self.memory is not None and self.builtin_memory_hook:

@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+## [6.10.0] — 2026-09-02
+
+### Added
+
+- **上下文三旋钮解耦**（此前折叠预算借用 ``max_tokens``——那是每次请求的**输出上限**，两个概念混用）：
+  - ``context_budget_tokens``：独立的折叠预算（投影前缀估算 token ≥ 它 × trigger_ratio 时折叠）；
+    None 回退 ``max_tokens``（兼容）。
+  - ``context_checkpoint_tokens``：轮边界按**上一轮真实 prompt_tokens**（= 当前上下文真实大小）判，
+    达到 → COMPLETE_DECIDE 收尾窗口 → 新终态 ``context_checkpoint`` → 正常投影 → 宿主续接。
+    与 ``max_tokens_per_run``（累计费用，随轮数平方增长）正交。
+  - ``insend_distill_tokens`` / ``insend_distill_batch`` / ``insend_distill_hot_tail``：send 内保险丝——
+    轮边界按**上一轮真实 prompt_tokens**判，达到阈值就把当前 send **最早的 batch 条**尚未蒸馏的
+    工具结果在内存里替换成投影行（同一套 ``ToolDefinition.project`` 蒸馏 + ``recall_send(send_index,
+    seq)`` 坐标），最近 ``hot_tail`` 条永不动；下一轮仍超就再蒸馏下一批（逐轮递进）。
+    不落盘、不改 pl_messages、不改行数。
+- 新终态 ``context_checkpoint``（LoopStatus）；workflow 叶子的 ContinuationPolicy/retry 与
+  子代理 LIMIT 事件把它按 ``hit_round_limit`` 同等处理。
+
 ## [6.9.0] — 2026-09-02
 
 ### Fixed

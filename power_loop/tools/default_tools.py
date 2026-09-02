@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import json
 import asyncio
 import difflib
 import fnmatch
+import json
 import logging
 import os
 import queue

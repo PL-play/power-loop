@@ -63,10 +63,10 @@ from .runner import claim_wake, parse_workflow_wake, register_wake_guard, run_de
 from .spec import (
     AgentNode,
     BranchNode,
+    ContinuationPolicy,
     ForeachNode,
     ParallelNode,
     RetryPolicy,
-    ContinuationPolicy,
     SequenceNode,
     WorkflowBudget,
     WorkflowNode,
