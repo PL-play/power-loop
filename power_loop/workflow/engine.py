@@ -98,6 +98,15 @@ class Executor(Protocol):
     ) -> dict[str, Any]: ...
 
 
+def _continuation_prompt(remaining: list[str], i: int, n: int) -> str:
+    todo_block = ("\n剩余待办：\n" + "\n".join(f"- {t}" for t in remaining)) if remaining else ""
+    return (
+        f"[continuation {i}/{n}] 你在轮数用尽前写下了「做了什么、还剩什么」的总结（见上）。"
+        f"现在给你追加了预算：**接着做剩余的部分，不要重做已完成的**。{todo_block}\n"
+        "做完后按原任务要求给出最终结果；仍完不成就明确说剩什么。"
+    )
+
+
 class InProcessExecutor:
     """Default executor: run the sub-agent in this process via ``run_agent_spec``."""
 
@@ -124,6 +133,45 @@ class InProcessExecutor:
         if not raw.get("usage"):
             raw["usage"] = await _usage_for(parent_loop, raw.get("session_id"))
         return raw
+
+    async def continue_agent(
+        self,
+        session_id: str,
+        user_input: str,
+        *,
+        parent_loop: Any,
+        extra_rounds: int,
+        stop_event: CancellationLike = None,
+    ) -> dict[str, Any]:
+        """耗尽续跑的默认实现：对**同一叶子会话** ``follow_up`` 一段续命输入。
+
+        走 parent_loop 的 child-run guards（host 注册过的 per-wake 钩子挂起，与
+        run_agent_spec 同一套保障），预算 ``extra_rounds`` 由调用方（引擎的
+        ContinuationPolicy）钳制。"""
+        import contextlib as _ctxlib
+
+        with _ctxlib.ExitStack() as guards:
+            for _name, guard in getattr(parent_loop, "_child_run_guards", ()) or ():
+                guards.enter_context(guard())
+            res = await parent_loop.follow_up(
+                user_input, session_id=session_id,
+                stop_event=stop_event, max_rounds=extra_rounds,
+            )
+        status = str(getattr(res, "status", "failed") or "failed")
+        return {
+            "status": status,
+            "final_text": str(getattr(res, "final_text", "") or ""),
+            "rounds": int(getattr(res, "rounds", 0) or 0),
+            "usage": await _usage_delta(parent_loop, session_id, getattr(res, "usage", None)),
+            "session_id": session_id,
+        }
+
+
+async def _usage_delta(parent_loop: Any, session_id: str, res_usage: Any) -> dict[str, int]:
+    """续跑轮的增量用量：优先取本次 send 结果自带的 usage；缺失再退回全会话统计（可能偏大）。"""
+    if isinstance(res_usage, dict) and res_usage:
+        return {k: int(v or 0) for k, v in res_usage.items() if isinstance(v, (int, float))}
+    return await _usage_for(parent_loop, session_id)
 
 
 async def _usage_for(parent_loop: Any, session_id: str | None) -> dict[str, int]:
@@ -281,9 +329,11 @@ class WorkflowEngine:
                 # 现在:任一叶子 failed 即 run failed,除非它显式 continue_on_error(或被兜底救回,
                 # 那种情况结果已被顶替成 completed)。这是 continue_on_error 得以有意义的前提。
                 # (叶子上限触顶时跳过:那时下面那条「ceiling」才是准确的根因诊断。)
+                # 6.7.0：hit_round_limit 也算 broken——被截断的叶子曾让 run 谎报 completed
+                # （只认 "failed" 的老判定漏掉它；continuation 救回来的已经是 completed 了）。
                 broken = [
                     nid for nid, r in self._results.items()
-                    if r.status == "failed" and nid not in self._tolerated
+                    if r.status not in ("completed",) and nid not in self._tolerated
                 ]
                 if broken:
                     status = "failed"
@@ -471,6 +521,44 @@ class WorkflowEngine:
                 "workflow leaf %s attempt %d/%d failed (%s); retrying",
                 node.id, attempt, max_attempts, raw.get("status"),
             )
+        # ── 耗尽续跑（6.7.0，ContinuationPolicy）：hit_round_limit + 门条件成立 → 原会话补轮。
+        # 与 retry 正交：retry 起新会话防污染，这里恰恰要**同一会话**接着成果做——引擎在
+        # 耗尽时已逼叶子写下「做了什么+还剩什么」，续命提示再喂它自己的剩余 todo。
+        cont = node.continuation
+        if cont is not None:
+            for c_i in range(1, cont.max_continuations + 1):
+                if str(raw.get("status")) != "hit_round_limit" or not raw.get("session_id"):
+                    break
+                if self._cancel.is_cancelled() or (
+                    self._budget is not None and not self._budget.can_spawn()
+                ):
+                    break
+                remaining = await self._todo_remaining(str(raw["session_id"]))
+                if cont.gate == "todo_remaining" and not remaining:
+                    break  # 没有账本（或全勾完）：不知道从哪接，续跑只会瞎跑
+                prompt = _continuation_prompt(remaining, c_i, cont.max_continuations)
+                logger.info("workflow leaf %s hit_round_limit; continuation %d/%d (+%d rounds)",
+                            node.id, c_i, cont.max_continuations, cont.extra_rounds)
+                try:
+                    more = await self._continue_leaf(
+                        str(raw["session_id"]), prompt, extra_rounds=cont.extra_rounds)
+                except Exception as exc:  # noqa: BLE001 — 续跑失败不毁掉已有成果
+                    logger.warning("workflow leaf %s continuation failed: %s", node.id, exc)
+                    break
+                merged_usage = dict(raw.get("usage") or {})
+                for k, v in (more.get("usage") or {}).items():
+                    merged_usage[k] = int(merged_usage.get(k, 0) or 0) + int(v or 0)
+                raw = {
+                    **raw,
+                    "status": more.get("status"),
+                    "final_text": more.get("final_text") or raw.get("final_text"),
+                    "rounds": int(raw.get("rounds") or 0) + int(more.get("rounds") or 0),
+                    "usage": merged_usage,
+                }
+                self._add_usage(more.get("usage") or {})
+                if self._budget is not None:
+                    self._budget.commit(more.get("usage") or {})
+
         if str(raw.get("status")) == "cancelled":
             self._cancelled = True
         payload: dict[str, Any] | None = None
@@ -533,10 +621,36 @@ class WorkflowEngine:
             logger.debug("file_io.render_ref failed for %s", path, exc_info=True)
             return f"[无法读取上游产物 {path}]"
 
+    async def _todo_remaining(self, session_id: str) -> list[str]:
+        """叶子自己的未完成 todo 文本（runtime_state key='todo'）。读不到=空（门自然关）。"""
+        try:
+            store = await self._loop.ensure_store()
+            state = await store.get_runtime_state(session_id, "todo")
+            items = state.get("items") if isinstance(state, dict) else None
+            if not isinstance(items, list):
+                return []
+            return [str(i.get("text") or "") for i in items
+                    if isinstance(i, dict) and i.get("status") != "completed"][:12]
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def _continue_leaf(self, session_id: str, prompt: str, *, extra_rounds: int) -> dict[str, Any]:
+        """原会话补轮。走 executor 的 ``continue_agent``（host 可换实现，如加自己的 guards）；
+        没有该方法的旧 executor 退回 InProcessExecutor 的默认路径。"""
+        fn = getattr(self._executor, "continue_agent", None)
+        if fn is None:
+            fn = InProcessExecutor().continue_agent
+        return await fn(session_id, prompt, parent_loop=self._loop,
+                        extra_rounds=extra_rounds, stop_event=self._cancel)
+
     @staticmethod
     def _should_retry(raw: dict[str, Any], triggers: set[str]) -> bool:
-        """这次 attempt 该不该重试。``failed``=状态不是 completed;``empty``=完成但没正文。"""
+        """这次 attempt 该不该重试。``failed``=状态不是 completed **也不是 hit_round_limit**
+        （耗尽单列——它有自己的触发名与 ContinuationPolicy 原会话续跑，新会话重跑只会同预算
+        再耗尽一次）;``empty``=完成但没正文;``hit_round_limit``=显式要旧行为时用。"""
         status = str(raw.get("status") or "")
+        if status == "hit_round_limit":
+            return "hit_round_limit" in triggers
         if status == "cancelled":
             return False          # 取消不是「没跑好」
         if status != "completed":

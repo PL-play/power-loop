@@ -337,3 +337,98 @@ async def test_foreach_iterations_get_distinct_output_files():
     files = sorted(c["output_file"] for c in ex.calls)
     assert files == ["outputs/worker.0.md", "outputs/worker.1.md", "outputs/worker.2.md"]
     assert sorted(c["input"].split("做 ")[1].split("\n")[0] for c in ex.calls) == ["x", "y", "z"]
+
+
+# ── continuation（6.7.0 耗尽续跑）────────────────────────────────────────────
+
+@dataclass
+class _ContinuingExecutor(_ScriptedExecutor):
+    """run_agent 走脚本；continue_agent 也走脚本（key = f"{sid}#cont"）。"""
+
+    cont_script: dict = field(default_factory=dict)
+    cont_calls: list = field(default_factory=list)
+
+    async def continue_agent(self, session_id, user_input, *, parent_loop,
+                             extra_rounds, stop_event=None):
+        self.cont_calls.append({"sid": session_id, "input": user_input,
+                                "extra_rounds": extra_rounds})
+        seq = self.cont_script.get(session_id) or [{"status": "completed", "final_text": "done"}]
+        idx = min(sum(1 for c in self.cont_calls if c["sid"] == session_id) - 1, len(seq) - 1)
+        return {"session_id": session_id, "rounds": 2, "usage": {"total_tokens": 7}, **seq[idx]}
+
+
+@pytest.mark.asyncio
+async def test_continuation_resumes_same_session_on_hit_round_limit():
+    ex = _ContinuingExecutor(
+        script={"a": [{"status": "hit_round_limit",
+                       "final_text": "[hit_round_limit]\n做了 3 屏，剩 2 屏", "rounds": 25}]},
+        cont_script={"s-a": [{"status": "completed", "final_text": "全部完成"}]},
+    )
+    res = await _run(_leaf("a", continuation={"gate": "always"}), ex)
+    assert res.status == "completed"
+    assert res.results["a"].text == "全部完成"
+    assert len(ex.cont_calls) == 1 and ex.cont_calls[0]["sid"] == "s-a"
+    assert "接着做剩余的部分" in ex.cont_calls[0]["input"]
+    assert ex.cont_calls[0]["extra_rounds"] == 8
+    # run_agent 只跑了一次——续跑不是新会话重跑
+    assert len(ex.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_continuation_todo_gate_blocks_without_a_todo_ledger():
+    """默认门 todo_remaining：叶子会话没有（读不到）未完成 todo → 不续，落地为耗尽。"""
+    ex = _ContinuingExecutor(
+        script={"a": [{"status": "hit_round_limit", "final_text": "[hit_round_limit]\nx"}]},
+    )
+    res = await _run(_leaf("a", continuation={}), ex)
+    assert ex.cont_calls == []
+    assert res.results["a"].status == "hit_round_limit"
+    assert res.status == "failed"          # 非 completed 叶子照旧拖垮 run（语义不变）
+
+
+@pytest.mark.asyncio
+async def test_continuation_stops_at_max_and_result_stays_hit_round_limit():
+    ex = _ContinuingExecutor(
+        script={"a": [{"status": "hit_round_limit", "final_text": "[hit_round_limit]\n1"}]},
+        cont_script={"s-a": [
+            {"status": "hit_round_limit", "final_text": "[hit_round_limit]\n2"},
+            {"status": "hit_round_limit", "final_text": "[hit_round_limit]\n3"},
+        ]},
+    )
+    res = await _run(_leaf("a", continuation={"gate": "always", "max_continuations": 2}), ex)
+    assert len(ex.cont_calls) == 2
+    assert res.results["a"].status == "hit_round_limit"
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_trigger_no_longer_catches_round_exhaustion():
+    """语义拆分：failed ≠ hit_round_limit。耗尽不再被 on:[failed] 从头重跑。"""
+    ex = _ScriptedExecutor(script={"a": [
+        {"status": "hit_round_limit", "final_text": "[hit_round_limit]\nx"},
+        {"status": "completed", "final_text": "would be retry"},
+    ]})
+    res = await _run(_leaf("a", retry={"max_attempts": 2, "on": ["failed"]}), ex)
+    assert len(ex.calls) == 1, "耗尽被 failed 触发器重跑了——语义拆分失效"
+    assert res.results["a"].status == "hit_round_limit"
+
+
+@pytest.mark.asyncio
+async def test_retry_hit_round_limit_trigger_restores_old_behaviour_explicitly():
+    ex = _ScriptedExecutor(script={"a": [
+        {"status": "hit_round_limit", "final_text": "[hit_round_limit]\nx"},
+        {"status": "completed", "final_text": "fresh rerun"},
+    ]})
+    res = await _run(_leaf("a", retry={"max_attempts": 2, "on": ["hit_round_limit"]}), ex)
+    assert len(ex.calls) == 2
+    assert res.results["a"].text == "fresh rerun"
+
+
+@pytest.mark.asyncio
+async def test_continuation_usage_and_rounds_fold_into_the_node_result():
+    ex = _ContinuingExecutor(
+        script={"a": [{"status": "hit_round_limit", "final_text": "[hit_round_limit]\nx",
+                       "rounds": 25, "usage": {"total_tokens": 100}}]},
+        cont_script={"s-a": [{"status": "completed", "final_text": "ok"}]},
+    )
+    res = await _run(_leaf("a", continuation={"gate": "always"}), ex)
+    assert res.results["a"].usage.get("total_tokens") == 107

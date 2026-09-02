@@ -90,7 +90,10 @@ class WorkflowSpecError(SpecValidationError):
 
 #: retry.on 的合法取值：``failed`` = executor 返回的 status 不是 completed；
 #: ``empty`` = 完成了但没有正文（模型空转收尾）。
-RETRY_TRIGGERS = frozenset({"failed", "empty"})
+#: ``failed`` = 状态既不是 completed 也不是 hit_round_limit（耗尽单列：那不是「没跑好」，
+#: 是「没跑完」——新会话重跑只会同预算再耗尽一次，正解是 ContinuationPolicy 原会话续跑）。
+#: 需要旧行为（耗尽也从头重跑）就显式加 ``hit_round_limit``。
+RETRY_TRIGGERS = frozenset({"failed", "empty", "hit_round_limit"})
 _MAX_ATTEMPTS_CAP = 5
 _MAX_BACKOFF_FACTOR = 10.0
 #: 单次重试等待的封顶秒数。
@@ -113,6 +116,25 @@ class RetryPolicy:
     backoff_s: float = 0.0
     #: 1.0 = 固定间隔；2.0 = 指数退避（2s → 4s → 8s）。provider 限流时才真正需要它。
     backoff_factor: float = 1.0
+
+
+_MAX_CONTINUATIONS_CAP = 3
+_MAX_EXTRA_ROUNDS = 50
+
+
+@dataclass(frozen=True)
+class ContinuationPolicy:
+    """耗尽续跑（6.7.0）：叶子以 ``hit_round_limit`` 落地时**在原会话上补轮**，接着成果做，
+    不起新会话（对比 RetryPolicy：那是「没跑好」的新会话重跑）。
+
+    引擎在续跑前把叶子自己的剩余 todo 读出来拼进续命提示；``gate="todo_remaining"``（默认）
+    要求叶子确有未完成 todo 才续（没账本=不知道从哪接，续了也是瞎跑）；``gate="always"``
+    无条件续。全程受 run 预算钳制；journal 的 usage 含续跑轮。
+    """
+
+    max_continuations: int = 1
+    extra_rounds: int = 8
+    gate: str = "todo_remaining"  # todo_remaining | always
 
 
 @dataclass(frozen=True)
@@ -144,6 +166,9 @@ class AgentNode:
     fallback: WorkflowNode | None = None
     #: 本叶子的产出文件（相对 run 工作区）。None = 由 host 的 FileIO 端口按 node_id 默认命名。
     output_file: str | None = None
+    #: 耗尽续跑策略（None=关）。与 retry 正交：retry 管 failed/empty（新会话），
+    #: continuation 管 hit_round_limit（原会话补轮）。
+    continuation: ContinuationPolicy | None = None
 
 
 @dataclass(frozen=True)
@@ -361,6 +386,12 @@ def _node_to_dict(node: WorkflowNode) -> dict[str, Any]:
             out["fallback"] = _node_to_dict(node.fallback)
         if node.output_file is not None:
             out["output_file"] = node.output_file
+        if node.continuation is not None:
+            out["continuation"] = {
+                "max_continuations": node.continuation.max_continuations,
+                "extra_rounds": node.continuation.extra_rounds,
+                "gate": node.continuation.gate,
+            }
         return out
     if isinstance(node, SequenceNode):
         out = {"type": "sequence", "steps": [_node_to_dict(s) for s in node.steps]}
@@ -621,7 +652,7 @@ def _parse_agent(
     _check_unknown(
         data,
         {"type", "id", "spec", "input", "inputs_from", "output_schema",
-         "retry", "continue_on_error", "fallback", "output_file"},
+         "retry", "continue_on_error", "fallback", "output_file", "continuation"},
         path, problems,
     )
     node_id = data.get("id")
@@ -684,6 +715,7 @@ def _parse_agent(
                 problems.append(f"{path}: output_schema has unknown key(s): {sorted(extra)}")
 
     retry = _parse_retry(data.get("retry"), path, problems)
+    continuation = _parse_continuation(data.get("continuation"), path, problems)
 
     cont = data.get("continue_on_error", False)
     if not isinstance(cont, bool):
@@ -714,10 +746,38 @@ def _parse_agent(
         inputs_from=tuple(inputs_from),
         output_schema=out_schema,
         retry=retry,
+        continuation=continuation,
         continue_on_error=cont,
         fallback=fallback,
         output_file=out_file,
     )
+
+
+def _parse_continuation(raw: Any, path: str, problems: list[str]) -> ContinuationPolicy | None:
+    """``continuation: {max_continuations?, extra_rounds?, gate?}`` → 策略；键名蛇形。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append(f"{path}: 'continuation' must be an object "
+                        "{max_continuations?, extra_rounds?, gate?}")
+        return None
+    extra = set(raw) - {"max_continuations", "extra_rounds", "gate"}
+    if extra:
+        problems.append(f"{path}.continuation: unknown key(s): {sorted(extra)}")
+        return None
+    n = raw.get("max_continuations", 1)
+    if not isinstance(n, int) or n < 1 or n > _MAX_CONTINUATIONS_CAP:
+        problems.append(f"{path}.continuation: 'max_continuations' must be 1..{_MAX_CONTINUATIONS_CAP}")
+        return None
+    r = raw.get("extra_rounds", 8)
+    if not isinstance(r, int) or r < 1 or r > _MAX_EXTRA_ROUNDS:
+        problems.append(f"{path}.continuation: 'extra_rounds' must be 1..{_MAX_EXTRA_ROUNDS}")
+        return None
+    gate = str(raw.get("gate", "todo_remaining"))
+    if gate not in ("todo_remaining", "always"):
+        problems.append(f"{path}.continuation: 'gate' must be todo_remaining or always")
+        return None
+    return ContinuationPolicy(max_continuations=n, extra_rounds=r, gate=gate)
 
 
 def _parse_retry(raw: Any, path: str, problems: list[str]) -> RetryPolicy | None:
