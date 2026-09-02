@@ -477,6 +477,10 @@ class WorkflowEngine:
                 **node.spec.metadata,
                 **self._step_idempotency(node.id),
                 **({"output_file": output_file} if output_file else {}),
+                # foreach 迭代号（6.8.1）：body 各迭代共享一个 node_id，观测端（活动面板）
+                # 没有它就把 N 路并发画成同一个节点反复亮灭——看起来像串行循环。
+                **({"workflow_iteration": env[ITERATION_ENV_KEY]}
+                   if ITERATION_ENV_KEY in env else {}),
             },
         )
         if self._on_node_start is not None:
