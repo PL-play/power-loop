@@ -318,6 +318,7 @@ class AgentPipeline:
             skills_dir=config.skills_dir,
         )
         self.history: list[LoopMessage] = []
+        self._image_rounds: dict[int, int] = {}
         # Monotonic per-session SEND index, set by the loop before run() (None when
         # unset, e.g. in tests). Stamped into each appended row's PERSISTED meta only
         # (never the in-memory/LLM message) so the transcript can delimit sends
@@ -439,6 +440,11 @@ class AgentPipeline:
         )
         await self.hooks.run_typed_async(HookPoint.MESSAGE_APPEND, ctx)
         self.history.append(ctx.message)
+        # 6.12.0 图片保留：记下「这一行是第几轮入的图」（旁路表，按对象身份；history 行原样发给
+        # 供应商，不能夹私货字段）。
+        _c = ctx.message.get("content")
+        if isinstance(_c, list) and any(isinstance(b, dict) and b.get("type") == "attachment" for b in _c):
+            self._image_rounds[id(ctx.message)] = int(round_index or 0)
         # SCALE-4: keep the token estimate current incrementally on the hot append path
         # — only when the cache was already in sync (else leave it for a full recompute).
         if self._tok_len == len(self.history) - 1:
@@ -591,6 +597,45 @@ class AgentPipeline:
     # Hook orchestration is handled entirely by run().
     # ══════════════════════════════════════════════════════════════
 
+    _IMAGE_RETIRED_MARK = "[image retired"
+
+    def _retire_stale_images(self, round_index: int, keep_rounds: int) -> int:
+        """把当前 send 里「入上下文已超过 keep_rounds 轮」的图片附件块在内存里换成占位文字。
+
+        图片行是 user 行（see_image / 用户发图），带 ``round_index``（``_append_message`` 记的）。
+        第 r 轮入的图在第 r+keep_rounds 轮之前都以原图参与请求，之后换成
+        ``[image retired: <name> — 已看过；要再看调 see_image]``。不改 pl_messages、不改行数。
+        返回替换了几个块。"""
+        n = 0
+        rounds = getattr(self, "_image_rounds", None) or {}
+        if not rounds:
+            return 0
+        for m in self.history:
+            r = rounds.get(id(m))
+            if r is None:
+                continue
+            c = m.get("content")
+            if not isinstance(c, list) or not any(isinstance(b, dict) and b.get("type") == "attachment" for b in c):
+                continue
+            if round_index - int(r) < keep_rounds:
+                continue
+            new_blocks = []
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "attachment":
+                    att = b.get("attachment") if isinstance(b.get("attachment"), dict) else {}
+                    name = str(att.get("name") or att.get("filename") or att.get("path") or att.get("ref") or "image")
+                    name = name.rsplit("/", 1)[-1]
+                    new_blocks.append({"type": "text",
+                                       "text": f"{self._IMAGE_RETIRED_MARK}: {name} — 已看过；要再看调 see_image]"})
+                    n += 1
+                else:
+                    new_blocks.append(b)
+            m["content"] = new_blocks
+        if n:
+            logger.info("image retention: retired %d image block(s) older than %d round(s) (round %d)",
+                        n, keep_rounds, round_index)
+        return n
+
     _DISTILL_MARK = "[distilled #"
 
     def _distill_oldest_tool_rows(self, batch: int, hot_tail: int) -> int:
@@ -702,6 +747,11 @@ class AgentPipeline:
         # Microcompact (dump old large tool outputs to disk + leave a short
         # pointer — orthogonal to LLM-based compaction). OFF by default as of
         # 3.1.x; opt in via config.microcompact_enabled. See AgentLoopConfig.
+        # ── 6.12.0 图片看过即撤：入上下文超过 image_retention_rounds 轮的 attachment 块换成占位文字 ──
+        irr = self.config.image_retention_rounds
+        if irr is not None and int(irr) > 0 and self._retire_stale_images(round_index, int(irr)):
+            self._tok_len = -1
+
         # ── 6.10.0 send 内保险丝：最早的 n 条工具结果 → 投影行（内存替换，pl_messages 不动）──
         # 触发依据 = 上一轮供应商返回的真实 prompt_tokens（就是当前上下文的真实大小；第一轮
         # 还没有就用估算）。每轮最多蒸馏一批（最早的 n 条、跳过已蒸馏的、不动最近 hot_tail 条）；
@@ -1053,6 +1103,7 @@ class AgentPipeline:
     async def run(self, messages: list[LoopMessage]) -> AgentLoopResult:
         """Run the full agent loop. Returns when done, cancelled, or hit round limit."""
         self.history = [dict(m) for m in messages]
+        self._image_rounds = {}   # 6.12.0：本 send 新入的图片行 id(row) → round_index
         self._tok_len = -1  # SCALE-4: wholesale (re)assignment invalidates the estimate
 
         # ── Session start ──

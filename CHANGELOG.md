@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+## [6.12.0] — 2026-09-03
+
+### Added
+
+- **图片看过即撤**：``AgentLoopConfig.image_retention_rounds``（默认 1）。send 内的图片附件块（see_image /
+  用户发图）只在入上下文后的这么多轮里以原图参与请求，之后在内存换成一行占位
+  ``[image retired: <name> — 已看过；要再看调 see_image]``（pl_messages 不动、行数不动）。
+  证据 conv-225：三张图入上下文后每次调用固定 +50–120s（文本 90%+ 命中缓存、输出仅一两百 token），
+  入图前每轮 2–7s——供应商每次都重新预填图片。None/0 = 旧行为。
+
 ## [6.11.0] — 2026-09-03
 
 ### Added

@@ -116,6 +116,11 @@ class AgentLoopConfig:
     #: 原顺序回填；TOOL_BEFORE 仍按序先跑完（闸类 hook 语义不变）。非 async_capable 工具永远串行。
     #: 0/1 = 关。
     tool_batch_concurrency: int = 4
+    #: 6.12.0 图片保留轮数：send 内的图片（see_image / 用户发图 的 attachment 块）只在进入上下文后的
+    #: 这么多轮里以原图参与请求；之后在内存里换成一行占位文字（原行不动、pl_messages 不动）。
+    #: 证据（conv-225）：三张图入上下文后每次调用 50–120s（文本部分全命中缓存、输出只有一两百 token），
+    #: 入图前每轮 2–7s——供应商每次都重新预填图片。None/0 = 不撤（旧行为）。
+    image_retention_rounds: int | None = 1
     #: ``fold_strategy`` — how older history is compacted (N records → 1 compact) once over budget:
     #:   * ``LLMSummaryFold`` (default): one LLM summary call, no side effects.
     #:   * ``AgenticFold``: LLM + a bounded tool loop that persists durable facts as notes.
