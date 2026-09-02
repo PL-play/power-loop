@@ -117,3 +117,106 @@ async def _fire(loop: StatefulAgentLoop, command: str) -> str:
     from power_loop.tools.default_tools import BG
 
     return await BG.run(command)
+
+
+# ── 6.8.0 action=tool：async_capable 工具后台化 ──────────────────────────────────
+
+class _ToolTaskReg:
+    def __init__(self, defs):
+        self._defs = {d.name: d for d in defs}
+        self.calls = []
+
+    def get(self, name):
+        d = self._defs.get(name)
+        if d is None:
+            return None
+        class _R:  # RegisteredTool 形状：.definition
+            definition = d
+        return _R()
+
+    def definitions(self):
+        return list(self._defs.values())
+
+    async def invoke_async(self, name, args):
+        self.calls.append((name, dict(args)))
+        await asyncio.sleep(0.01)
+        if args.get("boom"):
+            raise RuntimeError("provider down")
+        return f"image saved: {args.get('prompt', '')[:20]}"
+
+
+class _ToolTaskLoop:
+    def __init__(self, reg):
+        self.tool_registry = reg
+
+
+@pytest.mark.asyncio
+async def test_action_tool_runs_async_capable_tool_and_notifies(monkeypatch):
+    from power_loop.contracts.tools import ToolDefinition
+    from power_loop.core import agent_context
+    from power_loop.tools import default_tools as dt
+
+    reg = _ToolTaskReg([
+        ToolDefinition(name="generate_image", description="d", async_capable=True),
+        ToolDefinition(name="write_file", description="d"),
+        ToolDefinition(name="background_run", description="d"),
+    ])
+    monkeypatch.setattr(agent_context, "get_current_loop", lambda: _ToolTaskLoop(reg))
+    monkeypatch.setattr(dt, "_current_store_and_session", lambda: (None, None))
+    done = []
+
+    async def _cb(sid, task_id, status):
+        done.append((task_id, status))
+
+    dt.register_tool_task_callback(_cb)
+    try:
+        # 未标记的工具拒绝
+        with pytest.raises(ValueError, match="async_capable"):
+            await dt.BG.run_tool("write_file", {})
+        # 递归入口拒绝
+        with pytest.raises(ValueError, match="不允许后台化"):
+            await dt.BG.run_tool("background_run", {})
+        # happy path：立即返回 task_id，完成后回调 + check 可取结果
+        out = await dt.BG.run_tool("generate_image", {"prompt": "a cat"})
+        assert "task_id=" in out
+        tid = out.split("task_id=", 1)[1].split("（", 1)[0]
+        await asyncio.sleep(0.05)
+        assert done and done[0] == (None, "completed") or done[0][1] == "completed"
+        got = await dt.BG.check(tid)
+        assert "[completed]" in got and "image saved" in got
+        # 失败是任务结果不是崩溃
+        out2 = await dt.BG.run_tool("generate_image", {"boom": True})
+        tid2 = out2.split("task_id=", 1)[1].split("（", 1)[0]
+        await asyncio.sleep(0.05)
+        assert "[failed]" in await dt.BG.check(tid2)
+        assert "provider down" in await dt.BG.check(tid2)
+    finally:
+        dt.register_tool_task_callback(None)
+
+
+def test_async_capable_suffix_only_with_background_run_mounted():
+    from power_loop.contracts.tools import ToolDefinition
+    from power_loop.tools.registry import ToolRegistry
+
+    async def _h(**kw):
+        return "x"
+
+    def _mk(*defs):
+        r = ToolRegistry()
+        for d in defs:
+            r.register(d, _h)
+        return r
+
+    gen = ToolDefinition(name="generate_image", description="生成图片。", async_capable=True)
+    bg = ToolDefinition(name="background_run", description="bg。")
+    plain = ToolDefinition(name="write_file", description="写文件。")
+
+    with_bg = {t["function"]["name"]: t["function"]["description"]
+               for t in _mk(gen, bg, plain).to_openai_tools()}
+    assert "⏳ 可异步" in with_bg["generate_image"]
+    assert "⏳" not in with_bg["write_file"], "未标记的工具不加后缀"
+    assert "⏳" not in with_bg["background_run"]
+
+    without_bg = {t["function"]["name"]: t["function"]["description"]
+                  for t in _mk(gen, plain).to_openai_tools()}
+    assert "⏳" not in without_bg["generate_image"], "background_run 不在场就别教模型调它"

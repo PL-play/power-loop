@@ -21,6 +21,10 @@ class ToolDefinition:
     project: Callable[[Mapping[str, Any], str | None], dict[str, Any] | str] | None = field(
         default=None, compare=False
     )
+    #: 6.8.0：标记本工具可被 ``background_run(action="tool")`` 异步执行（无副作用、可安全
+    #: 并发/重跑的长耗时调用，如生成图像、抓网页）。标记后，只要 background_run 同在
+    #: 工具集里，渲染给模型的描述会自动追加「可异步」用法后缀（registry.to_openai_tools）。
+    async_capable: bool = False
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {

@@ -88,7 +88,22 @@ class ToolRegistry:
         return new
 
     def to_openai_tools(self) -> list[dict[str, Any]]:
-        return [d.to_openai_tool() for d in self.definitions()]
+        defs = self.definitions()
+        # async_capable 描述后缀（6.8.0）：仅当 background_run 真在本工具集里才追加——
+        # 否则是在教模型调一个不存在的入口。文案集中在这一处，别在各工具描述里手写。
+        has_bg = any(d.name == "background_run" for d in defs)
+        out: list[dict[str, Any]] = []
+        for d in defs:
+            t = d.to_openai_tool()
+            if has_bg and d.async_capable and d.name != "background_run":
+                t["function"]["description"] = (
+                    str(t["function"]["description"])
+                    + f"\n⏳ 可异步：background_run(action=\"tool\", tool=\"{d.name}\", "
+                      "args={…}) 立即返回 task_id 不阻塞；完成后会收到通知，"
+                      "background_run(action=\"check\") 取结果。不需要立刻用结果时优先异步。"
+                )
+            out.append(t)
+        return out
 
     def validate(self, name: str, args: Mapping[str, Any]) -> str | None:
         """Validate tool name and arguments. Returns an error string or ``None``.

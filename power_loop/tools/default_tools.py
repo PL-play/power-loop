@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import asyncio
 import difflib
 import fnmatch
@@ -1414,6 +1415,88 @@ class BackgroundManager:
         with self._lock:
             return sum(1 for t in self._threads.values() if t.is_alive())
 
+    async def run_tool(self, tool_name: str, args: dict[str, Any] | None) -> str:
+        """6.8.0 ``action=tool``：把一个 async_capable 工具作为后台任务跑，立即返回 task_id。
+
+        与 shell 分支不同：工具 handler 本来就是协程，直接 ``asyncio.create_task`` 在
+        本进程事件循环上跑——**contextvars 随 task 创建自动拷贝**（PEP 567），所以宿主的
+        计费/活动打标上下文天然跟着走，不需要捕获重播。结果持久化进同一张
+        background 任务表（command 字段以 ``tool:`` 前缀区分）；完成后调用宿主注册的
+        ``on_tool_task_complete``（best-effort），由宿主决定要不要唤醒睡着的 agent。
+        进程重启 = 任务丢失，行卡 running，由 check 的 flush_orphaned 语义外**另行**
+        诚实兜底：这里在启动时登记 in-memory，check 未命中 in-memory 且行仍 running
+        时按孤儿报告（复用 shell 分支已有的自愈路径）。
+        """
+        from power_loop.core.agent_context import get_current_loop
+
+        name = str(tool_name or "").strip()
+        if not name:
+            raise ValueError("background_run action=tool requires tool")
+        if name in ("background_run", "workflow", "spawn_agent"):
+            raise ValueError(f"{name} 不允许后台化（递归/编排类入口）")
+        loop = get_current_loop()
+        registry = getattr(loop, "tool_registry", None) if loop is not None else None
+        reg = registry.get(name) if registry is not None else None
+        if reg is None:
+            raise ValueError(f"unknown tool: {name}")
+        definition = getattr(reg, "definition", reg)
+        if not getattr(definition, "async_capable", False):
+            raise ValueError(
+                f"{name} 未标记可异步（async_capable=False）——直接同步调用即可；"
+                "只有无副作用的长耗时工具才开放后台化。"
+            )
+        store, sid = _current_store_and_session()
+        if store is not None and sid is not None:
+            rows = await store.list_background_tasks(sid)
+            running = sum(1 for r in rows if r.status == "running" and r.command.startswith("tool:"))
+            if running >= 8:
+                raise ValueError("后台工具任务已达并发上限（8）——先 check 收结果再发新的。")
+        task_id = str(uuid.uuid4())[:8]
+        args = dict(args or {})
+        label = f"tool:{name} " + json.dumps(args, ensure_ascii=False)[:160]
+        with self._lock:
+            self.tasks[task_id] = {"command": label, "status": "running", "result": None}
+        if store is not None and sid is not None:
+            await store.upsert_background_task(
+                sid, task_id=task_id, command=label, status="running",
+                return_code=None, output_tail="(running)",
+            )
+
+        async def _worker() -> None:
+            status, output = "completed", ""
+            try:
+                result = await registry.invoke_async(name, args)
+                output = str(result if result is not None else "")[:8000]
+            except Exception as exc:  # noqa: BLE001 — 失败是任务结果，不是崩溃
+                status = "failed"
+                output = f"{type(exc).__name__}: {exc}"[:2000]
+            with self._lock:
+                task = self.tasks.get(task_id)
+                if task is not None:
+                    task["status"] = status
+                    task["result"] = output or "(no output)"
+            if store is not None and sid is not None:
+                try:
+                    await store.upsert_background_task(
+                        sid, task_id=task_id, command=label, status=status,
+                        return_code=0 if status == "completed" else 1,
+                        output_tail=output or "(no output)",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("tool task %s: status write-back failed", task_id, exc_info=True)
+            cb = _TOOL_TASK_ON_COMPLETE
+            if cb is not None:
+                try:
+                    await cb(sid, task_id, status)
+                except Exception:  # noqa: BLE001 — 宿主回调失败不毁任务结果
+                    logger.warning("tool task %s: on_complete callback failed", task_id, exc_info=True)
+
+        asyncio.create_task(_worker(), name=f"bg-tool-{task_id}")
+        return (
+            f"后台任务已启动：task_id={task_id}（{label[:80]}）。你可以继续做别的；"
+            "完成后会收到通知，background_run(action=\"check\", task_id=\"" + task_id + "\") 取结果。"
+        )
+
     async def check(self, task_id: str | None = None) -> str:
         store, sid = _current_store_and_session()
         if store is not None and sid is not None:
@@ -1444,9 +1527,20 @@ class BackgroundManager:
 
 BG = BackgroundManager()
 
+#: 6.8.0 宿主 seam：后台**工具**任务完成时回调 ``(session_id, task_id, status)``。
+#: 宿主用它决定要不要唤醒一个已 pass_turn 的 agent（在忙的 session 下一轮开轮时
+#: BackgroundRuntimeProjector 本来就会注入更新，无需回调介入）。
+_TOOL_TASK_ON_COMPLETE: Any = None
+
+
+def register_tool_task_callback(cb: Any) -> None:
+    global _TOOL_TASK_ON_COMPLETE
+    _TOOL_TASK_ON_COMPLETE = cb
+
 
 async def run_background(
-    action: str, command: str | None = None, task_id: str | None = None
+    action: str, command: str | None = None, task_id: str | None = None,
+    tool: str | None = None, args: dict[str, Any] | None = None,
 ) -> str:
     """Execute one action of the merged ``background_run`` tool."""
     operation = str(action or "").strip().lower()
@@ -1456,7 +1550,9 @@ async def run_background(
         return await BG.run(str(command))
     if operation == "check":
         return await BG.check(task_id)
-    raise ValueError("background_run action must be one of: run, check")
+    if operation == "tool":
+        return await BG.run_tool(tool, args)
+    raise ValueError("background_run action must be one of: run, check, tool")
 
 
 async def run_todo(items: list[dict[str, Any]]) -> str:
@@ -1879,7 +1975,8 @@ async def _h_recall_send(**kw: Any) -> Any:
 
 
 async def _h_background_run(**kw: Any) -> Any:
-    return await run_background(kw["action"], kw.get("command"), kw.get("task_id"))
+    return await run_background(kw["action"], kw.get("command"), kw.get("task_id"),
+                                kw.get("tool"), kw.get("args"))
 
 
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {

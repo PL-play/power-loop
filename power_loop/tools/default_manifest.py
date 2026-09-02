@@ -297,20 +297,25 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="background_run",
         description=(
-            "Manage private background shell tasks with one action: run or check. action=run "
-            "starts a command in a private non-interactive background worker and returns its "
-            "task_id immediately. action=check reports a task's status/output by task_id, or "
-            "lists all your tasks when task_id is omitted."
+            "Manage private background tasks with one action: run, tool, or check. action=run "
+            "starts a shell command in a private non-interactive background worker and returns its "
+            "task_id immediately. action=tool runs one async-capable TOOL in the background "
+            "(tool=<name>, args={…}) and returns a task_id at once — use it for long, "
+            "side-effect-free calls (image generation, web fetches) whose result you do not "
+            "need immediately; you will be notified on completion. action=check reports a "
+            "task's status/output by task_id, or lists all your tasks when task_id is omitted."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["run", "check"],
+                    "enum": ["run", "tool", "check"],
                     "description": "Operation to perform.",
                 },
                 "command": {"type": "string", "description": "Required for action=run: shell command to execute."},
+                "tool": {"type": "string", "description": "Required for action=tool: name of an async-capable tool (marked ⏳ in its description)."},
+                "args": {"type": "object", "description": "action=tool: the tool's arguments, exactly as you would pass them when calling it directly."},
                 "task_id": {"type": "string", "description": "For action=check: task to inspect; omit to list all tasks."},
             },
             "required": ["action"],

@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+## [6.8.0] — 2026-09-02
+
+### Added
+
+- **工具异步化（长工具都是任务，不是调用）**：
+  - `ToolDefinition.async_capable: bool = False`——标记无副作用、可安全并发/重跑的长耗时
+    工具（生成图像、抓网页）。
+  - `background_run` 新增 `action=tool`：`(tool=<name>, args={…})` 把一个 async_capable
+    工具作为后台任务在本进程事件循环上跑，立即返回 task_id；结果持久化进同一张
+    background 任务表（`command` 以 `tool:` 前缀区分），`action=check` 取结果。
+    contextvars 随 task 创建自动拷贝（PEP 567）——宿主的计费/活动上下文天然跟着走。
+    并发上限 8/会话；`background_run`/`workflow`/`spawn_agent` 拒绝后台化（防递归）。
+  - `register_tool_task_callback(cb)`：后台工具任务完成时回调 `(session_id, task_id,
+    status)`，宿主决定要不要唤醒已睡的 agent（在忙的 session 由既有的
+    `BackgroundRuntimeProjector` 在下一轮开轮时注入更新，无需回调介入）。
+  - `ToolRegistry.to_openai_tools()`：async_capable 工具的描述自动追加「⏳ 可异步」用法
+    后缀——仅当 `background_run` 同在工具集里才追加（不教模型调不存在的入口）。
+
 ## [6.7.0] — 2026-09-02
 
 ### Added
