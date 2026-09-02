@@ -8,6 +8,35 @@
 
 ## [Unreleased]
 
+## [6.7.0] — 2026-09-02
+
+### Added
+
+- **`ContinuationPolicy`（耗尽续跑）**：`AgentNode.continuation = {max_continuations, extra_rounds,
+  gate}`。叶子以 `hit_round_limit` 落地且门条件成立（缺省 `gate="todo_remaining"`：该叶子
+  session 自己的 todo 还有未完成项）时，引擎在**原会话**上 `follow_up` 补 `extra_rounds` 轮
+  接着做——不起新会话、不从头重跑；至多续 `max_continuations` 次，全程受 run 共享预算钳制，
+  续跑轮的 rounds/usage 折算进节点结果。续命提示自动附上该叶子的剩余 todo 清单。
+  executor 可通过可选的 `continue_agent(session_id, input, *, parent_loop, extra_rounds,
+  stop_event)` 方法自定义续跑（缺省实现走 `InProcessExecutor`：child-run guards +
+  `parent_loop.follow_up`）。
+- **`journal.amend_step`**：宿主在 run **终局后**显式修正某节点的记录（status/text/usage，
+  带 `amended` 审计标记；run 级 status 不动）。与 `record_step` 互补——那条路对终局 run 冻结。
+  用途：宿主对某叶子原会话补轮（nudge）后回写新结果，否则日后 `resume` 会按旧的
+  hit_round_limit/failed 记录把该叶子从头重跑，清掉续跑成果。
+
+### Changed
+
+- **`retry.on` 语义拆分**：`failed` 触发器**不再**涵盖 `hit_round_limit`（耗尽不是「没跑好」
+  是「没跑完」——新会话重跑只会同预算再耗尽一次）。`RETRY_TRIGGERS` 新增 `hit_round_limit`
+  取值，需要旧行为（耗尽也从头重跑）就显式写上它。
+
+### Fixed
+
+- **run 级终态漏计截断叶子**：此前只有 `status=="failed"` 的叶子会让 run 落 failed，
+  `hit_round_limit` 的叶子让 run 谎报 completed。现在任何非 completed、非 tolerated
+  （continue_on_error）的叶子都会把 run 判为 failed。
+
 ## [6.6.1] — 2026-08-31
 
 ### Fixed
