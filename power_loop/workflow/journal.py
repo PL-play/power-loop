@@ -243,6 +243,49 @@ async def record_step(
     await store.mutate_runtime_state(parent_sid, run_key(run_id), _merge, default=None)
 
 
+async def amend_step(
+    store: SessionStore,
+    parent_sid: str,
+    run_id: str,
+    *,
+    node_id: str,
+    status: str,
+    text: str = "",
+    usage: dict[str, int] | None = None,
+    note: str | None = None,
+) -> bool:
+    """宿主显式修正一个**已终局** run 里某节点的记录（6.7.0，for host nudge）。
+
+    与 ``record_step`` 相反：那条路对终局 run 冻结（晚到的写入不许搅局），这条路只在
+    终局后开放——宿主对某叶子原会话补了轮（nudge）之后，把新结果写回 journal，
+    否则日后 resume 会拿旧的 hit_round_limit/failed 记录把该叶子**从头重跑**，
+    清掉续跑成果。run 级 status 不动（历史事实），节点记录附 ``amended`` 标记留审计。
+    返回是否写入（run 不存在或仍在跑 → False）。
+    """
+    wrote = False
+
+    def _merge(j: Any) -> Any:
+        nonlocal wrote
+        if j is None or not _is_terminal(j.get("status")):
+            return MUTATE_SKIP
+        steps = [s for s in j.get("steps", []) if s.get("node_id") != node_id]
+        steps.append({
+            "node_id": node_id, "status": status, "session_id": next(
+                (s.get("session_id") for s in j.get("steps", []) if s.get("node_id") == node_id),
+                None),
+            "usage": usage or {}, "error": None, "text": text or "",
+            "payload": None, "db_path": None,
+            "amended": {"at_ms": _now_ms(), "note": note or "host nudge"},
+        })
+        j["steps"] = steps
+        j["updated_at_ms"] = _now_ms()
+        wrote = True
+        return j
+
+    await store.mutate_runtime_state(parent_sid, run_key(run_id), _merge, default=None)
+    return wrote
+
+
 async def finalize(store: SessionStore, parent_sid: str, run_id: str, result: WorkflowResult) -> None:
     await update(
         store,
