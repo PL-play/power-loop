@@ -224,6 +224,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         name="schedule_wakeup",
         description=(
             "Manage your durable wake-up timers with one action: schedule, list, or cancel. "
+            "action defaults to schedule when you pass delay_seconds (to cancel when you pass only "
+            "timer_id, to list when you pass nothing) — but passing it explicitly is clearer. "
             "action=schedule arms a wake-up — after delay_seconds you receive your note back as "
             "a message and can act on it (check a long task, follow up on a promise); set "
             "every_seconds to make it RECURRING (fires repeatedly until cancelled). action=list "
@@ -244,9 +246,9 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
                 "every_seconds": {"type": "integer", "description": "Optional for action=schedule: repeat every N seconds after each fire (fixed-delay) until cancelled. Omit for one-shot."},
                 "timer_id": {"type": "integer", "description": "Required for action=cancel: the #id from action=list or the schedule confirmation."},
             },
-            "required": ["action"],
+            "required": [],
         },
-        required_params=("action",),
+        required_params=(),
     ),
     ToolDefinition(
         name="current_time",

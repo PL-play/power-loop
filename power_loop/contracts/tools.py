@@ -48,7 +48,9 @@ DEFAULT_REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
     "load_skill": ("name",),
     "todo": ("items",),
     "background_run": ("action",),
-    "schedule_wakeup": ("action",),
+    # schedule_wakeup 的 action 不再必填（6.13.0）：模型按「给了 delay_seconds+note 就是排闹钟」的
+    # 直觉省略它，被硬拒后每次白烧一轮（conv-222/223/224/226 实测 21 次调用 7 次因此失败，且同族的
+    # schedule_followup 的 operation 本来就可省略）。改由 handler 从参数形状推断，见 default_tools。
     "note": ("action",),
     "web_search": ("query",),
     "generate_image": ("prompt",),

@@ -1650,8 +1650,19 @@ async def run_schedule_wakeup(
     every_seconds: int | None = None,
     timer_id: int | None = None,
 ) -> str:
-    """Execute one action of the merged ``schedule_wakeup`` tool."""
+    """Execute one action of the merged ``schedule_wakeup`` tool.
+
+    ``action`` 可省略（6.13.0）：按参数形状推断——有 delay_seconds 就是 schedule，只有 timer_id
+    就是 cancel，什么都没有就是 list。省略 action 是模型的高频写法（与同族 schedule_followup 的
+    ``operation='schedule' (default)`` 一致），此前被必填校验硬拒，每次多烧一轮。"""
     operation = str(action or "").strip().lower()
+    if not operation:
+        if delay_seconds is not None:
+            operation = "schedule"
+        elif timer_id is not None:
+            operation = "cancel"
+        else:
+            operation = "list"
     if operation == "schedule":
         if delay_seconds is None:
             raise ValueError("schedule_wakeup action=schedule requires delay_seconds")

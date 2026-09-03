@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+## [6.13.0] — 2026-09-03
+
+### Changed
+
+- ``schedule_wakeup`` 的 ``action`` 不再必填：省略时按参数形状推断（有 ``delay_seconds`` → schedule，
+  只有 ``timer_id`` → cancel，都没有 → list）。模型按「给了 delay+note 就是排闹钟」的直觉省略它
+  （与同族 ``schedule_followup`` 的 ``operation='schedule' (default)`` 一致），此前被必填校验硬拒，
+  每次白烧一轮 LLM——实测 21 次调用里 7 次因此失败。
+
 ## [6.12.0] — 2026-09-03
 
 ### Added
