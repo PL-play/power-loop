@@ -213,9 +213,9 @@ def test_async_capable_suffix_only_with_background_run_mounted():
 
     with_bg = {t["function"]["name"]: t["function"]["description"]
                for t in _mk(gen, bg, plain).to_openai_tools()}
-    assert "⏳ 可异步" in with_bg["generate_image"]
-    assert "⏳" not in with_bg["write_file"], "未标记的工具不加后缀"
-    assert "⏳" not in with_bg["background_run"]
+    assert "可异步" in with_bg["generate_image"]
+    assert "可异步" not in with_bg["write_file"], "未标记的工具不加后缀"
+    assert "可异步" not in with_bg["background_run"]
 
     without_bg = {t["function"]["name"]: t["function"]["description"]
                   for t in _mk(gen, plain).to_openai_tools()}

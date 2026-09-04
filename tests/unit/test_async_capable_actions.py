@@ -62,4 +62,4 @@ def test_openai_description_names_the_allowed_actions():
     desc = next(t["function"]["description"] for t in reg.to_openai_tools()
                 if t["function"]["name"] == "design_reference")
     assert "可异步（仅 action=download/get/list）" in desc
-    assert "freeze" not in desc.split("⏳")[1]
+    assert "freeze" not in desc.split("可异步")[1]

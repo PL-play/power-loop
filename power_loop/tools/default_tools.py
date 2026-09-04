@@ -827,7 +827,7 @@ def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False)
             if replace_all or _hits != 1:
                 return (f"Error: File changed since last read. Re-read it before modifying: "
                         f"{_display_path(fp)}") + _guard_excerpt(fp, old_text)
-            stale_note = ("\n⚠️ 这个文件在你上次读过之后**被改动过**（不是你改的）。old_text 仍然唯一命中，"
+            stale_note = ("\n这个文件在你上次读过之后**被改动过**（不是你改的）。old_text 仍然唯一命中，"
                           "所以这次替换照做了；但你手里那份内容已经不是最新的——接着改之前先重读一遍。")
         bom, content = _split_bom(raw_content)
         original_ending = _detect_line_ending(content)
@@ -883,7 +883,7 @@ def _json_syntax_warning(fp: Path, updated: str) -> str:
         return ""
     except ValueError as exc:
         return (
-            f"\n⚠️ WARNING: {_display_path(fp)} is NOT valid JSON after this change "
+            f"\nWARNING: {_display_path(fp)} is NOT valid JSON after this change "
             f"({exc}). The file was written anyway — fix the syntax before using it."
         )
 

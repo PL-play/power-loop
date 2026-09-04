@@ -105,7 +105,7 @@ class RetryPolicy:
     """叶子重试策略。
 
     重试**起新的叶子会话**，不续跑失败那个：失败会话的上下文可能已被半截的工具调用污染。
-    🔴 重试会重跑工具——引擎的 ``idempotency_key``（run_id:node_id）在各次 attempt 之间
+    重试会重跑工具——引擎的 ``idempotency_key``（run_id:node_id）在各次 attempt 之间
     **保持不变**（变了工具就没法去重），另在 metadata 里带 ``attempt`` 供工具区分第几次。
     """
 

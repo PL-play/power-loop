@@ -352,7 +352,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
                     "description": "Operation to perform.",
                 },
                 "command": {"type": "string", "description": "Required for action=run: shell command to execute."},
-                "tool": {"type": "string", "description": "Required for action=tool: name of an async-capable tool (marked ⏳ in its description)."},
+                "tool": {"type": "string", "description": "Required for action=tool: name of an async-capable tool (marked in its description)."},
                 "args": {"type": "object", "description": "action=tool: the tool's arguments, exactly as you would pass them when calling it directly."},
                 "task_id": {"type": "string", "description": "For action=check: task to inspect; omit to list all tasks."},
             },

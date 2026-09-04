@@ -123,7 +123,7 @@ class ToolRegistry:
                 scope = ("（仅 action=" + "/".join(acts) + "）") if acts else ""
                 t["function"]["description"] = (
                     str(t["function"]["description"])
-                    + f"\n⏳ 可异步{scope}：background_run(action=\"tool\", tool=\"{d.name}\", "
+                    + f"\n可异步{scope}：background_run(action=\"tool\", tool=\"{d.name}\", "
                       "args={…}) 立即返回 task_id 不阻塞；完成后会收到通知，"
                       "background_run(action=\"check\") 取结果。不需要立刻用结果时优先异步。"
                 )
