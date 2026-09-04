@@ -1807,6 +1807,12 @@ RECALL_SEND_CONTENT_CHARS = 2000
 # a read file, a vision answer — so its cap is generous. The send-level view keeps the small cap
 # because it lists every row of the send.
 RECALL_SEND_ROW_CHARS = 40_000
+# The send-level listing is a MAP, not a payload. Real logs: no-seq calls averaged ~31.5K chars
+# against ~1.5K for seq'd ones — a listing of a tool-heavy send costs more context than the thing
+# the model was trying to find. So the whole listing lives inside one budget: every row still
+# appears (with its «sS» coordinate and its true size), bodies shrink together until they fit.
+RECALL_SEND_TOTAL_CHARS = 12_000
+RECALL_SEND_MIN_ROW_CHARS = 240
 
 
 async def run_recall_send(send_index: int, seq: int | None = None) -> str:
@@ -1852,21 +1858,28 @@ async def run_recall_send(send_index: int, seq: int | None = None) -> str:
         name = fn.get("name") if isinstance(fn, dict) else None
         return str(name or tc.get("name") or "?")
 
+    # 蒸馏（而不是原样吐 content）：多模态行的 content 是 JSON，原样返回等于把序列化的
+    # 块列表——内联 data URL 的话就是整个 base64——塞给模型。列整个 send 时不注入图片：
+    # 一次注入十几张会失控；要看某一行，recall 那一行（带 seq）。
+    bodies = [_recall_row_body(r)[0] for r in rows]
+    # One budget for the whole listing: rows all stay visible, bodies shrink together to fit.
+    cap = RECALL_SEND_CONTENT_CHARS
+    if sum(min(len(b), cap) for b in bodies) > RECALL_SEND_TOTAL_CHARS:
+        cap = max(RECALL_SEND_MIN_ROW_CHARS, RECALL_SEND_TOTAL_CHARS // max(1, len(rows)))
     blocks: list[str] = []
-    for r in rows:
-        # 蒸馏（而不是原样吐 content）：多模态行的 content 是 JSON，原样返回等于把序列化的
-        # 块列表——内联 data URL 的话就是整个 base64——塞给模型。列整个 send 时不注入图片：
-        # 一次注入十几张会失控；要看某一行，recall 那一行（带 seq）。
-        body, _images = _recall_row_body(r)
+    trimmed = 0
+    for r, body in zip(rows, bodies, strict=True):
         suffix = ""
         if r.tool_calls:
             names = ", ".join(_tc_name(tc) for tc in r.tool_calls)
             suffix = f"[tool_calls: {names}]"
+        full = len(body)
         # Truncate the CONTENT first (the body is the unbounded part), THEN append the
         # tool-calls suffix — otherwise a ~2000-char message would have its suffix cut, making
         # a tool-bearing send look tool-free in the inspector.
-        if len(body) > RECALL_SEND_CONTENT_CHARS:
-            body = body[:RECALL_SEND_CONTENT_CHARS] + " …[truncated]"
+        if full > cap:
+            trimmed += 1
+            body = body[:cap] + f" …[truncated: {full} chars — recall_send(send_index={target}, seq={r.seq}) for the original]"
         if suffix:
             body = f"{body}\n{suffix}" if body else suffix
         head = f"[seq {r.seq} · {r.role}"
@@ -1876,7 +1889,12 @@ async def run_recall_send(send_index: int, seq: int | None = None) -> str:
             head += f" · round {r.round_index}"
         head += "]"
         blocks.append(f"{head}\n{body}")
-    return f"send #{target} — {len(rows)} message(s):\n\n" + "\n\n".join(blocks)
+    header = f"send #{target} — {len(rows)} message(s)"
+    if trimmed:
+        header += (f"; {trimmed} body(ies) trimmed to {cap} chars to keep this listing small. "
+                   f"This is a MAP — for one original, call recall_send(send_index={target}, seq=S) "
+                   "with the seq you want (returns that row in full).")
+    return f"{header}:\n\n" + "\n\n".join(blocks)
 
 
 def _recall_row_body(row: Any) -> tuple[str, list[str]]:

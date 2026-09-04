@@ -23,6 +23,13 @@ from power_loop.runtime.store.store import SessionStore
 from power_loop.tools import create_default_tool_registry
 from power_loop.tools.default_tools import run_recall_send
 
+
+def _amake(rows):
+    async def _f(_sid):
+        return rows
+    return _f
+
+
 pytestmark = pytest.mark.unit
 
 
@@ -102,7 +109,7 @@ async def test_recall_send_truncation_keeps_tool_calls_suffix(store: SessionStor
     )
     with _active(store, sid):
         out = await run_recall_send(1)
-    assert "[tool_calls: bash]" in out and "…[truncated]" in out
+    assert "[tool_calls: bash]" in out and "…[truncated:" in out  # 体量与 seq 坐标现在写进截断标记里（/…[truncated: N chars — recall_send(…, seq=S)]）
 
 
 @pytest.mark.asyncio
@@ -135,7 +142,7 @@ async def test_recall_send_truncation_multiple_tool_calls(store: SessionStore) -
     )
     with _active(store, sid):
         out = await run_recall_send(1)
-    assert "[tool_calls: bash, python, node]" in out and "…[truncated]" in out
+    assert "[tool_calls: bash, python, node]" in out and "…[truncated:" in out
 
 
 def test_session_pending_error_tolerates_malformed_function() -> None:
@@ -179,7 +186,7 @@ async def test_recall_send_seq_returns_single_row_in_full_with_its_call(store):
         assert big in out  # NOT cut at 2000
         # send-level view still caps each body
         whole = await run_recall_send(1)
-        assert big not in whole and "…[truncated]" in whole
+        assert big not in whole and "…[truncated:" in whole
         # wrong seq → says the span, doesn't guess
         bad = await run_recall_send(1, 999)
         assert bad.startswith("No row seq 999 in send #1") and "span seq" in bad
@@ -198,3 +205,25 @@ async def test_recall_send_seq_caps_huge_row_and_counts_remainder(store, monkeyp
     with _active(store, sid):
         out = await run_recall_send(1, seq)
     assert "…[truncated: 150 more chars of 200]" in out
+
+
+@pytest.mark.asyncio
+async def test_send_level_listing_fits_one_budget(monkeypatch, tmp_path):
+    """列整份 send 是「地图」不是「载荷」。真实日志里不带 seq 的调用平均 31.5K 字符、带 seq 的
+    1.5K——找一样东西的目录比东西本身还贵。所以整份列表共用一个预算：行全在（连同 seq 坐标和
+    真实体量），正文一起缩到放得下。"""
+    from power_loop.tools import default_tools as dt
+
+    rows = [
+        SimpleNamespace(send_index=3, seq=s, role="tool", name=f"t{s}", round_index=1,
+                        tool_calls=None, tool_call_id=None, content="x" * 9000, meta=None)
+        for s in range(1, 9)
+    ]
+    store = SimpleNamespace(load_all_messages=_amake(rows))
+    monkeypatch.setattr(dt, "get_tool_runtime_context",
+                        lambda **_: SimpleNamespace(store=store, session_id="s1"))
+
+    out = await dt.run_recall_send(3)
+    assert len(out) < dt.RECALL_SEND_TOTAL_CHARS * 1.6          # 一个预算，不是 8×9000
+    assert all(f"[seq {s} ·" in out for s in range(1, 9))       # 每一行都还在
+    assert "seq=1" in out and "9000 chars" in out               # 坐标 + 真实体量都给了

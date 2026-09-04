@@ -283,8 +283,9 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "summarized tool line carries a coordinate «#N·sS» (send_index N, row seq S). To get "
             "ONE original tool result in full (a file you read, a skill you loaded, a vision answer, "
             "a command's output), call recall_send(send_index=N, seq=S) — that returns just that row "
-            "with a large cap. Without seq it lists every row of send #N (each body cut at 2000 "
-            "chars) — use that only to see what happened, not to fetch a body. Read-only, current session."
+            "with a large cap. Without seq you get a MAP of send #N — every row with its seq, "
+            "bodies trimmed to fit one small budget; use it to FIND the coordinate, then call again "
+            "with seq. Read-only, current session."
         ),
         input_schema={
             "type": "object",
