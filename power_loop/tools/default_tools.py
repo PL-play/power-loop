@@ -1534,9 +1534,13 @@ async def run_background(
         return await BG.run(str(command))
     if operation == "check":
         return await BG.check(task_id)
+    if operation == "list":
+        # 6.17.0：list 是 check 不带 task_id 的**显式**别名。「列出全部」原来藏在
+        # 「check 不带参数」这个隐式约定里，模型要先知道才用得上——同一件事该只有一个名字。
+        return await BG.check(None)
     if operation == "tool":
         return await BG.run_tool(tool, args)
-    raise ValueError("background_run action must be one of: run, check, tool")
+    raise ValueError("background_run action must be one of: run, check, list, tool")
 
 
 async def run_todo(items: list[dict[str, Any]]) -> str:

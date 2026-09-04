@@ -218,7 +218,10 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "or ongoing task state; action=list to read notes and obtain their #ids; action=update "
             "with note_id plus content and/or pinned to keep memory current; action=delete with "
             "note_id for stale memory. Keep notes short and self-contained; use pinned=true only for "
-            "notes that must never be hidden or auto-evicted."
+            "notes that must never be hidden or auto-evicted.\n"
+            "边界：**会过期的运行时状态不要写进 note**——后台 task_id、workflow run id、任务进度，"
+            "那些是待办的 owner/ref 与平台自己的台账在管，任务跑完你写的那条就成了没人删的垃圾。"
+            "note 只放「以后还成立」的事实与决定。"
         ),
         input_schema={
             "type": "object",
@@ -342,7 +345,10 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["run", "tool", "check"],
+                    # list = check 不带 task_id 的显式别名（6.17.0）。原来「列出全部」这件事
+                    # 藏在「check 不带参数」这个隐式约定里，模型要先知道才用得上——同一件事
+                    # 该只有一个名字（design/96 §6.4）。
+                    "enum": ["run", "tool", "check", "list"],
                     "description": "Operation to perform.",
                 },
                 "command": {"type": "string", "description": "Required for action=run: shell command to execute."},

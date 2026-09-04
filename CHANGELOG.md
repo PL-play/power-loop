@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+## [6.17.0] — 2026-09-04
+
+### Added
+
+- **`background_run(action="list")`** —— `check` 不带 `task_id` 的**显式**别名。「列出全部」
+  原来藏在「check 不带参数」这个隐式约定里，模型要先知道才用得上；同一件事该只有一个名字。
+
+### Changed
+
+- **`note` 的描述加上边界**：会过期的运行时状态（后台 task_id、workflow run id、任务进度）
+  不要写进 note——那些由待办的 `owner`/`ref` 与平台自己的台账管，任务跑完写下的那条就成了
+  没人删的垃圾。取证：真实会话的 176 条 note 里有 22 条是手抄的 run id，agent 在拿持久记忆
+  当派活台账（DeepTalk design/96 §1.3）。
+
 ## [6.16.0] — 2026-09-04
 
 ### Added

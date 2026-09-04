@@ -58,3 +58,22 @@ def test_render_shows_where_the_work_went():
     assert "(后台 task_9f2a)" in out          # 看得见派到哪，才回得来收
     assert "1 件在外面跑" in out
     assert "#2: 我自己写产品定义" in out and "(" not in out.split("#2")[1].split("\n")[0]
+
+
+@pytest.mark.asyncio
+async def test_background_run_list_is_an_explicit_alias_for_check_all(monkeypatch):
+    """「列出全部」原来藏在「check 不带 task_id」这个隐式约定里——模型要先知道才用得上。
+    同一件事该只有一个名字（design/96 §6.4）。"""
+    from power_loop.tools import default_tools as dt
+
+    seen: list = []
+
+    async def _check(task_id=None):
+        seen.append(task_id)
+        return "ok"
+
+    monkeypatch.setattr(dt.BG, "check", _check)
+    assert await dt.run_background("list") == "ok"
+    assert seen == [None]
+    await dt.run_background("check", task_id="t1")
+    assert seen[-1] == "t1"
