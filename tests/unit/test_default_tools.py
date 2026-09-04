@@ -236,3 +236,49 @@ def test_looks_binary_accepts_utf8_cjk_and_flags_real_binary():
     # Real binary still rejected.
     assert _looks_binary(b"\x00\x01\x02 stuff") is True
     assert _looks_binary(bytes(range(1, 32)) * 200) is True
+
+
+def test_identical_edit_is_a_no_op_not_an_error(tmp_path: Path) -> None:
+    """新旧完全相同 = 这次编辑本来就什么都不做。报错换来的只是「模型重发一遍」，
+    而它已经处在想要的状态了——如实说一声就够（真实日志 30 天 10 次）。"""
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
+    target = f"{rel}/same.txt"
+    registry.invoke("write_file", {"path": target, "content": "alpha\nbeta\n"})
+    registry.invoke("read_file", {"path": target})
+
+    out = str(registry.invoke("edit_file", {"path": target, "old_text": "beta", "new_text": "beta"}))
+    assert not out.startswith("Error")
+    assert "未改动" in out
+    assert (root / "same.txt").read_text() == "alpha\nbeta\n"   # 文件真的没被动
+
+
+def test_read_guard_errors_carry_the_current_region(tmp_path: Path) -> None:
+    """闸原来只说「去重读一遍再来」——一件事花两轮（read 一轮、重发编辑一轮）。
+    真实日志里这两条闸 30 天拦了 70 次 = 70 个白烧的往返。内容就在手边，直接给出来
+    就能一轮做完。**守卫不变**：该拦的照样拦，只是把出路一并给了。"""
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
+    target = f"{rel}/guard.txt"
+    (root / "guard.txt").write_text("head line\nANCHOR HERE\ntail line\n", encoding="utf-8")
+
+    # ① 从没读过：照样拦，但把现场带上
+    never = str(registry.invoke("edit_file",
+                                {"path": target, "old_text": "ANCHOR HERE", "new_text": "X"}))
+    assert never.startswith("Error") and "has not been read" in never
+    assert "ANCHOR HERE" in never and "old_text 仍然命中" in never
+
+    # ② 读过之后被外部改动：同样拦 + 带现场
+    registry.invoke("read_file", {"path": target})
+    (root / "guard.txt").write_text("head line\nANCHOR HERE\nNEW TAIL\n", encoding="utf-8")
+    stale = str(registry.invoke("edit_file",
+                                {"path": target, "old_text": "ANCHOR HERE", "new_text": "X"}))
+    assert stale.startswith("Error") and "changed since last read" in stale
+    assert "NEW TAIL" in stale          # 带回的是**当前**内容，不是它读过的旧版
+
+    # ③ 锚点根本不在文件里：退回给文件开头，让它对照着改锚点
+    gone = str(registry.invoke("edit_file",
+                               {"path": target, "old_text": "NOT THERE", "new_text": "X"}))
+    assert "old_text 没命中" in gone and "head line" in gone

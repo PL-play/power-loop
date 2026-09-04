@@ -169,13 +169,45 @@ def _remember_read(fp: Path) -> None:
             FILE_READ_STATE.popitem(last=False)  # evict least-recently-read
 
 
-def _check_read_state(fp: Path) -> str | None:
+#: 闸报错里最多带回多少字符的现场内容。够看清目标区域，又不至于把整份大文件塞进上下文。
+_READ_GUARD_EXCERPT = 1200
+
+
+def _guard_excerpt(fp: Path, anchor: str | None) -> str:
+    """闸拦下时，把**当前**文件里与这次编辑相关的一段带回去。
+
+    为什么：闸原来只说「去重读一遍再来」——于是一件事要花两轮（read_file 一轮、重发编辑一轮）。
+    真实日志里这两条闸 30 天拦了 70 次，也就是 70 个白烧的往返。内容本来就在手边，直接给出来
+    就能一轮做完。**这不削弱守卫**：该拦的照样拦，只是把「出路」一并给了（报错即出路）。
+    """
+    try:
+        if not fp.exists():
+            return ""
+        text = _read_text(fp, max_bytes=None)
+    except Exception:  # noqa: BLE001 — 现场读不到就退回纯报错，绝不能让闸本身抛
+        return ""
+    if anchor:
+        i = text.find(anchor)
+        if i >= 0:
+            lo = max(0, i - _READ_GUARD_EXCERPT // 3)
+            hi = min(len(text), i + len(anchor) + _READ_GUARD_EXCERPT // 3)
+            head = "…\n" if lo else ""
+            tail = "\n…" if hi < len(text) else ""
+            return f"\n\n当前文件里这段的现场（old_text 仍然命中）：\n{head}{text[lo:hi]}{tail}"
+    excerpt = text[:_READ_GUARD_EXCERPT]
+    tail = "\n…" if len(text) > _READ_GUARD_EXCERPT else ""
+    return f"\n\n当前文件开头（old_text 没命中，对照着改锚点）：\n{excerpt}{tail}"
+
+
+def _check_read_state(fp: Path, anchor: str | None = None) -> str | None:
     key = str(fp.resolve())
     stamp = FILE_READ_STATE.get(key)  # .get(): tolerate a concurrent LRU eviction
     if stamp is None:
-        return f"Error: File has not been read yet. Use read_file first before modifying: {_display_path(fp)}"
+        return (f"Error: File has not been read yet. Use read_file first before modifying: "
+                f"{_display_path(fp)}") + _guard_excerpt(fp, anchor)
     if fp.exists() and _file_stamp(fp) != stamp:
-        return f"Error: File changed since last read. Re-read it before modifying: {_display_path(fp)}"
+        return (f"Error: File changed since last read. Re-read it before modifying: "
+                f"{_display_path(fp)}") + _guard_excerpt(fp, anchor)
     return None
 
 
@@ -761,7 +793,8 @@ def _find_unique_edit_span(content: str, old_text: str, path: str, replace_all: 
 def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
     try:
         fp = safe_path(path)
-        read_err = _check_read_state(fp)
+        # 把 old_text 交给闸：拦下时它能定位到目标区域，一并把现场带回去（一轮而不是两轮）。
+        read_err = _check_read_state(fp, old_text)
         if read_err:
             return read_err
         raw_content = _read_text(fp, max_bytes=None)
@@ -772,7 +805,10 @@ def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False)
         norm_new = _normalize_to_lf(new_text)
 
         if norm_old == norm_new:
-            return "Error: old_text and new_text are identical."
+            # 新旧完全相同 = 这次编辑本来就什么都不做。报错换来的是「模型重发一遍」，
+            # 而它已经处在想要的状态了——如实说一声就够，不该白烧一轮（30 天 10 次）。
+            return (f"No change: old_text 与 new_text 完全相同，{_display_path(fp)} 未改动"
+                    "（它已经是你想要的样子了；如果你想改的是别处，换一个 old_text）。")
 
         span_or_error = _find_unique_edit_span(normalized, norm_old, path, replace_all)
         if isinstance(span_or_error, str):
