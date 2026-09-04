@@ -172,7 +172,15 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="todo",
-        description="Update the current task list (todo manager). Only one item can be in_progress at a time.",
+        description=(
+            "Update the current task list. Send the WHOLE list every time (it replaces the old one).\n"
+            "每一条有两个维度，别混：`status` 说**进展**（pending/in_progress/completed），"
+            "`owner` 说**谁在做**（self=你自己动手；background/subagent/workflow=派出去了）。\n"
+            "**同时只能有一件 owner=self 的 in_progress**——你自己一次只做一件事。但派出去的"
+            "不限：三件活分别在后台、子 agent、workflow 里跑，就是三条 in_progress，各带各的 owner。\n"
+            "owner 不是 self 时必须给 `ref`（task_id / run id / 子会话 id）：说不出派到哪的活"
+            "没法回来收，清单上会永远挂着。先真的派出去、拿到句柄，再把这一条标上。"
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -184,6 +192,15 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
                             "id": {"type": "string"},
                             "text": {"type": "string"},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            "owner": {
+                                "type": "string",
+                                "enum": ["self", "background", "subagent", "workflow"],
+                                "description": "谁在做（缺省 self）。不是 self 就必须给 ref。",
+                            },
+                            "ref": {
+                                "type": "string",
+                                "description": "派出去的句柄：background 的 task_id / workflow 的 run id / 子 agent 的会话 id。",
+                            },
                         },
                         "required": ["id", "text", "status"],
                     }

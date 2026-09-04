@@ -8,6 +8,30 @@
 
 ## [Unreleased]
 
+## [6.16.0] — 2026-09-04
+
+### Added
+
+- **待办支持 `owner` + `ref`：派出去的活也算「进行中」。** 旧模型只有一个 `in_progress`
+  名额，那是「一个人一次做一件事」的假设——对自己动手完全正确，但一个 agent 可以同时把
+  三件活分别丢给后台命令、子 agent、workflow。旧模型逼它二选一：要么谎报（把派出去的标
+  `pending`，清单就看不出有活在飞），要么撞「Only one task can be in_progress」的硬错。
+  现在拆成两个维度：
+  - `status` 只说**进展**（pending / in_progress / completed）；
+  - `owner` 说**谁在做**（`self` / `background` / `subagent` / `workflow`，缺省 `self`）。
+  - 单例规则收窄成它本来的意思：**同时只能有一件 `owner=self` 的 `in_progress`**；派出去的不限。
+  - `owner != "self"` 时 **`ref` 必填**（task_id / run id / 子会话 id）——说不出派到哪的活
+    没法回来收，清单上会永远挂着。
+  - 渲染带上去处（`[>] #1: 画三张封面  (后台 task_9f2a)`）与「N 件在外面跑」；
+    `counts` 新增 `delegated`。
+  - **完全向后兼容**：不带 `owner` 的旧清单一律视为 `self`，行为与 6.15.0 一致。
+
+### Changed
+
+- 待办的校验与渲染收敛到新的 `power_loop/runtime/todos.py`。此前 `core/state.py` 与
+  `tools/default_tools.py` 各有一份**逐字重复**的实现，改一处漏一处就会让清单在上下文层与
+  工具层各说各话。
+
 ## [6.15.0] — 2026-09-04
 
 ### Added

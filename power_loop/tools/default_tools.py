@@ -1157,38 +1157,11 @@ def _current_store_and_session() -> tuple[Any | None, str | None]:
     return runtime_ctx.store, runtime_ctx.session_id
 
 
-def _render_todos(items: list[dict[str, Any]]) -> str:
-    if not items:
-        return "No todos."
-    lines: list[str] = []
-    for item in items:
-        marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
-        lines.append(f"{marker} #{item['id']}: {item['text']}")
-    done = sum(1 for item in items if item["status"] == "completed")
-    lines.append(f"\n({done}/{len(items)} completed)")
-    return "\n".join(lines)
-
-
-def _validate_todos(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if len(items) > 20:
-        raise ValueError("Max 20 todos allowed")
-    validated: list[dict[str, Any]] = []
-    in_progress_count = 0
-    for i, item in enumerate(items):
-        text = str(item.get("text", "")).strip()
-        status = str(item.get("status", "pending")).lower()
-        item_id = str(item.get("id", str(i + 1)))
-        if not text:
-            raise ValueError(f"Item {item_id}: text required")
-        if status not in ("pending", "in_progress", "completed"):
-            raise ValueError(f"Item {item_id}: invalid status '{status}'")
-        if status == "in_progress":
-            in_progress_count += 1
-        validated.append({"id": item_id, "text": text, "status": status})
-    if in_progress_count > 1:
-        raise ValueError("Only one task can be in_progress at a time")
-    return validated
-
+# 6.16.0：校验与渲染收敛到 runtime/todos.py 一处——这两个函数原来在 core/state.py 里
+# 还有一份**逐字重复**的实现，改一处漏一处就是清单在工具层和上下文层各说各话。
+from power_loop.runtime.todos import render_todos as _render_todos  # noqa: E402
+from power_loop.runtime.todos import todo_counts as _todo_counts  # noqa: E402
+from power_loop.runtime.todos import validate_todos as _validate_todos  # noqa: E402
 
 #: Cap on retained in-memory background-task records. The durable record lives in the store; this
 #: is just a cache for `check`, so a long-lived loop must not accumulate task dicts (each pinning a
@@ -1571,15 +1544,10 @@ async def run_todo(items: list[dict[str, Any]]) -> str:
     store, sid = _current_store_and_session()
     if store is not None and sid is not None:
         rendered = _render_todos(validated)
-        done = sum(1 for item in validated if item["status"] == "completed")
         await store.set_runtime_state(
             sid,
             "todo",
-            {
-                "items": validated,
-                "rendered": rendered,
-                "counts": {"total": len(validated), "completed": done},
-            },
+            {"items": validated, "rendered": rendered, "counts": _todo_counts(validated)},
         )
         # Keep the in-process context warm for UI/event compatibility.
         get_ctx().todo.update(validated)
