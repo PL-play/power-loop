@@ -171,7 +171,7 @@ async def test_action_tool_runs_async_capable_tool_and_notifies(monkeypatch):
     dt.register_tool_task_callback(_cb)
     try:
         # 未标记的工具拒绝
-        with pytest.raises(ValueError, match="async_capable"):
+        with pytest.raises(ValueError, match="不能后台跑"):
             await dt.BG.run_tool("write_file", {})
         # 递归入口拒绝
         with pytest.raises(ValueError, match="不允许后台化"):

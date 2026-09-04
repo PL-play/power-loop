@@ -1493,9 +1493,24 @@ class BackgroundManager:
                     f"{name} 只有 action={'/'.join(acts)} 可以后台跑，这次传的是 {got}；"
                     "其余 action 有副作用，直接同步调用即可。"
                 )
+            # 报错即出路：说清「为什么不行」「哪些行」「这件事该怎么做」，三样都给。
+            # 明确**不做**兜底同步执行：模型调 background_run 的语义是「别阻塞我，给我一个
+            # task_id」；兜底改成阻塞执行，它拿到的是同步结果，接下来很可能去 check 一个不存在
+            # 的 task_id，或者以为自己已经并行了而其实没有。一个「成功」的错误回执比一个说清楚
+            # 的报错更贵。
+            _others = []
+            if registry is not None:
+                for _d in sorted(registry.definitions(), key=lambda x: x.name):
+                    if _d.name in ("background_run", "workflow", "spawn_agent"):
+                        continue
+                    if not getattr(_d, "async_capable", False):
+                        continue
+                    _a = async_capable_actions(_d)
+                    _others.append(f"{_d.name}({'/'.join(_a)})" if _a else _d.name)
             raise ValueError(
-                f"{name} 未标记可异步（async_capable=False）——直接同步调用即可；"
-                "只有无副作用的长耗时工具才开放后台化。"
+                f"{name} 不能后台跑：它有副作用（写文件 / 发布 / 对外投递这类），"
+                "重跑或并发都不安全。**这件事直接调用 " + name + " 就行**，不用包一层。"
+                + ("\n可以后台跑的是：" + "、".join(_others) if _others else "")
             )
         store, sid = _current_store_and_session()
         if store is not None and sid is not None:
