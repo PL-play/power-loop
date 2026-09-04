@@ -199,13 +199,27 @@ def _guard_excerpt(fp: Path, anchor: str | None) -> str:
     return f"\n\n当前文件开头（old_text 没命中，对照着改锚点）：\n{excerpt}{tail}"
 
 
-def _check_read_state(fp: Path, anchor: str | None = None) -> str | None:
+def _read_state_kind(fp: Path) -> str | None:
+    """``"unread"``（从没读过）/ ``"stale"``（读过但文件后来变了）/ ``None``（干净）。
+
+    两者性质不同，所以分开：**从没读过**意味着模型对这个文件没有任何依据；
+    **读过但变了**意味着依据可能过期——后者还有救（见 ``run_edit``），前者没有。
+    """
     key = str(fp.resolve())
     stamp = FILE_READ_STATE.get(key)  # .get(): tolerate a concurrent LRU eviction
     if stamp is None:
+        return "unread"
+    if fp.exists() and _file_stamp(fp) != stamp:
+        return "stale"
+    return None
+
+
+def _check_read_state(fp: Path, anchor: str | None = None) -> str | None:
+    kind = _read_state_kind(fp)
+    if kind == "unread":
         return (f"Error: File has not been read yet. Use read_file first before modifying: "
                 f"{_display_path(fp)}") + _guard_excerpt(fp, anchor)
-    if fp.exists() and _file_stamp(fp) != stamp:
+    if kind == "stale":
         return (f"Error: File changed since last read. Re-read it before modifying: "
                 f"{_display_path(fp)}") + _guard_excerpt(fp, anchor)
     return None
@@ -793,11 +807,28 @@ def _find_unique_edit_span(content: str, old_text: str, path: str, replace_all: 
 def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
     try:
         fp = safe_path(path)
-        # 把 old_text 交给闸：拦下时它能定位到目标区域，一并把现场带回去（一轮而不是两轮）。
-        read_err = _check_read_state(fp, old_text)
-        if read_err:
-            return read_err
+        # 「读过、但文件后来变了」（stale）不再一律拦（6.19.0）：如果 old_text 在**当前**内容里
+        # 仍然唯一命中，说明你要替换的那段原文还在原地，这次编辑是无歧义的——放行，并在回执里
+        # 明说文件在别处变过（不能让它以为脑子里那份还是最新的）。命中 0 次或 ≥2 次照样拦：
+        # 那才是「依据真的过期了」。
+        #
+        # 为什么只放这一类：从没读过（unread）意味着对这个文件没有任何依据，没得救；
+        # replace_all 也不放——它要替换的是「每一处」，而文件变了之后那个集合可能已经不同。
+        # 真实日志：这条闸 30 天拦了 35 次，每次都要模型重读整份文件再重发（两轮 + 一次整文件回执）。
+        stale_note = ""
+        kind = _read_state_kind(fp)
+        if kind == "unread":
+            return (f"Error: File has not been read yet. Use read_file first before modifying: "
+                    f"{_display_path(fp)}") + _guard_excerpt(fp, old_text)
         raw_content = _read_text(fp, max_bytes=None)
+        if kind == "stale":
+            _probe = _normalize_to_lf(_split_bom(raw_content)[1])
+            _hits = _probe.count(_normalize_to_lf(old_text))
+            if replace_all or _hits != 1:
+                return (f"Error: File changed since last read. Re-read it before modifying: "
+                        f"{_display_path(fp)}") + _guard_excerpt(fp, old_text)
+            stale_note = ("\n⚠️ 这个文件在你上次读过之后**被改动过**（不是你改的）。old_text 仍然唯一命中，"
+                          "所以这次替换照做了；但你手里那份内容已经不是最新的——接着改之前先重读一遍。")
         bom, content = _split_bom(raw_content)
         original_ending = _detect_line_ending(content)
         normalized = _normalize_to_lf(content)
@@ -827,6 +858,7 @@ def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False)
         diff_output = _generate_diff(normalized, updated)
         return (
             f"Edited {_display_path(fp)} ({label}, {count} replacement{'s' if count != 1 else ''})"
+            + stale_note
             + _json_syntax_warning(fp, updated)
             + (f"\n{diff_output}" if diff_output else "")
         )

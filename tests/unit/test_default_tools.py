@@ -270,15 +270,89 @@ def test_read_guard_errors_carry_the_current_region(tmp_path: Path) -> None:
     assert never.startswith("Error") and "has not been read" in never
     assert "ANCHOR HERE" in never and "old_text 仍然命中" in never
 
-    # ② 读过之后被外部改动：同样拦 + 带现场
+    # ② 读过之后被外部改动、且锚点变得有歧义：仍然拦 + 带现场
+    #    （锚点仍唯一命中的那一类已在 6.19.0 放行，见 test_stale_edit_goes_through_...）
     registry.invoke("read_file", {"path": target})
-    (root / "guard.txt").write_text("head line\nANCHOR HERE\nNEW TAIL\n", encoding="utf-8")
+    (root / "guard.txt").write_text("head line\nANCHOR HERE\nANCHOR HERE\n", encoding="utf-8")
     stale = str(registry.invoke("edit_file",
                                 {"path": target, "old_text": "ANCHOR HERE", "new_text": "X"}))
     assert stale.startswith("Error") and "changed since last read" in stale
-    assert "NEW TAIL" in stale          # 带回的是**当前**内容，不是它读过的旧版
+    assert "ANCHOR HERE" in stale        # 带回的是**当前**内容，不是它读过的旧版
 
-    # ③ 锚点根本不在文件里：退回给文件开头，让它对照着改锚点
-    gone = str(registry.invoke("edit_file",
-                               {"path": target, "old_text": "NOT THERE", "new_text": "X"}))
-    assert "old_text 没命中" in gone and "head line" in gone
+    # ③ 闸拦下、且锚点在当前文件里根本找不到：退回给文件开头，让它对照着改锚点
+    #    （用一个从没读过的新文件——读过之后状态就干净了，走不到闸）
+    (root / "other.txt").write_text("some other head\nbody\n", encoding="utf-8")
+    gone = str(registry.invoke("edit_file", {"path": f"{rel}/other.txt",
+                                             "old_text": "NOT THERE", "new_text": "X"}))
+    assert gone.startswith("Error") and "old_text 没命中" in gone
+    assert "some other head" in gone
+
+
+def test_stale_edit_goes_through_when_the_anchor_still_matches_uniquely(tmp_path: Path) -> None:
+    """「读过、但文件后来变了」不再一律拦（6.19.0）。
+
+    old_text 在**当前**内容里仍然唯一命中 = 你要替换的那段原文还在原地，这次编辑无歧义。
+    真实日志里这条闸 30 天拦了 35 次，每次都要模型重读整份文件再重发（两轮 + 一次整文件回执）。
+    """
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
+    target = f"{rel}/stale.txt"
+    (root / "stale.txt").write_text("head\nANCHOR\ntail\n", encoding="utf-8")
+    registry.invoke("read_file", {"path": target})
+
+    # 别人动了这个文件的**别处**
+    (root / "stale.txt").write_text("head\nANCHOR\nDIFFERENT TAIL\n", encoding="utf-8")
+    out = str(registry.invoke("edit_file",
+                              {"path": target, "old_text": "ANCHOR", "new_text": "REPLACED"}))
+    assert not out.startswith("Error")
+    assert "被改动过" in out          # 必须明说：别让它以为手里那份还是最新的
+    text = (root / "stale.txt").read_text()
+    assert "REPLACED" in text and "DIFFERENT TAIL" in text   # 别人的改动没被覆盖
+
+
+def test_stale_edit_is_still_blocked_when_the_anchor_is_ambiguous_or_gone(tmp_path: Path) -> None:
+    """放松只放这一类。命中 0 次或 ≥2 次，才是「依据真的过期了」。"""
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
+    target = f"{rel}/amb.txt"
+
+    # ① 锚点在新内容里出现了两次 → 拦
+    (root / "amb.txt").write_text("A\nX\n", encoding="utf-8")
+    registry.invoke("read_file", {"path": target})
+    (root / "amb.txt").write_text("A\nX\nA\n", encoding="utf-8")
+    out = str(registry.invoke("edit_file", {"path": target, "old_text": "A", "new_text": "B"}))
+    assert out.startswith("Error") and "changed since last read" in out
+
+    # ② 锚点没了 → 拦
+    (root / "amb.txt").write_text("A\n", encoding="utf-8")
+    registry.invoke("read_file", {"path": target})
+    (root / "amb.txt").write_text("totally different\n", encoding="utf-8")
+    out = str(registry.invoke("edit_file", {"path": target, "old_text": "A", "new_text": "B"}))
+    assert out.startswith("Error") and "changed since last read" in out
+
+
+def test_stale_replace_all_is_never_relaxed(tmp_path: Path) -> None:
+    """replace_all 要替换的是「每一处」，而文件变了之后那个集合可能已经不同——不放。"""
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
+    target = f"{rel}/ra.txt"
+    (root / "ra.txt").write_text("k\n", encoding="utf-8")
+    registry.invoke("read_file", {"path": target})
+    (root / "ra.txt").write_text("k\nnew line\n", encoding="utf-8")   # 唯一命中，但 replace_all
+    out = str(registry.invoke("edit_file",
+                              {"path": target, "old_text": "k", "new_text": "K", "replace_all": True}))
+    assert out.startswith("Error") and "changed since last read" in out
+
+
+def test_never_read_is_still_blocked_even_with_a_unique_anchor(tmp_path: Path) -> None:
+    """从没读过 = 对这个文件没有任何依据，没得救——唯一命中也不放。"""
+    registry = create_default_tool_registry(workspace_dir=tmp_path)
+    root = _sandbox(tmp_path)
+    rel = root.relative_to(tmp_path).as_posix()
+    (root / "fresh.txt").write_text("only once here\n", encoding="utf-8")
+    out = str(registry.invoke("edit_file", {"path": f"{rel}/fresh.txt",
+                                            "old_text": "only once here", "new_text": "X"}))
+    assert out.startswith("Error") and "has not been read" in out
