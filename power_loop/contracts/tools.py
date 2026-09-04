@@ -24,7 +24,16 @@ class ToolDefinition:
     #: 6.8.0：标记本工具可被 ``background_run(action="tool")`` 异步执行（无副作用、可安全
     #: 并发/重跑的长耗时调用，如生成图像、抓网页）。标记后，只要 background_run 同在
     #: 工具集里，渲染给模型的描述会自动追加「可异步」用法后缀（registry.to_openai_tools）。
-    async_capable: bool = False
+    #:
+    #: 6.15.0：支持 **action 粒度**。很多多义工具在同一个入口下既有只读 action 也有写
+    #: action（``design_reference`` 的 ``get``/``list`` 只读、``freeze`` 写），工具级的
+    #: 一个布尔值只能二选一：整体不标 → 纯读的那几个 action 也没法并发；整体标上 → 写
+    #: action 会被并发或被后台重跑。给一组 action 名即可只放行这几个：
+    #:
+    #:     async_capable=frozenset({"get", "list", "download"})
+    #:
+    #: ``True`` 仍表示整个工具都可异步，``False`` 表示都不可——旧写法完全不受影响。
+    async_capable: bool | frozenset[str] = False
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {

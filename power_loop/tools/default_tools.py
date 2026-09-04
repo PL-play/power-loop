@@ -1440,7 +1440,18 @@ class BackgroundManager:
         if reg is None:
             raise ValueError(f"unknown tool: {name}")
         definition = getattr(reg, "definition", reg)
-        if not getattr(definition, "async_capable", False):
+        from power_loop.tools.registry import async_capable_actions, async_capable_for
+
+        if not async_capable_for(definition, args):
+            acts = async_capable_actions(definition)
+            if acts:
+                # 工具本身可异步、只是这次这个 action 不行——把能异步的那几个报出来，
+                # 别让它以为整个工具都不能后台跑（报错即出路）。
+                got = str((args or {}).get("action") or "(没传 action)")
+                raise ValueError(
+                    f"{name} 只有 action={'/'.join(acts)} 可以后台跑，这次传的是 {got}；"
+                    "其余 action 有副作用，直接同步调用即可。"
+                )
             raise ValueError(
                 f"{name} 未标记可异步（async_capable=False）——直接同步调用即可；"
                 "只有无副作用的长耗时工具才开放后台化。"

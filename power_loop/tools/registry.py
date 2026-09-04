@@ -28,6 +28,29 @@ class RegisteredTool:
     is_async: bool = False
 
 
+
+def async_capable_for(definition: Any, args: Mapping[str, Any] | None = None) -> bool:
+    """这次调用可不可以异步跑（6.15.0：``async_capable`` 支持 action 粒度）。
+
+    ``True``/``False`` 是工具级的老语义。给一组 action 名时，只有 ``args["action"]`` 命中
+    这一组才算可异步——**拿不到 args 就一律判否**：同轮并发要在发起前就决定，宁可少并发一次，
+    也不能把一个写 action 当成只读的并发出去。标错的代价不对称。
+    """
+    flag = getattr(definition, "async_capable", False)
+    if isinstance(flag, bool):
+        return flag
+    if not flag:
+        return False
+    action = str((args or {}).get("action") or "").strip()
+    return bool(action) and action in flag
+
+
+def async_capable_actions(definition: Any) -> tuple[str, ...]:
+    """标了 action 粒度时返回那几个 action 名（工具级 True/False 返回空）——只给文案用。"""
+    flag = getattr(definition, "async_capable", False)
+    return tuple(sorted(flag)) if not isinstance(flag, bool) and flag else ()
+
+
 class ToolRegistry:
     """Open tool registry for dynamic bind/add/remove operations.
 
@@ -96,9 +119,11 @@ class ToolRegistry:
         for d in defs:
             t = d.to_openai_tool()
             if has_bg and d.async_capable and d.name != "background_run":
+                acts = async_capable_actions(d)
+                scope = ("（仅 action=" + "/".join(acts) + "）") if acts else ""
                 t["function"]["description"] = (
                     str(t["function"]["description"])
-                    + f"\n⏳ 可异步：background_run(action=\"tool\", tool=\"{d.name}\", "
+                    + f"\n⏳ 可异步{scope}：background_run(action=\"tool\", tool=\"{d.name}\", "
                       "args={…}) 立即返回 task_id 不阻塞；完成后会收到通知，"
                       "background_run(action=\"check\") 取结果。不需要立刻用结果时优先异步。"
                 )

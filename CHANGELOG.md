@@ -8,6 +8,31 @@
 
 ## [Unreleased]
 
+## [6.15.0] — 2026-09-04
+
+### Added
+
+- **`async_capable` 支持 action 粒度。** 很多多义工具在同一个入口下既有只读 action 也有写
+  action（`design_reference` 的 `get`/`list` 只读、`freeze` 要写），而工具级的一个布尔值只能
+  二选一：整体不标，纯读的那几个 action 也没法并发；整体标上，写 action 会被并发或被后台重跑。
+  现在给一组 action 名即可只放行它们——`async_capable=frozenset({"get", "list", "download"})`。
+  `True`/`False` 语义不变，**完全向后兼容**。
+  - 新增 `tools.registry.async_capable_for(definition, args)`（唯一判定口径，三个消费点共用）
+    与 `async_capable_actions(definition)`（只给文案用）。
+  - **拿不到 `action` 一律判否**：同轮并发要在发起前决定，宁可少并发一次，也不能把一个写
+    action 当成只读的并发出去。判据不对称——漏判只是慢，误判是数据损坏。
+  - `to_openai_tools()` 的「可异步」后缀会写明范围（`可异步（仅 action=get/list）`）。
+  - `background_run(action="tool")` 撞到不可异步的 action 时，报错里列出**能**后台跑的那几个，
+    而不是笼统说「本工具不可异步」。
+
+### Changed
+
+- **六个只读的内置工具标上 `async_capable`**：`read_file`、`glob`、`grep`、`load_skill`、
+  `recall_send`、`recall_compacted`。同轮并发的门槛是「一轮里 ≥2 个 async_capable 调用」，
+  而在此之前内置工具一个都没标——真实日志里一个 send 把 `read_file` 摊成 8 轮、`bash` 摊成
+  11 轮，67.8% 的轮只调 1 个工具，并发几乎永远触发不了（见 DeepTalk design/95）。
+  `bash` 与所有写工具保持不可异步。
+
 ## [6.14.0] — 2026-09-04
 
 ### Changed

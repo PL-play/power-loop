@@ -1005,10 +1005,14 @@ class AgentPipeline:
 
         return response
 
-    def _is_async_capable(self, tool_name: str) -> bool:
+    def _is_async_capable(self, tool_name: str, tool_args: Mapping[str, Any] | None = None) -> bool:
+        # 6.15.0：async_capable 可以是一组 action 名，所以判定要带上这次调用的参数——
+        # 同一个工具的 get 只读、freeze 要写，不能一刀切。
+        from power_loop.tools.registry import async_capable_for
+
         reg = self.tool_registry
         rt = reg.get(tool_name) if reg is not None else None
-        return bool(rt is not None and getattr(rt.definition, "async_capable", False))
+        return bool(rt is not None and async_capable_for(rt.definition, tool_args))
 
     def _spawn_tool_task(
         self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore
@@ -1595,7 +1599,8 @@ class AgentPipeline:
             used_todo = False
             _conc = int(self.config.tool_batch_concurrency or 0)
             _eligible: list[int] = (
-                [j for j, tc in enumerate(tool_calls) if self._is_async_capable(_tool_call_name(tc))]
+                [j for j, tc in enumerate(tool_calls)
+                 if self._is_async_capable(_tool_call_name(tc), _tool_call_args(tc))]
                 if (_conc > 1 and not skip_batch) else []
             )
             if len(_eligible) < 2:

@@ -44,6 +44,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["path"],
         },
         required_params=("path",),
+        # 可异步：纯只读。单次快，但一轮里读 8 个文件时并发才有意义——真实日志里一个 send 把 read_file 摊成 8 轮（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="edit_file",
@@ -126,6 +128,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["pattern"],
         },
         required_params=("pattern",),
+        # 可异步：纯只读的路径匹配（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="grep",
@@ -149,6 +153,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["pattern"],
         },
         required_params=("pattern",),
+        # 可异步：纯只读的内容检索（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="load_skill",
@@ -161,6 +167,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["name"],
         },
         required_params=("name",),
+        # 可异步：只读：把技能文件读进来（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="todo",
@@ -275,6 +283,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             },
         },
         required_params=(),
+        # 可异步：只读：回看被折叠掉的历史（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="recall_send",
@@ -296,6 +306,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["send_index"],
         },
         required_params=("send_index",),
+        # 可异步：只读：回看本会话的历史行（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="background_run",
