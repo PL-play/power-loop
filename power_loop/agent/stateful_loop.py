@@ -1715,19 +1715,19 @@ class StatefulAgentLoop:
 
             legacy_msgs = [_row_to_loop_message(r) for r in legacy_rows]
             current_msgs = [_row_to_loop_message(r) for r in current_rows]
-            # ── Recent-rows context cap (3.23, max_context_rows, default 300) ──
-            # History used to run from the compact all the way to the newest message; a session
-            # whose fold lags (or whose sends are tiny and numerous) grew without bound. Keep the
-            # most-recent ≤N rows: the compact (if any) is ALWAYS kept, the current send is always
-            # kept in full, and older material drops in whole chunks from the oldest end (legacy
-            # first, then whole sends) until the total fits. A single over-budget chunk is kept
-            # whole rather than split.
+            # ── History-rows cap (max_context_rows) ──
+            # 上限管的是**历史**消息的条数，**不含当前 send**：当前 send 内的膨胀由 send 内
+            # 保险丝（insend_distill）与切 send 阈值负责，两件事分开才可预期。
+            # 6.24.0 之前当前 send 也计入总数，于是一个 120 轮的 send 会把历史整段挤掉——
+            # 历史的预算随着本轮跑多久而变，没法解释。
+            # compact 行永远保留；当前 send 永远完整；更早的按「整块」从最老端丢（先 legacy，
+            # 再一个 send 一块），单块超预算也整块保留，绝不切开一个 send。
             kept_legacy_rows = legacy_rows
             cap = getattr(self.config, "max_context_rows", None)
             if cap and int(cap) > 0:
                 # chunks[0] = the legacy prefix (oldest), then one chunk per past send.
                 chunks: list[list[LoopMessage]] = [legacy_msgs, *send_chunks]
-                total = sum(len(c) for c in chunks) + len(current_msgs)
+                total = sum(len(c) for c in chunks)
                 drop = 0
                 while drop < len(chunks) and total > int(cap):
                     total -= len(chunks[drop])
@@ -1761,6 +1761,23 @@ class StatefulAgentLoop:
                 active_rows = await store.load_active_messages(sid)
                 if cache_eligible and cache_token is not None:
                     self._cache_put(sid, cache_token[0], active_rows, cache_token[1])
+            # ── History-rows cap，逐字模式（6.24.0）──
+            # 与投影分支同一条语义：只管**历史**的条数，当前 send 与 compact 笔记永远保留。
+            # 逐字模式一轮可能有多条消息（assistant(tool_calls) + 每个调用一条 tool 结果），
+            # 从最老端按条丢会切出孤儿 tool 结果——这不要紧：下面 align_tool_calls 是
+            # mode-agnostic 的兜底，孤儿会被清掉/补占位，发出去的历史始终合法。
+            _cap = getattr(self.config, "max_context_rows", None)
+            if _cap and int(_cap) > 0 and current_send_index is not None:
+                _hist_idx = [
+                    i for i, r in enumerate(active_rows)
+                    if getattr(r, "name", None) != "compact_note"
+                    and r.send_index is not None
+                    and r.send_index < current_send_index
+                ]
+                _over = len(_hist_idx) - int(_cap)
+                if _over > 0:
+                    _drop = set(_hist_idx[:_over])
+                    active_rows = [r for i, r in enumerate(active_rows) if i not in _drop]
             history = [_row_to_loop_message(r) for r in active_rows]
             # Mirror loaded seqs into the sink so the compactor can translate in-memory indices
             # back to store rows when it folds. Pass the parallel logical positions too: a

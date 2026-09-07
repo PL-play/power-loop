@@ -252,4 +252,40 @@ async def test_insend_distill_only_parses_the_rows_it_picks(tmp_path, monkeypatc
     args_parsed = [c for c in calls if c == '{"text": "x"}']
     # 3 次触发 × batch=1。旧写法这里是 1+2+3=6。
     assert len(args_parsed) == 3, f"解析了 {len(args_parsed)} 次，应当只解析选中的那 3 条"
+@pytest.mark.asyncio
+async def test_insend_distill_protects_everything_when_fewer_rows_than_hot_tail(tmp_path):
+    """工具行少于 hot_tail 时一条都不许动（负数切片曾让它绕回去）。
+
+    `tool_idx[len(tool_idx) - hot_tail:]`：条数不足时起点是负数，Python 当成「倒数第
+    |x| 条」。hot_tail=8 时，5 条只保住 3 条、6 条只保住 2 条、7 条只保住 1 条——被放开的
+    正是模型手边刚拿到的结果。三次大工具结果就能把上下文顶到阈值，这条路真能走到。
+    本意是「不足 hot_tail 条就全保住」：保险丝的前提是有旧结果可回收，没有旧的就什么都
+    不该动，让它涨到切 send 阈值优雅收尾（断片比切 send 贵得多）。
+    """
+    big = "R" * 400
+    llm = _Scripted(responses=[
+        _tool_resp("c1", prompt=100),   # 从 prepare_round(1) 起每轮都超阈值
+        _tool_resp("c2", prompt=100),
+        _tool_resp("c3", prompt=100),
+        _tool_resp("c4", prompt=100),
+        _tool_resp("c5", prompt=100),
+        _resp("done"),
+    ])
+    kwargs: dict[str, Any] = {}
+    rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
+    if rep_cls is not None:
+        kwargs["representation"] = rep_cls()
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=str(tmp_path / "s.db"),
+        # 工具行最多 5 条 < hot_tail=8：旧写法在第 5 条时只保住最后 3 条
+        config=AgentLoopConfig(system_prompt="t", max_rounds=10, insend_distill_tokens=50,
+                               insend_distill_batch=10, insend_distill_hot_tail=8, **kwargs),
+        tool_registry=_echo_registry(big),
+    )
+    sid = await loop.new_session()
+    assert (await loop.send("hi", session_id=sid)).status == "completed"
+    for i, req in enumerate(llm.seen):
+        rows = _tool_rows(req)
+        assert all(r == big for r in rows), f"第 {i} 次请求里有被蒸馏的行：{rows}"
+    await loop.aclose()
 

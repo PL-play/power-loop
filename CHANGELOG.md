@@ -8,6 +8,29 @@
 
 ## [Unreleased]
 
+## [6.24.0] — 2026-09-07
+
+### Changed
+
+- **`max_context_rows` 只管历史消息的条数，不含当前 send**。此前当前 send 的消息也计入
+  总数，于是一个 120 轮的 send 会把历史整段挤掉——历史的预算随着本轮跑多久而变，
+  没法解释。当前 send 内的膨胀本来就有 `insend_distill`（send 内保险丝）与
+  `context_checkpoint_tokens`（切 send）负责，两件事分开才可预期。
+  compact 行永远保留、当前 send 永远完整、超出的按整块从最旧端丢，绝不切开一个 send。
+- **逐字模式也应用同一个上限**：早于当前 send 的行按条数从最老端丢，`compact_note` 永不丢。
+  逐字模式一轮可能有多条消息，从中间切会留下孤儿 tool 结果——已有的 mode-agnostic 兜底
+  `align_tool_calls` 会清掉孤儿 / 补占位，发出去的历史始终合法。
+
+### Fixed
+
+- **保险丝的热尾保护在工具行不足 hot_tail 条时漏放**（`_distill_oldest_tool_rows`）：
+  `tool_idx[len(tool_idx) - hot_tail:]` 在条数不足时起点是负数，Python 当成「倒数第 |x| 条」
+  绕了回去——`hot_tail=8` 时 5 条只保住 3 条、6 条只保住 2 条、7 条只保住 1 条，被放开的
+  正是模型手边刚拿到的结果，下一轮张嘴看到的是「原文已移出，需要 recall_send 回取」。
+  三次大工具结果（几万字符的技能全文）就能把上下文顶到阈值，这条路真能走到。
+  改成 `max(0, …)`：不足 hot_tail 条就全保住——保险丝的前提是有旧结果可回收，没有旧的
+  就什么都不该动，让上下文涨到 `context_checkpoint_tokens` 优雅切 send 即可（断片更贵）。
+
 ## [6.23.0] — 2026-09-07
 
 ### Changed

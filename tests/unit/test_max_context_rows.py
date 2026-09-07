@@ -91,3 +91,37 @@ async def test_cap_never_drops_the_fold_compact(store: SessionStore) -> None:
     joined = "\n".join(str(m.get("content")) for m in main_calls[-1])
     assert "folded — recall_send" in joined   # the compact row survives the cap
     assert "u1" not in joined                 # while pre-compact content itself is gone from live rows
+
+def _tool_call(cid: str) -> LLMResponse:
+    return LLMResponse(raw_text="", tool_calls=[{
+        "id": cid, "type": "function",
+        "function": {"name": "echo", "arguments": '{"text": "x"}'},
+    }])
+
+
+@pytest.mark.asyncio
+async def test_cap_counts_history_only_not_the_current_send(store: SessionStore) -> None:
+    """上限只管历史，不含当前 send（6.24.0）。
+
+    此前当前 send 的消息也计入总数，于是一个多轮的 send 会把历史整段挤掉——历史的预算
+    随着本轮跑多久而变，没法解释。当前 send 内的膨胀有 send 内保险丝和切 send 阈值负责。
+    """
+    llm = _Scripted(responses=[
+        LLMResponse(raw_text="d1"), LLMResponse(raw_text="d2"), LLMResponse(raw_text="d3"),
+        # 第 4 个 send 跑很多轮：光它自己就远超 cap
+        _tool_call("t1"), _tool_call("t2"), _tool_call("t3"), _tool_call("t4"),
+        LLMResponse(raw_text="done"),
+    ])
+    loop = _loop(store, llm, cap=4)
+    sid = await loop.new_session()
+    for i in range(1, 4):
+        await loop.send(f"u{i}", session_id=sid)
+    await loop.send("u4", session_id=sid, max_rounds=8)
+
+    non_system = [m for m in llm.calls[-1] if m.get("role") != "system"]
+    joined = "\n".join(str(m.get("content")) for m in non_system)
+    # 3 个历史 send × 2 行 = 6 行 > cap=4 → 丢最老的一个，剩 u2/u3
+    assert "u3" in joined and "u2" in joined, "历史被当前 send 挤掉了"
+    assert "u1" not in joined, "cap 本身仍要生效"
+    assert "u4" in joined
+

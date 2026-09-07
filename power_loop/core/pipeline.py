@@ -654,7 +654,14 @@ class AgentPipeline:
             i for i, m in enumerate(self.history)
             if m.get("role") == "tool" and isinstance(m.get("content"), str)
         ]
-        protected = set(tool_idx[len(tool_idx) - max(0, hot_tail):]) if hot_tail > 0 else set()
+        # max(0, …)：本 send 的工具行少于 hot_tail 时，切片起点会是负数，Python 把它当成
+        # 「倒数第 |x| 条」绕回去——5 条工具行配 hot_tail=8 时只保住最后 3 条，最早 2 条
+        # 照样被蒸馏，而那 2 条正是模型手边的东西。本意是「不足 hot_tail 条就全保住」：
+        # 保险丝的前提是有旧结果可回收，没有旧的就什么都不该动，让它涨到切 send 阈值
+        # 优雅收尾即可（断片比切 send 贵得多）。
+        protected = (
+            set(tool_idx[max(0, len(tool_idx) - hot_tail):]) if hot_tail > 0 else set()
+        )
         candidates = [
             i for i in tool_idx
             if i not in protected
