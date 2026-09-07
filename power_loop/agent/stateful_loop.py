@@ -1651,6 +1651,38 @@ class StatefulAgentLoop:
                 if int(r.projector_version or 0) == version:
                     cur_proj_by_send.setdefault(r.send_index, []).append(r)
 
+            # ── 6.9.0 self-heal: project past sends that have NO current-version projection ──
+            # A send killed mid-flight (process restart / crash) never reaches its end-of-send
+            # projection, so its raw rows used to ride VERBATIM into every later send forever
+            # (真实事故: one interrupted 80-round send = 182K chars ≈ 115K tokens, every following
+            # round took 2–3 minutes and the agent looked dead). Projection is deterministic and
+            # LLM-free, so heal lazily HERE: project + persist (idempotent upsert, short lock),
+            # then render like any other send. The verbatim fallback below now only covers a
+            # projection that itself fails.
+            _lo0 = compact.compact_to_send if compact is not None else 0
+            _missing = [
+                si for si in sorted(active_by_send)
+                if (_lo0 or 0) < si < current_send_index and si not in cur_proj_by_send
+            ]
+            if _missing:
+                _healed_any = False
+                for si in _missing:
+                    healed = await self._heal_send_projection(
+                        store, sid, send_index=si, rows=active_by_send[si], projector=projector,
+                    )
+                    if healed:
+                        _healed_any = True
+                if _healed_any:
+                    proj_rows = [
+                        r
+                        for r in await store.load_project_messages(sid, after_send_index=cutoff)
+                        if r.send_index < current_send_index
+                    ]
+                    cur_proj_by_send = {}
+                    for r in proj_rows:
+                        if int(r.projector_version or 0) == version:
+                            cur_proj_by_send.setdefault(r.send_index, []).append(r)
+
             # Attach recency + cross-send-dedup context ONCE over the full ordered project-row set
             # (the ONLY place with global send ordering + the current cursor). A recency-aware
             # render_project_row then renders the most-recent sends richly and collapses older ones;
@@ -1979,6 +2011,44 @@ class StatefulAgentLoop:
                     await store.update_note(sid, op.note_id, content=op.content, pinned=op.pinned)
             except Exception:
                 logger.exception("session %s: migration note op failed (continuing)", sid)
+
+    async def _heal_send_projection(
+        self,
+        store: SessionStore,
+        sid: str,
+        *,
+        send_index: int,
+        rows: list[Any],
+        projector: Representation,
+    ) -> bool:
+        """Project + persist ONE past send that has no current-version projection rows (6.9.0).
+
+        Used at context-build time for sends whose end-of-send projection never ran (killed
+        mid-flight) or was written by another projector version. Deterministic, no LLM, no fold
+        (the fold still only runs at end-of-send). Returns True when rows were written. Never
+        raises — a failure keeps the caller's verbatim fallback."""
+        try:
+            projected = projector.project_send(
+                rows, send_index=send_index, tool_registry=getattr(self, "tool_registry", None)
+            )
+            if not projected.rows:
+                return False
+            await store.write_send_projection_rows(
+                sid, send_index=send_index,
+                rows=[(pr.kind, pr.content, pr.rendered_text) for pr in projected.rows],
+                source_seq_lo=projected.source_seq_lo, source_seq_hi=projected.source_seq_hi,
+                projector_version=int(getattr(projector, "version", 0) or 0),
+            )
+            logger.info(
+                "projection self-heal: session %s send %d projected lazily (%d raw rows)",
+                sid, send_index, len(rows),
+            )
+            return True
+        except Exception:  # noqa: BLE001 — heal is best-effort; verbatim fallback still works
+            logger.warning(
+                "projection self-heal failed for session %s send %d", sid, send_index, exc_info=True
+            )
+            return False
 
     async def _write_send_projection(
         self,

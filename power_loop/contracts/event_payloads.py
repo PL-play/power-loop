@@ -63,6 +63,15 @@ class LlmCallCompletedPayload(BaseEventPayload):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    #: Prompt-cache split, when the provider reports it (DeepSeek, OpenAI, …). The transport has
+    #: parsed these into ``LLMTokenUsage`` since forever, but the event dropped them — so a host
+    #: could see "this round cost 44k prompt tokens" and had **no way to tell** whether that was
+    #: 44k billed at full price or 99% served from cache at a tenth of it. Without the split, any
+    #: judgement about context cost is guesswork: it is the difference between "trim the history"
+    #: being a big win and being a 20× loss (editing history mid-prefix invalidates the cache).
+    #: ``None`` = the provider did not report it (not "zero").
+    prompt_cached_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
 
 
 @dataclass
@@ -243,6 +252,18 @@ class HitRoundLimitStatusPayload(StatusChangedPayload):
 @dataclass
 class BudgetExceededStatusPayload(StatusChangedPayload):
     kind: str = "budget_exceeded"
+    budget_tokens: int = 0
+    spent_tokens: int = 0
+    rounds: int = 0
+
+
+# ── Usage ──
+
+
+
+@dataclass
+class ContextCheckpointStatusPayload(StatusChangedPayload):
+    kind: str = "context_checkpoint"
     budget_tokens: int = 0
     spent_tokens: int = 0
     rounds: int = 0

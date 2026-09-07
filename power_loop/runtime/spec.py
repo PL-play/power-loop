@@ -372,7 +372,7 @@ async def run_agent_spec(
                 rounds=result.rounds, final_text=result.final_text or "",
             ),
         )
-    elif result.status == "hit_round_limit":
+    elif result.status in ("hit_round_limit", "context_checkpoint"):
         _publish_subagent_event(
             parent_loop, parent_sid, AgentEventType.SUBAGENT_LIMIT,
             SubagentLimitPayload(sub_session_id=child_sid, max_rounds=int(spec.max_rounds)),

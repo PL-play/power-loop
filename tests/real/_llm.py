@@ -16,10 +16,15 @@ def make_llm(
     max_tokens: int = 1024,
     temperature: float = 0.2,
     model: str | None = None,
+    capabilities: dict[str, object] | None = None,
 ) -> LLMService:
     cfg = LLMProviderConfig.from_env()
     if model is not None:
         cfg.model = model
+    if capabilities is not None:
+        # Declared per config object — from_env deliberately reads no capabilities, so a
+        # test that needs image input has to say so here.
+        cfg.capabilities = dict(capabilities)
     cfg.max_tokens = max_tokens
     cfg.temperature = temperature
     return create_llm_service_from_config(

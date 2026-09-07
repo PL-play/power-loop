@@ -138,3 +138,70 @@ async def test_retries_are_individually_visible() -> None:
         assert [c.error_type for c in completed[:2]] == ["RuntimeError", "RuntimeError"]
     finally:
         await store.close()
+
+
+@dataclass
+class _CacheUsageLLM(LLMService):
+    """Reports the prompt-cache split the way DeepSeek/OpenAI do."""
+
+    async def complete(self, request: LLMRequest, *, on_chunk_delta_text: Callable | None = None,
+                       on_chunk_think: Callable | None = None,
+                       on_stream_end: Callable | None = None) -> LLMResponse:
+        return LLMResponse(
+            raw_text="ok",
+            token_usage=LLMTokenUsage(
+                prompt_tokens=5296, completion_tokens=7, total_tokens=5303,
+                prompt_cached_tokens=5248, prompt_cache_miss_tokens=48,
+            ),
+        )
+
+    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+        async def _e() -> AsyncIterator[LLMStreamChunk]:
+            if False:
+                yield LLMStreamChunk()
+        return _e()
+
+
+@pytest.mark.asyncio
+async def test_completed_event_carries_the_prompt_cache_split() -> None:
+    """Without this split a host sees "this round cost 5,296 prompt tokens" and cannot tell
+    whether that was billed at full price or 99% served from cache at a tenth of it — which is
+    the difference between "trimming history is a big win" and "it is a 20x loss" (editing
+    history mid-prefix invalidates the cache from that point on)."""
+    store = await SessionStore.open(":memory:")
+    try:
+        bus = AgentEventBus()
+        seen = _collect(bus)
+        loop = StatefulAgentLoop(
+            llm=_CacheUsageLLM(), store=store, event_bus=bus,
+            config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+        )
+        await loop.send("hi", session_id=await loop.new_session())
+
+        done = seen[AgentEventType.LLM_CALL_COMPLETED][-1]
+        assert done.prompt_tokens == 5296
+        assert done.prompt_cached_tokens == 5248
+        assert done.prompt_cache_miss_tokens == 48
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cache_fields_are_none_when_the_provider_omits_them() -> None:
+    # None means "not reported", which must stay distinguishable from a real zero (= nothing
+    # was cached) — otherwise a provider without cache reporting looks like a 0% hit rate.
+    store = await SessionStore.open(":memory:")
+    try:
+        bus = AgentEventBus()
+        seen = _collect(bus)
+        loop = StatefulAgentLoop(
+            llm=_UsageLLM(), store=store, event_bus=bus,
+            config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
+        )
+        await loop.send("hi", session_id=await loop.new_session())
+        done = seen[AgentEventType.LLM_CALL_COMPLETED][-1]
+        assert done.prompt_tokens == 11
+        assert done.prompt_cached_tokens is None
+        assert done.prompt_cache_miss_tokens is None
+    finally:
+        await store.close()

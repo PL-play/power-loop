@@ -8,6 +8,480 @@
 
 ## [Unreleased]
 
+## [6.21.0] — 2026-09-04
+
+### Changed
+
+- **`background_run(action="tool")` 撞上不可异步的工具时，报错把出路说到底**：为什么不行
+  （有副作用，重跑或并发都不安全）、**这件事该怎么做**（直接调用它就行，不用包一层）、
+  以及**哪些能后台跑**（从当前注册表现列，含 action 粒度）。
+  **明确不做兜底同步执行**：模型调 `background_run` 的语义是「别阻塞我，给我一个 task_id」；
+  兜底改成阻塞执行，它拿到的是同步结果，接下来很可能去 `check` 一个不存在的 task_id，
+  或者以为自己已经并行了而其实没有——一个「成功」的错误回执比一个说清楚的报错更贵。
+
+## [6.20.0] — 2026-09-04
+
+### Changed
+
+- **模型能看见的文字里不再有 emoji 图标。** 工具描述、参数说明、回执与状态行里的
+  🔴 ✅ ❌ ⚠️ ⏳ 等图形符号一律去掉（其中包括 `to_openai_tools()` 自动追加的「可异步」后缀）。
+  排版符号 `→` `①` `↔` `✗` 保留——它们是标点不是图标，读起来更清楚。
+  **匹配工具输出的模式串不动**：发端与匹配端必须同步，只改一边就是解析失效。
+
+## [6.19.0] — 2026-09-04
+
+### Changed
+
+- **`edit_file` 的「读过、但文件后来变了」不再一律拦。** 如果 `old_text` 在**当前**内容里
+  仍然**唯一命中**，说明你要替换的那段原文还在原地，这次编辑是无歧义的——放行，并在回执里
+  明说「这个文件在你上次读过之后被改动过（不是你改的）……接着改之前先重读一遍」。
+  真实日志：这条闸 30 天拦了 35 次，每次都要模型重读整份文件再重发（两轮 + 一次整文件回执），
+  而重复读本身占了 `read_file` 全部调用的 44.7%。
+
+  **放松只放这一类，边界都有测试守着**：
+  - 命中 0 次或 ≥2 次 → 照样拦（那才是「依据真的过期了」）；
+  - `replace_all` → 永不放松（它要替换的是「每一处」，而文件变了之后那个集合可能已经不同）；
+  - **从没读过**（`unread`）→ 永不放松，唯一命中也不放（对这个文件没有任何依据）。
+
+## [6.18.0] — 2026-09-04
+
+### Changed
+
+- **读后写闸的报错带上现场内容。** `edit_file` / `write_file` 撞上「还没读过」或「读过之后
+  文件变了」时，原来只说「去重读一遍再来」——于是一件事要花两轮（`read_file` 一轮、重发编辑
+  一轮）。真实日志里这两条闸 30 天拦了 **70 次**，也就是 70 个白烧的往返。现在报错里直接带回
+  **当前**文件的相关片段：`old_text` 命中就给命中处上下文，没命中就给文件开头（让它对照着改
+  锚点）。**守卫一点没削弱**——该拦的照样拦，只是把出路一并给了。
+- **`edit_file` 的「新旧文本完全相同」不再是错**，改成如实说一句「未改动」。这次编辑本来就
+  什么都不做，而报错换来的只是模型重发一遍——它已经处在想要的状态了（30 天 10 次）。
+
+## [6.17.0] — 2026-09-04
+
+### Added
+
+- **`background_run(action="list")`** —— `check` 不带 `task_id` 的**显式**别名。「列出全部」
+  原来藏在「check 不带参数」这个隐式约定里，模型要先知道才用得上；同一件事该只有一个名字。
+
+### Changed
+
+- **`note` 的描述加上边界**：会过期的运行时状态（后台 task_id、workflow run id、任务进度）
+  不要写进 note——那些由待办的 `owner`/`ref` 与平台自己的台账管，任务跑完写下的那条就成了
+  没人删的垃圾。取证：真实会话的 176 条 note 里有 22 条是手抄的 run id，agent 在拿持久记忆
+  当派活台账（DeepTalk design/96 §1.3）。
+
+## [6.16.0] — 2026-09-04
+
+### Added
+
+- **待办支持 `owner` + `ref`：派出去的活也算「进行中」。** 旧模型只有一个 `in_progress`
+  名额，那是「一个人一次做一件事」的假设——对自己动手完全正确，但一个 agent 可以同时把
+  三件活分别丢给后台命令、子 agent、workflow。旧模型逼它二选一：要么谎报（把派出去的标
+  `pending`，清单就看不出有活在飞），要么撞「Only one task can be in_progress」的硬错。
+  现在拆成两个维度：
+  - `status` 只说**进展**（pending / in_progress / completed）；
+  - `owner` 说**谁在做**（`self` / `background` / `subagent` / `workflow`，缺省 `self`）。
+  - 单例规则收窄成它本来的意思：**同时只能有一件 `owner=self` 的 `in_progress`**；派出去的不限。
+  - `owner != "self"` 时 **`ref` 必填**（task_id / run id / 子会话 id）——说不出派到哪的活
+    没法回来收，清单上会永远挂着。
+  - 渲染带上去处（`[>] #1: 画三张封面  (后台 task_9f2a)`）与「N 件在外面跑」；
+    `counts` 新增 `delegated`。
+  - **完全向后兼容**：不带 `owner` 的旧清单一律视为 `self`，行为与 6.15.0 一致。
+
+### Changed
+
+- 待办的校验与渲染收敛到新的 `power_loop/runtime/todos.py`。此前 `core/state.py` 与
+  `tools/default_tools.py` 各有一份**逐字重复**的实现，改一处漏一处就会让清单在上下文层与
+  工具层各说各话。
+
+## [6.15.0] — 2026-09-04
+
+### Added
+
+- **`async_capable` 支持 action 粒度。** 很多多义工具在同一个入口下既有只读 action 也有写
+  action（`design_reference` 的 `get`/`list` 只读、`freeze` 要写），而工具级的一个布尔值只能
+  二选一：整体不标，纯读的那几个 action 也没法并发；整体标上，写 action 会被并发或被后台重跑。
+  现在给一组 action 名即可只放行它们——`async_capable=frozenset({"get", "list", "download"})`。
+  `True`/`False` 语义不变，**完全向后兼容**。
+  - 新增 `tools.registry.async_capable_for(definition, args)`（唯一判定口径，三个消费点共用）
+    与 `async_capable_actions(definition)`（只给文案用）。
+  - **拿不到 `action` 一律判否**：同轮并发要在发起前决定，宁可少并发一次，也不能把一个写
+    action 当成只读的并发出去。判据不对称——漏判只是慢，误判是数据损坏。
+  - `to_openai_tools()` 的「可异步」后缀会写明范围（`可异步（仅 action=get/list）`）。
+  - `background_run(action="tool")` 撞到不可异步的 action 时，报错里列出**能**后台跑的那几个，
+    而不是笼统说「本工具不可异步」。
+
+### Changed
+
+- **六个只读的内置工具标上 `async_capable`**：`read_file`、`glob`、`grep`、`load_skill`、
+  `recall_send`、`recall_compacted`。同轮并发的门槛是「一轮里 ≥2 个 async_capable 调用」，
+  而在此之前内置工具一个都没标——真实日志里一个 send 把 `read_file` 摊成 8 轮、`bash` 摊成
+  11 轮，67.8% 的轮只调 1 个工具，并发几乎永远触发不了（见 DeepTalk design/95）。
+  `bash` 与所有写工具保持不可异步。
+
+## [6.14.0] — 2026-09-04
+
+### Changed
+
+- **`recall_send` 不带 `seq` 时是「地图」而不是「载荷」。** 真实日志里不带 seq 的调用平均
+  31.5K 字符，带 seq 的 1.5K —— 用来**找**一样东西的目录，比那样东西本身还贵。现在整份
+  列表共用一个 12K 预算（`RECALL_SEND_TOTAL_CHARS`）：每一行仍然全在（角色、轮次、
+  `tool_calls`、真实字数），正文按行数一起缩到放得下，下限 240 字符/行。被截断的行直接把
+  取原文的调用写在截断标记里（`…[truncated: N chars — recall_send(send_index=X, seq=S)]`），
+  下一步不用猜。带 `seq` 的单行回取不受影响，仍是 40K。描述同步改成「先找坐标，再取原文」。
+
+## [6.13.0] — 2026-09-03
+
+### Changed
+
+- ``schedule_wakeup`` 的 ``action`` 不再必填：省略时按参数形状推断（有 ``delay_seconds`` → schedule，
+  只有 ``timer_id`` → cancel，都没有 → list）。模型按「给了 delay+note 就是排闹钟」的直觉省略它
+  （与同族 ``schedule_followup`` 的 ``operation='schedule' (default)`` 一致），此前被必填校验硬拒，
+  每次白烧一轮 LLM——实测 21 次调用里 7 次因此失败。
+
+## [6.12.0] — 2026-09-03
+
+### Added
+
+- **图片看过即撤**：``AgentLoopConfig.image_retention_rounds``（默认 1）。send 内的图片附件块（see_image /
+  用户发图）只在入上下文后的这么多轮里以原图参与请求，之后在内存换成一行占位
+  ``[image retired: <name> — 已看过；要再看调 see_image]``（pl_messages 不动、行数不动）。
+  证据 conv-225：三张图入上下文后每次调用固定 +50–120s（文本 90%+ 命中缓存、输出仅一两百 token），
+  入图前每轮 2–7s——供应商每次都重新预填图片。None/0 = 旧行为。
+
+## [6.11.0] — 2026-09-03
+
+### Added
+
+- **同轮并发**（design/86 修订）：同一轮里 ≥2 个 ``async_capable`` 工具调用并发执行
+  （``AgentLoopConfig.tool_batch_concurrency``，默认 4；0/1 关）。模型面对「三张图」的直觉是同轮批量
+  发调用而不是先起 background_run，之前逐个排队（conv-224 三张图 3 分钟）。不变量：TOOL_BEFORE 仍按
+  原顺序先跑完（闸类 hook 语义不变，判 SKIP 的不起任务）；结果按原顺序回填；TOOL_AFTER / 事件 /
+  落库串行；非 async_capable 工具永远串行；取消 / HumanInputRequired / TOOL_AFTER BREAK 会取消未完成
+  的并发任务。
+
+## [6.10.0] — 2026-09-02
+
+### Added
+
+- **上下文三旋钮解耦**（此前折叠预算借用 ``max_tokens``——那是每次请求的**输出上限**，两个概念混用）：
+  - ``context_budget_tokens``：独立的折叠预算（投影前缀估算 token ≥ 它 × trigger_ratio 时折叠）；
+    None 回退 ``max_tokens``（兼容）。
+  - ``context_checkpoint_tokens``：轮边界按**上一轮真实 prompt_tokens**（= 当前上下文真实大小）判，
+    达到 → COMPLETE_DECIDE 收尾窗口 → 新终态 ``context_checkpoint`` → 正常投影 → 宿主续接。
+    与 ``max_tokens_per_run``（累计费用，随轮数平方增长）正交。
+  - ``insend_distill_tokens`` / ``insend_distill_batch`` / ``insend_distill_hot_tail``：send 内保险丝——
+    轮边界按**上一轮真实 prompt_tokens**判，达到阈值就把当前 send **最早的 batch 条**尚未蒸馏的
+    工具结果在内存里替换成投影行（同一套 ``ToolDefinition.project`` 蒸馏 + ``recall_send(send_index,
+    seq)`` 坐标），最近 ``hot_tail`` 条永不动；下一轮仍超就再蒸馏下一批（逐轮递进）。
+    不落盘、不改 pl_messages、不改行数。
+- 新终态 ``context_checkpoint``（LoopStatus）；workflow 叶子的 ContinuationPolicy/retry 与
+  子代理 LIMIT 事件把它按 ``hit_round_limit`` 同等处理。
+
+## [6.9.0] — 2026-09-02
+
+### Fixed
+
+- **投影模式：中断的 send 现场自愈投影**（真实事故）。投影只在 end-of-send 写入；一个被进程
+  重启/崩溃杀在半途的 send 永远没有投影行，装配上下文时走「逐字回退」——它的全部原始行
+  （含 tool 协议行）从此逐字带进之后**每一个** send（一个 80 轮 send = 182K 字符 ≈ 115K tokens，
+  之后每轮 2–3 分钟，agent 看起来像死了；四个长会话全部如此，`pl_compactions` 一次没触发——
+  因为膨胀的不是投影前缀而是这段原始行，折叠触发器量不到它）。现在
+  `_run_loop` 装配时对**没有当前版本投影行**的过去 send 调 `_heal_send_projection`：确定性
+  `project_send` + 幂等落库（短锁、无 LLM、不触发 fold），再按投影渲染。版本不匹配/未迁移/
+  迁移失败同样自愈；逐字回退只剩「投影本身抛异常」一种情形。
+
+### Changed
+
+- 行为变更（测试契约随之更新）：缺投影行/旧版本投影行的过去 send 不再逐字进入上下文。
+  内容不丢（蒸馏文本可读、`recall_send` 可回取原文），只是不再以 tool 协议行形态出现。
+
+## [6.8.1] — 2026-09-02
+
+### Added
+
+- **foreach 迭代号进叶子 metadata**（`workflow_iteration`）：body 各迭代共享一个 node_id，
+  观测端没有迭代号就把 N 路并发画成同一个节点反复亮灭——被用户读成「循环不是并行」
+  （真实反馈）。宿主活动面板据此把 foreach 铺开成逐迭代格子/×N 计数。
+
+## [6.8.0] — 2026-09-02
+
+### Added
+
+- **工具异步化（长工具都是任务，不是调用）**：
+  - `ToolDefinition.async_capable: bool = False`——标记无副作用、可安全并发/重跑的长耗时
+    工具（生成图像、抓网页）。
+  - `background_run` 新增 `action=tool`：`(tool=<name>, args={…})` 把一个 async_capable
+    工具作为后台任务在本进程事件循环上跑，立即返回 task_id；结果持久化进同一张
+    background 任务表（`command` 以 `tool:` 前缀区分），`action=check` 取结果。
+    contextvars 随 task 创建自动拷贝（PEP 567）——宿主的计费/活动上下文天然跟着走。
+    并发上限 8/会话；`background_run`/`workflow`/`spawn_agent` 拒绝后台化（防递归）。
+  - `register_tool_task_callback(cb)`：后台工具任务完成时回调 `(session_id, task_id,
+    status)`，宿主决定要不要唤醒已睡的 agent（在忙的 session 由既有的
+    `BackgroundRuntimeProjector` 在下一轮开轮时注入更新，无需回调介入）。
+  - `ToolRegistry.to_openai_tools()`：async_capable 工具的描述自动追加「⏳ 可异步」用法
+    后缀——仅当 `background_run` 同在工具集里才追加（不教模型调不存在的入口）。
+
+## [6.7.0] — 2026-09-02
+
+### Added
+
+- **`ContinuationPolicy`（耗尽续跑）**：`AgentNode.continuation = {max_continuations, extra_rounds,
+  gate}`。叶子以 `hit_round_limit` 落地且门条件成立（缺省 `gate="todo_remaining"`：该叶子
+  session 自己的 todo 还有未完成项）时，引擎在**原会话**上 `follow_up` 补 `extra_rounds` 轮
+  接着做——不起新会话、不从头重跑；至多续 `max_continuations` 次，全程受 run 共享预算钳制，
+  续跑轮的 rounds/usage 折算进节点结果。续命提示自动附上该叶子的剩余 todo 清单。
+  executor 可通过可选的 `continue_agent(session_id, input, *, parent_loop, extra_rounds,
+  stop_event)` 方法自定义续跑（缺省实现走 `InProcessExecutor`：child-run guards +
+  `parent_loop.follow_up`）。
+- **`journal.amend_step`**：宿主在 run **终局后**显式修正某节点的记录（status/text/usage，
+  带 `amended` 审计标记；run 级 status 不动）。与 `record_step` 互补——那条路对终局 run 冻结。
+  用途：宿主对某叶子原会话补轮（nudge）后回写新结果，否则日后 `resume` 会按旧的
+  hit_round_limit/failed 记录把该叶子从头重跑，清掉续跑成果。
+
+### Changed
+
+- **`retry.on` 语义拆分**：`failed` 触发器**不再**涵盖 `hit_round_limit`（耗尽不是「没跑好」
+  是「没跑完」——新会话重跑只会同预算再耗尽一次）。`RETRY_TRIGGERS` 新增 `hit_round_limit`
+  取值，需要旧行为（耗尽也从头重跑）就显式写上它。
+
+### Fixed
+
+- **run 级终态漏计截断叶子**：此前只有 `status=="failed"` 的叶子会让 run 落 failed，
+  `hit_round_limit` 的叶子让 run 谎报 completed。现在任何非 completed、非 tolerated
+  （continue_on_error）的叶子都会把 run 判为 failed。
+
+## [6.6.1] — 2026-08-31
+
+### Fixed
+
+- **截断提示的位置**：6.6.0 引入的「工具调用 arguments 被截断」提示，被追加在
+  `assistant(tool_calls)` 与它的 `tool` 结果**之间**，造出非法历史
+  `assistant(tool_calls) → user → tool`。下一次请求供应商直接回 400
+  （"An assistant message with 'tool_calls' must be followed by tool messages responding to
+  each 'tool_call_id'"）→ 重试耗尽 → 整个 run 降级。
+  真实事故：一个会话在**第一次发交互卡片**时就死在这（提示内容是对的，位置错了）。
+  现在提示补在**该轮所有 tool 结果之后**。
+  同一条不变量在 `TOOL_AFTER` BREAK 分支本来就守着（被跳过的工具也要补 tool 结果），
+  6.6.0 在新分支上漏了。新增单测直接钉住**消息序列合法性**本身，而不是「提示在不在」。
+
+## [6.6.0] — 2026-08-30
+
+### 修复
+
+- **被 max_tokens 截断的一轮不再当成「供应商打嗝」原样重试。** 真实事故
+  （DeepTalk conv-213，glm-5.3-flash）：模型想在一轮里写一个 25KB 的 CSS 文件，输出打到
+  `max_tokens=20000` 被切在工具调用的 JSON 中间 → 解析不出 `tool_calls`、正文也是空的
+  （内容全在那段 JSON 里）→ 命中「空响应 = 打嗝」的重试路径 → **原样重试** → 同一个
+  prompt、同一个模型、写出同样长的东西、同样被切断。两轮各约 8 分钟、产出为零，
+  用户那边看到的是 16 分钟沉默。
+
+  区分两者的信号一直都在：provider 的 `finish_reason`（截断是 `length` / `max_tokens`）。
+  现在按它判定（取不到时以 `completion_tokens` 打满 `max_tokens` 兜底），
+  处置不是重试而是**改变输入**——把「你上一轮被从中间截断了，把它拆小再来」作为一条
+  user 消息落进历史。输入变了，模型才可能给出不一样的输出。最多提示 2 次。
+
+- **截断的第二种表现也说实话**：工具调用在、但它的 `arguments` JSON 断在半路时，
+  参数会被降成 `{}`，必填校验于是报「缺参数」——模型据此以为自己忘了填，原样再写一遍、
+  再被截断（conv-213 实测：一条 `missing required parameter` 背后是
+  `completion_tokens=20000`）。现在同样补一句实话。
+
+  🔴 **这里刻意不做 JSON 修复**：把截断的 `{"path":"a.css","content":"body{co` 补成合法
+  JSON，`content` 就是那半个文件——`write_file` 会当成功写下去、agent 继续往前走，
+  交付一份残缺的稿子。静默损坏比报错严重得多。（结构化输出那条路的
+  `runtime/structured._try_repair_json` 不受影响：补全一个只读的 JSON 结果无害。）
+
+### 内部
+
+- `_sanitize_tool_calls` 返回 `(calls, 有参数解析不了)`。标志走返回值而不是塞进 call 里：
+  那些 dict 会原样进 assistant 消息、下一轮发回给供应商，多一个非标准字段可能把请求打挂。
+
+
+## [6.5.0] — 2026-08-28
+
+### Fixed
+
+* 🔴 **`.webp` 在某些镜像里猜不出 MIME，会拖垮整个会话**。`mimetypes` 读的是系统的
+  mime.types，不同镜像装的不一样：宿主 Python 认得 `.webp`，DeepTalk 的生产容器里
+  `guess_type(".webp")` 返回 `None` → 落到 `application/octet-stream` → 渲染层判定
+  「这不是图片」抛 `ModelCapabilityError` → 重试耗尽 → run 降级终止（真实事故 conv-201：
+  agent 刚把配图处理成 webp、正要看一眼，会话就断在那里，用户说「继续」才接上）。
+  现在 `_guess_mime_type` 在系统表认不出时查一张**内置**扩展名表兜底
+  （webp/avif/heic/heif/png/jpg/gif/bmp/tiff/svg/pdf）。本地全绿、生产炸掉的典型，
+  只能靠内置表挡。
+* **认不出类型的附件降级，不再抛**。原先 `prepare_attachment` 对非 image/pdf 抛
+  `ModelCapabilityError`，理由是「占位读起来像文件已经被读过」——那对含糊的占位成立，对
+  现在这句不成立：它明说模型没拿到内容并给出回取坐标。而抛出去的代价是整个会话不可用
+  （历史里躺着一个认不出类型的附件，之后每一次 send 都失败）。
+
+* **图片文件读不到时降级，不再抛异常**。`_render_image_attachment` 过去让 `FileNotFoundError`
+  穿出渲染层，代价与「模型不支持看图」那一路完全一样：一次 render 同时渲染历史与本轮输入，
+  一个读不到的附件会让**每一次** send 都失败，重试耗尽后整个 run 终止。DeepTalk conv-198 真实
+  发生——宿主把相对路径交给渲染器，两张刚生成的图按进程 cwd 解析而找不到，agent 就此停在半路，
+  图既没进上下文也没发给用户。现在与能力不匹配同款处理：降级成占位文本，**说清模型没有看到**，
+  并带上 `ref` 坐标供找回。宿主的路径 bug 该自己修，但渲染器不该把「一个附件读不到」放大成
+  「会话不可用」。
+* `_downscale_to_data_url` 遇到 `OSError` 不再吞掉后重试读同一个文件——那会打出
+  "could not downscale …; sending it at original size" 这句**误导性**日志（毛病在路径，不在
+  图像解码），现在直接上抛交由降级处理。
+
+## [6.4.0] — 2026-08-28
+
+### Added
+
+* **`queue_images_for_next_round()`：一批图入队成 ONE user 消息**（一个说明 + 每张一个
+  attachment 块）。逐张调 `queue_image_for_next_round` 会产生 N 条独立 user 轮次、**每条都
+  重复一遍同样的说明**——真实会话里「三张截图配一个问题」就在 transcript 里留下三份那个问题。
+  一批一条也正是 provider API 期望的形状。
+
+
+## [6.3.0] — 2026-08-28
+
+### Changed
+
+* **图片注入默认改为 DURABLE**（落库成真实 ``user`` 行），`queue_image_for_next_round(durable=False)`
+  保留原来的「只活一轮」语义。默认之所以反转：第一版选 ephemeral 是怕「回取三次就永久带三张图」，
+  实测把这个顾虑推翻了——provider 的 prefix cache 对稳定前缀命中率约 99%，图待在前缀里每轮只花
+  约十分之一价；而语义上 durable 明显更自然：看完一张 UI 图要基于它写十几轮代码，图该一直在
+  眼前，而不是看一眼就消失、想再看得重新调一次。跨 send 由投影蒸馏成
+  ``[image: shot.png · file_uuid=…]``，不会无界累积。
+
+  ``drain_queued_images()`` 相应返回 ``(durable, ephemeral)`` 两组（**签名变更**，但这是 6.1.0
+  才引入的内部面，未进 ``STABLE_API``）。注入位置在 hook 自己的 ``persist_messages`` **之后**——
+  一张图应该落在宣告它的那条工具结果下面，这正是模型预期它出现的地方。
+
+
+## [6.2.0] — 2026-08-28
+
+### Added
+
+* **`LlmCallCompletedPayload` 带上 prompt-cache 拆分**（`prompt_cached_tokens` /
+  `prompt_cache_miss_tokens`）。transport 早就把这两个数从 provider 响应里解析进
+  `LLMTokenUsage` 了，但**逐次调用的事件把它们丢掉了**：宿主只能看到「这一轮花了 44k prompt
+  token」，**无从判断**那是 44k 全价、还是 99% 命中缓存只按十分之一计。
+  没有这个拆分，任何关于上下文成本的判断都是猜——它决定了「精简历史」是一次大胜还是 20 倍的
+  亏损（改动历史中段会让该点之后的缓存全部失效）。累计口径的 `USAGE_UPDATED.usage` 早有
+  `cache_read_tokens`；这里补的是**逐轮精度**，用来定位是哪一轮击穿了缓存。
+  `None` 表示 provider 没报（与真实的 0 区分开）。
+
+
+## [6.1.1] — 2026-08-28
+
+### Fixed
+
+* 投影/重放读取行 ``meta`` 时改用 ``getattr(..., None)``。``Representation`` 是公开 seam——
+  宿主与测试可以喂任何行对象进来，缺一个属性不该让整个 send 的投影炸掉（6.1.0 引入 meta 读取
+  时漏了这层防御）。
+
+
+## [6.1.0] — 2026-08-28
+
+### Fixed
+
+* 🔴 **换到看不了图的模型会让整个会话崩掉。** 一次 render 同时渲染**历史**与本轮输入，所以
+  6.0.0 那条「未声明发图直接抛」在 `VerbatimRepresentation` 下会被历史里的图触发：定义换模型
+  后，每一个 send 都抛 `ModelCapabilityError`，会话彻底不可用。而历史是既成事实，不是调用方
+  的错。现在渲染层**降级**而不抛。
+
+  降级不等于回到 5.x 那个静默毛病——区别全在文案。旧实现塞的是一句含糊的 "The current model
+  does not support image input"，混在附件描述里，模型照样按「我看过这张图」的语气编答案。新的
+  占位必须做到两件事：**说清模型没有看到**，并**给出把图找回来的坐标**。
+  想要「发图给看不了图的模型就报错」的调用方，用 `capabilities.require_image_input()` 自查。
+
+### Added
+
+* **`AttachmentRef.ref`：宿主给的回取坐标**，由 `create_attachment_ref(path, ref=…)` 传入，
+  跟着这张图走进**蒸馏行**（`[image: shot.png · file_uuid=…]`）与**降级占位**。换到看不了图的
+  模型之后，这行文本是模型唯一能据以找回原图的东西——DeepTalk 放 `file_uuid=…`，可直接喂给
+  see_image。`recall_send` 与 `queue_image_for_next_round(ref=…)` 全程携带。
+
+
+## [6.0.0] — 2026-08-28
+
+### Added
+
+* **`ModelCapabilities.max_image_edge`：图片长边上限，在渲染的唯一汇点生效。** 因此「新发的图」
+  「recall 回取放回眼前的图」「宿主自己塞的图」一律受限——不靠每条入口各自记得裁一次。
+  已在限内的文件**原样直通**（不解码、不重编码），所以常见情况零开销。Pillow 是可选依赖
+  （`power-loop[images]`，已并入 `[all]`）；缺席时按原尺寸发送并告警一次，而不是把图丢掉。
+  为什么是这个旋钮：图片按**像素**计费而非字节——787KB 的噪点图与 1.8KB 的同尺寸纯色图 token
+  完全相同（实测），所以降 JPEG 质量一个 token 都不省，缩边长省 43%。
+
+* **按需图片回取**：`recall_send(send_index, seq=…)` 命中一行含图片的记录时，把图放回模型眼前
+  **一轮**（`runtime/image_recall.py`）。图不能从工具返回——OpenAI 兼容协议的 `tool` 消息
+  是纯文本类型——所以它作为独立 user 消息进入本轮请求，工具返回值只说明「图已放到你眼前」。
+  刻意是 **ephemeral**：只进请求、不落库、不进投影，否则回取三次就永久携带三张图，正是投影
+  要避免的无界增长。
+
+* 顶层导出 `create_attachment_ref()`：构造多模态输入的必需件，宿主不该为此 import `_vendor`
+  内部路径。（未进 `STABLE_API`——多模态输入面仍在演进。）
+
+### Changed — BREAKING
+
+* **模型能力改为「声明」，不再从模型名推断。** 原先 `resolve_model_capabilities()` 用一张约 15 条
+  厂商正则的表按**模型名**猜 `supports_image_input` 等能力，猜不中就判定为不支持，并**静默**把图片
+  换成一句「当前模型不支持图片输入」再照常发出去。真实后果：`deepseek-v4-flash-vision-exp`（一个
+  实测能吃 `image_url` 的模型）不在表里，发给它的每张图都被悄悄丢掉，模型照样给出通顺答案，调用方
+  完全看不出这个答案是在没看见图的情况下编的——绿灯罩着一个从未发生过的能力。
+
+  现在：能力是 `LLMProviderConfig(capabilities={"supports_image_input": True})` 上的**配置**，
+  三态（`True` 支持 / `False` 明确不支持 / `None` 未声明，且 `None` **不等于** `False`）。
+  未声明或声明为不支持时发图 → 抛 `ModelCapabilityError`，绝不降级。
+
+  **受影响的 Public API：**
+  - 删除 `resolve_model_capabilities()`、`capability_overrides_from_env()`、`PROVIDER_DEFAULTS`、
+    `MODEL_PATTERNS`、`CAPABILITY_OVERRIDE_ENV_MAP`。
+  - 删除环境变量 `POWER_LOOP_SUPPORTS_*` / `OPENAI_COMPAT_SUPPORTS_*`（进程级作用域无法表达
+    「同一进程里这个定义的模型能看图、那个不能」，而这正是多 agent 宿主的常态）。
+  - `LLMProviderConfig.capability_overrides` → `LLMProviderConfig.capabilities`；
+    `OpenAICompatibleChatConfig.capability_overrides` → `.capabilities`。
+  - `ModelCapabilities` 只保留 `model` 与 `supports_image_input`。删除 `provider` / `api_family` /
+    `supports_tools` / `supports_stream` / `supports_data_url` / `supports_pdf_input_chat` /
+    `supports_pdf_input_responses`——它们**没有任何代码读取**，是纯装饰。传入这些键现在直接 `ValueError`，
+    以免一份配置声称拥有一个永远不会被兑现的能力。
+  - 新增导出 `ModelCapabilities` / `ModelCapabilityError`。
+
+* **`LLMRequest.to_messages()` 不传 capabilities 不再等于「跳过渲染」。** 以前 `capabilities=None`
+  会整个跳过多模态渲染，把 `{"type": "attachment"}` 原样塞进 provider 请求体；现在等同「什么都没声明」，
+  同样抛 `ModelCapabilityError`。
+
+* **PDF 一律走文本抽取。** 任何 transport 都没有实现原生 PDF 传输，所以 `supports_pdf_input_*` 是一个
+  没人兑现的承诺，直接删掉而不是留着当摆设。文本 PDF 抽取是忠实路径（内容确实到达模型），不抛异常；
+  **抽不出文本**的 PDF（扫描件 / 纯图导出 / 加密）改为抛异常——塞一句「未能读取内容」给模型，会复现
+  刚刚被消灭的那种「无中生有的答案」。不支持的附件类型同理，不再降级成占位文字。
+
+### Fixed
+
+* **`recall_send` 会把序列化的多模态记录原样吐给模型。** 它直接返回 `content` 文本列，而多模态
+  行存的是 JSON——内联 data URL 的话就是整个 base64。现在文本侧走与投影同一个蒸馏
+  （`[image: shot.png]`），图片侧改为放回眼前（见 Added）。纯文本记录不受影响。
+
+* **steering 会丢掉图片。** 进程内 follow-up 队列保留的是原始对象，但 `merge_follow_up_inputs`
+  用 `json.dumps` 把 content 压成一坨文本——图片只以「序列化后的块」形式活下来，模型看不见。
+  同一张用户照片，会话恰好空闲时看得见、恰好在忙时看不见。现在文本合进 `<follow_up>` 信封，
+  **非文本块（图片）作为独立内容块带过去**。跨进程队列是 TEXT 列、图片本就无法穿越，但
+  `follow_up_text()` 也不再把整个 data URL 粘进去（改为 `[image_url]` 标记）。
+
+* **verbatim 重放不还原结构化内容（多模态静默失效）。** `runtime/representation.py` 的
+  `_row_to_loop_dict` docstring 声称 "mirrors `stateful_loop._row_to_loop_message`"，却恰恰没有镜像
+  其中的 JSON 还原那段——`CONTENT_ENCODING_META_KEY` 在整个 `representation.py` 里一次都没出现过。
+  于是 `VerbatimRepresentation` 模式下，一条多模态消息重放时 content 是**字面 JSON 字符串**而不是
+  数组：模型收到一段 prose，图片彻底失效，全程无报错。
+  常量与新的 `decode_row_content()` 移到 `runtime/store/types.py`（中立位置，避免 runtime→agent
+  循环导入），写入侧与读取侧共用同一份定义。`power_loop.agent.sink` 继续 re-export，下游 import 不变。
+
+* **投影会把内联 base64 当文本逐字保留。** `project_send` 对 send 的输入侧刻意 verbatim（注释理由：
+  "it is short relative to tool output"）——对文本成立，对 `data:` URL 崩塌：图片变成不可读的文本，
+  却在**之后每一个 send** 上被重复计费。新增 `distill_multimodal_text()` 把每个内容块蒸馏为一行引用
+  （`attachment` → `[image: shot.png]`，保留可回取的文件名；内联 data URL → `[image]`），并以
+  `_strip_data_urls()` 兜底：无论哪条路径（含未打编码标记的老行）塞进来的 data URL 都不会进投影。
+  send 输入与 send 中途注入（`__user__`）两个入口都已接上。
+
+* **Anthropic transport 会丢弃 `attachment` 块。** 该 transport 自己翻译消息、不走
+  `LLMRequest.to_messages()`，因此从未执行过多模态渲染：附件块原封不动到达 `_non_text_blocks`，
+  被当作 `[unsupported content block dropped: attachment]` 扔掉。现在它先跑同一套渲染与能力判定，
+  再把 `image_url` 翻成原生 Anthropic image block。`AnthropicChatConfig` 随之新增 `capabilities`
+  字段（此前它根本收不到任何能力信息）。
+
 ## [5.4.0] — 2026-08-27
 
 ### Added

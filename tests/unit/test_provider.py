@@ -59,27 +59,26 @@ def test_from_env_reads_primary_prefix() -> None:
     assert cfg.temperature == 0.3
 
 
-def test_capability_overrides_wired_from_env_into_transport_config() -> None:
-    # M-llm-transport-1: POWER_LOOP_SUPPORTS_* must actually reach the transport (was dead config).
-    cfg = LLMProviderConfig.from_env(env=_env(
-        POWER_LOOP_BASE_URL="https://x/v1",
-        POWER_LOOP_API_KEY="k",
-        POWER_LOOP_MODEL="m",
-        POWER_LOOP_SUPPORTS_IMAGE_INPUT="false",
-        POWER_LOOP_SUPPORTS_TOOLS="true",
-    ))
-    assert cfg.capability_overrides == {"supports_image_input": False, "supports_tools": True}
-    # …and it is carried into the OpenAI-compatible transport config (not dropped).
-    assert cfg.to_openai_compatible().capability_overrides == {
-        "supports_image_input": False, "supports_tools": True,
-    }
+def test_declared_capabilities_reach_both_transport_configs() -> None:
+    # Capabilities are config on THIS object (per-loop / per-definition) — the only source.
+    cfg = LLMProviderConfig(
+        base_url="https://x/v1", api_key="k", model="m",
+        capabilities={"supports_image_input": True},
+    )
+    assert cfg.to_openai_compatible().capabilities == {"supports_image_input": True}
+    # The Anthropic transport used to receive NO capabilities at all, which is how it ended
+    # up dropping attachment blocks as "unsupported content".
+    assert cfg.to_anthropic().capabilities == {"supports_image_input": True}
 
 
-def test_no_capability_env_means_empty_overrides() -> None:
+def test_capabilities_are_not_read_from_env() -> None:
+    # POWER_LOOP_SUPPORTS_* is retired: process-wide env cannot express "this definition's
+    # model sees images, that one's doesn't" when both run in one process.
     cfg = LLMProviderConfig.from_env(env=_env(
         POWER_LOOP_BASE_URL="https://x/v1", POWER_LOOP_API_KEY="k", POWER_LOOP_MODEL="m",
+        POWER_LOOP_SUPPORTS_IMAGE_INPUT="true",
     ))
-    assert cfg.capability_overrides == {}
+    assert cfg.capabilities == {}
 
 
 def test_from_env_falls_back_to_legacy_prefix() -> None:

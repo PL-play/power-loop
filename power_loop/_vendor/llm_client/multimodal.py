@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import base64
+import logging
 import mimetypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .capabilities import ModelCapabilities
+from .capabilities import ModelCapabilities, ModelCapabilityError
 
 try:
     from pypdf import PdfReader
 except Exception:  # pragma: no cover
     PdfReader = None  # type: ignore[assignment,misc]
 
+
+logger = logging.getLogger(__name__)
 
 MAX_PDF_TEXT_CHARS = 24_000
 
@@ -23,6 +26,9 @@ class AttachmentRef:
     filename: str
     mime_type: str
     kind: str
+    #: 宿主给的「怎么把这张图找回来」坐标，原样带进蒸馏与降级文案（DeepTalk 放
+    #: ``file_uuid=…``，模型可直接拿去 see_image）。空字符串 = 没有。
+    ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -33,12 +39,31 @@ class PreparedAttachment:
     strategy: str = "text"
 
 
+#: 扩展名 → MIME 的**内置**兜底表。不能只靠 `mimetypes`：它读的是系统的 mime.types，
+#: 不同镜像装的不一样。真实事故（DeepTalk conv-201）：宿主 Python 认得 `.webp`，
+#: 生产容器里 `guess_type(".webp")` 返回 None → 落到 application/octet-stream →
+#: 渲染层判定「这不是图片」抛 ModelCapabilityError → 重试耗尽 → 整个 run 降级终止。
+#: agent 刚把配图处理成 webp、正要看一眼，会话就死在这里。本地全绿、生产炸掉的典型。
+_EXT_MIME_FALLBACK = {
+    ".webp": "image/webp", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".bmp": "image/bmp", ".tif": "image/tiff", ".tiff": "image/tiff",
+    ".avif": "image/avif", ".heic": "image/heic", ".heif": "image/heif", ".svg": "image/svg+xml",
+    ".pdf": "application/pdf",
+}
+
+
 def _guess_mime_type(path: Path) -> str:
+    """文件的 MIME。系统表优先，认不出来再查内置表 —— 顺序不能反：
+    系统表更全，内置表只补它在某些镜像里缺的那几个。"""
     mime_type, _ = mimetypes.guess_type(str(path))
+    if not mime_type:
+        mime_type = _EXT_MIME_FALLBACK.get(path.suffix.lower())
     return mime_type or "application/octet-stream"
 
 
-def create_attachment_ref(path: str | Path) -> dict[str, Any]:
+def create_attachment_ref(path: str | Path, *, ref: str = "") -> dict[str, Any]:
+    """``ref`` 是可选的回取坐标，会跟着这张图走到蒸馏与降级文案里——**换到看不了图的模型
+    之后**，那行文本就是模型唯一能据以把原图找回来的东西。"""
     file_path = Path(path).expanduser().resolve()
     mime_type = _guess_mime_type(file_path)
     kind = "other"
@@ -46,13 +71,14 @@ def create_attachment_ref(path: str | Path) -> dict[str, Any]:
         kind = "image"
     elif mime_type == "application/pdf":
         kind = "pdf"
-    ref = AttachmentRef(
+    attachment = AttachmentRef(
         path=str(file_path),
         filename=file_path.name,
         mime_type=mime_type,
         kind=kind,
+        ref=ref,
     )
-    return ref.__dict__.copy()
+    return attachment.__dict__.copy()
 
 
 def extract_text_from_content(content: Any) -> str:
@@ -111,19 +137,92 @@ def _extract_pdf_text(path: Path) -> str:
     return "\n\n".join(pages)[:MAX_PDF_TEXT_CHARS]
 
 
+def _downscale_to_data_url(path: Path, mime_type: str, max_edge: int | None) -> str:
+    """Data URL for ``path``, downscaled so its longest edge is at most ``max_edge``.
+
+    A file already within the limit is streamed through UNTOUCHED — no decode, no re-encode —
+    so the common case (a host that already sized the image) costs nothing. Pillow is optional;
+    without it the image is sent at its original size rather than not at all, with one warning.
+    """
+    if not max_edge or max_edge <= 0:
+        return _file_to_data_url(path, mime_type)
+    try:
+        import io
+
+        from PIL import Image
+    except ImportError:
+        logger.warning(
+            "max_image_edge=%s requested but Pillow is not installed; sending %s at its "
+            "original size. Install power-loop[images] (or Pillow) to enforce the limit.",
+            max_edge, path.name,
+        )
+        return _file_to_data_url(path, mime_type)
+    try:
+        with Image.open(path) as img:
+            if max(img.width, img.height) <= max_edge:
+                return _file_to_data_url(path, mime_type)  # already within budget
+            scale = max_edge / float(max(img.width, img.height))
+            resized = img.convert("RGB").resize(
+                (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+            )
+            buf = io.BytesIO()
+            resized.save(buf, format="JPEG", quality=85, optimize=True)
+        payload = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{payload}"
+    except OSError:
+        # 文件读不到不是「缩放失败」——报 "sending it at original size" 会把调用方引到
+        # 图像解码上，而真正的毛病在路径。交给上层按「读不到」降级。
+        raise
+    except Exception:  # noqa: BLE001 — a decode failure must not lose the image entirely
+        logger.warning("could not downscale %s; sending it at original size", path.name,
+                       exc_info=True)
+        return _file_to_data_url(path, mime_type)
+
+
 def _render_image_attachment(ref: AttachmentRef, path: Path, capabilities: ModelCapabilities) -> PreparedAttachment:
-    if capabilities.supports_image_input and capabilities.supports_data_url:
-        part = {
-            "type": "image_url",
-            "image_url": {
-                "url": _file_to_data_url(path, ref.mime_type),
-            },
-        }
+    """图片 → 原生 image 块；模型没声明看图能力时 → **明确的**文本占位。
+
+    为什么不抛：一次 render 同时渲染**历史**和本轮输入。一个定义换到看不了图的模型之后，
+    历史里的图会让整个 send 抛异常、会话彻底不可用——而历史是既成事实，不是调用方的错。
+
+    为什么降级不等于回到老毛病：老实现塞的是一句含糊的
+    "The current model does not support image input"，混在附件描述里，模型读过去照样按
+    「我看过这张图」的语气编答案。这里的占位必须做到两件事——**说清楚模型没有看到**，并且
+    **给出把图找回来的坐标**（``ref``，DeepTalk 放 file_uuid，可直接喂给 see_image）。
+    调用方想要「发图给看不了图的模型就报错」，用 ``capabilities.require_image_input()`` 自查。
+    """
+    if capabilities.supports_image_input is True:
+        try:
+            url = _downscale_to_data_url(path, ref.mime_type, capabilities.max_image_edge)
+        except OSError as exc:
+            # 文件读不到（路径解析错、被清理、权限）——**降级，不抛**。抛出去的代价与
+            # 能力不匹配那一路完全一样：一次 render 同时渲染历史与本轮，一个读不到的
+            # 附件会让每一次 send 都失败，重试耗尽后整个 run 终止。DeepTalk conv-198
+            # 真实发生过：两张刚生成的图因相对路径被按进程 cwd 解析而找不到，agent 就此
+            # 停在半路，图既没被看到也没发出去。占位文本同样必须说清「你没有看到」。
+            logger.warning("image %s could not be read (%s); surfaced as a text placeholder",
+                           ref.filename, exc)
+            text = (
+                f"[图片 {describe_attachment_ref(ref)}——**这个文件读不到，你没有看到它的内容**。"
+                "不要凭空描述这张图；需要看就按上面的坐标用视觉工具重新取它。]"
+            )
+            return PreparedAttachment(
+                ref=ref,
+                text_fallback=text,
+                rendered_parts=({"type": "text", "text": text},),
+                strategy="image-unreadable",
+            )
+        part = {"type": "image_url", "image_url": {"url": url}}
         return PreparedAttachment(ref=ref, rendered_parts=(part,), strategy="native-image")
 
+    logger.warning(
+        "image %s not sent: model %r has not declared image support (supports_image_input=%r); "
+        "surfaced as a text placeholder instead",
+        ref.filename, capabilities.model or "<unnamed>", capabilities.supports_image_input,
+    )
     text = (
-        f"[Attached image: {ref.filename}]\n"
-        "The current model does not support image input, so the image was not sent natively."
+        f"[图片 {describe_attachment_ref(ref)}——**当前模型看不了图片，你没有看到它的内容**。"
+        "不要凭空描述这张图；需要看就用 see_image 之类的视觉工具，按上面的坐标取它。]"
     )
     return PreparedAttachment(
         ref=ref,
@@ -133,41 +232,38 @@ def _render_image_attachment(ref: AttachmentRef, path: Path, capabilities: Model
     )
 
 
+def describe_attachment_ref(ref: AttachmentRef) -> str:
+    """``shot.png · file_uuid=491b…`` —— 蒸馏与降级共用的一行标识。"""
+    return f"{ref.filename} · {ref.ref}" if ref.ref else ref.filename
+
+
 def _render_pdf_attachment(ref: AttachmentRef, path: Path, capabilities: ModelCapabilities) -> PreparedAttachment:
+    """PDFs are always delivered as EXTRACTED TEXT.
+
+    Native PDF transmission is not implemented by this library on any transport, so a
+    ``supports_pdf_input_*`` capability field would be a promise nothing keeps — it was
+    removed rather than left as decoration. Text extraction is a faithful path for a text
+    PDF (the content really does reach the model), so it is not a silent downgrade and does
+    not raise.
+
+    What DOES raise: a PDF no text can be extracted from (a scan, an image-only export, an
+    encrypted file). Feeding the model "[Attached PDF: x.pdf] no readable text" invites the
+    same unfounded-answer failure the image path just eliminated.
+    """
     extracted_text = _extract_pdf_text(path)
-
-    if capabilities.supports_pdf_input_chat:
-        text = (
-            f"[Attached PDF: {ref.filename}]\n"
-            "Native PDF chat transmission is not enabled in this build, so extracted text fallback was used instead."
+    if not extracted_text:
+        raise ModelCapabilityError(
+            f"Cannot send PDF {ref.filename!r}: no text could be extracted from it "
+            "(scanned/image-only or encrypted PDF), and native PDF input is not implemented "
+            "on any transport. Convert its pages to images and send those to a model that "
+            "declares supports_image_input, or extract the text yourself."
         )
-        if extracted_text:
-            text = f"{text}\n\n{extracted_text}"
-        return PreparedAttachment(
-            ref=ref,
-            text_fallback=text,
-            rendered_parts=({"type": "text", "text": text},),
-            strategy="pdf-fallback-text",
-        )
-
-    if extracted_text:
-        text = f"[Attached PDF: {ref.filename}]\n\n{extracted_text}"
-        return PreparedAttachment(
-            ref=ref,
-            text_fallback=text,
-            rendered_parts=({"type": "text", "text": text},),
-            strategy="pdf-extracted-text",
-        )
-
-    text = (
-        f"[Attached PDF: {ref.filename}]\n"
-        "No readable text could be extracted from this PDF, and the current model/path does not support native PDF input."
-    )
+    text = f"[Attached PDF: {ref.filename}]\n\n{extracted_text}"
     return PreparedAttachment(
         ref=ref,
         text_fallback=text,
         rendered_parts=({"type": "text", "text": text},),
-        strategy="pdf-unreadable",
+        strategy="pdf-extracted-text",
     )
 
 
@@ -177,6 +273,7 @@ def prepare_attachment(ref_payload: dict[str, Any], capabilities: ModelCapabilit
         filename=str(ref_payload.get("filename") or Path(str(ref_payload.get("path") or "attachment")).name),
         mime_type=str(ref_payload.get("mime_type") or "application/octet-stream"),
         kind=str(ref_payload.get("kind") or "other"),
+        ref=str(ref_payload.get("ref") or ""),
     )
     path = Path(ref.path)
 
@@ -185,12 +282,24 @@ def prepare_attachment(ref_payload: dict[str, Any], capabilities: ModelCapabilit
     if ref.kind == "pdf":
         return _render_pdf_attachment(ref, path, capabilities)
 
-    text = f"[Attached file: {ref.filename}] Unsupported attachment type: {ref.mime_type}"
+    # 认不出的类型：降级成**明说没读到**的占位，不抛。
+    #
+    # 原先这里抛 ModelCapabilityError，理由是「占位符读起来像文件已经被读过」——那个理由
+    # 对含糊的占位成立，对下面这句不成立：它明确写着模型没有拿到内容，并给出回取坐标。
+    # 而抛出去的代价是整个会话不可用：一次 render 同时渲染历史与本轮，历史里躺着一个认不出
+    # 类型的附件，之后**每一次** send 都失败。DeepTalk conv-201 就是这么断的——容器里
+    # `.webp` 猜不出 MIME（见 _EXT_MIME_FALLBACK），agent 处理完配图正要看一眼，会话就死了。
+    logger.warning("attachment %s has unsupported type %r; surfaced as a text placeholder",
+                   ref.filename, ref.mime_type)
+    text = (
+        f"[附件 {describe_attachment_ref(ref)}（类型 {ref.mime_type}）——**这个类型发不进上下文，"
+        "你没有读到它的内容**。不要凭空描述它；需要的话先把它转成图片或可提取文本的 PDF。]"
+    )
     return PreparedAttachment(
         ref=ref,
         text_fallback=text,
         rendered_parts=({"type": "text", "text": text},),
-        strategy="unsupported-file",
+        strategy="unsupported-type",
     )
 
 

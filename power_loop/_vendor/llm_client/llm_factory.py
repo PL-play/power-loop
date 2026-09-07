@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from openai import AsyncOpenAI
 
-from .capabilities import ModelCapabilities, resolve_model_capabilities
+from .capabilities import ModelCapabilities, coerce_capabilities
 from .interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage, OpenAICompatibleChatConfig
 from .llm_utils import parse_json_from_model_output_detailed
 
@@ -107,10 +107,10 @@ class OpenAICompatibleChatLLMService(LLMService):
         self._cfg = cfg
         self._client: Any = None
         self._last_usage: dict[str, Any] = {}
-        self._capabilities: ModelCapabilities = resolve_model_capabilities(
-            cfg.model,
-            cfg.base_url,
-            cfg.capability_overrides,
+        # Read straight from config — no inference from the model name (that guessing table
+        # is gone; see capabilities.py). Declared nothing => capable of nothing but text.
+        self._capabilities: ModelCapabilities = coerce_capabilities(
+            cfg.capabilities, model=cfg.model
         )
 
         logger.info(

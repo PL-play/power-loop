@@ -9,6 +9,7 @@ wrapper that delegates to ``AgentPipeline.run()``.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import inspect
 import json
@@ -35,6 +36,7 @@ from power_loop.contracts.event_payloads import (
     AutoCompactStatusPayload,
     BaseEventPayload,
     BudgetExceededStatusPayload,
+    ContextCheckpointStatusPayload,
     HitRoundLimitStatusPayload,
     LlmCallCompletedPayload,
     LlmCallStartedPayload,
@@ -83,6 +85,7 @@ from power_loop.runtime.budget import estimate_message_tokens, estimate_tokens
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.compact import CompactionContext
 from power_loop.runtime.human_input import HumanInputRequired
+from power_loop.runtime.image_recall import drain_queued_images
 from power_loop.runtime.memory import MemorySnapshot
 from power_loop.runtime.retry import with_retry
 from power_loop.tools.registry import ToolRegistry
@@ -93,6 +96,48 @@ logger = logging.getLogger(__name__)
 # An empty turn is a provider hiccup, not a completion signal; a couple of retries clears a
 # transient blank, while the cap keeps a persistently-broken provider from spinning to max_rounds.
 _EMPTY_RESPONSE_MAX_RETRIES = 3
+
+# 截断（provider 因 max_tokens 硬切）与「空响应打嗝」是两回事，处置也必须不同：
+# 打嗝重试一次就好了；截断**原样重试必然再次截断**——同一个 prompt、同一个模型、
+# 同样写超。真实事故（conv-213）：模型一轮里写一个 25KB 的 CSS 文件，输出打到
+# max_tokens=20000 被切在工具调用的 JSON 中间 → 解析不出工具调用、正文也是空的 →
+# 被判成打嗝 → 重试 → 再截断。两轮各约 8 分钟、产出为零，用户看到的是 16 分钟沉默。
+_TRUNCATED_MAX_RETRIES = 2
+_TRUNCATION_FINISH_REASONS = frozenset({"length", "max_tokens", "model_length"})
+_TRUNCATION_NOTICE = (
+    "[系统] 你上一轮的输出**超过了单轮长度上限，被从中间截断了**——所以那一轮什么都没生效"
+    "（工具调用的 JSON 断在半路，解析不出来）。原样再写一遍只会再被截断一次。\n"
+    "把它拆小再来：一次只写一个文件；单个文件很大就先写骨架、再用 edit_file/apply_patch "
+    "分几次补内容；不要在一轮里同时写多个大文件。"
+)
+
+
+def _finish_reason(response: Any) -> str:
+    """尽力从 provider 的原始响应里取 finish_reason（取不到就返回空串，绝不猜）。
+
+    各家形状不同：OpenAI 兼容在 ``choices[0].finish_reason``，Anthropic 在
+    ``stop_reason``（截断是 ``"max_tokens"``），流式聚合的放在最后一个 chunk 里。
+    """
+    for obj in (getattr(response, "raw_completion", None),
+                getattr(response, "raw_message", None)):
+        if obj is None:
+            continue
+        reason = getattr(obj, "stop_reason", None)
+        if isinstance(reason, str) and reason:
+            return reason.lower()
+        choices = getattr(obj, "choices", None)
+        if isinstance(choices, (list, tuple)) and choices:
+            reason = getattr(choices[0], "finish_reason", None)
+            if isinstance(reason, str) and reason:
+                return reason.lower()
+        if isinstance(obj, dict):
+            reason = obj.get("stop_reason") or (
+                (obj.get("choices") or [{}])[0].get("finish_reason")
+                if isinstance(obj.get("choices"), list) and obj["choices"] else None
+            )
+            if isinstance(reason, str) and reason:
+                return reason.lower()
+    return ""
 
 RESULT_MAX_CHARS = 50000
 
@@ -151,8 +196,16 @@ def _tool_call_args(tool_call: Mapping[str, Any]) -> dict[str, Any]:
             return {}
 
 
-def _sanitize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _sanitize_tool_calls(
+    tool_calls: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """消毒后的 tool_calls + 「有参数解析不了」的标志。
+
+    标志走**返回值**而不是塞进 call 里：这些 dict 会原样进 assistant 消息、下一轮发回给
+    供应商，多一个非标准字段可能直接把请求打挂。
+    """
     out: list[dict[str, Any]] = []
+    unparseable = False
     for tc in tool_calls:
         tc2: dict[str, Any] = dict(tc)
         fn = tc2.get("function")
@@ -170,12 +223,20 @@ def _sanitize_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any
                         json.loads(repaired)
                         fn2["arguments"] = repaired
                     except Exception:
+                        # 参数解析不了，最常见的原因是**输出超长被截断**（JSON 断在半路）。
+                        # 这里不做 json 修复：补全出来的 `content` 就是那半个文件，
+                        # write_file 会当成功写下去、agent 继续往前走，交付一份残缺的稿子——
+                        # 那是静默损坏，比报错严重得多。降成 {} 让必填校验去报，
+                        # 同时留个标记，管线据此告诉模型「你是被截断了」而不是「你忘了填参数」
+                        # （conv-213 实测：一条 "missing required parameter" 背后是
+                        #  completion_tokens=20000 打满上限）。
                         fn2["arguments"] = "{}"
+                        unparseable = True
             elif args is None:
                 fn2["arguments"] = "{}"
             tc2["function"] = fn2
         out.append(tc2)
-    return out
+    return out, unparseable
 
 
 def _is_cancelled(token: CancellationToken | None) -> bool:
@@ -257,6 +318,7 @@ class AgentPipeline:
             skills_dir=config.skills_dir,
         )
         self.history: list[LoopMessage] = []
+        self._image_rounds: dict[int, int] = {}
         # Monotonic per-session SEND index, set by the loop before run() (None when
         # unset, e.g. in tests). Stamped into each appended row's PERSISTED meta only
         # (never the in-memory/LLM message) so the transcript can delimit sends
@@ -378,6 +440,11 @@ class AgentPipeline:
         )
         await self.hooks.run_typed_async(HookPoint.MESSAGE_APPEND, ctx)
         self.history.append(ctx.message)
+        # 6.12.0 图片保留：记下「这一行是第几轮入的图」（旁路表，按对象身份；history 行原样发给
+        # 供应商，不能夹私货字段）。
+        _c = ctx.message.get("content")
+        if isinstance(_c, list) and any(isinstance(b, dict) and b.get("type") == "attachment" for b in _c):
+            self._image_rounds[id(ctx.message)] = int(round_index or 0)
         # SCALE-4: keep the token estimate current incrementally on the hot append path
         # — only when the cache was already in sync (else leave it for a full recompute).
         if self._tok_len == len(self.history) - 1:
@@ -530,6 +597,109 @@ class AgentPipeline:
     # Hook orchestration is handled entirely by run().
     # ══════════════════════════════════════════════════════════════
 
+    _IMAGE_RETIRED_MARK = "[image retired"
+
+    def _retire_stale_images(self, round_index: int, keep_rounds: int) -> int:
+        """把当前 send 里「入上下文已超过 keep_rounds 轮」的图片附件块在内存里换成占位文字。
+
+        图片行是 user 行（see_image / 用户发图），带 ``round_index``（``_append_message`` 记的）。
+        第 r 轮入的图在第 r+keep_rounds 轮之前都以原图参与请求，之后换成
+        ``[image retired: <name> — 已看过；要再看调 see_image]``。不改 pl_messages、不改行数。
+        返回替换了几个块。"""
+        n = 0
+        rounds = getattr(self, "_image_rounds", None) or {}
+        if not rounds:
+            return 0
+        for m in self.history:
+            r = rounds.get(id(m))
+            if r is None:
+                continue
+            c = m.get("content")
+            if not isinstance(c, list) or not any(isinstance(b, dict) and b.get("type") == "attachment" for b in c):
+                continue
+            if round_index - int(r) < keep_rounds:
+                continue
+            new_blocks = []
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "attachment":
+                    att = b.get("attachment") if isinstance(b.get("attachment"), dict) else {}
+                    name = str(att.get("name") or att.get("filename") or att.get("path") or att.get("ref") or "image")
+                    name = name.rsplit("/", 1)[-1]
+                    new_blocks.append({"type": "text",
+                                       "text": f"{self._IMAGE_RETIRED_MARK}: {name} — 已看过；要再看调 see_image]"})
+                    n += 1
+                else:
+                    new_blocks.append(b)
+            m["content"] = new_blocks
+        if n:
+            logger.info("image retention: retired %d image block(s) older than %d round(s) (round %d)",
+                        n, keep_rounds, round_index)
+        return n
+
+    _DISTILL_MARK = "[distilled #"
+
+    def _distill_oldest_tool_rows(self, batch: int, hot_tail: int) -> int:
+        """把当前 send 里**最早的 batch 条**尚未蒸馏的工具结果在内存里替换成投影行（6.10.0）。
+
+        投影行 = 与 end-of-send 投影**同一套** ``ToolDefinition.project`` 蒸馏（找不到钩子就截断），
+        带 ``recall_send(send_index, seq)`` 坐标——原文永远在 pl_messages，要用就回取。不落盘、不改
+        数据库、不改行数（sink 的 index↔seq 对齐不受影响）。最近 ``hot_tail`` 条永不动。verbatim
+        模式不做（那边有就地压缩器）。返回本批释放的估算 token（≈字符/4）。"""
+        rep = self.config.representation
+        if getattr(rep, "kind", "projection") == "verbatim":
+            return 0
+        project_tool = getattr(rep, "_project_tool", None)
+        seqs = getattr(self.sink, "_history_seqs", None) or []
+        tool_idx = [
+            i for i, m in enumerate(self.history)
+            if m.get("role") == "tool" and isinstance(m.get("content"), str)
+        ]
+        protected = set(tool_idx[len(tool_idx) - max(0, hot_tail):]) if hot_tail > 0 else set()
+        candidates = [
+            i for i in tool_idx
+            if i not in protected
+            and not str(self.history[i].get("content")).startswith(self._DISTILL_MARK)
+            and len(self.history[i].get("content") or "") > 300
+        ]
+        picked = candidates[: max(1, batch)]
+        if not picked:
+            return 0
+        # tool_call_id → (name, args) 从前面的 assistant(tool_calls) 行反查
+        call_meta: dict[str, tuple[str, Any]] = {}
+        for m in self.history:
+            if m.get("role") == "assistant":
+                for tc in m.get("tool_calls") or []:
+                    fn = (tc or {}).get("function") or {}
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except (TypeError, ValueError):
+                            args = {"raw": args[:200]}
+                    call_meta[str((tc or {}).get("id") or "")] = (str(fn.get("name") or "tool"), args)
+        freed = 0
+        for i in picked:
+            m = self.history[i]
+            name, args = call_meta.get(str(m.get("tool_call_id") or ""), ("tool", {}))
+            content = str(m.get("content") or "")
+            if project_tool is not None:
+                try:
+                    d = project_tool(name, args, content, getattr(self, "tool_registry", None))
+                    parts = [f"{k}={v}" for k, v in (d or {}).items() if k != "name" and v not in (None, "")]
+                    line = f"{name}(" + ", ".join(str(x)[:200] for x in parts) + ")"
+                except Exception:  # noqa: BLE001 — 蒸馏钩子出错就退回截断
+                    line = f"{name}: {content[:200]}…"
+            else:
+                line = f"{name}: {content[:200]}…"
+            seq = seqs[i] if i < len(seqs) else None
+            coord = (f"recall_send(send_index={self.send_index}, seq={seq})"
+                     if (self.send_index is not None and seq is not None) else "recall_send")
+            new_content = (f"{self._DISTILL_MARK}{self.send_index} seq={seq} — 原文已从上下文移出，"
+                           f"需要时 {coord} 回取] {line}")
+            freed += max(0, (len(content) - len(new_content)) // 4)
+            m["content"] = new_content
+        return freed
+
     def _estimate_history_tokens(self) -> int:
         """Current history token estimate, maintained incrementally (SCALE-4).
 
@@ -577,6 +747,30 @@ class AgentPipeline:
         # Microcompact (dump old large tool outputs to disk + leave a short
         # pointer — orthogonal to LLM-based compaction). OFF by default as of
         # 3.1.x; opt in via config.microcompact_enabled. See AgentLoopConfig.
+        # ── 6.12.0 图片看过即撤：入上下文超过 image_retention_rounds 轮的 attachment 块换成占位文字 ──
+        irr = self.config.image_retention_rounds
+        if irr is not None and int(irr) > 0 and self._retire_stale_images(round_index, int(irr)):
+            self._tok_len = -1
+
+        # ── 6.10.0 send 内保险丝：最早的 n 条工具结果 → 投影行（内存替换，pl_messages 不动）──
+        # 触发依据 = 上一轮供应商返回的真实 prompt_tokens（就是当前上下文的真实大小；第一轮
+        # 还没有就用估算）。每轮最多蒸馏一批（最早的 n 条、跳过已蒸馏的、不动最近 hot_tail 条）；
+        # 下一轮真实 prompt 仍超阈值就再蒸馏下一批——逐轮递进，只蒸馏到够用为止。
+        dt = self.config.insend_distill_tokens
+        if dt is not None and int(dt) > 0:
+            real = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0) if round_index > 0 else 0
+            basis = real if real > 0 else self._estimate_history_tokens()
+            if basis >= int(dt):
+                freed = self._distill_oldest_tool_rows(
+                    int(self.config.insend_distill_batch or 10),
+                    int(self.config.insend_distill_hot_tail or 0),
+                )
+                if freed:
+                    self._tok_len = -1  # content shrank in place; force a fresh estimate
+                    logger.info(
+                        "insend distill: context %d tokens >= %d; freed ~%d tokens this round "
+                        "(send %s, round %d)", basis, int(dt), freed, self.send_index, round_index,
+                    )
         if self.config.microcompact_enabled:
             self.ctx.microcompact(
                 self.history,
@@ -777,6 +971,8 @@ class AgentPipeline:
                         prompt_tokens=getattr(usage, "prompt_tokens", None),
                         completion_tokens=getattr(usage, "completion_tokens", None),
                         total_tokens=getattr(usage, "total_tokens", None),
+                        prompt_cached_tokens=getattr(usage, "prompt_cached_tokens", None),
+                        prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
                     ),
                     round_index=round_index, stream_id="main",
                 )
@@ -808,6 +1004,35 @@ class AgentPipeline:
             )
 
         return response
+
+    def _is_async_capable(self, tool_name: str, tool_args: Mapping[str, Any] | None = None) -> bool:
+        # 6.15.0：async_capable 可以是一组 action 名，所以判定要带上这次调用的参数——
+        # 同一个工具的 get 只读、freeze 要写，不能一刀切。
+        from power_loop.tools.registry import async_capable_for
+
+        reg = self.tool_registry
+        rt = reg.get(tool_name) if reg is not None else None
+        return bool(rt is not None and async_capable_for(rt.definition, tool_args))
+
+    def _spawn_tool_task(
+        self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore
+    ) -> asyncio.Future:
+        """同轮并发的一个成员：受信号量限流地跑 execute_tool。contextvars 随 task 自动拷贝
+        （PEP 567），计费 / 活动打标 / 运行时上下文零处理。异常原样留在 task 里，轮到它时
+        再由串行路径的 HumanInputRequired / TOOL_ERROR 分支处理。"""
+
+        async def _run() -> tuple[str, bool]:
+            async with sem:
+                return await self.execute_tool(tool_name, tool_args)
+
+        return asyncio.ensure_future(_run())
+
+    @staticmethod
+    def _cancel_pre_tasks(pre: dict[int, tuple[asyncio.Future, Any]]) -> None:
+        for task, _ in pre.values():
+            if not task.done():
+                task.cancel()
+        pre.clear()
 
     async def execute_tool(
         self, tool_name: str, tool_args: dict[str, Any], *, count: bool = True
@@ -882,6 +1107,7 @@ class AgentPipeline:
     async def run(self, messages: list[LoopMessage]) -> AgentLoopResult:
         """Run the full agent loop. Returns when done, cancelled, or hit round limit."""
         self.history = [dict(m) for m in messages]
+        self._image_rounds = {}   # 6.12.0：本 send 新入的图片行 id(row) → round_index
         self._tok_len = -1  # SCALE-4: wholesale (re)assignment invalidates the estimate
 
         # ── Session start ──
@@ -910,6 +1136,7 @@ class AgentPipeline:
         # completion signal (see the no-tools block below). Count consecutive
         # empties so we retry a bounded number of times before giving up.
         self._empty_response_streak = 0
+        self._truncated_streak = 0
         round_idx = -1
         while True:
             round_idx += 1
@@ -963,6 +1190,38 @@ class AgentPipeline:
                         return self._make_result(
                             "budget_exceeded",
                             final_text="[budget_exceeded]",
+                            rounds=round_idx,
+                        )
+
+            # ── 6.10.0 上下文检查点（轮边界）：上一轮供应商返回的真实 prompt_tokens 就是当前上下文的
+            # 真实大小。达到阈值 → 宿主 COMPLETE_DECIDE 先拿收尾窗口（总结做了什么/还剩什么），否则
+            # 以 context_checkpoint 结束本 send → 正常投影 → 宿主续接机制在新 send 里接着干。
+            # 与 max_tokens_per_run 不同：那是累计费用（Σ prompt+completion，随轮数平方增长），
+            # 量不出「上下文有多大」；这里量的正是它。
+            ckpt = self.config.context_checkpoint_tokens
+            if (
+                ckpt is not None
+                and int(ckpt) > 0
+                and round_idx > 0
+                and not self._terminal_grace_active
+            ):
+                last_prompt = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0)
+                if last_prompt >= int(ckpt):
+                    self._emit(
+                        AgentEventType.STATUS_CHANGED,
+                        ContextCheckpointStatusPayload(
+                            budget_tokens=int(ckpt), spent_tokens=last_prompt, rounds=round_idx,
+                        ),
+                        round_index=round_idx,
+                    )
+                    if not await self._complete_decide(
+                        reason="context_checkpoint", round_idx=round_idx, final_text="",
+                        next_round=round_idx,
+                    ):
+                        await self._finalize("context_checkpoint", rounds=round_idx)
+                        return self._make_result(
+                            "context_checkpoint",
+                            final_text="[context_checkpoint]",
                             rounds=round_idx,
                         )
 
@@ -1040,6 +1299,20 @@ class AgentPipeline:
             for _pm in llm_before.persist_messages:
                 await self._append_message(_pm, round_index=round_idx)
                 llm_before.messages.append(dict(_pm))
+
+            # Image recall: a tool (see_image / recall_send / an image generator) can put
+            # pictures in front of the model. DURABLE ones become real `user` rows — the image
+            # stays in view for the rest of the send (cheap: it sits in the provider's cached
+            # prefix) and is distilled to `[image: … · file_uuid=…]` across sends, so nothing
+            # accumulates without bound. EPHEMERAL ones go into this request only.
+            # Appended AFTER the hook's own persist_messages so a tool's picture lands below
+            # the tool result that announced it — which is exactly where the model expects it.
+            _durable_imgs, _ephemeral_imgs = drain_queued_images(self.session_id)
+            for _img in _durable_imgs:
+                await self._append_message(_img, round_index=round_idx)
+                llm_before.messages.append(dict(_img))
+            for _img in _ephemeral_imgs:
+                llm_before.messages.append(_img)
 
             if llm_before.directive == HookDirective.SHORT_CIRCUIT:
                 response = llm_before.output
@@ -1123,14 +1396,29 @@ class AgentPipeline:
             # Any productive round (said something OR called a tool) clears the empty streak.
             if assistant_text or tool_calls:
                 self._empty_response_streak = 0
+            if tool_calls:
+                self._truncated_streak = 0
 
             # Append assistant message
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
             sanitized_tool_calls: list[dict[str, Any]] | None = None
+            _args_cut = False
             if tool_calls:
-                sanitized_tool_calls = _sanitize_tool_calls(tool_calls)
+                sanitized_tool_calls, _args_cut = _sanitize_tool_calls(tool_calls)
                 assistant_msg["tool_calls"] = sanitized_tool_calls
             await self._append_message(assistant_msg, round_index=round_idx, hook_injected=hook_audit)
+            # 截断的第二种表现：工具调用本身在，但它的 arguments JSON 断在半路 → 降成 {} →
+            # 必填校验报「缺参数」，模型据此以为自己忘了填，于是原样再写一遍、再被截断。
+            # 真实事故（conv-213）：一条 "missing required parameter" 背后是 20000 token 打满。
+            # 提示要补，但**不能在这里补**——见工具循环之后那一处。
+            if sanitized_tool_calls and _args_cut:
+                logger.warning(
+                    "tool-call arguments were unparseable at round %d (likely truncation; "
+                    "finish_reason=%r, completion_tokens=%s) — will tell the model to write smaller "
+                    "after this round's tool results (session=%s)",
+                    round_idx, _finish_reason(response),
+                    (usage or {}).get("completion_tokens"), self.session_id,
+                )
             # Mark pending IMMEDIATELY so a crash here leaves a recoverable state.
             if sanitized_tool_calls:
                 assistant_seq = len(self.history)  # 1-based position in history
@@ -1140,6 +1428,38 @@ class AgentPipeline:
                     tool_calls=sanitized_tool_calls,
                     round_index=round_idx,
                 )
+
+            # ── 截断优先判定：它和「空响应打嗝」长得像，但重试方式必须相反 ──
+            # provider 因 max_tokens 硬切时，工具调用的 JSON 断在半路 → 解析不出 tool_calls，
+            # 正文往往也是空的（内容全在那段 JSON 里）。**原样重试必然再次截断**，
+            # 每次烧满一个 max_tokens（conv-213：两轮各约 8 分钟、产出为零）。
+            # 所以这里不重试，而是把「你被截断了，拆小再来」作为一条 user 消息落进历史——
+            # 改变了输入，模型才有可能给出不一样的输出。
+            if not tool_calls:
+                reason = _finish_reason(response)
+                cap = self.config.max_tokens
+                out_tokens = int((usage or {}).get("completion_tokens") or 0)
+                truncated = (reason in _TRUNCATION_FINISH_REASONS
+                             or (bool(cap) and out_tokens >= int(cap)))
+                if truncated and self._truncated_streak < _TRUNCATED_MAX_RETRIES:
+                    self._truncated_streak += 1
+                    logger.warning(
+                        "truncated LLM response at round %d (finish_reason=%r, "
+                        "completion_tokens=%d/%s) streak=%d/%d — nudging to write smaller "
+                        "(session=%s)",
+                        round_idx, reason, out_tokens, cap, self._truncated_streak,
+                        _TRUNCATED_MAX_RETRIES, self.session_id,
+                    )
+                    await self._append_message(
+                        {"role": "user", "content": _TRUNCATION_NOTICE}, round_index=round_idx)
+                    self._emit(AgentEventType.ROUND_COMPLETED,
+                               RoundCompletedPayload(round_index=round_idx, has_tools=False),
+                               round_index=round_idx)
+                    await self.hooks.run_typed_async(HookPoint.ROUND_END, RoundEndCtx(
+                        round_index=round_idx, messages=self.history,
+                        has_tools=False, response_text=assistant_text))
+                    await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
+                    continue
 
             # ── No tools → completed (unless a follow-up is waiting) ──
             if not tool_calls:
@@ -1271,9 +1591,26 @@ class AgentPipeline:
             skip_batch = batch_ctx.directive == HookDirective.SKIP
 
             # ── Execute tools ──
+            # 6.11.0 同轮并发（design/86 修订）：模型面对「三张图」的直觉是同一轮批量发调用，
+            # 而不是先起 background_run 再回头查（conv-224：三次 design_pack_image 同轮发出、
+            # 逐个排队 3 分钟）。所以顺着它：同一轮 ≥2 个 async_capable 调用并发执行。
+            # 不变量：TOOL_BEFORE 仍按原顺序先跑（闸类 hook 语义不变）；结果按原顺序回填；
+            # TOOL_AFTER / 事件 / 落库全部串行；非 async_capable 工具永远串行。
             used_todo = False
+            _conc = int(self.config.tool_batch_concurrency or 0)
+            _eligible: list[int] = (
+                [j for j, tc in enumerate(tool_calls)
+                 if self._is_async_capable(_tool_call_name(tc), _tool_call_args(tc))]
+                if (_conc > 1 and not skip_batch) else []
+            )
+            if len(_eligible) < 2:
+                _eligible = []
+            _pre: dict[int, tuple[asyncio.Future, Any]] = {}   # 已起任务：index → (task, tb_ctx)
+            _pre_skip: dict[int, Any] = {}                       # TOOL_BEFORE 判 SKIP 的 hoisted 调用
+            _pre_sem: asyncio.Semaphore | None = None
             for i, tool_call in enumerate(tool_calls):
                 if _is_cancelled(self.cancel_token):
+                    self._cancel_pre_tasks(_pre)
                     await self._finalize("cancelled")
                     return self._make_result("cancelled", final_text="[cancelled by user]", rounds=round_idx + 1)
 
@@ -1289,33 +1626,74 @@ class AgentPipeline:
                     )
                     continue
 
-                # ── Hook: TOOL_BEFORE ──
-                tb_ctx = ToolBeforeCtx(
-                    round_index=round_idx,
-                    tool_call=tool_call,
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                )
-                await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_ctx)
-                tool_name = tb_ctx.tool_name
-                tool_args = tb_ctx.tool_args
-
-                if tb_ctx.directive == HookDirective.SKIP:
+                pre_task: asyncio.Future | None = None
+                if i in _pre_skip:
+                    tb_ctx = _pre_skip.pop(i)
                     await self._append_message(
-                        {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": tb_ctx.output},
+                        {"role": "tool", "tool_call_id": call_id, "name": tb_ctx.tool_name,
+                         "content": tb_ctx.output},
                         round_index=round_idx,
                     )
                     continue
+                if i in _pre:
+                    pre_task, tb_ctx = _pre.pop(i)
+                    tool_name = tb_ctx.tool_name
+                    tool_args = tb_ctx.tool_args
+                else:
+                    # ── Hook: TOOL_BEFORE ──
+                    tb_ctx = ToolBeforeCtx(
+                        round_index=round_idx,
+                        tool_call=tool_call,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                    )
+                    await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_ctx)
+                    tool_name = tb_ctx.tool_name
+                    tool_args = tb_ctx.tool_args
 
-                self._emit(AgentEventType.TOOL_CALL_STARTED,
-                           ToolCallStartedPayload(name=tool_name, tool_input=tool_args, tool_call_id=call_id),
-                           round_index=round_idx)
+                    if tb_ctx.directive == HookDirective.SKIP:
+                        await self._append_message(
+                            {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": tb_ctx.output},
+                            round_index=round_idx,
+                        )
+                        continue
+
+                    self._emit(AgentEventType.TOOL_CALL_STARTED,
+                               ToolCallStartedPayload(name=tool_name, tool_input=tool_args, tool_call_id=call_id),
+                               round_index=round_idx)
+
+                    if i in _eligible and any(j > i for j in _eligible):
+                        # 起批：本调用 + 后面所有 eligible 调用一起起任务。后者的 TOOL_BEFORE 在这里
+                        # 按序先跑（保序），判 SKIP 的不起任务，轮到它时直接落 SKIP 结果。
+                        _pre_sem = _pre_sem or asyncio.Semaphore(_conc)
+                        pre_task = self._spawn_tool_task(tool_name, tool_args, _pre_sem)
+                        for j in _eligible:
+                            if j <= i or j in _pre or j in _pre_skip:
+                                continue
+                            tc_j = tool_calls[j]
+                            tb_j = ToolBeforeCtx(
+                                round_index=round_idx, tool_call=tc_j,
+                                tool_name=_tool_call_name(tc_j), tool_args=_tool_call_args(tc_j),
+                            )
+                            await self.hooks.run_typed_async(HookPoint.TOOL_BEFORE, tb_j)
+                            if tb_j.directive == HookDirective.SKIP:
+                                _pre_skip[j] = tb_j
+                                continue
+                            self._emit(AgentEventType.TOOL_CALL_STARTED,
+                                       ToolCallStartedPayload(name=tb_j.tool_name, tool_input=tb_j.tool_args,
+                                                              tool_call_id=str(tc_j.get("id") or "")),
+                                       round_index=round_idx)
+                            _pre[j] = (self._spawn_tool_task(tb_j.tool_name, tb_j.tool_args, _pre_sem), tb_j)
 
                 # ── Business logic: execute tool ──
                 failed = False
                 try:
-                    output, failed = await self.execute_tool(tool_name, tool_args)
+                    if pre_task is not None:
+                        output, failed = await pre_task
+                    else:
+                        output, failed = await self.execute_tool(tool_name, tool_args)
                 except HumanInputRequired as exc:
+                    self._cancel_pre_tasks(_pre)
                     interaction = exc.to_pending(tool_call_id=call_id, tool_name=tool_name)
                     await self._persist_pending_interaction(interaction=interaction, round_index=round_idx)
                     # The model batched request_user_input with later tool_calls;
@@ -1396,11 +1774,23 @@ class AgentPipeline:
                 # the next round's request isn't an invalid sequence (assistant
                 # with tool_calls that have no matching tool responses).
                 if ta_ctx.directive == HookDirective.BREAK:
+                    self._cancel_pre_tasks(_pre)
                     await self._resolve_skipped_tool_calls(
                         tool_calls[i + 1 :], reason="tool.after hook stopped the batch",
                         round_idx=round_idx,
                     )
                     break
+
+            # 🔴 截断提示只能补在**所有 tool 结果都落完之后**。
+            # 补在 assistant(tool_calls) 与它的 tool 结果之间，会造出
+            # `assistant(tool_calls) → user → tool` 这种非法序列，下一次请求直接 400：
+            # "An assistant message with 'tool_calls' must be followed by tool messages
+            #  responding to each 'tool_call_id'" → 重试耗尽 → 整个 run 降级。
+            # 真实事故 conv-215：第一次发卡片就死在这（提示本身是对的，位置错了）。
+            # 同一条不变量在上面 TOOL_AFTER BREAK 处也写着——那里守住了，这里当初漏了。
+            if _args_cut:
+                await self._append_message(
+                    {"role": "user", "content": _TRUNCATION_NOTICE}, round_index=round_idx)
 
             # ── Hook: TOOLS_BATCH_AFTER ──
             batch_after_ctx = ToolsBatchAfterCtx(

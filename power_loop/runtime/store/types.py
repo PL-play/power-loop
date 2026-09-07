@@ -119,6 +119,31 @@ class SessionRow:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+#: ``MessageRow.meta`` key recording that the row's ``content`` TEXT column holds a
+#: JSON-encoded *structured* (multimodal) payload rather than a plain string. The marker has to
+#: live in meta because the content column alone cannot tell a serialized list apart from a user
+#: string that merely looks like JSON. Defined HERE (not in agent.sink, where it originated) so
+#: the runtime layer can honour it without an agent→runtime import cycle — a mismatch between
+#: writer and reader silently hands the model a literal JSON string instead of its images.
+CONTENT_ENCODING_META_KEY = "content_encoding"
+CONTENT_ENCODING_JSON = "json"
+
+
+def decode_row_content(content: str | None, meta: dict[str, Any] | None) -> Any:
+    """Reverse of ``agent.sink._encode_content``: rebuild structured content flagged by the
+    marker. A corrupt/unparseable payload degrades to the raw text rather than raising."""
+    if content is None:
+        return None
+    if (meta or {}).get(CONTENT_ENCODING_META_KEY) != CONTENT_ENCODING_JSON:
+        return content
+    import json as _json
+
+    try:
+        return _json.loads(content)
+    except (ValueError, TypeError):
+        return content
+
+
 @dataclass
 class MessageRow:
     session_id: str

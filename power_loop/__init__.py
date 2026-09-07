@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "5.4.0"
+__version__ = "6.22.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -25,6 +25,7 @@ __version__ = "5.4.0"
 # "power_loop.*" subtree (getLogger(__name__)), so one handler routes the whole tree.
 import logging as _logging
 
+from power_loop._vendor.llm_client.capabilities import ModelCapabilities, ModelCapabilityError
 from power_loop._vendor.llm_client.interface import (
     AnthropicChatConfig,
     LLMRequest,
@@ -34,6 +35,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMTokenUsage,
     OpenAICompatibleChatConfig,
 )
+from power_loop._vendor.llm_client.multimodal import create_attachment_ref
 from power_loop.agent.follow_up import FollowUpQueued
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
@@ -288,6 +290,8 @@ STABLE_API = (
     "LLMResponse",
     "LLMStreamChunk",
     "LLMProviderConfig",
+    "ModelCapabilities",
+    "ModelCapabilityError",
     "create_llm_service_from_env",
     "create_llm_service_from_config",
 )
@@ -400,6 +404,9 @@ __all__ = [
 	"estimate_text_tokens",
 	"trim_history",
 	"LLMProviderConfig",
+	"ModelCapabilities",
+	"ModelCapabilityError",
+	"create_attachment_ref",
 	"create_llm_service_from_config",
 	"create_llm_service_from_env",
 	"MessageSink",

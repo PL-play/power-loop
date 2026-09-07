@@ -19,27 +19,11 @@ class TodoManager:
         self.items: list[dict[str, Any]] = []
 
     def update(self, items: list[dict[str, Any]]) -> str:
-        if len(items) > 20:
-            raise ValueError("Max 20 todos allowed")
+        from power_loop.runtime.todos import validate_todos
 
-        validated: list[dict[str, Any]] = []
-        in_progress_count = 0
-        for i, item in enumerate(items):
-            text = str(item.get("text", "")).strip()
-            status = str(item.get("status", "pending")).lower()
-            item_id = str(item.get("id", str(i + 1)))
-            if not text:
-                raise ValueError(f"Item {item_id}: text required")
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"Item {item_id}: invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item_id, "text": text, "status": status})
-
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress at a time")
-
-        self.items = validated
+        # 与工具层同一个校验口径（6.16.0）——这里原来是一份**逐字重复**的实现，
+        # 改一处漏一处，清单就会在工具层和上下文层各说各话。
+        self.items = validate_todos(items)
         result = self.render()
         done = sum(1 for t in self.items if t["status"] == "completed")
 
@@ -60,15 +44,9 @@ class TodoManager:
         return result
 
     def render(self) -> str:
-        if not self.items:
-            return "No todos."
-        lines: list[str] = []
-        for item in self.items:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
-            lines.append(f"{marker} #{item['id']}: {item['text']}")
-        done = sum(1 for t in self.items if t["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} completed)")
-        return "\n".join(lines)
+        from power_loop.runtime.todos import render_todos
+
+        return render_todos(self.items)
 
     def snapshot_for_prompt(self) -> str:
         if not self.items:

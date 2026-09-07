@@ -102,3 +102,27 @@ async def test_update_returns_none_when_absent_and_frozen_blob_when_terminal() -
         # allow_terminal lets a legitimate writer through (e.g. resume / wake guard)
         woke = await journal.update(store, parent, run_id, allow_terminal=True, woke=True)
         assert woke is not None and woke["woke"] is True
+
+
+@pytest.mark.asyncio
+async def test_amend_step_writes_only_after_finalize() -> None:
+    """amend_step 与 record_step 互补：record 对终局冻结，amend 只在终局后开放（host nudge 回写）。"""
+    async with await SessionStore.open(":memory:") as store:
+        parent = await store.create_session(system_prompt="parent")
+        run_id = "r-amend"
+        await journal.seed(store, parent, run_id, "wf", spec={})
+        await journal.record_step(store, parent, run_id, node_id="a",
+                                  status="hit_round_limit", session_id="s-a", text="[hit]剩2屏")
+        # 还在跑：amend 拒绝（在跑的 run 由引擎独占写入）
+        assert not await journal.amend_step(store, parent, run_id, node_id="a",
+                                            status="completed", text="早了")
+        await journal.update(store, parent, run_id, status="failed")
+        # 终局后：amend 放行，session_id 保留、amended 标记留审计
+        assert await journal.amend_step(store, parent, run_id, node_id="a",
+                                        status="completed", text="补轮后全齐", note="nudge")
+        j = await journal.read(store, parent, run_id)
+        step = next(s for s in j["steps"] if s["node_id"] == "a")
+        assert step["status"] == "completed" and step["text"] == "补轮后全齐"
+        assert step["session_id"] == "s-a"
+        assert step["amended"]["note"] == "nudge"
+        assert j["status"] == "failed", "run 级历史事实不动"

@@ -18,6 +18,10 @@ from typing import Any, Protocol, runtime_checkable
 
 from power_loop.agent.types import LoopMessage
 from power_loop.runtime.store.store import SessionStore
+from power_loop.runtime.store.types import (
+    CONTENT_ENCODING_JSON,
+    CONTENT_ENCODING_META_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -393,8 +397,9 @@ class SQLiteSink:
 # handing the model a literal JSON string. (H6 — BUG_REVIEW_3.4.) The marker lives in meta
 # (jsonb, already round-trips) because the content column alone can't distinguish a
 # stringified list from a user string that merely looks like JSON.
-CONTENT_ENCODING_META_KEY = "content_encoding"
-CONTENT_ENCODING_JSON = "json"
+# CONTENT_ENCODING_META_KEY / CONTENT_ENCODING_JSON are imported above from
+# runtime.store.types (the authoritative definition — the runtime layer must read the same
+# marker this sink writes) and re-exported here for the existing importers.
 
 
 def _encode_content(content: Any) -> tuple[str | None, bool]:

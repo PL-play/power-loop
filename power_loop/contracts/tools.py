@@ -21,6 +21,19 @@ class ToolDefinition:
     project: Callable[[Mapping[str, Any], str | None], dict[str, Any] | str] | None = field(
         default=None, compare=False
     )
+    #: 6.8.0：标记本工具可被 ``background_run(action="tool")`` 异步执行（无副作用、可安全
+    #: 并发/重跑的长耗时调用，如生成图像、抓网页）。标记后，只要 background_run 同在
+    #: 工具集里，渲染给模型的描述会自动追加「可异步」用法后缀（registry.to_openai_tools）。
+    #:
+    #: 6.15.0：支持 **action 粒度**。很多多义工具在同一个入口下既有只读 action 也有写
+    #: action（``design_reference`` 的 ``get``/``list`` 只读、``freeze`` 写），工具级的
+    #: 一个布尔值只能二选一：整体不标 → 纯读的那几个 action 也没法并发；整体标上 → 写
+    #: action 会被并发或被后台重跑。给一组 action 名即可只放行这几个：
+    #:
+    #:     async_capable=frozenset({"get", "list", "download"})
+    #:
+    #: ``True`` 仍表示整个工具都可异步，``False`` 表示都不可——旧写法完全不受影响。
+    async_capable: bool | frozenset[str] = False
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {
@@ -44,7 +57,9 @@ DEFAULT_REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
     "load_skill": ("name",),
     "todo": ("items",),
     "background_run": ("action",),
-    "schedule_wakeup": ("action",),
+    # schedule_wakeup 的 action 不再必填（6.13.0）：模型按「给了 delay_seconds+note 就是排闹钟」的
+    # 直觉省略它，被硬拒后每次白烧一轮（conv-222/223/224/226 实测 21 次调用 7 次因此失败，且同族的
+    # schedule_followup 的 operation 本来就可省略）。改由 handler 从参数形状推断，见 default_tools。
     "note": ("action",),
     "web_search": ("query",),
     "generate_image": ("prompt",),

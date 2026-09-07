@@ -544,9 +544,10 @@ async def test_missing_projection_row_falls_back_to_verbatim(store: SessionStore
     req = llm.calls[n]
     joined = "\n".join(str(m.get("content", "")) for m in req)
     assert "first" in joined and "done1" in joined  # send 1 recovered (NOT dropped)
-    # recovered VERBATIM (the audit rows incl. tool protocol), proving the fallback fired —
-    # the projection path emits plain text only.
-    assert any("tool_calls" in m for m in req)
+    # 6.9.0：不再逐字回退——缺投影行的 send 在装配时现场投影并落库（确定性、无 LLM），
+    # 请求里是蒸馏文本而不是原始 tool 协议行；投影行也已重新出现在表里。
+    assert not any("tool_calls" in m for m in req)
+    assert [r for r in await store.load_project_messages(sid) if r.send_index == 1]
 
 
 @pytest.mark.asyncio
@@ -565,7 +566,9 @@ async def test_stale_projector_version_falls_back_to_verbatim(store: SessionStor
     req = llm2.calls[0]
     joined = "\n".join(str(m.get("content", "")) for m in req)
     assert "first" in joined and "done1" in joined  # send 1 still present…
-    assert any("tool_calls" in m for m in req)  # …rendered verbatim (version mismatch → fallback)
+    # 6.9.0：版本不匹配 → 用当前版本投影器现场重投影（不再逐字回退），表里出现 v2 行。
+    assert not any("tool_calls" in m for m in req)
+    assert 2 in {r.projector_version for r in await store.load_project_messages(sid) if r.send_index == 1}
 
 
 class _BoomCompactProjector(DefaultDeterministicProjector):
@@ -628,8 +631,10 @@ async def test_switch_default_to_projection_verbatim_when_migration_off(store: S
     await proj.send("second", session_id=sid)
     joined = "\n".join(str(m.get("content", "")) for m in proj_llm.calls[0])
     assert "first" in joined and "done1" in joined
-    assert any("tool_calls" in m for m in proj_llm.calls[0])  # verbatim (not migrated)
-    assert {r.send_index for r in await store.load_project_messages(sid)} == {2}  # only send 2 projected
+    # 6.9.0：不迁移 ≠ 逐字——未投影的过去 send 在装配时现场投影（每 send 独立投影行，无 compact）。
+    assert not any("tool_calls" in m for m in proj_llm.calls[0])
+    assert {r.send_index for r in await store.load_project_messages(sid)} == {1, 2}
+    assert not [r for r in await store.load_project_messages(sid) if r.kind == "compact"]
 
 
 @pytest.mark.asyncio
@@ -826,7 +831,8 @@ async def test_migration_failure_falls_back_to_verbatim(store: SessionStore, mon
     r = await proj.send("second", session_id=sid)
     assert r.status == "completed"  # migration failure did not crash the send
     joined = "\n".join(str(m.get("content", "")) for m in proj_llm.calls[0])
-    assert "first" in joined and any("tool_calls" in m for m in proj_llm.calls[0])  # verbatim fallback
+    assert "first" in joined and "done1" in joined  # 6.9.0：迁移失败也不丢——现场投影兜底
+    assert not any("tool_calls" in m for m in proj_llm.calls[0])
     assert (await store.get_session(sid)).metadata.get("projection_migrated") is None  # not marked
     assert 2 in {r.send_index for r in await store.load_project_messages(sid)}  # send 2 still projects
 
@@ -865,3 +871,34 @@ def test_config_rejects_nonpositive_max_tokens_with_projector() -> None:
     with pytest.raises(ValueError, match="max_tokens"):
         cfg.max_tokens = 0
     assert cfg.max_tokens == 8000  # rolled back, config still valid
+
+
+@pytest.mark.asyncio
+async def test_interrupted_send_is_lazily_projected_on_next_send(store: SessionStore) -> None:
+    """6.9.0 self-heal（真实事故）：一个被进程重启杀在半途的 send 永远走不到 end-of-send 投影，
+    它的原始行（含 tool 协议行）以前会逐字进入之后每个 send 的上下文（一个 80 轮 send = 182K 字符
+    ≈ 115K tokens，每轮 2–3 分钟）。现在下一个 send 装配上下文时现场投影并落库。"""
+    big = "BIGRAWTOOLRESULT-" * 300
+    llm = _Scripted(responses=[LLMResponse(raw_text="after heal")])
+    loop = _projection_loop_with_tools(store, llm, _echo_registry())
+    sid = await store.create_session()
+    # 模拟中断的 send 1：只有原始行，没有投影行
+    await store.mutate_runtime_state(sid, "send_index", lambda v: 1, default=0)
+    await store.append_message(sid, role="user", content="kick off", send_index=1)
+    await store.append_message(
+        sid, role="assistant", send_index=1, round_index=0,
+        tool_calls=[{"id": "tc-h", "function": {"name": "echo", "arguments": '{"text":"x"}'}}],
+    )
+    await store.append_message(sid, role="tool", content=big, send_index=1,
+                               tool_call_id="tc-h", round_index=0)
+    assert not [r for r in await store.load_project_messages(sid) if r.send_index == 1]
+
+    await loop.send("next", session_id=sid)  # send 2
+
+    healed = [r for r in await store.load_project_messages(sid) if r.send_index == 1]
+    assert {r.kind for r in healed} >= {"user", "project"}, "中断的 send 1 应被现场投影并落库"
+    req = llm.calls[0]
+    roles = [m.get("role") for m in req]
+    assert "tool" not in roles, "send 1 的原始 tool 协议行不该再逐字进入 send 2 的上下文"
+    joined = "\n".join(str(m.get("content") or "") for m in req)
+    assert big not in joined, "182K 式原文不该原样带入——应是蒸馏后的投影"

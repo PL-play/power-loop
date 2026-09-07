@@ -44,6 +44,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["path"],
         },
         required_params=("path",),
+        # 可异步：纯只读。单次快，但一轮里读 8 个文件时并发才有意义——真实日志里一个 send 把 read_file 摊成 8 轮（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="edit_file",
@@ -126,6 +128,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["pattern"],
         },
         required_params=("pattern",),
+        # 可异步：纯只读的路径匹配（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="grep",
@@ -149,6 +153,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["pattern"],
         },
         required_params=("pattern",),
+        # 可异步：纯只读的内容检索（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="load_skill",
@@ -161,10 +167,20 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["name"],
         },
         required_params=("name",),
+        # 可异步：只读：把技能文件读进来（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="todo",
-        description="Update the current task list (todo manager). Only one item can be in_progress at a time.",
+        description=(
+            "Update the current task list. Send the WHOLE list every time (it replaces the old one).\n"
+            "每一条有两个维度，别混：`status` 说**进展**（pending/in_progress/completed），"
+            "`owner` 说**谁在做**（self=你自己动手；background/subagent/workflow=派出去了）。\n"
+            "**同时只能有一件 owner=self 的 in_progress**——你自己一次只做一件事。但派出去的"
+            "不限：三件活分别在后台、子 agent、workflow 里跑，就是三条 in_progress，各带各的 owner。\n"
+            "owner 不是 self 时必须给 `ref`（task_id / run id / 子会话 id）：说不出派到哪的活"
+            "没法回来收，清单上会永远挂着。先真的派出去、拿到句柄，再把这一条标上。"
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -176,6 +192,15 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
                             "id": {"type": "string"},
                             "text": {"type": "string"},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            "owner": {
+                                "type": "string",
+                                "enum": ["self", "background", "subagent", "workflow"],
+                                "description": "谁在做（缺省 self）。不是 self 就必须给 ref。",
+                            },
+                            "ref": {
+                                "type": "string",
+                                "description": "派出去的句柄：background 的 task_id / workflow 的 run id / 子 agent 的会话 id。",
+                            },
                         },
                         "required": ["id", "text", "status"],
                     }
@@ -193,7 +218,10 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "or ongoing task state; action=list to read notes and obtain their #ids; action=update "
             "with note_id plus content and/or pinned to keep memory current; action=delete with "
             "note_id for stale memory. Keep notes short and self-contained; use pinned=true only for "
-            "notes that must never be hidden or auto-evicted."
+            "notes that must never be hidden or auto-evicted.\n"
+            "边界：**会过期的运行时状态不要写进 note**——后台 task_id、workflow run id、任务进度，"
+            "那些是待办的 owner/ref 与平台自己的台账在管，任务跑完你写的那条就成了没人删的垃圾。"
+            "note 只放「以后还成立」的事实与决定。"
         ),
         input_schema={
             "type": "object",
@@ -205,7 +233,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
                 },
                 "note_id": {
                     "type": "integer",
-                    "description": "Required for update/delete; obtain it with action=list.",
+                    "description": "Required for delete; for update obtain it with action=list — an update WITHOUT note_id is recorded as a new note (receipt returns its #id with a warning).",
                 },
                 "content": {
                     "type": "string",
@@ -224,6 +252,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         name="schedule_wakeup",
         description=(
             "Manage your durable wake-up timers with one action: schedule, list, or cancel. "
+            "action defaults to schedule when you pass delay_seconds (to cancel when you pass only "
+            "timer_id, to list when you pass nothing) — but passing it explicitly is clearer. "
             "action=schedule arms a wake-up — after delay_seconds you receive your note back as "
             "a message and can act on it (check a long task, follow up on a promise); set "
             "every_seconds to make it RECURRING (fires repeatedly until cancelled). action=list "
@@ -244,9 +274,9 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
                 "every_seconds": {"type": "integer", "description": "Optional for action=schedule: repeat every N seconds after each fire (fixed-delay) until cancelled. Omit for one-shot."},
                 "timer_id": {"type": "integer", "description": "Required for action=cancel: the #id from action=list or the schedule confirmation."},
             },
-            "required": ["action"],
+            "required": [],
         },
-        required_params=("action",),
+        required_params=(),
     ),
     ToolDefinition(
         name="current_time",
@@ -273,6 +303,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             },
         },
         required_params=(),
+        # 可异步：只读：回看被折叠掉的历史（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="recall_send",
@@ -281,8 +313,9 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "summarized tool line carries a coordinate «#N·sS» (send_index N, row seq S). To get "
             "ONE original tool result in full (a file you read, a skill you loaded, a vision answer, "
             "a command's output), call recall_send(send_index=N, seq=S) — that returns just that row "
-            "with a large cap. Without seq it lists every row of send #N (each body cut at 2000 "
-            "chars) — use that only to see what happened, not to fetch a body. Read-only, current session."
+            "with a large cap. Without seq you get a MAP of send #N — every row with its seq, "
+            "bodies trimmed to fit one small budget; use it to FIND the coordinate, then call again "
+            "with seq. Read-only, current session."
         ),
         input_schema={
             "type": "object",
@@ -293,24 +326,34 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "required": ["send_index"],
         },
         required_params=("send_index",),
+        # 可异步：只读：回看本会话的历史行（design/95）
+        async_capable=True,
     ),
     ToolDefinition(
         name="background_run",
         description=(
-            "Manage private background shell tasks with one action: run or check. action=run "
-            "starts a command in a private non-interactive background worker and returns its "
-            "task_id immediately. action=check reports a task's status/output by task_id, or "
-            "lists all your tasks when task_id is omitted."
+            "Manage private background tasks with one action: run, tool, or check. action=run "
+            "starts a shell command in a private non-interactive background worker and returns its "
+            "task_id immediately. action=tool runs one async-capable TOOL in the background "
+            "(tool=<name>, args={…}) and returns a task_id at once — use it for long, "
+            "side-effect-free calls (image generation, web fetches) whose result you do not "
+            "need immediately; you will be notified on completion. action=check reports a "
+            "task's status/output by task_id, or lists all your tasks when task_id is omitted."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["run", "check"],
+                    # list = check 不带 task_id 的显式别名（6.17.0）。原来「列出全部」这件事
+                    # 藏在「check 不带参数」这个隐式约定里，模型要先知道才用得上——同一件事
+                    # 该只有一个名字（design/96 §6.4）。
+                    "enum": ["run", "tool", "check", "list"],
                     "description": "Operation to perform.",
                 },
                 "command": {"type": "string", "description": "Required for action=run: shell command to execute."},
+                "tool": {"type": "string", "description": "Required for action=tool: name of an async-capable tool (marked in its description)."},
+                "args": {"type": "object", "description": "action=tool: the tool's arguments, exactly as you would pass them when calling it directly."},
                 "task_id": {"type": "string", "description": "For action=check: task to inspect; omit to list all tasks."},
             },
             "required": ["action"],

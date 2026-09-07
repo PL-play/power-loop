@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import fnmatch
+import json
 import logging
 import os
 import queue
@@ -168,13 +169,59 @@ def _remember_read(fp: Path) -> None:
             FILE_READ_STATE.popitem(last=False)  # evict least-recently-read
 
 
-def _check_read_state(fp: Path) -> str | None:
+#: 闸报错里最多带回多少字符的现场内容。够看清目标区域，又不至于把整份大文件塞进上下文。
+_READ_GUARD_EXCERPT = 1200
+
+
+def _guard_excerpt(fp: Path, anchor: str | None) -> str:
+    """闸拦下时，把**当前**文件里与这次编辑相关的一段带回去。
+
+    为什么：闸原来只说「去重读一遍再来」——于是一件事要花两轮（read_file 一轮、重发编辑一轮）。
+    真实日志里这两条闸 30 天拦了 70 次，也就是 70 个白烧的往返。内容本来就在手边，直接给出来
+    就能一轮做完。**这不削弱守卫**：该拦的照样拦，只是把「出路」一并给了（报错即出路）。
+    """
+    try:
+        if not fp.exists():
+            return ""
+        text = _read_text(fp, max_bytes=None)
+    except Exception:  # noqa: BLE001 — 现场读不到就退回纯报错，绝不能让闸本身抛
+        return ""
+    if anchor:
+        i = text.find(anchor)
+        if i >= 0:
+            lo = max(0, i - _READ_GUARD_EXCERPT // 3)
+            hi = min(len(text), i + len(anchor) + _READ_GUARD_EXCERPT // 3)
+            head = "…\n" if lo else ""
+            tail = "\n…" if hi < len(text) else ""
+            return f"\n\n当前文件里这段的现场（old_text 仍然命中）：\n{head}{text[lo:hi]}{tail}"
+    excerpt = text[:_READ_GUARD_EXCERPT]
+    tail = "\n…" if len(text) > _READ_GUARD_EXCERPT else ""
+    return f"\n\n当前文件开头（old_text 没命中，对照着改锚点）：\n{excerpt}{tail}"
+
+
+def _read_state_kind(fp: Path) -> str | None:
+    """``"unread"``（从没读过）/ ``"stale"``（读过但文件后来变了）/ ``None``（干净）。
+
+    两者性质不同，所以分开：**从没读过**意味着模型对这个文件没有任何依据；
+    **读过但变了**意味着依据可能过期——后者还有救（见 ``run_edit``），前者没有。
+    """
     key = str(fp.resolve())
     stamp = FILE_READ_STATE.get(key)  # .get(): tolerate a concurrent LRU eviction
     if stamp is None:
-        return f"Error: File has not been read yet. Use read_file first before modifying: {_display_path(fp)}"
+        return "unread"
     if fp.exists() and _file_stamp(fp) != stamp:
-        return f"Error: File changed since last read. Re-read it before modifying: {_display_path(fp)}"
+        return "stale"
+    return None
+
+
+def _check_read_state(fp: Path, anchor: str | None = None) -> str | None:
+    kind = _read_state_kind(fp)
+    if kind == "unread":
+        return (f"Error: File has not been read yet. Use read_file first before modifying: "
+                f"{_display_path(fp)}") + _guard_excerpt(fp, anchor)
+    if kind == "stale":
+        return (f"Error: File changed since last read. Re-read it before modifying: "
+                f"{_display_path(fp)}") + _guard_excerpt(fp, anchor)
     return None
 
 
@@ -760,10 +807,28 @@ def _find_unique_edit_span(content: str, old_text: str, path: str, replace_all: 
 def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False) -> str:
     try:
         fp = safe_path(path)
-        read_err = _check_read_state(fp)
-        if read_err:
-            return read_err
+        # 「读过、但文件后来变了」（stale）不再一律拦（6.19.0）：如果 old_text 在**当前**内容里
+        # 仍然唯一命中，说明你要替换的那段原文还在原地，这次编辑是无歧义的——放行，并在回执里
+        # 明说文件在别处变过（不能让它以为脑子里那份还是最新的）。命中 0 次或 ≥2 次照样拦：
+        # 那才是「依据真的过期了」。
+        #
+        # 为什么只放这一类：从没读过（unread）意味着对这个文件没有任何依据，没得救；
+        # replace_all 也不放——它要替换的是「每一处」，而文件变了之后那个集合可能已经不同。
+        # 真实日志：这条闸 30 天拦了 35 次，每次都要模型重读整份文件再重发（两轮 + 一次整文件回执）。
+        stale_note = ""
+        kind = _read_state_kind(fp)
+        if kind == "unread":
+            return (f"Error: File has not been read yet. Use read_file first before modifying: "
+                    f"{_display_path(fp)}") + _guard_excerpt(fp, old_text)
         raw_content = _read_text(fp, max_bytes=None)
+        if kind == "stale":
+            _probe = _normalize_to_lf(_split_bom(raw_content)[1])
+            _hits = _probe.count(_normalize_to_lf(old_text))
+            if replace_all or _hits != 1:
+                return (f"Error: File changed since last read. Re-read it before modifying: "
+                        f"{_display_path(fp)}") + _guard_excerpt(fp, old_text)
+            stale_note = ("\n这个文件在你上次读过之后**被改动过**（不是你改的）。old_text 仍然唯一命中，"
+                          "所以这次替换照做了；但你手里那份内容已经不是最新的——接着改之前先重读一遍。")
         bom, content = _split_bom(raw_content)
         original_ending = _detect_line_ending(content)
         normalized = _normalize_to_lf(content)
@@ -771,7 +836,10 @@ def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False)
         norm_new = _normalize_to_lf(new_text)
 
         if norm_old == norm_new:
-            return "Error: old_text and new_text are identical."
+            # 新旧完全相同 = 这次编辑本来就什么都不做。报错换来的是「模型重发一遍」，
+            # 而它已经处在想要的状态了——如实说一声就够，不该白烧一轮（30 天 10 次）。
+            return (f"No change: old_text 与 new_text 完全相同，{_display_path(fp)} 未改动"
+                    "（它已经是你想要的样子了；如果你想改的是别处，换一个 old_text）。")
 
         span_or_error = _find_unique_edit_span(normalized, norm_old, path, replace_all)
         if isinstance(span_or_error, str):
@@ -790,6 +858,7 @@ def run_edit(path: str, old_text: str, new_text: str, replace_all: bool = False)
         diff_output = _generate_diff(normalized, updated)
         return (
             f"Edited {_display_path(fp)} ({label}, {count} replacement{'s' if count != 1 else ''})"
+            + stale_note
             + _json_syntax_warning(fp, updated)
             + (f"\n{diff_output}" if diff_output else "")
         )
@@ -814,7 +883,7 @@ def _json_syntax_warning(fp: Path, updated: str) -> str:
         return ""
     except ValueError as exc:
         return (
-            f"\n⚠️ WARNING: {_display_path(fp)} is NOT valid JSON after this change "
+            f"\nWARNING: {_display_path(fp)} is NOT valid JSON after this change "
             f"({exc}). The file was written anyway — fix the syntax before using it."
         )
 
@@ -1156,38 +1225,11 @@ def _current_store_and_session() -> tuple[Any | None, str | None]:
     return runtime_ctx.store, runtime_ctx.session_id
 
 
-def _render_todos(items: list[dict[str, Any]]) -> str:
-    if not items:
-        return "No todos."
-    lines: list[str] = []
-    for item in items:
-        marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
-        lines.append(f"{marker} #{item['id']}: {item['text']}")
-    done = sum(1 for item in items if item["status"] == "completed")
-    lines.append(f"\n({done}/{len(items)} completed)")
-    return "\n".join(lines)
-
-
-def _validate_todos(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if len(items) > 20:
-        raise ValueError("Max 20 todos allowed")
-    validated: list[dict[str, Any]] = []
-    in_progress_count = 0
-    for i, item in enumerate(items):
-        text = str(item.get("text", "")).strip()
-        status = str(item.get("status", "pending")).lower()
-        item_id = str(item.get("id", str(i + 1)))
-        if not text:
-            raise ValueError(f"Item {item_id}: text required")
-        if status not in ("pending", "in_progress", "completed"):
-            raise ValueError(f"Item {item_id}: invalid status '{status}'")
-        if status == "in_progress":
-            in_progress_count += 1
-        validated.append({"id": item_id, "text": text, "status": status})
-    if in_progress_count > 1:
-        raise ValueError("Only one task can be in_progress at a time")
-    return validated
-
+# 6.16.0：校验与渲染收敛到 runtime/todos.py 一处——这两个函数原来在 core/state.py 里
+# 还有一份**逐字重复**的实现，改一处漏一处就是清单在工具层和上下文层各说各话。
+from power_loop.runtime.todos import render_todos as _render_todos  # noqa: E402
+from power_loop.runtime.todos import todo_counts as _todo_counts  # noqa: E402
+from power_loop.runtime.todos import validate_todos as _validate_todos  # noqa: E402
 
 #: Cap on retained in-memory background-task records. The durable record lives in the store; this
 #: is just a cache for `check`, so a long-lived loop must not accumulate task dicts (each pinning a
@@ -1414,6 +1456,114 @@ class BackgroundManager:
         with self._lock:
             return sum(1 for t in self._threads.values() if t.is_alive())
 
+    async def run_tool(self, tool_name: str, args: dict[str, Any] | None) -> str:
+        """6.8.0 ``action=tool``：把一个 async_capable 工具作为后台任务跑，立即返回 task_id。
+
+        与 shell 分支不同：工具 handler 本来就是协程，直接 ``asyncio.create_task`` 在
+        本进程事件循环上跑——**contextvars 随 task 创建自动拷贝**（PEP 567），所以宿主的
+        计费/活动打标上下文天然跟着走，不需要捕获重播。结果持久化进同一张
+        background 任务表（command 字段以 ``tool:`` 前缀区分）；完成后调用宿主注册的
+        ``on_tool_task_complete``（best-effort），由宿主决定要不要唤醒睡着的 agent。
+        进程重启 = 任务丢失，行卡 running，由 check 的 flush_orphaned 语义外**另行**
+        诚实兜底：这里在启动时登记 in-memory，check 未命中 in-memory 且行仍 running
+        时按孤儿报告（复用 shell 分支已有的自愈路径）。
+        """
+        from power_loop.core.agent_context import get_current_loop
+
+        name = str(tool_name or "").strip()
+        if not name:
+            raise ValueError("background_run action=tool requires tool")
+        if name in ("background_run", "workflow", "spawn_agent"):
+            raise ValueError(f"{name} 不允许后台化（递归/编排类入口）")
+        loop = get_current_loop()
+        registry = getattr(loop, "tool_registry", None) if loop is not None else None
+        reg = registry.get(name) if registry is not None else None
+        if reg is None:
+            raise ValueError(f"unknown tool: {name}")
+        definition = getattr(reg, "definition", reg)
+        from power_loop.tools.registry import async_capable_actions, async_capable_for
+
+        if not async_capable_for(definition, args):
+            acts = async_capable_actions(definition)
+            if acts:
+                # 工具本身可异步、只是这次这个 action 不行——把能异步的那几个报出来，
+                # 别让它以为整个工具都不能后台跑（报错即出路）。
+                got = str((args or {}).get("action") or "(没传 action)")
+                raise ValueError(
+                    f"{name} 只有 action={'/'.join(acts)} 可以后台跑，这次传的是 {got}；"
+                    "其余 action 有副作用，直接同步调用即可。"
+                )
+            # 报错即出路：说清「为什么不行」「哪些行」「这件事该怎么做」，三样都给。
+            # 明确**不做**兜底同步执行：模型调 background_run 的语义是「别阻塞我，给我一个
+            # task_id」；兜底改成阻塞执行，它拿到的是同步结果，接下来很可能去 check 一个不存在
+            # 的 task_id，或者以为自己已经并行了而其实没有。一个「成功」的错误回执比一个说清楚
+            # 的报错更贵。
+            _others = []
+            if registry is not None:
+                for _d in sorted(registry.definitions(), key=lambda x: x.name):
+                    if _d.name in ("background_run", "workflow", "spawn_agent"):
+                        continue
+                    if not getattr(_d, "async_capable", False):
+                        continue
+                    _a = async_capable_actions(_d)
+                    _others.append(f"{_d.name}({'/'.join(_a)})" if _a else _d.name)
+            raise ValueError(
+                f"{name} 不能后台跑：它有副作用（写文件 / 发布 / 对外投递这类），"
+                "重跑或并发都不安全。**这件事直接调用 " + name + " 就行**，不用包一层。"
+                + ("\n可以后台跑的是：" + "、".join(_others) if _others else "")
+            )
+        store, sid = _current_store_and_session()
+        if store is not None and sid is not None:
+            rows = await store.list_background_tasks(sid)
+            running = sum(1 for r in rows if r.status == "running" and r.command.startswith("tool:"))
+            if running >= 8:
+                raise ValueError("后台工具任务已达并发上限（8）——先 check 收结果再发新的。")
+        task_id = str(uuid.uuid4())[:8]
+        args = dict(args or {})
+        label = f"tool:{name} " + json.dumps(args, ensure_ascii=False)[:160]
+        with self._lock:
+            self.tasks[task_id] = {"command": label, "status": "running", "result": None}
+        if store is not None and sid is not None:
+            await store.upsert_background_task(
+                sid, task_id=task_id, command=label, status="running",
+                return_code=None, output_tail="(running)",
+            )
+
+        async def _worker() -> None:
+            status, output = "completed", ""
+            try:
+                result = await registry.invoke_async(name, args)
+                output = str(result if result is not None else "")[:8000]
+            except Exception as exc:  # noqa: BLE001 — 失败是任务结果，不是崩溃
+                status = "failed"
+                output = f"{type(exc).__name__}: {exc}"[:2000]
+            with self._lock:
+                task = self.tasks.get(task_id)
+                if task is not None:
+                    task["status"] = status
+                    task["result"] = output or "(no output)"
+            if store is not None and sid is not None:
+                try:
+                    await store.upsert_background_task(
+                        sid, task_id=task_id, command=label, status=status,
+                        return_code=0 if status == "completed" else 1,
+                        output_tail=output or "(no output)",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("tool task %s: status write-back failed", task_id, exc_info=True)
+            cb = _TOOL_TASK_ON_COMPLETE
+            if cb is not None:
+                try:
+                    await cb(sid, task_id, status)
+                except Exception:  # noqa: BLE001 — 宿主回调失败不毁任务结果
+                    logger.warning("tool task %s: on_complete callback failed", task_id, exc_info=True)
+
+        asyncio.create_task(_worker(), name=f"bg-tool-{task_id}")
+        return (
+            f"后台任务已启动：task_id={task_id}（{label[:80]}）。你可以继续做别的；"
+            "完成后会收到通知，background_run(action=\"check\", task_id=\"" + task_id + "\") 取结果。"
+        )
+
     async def check(self, task_id: str | None = None) -> str:
         store, sid = _current_store_and_session()
         if store is not None and sid is not None:
@@ -1444,9 +1594,20 @@ class BackgroundManager:
 
 BG = BackgroundManager()
 
+#: 6.8.0 宿主 seam：后台**工具**任务完成时回调 ``(session_id, task_id, status)``。
+#: 宿主用它决定要不要唤醒一个已 pass_turn 的 agent（在忙的 session 下一轮开轮时
+#: BackgroundRuntimeProjector 本来就会注入更新，无需回调介入）。
+_TOOL_TASK_ON_COMPLETE: Any = None
+
+
+def register_tool_task_callback(cb: Any) -> None:
+    global _TOOL_TASK_ON_COMPLETE
+    _TOOL_TASK_ON_COMPLETE = cb
+
 
 async def run_background(
-    action: str, command: str | None = None, task_id: str | None = None
+    action: str, command: str | None = None, task_id: str | None = None,
+    tool: str | None = None, args: dict[str, Any] | None = None,
 ) -> str:
     """Execute one action of the merged ``background_run`` tool."""
     operation = str(action or "").strip().lower()
@@ -1456,7 +1617,13 @@ async def run_background(
         return await BG.run(str(command))
     if operation == "check":
         return await BG.check(task_id)
-    raise ValueError("background_run action must be one of: run, check")
+    if operation == "list":
+        # 6.17.0：list 是 check 不带 task_id 的**显式**别名。「列出全部」原来藏在
+        # 「check 不带参数」这个隐式约定里，模型要先知道才用得上——同一件事该只有一个名字。
+        return await BG.check(None)
+    if operation == "tool":
+        return await BG.run_tool(tool, args)
+    raise ValueError("background_run action must be one of: run, check, list, tool")
 
 
 async def run_todo(items: list[dict[str, Any]]) -> str:
@@ -1464,15 +1631,10 @@ async def run_todo(items: list[dict[str, Any]]) -> str:
     store, sid = _current_store_and_session()
     if store is not None and sid is not None:
         rendered = _render_todos(validated)
-        done = sum(1 for item in validated if item["status"] == "completed")
         await store.set_runtime_state(
             sid,
             "todo",
-            {
-                "items": validated,
-                "rendered": rendered,
-                "counts": {"total": len(validated), "completed": done},
-            },
+            {"items": validated, "rendered": rendered, "counts": _todo_counts(validated)},
         )
         # Keep the in-process context warm for UI/event compatibility.
         get_ctx().todo.update(validated)
@@ -1516,7 +1678,15 @@ async def run_note(
         return f"noted as #{row.note_id} ({count}/{policy.max_notes} notes used)"
     if operation == "update":
         if note_id is None:
-            raise ValueError("note action=update requires note_id")
+            # 6.22.0: update without an id used to raise; the model routinely ignored the error and the
+            # memory was lost. Record it as a new note and say so — the id comes back in the receipt.
+            if not str(content or "").strip():
+                raise ValueError("note action=update without note_id needs content (or use action=list to find the #id)")
+            row = await add_note_checked(store, sid, content, pinned=bool(pinned), policy=policy)
+            count = await store.count_notes(sid)
+            return (f"warning: update had no note_id, so this was recorded as a NEW note #{row.note_id} "
+                    f"({count}/{policy.max_notes} used). Pass note_id=#{row.note_id} to change it later; "
+                    "if you meant an older note, list notes, update that one and delete this duplicate.")
         await update_note_checked(
             store, sid, int(note_id), content=content, pinned=pinned, policy=policy
         )
@@ -1554,8 +1724,19 @@ async def run_schedule_wakeup(
     every_seconds: int | None = None,
     timer_id: int | None = None,
 ) -> str:
-    """Execute one action of the merged ``schedule_wakeup`` tool."""
+    """Execute one action of the merged ``schedule_wakeup`` tool.
+
+    ``action`` 可省略（6.13.0）：按参数形状推断——有 delay_seconds 就是 schedule，只有 timer_id
+    就是 cancel，什么都没有就是 list。省略 action 是模型的高频写法（与同族 schedule_followup 的
+    ``operation='schedule' (default)`` 一致），此前被必填校验硬拒，每次多烧一轮。"""
     operation = str(action or "").strip().lower()
+    if not operation:
+        if delay_seconds is not None:
+            operation = "schedule"
+        elif timer_id is not None:
+            operation = "cancel"
+        else:
+            operation = "list"
     if operation == "schedule":
         if delay_seconds is None:
             raise ValueError("schedule_wakeup action=schedule requires delay_seconds")
@@ -1700,6 +1881,12 @@ RECALL_SEND_CONTENT_CHARS = 2000
 # a read file, a vision answer — so its cap is generous. The send-level view keeps the small cap
 # because it lists every row of the send.
 RECALL_SEND_ROW_CHARS = 40_000
+# The send-level listing is a MAP, not a payload. Real logs: no-seq calls averaged ~31.5K chars
+# against ~1.5K for seq'd ones — a listing of a tool-heavy send costs more context than the thing
+# the model was trying to find. So the whole listing lives inside one budget: every row still
+# appears (with its «sS» coordinate and its true size), bodies shrink together until they fit.
+RECALL_SEND_TOTAL_CHARS = 12_000
+RECALL_SEND_MIN_ROW_CHARS = 240
 
 
 async def run_recall_send(send_index: int, seq: int | None = None) -> str:
@@ -1745,18 +1932,28 @@ async def run_recall_send(send_index: int, seq: int | None = None) -> str:
         name = fn.get("name") if isinstance(fn, dict) else None
         return str(name or tc.get("name") or "?")
 
+    # 蒸馏（而不是原样吐 content）：多模态行的 content 是 JSON，原样返回等于把序列化的
+    # 块列表——内联 data URL 的话就是整个 base64——塞给模型。列整个 send 时不注入图片：
+    # 一次注入十几张会失控；要看某一行，recall 那一行（带 seq）。
+    bodies = [_recall_row_body(r)[0] for r in rows]
+    # One budget for the whole listing: rows all stay visible, bodies shrink together to fit.
+    cap = RECALL_SEND_CONTENT_CHARS
+    if sum(min(len(b), cap) for b in bodies) > RECALL_SEND_TOTAL_CHARS:
+        cap = max(RECALL_SEND_MIN_ROW_CHARS, RECALL_SEND_TOTAL_CHARS // max(1, len(rows)))
     blocks: list[str] = []
-    for r in rows:
-        body = r.content or ""
+    trimmed = 0
+    for r, body in zip(rows, bodies, strict=True):
         suffix = ""
         if r.tool_calls:
             names = ", ".join(_tc_name(tc) for tc in r.tool_calls)
             suffix = f"[tool_calls: {names}]"
+        full = len(body)
         # Truncate the CONTENT first (the body is the unbounded part), THEN append the
         # tool-calls suffix — otherwise a ~2000-char message would have its suffix cut, making
         # a tool-bearing send look tool-free in the inspector.
-        if len(body) > RECALL_SEND_CONTENT_CHARS:
-            body = body[:RECALL_SEND_CONTENT_CHARS] + " …[truncated]"
+        if full > cap:
+            trimmed += 1
+            body = body[:cap] + f" …[truncated: {full} chars — recall_send(send_index={target}, seq={r.seq}) for the original]"
         if suffix:
             body = f"{body}\n{suffix}" if body else suffix
         head = f"[seq {r.seq} · {r.role}"
@@ -1766,7 +1963,36 @@ async def run_recall_send(send_index: int, seq: int | None = None) -> str:
             head += f" · round {r.round_index}"
         head += "]"
         blocks.append(f"{head}\n{body}")
-    return f"send #{target} — {len(rows)} message(s):\n\n" + "\n\n".join(blocks)
+    header = f"send #{target} — {len(rows)} message(s)"
+    if trimmed:
+        header += (f"; {trimmed} body(ies) trimmed to {cap} chars to keep this listing small. "
+                   f"This is a MAP — for one original, call recall_send(send_index={target}, seq=S) "
+                   "with the seq you want (returns that row in full).")
+    return f"{header}:\n\n" + "\n\n".join(blocks)
+
+
+def _recall_row_body(row: Any) -> tuple[str, list[str]]:
+    """One stored row → (text a tool may return, ``[(path, ref)]`` of any images in it).
+
+    A multimodal row's ``content`` column holds JSON, and returning it raw hands the model a
+    serialized block list — with an inlined data URL that is the whole base64 payload. So the
+    text side is DISTILLED (same helper the projection uses), and the images are reported
+    separately for the caller to put back in front of the model.
+    """
+    from power_loop.runtime.representation import distill_multimodal_text
+    from power_loop.runtime.store.types import decode_row_content
+
+    text = distill_multimodal_text(getattr(row, "content", None), getattr(row, "meta", None)) or ""
+    decoded = decode_row_content(getattr(row, "content", None), getattr(row, "meta", None))
+    images: list[tuple[str, str]] = []
+    if isinstance(decoded, list):
+        for block in decoded:
+            if not isinstance(block, dict) or block.get("type") != "attachment":
+                continue
+            att = block.get("attachment") or {}
+            if att.get("kind") == "image" and att.get("path"):
+                images.append((str(att["path"]), str(att.get("ref") or "")))
+    return text, images
 
 
 def _render_recall_row(hit: Any, rows: list[Any], *, cap: int, head: str) -> str:
@@ -1784,12 +2010,36 @@ def _render_recall_row(hit: Any, rows: list[Any], *, cap: int, head: str) -> str
                         f"{fn.get('arguments') or ''}"
                     )
                     break
-    body = hit.content or ""
+    body, row_images = _recall_row_body(hit)
     total = len(body)
     if total > cap:
         body = body[:cap] + f" …[truncated: {total - cap} more chars of {total}]"
     label = f"[seq {hit.seq} · {hit.role}" + (f" · {hit.name}" if hit.name else "") + "]"
     blocks.append(f"{label}\n{body}")
+    # This row held image(s): put them back in front of the model for ONE round. A tool result
+    # cannot carry an image (OpenAI-compatible `tool` messages are text-only), so the picture
+    # arrives as its own user message and this text just says it is there.
+    if row_images:
+        from power_loop.core.agent_context import get_session_id
+        from power_loop.runtime.image_recall import queue_image_for_next_round
+
+        sid = get_session_id()
+        shown = [
+            path for path, ref in row_images
+            if queue_image_for_next_round(
+                sid, path=path, ref=ref, note=f"（{head} 里的图，已放回你眼前）"
+            )
+        ]
+        if shown:
+            blocks.append(
+                f"[{len(shown)} 张图已放到你眼前——它们只在这一轮可见，看完就没了；"
+                "还要再看就再 recall 一次。]"
+            )
+        else:
+            blocks.append(
+                "[这一行有图，但没能放进上下文（会话不可用或本轮排队已满）；"
+                "可以用 see_image 直接看它的路径。]"
+            )
     return f"{head} — original row ({total} chars):\n\n" + "\n\n".join(blocks)
 
 
@@ -1828,7 +2078,8 @@ async def _h_recall_send(**kw: Any) -> Any:
 
 
 async def _h_background_run(**kw: Any) -> Any:
-    return await run_background(kw["action"], kw.get("command"), kw.get("task_id"))
+    return await run_background(kw["action"], kw.get("command"), kw.get("task_id"),
+                                kw.get("tool"), kw.get("args"))
 
 
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {

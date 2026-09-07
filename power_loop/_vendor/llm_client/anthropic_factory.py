@@ -9,8 +9,10 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 
+from .capabilities import ModelCapabilities, coerce_capabilities
 from .interface import AnthropicChatConfig, LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
 from .llm_utils import parse_json_from_model_output_detailed
+from .multimodal import render_message_content
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,14 @@ class AnthropicMessagesLLMService(LLMService):
         self._cfg = cfg
         self._client: AsyncAnthropic | None = None
         self._last_usage: dict[str, Any] = {}
+        # Same declared-capabilities contract as the OpenAI-compatible transport. This
+        # transport translates messages itself instead of calling LLMRequest.to_messages(),
+        # so it never ran the multimodal renderer: an `attachment` block arrived here
+        # unrendered and _non_text_blocks emitted "[unsupported content block dropped]".
+        # Images therefore vanished on this path with only a marker to show for it.
+        self._capabilities: ModelCapabilities = coerce_capabilities(
+            cfg.capabilities, model=cfg.model
+        )
         logger.info(
             "Anthropic LLM: base_url=%s model=%s timeout_s=%s max_tokens=%s temperature=%s api_key=%s",
             cfg.base_url,
@@ -113,6 +123,10 @@ class AnthropicMessagesLLMService(LLMService):
     def _record_usage(self, usage: Any) -> None:
         self._last_usage = self._usage_dict_from_any(usage)
 
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self._capabilities
+
     def _system_and_messages(self, request: LLMRequest) -> tuple[str | None, list[dict[str, Any]]]:
         system_parts: list[str] = []
         if request.system_prompt:
@@ -130,6 +144,13 @@ class AnthropicMessagesLLMService(LLMService):
         for raw in request.messages or []:
             msg = dict(raw)
             role = str(msg.get("role") or "user")
+            if "content" in msg:
+                # Render attachments FIRST (attachment -> image_url data URL, PDF -> text),
+                # enforcing the declared-capability check, then let the translation below
+                # turn image_url blocks into native Anthropic image blocks.
+                msg["content"] = render_message_content(
+                    msg.get("content"), role=role, capabilities=self._capabilities
+                )
             if role == "system":
                 content = self._text_from_content(msg.get("content"))
                 if content:
