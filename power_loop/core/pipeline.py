@@ -638,8 +638,74 @@ class AgentPipeline:
 
     _DISTILL_MARK = "[distilled #"
 
+    #: 参数被瘦身后留在原位的标记（值本身仍是合法 JSON 字符串，工具早已执行完，
+    #: 这里只影响模型回看时读到什么）。
+    _ARGS_MARK = "⟨已移出上下文"
+    #: 单个参数字段超过它才瘦身：短字段（路径、开关、行号）留着才看得出这次调用干了什么。
+    _ARGS_KEEP_CHARS = 200
+
+    def _has_heavy_args(self, idx: int) -> bool:
+        """这一行是 assistant，且它的某个 tool_calls 参数里有还没瘦过的大字段。"""
+        m = self.history[idx]
+        if m.get("role") != "assistant":
+            return False
+        for tc in m.get("tool_calls") or []:
+            raw = ((tc or {}).get("function") or {}).get("arguments")
+            if (
+                isinstance(raw, str)
+                and len(raw) > 300
+                and self._ARGS_MARK not in raw
+            ):
+                return True
+        return False
+
+    def _distill_tool_call_args(self, idx: int, seqs: list[Any]) -> int:
+        """把一行 assistant 的 tool_calls 参数里的大字段换成指针，**保持合法 JSON**。
+
+        为什么不套用投影那套逐工具规则：那边产出的是给人读的一行散文，而这里改的是
+        供应商要按 JSON 解析的 ``function.arguments``。所以规则通用——短字段原样留下
+        （路径、模式、行号这些才看得出这次调用干了什么），只有超过 ``_ARGS_KEEP_CHARS``
+        的长字符串换成一句带 ``recall_send`` 坐标的说明。工具早已执行完，改它不影响任何
+        副作用，只影响模型回看时读到什么。返回释放的估算 token。"""
+        m = self.history[idx]
+        seq = seqs[idx] if idx < len(seqs) else None
+        coord = (
+            f"recall_send(send_index={self.send_index}, seq={seq})"
+            if (self.send_index is not None and seq is not None)
+            else "recall_send"
+        )
+        freed = 0
+        for tc in m.get("tool_calls") or []:
+            fn = (tc or {}).get("function") or {}
+            raw = fn.get("arguments")
+            if not isinstance(raw, str) or len(raw) <= 300 or self._ARGS_MARK in raw:
+                continue
+            try:
+                args = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(args, dict):
+                continue
+            slim = {
+                k: (
+                    f"{self._ARGS_MARK} {len(v)} 字符，需要时 {coord} 回取⟩"
+                    if isinstance(v, str) and len(v) > self._ARGS_KEEP_CHARS
+                    else v
+                )
+                for k, v in args.items()
+            }
+            new_raw = json.dumps(slim, ensure_ascii=False)
+            if len(new_raw) >= len(raw):
+                continue  # 没省下就别动（改了反而打断前缀缓存）
+            fn["arguments"] = new_raw
+            freed += (len(raw) - len(new_raw)) // 4
+        return freed
+
     def _distill_oldest_tool_rows(self, batch: int, hot_tail: int) -> int:
-        """把当前 send 里**最早的 batch 条**尚未蒸馏的工具结果在内存里替换成投影行（6.10.0）。
+        """把当前 send 里**最早的 batch 条**工具占用在内存里换成指针（6.10.0；6.25.0 起含调用参数）。
+
+        「工具占用」有两块：结果在 tool 行、**参数在 assistant 行的 tool_calls 里**。两块按位置
+        统一排队、一起算进 batch，最早的先回收。
 
         投影行 = 与 end-of-send 投影**同一套** ``ToolDefinition.project`` 蒸馏（找不到钩子就截断），
         带 ``recall_send(send_index, seq)`` 坐标——原文永远在 pl_messages，要用就回取。不落盘、不改
@@ -662,14 +728,27 @@ class AgentPipeline:
         protected = (
             set(tool_idx[max(0, len(tool_idx) - hot_tail):]) if hot_tail > 0 else set()
         )
-        candidates = [
+        # 热尾的起点：它之后的任何一行（工具结果、assistant 的调用参数）都算「手边的东西」。
+        protect_from = min(protected) if protected else len(self.history)
+        result_ok = {
             i for i in tool_idx
             if i not in protected
             and not str(self.history[i].get("content")).startswith(self._DISTILL_MARK)
             and len(self.history[i].get("content") or "") > 300
-        ]
-        picked = candidates[: max(1, batch)]
-        if not picked:
+        }
+        # 工具在上下文里占两块：结果在 tool 行，**参数在 assistant 行的 tool_calls 里**。
+        # 参数从来没被保险丝碰过，而实测它占全库上下文的 29%——write_file 一个人 12.6MB，
+        # 单次最大 5.4 万字符：文件已经落盘了，正文却还在 prompt 里一轮轮重发。
+        # 跨 send 的投影早就把两块一起收掉了，缺的只是 send 内这一层。
+        candidates: list[tuple[str, int]] = sorted(
+            [("result", i) for i in result_ok]
+            + [("args", i) for i in range(protect_from) if self._has_heavy_args(i)],
+            key=lambda x: x[1],
+        )
+        picked_all = candidates[: max(1, batch)]
+        picked = [i for kind, i in picked_all if kind == "result"]
+        picked_args = [i for kind, i in picked_all if kind == "args"]
+        if not picked_all:
             return 0
         # tool_call_id → (name, args) 从前面的 assistant(tool_calls) 行反查。
         # 只解析**本批选中的**那几个 id：以前是每次触发都把全历史所有 assistant 行的所有
@@ -678,7 +757,7 @@ class AgentPipeline:
         wanted = {str(self.history[i].get("tool_call_id") or "") for i in picked}
         wanted.discard("")
         call_meta: dict[str, tuple[str, Any]] = {}
-        for m in self.history:
+        for m in self.history if wanted else ():
             if m.get("role") != "assistant":
                 continue
             for tc in m.get("tool_calls") or []:
@@ -716,6 +795,8 @@ class AgentPipeline:
                            f"需要时 {coord} 回取] {line}")
             freed += max(0, (len(content) - len(new_content)) // 4)
             m["content"] = new_content
+        for i in picked_args:
+            freed += self._distill_tool_call_args(i, seqs)
         return freed
 
     def _estimate_history_tokens(self) -> int:

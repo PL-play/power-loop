@@ -289,3 +289,66 @@ async def test_insend_distill_protects_everything_when_fewer_rows_than_hot_tail(
         assert all(r == big for r in rows), f"第 {i} 次请求里有被蒸馏的行：{rows}"
     await loop.aclose()
 
+def _write_call(cid: str, path: str, body: str) -> LLMResponse:
+    import json as _json
+    args = _json.dumps({"path": path, "content": body, "mode": "overwrite"}, ensure_ascii=False)
+    return LLMResponse(raw_text="", tool_calls=[{
+        "id": cid, "type": "function", "function": {"name": "echo", "arguments": args},
+    }])
+
+
+def _args_of(msgs: list[dict[str, Any]]) -> list[str]:
+    out = []
+    for m in msgs:
+        for tc in m.get("tool_calls") or []:
+            out.append(((tc or {}).get("function") or {}).get("arguments") or "")
+    return out
+
+
+@pytest.mark.asyncio
+async def test_insend_distill_also_slims_tool_call_arguments(tmp_path):
+    """保险丝也回收**调用参数**，不只是结果（6.25.0）。
+
+    工具在上下文里占两块：结果在 tool 行、参数在 assistant 行的 tool_calls 里。参数此前
+    从没被碰过，而实测占全库上下文 29%——write_file 一个人 12.6MB、单次最大 5.4 万字符：
+    文件已经落盘，正文却还在 prompt 里一轮轮重发。跨 send 的投影早就两块一起收，缺的是
+    send 内这一层。规则通用：短字段（path/mode）原样留下，长字符串换成带 recall_send 坐标
+    的说明，且**仍是合法 JSON**。
+    """
+    body = "B" * 3000
+    llm = _Scripted(responses=[
+        _write_call("w1", "a.txt", body),   # prepare_round(1)：10 < 50 不动
+        _write_call("w2", "b.txt", body),   # prepare_round(2)：触发
+        _write_call("w3", "c.txt", body),
+        _resp("done"),
+    ])
+    llm.responses[0].token_usage = LLMTokenUsage(prompt_tokens=10, completion_tokens=1, total_tokens=11)
+    for r in llm.responses[1:3]:
+        r.token_usage = LLMTokenUsage(prompt_tokens=100, completion_tokens=1, total_tokens=101)
+    kwargs: dict[str, Any] = {}
+    rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
+    if rep_cls is not None:
+        kwargs["representation"] = rep_cls()
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=str(tmp_path / "s.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs),
+        tool_registry=_echo_registry("ok"),
+    )
+    sid = await loop.new_session()
+    assert (await loop.send("hi", session_id=sid)).status == "completed"
+
+    last = _args_of(llm.seen[-1])
+    assert last, "最后一次请求里应当有工具调用"
+    slimmed = [a for a in last if "⟨已移出上下文" in a]
+    assert slimmed, f"参数没有被回收：{[a[:80] for a in last]}"
+    import json as _json
+    for a in slimmed:
+        d = _json.loads(a)                      # 仍是合法 JSON
+        assert d["mode"] == "overwrite"         # 短字段原样保留
+        assert d["path"] in ("a.txt", "b.txt", "c.txt")
+        assert "recall_send" in d["content"]    # 长字段换成带坐标的指针
+        assert body not in a
+    assert any(body in a for a in last), "热的那次调用参数不该被动"
+    await loop.aclose()
+
