@@ -233,7 +233,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
                 },
                 "note_id": {
                     "type": "integer",
-                    "description": "Required for update/delete; obtain it with action=list.",
+                    "description": "Required for delete; for update obtain it with action=list — an update WITHOUT note_id is recorded as a new note (receipt returns its #id with a warning).",
                 },
                 "content": {
                     "type": "string",

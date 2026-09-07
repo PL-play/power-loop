@@ -1678,7 +1678,15 @@ async def run_note(
         return f"noted as #{row.note_id} ({count}/{policy.max_notes} notes used)"
     if operation == "update":
         if note_id is None:
-            raise ValueError("note action=update requires note_id")
+            # 6.22.0: update without an id used to raise; the model routinely ignored the error and the
+            # memory was lost. Record it as a new note and say so — the id comes back in the receipt.
+            if not str(content or "").strip():
+                raise ValueError("note action=update without note_id needs content (or use action=list to find the #id)")
+            row = await add_note_checked(store, sid, content, pinned=bool(pinned), policy=policy)
+            count = await store.count_notes(sid)
+            return (f"warning: update had no note_id, so this was recorded as a NEW note #{row.note_id} "
+                    f"({count}/{policy.max_notes} used). Pass note_id=#{row.note_id} to change it later; "
+                    "if you meant an older note, list notes, update that one and delete this duplicate.")
         await update_note_checked(
             store, sid, int(note_id), content=content, pinned=pinned, policy=policy
         )

@@ -320,8 +320,12 @@ async def test_note_list_action_reads_back_notes(store: SessionStore) -> None:
 
         with pytest.raises(ValueError, match="requires content"):
             await run_note("add")
-        with pytest.raises(ValueError, match="requires note_id"):
-            await run_note("update", content="missing id")
+        # 6.22.0: update without note_id is recorded as a new note with a warning (not an error).
+        out = await run_note("update", content="missing id")
+        assert out.startswith("warning:") and "NEW note #" in out
+        assert "missing id" in await run_note("list")
+        with pytest.raises(ValueError, match="needs content"):
+            await run_note("update")
         with pytest.raises(ValueError, match="must be one of"):
             await run_note("unknown")
     finally:
@@ -347,3 +351,29 @@ def test_note_registered_as_single_default_tool() -> None:
         "delete",
         "list",
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_note_update_without_id_records_new_note(store) -> None:
+    """6.22.0: update with no note_id is recorded as a NEW note with a warning (never a lost memory)."""
+    from power_loop.core.agent_context import set_current_loop, set_session_id
+    from power_loop.tools.default_tools import run_note
+
+    class _FakeLoop:
+        def __init__(self, s) -> None:
+            self.store = s
+            self.config = None
+
+    sid = await store.create_session()
+    tok_l = set_current_loop(_FakeLoop(store))  # type: ignore[arg-type]
+    tok_s = set_session_id(sid)
+    try:
+        out = await run_note("update", content="user prefers the wine-red accent")
+        assert out.startswith("warning:") and "#1" in out
+        assert "wine-red" in await run_note("list")
+        with pytest.raises(ValueError):
+            await run_note("update")  # neither id nor content
+    finally:
+        from power_loop.core.agent_context import reset_current_loop, reset_session_id
+        reset_session_id(tok_s)
+        reset_current_loop(tok_l)
