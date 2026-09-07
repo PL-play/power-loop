@@ -2072,9 +2072,9 @@ class StatefulAgentLoop:
             return  # a spawned sub-agent run, not a top-level send
         if status in ("waiting_for_input", "pending_tools"):
             return  # send not finished; the resume will re-finalize under the same send_index
-        rows = [
-            r for r in await store.load_active_messages(sid) if r.send_index == send_index
-        ]
+        # 只取本 send 的行：这里要投影的就是这一个 send，从前是读全表再在 Python 里过滤，
+        # 等于每个 send 都为一小段做一次 O(会话) 的读。投影模式下 pl_messages 永不压缩。
+        rows = await store.load_active_messages(sid, send_index=send_index)
         if not rows:
             return
         projected = projector.project_send(rows, send_index=send_index, tool_registry=tool_registry)

@@ -405,7 +405,7 @@ class SessionStore:
         return [_row_to_hook_event(r) for r in rows]
 
     async def load_active_messages(
-        self, session_id: str, *, after_seq: int | None = None
+        self, session_id: str, *, after_seq: int | None = None, send_index: int | None = None
     ) -> list[MessageRow]:
         """Active messages in **logical** order (a ``compact_note`` sorts at its
         ``meta['ord']``, not its high identity ``seq``).
@@ -413,18 +413,25 @@ class SessionStore:
         ``after_seq`` (inclusive) returns only the active tail with ``seq >= after_seq`` — a
         cheap O(delta) read for incrementally extending a cached window after the caller's own
         appends (valid only when no compaction reshuffled the older active set; the caller
-        must reload in full otherwise)."""
-        if after_seq is None:
-            rows = await self._db.fetchall(
-                f"SELECT * FROM {self.t.messages} WHERE session_id=? AND state=? ORDER BY seq ASC",
-                (session_id, MessageState.ACTIVE.value),
-            )
-        else:
-            rows = await self._db.fetchall(
-                f"SELECT * FROM {self.t.messages} WHERE session_id=? AND state=? AND seq>=? "
-                "ORDER BY seq ASC",
-                (session_id, MessageState.ACTIVE.value, int(after_seq)),
-            )
+        must reload in full otherwise).
+
+        ``send_index`` returns only that one send's rows. The end-of-send projection needs
+        exactly this and used to read the WHOLE session then filter in Python — an O(session)
+        read (and O(session) row objects) on every send, for a slice that is O(one send).
+        In projection mode ``pl_messages`` is never compacted, so that table only grows:
+        the largest real session was 2332 rows / 2.7 MB. Rows with a NULL ``send_index``
+        (compact notes) are excluded, matching the Python filter this replaces."""
+        where = "WHERE session_id=? AND state=?"
+        params: list[object] = [session_id, MessageState.ACTIVE.value]
+        if after_seq is not None:
+            where += " AND seq>=?"
+            params.append(int(after_seq))
+        if send_index is not None:
+            where += " AND send_index=?"
+            params.append(int(send_index))
+        rows = await self._db.fetchall(
+            f"SELECT * FROM {self.t.messages} {where} ORDER BY seq ASC", tuple(params)
+        )
         messages = [_row_to_message(r) for r in rows]
         messages.sort(key=_logical_order_key)
         return messages

@@ -190,3 +190,66 @@ async def test_insend_distill_respects_hot_tail(tmp_path):
     # 只有两条工具结果且 hot_tail=2 → 一条都不许动
     assert _tool_rows(llm.seen[2]) == [big, big]
     await loop.aclose()
+
+@pytest.mark.asyncio
+async def test_insend_distill_only_parses_the_rows_it_picks(tmp_path, monkeypatch):
+    """反查 (name, args) 只解析本批选中的那几条，不是每轮把全历史重建一遍。
+
+    旧写法每次触发都遍历全部 assistant 行、json.loads 每一个 tool_calls 的 arguments，
+    只为查其中 batch 条（默认 10）。保险丝一旦启动几乎每轮都触发，于是每轮做一次
+    O(历史) 的反序列化。这里数 json.loads 的次数：新写法 = 触发次数 × batch，
+    旧写法 = 1+2+3+…（随轮次线性增长）。
+    """
+    import power_loop.core.pipeline as pipeline_mod
+
+    # 只数蒸馏函数**内部**的解析：同一个 json.loads 在工具执行那条路径上也会被调用。
+    calls: list[str] = []
+    inside: list[bool] = []
+    real_loads = pipeline_mod.json.loads
+    real_distill = pipeline_mod.AgentPipeline._distill_oldest_tool_rows
+
+    class _CountingJson:
+        dumps = staticmethod(pipeline_mod.json.dumps)
+
+        @staticmethod
+        def loads(x, *a, **kw):
+            if inside and isinstance(x, str):
+                calls.append(x)
+            return real_loads(x, *a, **kw)
+
+    def _spy(self, batch, hot_tail):
+        inside.append(True)
+        try:
+            return real_distill(self, batch, hot_tail)
+        finally:
+            inside.pop()
+
+    monkeypatch.setattr(pipeline_mod, "json", _CountingJson)
+    monkeypatch.setattr(pipeline_mod.AgentPipeline, "_distill_oldest_tool_rows", _spy)
+
+    big = "R" * 400
+    llm = _Scripted(responses=[
+        _tool_resp("c1", prompt=10),    # prepare_round(1)：10 < 50，不触发
+        _tool_resp("c2", prompt=100),   # prepare_round(2)：触发，选 1 条
+        _tool_resp("c3", prompt=100),   # prepare_round(3)：触发，选 1 条
+        _tool_resp("c4", prompt=100),   # prepare_round(4)：触发，选 1 条
+        _resp("done"),
+    ])
+    kwargs: dict[str, Any] = {}
+    rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
+    if rep_cls is not None:
+        kwargs["representation"] = rep_cls()
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=str(tmp_path / "s.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs),
+        tool_registry=_echo_registry(big),
+    )
+    sid = await loop.new_session()
+    assert (await loop.send("hi", session_id=sid)).status == "completed"
+    await loop.aclose()
+
+    args_parsed = [c for c in calls if c == '{"text": "x"}']
+    # 3 次触发 × batch=1。旧写法这里是 1+2+3=6。
+    assert len(args_parsed) == 3, f"解析了 {len(args_parsed)} 次，应当只解析选中的那 3 条"
+

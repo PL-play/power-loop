@@ -664,19 +664,30 @@ class AgentPipeline:
         picked = candidates[: max(1, batch)]
         if not picked:
             return 0
-        # tool_call_id → (name, args) 从前面的 assistant(tool_calls) 行反查
+        # tool_call_id → (name, args) 从前面的 assistant(tool_calls) 行反查。
+        # 只解析**本批选中的**那几个 id：以前是每次触发都把全历史所有 assistant 行的所有
+        # tool_calls 的 arguments 反序列化一遍建全表，只为查其中 batch 条（默认 10）。
+        # 保险丝一旦启动几乎每轮都触发，于是每轮做一次 O(历史) 的 json.loads。
+        wanted = {str(self.history[i].get("tool_call_id") or "") for i in picked}
+        wanted.discard("")
         call_meta: dict[str, tuple[str, Any]] = {}
         for m in self.history:
-            if m.get("role") == "assistant":
-                for tc in m.get("tool_calls") or []:
-                    fn = (tc or {}).get("function") or {}
-                    args = fn.get("arguments")
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except (TypeError, ValueError):
-                            args = {"raw": args[:200]}
-                    call_meta[str((tc or {}).get("id") or "")] = (str(fn.get("name") or "tool"), args)
+            if m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or []:
+                cid = str((tc or {}).get("id") or "")
+                if cid not in wanted or cid in call_meta:
+                    continue
+                fn = (tc or {}).get("function") or {}
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (TypeError, ValueError):
+                        args = {"raw": args[:200]}
+                call_meta[cid] = (str(fn.get("name") or "tool"), args)
+            if len(call_meta) == len(wanted):
+                break
         freed = 0
         for i in picked:
             m = self.history[i]

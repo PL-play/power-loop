@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+## [6.23.0] — 2026-09-07
+
+### Changed
+
+- **send 内保险丝只解析它挑中的那几条**（`AgentPipeline._distill_oldest_tool_rows`）：
+  反查 `tool_call_id → (name, args)` 原来是每次触发都遍历**全部** assistant 行、
+  `json.loads` 每一个 `tool_calls` 的 arguments 建一张全表，只为查其中 `batch` 条
+  （默认 10）。保险丝一旦启动几乎每轮都触发，于是每轮做一次 O(历史) 的反序列化。
+  现在只解析选中行对应的那几个 id，凑齐就 break。行为不变，测试用 json.loads 计数守住。
+
+- **end-of-send 投影只读本 send 的行**：`SessionStore.load_active_messages` 新增
+  `send_index=` 过滤（下推到 SQL），`stateful_loop` 的收尾投影改用它。原来是
+  `load_active_messages(sid)` 读整个会话再在 Python 里 `r.send_index == send_index`
+  过滤——投影模式下 `pl_messages` 永不压缩，那张表只会一直长（真实会话已到 2332 行 /
+  2.7 MB），每个 send 都为一小段做一次 O(会话) 的读与 O(会话) 的行对象构造。
+  `send_index` 为 NULL 的行（compact note）照旧排除，与被替换的 Python 过滤等价。
+
+- `note(action="update")` 没带 `note_id` 时**按新建记录并回一句 warning**，不再抛错
+  （原 6.22.0，未发布）：模型撞了错就把那条记忆丢了，而它真正想做的是记下来。
+
 ## [6.21.0] — 2026-09-04
 
 ### Changed

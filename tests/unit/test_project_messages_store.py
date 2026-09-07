@@ -209,3 +209,30 @@ async def test_v2_to_v3_migration_adds_hook_events(tmp_path) -> None:
     assert evs[0].message_seq == seq and evs[0].hook == "builtin.memory_recall"
     assert evs[0].payload["items"][0]["name"] == "memory_0"
     await s2.close()
+
+@pytest.mark.asyncio
+async def test_load_active_messages_can_filter_to_one_send(store: SessionStore) -> None:
+    """end-of-send 投影只要这一个 send 的行——以前是读全表再在 Python 里过滤。
+
+    投影模式下 pl_messages 永不压缩，那张表只会一直长（真实会话已到 2332 行 / 2.7MB），
+    而每个 send 都要为一小段做一次 O(会话) 的读。send_index=None 的行（compact note）
+    不属于任何 send，必须排除——与它替代的那句 Python 过滤语义一致。
+    """
+    sid = await store.create_session()
+    await store.append_message(sid, role="user", content="s1-u", round_index=0, send_index=1)
+    await store.append_message(sid, role="assistant", content="s1-a", round_index=1, send_index=1)
+    await store.append_message(sid, role="user", content="s2-u", round_index=0, send_index=2)
+    await store.append_message(sid, role="assistant", content="no-send", round_index=0)
+
+    all_rows = await store.load_active_messages(sid)
+    assert len(all_rows) == 4
+
+    s1 = await store.load_active_messages(sid, send_index=1)
+    assert [r.content for r in s1] == ["s1-u", "s1-a"]
+    s2 = await store.load_active_messages(sid, send_index=2)
+    assert [r.content for r in s2] == ["s2-u"]
+    assert await store.load_active_messages(sid, send_index=99) == []
+    # 与它替代的 Python 过滤逐字等价
+    assert [r.seq for r in s1] == [r.seq for r in all_rows if r.send_index == 1]
+    await store.close_session_tree(sid)
+
