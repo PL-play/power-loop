@@ -471,3 +471,31 @@ async def test_subagent_inherits_parent_retry_policy(store: SessionStore) -> Non
 
     assert child_result["status"] == "completed"
     assert child_result["final_text"] == "child made it"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_spec_llm_override_uses_another_service(store: SessionStore) -> None:
+    """6.26.0：``llm=`` 让子运行用另一个 LLM 服务（另一家供应商 / endpoint），而不只是 ``spec.model``
+    那种同一服务上的模型名覆盖。宿主的「答题子 agent」用它把模型指向后台配置的条目。"""
+    spec = AgentSpec(name="qa", system_prompt="P", lifecycle=SubagentLifecycle.EPHEMERAL.value)
+    parent_llm = _Scripted(responses=[LLMResponse(raw_text="parent immediate")])
+    parent_loop = StatefulAgentLoop(llm=parent_llm, store=store, config=AgentLoopConfig(max_rounds=1))
+    parent_sid = (await parent_loop.send("hi", session_id=await parent_loop.new_session())).session_id
+
+    # 父 loop 的服务如果被用到会答「parent side」；覆盖的服务答「override side」。
+    parent_loop.llm = _Scripted(responses=[LLMResponse(raw_text="parent side")])
+    override = _Scripted(responses=[LLMResponse(raw_text="override side")])
+    from power_loop.core.agent_context import (
+        reset_current_loop,
+        reset_session_id,
+        set_current_loop,
+        set_session_id,
+    )
+    tok_loop, tok_sid = set_current_loop(parent_loop), set_session_id(parent_sid)
+    try:
+        r = await run_agent_spec(spec, "go", parent_loop=parent_loop, llm=override)
+    finally:
+        reset_current_loop(tok_loop)
+        reset_session_id(tok_sid)
+    # 父 loop 的服务被调到的话答案会是「parent side」——final_text 本身就证明走的是覆盖的服务。
+    assert r["status"] == "completed" and r["final_text"] == "override side"

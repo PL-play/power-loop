@@ -178,6 +178,7 @@ async def run_agent_spec(
     parent_loop: Any,
     spawn_tool_call_id: str | None = None,
     stop_event: CancellationLike = None,
+    llm: Any | None = None,
     inherit_send_filter: bool = True,
 ) -> dict[str, Any]:
     """Materialize ``spec`` as a child session under ``parent_loop`` and run it.
@@ -204,6 +205,7 @@ async def run_agent_spec(
         so the parent can debug.
       * ``LINKED`` → child kept; cascade-deleted when parent is closed.
       * ``DETACHED`` → child kept, lives independently.
+        ``llm`` overrides the LLM service for the child (default: the parent loop's).
     """
     if not isinstance(spec, AgentSpec):
         spec = AgentSpec.from_json(spec)
@@ -313,8 +315,11 @@ async def run_agent_spec(
     # Build a sibling loop sharing the same store + registry-subset.
     from power_loop.agent.stateful_loop import StatefulAgentLoop
 
+    # ``llm`` 覆盖（6.26.0）：子运行可以用另一个 LLM 服务（另一家供应商 / 另一个 endpoint），
+    # 而不只是 ``spec.model`` 那种同一服务上的模型名覆盖。宿主的「答题子 agent」用它把模型
+    # 指向后台配置的 admin_llm_models 条目；None = 沿用父 loop 的服务（原行为）。
     child_loop = StatefulAgentLoop(
-        llm=parent_loop.llm,
+        llm=llm if llm is not None else parent_loop.llm,
         store=store,
         config=child_config,
         tool_registry=sub_registry,

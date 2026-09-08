@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+## [6.26.0] — 2026-09-08
+
+### Added
+
+- **`run_agent_spec(..., llm=)`**：子运行可以用另一个 LLM 服务（另一家供应商 / 另一个 endpoint），
+  而不只是 `AgentSpec.model` 那种「同一服务上换个模型名」的覆盖。None = 沿用父 loop 的服务（原行为）。
+  宿主的「答题子 agent」用它把模型指向后台配置的 `admin_llm_models` 条目，配置留空则随主 agent。
+
 ## [6.25.0] — 2026-09-07
 
 ### Changed
