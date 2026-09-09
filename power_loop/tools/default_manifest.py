@@ -337,8 +337,12 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "task_id immediately. action=tool runs one async-capable TOOL in the background "
             "(tool=<name>, args={…}) and returns a task_id at once — use it for long, "
             "side-effect-free calls (image generation, web fetches) whose result you do not "
-            "need immediately; you will be notified on completion. action=check reports a "
-            "task's status/output by task_id, or lists all your tasks when task_id is omitted."
+            "need immediately. **Results are delivered to you automatically on completion — "
+            "do not poll for them.** While a task runs, do other work, or pass_turn if there "
+            "is nothing else to do; repeatedly calling check to see whether it finished burns "
+            "rounds without making it finish sooner. action=check is the fallback for a task "
+            "you suspect is stuck: it reports status/output by task_id, or lists all your "
+            "tasks when task_id is omitted."
         ),
         input_schema={
             "type": "object",

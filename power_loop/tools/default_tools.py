@@ -1314,7 +1314,11 @@ class BackgroundManager:
         with self._lock:
             self._threads[task_id] = thread
         thread.start()
-        return f"Background task {task_id} started: {command[:80]}"
+        return (
+            f"Background task {task_id} started: {command[:80]}. "
+            "Its result is delivered to you on completion — do NOT poll with check; "
+            "do something else, or pass_turn if there is nothing else to do."
+        )
 
     def _execute(self, task_id: str, command: str) -> None:
         store = None
@@ -1560,8 +1564,11 @@ class BackgroundManager:
 
         asyncio.create_task(_worker(), name=f"bg-tool-{task_id}")
         return (
-            f"后台任务已启动：task_id={task_id}（{label[:80]}）。你可以继续做别的；"
-            "完成后会收到通知，background_run(action=\"check\", task_id=\"" + task_id + "\") 取结果。"
+            f"后台任务已启动：task_id={task_id}（{label[:80]}）。"
+            "**完成时结果会自动送到你面前，不用去取。** 现在去做别的；"
+            "手上没有别的可做就 pass_turn 停轮等它——用 check 反复问「好了没」只会空烧回合，"
+            "任务不会因此快一点，用户还得等你。"
+            "只有在迟迟等不到、怀疑它卡住时，才 background_run(action=\"check\", task_id=\"" + task_id + "\")。"
         )
 
     async def check(self, task_id: str | None = None) -> str:
