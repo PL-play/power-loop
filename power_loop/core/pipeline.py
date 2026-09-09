@@ -318,6 +318,8 @@ class AgentPipeline:
             skills_dir=config.skills_dir,
         )
         self.history: list[LoopMessage] = []
+        self._send_start_len: int = 0          # 6.27.0 本 send 在 history 里的起点（run() 设）
+        self._send_baseline_prompt: int | None = None  # 6.27.0 本 send 第一轮的真实 prompt_tokens
         self._image_rounds: dict[int, int] = {}
         # Monotonic per-session SEND index, set by the loop before run() (None when
         # unset, e.g. in tests). Stamped into each appended row's PERSISTED meta only
@@ -649,8 +651,12 @@ class AgentPipeline:
         m = self.history[idx]
         if m.get("role") != "assistant":
             return False
+        keep = set(getattr(self.config, "insend_distill_keep_tools", ()) or ())
         for tc in m.get("tool_calls") or []:
-            raw = ((tc or {}).get("function") or {}).get("arguments")
+            fn = (tc or {}).get("function") or {}
+            if str(fn.get("name") or "") in keep:
+                continue
+            raw = fn.get("arguments")
             if (
                 isinstance(raw, str)
                 and len(raw) > 300
@@ -675,8 +681,11 @@ class AgentPipeline:
             else "recall_send"
         )
         freed = 0
+        keep = set(getattr(self.config, "insend_distill_keep_tools", ()) or ())
         for tc in m.get("tool_calls") or []:
             fn = (tc or {}).get("function") or {}
+            if str(fn.get("name") or "") in keep:
+                continue   # 模型自己的发言（send_message 之类）：瘦成占位符它会照样再发一遍
             raw = fn.get("arguments")
             if not isinstance(raw, str) or len(raw) <= 300 or self._ARGS_MARK in raw:
                 continue
@@ -716,9 +725,12 @@ class AgentPipeline:
             return 0
         project_tool = getattr(rep, "_project_tool", None)
         seqs = getattr(self.sink, "_history_seqs", None) or []
+        # 6.27.0 只动**本 send** 追加的行：run 之前就在历史里的（上一个 send 留下的逐字行）归跨 send
+        # 投影管，保险丝碰它们等于两套机制抢同一段历史。
+        start = min(int(getattr(self, "_send_start_len", 0) or 0), len(self.history))
         tool_idx = [
             i for i, m in enumerate(self.history)
-            if m.get("role") == "tool" and isinstance(m.get("content"), str)
+            if i >= start and m.get("role") == "tool" and isinstance(m.get("content"), str)
         ]
         # max(0, …)：本 send 的工具行少于 hot_tail 时，切片起点会是负数，Python 把它当成
         # 「倒数第 |x| 条」绕回去——5 条工具行配 hot_tail=8 时只保住最后 3 条，最早 2 条
@@ -742,7 +754,7 @@ class AgentPipeline:
         # 跨 send 的投影早就把两块一起收掉了，缺的只是 send 内这一层。
         candidates: list[tuple[str, int]] = sorted(
             [("result", i) for i in result_ok]
-            + [("args", i) for i in range(protect_from) if self._has_heavy_args(i)],
+            + [("args", i) for i in range(start, protect_from) if self._has_heavy_args(i)],
             key=lambda x: x[1],
         )
         picked_all = candidates[: max(1, batch)]
@@ -856,10 +868,20 @@ class AgentPipeline:
         # 还没有就用估算）。每轮最多蒸馏一批（最早的 n 条、跳过已蒸馏的、不动最近 hot_tail 条）；
         # 下一轮真实 prompt 仍超阈值就再蒸馏下一批——逐轮递进，只蒸馏到够用为止。
         dt = self.config.insend_distill_tokens
-        if dt is not None and int(dt) > 0:
-            real = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0) if round_index > 0 else 0
-            basis = real if real > 0 else self._estimate_history_tokens()
-            if basis >= int(dt):
+        if dt is not None and int(dt) > 0 and round_index > 0:
+            # 6.27.0：量的是**本 send 内的增长**，不是整个上下文。系统提示词 + 技能 + 工具目录 + 历史
+            # 一开局就可能有几万 token，按整体判的话第一轮就超阈值、之后每轮都烧（真实事故：一个
+            # 会话 44 次触发，模型自己的发言参数被瘦成占位符，再被照样发进聊天）。保险丝的本意是
+            # 「这一个 send 跑得太长」才出手：第一轮的真实 prompt_tokens 是基线，之后每轮减它。
+            real = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0)
+            if real > 0:
+                if self._send_baseline_prompt is None:
+                    self._send_baseline_prompt = real
+                growth = real - int(self._send_baseline_prompt)
+            else:
+                start = min(int(getattr(self, "_send_start_len", 0) or 0), len(self.history))
+                growth = estimate_tokens(self.history[start:])
+            if growth >= int(dt):
                 freed = self._distill_oldest_tool_rows(
                     int(self.config.insend_distill_batch or 10),
                     int(self.config.insend_distill_hot_tail or 0),
@@ -867,8 +889,8 @@ class AgentPipeline:
                 if freed:
                     self._tok_len = -1  # content shrank in place; force a fresh estimate
                     logger.info(
-                        "insend distill: context %d tokens >= %d; freed ~%d tokens this round "
-                        "(send %s, round %d)", basis, int(dt), freed, self.send_index, round_index,
+                        "insend distill: send grew %d tokens >= %d; freed ~%d tokens this round "
+                        "(send %s, round %d)", growth, int(dt), freed, self.send_index, round_index,
                     )
         if self.config.microcompact_enabled:
             self.ctx.microcompact(
@@ -1208,6 +1230,10 @@ class AgentPipeline:
         self.history = [dict(m) for m in messages]
         self._image_rounds = {}   # 6.12.0：本 send 新入的图片行 id(row) → round_index
         self._tok_len = -1  # SCALE-4: wholesale (re)assignment invalidates the estimate
+        # 6.27.0 send 内保险丝只管**本 send**：起点 = 进入 run 时的历史长度（之前的行归跨 send 投影管）；
+        # 触发量 = 本 send 内的增长（第一轮真实 prompt_tokens 是基线）。
+        self._send_start_len = len(self.history)
+        self._send_baseline_prompt = None
 
         # ── Session start ──
         session_ctx = SessionStartCtx(
@@ -1217,6 +1243,7 @@ class AgentPipeline:
         if isinstance(session_ctx.messages, list):
             self.history = session_ctx.messages
             self._tok_len = -1  # a hook may have replaced history (even same-length)
+            self._send_start_len = len(self.history)
         self._emit(AgentEventType.SESSION_STARTED, SessionStartedPayload(scope="main"))
         self._session_started = True
 

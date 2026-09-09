@@ -352,3 +352,129 @@ async def test_insend_distill_also_slims_tool_call_arguments(tmp_path):
     assert any(body in a for a in last), "热的那次调用参数不该被动"
     await loop.aclose()
 
+
+
+@pytest.mark.asyncio
+async def test_insend_distill_measures_growth_within_the_send_not_the_whole_context(tmp_path):
+    """6.27.0：触发量 = 本 send 内的增长，不是整个上下文。
+
+    真实事故（conv-237）：系统提示词 + 技能 + 工具目录一开局 3 万 token，trigger 配 30000，按整体判
+    第 1 轮就超、之后 44 次连烧；模型自己刚发的 send_message 参数被瘦成占位符，模型照着占位符
+    又发了九条进聊天。这里整个上下文一直远超阈值（4 万），但 send 内只涨了 20，保险丝不该动。
+    """
+    big = "R" * 400
+    llm = _Scripted(responses=[
+        _tool_resp("c1", prompt=40000),   # 第一轮真实 prompt = 基线
+        _tool_resp("c2", prompt=40010),   # 增长 10 < 50
+        _tool_resp("c3", prompt=40020),   # 增长 20 < 50
+        _resp("done"),
+    ])
+    kwargs: dict[str, Any] = {}
+    rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
+    if rep_cls is not None:
+        kwargs["representation"] = rep_cls()
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=str(tmp_path / "s.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs),
+        tool_registry=_echo_registry(big),
+    )
+    sid = await loop.new_session()
+    assert (await loop.send("hi", session_id=sid)).status == "completed"
+    for req in llm.seen[1:]:
+        assert all(not r.startswith("[distilled #") for r in _tool_rows(req)), "整体大但 send 内没涨，不该蒸馏"
+    # 同样的配置，send 内真涨了就该动（基线 100 → 100+60）
+    llm2 = _Scripted(responses=[_tool_resp("c1", prompt=100), _tool_resp("c2", prompt=160), _resp("done")])
+    loop2 = StatefulAgentLoop(
+        llm=llm2, db_path=str(tmp_path / "s2.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=1, insend_distill_hot_tail=0, **kwargs),
+        tool_registry=_echo_registry(big),
+    )
+    sid2 = await loop2.new_session()
+    assert (await loop2.send("hi", session_id=sid2)).status == "completed"
+    assert _tool_rows(llm2.seen[2])[0].startswith("[distilled #")
+    await loop.aclose()
+    await loop2.aclose()
+
+
+@pytest.mark.asyncio
+async def test_insend_distill_keeps_arguments_of_registered_speech_tools(tmp_path):
+    """6.27.0：insend_distill_keep_tools 里的工具，调用参数永不瘦身（结果照旧）。
+
+    send_message 的参数就是模型的发言；瘦成「⟨已移出上下文 N 字符…⟩」后，模型下一轮照着这个样子
+    再发一遍——占位符进了聊天。write_file 的正文该瘦照瘦。
+    """
+    speech = "S" * 3000
+    body = "B" * 3000
+
+    import json as _json
+
+    def _say_call(call_id: str) -> LLMResponse:
+        r = LLMResponse(raw_text="", tool_calls=[{"id": call_id, "type": "function",
+                                                  "function": {"name": "say", "arguments": _json.dumps({"text": speech})}}])
+        r.token_usage = LLMTokenUsage(prompt_tokens=10, completion_tokens=1, total_tokens=11)
+        return r
+
+    llm = _Scripted(responses=[
+        _say_call("s1"),                    # 基线
+        _write_call("w1", "a.txt", body),   # 增长 90 → 触发
+        _write_call("w2", "b.txt", body),
+        _resp("done"),
+    ])
+    for r in llm.responses[1:3]:
+        r.token_usage = LLMTokenUsage(prompt_tokens=100, completion_tokens=1, total_tokens=101)
+    kwargs: dict[str, Any] = {}
+    rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
+    if rep_cls is not None:
+        kwargs["representation"] = rep_cls()
+    reg = _echo_registry("ok")
+    async def _say(**kw: Any) -> str:
+        return "said"
+    reg.register(ToolDefinition(name="say", description="speak", input_schema={"type": "object", "properties": {"text": {"type": "string"}}}), _say)
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=str(tmp_path / "s.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,
+                               insend_distill_batch=5, insend_distill_hot_tail=0,
+                               insend_distill_keep_tools=("say",), **kwargs),
+        tool_registry=reg,
+    )
+    sid = await loop.new_session()
+    assert (await loop.send("hi", session_id=sid)).status == "completed"
+    last = _args_of(llm.seen[-1])
+    assert any(speech in a for a in last), "发言参数被瘦身了——模型会照着占位符再发一遍"
+    assert any("⟨已移出上下文" in a for a in last), "write_file 的正文仍该瘦身"
+    await loop.aclose()
+
+
+def test_insend_distill_never_touches_rows_before_this_send():
+    """6.27.0：保险丝只动本 send 追加的行；run 之前就在历史里的（上一 send 的逐字行）归跨 send 投影管。"""
+    import json as _json
+    from power_loop.core.pipeline import AgentPipeline
+
+    json_dumps = _json.dumps
+    p = AgentPipeline.__new__(AgentPipeline)
+    rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
+    if rep_cls is None:
+        pytest.skip("保险丝只在投影表示法下工作")
+    p.config = AgentLoopConfig(system_prompt="t", insend_distill_tokens=1, insend_distill_batch=10,
+                               insend_distill_hot_tail=0, representation=rep_cls())
+    p.send_index = 3
+    p.sink = None
+    old_result = "O" * 500
+    old_args = json_dumps({"path": "x", "content": "A" * 1000})
+    new_result = "N" * 500
+    p.history = [
+        {"role": "user", "content": "earlier send"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "o1", "type": "function", "function": {"name": "write_file", "arguments": old_args}}]},
+        {"role": "tool", "tool_call_id": "o1", "name": "write_file", "content": old_result},
+        {"role": "user", "content": "this send"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "n1", "type": "function", "function": {"name": "write_file", "arguments": old_args}}]},
+        {"role": "tool", "tool_call_id": "n1", "name": "write_file", "content": new_result},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "n2", "type": "function", "function": {"name": "grep", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "n2", "name": "grep", "content": "x"},
+    ]
+    p._send_start_len = 4
+    p._distill_oldest_tool_rows(10, 0)
+    assert p.history[2]["content"] == old_result and p.history[1]["tool_calls"][0]["function"]["arguments"] == old_args
+    assert p.history[5]["content"].startswith("[distilled #3") and "⟨已移出上下文" in p.history[4]["tool_calls"][0]["function"]["arguments"]
