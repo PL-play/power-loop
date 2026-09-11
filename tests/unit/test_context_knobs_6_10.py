@@ -10,6 +10,7 @@ import pytest
 
 import power_loop
 from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, StatefulAgentLoop
+from power_loop.core.pipeline import AgentPipeline
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -478,3 +479,58 @@ def test_insend_distill_never_touches_rows_before_this_send():
     p._distill_oldest_tool_rows(10, 0)
     assert p.history[2]["content"] == old_result and p.history[1]["tool_calls"][0]["function"]["arguments"] == old_args
     assert p.history[5]["content"].startswith("[distilled #3") and "⟨已移出上下文" in p.history[4]["tool_calls"][0]["function"]["arguments"]
+
+
+# ── 上下文画像：排查上下文暴涨时，第一个要问的是「大头在哪」──────────────
+
+
+def _bare_pipeline() -> AgentPipeline:
+    """只为调纯函数：画像不碰 llm / store / sink，给足构造参数就行。"""
+    from power_loop.core.state import ContextManager
+    from power_loop.core.hooks import AgentHooks
+
+    return AgentPipeline(
+        llm=_Scripted(responses=[]), config=AgentLoopConfig(system_prompt="t", max_rounds=2),
+        tool_registry=_echo_registry("ok"), hooks=AgentHooks(), bus=AgentEventBus(),
+        ctx=ContextManager(),
+    )
+
+
+def test_context_profile_separates_call_args_from_results():
+    """回执和调用参数必须分开算。
+
+    真实经历：一次排查里答案是 `write_file` 的**调用参数**占了全部参数字符的 66%，
+    而它的回执只有一句「Wrote 4628 bytes」——只看回执永远看不出来大头在哪。
+    """
+    p = _bare_pipeline()
+    p.history = [
+        {"role": "user", "content": "x"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "type": "function",
+             "function": {"name": "write_file",
+                          "arguments": '{"content":"' + "x" * 8000 + '"}'}}]},
+        {"role": "tool", "tool_call_id": "a", "name": "write_file", "content": "Wrote 8000 bytes"},
+        {"role": "tool", "tool_call_id": "b", "name": "read_file", "content": "y" * 3000},
+    ]
+    out = p._context_profile(0)
+    assert "args:write_file=8K" in out
+    assert "res:read_file=3K" in out
+    # write_file 的回执小到进不了榜——它本来就不是大头，这正是要区分两块的理由
+    assert "res:write_file" not in out
+
+
+def test_context_profile_is_quiet_when_nothing_is_big():
+    p = _bare_pipeline()
+    p.history = [{"role": "tool", "tool_call_id": "a", "name": "todo", "content": "ok"}]
+    assert p._context_profile(0) == "(无大项)"
+
+
+def test_context_profile_only_looks_at_this_send():
+    """起点之前的行归跨 send 投影管，画像不该把它们算进来。"""
+    p = _bare_pipeline()
+    p.history = [
+        {"role": "tool", "tool_call_id": "old", "name": "read_file", "content": "z" * 9000},
+        {"role": "tool", "tool_call_id": "new", "name": "grep", "content": "w" * 2000},
+    ]
+    assert "read_file" not in p._context_profile(1)
+    assert "res:grep=2K" in p._context_profile(1)

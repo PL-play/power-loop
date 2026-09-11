@@ -563,10 +563,34 @@ class AgentPipeline:
                 ),
             )
 
+    def _log_send_summary(self, status: str, rounds: int) -> None:
+        """一个 send 跑完记一行：轮数、上下文从多大涨到多大、这一程重发了多少、大头是谁。
+
+        为什么值得单独记：账单和体感都由「轮数 × 每轮上下文」决定，而这两个数过去哪个都不落日志。
+        真实经历：一次排查里，要回答「这一程为什么烧了 900 万 token」，只能去 docker logs 里
+        grep 每一轮的 token_usage 再手工求和——而那时候日志可能已经滚掉了。
+        """
+        try:
+            usage = dict(self.ctx.usage_totals or {})
+            total_in = int(usage.get("prompt_tokens", 0) or 0)
+            real = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0)
+            base = self._send_baseline_prompt
+            start_i = min(int(getattr(self, "_send_start_len", 0) or 0), len(self.history))
+            logger.info(
+                "send done: %s in %d rounds (send %s) | 上下文 %s → %s | 本程累计重发 %d token"
+                "（均 %d/轮）| 大头: %s",
+                status, rounds, self.send_index,
+                f"{int(base):,}" if base else "?", f"{real:,}" if real else "?",
+                total_in, total_in // max(1, rounds), self._context_profile(start_i),
+            )
+        except Exception:  # noqa: BLE001 — 日志永远不该弄挂一次正常收尾
+            logger.debug("send summary log failed", exc_info=True)
+
     def _make_result(self, status: str, *, final_text: str = "", rounds: int = 0,
                      pending_tool_calls: list | None = None,
                      pending_interactions: list | None = None) -> AgentLoopResult:
         self._completed_rounds = rounds  # for MemorySnapshot
+        self._log_send_summary(status, rounds)
         return AgentLoopResult(
             status=status,  # type: ignore[arg-type]
             final_text=final_text,
@@ -709,6 +733,32 @@ class AgentPipeline:
             fn["arguments"] = new_raw
             freed += (len(raw) - len(new_raw)) // 4
         return freed
+
+    def _context_profile(self, start: int, limit: int = 4) -> str:
+        """本 send 的上下文被谁占着——`工具名:来源=字符数`，最大的几个。
+
+        排查上下文暴涨时，第一个要问的问题是「大头在哪」，而这个问题过去只能靠事后翻
+        pl_messages 手工统计（真实经历：一次排查里，答案是 write_file 的**调用参数**占了
+        全部参数字符的 66%，而它的回执只有一句「Wrote 4628 bytes」——光看回执永远看不出来）。
+        所以这里把两块分开算：`args` 是 assistant 的 tool_calls 参数，`res` 是工具回执。
+
+        只在保险丝触发那一轮算一次，O(本 send 行数)，不进热路径。
+        """
+        buckets: dict[str, int] = {}
+        for m in self.history[start:]:
+            role = m.get("role")
+            if role == "tool":
+                name = str(m.get("name") or "tool")
+                buckets[f"res:{name}"] = buckets.get(f"res:{name}", 0) + len(str(m.get("content") or ""))
+            elif role == "assistant":
+                for tc in m.get("tool_calls") or []:
+                    fn = (tc or {}).get("function") or {}
+                    raw = fn.get("arguments")
+                    if isinstance(raw, str):
+                        k = f"args:{fn.get('name') or 'tool'}"
+                        buckets[k] = buckets.get(k, 0) + len(raw)
+        top = sorted(buckets.items(), key=lambda kv: -kv[1])[:limit]
+        return " ".join(f"{k}={v // 1000}K" for k, v in top if v >= 1000) or "(无大项)"
 
     def _distill_oldest_tool_rows(self, batch: int, hot_tail: int) -> int:
         """把当前 send 里**最早的 batch 条**工具占用在内存里换成指针（6.10.0；6.25.0 起含调用参数）。
@@ -888,10 +938,17 @@ class AgentPipeline:
                 )
                 if freed:
                     self._tok_len = -1  # content shrank in place; force a fresh estimate
-                    logger.info(
-                        "insend distill: send grew %d tokens >= %d; freed ~%d tokens this round "
-                        "(send %s, round %d)", growth, int(dt), freed, self.send_index, round_index,
-                    )
+                start_i = min(int(getattr(self, "_send_start_len", 0) or 0), len(self.history))
+                # freed==0 也要记：那是「保险丝烧完了、再触发也没用」的静默状态，
+                # 而它的表现和「一切正常」一模一样——上下文继续涨，日志里一个字都没有。
+                logger.info(
+                    "insend distill: send grew %d >= %d tokens; freed ~%d this round "
+                    "(send %s, round %d, prompt %d, rows %d) | 大头: %s%s",
+                    growth, int(dt), freed, self.send_index, round_index, real,
+                    len(self.history) - start_i, self._context_profile(start_i),
+                    "" if freed else "  ← 没有可回收的了：剩下的要么在热尾、要么已蒸馏、要么是"
+                                     "模型自己的正文（保险丝只动工具结果与调用参数）",
+                )
         if self.config.microcompact_enabled:
             self.ctx.microcompact(
                 self.history,
