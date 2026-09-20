@@ -588,3 +588,21 @@ async def test_reasoning_content_is_echoed_back(store: SessionStore) -> None:
     echoed = [m for m in seen[-1]
               if m.get("role") == "assistant" and m.get("reasoning_content") == "推演过程"]
     assert echoed, f"下一次请求里没带回思考内容：{[m.get('role') for m in seen[-1]]}"
+
+
+def test_store_strips_nul_bytes() -> None:
+    """模型输出里的 0x00 不能让整程工作丢掉。
+
+    Postgres 的 text/jsonb 存不下 NUL（invalid byte sequence for encoding "UTF8": 0x00），
+    这是硬约束。真实事故：一次正常的 assistant 回复里夹了一个 NUL，落库直接抛，
+    整个 run 失败——用户那边看到的是会话自己停了。
+    """
+    from power_loop.runtime.store.store import _dumps, _nul_safe
+
+    assert _nul_safe("好\x00的") == "好的"
+    assert _nul_safe(None) is None
+    assert _nul_safe("没有控制字符") == "没有控制字符"
+    # 别的字符一个都不能动（制表符、换行、Unicode 都是合法内容）
+    assert _nul_safe("a\tb\nc—😀") == "a\tb\nc—😀"
+    # JSON 那一路同样要干净（tool_calls / meta 都走它）
+    assert "\x00" not in (_dumps({"k": "v\x00w"}) or "")

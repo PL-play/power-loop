@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+## [6.30.1] — 2026-09-20
+
+### Fixed
+
+- 🔴 **模型输出里的一个 NUL 字节会让整个 run 失败**（真实事故 conv267：会话进行到第 9 分钟
+  「自己停了」，用户那边没有任何提示）。Postgres 的 text/jsonb 存不下 `0x00`
+  （`invalid byte sequence for encoding "UTF8": 0x00`），这是硬约束不是配置——而模型的输出
+  偶尔真的会夹一个进来。落库时直接抛，`run failed`，一整程工作丢掉。
+  现在在落库这个汇点统一剔除：`messages`（content / name / tool_call_id / tool_calls_json /
+  meta_json）、折叠笔记、续接队列、投影行的 rendered_text。**只去 NUL**，制表符、换行、
+  各种 Unicode 原样保留——它们都是合法内容。
+
+
 ## [6.30.0] — 2026-09-20
 
 ### Fixed

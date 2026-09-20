@@ -92,10 +92,19 @@ def _new_session_id() -> str:
     return "sess_" + secrets.token_hex(12)
 
 
+#: 🔴 Postgres 的 text/jsonb **存不下 0x00**（`invalid byte sequence for encoding "UTF8": 0x00`），
+#: 这是硬约束不是配置。而模型的输出偶尔真的会带一个 NUL 进来——真实事故：一次正常的
+#: assistant 回复里夹了 0x00，落库直接抛，**整个 run 失败**，用户那边看到的是会话自己停了。
+#: 所以在落库这个汇点统一剔除：一个控制字符不值得让一整程工作丢掉。
+#: 只去 NUL，别的字符原样保留（制表符、换行、各种 Unicode 都是合法内容）。
+def _nul_safe(v: str | None) -> str | None:
+    return v.replace("\x00", "") if isinstance(v, str) and "\x00" in v else v
+
+
 def _dumps(obj: Any) -> str | None:
     if obj is None:
         return None
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    return _nul_safe(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
 
 
 def _loads(s: str | None) -> Any:
@@ -351,8 +360,8 @@ class SessionStore:
                 "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
                 "round_index, state, meta_json, send_index, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    session_id, seq, role, name, content,
-                    _dumps(tool_calls) if tool_calls else None, tool_call_id, round_index,
+                    session_id, seq, role, _nul_safe(name), _nul_safe(content),
+                    _dumps(tool_calls) if tool_calls else None, _nul_safe(tool_call_id), round_index,
                     MessageState.ACTIVE.value, _dumps(meta or {}),
                     (int(send_index) if send_index is not None else None), now,
                 ),
@@ -503,7 +512,7 @@ class SessionStore:
                 "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
                 "round_index, state, meta_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    session_id, note_seq, "system", "compact_note", note_content, None, None,
+                    session_id, note_seq, "system", "compact_note", _nul_safe(note_content), None, None,
                     round_index, MessageState.ACTIVE.value, _dumps(meta), now,
                 ),
             )
@@ -591,7 +600,7 @@ class SessionStore:
             sql,
             (
                 session_id, int(send_index), kind,
-                _dumps(content if content is not None else {}), rendered_text,
+                _dumps(content if content is not None else {}), _nul_safe(rendered_text),
                 source_seq_lo, source_seq_hi, compact_from_send, compact_to_send,
                 int(projector_version), token_estimate, now,
             ),
@@ -882,7 +891,7 @@ class SessionStore:
             await tx.execute(
                 f"INSERT INTO {self.t.follow_up_queue} (session_id, content, created_at) "
                 "VALUES (?, ?, ?)",
-                (session_id, content, _now_ms()),
+                (session_id, _nul_safe(content), _now_ms()),
             )
             row = await tx.fetchone(
                 f"SELECT COUNT(*) AS c FROM {self.t.follow_up_queue} WHERE session_id=?",
