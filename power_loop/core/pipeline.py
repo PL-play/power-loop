@@ -110,6 +110,14 @@ _TRUNCATION_NOTICE = (
     "把它拆小再来：一次只写一个文件；单个文件很大就先写骨架、再用 edit_file/apply_patch "
     "分几次补内容；不要在一轮里同时写多个大文件。"
 )
+#: 只有思考、没有正文也没有工具调用时的提示。与上面那条分开：这里不是「写太长」，
+#: 而是「想太久，预算全花在思考上了」——让它直接给结论，别再展开想。
+_THINK_ONLY_NOTICE = (
+    "[系统] 你上一轮**只产出了思考、没有任何正文和工具调用**——那一轮对外什么都没发生。"
+    "思考内容也算在单轮长度上限里，想得太久就没有余量写答案了。\n"
+    "这一轮直接给结论或直接调工具：先写要做的那一步，别再展开推演；"
+    "确实需要很多步的，就只做第一步，做完再想下一步。"
+)
 
 
 def _finish_reason(response: Any) -> str:
@@ -1584,12 +1592,28 @@ class AgentPipeline:
 
             # Append assistant message
             assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
+            # 🔴 思考内容要原样带回去。DeepSeek 的思考模式（deepseek-flash 等）明确要求：
+            # 带过 reasoning_content 的 assistant 消息，下一次请求必须把它一起回传，否则 400
+            # "The `reasoning_content` in the thinking mode must be passed back to the API."
+            # ——那是个硬错，重试同样的历史只会再错一遍，最后 retry_exhausted 整个 run 降级
+            # （真实事故：会话刚发完第一张卡片就死在这里）。
+            #
+            # 只在**这次回复真的带了**思考内容时才回传：产生它的供应商必然收得回去；
+            # 没产生的（OpenAI 正统、Anthropic 走自己的 thinking 块）什么都不加，行为不变。
+            _think = (getattr(response, "think", "") or "").strip()
+            if _think:
+                assistant_msg["reasoning_content"] = _think
+            # 第二道：正文、工具调用、思考**三样都没有**的那一轮，历史里不要留这条空 assistant 行。
+            # 它一个字的信息都不带，却会让下一次请求以一条空 assistant 消息结尾——在 DeepSeek 的
+            # 思考模式下那是非法的（见上），别的供应商也只是白占一行。下面的空回复分支会重试这一轮。
+            _skip_empty = not assistant_text and not tool_calls and not _think
             sanitized_tool_calls: list[dict[str, Any]] | None = None
             _args_cut = False
             if tool_calls:
                 sanitized_tool_calls, _args_cut = _sanitize_tool_calls(tool_calls)
                 assistant_msg["tool_calls"] = sanitized_tool_calls
-            await self._append_message(assistant_msg, round_index=round_idx, hook_injected=hook_audit)
+            if not _skip_empty:
+                await self._append_message(assistant_msg, round_index=round_idx, hook_injected=hook_audit)
             # 截断的第二种表现：工具调用本身在，但它的 arguments JSON 断在半路 → 降成 {} →
             # 必填校验报「缺参数」，模型据此以为自己忘了填，于是原样再写一遍、再被截断。
             # 真实事故（conv-213）：一条 "missing required parameter" 背后是 20000 token 打满。
@@ -1622,19 +1646,31 @@ class AgentPipeline:
                 reason = _finish_reason(response)
                 cap = self.config.max_tokens
                 out_tokens = int((usage or {}).get("completion_tokens") or 0)
+                # 🔴 第三条判据：**有思考、却没正文也没工具调用**。
+                # 开了思考的模型把整轮预算花在思考上就是这个样子，而流式响应里 finish_reason 与
+                # usage 常常都取不到（真实事故：子 agent cap=3000，上面两条判据双双落空，
+                # 于是被当成「打嗝」原样重试——重试当然又是一轮只有思考的空回复）。
+                # 无论是不是真被 max_tokens 切的，结论一样：**输入不变，输出不会变**，
+                # 所以走「改变输入」这条路，而不是重试。
+                think_only = bool(_think) and not assistant_text
                 truncated = (reason in _TRUNCATION_FINISH_REASONS
-                             or (bool(cap) and out_tokens >= int(cap)))
+                             or (bool(cap) and out_tokens >= int(cap))
+                             or think_only)
                 if truncated and self._truncated_streak < _TRUNCATED_MAX_RETRIES:
                     self._truncated_streak += 1
                     logger.warning(
-                        "truncated LLM response at round %d (finish_reason=%r, "
+                        "%s at round %d (finish_reason=%r, "
                         "completion_tokens=%d/%s) streak=%d/%d — nudging to write smaller "
                         "(session=%s)",
+                        "think-only response (no text, no tool call)" if think_only
+                        else "truncated LLM response",
                         round_idx, reason, out_tokens, cap, self._truncated_streak,
                         _TRUNCATED_MAX_RETRIES, self.session_id,
                     )
                     await self._append_message(
-                        {"role": "user", "content": _TRUNCATION_NOTICE}, round_index=round_idx)
+                        {"role": "user",
+                         "content": _THINK_ONLY_NOTICE if think_only else _TRUNCATION_NOTICE},
+                        round_index=round_idx)
                     self._emit(AgentEventType.ROUND_COMPLETED,
                                RoundCompletedPayload(round_index=round_idx, has_tools=False),
                                round_index=round_idx)

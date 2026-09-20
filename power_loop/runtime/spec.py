@@ -72,7 +72,10 @@ class AgentSpec:
     system_prompt: str
     tools: list[str] | None = None      # whitelist; None = inherit all from parent
     max_rounds: int = 8
-    max_tokens: int = 4000
+    # None = 跟父 loop 一样（推荐）。**这一项不是「答案能多长」，思考内容也算在里面**：
+    # 开了思考的模型被压在一个小预算里，会把预算全花在思考上、正文一个字都没有 =「空回复」，
+    # 而那一轮重试还会再空一次（真实事故：子 agent 3000、父 40000，子运行整个降级）。
+    max_tokens: int | None = None
     temperature: float = 0.0
     model: str | None = None      # per-subagent model override (None = inherit the service default)
     output_schema: dict[str, Any] | None = None   # {name, schema}; enforces structured output
@@ -252,7 +255,10 @@ async def run_agent_spec(
     child_config = AgentLoopConfig(
         system_prompt=spec.system_prompt,
         max_rounds=int(spec.max_rounds),
-        max_tokens=int(spec.max_tokens),
+        # max_tokens=None → 跟父：子运行和父用的是同一个模型（model=None 时），
+        # 父的预算容得下它的思考，子的也该容得下。
+        max_tokens=int(spec.max_tokens) if spec.max_tokens else int(
+            getattr(parent_config, "max_tokens", 0) or 4000),
         temperature=float(spec.temperature),
         model=spec.model,
         response_format=response_format,

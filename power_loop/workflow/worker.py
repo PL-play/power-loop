@@ -149,7 +149,7 @@ async def run_spec_isolated(
     config = AgentLoopConfig(
         system_prompt=spec.system_prompt,
         max_rounds=int(spec.max_rounds),
-        max_tokens=int(spec.max_tokens),
+        max_tokens=int(spec.max_tokens) if spec.max_tokens else 4000,
         temperature=float(spec.temperature),
         model=spec.model,
         response_format=response_format,

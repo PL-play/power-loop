@@ -499,3 +499,92 @@ async def test_run_agent_spec_llm_override_uses_another_service(store: SessionSt
         reset_session_id(tok_sid)
     # 父 loop 的服务被调到的话答案会是「parent side」——final_text 本身就证明走的是覆盖的服务。
     assert r["status"] == "completed" and r["final_text"] == "override side"
+
+
+@pytest.mark.asyncio
+async def test_subagent_inherits_parent_max_tokens(store: SessionStore) -> None:
+    """max_tokens 不传就跟父。
+
+    真实事故：子 agent 写死 3000、父是 40000，而两者用的是**同一个开了思考的模型**。
+    思考内容也算在 max_tokens 里，于是子运行整轮预算被思考吃光、正文一个字都没有 =
+    空回复；重试又是一轮空回复，最后整个子运行降级。
+    """
+    spec = AgentSpec(name="inherits", system_prompt="P", max_rounds=1)
+    assert spec.max_tokens is None, "默认应当是「跟父」，不是某个写死的小数字"
+    parent_loop = StatefulAgentLoop(
+        llm=_Scripted(responses=[LLMResponse(raw_text="parent")]), store=store,
+        config=AgentLoopConfig(max_rounds=1, max_tokens=40000),
+    )
+    sid = (await parent_loop.send("hi", session_id=await parent_loop.new_session())).session_id
+    seen: dict[str, int] = {}
+
+    class _Recording(_Scripted):
+        async def complete(self, request, *, on_chunk_delta_text=None,
+                           on_chunk_think=None, on_stream_end=None):
+            seen["max_tokens"] = int(getattr(request, "max_tokens", 0) or 0)
+            return await super().complete(request)
+
+    parent_loop.llm = _Recording(responses=[LLMResponse(raw_text="child")])
+    from power_loop.core.agent_context import (
+        reset_current_loop, reset_session_id, set_current_loop, set_session_id,
+    )
+    tok_loop, tok_sid = set_current_loop(parent_loop), set_session_id(sid)
+    try:
+        await run_agent_spec(spec, "go", parent_loop=parent_loop)
+    finally:
+        reset_current_loop(tok_loop)
+        reset_session_id(tok_sid)
+    assert seen.get("max_tokens") == 40000
+
+
+@pytest.mark.asyncio
+async def test_think_only_round_is_not_retried_verbatim(store: SessionStore) -> None:
+    """只有思考、没有正文也没有工具调用 → 不当「打嗝」原样重试。
+
+    输入不变，输出不会变：重试只会再烧一轮同样的预算。正确做法是改变输入——
+    往历史里补一条「你上一轮只产出了思考」的提示，让它直接给结论。
+    流式响应常常取不到 finish_reason 与 usage，所以这条判据不能只靠它们。
+    """
+    from power_loop.core.pipeline import _THINK_ONLY_NOTICE
+
+    llm = _Scripted(responses=[
+        LLMResponse(raw_text="", think="想了很久但什么都没写"),   # 第 1 轮：只有思考
+        LLMResponse(raw_text="这是结论"),                          # 第 2 轮：被提示后给出正文
+    ])
+    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=4))
+    sid = await loop.new_session()
+    r = await loop.send("问题", session_id=sid)
+    assert r.final_text == "这是结论"
+    rows = await store.load_active_messages(r.session_id or sid)
+    assert any(r0.role == "user" and _THINK_ONLY_NOTICE in str(r0.content or "") for r0 in rows), \
+        "应当补一条提示改变输入，而不是原样重试"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_content_is_echoed_back(store: SessionStore) -> None:
+    """带过思考的 assistant 消息，**下一次请求**要把 reasoning_content 原样带回去。
+
+    DeepSeek 的思考模式明确要求这一点，少了就是 400（硬错：重试同样的历史只会再错一遍），
+    最后 retry_exhausted 整个 run 降级。这里验的是真正的契约——发出去的 messages 里有没有，
+    而不是落库那一份（落库是给重启后重放用的，另一回事）。
+    """
+    seen: list[list[dict]] = []
+
+    class _Recording(_Scripted):
+        async def complete(self, request, *, on_chunk_delta_text=None,
+                           on_chunk_think=None, on_stream_end=None):
+            seen.append([dict(m) for m in (getattr(request, "messages", None) or [])])
+            return await super().complete(request)
+
+    # 第一轮只有思考（没正文、没工具调用）→ 触发「只有思考」那条路：补一条提示后再来一轮。
+    # 于是第二次请求里必然带着第一轮那条 assistant 消息，正好用来验思考有没有回传。
+    llm = _Recording(responses=[
+        LLMResponse(raw_text="", think="推演过程"),
+        LLMResponse(raw_text="答案"),
+    ])
+    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
+    await loop.send("问题", session_id=await loop.new_session())
+    assert len(seen) >= 2, "应当有第二次请求"
+    echoed = [m for m in seen[-1]
+              if m.get("role") == "assistant" and m.get("reasoning_content") == "推演过程"]
+    assert echoed, f"下一次请求里没带回思考内容：{[m.get('role') for m in seen[-1]]}"
