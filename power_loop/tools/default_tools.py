@@ -731,7 +731,7 @@ def _list_directory(dp: Path, limit: int = 200) -> str:
 
 def run_read(path: str, offset: int | None = None, limit: int | None = None) -> str:
     try:
-        fp = safe_path(path)
+        fp = safe_path(path, "r")
         if fp.is_dir():
             return _list_directory(fp)
 
@@ -1064,7 +1064,7 @@ def _iter_files_for_glob(base: Path, pattern: str, include_hidden: bool) -> list
 
 def run_glob(pattern: str, path: str = ".", max_results: int = 100, include_hidden: bool = False) -> str:
     try:
-        base = safe_path(path)
+        base = safe_path(path, "r")
         if not base.is_dir():
             return f"Error: {path} is not a directory"
         if not pattern.strip():
@@ -1143,7 +1143,7 @@ def run_grep(
     include_hidden: bool = False,
 ) -> str:
     try:
-        base = safe_path(path)
+        base = safe_path(path, "r")
         if not base.exists():
             return f"Error: path does not exist: {path}"
         if not pattern:

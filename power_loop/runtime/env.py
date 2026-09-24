@@ -39,6 +39,11 @@ class RuntimeEnv:
     # tools.command_policy): "package_install" | "download" | "daemon". "pipe_to_shell"
     # is always blocked. Empty (default) = only the always-blocked set applies.
     blocked_command_categories: frozenset[str] = frozenset()
+    # Directories the file tools may READ but never write (e.g. a shared knowledge base
+    # every agent consults). Checked before every other rule: a path under one of these
+    # resolves only for purpose "r"; any write-capable purpose is refused, even when the
+    # same path would also fall inside the workspace or the home allowlist.
+    read_only_roots: tuple[Path, ...] = ()
 
     @classmethod
     def from_env(
@@ -122,7 +127,23 @@ def _is_in_home_rw_allowlist(path: Path, env: RuntimeEnv) -> bool:
     return False
 
 
+def _read_only_root_of(path: Path, env: RuntimeEnv) -> Path | None:
+    for root in env.read_only_roots:
+        try:
+            r = root.resolve()
+            if path.is_relative_to(r):
+                return r
+        except Exception:
+            continue
+    return None
+
+
 def safe_path(p: str, purpose: str = "rw", *, env: RuntimeEnv | None = None) -> Path:
+    """Resolve ``p`` inside the directories this runtime may touch.
+
+    ``purpose`` is "r" for read-only access; anything else ("rw", "w") means the caller may
+    write. Paths under ``RuntimeEnv.read_only_roots`` resolve only for "r".
+    """
     runtime_env = env if env is not None else get_runtime_env()
     # Resolve the workspace before comparing: ``candidate`` below is always resolved
     # (symlinks + ``..`` collapsed), so the boundary check must compare against an
@@ -147,6 +168,15 @@ def safe_path(p: str, purpose: str = "rw", *, env: RuntimeEnv | None = None) -> 
             candidate = raw.resolve()
         else:
             candidate = (workspace_dir / raw).resolve()
+
+    ro_root = _read_only_root_of(candidate, runtime_env)
+    if ro_root is not None:
+        if purpose == "r":
+            return candidate
+        raise ValueError(
+            f"{p} is under a read-only directory ({ro_root}): it can be read, not written. "
+            "Write your own files in the workspace instead."
+        )
 
     if candidate.is_relative_to(workspace_dir):
         return candidate

@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+## [6.31.0] — 2026-09-24
+
+### Added
+
+- **只读目录 `RuntimeEnv.read_only_roots`**：一份全平台共用、谁都能读、谁也不能改的资料
+  （DeepTalk 用它把平台问答的材料开放给主 agent：答题子 agent 给出出处，主 agent 能直接打开看细节）。
+  `safe_path(p, purpose)` 第一次真正区分读写：只读目录下只有 `purpose="r"` 放行，其余一律拒绝，
+  报错说明「能读不能写，自己的文件写在工作区」。这条判断排在所有放行规则之前——
+  哪怕同一路径也落在工作区或 home 放行名单里，照样只读。
+- 内置 `read_file` / `glob` / `grep` 按读意图调用 `safe_path(..., "r")`；`write_file` / `edit_file` /
+  `apply_patch` 保持写意图。不设只读目录时行为与之前完全一致。
+
 ## [6.30.1] — 2026-09-20
 
 ### Fixed
