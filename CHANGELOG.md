@@ -8,6 +8,17 @@
 
 ## [Unreleased]
 
+## [6.32.0] — 2026-09-25
+
+### Changed（只改工具说明文字，行为不变）
+
+依据 DeepTalk 5.4 万次历史工具调用：
+- **bash**：第一行写明看文件用 read_file、找文件用 glob、搜内容用 grep，别写成 cat/sed -n/ls/find/grep 命令（此前 37% 的 bash 调用只是在看文件，最近一周 49%）；read_file 同步写明「代替 bash cat/sed」。
+- **background_run**：结果自动送达，check 只在唤醒消息要求或怀疑卡住时用（此前 check 234 次，25 次过早只拿到 running）；「可异步」后缀改成「完成后自动送到，不用 check」，并且不再贴在 read_file / grep / glob / recall_send / load_skill / list_skills 这类快速只读工具上（`async_capable` 不变，同轮并发照旧）。
+- **schedule_wakeup**：去掉「check a long task」的例子，写明 workflow / 子 agent / 后台任务 / 卡片提交会自动唤醒，别用定时器盯。
+- **note**：注明平台自动写的 workflow 记录是例外。
+- **write_file / read_file**：不再点名 apply_patch（它不一定挂着）。
+
 ## [6.31.0] — 2026-09-24
 
 ### Added

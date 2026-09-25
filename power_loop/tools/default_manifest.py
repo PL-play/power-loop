@@ -10,8 +10,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         description=(
             "Create a new UTF-8 text file or overwrite an existing one with the complete provided content. "
             "Parent directories are created automatically. For safety, overwriting an existing file requires that you "
-            "have read it with read_file in this process and that it has not changed since that read; use edit_file or "
-            "apply_patch for smaller edits to existing files. Send the entire desired file content in one call, not chunks."
+            "have read it with read_file in this process and that it has not changed since that read; use edit_file "
+            "for smaller edits to existing files. Send the entire desired file content in one call, not chunks."
         ),
         input_schema={
             "type": "object",
@@ -30,9 +30,9 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="read_file",
         description=(
-            "Read a UTF-8 text file with stable line numbers, or list a directory. Use this before edit_file, apply_patch, "
-            "or overwriting an existing file. Large files are paged by line range; use offset and limit to continue. "
-            "Binary-looking files are refused instead of decoded blindly."
+            "Read a UTF-8 text file with stable line numbers, or list a directory — instead of bash cat/head/sed -n/ls. "
+            "Read before editing or overwriting an existing file. Large files are paged by line range; use offset and "
+            "limit to continue. Binary-looking files are refused instead of decoded blindly."
         ),
         input_schema={
             "type": "object",
@@ -93,10 +93,12 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="bash",
         description=(
-            "Run a shell command in a persistent bash session rooted at the workspace. Use dedicated tools for file reads, "
-            "writes, search, and patches whenever possible; use bash for tests, builds, package managers, git inspection, "
-            "and other CLI-only operations. Output is truncated, timeouts restart the shell to prevent leftover commands, "
-            "and obviously dangerous privileged/device-level commands are blocked. Set restart=true to reset the session."
+            "View file contents → read_file; find files → glob; search content → grep. Do not write these as "
+            "cat/head/sed -n/ls/find/grep commands — bash is for running programs: builds, tests, scripts and python "
+            "processing, package managers, git.\n"
+            "Runs in a persistent bash session rooted at the workspace. Output is truncated, timeouts restart the shell "
+            "to prevent leftover commands, and obviously dangerous privileged/device-level commands are blocked. Set "
+            "restart=true to reset the session."
         ),
         input_schema={
             "type": "object",
@@ -221,7 +223,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "notes that must never be hidden or auto-evicted.\n"
             "边界：**会过期的运行时状态不要写进 note**——后台 task_id、workflow run id、任务进度，"
             "那些是待办的 owner/ref 与平台自己的台账在管，任务跑完你写的那条就成了没人删的垃圾。"
-            "note 只放「以后还成立」的事实与决定。"
+            "note 只放「以后还成立」的事实与决定。例外：平台自动写进来的 workflow 记录（若有），run 结束后可以删。"
         ),
         input_schema={
             "type": "object",
@@ -251,15 +253,15 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="schedule_wakeup",
         description=(
-            "Manage your durable wake-up timers with one action: schedule, list, or cancel. "
-            "action defaults to schedule when you pass delay_seconds (to cancel when you pass only "
-            "timer_id, to list when you pass nothing) — but passing it explicitly is clearer. "
-            "action=schedule arms a wake-up — after delay_seconds you receive your note back as "
-            "a message and can act on it (check a long task, follow up on a promise); set "
-            "every_seconds to make it RECURRING (fires repeatedly until cancelled). action=list "
-            "shows your wake-ups (#id, seconds until due, note). action=cancel disarms one by "
-            "timer_id. Timers survive restarts. Requires the host to run a TimerRunner; if the "
-            "host documented no timer support, don't rely on wake-ups firing."
+            "Manage your durable wake-up timers: action=schedule, list, or cancel (pass action "
+            "explicitly; if omitted it is inferred from the args). action=schedule arms a wake-up — "
+            "after delay_seconds you receive your note back as a message and can act on it (a "
+            "follow-up, a reminder); every_seconds makes it RECURRING until cancelled. action=list "
+            "shows your wake-ups (#id, seconds until due, note); action=cancel disarms one by "
+            "timer_id. Timers survive restarts. Workflows, sub-agents, background tasks and card "
+            "submissions wake you automatically when they finish — don't set timers to watch them; "
+            "use timers only when real time must pass. Requires the host to run a TimerRunner; "
+            "without one, wake-ups don't fire."
         ),
         input_schema={
             "type": "object",
@@ -337,12 +339,12 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "task_id immediately. action=tool runs one async-capable TOOL in the background "
             "(tool=<name>, args={…}) and returns a task_id at once — use it for long, "
             "side-effect-free calls (image generation, web fetches) whose result you do not "
-            "need immediately. **Results are delivered to you automatically on completion — "
-            "do not poll for them.** While a task runs, do other work, or pass_turn if there "
-            "is nothing else to do; repeatedly calling check to see whether it finished burns "
-            "rounds without making it finish sooner. action=check is the fallback for a task "
-            "you suspect is stuck: it reports status/output by task_id, or lists all your "
-            "tasks when task_id is omitted."
+            "need immediately. **Results are delivered to you automatically on completion "
+            "(in the background updates block or a wake message) — do not poll for them.** "
+            "While a task runs, do other work, or pass_turn if there is nothing else to do. "
+            "action=check is a fallback: call it only when a wake message explicitly asks you to, "
+            "or when you suspect a task is stuck — checking early just returns \"running\". It reports "
+            "status/output by task_id; action=list lists all your tasks."
         ),
         input_schema={
             "type": "object",

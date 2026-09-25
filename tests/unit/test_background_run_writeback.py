@@ -220,3 +220,26 @@ def test_async_capable_suffix_only_with_background_run_mounted():
     without_bg = {t["function"]["name"]: t["function"]["description"]
                   for t in _mk(gen, plain).to_openai_tools()}
     assert "⏳" not in without_bg["generate_image"], "background_run 不在场就别教模型调它"
+
+
+def test_fast_readonly_tools_get_no_background_suffix_but_stay_async_capable():
+    """read_file/grep/glob/recall_send 从没被 background_run 跑过：不追加后缀，
+    但 async_capable 不动（同轮并发靠它）。后缀本身不再教模型去 check 取结果。"""
+    from power_loop.contracts.tools import ToolDefinition
+    from power_loop.tools.registry import ToolRegistry
+
+    async def _h(**kw):
+        return "x"
+
+    r = ToolRegistry()
+    for d in (
+        ToolDefinition(name="read_file", description="读。", async_capable=True),
+        ToolDefinition(name="generate_image", description="生成图片。", async_capable=True),
+        ToolDefinition(name="background_run", description="bg。"),
+    ):
+        r.register(d, _h)
+    out = {t["function"]["name"]: t["function"]["description"] for t in r.to_openai_tools()}
+    assert "可异步" not in out["read_file"]
+    assert r.get("read_file").definition.async_capable is True
+    assert "可异步" in out["generate_image"]
+    assert "action=\"check\")" not in out["generate_image"], "后缀不该教它去 check 取结果"

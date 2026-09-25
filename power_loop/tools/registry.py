@@ -28,6 +28,12 @@ class RegisteredTool:
     is_async: bool = False
 
 
+#: 快速只读工具：async_capable 照旧（同轮并发靠它），但描述里不追加「可异步」后缀——
+#: 它们单次毫秒级，历史上从没被 background_run 跑过，后缀只是在诱导多余的后台化。
+NO_BACKGROUND_SUFFIX: frozenset[str] = frozenset(
+    {"read_file", "grep", "glob", "recall_send", "recall_compacted", "load_skill", "list_skills"}
+)
+
 
 def async_capable_for(definition: Any, args: Mapping[str, Any] | None = None) -> bool:
     """这次调用可不可以异步跑（6.15.0：``async_capable`` 支持 action 粒度）。
@@ -118,14 +124,15 @@ class ToolRegistry:
         out: list[dict[str, Any]] = []
         for d in defs:
             t = d.to_openai_tool()
-            if has_bg and d.async_capable and d.name != "background_run":
+            if (has_bg and d.async_capable and d.name != "background_run"
+                    and d.name not in NO_BACKGROUND_SUFFIX):
                 acts = async_capable_actions(d)
                 scope = ("（仅 action=" + "/".join(acts) + "）") if acts else ""
                 t["function"]["description"] = (
                     str(t["function"]["description"])
                     + f"\n可异步{scope}：background_run(action=\"tool\", tool=\"{d.name}\", "
-                      "args={…}) 立即返回 task_id 不阻塞；完成后会收到通知，"
-                      "background_run(action=\"check\") 取结果。不需要立刻用结果时优先异步。"
+                      "args={…}) 立即返回 task_id 不阻塞；结果完成后自动送到你面前，不用 check。"
+                      "不需要立刻用结果时优先异步。"
                 )
             out.append(t)
         return out
