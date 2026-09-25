@@ -10,6 +10,7 @@ wrapper that delegates to ``AgentPipeline.run()``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import inspect
 import json
@@ -56,6 +57,7 @@ from power_loop.contracts.event_payloads import (
     RoundUsageStatusPayload,
     SessionEndedPayload,
     SessionStartedPayload,
+    SteerInterruptedPayload,
     StreamCompletedPayload,
     StreamDeltaPayload,
     StreamStartedPayload,
@@ -101,6 +103,15 @@ from power_loop.runtime.usage_estimate import (
 from power_loop.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_key(msg: Mapping[str, Any]) -> str:
+    """Identity of a durable LLM_BEFORE injection (role + name + content), for Z8 dedupe."""
+    try:
+        body = json.dumps(msg.get("content"), ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        body = str(msg.get("content"))
+    return f"{msg.get('role')}|{msg.get('name') or ''}|{body}"
 
 
 def _failure_outcome(exc: BaseException) -> str:
@@ -316,6 +327,7 @@ class AgentPipeline:
         sink: MessageSink | None = None,
         store: Any | None = None,
         drain_follow_ups: Any | None = None,
+        steer_event: asyncio.Event | None = None,
     ) -> None:
         self.llm = llm
         self.config = config
@@ -331,6 +343,13 @@ class AgentPipeline:
         self.sink: MessageSink = sink if sink is not None else NullSink()
         self.store = store
         self._drain_follow_ups = drain_follow_ups
+        # design/124 §7: set while a steer-mode inbox item waits undelivered. The model call and
+        # interruptible tools race it; the next round's drain delivers the item (and clears it).
+        self._steer_event = steer_event
+        self._steer_aborts = 0                     # consecutive steer-aborted model calls
+        # Z8: durable LLM_BEFORE injections already written by a round whose model call a steer
+        # aborted — the re-run round's hooks may produce them again; they're in history already.
+        self._aborted_persist_keys: set[str] = set()
 
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
         # Auto-inject tool catalog + skill section (M1.10). Built ONCE here and
@@ -500,6 +519,92 @@ class AgentPipeline:
         if inbox is not None:
             sink_msg = {**sink_msg, "inbox": inbox}
         await self._emit_sink(self.sink.on_message_appended, sink_msg, round_index=round_index)
+
+    # ── Steering (design/124 §7) ──
+
+    #: Safety valve: more consecutive steer-aborts than this in one send and the model call
+    #: runs to completion regardless (a steer flag that can never be cleared must not spin).
+    MAX_STEER_ABORTS = 5
+    STEER_SKIP_REASON = "为先处理用户的新消息，这个调用没有执行；需要的话重新调用"
+    STEER_ABORT_TEXT = ("[interrupted: 为先处理用户的新消息，这个调用已中断，结果没有产生。"
+                        "不是用户拒绝了它，需要的话可以重新执行。]")
+    STEER_BACKGROUND_TEXT = ("[moved to background: 为先处理用户的新消息，这个调用已转到后台继续运行，"
+                             "task_id={task_id}。完成后结果会自动送到你面前；不是用户拒绝了它，"
+                             "也不要重新调用。]")
+
+    def _steer_pending(self) -> bool:
+        ev = self._steer_event
+        return ev is not None and ev.is_set()
+
+    def _interrupt_mode(self, tool_name: str) -> str:
+        reg = self.tool_registry
+        rt = reg.get(tool_name) if reg is not None else None
+        definition = getattr(rt, "definition", None) if rt is not None else None
+        return str(getattr(definition, "interrupt", "finish") or "finish")
+
+    async def _race_steer(self, work: asyncio.Future) -> tuple[Any, bool]:
+        """Await ``work`` unless steering arrives first. ``(result, False)`` when it finished
+        (its exception propagates), ``(None, True)`` when the steer event fired first — ``work``
+        is left RUNNING; the caller decides to cancel or adopt it."""
+        ev = self._steer_event
+        if ev is None:
+            return await work, False
+        waiter = asyncio.ensure_future(ev.wait())
+        try:
+            done, _ = await asyncio.wait({work, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            # We are being cancelled (a stop, shutdown): take the work down WITH us and let
+            # it finish its own cleanup first — a model call records its (estimated) usage
+            # and closes its stream in its cancel path; leaving that to run after we are gone
+            # reorders events and can lose the accounting entirely.
+            waiter.cancel()
+            work.cancel()
+            await asyncio.wait({work}, timeout=5)
+            raise
+        if work in done:
+            waiter.cancel()
+            return work.result(), False
+        return None, True
+
+    async def _settle_steered_tool(
+        self, work: asyncio.Future, mode: str, tool_name: str, tool_args: dict[str, Any],
+        call_id: str, round_idx: int,
+    ) -> str:
+        """A steer arrived while this tool ran: ``abort`` cancels it, ``background`` hands the
+        running call to the background task table. Returns the synthetic result for the model."""
+        task_id = ""
+        if mode == "background":
+            from power_loop.tools.default_tools import BG
+
+            task_id = await BG.adopt(tool_name, tool_args, work)
+            output = self.STEER_BACKGROUND_TEXT.format(task_id=task_id)
+        else:
+            work.cancel()
+            with contextlib.suppress(BaseException):
+                await work
+            output = self.STEER_ABORT_TEXT
+        self._emit(AgentEventType.STEER_INTERRUPTED, SteerInterruptedPayload(
+            where="tool", action=mode, round_index=round_idx, tool_name=tool_name,
+            tool_call_id=call_id, task_id=task_id), round_index=round_idx)
+        return output
+
+    async def _restart_round_for_steer(self, round_idx: int, llm_before: Any) -> None:
+        """Close a round whose model call a steer aborted, so the next round (whose drain
+        delivers the steer) starts clean: paired round events, no usage row (the aborted call's
+        estimate is already in the run totals), the round not counted against the limit, and the
+        round's durable LLM_BEFORE injections remembered so they aren't written twice (Z8)."""
+        self._steer_aborts += 1
+        self._aborted_persist_keys.update(
+            _persist_key(m) for m in getattr(llm_before, "persist_messages", ()) or ())
+        self._emit(AgentEventType.STEER_INTERRUPTED, SteerInterruptedPayload(
+            where="llm", action="restart", round_index=round_idx), round_index=round_idx)
+        self._emit(AgentEventType.ROUND_COMPLETED,
+                   RoundCompletedPayload(round_index=round_idx, has_tools=False),
+                   round_index=round_idx)
+        await self.hooks.run_typed_async(HookPoint.ROUND_END, RoundEndCtx(
+            round_index=round_idx, messages=self.history, has_tools=False, response_text=""))
+        await self._emit_sink(self.sink.on_round_ended, round_idx, usage=None)
+        self._round_limit += 1
 
     async def _resolve_skipped_tool_calls(
         self, skipped: Sequence[Mapping[str, Any]], *, reason: str, round_idx: int
@@ -1574,6 +1679,12 @@ class AgentPipeline:
             # the send (e.g. a periodic "you haven't called X in N rounds" reminder). Computed AFTER
             # hook_audit so these durable rows don't get counted as ephemeral injections.
             for _pm in llm_before.persist_messages:
+                _pk = _persist_key(_pm)
+                if _pk in self._aborted_persist_keys:
+                    # Z8: written by the round a steer aborted — already in history (and in
+                    # llm_before.messages via self.history); don't write it a second time.
+                    self._aborted_persist_keys.discard(_pk)
+                    continue
                 await self._append_message(_pm, round_index=round_idx)
                 llm_before.messages.append(dict(_pm))
 
@@ -1601,7 +1712,7 @@ class AgentPipeline:
             else:
                 # ── Business logic: call LLM (with retry/timeout/cancel) ──
                 try:
-                    response = await self.call_llm(
+                    _llm_call = self.call_llm(
                         round_idx,
                         messages=llm_before.messages,
                         system_prompt=llm_before.system_prompt,
@@ -1609,6 +1720,26 @@ class AgentPipeline:
                         max_tokens=llm_before.max_tokens,
                         temperature=llm_before.temperature,
                     )
+                    # design/124 §7.2: the model call races incoming steering. A steer flag
+                    # already up at this point survived the round-start drain (store blip) —
+                    # racing it would abort at once, forever; so only a steer that arrives
+                    # DURING the call interrupts it, and only a bounded number of times.
+                    if (self._steer_event is not None and not self._steer_event.is_set()
+                            and self._steer_aborts < self.MAX_STEER_ABORTS):
+                        _llm_work = asyncio.ensure_future(_llm_call)
+                        response, _steered = await self._race_steer(_llm_work)
+                        if _steered:
+                            # Discard the call: nothing it produced reaches history (the
+                            # response is only assembled at its end), its partial usage is
+                            # recorded as an estimate by call_llm's own failure path.
+                            _llm_work.cancel()
+                            with contextlib.suppress(BaseException):
+                                await _llm_work
+                            await self._restart_round_for_steer(round_idx, llm_before)
+                            continue
+                    else:
+                        response = await _llm_call
+                    self._steer_aborts = 0
                     await self._acknowledge_runtime()
                 except CancellationRequested as exc:
                     self._emit(
@@ -1928,6 +2059,18 @@ class AgentPipeline:
                 tool_name = _tool_call_name(tool_call)
                 tool_args = _tool_call_args(tool_call)
 
+                # design/124 §7.3: steering is waiting → don't START anything new this batch.
+                # (Calls already running concurrently go through the normal path below, where
+                # their own interrupt mode decides.) The next round's drain delivers the steer.
+                if self._steer_pending() and i not in _pre and i not in _pre_skip and not skip_batch:
+                    await self._resolve_skipped_tool_calls(
+                        [tool_call], reason=self.STEER_SKIP_REASON, round_idx=round_idx)
+                    self._emit(AgentEventType.STEER_INTERRUPTED, SteerInterruptedPayload(
+                        where="between_tools", action="skip", round_index=round_idx,
+                        tool_name=tool_name, tool_call_id=call_id, skipped=1),
+                        round_index=round_idx)
+                    continue
+
                 # Batch skip
                 if skip_batch:
                     await self._append_message(
@@ -1998,7 +2141,19 @@ class AgentPipeline:
                 # ── Business logic: execute tool ──
                 failed = False
                 try:
-                    if pre_task is not None:
+                    _mode = (self._interrupt_mode(tool_name) if self._steer_event is not None
+                             else "finish")
+                    if _mode != "finish":
+                        # Interruptible (design/124 §7.3): race the call against steering.
+                        _work = (pre_task if pre_task is not None
+                                 else asyncio.ensure_future(self.execute_tool(tool_name, tool_args)))
+                        _res, _steered = await self._race_steer(_work)
+                        if _steered:
+                            output = await self._settle_steered_tool(
+                                _work, _mode, tool_name, tool_args, call_id, round_idx)
+                        else:
+                            output, failed = _res
+                    elif pre_task is not None:
                         output, failed = await pre_task
                     else:
                         output, failed = await self.execute_tool(tool_name, tool_args)

@@ -8,6 +8,37 @@
 
 ## [Unreleased]
 
+## [6.34.0] — 2026-09-26
+
+design/124 §7：插队消息（`InboxItem(mode="steer")`）不再等这一批工作做完才被看到。
+没有 steer 条目时行为与 6.33 完全一致。
+
+### Added
+
+- **模型生成中可被插队打断**：模型调用与会话的插队信号竞速。插队先到 → 取消这次调用
+  （已流出的文字作废、不进历史；它的用量按 6.33 的规则记成估算值）→ 本轮事件照常收尾、
+  **不计入轮数上限** → 下一轮开头取出插队消息再调模型。发 `STEER_INTERRUPTED`
+  （`where="llm", action="restart"`），界面据此撤回半截文字。
+  保险：本轮开始时插队信号已经亮着（开头的取件没能清掉它）就不竞速；一次 send 里最多连续
+  中止 `MAX_STEER_ABORTS=5` 次——一个清不掉的信号不能让循环空转。
+- **工具声明被插队时怎么办**：`ToolDefinition.interrupt` = `finish`（默认，等它跑完）/
+  `abort`（取消，结果写「为先处理新消息已中断，需要可重新执行」）/ `background`（不打断，
+  **把这个正在跑的调用收进后台任务表**继续跑，结果写「已转后台 task_id=…，完成后自动送达」）。
+  合成结果都写明「不是用户拒绝了它」。插队信号亮着时，这一批里**还没开始**的调用不再开始，补
+  「为先处理新消息未执行」。内置 `spawn_agent` 与 `create_workflow` 声明为 `background`。
+- `BackgroundManager.adopt(tool_name, args, future)`：收养一个已在跑的调用（不做 async_capable /
+  并发上限检查——它不是新调用）。后台工具任务被取消时台账记 `cancelled`（此前停在 running）；
+  保留任务引用。
+- `wait_or_steer(awaitable)`：等待型工具用它等，插队消息一到就提前返回。
+- 事件 `STEER_INTERRUPTED` + `SteerInterruptedPayload(where, action, round_index, tool_name,
+  tool_call_id, task_id, skipped)`。
+
+### Fixed
+
+- **Z8**：被插队中止的那一轮里 LLM_BEFORE 写下的耐久注入，重跑这一轮时不会再写一遍。
+- 外层 send 被取消（停止、关机）时，先等模型调用自己的取消收尾（关流、记估算用量）再返回——
+  调用放进独立任务后，这段收尾曾跑在 send 返回之后，记账事件会丢。
+
 ## [6.33.0] — 2026-09-26
 
 design/124（steering 与停止）第一步：先把「消息投递」和「用量记账」做对。

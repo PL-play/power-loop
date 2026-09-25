@@ -157,6 +157,8 @@ CREATE_WORKFLOW_DEFINITION = ToolDefinition(
         "required": ["spec"],
     },
     required_params=("spec",),
+    # design/124 §7.3: a synchronously awaited workflow moves to the background on steer.
+    interrupt="background",
 )
 
 VALIDATE_WORKFLOW_DEFINITION = ToolDefinition(

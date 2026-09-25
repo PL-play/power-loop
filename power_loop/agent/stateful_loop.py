@@ -1949,6 +1949,7 @@ class StatefulAgentLoop:
                     sink=sink,
                     store=store,
                     drain_follow_ups=_drain_follow_ups,
+                    steer_event=_session_sync(sid, owner=id(self)).steer,
                 )
                 # Every row this run appends (assistant/tool/system, plus follow-up and
                 # trailing-notice rows drained mid-run) inherits the current send index, so

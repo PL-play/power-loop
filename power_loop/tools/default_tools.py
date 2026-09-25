@@ -1243,6 +1243,9 @@ class BackgroundManager:
     def __init__(self) -> None:
         self.tasks: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        # asyncio tasks of in-process tool tasks (run_tool / adopt), by task_id — kept so they
+        # aren't garbage-collected mid-flight and so a later stop can reach them.
+        self._workers: dict[str, asyncio.Future] = {}
         # Live daemon threads (so shutdown can drain them) and terminal write-backs that
         # could not be delivered to their owning loop (so a later check / shutdown can
         # still persist them instead of leaving the row stuck at 'running' forever).
@@ -1533,36 +1536,7 @@ class BackgroundManager:
                 return_code=None, output_tail="(running)",
             )
 
-        async def _worker() -> None:
-            status, output = "completed", ""
-            try:
-                result = await registry.invoke_async(name, args)
-                output = str(result if result is not None else "")[:8000]
-            except Exception as exc:  # noqa: BLE001 — 失败是任务结果，不是崩溃
-                status = "failed"
-                output = f"{type(exc).__name__}: {exc}"[:2000]
-            with self._lock:
-                task = self.tasks.get(task_id)
-                if task is not None:
-                    task["status"] = status
-                    task["result"] = output or "(no output)"
-            if store is not None and sid is not None:
-                try:
-                    await store.upsert_background_task(
-                        sid, task_id=task_id, command=label, status=status,
-                        return_code=0 if status == "completed" else 1,
-                        output_tail=output or "(no output)",
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning("tool task %s: status write-back failed", task_id, exc_info=True)
-            cb = _TOOL_TASK_ON_COMPLETE
-            if cb is not None:
-                try:
-                    await cb(sid, task_id, status)
-                except Exception:  # noqa: BLE001 — 宿主回调失败不毁任务结果
-                    logger.warning("tool task %s: on_complete callback failed", task_id, exc_info=True)
-
-        asyncio.create_task(_worker(), name=f"bg-tool-{task_id}")
+        self._supervise(task_id, label, store, sid, registry.invoke_async(name, args))
         return (
             f"后台任务已启动：task_id={task_id}（{label[:80]}）。"
             "**完成时结果会自动送到你面前，不用去取。** 现在去做别的；"
@@ -1570,6 +1544,87 @@ class BackgroundManager:
             "任务不会因此快一点，用户还得等你。"
             "只有在迟迟等不到、怀疑它卡住时，才 background_run(action=\"check\", task_id=\"" + task_id + "\")。"
         )
+
+    def _supervise(self, task_id: str, label: str, store: Any, sid: str | None,
+                   work: Any) -> asyncio.Task:
+        """Await ``work`` (a coroutine, or an already-running Future) as background task
+        ``task_id``: record its terminal status in memory + the store, then fire the host's
+        ``on_tool_task_complete``. Shared by :meth:`run_tool` (a fresh call) and :meth:`adopt`
+        (a call already in flight). A result of ``(output, failed)`` — ``execute_tool``'s shape —
+        is unpacked; anything else is the output.
+
+        Cancelled (process shutdown, a stop) → status ``cancelled`` is written back before the
+        cancellation propagates; it used to leave the row at ``running`` forever."""
+
+        async def _worker() -> None:
+            status, output = "completed", ""
+            try:
+                result = await work
+                if (isinstance(result, tuple) and len(result) == 2
+                        and isinstance(result[1], bool)):
+                    output, failed = str(result[0] or ""), result[1]
+                    if failed:
+                        status = "failed"
+                else:
+                    output = str(result if result is not None else "")
+                output = output[:8000]
+            except asyncio.CancelledError:
+                status, output = "cancelled", "(cancelled)"
+                await self._settle(task_id, label, store, sid, status, output, notify=False)
+                raise
+            except Exception as exc:  # noqa: BLE001 — 失败是任务结果，不是崩溃
+                status = "failed"
+                output = f"{type(exc).__name__}: {exc}"[:2000]
+            await self._settle(task_id, label, store, sid, status, output, notify=True)
+
+        task = asyncio.ensure_future(_worker())
+        self._workers[task_id] = task
+        task.add_done_callback(lambda _t, _id=task_id: self._workers.pop(_id, None))
+        return task
+
+    async def _settle(self, task_id: str, label: str, store: Any, sid: str | None,
+                      status: str, output: str, *, notify: bool) -> None:
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is not None:
+                task["status"] = status
+                task["result"] = output or "(no output)"
+        if store is not None and sid is not None:
+            try:
+                await store.upsert_background_task(
+                    sid, task_id=task_id, command=label, status=status,
+                    return_code=0 if status == "completed" else 1,
+                    output_tail=output or "(no output)",
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("tool task %s: status write-back failed", task_id, exc_info=True)
+        cb = _TOOL_TASK_ON_COMPLETE
+        if notify and cb is not None:
+            try:
+                await cb(sid, task_id, status)
+            except Exception:  # noqa: BLE001 — 宿主回调失败不毁任务结果
+                logger.warning("tool task %s: on_complete callback failed", task_id, exc_info=True)
+
+    async def adopt(self, tool_name: str, args: dict[str, Any] | None, work: Any) -> str:
+        """Take a tool call that is ALREADY RUNNING (``work``: its Future) into the background
+        task table and return its ``task_id`` (design/124 §7.3, ``interrupt="background"``).
+
+        The call keeps running untouched — same task, same contextvars — its result is recorded
+        like any ``background_run(action="tool")`` task and delivered by the host's completion
+        callback. No async_capable / concurrency-cap checks: this is not a new call, it is one
+        the model already made that simply shouldn't block the turn any longer."""
+        store, sid = _current_store_and_session()
+        task_id = str(uuid.uuid4())[:8]
+        label = f"tool:{tool_name} " + json.dumps(dict(args or {}), ensure_ascii=False)[:160]
+        with self._lock:
+            self.tasks[task_id] = {"command": label, "status": "running", "result": None}
+        if store is not None and sid is not None:
+            await store.upsert_background_task(
+                sid, task_id=task_id, command=label, status="running",
+                return_code=None, output_tail="(running)",
+            )
+        self._supervise(task_id, label, store, sid, work)
+        return task_id
 
     async def check(self, task_id: str | None = None) -> str:
         store, sid = _current_store_and_session()

@@ -67,6 +67,9 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(
         "required": ["task"],
     },
     required_params=("task",),
+    # design/124 §7.3: a sub-agent is long, useful work — a steer moves it to the background
+    # (its result is delivered when it finishes) instead of killing it or blocking the turn.
+    interrupt="background",
 )
 
 

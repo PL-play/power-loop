@@ -34,6 +34,9 @@ class AgentEventType(str, Enum):
     LLM_RETRY_ATTEMPTED = "llm_retry_attempted"
     LLM_DEGRADED = "llm_degraded"
     LOOP_CANCELLED = "loop_cancelled"
+    #: 6.34.0：一条插队消息打断了正在进行的东西（模型输出 / 工具 / 一批工具的剩余部分）。
+    #: 已经流出的半截文字作废（界面据此撤回或标注）。
+    STEER_INTERRUPTED = "steer_interrupted"
 
     # Memory lifecycle (M1.9)
     MEMORY_RECALLED = "memory_recalled"
