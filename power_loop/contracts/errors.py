@@ -124,6 +124,17 @@ class LLMRetryExhausted(PowerLoopError):
         )
 
 
+class LLMNonRetryable(LLMRetryExhausted):
+    """The LLM call failed with an error retrying cannot fix (the retry policy's ``give_up_on``
+    said so — e.g. HTTP 402 insufficient balance, 401 bad key, 404 unknown model), so it was
+    given up after ``attempts`` call(s) instead of burning the whole retry budget.
+
+    A subclass of :class:`LLMRetryExhausted` so every existing ``except LLMRetryExhausted``
+    degrades it the same way; the pipeline reports ``reason="non_retryable"``."""
+
+    code = "llm.non_retryable"
+
+
 class CancellationRequested(PowerLoopError):
     """Raised when a ``CancellationToken`` fires while the loop is awaiting work.
 

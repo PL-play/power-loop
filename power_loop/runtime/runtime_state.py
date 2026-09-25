@@ -122,15 +122,24 @@ class BackgroundRuntimeProjector(RuntimeProjector):
                 )
             )
         chunks.append("</background_updates>")
+        msg: RuntimeMessage = {
+            "role": "user",
+            "name": "runtime_background_updates",
+            "content": "\n\n".join(chunks),
+        }
         if self.mark_seen:
-            await store.mark_background_seen(session_id, [task.task_id for task in updates])
-        return [
-            {
-                "role": "user",
-                "name": "runtime_background_updates",
-                "content": "\n\n".join(chunks),
-            }
-        ]
+            # Deferred: "seen" means the MODEL saw it, i.e. the LLM call carrying this message
+            # succeeded. The pipeline strips this private marker before the request and calls
+            # :meth:`acknowledge` only after a successful call — a failed / degraded / aborted
+            # call must not swallow the updates (design/124 Z7).
+            msg["_ack"] = ("background_seen", [task.task_id for task in updates])
+        return [msg]
+
+    async def acknowledge(self, *, store: Any, session_id: str, ack: Any) -> None:
+        """Mark the projected tasks seen — called by the pipeline once the model saw them."""
+        kind, ids = ack
+        if kind == "background_seen" and ids:
+            await store.mark_background_seen(session_id, list(ids))
 
 
 def default_runtime_projectors() -> tuple[RuntimeProjector, ...]:

@@ -20,12 +20,18 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Any
 
-from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService
+from power_loop._vendor.llm_client.interface import (
+    LLMRequest,
+    LLMResponse,
+    LLMService,
+    LLMTokenUsage,
+)
 from power_loop.agent.sink import MessageSink, NullSink
 from power_loop.agent.system_prompt import resolve_runtime_system_prompt
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
     CancellationRequested,
+    LLMNonRetryable,
     LLMRetryExhausted,
     LLMTimeout,
     ToolNotFound,
@@ -87,10 +93,25 @@ from power_loop.runtime.compact import CompactionContext
 from power_loop.runtime.human_input import HumanInputRequired
 from power_loop.runtime.image_recall import drain_queued_images
 from power_loop.runtime.memory import MemorySnapshot
-from power_loop.runtime.retry import with_retry
+from power_loop.runtime.retry import _status_of, with_retry
+from power_loop.runtime.usage_estimate import (
+    estimate_completion_tokens,
+    estimate_prompt_tokens,
+)
 from power_loop.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _failure_outcome(exc: BaseException) -> str:
+    """How an LLM attempt ended, for the usage record: ``aborted`` (the call's task was
+    cancelled — a retry deadline, steering, a stop), ``timeout`` (the transport gave up), or
+    ``error``."""
+    if isinstance(exc, asyncio.CancelledError):
+        return "aborted"
+    if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower():
+        return "timeout"
+    return "error"
 
 # How many consecutive empty LLM responses (no text, no tool call) to retry before giving up.
 # An empty turn is a provider hiccup, not a completion signal; a couple of retries clears a
@@ -443,9 +464,15 @@ class AgentPipeline:
         round_index: int | None = None,
         hook_injected: dict[str, Any] | None = None,
     ) -> None:
+        # An inbox delivery (design/124 §6) arrives with a private ``_inbox`` marker naming the
+        # claimed inbox rows it carries. Strip it BEFORE hooks/history — the history row is sent
+        # verbatim to the provider — and hand it only to the sink, which marks those rows
+        # delivered in the same transaction as this transcript row.
+        message = dict(msg)
+        inbox = message.pop("_inbox", None)
         ctx = MessageAppendCtx(
             round_index=round_index or 0,
-            message=dict(msg),
+            message=message,
             session_id=self.session_id,
         )
         await self.hooks.run_typed_async(HookPoint.MESSAGE_APPEND, ctx)
@@ -470,6 +497,8 @@ class AgentPipeline:
             sink_msg = {**sink_msg, "send_index": self.send_index}
         if hook_injected is not None:
             sink_msg = {**sink_msg, "hook_injected": hook_injected}
+        if inbox is not None:
+            sink_msg = {**sink_msg, "inbox": inbox}
         await self._emit_sink(self.sink.on_message_appended, sink_msg, round_index=round_index)
 
     async def _resolve_skipped_tool_calls(
@@ -1058,6 +1087,10 @@ class AgentPipeline:
             return [{"role": "user", "content": todo_snap}] if todo_snap else []
 
         messages: list[LoopMessage] = []
+        # A projection is only "consumed" once the model saw it: projectors hand back a private
+        # ``_ack`` marker, stripped here and settled by _acknowledge_runtime() after a SUCCESSFUL
+        # LLM call. A failed call leaves nothing acknowledged, so the next round re-projects.
+        self._pending_acks = []
         for projector in self.config.runtime_projectors:
             projected = await projector.project(
                 store=self.store,
@@ -1065,8 +1098,22 @@ class AgentPipeline:
                 round_index=round_index,
                 context=self.ctx,
             )
-            messages.extend(dict(msg) for msg in projected)
+            for msg in projected:
+                m = dict(msg)
+                ack = m.pop("_ack", None)
+                if ack is not None and hasattr(projector, "acknowledge"):
+                    self._pending_acks.append((projector, ack))
+                messages.append(m)
         return messages
+
+    async def _acknowledge_runtime(self) -> None:
+        """Settle this round's projection acks (the model saw the projected state)."""
+        pending, self._pending_acks = getattr(self, "_pending_acks", []), []
+        for projector, ack in pending:
+            try:
+                await projector.acknowledge(store=self.store, session_id=self.session_id, ack=ack)
+            except Exception:  # an ack failure only means the state is shown once more
+                logger.warning("runtime projection ack failed", exc_info=True)
 
     async def call_llm(
         self,
@@ -1085,14 +1132,20 @@ class AgentPipeline:
         :class:`LLMTimeout`, which :meth:`run` catches and degrades from.
         Cancellation during retry sleep raises :class:`CancellationRequested`.
         """
+        # What THIS attempt has streamed so far — the only record of billed output if the call
+        # dies before its final (usage-carrying) chunk (design/124 §10). Reset per attempt.
+        streamed: dict[str, list[str]] = {"text": [], "think": []}
+
         def _on_delta(text: str) -> None:
             if text:
+                streamed["text"].append(text)
                 self._emit(AgentEventType.STREAM_DELTA,
                            StreamDeltaPayload(text=text, is_think=False),
                            round_index=round_index, stream_id="main")
 
         def _on_think(text: str) -> None:
             if text:
+                streamed["think"].append(text)
                 self._emit(AgentEventType.STREAM_THINK_DELTA,
                            StreamDeltaPayload(text=text, is_think=True),
                            round_index=round_index, stream_id="main")
@@ -1119,6 +1172,8 @@ class AgentPipeline:
             attempt_box[0] += 1
             attempt = attempt_box[0]
             call_id = f"r{round_index}.a{attempt}"
+            streamed["text"].clear()
+            streamed["think"].clear()
             self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
                        round_index=round_index, stream_id="main")
             try:
@@ -1137,17 +1192,44 @@ class AgentPipeline:
                         request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
                     )
                 except BaseException as exc:
+                    # No usage chunk will ever come for this attempt, but it was billed: prompt
+                    # in full once the provider started on it, plus what it streamed before the
+                    # failure (design/124 §11.2). A request REJECTED with an HTTP status before any
+                    # output (402, 401, 400…) was never processed → prompt 0.
+                    outcome = _failure_outcome(exc)
+                    produced = "".join(streamed["text"]), "".join(streamed["think"])
+                    rejected = _status_of(exc) is not None and not any(produced)
+                    p_est = 0 if rejected else estimate_prompt_tokens(
+                        messages=messages, system_prompt=system_prompt, tools=tools)
+                    c_est = estimate_completion_tokens(text=produced[0], think=produced[1])
+                    self.ctx.add_unreported_usage(p_est, c_est)
                     self._emit(
                         AgentEventType.LLM_CALL_COMPLETED,
                         LlmCallCompletedPayload(
                             call_id=call_id, round_index=round_index, attempt=attempt,
                             model=model_name, duration_ms=(time.perf_counter() - t0) * 1000.0,
                             success=False, error_type=type(exc).__name__,
+                            prompt_tokens=p_est, completion_tokens=c_est,
+                            total_tokens=p_est + c_est, estimated=True, outcome=outcome,
                         ),
                         round_index=round_index, stream_id="main",
                     )
                     raise
                 usage = getattr(resp, "token_usage", None)
+                estimated = usage is None or getattr(usage, "prompt_tokens", None) is None
+                if estimated:
+                    # The provider sent no usage for a call that completed (U1: we no longer
+                    # borrow the service's previous call's numbers) — estimate and say so.
+                    p_est = estimate_prompt_tokens(
+                        messages=messages, system_prompt=system_prompt, tools=tools)
+                    c_est = estimate_completion_tokens(
+                        text=getattr(resp, "raw_text", "") or "",
+                        think=getattr(resp, "think", "") or "",
+                        tool_calls=getattr(resp, "tool_calls", None) or ())
+                    usage = LLMTokenUsage(prompt_tokens=p_est, completion_tokens=c_est,
+                                          total_tokens=p_est + c_est)
+                    resp.token_usage = usage
+                    self.ctx.note_estimated_call(p_est + c_est)
                 self._emit(
                     AgentEventType.LLM_CALL_COMPLETED,
                     LlmCallCompletedPayload(
@@ -1159,6 +1241,7 @@ class AgentPipeline:
                         total_tokens=getattr(usage, "total_tokens", None),
                         prompt_cached_tokens=getattr(usage, "prompt_cached_tokens", None),
                         prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
+                        estimated=estimated,
                     ),
                     round_index=round_index, stream_id="main",
                 )
@@ -1523,6 +1606,7 @@ class AgentPipeline:
                         max_tokens=llm_before.max_tokens,
                         temperature=llm_before.temperature,
                     )
+                    await self._acknowledge_runtime()
                 except CancellationRequested as exc:
                     self._emit(
                         AgentEventType.LOOP_CANCELLED,
@@ -1534,7 +1618,11 @@ class AgentPipeline:
                         "cancelled", final_text=f"[cancelled: {exc.reason}]", rounds=round_idx,
                     )
                 except (LLMRetryExhausted, LLMTimeout) as exc:
-                    reason = "timeout" if isinstance(exc, LLMTimeout) else "retry_exhausted"
+                    reason = (
+                        "timeout" if isinstance(exc, LLMTimeout)
+                        else "non_retryable" if isinstance(exc, LLMNonRetryable)
+                        else "retry_exhausted"
+                    )
                     inner = getattr(exc, "last_error", exc)
                     self._emit(
                         AgentEventType.LLM_DEGRADED,

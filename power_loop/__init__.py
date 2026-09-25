@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "6.32.0"
+__version__ = "6.33.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -36,7 +36,7 @@ from power_loop._vendor.llm_client.interface import (
     OpenAICompatibleChatConfig,
 )
 from power_loop._vendor.llm_client.multimodal import create_attachment_ref
-from power_loop.agent.follow_up import FollowUpQueued
+from power_loop.agent.follow_up import FollowUpQueued, InboxItem
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
 from power_loop.agent.system_prompt import (
@@ -55,6 +55,7 @@ from power_loop.agent.types import AgentLoopConfig, AgentLoopResult
 from power_loop.contracts.errors import (
     CancellationRequested,
     CompactionFailed,
+    LLMNonRetryable,
     LLMRetryExhausted,
     LLMTimeout,
     PowerLoopError,
@@ -191,7 +192,7 @@ from power_loop.runtime.representation import (
     Representation,
     VerbatimRepresentation,
 )
-from power_loop.runtime.retry import LLMRetryPolicy, with_retry
+from power_loop.runtime.retry import LLMRetryPolicy, is_permanent_llm_error, with_retry
 from power_loop.runtime.runtime_state import (
     BackgroundRuntimeProjector,
     RuntimeMessage,
@@ -338,9 +339,11 @@ __all__ = [
 	"ToolValidationError",
 	"SpecValidationError",
 	"LLMTimeout",
+	"LLMNonRetryable",
 	"LLMRetryExhausted",
 	"CancellationRequested",
 	"CompactionFailed",
+	"is_permanent_llm_error",
 	"LLMRetryPolicy",
 	"with_retry",
 	"RuntimeMessage",
@@ -489,6 +492,7 @@ __all__ = [
 	"create_default_tool_registry",
 	"DEFAULT_TOOL_HANDLERS",
 	"FollowUpQueued",
+	"InboxItem",
 	"get_tool_definitions",
 	"CORE_TOOL_NAMES",
 	"EXPLORE_TOOL_NAMES",

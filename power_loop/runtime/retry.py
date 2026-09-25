@@ -42,7 +42,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TypeVar
 
-from power_loop.contracts.errors import CancellationRequested, LLMRetryExhausted, LLMTimeout
+from power_loop.contracts.errors import (
+    CancellationRequested,
+    LLMNonRetryable,
+    LLMRetryExhausted,
+    LLMTimeout,
+)
 from power_loop.runtime.cancellation import CancellationToken
 
 T = TypeVar("T")
@@ -61,6 +66,31 @@ def _default_retryable() -> tuple[type[BaseException], ...]:
     control pass an explicit tuple.
     """
     return (Exception,)
+
+
+#: HTTP statuses worth retrying — the OpenAI SDK's own rule: request timeout, conflict, rate
+#: limit, and any server error. Every other 4xx is the request's (or the account's) fault and
+#: comes back identical on a retry: 400 bad request, 401 bad key, 402 insufficient balance,
+#: 403 forbidden, 404 unknown model, 413 too large, 422 unprocessable.
+_RETRYABLE_STATUSES = frozenset({408, 409, 429})
+
+
+def _status_of(exc: BaseException) -> int | None:
+    for attr in ("status_code", "status"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int):
+            return v
+    resp = getattr(exc, "response", None)
+    v = getattr(resp, "status_code", None)
+    return v if isinstance(v, int) else None
+
+
+def is_permanent_llm_error(exc: BaseException) -> bool:
+    """True when ``exc`` carries an HTTP status a retry cannot change (a 4xx other than
+    408/409/429). Errors without a status (connection drops, mid-stream failures, timeouts)
+    are NOT permanent. The default :attr:`LLMRetryPolicy.give_up_on`."""
+    status = _status_of(exc)
+    return status is not None and 400 <= status < 500 and status not in _RETRYABLE_STATUSES
 
 
 @dataclass
@@ -83,6 +113,13 @@ class LLMRetryPolicy:
     retry_on:
         Exception types that trigger a retry. Anything outside this tuple
         bubbles up immediately (and never counts as a retry).
+    give_up_on:
+        ``(exc) -> bool``: True means this failure cannot be fixed by retrying — stop at once
+        with :class:`LLMNonRetryable` instead of spending the remaining attempts (design/124
+        Z11: an exhausted account used to be hit ``attempts × transport retries`` times per
+        round). Default :func:`is_permanent_llm_error` (4xx except 408/409/429). Hosts can
+        widen it (e.g. match "insufficient balance" in a streamed error text) or pass ``None``
+        to retry everything ``retry_on`` matches, as before.
     """
 
     max_attempts: int = 3
@@ -90,6 +127,7 @@ class LLMRetryPolicy:
     backoff_max: float = 8.0
     total_timeout: float | None = 60.0
     retry_on: tuple[type[BaseException], ...] = field(default_factory=_default_retryable)
+    give_up_on: Callable[[BaseException], bool] | None = is_permanent_llm_error
 
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
@@ -168,6 +206,13 @@ async def with_retry(
             raise  # terminal: our budget timeout must not be swallowed by retry_on
         except policy.retry_on as exc:
             last_error = exc
+            if policy.give_up_on is not None:
+                try:
+                    permanent = bool(policy.give_up_on(exc))
+                except Exception:  # a broken classifier must not turn into a new failure mode
+                    permanent = False
+                if permanent:
+                    raise LLMNonRetryable(attempts=attempt + 1, last_error=exc) from exc
             is_last = attempt == policy.max_attempts - 1
             if is_last:
                 break
@@ -210,4 +255,9 @@ async def _cancellable_sleep(seconds: float, token: CancellationToken, *, slice_
     token.raise_if_cancelled()
 
 
-__all__ = ["LLMRetryPolicy", "RetryAttemptCallback", "with_retry"]
+__all__ = [
+    "LLMRetryPolicy",
+    "RetryAttemptCallback",
+    "is_permanent_llm_error",
+    "with_retry",
+]

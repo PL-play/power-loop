@@ -387,7 +387,9 @@ class AnthropicMessagesLLMService(LLMService):
         result.raw_message = response
         result.think = think
         result.tool_calls = tool_calls
-        result.token_usage = self._usage_obj()
+        # From THIS response only — never the instance's shared last-usage (design/124 U1).
+        _u = getattr(response, "usage", None)
+        result.token_usage = self._usage_obj(_u) if _u is not None else None
 
         if on_chunk_delta_text and text:
             maybe = on_chunk_delta_text(text)

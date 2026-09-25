@@ -72,6 +72,14 @@ class LlmCallCompletedPayload(BaseEventPayload):
     #: ``None`` = the provider did not report it (not "zero").
     prompt_cached_tokens: int | None = None
     prompt_cache_miss_tokens: int | None = None
+    #: ``True`` when the token numbers are OUR estimate, not the provider's report: a failed /
+    #: timed-out / aborted attempt never receives the usage chunk (it is the last one), and some
+    #: providers omit usage altogether. Such attempts were still billed (design/124 §11.2), so
+    #: they carry an estimate instead of reading as free.
+    estimated: bool = False
+    #: ``ok`` · ``error`` · ``timeout`` · ``aborted`` (the attempt's task was cancelled: a retry
+    #: deadline, steering, a stop).
+    outcome: str = "ok"
 
 
 @dataclass

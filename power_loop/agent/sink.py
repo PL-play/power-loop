@@ -221,14 +221,21 @@ class SQLiteSink:
             return
         # user / system / anything else
         text, structured = _encode_content(message.get("content"))
+        inbox = message.get("inbox")
+        meta = _meta_with_content_encoding(message.get("meta"), structured=structured)
+        if inbox:
+            # Which inbox items this row carries (dedupe/audit; design/124 §6).
+            meta = {**(meta or {}), "inbox": {k: inbox[k] for k in ("item_ids", "kinds")
+                                              if k in inbox}}
         seq = await self.store.append_message(
             self.session_id,
             role=str(role or "user"),
             content=text,
             name=message.get("name"),
             round_index=round_index,
-            meta=_meta_with_content_encoding(message.get("meta"), structured=structured),
+            meta=meta,
             send_index=message.get("send_index"),
+            inbox=inbox,
         )
         self._history_seqs.append(seq)
         self._history_ord.append(seq)

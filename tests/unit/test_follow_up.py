@@ -276,8 +276,12 @@ async def test_flush_follow_ups_runs_stranded_queue(store: SessionStore) -> None
         config=AgentLoopConfig(system_prompt="S", max_rounds=4, compactor=None),
     )
     sid = await loop.new_session()
-    # Simulate the terminal-window acceptance: enqueue directly onto the idle session.
-    await loop._enqueue_follow_up(sid, "stranded card submission")
+    # Simulate the terminal-window acceptance: park an item in the idle session's inbox (what a
+    # follow_up accepted while the lock was still held leaves behind).
+    store_ = await loop.ensure_store()
+    await store_.inbox_put(sid, [{"item_id": "card-1", "content": "stranded card submission"}])
+    from power_loop.agent.stateful_loop import _session_sync
+    _session_sync(sid).pending_hint += 1
     assert loop.pending_follow_up_count(sid) == 1
 
     result = await loop.flush_follow_ups(sid)

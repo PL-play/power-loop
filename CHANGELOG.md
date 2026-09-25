@@ -8,6 +8,57 @@
 
 ## [Unreleased]
 
+## [6.33.0] — 2026-09-26
+
+design/124（steering 与停止）第一步：先把「消息投递」和「用量记账」做对。
+
+### Added
+
+- **会话收件箱（inbox）**：凡是要送到模型面前、但此刻不能写进对话的东西（运行中来的消息、
+  后台任务完成、提醒、agent 间接力）都先落进持久的收件箱，不再只放在进程内存里。
+  - `StatefulAgentLoop.deliver(items, session_id)` + `InboxItem(content, kind, mode, item_id, meta)`：
+    忙时入箱、下一轮开头投递；空闲时直接以收件箱内容起一次 send。
+  - **`item_id` 去重，永久有效**：同一会话里同一个 id 只收一次（已投递的也算），宿主重发同一批消息是空操作。
+  - **投递与写入对话在同一个事务里**：条目「在对话里」当且仅当它被标记为已投递——取消的 run
+    既不会丢掉排队的消息，也不会让它重复进历史（修 Z4：取消后残留队列 + 宿主重读，同一批用户消息进历史两次）。
+  - 投递时**同类合并、不同类分开**：人说的话永远不和系统唤醒挤在一条消息里（修 Z2）；
+    对话行的 `meta.inbox` 记录它带着哪些条目。
+  - 图片等结构化内容完整穿过收件箱（旧的跨进程队列只存文本，会把图丢掉）。
+  - `mode="steer"` 条目会置位 `loop.steer_event(sid)`（插队的接住点在后续版本接上）；
+    `loop.inbox_pending(sid)` 从存储读权威计数；`SessionStore.inbox_void()` 撤回未投递条目。
+  - `follow_up()` 变成单条 `deliver()` 的包装，新增可选 `kind` / `mode` / `item_id`；
+    `FollowUpQueued` 新增 `accepted` / `duplicates` / `accepted_ids`（有默认值，兼容）。
+- **不可重试的错误当场放弃**：`LLMRetryPolicy.give_up_on`（默认 `is_permanent_llm_error`：
+  408/409/429 以外的 4xx）——余额不足、密钥无效、模型不存在第一次就失败，抛 `LLMNonRetryable`
+  （`LLMRetryExhausted` 的子类），`LLM_DEGRADED.reason = "non_retryable"`。供应商层的打开流重试
+  按同一规则停止。此前一次 402 要发 3×4=12 个请求、退避近一分钟。宿主可以放宽规则（按错误文本识别），
+  传 `None` 恢复旧行为。
+- **没有上报用量的调用也记账**：失败、超时、被中止的尝试收不到用量（用量只在最后一个 chunk），
+  但供应商照样收费（prompt 全额 + 已生成部分）。现在这类尝试带**估算**用量：
+  `LLM_CALL_COMPLETED` 新增 `estimated` / `outcome`（ok/error/timeout/aborted），
+  run 的 `usage` 总数计入它们，并新增 `failed_calls` / `estimated_calls` / `estimated_tokens`。
+  以 HTTP 状态被拒、还没有任何输出的请求不计 prompt。估算器 `power_loop.runtime.usage_estimate`
+  （中日韩字符与其它字符分开算；对 DeepSeek 实测 prompt 估算 / 实际 ≈ 1.2）。
+
+### Changed
+
+- **后台任务结果「模型真看到了」才算已读**：`<background_updates>` 以前在组装请求时就标记已读，
+  这次调用一失败，结果就永远不再出现（修 Z7）。现在调用成功后才确认（投影器新增 `acknowledge()`）。
+- **不再借用上一次调用的用量**：流里没有用量时，OpenAI 兼容 / Anthropic 传输层以前会填上这个服务实例
+  **上一次**调用的用量（可能是别的会话的），造成重复计或记错会话（修 U1）。现在没有就是没有，由 pipeline 估算并标记。
+- 默认重试不再重试 408/409/429 以外的 4xx（见上）。
+
+### Removed
+
+- `SessionStore.enqueue_follow_up` / `drain_follow_up_queue` / `pending_follow_up_depth` 与
+  `Dialect.claim_follow_ups`——只在 `distributed_sessions` 下被 loop 内部使用，由 `inbox_put` /
+  `inbox_claim` / `inbox_counts` 取代。
+
+### Migration
+
+- 存储 schema **v7 → v8**（自动）：`follow_up_queue` 重建为收件箱结构（建新表→拷贝→删旧→改名，
+  中断后可重跑）。v7 里排队的行保留为待投递的 `user` 条目（`item_id = v7:<id>`）。
+
 ## [6.32.0] — 2026-09-25
 
 ### Changed（只改工具说明文字，行为不变）

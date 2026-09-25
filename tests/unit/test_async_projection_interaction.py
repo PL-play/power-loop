@@ -78,8 +78,14 @@ async def test_background_updates_reenter_once_and_are_marked_seen(store: Sessio
     body = str(first[0]["content"])
     assert "<background_updates>" in body and "bg-1" in body and "BUILD OK" in body
 
-    # Marked seen → the next round does not re-inject the same finished task.
-    second = await projector.project(store=store, session_id=sid, round_index=1, context=None)
+    # Not seen until acknowledged (the pipeline acks only after a SUCCESSFUL LLM call, so a
+    # failed call can't swallow the update — design/124 Z7) …
+    assert "_ack" in first[0]
+    again = await projector.project(store=store, session_id=sid, round_index=1, context=None)
+    assert len(again) == 1
+    # … acknowledged → the next round does not re-inject the same finished task.
+    await projector.acknowledge(store=store, session_id=sid, ack=again[0]["_ack"])
+    second = await projector.project(store=store, session_id=sid, round_index=2, context=None)
     assert second == []
 
 

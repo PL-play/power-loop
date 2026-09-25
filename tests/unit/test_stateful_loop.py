@@ -1162,8 +1162,8 @@ async def test_two_loop_objects_serialize_on_one_session(store: SessionStore) ->
     # follow_up uses to fold instead of starting a competing owner run.
     async with first._lock_for(sid):
         assert second._lock_for(sid).locked()
-        depth = await second._enqueue_follow_up(sid, "steer")
-        assert depth == 1
+        queued = await second.follow_up("steer", sid)
+        assert isinstance(queued, FollowUpQueued) and queued.queue_depth == 1
         # …and the loop that is actually running the session drains what the other enqueued,
         # instead of it being stranded in a queue nobody reads.
         drained = await first._drain_follow_up_messages(sid)

@@ -91,11 +91,10 @@ async def test_only_the_holder_can_renew(stores) -> None:
 async def test_concurrent_drains_deliver_each_item_exactly_once(stores) -> None:
     """The regression that SQLite could not see: steering must never be replayed."""
     sid = await stores[0].create_session(system_prompt="S")
-    for i in range(50):
-        await stores[0].enqueue_follow_up(sid, f"m{i}")
+    await stores[0].inbox_put(sid, [{"item_id": f"m{i}", "content": f"m{i}"} for i in range(50)])
 
-    batches = await asyncio.gather(*(s.drain_follow_up_queue(sid) for s in stores))
-    seen = [item for batch in batches for item in batch]
+    batches = await asyncio.gather(*(s.inbox_claim(sid) for s in stores))
+    seen = [r["item_id"] for batch in batches for r in batch]
 
     assert len(seen) == len(set(seen)), "an item was delivered to more than one drain"
     assert sorted(seen) == sorted(f"m{i}" for i in range(50)), "items lost or duplicated"
@@ -175,7 +174,7 @@ async def test_follow_up_parks_steering_for_the_remote_holder(stores) -> None:
     queued = await loop.follow_up("steer me", sid)
     assert queued.__class__.__name__ == "FollowUpQueued"
     assert not llm.calls, "follow_up started a run over a held session"
-    assert await stores[0].pending_follow_up_depth(sid) == 1
+    assert (await stores[0].inbox_counts(sid))["pending"] == 1
 
     await stores[1].release_session_lease(sid, owner_id="other-process")
     await loop.aclose()
@@ -199,14 +198,14 @@ async def test_holder_drains_steering_parked_by_another_process(stores) -> None:
         pytest.fail("the run never reached its LLM")
 
     # A different process parks steering while this one holds the lease.
-    await stores[1].enqueue_follow_up(sid, "steer from elsewhere")
+    await stores[1].inbox_put(sid, [{"item_id": "remote-1", "content": "steer from elsewhere"}])
     llm.release.set()
     await run
 
     msgs = await loop.get_messages(sid)
     hits = [m for m in msgs if "steer from elsewhere" in str(m.get("content") or "")]
     assert len(hits) == 1, f"steering reached history {len(hits)} times"
-    assert await stores[0].pending_follow_up_depth(sid) == 0
+    assert (await stores[0].inbox_counts(sid))["pending"] == 0
 
     await loop.aclose()
     await stores[0].close_session(sid)

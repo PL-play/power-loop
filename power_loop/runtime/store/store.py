@@ -19,7 +19,8 @@ import contextlib
 import json
 import secrets
 import time
-from collections.abc import Callable, Mapping
+import uuid
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from power_loop.runtime.store.capabilities import Maintenance
@@ -341,6 +342,7 @@ class SessionStore:
         meta: dict[str, Any] | None = None,
         send_index: int | None = None,
         hook_injected: dict[str, Any] | None = None,
+        inbox: Mapping[str, Any] | None = None,
     ) -> int:
         """Append one message and return its allocated per-session ``seq`` (allocated +
         inserted atomically in one transaction). ``send_index`` is the authoritative per-session
@@ -350,7 +352,11 @@ class SessionStore:
         into this round's LLM call (e.g. recalled memory) as a child ``hook_events`` row in the SAME
         transaction — linked to this message's ``seq``. It NEVER touches the ``messages`` row itself,
         so it can't reach history or the LLM request. Shape:
-        ``{hook_point, hook, position, kind, payload}``."""
+        ``{hook_point, hook, position, kind, payload}``.
+
+        ``inbox`` (``{"claim_token": str, "ids": [row ids]}``) marks those claimed inbox rows
+        ``delivered`` — pointing at this message's seq — in the SAME transaction, so an inbox
+        item is in the transcript iff it is marked delivered (see :meth:`inbox_claim`)."""
         now = _now_ms()
         async with self._db.transaction() as tx:
             st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
@@ -373,6 +379,16 @@ class SessionStore:
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
             )
+            if inbox and inbox.get("ids"):
+                ids = [int(i) for i in inbox["ids"]]
+                await tx.execute(
+                    f"UPDATE {self.t.follow_up_queue} SET status='delivered', delivered_at=?, "
+                    "delivered_seq=?, delivered_send_index=?, claim_token=NULL "
+                    f"WHERE session_id=? AND claim_token=? AND status='claimed' "
+                    f"AND id IN ({','.join('?' for _ in ids)})",
+                    (now, seq, (int(send_index) if send_index is not None else None),
+                     session_id, str(inbox.get("claim_token") or ""), *ids),
+                )
             if hook_injected:
                 # Per-session monotonic event_id; MAX+1 is race-free here because we hold the
                 # session_state lock for the whole append (serializes same-session writers).
@@ -880,44 +896,136 @@ class SessionStore:
         )
         return dict(row) if row else None
 
-    async def enqueue_follow_up(self, session_id: str, content: str) -> int:
-        """Hand steering to whichever process holds ``session_id``; returns the new queue depth.
+    # ── inbox (design/124 §6; schema v8) ────────────────────────────────────
+    #
+    # Everything that should reach a session's model but can't be written into its transcript
+    # right now (a run is in flight, or it belongs to the next send) waits here. Lifecycle:
+    #
+    #   pending ──claim──▶ claimed ──(same tx as the transcript row)──▶ delivered
+    #      ▲                  │
+    #      └──release/stale───┘                     pending ──void──▶ void
+    #
+    # ``delivered`` is written in the SAME transaction as the transcript row (append_message's
+    # ``inbox=``), so "in the transcript" and "marked delivered" can never disagree: a row still
+    # ``claimed`` long after its claim was taken provably never reached the transcript and is
+    # safe to hand out again. Delivered rows are KEPT — the unique (session_id, item_id) index is
+    # what makes a re-sent item a no-op, and it needs the old row to be there.
 
-        This is what makes losing the lease race harmless: instead of starting a competing run (or
-        dropping the message), the loser parks it here and the holder picks it up at its next round
-        boundary — folding, across processes.
-        """
+    async def inbox_put(
+        self, session_id: str, items: Sequence[Mapping[str, Any]]
+    ) -> list[str]:
+        """Accept ``items`` into ``session_id``'s inbox, returning the ``item_id``s that were NEW.
+
+        Each item: ``item_id`` (required — the dedupe key; the same id is accepted at most once
+        per session, ever), ``content`` (str; structured content is encoded by the caller, see
+        ``meta``), ``kind`` (default ``user``), ``mode`` (``queue``/``steer``), ``meta`` (dict).
+        A duplicate is skipped silently (``INSERT … ON CONFLICT DO NOTHING``), which is why the
+        return value — not the input — says what was actually taken."""
+        cols = ("session_id", "item_id", "kind", "mode", "status", "content", "meta_json",
+                "created_at")
+        sql = self._db.dialect.insert_ignore(self.t.follow_up_queue, cols)
+        now = _now_ms()
+        accepted: list[str] = []
+        async with self._db.transaction() as tx:
+            for it in items:
+                item_id = str(it["item_id"])
+                meta = it.get("meta")
+                n = await tx.execute(sql, (
+                    session_id, item_id, str(it.get("kind") or "user"),
+                    str(it.get("mode") or "queue"), "pending", _nul_safe(str(it.get("content") or "")),
+                    _dumps(meta) if meta else None, now,
+                ))
+                if n:
+                    accepted.append(item_id)
+        return accepted
+
+    async def inbox_claim(
+        self, session_id: str, *, stale_after_ms: int = 60_000
+    ) -> list[dict[str, Any]]:
+        """Claim every pending item of ``session_id`` (oldest first) for delivery.
+
+        The claim is one ``UPDATE … WHERE status='pending'`` stamped with a fresh token, then a
+        read by that token — atomic on every backend (a concurrent claimer's UPDATE blocks on the
+        row locks and then re-checks ``status``), with no ``RETURNING`` needed. Claims older than
+        ``stale_after_ms`` are first returned to pending: their claimer died before the
+        transcript write (which would have flipped them to ``delivered`` in the same tx)."""
+        token = uuid.uuid4().hex
+        now = _now_ms()
+        q = self.t.follow_up_queue
         async with self._db.transaction() as tx:
             await tx.execute(
-                f"INSERT INTO {self.t.follow_up_queue} (session_id, content, created_at) "
-                "VALUES (?, ?, ?)",
-                (session_id, _nul_safe(content), _now_ms()),
+                f"UPDATE {q} SET status='pending', claim_token=NULL, claimed_at=NULL "
+                "WHERE session_id=? AND status='claimed' AND claimed_at < ?",
+                (session_id, now - int(stale_after_ms)),
             )
-            row = await tx.fetchone(
-                f"SELECT COUNT(*) AS c FROM {self.t.follow_up_queue} WHERE session_id=?",
-                (session_id,),
+            await tx.execute(
+                f"UPDATE {q} SET status='claimed', claim_token=?, claimed_at=? "
+                "WHERE session_id=? AND status='pending'",
+                (token, now, session_id),
             )
-            return int(row["c"]) if row else 1
-
-    async def drain_follow_up_queue(self, session_id: str) -> list[str]:
-        """Claim and remove everything queued for ``session_id``, oldest first.
-
-        Read and delete run in ONE transaction so two drains can't both return the same item.
-        """
-        async with self._db.transaction() as tx:
-            rows = await self._db.dialect.claim_follow_ups(
-                tx, self.t.follow_up_queue, session_id=session_id
+            rows = await tx.fetchall(
+                f"SELECT id, item_id, kind, mode, content, meta_json, created_at FROM {q} "
+                "WHERE session_id=? AND claim_token=? ORDER BY id",
+                (session_id, token),
             )
-            return [str(r["content"]) for r in rows]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            meta = r["meta_json"]
+            out.append({
+                "id": int(r["id"]), "item_id": r["item_id"], "kind": r["kind"],
+                "mode": r["mode"], "content": r["content"],
+                "meta": json.loads(meta) if meta else {}, "created_at": r["created_at"],
+                "claim_token": token,
+            })
+        return out
 
-    async def pending_follow_up_depth(self, session_id: str) -> int:
-        """How many items are parked for ``session_id`` (host observability / stranded-steering
-        checks) without claiming them."""
+    async def inbox_release(self, session_id: str, claim_token: str) -> int:
+        """Return still-claimed rows of ``claim_token`` to pending (the delivery they were claimed
+        for did not happen). Rows already delivered are untouched. Returns how many."""
+        return await self._db.execute(
+            f"UPDATE {self.t.follow_up_queue} SET status='pending', claim_token=NULL, "
+            "claimed_at=NULL WHERE session_id=? AND claim_token=? AND status='claimed'",
+            (session_id, claim_token),
+        )
+
+    async def inbox_void(self, session_id: str, item_ids: Sequence[str]) -> int:
+        """Withdraw not-yet-delivered items (pending or claimed) so they never reach the model.
+        Delivered items are history and are left alone. Returns how many were voided."""
+        if not item_ids:
+            return 0
+        marks = ",".join("?" for _ in item_ids)
+        return await self._db.execute(
+            f"UPDATE {self.t.follow_up_queue} SET status='void', claim_token=NULL "
+            f"WHERE session_id=? AND status IN ('pending','claimed') AND item_id IN ({marks})",
+            (session_id, *[str(i) for i in item_ids]),
+        )
+
+    async def inbox_counts(self, session_id: str) -> dict[str, int]:
+        """``{"pending": n, "steer": m}`` — undelivered items (pending + claimed) and how many of
+        those are steering. Observability / stranded-steering checks; claims nothing."""
         row = await self._db.fetchone(
-            f"SELECT COUNT(*) AS c FROM {self.t.follow_up_queue} WHERE session_id=?",
+            f"SELECT COUNT(*) AS n, "
+            f"SUM(CASE WHEN mode='steer' THEN 1 ELSE 0 END) AS s FROM {self.t.follow_up_queue} "
+            "WHERE session_id=? AND status IN ('pending','claimed')",
             (session_id,),
         )
-        return int(row["c"]) if row else 0
+        return {"pending": int(row["n"] or 0) if row else 0,
+                "steer": int(row["s"] or 0) if row else 0}
+
+    async def inbox_items(
+        self, session_id: str, *, statuses: Sequence[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Inspect a session's inbox rows (oldest first), optionally filtered by status."""
+        sql = (f"SELECT id, item_id, kind, mode, status, content, meta_json, created_at, "
+               f"delivered_at, delivered_seq, delivered_send_index FROM {self.t.follow_up_queue} "
+               "WHERE session_id=?")
+        params: list[Any] = [session_id]
+        if statuses:
+            sql += f" AND status IN ({','.join('?' for _ in statuses)})"
+            params += list(statuses)
+        rows = await self._db.fetchall(sql + " ORDER BY id", tuple(params))
+        return [{**dict(r), "meta": json.loads(r["meta_json"]) if r["meta_json"] else {}}
+                for r in rows]
 
     async def close_session(self, session_id: str, *, cascade: bool = True) -> int:
         """Physically delete the session's rows across all tables.

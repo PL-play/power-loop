@@ -78,7 +78,12 @@ def validate_table_prefix(prefix: str) -> str:
 #:   agent processes on one database, two of them could drive a session concurrently. The lease row
 #:   is the shared arbiter, and the queue lets a process that loses the race hand its steering to
 #:   the holder instead of starting a competing run.
-CURRENT_SCHEMA_VERSION = 7
+#: v8 (2026-09): ``{prefix}follow_up_queue`` becomes the durable INBOX (design/124 §6): every
+#:   item is stored (not only cross-process ones), carries a dedupe ``item_id`` (unique per
+#:   session), ``kind``/``mode``/``status``, and is marked ``delivered`` in the SAME transaction
+#:   that writes it into the transcript — so a cancelled run neither loses nor double-delivers
+#:   queued steering. Rebuilt as ``…_v8`` + copy + rename (v7 rows become pending user items).
+CURRENT_SCHEMA_VERSION = 8
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -148,11 +153,49 @@ async def _migration_steps(
         if not await _column_exists(tx, db.dialect.name, f"{prefix}usage_rounds", "send_index"):
             steps += _usage_rounds_v6_ddl(db.dialect.name, prefix)
     if from_version < 7:
-        # v6 → v7: add the session_leases + follow_up_queue tables (cross-process session mutual
-        # exclusion). Both are new CREATE TABLE IF NOT EXISTS — idempotent, no ALTER, so no
-        # catalog probe is needed.
+        # v6 → v7: add the session_leases table (cross-process session mutual exclusion). New
+        # CREATE TABLE IF NOT EXISTS — idempotent, no probe. The v7 follow_up_queue table is NOT
+        # created here any more: the v8 step below builds the inbox shape directly.
         steps += db.dialect.leases_ddl(prefix)
+    if from_version < 8:
+        steps += await _inbox_v8_steps(tx, db, prefix)
     return steps
+
+
+async def _inbox_v8_steps(tx: Transaction, db: Database, prefix: str) -> list[str]:
+    """v7 → v8: rebuild ``follow_up_queue`` into the inbox shape. Probes make it resumable from
+    ANY point of a half-applied MySQL ladder (its DDL auto-commits): already migrated → nothing;
+    the ``_v8`` table may already exist (CREATE IF NOT EXISTS) and hold a partial copy (the copy
+    ignores duplicates); the old table may already be gone (skip copy + drop, just rename)."""
+    name = db.dialect.name
+    old, tmp = f"{prefix}follow_up_queue", f"{prefix}follow_up_queue_v8"
+    old_exists = await _table_exists_tx(tx, name, old)
+    if old_exists and await _column_exists(tx, name, old, "status"):
+        return []
+    steps = list(db.dialect.inbox_ddl(prefix, tmp))
+    if old_exists:
+        steps += [db.dialect.inbox_v8_copy_sql(prefix, old, tmp), f"DROP TABLE {old}"]
+    steps.append(f"ALTER TABLE {tmp} RENAME TO {old}")
+    return steps
+
+
+async def _table_exists_tx(tx: Transaction, dialect_name: str, table: str) -> bool:
+    """:func:`_table_exists` on the OPEN migration transaction (a fresh ``db`` query would
+    deadlock on SQLite's single connection)."""
+    if dialect_name == "sqlite":
+        row = await tx.fetchone(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        )
+        return row is not None
+    if dialect_name == "postgres":
+        row = await tx.fetchone("SELECT to_regclass(?) AS reg", (table,))
+        return row is not None and row["reg"] is not None
+    row = await tx.fetchone(
+        "SELECT 1 AS present FROM information_schema.tables "
+        "WHERE table_schema=DATABASE() AND table_name=?",
+        (table,),
+    )
+    return row is not None
 
 
 def _usage_rounds_v6_ddl(dialect_name: str, prefix: str) -> list[str]:
@@ -209,6 +252,15 @@ def migration_ddl_for_display(db: Database, prefix: str, *, from_version: int) -
         )
     if from_version < 6:
         steps += _usage_rounds_v6_ddl(db.dialect.name, prefix)
+    if from_version < 7:
+        steps += db.dialect.leases_ddl(prefix)
+    if from_version < 7:
+        steps += db.dialect.inbox_ddl(prefix, f"{prefix}follow_up_queue")
+    elif from_version < 8:
+        old, tmp = f"{prefix}follow_up_queue", f"{prefix}follow_up_queue_v8"
+        steps += db.dialect.inbox_ddl(prefix, tmp)
+        steps += [db.dialect.inbox_v8_copy_sql(prefix, old, tmp), f"DROP TABLE {old}",
+                  f"ALTER TABLE {tmp} RENAME TO {old}"]
     return steps
 
 

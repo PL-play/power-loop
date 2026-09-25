@@ -24,9 +24,11 @@ _BIG_SP = "You are a terse assistant; reply with a single lowercase word.\n" + (
 async def test_real_cached_tokens_persisted(tmp_path) -> None:
     db = str(tmp_path / "cached.db")
     loop = StatefulAgentLoop(
-        llm=make_llm(max_tokens=16, temperature=0),
+        # 256, not 16: a thinking model (deepseek-flash thinks by default) spends the first tokens
+        # reasoning, so a 16-token budget truncates before any answer → hit_round_limit.
+        llm=make_llm(max_tokens=256, temperature=0),
         db_path=db,
-        config=AgentLoopConfig(system_prompt=_BIG_SP, max_rounds=1, max_tokens=16, temperature=0),
+        config=AgentLoopConfig(system_prompt=_BIG_SP, max_rounds=1, max_tokens=256, temperature=0),
     )
     sid = await loop.new_session()
     expected_cached = 0

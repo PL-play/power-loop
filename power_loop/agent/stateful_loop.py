@@ -32,11 +32,11 @@ from typing import TYPE_CHECKING, Any
 
 from power_loop._vendor.llm_client.interface import LLMService
 from power_loop.agent.follow_up import (
+    INBOX_KIND_USER,
     FollowUpQueued,
-    merge_follow_up_inputs,
-)
-from power_loop.agent.follow_up import (
-    follow_up_text as _follow_up_text,
+    InboxItem,
+    inbox_row,
+    render_inbox_rows,
 )
 from power_loop.agent.sink import (
     CONTENT_ENCODING_JSON,
@@ -176,8 +176,16 @@ class _SessionSync:
     """
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Serializes this process's inbox claims for the session (the claim itself is atomic in the
+    # store; this just avoids two same-process drains racing for nothing).
     queue_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    queue: list[str | LoopMessage] = field(default_factory=list)
+    # In-process HINT of undelivered inbox items this process accepted (+ on accept, − on claim,
+    # + on release). The store is the truth (``inbox_counts``); this only backs the sync
+    # ``pending_follow_up_count`` and registry cleanup.
+    pending_hint: int = 0
+    # Set while a ``steer``-mode item waits undelivered (design/124 §7 interrupt points and
+    # waiting tools await it); cleared when the inbox is claimed.
+    steer: asyncio.Event = field(default_factory=asyncio.Event)
     refs: set[int] = field(default_factory=set)
 
 
@@ -232,7 +240,7 @@ def _release_session_sync(sid: str, owner: int) -> None:
         if entry is None:
             return
         entry.refs.discard(owner)
-        if not entry.refs and not entry.lock.locked() and not entry.queue:
+        if not entry.refs and not entry.lock.locked() and entry.pending_hint <= 0:
             del _SESSION_SYNC[sid]
 
 
@@ -240,20 +248,6 @@ def _discard_session_sync(sid: str) -> None:
     """Forget ``sid`` entirely (the session was physically deleted)."""
     with _SESSION_SYNC_GUARD:
         _SESSION_SYNC.pop(sid, None)
-
-
-def _drain_queue(sid: str) -> list[str | LoopMessage]:
-    """Take everything queued for ``sid``, leaving the (shared) entry in place.
-
-    Callers hold the session's queue_lock. The list is emptied IN PLACE rather than replaced so
-    every loop holding a reference to it sees the drain.
-    """
-    entry = _SESSION_SYNC.get(sid)
-    if entry is None:
-        return []
-    pending = list(entry.queue)
-    entry.queue.clear()
-    return pending
 
 
 class StatefulAgentLoop:
@@ -769,6 +763,68 @@ class StatefulAgentLoop:
                     max_rounds=max_rounds, response_format=response_format,
                 )
 
+    async def deliver(
+        self,
+        items: InboxItem | Sequence[InboxItem],
+        session_id: str,
+        *,
+        stop_event: CancellationLike = None,
+        tools: Sequence[str] | ToolRegistry | None = None,
+        system_prompt: str | None = None,
+        max_rounds: int | None = None,
+    ) -> StatefulResult | FollowUpQueued:
+        """Put ``items`` in front of the session's model — now, or as soon as it can take them.
+
+        Every item first lands in the session's durable inbox (design/124 §6); an ``item_id``
+        seen before is dropped (at most once per session, ever). Then:
+
+        * a run is in flight on this session (this process holds its lock) → the items wait in
+          the inbox; that run claims them at its next round boundary. Returns
+          :class:`FollowUpQueued`.
+        * another process holds the session (``distributed_sessions``) → same, its run claims
+          them. Returns :class:`FollowUpQueued`.
+        * idle → a fresh send runs with the waiting items as its input (everything pending —
+          including items a cancelled run left behind — oldest first). Returns its result.
+        * nothing new (all duplicates) → :class:`FollowUpQueued` with ``accepted=0``.
+
+        ``stop_event`` / ``tools`` / ``system_prompt`` / ``max_rounds`` apply only to a run this
+        call starts (the idle case); a run in flight keeps its own.
+        """
+        sid = session_id
+        batch = [items] if isinstance(items, InboxItem) else list(items)
+        self._raise_if_closing()
+        store = await self._ensure_store()
+        await self._ensure_session_or_raise(sid)
+        rows = [inbox_row(it) for it in batch]
+        accepted = await store.inbox_put(sid, rows)
+        entry = _session_sync(sid, owner=id(self))
+        self._sync_sids.add(sid)
+        entry.pending_hint += len(accepted)
+        accepted_set = set(accepted)
+        if any(r["mode"] == "steer" and r["item_id"] in accepted_set for r in rows):
+            entry.steer.set()
+
+        async def _queued() -> FollowUpQueued:
+            counts = await store.inbox_counts(sid)
+            return FollowUpQueued(
+                session_id=sid, queue_depth=counts["pending"], accepted=len(accepted),
+                duplicates=len(rows) - len(accepted), accepted_ids=tuple(accepted),
+            )
+
+        if not accepted or self._lock_for(sid).locked():
+            return await _queued()
+        if self.config.distributed_sessions:
+            # Idle HERE, but another process may be driving this session: its run claims the
+            # items at its next round boundary — don't start a competing run.
+            holder = await store.session_lease_holder(sid)
+            if holder is not None and holder["owner_id"] != self._owner_id:
+                return await _queued()
+        result = await self._send_from_inbox(
+            sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+            max_rounds=max_rounds,
+        )
+        return result if result is not None else await _queued()
+
     async def follow_up(
         self,
         user_input: str | LoopMessage,
@@ -778,50 +834,47 @@ class StatefulAgentLoop:
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
         max_rounds: int | None = None,
+        kind: str = INBOX_KIND_USER,
+        mode: str = "queue",
+        item_id: str | None = None,
     ) -> StatefulResult | FollowUpQueued:
-        """Steer an in-flight loop, or fall back to :meth:`send`.
+        """Steer an in-flight loop, or run it now if the session is idle.
 
-        When the session lock is held by a running :meth:`send` / :meth:`resume`
-        / :meth:`submit_input`, the input is appended to a per-session queue.
-        The pipeline drains that queue at each **round** boundary (before
-        ``prepare_round``), injects a wrapped ``<follow_up>`` user message, and
-        clears the drained items.
-
-        When the session is idle (lock not held), behaves like :meth:`send`.
+        One-item :meth:`deliver`: while a run holds the session the input waits in the inbox and
+        is claimed at that run's next **round** boundary (as a ``<follow_up>`` user message);
+        on an idle session it runs as a send. ``kind`` / ``mode`` / ``item_id`` — see
+        :class:`InboxItem`.
 
         ``max_rounds`` (per-call, idle path only): run this continuation with a different round
         budget than ``config.max_rounds`` — e.g. a short bounded "finalize" turn. Ignored on the
         STEERED path (an in-flight loop's own budget governs the drained follow-up).
         """
-        sid = session_id
-        self._raise_if_closing()
-        await self._ensure_store()
-        await self._ensure_session_or_raise(sid)
-        session_lock = self._lock_for(sid)
-        if session_lock.locked():
-            depth = await self._enqueue_follow_up(sid, user_input)
-            return FollowUpQueued(session_id=sid, queue_depth=depth)
-        if self.config.distributed_sessions and self.store is not None:
-            # Idle HERE, but another process may be driving this session. Park the steering in the
-            # shared queue for that holder to drain instead of starting a competing run.
-            holder = await self.store.session_lease_holder(sid)
-            if holder is not None and holder["owner_id"] != self._owner_id:
-                depth = await self.store.enqueue_follow_up(sid, _follow_up_text(user_input))
-                return FollowUpQueued(session_id=sid, queue_depth=depth)
-        return await self.send(
-            user_input, sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+        return await self.deliver(
+            InboxItem(content=user_input, kind=kind, mode=mode, item_id=item_id),
+            session_id, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
             max_rounds=max_rounds,
         )
 
     def pending_follow_up_count(self, session_id: str) -> int:
-        """Number of queued (not yet drained) follow-up items for ``session_id``.
+        """In-process HINT of undelivered inbox items for ``session_id`` (items this process
+        accepted and no drain has claimed yet).
 
-        Steering accepted in the terminal window of a run (after the loop's last
-        round-boundary drain) stays queued on the now-idle session. Hosts use this
-        after a run returns to detect stranded steering and hand it to
-        :meth:`flush_follow_ups` instead of leaving it silently parked.
-        """
-        return len(_session_sync(session_id).queue)
+        Steering accepted in the terminal window of a run (after the loop's last round-boundary
+        drain) stays in the inbox of the now-idle session; hosts use this after a run returns to
+        detect it and hand it to :meth:`flush_follow_ups`. Sync and cheap, but blind to other
+        processes and to a restart — :meth:`inbox_pending` asks the store."""
+        entry = _SESSION_SYNC.get(session_id)
+        return max(0, entry.pending_hint) if entry is not None else 0
+
+    async def inbox_pending(self, session_id: str) -> dict[str, int]:
+        """Authoritative ``{"pending": n, "steer": m}`` for ``session_id`` from the store."""
+        store = await self._ensure_store()
+        return await store.inbox_counts(session_id)
+
+    def steer_event(self, session_id: str) -> asyncio.Event:
+        """The session's "steering is waiting" event (set while a ``mode="steer"`` item this
+        process accepted is undelivered). Interrupt points and waiting tools await it."""
+        return _session_sync(session_id).steer
 
     async def flush_follow_ups(
         self,
@@ -832,14 +885,13 @@ class StatefulAgentLoop:
         system_prompt: str | None = None,
         max_rounds: int | None = None,
     ) -> StatefulResult | None:
-        """Run queued follow-up steering left stranded on an IDLE session.
+        """Run inbox items left waiting on an IDLE session.
 
-        Returns ``None`` when there is nothing to do: the queue is empty, or the
-        session lock is held (the running owner drains the queue itself at its
-        round boundaries). Otherwise drains the queue, merges the items into one
-        ``<follow_up>`` user message and runs it via :meth:`send`, returning that
-        run's result. Call in a loop until it returns ``None`` to also cover items
-        enqueued during the flush run's own terminal window.
+        Returns ``None`` when there is nothing to do: the inbox is empty, or the session lock is
+        held (the running owner claims the inbox itself at its round boundaries). Otherwise runs
+        a send whose input is everything waiting and returns that run's result. Call in a loop
+        until it returns ``None`` to also cover items that arrived during the flush run's own
+        terminal window.
         """
         sid = session_id
         self._raise_if_closing()
@@ -847,15 +899,46 @@ class StatefulAgentLoop:
         await self._ensure_session_or_raise(sid)
         if self._lock_for(sid).locked():
             return None
-        async with self._follow_up_queue_lock_for(sid):
-            pending = _drain_queue(sid)
-        merged = merge_follow_up_inputs(pending)
-        if merged is None:
-            return None
-        return await self.send(
-            merged, sid, stop_event=stop_event, tools=tools,
-            system_prompt=system_prompt, max_rounds=max_rounds,
+        return await self._send_from_inbox(
+            sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+            max_rounds=max_rounds,
         )
+
+    async def _send_from_inbox(
+        self,
+        sid: str,
+        *,
+        stop_event: CancellationLike,
+        tools: Sequence[str] | ToolRegistry | None,
+        system_prompt: str | None,
+        max_rounds: int | None,
+    ) -> StatefulResult | None:
+        """A send whose input is the waiting inbox items; ``None`` if nothing is waiting.
+
+        The claim happens only after the pending check passed, so a refused send leaves the
+        items pending. The first message (the first run of same-kind items) becomes the send's
+        input and is marked delivered in the same transaction as its transcript row; the rest
+        go straight back to pending and are claimed by the pipeline's round-0 drain moments
+        later — still before the first model call."""
+        store = await self._ensure_store()
+        async with self._lock_for(sid):
+            await self._ensure_session_or_raise(sid)
+            await self._raise_if_pending(sid)
+            async with self._session_lease(sid):
+                claimed = await self._claim_inbox(sid)
+                if not claimed:
+                    return None
+                token = claimed[0]["claim_token"]
+                first = render_inbox_rows(claimed, wrap=False)[0]
+                try:
+                    await self._persist_user_input(sid, first)
+                finally:
+                    released = await store.inbox_release(sid, token)
+                    _session_sync(sid).pending_hint += released
+                return await self._run_loop(
+                    sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+                    max_rounds=max_rounds,
+                )
 
     def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
         """Drive ``coro`` to completion on the loop's dedicated sync event loop.
@@ -1292,28 +1375,27 @@ class StatefulAgentLoop:
         self._sync_sids.add(sid)
         return _session_sync(sid, owner=id(self)).lock
 
-    def _follow_up_queue_lock_for(self, sid: str) -> asyncio.Lock:
+    async def _claim_inbox(self, sid: str) -> list[dict[str, Any]]:
+        """Claim everything waiting in ``sid``'s inbox (see ``SessionStore.inbox_claim``)."""
+        store = await self._ensure_store()
+        entry = _session_sync(sid, owner=id(self))
         self._sync_sids.add(sid)
-        lock = _session_sync(sid, owner=id(self)).queue_lock
-        return lock
-
-    async def _enqueue_follow_up(self, sid: str, user_input: str | LoopMessage) -> int:
-        async with self._follow_up_queue_lock_for(sid):
-            queue = _session_sync(sid, owner=id(self)).queue
-            queue.append(user_input)
-            return len(queue)
+        async with entry.queue_lock:
+            rows = await store.inbox_claim(sid)
+        entry.pending_hint = max(0, entry.pending_hint - len(rows))
+        if rows:
+            entry.steer.clear()
+        return rows
 
     async def _drain_follow_up_messages(self, sid: str) -> list[LoopMessage]:
-        async with self._follow_up_queue_lock_for(sid):
-            pending: list[str | LoopMessage] = _drain_queue(sid)
-        if self.config.distributed_sessions and self.store is not None:
-            # Also take what OTHER processes parked for us. Same round boundary, one merged
-            # message — from the model's side there is no difference between steering that came
-            # from this process and steering that came from another.
-            with contextlib.suppress(Exception):  # never let a DB blip abort a live round
-                pending += await self.store.drain_follow_up_queue(sid)
-        merged = merge_follow_up_inputs(pending)
-        return [merged] if merged is not None else []
+        """Round-boundary drain: claim the inbox and render it as ``<follow_up>`` messages (one
+        per run of same-kind items), each marked for same-transaction delivery."""
+        try:
+            rows = await self._claim_inbox(sid)
+        except Exception:  # never let a store blip abort a live round — the items stay pending
+            logger.warning("inbox claim failed for %s; will retry next round", sid, exc_info=True)
+            return []
+        return render_inbox_rows(rows, wrap=True) if rows else []
 
     async def _ensure_session_or_raise(self, sid: str) -> None:
         store = await self._ensure_store()
@@ -1358,6 +1440,12 @@ class StatefulAgentLoop:
 
     async def _persist_user_input(self, sid: str, user_input: str | LoopMessage) -> None:
         store = await self._ensure_store()
+        inbox = None
+        if isinstance(user_input, dict) and "_inbox" in user_input:
+            # A send fed from the inbox (_send_from_inbox): mark those rows delivered in the same
+            # transaction as this user row, and record which items it carries.
+            user_input = dict(user_input)
+            inbox = user_input.pop("_inbox")
         role: str
         content: str | None
         name: str | None
@@ -1371,6 +1459,9 @@ class StatefulAgentLoop:
             content, structured = _encode_content(user_input.get("content"))
             name = user_input.get("name")
         meta = _meta_with_content_encoding(None, structured=structured)
+        if inbox:
+            meta = {**(meta or {}), "inbox": {k: inbox[k] for k in ("item_ids", "kinds")
+                                              if k in inbox}}
         # Allocate the next monotonic SEND index for this session (atomic RMW under the
         # session_state row lock — never resets, unlike round_index). This is the single
         # send-begin point (exactly one user row per send; resume()/follow-up drains do
@@ -1380,7 +1471,8 @@ class StatefulAgentLoop:
             sid, "send_index", lambda v: int(v or 0) + 1, default=0
         )
         seq = await store.append_message(
-            sid, role=role, content=content, name=name, send_index=send_index, meta=meta
+            sid, role=role, content=content, name=name, send_index=send_index, meta=meta,
+            inbox=inbox,
         )
         # Keep a live cache entry current with the loop's OWN append (no reload): the next
         # send's next_seq token will then match and reuse the cached window. No-op if this

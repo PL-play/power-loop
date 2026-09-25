@@ -70,7 +70,9 @@ def _text_pdf(lines: list[str]) -> bytes:
     return bytes(out)
 
 
-def _ask_about(path, question: str, *, capabilities=VISION, max_tokens: int = 200) -> str:
+# 4096, not 200: a thinking model (deepseek-flash) spends 150–1000 tokens (measured)
+# reasoning first; a small budget leaves an EMPTY answer that reads as "didn't see it".
+def _ask_about(path, question: str, *, capabilities=VISION, max_tokens: int = 4096) -> str:
     svc = make_llm(max_tokens=max_tokens, temperature=0.0, capabilities=capabilities)
     request = LLMRequest(
         messages=[
@@ -104,13 +106,19 @@ def test_declared_vision_model_really_sees_the_image(tmp_path, rgb, expected) ->
     assert any(token in answer.lower() for token in expected), answer
 
 
-def test_same_model_undeclared_raises_instead_of_answering(tmp_path) -> None:
-    # Same model, same image — the ONLY difference is that nothing was declared. Before this
-    # rework the library shipped the request anyway (minus the image) and returned prose.
+def test_same_model_undeclared_is_told_it_did_not_see_the_image(tmp_path) -> None:
+    # Same model, same image — the ONLY difference is that nothing was declared. render does NOT
+    # raise (an old picture in HISTORY must not brick a session that moved to an image-blind
+    # model — see multimodal.prepare_image); it sends a placeholder that says plainly the model
+    # did not see the picture. A caller that wants a hard error asks for it explicitly.
     path = tmp_path / "attachment.png"
     path.write_bytes(_solid_png(64, 64, (220, 20, 20)))
+    svc = make_llm(capabilities=None)
     with pytest.raises(ModelCapabilityError, match="has not declared image support"):
-        _ask_about(path, "这张图是什么纯色？", capabilities=None)
+        svc.capabilities.require_image_input(what="attachment.png")
+    answer = _ask_about(path, "这张图是什么纯色？只回颜色名。", capabilities=None)
+    assert "红" not in answer and "red" not in answer.lower(), (
+        f"model claimed to see an image it was never sent: {answer!r}")
 
 
 # ── PDFs ─────────────────────────────────────────────────────────────────────

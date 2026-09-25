@@ -43,9 +43,35 @@ class Dialect(Protocol):
         ...
 
     def leases_ddl(self, prefix: str) -> list[str]:
-        """DDL for the ``session_leases`` + ``follow_up_queue`` tables, split out so the
-        v6→v7 migration can add just these. Included in :meth:`ddl` for fresh provisioning.
-        Idempotent (CREATE … IF NOT EXISTS)."""
+        """DDL for the ``session_leases`` table, split out so the v6→v7 migration can add it.
+        Included in :meth:`ddl` for fresh provisioning. Idempotent (CREATE … IF NOT EXISTS).
+        (Until v8 this also created ``follow_up_queue``; that table is now :meth:`inbox_ddl`,
+        created by fresh provisioning or by the v7→v8 step — never by the v7 step, which would
+        race the v8 rebuild.)"""
+        ...
+
+    def inbox_ddl(self, prefix: str, table: str) -> list[str]:
+        """DDL for the inbox table (``{prefix}follow_up_queue``, schema v8 shape) created under
+        the name ``table`` — the v7→v8 migration builds it as ``…_v8`` and renames it into place.
+        Index names are FIXED (``{prefix}uq_inbox_item`` / ``{prefix}idx_inbox_session_status``)
+        whatever ``table`` is, so a rename keeps them and a fresh store gets the same names.
+
+        Columns: ``item_id`` (dedupe key, unique per session) · ``kind`` · ``mode``
+        (queue/steer) · ``status`` (pending/claimed/delivered/void) · ``content`` + ``meta_json``
+        · ``claim_token``/``claimed_at`` (a drain in progress) · ``delivered_*`` (where it
+        landed in the transcript)."""
+        ...
+
+    def inbox_v8_copy_sql(self, prefix: str, src: str, dst: str) -> str:
+        """``INSERT … SELECT`` carrying v7 queue rows (session_id/content/created_at only) into
+        the v8 table as pending ``user``/``queue`` items with a synthetic ``v7:<id>`` item_id."""
+        ...
+
+    def insert_ignore(self, table: str, cols: Sequence[str]) -> str:
+        """Render an INSERT that silently does nothing when it would violate a unique key
+        (``ON CONFLICT DO NOTHING`` / MySQL ``INSERT IGNORE``). ``execute`` then reports 1 row
+        for a real insert and 0 for a skipped duplicate — the inbox uses that as its
+        "accepted vs. already had it" signal."""
         ...
 
     async def try_acquire_lease(
@@ -67,16 +93,6 @@ class Dialect(Protocol):
         it — precisely the race the lease exists to prevent."""
         ...
 
-    async def claim_follow_ups(
-        self, tx: Transaction, table: str, *, session_id: str
-    ) -> list[Row]:
-        """Atomically take every queued follow-up for ``session_id`` (claim AND remove).
-
-        A dialect seam because a plain ``SELECT`` then ``DELETE`` is NOT safe under PostgreSQL's
-        READ COMMITTED: two drains both read the same rows before either deletes, and each hands
-        the same steering to its model — the user's message replayed twice. SQLite's serialized
-        writer hides this, so it must be tested on a server backend."""
-        ...
 
     def upsert(
         self,
@@ -179,6 +195,7 @@ class SqliteDialect:
             *self.project_messages_ddl(p),
             *self.hook_events_ddl(p),
             *self.leases_ddl(p),
+            *self.inbox_ddl(p, f"{p}follow_up_queue"),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -214,26 +231,40 @@ class SqliteDialect:
                 session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
                 acquired_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
                 fence INTEGER NOT NULL DEFAULT 1)""",
-            f"""CREATE TABLE IF NOT EXISTS {p}follow_up_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-                content TEXT NOT NULL, created_at INTEGER NOT NULL)""",
-            f"CREATE INDEX IF NOT EXISTS {p}idx_follow_up_queue_session "
-            f"ON {p}follow_up_queue(session_id, id)",
         ]
+
+    def inbox_ddl(self, prefix: str, table: str) -> list[str]:
+        p = prefix
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {table} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                item_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'user',
+                mode TEXT NOT NULL DEFAULT 'queue', status TEXT NOT NULL DEFAULT 'pending',
+                content TEXT NOT NULL, meta_json TEXT, claim_token TEXT, claimed_at INTEGER,
+                created_at INTEGER NOT NULL, delivered_at INTEGER, delivered_seq INTEGER,
+                delivered_send_index INTEGER)""",
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {p}uq_inbox_item ON {table}(session_id, item_id)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_inbox_session_status "
+            f"ON {table}(session_id, status, id)",
+        ]
+
+    def inbox_v8_copy_sql(self, prefix: str, src: str, dst: str) -> str:
+        return (
+            f"INSERT OR IGNORE INTO {dst} (session_id, item_id, content, created_at) "
+            f"SELECT session_id, 'v7:' || id, content, created_at FROM {src}"
+        )
+
+    def insert_ignore(self, table, cols):
+        return (
+            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)}) "
+            "ON CONFLICT DO NOTHING"
+        )
 
     async def try_acquire_lease(self, tx, table, *, session_id, owner_id, now_ms, expires_at):
         return await _onconflict_try_acquire_lease(
             tx, table, session_id=session_id, owner_id=owner_id,
             now_ms=now_ms, expires_at=expires_at,
         )
-
-    async def claim_follow_ups(self, tx, table, *, session_id):
-        # DELETE … RETURNING is a single atomic claim: rows this statement returns are, by
-        # construction, rows no concurrent drain can also return.
-        rows = await tx.fetchall(
-            f"DELETE FROM {table} WHERE session_id=? RETURNING id, content", (session_id,)
-        )
-        return sorted(rows, key=lambda r: r["id"])  # RETURNING order is not guaranteed
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
         return _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols)
@@ -375,6 +406,7 @@ class PostgresDialect:
             *self.project_messages_ddl(p),
             *self.hook_events_ddl(p),
             *self.leases_ddl(p),
+            *self.inbox_ddl(p, f"{p}follow_up_queue"),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -410,26 +442,41 @@ class PostgresDialect:
                 session_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
                 acquired_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
                 fence BIGINT NOT NULL DEFAULT 1)""",
-            f"""CREATE TABLE IF NOT EXISTS {p}follow_up_queue (
-                id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL,
-                content TEXT NOT NULL, created_at BIGINT NOT NULL)""",
-            f"CREATE INDEX IF NOT EXISTS {p}idx_follow_up_queue_session "
-            f"ON {p}follow_up_queue(session_id, id)",
         ]
+
+    def inbox_ddl(self, prefix: str, table: str) -> list[str]:
+        p = prefix
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {table} (
+                id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL,
+                item_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'user',
+                mode TEXT NOT NULL DEFAULT 'queue', status TEXT NOT NULL DEFAULT 'pending',
+                content TEXT NOT NULL, meta_json TEXT, claim_token TEXT, claimed_at BIGINT,
+                created_at BIGINT NOT NULL, delivered_at BIGINT, delivered_seq BIGINT,
+                delivered_send_index BIGINT)""",
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {p}uq_inbox_item ON {table}(session_id, item_id)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_inbox_session_status "
+            f"ON {table}(session_id, status, id)",
+        ]
+
+    def inbox_v8_copy_sql(self, prefix: str, src: str, dst: str) -> str:
+        return (
+            f"INSERT INTO {dst} (session_id, item_id, content, created_at) "
+            f"SELECT session_id, 'v7:' || id, content, created_at FROM {src} "
+            "ON CONFLICT DO NOTHING"
+        )
+
+    def insert_ignore(self, table, cols):
+        return (
+            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)}) "
+            "ON CONFLICT DO NOTHING"
+        )
 
     async def try_acquire_lease(self, tx, table, *, session_id, owner_id, now_ms, expires_at):
         return await _onconflict_try_acquire_lease(
             tx, table, session_id=session_id, owner_id=owner_id,
             now_ms=now_ms, expires_at=expires_at,
         )
-
-    async def claim_follow_ups(self, tx, table, *, session_id):
-        # DELETE … RETURNING is a single atomic claim: rows this statement returns are, by
-        # construction, rows no concurrent drain can also return.
-        rows = await tx.fetchall(
-            f"DELETE FROM {table} WHERE session_id=? RETURNING id, content", (session_id,)
-        )
-        return sorted(rows, key=lambda r: r["id"])  # RETURNING order is not guaranteed
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
         return _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols)
@@ -536,6 +583,7 @@ class MySQLDialect:
             *self.project_messages_ddl(p),
             *self.hook_events_ddl(p),
             *self.leases_ddl(p),
+            *self.inbox_ddl(p, f"{p}follow_up_queue"),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -572,12 +620,35 @@ class MySQLDialect:
                 session_id VARCHAR(255) PRIMARY KEY, owner_id VARCHAR(255) NOT NULL,
                 acquired_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
                 fence BIGINT NOT NULL DEFAULT 1) {opts}""",
-            f"""CREATE TABLE IF NOT EXISTS {p}follow_up_queue (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                session_id VARCHAR(255) NOT NULL, content LONGTEXT NOT NULL,
-                created_at BIGINT NOT NULL,
-                KEY {p}idx_follow_up_queue_session (session_id, id)) {opts}""",
         ]
+
+    def inbox_ddl(self, prefix: str, table: str) -> list[str]:
+        p = prefix
+        opts = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+        return [
+            f"""CREATE TABLE IF NOT EXISTS {table} (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                session_id VARCHAR(255) NOT NULL, item_id VARCHAR(255) NOT NULL,
+                kind VARCHAR(32) NOT NULL DEFAULT 'user', mode VARCHAR(16) NOT NULL DEFAULT 'queue',
+                status VARCHAR(16) NOT NULL DEFAULT 'pending', content LONGTEXT NOT NULL,
+                meta_json LONGTEXT, claim_token VARCHAR(64), claimed_at BIGINT,
+                created_at BIGINT NOT NULL, delivered_at BIGINT, delivered_seq BIGINT,
+                delivered_send_index BIGINT,
+                UNIQUE KEY {p}uq_inbox_item (session_id, item_id),
+                KEY {p}idx_inbox_session_status (session_id, status, id)) {opts}""",
+        ]
+
+    def inbox_v8_copy_sql(self, prefix: str, src: str, dst: str) -> str:
+        return (
+            f"INSERT IGNORE INTO {dst} (session_id, item_id, content, created_at) "
+            f"SELECT session_id, CONCAT('v7:', id), content, created_at FROM {src}"
+        )
+
+    def insert_ignore(self, table, cols):
+        return (
+            f"INSERT IGNORE INTO {table} ({', '.join(cols)}) "
+            f"VALUES ({', '.join('?' for _ in cols)})"
+        )
 
     async def try_acquire_lease(self, tx, table, *, session_id, owner_id, now_ms, expires_at):
         # MySQL has no conditional ON DUPLICATE KEY UPDATE, so each assignment carries its own
@@ -597,21 +668,6 @@ class MySQLDialect:
         # guards left every column unchanged. Read back who actually holds it.
         row = await tx.fetchone(f"SELECT owner_id FROM {table} WHERE session_id=?", (session_id,))
         return bool(row) and row["owner_id"] == owner_id
-
-    async def claim_follow_ups(self, tx, table, *, session_id):
-        # MySQL has no DELETE … RETURNING, so lock the rows for the rest of the transaction
-        # (FOR UPDATE) before deleting — a concurrent drain blocks on the lock instead of
-        # reading the same rows and delivering them a second time.
-        rows = await tx.fetchall(
-            f"SELECT id, content FROM {table} WHERE session_id=? ORDER BY id FOR UPDATE",
-            (session_id,),
-        )
-        if rows:
-            await tx.execute(
-                f"DELETE FROM {table} WHERE session_id=? AND id<=?",
-                (session_id, rows[-1]["id"]),
-            )
-        return list(rows)
 
     #: Free-text / JSON columns (table → [(column, not_null)]) whose MySQL type was widened from
     #: TEXT (64 KiB) to LONGTEXT. Used by the v3→v4 migration to ALTER pre-existing MySQL stores.

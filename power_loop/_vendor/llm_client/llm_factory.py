@@ -95,6 +95,14 @@ def merge_request_extra(base: dict[str, Any] | None, override: dict[str, Any] | 
     return out
 
 
+def _is_permanent_status(exc: BaseException) -> bool:
+    """4xx other than 408/409/429 — mirrors power_loop.runtime.retry.is_permanent_llm_error (kept
+    local: the vendored client must not import the runtime package)."""
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500 and status not in (408, 409, 429)
+
 class OpenAICompatibleChatLLMService(LLMService):
     """
     Minimal OpenAI-compatible chat completion client.
@@ -448,7 +456,9 @@ class OpenAICompatibleChatLLMService(LLMService):
                 return await fn()
             except Exception as e:
                 last_err = e
-                if i >= attempts - 1:
+                if i >= attempts - 1 or _is_permanent_status(e):
+                    # A 4xx other than 408/409/429 (bad key, insufficient balance, unknown model…)
+                    # comes back identical on a retry — don't spend the budget (design/124 Z11).
                     break
                 # exponential backoff + jitter
                 base = float(self._cfg.retry_base_delay_s)
@@ -567,7 +577,10 @@ class OpenAICompatibleChatLLMService(LLMService):
         else:
             res = LLMResponse(raw_text=text, content_text=text)
 
-        res.token_usage = final_usage if final_usage is not None else self._usage_obj()
+        # No fallback to the instance's LAST usage: that belonged to some other call (possibly
+        # another session sharing this service) — reporting it would double-count or misattribute
+        # (design/124 U1). No usage in the stream = unknown; the pipeline estimates and flags it.
+        res.token_usage = final_usage
         res.tool_calls = last_tool_calls
         res.stream_chunks = chunks
         res.raw_completion = last_raw_event

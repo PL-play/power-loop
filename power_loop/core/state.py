@@ -165,6 +165,29 @@ class ContextManager:
             totals[key] = totals.get(key, 0) + usage_out[key]
         return usage_out
 
+    def add_unreported_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+        """Count an LLM attempt that FAILED (error / timeout / aborted) into the run totals with
+        estimated tokens — it was billed but never reported usage (design/124 §10). Does not touch
+        :attr:`token_usage` (the last SUCCESSFUL round's real numbers, which budget checks read).
+        ``estimated_calls`` / ``estimated_tokens`` say how much of the total is an estimate."""
+        totals = self.usage_totals
+        p, c = int(prompt_tokens or 0), int(completion_tokens or 0)
+        totals["calls"] = totals.get("calls", 0) + 1
+        totals["failed_calls"] = totals.get("failed_calls", 0) + 1
+        totals["prompt_tokens"] = totals.get("prompt_tokens", 0) + p
+        totals["completion_tokens"] = totals.get("completion_tokens", 0) + c
+        totals["total_tokens"] = totals.get("total_tokens", 0) + p + c
+        totals["estimated_calls"] = totals.get("estimated_calls", 0) + 1
+        totals["estimated_tokens"] = totals.get("estimated_tokens", 0) + p + c
+
+    def note_estimated_call(self, tokens: int) -> None:
+        """A successful call whose usage was estimated (the provider sent none). Its tokens reach
+        the totals through :meth:`update_usage` as usual; this only records how much of the total
+        is an estimate."""
+        totals = self.usage_totals
+        totals["estimated_calls"] = totals.get("estimated_calls", 0) + 1
+        totals["estimated_tokens"] = totals.get("estimated_tokens", 0) + int(tokens or 0)
+
     def microcompact(
         self,
         messages: list[dict[str, Any]],
