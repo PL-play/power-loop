@@ -194,3 +194,25 @@ async def test_transport_never_reports_a_previous_calls_usage() -> None:
     res = await svc.complete(LLMRequest(messages=[{"role": "user", "content": "x"}]))
     assert res.raw_text == "hello"
     assert res.token_usage is None
+
+
+@pytest.mark.asyncio
+async def test_call_events_name_the_services_model_when_loop_sets_none() -> None:
+    from power_loop._vendor.llm_client.capabilities import ModelCapabilities
+
+    class _Named(_Script):
+        capabilities = ModelCapabilities(model="deepseek-flash")
+
+    store = await SessionStore.open(":memory:")
+    bus = AgentEventBus()
+    events: list[dict] = []
+    bus.subscribe(AgentEventType.LLM_CALL_COMPLETED, lambda e: events.append(dict(e.payload or {})))
+    real = LLMTokenUsage(prompt_tokens=5, completion_tokens=1, total_tokens=6)
+    loop = StatefulAgentLoop(llm=_Named([("ok", real)]), store=store, event_bus=bus,
+                             config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
+    sid = await loop.new_session()
+    try:
+        await loop.send("hi", sid)
+    finally:
+        await store.close()
+    assert events[0]["model"] == "deepseek-flash"

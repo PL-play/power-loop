@@ -1161,7 +1161,10 @@ class AgentPipeline:
             response_format=self.config.response_format,  # structured output when set
         )
 
-        model_name = self.config.model or ""
+        # The model that actually served the call: the per-loop override if set, else the
+        # service's own configured model (design/124 U6 — "" left 61% of usage rows unattributed).
+        model_name = (self.config.model
+                      or getattr(getattr(self.llm, "capabilities", None), "model", None) or "")
         attempt_box = [0]
 
         async def _do_call() -> LLMResponse:
