@@ -30,7 +30,9 @@ class _FakeClient:
         self.closed = True
 
 
-def _service(response: Any) -> tuple[AnthropicMessagesLLMService, _FakeClient]:
+def _service(
+    response: Any, *, capabilities: dict[str, Any] | None = None,
+) -> tuple[AnthropicMessagesLLMService, _FakeClient]:
     svc = AnthropicMessagesLLMService(
         AnthropicChatConfig(
             base_url="https://anthropic.example",
@@ -38,6 +40,7 @@ def _service(response: Any) -> tuple[AnthropicMessagesLLMService, _FakeClient]:
             model="claude-test",
             max_tokens=256,
             temperature=0.2,
+            capabilities=dict(capabilities or {}),
         )
     )
     client = _FakeClient(response)
@@ -161,7 +164,8 @@ async def test_multimodal_content_is_translated_not_silently_dropped() -> None:
     blocks (data-URL → base64, http(s) → url); an unknown non-text block becomes a
     VISIBLE marker — never a silent drop."""
     svc, client = _service(SimpleNamespace(content=[{"type": "text", "text": "ok"}],
-                                           usage={"input_tokens": 1, "output_tokens": 1}))
+                                           usage={"input_tokens": 1, "output_tokens": 1}),
+                           capabilities={"supports_image_input": True})
     await svc.complete(LLMRequest(messages=[{"role": "user", "content": [
         {"type": "text", "text": "what is this?"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
@@ -176,3 +180,19 @@ async def test_multimodal_content_is_translated_not_silently_dropped() -> None:
     # the unknown block is surfaced, not dropped
     assert any(b.get("type") == "text" and "unsupported content block dropped" in b.get("text", "")
                for b in blocks)
+
+
+async def test_raw_image_blocks_to_a_model_that_cannot_see_become_placeholders() -> None:
+    """Without a vision declaration a ready-made ``image_url`` block must not reach the provider
+    (it 400s the request or is silently ignored) — the model is told it did not see a picture."""
+    svc, client = _service(SimpleNamespace(content=[{"type": "text", "text": "ok"}],
+                                           usage={"input_tokens": 1, "output_tokens": 1}))
+    await svc.complete(LLMRequest(messages=[{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+    ]}]))
+    sent = client.messages.calls[0]["messages"][0]["content"]
+    blocks = sent if isinstance(sent, list) else [{"type": "text", "text": sent}]
+    assert not any(b.get("type") == "image" for b in blocks)
+    text = " ".join(b.get("text", "") for b in blocks)
+    assert "what is this?" in text and "当前模型看不了图片" in text

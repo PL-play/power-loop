@@ -150,6 +150,14 @@ class AgentLoopConfig:
     compactor: Any = _UNSET
     history_projector: Any = _UNSET
     migrate_history_on_projection_switch: Any = _UNSET
+    #: Internal, not API: what a deprecated ``compactor=`` resolved to, and the fold this config
+    #: seeded itself. They are FIELDS (not plain attributes) so ``dataclasses.replace`` — which the
+    #: loop runs for every per-send override — carries them. As attributes they were dropped:
+    #: ``compactor=None`` (never compact) or ``compactor=AgenticMemoryCompactor(...)`` silently
+    #: became the seeded default fold's DefaultCompactor on any send with an override, e.g. a
+    #: session whose stored system prompt differs from the config's.
+    _legacy_verbatim_compactor: Any = field(default=_UNSET, repr=False, compare=False)
+    _seeded_fold: Any = field(default=None, repr=False, compare=False)
     #: History-repair backstop (the always-on prompt sanitizer in `align_tool_calls` realigns
     #: tool-call/result pairing before every LLM call regardless). When True, the orphan
     #: tool-result rows that sanitizer drops are ALSO physically deactivated in the store
@@ -302,6 +310,9 @@ class AgentLoopConfig:
         legacy_proj = self.history_projector
         legacy_comp = self.compactor
         fold_was_unset = self.fold_strategy is _UNSET
+        # On dataclasses.replace the fold is no longer _UNSET — it is the one WE seeded. It only
+        # counts as the caller's choice when replace() swapped in a different object.
+        fold_still_seeded = self._seeded_fold is not None and self.fold_strategy is self._seeded_fold
         if legacy_proj is not _UNSET or legacy_comp is not _UNSET or (
             self.migrate_history_on_projection_switch is not _UNSET
         ):
@@ -324,6 +335,9 @@ class AgentLoopConfig:
                 else _default_fold_strategy()
             )
             object.__setattr__(self, "fold_strategy", fs)
+            object.__setattr__(self, "_seeded_fold", fs)
+        elif not fold_still_seeded:
+            object.__setattr__(self, "_seeded_fold", None)
         # A legacy verbatim compactor (incl. an explicit None = no compaction) is preserved exactly
         # via resolve_compactor — but ONLY on the pure-legacy path (no projector AND no explicit
         # new fold_strategy). If the caller set fold_strategy explicitly, the new axis wins and a
@@ -341,6 +355,8 @@ class AgentLoopConfig:
             # (the seeder coerces keep 0→positive) and, on the old projection path, drop the compact
             # (B7 data loss). Routes via resolve_compactor's verbatim branch (kind=='verbatim').
             object.__setattr__(self, "_legacy_verbatim_compactor", None)
+        elif fold_still_seeded and self._legacy_verbatim_compactor is not _UNSET:
+            pass  # dataclasses.replace of a config that already resolved one — keep it
         else:
             object.__setattr__(self, "_legacy_verbatim_compactor", _UNSET)
         if self.migrate_history_on_projection_switch is not _UNSET:

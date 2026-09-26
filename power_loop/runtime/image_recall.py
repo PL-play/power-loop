@@ -27,11 +27,14 @@ Pass ``durable=False`` for the look-once case (request-only, never stored).
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Sequence
 from typing import Any
 
 LoopMessage = dict[str, Any]
+
+logger = logging.getLogger(__name__)
 
 # session_id -> messages queued for the NEXT round of that session. Module-level rather than a
 # contextvar because a tool handler may run in a worker thread (``asyncio.to_thread``), which
@@ -44,6 +47,38 @@ _lock = threading.Lock()
 MAX_PENDING_PER_SESSION = 8
 
 
+def current_model_sees_images() -> bool | None:
+    """Can the model of the loop running right now actually see an image?
+
+    ``True`` / ``False`` when a loop is in context: its client's DECLARED capability, narrowed to
+    the model this loop really requests (a sub-agent or workflow leaf that overrides ``model``
+    gets nothing declared — see ``ModelCapabilities.for_model``). ``None`` when it cannot be
+    told (no loop in context, or a client wrapper that exposes no ``capabilities``); the
+    renderer's placeholder is then the last gate.
+
+    Tools that put pictures in front of the model ask this FIRST, so they can say "this model
+    cannot see images" instead of "the image is in front of you" next to a placeholder that
+    says the opposite.
+    """
+    from power_loop.core.agent_context import get_current_loop
+
+    loop = get_current_loop()
+    caps = getattr(getattr(loop, "llm", None), "capabilities", None)
+    if loop is None or caps is None:
+        return None
+    model = getattr(getattr(loop, "config", None), "model", None)
+    if hasattr(caps, "for_model"):
+        caps = caps.for_model(model)
+    return getattr(caps, "supports_image_input", None) is True
+
+
+def _refuse_blind(what: str) -> bool:
+    if current_model_sees_images() is False:
+        logger.info("not queuing %s: the current model cannot see images", what)
+        return True
+    return False
+
+
 def queue_image_for_next_round(
     session_id: str | None, *, path: str, note: str = "", ref: str = "",
     durable: bool = True,
@@ -54,10 +89,11 @@ def queue_image_for_next_round(
     model for the rest of the send and is distilled to a text reference across sends.
     ``durable=False`` puts it in the request only — visible for exactly one round.
 
-    Returns False when there is no session to queue against, or the queue is full — the caller
-    should then say so in its own return value rather than pretend the image was delivered.
+    Returns False when there is no session to queue against, the queue is full, or the current
+    model cannot see images (:func:`current_model_sees_images` — ask it first to word the
+    reply) — the caller should then say so rather than pretend the image was delivered.
     """
-    if not session_id or not path:
+    if not session_id or not path or _refuse_blind(path):
         return False
     blocks: list[dict[str, Any]] = []
     if note:
@@ -91,10 +127,11 @@ def queue_images_for_next_round(
     screenshots asked about with one question became three copies of that question in the
     transcript. A batch is one turn, which is also what the provider APIs expect.
 
-    ``images`` is ``[(path, ref)]``. Returns how many were accepted (0 = nothing queued, so the
-    caller must say so rather than claim the pictures were delivered).
+    ``images`` is ``[(path, ref)]``. Returns how many were accepted (0 = nothing queued — also
+    when the current model cannot see images — so the caller must say so rather than claim the
+    pictures were delivered).
     """
-    if not session_id:
+    if not session_id or _refuse_blind(f"{len(images)} image(s)"):
         return 0
     blocks: list[dict[str, Any]] = []
     if note:

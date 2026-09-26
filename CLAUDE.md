@@ -13,7 +13,12 @@ requires a major bump + CHANGELOG entry).
 
 ## Real-LLM tests — available, use them
 `.env` (in this repo) holds a **working real LLM config** (`POWER_LOOP_API_KEY` /
-`POWER_LOOP_BASE_URL` / `POWER_LOOP_MODEL` / `POWER_LOOP_PROVIDER` + `POWER_LOOP_SUPPORTS_*`).
+`POWER_LOOP_BASE_URL` / `POWER_LOOP_MODEL` / `POWER_LOOP_PROVIDER`). The suite runs on
+**DeepSeek v4.1 flash** — API name `deepseek-flash` (the endpoint rejects `deepseek-v4.1-flash`).
+It can see images and thinks by default (give real tests `max_tokens` ≥ 2048 or the answer is
+cut to nothing). **Never assume vision**: capabilities are declared per test via
+`tests/real/_llm.py::make_llm(capabilities=...)`; the default is undeclared (= non-vision), and
+non-vision behavior (explicit placeholders, no pretending to have seen) must be tested too.
 `tests/conftest.py` auto-loads it (`load_dotenv`) and gates the real suite on
 `REAL_LLM_ENV_GROUPS`. So **`tests/real/` runs against a live provider** — use it to
 validate real behavior; don't mock or skip when the point is real validation.

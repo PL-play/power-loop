@@ -149,7 +149,8 @@ class AnthropicMessagesLLMService(LLMService):
                 # enforcing the declared-capability check, then let the translation below
                 # turn image_url blocks into native Anthropic image blocks.
                 msg["content"] = render_message_content(
-                    msg.get("content"), role=role, capabilities=self._capabilities
+                    msg.get("content"), role=role,
+                    capabilities=self._capabilities.for_model(request.model),
                 )
             if role == "system":
                 content = self._text_from_content(msg.get("content"))

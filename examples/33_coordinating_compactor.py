@@ -97,11 +97,14 @@ async def main() -> dict:
         # ── Session A: long convo → compaction → compactor captures the slice ──
         sid_a = await store.create_session(system_prompt="S")
         await _seed_with_codename(store, sid_a)
+        # Token caps are output ceilings, not targets: a reasoning model spends part of them
+        # thinking before its first word, so a 40-token summary cap yields an EMPTY summary, the
+        # fold soft-fails, and there is nothing to capture. Leave room.
         loop_a = StatefulAgentLoop(
-            llm=make_llm(max_tokens=200), store=store,
+            llm=make_llm(max_tokens=2048), store=store,
             config=AgentLoopConfig(
                 system_prompt="Answer concisely.", max_rounds=1,
-                compactor=CoordinatingCompactor(trigger_ratio=0.5, keep_last_n=1, summary_max_tokens=40),
+                compactor=CoordinatingCompactor(trigger_ratio=0.5, keep_last_n=1, summary_max_tokens=2048),
                 memory=memory,
             ),
         )
@@ -112,7 +115,7 @@ async def main() -> dict:
         # ── Session B: brand-new session — the codename comes back via recall ──
         sid_b = await store.create_session(system_prompt="S")
         loop_b = StatefulAgentLoop(
-            llm=make_llm(max_tokens=200), store=store,
+            llm=make_llm(max_tokens=2048), store=store,
             config=AgentLoopConfig(
                 system_prompt="Answer concisely using what you know.", max_rounds=1,
                 compactor=None, memory=memory,

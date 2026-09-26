@@ -85,9 +85,11 @@ async def main() -> dict:
                     "answering. Answer concisely."
                 ),
                 max_rounds=4,
-                # A deliberately tiny summary budget: the note can't fit the
-                # incidental serial, so retrieving it requires the tool.
-                compactor=DefaultCompactor(trigger_ratio=0.5, keep_last_n=1, summary_max_tokens=40),
+                # The summary keeps decisions/facts, so an incidental serial usually does not
+                # survive the fold — getting it back exactly is what the tool is for. (The budget
+                # is an output CEILING, not a way to force that: a reasoning model thinks before
+                # its first word, and a 40-token cap left an empty summary → no fold at all.)
+                compactor=DefaultCompactor(trigger_ratio=0.5, keep_last_n=1, summary_max_tokens=2048),
             ),
         )
         loop.event_bus.subscribe(

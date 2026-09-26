@@ -303,6 +303,13 @@ def prepare_attachment(ref_payload: dict[str, Any], capabilities: ModelCapabilit
     )
 
 
+_RAW_IMAGE_BLOCK_TYPES = frozenset({"image_url", "image", "input_image"})
+_RAW_IMAGE_PLACEHOLDER = (
+    "[图片——**当前模型看不了图片，你没有看到它的内容**。不要凭空描述这张图；"
+    "需要知道图里有什么，就用能看图的工具，或请对方用文字说明。]"
+)
+
+
 def render_message_content(content: Any, role: str, capabilities: ModelCapabilities) -> Any:
     if not isinstance(content, list) or role != "user":
         return content
@@ -328,6 +335,20 @@ def render_message_content(content: Any, role: str, capabilities: ModelCapabilit
             prepared = prepare_attachment(block.get("attachment") or {}, capabilities)
             debug_strategies.append(prepared.strategy)
             rendered.extend(prepared.rendered_parts)
+            continue
+
+        if block_type in _RAW_IMAGE_BLOCK_TYPES and not capabilities.sees_images:
+            # A host (or a follow-up that carried user blocks through) may hand over a ready-made
+            # image block instead of an ``attachment``. It gets the same capability gate: sent
+            # as-is, a model that cannot see either 400s the whole request or quietly ignores the
+            # picture and answers as if it had looked.
+            logger.warning(
+                "raw %s block not sent: model %r has not declared image support; "
+                "surfaced as a text placeholder instead",
+                block_type, capabilities.model or "<unnamed>",
+            )
+            debug_strategies.append("image-unsupported")
+            rendered.append({"type": "text", "text": _RAW_IMAGE_PLACEHOLDER})
             continue
 
         rendered.append(block)

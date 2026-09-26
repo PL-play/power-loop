@@ -842,6 +842,12 @@ class AgentPipeline:
         rounds = getattr(self, "_image_rounds", None) or {}
         if not rounds:
             return 0
+        # A model that cannot see images was shown a "you did not see it" placeholder, not the
+        # picture — retiring it as "已看过" would tell it the opposite. Unknown → the old wording.
+        caps = getattr(self.llm, "capabilities", None)
+        if caps is not None and hasattr(caps, "for_model"):
+            caps = caps.for_model(self.config.model)
+        blind = caps is not None and getattr(caps, "supports_image_input", None) is not True
         for m in self.history:
             r = rounds.get(id(m))
             if r is None:
@@ -857,8 +863,14 @@ class AgentPipeline:
                     att = b.get("attachment") if isinstance(b.get("attachment"), dict) else {}
                     name = str(att.get("name") or att.get("filename") or att.get("path") or att.get("ref") or "image")
                     name = name.rsplit("/", 1)[-1]
+                    # keep the host's recall coordinate (file_uuid=…) — it is how the image is fetched again
+                    coord = f" · {att['ref']}" if att.get("ref") else ""
+                    if blind and att.get("kind") == "image":
+                        tail = "当前模型看不了图片，没看到过它的内容"
+                    else:
+                        tail = "已看过；要再看调 see_image"
                     new_blocks.append({"type": "text",
-                                       "text": f"{self._IMAGE_RETIRED_MARK}: {name} — 已看过；要再看调 see_image]"})
+                                       "text": f"{self._IMAGE_RETIRED_MARK}: {name}{coord} — {tail}]"})
                     n += 1
                 else:
                     new_blocks.append(b)

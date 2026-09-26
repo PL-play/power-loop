@@ -3,6 +3,11 @@
 Centralizes env reading so every test gets the same configured client without
 duplicating boilerplate. Skipped automatically (via the project ``conftest.py``)
 when the required env vars are absent.
+
+Capabilities are NOT inherited from what the test model can do. The suite runs on DeepSeek
+v4.1 flash, which can see images, but the default here is "nothing declared" — the same as
+the many deployments whose model cannot. A test that needs vision passes
+``capabilities={"supports_image_input": True}``; everything else must work without it.
 """
 
 from __future__ import annotations

@@ -2218,7 +2218,22 @@ def _render_recall_row(hit: Any, rows: list[Any], *, cap: int, head: str) -> str
     # arrives as its own user message and this text just says it is there.
     if row_images:
         from power_loop.core.agent_context import get_session_id
-        from power_loop.runtime.image_recall import queue_image_for_next_round
+        from power_loop.runtime.image_recall import (
+            current_model_sees_images,
+            queue_image_for_next_round,
+        )
+
+        if current_model_sees_images() is False:
+            # Queuing would put a "you did not see this" placeholder right under a line claiming
+            # the picture is in front of the model. Say what is true instead, with the coordinates.
+            where = "；".join(
+                f"{Path(path).name}" + (f" · {ref}" if ref else "") for path, ref in row_images
+            )
+            blocks.append(
+                f"[这一行有 {len(row_images)} 张图（{where}），当前模型看不了图片，没有放进上下文。"
+                "不要凭空描述它们；需要知道内容就用能看图的工具去看。]"
+            )
+            return f"{head} — original row ({total} chars):\n\n" + "\n\n".join(blocks)
 
         sid = get_session_id()
         shown = [

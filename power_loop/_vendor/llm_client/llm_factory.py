@@ -839,7 +839,8 @@ class OpenAICompatibleChatLLMService(LLMService):
                 return [{"index": 0, "type": "function", "function": fc}]
             return None
 
-        rendered_messages = current_request.to_messages(self._capabilities)
+        rendered_messages = current_request.to_messages(
+            self._capabilities.for_model(current_request.model))
         self._emit_debug_payload(method="stream", messages=rendered_messages, kwargs=stream_kwargs)
 
         while True:
@@ -935,7 +936,8 @@ class OpenAICompatibleChatLLMService(LLMService):
                     e,
                 )
                 current_request = self._build_resume_request(request, aggregated_text)
-                rendered_messages = current_request.to_messages(self._capabilities)
+                rendered_messages = current_request.to_messages(
+                    self._capabilities.for_model(current_request.model))
                 self._emit_debug_payload(method="stream-resume", messages=rendered_messages, kwargs=stream_kwargs)
                 # Reset the tool-call accumulators before re-opening the stream: a tool
                 # call only partially streamed on the interrupted attempt has truncated

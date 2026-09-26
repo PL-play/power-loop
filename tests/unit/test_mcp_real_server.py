@@ -39,16 +39,16 @@ async def test_stdio_client_roundtrip_against_real_server() -> None:
 
         # register into a ToolRegistry and invoke through it — a real stdio round-trip
         registry = ToolRegistry()
-        names = await register_mcp_tools(registry, client, prefix="mcp.")
-        assert "mcp.add" in names and "mcp.greet" in names
+        names = await register_mcp_tools(registry, client, prefix="mcp_")
+        assert "mcp_add" in names and "mcp_greet" in names
 
-        add_out = await registry.invoke_async("mcp.add", {"a": 2, "b": 3})
+        add_out = await registry.invoke_async("mcp_add", {"a": 2, "b": 3})
         assert "5" in add_out, add_out
-        greet_out = await registry.invoke_async("mcp.greet", {"name": "Ada"})
+        greet_out = await registry.invoke_async("mcp_greet", {"name": "Ada"})
         assert "Hello, Ada!" in greet_out, greet_out
 
         # the registered definition carries the server's inputSchema + required params
-        add_def = registry.get("mcp.add")
+        add_def = registry.get("mcp_add")
         assert add_def is not None
         assert set(add_def.definition.required_params) == {"a", "b"}
     finally:
@@ -56,12 +56,13 @@ async def test_stdio_client_roundtrip_against_real_server() -> None:
 
 
 async def test_register_then_direct_call_proxies_remote_name() -> None:
-    """A prefixed local tool proxies to the unprefixed remote name on the real server."""
+    """A prefixed local tool proxies to the unprefixed remote name on the real server
+    (a dotted prefix is made portable: ``srv.`` → ``srv_``)."""
     client = await StdioMCPClient(sys.executable, [_SERVER]).connect()
     try:
         registry = ToolRegistry()
         await register_mcp_tools(registry, client, prefix="srv.")
-        out = await registry.invoke_async("srv.greet", {"name": "Bob"})
+        out = await registry.invoke_async("srv_greet", {"name": "Bob"})
         assert out == "Hello, Bob!"
     finally:
         await client.aclose()

@@ -1,10 +1,12 @@
 """Real-model cover for the declared-capability contract (images + PDFs).
 
-Runs against the endpoint in ``.env`` — currently ``deepseek-v4-flash-vision-exp``, which
-is exactly the model the retired name-guessing table got WRONG: no vendor regex matched it,
-so it was classified image-blind and every picture sent to it was silently swapped for an
-apology sentence. These tests fail if that ever comes back, because they assert on content
-only a model that actually saw the bytes can produce.
+Runs against the endpoint in ``.env`` — DeepSeek v4.1 flash (``deepseek-flash``), which can
+see images. Both halves of the contract are exercised on that one model: with vision
+DECLARED the answer must contain what only a model that saw the bytes can know; with it NOT
+declared (the default — most configured models cannot see) the image must arrive as an
+explicit "you did not see it" placeholder and the model must not describe the picture. The
+retired name-guessing table once judged a vision model image-blind and swapped its pictures
+for an apology sentence; these tests fail if either direction regresses.
 
 Fixtures are built with the stdlib (zlib/struct) on purpose: Pillow and reportlab are not
 power-loop dependencies, and a test for "did the image really arrive" must not itself
@@ -119,6 +121,41 @@ def test_same_model_undeclared_is_told_it_did_not_see_the_image(tmp_path) -> Non
     answer = _ask_about(path, "这张图是什么纯色？只回颜色名。", capabilities=None)
     assert "红" not in answer and "red" not in answer.lower(), (
         f"model claimed to see an image it was never sent: {answer!r}")
+
+
+def test_ready_made_image_block_to_an_undeclared_model_is_not_sent() -> None:
+    # A host may hand over an ``image_url`` block instead of an attachment. Undeclared, it used to
+    # go out as-is — a text-only model then 400s the request or answers as if it had looked.
+    import base64
+
+    url = "data:image/png;base64," + base64.b64encode(_solid_png(64, 64, (220, 20, 20))).decode()
+    svc = make_llm(max_tokens=4096, temperature=0.0, capabilities=None)
+    response = asyncio.run(svc.complete(LLMRequest(messages=[{"role": "user", "content": [
+        {"type": "text", "text": "这张图是什么纯色？只回颜色名。"},
+        {"type": "image_url", "image_url": {"url": url}},
+    ]}])))
+    answer = (response.content_text or "").strip()
+    assert answer and "红" not in answer and "red" not in answer.lower(), answer
+
+
+def test_request_for_another_model_does_not_inherit_the_vision_declaration(tmp_path) -> None:
+    # A sub-agent / workflow leaf that sets its own ``model`` rides the parent's client. A
+    # declaration made for the parent's model says nothing about the other one, so the request
+    # gets the placeholder. Wired so the test BITES: the parent client is configured for
+    # deepseek-v4-pro (declared vision) and the request names deepseek-flash, which really can
+    # see — had the parent's declaration been applied, the picture would go out and be named.
+    path = tmp_path / "attachment.png"
+    path.write_bytes(_solid_png(64, 64, (220, 20, 20)))
+    svc = make_llm(max_tokens=4096, temperature=0.0, model="deepseek-v4-pro", capabilities=VISION)
+    response = asyncio.run(svc.complete(LLMRequest(model="deepseek-flash", messages=[{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "这张图是什么纯色？只回颜色名。"},
+            {"type": "attachment", "attachment": create_attachment_ref(str(path))},
+        ],
+    }])))
+    answer = (response.content_text or "").strip()
+    assert answer and "红" not in answer and "red" not in answer.lower(), answer
 
 
 # ── PDFs ─────────────────────────────────────────────────────────────────────

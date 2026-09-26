@@ -2,7 +2,9 @@
 
 These double as living documentation: if a numbered example breaks, either
 the example needs an update or a public API regressed. Each example must
-remain runnable as ``python examples/NN_*.py`` against real DashScope.
+remain runnable as ``python examples/NN_*.py`` against the provider in ``.env`` (the suite
+is run on DeepSeek v4.1 flash, ``deepseek-flash``, which is strict about the OpenAI wire
+format — e.g. tool names must match ``[A-Za-z0-9_-]{1,64}``).
 """
 
 from __future__ import annotations
@@ -304,7 +306,7 @@ def test_example_38_mcp_tools_runs() -> None:
         pytest.skip("mcp SDK not installed")
     module = _load_example("38_mcp_tools.py")
     summary = asyncio.run(module.main())
-    assert "mcp.add" in summary and "42" in summary
+    assert "mcp_add" in summary and "42" in summary
 
 
 def test_example_40_send_context_projection_runs() -> None:

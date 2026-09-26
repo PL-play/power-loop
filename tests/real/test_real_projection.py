@@ -31,7 +31,7 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_real_projection_compaction_and_recall() -> None:
-    llm = make_llm(max_tokens=64, temperature=0.0)
+    llm = make_llm(max_tokens=2048, temperature=0.0)
     store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
@@ -39,8 +39,9 @@ async def test_real_projection_compaction_and_recall() -> None:
             config=AgentLoopConfig(
                 system_prompt="You are terse. Reply with one short sentence.",
                 max_rounds=3, compactor=None,
-                # small max_tokens so the token-driven fold (max_tokens × trigger_ratio) fires
-                max_tokens=40,
+                # tiny FOLD budget so the token-driven fold (budget × trigger_ratio) fires; the
+                # output cap stays roomy — a reasoning model needs it before its first word.
+                max_tokens=2048, context_budget_tokens=40,
                 history_projector=DefaultDeterministicProjector(keep_last_sends=2),
             ),
         )

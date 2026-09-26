@@ -15,13 +15,15 @@ talks to a stdio MCP server::
     from power_loop.contrib.mcp import StdioMCPClient, register_mcp_tools
 
     client = await StdioMCPClient("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/data"]).connect()
-    names = await register_mcp_tools(registry, client, prefix="fs.")
+    names = await register_mcp_tools(registry, client, prefix="fs_")
     ...
     await client.aclose()
 """
 
 from __future__ import annotations
 
+import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -31,6 +33,20 @@ from power_loop.tools.registry import ToolRegistry
 __all__ = ["McpToolSpec", "MCPToolSource", "register_mcp_tools", "StdioMCPClient"]
 
 _EMPTY_SCHEMA: dict[str, Any] = {"type": "object", "properties": {}}
+
+logger = logging.getLogger(__name__)
+
+#: What every function-calling API accepts as a tool name: OpenAI and Anthropic both allow
+#: ``^[a-zA-Z0-9_-]{1,64}$``; DeepSeek enforces it (400 on ``mcp.add``) while some other
+#: OpenAI-compatible endpoints let dots through — so a name that "works" on one provider
+#: breaks the whole request on the next. MCP servers are free to name tools ``github.search``
+#: or ``fs/read``, hence the adapter, not the caller, owns the conversion.
+_INVALID_NAME_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+_MAX_NAME_LEN = 64
+
+
+def _portable_tool_name(name: str) -> str:
+    return _INVALID_NAME_CHARS.sub("_", name)[:_MAX_NAME_LEN] or "_"
 
 
 @dataclass
@@ -62,12 +78,28 @@ async def register_mcp_tools(
     ``prefix``-ed to avoid collisions). Each tool's ``inputSchema`` becomes the
     ``ToolDefinition`` schema (its ``required`` list drives missing-param validation),
     and the handler proxies the call to ``source.call_tool``. Returns the registered
-    tool names. Async because enumerating an MCP server is a network round-trip."""
+    tool names. Async because enumerating an MCP server is a network round-trip.
+
+    Registered names are made portable (characters outside ``[A-Za-z0-9_-]`` → ``_``, at most
+    64 long) so the same registry works on every provider; the remote call still uses the
+    server's own name. Two tools that collapse onto one portable name raise ``ValueError``
+    instead of one silently shadowing the other."""
     registered: list[str] = []
+    origin: dict[str, str] = {}
     for spec in await source.list_tools():
         schema = spec.input_schema or dict(_EMPTY_SCHEMA)
         required = tuple(schema.get("required", []) or ())
-        local_name = f"{prefix}{spec.name}"
+        wanted = f"{prefix}{spec.name}"
+        local_name = _portable_tool_name(wanted)
+        if local_name in origin:
+            raise ValueError(
+                f"MCP tools {origin[local_name]!r} and {wanted!r} both map to tool name "
+                f"{local_name!r}; use a prefix or rename one on the server"
+            )
+        origin[local_name] = wanted
+        if local_name != wanted:
+            logger.warning("MCP tool %r registered as %r (tool names allow only [A-Za-z0-9_-], "
+                           "max %d)", wanted, local_name, _MAX_NAME_LEN)
 
         def _make_handler(remote_name: str):
             async def _handler(**kwargs: Any) -> str:

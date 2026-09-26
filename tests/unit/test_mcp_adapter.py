@@ -78,12 +78,32 @@ async def test_missing_required_param_is_rejected() -> None:
 async def test_prefix_avoids_name_collisions() -> None:
     reg = ToolRegistry()
     reg2_src = _FakeSource(_specs())
-    names = await register_mcp_tools(reg, reg2_src, prefix="mcp.")
-    assert names == ["mcp.search", "mcp.ping"]
-    assert reg.has("mcp.search") and not reg.has("search")
+    names = await register_mcp_tools(reg, reg2_src, prefix="mcp_")
+    assert names == ["mcp_search", "mcp_ping"]
+    assert reg.has("mcp_search") and not reg.has("search")
     # the proxy still calls the REMOTE (unprefixed) name
-    await reg.invoke_async("mcp.ping", {})
+    await reg.invoke_async("mcp_ping", {})
     assert reg2_src.calls[-1][0] == "ping"
+
+
+async def test_names_are_made_portable_but_remote_name_is_kept() -> None:
+    """DeepSeek 400s on a tool named ``mcp.add`` (only [A-Za-z0-9_-]{1,64} is portable); MCP
+    servers may still name tools ``github.search`` / ``fs/read``."""
+    reg = ToolRegistry()
+    src = _FakeSource([McpToolSpec(name="github.search"), McpToolSpec(name="fs/read"),
+                       McpToolSpec(name="x" * 80)])
+    names = await register_mcp_tools(reg, src, prefix="gh.")
+    assert names == ["gh_github_search", "gh_fs_read", "gh_" + "x" * 61]
+    assert all(len(n) <= 64 for n in names)
+    await reg.invoke_async("gh_fs_read", {})
+    assert src.calls[-1][0] == "fs/read"
+
+
+async def test_names_that_collapse_together_are_refused() -> None:
+    reg = ToolRegistry()
+    src = _FakeSource([McpToolSpec(name="a.b"), McpToolSpec(name="a_b")])
+    with pytest.raises(ValueError, match="both map to tool name 'a_b'"):
+        await register_mcp_tools(reg, src)
 
 
 def test_stdio_client_importable_without_mcp_sdk() -> None:

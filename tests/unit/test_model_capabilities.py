@@ -201,3 +201,20 @@ def test_missing_file_degrades_instead_of_killing_the_send(tmp_path) -> None:
     assert isinstance(out, str)                 # 没有任何 image_url 块发出去
     assert "读不到" in out and "没有看到" in out  # 模型不会以为自己看过
     assert "file_uuid=491b-abc" in out          # 还能把图找回来
+
+
+def test_to_messages_fills_missing_tool_call_type() -> None:
+    """Host-written ``{"id", "function"}`` calls (the store accepts them) must reach the
+    provider with ``type`` — DeepSeek 422s the whole request on ``missing field `type```."""
+    short = {"id": "tc-1", "function": {"name": "echo", "arguments": "{}"}}
+    full = {"id": "tc-2", "type": "function", "function": {"name": "echo", "arguments": "{}"}}
+    req = LLMRequest(messages=[
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "", "tool_calls": [short, full]},
+        {"role": "tool", "tool_call_id": "tc-1", "content": "x"},
+        {"role": "tool", "tool_call_id": "tc-2", "content": "y"},
+    ])
+    calls = req.to_messages()[1]["tool_calls"]
+    assert [c["type"] for c in calls] == ["function", "function"]
+    assert calls[1] is full  # already-complete calls pass through untouched
+    assert "type" not in short  # the caller's (stored) dict is not mutated

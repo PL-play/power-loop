@@ -50,7 +50,7 @@ async def main() -> str:
                 max_rounds=4,
             ),
         )
-        names = await register_mcp_tools(loop.tool_registry or _new_registry(loop), client, prefix="mcp.")
+        names = await register_mcp_tools(loop.tool_registry or _new_registry(loop), client, prefix="mcp_")
         sid = await loop.new_session()
         result = await loop.send("What is 21 + 21? Use the add tool.", session_id=sid, tools=names)
         summary = f"registered {names} | answer={result.final_text!r}"

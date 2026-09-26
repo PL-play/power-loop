@@ -57,7 +57,7 @@ class _FlakyWrap(LLMService):
 @pytest.mark.asyncio
 async def test_real_llm_retries_through_transient_then_completes() -> None:
     """Two synthetic failures, third real attempt succeeds."""
-    inner = make_llm(max_tokens=128, temperature=0.0)
+    inner = make_llm(max_tokens=2048, temperature=0.0)
     llm = _FlakyWrap(inner, fail_first=2)
     bus = AgentEventBus()
     events: list = []
@@ -69,7 +69,7 @@ async def test_real_llm_retries_through_transient_then_completes() -> None:
             llm=llm, store=store, event_bus=bus,
             config=AgentLoopConfig(
                 system_prompt="Reply in one short sentence.",
-                max_rounds=1, max_tokens=128, temperature=0.0,
+                max_rounds=1, max_tokens=2048, temperature=0.0,
                 compactor=None,
                 retry_policy=LLMRetryPolicy(
                     max_attempts=4, backoff_initial=0.05, backoff_max=0.1,
@@ -92,7 +92,7 @@ async def test_real_llm_retries_through_transient_then_completes() -> None:
 @pytest.mark.asyncio
 async def test_real_llm_path_degrades_when_all_attempts_fail() -> None:
     """All attempts fail synthetically — never hits the real network."""
-    inner = make_llm(max_tokens=128, temperature=0.0)
+    inner = make_llm(max_tokens=2048, temperature=0.0)
     llm = _FlakyWrap(inner, fail_first=1_000_000)  # always fail
     bus = AgentEventBus()
     events: list = []

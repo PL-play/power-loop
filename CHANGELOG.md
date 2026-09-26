@@ -8,6 +8,47 @@
 
 ## [Unreleased]
 
+## [6.36.0] — 2026-09-26
+
+不要默认模型能看图：真实测试统一在 DeepSeek v4.1 flash（`deepseek-flash`，能看图、默认思考）上跑，
+以此为契机把「配的是看不了图的模型」这一侧的每条路径补齐；外加三处在严格供应商上才暴露的库缺陷。
+
+### Fixed
+
+- **能力声明只对声明它的那个模型生效**（`ModelCapabilities.for_model`）。子 agent / workflow 叶子
+  在父的 client 上换了 `model`，此前沿用父模型的声明——能看图的父把图发给看不了图的子（400 或
+  被无视后照样答）。现在请求里的模型名与声明的不同 → 什么都没声明 → 占位。两个传输层都按请求取。
+- **现成的 `image_url` / `image` / `input_image` 块也过能力闸**：此前只有 `attachment` 块检查，
+  宿主直接给的图片块原样发给看不了图的模型。现在同样换成「你没有看到这张图」的占位。
+- **`recall_send` 回取到带图的行**：看不了图时不再把图排进下一轮、回执也不再写「已放到你眼前」
+  （旁边就是一句「你没看到」的占位），改为如实说明几张图、坐标在哪。
+- **撤图文字按能力写**：看不了图的模型看到的是占位，撤下时不再写「已看过」；两种写法都保留
+  回取坐标（此前只剩文件名）。
+- **`dataclasses.replace` 丢掉旧参数 `compactor=`**：loop 每次按 send 覆盖配置（例如会话存的
+  系统提示词与配置不同）都会 replace，解析好的旧压缩器存在普通属性里、被丢掉，于是
+  `compactor=None`（不压缩）变成开始压缩、`AgenticMemoryCompactor` 悄悄退化成单次总结、不再写
+  笔记。现在两项解析结果是隐藏字段，replace 会带上；replace 时显式换了 `fold_strategy` 仍以新的为准。
+- **历史里缺 `type` 的 tool_call**：存储接受宿主写入的 `{"id","function"}` 短形状，宽松的供应商
+  照收，DeepSeek 整个请求 422（`missing field `type``）。`to_messages` 统一补 `"function"`。
+- **MCP 工具名**：注册时把 `[A-Za-z0-9_-]` 以外的字符换成 `_`、截到 64（`mcp.add` → `mcp_add`；
+  DeepSeek 对带点的名字 400，别的供应商放行——同一个注册表换个供应商就整请求失败）；远端仍用原名；
+  两个工具归一到同一个名字时报错而不是互相覆盖。
+
+### Added
+
+- `power_loop.runtime.image_recall.current_model_sees_images()`：正在跑的这个 loop 的模型能不能
+  看图（True/False；判断不了 → None）。往模型眼前放图的工具先问它，据此措辞；
+  `queue_image(s)_for_next_round` 在确定看不了时拒绝入队（返回 False / 0）。
+- `ModelCapabilities.sees_images`。
+
+### Changed
+
+- 能力模块与 `LLMProviderConfig.capabilities` 的说明改成与行为一致：未声明＝按看不了处理，
+  图片降级成明确占位，不抛（此前文档仍写「未声明发图就抛」）。
+- 真实测试约定（`tests/real/_llm.py`、`.env.example`、CLAUDE.md）：统一 `deepseek-flash`；
+  能力逐个测试声明、默认不声明；折叠预算用 `context_budget_tokens` 而不是借用极小的 `max_tokens`
+  （思考模型在第一个字之前就用完了）。
+
 ## [6.35.0] — 2026-09-26
 
 design/124 §8：停止——按件停、停得准、停得干净，全程机械、有时限、不调模型。

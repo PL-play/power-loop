@@ -59,8 +59,9 @@ class LLMProviderConfig:
     # DECLARED model capabilities, e.g. ``{"supports_image_input": True}``. THE source of
     # truth: nothing is inferred from the model name, and there is no env-var equivalent —
     # this config object is per-loop / per-agent-definition, which is the scope a host
-    # actually needs when it runs several models in one process. Undeclared capabilities
-    # raise ModelCapabilityError at render time rather than downgrading the input.
+    # actually needs when it runs several models in one process. Undeclared = unsupported:
+    # an image becomes an explicit "you did not see this" placeholder at render time. The
+    # declaration applies to THIS model only (a request naming another model gets none).
     capabilities: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

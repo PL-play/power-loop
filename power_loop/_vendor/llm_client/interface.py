@@ -79,8 +79,14 @@ class LLMRequest:
 
         ``capabilities`` omitted means "nothing declared", NOT "skip rendering": rendering
         used to be skipped entirely when it was None, which passed ``attachment`` blocks
-        through verbatim into the provider payload. Now an undeclared caller gets the same
-        loud :class:`ModelCapabilityError` as an explicitly-unsupported one.
+        through verbatim into the provider payload. An undeclared caller is treated exactly
+        like an explicitly non-vision one (images become an explicit "you did not see this"
+        placeholder — see ``multimodal._render_image_attachment``).
+
+        Assistant ``tool_calls`` missing ``"type"`` get ``"function"``: the store accepts
+        host-written calls in the short ``{"id", "function"}`` shape, lenient providers take
+        it, strict ones (DeepSeek) reject the whole request with 422
+        ``messages[i]: missing field `type```.
         """
         from .capabilities import coerce_capabilities
         from .multimodal import render_message_content
@@ -98,6 +104,14 @@ class LLMRequest:
                     role=str(msg.get("role") or "user"),
                     capabilities=caps,
                 )
+            calls = msg.get("tool_calls")
+            if isinstance(calls, list) and any(
+                isinstance(c, dict) and not c.get("type") for c in calls
+            ):
+                msg["tool_calls"] = [
+                    {**c, "type": "function"} if isinstance(c, dict) and not c.get("type") else c
+                    for c in calls
+                ]
             msgs.append(msg)
         return msgs
 

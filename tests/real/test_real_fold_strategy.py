@@ -33,13 +33,17 @@ from tests.real._llm import make_llm
 pytestmark = pytest.mark.asyncio
 
 
-def _loop(store, representation, fold_strategy, *, max_tokens=40):
+def _loop(store, representation, fold_strategy, *, budget=40):
+    # The FOLD budget is tiny so a few short sends cross it; the OUTPUT cap is not. The two used
+    # to be one knob (max_tokens=40), which only worked on models that answer without thinking —
+    # a reasoning model (the suite runs on deepseek-flash) spends 40 tokens before its first word
+    # and every send ended hit_round_limit. context_budget_tokens is the fold budget on its own.
     return StatefulAgentLoop(
-        llm=make_llm(max_tokens=80, temperature=0.0),
+        llm=make_llm(max_tokens=2048, temperature=0.0),
         store=store,
         config=AgentLoopConfig(
             system_prompt="You are terse. Reply with one short sentence.",
-            max_rounds=3, max_tokens=max_tokens,
+            max_rounds=3, max_tokens=2048, context_budget_tokens=budget,
             representation=representation, fold_strategy=fold_strategy,
         ),
     )
@@ -56,7 +60,7 @@ async def _drive(loop, sid, n=5):
 
 async def test_real_verbatim_llm_summary_fold(monkeypatch) -> None:
     # The in-place compactor honors CONTEXT_COMPACT_THRESHOLD (env) as an absolute override; clear
-    # it so the fold triggers at max_tokens × trigger_ratio in this small test.
+    # it so the fold triggers at context_budget_tokens × trigger_ratio in this small test.
     monkeypatch.delenv("CONTEXT_COMPACT_THRESHOLD", raising=False)
     store = await SessionStore.open(":memory:")
     try:
@@ -117,7 +121,7 @@ async def test_real_projection_agentic_fold() -> None:
     store = await SessionStore.open(":memory:")
     try:
         loop = _loop(store, ProjectedRepresentation(),
-                     AgenticFold(keep_last_sends=2, summary_max_tokens=160, max_rounds=3))
+                     AgenticFold(keep_last_sends=2, summary_max_tokens=2048, max_rounds=3))
         sid = await loop.new_session()
         await loop.send("Remember: my project is Zephyr; I prefer metric units. Reply OK.",
                         session_id=sid)
@@ -135,13 +139,13 @@ async def test_real_projection_agentic_fold() -> None:
 async def test_real_mode_switch_verbatim_to_projection_migrates() -> None:
     store = await SessionStore.open(":memory:")
     try:
-        v = _loop(store, VerbatimRepresentation(), LLMSummaryFold(keep_last_sends=4), max_tokens=8000)
+        v = _loop(store, VerbatimRepresentation(), LLMSummaryFold(keep_last_sends=4), budget=8000)
         sid = await v.new_session()
         await _drive(v, sid, 2)
         assert await store.load_project_messages(sid) == []  # verbatim wrote no projection rows
 
         # Re-open the SAME session in projection mode → migration folds prior history once.
-        p = _loop(store, ProjectedRepresentation(), LLMSummaryFold(keep_last_sends=2), max_tokens=40)
+        p = _loop(store, ProjectedRepresentation(), LLMSummaryFold(keep_last_sends=2), budget=40)
         r = await p.send("Now reply OK once more.", session_id=sid)
         assert r.status == "completed"
         assert await store.load_project_messages(sid), "prior history migrated into projection table"

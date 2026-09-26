@@ -20,8 +20,18 @@ model could see an image:
 
 So: capabilities are **configuration on the LLM config object** (hence per-loop /
 per-definition, see :class:`power_loop.runtime.provider.LLMProviderConfig`), every field is
-tri-state, and asking for a capability that was not declared **raises**. The library never
-infers, never falls back, never downgrades your input behind your back.
+tri-state, and nothing is inferred. Undeclared is treated exactly like unsupported — most
+configured models cannot see, so that is the only safe default.
+
+What "unsupported" does to an image is an EXPLICIT degradation, never a silent one: the
+renderer (``multimodal.py``) replaces it with a placeholder that says the model did NOT see
+it and carries the host's recall coordinate, so the model cannot answer as if it had looked,
+and the session keeps working (history full of images must not brick a model switch).
+Callers that would rather fail use :meth:`ModelCapabilities.require_image_input`.
+
+A declaration belongs to ONE model (:meth:`ModelCapabilities.for_model`): a request for a
+different model name — a sub-agent or workflow leaf overriding ``model`` on the parent's
+client — gets nothing declared, instead of silently inheriting what the parent can do.
 """
 
 from __future__ import annotations
@@ -46,12 +56,12 @@ class ModelCapabilities:
     ``True``
         Declared supported. Used natively.
     ``False``
-        Declared unsupported. Sending input that needs it raises.
+        Declared unsupported. Input that needs it is degraded explicitly (see module doc).
     ``None`` (the default)
-        **Undeclared** — *not* a synonym for ``False``. Nothing guesses on your behalf;
-        input that needs the capability raises, and the error tells you where to declare it.
+        **Undeclared** — nothing guesses on your behalf; handled like ``False``. It stays a
+        separate value so errors and logs can say "not declared" rather than "declared no".
 
-    ``model`` is carried only so errors can name the model that lacks the declaration.
+    ``model`` names the model the declaration is FOR (see :meth:`for_model`).
     """
 
     model: str = ""
@@ -67,6 +77,22 @@ class ModelCapabilities:
     #: point, so every path in (a fresh send, a recalled image, anything a host builds) is
     #: covered by construction.
     max_image_edge: int | None = None
+
+    def for_model(self, model: str | None) -> ModelCapabilities:
+        """The declaration that applies to a request for ``model``.
+
+        A client serves one configured model, but a request may name another (a sub-agent or
+        workflow leaf with its own ``model`` on the parent's client). What the parent's model
+        can do says nothing about that one, so it gets an all-undeclared instance. Same (or
+        no) model name → ``self``."""
+        if not model or not self.model or model == self.model:
+            return self
+        return ModelCapabilities(model=model)
+
+    @property
+    def sees_images(self) -> bool:
+        """Images reach this model natively (declared). Anything else gets a placeholder."""
+        return self.supports_image_input is True
 
     def require_image_input(self, *, what: str) -> None:
         """Raise unless image input is DECLARED supported. ``what`` names the offending
@@ -84,8 +110,8 @@ class ModelCapabilities:
         raise ModelCapabilityError(
             f"Cannot send {what}: {reason}. Either declare it — "
             "LLMProviderConfig(..., capabilities={'supports_image_input': True}) — "
-            "or stop sending images to this model. It is NOT downgraded to text: an answer "
-            "produced without the image would look valid and be unfounded."
+            "or stop sending images to this model. (This is the strict check; the renderer "
+            "itself degrades an image to an explicit 'you did not see this' placeholder.)"
         )
 
 
@@ -93,7 +119,7 @@ def coerce_capabilities(value: Any, *, model: str = "") -> ModelCapabilities:
     """Build a :class:`ModelCapabilities` from config (a dict, an instance, or ``None``).
 
     ``None`` / ``{}`` yields an all-undeclared instance — which is exactly right: a caller
-    that declared nothing gets a model that can do nothing beyond plain text, loudly.
+    that declared nothing gets a model treated as text-only, with explicit placeholders.
     """
     if isinstance(value, ModelCapabilities):
         if value.model or not model:

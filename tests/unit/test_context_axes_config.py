@@ -129,6 +129,26 @@ def test_legacy_compactor_instance_preserved_exactly():
     assert c.resolve_compactor() is comp  # the EXACT instance, untouched
 
 
+def test_legacy_compactor_survives_dataclasses_replace():
+    """The loop runs ``dataclasses.replace`` for every per-send override (e.g. a session whose
+    stored system prompt differs from the config's). That used to drop the resolved legacy
+    compactor and fall back to the seeded default fold: ``compactor=None`` (never compact) began
+    compacting, ``compactor=AgenticMemoryCompactor(...)`` silently lost its note extraction."""
+    import dataclasses
+
+    comp = AgenticMemoryCompactor(keep_last_n=1)
+    with _no_warn():
+        c = AgentLoopConfig(compactor=comp)
+        never = AgentLoopConfig(compactor=None)
+    assert dataclasses.replace(c, system_prompt="per-send").resolve_compactor() is comp
+    twice = dataclasses.replace(dataclasses.replace(never, system_prompt="a"), max_rounds=3)
+    assert twice.resolve_compactor() is None
+    # …but a fold the caller swaps in on replace() is the new axis, and it wins
+    swapped = dataclasses.replace(c, fold_strategy=LLMSummaryFold())
+    assert isinstance(swapped.resolve_compactor(), DefaultCompactor)
+    assert not isinstance(swapped.resolve_compactor(), AgenticMemoryCompactor)
+
+
 def test_legacy_projector_becomes_projection_representation():
     proj = DefaultDeterministicProjector(keep_last_sends=2)
     with _no_warn():
