@@ -153,8 +153,8 @@ def test_worker_job_roundtrip() -> None:
 def test_bootstrap_serializable_roundtrip_and_factory_guard() -> None:
     b = WorkerBootstrap(llm_from_env=True, tool_preset="core", workspace_dir="/tmp/ws")
     d = b.to_serializable_dict()
-    assert d == {"llm_from_env": True, "provider_prefix": None, "tool_preset": "core",
-                 "workspace_dir": "/tmp/ws", "home_dir": None}
+    assert d == {"llm_from_env": True, "provider_prefix": None, "capabilities": None,
+                 "tool_preset": "core", "workspace_dir": "/tmp/ws", "home_dir": None}
     b2 = WorkerBootstrap.from_dict(d)
     assert b2.llm_from_env and b2.tool_preset == "core" and b2.workspace_dir == "/tmp/ws"
     # A factory bootstrap cannot cross a process boundary.
@@ -249,3 +249,69 @@ def test_worker_runs_as_a_real_spawned_process() -> None:
     assert result["result"]["final_text"] == "spawned-ok"
     assert os.path.exists(db)
     os.remove(db)
+
+
+
+# ── declared capabilities cross the process boundary ─────────────────────────
+
+
+def _env_model(monkeypatch, model: str) -> None:
+    monkeypatch.setenv("POWER_LOOP_PROVIDER", "openai")
+    monkeypatch.setenv("POWER_LOOP_BASE_URL", "https://llm.example/v1")
+    monkeypatch.setenv("POWER_LOOP_API_KEY", "sk-test")
+    monkeypatch.setenv("POWER_LOOP_MODEL", model)
+
+
+def test_worker_rebuilds_its_client_with_the_declared_capabilities(monkeypatch) -> None:
+    """Capabilities are not env-configurable, so a worker rebuilt from env used to be
+    image-blind under any model. The bootstrap now carries the declaration across."""
+    _env_model(monkeypatch, "vision-m")
+    decl = {"model": "vision-m", "supports_image_input": True, "supports_json_schema": True}
+    b = WorkerBootstrap.from_dict(WorkerBootstrap(llm_from_env=True, capabilities=decl)
+                                  .to_serializable_dict())
+    caps = b.build_llm().capabilities
+    assert caps.supports_image_input is True and caps.supports_json_schema is True
+    assert WorkerBootstrap(llm_from_env=True).build_llm().capabilities.supports_image_input is None
+
+
+def test_a_declaration_for_another_model_is_not_applied(monkeypatch) -> None:
+    # the parent sees images on vision-m; this worker's env builds text-m
+    _env_model(monkeypatch, "text-m")
+    b = WorkerBootstrap(llm_from_env=True,
+                        capabilities={"model": "vision-m", "supports_image_input": True})
+    caps = b.build_llm().capabilities
+    assert caps.supports_image_input is None and caps.model == "text-m"
+
+
+@pytest.mark.asyncio
+async def test_subprocess_executor_hands_the_parent_declaration_to_the_worker() -> None:
+    from types import SimpleNamespace
+
+    from power_loop._vendor.llm_client.capabilities import coerce_capabilities
+    from power_loop.runtime.spec import AgentSpec
+    from power_loop.workflow.subprocess_executor import SubprocessExecutor
+
+    def _parent(caps: dict | None):
+        return SimpleNamespace(llm=SimpleNamespace(
+            capabilities=coerce_capabilities(caps, model="vision-m")))
+
+    async def _run(executor, parent) -> dict:
+        seen: list = []
+
+        async def _capture(job, spec, token):
+            seen.append(job)
+            return {"status": "completed"}
+
+        executor._spawn_and_collect = _capture
+        await executor.run_agent(AgentSpec(name="leaf", system_prompt="x"), "hi",
+                                 parent_loop=parent, driver_sid="d")
+        return seen[0].bootstrap
+
+    inherit = SubprocessExecutor(bootstrap=WorkerBootstrap(llm_from_env=True))
+    got = await _run(inherit, _parent({"supports_image_input": True, "max_image_edge": 768}))
+    assert got["capabilities"] == {"model": "vision-m", "supports_image_input": True,
+                                   "max_image_edge": 768}
+    assert not (await _run(inherit, _parent(None))).get("capabilities")  # nothing declared
+    explicit = {"model": "m2", "supports_image_input": False}
+    own = SubprocessExecutor(bootstrap=WorkerBootstrap(llm_from_env=True, capabilities=explicit))
+    assert (await _run(own, _parent({"supports_image_input": True})))["capabilities"] == explicit

@@ -75,6 +75,12 @@ class WorkerBootstrap:
     # serializable path
     llm_from_env: bool = False
     provider_prefix: str | None = None
+    #: Declared model capabilities for the rebuilt client (``{"model": ..., "supports_image_input":
+    #: True, ...}``). The env path can't carry them — capabilities are deliberately not
+    #: env-configurable — so without this every subprocess leaf was image-blind even under a
+    #: vision model. ``SubprocessExecutor`` fills it from the parent's client when unset; a
+    #: declaration whose ``model`` differs from the model the worker actually builds is ignored.
+    capabilities: dict[str, Any] | None = None
     tool_preset: str | None = None       # None → no tools (safe default for an isolated leaf)
     workspace_dir: str | None = None
     home_dir: str | None = None
@@ -86,11 +92,16 @@ class WorkerBootstrap:
         if self.llm_factory is not None:
             return self.llm_factory()
         if self.llm_from_env:
-            from power_loop.runtime.provider import create_llm_service_from_env
+            from power_loop.runtime.provider import (
+                LLMProviderConfig,
+                create_llm_service_from_config,
+            )
 
-            if self.provider_prefix:
-                return create_llm_service_from_env(prefix=self.provider_prefix)
-            return create_llm_service_from_env()
+            cfg = (LLMProviderConfig.from_env(prefix=self.provider_prefix)
+                   if self.provider_prefix else LLMProviderConfig.from_env())
+            if self.capabilities:
+                cfg.capabilities = dict(self.capabilities)
+            return create_llm_service_from_config(cfg)
         raise WorkerBootstrapError(
             "WorkerBootstrap has no LLM source: set llm_factory or llm_from_env=True"
         )
@@ -187,7 +198,7 @@ async def run_spec_isolated(
 
 # Only these WorkerBootstrap fields survive a process boundary (factories cannot).
 _BOOTSTRAP_SERIALIZABLE = (
-    "llm_from_env", "provider_prefix", "tool_preset", "workspace_dir", "home_dir",
+    "llm_from_env", "provider_prefix", "capabilities", "tool_preset", "workspace_dir", "home_dir",
 )
 
 

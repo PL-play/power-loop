@@ -54,7 +54,7 @@ class AnthropicMessagesLLMService(LLMService):
         # Images therefore vanished on this path with only a marker to show for it.
         self._capabilities: ModelCapabilities = coerce_capabilities(
             cfg.capabilities, model=cfg.model
-        )
+        ).for_model(cfg.model)  # a declaration naming another model → undeclared here
         logger.info(
             "Anthropic LLM: base_url=%s model=%s timeout_s=%s max_tokens=%s temperature=%s api_key=%s",
             cfg.base_url,

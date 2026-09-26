@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **子进程 workflow 叶子（`SubprocessExecutor`）不再永远按看不了图处理**：跨进程只能传数据，
+  worker 从 env 重建 LLM，而能力刻意不走 env，于是子进程叶子一律「未声明」。`WorkerBootstrap`
+  新增可序列化的 `capabilities`；调用方没填时执行器把父 client 的声明（连同它是给哪个模型的）
+  带过去。worker 从 env 建出的模型若与声明的模型不同，声明不生效——两个传输层在构造时即按
+  `for_model(cfg.model)` 收窄，client 的 `capabilities` 永远描述它自己的模型。
+- 注意：子进程叶子目前只有内置工具，内置工具里没有「按路径看一张图」的入口，能力传过去之后
+  图片仍要靠宿主提供的途径进入叶子。
+
 ## [6.36.0] — 2026-09-26
 
 不要默认模型能看图、也不要默认能用原生 json_schema：真实测试统一在 DeepSeek v4.1 flash

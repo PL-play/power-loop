@@ -165,6 +165,22 @@ def reap_runs(runs_dir: str, *, older_than_s: float, now: float | None = None) -
     return reaped
 
 
+def _declared_capabilities(parent_loop: Any) -> dict[str, Any] | None:
+    """The parent client's DECLARED capabilities as plain data (only fields actually declared,
+    plus the model they are for) — or None when there is nothing to hand down."""
+    caps = getattr(getattr(parent_loop, "llm", None), "capabilities", None)
+    if caps is None:
+        return None
+    out = {k: getattr(caps, k, None)
+           for k in ("supports_image_input", "max_image_edge", "supports_json_schema")}
+    out = {k: v for k, v in out.items() if v is not None}
+    if not out:
+        return None
+    if getattr(caps, "model", ""):
+        out["model"] = caps.model
+    return out
+
+
 class SubprocessExecutor:
     """Run each workflow leaf in a separate OS process with its own database."""
 
@@ -208,11 +224,18 @@ class SubprocessExecutor:
     ) -> dict[str, Any]:
         spec = spec if isinstance(spec, AgentSpec) else AgentSpec.from_json(spec)
         db_path = self._db_path_for(spec)
+        bootstrap = self._bootstrap_dict
+        if not bootstrap.get("capabilities"):
+            # Hand the parent client's declaration (with the model it is FOR) to the worker, so a
+            # leaf under a vision model can see. The worker drops it if its env builds another model.
+            inherited = _declared_capabilities(parent_loop)
+            if inherited:
+                bootstrap = {**bootstrap, "capabilities": inherited}
         job = WorkerJob(
             spec=asdict(spec),
             user_input=user_input,
             db_path=db_path,
-            bootstrap=self._bootstrap_dict,
+            bootstrap=bootstrap,
         )
         return await self._spawn_and_collect(job, spec, CancellationToken.from_any(stop_event))
 

@@ -117,9 +117,11 @@ class OpenAICompatibleChatLLMService(LLMService):
         self._last_usage: dict[str, Any] = {}
         # Read straight from config — no inference from the model name (that guessing table
         # is gone; see capabilities.py). Declared nothing => capable of nothing but text.
+        # A declaration that names ANOTHER model (e.g. handed down from a parent process whose
+        # model differs from this client's) says nothing about this one → undeclared.
         self._capabilities: ModelCapabilities = coerce_capabilities(
             cfg.capabilities, model=cfg.model
-        )
+        ).for_model(cfg.model)
 
         logger.info(
             "GraphExtractor LLM: base_url=%s model=%s timeout_s=%s max_tokens=%s temperature=%s api_key=%s",
