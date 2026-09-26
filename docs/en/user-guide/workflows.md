@@ -51,7 +51,7 @@ SPEC = {
 Data flow between nodes:
 
 - `{{input}}` / `{{var}}` — template substitution in a node's `input`.
-- `output_schema` — make a leaf emit structured JSON (validated); downstream nodes read it.
+- `output_schema` — make a leaf emit structured JSON (validated); downstream nodes read it. `{name, schema, strict?}`; `strict` defaults to true — set false for schemas that don't follow strict-mode rules.
 - `items_from: "plan.subtopics"` — a `foreach` reads a key out of a prior agent's parsed payload; `inputs_from: ["research"]` feeds prior results in as text.
 
 ## Running it

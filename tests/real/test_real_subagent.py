@@ -126,3 +126,49 @@ async def test_run_agent_spec_with_linked_lifecycle_persists_child() -> None:
         )
     finally:
         await store.close()
+
+
+# ── design/126 §2: spawn_agent(output_schema=…) on a model without native json_schema ──
+
+_TICKET = {
+    "type": "object",
+    "properties": {
+        "priority": {"type": "string", "enum": ["low", "normal", "urgent"]},
+        "team": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["priority", "team"],
+}
+
+
+@pytest.mark.asyncio
+async def test_spawn_agent_returns_parsed_json_without_native_json_schema() -> None:
+    """deepseek-flash rejects native json_schema; undeclared capability → the schema is written
+    into the child's system prompt instead, and the tool hands back parsed, compact JSON."""
+    import json
+
+    from power_loop.tools.spawn_agent import _handle_spawn_agent
+
+    store = await SessionStore.open(":memory:")
+    try:
+        loop = StatefulAgentLoop(
+            llm=make_llm(max_tokens=2048, temperature=0), store=store,
+            config=AgentLoopConfig(max_rounds=3, max_tokens=2048, compactor=None),
+        )
+        parent = await loop.new_session()
+        tok_loop, tok_sid = set_current_loop(loop), set_session_id(parent)
+        try:
+            out = await _handle_spawn_agent(
+                task=("Triage this ticket: 'Checkout page returns 500 for every user since the "
+                      "last deploy; payments are down.' Pick a priority and the owning team."),
+                output_schema=json.dumps({"name": "Triage", "schema": _TICKET}),
+            )
+        finally:
+            reset_current_loop(tok_loop)
+            reset_session_id(tok_sid)
+        assert out.startswith("结构化结果："), out
+        value = json.loads(out[len("结构化结果："):])
+        assert value["priority"] == "urgent", value
+        assert isinstance(value["team"], str) and value["team"].strip(), value
+    finally:
+        await store.close()

@@ -38,6 +38,21 @@ result = await loop.send("Find where authentication logic is defined in this pro
 # → child runs its own loop → parent gets the result
 ```
 
+### Structured results: `output_schema`
+
+When the parent needs data rather than prose, it can pass `output_schema` — `{"name"?, "schema", "strict"?}`,
+a bare JSON Schema, or either one as a JSON string. The root must be `{"type": "object", ...}`.
+
+- The schema goes to the child as `AgentSpec.output_schema`: natively (`response_format: json_schema`) when the
+  model declares `supports_json_schema`, otherwise written into that request's system prompt.
+- `strict` defaults to **false** here: schemas an LLM writes rarely follow strict-mode rules (every key required,
+  no extra keys at any level), and a native provider rejects those with 400. Pass `"strict": true` for schemas
+  that do follow them.
+- On completion the tool returns `结构化结果：{compact JSON}` when the reply parses (fences, trailing commas and
+  surrounding prose are tolerated), or `结构化结果解析失败（reason），原文：…` with up to 4000 characters of the
+  reply. The child session is deleted afterwards, so there is no repair round; the parent decides what to do.
+- A child that did not complete (round limit, stopped) is reported as before, without parsing.
+
 ## Declarative: AgentSpec
 
 ```python
@@ -69,6 +84,7 @@ result = await run_agent_spec(spec, "Find all SQL injection vulnerabilities", pa
 | `max_tokens` | `int` | `2000` | Per-request token cap. |
 | `temperature` | `float` | `0.0` | LLM temperature. |
 | `model` | `str \| None` | `None` | Override model. `None` = use parent's. |
+| `output_schema` | `dict \| None` | `None` | `{name, schema, strict?}` — the child must return one JSON object. `strict` defaults to `true`; set `false` for schemas that don't follow strict-mode rules. Helpers: `normalize_output_schema()`, `output_response_format()`. |
 | `lifecycle` | `str` | `"ephemeral"` | `"ephemeral"` / `"linked"` / `"detached"` |
 | `metadata` | `dict` | `{}` | Free-form metadata for audit. |
 

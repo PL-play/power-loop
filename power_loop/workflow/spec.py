@@ -144,7 +144,7 @@ class AgentNode:
     ``spec`` is materialized into an :class:`AgentSpec`. ``input`` is a template
     (``{{var}}`` placeholders) for the user message sent to the sub-agent;
     ``inputs_from`` names earlier node ids whose output text is appended as
-    context. ``output_schema`` (``{"name", "schema"}``) makes the engine parse
+    context. ``output_schema`` (``{"name", "schema", "strict"?}``) makes the engine parse
     the sub-agent's final text into a structured payload that downstream
     ``items_from`` / ``branch.on`` references can read.
     """
@@ -704,13 +704,17 @@ def _parse_agent(
             problems.append(f"{path}: 'output_schema' must be an object {{name, schema}}")
             out_schema = None
         else:
-            extra = set(out_schema) - {"name", "schema"}
+            # strict (optional bool, default true): false for schemas that don't follow strict-mode
+            # rules (e.g. written by an LLM) — a native json_schema provider 400s on those.
+            extra = set(out_schema) - {"name", "schema", "strict"}
             name_val = out_schema.get("name")
             schema_val = out_schema.get("schema")
             if not isinstance(name_val, str) or not name_val.strip():
                 problems.append(f"{path}: output_schema.name must be a non-empty string")
             if not isinstance(schema_val, dict):
                 problems.append(f"{path}: output_schema.schema must be an object")
+            if not isinstance(out_schema.get("strict", True), bool):
+                problems.append(f"{path}: output_schema.strict must be true or false")
             if extra:
                 problems.append(f"{path}: output_schema has unknown key(s): {sorted(extra)}")
 

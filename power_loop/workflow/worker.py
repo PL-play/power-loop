@@ -143,19 +143,12 @@ async def run_spec_isolated(
     """
     from power_loop.agent.stateful_loop import StatefulAgentLoop
     from power_loop.agent.types import AgentLoopConfig
-    from power_loop.runtime.spec import AgentSpec
+    from power_loop.runtime.spec import AgentSpec, output_response_format
     from power_loop.runtime.store.store import MAX_SPAWN_DEPTH
 
     spec = spec if isinstance(spec, AgentSpec) else AgentSpec.from_json(spec)
 
-    response_format = None
-    if spec.output_schema:
-        from power_loop.runtime.structured import StructuredOutputSpec
-
-        response_format = StructuredOutputSpec(
-            name=str(spec.output_schema.get("name") or "Output"),
-            schema=spec.output_schema.get("schema") or spec.output_schema,
-        ).to_openai_response_format()
+    response_format = output_response_format(spec.output_schema) if spec.output_schema else None
 
     config = AgentLoopConfig(
         system_prompt=spec.system_prompt,

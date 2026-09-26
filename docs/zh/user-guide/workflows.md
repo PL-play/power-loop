@@ -51,7 +51,7 @@ SPEC = {
 节点之间的数据流：
 
 - `{{input}}` / `{{var}}` —— 在节点的 `input` 中做模板替换。
-- `output_schema` —— 让叶子产出结构化 JSON（经校验）；下游节点读取它。
+- `output_schema` —— 让叶子产出结构化 JSON（经校验）；下游节点读取它。形如 `{name, schema, strict?}`，`strict` 默认 true，schema 不符合 strict 规范时写 false。
 - `items_from: "plan.subtopics"` —— `foreach` 从前序 agent 已解析的 payload 中读取一个键；`inputs_from: ["research"]` 则把前序结果作为文本喂入。
 
 ## 运行它

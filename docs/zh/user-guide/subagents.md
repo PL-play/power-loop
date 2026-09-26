@@ -38,6 +38,19 @@ result = await loop.send("找到项目中的认证逻辑代码。", session_id=s
 # → 子代理跑自己的循环 → 父代理拿到结果
 ```
 
+### 结构化结果：`output_schema`
+
+主代理要的是数据而不是一段话时，可以传 `output_schema`：`{"name"?, "schema", "strict"?}`、裸 JSON Schema，
+或二者的 JSON 字符串。根必须是 `{"type": "object", ...}`。
+
+- schema 作为 `AgentSpec.output_schema` 交给子代理：模型声明了 `supports_json_schema` 就走原生
+  `response_format: json_schema`，否则写进那一次请求的 system prompt。
+- 这里 `strict` 默认 **false**：LLM 自己写的 schema 很少符合 strict 规范（每层所有键必填、禁止多余字段），
+  原生服务端遇到会直接 400。确实符合规范的 schema 可以写 `"strict": true`。
+- 子代理完成后：解析成功返回 `结构化结果：{紧凑 JSON}`（容忍代码围栏、尾逗号、前后的说明文字）；失败返回
+  `结构化结果解析失败（原因），原文：…`，原文最多 4000 字。子会话用完即删，所以不做修复轮，由主代理决定怎么办。
+- 子代理没正常完成（撞轮数、被停止）时照旧返回状态和原文，不去解析。
+
 ## 声明式：AgentSpec
 
 ```python
@@ -55,6 +68,10 @@ spec = AgentSpec(
 
 result = await run_agent_spec(spec, "查找所有 SQL 注入漏洞", parent_loop=loop)
 ```
+
+`AgentSpec.output_schema`（`{name, schema, strict?}`）要求子代理交回一个 JSON 对象；`strict` 默认 `true`，
+schema 不符合 strict 规范时写 `false`。辅助函数：`normalize_output_schema()`、`output_response_format()`。
+workflow 的 agent 节点 `output_schema` 同样可以带 `strict`。
 
 ### AgentSpec 校验
 

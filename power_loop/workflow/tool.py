@@ -46,7 +46,7 @@ _AGENT_SPEC_FIELD_DOCS: dict[str, str] = {
     "temperature": "optional sampling temperature (default 0)",
     "model": "optional model override (omit to use the service default)",
     "output_schema": (
-        "optional {\"name\", \"schema\"(JSON Schema)} — forces the leaf to emit "
+        "optional {\"name\", \"schema\"(JSON Schema), \"strict\"?(default true)} — forces the leaf to emit "
         "validated JSON that downstream items_from / branch.on / .key references can read"
     ),
     "lifecycle": "managed by the engine — do not set",
@@ -77,7 +77,7 @@ def _build_create_workflow_description() -> str:
         "SPEC: {\"name\": str, \"input\"?: str, \"root\": <node>}. Node types:\n"
         "- {\"type\":\"agent\", \"id\": globally-unique str, \"spec\": <AgentSpec>, "
         "\"input\"?: template, \"inputs_from\"?: [earlier node ids], "
-        "\"output_schema\"?: {\"name\", \"schema\"}}\n"
+        "\"output_schema\"?: {\"name\", \"schema\", \"strict\"?}}\n"
         "- {\"type\":\"sequence\", \"steps\": [node, ...]} — run in order\n"
         "- {\"type\":\"parallel\", \"branches\": [node, ...], \"max_concurrency\"?: int} "
         "— run concurrently, barrier at the end\n"

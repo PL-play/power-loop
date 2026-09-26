@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
@@ -45,6 +46,8 @@ __all__ = [
     "AgentSpec",
     "AgentSpecError",
     "filtered_registry",
+    "normalize_output_schema",
+    "output_response_format",
     "run_agent_spec",
 ]
 
@@ -78,7 +81,9 @@ class AgentSpec:
     max_tokens: int | None = None
     temperature: float = 0.0
     model: str | None = None      # per-subagent model override (None = inherit the service default)
-    output_schema: dict[str, Any] | None = None   # {name, schema}; enforces structured output
+    # {name, schema, strict?}; enforces structured output. strict defaults to True — a schema that
+    # doesn't follow strict-mode rules (all keys required, no extra keys) opts out with strict: false.
+    output_schema: dict[str, Any] | None = None
     lifecycle: str = SubagentLifecycle.EPHEMERAL.value
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -100,6 +105,10 @@ class AgentSpec:
             raise AgentSpecError(f"unknown lifecycle: {self.lifecycle}") from exc
         if self.output_schema is not None and not isinstance(self.output_schema, dict):
             raise AgentSpecError("AgentSpec.output_schema must be an object or None")
+        if self.output_schema is not None and not isinstance(
+            self.output_schema.get("strict", True), bool
+        ):
+            raise AgentSpecError("AgentSpec.output_schema.strict must be a boolean")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgentSpec:
@@ -124,6 +133,54 @@ class AgentSpec:
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
+
+# OpenAI json_schema 的 name 只收 ^[A-Za-z0-9_-]{1,64}$；agent 起的名字可能是中文，原样发给原生模型会 400。
+_SCHEMA_NAME_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def normalize_output_schema(
+    value: Any, *, default_name: str = "Output", default_strict: bool = True
+) -> dict[str, Any]:
+    """Normalize a structured-output declaration to ``{"name", "schema", "strict"}``.
+
+    Accepts ``{name?, schema, strict?}``, a bare JSON Schema, or either one as a JSON string
+    (models sometimes send an object argument as a string). The root must be ``type: object`` —
+    structured output only returns objects. ``strict`` is what the declaration says, else
+    ``default_strict``; pass False for schemas an LLM wrote (they rarely follow strict-mode
+    rules, and a native json_schema provider 400s on them). Raises :class:`AgentSpecError`.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise AgentSpecError(f"output_schema 不是合法的 JSON：{exc}") from None
+    if not isinstance(value, dict) or not value:
+        raise AgentSpecError("output_schema 要是一个 JSON Schema 对象")
+    if isinstance(value.get("schema"), dict):
+        name, schema = value.get("name"), value["schema"]
+        strict = value.get("strict", default_strict)
+    else:
+        name, schema, strict = None, value, default_strict
+    if schema.get("type") != "object":
+        raise AgentSpecError(
+            'output_schema 的根必须是 {"type": "object", ...}（结构化输出只收对象）'
+        )
+    if not isinstance(strict, bool):
+        raise AgentSpecError("output_schema.strict 只能是 true 或 false")
+    name = _SCHEMA_NAME_RE.sub("_", str(name or default_name))[:64] or default_name
+    return {"name": name, "schema": schema, "strict": strict}
+
+
+def output_response_format(output_schema: dict[str, Any]) -> dict[str, Any]:
+    """``AgentSpec.output_schema`` (``{name, schema, strict?}`` or a bare schema) → the
+    OpenAI-compatible ``response_format``. ``strict`` defaults to True."""
+    from power_loop.runtime.structured import StructuredOutputSpec
+
+    return StructuredOutputSpec(
+        name=str(output_schema.get("name") or "Output"),
+        schema=output_schema.get("schema") or output_schema,
+        strict=bool(output_schema.get("strict", True)),
+    ).to_openai_response_format()
 
 
 def filtered_registry(
@@ -245,14 +302,7 @@ async def run_agent_spec(
                 "depth": parent_row.spawn_depth + 1,
             }
 
-    response_format = None
-    if spec.output_schema:
-        from power_loop.runtime.structured import StructuredOutputSpec
-
-        response_format = StructuredOutputSpec(
-            name=str(spec.output_schema.get("name") or "Output"),
-            schema=spec.output_schema.get("schema") or spec.output_schema,
-        ).to_openai_response_format()
+    response_format = output_response_format(spec.output_schema) if spec.output_schema else None
 
     # Inherit the parent's transport resilience: the child reuses the parent's
     # LLM client (same connection pool), and a delegation often fires after a

@@ -8,6 +8,28 @@
 
 ## [Unreleased]
 
+## [6.39.0] — 2026-09-26
+
+design/126 §2：`spawn_agent` 能要结构化结果；`strict` 开关一路带到请求。
+
+### Added
+
+- **`spawn_agent(output_schema=…)`**：接受 `{name?, schema, strict?}`、裸 JSON Schema，或二者的 JSON 字符串，
+  根必须是 object。**这里 `strict` 默认 false**（LLM 写的 schema 很少符合 strict 规范，原生 json_schema 服务端
+  会 400）。子 agent 正常完成后解析：成功返回 `结构化结果：{紧凑 JSON}`；失败返回
+  `结构化结果解析失败（原因），原文：…`（原文最多 4000 字）。子会话用完即删，不做修复轮。
+  没正常完成（撞轮数、被停）照旧返回状态与原文。
+- **`normalize_output_schema(value, *, default_name="Output", default_strict=True)`** 与
+  **`output_response_format(output_schema)`**（`power_loop.runtime.spec`，PROVISIONAL）：结构化输出声明的归一与
+  `response_format` 生成，`run_agent_spec` 与隔离 worker 共用。
+
+### Changed
+
+- **`AgentSpec.output_schema` 认 `strict`**：`{name, schema, strict?}`，`strict` 默认 true、必须是布尔值
+  （否则 `AgentSpecError`）。以前 `run_agent_spec` 与隔离 worker 一律按 strict=true 生成 `response_format`。
+- **workflow agent 节点的 `output_schema` 可以带 `strict`**（可选布尔，默认 true）；节点序列化、resume 从 journal
+  重建时原样保留。其它多余键仍然报错。
+
 ## [6.38.0] — 2026-09-26
 
 design/125 补充：能力探测没测成时，说清是为什么没测成。
