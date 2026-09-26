@@ -4,6 +4,8 @@ view_image lets a loop look at a workspace file — or says plainly that it cann
 Runs on the endpoint in ``.env`` (DeepSeek, ``deepseek-flash``: sees images, rejects native
 json_schema). ``deepseek-v4-pro`` on the same endpoint does NOT see images (2026-09-26: it answers
 "无法确定") — it is the real "no" here; if DeepSeek ever gives it vision, that assertion flags it.
+A bogus key (401) and a wrong model name (DeepSeek answers 400 "The supported API model names are
+…, but you passed …") must come back inconclusive with ``error_kind`` auth / model_missing.
 """
 
 from __future__ import annotations
@@ -50,6 +52,27 @@ def test_probe_on_a_model_that_cannot_see() -> None:
     img = rep.checks["image_input"]
     assert img.status == "no", (
         f"deepseek-v4-pro judged {img.status!r} ({img.evidence}) — if it gained vision, update this test")
+
+
+# ── a broken configuration says what is broken ───────────────────────────────
+
+
+def test_probe_with_a_bogus_key_is_inconclusive_auth_everywhere() -> None:
+    cfg = dataclasses.replace(LLMProviderConfig.from_env(), api_key="sk-bogus0000000000000000000000")
+    rep = asyncio.run(probe_capabilities(cfg))
+    got = {k: (v.status, v.error_kind, v.evidence) for k, v in rep.checks.items()}
+    assert {k: v[:2] for k, v in got.items()} == {
+        k: ("inconclusive", "auth") for k in ("image_input", "json_schema", "tools", "thinking")}, got
+    assert rep.capabilities() == {}
+    assert all("sk-bogus0000" not in v.evidence for v in rep.checks.values()), got
+
+
+def test_probe_with_a_nonexistent_model_is_inconclusive_model_missing() -> None:
+    rep = _probe("deepseek-no-such-model")
+    got = {k: (v.status, v.error_kind, v.evidence) for k, v in rep.checks.items()}
+    assert {k: v[:2] for k, v in got.items()} == {
+        k: ("inconclusive", "model_missing") for k in ("image_input", "json_schema", "tools", "thinking")}, got
+    assert rep.capabilities() == {}
 
 
 # ── view_image through a real loop ───────────────────────────────────────────

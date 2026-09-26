@@ -288,7 +288,10 @@ async def run_agent_spec(
             )
 
     child_sid = await store.create_session(
-        system_prompt=spec.system_prompt,
+        # The FACTORY-adjusted prompt, not spec.system_prompt: a send resolves the prompt as
+        # per-call > session > config, so storing the spec's original here silently discarded
+        # anything a host factory added (DeepTalk's structured-output note never reached the model).
+        system_prompt=child_config.system_prompt or spec.system_prompt,
         config={
             "spec_name": spec.name,
             "max_rounds": child_config.max_rounds,

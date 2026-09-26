@@ -132,3 +132,21 @@ async def test_factory_exception_propagates_without_leaking(store: SessionStore)
             AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop,
         )
     assert llm.seen == []
+
+
+@pytest.mark.asyncio
+async def test_a_system_prompt_the_factory_adds_reaches_the_model(store: SessionStore) -> None:
+    """The child session used to be created with spec.system_prompt; a send resolves the prompt
+    as per-call > session > config, so whatever a host factory appended never reached the model
+    (DeepTalk's structured-output note was silently dropped — design/126 §0)."""
+
+    def factory(spec: AgentSpec, default: AgentLoopConfig) -> AgentLoopConfig:
+        return replace(default, system_prompt=(default.system_prompt or "") + "\n\nHOST NOTE")
+
+    llm = _Capturing(responses=[LLMResponse(raw_text="child out")])
+    loop = StatefulAgentLoop(
+        llm=llm, store=store,
+        config=AgentLoopConfig(max_rounds=3, subagent_config_factory=factory),
+    )
+    await run_agent_spec(AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop)
+    assert llm.seen[0].system_prompt.startswith("p") and "HOST NOTE" in llm.seen[0].system_prompt

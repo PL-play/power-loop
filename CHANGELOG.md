@@ -8,6 +8,48 @@
 
 ## [Unreleased]
 
+## [6.38.0] — 2026-09-26
+
+design/125 补充：能力探测没测成时，说清是为什么没测成。
+
+### Added
+
+- **`CheckResult.error_kind`**（PROVISIONAL）：某项因为出错而 `inconclusive` 时，写明原因，取值见
+  `ERROR_KINDS`：`balance`（402 或余额/配额不足字样——先判：OpenAI 配额用完是 429，账户未开通付费是
+  429「… please check your billing details」（`billing_not_active`），Moonshot 账户停用是 429
+  `exceeded_current_quota_error`「… is suspended, please check your plan and billing details」，阿里云
+  百炼欠费是 400「Access denied, please make sure your account is in good standing」（code
+  `Arrearage`），Anthropic 是 400「Your credit balance is too low」；不认单独的 billing 一词，OpenAI 免费档
+  的 429 限流提示里就带着 `…/account/billing` 链接，仍是 `rate_limited`）、`auth`（401 或密钥无效字样，
+  含 Gemini 的 400「API key not valid」）、`forbidden`（403 或拒绝访问字样）、`model_missing`（404 或模型
+  不存在字样：「does not exist」要和前面的 model 在同一句里——「The model `gpt-4.1-nano` does not exist
+  …」算（名字里的点不算句号），工具检查的 400「function does not exist」不算，那是在说工具；旧 DeepSeek
+  的「Model Not Exist」；DeepSeek 模型名写错时的 400「model names are … you passed …」，两段都要有——
+  「the schema you passed is invalid」不算）、`rate_limited`（429）、
+  `server`（5xx）、`timeout`（SDK / httpx / 探测自身超时、408）、`network`（连不上、连接断开）、
+  `empty`（空回复）、`unknown`（其它错误）。文字规则以 DeepTalk `agent/app/llm_incidents.py` 为起点；
+  SDK 异常按类名认，不引入 SDK 依赖。`to_dict()` 带上它；字段加在最后，按位置构造
+  `CheckResult(name, status, evidence, latency_ms, usage)` 不受影响。有结论的项、以及工具检查「答了但没调用」都是 `None`。
+- **`BLOCKING_ERROR_KINDS`**：`balance` / `auth` / `forbidden` / `model_missing` 四种重试也好不了，得有人
+  去改配置或充值。判定顺序：① 这四种的字样、裸 402 / 401 → `inconclusive`，优先于「4xx 点名该能力 =
+  不支持」：402 的错误信息里提到 image 也仍是 `inconclusive`，不会把能看图的模型判成看不了；② 其余
+  4xx（408 / 409 / 429 除外）点名被测能力 → `no`，**含 403 / 404**：OpenRouter 对不支持的模型回 404
+  「No endpoints found that support image input」/「… tool use」，这是答案不是模型不存在；③ 没点名能力
+  的裸 403 / 404 才是 `forbidden` / `model_missing`。看「点名被测能力」之前先从错误信息里去掉配置的模型名
+  （不分大小写；`org/name` 形式的也去掉单独的 `name`）：模型叫 `…-vision-instruct` / `vision-pro` /
+  `xxx-tools` 时，OpenRouter 的 404「No endpoints found for meta-llama/llama-3.2-11b-vision-instruct.」
+  是 `model_missing`，不是「看不了图」。
+
+实测（`.env` 里的 DeepSeek）：假密钥四项都是 `inconclusive` / `auth`（401「Authentication Fails」）；
+模型名写错四项都是 `inconclusive` / `model_missing`（400「The supported API model names are …」）。
+
+### Fixed
+
+- **宿主 `subagent_config_factory` 对子 agent 系统提示词的改动不再被丢掉**（design/126 §0）：`run_agent_spec`
+  建子会话时存的是 `spec.system_prompt` 原文，而发请求时「单次参数 > 会话 > config」，工厂追加的内容
+  （DeepTalk 曾把结构化输出的 schema 说明追加在这里）从来到不了模型。现在用工厂处理后的
+  `child_config.system_prompt` 建会话。
+
 ## [6.37.0] — 2026-09-26
 
 design/125 阶段 1：测出模型实际能做什么；子进程 workflow 叶子能看图。
