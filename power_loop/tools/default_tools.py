@@ -2255,6 +2255,44 @@ def _render_recall_row(hit: Any, rows: list[Any], *, cap: int, head: str) -> str
     return f"{head} — original row ({total} chars):\n\n" + "\n\n".join(blocks)
 
 
+#: What view_image hands to the renderer. No SVG: models take raster images only (a host that
+#: wants SVG rasterizes first).
+_VIEW_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
+
+
+def run_view_image(path: str, question: str = "") -> str:
+    """Queue one workspace image for the next round (design/125 §10).
+
+    The generic way for a loop to look at a picture by path — the one a subprocess workflow leaf
+    has, since host tools do not cross the process boundary. Asks the current model FIRST: a
+    model that cannot see gets a plain "cannot see images", not a queued placeholder next to a
+    reply claiming the picture is in front of it.
+    """
+    from power_loop.core.agent_context import get_session_id
+    from power_loop.runtime.image_recall import (
+        current_model_sees_images,
+        queue_image_for_next_round,
+    )
+
+    try:
+        fp = safe_path(path, "r")
+    except Exception as e:
+        return f"Error: {e}"
+    if not fp.is_file():
+        return f"Error: {path} 不是文件，或不存在。"
+    if fp.suffix.lower() not in _VIEW_IMAGE_EXTS:
+        return (f"Error: {fp.name} 不是能直接看的图片（支持 png / jpg / webp / gif / bmp）；"
+                "SVG 等矢量图先转成位图。")
+    shown = _display_path(fp)
+    if current_model_sees_images() is False:
+        return (f"当前模型看不了图片，{shown} 没有放进上下文。不要凭空描述它；"
+                "需要知道图里有什么，就换能看图的模型，或请能看图的一方描述。")
+    note = (question or "").strip() or f"（你要看的图：{shown}）"
+    if not queue_image_for_next_round(get_session_id(), path=str(fp), note=note, ref=shown):
+        return "图没能放进上下文（会话不可用或本轮排队已满）。"
+    return f"{shown} 已放到你眼前——下一步直接看图作答。"
+
+
 # Async tool handlers are registered as ``async def`` adapters (NOT sync lambdas that
 # merely return a coroutine): the registry uses ``inspect.iscoroutinefunction`` to decide
 # sync-vs-async dispatch and to keep the per-call ``runtime_env_context`` held across the
@@ -2322,6 +2360,7 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "current_time": lambda **kw: run_current_time(),
     "recall_compacted": _h_recall_compacted,
     "recall_send": _h_recall_send,
+    "view_image": lambda **kw: run_view_image(kw["path"], kw.get("question") or ""),
     "background_run": _h_background_run,
     "request_user_input": lambda **kw: request_user_input(
         kind=kw.get("kind", "text"),

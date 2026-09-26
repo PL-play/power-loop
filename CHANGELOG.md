@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+## [6.37.0] — 2026-09-26
+
+design/125 阶段 1：测出模型实际能做什么；子进程 workflow 叶子能看图。
+
+### Added
+
+- **`power_loop.runtime.capability_probe.probe_capabilities(config)`**（PROVISIONAL）：对一个
+  `LLMProviderConfig` 并发发四个极小的真实请求，报告 `image_input` / `json_schema` / `tools` /
+  `thinking` 各自是 `yes` / `no` / `inconclusive`，附证据（模型原话前 60 字，密钥打码）、耗时、用量。
+  看图用左右两色随机图（6 色取 2，两色按顺序都答对才算，蒙中约 1/30）；原生 json_schema 的提示词
+  不提 JSON，只有真正按 schema 约束的服务端才算 `yes`；限流、5xx、超时、网络、鉴权、未知模型一律
+  `inconclusive`——`CapabilityReport.capabilities()` 只给出有结论的项，宿主不会被一次 429 改掉结论。
+  每项走本库真实传输、只临时声明被测那一项、不重试、`max_tokens=2048`（思考模型）。
+  实测：deepseek-flash 能看图、json_schema 400；deepseek-v4-pro 看不了图（答「无法确定」）。
+- **内置工具 `view_image(path, question?)`**：把工作区里的一张位图放到模型眼前；当前模型确定看不了图时
+  如实说、不排队。进 `full` 预设，不进 `core` / `explore`。子进程 workflow 叶子只有内置工具，这是它们
+  看图的入口。
+
 ### Fixed
 
 - **子进程 workflow 叶子（`SubprocessExecutor`）不再永远按看不了图处理**：跨进程只能传数据，

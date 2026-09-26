@@ -178,3 +178,53 @@ def test_retired_image_on_a_vision_model_keeps_its_recall_coordinate() -> None:
     text = _retire(VISION)
     assert "已看过" in text and "shot.png · file_uuid=abc" in text
     assert "没看到过" in _retire(VISION, loop_model="other-model")
+
+
+# ── view_image: the generic "look at this file" (design/125 §10) ─────────────
+
+
+def _ws_image(tmp_path):
+    from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+
+    (tmp_path / "shots").mkdir()
+    (tmp_path / "shots" / "a.png").write_bytes(_PNG)
+    (tmp_path / "logo.svg").write_text("<svg/>")
+    return runtime_env_context(RuntimeEnv(workspace_dir=tmp_path))
+
+
+def test_view_image_on_a_blind_model_says_so_and_queues_nothing(tmp_path) -> None:
+    from power_loop.tools.default_tools import run_view_image
+
+    with _ws_image(tmp_path), _InLoop(_loop(None)):
+        out = run_view_image("shots/a.png", "what colour?")
+        assert image_recall.drain_queued_images("s1") == ([], [])
+    assert "当前模型看不了图片" in out and "放到你眼前" not in out
+
+
+def test_view_image_on_a_vision_model_puts_it_in_front(tmp_path) -> None:
+    from power_loop.tools.default_tools import run_view_image
+
+    with _ws_image(tmp_path), _InLoop(_loop(VISION)):
+        out = run_view_image("shots/a.png", "what colour?")
+        durable, _ = image_recall.drain_queued_images("s1")
+    assert "已放到你眼前" in out and len(durable) == 1
+    blocks = durable[0]["content"]
+    assert blocks[0] == {"type": "text", "text": "what colour?"}
+    assert blocks[1]["attachment"]["ref"].endswith("shots/a.png")
+
+
+def test_view_image_refuses_what_it_cannot_show(tmp_path) -> None:
+    from power_loop.tools.default_tools import run_view_image
+
+    with _ws_image(tmp_path), _InLoop(_loop(VISION)):
+        assert run_view_image("logo.svg").startswith("Error:")      # vector: rasterize first
+        assert run_view_image("nope.png").startswith("Error:")      # missing
+        assert run_view_image("../../etc/passwd").startswith("Error:")  # outside the workspace
+        assert image_recall.drain_queued_images("s1") == ([], [])
+
+
+def test_view_image_is_in_the_full_preset_only() -> None:
+    from power_loop.tools.default_manifest import TOOL_PRESETS
+
+    assert "view_image" in TOOL_PRESETS["full"]
+    assert "view_image" not in TOOL_PRESETS["core"] and "view_image" not in TOOL_PRESETS["explore"]

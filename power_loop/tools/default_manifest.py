@@ -332,6 +332,24 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         async_capable=True,
     ),
     ToolDefinition(
+        name="view_image",
+        description=(
+            "Put ONE image file from the workspace in front of you so you can look at it yourself "
+            "(png / jpg / webp / gif / bmp). It arrives with your next round — then answer from what "
+            "you actually see. If the current model cannot see images, the tool says so instead of "
+            "pretending; do not describe a picture you were not shown."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative path, absolute workspace path, or @workspace/..."},
+                "question": {"type": "string", "description": "Optional: what to look for — shown with the image."},
+            },
+            "required": ["path"],
+        },
+        required_params=("path",),
+    ),
+    ToolDefinition(
         name="background_run",
         description=(
             "Manage private background tasks with one action: run, tool, or check. action=run "
