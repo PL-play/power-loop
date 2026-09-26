@@ -601,6 +601,9 @@ class OpenAICompatibleChatLLMService(LLMService):
         If provider does not support streaming, callers can switch to `complete()`.
         """
         client: AsyncOpenAI = self._ensure_client()
+        # json_schema only to a model that declares it; otherwise the schema rides in the system
+        # prompt. Done once here so kwargs, rendering and a stream resume all see the same request.
+        request = request.with_structured_fallback(self._capabilities.for_model(request.model))
         kwargs = self._request_kwargs(request)
 
         stream_kwargs = dict(kwargs)

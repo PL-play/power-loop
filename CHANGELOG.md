@@ -10,10 +10,22 @@
 
 ## [6.36.0] — 2026-09-26
 
-不要默认模型能看图：真实测试统一在 DeepSeek v4.1 flash（`deepseek-flash`，能看图、默认思考）上跑，
-以此为契机把「配的是看不了图的模型」这一侧的每条路径补齐；外加三处在严格供应商上才暴露的库缺陷。
+不要默认模型能看图、也不要默认能用原生 json_schema：真实测试统一在 DeepSeek v4.1 flash
+（`deepseek-flash`，能看图、默认思考、不支持 json_schema）上跑，以此为契机把「配的模型做不到」
+这一侧的每条路径补齐；外加几处在严格供应商上才暴露的库缺陷。
 
 ### Fixed
+
+- **结构化输出不再默认原生 json_schema**：新能力 `supports_json_schema`（与看图同样是声明式、
+  不按模型名猜）。未声明时 `response_format={"type": "json_schema", ...}` 不发给供应商，schema
+  作为硬性要求追加到 system prompt（`LLMRequest.with_structured_fallback`；解析仍由
+  `parse_structured` 修复围栏与近似 JSON）。DeepSeek 等端点对原生形式整请求 400（"This
+  response_format type is unavailable now"），workflow 的 `output_schema` 与子 agent 结构化输出
+  此前在这些模型上直接失败。显式的 `{"type": "json_object"}` 是调用方的选择，原样透传。
+  ⚠️ 依赖原生 strict 模式的调用方需声明 `capabilities={"supports_json_schema": True}`。
+- **提取不到文字的 PDF（扫描件/纯图片导出/加密/文件不在）不再抛异常**：一次 render 同时渲染
+  历史与本轮，用户发过一份扫描版 PDF，之后该会话**每一次** send 都失败（重试耗尽→run 降级）。
+  现在是明确占位：写清没读到及原因、带回取坐标；加密 PDF 在遍历页面时抛的异常也兜住。
 
 - **能力声明只对声明它的那个模型生效**（`ModelCapabilities.for_model`）。子 agent / workflow 叶子
   在父的 client 上换了 `model`，此前沿用父模型的声明——能看图的父把图发给看不了图的子（400 或
@@ -39,7 +51,8 @@
 - `power_loop.runtime.image_recall.current_model_sees_images()`：正在跑的这个 loop 的模型能不能
   看图（True/False；判断不了 → None）。往模型眼前放图的工具先问它，据此措辞；
   `queue_image(s)_for_next_round` 在确定看不了时拒绝入队（返回 False / 0）。
-- `ModelCapabilities.sees_images`。
+- `ModelCapabilities.sees_images`、`ModelCapabilities.supports_json_schema`、
+  `LLMRequest.with_structured_fallback()`。
 
 ### Changed
 

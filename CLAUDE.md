@@ -19,6 +19,8 @@ It can see images and thinks by default (give real tests `max_tokens` ≥ 2048 o
 cut to nothing). **Never assume vision**: capabilities are declared per test via
 `tests/real/_llm.py::make_llm(capabilities=...)`; the default is undeclared (= non-vision), and
 non-vision behavior (explicit placeholders, no pretending to have seen) must be tested too.
+Same for structured output: deepseek-flash rejects native `json_schema`; undeclared
+`supports_json_schema` makes the transport put the schema in the system prompt instead.
 `tests/conftest.py` auto-loads it (`load_dotenv`) and gates the real suite on
 `REAL_LLM_ENV_GROUPS`. So **`tests/real/` runs against a live provider** — use it to
 validate real behavior; don't mock or skip when the point is real validation.

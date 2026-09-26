@@ -239,3 +239,45 @@ async def test_stream_resume_discards_partial_tool_call() -> None:
     assert len(result.tool_calls) == 1
     assert result.tool_calls[0]["id"] == "call_full"
     assert json.loads(result.tool_calls[0]["function"]["arguments"]) == {"path": "a", "content": "b"}
+
+
+# ── structured output: json_schema only to a model that declares it ──────────────
+
+_CARD_RF = {"type": "json_schema", "json_schema": {
+    "name": "Card", "strict": True, "description": "a user card",
+    "schema": {"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"]}}}
+
+
+async def _send_structured(response_format: dict, *, model: str | None = None, **cfg: Any) -> dict:
+    svc, client = _service([[_content_event('{"n": 1}'), _usage_event(1, 1, 2)]], **cfg)
+    await svc.complete(LLMRequest(messages=[{"role": "user", "content": "go"}], system_prompt="S",
+                                  model=model, response_format=response_format))
+    return client.chat.completions.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_undeclared_json_schema_rides_in_the_system_prompt() -> None:
+    """DeepSeek 400s the native form ("This response_format type is unavailable now"); most
+    endpoints are like that, so nothing declared = no native json_schema."""
+    sent = await _send_structured(_CARD_RF)
+    assert "response_format" not in sent
+    system = sent["messages"][0]
+    assert system["role"] == "system" and system["content"].startswith("S\n\n")
+    assert '"required": ["n"]' in system["content"] and "a user card" in system["content"]
+
+
+@pytest.mark.asyncio
+async def test_declared_json_schema_is_sent_natively() -> None:
+    sent = await _send_structured(_CARD_RF, capabilities={"supports_json_schema": True})
+    assert sent["response_format"] == _CARD_RF
+    assert sent["messages"][0]["content"] == "S"
+    # …for THAT model only: a request naming another one gets the prompt form
+    other = await _send_structured(_CARD_RF, model="other-model",
+                                   capabilities={"supports_json_schema": True})
+    assert "response_format" not in other
+
+
+@pytest.mark.asyncio
+async def test_explicit_json_object_passes_through_undeclared() -> None:
+    sent = await _send_structured({"type": "json_object"})
+    assert sent["response_format"] == {"type": "json_object"}

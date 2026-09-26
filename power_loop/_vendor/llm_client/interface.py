@@ -73,6 +73,43 @@ class LLMRequest:
     # Provider-specific passthrough
     extra: dict[str, Any] = field(default_factory=dict)
 
+    def with_structured_fallback(self, capabilities: Any = None) -> "LLMRequest":
+        """This request as the model can take it, structured-output-wise.
+
+        A ``json_schema`` ``response_format`` is sent natively only to a model that DECLARES
+        ``supports_json_schema``. Otherwise it is dropped and the schema goes into the system
+        prompt as a hard instruction — the one form every chat model accepts; the caller's
+        parser (``parse_structured``) already strips fences and repairs near-JSON. Nothing is
+        guessed from the model name, same as images. Other ``response_format`` values (e.g. an
+        explicit ``{"type": "json_object"}``) are the caller's explicit choice and pass through.
+        """
+        import dataclasses
+        import json
+
+        from .capabilities import coerce_capabilities
+
+        rf = self.response_format
+        if not isinstance(rf, dict) or rf.get("type") != "json_schema":
+            return self
+        if coerce_capabilities(capabilities, model=self.model or "").supports_json_schema is True:
+            return self
+        js = rf.get("json_schema") if isinstance(rf.get("json_schema"), dict) else {}
+        schema = js.get("schema", js)
+        try:
+            rendered = json.dumps(schema, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            rendered = str(schema)
+        note = (
+            "# Output format (hard requirement)\n"
+            "Your final reply must be exactly one JSON object that matches this JSON Schema — "
+            "no other text (a ```json fence is acceptable).\n"
+            f"Schema: {rendered}"
+        )
+        if js.get("description"):
+            note += f"\nAbout the object: {js['description']}"
+        system_prompt = f"{self.system_prompt}\n\n{note}" if self.system_prompt else note
+        return dataclasses.replace(self, response_format=None, system_prompt=system_prompt)
+
     def to_messages(self, capabilities: Any = None) -> list[dict[str, Any]]:
         """
         Normalize messages for OpenAI-compatible APIs.

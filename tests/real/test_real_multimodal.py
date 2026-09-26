@@ -181,8 +181,34 @@ def test_pdf_needs_no_image_capability(tmp_path) -> None:
     assert "ARTICHOKE-7742" in answer.upper(), answer
 
 
-def test_unreadable_pdf_raises_rather_than_sending_a_placeholder(tmp_path) -> None:
+def test_scanned_pdf_in_history_does_not_break_later_sends(tmp_path) -> None:
+    """A PDF no text can be extracted from used to RAISE at render. A render covers history,
+    so one scanned PDF a user sent made every later send of the session fail. Now it is an
+    explicit "you did not read it" placeholder: both sends complete, nothing is made up."""
+    from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+
     path = tmp_path / "attachment.pdf"
     path.write_bytes(b"%PDF-1.4\n% image-only export, no extractable text\n")
-    with pytest.raises(ModelCapabilityError, match="no text could be extracted"):
-        _ask_about(path, "口令是什么？")
+
+    async def _run() -> tuple[str, str, str, str]:
+        store = await SessionStore.open(":memory:")
+        try:
+            loop = StatefulAgentLoop(
+                llm=make_llm(max_tokens=4096, temperature=0.0), store=store,
+                config=AgentLoopConfig(system_prompt="Answer briefly.", max_rounds=2,
+                                       max_tokens=4096),
+            )
+            sid = await loop.new_session()
+            first = await loop.send({"role": "user", "content": [
+                {"type": "text", "text": "这份 PDF 里的口令是什么？"},
+                {"type": "attachment", "attachment": create_attachment_ref(str(path))},
+            ]}, session_id=sid)
+            second = await loop.send("好的。只回一个字：好", session_id=sid)
+            return first.status, first.final_text or "", second.status, second.final_text or ""
+        finally:
+            await store.close()
+
+    s1, a1, s2, a2 = asyncio.run(_run())
+    assert s1 == "completed" and a1.strip(), (s1, a1)
+    assert s2 == "completed" and a2.strip(), (s2, a2)
+    assert "ARTICHOKE" not in a1.upper()

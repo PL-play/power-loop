@@ -137,16 +137,28 @@ def test_assistant_content_is_untouched(image_path) -> None:
     assert render_message_content("plain reply", role="assistant", capabilities=caps) == "plain reply"
 
 
-# ── PDFs: extracted text is a faithful path, an unreadable PDF is not ────────
+# ── PDFs: extracted text is a faithful path; an unreadable one is an explicit placeholder ──
 
 
-def test_unreadable_pdf_raises(tmp_path) -> None:
+def test_unreadable_pdf_degrades_instead_of_killing_every_later_send(tmp_path) -> None:
+    """It used to raise — and a render covers HISTORY, so one scanned PDF a user sent made
+    every later send of the session fail. Now: an explicit "you did not read it" + coordinate."""
     p = tmp_path / "scan.pdf"
     p.write_bytes(b"%PDF-1.4\n% not a real pdf body\n")
     caps = coerce_capabilities({"supports_image_input": True}, model="m")
-    content = [{"type": "attachment", "attachment": create_attachment_ref(str(p))}]
-    with pytest.raises(ModelCapabilityError, match="no text could be extracted"):
-        render_message_content(content, role="user", capabilities=caps)
+    content = [{"type": "text", "text": "口令是什么？"},
+               {"type": "attachment", "attachment": create_attachment_ref(str(p), ref="file_uuid=pdf1")}]
+    out = render_message_content(content, role="user", capabilities=caps)
+    assert isinstance(out, str) and "口令是什么？" in out
+    assert "你没有读到它的内容" in out and "scan.pdf · file_uuid=pdf1" in out
+    assert "提取不到文字" in out
+
+
+def test_missing_pdf_says_it_could_not_be_read(tmp_path) -> None:
+    content = [{"type": "attachment",
+                "attachment": create_attachment_ref(str(tmp_path / "gone.pdf"))}]
+    out = render_message_content(content, role="user", capabilities=coerce_capabilities(None))
+    assert "这个文件读不到" in out and "你没有读到它的内容" in out
 
 
 def test_unsupported_attachment_type_degrades(tmp_path) -> None:

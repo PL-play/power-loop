@@ -77,6 +77,11 @@ class ModelCapabilities:
     #: point, so every path in (a fresh send, a recalled image, anything a host builds) is
     #: covered by construction.
     max_image_edge: int | None = None
+    #: Accepts ``response_format={"type": "json_schema", ...}`` natively. Undeclared, a json_schema
+    #: request is sent WITHOUT it and the schema goes into the system prompt as a hard instruction
+    #: (``LLMRequest.with_structured_fallback``) — many OpenAI-compatible endpoints reject the
+    #: native form outright (DeepSeek: 400 "This response_format type is unavailable now").
+    supports_json_schema: bool | None = None
 
     def for_model(self, model: str | None) -> ModelCapabilities:
         """The declaration that applies to a request for ``model``.
@@ -128,15 +133,16 @@ def coerce_capabilities(value: Any, *, model: str = "") -> ModelCapabilities:
             model=model,
             supports_image_input=value.supports_image_input,
             max_image_edge=value.max_image_edge,
+            supports_json_schema=value.supports_json_schema,
         )
     fields: dict[str, Any] = dict(value or {})
-    unknown = set(fields) - {"model", "supports_image_input", "max_image_edge"}
+    unknown = set(fields) - {"model", "supports_image_input", "max_image_edge", "supports_json_schema"}
     if unknown:
         # A typo'd or retired key (supports_tools, supports_stream, api_family, provider,
         # supports_pdf_input_* — all removed as dead config) must not read as "declared".
         raise ValueError(
             f"Unknown model capability key(s): {sorted(unknown)}. "
-            "Supported keys: 'supports_image_input', 'max_image_edge'."
+            "Supported keys: 'supports_image_input', 'max_image_edge', 'supports_json_schema'."
         )
     fields.setdefault("model", model)
     return ModelCapabilities(**fields)

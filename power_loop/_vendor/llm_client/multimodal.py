@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .capabilities import ModelCapabilities, ModelCapabilityError
+from .capabilities import ModelCapabilities
 
 try:
     from pypdf import PdfReader
@@ -125,7 +125,11 @@ def _extract_pdf_text(path: Path) -> str:
         return ""
 
     pages: list[str] = []
-    for index, page in enumerate(reader.pages, start=1):
+    try:
+        page_list = list(reader.pages)  # an encrypted PDF raises here, not at open
+    except Exception:
+        return ""
+    for index, page in enumerate(page_list, start=1):
         text = ""
         try:
             text = (page.extract_text() or "").strip()
@@ -246,17 +250,32 @@ def _render_pdf_attachment(ref: AttachmentRef, path: Path, capabilities: ModelCa
     PDF (the content really does reach the model), so it is not a silent downgrade and does
     not raise.
 
-    What DOES raise: a PDF no text can be extracted from (a scan, an image-only export, an
-    encrypted file). Feeding the model "[Attached PDF: x.pdf] no readable text" invites the
-    same unfounded-answer failure the image path just eliminated.
+    A PDF no text can be extracted from (a scan, an image-only export, an encrypted file, a
+    file that is gone) degrades to an explicit placeholder — it used to RAISE, and a render
+    covers history as well as the new input, so one scanned PDF a user sent made EVERY later
+    send of that session fail (retries exhausted → run degraded). The placeholder is not the
+    vague "[Attached PDF] no readable text" that invites an unfounded answer: it says plainly
+    the model did NOT read it and why, and carries the host's recall coordinate.
     """
     extracted_text = _extract_pdf_text(path)
     if not extracted_text:
-        raise ModelCapabilityError(
-            f"Cannot send PDF {ref.filename!r}: no text could be extracted from it "
-            "(scanned/image-only or encrypted PDF), and native PDF input is not implemented "
-            "on any transport. Convert its pages to images and send those to a model that "
-            "declares supports_image_input, or extract the text yourself."
+        if not path.is_file():
+            why = "这个文件读不到"
+        elif PdfReader is None:
+            why = "运行环境没有 PDF 解析库，读不出文字"
+        else:
+            why = "提取不到文字（扫描件、纯图片导出或加密的 PDF）"
+        logger.warning("PDF %s: %s; surfaced as a text placeholder", ref.filename, why)
+        text = (
+            f"[PDF {describe_attachment_ref(ref)}——{why}，**你没有读到它的内容**。"
+            "不要凭空描述或猜测里面写了什么；需要的话请对方给文字版，"
+            "或把页面转成图片后用能看图的方式去看。]"
+        )
+        return PreparedAttachment(
+            ref=ref,
+            text_fallback=text,
+            rendered_parts=({"type": "text", "text": text},),
+            strategy="pdf-unreadable",
         )
     text = f"[Attached PDF: {ref.filename}]\n\n{extracted_text}"
     return PreparedAttachment(
