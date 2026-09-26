@@ -86,6 +86,10 @@ from power_loop.contracts.hook_contexts import (
     ToolsBatchBeforeCtx,
 )
 from power_loop.contracts.hooks import HookDirective, HookPoint
+from power_loop.core.agent_context import (
+    reset_current_cancel_token,
+    set_current_cancel_token,
+)
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.state import ContextManager
@@ -350,6 +354,8 @@ class AgentPipeline:
         # Z8: durable LLM_BEFORE injections already written by a round whose model call a steer
         # aborted — the re-run round's hooks may produce them again; they're in history already.
         self._aborted_persist_keys: set[str] = set()
+        # design/124 §8.2: each running tool call's own stop token (child of the run's).
+        self._tool_tokens: dict[asyncio.Future, CancellationToken] = {}
 
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
         # Auto-inject tool catalog + skill section (M1.10). Built ONCE here and
@@ -542,29 +548,86 @@ class AgentPipeline:
         definition = getattr(rt, "definition", None) if rt is not None else None
         return str(getattr(definition, "interrupt", "finish") or "finish")
 
-    async def _race_steer(self, work: asyncio.Future) -> tuple[Any, bool]:
-        """Await ``work`` unless steering arrives first. ``(result, False)`` when it finished
-        (its exception propagates), ``(None, True)`` when the steer event fired first — ``work``
-        is left RUNNING; the caller decides to cancel or adopt it."""
-        ev = self._steer_event
-        if ev is None:
-            return await work, False
-        waiter = asyncio.ensure_future(ev.wait())
+    async def _race(self, work: asyncio.Future, *, steer: bool) -> tuple[Any, str]:
+        """Await ``work`` unless steering (when ``steer``) or a stop arrives first.
+        ``(result, "done")`` when it finished (its exception propagates); ``(None, "stop")`` /
+        ``(None, "steer")`` otherwise — ``work`` is left RUNNING, the caller decides. A stop wins
+        over a steer that arrives in the same instant."""
+        waiters: dict[str, asyncio.Future] = {}
+        if steer and self._steer_event is not None:
+            waiters["steer"] = asyncio.ensure_future(self._steer_event.wait())
+        if not self.cancel_token.is_never:
+            waiters["stop"] = asyncio.ensure_future(self.cancel_token.wait())
+        if not waiters:
+            return await work, "done"
         try:
-            done, _ = await asyncio.wait({work, waiter}, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait({work, *waiters.values()},
+                                         return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             # We are being cancelled (a stop, shutdown): take the work down WITH us and let
             # it finish its own cleanup first — a model call records its (estimated) usage
             # and closes its stream in its cancel path; leaving that to run after we are gone
             # reorders events and can lose the accounting entirely.
-            waiter.cancel()
+            for w in waiters.values():
+                w.cancel()
             work.cancel()
             await asyncio.wait({work}, timeout=5)
             raise
+        for w in waiters.values():
+            if w not in done:
+                w.cancel()
         if work in done:
-            waiter.cancel()
-            return work.result(), False
-        return None, True
+            return work.result(), "done"
+        if "stop" in waiters and waiters["stop"] in done:
+            return None, "stop"
+        return None, "steer"
+
+    def _start_tool(
+        self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore | None = None,
+    ) -> asyncio.Future:
+        """Run one tool call as its own task with its OWN stop token (a child of the run's —
+        design/124 §8.2), exposed to the handler as the current cancel token. Stopping the run
+        reaches it; stopping just this call (e.g. once it was moved to the background) leaves
+        the run alone."""
+        tok = self.cancel_token.child()
+
+        async def _run() -> tuple[str, bool]:
+            if sem is None:
+                return await self.execute_tool(tool_name, tool_args, cancel_token=tok)
+            async with sem:
+                return await self.execute_tool(tool_name, tool_args, cancel_token=tok)
+
+        fut = asyncio.ensure_future(_run())
+        self._tool_tokens[fut] = tok
+        fut.add_done_callback(lambda f: self._tool_tokens.pop(f, None))
+        return fut
+
+    async def _settle_stopped_tool(
+        self, work: asyncio.Future, mode: str,
+    ) -> tuple[str, bool]:
+        """The run was stopped while this tool ran (design/124 §8.4). Mechanical, bounded:
+        ``abort`` → cancel now; a sub-task (``background``: its child token is already flipped,
+        it winds itself down) → up to ``subtask_s``; ``finish`` → up to ``finish_tool_s`` for its
+        real result. Past the limit the call is cancelled and the model is told so."""
+        pol = self.config.stop_policy
+        reason = self.cancel_token.reason
+        if mode == "abort":
+            work.cancel()
+            await asyncio.wait({work}, timeout=pol.abort_tool_s)
+            return (f"[stopped: 用户要求停止（{reason}），这个调用已中止，结果没有产生。]", False)
+        grace = pol.subtask_s if mode == "background" else pol.finish_tool_s
+        done, _ = await asyncio.wait({work}, timeout=grace)
+        if work in done and not work.cancelled():
+            try:
+                out, failed = work.result()
+            except Exception as exc:  # noqa: BLE001
+                out, failed = f"Error: {exc}", True
+            return (f"[stopped: 用户要求停止（{reason}）；这个调用在停止前收了尾，下面是它交回的结果]\n"
+                    f"{out}", failed)
+        work.cancel()
+        await asyncio.wait({work}, timeout=pol.abort_tool_s)
+        return (f"[stopped: 用户要求停止（{reason}）；这个调用 {grace:.0f} 秒内没有结束，已强制中止，"
+                "结果不完整或没有。]", False)
 
     async def _settle_steered_tool(
         self, work: asyncio.Future, mode: str, tool_name: str, tool_args: dict[str, Any],
@@ -576,7 +639,8 @@ class AgentPipeline:
         if mode == "background":
             from power_loop.tools.default_tools import BG
 
-            task_id = await BG.adopt(tool_name, tool_args, work)
+            task_id = await BG.adopt(tool_name, tool_args, work,
+                                     stop_token=self._tool_tokens.get(work))
             output = self.STEER_BACKGROUND_TEXT.format(task_id=task_id)
         else:
             work.cancel()
@@ -1394,15 +1458,10 @@ class AgentPipeline:
     def _spawn_tool_task(
         self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore
     ) -> asyncio.Future:
-        """同轮并发的一个成员：受信号量限流地跑 execute_tool。contextvars 随 task 自动拷贝
-        （PEP 567），计费 / 活动打标 / 运行时上下文零处理。异常原样留在 task 里，轮到它时
-        再由串行路径的 HumanInputRequired / TOOL_ERROR 分支处理。"""
-
-        async def _run() -> tuple[str, bool]:
-            async with sem:
-                return await self.execute_tool(tool_name, tool_args)
-
-        return asyncio.ensure_future(_run())
+        """同轮并发的一个成员：受信号量限流地跑 execute_tool（自带子停止标记，见 _start_tool）。
+        contextvars 随 task 自动拷贝（PEP 567），计费 / 活动打标 / 运行时上下文零处理。异常原样
+        留在 task 里，轮到它时再由串行路径的 HumanInputRequired / TOOL_ERROR 分支处理。"""
+        return self._start_tool(tool_name, tool_args, sem)
 
     @staticmethod
     def _cancel_pre_tasks(pre: dict[int, tuple[asyncio.Future, Any]]) -> None:
@@ -1412,7 +1471,8 @@ class AgentPipeline:
         pre.clear()
 
     async def execute_tool(
-        self, tool_name: str, tool_args: dict[str, Any], *, count: bool = True
+        self, tool_name: str, tool_args: dict[str, Any], *, count: bool = True,
+        cancel_token: CancellationToken | None = None,
     ) -> tuple[str, bool]:
         """Execute a single tool and return ``(output_string, failed)``.
 
@@ -1434,7 +1494,13 @@ class AgentPipeline:
 
             if count:
                 self.ctx.tool_calls += 1
-            result = await self.tool_registry.invoke_async(tool_name, tool_args)
+            # design/124 §8.2: the handler sees this call's stop token (a sub-run it starts
+            # derives from it). Default: a fresh child of the run's token.
+            _ctok = set_current_cancel_token(cancel_token or self.cancel_token.child())
+            try:
+                result = await self.tool_registry.invoke_async(tool_name, tool_args)
+            finally:
+                reset_current_cancel_token(_ctok)
         except (ToolNotFound, ToolValidationError) as exc:
             return (str(exc), True)
         if not isinstance(result, str):
@@ -1724,17 +1790,22 @@ class AgentPipeline:
                     # already up at this point survived the round-start drain (store blip) —
                     # racing it would abort at once, forever; so only a steer that arrives
                     # DURING the call interrupts it, and only a bounded number of times.
-                    if (self._steer_event is not None and not self._steer_event.is_set()
-                            and self._steer_aborts < self.MAX_STEER_ABORTS):
+                    # design/124 §8.4: a STOP interrupts the model call too (immediately — its
+                    # output is discarded like a steered one, the run ends cancelled).
+                    _steer_ok = (self._steer_event is not None and not self._steer_event.is_set()
+                                 and self._steer_aborts < self.MAX_STEER_ABORTS)
+                    if _steer_ok or not self.cancel_token.is_never:
                         _llm_work = asyncio.ensure_future(_llm_call)
-                        response, _steered = await self._race_steer(_llm_work)
-                        if _steered:
+                        response, _why = await self._race(_llm_work, steer=_steer_ok)
+                        if _why != "done":
                             # Discard the call: nothing it produced reaches history (the
                             # response is only assembled at its end), its partial usage is
                             # recorded as an estimate by call_llm's own failure path.
                             _llm_work.cancel()
                             with contextlib.suppress(BaseException):
                                 await _llm_work
+                            if _why == "stop":
+                                raise CancellationRequested(self.cancel_token.reason)
                             await self._restart_round_for_steer(round_idx, llm_before)
                             continue
                     else:
@@ -2140,19 +2211,24 @@ class AgentPipeline:
 
                 # ── Business logic: execute tool ──
                 failed = False
+                _stopped = False
                 try:
-                    _mode = (self._interrupt_mode(tool_name) if self._steer_event is not None
-                             else "finish")
-                    if _mode != "finish":
-                        # Interruptible (design/124 §7.3): race the call against steering.
+                    _mode = self._interrupt_mode(tool_name)
+                    _steerable = self._steer_event is not None and _mode != "finish"
+                    if _steerable or not self.cancel_token.is_never:
+                        # design/124 §7.3 / §8.4: race the call against steering (if its mode
+                        # allows) and against a stop (always).
                         _work = (pre_task if pre_task is not None
-                                 else asyncio.ensure_future(self.execute_tool(tool_name, tool_args)))
-                        _res, _steered = await self._race_steer(_work)
-                        if _steered:
+                                 else self._start_tool(tool_name, tool_args))
+                        _res, _why = await self._race(_work, steer=_steerable)
+                        if _why == "done":
+                            output, failed = _res
+                        elif _why == "steer":
                             output = await self._settle_steered_tool(
                                 _work, _mode, tool_name, tool_args, call_id, round_idx)
                         else:
-                            output, failed = _res
+                            output, failed = await self._settle_stopped_tool(_work, _mode)
+                            _stopped = True
                     elif pre_task is not None:
                         output, failed = await pre_task
                     else:
@@ -2234,6 +2310,20 @@ class AgentPipeline:
                     {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": _truncate_result(output)},
                     round_index=round_idx,
                 )
+
+                if _stopped:
+                    # design/124 §8.4: the run was stopped mid-tool — this call is settled; the
+                    # rest of the batch never starts (the host's abort_pending resolves them),
+                    # concurrent siblings are cancelled, the run ends cancelled.
+                    self._cancel_pre_tasks(_pre)
+                    self._emit(AgentEventType.LOOP_CANCELLED,
+                               LoopCancelledPayload(reason=self.cancel_token.reason,
+                                                    round_index=round_idx),
+                               round_index=round_idx)
+                    await self._finalize("cancelled")
+                    return self._make_result(
+                        "cancelled", final_text=f"[cancelled: {self.cancel_token.reason}]",
+                        rounds=round_idx + 1)
 
                 # TOOL_AFTER BREAK → stop remaining tools. Still resolve them so
                 # the next round's request isn't an invalid sequence (assistant

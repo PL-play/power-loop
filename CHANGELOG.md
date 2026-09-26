@@ -8,6 +8,37 @@
 
 ## [Unreleased]
 
+## [6.35.0] — 2026-09-26
+
+design/124 §8：停止——按件停、停得准、停得干净，全程机械、有时限、不调模型。
+
+### Added
+
+- **停止标记树**：`CancellationToken.child()`（自己或任一祖先被取消即取消；停一个节点停整棵子树，
+  兄弟不受影响）、`any_of(...)`（多个主人：任一取消即取消）、`reason`（取到真正触发的那个原因）、
+  `wait()`（可等待）、`is_never`。
+- **每个工具调用有自己的停止标记**（运行标记的子标记），handler 通过 `get_current_cancel_token()`
+  拿到。`run_agent_spec` 不传 `stop_event` 时默认用它——子 agent 随调用它的运行一起停；
+  同步 `Workflow.run()` 同样接上（`any_of(自己的, 调用方的)`）。**detached workflow 不接**：
+  它本来就比发起它的 send 活得久，只能按 id 停。
+- **停止与模型调用、工具执行竞速**（6.34 只和插队竞速）：模型输出中被停 → 立即中止（半截作废、
+  用量记估算）；工具执行中被停 → 按 `interrupt`：`abort` 立即取消；子任务（`background`，子标记已翻）
+  给 `subtask_s` 在自己的检查点停下并交回已有结果；`finish` 最多等 `finish_tool_s` 拿真实结果——
+  超时一律强制中止并如实告诉模型。本批其余调用不再开始，运行以 cancelled 结束。
+- **`StopPolicy`**（`AgentLoopConfig.stop_policy`）：各类工作的收尾时限，全部可配，默认
+  abort 5s / finish 30s / 子任务 30s / workflow 60s / 后台任务 10s / shell SIGTERM→SIGKILL 5s / 停机 45s。
+- **按 id 停止**：`loop.list_jobs(sid)`（前台这一轮 `send`、后台任务 `bg:…`、detached workflow `wf:…`、
+  定时器 `timer:…`，每项带启动它的那次 send 的用户输入开头 `origin`）+ `loop.stop_job(sid, id)`。
+  `BG.cancel_task(task_id)`：先翻它的停止标记让它自己收尾，超时再取消；`workflow.runner.stop_run(run_id)`
+  + 进程内 run_id → 句柄注册表 `get_run_handle`。**被停掉的工作结束时不再唤醒 agent**（用户说了停）。
+- **后台 shell 任务可停**：`Popen` + 独立进程组；每个进程带 `PL_BG_TAG=<task_id>` 环境标记，停止时除了
+  信号本地进程组，还通过**同一个 shell 后端**按标记杀进程——命令在沙箱里跑时，本地进程只是沙箱客户端，
+  杀它碰不到容器里的命令（实测：之前停止后容器里的进程照样活着）。
+
+### Changed
+
+- 后台工具任务被取消时台账记 `cancelled`、不唤醒（6.34 起）；主动停止的同理。
+
 ## [6.34.0] — 2026-09-26
 
 design/124 §7：插队消息（`InboxItem(mode="steer")`）不再等这一批工作做完才被看到。

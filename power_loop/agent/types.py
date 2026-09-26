@@ -5,6 +5,8 @@ import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from power_loop.runtime.stop_policy import StopPolicy
+
 #: Distinguishes "caller passed nothing" from an explicit None on the deprecated 2.x kwargs.
 _UNSET: Any = object()
 
@@ -238,6 +240,8 @@ class AgentLoopConfig:
     notes_policy: NotesPolicy | None = None
     skills_dir: str | None = None
     runtime_projectors: tuple[RuntimeProjector, ...] = field(default_factory=_default_runtime_projectors)
+    #: design/124 §8.4: bounded wind-down per kind of work once it is told to stop.
+    stop_policy: StopPolicy = field(default_factory=StopPolicy)
 
     # ── Tool catalog auto-injection (M1.10) ──
     #

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import fnmatch
 import json
@@ -9,6 +10,7 @@ import os
 import queue
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -1220,6 +1222,36 @@ def run_load_skill(name: str) -> str:
     return get_default_loader().get_content(name)
 
 
+#: env var carrying a background shell task's id into every process it starts (see _kill_tagged)
+_BG_TAG_VAR = "PL_BG_TAG"
+
+
+def _kill_tagged(backend: Any, workspace_dir: Any, task_id: str, sig: str) -> None:
+    """Signal every process whose environment carries ``PL_BG_TAG=<task_id>`` — run through the
+    task's own shell backend, so it executes where the command runs (the host, or inside the
+    sandbox container). Best-effort; a failure only means the local group signal is all we had."""
+    tag = f"{_BG_TAG_VAR}={task_id}"
+    script = (
+        f"for p in /proc/[0-9]*; do "
+        f"tr '\\0' '\\n' < \"$p/environ\" 2>/dev/null | grep -qx '{tag}' "
+        f"&& [ \"${{p#/proc/}}\" != \"$$\" ] && kill -{sig} \"${{p#/proc/}}\" 2>/dev/null; "
+        f"done; true\n"
+    )
+    try:
+        b = backend or DEFAULT_SHELL_BACKEND
+        wd = workspace_dir if isinstance(workspace_dir, Path) else Path(str(workspace_dir or "."))
+        subprocess.run(b.launch_argv(wd), input=script, text=True, capture_output=True,
+                       cwd=b.launch_cwd(wd), env=b.launch_env(wd), timeout=15)
+    except Exception:  # noqa: BLE001
+        logger.warning("background task %s: tagged kill failed", task_id, exc_info=True)
+
+
+def _signal_group(proc: Any, sig: int) -> None:
+    """Signal ``proc``'s whole process group (it was started with start_new_session)."""
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(proc.pid, sig)
+
+
 def _current_store_and_session() -> tuple[Any | None, str | None]:
     runtime_ctx = get_tool_runtime_context()
     return runtime_ctx.store, runtime_ctx.session_id
@@ -1246,6 +1278,11 @@ class BackgroundManager:
         # asyncio tasks of in-process tool tasks (run_tool / adopt), by task_id — kept so they
         # aren't garbage-collected mid-flight and so a later stop can reach them.
         self._workers: dict[str, asyncio.Future] = {}
+        # Stop tokens of tool tasks (design/124 §8.2), so a stop can ask them to wind down
+        # before cancelling; and the ids a stop has been issued for (they must not wake the
+        # agent when they settle — the user said stop).
+        self._stop_tokens: dict[str, Any] = {}
+        self._stopped: set[str] = set()
         # Live daemon threads (so shutdown can drain them) and terminal write-backs that
         # could not be delivered to their owning loop (so a later check / shutdown can
         # still persist them instead of leaving the row stuck at 'running' forever).
@@ -1347,18 +1384,39 @@ class BackgroundManager:
             # default LocalShellBackend this is an in-process bash, equivalent to the
             # prior behavior; for a sandbox backend it runs inside the sandbox.
             backend = shell_backend or DEFAULT_SHELL_BACKEND
-            result = subprocess.run(
+            # Popen in its OWN process group (design/124 §8.4): a stop / the timeout signals the
+            # whole group, not just the first process. The handle is kept on the task so
+            # cancel_task can reach it. (Under a sandbox backend the local process is the
+            # sandbox client; killing work INSIDE the sandbox is the backend's job.)
+            proc = subprocess.Popen(
                 backend.launch_argv(workspace_dir),
-                input=command,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 cwd=backend.launch_cwd(workspace_dir),
                 env=backend.launch_env(workspace_dir),
-                capture_output=True,
-                text=True,
-                timeout=300,
+                text=True, start_new_session=True,
             )
-            output = _truncate_chars((result.stdout + result.stderr).strip())
-            status = "completed" if result.returncode == 0 else f"failed({result.returncode})"
-            return_code = result.returncode
+            with self._lock:
+                if task_id in self.tasks:
+                    self.tasks[task_id]["proc"] = proc
+            try:
+                # Tag every process of this task (children inherit the env): a stop can then find
+                # them wherever they run — including inside a sandbox, where the local process is
+                # only the sandbox client and its death doesn't reach the command.
+                out, err = proc.communicate(
+                    input=f"export {_BG_TAG_VAR}={task_id}\n{command}", timeout=300)
+            except subprocess.TimeoutExpired:
+                _signal_group(proc, signal.SIGKILL)
+                out, err = proc.communicate()
+                raise
+            output = _truncate_chars(((out or "") + (err or "")).strip())
+            return_code = proc.returncode
+            with self._lock:
+                stopped = bool((self.tasks.get(task_id) or {}).get("stopped"))
+            if stopped:
+                status = "cancelled"
+                output = (output + "\n(stopped)").strip()
+            else:
+                status = "completed" if return_code == 0 else f"failed({return_code})"
         except subprocess.TimeoutExpired:
             output = "Error: Timeout (300s)"
             status = "timeout"
@@ -1536,7 +1594,25 @@ class BackgroundManager:
                 return_code=None, output_tail="(running)",
             )
 
-        self._supervise(task_id, label, store, sid, registry.invoke_async(name, args))
+        # Its own ROOT stop token: a background task outlives the send that started it (the
+        # UI stop button stops the foreground, not this); only a stop by id reaches it.
+        from power_loop.core.agent_context import (
+            reset_current_cancel_token,
+            set_current_cancel_token,
+        )
+        from power_loop.runtime.cancellation import CancellationToken
+
+        tok = CancellationToken()
+        self._stop_tokens[task_id] = tok
+
+        async def _invoke() -> Any:
+            ctok = set_current_cancel_token(tok)
+            try:
+                return await registry.invoke_async(name, args)
+            finally:
+                reset_current_cancel_token(ctok)
+
+        self._supervise(task_id, label, store, sid, _invoke())
         return (
             f"后台任务已启动：task_id={task_id}（{label[:80]}）。"
             "**完成时结果会自动送到你面前，不用去取。** 现在去做别的；"
@@ -1584,6 +1660,11 @@ class BackgroundManager:
 
     async def _settle(self, task_id: str, label: str, store: Any, sid: str | None,
                       status: str, output: str, *, notify: bool) -> None:
+        self._stop_tokens.pop(task_id, None)
+        if task_id in self._stopped:
+            # Stopped by request: record what it left, but don't wake the agent for it.
+            self._stopped.discard(task_id)
+            status, notify = "cancelled", False
         with self._lock:
             task = self.tasks.get(task_id)
             if task is not None:
@@ -1605,7 +1686,8 @@ class BackgroundManager:
             except Exception:  # noqa: BLE001 — 宿主回调失败不毁任务结果
                 logger.warning("tool task %s: on_complete callback failed", task_id, exc_info=True)
 
-    async def adopt(self, tool_name: str, args: dict[str, Any] | None, work: Any) -> str:
+    async def adopt(self, tool_name: str, args: dict[str, Any] | None, work: Any,
+                    *, stop_token: Any = None) -> str:
         """Take a tool call that is ALREADY RUNNING (``work``: its Future) into the background
         task table and return its ``task_id`` (design/124 §7.3, ``interrupt="background"``).
 
@@ -1623,8 +1705,61 @@ class BackgroundManager:
                 sid, task_id=task_id, command=label, status="running",
                 return_code=None, output_tail="(running)",
             )
+        if stop_token is not None:
+            self._stop_tokens[task_id] = stop_token
         self._supervise(task_id, label, store, sid, work)
         return task_id
+
+    async def _stop_shell(self, task_id: str, *, term_s: float) -> str:
+        with self._lock:
+            task = self.tasks.get(task_id)
+            proc = task.get("proc") if task else None
+            backend = task.get("shell_backend") if task else None
+            workspace_dir = task.get("workspace_dir") if task else None
+            if proc is not None:
+                task["stopped"] = True
+        if proc is None:
+            return "unknown"
+        if proc.poll() is not None:
+            return "finished"
+
+        async def _signal(sig: str) -> None:
+            # the local process group, and every process tagged with this task wherever it runs
+            _signal_group(proc, signal.SIGTERM if sig == "TERM" else signal.SIGKILL)
+            await asyncio.to_thread(_kill_tagged, backend, workspace_dir, task_id, sig)
+
+        await _signal("TERM")
+        try:
+            await asyncio.to_thread(proc.wait, term_s)
+            return "stopped"
+        except subprocess.TimeoutExpired:
+            await _signal("KILL")
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                await asyncio.to_thread(proc.wait, 5)
+            return "forced"
+
+    async def cancel_task(self, task_id: str, *, grace_s: float = 10.0,
+                          shell_term_s: float = 5.0) -> str:
+        """Stop an in-process tool task (design/124 §8.4): flip its stop token so a sub-run can
+        wind down at its own checkpoints, wait up to ``grace_s``, then cancel the task. It is
+        recorded ``cancelled`` and does NOT wake the agent. Returns ``stopped`` / ``forced`` /
+        ``finished`` (it had already ended) / ``unknown`` (not an in-process task here)."""
+        worker = self._workers.get(task_id)
+        if worker is None:
+            # a background SHELL task (thread + process group), if it is one
+            return await self._stop_shell(task_id, term_s=shell_term_s)
+        if worker.done():
+            return "finished"
+        self._stopped.add(task_id)
+        tok = self._stop_tokens.get(task_id)
+        if tok is not None and hasattr(tok, "cancel"):
+            tok.cancel("stopped")
+            done, _ = await asyncio.wait({worker}, timeout=grace_s)
+            if worker in done:
+                return "stopped"
+        worker.cancel()
+        await asyncio.wait({worker}, timeout=5)
+        return "forced"
 
     async def check(self, task_id: str | None = None) -> str:
         store, sid = _current_store_and_session()

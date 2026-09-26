@@ -59,7 +59,7 @@ OnComplete = Callable[["WorkflowCompletion"], Awaitable[None]]
 
 __all__ = [
     "run_detached", "make_wake_guard", "register_wake_guard", "make_on_step", "spawn_background",
-    "claim_wake", "parse_workflow_wake",
+    "claim_wake", "parse_workflow_wake", "get_run_handle", "stop_run",
 ]
 
 #: run_ids whose engine is currently executing IN THIS PROCESS (set by spawn_background +
@@ -72,6 +72,38 @@ _LIVE_RUN_IDS: set[str] = set()
 def is_run_live(run_id: str) -> bool:
     """True iff ``run_id``'s engine is currently executing in this process (workflow-durability-3)."""
     return run_id in _LIVE_RUN_IDS
+
+
+#: design/124 §8.4: run_id → handle of every DETACHED run executing in this process, so a stop can
+#: reach a run by id (it used to be reachable only through whatever handle its starter kept).
+_HANDLES: dict[str, WorkflowRunHandle] = {}
+#: runs stopped by :func:`stop_run` — they settle ``cancelled`` and must NOT wake the parent agent
+#: (the user said stop; a "your workflow finished" wake-up would contradict them).
+_STOPPED_RUNS: set[str] = set()
+
+
+def get_run_handle(run_id: str) -> WorkflowRunHandle | None:
+    return _HANDLES.get(run_id)
+
+
+async def stop_run(run_id: str, *, grace_s: float = 60.0, reason: str = "stopped") -> str:
+    """Stop a detached run by id: flip its token (leaves stop at their next checkpoint, no new
+    steps start), wait up to ``grace_s`` for it to settle, then cancel its task. It will not wake
+    the parent. Returns ``stopped`` / ``forced`` / ``finished`` / ``unknown``."""
+    handle = _HANDLES.get(run_id)
+    if handle is None:
+        return "unknown"
+    task = handle.task
+    if task is None or task.done():
+        return "finished"
+    _STOPPED_RUNS.add(run_id)
+    handle.cancel(reason)
+    done, _ = await asyncio.wait({task}, timeout=grace_s)
+    if task in done:
+        return "stopped"
+    task.cancel()
+    await asyncio.wait({task}, timeout=5)
+    return "forced"
 
 
 def make_on_step(store: Any, parent_sid: str, run_id: str):
@@ -310,6 +342,8 @@ def spawn_background(
             status = "failed"
             note = _wake_note(run_id, "failed", repr(exc))
             _publish(loop, parent_sid, run_id, "failed", "failed", level="error")
+        if run_id in _STOPPED_RUNS:
+            return  # stopped by request — journaled as cancelled, no wake (design/124 §8.4)
         if on_complete is not None:
             # Host owns delivery (timer-free, die-with-process). Supersedes eager_wake.
             await _run_on_complete(on_complete, parent_sid, run_id, status, note)
@@ -325,7 +359,16 @@ def spawn_background(
     # a crashed run is therefore NOT marked live, so resume-after-crash still works.
     _LIVE_RUN_IDS.add(run_id)
     task.add_done_callback(lambda _t: _LIVE_RUN_IDS.discard(run_id))
-    return WorkflowRunHandle(run_id=run_id, task=task, cancel_token=cancel_token)
+    handle = WorkflowRunHandle(run_id=run_id, task=task, cancel_token=cancel_token)
+    _HANDLES[run_id] = handle
+
+    def _forget(_t: Any) -> None:
+        if _HANDLES.get(run_id) is handle:
+            _HANDLES.pop(run_id, None)
+        _STOPPED_RUNS.discard(run_id)
+
+    task.add_done_callback(_forget)
+    return handle
 
 
 async def _eager_wake(

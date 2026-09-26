@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from power_loop.agent.stateful_loop import StatefulAgentLoop
@@ -68,6 +68,25 @@ def set_effective_tools(names: frozenset[str] | None) -> Token:
 
 def reset_effective_tools(token: Token) -> None:
     _effective_tools.reset(token)
+
+
+#: design/124 §8.2: the stop token of the TOOL CALL being executed (a child of its run's token).
+#: A tool that starts a sub-run passes it (or a child of it) down, so stopping the run — or just
+#: this call — reaches the sub-run too.
+_current_cancel_token: ContextVar[Any] = ContextVar("power_loop_cancel_token", default=None)
+
+
+def get_current_cancel_token() -> Any:
+    """The executing tool call's :class:`CancellationToken`, or None outside a tool call."""
+    return _current_cancel_token.get()
+
+
+def set_current_cancel_token(token: Any) -> Token:
+    return _current_cancel_token.set(token)
+
+
+def reset_current_cancel_token(token: Token) -> None:
+    _current_cancel_token.reset(token)
 
 
 def get_current_loop() -> StatefulAgentLoop | None:

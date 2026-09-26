@@ -82,10 +82,18 @@ class Workflow:
         self._cancel.cancel(reason)
 
     async def run(self) -> WorkflowResult:
-        """Interpret the spec to completion (in-process, synchronous) and return it."""
+        """Interpret the spec to completion (in-process, synchronous) and return it.
+
+        Awaited from a tool call, the run is ALSO stopped by that call's stop token (design/124
+        §8.2): stopping the calling run stops the workflow it is waiting on. (A detached run —
+        :meth:`start` with ``detached=True`` — is not tied to the caller: it outlives the send
+        and is stopped only by its own handle / ``stop_run``.)"""
+        from power_loop.core.agent_context import get_current_cancel_token
+
         engine = WorkflowEngine(
             self._loop, executor=self._executor, budget=self._budget,
-            stop_event=self._cancel, allowed_tools=self._allowed_tools,
+            stop_event=CancellationToken.any_of(self._cancel, get_current_cancel_token()),
+            allowed_tools=self._allowed_tools,
             file_io=self._file_io,
         )
         return await engine.run(self.spec)

@@ -186,6 +186,10 @@ async def run_agent_spec(
 ) -> dict[str, Any]:
     """Materialize ``spec`` as a child session under ``parent_loop`` and run it.
 
+    design/124 §8.2: with no ``stop_event`` given, the child is stopped by the stop token of the
+    TOOL CALL that runs it (``get_current_cancel_token``) — stopping the parent run, or just
+    that call, stops the sub-agent at its next checkpoint.
+
     Returns a dict with ``final_text``, ``status``, ``rounds``, ``session_id``,
     ``depth`` — easy for the parent LLM to consume as a tool result.
 
@@ -210,6 +214,10 @@ async def run_agent_spec(
       * ``DETACHED`` → child kept, lives independently.
         ``llm`` overrides the LLM service for the child (default: the parent loop's).
     """
+    if stop_event is None:
+        from power_loop.core.agent_context import get_current_cancel_token
+
+        stop_event = get_current_cancel_token()
     if not isinstance(spec, AgentSpec):
         spec = AgentSpec.from_json(spec)
 

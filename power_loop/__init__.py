@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "6.34.0"
+__version__ = "6.35.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -211,6 +211,7 @@ from power_loop.runtime.skills import (
 )
 from power_loop.runtime.spec import AgentSpec, AgentSpecError, run_agent_spec
 from power_loop.runtime.steer import wait_or_steer
+from power_loop.runtime.stop_policy import StopPolicy
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.store.schema import SchemaPolicy, StoreSchemaError
 from power_loop.runtime.store.store import (
@@ -345,6 +346,7 @@ __all__ = [
 	"LLMRetryExhausted",
 	"CancellationRequested",
 	"CompactionFailed",
+	"StopPolicy",
 	"wait_or_steer",
 	"is_permanent_llm_error",
 	"LLMRetryPolicy",

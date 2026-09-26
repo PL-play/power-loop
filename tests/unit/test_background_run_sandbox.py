@@ -53,20 +53,27 @@ def _wait(mgr: BackgroundManager, task_id: str, timeout: float = 5.0) -> str:
 async def test_background_run_launches_through_shell_backend(monkeypatch, tmp_path) -> None:
     captured: dict = {}
 
-    def fake_run(argv, **kw):
-        captured["argv"] = argv
-        captured["input"] = kw.get("input")
-        captured["env"] = kw.get("env")
-        captured["cwd"] = kw.get("cwd")
+    class _FakePopen:
+        """Stand-in for the Popen the background runner starts (its own process group since
+        design/124 — a stop signals the group)."""
 
-        class _R:
-            stdout = ""
-            stderr = ""
-            returncode = 0
+        pid = 999999
+        returncode = 0
 
-        return _R()
+        def __init__(self, argv, **kw):
+            captured["argv"] = argv
+            captured["env"] = kw.get("env")
+            captured["cwd"] = kw.get("cwd")
+            captured["new_session"] = kw.get("start_new_session")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+        def communicate(self, input=None, timeout=None):
+            captured["input"] = input
+            return "", ""
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
 
     mgr = BackgroundManager()
     with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path, shell_backend=_MarkerBackend())):
@@ -77,9 +84,12 @@ async def test_background_run_launches_through_shell_backend(monkeypatch, tmp_pa
     # The command goes to the backend-launched shell's stdin — NOT
     # subprocess.run("echo hi", shell=True) on the host.
     assert captured["argv"] == ["/bin/bash", "--norc", "--noprofile"]
-    assert captured["input"] == "echo hi"
+    # the command, preceded by the task tag every process of it inherits (a stop finds them by it)
+    assert captured["input"].splitlines()[-1] == "echo hi"
+    assert captured["input"].startswith(f"export PL_BG_TAG={task_id}")
     assert captured["cwd"] == str(tmp_path)
     assert captured["env"].get("PL_SANDBOX_MARKER") == "sandbox-123"
+    assert captured["new_session"] is True   # its own process group: a stop reaches all of it
 
 
 async def test_background_run_executes_in_backend_environment(tmp_path) -> None:
