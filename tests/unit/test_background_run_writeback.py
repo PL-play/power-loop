@@ -324,3 +324,34 @@ def test_a_command_stopped_by_request_does_not_call_back(tmp_path) -> None:
             await store.close()
 
     asyncio.run(scenario())
+
+
+def test_background_command_timeout_comes_from_the_runtime_env(tmp_path) -> None:
+    """6.41.0: the hard limit was a fixed 300s; now RuntimeEnv.background_timeout_s (default 300)."""
+
+    async def scenario() -> None:
+        store = await SessionStore.open(str(tmp_path / "to.db"))
+        try:
+            sid = await store.create_session()
+            mgr = BackgroundManager()
+            tok_l = set_current_loop(_FakeLoop(store))
+            tok_s = set_session_id(sid)
+            try:
+                with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path, background_timeout_s=1)):
+                    started = await mgr.run("sleep 10; echo never")
+            finally:
+                reset_current_loop(tok_l)
+                reset_session_id(tok_s)
+            task_id = started.split()[2]
+            for _ in range(60):
+                row = await store.get_background_task(sid, task_id)
+                if row is not None and row.status != "running":
+                    break
+                await asyncio.sleep(0.1)
+            assert row is not None and row.status == "timeout", row
+            assert "Timeout (1s)" in (row.output_tail or "")
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+    assert RuntimeEnv().background_timeout_s == 300.0

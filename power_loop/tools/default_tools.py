@@ -1323,6 +1323,7 @@ class BackgroundManager:
         # as `bash` — running on the host would bypass an installed sandbox and leak
         # the host environment (C1).
         shell_backend = env.shell_backend
+        timeout_s = max(1.0, float(getattr(env, "background_timeout_s", 300.0) or 300.0))
         store, sid = _current_store_and_session()
         # Capture the running event loop so the daemon thread can drive the async
         # store's writes back on it (the store's transaction/lock are loop-bound).
@@ -1348,6 +1349,7 @@ class BackgroundManager:
                 "event_loop": event_loop,
                 "workspace_dir": workspace_dir,
                 "shell_backend": shell_backend,
+                "timeout_s": timeout_s,
             }
             self._prune_locked()
 
@@ -1366,6 +1368,7 @@ class BackgroundManager:
         sid = None
         event_loop = None
         shell_backend: ShellBackend | None = None
+        timeout_s = 300.0
         with self._lock:
             task = self.tasks.get(task_id)
             if task is not None:
@@ -1374,6 +1377,7 @@ class BackgroundManager:
                 event_loop = task.get("event_loop")
                 workspace_dir = task.get("workspace_dir")
                 shell_backend = task.get("shell_backend")
+                timeout_s = float(task.get("timeout_s") or 300.0)
             else:
                 workspace_dir = None
         try:
@@ -1404,7 +1408,7 @@ class BackgroundManager:
                 # them wherever they run — including inside a sandbox, where the local process is
                 # only the sandbox client and its death doesn't reach the command.
                 out, err = proc.communicate(
-                    input=f"export {_BG_TAG_VAR}={task_id}\n{command}", timeout=300)
+                    input=f"export {_BG_TAG_VAR}={task_id}\n{command}", timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 _signal_group(proc, signal.SIGKILL)
                 out, err = proc.communicate()
@@ -1419,7 +1423,7 @@ class BackgroundManager:
             else:
                 status = "completed" if return_code == 0 else f"failed({return_code})"
         except subprocess.TimeoutExpired:
-            output = "Error: Timeout (300s)"
+            output = f"Error: Timeout ({timeout_s:g}s)"
             status = "timeout"
             return_code = None
         except Exception as e:  # pragma: no cover

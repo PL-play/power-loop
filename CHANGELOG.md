@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+## [6.41.0] — 2026-09-27
+
+### Added
+
+- **`RuntimeEnv.background_timeout_s`**（默认 300.0，PROVISIONAL）：一条 `background_run(action="run")` 命令的硬时限。
+  以前写死 300 秒——后台跑的本来多是长活（构建、批处理），超过 5 分钟就被杀、记为 `timeout`。宿主按需调大；
+  超时的任务照常写回并回调（6.40.0 起命令任务也回调），报错写明实际时限（`Error: Timeout (Ns)`）。
+
 ## [6.40.0] — 2026-09-27
 
 后台**命令**任务跑完也通知宿主，让宿主能叫醒已经 pass_turn 的 agent。

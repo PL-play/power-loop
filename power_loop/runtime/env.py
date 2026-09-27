@@ -44,6 +44,10 @@ class RuntimeEnv:
     # resolves only for purpose "r"; any write-capable purpose is refused, even when the
     # same path would also fall inside the workspace or the home allowlist.
     read_only_roots: tuple[Path, ...] = ()
+    # Hard time limit for one `background_run(action="run")` command (seconds; 6.41.0). The command
+    # is killed when it runs longer and the task settles as "timeout". Was a fixed 300s — a host whose
+    # agents run genuinely long jobs in the background (builds, batch processing) raises it.
+    background_timeout_s: float = 300.0
 
     @classmethod
     def from_env(
