@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import difflib
 import fnmatch
+import functools
 import json
 import logging
 import os
@@ -1468,6 +1469,20 @@ class BackgroundManager:
                         "background task %s: terminal status write-back failed on its "
                         "owning event loop; deferring for recovery", task_id, exc_info=True
                     )
+            # 6.40.0: a finished COMMAND task tells the host too, exactly like a tool task (_settle).
+            # Before, only `action=tool` tasks called back, so a host could never wake an agent that
+            # had pass_turn'ed while its `sleep 240 && …` ran — the result was silently never
+            # reported, although the tool reply had promised "delivered to you on completion".
+            # Only after a successful write-back (the host reads the row it is told about); a task
+            # stopped by request doesn't wake anyone.
+            cb = _TOOL_TASK_ON_COMPLETE
+            if delivered and cb is not None and status != "cancelled":
+                try:
+                    cb_fut = asyncio.run_coroutine_threadsafe(cb(sid, task_id, status), event_loop)
+                    cb_fut.add_done_callback(functools.partial(_log_callback_failure, task_id))
+                except Exception:  # noqa: BLE001 — a host callback never breaks the task result
+                    logger.warning("background task %s: on_complete callback not scheduled",
+                                   task_id, exc_info=True)
             if not delivered:
                 with self._lock:
                     self._orphaned.append(payload)
@@ -1791,9 +1806,20 @@ class BackgroundManager:
 
 BG = BackgroundManager()
 
-#: 6.8.0 宿主 seam：后台**工具**任务完成时回调 ``(session_id, task_id, status)``。
-#: 宿主用它决定要不要唤醒一个已 pass_turn 的 agent（在忙的 session 下一轮开轮时
-#: BackgroundRuntimeProjector 本来就会注入更新，无需回调介入）。
+def _log_callback_failure(task_id: str, fut: Any) -> None:
+    """Done-callback for a command task's host notification: log a failure, never raise."""
+    try:
+        exc = fut.exception()
+    except BaseException:  # cancelled — nothing to report
+        return
+    if exc is not None:
+        logger.warning("background task %s: on_complete callback failed: %r", task_id, exc)
+
+
+#: 6.8.0 宿主 seam：后台任务完成时回调 ``(session_id, task_id, status)``——6.40.0 起**工具任务与命令任务**
+#: （``action=tool`` / ``action=run``）都回调，被按 id 停掉的不回调。宿主用它决定要不要唤醒一个已
+#: pass_turn 的 agent（在忙的 session 下一轮开轮时 BackgroundRuntimeProjector 本来就会注入更新，
+#: 无需回调介入）。命令任务的回调在它自己的事件循环上跑（任务本身在后台线程里）。
 _TOOL_TASK_ON_COMPLETE: Any = None
 
 

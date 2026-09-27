@@ -243,3 +243,84 @@ def test_fast_readonly_tools_get_no_background_suffix_but_stay_async_capable():
     assert r.get("read_file").definition.async_capable is True
     assert "可异步" in out["generate_image"]
     assert "action=\"check\")" not in out["generate_image"], "后缀不该教它去 check 取结果"
+
+
+# ── 6.40.0: a finished COMMAND task calls the host back, like a tool task ─────────────────────
+
+
+async def _fire_live(mgr: BackgroundManager, store: object, sid: str, workspace, command: str) -> str:
+    tok_l = set_current_loop(_FakeLoop(store))
+    tok_s = set_session_id(sid)
+    try:
+        with runtime_env_context(RuntimeEnv(workspace_dir=workspace)):
+            return await mgr.run(command)
+    finally:
+        reset_current_loop(tok_l)
+        reset_session_id(tok_s)
+
+
+def test_finished_command_task_calls_the_host_back(tmp_path) -> None:
+    """Before 6.40.0 only action=tool tasks called back, so a host could never wake an agent that
+    had pass_turn'ed while its command ran — the promised result was silently never reported."""
+    from power_loop.tools.default_tools import register_tool_task_callback
+
+    calls: list[tuple] = []
+    done = asyncio.Event()
+
+    async def on_done(sid, task_id, status):
+        calls.append((sid, task_id, status))
+        done.set()
+
+    async def scenario() -> None:
+        store = await SessionStore.open(str(tmp_path / "cb.db"))
+        try:
+            sid = await store.create_session()
+            mgr = BackgroundManager()
+            register_tool_task_callback(on_done)
+            try:
+                started = await _fire_live(mgr, store, sid, tmp_path, "sleep 0.2; echo done")
+                task_id = started.split()[2]
+                await asyncio.wait_for(done.wait(), 10)
+                assert calls == [(sid, task_id, "completed")]
+                row = await store.get_background_task(sid, task_id)
+                assert row is not None and row.status == "completed"   # the host reads a settled row
+            finally:
+                register_tool_task_callback(None)
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
+
+
+def test_a_command_stopped_by_request_does_not_call_back(tmp_path) -> None:
+    from power_loop.tools.default_tools import register_tool_task_callback
+
+    calls: list[tuple] = []
+
+    async def on_done(sid, task_id, status):
+        calls.append((sid, task_id, status))
+
+    async def scenario() -> None:
+        store = await SessionStore.open(str(tmp_path / "stop.db"))
+        try:
+            sid = await store.create_session()
+            mgr = BackgroundManager()
+            register_tool_task_callback(on_done)
+            try:
+                started = await _fire_live(mgr, store, sid, tmp_path, "sleep 30")
+                task_id = started.split()[2]
+                await asyncio.sleep(0.3)
+                await mgr.cancel_task(task_id, grace_s=1.0)
+                for _ in range(50):                       # let the thread finish its write-back
+                    row = await store.get_background_task(sid, task_id)
+                    if row is not None and row.status != "running":
+                        break
+                    await asyncio.sleep(0.1)
+                await asyncio.sleep(0.2)
+                assert calls == []
+            finally:
+                register_tool_task_callback(None)
+        finally:
+            await store.close()
+
+    asyncio.run(scenario())
