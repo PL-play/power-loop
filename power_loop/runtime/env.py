@@ -12,6 +12,7 @@ from power_loop.runtime.exec_backend import ShellBackend
 
 if TYPE_CHECKING:
     from power_loop.runtime.blackboard import Blackboard
+    from power_loop.tools.command_rules import CommandRules
 
 
 class RuntimeEnvError(RuntimeError):
@@ -48,6 +49,10 @@ class RuntimeEnv:
     # is killed when it runs longer and the task settles as "timeout". Was a fixed 300s — a host whose
     # agents run genuinely long jobs in the background (builds, batch processing) raises it.
     background_timeout_s: float = 300.0
+    # The command rule layer for `bash` / `background_run` as data (6.42.0; see tools.command_rules):
+    # absolute deny programs / regexes, always-blocked categories, extra category regexes, refusal
+    # text. None (default) = the built-in rules, identical to the pre-6.42.0 hard-coded constants.
+    command_rules: CommandRules | None = None
 
     @classmethod
     def from_env(

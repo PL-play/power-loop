@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+## [6.42.0] — 2026-09-30
+
+命令规则层可由宿主配置：原来写死的硬拦截清单与类目策略变成数据，宿主逐字段覆盖，不设置就用内置（与 6.41.0 完全一致）。
+
+### Added
+
+- **`tools.command_rules`**（PROVISIONAL）：`CommandRules`（`deny_programs` / `deny_patterns` / `always_blocked` /
+  `category_patterns` / `category_messages`）、`DEFAULT_COMMAND_RULES`（= 旧常量）、`from_overrides(dict)`
+  （缺省或 None 的字段保留内置值；给了就**替换**，空列表就是真的没有；非法正则 / 未知类目抛 `ValueError`）、
+  `validate_overrides`、`defaults_as_dict` / `rules_as_dict`（宿主 UI 用的 JSON 形状）、`dangerous_command_reason`。
+- **`RuntimeEnv.command_rules`**（默认 None = 内置规则）：`bash` 与 `background_run(action="run")` 的硬拦截和类目检查按它来。
+- `tools.command_policy.command_categories(command, rules)`：内置词法分类 ∪ 宿主追加的类目正则；
+  `command_policy_reason(command, blocked, rules=None)` 新增可选 `rules` 参数（旧的两参调用不变）。
+
+### Not changed
+
+- POWER_LOOP_HOME 路径保护仍是写死的：它保护运行时自己的文件，不是「允许 agent 跑哪些命令」的策略。
+
 ## [6.41.0] — 2026-09-27
 
 ### Added

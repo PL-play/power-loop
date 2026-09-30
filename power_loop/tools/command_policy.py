@@ -17,7 +17,8 @@ each simple command's program name + subcommand. False negatives are possible (`
 positives are cheap: the model gets a tool result telling it the category and the exit.
 
 Library default: nothing blocked except ``pipe_to_shell`` (there is no legitimate use for
-``curl … | sh`` inside an agent sandbox). Hosts opt in to more.
+``curl … | sh`` inside an agent sandbox). Hosts opt in to more. Since 6.42.0 the always-blocked set,
+extra category regexes and the refusal text are data (``command_rules.CommandRules``) a host can override.
 """
 from __future__ import annotations
 
@@ -25,8 +26,17 @@ import re
 import shlex
 from pathlib import Path
 
-CATEGORIES: tuple[str, ...] = ("package_install", "download", "pipe_to_shell", "daemon")
-ALWAYS_BLOCKED: frozenset[str] = frozenset({"pipe_to_shell"})
+from power_loop.tools.command_rules import (
+    CATEGORIES,
+    DEFAULT_ALWAYS_BLOCKED,
+    DEFAULT_CATEGORY_MESSAGES,
+    CommandRules,
+    category_message,
+    extra_categories,
+)
+
+#: Built-in "always blocked" set (hosts can override it via ``CommandRules.always_blocked``, 6.42.0).
+ALWAYS_BLOCKED: frozenset[str] = DEFAULT_ALWAYS_BLOCKED
 
 _OPERATORS = {"|", "||", "&&", ";", "&", "(", ")", ";;", "|&"}
 _INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "python", "python3", "node", "perl", "ruby", "php"}
@@ -168,34 +178,32 @@ def classify_command(command: str) -> set[str]:
     return cats
 
 
-_EXITS = {
-    "package_install": (
-        "installing packages (npm/pip/apt/cargo…) is disabled for this agent. Use what is preinstalled "
-        "in the sandbox; if something is genuinely missing, tell the user so the platform can add it. "
-        "For screenshots of HTML prototypes use the render_html tool, not a browser install."
-    ),
-    "download": (
-        "downloading files with curl/wget/git clone is disabled for this agent. Use the platform's "
-        "fetch_file / web_read tools for content you need, or ask the user to provide the file."
-    ),
-    "pipe_to_shell": (
-        "piping a download straight into a shell/interpreter (curl … | sh) is never allowed."
-    ),
-    "daemon": (
-        "starting long-running/background daemons is disabled for this agent. Run the command in the "
-        "foreground with a timeout, or use the background_run tool for a bounded job."
-    ),
-}
+#: Built-in refusal text per category (kept for backward compatibility; see command_rules).
+_EXITS = DEFAULT_CATEGORY_MESSAGES
 
 
-def command_policy_reason(command: str, blocked: frozenset[str] | set[str] | None) -> str | None:
-    """Return a refusal message if ``command`` touches a blocked category, else None."""
-    effective = set(ALWAYS_BLOCKED) | set(blocked or ())
-    hit = classify_command(command) & effective
+def command_categories(command: str, rules: CommandRules | None = None) -> set[str]:
+    """Built-in lexical classification ∪ the host's extra category regexes (6.42.0)."""
+    return classify_command(command) | extra_categories(command, rules)
+
+
+def command_policy_reason(
+    command: str,
+    blocked: frozenset[str] | set[str] | None,
+    rules: CommandRules | None = None,
+) -> str | None:
+    """Return a refusal message if ``command`` touches a blocked category, else None.
+
+    ``rules`` (6.42.0) overrides the always-blocked set, adds category regexes and replaces refusal
+    text; ``None`` = built-in rules (identical to 6.41.0).
+    """
+    always = rules.always_blocked if rules is not None else ALWAYS_BLOCKED
+    effective = set(always) | set(blocked or ())
+    hit = command_categories(command, rules) & effective
     if not hit:
         return None
     cat = next(c for c in CATEGORIES if c in hit)  # stable, most-severe-first order
-    return f"Error: Command blocked by sandbox policy ({cat}): {_EXITS[cat]}"
+    return f"Error: Command blocked by sandbox policy ({cat}): {category_message(cat, rules)}"
 
 
-__all__ = ["ALWAYS_BLOCKED", "CATEGORIES", "classify_command", "command_policy_reason"]
+__all__ = ["ALWAYS_BLOCKED", "CATEGORIES", "classify_command", "command_categories", "command_policy_reason"]

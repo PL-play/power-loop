@@ -10,7 +10,6 @@ import logging
 import os
 import queue
 import re
-import shlex
 import signal
 import subprocess
 import threading
@@ -28,6 +27,7 @@ from power_loop.runtime.human_input import request_user_input
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
 from power_loop.tools.command_policy import command_policy_reason
+from power_loop.tools.command_rules import CommandRules, dangerous_command_reason
 
 logger = logging.getLogger(__name__)
 
@@ -406,46 +406,9 @@ def _validate_bash_command_scope(command: str) -> str | None:
     )
 
 
-def _dangerous_command_reason(command: str) -> str | None:
-    lowered = command.strip().lower()
-    compact = re.sub(r"\s+", " ", lowered)
-    # Recursive/force rm targeting root, home, or a top-level SYSTEM directory.
-    # The target alternatives below deliberately allow /tmp and relative paths
-    # (scratch is fine) while blocking '/', '~', '$HOME', '~/…', '$HOME/…', and
-    # '/etc', '/usr/local', '/var/…' etc. The flag group repeats so 'rm -r -f /x'
-    # is caught too. (Older regex only matched the BARE root/home — it missed
-    # 'rm -rf /etc', a real false-negative.)
-    if re.search(
-        r"\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+"
-        r"(?:/(?:\s|$)"                                       # bare /
-        r"|~(?:/|\s|$)"                                       # ~ or ~/…
-        r"|\$home"                                           # $HOME or $HOME/…
-        r"|/(?:bin|boot|dev|etc|home|lib|lib64|opt|proc|root|run|sbin|srv|sys|usr|var)(?:/|\s|$))",  # /sysdir…
-        compact,
-    ):
-        return "refusing recursive deletion of a root/home/system path"
-    if re.search(r">\s*/dev/(sd|disk|rdisk|nvme|zero|mem)", compact):
-        return "refusing redirection to raw device paths"
-    try:
-        tokens = shlex.split(command, comments=False, posix=True)
-    except ValueError:
-        tokens = command.split()
-    commands = {Path(token).name for token in tokens if token and not token.startswith("-")}
-    blocked = {
-        "sudo",
-        "su",
-        "shutdown",
-        "reboot",
-        "halt",
-        "poweroff",
-        "mkfs",
-        "diskutil",
-        "dd",
-    }
-    used = sorted(commands & blocked)
-    if used:
-        return f"refusing privileged or device-level command: {', '.join(used)}"
-    return None
+def _dangerous_command_reason(command: str, rules: CommandRules | None = None) -> str | None:
+    """Absolute deny-list (6.42.0: data in ``command_rules``; ``rules=None`` = built-in, unchanged)."""
+    return dangerous_command_reason(command, rules)
 
 
 class BashSession:
@@ -579,10 +542,11 @@ class BashSession:
         return head + middle + list(tail), exit_code
 
     def execute(self, command: str, timeout: int = 120) -> str:
-        reason = _dangerous_command_reason(command)
+        env = get_runtime_env()
+        reason = _dangerous_command_reason(command, env.command_rules)
         if reason:
             return f"Error: Dangerous command blocked ({reason}). Run it manually if you really intend it."
-        policy_err = command_policy_reason(command, get_runtime_env().blocked_command_categories)
+        policy_err = command_policy_reason(command, env.blocked_command_categories, env.command_rules)
         if policy_err:
             return policy_err
 
@@ -1304,10 +1268,11 @@ class BackgroundManager:
                 break  # everything still running — nothing safe to evict yet
 
     async def run(self, command: str) -> str:
-        reason = _dangerous_command_reason(command)
+        env = get_runtime_env()
+        reason = _dangerous_command_reason(command, env.command_rules)
         if reason:
             return f"Error: Dangerous command blocked ({reason}). Run it manually if you really intend it."
-        policy_err = command_policy_reason(command, get_runtime_env().blocked_command_categories)
+        policy_err = command_policy_reason(command, env.blocked_command_categories, env.command_rules)
         if policy_err:
             return policy_err
 
