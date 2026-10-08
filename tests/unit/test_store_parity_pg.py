@@ -22,7 +22,7 @@ from tests.unit.test_store_parity import SCENARIOS, run_parity  # noqa: E402
 
 PG_DSN = os.environ.get(
     "POWER_LOOP_TEST_PG_DSN",
-    "postgresql://deeptalk:deeptalk@localhost:5433/power_loop_test",
+    f"postgresql://deeptalk:{os.environ.get('POSTGRES_PASSWORD', 'deeptalk')}@localhost:5433/power_loop_test",
 )
 
 

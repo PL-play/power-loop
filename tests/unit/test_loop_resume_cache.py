@@ -11,6 +11,7 @@ comparing the recorded LLM requests of a cache-on run and a cache-off run on sep
 from __future__ import annotations
 
 import copy
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -555,7 +556,6 @@ async def test_owned_store_schema_verify_on_fresh_db_raises_with_ddl(tmp_path):
 
 # ── gated: the loop binds to real server backends via dsn (Step A end-to-end) ─
 
-import os  # noqa: E402
 import socket  # noqa: E402
 from urllib.parse import urlparse  # noqa: E402
 
@@ -569,7 +569,7 @@ def _reachable(dsn: str, default_port: int) -> bool:
         return False
 
 
-_PG_DSN = os.environ.get("POWER_LOOP_TEST_PG_DSN", "postgresql://deeptalk:deeptalk@localhost:5433/power_loop_test")
+_PG_DSN = os.environ.get("POWER_LOOP_TEST_PG_DSN", f"postgresql://deeptalk:{os.environ.get('POSTGRES_PASSWORD', 'deeptalk')}@localhost:5433/power_loop_test")
 _MYSQL_DSN = os.environ.get("POWER_LOOP_TEST_MYSQL_DSN", "mysql://deeptalk:deeptalk@localhost:3307/power_loop_test")
 
 

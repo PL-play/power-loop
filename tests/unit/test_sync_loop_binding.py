@@ -52,7 +52,7 @@ async def test_sync_api_rejected_inside_running_loop(tmp_path) -> None:
 # ── the real regression: a server backend whose pool is event-loop-bound ──────────────
 PG_DSN = os.environ.get(
     "POWER_LOOP_TEST_PG_DSN",
-    "postgresql://deeptalk:deeptalk@localhost:5433/power_loop_test",
+    f"postgresql://deeptalk:{os.environ.get('POSTGRES_PASSWORD', 'deeptalk')}@localhost:5433/power_loop_test",
 )
 
 

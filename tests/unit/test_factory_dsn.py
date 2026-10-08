@@ -79,7 +79,7 @@ async def test_driver_qualified_pg_scheme_does_not_become_sqlite(tmp_path, monke
 
 
 PG_DSN = os.environ.get(
-    "POWER_LOOP_TEST_PG_DSN", "postgresql://deeptalk:deeptalk@localhost:5433/power_loop_test"
+    "POWER_LOOP_TEST_PG_DSN", f"postgresql://deeptalk:{os.environ.get('POSTGRES_PASSWORD', 'deeptalk')}@localhost:5433/power_loop_test"
 )
 
 

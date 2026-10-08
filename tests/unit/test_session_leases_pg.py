@@ -23,7 +23,7 @@ from power_loop.runtime.store.factory import open_store  # noqa: E402
 
 PG_DSN = os.environ.get(
     "POWER_LOOP_TEST_PG_DSN",
-    "postgresql://deeptalk:deeptalk@localhost:5433/power_loop_test",
+    f"postgresql://deeptalk:{os.environ.get('POSTGRES_PASSWORD', 'deeptalk')}@localhost:5433/power_loop_test",
 )
 
 

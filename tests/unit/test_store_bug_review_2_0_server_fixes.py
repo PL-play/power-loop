@@ -18,7 +18,7 @@ pytestmark = pytest.mark.unit
 
 PG_DSN = os.environ.get(
     "POWER_LOOP_TEST_PG_DSN",
-    "postgresql://deeptalk:deeptalk@localhost:5433/power_loop_test",
+    f"postgresql://deeptalk:{os.environ.get('POSTGRES_PASSWORD', 'deeptalk')}@localhost:5433/power_loop_test",
 )
 MYSQL_DSN = os.environ.get(
     "POWER_LOOP_TEST_MYSQL_DSN",
