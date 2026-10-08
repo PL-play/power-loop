@@ -7,12 +7,13 @@ import logging
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
 from .capabilities import ModelCapabilities, coerce_capabilities
 from .interface import AnthropicChatConfig, LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
 from .llm_utils import parse_json_from_model_output_detailed
 from .multimodal import render_message_content
+from .proxy_fallback import env_proxy_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class AnthropicMessagesLLMService(LLMService):
                 base_url=self._cfg.base_url,
                 timeout=self._cfg.timeout_s,
                 max_retries=self._cfg.max_retries,
+                http_client=env_proxy_http_client(DefaultAsyncHttpxClient),
             )
         return self._client
 

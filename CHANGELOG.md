@@ -8,6 +8,23 @@
 
 ## [Unreleased]
 
+## [6.43.0] — 2026-10-08
+
+LLM 请求经环境代理（`HTTPS_PROXY` 等）时，代理本身连不上就改直连，默认打开。
+
+### Added
+
+- OpenAI 兼容与 Anthropic 两个传输层的 SDK 客户端改用 `_vendor/llm_client/proxy_fallback.py` 构造：
+  分流规则与 httpx 默认一致（`HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY`）；连代理失败（`ConnectError` /
+  `ConnectTimeout`）时再用 2 秒 TCP 探测代理端口，**确认代理连不上**才把这次请求改走直连，之后 30 秒内都直连
+  （进程内共享），过后再试代理。打一行 WARNING。
+- 只有「代理连不上」才兜底：代理答了话（拒绝 CONNECT、返回错误状态），或代理活着但后面连不通，照旧报错。
+- 开关 `POWER_LOOP_PROXY_FALLBACK=0` 关闭（SDK 自己建客户端，与 6.42.0 完全一致）。环境里没设代理时也不变。
+
+### Changed
+
+- 设了代理时，SDK 客户端的连接带 TCP keepalive（与 Anthropic SDK 默认客户端相同；OpenAI SDK 默认没有）。
+
 ## [6.42.0] — 2026-09-30
 
 命令规则层可由宿主配置：原来写死的硬拦截清单与类目策略变成数据，宿主逐字段覆盖，不设置就用内置（与 6.41.0 完全一致）。

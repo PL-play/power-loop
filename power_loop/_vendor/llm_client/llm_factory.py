@@ -17,11 +17,12 @@ import random
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
 from .capabilities import ModelCapabilities, coerce_capabilities
 from .interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage, OpenAICompatibleChatConfig
 from .llm_utils import parse_json_from_model_output_detailed
+from .proxy_fallback import env_proxy_http_client
 
 if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionChunk
@@ -149,6 +150,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             base_url=self._cfg.base_url,
             api_key=self._cfg.api_key,
             timeout=self._cfg.timeout_s,
+            http_client=env_proxy_http_client(DefaultAsyncHttpxClient),
         )
         return self._client
 
