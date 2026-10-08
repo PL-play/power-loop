@@ -27,7 +27,14 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class ShellBackend(Protocol):
-    """Decides how the persistent shell for a workspace is launched."""
+    """Decides how the persistent shell for a workspace is launched.
+
+    Optional hook (not part of the protocol, looked up with ``getattr``):
+    ``touch(workspace_dir) -> None`` is called before every foreground ``bash`` command, so a
+    host can tell that the execution target is still in use (e.g. keep a sandbox container from
+    being reaped as idle while its persistent shell is busy with one command after another).
+    Exceptions from it are logged and ignored.
+    """
 
     def launch_argv(self, workspace_dir: Path) -> list[str]:
         """argv used to start the persistent shell process."""

@@ -550,13 +550,24 @@ class BashSession:
         if policy_err:
             return policy_err
 
+        touch = getattr(self._backend, "touch", None)
+        if touch is not None:
+            try:
+                touch(self._cwd)
+            except Exception:  # noqa: BLE001 — a liveness hint, never a reason to fail the command
+                logger.warning("shell backend touch failed", exc_info=True)
+
         with self._lock:
             if self._proc is None or self._proc.poll() is not None:
                 self._start()
 
             assert self._proc is not None and self._proc.stdin is not None
             sentinel = f"{SENTINEL_PREFIX}{uuid.uuid4().hex}___"
-            full_cmd = f"{command}\nprintf '\\n{sentinel} %s\\n' $?\n"
+            # Tag every process this command starts (children inherit the env, the shell itself
+            # doesn't), so a timeout can kill them where they run. Killing only the local client
+            # is not enough under a sandbox backend: the command keeps running in the container.
+            tag = uuid.uuid4().hex
+            full_cmd = f"export {_FG_TAG_VAR}={tag}\n{command}\nprintf '\\n{sentinel} %s\\n' $?\n"
             try:
                 self._proc.stdin.write(full_cmd)
                 self._proc.stdin.flush()
@@ -567,6 +578,7 @@ class BashSession:
             lines, exit_code = self._drain_until(sentinel, timeout=timeout)
             timed_out = exit_code is None
             if timed_out:
+                _kill_tagged(self._backend, self._cwd, tag, "KILL", var=_FG_TAG_VAR)
                 self._restart_locked()
 
         header = f"exit_code={exit_code or '?'}"
@@ -1189,13 +1201,15 @@ def run_load_skill(name: str) -> str:
 
 #: env var carrying a background shell task's id into every process it starts (see _kill_tagged)
 _BG_TAG_VAR = "PL_BG_TAG"
+#: same for one foreground ``bash`` command (6.44.0): a timeout kills what it started
+_FG_TAG_VAR = "PL_FG_TAG"
 
 
-def _kill_tagged(backend: Any, workspace_dir: Any, task_id: str, sig: str) -> None:
-    """Signal every process whose environment carries ``PL_BG_TAG=<task_id>`` — run through the
+def _kill_tagged(backend: Any, workspace_dir: Any, task_id: str, sig: str, *, var: str = _BG_TAG_VAR) -> None:
+    """Signal every process whose environment carries ``<var>=<task_id>`` — run through the
     task's own shell backend, so it executes where the command runs (the host, or inside the
     sandbox container). Best-effort; a failure only means the local group signal is all we had."""
-    tag = f"{_BG_TAG_VAR}={task_id}"
+    tag = f"{var}={task_id}"
     script = (
         f"for p in /proc/[0-9]*; do "
         f"tr '\\0' '\\n' < \"$p/environ\" 2>/dev/null | grep -qx '{tag}' "
