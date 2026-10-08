@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+## [6.43.1] — 2026-10-08
+
+### Fixed
+
+- 6.43.0 的代理兜底在 openai>=3 / anthropic>=1 上让**每次** LLM 请求都失败（`AssertionError`，
+  `isinstance(request.stream, AsyncByteStream)`）：这两个 SDK 基于 `httpx2`（同接口、另一个包），兜底却用
+  `httpx` 建 transport，请求对象类型对不上。现在从 SDK 客户端类的继承链找出它用的包（`httpx` / `httpx2`），
+  transport、连接上限、异常类型、读环境代理都用同一个包。单测对两个包各跑一遍。
+- 6.43.0 只在 openai 2.x（httpx）环境测过；**不要用 6.43.0**。
+
 ## [6.43.0] — 2026-10-08
 
 LLM 请求经环境代理（`HTTPS_PROXY` 等）时，代理本身连不上就改直连，默认打开。

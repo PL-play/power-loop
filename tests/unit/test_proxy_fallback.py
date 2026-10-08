@@ -1,17 +1,22 @@
 """Env-proxy client with a direct fallback when the proxy itself is unreachable.
 
 Real sockets throughout: a local HTTP server stands in for the provider, a closed port for a
-proxy that is down, and a tiny listening server for a proxy that is up.
+proxy that is down, and a tiny listening server for a proxy that is up. Each request test runs
+on ``httpx`` and on ``httpx2`` (what openai>=3 / anthropic>=1 are built on): 6.43.0 built
+``httpx`` transports into ``httpx2`` SDK clients and every request failed.
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
 import socket
 import threading
 import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import ModuleType
+from typing import Any
 
 import httpx
 import pytest
@@ -23,6 +28,25 @@ from power_loop._vendor.llm_client.llm_factory import OpenAICompatibleChatLLMSer
 from power_loop._vendor.llm_client.proxy_fallback import ProxyFallbackTransport, env_proxy_http_client
 
 _PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+
+
+def _packages() -> list[ModuleType]:
+    found = [httpx]
+    try:
+        found.append(importlib.import_module("httpx2"))
+    except ImportError:
+        pass
+    return found
+
+
+@pytest.fixture(params=_packages(), ids=lambda m: m.__name__)
+def hx(request: pytest.FixtureRequest) -> ModuleType:
+    return request.param
+
+
+def _sdk_like_client_cls(hx: ModuleType) -> type:
+    """Like the SDKs' ``DefaultAsyncHttpxClient``: a subclass of that package's AsyncClient."""
+    return type("DefaultAsyncHttpxClient", (hx.AsyncClient,), {})
 
 
 @pytest.fixture(autouse=True)
@@ -88,26 +112,27 @@ def _closed_port_url() -> str:
     return f"http://127.0.0.1:{port}"
 
 
-def _fallback_transports(client: httpx.AsyncClient) -> list[ProxyFallbackTransport]:
+def _fallback_transports(client: Any) -> list[ProxyFallbackTransport]:
     return [t for t in client._mounts.values() if isinstance(t, ProxyFallbackTransport)]
 
 
-def test_no_proxy_in_env_keeps_the_sdk_default_client() -> None:
-    assert env_proxy_http_client(httpx.AsyncClient) is None
+def test_no_proxy_in_env_keeps_the_sdk_default_client(hx: ModuleType) -> None:
+    assert env_proxy_http_client(_sdk_like_client_cls(hx)) is None
 
 
-def test_switch_off_keeps_the_sdk_default_client(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_switch_off_keeps_the_sdk_default_client(hx: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://gateway.invalid:8890")
     monkeypatch.setenv(proxy_fallback.ENV_SWITCH, "0")
-    assert env_proxy_http_client(httpx.AsyncClient) is None
+    assert env_proxy_http_client(_sdk_like_client_cls(hx)) is None
 
 
 async def test_proxy_down_goes_direct_and_stays_direct_for_a_while(
+    hx: ModuleType,
     monkeypatch: pytest.MonkeyPatch, provider: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     proxy = _closed_port_url()
     monkeypatch.setenv("HTTP_PROXY", proxy)
-    client = env_proxy_http_client(httpx.AsyncClient)
+    client = env_proxy_http_client(_sdk_like_client_cls(hx))
     assert client is not None
     async with client:
         with caplog.at_level(logging.WARNING, logger=proxy_fallback.__name__):
@@ -120,7 +145,7 @@ async def test_proxy_down_goes_direct_and_stays_direct_for_a_while(
         (transport,) = _fallback_transports(client)
         tried: list[str] = []
 
-        async def _must_not_be_called(request: httpx.Request) -> httpx.Response:
+        async def _must_not_be_called(request: Any) -> Any:
             tried.append(str(request.url))
             raise AssertionError("proxy tried inside the down window")
 
@@ -137,9 +162,10 @@ async def test_proxy_down_goes_direct_and_stays_direct_for_a_while(
         assert proxy_fallback._down_until[proxy] > time.monotonic()
 
 
-async def test_a_live_proxy_answer_stands(monkeypatch: pytest.MonkeyPatch, provider: str, refusing_proxy: str) -> None:
+async def test_a_live_proxy_answer_stands(
+    hx: ModuleType, monkeypatch: pytest.MonkeyPatch, provider: str, refusing_proxy: str) -> None:
     monkeypatch.setenv("HTTP_PROXY", refusing_proxy)
-    client = env_proxy_http_client(httpx.AsyncClient)
+    client = env_proxy_http_client(_sdk_like_client_cls(hx))
     assert client is not None
     async with client:
         resp = await client.get(provider)
@@ -148,27 +174,27 @@ async def test_a_live_proxy_answer_stands(monkeypatch: pytest.MonkeyPatch, provi
 
 
 async def test_connect_failure_past_a_live_proxy_is_raised(
-    monkeypatch: pytest.MonkeyPatch, provider: str, refusing_proxy: str
+    hx: ModuleType, monkeypatch: pytest.MonkeyPatch, provider: str, refusing_proxy: str
 ) -> None:
     monkeypatch.setenv("HTTP_PROXY", refusing_proxy)
-    client = env_proxy_http_client(httpx.AsyncClient)
+    client = env_proxy_http_client(_sdk_like_client_cls(hx))
     assert client is not None
     (transport,) = _fallback_transports(client)
 
-    async def _upstream_tls_failed(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("upstream TLS handshake failed")
+    async def _upstream_tls_failed(request: Any) -> Any:
+        raise hx.ConnectError("upstream TLS handshake failed")
 
     monkeypatch.setattr(transport._proxied, "handle_async_request", _upstream_tls_failed)
     async with client:
-        with pytest.raises(httpx.ConnectError, match="upstream TLS"):
+        with pytest.raises(hx.ConnectError, match="upstream TLS"):
             await client.get(provider)
     assert proxy_fallback._down_until == {}
 
 
-async def test_no_proxy_hosts_never_touch_the_proxy(monkeypatch: pytest.MonkeyPatch, provider: str) -> None:
+async def test_no_proxy_hosts_never_touch_the_proxy(hx: ModuleType, monkeypatch: pytest.MonkeyPatch, provider: str) -> None:
     monkeypatch.setenv("HTTP_PROXY", _closed_port_url())
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
-    client = env_proxy_http_client(httpx.AsyncClient)
+    client = env_proxy_http_client(_sdk_like_client_cls(hx))
     assert client is not None
     async with client:
         resp = await client.get(provider)
@@ -194,3 +220,12 @@ def test_sdk_clients_stay_default_without_a_proxy() -> None:
         OpenAICompatibleChatConfig(base_url="https://llm.example/v1", api_key="sk-test", model="m")
     )
     assert _fallback_transports(openai_svc._ensure_client()._client) == []
+
+
+def test_transports_come_from_the_sdk_clients_own_package(hx: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://gateway.invalid:8890")
+    client = env_proxy_http_client(_sdk_like_client_cls(hx))
+    assert client is not None
+    (transport,) = _fallback_transports(client)
+    assert isinstance(transport._proxied, hx.AsyncHTTPTransport)
+    assert isinstance(client._transport, hx.AsyncHTTPTransport)
