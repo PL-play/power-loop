@@ -28,10 +28,10 @@ validate real behavior; don't mock or skip when the point is real validation.
 first; some real tests have pre-existing cross-test async-teardown flakiness (pass in isolation).
 
 ## Publishing to PyPI
-Token at **`/home/ubuntu/deeptalk/pypi_token`** (workspace root; `._pypi_token` is a macOS
+Token at **`/home/ubuntu/.config/deeptalk/pypi_token`** (moved 2026-10-10 out of the workspace, mode 600; `._pypi_token` is a macOS
 sidecar — ignore). Version = `power_loop.__version__` (pyproject `dynamic`); bump it + add a
 CHANGELOG entry, then:
-`.venv/bin/python -m build && .venv/bin/python -m twine upload -u __token__ -p "$(cat /home/ubuntu/deeptalk/pypi_token)" dist/*`.
+`.venv/bin/python -m build && .venv/bin/python -m twine upload -u __token__ -p "$(cat /home/ubuntu/.config/deeptalk/pypi_token)" dist/*`.
 Publishing is irreversible/outward — only when the user explicitly asks to release. After a
 release, repin DeepTalk `agent`+`dispatcher` (`power-loop[all]>=X`) and rebuild.
 
