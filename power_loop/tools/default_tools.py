@@ -1571,8 +1571,11 @@ class BackgroundManager:
                     _a = async_capable_actions(_d)
                     _others.append(f"{_d.name}({'/'.join(_a)})" if _a else _d.name)
             raise ValueError(
-                f"{name} 不能后台跑：它有副作用（写文件 / 发布 / 对外投递这类），"
-                "重跑或并发都不安全。**这件事直接调用 " + name + " 就行**，不用包一层。"
+                # 只说事实：工具定义没声明 async_capable。没声明的一律按可能有副作用处理，但别断言它「有副作用」——
+                # 新工具的作者只是漏标时，那句话会被当成判断（10-16 建造师 world_sketch 事故）。
+                f"{name} 不能后台跑：这个工具没有声明可以后台跑（定义里没标 async_capable），"
+                "没声明的一律按可能有副作用（写文件 / 发布 / 对外投递这类）处理，重跑或并发不一定安全。"
+                "**这件事直接调用 " + name + " 就行**，不用包一层。"
                 + ("\n可以后台跑的是：" + "、".join(_others) if _others else "")
             )
         store, sid = _current_store_and_session()

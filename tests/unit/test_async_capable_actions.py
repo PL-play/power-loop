@@ -92,6 +92,7 @@ async def test_background_run_refuses_side_effecting_tools_with_the_way_out(monk
         await dt.BG.run_tool("write_file", {"path": "a", "content": "b"})
     msg = str(exc.value)
     assert "不能后台跑" in msg and "副作用" in msg          # 为什么不行
+    assert "没有声明可以后台跑" in msg                       # 说的是「没标」，不是断定它有副作用
     assert "直接调用 write_file 就行" in msg                # 这件事该怎么做
     assert "design_reference(download/get/list)" in msg      # 哪些行（含 action 粒度）
     assert "see_image" in msg
