@@ -49,6 +49,9 @@ from power_loop.runtime.spec import AgentSpec, AgentSpecError
 # foreach `as` name validated here is guaranteed substitutable as {{name}} in the body.
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*$")
 
+#: 整个 run 的时限上限（7 天）
+MAX_RUN_TIMEOUT_S = 7 * 24 * 3600
+
 __all__ = [
     "WorkflowSpecError",
     "RetryPolicy",
@@ -169,6 +172,13 @@ class AgentNode:
     #: 耗尽续跑策略（None=关）。与 retry 正交：retry 管 failed/empty（新会话），
     #: continuation 管 hit_round_limit（原会话补轮）。
     continuation: ContinuationPolicy | None = None
+    #: 条件（6.46，DeepTalk design/170 第二批）：``{"ref": "节点" 或 "节点.键", "op": eq|ne|in|truthy|falsy, "value": …}``。
+    #: 不成立 → 这个节点记为 ``skipped``（不算失败、不跑叶子）。引用的节点必须在它之前做完（和 inputs_from 同一套校验）。
+    when: dict[str, Any] | None = None
+
+
+#: when.op 的取值
+WHEN_OPS = ("eq", "ne", "in", "truthy", "falsy")
 
 
 @dataclass(frozen=True)
@@ -243,6 +253,8 @@ class WorkflowSpec:
     input: str = ""
     budget: WorkflowBudget | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: 整个 run 的时限（秒，6.46）：到点停掉所有在跑的叶子、不再启动新节点，run 判 failed（错误里写明超时）。None = 不限。
+    timeout_s: float | None = None
 
     # ── construction / validation ──────────────────────────────────────────
 
@@ -263,7 +275,7 @@ class WorkflowSpec:
             raise WorkflowSpecError(["payload must decode to an object"])
 
         problems: list[str] = []
-        allowed = {"name", "root", "input", "budget", "metadata"}
+        allowed = {"name", "root", "input", "budget", "metadata", "timeout_s"}
         unknown = set(data) - allowed
         if unknown:
             problems.append(f"unknown top-level key(s): {sorted(unknown)}")
@@ -286,6 +298,14 @@ class WorkflowSpec:
         if not isinstance(metadata, dict):
             problems.append("'metadata' must be an object")
             metadata = {}
+
+        timeout_s = data.get("timeout_s")
+        if timeout_s is not None:
+            if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)) or not 1 <= float(timeout_s) <= MAX_RUN_TIMEOUT_S:
+                problems.append(f"'timeout_s' must be a number of seconds in [1, {MAX_RUN_TIMEOUT_S}]")
+                timeout_s = None
+            else:
+                timeout_s = float(timeout_s)
 
         root = None
         if "root" not in data:
@@ -323,7 +343,7 @@ class WorkflowSpec:
             raise WorkflowSpecError(problems)
 
         assert root is not None  # guaranteed when no problems
-        return cls(name=name, root=root, input=wf_input, budget=budget, metadata=dict(metadata))
+        return cls(name=name, root=root, input=wf_input, budget=budget, metadata=dict(metadata), timeout_s=timeout_s)
 
     # ── serialization (round-trips through from_json) ───────────────────────
 
@@ -345,6 +365,8 @@ class WorkflowSpec:
             }
         if self.metadata:
             out["metadata"] = dict(self.metadata)
+        if self.timeout_s is not None:
+            out["timeout_s"] = self.timeout_s
         return out
 
 
@@ -392,6 +414,8 @@ def _node_to_dict(node: WorkflowNode) -> dict[str, Any]:
                 "extra_rounds": node.continuation.extra_rounds,
                 "gate": node.continuation.gate,
             }
+        if node.when is not None:
+            out["when"] = dict(node.when)
         return out
     if isinstance(node, SequenceNode):
         out = {"type": "sequence", "steps": [_node_to_dict(s) for s in node.steps]}
@@ -588,6 +612,8 @@ def _reach_pass(
     if isinstance(node, AgentNode):
         for ref in node.inputs_from or ():
             _need(ref, f"{path}: inputs_from")
+        if node.when:
+            _need(str(node.when.get("ref") or ""), f"{path}: when")
         return {node.id} if node.id else set()
     if isinstance(node, SequenceNode):
         avail = set(available)
@@ -652,7 +678,7 @@ def _parse_agent(
     _check_unknown(
         data,
         {"type", "id", "spec", "input", "inputs_from", "output_schema",
-         "retry", "continue_on_error", "fallback", "output_file", "continuation"},
+         "retry", "continue_on_error", "fallback", "output_file", "continuation", "when"},
         path, problems,
     )
     node_id = data.get("id")
@@ -720,6 +746,7 @@ def _parse_agent(
 
     retry = _parse_retry(data.get("retry"), path, problems)
     continuation = _parse_continuation(data.get("continuation"), path, problems)
+    when = _parse_when(data.get("when"), path, problems, ids, body_ids)
 
     cont = data.get("continue_on_error", False)
     if not isinstance(cont, bool):
@@ -754,7 +781,40 @@ def _parse_agent(
         continue_on_error=cont,
         fallback=fallback,
         output_file=out_file,
+        when=when,
     )
+
+
+def _parse_when(raw: Any, path: str, problems: list[str], ids: set[str], body_ids: set[str]) -> dict[str, Any] | None:
+    """``when: {ref, op?, value?}``：op 缺省 truthy；eq / ne / in 要 value（in 的 value 是列表）。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        problems.append(f"{path}: 'when' must be an object {{ref, op?, value?}}")
+        return None
+    extra = set(raw) - {"ref", "op", "value"}
+    if extra:
+        problems.append(f"{path}.when: unknown key(s): {sorted(extra)}")
+    ref = raw.get("ref")
+    if not isinstance(ref, str) or not ref.strip():
+        problems.append(f"{path}.when: 'ref' must be a node id or 'node.key'")
+        return None
+    if not _check_not_body_ref(ref, path, "when", body_ids, problems) and _ref_target(ref) not in ids:
+        problems.append(f"{path}.when: references unknown node '{_ref_target(ref)}' (known: {sorted(ids)})")
+    op = raw.get("op", "truthy")
+    if op not in WHEN_OPS:
+        problems.append(f"{path}.when: 'op' must be one of {list(WHEN_OPS)}")
+        return None
+    if op in ("eq", "ne", "in") and "value" not in raw:
+        problems.append(f"{path}.when: op '{op}' needs 'value'")
+        return None
+    if op == "in" and not isinstance(raw.get("value"), list):
+        problems.append(f"{path}.when: op 'in' needs a list 'value'")
+        return None
+    out: dict[str, Any] = {"ref": ref, "op": op}
+    if "value" in raw:
+        out["value"] = raw["value"]
+    return out
 
 
 def _parse_continuation(raw: Any, path: str, problems: list[str]) -> ContinuationPolicy | None:

@@ -238,6 +238,10 @@ def _publish_subagent_event(
 _USAGE_SINK: ContextVar[dict[str, int] | None] = ContextVar("power_loop_usage_sink", default=None)
 
 
+#: 子会话建好时的回调（6.46）：``cb(child_session_id)``，可以是协程函数。workflow 引擎用它记「节点 → 叶子会话」。
+_ON_CHILD_SESSION: ContextVar[Any] = ContextVar("power_loop_on_child_session", default=None)
+
+
 def _add_usage(into: dict[str, int], usage: dict[str, Any] | None) -> None:
     for k, v in (usage or {}).items():
         if isinstance(v, (int, float)) and not isinstance(v, bool):
@@ -369,6 +373,16 @@ async def run_agent_spec(
         # name, not the raw session UUID (subagent-coordination-3): blackboard._author reads metadata.
         metadata={**dict(spec.metadata), "spec_name": spec.name},
     )
+    # 子会话建好就告诉设了回调的那一层（6.46：workflow 引擎把「节点 → 叶子会话」记进 journal，重启后 resume 接着原会话跑）。
+    # 只告诉最外层：这次子运行期间把回调清掉，叶子自己再派的子 agent 不会被当成叶子会话。
+    _session_cb = _ON_CHILD_SESSION.get()
+    if _session_cb is not None:
+        try:
+            _r = _session_cb(child_sid)
+            if hasattr(_r, "__await__"):
+                await _r
+        except Exception:  # noqa: BLE001 — 观测回调失败不毁子运行
+            pass
 
     child_row = await store.get_session(child_sid)
     depth = child_row.spawn_depth if child_row is not None else 1
@@ -424,11 +438,13 @@ async def run_agent_spec(
             _outer_sink = _USAGE_SINK.get()
             _my_sink: dict[str, int] = {}
             _sink_tok = _USAGE_SINK.set(_my_sink)
+            _cb_tok = _ON_CHILD_SESSION.set(None)
             try:
                 result = await child_loop.send(
                     user_input, session_id=child_sid, stop_event=stop_event
                 )
             finally:
+                _ON_CHILD_SESSION.reset(_cb_tok)
                 _USAGE_SINK.reset(_sink_tok)
             _total_usage: dict[str, int] = {}
             _add_usage(_total_usage, dict(result.usage or {}))

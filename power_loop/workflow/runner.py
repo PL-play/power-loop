@@ -59,7 +59,7 @@ OnComplete = Callable[["WorkflowCompletion"], Awaitable[None]]
 
 __all__ = [
     "run_detached", "make_wake_guard", "register_wake_guard", "make_on_step", "spawn_background",
-    "claim_wake", "parse_workflow_wake", "get_run_handle", "stop_run",
+    "claim_wake", "parse_workflow_wake", "get_run_handle", "stop_run", "cancel_node",
 ]
 
 #: run_ids whose engine is currently executing IN THIS PROCESS (set by spawn_background +
@@ -123,6 +123,27 @@ def make_on_step(store: Any, parent_sid: str, run_id: str):
         )
 
     return _on_step
+
+
+def make_on_node_session(store: Any, parent_sid: str, run_id: str):
+    """叶子会话建好时把「节点 → 会话」记进 journal（6.46），resume 时接着原会话跑。"""
+
+    async def _on_node_session(node_id: str, session_id: str) -> None:
+        await journal.node_session(store, parent_sid, run_id, node_id=node_id, session_id=session_id)
+
+    return _on_node_session
+
+
+#: run_id → 正在本进程跑的引擎（6.46）：单节点取消要找到它。
+_ENGINES: dict[str, Any] = {}
+
+
+def cancel_node(run_id: str, node_id: str, reason: str = "cancelled by host") -> int | None:
+    """只取消某个 run 里的一个节点（6.46）。返回停了几个在跑的叶子；None = 这个 run 不在本进程跑。"""
+    eng = _ENGINES.get(run_id)
+    if eng is None:
+        return None
+    return int(eng.cancel_node(node_id, reason))
 
 
 def make_on_node_start(store: Any, parent_sid: str, run_id: str):
@@ -287,6 +308,7 @@ async def run_detached(
             loop, executor=workflow._executor, budget=workflow._budget,
             on_step=make_on_step(store, parent_sid, run_id),
             on_node_start=make_on_node_start(store, parent_sid, run_id),
+            on_node_session=make_on_node_session(store, parent_sid, run_id),
             stop_event=workflow._cancel, run_id=run_id,
             allowed_tools=workflow._allowed_tools,
             file_io=getattr(workflow, "_file_io", None),
@@ -331,7 +353,13 @@ def spawn_background(
     async def _bg() -> None:
         status = "failed"
         try:
-            result = await build_engine().run(run_spec)
+            engine = build_engine()
+            _ENGINES[run_id] = engine
+            try:
+                result = await engine.run(run_spec)
+            finally:
+                if _ENGINES.get(run_id) is engine:
+                    _ENGINES.pop(run_id, None)
             await journal.finalize(store, parent_sid, run_id, result)
             status = result.status
             note = _wake_note(run_id, status)

@@ -187,6 +187,8 @@ class _SessionSync:
     # waiting tools await it); cleared when the inbox is claimed.
     steer: asyncio.Event = field(default_factory=asyncio.Event)
     refs: set[int] = field(default_factory=set)
+    # 运行中追加的轮数（6.46，extend_rounds）：正在跑的这个 send 在下一轮开始时把它加到轮数上限上。
+    round_bonus: int = 0
 
 
 # session_id -> _SessionSync. PROCESS-GLOBAL and deliberately NOT per-instance state.
@@ -208,6 +210,17 @@ class _SessionSync:
 # session driven from two event loops (e.g. mixing the sync API's runner thread with direct async
 # calls) is already broken today with per-instance locks. This changes nothing there.
 _SESSION_SYNC: dict[str, _SessionSync] = {}
+
+
+def take_round_bonus(session_id: str | None) -> int:
+    """取走这个会话运行中追加的轮数（6.46，extend_rounds）；流水线每轮开始时调。"""
+    if not session_id:
+        return 0
+    entry = _SESSION_SYNC.get(session_id)
+    if entry is None or entry.round_bonus <= 0:
+        return 0
+    n, entry.round_bonus = entry.round_bonus, 0
+    return n
 # Guards only registry mutation (dict insert/delete) — instances may be constructed from several
 # threads. Never held across an await.
 _SESSION_SYNC_GUARD = threading.Lock()
@@ -870,6 +883,15 @@ class StatefulAgentLoop:
         """Authoritative ``{"pending": n, "steer": m}`` for ``session_id`` from the store."""
         store = await self._ensure_store()
         return await store.inbox_counts(session_id)
+
+    def extend_rounds(self, session_id: str, rounds: int) -> bool:
+        """给**正在跑**的会话加轮数（6.46，DeepTalk design/170）：它在下一轮开始时把轮数上限加上 ``rounds``。
+        会话没在跑（锁没被占）返回 False——空闲的会话用 follow_up / send 的 max_rounds。"""
+        entry = _SESSION_SYNC.get(session_id)
+        if entry is None or not entry.lock.locked() or int(rounds) <= 0:
+            return False
+        entry.round_bonus += int(rounds)
+        return True
 
     def steer_event(self, session_id: str) -> asyncio.Event:
         """The session's "steering is waiting" event (set while a ``mode="steer"`` item this

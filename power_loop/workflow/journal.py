@@ -189,6 +189,23 @@ async def node_start(
     await store.mutate_runtime_state(parent_sid, run_key(run_id), _apply, default=None)
 
 
+async def node_session(
+    store: SessionStore, parent_sid: str, run_id: str, *, node_id: str, session_id: str
+) -> None:
+    """记下节点的叶子会话（``live_sessions[node_id] = session_id``，6.46）。进程重启后 resume 对没做完、
+    有会话的节点在原会话接着跑，不再从头开新会话（叶子的上下文和半成品都在）。"""
+    def _apply(jn: Any) -> Any:
+        if jn is None or _is_terminal(jn.get("status")):
+            return MUTATE_SKIP
+        ls = dict(jn.get("live_sessions") or {})
+        ls[node_id] = session_id
+        jn["live_sessions"] = ls
+        jn["updated_at_ms"] = _now_ms()
+        return jn
+
+    await store.mutate_runtime_state(parent_sid, run_key(run_id), _apply, default=None)
+
+
 async def record_step(
     store: SessionStore,
     parent_sid: str,

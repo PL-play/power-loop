@@ -42,6 +42,7 @@ from .runner import (
     _LIVE_RUN_IDS,
     OnComplete,
     is_run_live,
+    make_on_node_session,
     make_on_node_start,
     make_on_step,
     spawn_background,
@@ -143,6 +144,13 @@ async def rehydrate(
     return spec, replay, j
 
 
+def resume_sessions(spec: WorkflowSpec, replay: dict[str, AgentResult], j: dict[str, Any]) -> dict[str, str]:
+    """没做完、但记下了叶子会话的节点（6.46）：resume 时在原会话接着跑，不从头开。foreach 迭代不在内（共用 id）。"""
+    replayable = replayable_node_ids(spec)
+    return {nid: str(sid) for nid, sid in (j.get("live_sessions") or {}).items()
+            if nid in replayable and nid not in replay and sid}
+
+
 def _journaled_clamp(j: dict[str, Any]) -> frozenset[str] | None:
     """The run's journaled capability clamp (see ``journal.new_journal``).
 
@@ -208,6 +216,8 @@ async def resume_run(
         loop, executor=executor, budget=budget,
         on_step=make_on_step(store, parent_sid, run_id),
         on_node_start=make_on_node_start(store, parent_sid, run_id),
+        on_node_session=make_on_node_session(store, parent_sid, run_id),
+        resume_sessions=resume_sessions(spec, replay, j),
         replay=replay, run_id=run_id,
         allowed_tools=_journaled_clamp(j),
         file_io=file_io,
@@ -259,6 +269,8 @@ async def resume_detached(
             loop, executor=executor, budget=budget,
             on_step=make_on_step(store, parent_sid, run_id),
             on_node_start=make_on_node_start(store, parent_sid, run_id),
+            on_node_session=make_on_node_session(store, parent_sid, run_id),
+            resume_sessions=resume_sessions(spec, replay, j),
             replay=replay, run_id=run_id, stop_event=cancel_token,
             allowed_tools=_journaled_clamp(j),
             file_io=file_io,

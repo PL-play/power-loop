@@ -38,7 +38,7 @@ from typing import Any, Protocol
 
 from power_loop.core.agent_context import reset_session_id, set_session_id
 from power_loop.runtime.cancellation import CancellationLike, CancellationToken
-from power_loop.runtime.spec import AgentSpec, run_agent_spec
+from power_loop.runtime.spec import _ON_CHILD_SESSION, AgentSpec, run_agent_spec
 from power_loop.runtime.structured import StructuredOutputError, parse_structured
 
 from .result import AgentResult, SharedBudget, WorkflowResult
@@ -65,6 +65,10 @@ MAX_TOTAL_LEAVES = 10_000
 
 #: ``{{var}}``（foreach 变量等）和 ``{{node.key}}``（上游节点结构化输出里的一个键，6.45：之前不认带点的名字，
 #: YAML 的 ``${{ needs.x.outputs.k }}`` 编成 ``{{x.k}}`` 后原样送给了模型）。节点 id 可以带短横线。
+#: 重启后在原会话接着跑时给叶子的话（6.46）
+_RESUME_PROMPT = ("进程重启打断了你，你的会话、文件和半成品都还在。先看一眼自己做到哪了（todo、产出文件），"
+                  "接着把原来的任务做完，然后照原来的要求给出最终回复。")
+
 _VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][\w-]*(?:\.[a-zA-Z_]\w*)?)\s*\}\}")
 
 # Set while a workflow run is in flight. Propagates into child sub-agent tasks
@@ -249,6 +253,8 @@ class WorkflowEngine:
         close_driver: bool = True,
         allowed_tools: frozenset[str] | None = None,
         file_io: WorkflowFileIO | None = None,
+        on_node_session: Callable[[str, str], Awaitable[None]] | None = None,
+        resume_sessions: dict[str, str] | None = None,
     ) -> None:
         self._loop = parent_loop
         self._executor = executor or InProcessExecutor()
@@ -275,7 +281,17 @@ class WorkflowEngine:
         # Cooperative cancellation: forwarded into every in-flight leaf so they
         # stop at their next checkpoint, and checked before spawning new leaves
         # so a cancelled run stops fanning out.
-        self._cancel: CancellationToken = CancellationToken.from_any(stop_event)
+        # 6.46：引擎自己也持有一个令牌（run 超时用它停整个 run），和外面传进来的「谁取消都算」。
+        self._own_cancel = CancellationToken()
+        self._cancel: CancellationToken = CancellationToken.any_of(
+            CancellationToken.from_any(stop_event), self._own_cancel)
+        self._timed_out = False
+        # 单节点取消（6.46）：每个节点一个子令牌——取消它只停这个节点，run 和别的节点照跑。
+        self._node_tokens: dict[str, list[CancellationToken]] = {}
+        self._node_cancelled: set[str] = set()
+        # 叶子会话建好时的观察者（runner 把「节点 → 会话」记进 journal）；resume 时有会话的节点在原会话接着跑。
+        self._on_node_session = on_node_session
+        self._resume_sessions: dict[str, str] = dict(resume_sessions or {})
         # Resume support: results of already-completed nodes, keyed by node id,
         # rehydrated from a run's journal. A node whose id is here is replayed
         # (its cached result is returned) instead of re-executed. Foreach-body
@@ -325,6 +341,13 @@ class WorkflowEngine:
             env: dict[str, Any] = {"input": spec.input}
             status = "completed"
             guard = _IN_WORKFLOW.set(True)
+            watchdog: asyncio.Task[None] | None = None
+            if spec.timeout_s:
+                async def _watchdog(limit: float = float(spec.timeout_s)) -> None:
+                    await asyncio.sleep(limit)
+                    self._timed_out = True
+                    self._own_cancel.cancel(f"run timeout ({int(limit)}s)")
+                watchdog = asyncio.create_task(_watchdog(), name="workflow-timeout")
             try:
                 await self._exec(spec.root, env, driver_sid)
             except WorkflowRunError as exc:
@@ -332,7 +355,12 @@ class WorkflowEngine:
                 self._errors.append(str(exc))
             finally:
                 _IN_WORKFLOW.reset(guard)
-            if self._cancelled or self._cancel.is_cancelled():
+                if watchdog is not None:
+                    watchdog.cancel()
+            if self._timed_out:
+                status = "failed"
+                self._errors.append(f"run 超时（{int(spec.timeout_s or 0)} 秒）：没跑完的节点已停，没开始的不再启动")
+            elif self._cancelled or self._cancel.is_cancelled():
                 status = "cancelled"
             elif self._budget_hit:
                 status = "budget_exceeded"
@@ -345,7 +373,7 @@ class WorkflowEngine:
                 # （只认 "failed" 的老判定漏掉它；continuation 救回来的已经是 completed 了）。
                 broken = [
                     nid for nid, r in self._results.items()
-                    if r.status not in ("completed",) and nid not in self._tolerated
+                    if r.status not in ("completed", "skipped") and nid not in self._tolerated
                 ]
                 if broken:
                     status = "failed"
@@ -417,6 +445,14 @@ class WorkflowEngine:
             await self._emit_step(res)
             return res
 
+        if node.when is not None:
+            ok, why = self._eval_when(node.when)
+            if not ok:
+                res = AgentResult(node_id=node.id, status="skipped", text="", error=f"条件不成立，跳过：{why}")
+                self._results[node.id] = res
+                await self._emit_step(res)
+                return res
+
         if self._budget is not None and not self._budget.can_spawn():
             self._budget_hit = True
             res = AgentResult(node_id=node.id, status="budget_exceeded", text="",
@@ -441,7 +477,9 @@ class WorkflowEngine:
                 up = self._results.get(ref)
                 if up is None:
                     continue
-                if up.status != "completed":
+                if up.status == "skipped":
+                    extras.append(f"[上游节点 '{ref}' 条件不成立，跳过了：{up.error or ''}]")
+                elif up.status != "completed":
                     # 🔴 上游失败时**绝不能**给空字符串:下游模型会把「没说话」读成「没意见」,
                     # 进而在缺证据的情况下下结论。给一个显式的失败说明。
                     extras.append(
@@ -502,6 +540,21 @@ class WorkflowEngine:
             except Exception:  # noqa: BLE001 — observability must not fail the run
                 pass
 
+        node_tok = self._cancel.child()
+        self._node_tokens.setdefault(node.id, []).append(node_tok)
+        # 重启后接着跑（6.46）：这个节点上次有叶子会话、没做完 → 先在原会话补轮；补不了再照常开新会话。
+        resumed_raw: dict[str, Any] | None = None
+        rs = self._resume_sessions.pop(node.id, None) if not self._emit_suppressed else None
+        if rs:
+            try:
+                resumed_raw = await self._continue_leaf(
+                    rs, _RESUME_PROMPT, extra_rounds=max(int(node.spec.max_rounds or 30), 10), stop=node_tok)
+                resumed_raw.setdefault("session_id", rs)
+                logger.info("workflow leaf %s resumed in its original session %s", node.id, rs)
+            except Exception as exc:  # noqa: BLE001 — 会话丢了就照常重跑
+                logger.warning("workflow leaf %s: resume in session %s failed (%s); re-running", node.id, rs, exc)
+                resumed_raw = None
+
         # ── 重试循环（design/64 §1）──────────────────────────────────────────────
         # 每次 attempt 都起**新的叶子会话**（失败会话的上下文可能已被半截的工具调用污染）。
         # idempotency_key 跨 attempt 不变（变了工具就没法去重），attempt 号单独进 metadata。
@@ -522,15 +575,24 @@ class WorkflowEngine:
                     # 第 N 次重试等 backoff_s * factor**(N-1)；factor=1 就是固定间隔。
                     delay = policy.backoff_s * (policy.backoff_factor ** (attempt - 2))
                     await asyncio.sleep(min(delay, MAX_BACKOFF_S))
-            raw = await self._executor.run_agent(
-                replace(spec, metadata={**spec.metadata, "attempt": attempt}),
-                user_input, parent_loop=self._loop, driver_sid=driver_sid,
-                stop_event=self._cancel,
-            )
+            if attempt == 1 and resumed_raw is not None:
+                raw = resumed_raw
+            else:
+                cb_tok = (_ON_CHILD_SESSION.set(self._session_cb(node.id))
+                          if self._on_node_session is not None and not self._emit_suppressed else None)
+                try:
+                    raw = await self._executor.run_agent(
+                        replace(spec, metadata={**spec.metadata, "attempt": attempt}),
+                        user_input, parent_loop=self._loop, driver_sid=driver_sid,
+                        stop_event=node_tok,
+                    )
+                finally:
+                    if cb_tok is not None:
+                        _ON_CHILD_SESSION.reset(cb_tok)
             if attempt >= max_attempts or not self._should_retry(raw, triggers):
                 break
             # 取消/预算耗尽时不再重试:那不是「这次没跑好」,是整个 run 该停了。
-            if self._cancel.is_cancelled() or (
+            if node_tok.is_cancelled() or (
                 self._budget is not None and not self._budget.can_spawn()
             ):
                 break
@@ -546,7 +608,7 @@ class WorkflowEngine:
             for c_i in range(1, cont.max_continuations + 1):
                 if str(raw.get("status")) not in ("hit_round_limit", "context_checkpoint") or not raw.get("session_id"):
                     break
-                if self._cancel.is_cancelled() or (
+                if node_tok.is_cancelled() or (
                     self._budget is not None and not self._budget.can_spawn()
                 ):
                     break
@@ -558,7 +620,7 @@ class WorkflowEngine:
                             node.id, c_i, cont.max_continuations, cont.extra_rounds)
                 try:
                     more = await self._continue_leaf(
-                        str(raw["session_id"]), prompt, extra_rounds=cont.extra_rounds)
+                        str(raw["session_id"]), prompt, extra_rounds=cont.extra_rounds, stop=node_tok)
                 except Exception as exc:  # noqa: BLE001 — 续跑失败不毁掉已有成果
                     logger.warning("workflow leaf %s continuation failed: %s", node.id, exc)
                     break
@@ -577,7 +639,12 @@ class WorkflowEngine:
                     self._budget.commit(more.get("usage") or {})
 
         if str(raw.get("status")) == "cancelled":
-            self._cancelled = True
+            if node_tok.is_cancelled() and not self._cancel.is_cancelled():
+                # 只取消了这一个节点（cancel_node）：run 照跑，这个节点按「放行的失败」记
+                self._node_cancelled.add(node.id)
+                raw = {**raw, "error": raw.get("error") or f"节点被单独取消：{node_tok.reason}"}
+            else:
+                self._cancelled = True
         payload: dict[str, Any] | None = None
         err: str | None = None
         if node.output_schema is not None and raw.get("status") == "completed":
@@ -624,10 +691,58 @@ class WorkflowEngine:
                 await self._emit_step(res)
                 return res
 
-        # continue_on_error:失败但明确放行——记下来,run 终态判定跳过它。
-        if res.status == "failed" and node.continue_on_error:
+        # continue_on_error:失败但明确放行——记下来,run 终态判定跳过它。被单独取消的节点同样放行。
+        if (res.status == "failed" and node.continue_on_error) or node.id in self._node_cancelled:
             self._tolerated.add(node.id)
         return res
+
+    def _session_cb(self, node_id: str) -> Callable[[str], Awaitable[None]]:
+        async def _cb(sid: str) -> None:
+            if self._on_node_session is not None:
+                try:
+                    await self._on_node_session(node_id, sid)
+                except Exception:  # noqa: BLE001 — 观测失败不毁叶子
+                    logger.debug("on_node_session failed for %s", node_id, exc_info=True)
+        return _cb
+
+    def cancel_node(self, node_id: str, reason: str = "cancelled by host") -> int:
+        """只取消一个节点（6.46）：它在跑就在下一个检查点停下，run 和别的节点照跑；被取消的节点按「放行的失败」记。
+        返回取消了几个在跑的叶子（foreach 的迭代共用一个 id，会一起停）。"""
+        n = 0
+        for tok in self._node_tokens.get(node_id) or []:
+            if not tok.is_cancelled():
+                tok.cancel(reason)
+                n += 1
+        return n
+
+    def _eval_when(self, when: dict[str, Any]) -> tuple[bool, str]:
+        """``when`` 成立吗？引用取不到（上游失败 / 跳过 / 没交结构化结果）按不成立。返回 (成立, 说明)。"""
+        ref = str(when.get("ref") or "")
+        op = str(when.get("op") or "truthy")
+        try:
+            value = self._resolve_ref(ref)
+        except WorkflowRunError as exc:
+            return False, f"取不到 {ref}（{exc}）"
+
+        def norm(x: Any) -> Any:
+            if isinstance(x, str) and x.strip().lower() in ("true", "false"):
+                return x.strip().lower() == "true"
+            return x
+
+        v = norm(value)
+        target = when.get("value")
+        if op == "truthy":
+            ok = bool(v)
+        elif op == "falsy":
+            ok = not bool(v)
+        elif op == "eq":
+            ok = v == norm(target) or str(value) == str(target)
+        elif op == "ne":
+            ok = not (v == norm(target) or str(value) == str(target))
+        else:  # in
+            ok = any(v == norm(x) or str(value) == str(x) for x in (target or []))
+        shown = json.dumps(value, ensure_ascii=False)[:80] if not isinstance(value, str) else value[:80]
+        return ok, f"{ref} = {shown}（要求 {op}{'' if op in ('truthy', 'falsy') else ' ' + json.dumps(target, ensure_ascii=False)[:60]}）"
 
     def _render_fileref(self, path: str, slice_expr: str) -> str:
         if self._file_io is None:
@@ -651,14 +766,15 @@ class WorkflowEngine:
         except Exception:  # noqa: BLE001
             return []
 
-    async def _continue_leaf(self, session_id: str, prompt: str, *, extra_rounds: int) -> dict[str, Any]:
+    async def _continue_leaf(self, session_id: str, prompt: str, *, extra_rounds: int,
+                             stop: CancellationToken | None = None) -> dict[str, Any]:
         """原会话补轮。走 executor 的 ``continue_agent``（host 可换实现，如加自己的 guards）；
         没有该方法的旧 executor 退回 InProcessExecutor 的默认路径。"""
         fn = getattr(self._executor, "continue_agent", None)
         if fn is None:
             fn = InProcessExecutor().continue_agent
         return await fn(session_id, prompt, parent_loop=self._loop,
-                        extra_rounds=extra_rounds, stop_event=self._cancel)
+                        extra_rounds=extra_rounds, stop_event=stop or self._cancel)
 
     @staticmethod
     def _should_retry(raw: dict[str, Any], triggers: set[str]) -> bool:

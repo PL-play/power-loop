@@ -1600,6 +1600,10 @@ class AgentPipeline:
         round_idx = -1
         while True:
             round_idx += 1
+            from power_loop.agent.stateful_loop import take_round_bonus
+            _bonus = take_round_bonus(self.session_id)
+            if _bonus:
+                self._round_limit += _bonus   # 宿主在运行中加了轮数（extend_rounds）
             if round_idx >= self._round_limit:
                 # ── Hook: COMPLETE_DECIDE (round budget exhausted) ──
                 # A SHORT_CIRCUIT with inject extends the budget and keeps
