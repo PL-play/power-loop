@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import re
+from collections import ChainMap
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import replace
@@ -57,6 +58,37 @@ from .spec import (
 
 #: 循环信息在 env 里的键（模板变量正则匹配不到它，不会被当成 {{变量}}）
 _LOOP_KEY = "\x00loop"
+
+#: 当前 foreach 迭代自己的结果表（6.46.1）。body 的节点在每次迭代里 id 都一样，并行迭代共用全局结果表时，
+#: 体内的 inputs_from / when / 循环的 until 会读到别的迭代的结果。每个迭代在自己的 task 里开一层，嵌套的迭代再往里叠一层。
+_ITER_SCOPE: ContextVar[ChainMap[str, AgentResult] | None] = ContextVar("pl_wf_iter_scope", default=None)
+
+
+class _ScopedResults(dict):
+    """节点结果表：写的时候全局和当前迭代都写；读的时候先看当前迭代（再往外层迭代），最后看全局。
+    ``dict(self)`` / ``.items()`` 拿到的是全局那份（run 结果、journal 用）。"""
+
+    def __setitem__(self, key: str, value: AgentResult) -> None:
+        super().__setitem__(key, value)
+        scope = _ITER_SCOPE.get()
+        if scope is not None:
+            scope[key] = value
+
+    def get(self, key: str, default: Any = None) -> Any:
+        scope = _ITER_SCOPE.get()
+        if scope is not None and key in scope:
+            return scope[key]
+        return super().get(key, default)
+
+    def __getitem__(self, key: str) -> AgentResult:
+        scope = _ITER_SCOPE.get()
+        if scope is not None and key in scope:
+            return scope[key]
+        return super().__getitem__(key)
+
+    def __contains__(self, key: object) -> bool:
+        scope = _ITER_SCOPE.get()
+        return (scope is not None and key in scope) or super().__contains__(key)
 
 __all__ = ["Executor", "InProcessExecutor", "WorkflowEngine", "WorkflowRunError", "in_workflow"]
 
@@ -329,7 +361,7 @@ class WorkflowEngine:
         # Stable id for this run; threaded into each leaf's metadata as an
         # idempotency key so side-effecting tools can dedupe across a resume.
         self._run_id = run_id
-        self._results: dict[str, AgentResult] = {}
+        self._results: dict[str, AgentResult] = _ScopedResults()
         self._errors: list[str] = []
         self._last: AgentResult | None = None
         self._budget_hit = False
@@ -999,10 +1031,15 @@ class WorkflowEngine:
             # ITERATION_ENV_KEY：body 的所有迭代共享同一个 node_id，宿主的 FileIO 端口靠它
             # 给每次迭代分不同的产出文件——不区分的话 N 个并发迭代会追加进同一个文件，互相搅乱。
             child_env = {**env, node.as_var: item, ITERATION_ENV_KEY: index}
-            if node.parallel:
-                async with sem:
-                    return await self._exec(node.body, child_env, driver_sid)
-            return await self._exec(node.body, child_env, driver_sid)
+            outer = _ITER_SCOPE.get()
+            tok = _ITER_SCOPE.set(ChainMap() if outer is None else outer.new_child())
+            try:
+                if node.parallel:
+                    async with sem:
+                        return await self._exec(node.body, child_env, driver_sid)
+                return await self._exec(node.body, child_env, driver_sid)
+            finally:
+                _ITER_SCOPE.reset(tok)
 
         # Per-iteration leaves are not journaled individually (see _emit_step);
         # the aggregate below is the resume unit. Reset even if a body raises.

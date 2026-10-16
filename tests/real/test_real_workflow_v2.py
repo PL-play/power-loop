@@ -71,3 +71,41 @@ async def test_real_loop_dev_review_fix_converges():
     agg = res.results["pier"].payload
     assert agg["converged"] is True and agg["iterations"] >= 2, agg
     assert "to-pier" in res.results["dev"].text and "_" not in res.results["dev"].text.strip().splitlines()[-1]
+
+
+MATRIX_LOOP_SPEC = {
+    "name": "per_scene_loops",
+    "input": "scenes",
+    "root": {"type": "foreach", "id": "scenes", "items": ["pier", "tower", "market"], "as": "scene", "parallel": True,
+             "body": {"type": "loop", "id": "scene-loop", "max_iterations": 3, "continue_nodes": ["dev"],
+                      "until": {"ref": "review.pass"},
+                      "body": {"type": "sequence", "steps": [
+                          {"type": "agent", "id": "dev", "spec": {"name": "dev", "max_tokens": 2048, "system_prompt": (
+                              "You write the exit key for a game scene. Reply with ONLY the key. On your FIRST answer write "
+                              "exactly: to_<scene> (with an underscore). If you later get review feedback, fix the key "
+                              "accordingly and reply with ONLY the fixed key.")},
+                           "input": "Scene: {{scene}}. Write the exit key that leads to this scene."},
+                          {"type": "agent", "id": "review", "spec": {"name": "review", "max_tokens": 2048, "system_prompt": (
+                              "You check an exit key. Rule: only lowercase letters, digits and hyphens; underscores are NOT "
+                              'allowed. Respond ONLY with JSON: {"pass": <true|false>, "key": "<the key you checked>", '
+                              '"problems": ["..."]}.')},
+                           "inputs_from": ["dev"], "input": "Check this key.",
+                           "output_schema": {"name": "Review", "schema": {"type": "object", "required": ["pass", "key", "problems"],
+                                                                          "properties": {"pass": {"type": "boolean"}, "key": {"type": "string"},
+                                                                                         "problems": {"type": "array", "items": {"type": "string"}}}}}},
+                      ]}}},
+}
+
+
+async def test_real_matrix_of_loops_each_scene_fixes_its_own_key():
+    loop = StatefulAgentLoop(llm=create_llm_service_from_env(), db_path=tempfile.mktemp(suffix=".db"),
+                             config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3))
+    res = await create_workflow(MATRIX_LOOP_SPEC, parent_loop=loop).run()
+    assert res.status == "completed", res.errors
+    items = res.results["scenes"].payload["items"]
+    assert len(items) == 3
+    keys = sorted(it["last"]["dev"]["text"].strip().splitlines()[-1] for it in items)
+    # 每一路改的是自己那个场景的 key（迭代之间不串），而且改对了（没有下划线）
+    assert [k for k in keys if "market" in k] and [k for k in keys if "pier" in k] and [k for k in keys if "tower" in k], keys
+    assert all("_" not in k for k in keys), keys
+    assert all(it["converged"] and it["iterations"] >= 2 for it in items), items

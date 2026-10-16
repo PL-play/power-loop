@@ -667,7 +667,8 @@ def _reach_pass(
     if isinstance(node, ForeachNode):
         if node.items_from:
             _need(node.items_from, f"{path}: items_from")
-        _reach_pass(node.body, set(available), refset, problems, f"{path}.body")  # body is isolated
+        # body 每次迭代自成一体：体内可以引用体内先跑完的节点，体外看不到体内
+        _reach_pass(node.body, set(available), refset | _local_ids(node.body), problems, f"{path}.body")
         return {node.id} if node.id else set()
     if isinstance(node, LoopNode):
         # 循环体至少跑一轮：它产出的 id 在 until 判断时和循环之后都可用
@@ -677,6 +678,26 @@ def _reach_pass(
             problems.append(f"{path}: until references '{target}', which is neither in the loop body nor completed before it")
         return produced | {node.id}
     return set()
+
+
+def _local_ids(node: WorkflowNode) -> set[str]:
+    """一个（已解析的）子树里能被同层引用的 id：agent / foreach 聚合 / loop，不进更里层 foreach 的体。"""
+    out: set[str] = set()
+    if isinstance(node, AgentNode):
+        return {node.id} if node.id else out
+    if isinstance(node, ForeachNode):
+        return {node.id} if node.id else out
+    if isinstance(node, LoopNode):
+        out.add(node.id)
+        return out | _local_ids(node.body)
+    for child in (getattr(node, "steps", None) or getattr(node, "branches", None) or ()):
+        out |= _local_ids(child)
+    if isinstance(node, BranchNode):
+        for c in node.cases.values():
+            out |= _local_ids(c)
+        if node.default is not None:
+            out |= _local_ids(node.default)
+    return out
 
 
 def _parse_node(
@@ -1092,7 +1113,11 @@ def _parse_foreach(
     if "body" not in data:
         problems.append(f"{path}: foreach requires 'body'")
     else:
-        body = _parse_node(data["body"], f"{path}.body", problems, ids, body_ids)
+        # 体内的节点可以引用同一个体里的节点（6.46.1：每次迭代有自己的结果表，引擎按迭代取值，不会串）；
+        # 体外仍然只能引用 foreach 的聚合 id。更里一层 foreach 的体照旧不对这一层开放。
+        local: set[str] = set()
+        _collect_referenceable_ids(data["body"], local, in_body=False)
+        body = _parse_node(data["body"], f"{path}.body", problems, ids | local, body_ids - local)
     if body is None:
         return None
     return ForeachNode(

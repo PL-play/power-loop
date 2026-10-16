@@ -436,3 +436,61 @@ async def test_loop_replay_restores_body_results():
     res = await WorkflowEngine(_loop_loop(llm), replay=replay).run(WorkflowSpec.from_json(_loop_spec()))
     assert res.status == "completed" and llm.reviews == 0          # 循环没重跑
     assert "pass=True" in res.results["after"].text
+
+
+@dataclass
+class _IterLLM(LLMService):
+    """review：scene=a 第一轮就过（但回得慢），其余第 2 轮才过；dev 回显输入。看并行迭代会不会读串结果。"""
+
+    async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,
+                       on_chunk_think=None, on_stream_end=None) -> LLMResponse:
+        import asyncio
+        import re
+
+        sp = (request.system_prompt or "").lower()
+        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user"), "")
+        if "review" in sp:
+            m = re.search(r"scene=(\w+) it=(\d+)", last)
+            scene, it = (m.group(1), int(m.group(2))) if m else ("?", 0)
+            await asyncio.sleep(0.3 if scene == "a" else 0.05)
+            txt = json.dumps({"pass": scene == "a" or it >= 2, "scene": scene})
+        else:
+            txt = f"dev::{last}"
+        return LLMResponse(raw_text=txt, content_text=txt)
+
+    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+        async def _empty() -> AsyncIterator[LLMStreamChunk]:
+            if False:
+                yield LLMStreamChunk()
+        return _empty()
+
+    async def close(self) -> None:
+        return None
+
+
+async def test_loop_inside_parallel_foreach_reads_own_iteration():
+    loop = StatefulAgentLoop(llm=_IterLLM(), db_path=tempfile.mktemp(suffix=".db"),
+                             config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3, compactor=None))
+    spec = {
+        "name": "w", "input": "x",
+        "root": {"type": "foreach", "id": "scenes", "items": ["a", "b", "c"], "as": "scene", "parallel": True,
+                 "body": {"type": "loop", "id": "dev-review", "max_iterations": 3, "continue_nodes": ["dev"],
+                          "until": {"ref": "review.pass", "op": "truthy"},
+                          "body": {"type": "sequence", "steps": [
+                              {"type": "agent", "id": "dev", "spec": {"name": "d", "system_prompt": "dev"},
+                               "input": "build scene={{scene}}"},
+                              {"type": "agent", "id": "review", "spec": {"name": "r", "system_prompt": "review"},
+                               "input": "scene={{scene}} it={{loop_iteration}}", "inputs_from": ["dev"],
+                               "output_schema": {"name": "R", "schema": {"type": "object", "properties": {
+                                   "pass": {"type": "boolean"}, "scene": {"type": "string"}}}}},
+                          ]}}},
+    }
+    res = await create_workflow(spec, parent_loop=loop).run()
+    assert res.status == "completed", res.errors
+    items = res.results["scenes"].payload["items"]
+    by_scene = {it["last"]["review"]["payload"]["scene"]: it for it in items}
+    assert by_scene["a"]["iterations"] == 1 and by_scene["a"]["converged"]
+    assert by_scene["b"]["iterations"] == 2 and by_scene["c"]["iterations"] == 2
+    # 第 2 轮的开发接着自己的会话做，收到的是自己这个场景的审核意见
+    dev_b = by_scene["b"]["last"]["dev"]["text"]
+    assert "第 2/3 轮" in dev_b and '"scene": "b"' in dev_b and '"scene": "c"' not in dev_b
