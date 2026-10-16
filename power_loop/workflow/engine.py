@@ -362,6 +362,7 @@ class WorkflowEngine:
         # idempotency key so side-effecting tools can dedupe across a resume.
         self._run_id = run_id
         self._results: dict[str, AgentResult] = _ScopedResults()
+        self._iter_broken: list[str] = []
         self._errors: list[str] = []
         self._last: AgentResult | None = None
         self._budget_hit = False
@@ -435,10 +436,12 @@ class WorkflowEngine:
                     nid for nid, r in self._results.items()
                     if r.status not in ("completed", "skipped") and nid not in self._tolerated
                 ]
+                # foreach 各路里没成功的（全局表里只留了最后写的那一路，见 _iter_broken）
+                broken += [b for b in self._iter_broken if b.rsplit(".", 1)[-1] not in self._tolerated]
                 if broken:
                     status = "failed"
                     self._errors.append(
-                        "failed node(s): " + ", ".join(sorted(broken))
+                        "failed node(s): " + ", ".join(sorted(set(broken)))
                         + "（如果这些失败是可接受的，给对应节点加 continue_on_error: true）"
                     )
             if self._leaf_cap_hit and status == "completed":
@@ -1032,7 +1035,8 @@ class WorkflowEngine:
             # 给每次迭代分不同的产出文件——不区分的话 N 个并发迭代会追加进同一个文件，互相搅乱。
             child_env = {**env, node.as_var: item, ITERATION_ENV_KEY: index}
             outer = _ITER_SCOPE.get()
-            tok = _ITER_SCOPE.set(ChainMap() if outer is None else outer.new_child())
+            scope: ChainMap[str, AgentResult] = ChainMap() if outer is None else outer.new_child()
+            tok = _ITER_SCOPE.set(scope)
             try:
                 if node.parallel:
                     async with sem:
@@ -1040,6 +1044,10 @@ class WorkflowEngine:
                 return await self._exec(node.body, child_env, driver_sid)
             finally:
                 _ITER_SCOPE.reset(tok)
+                # 这一路里没成功的节点（6.46.1）：全局结果表里体内 id 只留最后写的那一路，run 终态要看每一路
+                for nid, r in scope.maps[0].items():
+                    if r.status not in ("completed", "skipped") and nid not in self._tolerated:
+                        self._iter_broken.append(f"{node.id or 'foreach'}[{index}].{nid}")
 
         # Per-iteration leaves are not journaled individually (see _emit_step);
         # the aggregate below is the resume unit. Reset even if a body raises.

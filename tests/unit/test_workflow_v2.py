@@ -453,7 +453,7 @@ class _IterLLM(LLMService):
             m = re.search(r"scene=(\w+) it=(\d+)", last)
             scene, it = (m.group(1), int(m.group(2))) if m else ("?", 0)
             await asyncio.sleep(0.3 if scene == "a" else 0.05)
-            txt = json.dumps({"pass": scene == "a" or it >= 2, "scene": scene})
+            txt = json.dumps({"pass": scene == "a" or (it >= 2 and scene != "never"), "scene": scene})
         else:
             txt = f"dev::{last}"
         return LLMResponse(raw_text=txt, content_text=txt)
@@ -471,7 +471,19 @@ class _IterLLM(LLMService):
 async def test_loop_inside_parallel_foreach_reads_own_iteration():
     loop = StatefulAgentLoop(llm=_IterLLM(), db_path=tempfile.mktemp(suffix=".db"),
                              config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3, compactor=None))
-    spec = {
+    spec = _ITER_SPEC
+    res = await create_workflow(spec, parent_loop=loop).run()
+    assert res.status == "completed", res.errors
+    items = res.results["scenes"].payload["items"]
+    by_scene = {it["last"]["review"]["payload"]["scene"]: it for it in items}
+    assert by_scene["a"]["iterations"] == 1 and by_scene["a"]["converged"]
+    assert by_scene["b"]["iterations"] == 2 and by_scene["c"]["iterations"] == 2
+    # 第 2 轮的开发接着自己的会话做，收到的是自己这个场景的审核意见
+    dev_b = by_scene["b"]["last"]["dev"]["text"]
+    assert "第 2/3 轮" in dev_b and '"scene": "b"' in dev_b and '"scene": "c"' not in dev_b
+
+
+_ITER_SPEC = {
         "name": "w", "input": "x",
         "root": {"type": "foreach", "id": "scenes", "items": ["a", "b", "c"], "as": "scene", "parallel": True,
                  "body": {"type": "loop", "id": "dev-review", "max_iterations": 3, "continue_nodes": ["dev"],
@@ -484,13 +496,28 @@ async def test_loop_inside_parallel_foreach_reads_own_iteration():
                                "output_schema": {"name": "R", "schema": {"type": "object", "properties": {
                                    "pass": {"type": "boolean"}, "scene": {"type": "string"}}}}},
                           ]}}},
-    }
-    res = await create_workflow(spec, parent_loop=loop).run()
-    assert res.status == "completed", res.errors
+}
+
+
+async def test_one_foreach_iteration_failing_fails_run_deterministically():
+    import copy
+
+    def spec(on_exhausted: str, items: list[str]) -> dict:
+        sp = copy.deepcopy(_ITER_SPEC)
+        sp["root"]["items"] = items
+        sp["root"]["body"]["on_exhausted"] = on_exhausted
+        sp["root"]["body"]["max_iterations"] = 2
+        return sp
+
+    def loop() -> StatefulAgentLoop:
+        return StatefulAgentLoop(llm=_IterLLM(), db_path=tempfile.mktemp(suffix=".db"),
+                                 config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3, compactor=None))
+
+    # 没收敛的那一路排在前面（a 回得慢，最后写全局表的是 a）：run 照样要判失败，其余各路照常做完
+    res = await create_workflow(spec("fail", ["never", "a", "b"]), parent_loop=loop()).run()
+    assert res.status == "failed"
+    assert any("scenes[0].dev-review" in e for e in res.errors), res.errors
     items = res.results["scenes"].payload["items"]
-    by_scene = {it["last"]["review"]["payload"]["scene"]: it for it in items}
-    assert by_scene["a"]["iterations"] == 1 and by_scene["a"]["converged"]
-    assert by_scene["b"]["iterations"] == 2 and by_scene["c"]["iterations"] == 2
-    # 第 2 轮的开发接着自己的会话做，收到的是自己这个场景的审核意见
-    dev_b = by_scene["b"]["last"]["dev"]["text"]
-    assert "第 2/3 轮" in dev_b and '"scene": "b"' in dev_b and '"scene": "c"' not in dev_b
+    assert [it["converged"] for it in items] == [False, True, True]
+    res2 = await create_workflow(spec("continue", ["never", "a", "b"]), parent_loop=loop()).run()
+    assert res2.status == "completed", res2.errors
