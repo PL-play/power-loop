@@ -21,6 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
@@ -231,6 +232,18 @@ def _publish_subagent_event(
         pass
 
 
+#: 用量收集袋（6.45，DeepTalk design/170 §5）：子 agent 跑在父 agent 的工具调用里，它的用量原来只算它自己的——workflow 叶子派的
+#: 子 agent 花的 token 不进叶子的用量、不扣共享预算。每次 run_agent_spec 给子 agent 开一个新袋子；它下面再派的子 agent 跑完把
+#: 「自己 + 袋子里的」放进这个袋子；它自己跑完返回的 usage 也是「自己 + 袋子」，再放进上一层的袋子。
+_USAGE_SINK: ContextVar[dict[str, int] | None] = ContextVar("power_loop_usage_sink", default=None)
+
+
+def _add_usage(into: dict[str, int], usage: dict[str, Any] | None) -> None:
+    for k, v in (usage or {}).items():
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            into[k] = int(into.get(k, 0)) + int(v)
+
+
 async def run_agent_spec(
     spec: AgentSpec | dict[str, Any] | str,
     user_input: str,
@@ -408,9 +421,20 @@ async def run_agent_spec(
         with contextlib.ExitStack() as _guard_stack:
             for _gname, _guard in getattr(parent_loop, "_child_run_guards", ()) or ():
                 _guard_stack.enter_context(_guard())
-            result = await child_loop.send(
-                user_input, session_id=child_sid, stop_event=stop_event
-            )
+            _outer_sink = _USAGE_SINK.get()
+            _my_sink: dict[str, int] = {}
+            _sink_tok = _USAGE_SINK.set(_my_sink)
+            try:
+                result = await child_loop.send(
+                    user_input, session_id=child_sid, stop_event=stop_event
+                )
+            finally:
+                _USAGE_SINK.reset(_sink_tok)
+            _total_usage: dict[str, int] = {}
+            _add_usage(_total_usage, dict(result.usage or {}))
+            _add_usage(_total_usage, _my_sink)
+            if _outer_sink is not None:
+                _add_usage(_outer_sink, _total_usage)
     except BaseException:
         # A raised child run (cancellation, provider error, bug) would otherwise leak the EPHEMERAL
         # child session — the cleanup below is only reached on a normal return (subagent-coordination-2).
@@ -474,5 +498,6 @@ async def run_agent_spec(
         "final_text": result.final_text,
         "rounds": result.rounds,
         "depth": depth,
-        "usage": dict(result.usage or {}),
+        # 自己 + 它下面所有子 agent 的用量（_USAGE_SINK）
+        "usage": _total_usage,
     }

@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+## [6.45.0] — 2026-10-17
+
+workflow v2 第一批（DeepTalk design/170）：节点输入能引用上游的结构化结果；叶子能等自己的后台任务；子 agent 的用量算进调用它的那一层；
+宿主能看到哪些失败节点是被放行的。
+
+### Added
+
+- `background_run(action="wait", task_ids?, timeout_s?)`：阻塞到这些后台任务（不给就是本会话所有在跑的）落定，返回逐件状态和输出尾巴；
+  超时只是不再等，任务照常在跑；等的时候来了插话（steer）就提前返回。workflow 叶子收不到后台任务的完成唤醒，靠它在自己这一轮里拿结果。
+- `WorkflowResult.tolerated`：失败但 `continue_on_error` 放行的节点 id。宿主自己再判 run 终态时要跳过它们（之前宿主看不到，只能一律判失败）。
+
+### Fixed
+
+- 节点 `input` 里的 `{{节点.键}}` 原样送给了模型：引擎的变量正则不认带点的名字。现在从上游节点的结构化结果（output_schema 解析出的 payload）
+  取值，对象 / 列表转成 JSON；取不到时换成一句明确说明（「取不到 x.k：原因」），不让整个 run 崩。节点 id 可以带短横线。
+- 子 agent 的用量原来只算它自己：workflow 叶子在工具调用里派的子 agent 花的 token 不进叶子的用量，也不扣共享预算。现在每层都把
+  「自己 + 下面所有子 agent」的用量交给上一层（`run_agent_spec` 的返回值和引擎的续跑轮都算上）。
+
 ## [6.44.1] — 2026-10-16
 
 `background_run(action="tool")` 拒绝没标 `async_capable` 的工具时，报错只说事实。

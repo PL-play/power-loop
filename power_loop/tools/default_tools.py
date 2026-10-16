@@ -1762,6 +1762,61 @@ class BackgroundManager:
         await asyncio.wait({worker}, timeout=5)
         return "forced"
 
+    async def _status_of(self, store: Any, sid: str | None, task_id: str) -> tuple[str, str]:
+        """(status, 输出尾巴)：优先读 store 里这个会话的行，没有就读进程内记录。"""
+        if store is not None and sid is not None:
+            row = await store.get_background_task(sid, task_id)
+            if row is not None:
+                return str(row.status), str(row.output_tail or "")
+        with self._lock:
+            task = self.tasks.get(task_id)
+        if task is None:
+            return "unknown", ""
+        return str(task.get("status") or "running"), str(task.get("result") or "")
+
+    async def wait(self, task_ids: list[str] | None = None, timeout_s: float = 600.0) -> str:
+        """等后台任务落定（6.45，DeepTalk design/170 §4）：workflow 的叶子收不到后台任务的完成唤醒——它要在自己这一轮里
+        等结果。不给 ``task_ids`` 就等本会话所有还在跑的。等的时候一条插话进来就提前返回（下一轮先处理插话）。
+        返回逐件状态和输出尾巴；超时只是不再等，任务照常在跑。"""
+        store, sid = _current_store_and_session()
+        if store is not None and sid is not None:
+            await self.flush_orphaned(store, sid)
+        ids = [str(x) for x in (task_ids or []) if str(x).strip()]
+        if not ids:
+            if store is not None and sid is not None:
+                ids = [r.task_id for r in await store.list_background_tasks(sid) if str(r.status) == "running"]
+            else:
+                with self._lock:
+                    ids = [tid for tid, tk in self.tasks.items() if tk.get("status") == "running"]
+        if not ids:
+            return "没有在跑的后台任务。"
+        timeout_s = max(1.0, min(float(timeout_s or 600.0), 3600.0))
+
+        async def _poll() -> None:
+            loop = asyncio.get_running_loop()
+            end = loop.time() + timeout_s
+            while loop.time() < end:
+                states = [(await self._status_of(store, sid, tid))[0] for tid in ids]
+                if all(s not in ("running", "unknown") for s in states):
+                    return
+                futs = {self._workers[tid] for tid in ids if tid in self._workers and not self._workers[tid].done()}
+                await asyncio.wait(futs or {asyncio.ensure_future(asyncio.sleep(1.0))}, timeout=1.0,
+                                   return_when=asyncio.FIRST_COMPLETED)
+
+        from power_loop.runtime.steer import wait_or_steer
+
+        _r, steered = await wait_or_steer(_poll(), session_id=sid)
+        lines = []
+        pending = 0
+        for tid in ids:
+            status, tail = await self._status_of(store, sid, tid)
+            pending += status == "running"
+            lines.append(f"{tid}: [{status}] {tail[-1500:] if tail else ''}".rstrip())
+        head = ("等的时候来了新消息，先停下来等（任务照常在跑）。" if steered
+                else f"还有 {pending} 件没做完（等了 {int(timeout_s)} 秒，任务照常在跑）。" if pending
+                else "都做完了。")
+        return head + "\n" + "\n".join(lines)
+
     async def check(self, task_id: str | None = None) -> str:
         store, sid = _current_store_and_session()
         if store is not None and sid is not None:
@@ -1817,6 +1872,7 @@ def register_tool_task_callback(cb: Any) -> None:
 async def run_background(
     action: str, command: str | None = None, task_id: str | None = None,
     tool: str | None = None, args: dict[str, Any] | None = None,
+    task_ids: list[str] | None = None, timeout_s: float | None = None,
 ) -> str:
     """Execute one action of the merged ``background_run`` tool."""
     operation = str(action or "").strip().lower()
@@ -1832,7 +1888,10 @@ async def run_background(
         return await BG.check(None)
     if operation == "tool":
         return await BG.run_tool(tool, args)
-    raise ValueError("background_run action must be one of: run, check, list, tool")
+    if operation == "wait":
+        ids = list(task_ids or []) or ([task_id] if task_id else [])
+        return await BG.wait(ids, timeout_s if timeout_s is not None else 600.0)
+    raise ValueError("background_run action must be one of: run, check, list, tool, wait")
 
 
 async def run_todo(items: list[dict[str, Any]]) -> str:
@@ -2341,7 +2400,7 @@ async def _h_recall_send(**kw: Any) -> Any:
 
 async def _h_background_run(**kw: Any) -> Any:
     return await run_background(kw["action"], kw.get("command"), kw.get("task_id"),
-                                kw.get("tool"), kw.get("args"))
+                                kw.get("tool"), kw.get("args"), kw.get("task_ids"), kw.get("timeout_s"))
 
 
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {

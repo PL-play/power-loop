@@ -352,7 +352,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="background_run",
         description=(
-            "Manage private background tasks with one action: run, tool, or check. action=run "
+            "Manage private background tasks with one action: run, tool, check, list or wait. action=run "
             "starts a shell command in a private non-interactive background worker and returns its "
             "task_id immediately. action=tool runs one async-capable TOOL in the background "
             "(tool=<name>, args={…}) and returns a task_id at once — use it for long, "
@@ -362,7 +362,10 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "While a task runs, do other work, or pass_turn if there is nothing else to do. "
             "action=check is a fallback: call it only when a wake message explicitly asks you to, "
             "or when you suspect a task is stuck — checking early just returns \"running\". It reports "
-            "status/output by task_id; action=list lists all your tasks."
+            "status/output by task_id; action=list lists all your tasks. action=wait blocks until the "
+            "given task_ids (or all your running tasks) finish and returns their results — use it when "
+            "you cannot be woken later (e.g. inside a workflow node) or when your next step needs those "
+            "results; a new message cuts the wait short."
         ),
         input_schema={
             "type": "object",
@@ -372,13 +375,15 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
                     # list = check 不带 task_id 的显式别名（6.17.0）。原来「列出全部」这件事
                     # 藏在「check 不带参数」这个隐式约定里，模型要先知道才用得上——同一件事
                     # 该只有一个名字（design/96 §6.4）。
-                    "enum": ["run", "tool", "check", "list"],
+                    "enum": ["run", "tool", "check", "list", "wait"],
                     "description": "Operation to perform.",
                 },
                 "command": {"type": "string", "description": "Required for action=run: shell command to execute."},
                 "tool": {"type": "string", "description": "Required for action=tool: name of an async-capable tool (marked in its description)."},
                 "args": {"type": "object", "description": "action=tool: the tool's arguments, exactly as you would pass them when calling it directly."},
                 "task_id": {"type": "string", "description": "For action=check: task to inspect; omit to list all tasks."},
+                "task_ids": {"type": "array", "items": {"type": "string"}, "description": "For action=wait: tasks to wait for; omit to wait for all your running tasks."},
+                "timeout_s": {"type": "number", "description": "For action=wait: give up waiting after this many seconds (default 600, max 3600); tasks keep running."},
             },
             "required": ["action"],
         },

@@ -69,6 +69,9 @@ class WorkflowResult:
     final: AgentResult | None = None
     usage: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    #: 失败但明确放行（continue_on_error）的节点 id（6.45）：宿主自己再判一遍 run 终态时要跳过它们，
+    #: 否则 continue_on_error 在宿主侧等于没开（DeepTalk design/170 §6）。
+    tolerated: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -98,6 +101,7 @@ class WorkflowResult:
             "final": self.final.to_dict() if self.final else None,
             "usage": self.usage,
             "errors": self.errors,
+            "tolerated": self.tolerated,
         }
 
 

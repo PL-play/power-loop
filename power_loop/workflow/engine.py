@@ -28,6 +28,7 @@ driver session id **inside each leaf coroutine**, so concurrent fan-out tasks
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -62,7 +63,9 @@ logger = logging.getLogger(__name__)
 #: programmatically-built spec that bypasses the static validation caps. Fail-closed when exceeded.
 MAX_TOTAL_LEAVES = 10_000
 
-_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_]\w*)\s*\}\}")
+#: ``{{var}}``（foreach 变量等）和 ``{{node.key}}``（上游节点结构化输出里的一个键，6.45：之前不认带点的名字，
+#: YAML 的 ``${{ needs.x.outputs.k }}`` 编成 ``{{x.k}}`` 后原样送给了模型）。节点 id 可以带短横线。
+_VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][\w-]*(?:\.[a-zA-Z_]\w*)?)\s*\}\}")
 
 # Set while a workflow run is in flight. Propagates into child sub-agent tasks
 # (asyncio copies the context), so a leaf that calls the create_workflow tool can
@@ -150,19 +153,28 @@ class InProcessExecutor:
         ContinuationPolicy）钳制。"""
         import contextlib as _ctxlib
 
-        with _ctxlib.ExitStack() as guards:
-            for _name, guard in getattr(parent_loop, "_child_run_guards", ()) or ():
-                guards.enter_context(guard())
-            res = await parent_loop.follow_up(
-                user_input, session_id=session_id,
-                stop_event=stop_event, max_rounds=extra_rounds,
-            )
+        from power_loop.runtime.spec import _USAGE_SINK, _add_usage
+
+        sink: dict[str, int] = {}   # 续跑这几轮里派的子 agent 的用量也算进来（design/170 §5）
+        sink_tok = _USAGE_SINK.set(sink)
+        try:
+            with _ctxlib.ExitStack() as guards:
+                for _name, guard in getattr(parent_loop, "_child_run_guards", ()) or ():
+                    guards.enter_context(guard())
+                res = await parent_loop.follow_up(
+                    user_input, session_id=session_id,
+                    stop_event=stop_event, max_rounds=extra_rounds,
+                )
+        finally:
+            _USAGE_SINK.reset(sink_tok)
         status = str(getattr(res, "status", "failed") or "failed")
+        usage = await _usage_delta(parent_loop, session_id, getattr(res, "usage", None))
+        _add_usage(usage, sink)
         return {
             "status": status,
             "final_text": str(getattr(res, "final_text", "") or ""),
             "rounds": int(getattr(res, "rounds", 0) or 0),
-            "usage": await _usage_delta(parent_loop, session_id, getattr(res, "usage", None)),
+            "usage": usage,
             "session_id": session_id,
         }
 
@@ -369,6 +381,7 @@ class WorkflowEngine:
             final=self._last,
             usage=self._total_usage(),
             errors=list(self._errors),
+            tolerated=sorted(self._tolerated),
         )
 
     # ── node dispatch ──────────────────────────────────────────────────────
@@ -421,7 +434,7 @@ class WorkflowEngine:
             return res
         self._leaves_run += 1
 
-        user_input = _render(node.input, env)
+        user_input = _render(node.input, env, self._resolve_ref_soft)
         if node.inputs_from:
             extras = []
             for ref in node.inputs_from:
@@ -869,6 +882,16 @@ class WorkflowEngine:
             )
         return res.payload[key]
 
+    def _resolve_ref_soft(self, ref: str) -> str:
+        """渲染节点输入里的 ``{{node.key}}``：取不到时给一句明确说明，不让整个 run 崩（下游自己判断怎么办）。"""
+        try:
+            value = self._resolve_ref(ref)
+        except WorkflowRunError as exc:
+            return f"[取不到 {ref}：{exc}]"
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
+
     def _total_usage(self) -> dict[str, int]:
         # Accumulated once per real leaf / replayed result — not summed from
         # _results (where foreach bodies share one id and would mis-count).
@@ -883,11 +906,15 @@ def _sum_usage(results: list[AgentResult]) -> dict[str, int]:
     return total
 
 
-def _render(template: str, env: dict[str, Any]) -> str:
-    """Substitute ``{{var}}`` from ``env``; leave unknown placeholders untouched."""
+def _render(template: str, env: dict[str, Any], resolve_ref: Callable[[str], str] | None = None) -> str:
+    """Substitute ``{{var}}`` from ``env`` and ``{{node.key}}`` via ``resolve_ref``; leave unknown placeholders untouched."""
 
     def repl(m: re.Match[str]) -> str:
         name = m.group(1)
-        return str(env[name]) if name in env else m.group(0)
+        if name in env:
+            return str(env[name])
+        if "." in name and resolve_ref is not None:
+            return resolve_ref(name)
+        return m.group(0)
 
     return _VAR_RE.sub(repl, template)

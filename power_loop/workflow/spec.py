@@ -45,7 +45,7 @@ from typing import Any
 from power_loop.contracts.errors import SpecValidationError
 from power_loop.runtime.spec import AgentSpec, AgentSpecError
 
-# Template variable identifier grammar — must match engine._VAR_RE's capture (`[a-zA-Z_]\w*`), so a
+# Template variable identifier grammar — a subset of engine._VAR_RE's capture (which also allows {{node.key}}), so a
 # foreach `as` name validated here is guaranteed substitutable as {{name}} in the body.
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*$")
 
