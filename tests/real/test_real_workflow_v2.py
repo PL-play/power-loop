@@ -40,3 +40,34 @@ async def test_real_dotted_ref_carries_structured_verdict():
     assert verdict and verdict["pass"] is False and verdict["problems"]
     fixed = res.results["fix"].text
     assert "to-pier" in fixed and "{{" not in fixed
+
+
+LOOP_SPEC = {
+    "name": "dev_review_loop",
+    "input": "scene pier",
+    "root": {"type": "sequence", "steps": [
+        {"type": "loop", "id": "pier", "max_iterations": 3, "continue_nodes": ["dev"], "until": {"ref": "review.pass"},
+         "body": {"type": "sequence", "steps": [
+             {"type": "agent", "id": "dev", "spec": {"name": "dev", "max_tokens": 2048, "system_prompt": (
+                 "You write the exit key for a game scene. Reply with ONLY the key. On your FIRST answer write exactly: to_pier. "
+                 "If you later get review feedback, fix the key accordingly and reply with ONLY the fixed key.")},
+              "input": "Write the exit key that leads to the pier."},
+             {"type": "agent", "id": "review", "spec": {"name": "review", "max_tokens": 2048, "system_prompt": (
+                 "You check an exit key. Rule: only lowercase letters, digits and hyphens; underscores are NOT allowed. "
+                 'Respond ONLY with JSON: {"pass": <true|false>, "problems": ["..."]}.')},
+              "inputs_from": ["dev"], "input": "Check this key.",
+              "output_schema": {"name": "Review", "schema": {"type": "object", "required": ["pass", "problems"], "properties": {
+                  "pass": {"type": "boolean"}, "problems": {"type": "array", "items": {"type": "string"}}}}}},
+         ]}},
+    ]},
+}
+
+
+async def test_real_loop_dev_review_fix_converges():
+    loop = StatefulAgentLoop(llm=create_llm_service_from_env(), db_path=tempfile.mktemp(suffix=".db"),
+                             config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3))
+    res = await create_workflow(LOOP_SPEC, parent_loop=loop).run()
+    assert res.status == "completed", res.errors
+    agg = res.results["pier"].payload
+    assert agg["converged"] is True and agg["iterations"] >= 2, agg
+    assert "to-pier" in res.results["dev"].text and "_" not in res.results["dev"].text.strip().splitlines()[-1]

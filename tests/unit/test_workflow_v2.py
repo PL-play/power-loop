@@ -155,7 +155,6 @@ class _CostLLM(LLMService):
 
 async def test_child_usage_flows_into_enclosing_sink():
     from power_loop.runtime.spec import _USAGE_SINK, run_agent_spec
-
     from power_loop.runtime.store.store import SessionStore
 
     store = await SessionStore.open(tempfile.mktemp(suffix=".db"))
@@ -325,3 +324,115 @@ def test_extend_rounds_only_for_running_session():
 
     ok, first, second = asyncio.run(go())
     assert ok and first == 7 and second == 0
+
+
+# ── 第三批：loop（开发 → 审核 → 不过就修）────────────────────────────────────────
+
+
+@dataclass
+class _LoopLLM(LLMService):
+    """review 第 pass_on 次才通过；dev 回显收到的最后一条用户消息（看它收到了什么）。"""
+
+    pass_on: int = 2
+    reviews: int = 0
+
+    async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,
+                       on_chunk_think=None, on_stream_end=None) -> LLMResponse:
+        sp = (request.system_prompt or "").lower()
+        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user"), "")
+        if "review" in sp:
+            self.reviews += 1
+            ok = self.reviews >= self.pass_on
+            txt = json.dumps({"pass": ok, "problems": [] if ok else [f"第{self.reviews}次：出口 key 写错"]})
+        else:
+            txt = f"dev-saw::{last[:300]}"
+        return LLMResponse(raw_text=txt, content_text=txt)
+
+    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
+        async def _empty() -> AsyncIterator[LLMStreamChunk]:
+            if False:
+                yield LLMStreamChunk()
+        return _empty()
+
+    async def close(self) -> None:
+        return None
+
+
+def _loop_spec(max_iterations: int = 3, on_exhausted: str = "fail") -> dict:
+    return {"name": "scene", "input": "做场景 pier", "root": {"type": "sequence", "steps": [
+        {"type": "loop", "id": "pier", "max_iterations": max_iterations, "on_exhausted": on_exhausted,
+         "continue_nodes": ["dev"], "until": {"ref": "review.pass"},
+         "body": {"type": "sequence", "steps": [
+             {"type": "agent", "id": "dev", "spec": {"name": "d", "system_prompt": "dev the scene"}, "input": "做 pier"},
+             {"type": "agent", "id": "review", "spec": {"name": "r", "system_prompt": "review it"}, "inputs_from": ["dev"],
+              "output_schema": {"name": "R", "schema": {"type": "object", "properties": {
+                  "pass": {"type": "boolean"}, "problems": {"type": "array", "items": {"type": "string"}}}}}},
+         ]}},
+        {"type": "agent", "id": "after", "spec": {"name": "a", "system_prompt": "after"}, "input": "pass={{review.pass}}"},
+    ]}}
+
+
+def _loop_loop(llm: LLMService) -> StatefulAgentLoop:
+    return StatefulAgentLoop(llm=llm, db_path=tempfile.mktemp(suffix=".db"),
+                             config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=3, compactor=None))
+
+
+async def test_loop_converges_and_dev_continues_its_session():
+    llm = _LoopLLM(pass_on=2)
+    seen: list[tuple[str, str]] = []
+
+    from power_loop.workflow.engine import WorkflowEngine
+    from power_loop.workflow.spec import WorkflowSpec
+
+    async def on_sess(nid, sid):
+        seen.append((nid, sid))
+
+    res = await WorkflowEngine(_loop_loop(llm), on_node_session=on_sess).run(WorkflowSpec.from_json(_loop_spec()))
+    assert res.status == "completed", res.errors
+    agg = res.results["pier"].payload
+    assert agg["converged"] is True and agg["iterations"] == 2
+    dev_sessions = [s for n, s in seen if n == "dev"]
+    assert len(dev_sessions) == 1                         # 第 2 轮没开新会话
+    assert res.results["dev"].session_id == dev_sessions[0]
+    assert "第 2/3 轮" in res.results["dev"].text and "出口 key 写错" in res.results["dev"].text
+    assert len([s for n, s in seen if n == "review"]) == 2  # 审核每轮新开
+    assert "pass=True" in res.results["after"].text
+
+
+async def test_loop_exhausted_fails_or_continues():
+    res = await create_workflow(_loop_spec(max_iterations=2), parent_loop=_loop_loop(_LoopLLM(pass_on=9))).run()
+    assert res.status == "failed" and res.results["pier"].status == "failed"
+    assert res.results["pier"].payload["converged"] is False and "跑了 2 轮" in (res.results["pier"].error or "")
+    res2 = await create_workflow(_loop_spec(max_iterations=2, on_exhausted="continue"),
+                                 parent_loop=_loop_loop(_LoopLLM(pass_on=9))).run()
+    assert res2.status == "completed" and res2.results["pier"].payload["converged"] is False
+
+
+def test_loop_spec_roundtrip_and_validation():
+    from power_loop.workflow import WorkflowSpecError
+    from power_loop.workflow.spec import WorkflowSpec
+
+    s = WorkflowSpec.from_json(_loop_spec())
+    again = WorkflowSpec.from_json(s.to_dict())
+    assert again.to_dict() == s.to_dict()
+    bad = _loop_spec()
+    bad["root"]["steps"][0]["continue_nodes"] = ["nope"]
+    bad["root"]["steps"][0]["until"] = {"ref": "ghost.pass"}
+    with pytest.raises(WorkflowSpecError) as exc:
+        WorkflowSpec.from_json(bad)
+    text = " ".join(exc.value.problems)
+    assert "continue_nodes 'nope'" in text and "ghost" in text
+
+
+async def test_loop_replay_restores_body_results():
+    from power_loop.workflow.engine import WorkflowEngine
+    from power_loop.workflow.result import AgentResult
+    from power_loop.workflow.spec import WorkflowSpec
+
+    replay = {"pier": AgentResult(node_id="pier", status="completed", text="done", payload={
+        "converged": True, "iterations": 2, "why": "",
+        "last": {"review": {"status": "completed", "text": "{}", "payload": {"pass": True, "problems": []}}}})}
+    llm = _LoopLLM(pass_on=99)
+    res = await WorkflowEngine(_loop_loop(llm), replay=replay).run(WorkflowSpec.from_json(_loop_spec()))
+    assert res.status == "completed" and llm.reviews == 0          # 循环没重跑
+    assert "pass=True" in res.results["after"].text

@@ -86,6 +86,11 @@ def _build_create_workflow_description() -> str:
         "— map body over a list\n"
         "- {\"type\":\"branch\", \"on\": \"node_id.key\", \"cases\": {value: node}, "
         "\"default\"?: node} — pick one child by a prior result\n"
+        "- {\"type\":\"loop\", \"id\", \"body\": node, \"until\": {ref, op?, value?}, \"max_iterations\"?: 1-10, "
+        "\"continue_nodes\"?: [agent ids in body], \"on_exhausted\"?: \"fail\"|\"continue\"} — repeat body "
+        "(e.g. dev then review) until the condition holds; continue_nodes resume their own session each round\n"
+        "An agent node may carry \"when\": {ref, op: eq|ne|in|truthy|falsy, value?} — not met = skipped. "
+        "Top-level \"timeout_s\" caps the whole run.\n"
         "\n"
         "AGENTSPEC (a leaf's \"spec\") — these fields and NO others (unknown keys "
         "are rejected):\n"
@@ -141,7 +146,8 @@ CREATE_WORKFLOW_DEFINITION = ToolDefinition(
                     "{type:'sequence', steps:[node...]}; "
                     "{type:'parallel', branches:[node...], max_concurrency?, on_error?}; "
                     "{type:'foreach', as, items_from|items, body:<node>, parallel?, max_concurrency?, on_error?}; "
-                    "{type:'branch', on:'node_id.key', cases:{value:node}, default?}. "
+                    "{type:'branch', on:'node_id.key', cases:{value:node}, default?}; "
+                    "{type:'loop', id, body:<node>, until:{ref, op?, value?}, max_iterations?, continue_nodes?, on_exhausted?}. "
                     "Use {{var}} in an agent's 'input'/system_prompt for the foreach var or {{input}}."
                 ),
             },
@@ -288,7 +294,7 @@ _handle_create_workflow = _make_create_workflow_handler()
 
 def _spec_summary(spec: WorkflowSpec) -> str:
     """A compact structure recap for a VALID spec (validate_workflow's reply)."""
-    from .spec import AgentNode, BranchNode, ForeachNode, ParallelNode, SequenceNode
+    from .spec import AgentNode, BranchNode, ForeachNode, LoopNode, ParallelNode, SequenceNode
 
     counts: dict[str, int] = {}
     leaf_ids: list[str] = []
@@ -314,6 +320,8 @@ def _spec_summary(spec: WorkflowSpec) -> str:
                 walk(c)
             if node.default is not None:
                 walk(node.default)
+        elif isinstance(node, LoopNode):
+            walk(node.body)
 
     walk(spec.root)
     shape = ", ".join(f"{t}×{n}" for t, n in sorted(counts.items()))

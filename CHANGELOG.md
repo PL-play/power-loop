@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+## [6.46.0] — 2026-10-17
+
+workflow v2 第二、三批（DeepTalk design/170）：条件节点、run 级超时、单节点取消、运行中加轮数、重启后叶子在原会话接着跑；
+新增 `loop` 节点（开发 → 审核 → 不过就修，最多 N 轮）。
+
+### Added
+
+- `AgentNode.when`（`{ref, op, value}`，op 为 `eq/ne/in/truthy/falsy`，ref 引用上游结构化结果 `节点.键`）：不成立时节点状态为
+  `skipped`，不算失败，下游照常跑。
+- `WorkflowSpec.timeout_s`（上限 `MAX_RUN_TIMEOUT_S`）：整个 run 的墙钟超时，到点取消在跑的节点，run 判 failed。
+- 单节点取消：每个节点有自己的子取消令牌；`cancel_node(run_id, node_id)`（runner 层）只停这一个节点，它进 `tolerated`，其余照跑。
+- `StatefulAgentLoop.extend_rounds(n)`：运行中给某个会话加轮数上限，下一轮生效。
+- 叶子会话登记：引擎在子 agent 会话建好时回调（journal 记 `node_session` / `live_sessions`）；`resume_sessions()` 让重启后
+  没跑完的叶子在**原会话**接着做（带一句「你被中断了，接着做」的提示），而不是从头重跑。
+- `LoopNode`（`type: "loop"`）：`body` 反复跑到 `until` 成立；`max_iterations` 1–10；`on_exhausted` 为 `fail`（默认）或 `continue`；
+  `continue_nodes` 里的节点从第 2 轮起在上一轮自己的会话里接着做，并收到 `until` 所引用节点交回的意见；循环体里的节点 id 在循环之后
+  可引用（最后一轮的结果），循环自己交 `{converged, iterations, why, last}`。重放时循环体整体当一个单位，不单独重放体内节点。
+
 ## [6.45.0] — 2026-10-17
 
 workflow v2 第一批（DeepTalk design/170）：节点输入能引用上游的结构化结果；叶子能等自己的后台任务；子 agent 的用量算进调用它的那一层；

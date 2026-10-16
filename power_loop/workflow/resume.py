@@ -51,6 +51,7 @@ from .spec import (
     AgentNode,
     BranchNode,
     ForeachNode,
+    LoopNode,
     ParallelNode,
     SequenceNode,
     WorkflowNode,
@@ -98,6 +99,12 @@ def _collect(node: WorkflowNode, *, in_foreach_body: bool, out: set[str]) -> Non
             out.add(node.id)  # the aggregate is atomically replayable
         _collect(node.body, in_foreach_body=True, out=out)  # body ids are not
         return
+    if isinstance(node, LoopNode):
+        # 循环整体重放（聚合里带着最后一轮的结果）；循环体里的节点不单独重放——没跑完的循环 resume 时从头再跑（6.46）
+        if not in_foreach_body:
+            out.add(node.id)
+        _collect(node.body, in_foreach_body=True, out=out)
+        return
     if isinstance(node, BranchNode):
         for c in node.cases.values():
             _collect(c, in_foreach_body=in_foreach_body, out=out)
@@ -144,11 +151,29 @@ async def rehydrate(
     return spec, replay, j
 
 
+def _session_resumable_ids(node: WorkflowNode, *, in_foreach: bool, out: set[str]) -> None:
+    """能在原会话接着跑的节点：foreach 体以外的 agent（循环体里的也算——循环重跑时第一轮接着原会话）。"""
+    if isinstance(node, AgentNode):
+        if not in_foreach:
+            out.add(node.id)
+        return
+    for child in (getattr(node, "steps", None) or getattr(node, "branches", None) or ()):
+        _session_resumable_ids(child, in_foreach=in_foreach, out=out)
+    if isinstance(node, BranchNode):
+        for c in node.cases.values():
+            _session_resumable_ids(c, in_foreach=in_foreach, out=out)
+        if node.default is not None:
+            _session_resumable_ids(node.default, in_foreach=in_foreach, out=out)
+    if isinstance(node, (ForeachNode, LoopNode)):
+        _session_resumable_ids(node.body, in_foreach=in_foreach or isinstance(node, ForeachNode), out=out)
+
+
 def resume_sessions(spec: WorkflowSpec, replay: dict[str, AgentResult], j: dict[str, Any]) -> dict[str, str]:
     """没做完、但记下了叶子会话的节点（6.46）：resume 时在原会话接着跑，不从头开。foreach 迭代不在内（共用 id）。"""
-    replayable = replayable_node_ids(spec)
+    ok: set[str] = set()
+    _session_resumable_ids(spec.root, in_foreach=False, out=ok)
     return {nid: str(sid) for nid, sid in (j.get("live_sessions") or {}).items()
-            if nid in replayable and nid not in replay and sid}
+            if nid in ok and nid not in replay and sid}
 
 
 def _journaled_clamp(j: dict[str, Any]) -> frozenset[str] | None:

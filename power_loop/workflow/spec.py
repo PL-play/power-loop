@@ -57,6 +57,7 @@ __all__ = [
     "RetryPolicy",
     "RETRY_TRIGGERS",
     "AgentNode",
+    "LoopNode",
     "SequenceNode",
     "ParallelNode",
     "ForeachNode",
@@ -228,9 +229,32 @@ class BranchNode:
     default: WorkflowNode | None = None
 
 
-WorkflowNode = AgentNode | SequenceNode | ParallelNode | ForeachNode | BranchNode
+@dataclass(frozen=True)
+class LoopNode:
+    """反复跑 ``body`` 直到 ``until`` 成立（6.46，DeepTalk design/170 第三批：开发 → 审核 → 不过就修）。
 
-_NODE_TYPES = {"agent", "sequence", "parallel", "foreach", "branch"}
+    - ``until`` 和 AgentNode.when 同一套（``{ref, op, value}``），通常引用循环体里审核节点的结构化结果（``review.pass``）。
+    - ``max_iterations``（1–10）到了还不成立：``on_exhausted="fail"`` 判失败，``"continue"`` 照常往下（结果里 converged=false）。
+    - ``continue_nodes``：从第 2 轮起在**上一轮自己的会话**里接着做的节点（开发：它记得自己做过什么），收到上一轮
+      ``until`` 引用的那个节点交回的意见；其余节点每轮新开会话（审核保持独立）。
+    - 循环体里的节点 id 在循环之后也能引用（最后一轮的结果）；循环自己的 id 交 ``{converged, iterations, why, last}``。
+    """
+
+    type: str
+    id: str
+    body: WorkflowNode
+    until: dict[str, Any]
+    max_iterations: int = 3
+    continue_nodes: tuple[str, ...] = ()
+    on_exhausted: str = "fail"
+
+
+#: 循环的轮数上限
+MAX_LOOP_ITERATIONS = 10
+
+WorkflowNode = AgentNode | SequenceNode | ParallelNode | ForeachNode | BranchNode | LoopNode
+
+_NODE_TYPES = {"agent", "sequence", "parallel", "foreach", "branch", "loop"}
 _ON_ERROR = {"halt", "continue"}
 
 
@@ -417,6 +441,14 @@ def _node_to_dict(node: WorkflowNode) -> dict[str, Any]:
         if node.when is not None:
             out["when"] = dict(node.when)
         return out
+    if isinstance(node, LoopNode):
+        out = {"type": "loop", "id": node.id, "body": _node_to_dict(node.body), "until": dict(node.until),
+               "max_iterations": node.max_iterations}
+        if node.continue_nodes:
+            out["continue_nodes"] = list(node.continue_nodes)
+        if node.on_exhausted != "fail":
+            out["on_exhausted"] = node.on_exhausted
+        return out
     if isinstance(node, SequenceNode):
         out = {"type": "sequence", "steps": [_node_to_dict(s) for s in node.steps]}
         if node.id is not None:
@@ -494,7 +526,7 @@ def _collect_referenceable_ids(data: Any, out: set[str], *, in_body: bool) -> No
         return
     ntype = data.get("type")
     nid = data.get("id")
-    if not in_body and isinstance(nid, str) and nid.strip() and ntype in ("agent", "foreach"):
+    if not in_body and isinstance(nid, str) and nid.strip() and ntype in ("agent", "foreach", "loop"):
         out.add(nid)
     for key in ("steps", "branches"):
         for child in data.get(key) or []:
@@ -637,6 +669,13 @@ def _reach_pass(
             _need(node.items_from, f"{path}: items_from")
         _reach_pass(node.body, set(available), refset, problems, f"{path}.body")  # body is isolated
         return {node.id} if node.id else set()
+    if isinstance(node, LoopNode):
+        # 循环体至少跑一轮：它产出的 id 在 until 判断时和循环之后都可用
+        produced = _reach_pass(node.body, set(available), refset, problems, f"{path}.body")
+        target = _ref_target(str(node.until.get("ref") or ""))
+        if target in refset and target not in available and target not in produced:
+            problems.append(f"{path}: until references '{target}', which is neither in the loop body nor completed before it")
+        return produced | {node.id}
     return set()
 
 
@@ -663,6 +702,8 @@ def _parse_node(
         return _parse_foreach(data, path, problems, ids, body_ids)
     if ntype == "branch":
         return _parse_branch(data, path, problems, ids, body_ids)
+    if ntype == "loop":
+        return _parse_loop(data, path, problems, ids, body_ids)
     return None  # unreachable
 
 
@@ -935,6 +976,58 @@ def _parse_parallel(
         max_concurrency=mc,
         on_error=on_err,
     )
+
+
+def _agent_ids_raw(data: Any, out: list[str]) -> None:
+    if not isinstance(data, dict):
+        return
+    if data.get("type") == "agent" and isinstance(data.get("id"), str):
+        out.append(data["id"])
+    for key in ("steps", "branches"):
+        for child in data.get(key) or []:
+            _agent_ids_raw(child, out)
+    if isinstance(data.get("body"), dict):
+        _agent_ids_raw(data["body"], out)
+    for child in (data.get("cases") or {}).values():
+        _agent_ids_raw(child, out)
+    if isinstance(data.get("default"), dict):
+        _agent_ids_raw(data["default"], out)
+
+
+def _parse_loop(
+    data: dict, path: str, problems: list[str], ids: set[str], body_ids: set[str]
+) -> LoopNode | None:
+    _check_unknown(data, {"type", "id", "body", "until", "max_iterations", "continue_nodes", "on_exhausted"}, path, problems)
+    lid = data.get("id")
+    if not isinstance(lid, str) or not lid.strip():
+        problems.append(f"{path}: loop requires a non-empty string 'id'")
+        lid = "loop"
+    inner: list[str] = []
+    _agent_ids_raw(data.get("body"), inner)
+    until = _parse_when(data.get("until"), f"{path}", problems, ids, body_ids) if data.get("until") is not None else None
+    if until is None:
+        problems.append(f"{path}: loop requires 'until' {{ref, op?, value?}}（通常引用循环体里审核节点的结构化结果）")
+    mi = _int_ge1(data.get("max_iterations", 3), f"{path}.max_iterations", problems, hi=MAX_LOOP_ITERATIONS)
+    cn = data.get("continue_nodes", [])
+    if not (isinstance(cn, list) and all(isinstance(x, str) for x in cn)):
+        problems.append(f"{path}: 'continue_nodes' must be a list of agent ids inside the body")
+        cn = []
+    for x in cn:
+        if x not in inner:
+            problems.append(f"{path}: continue_nodes '{x}' is not an agent inside this loop's body (have: {inner})")
+    oe = data.get("on_exhausted", "fail")
+    if oe not in ("fail", "continue"):
+        problems.append(f"{path}: 'on_exhausted' must be 'fail' or 'continue'")
+        oe = "fail"
+    body = None
+    if "body" not in data:
+        problems.append(f"{path}: loop requires 'body'")
+    else:
+        body = _parse_node(data["body"], f"{path}.body", problems, ids, body_ids)
+    if body is None or until is None:
+        return None
+    return LoopNode(type="loop", id=lid, body=body, until=until, max_iterations=mi,
+                    continue_nodes=tuple(cn), on_exhausted=oe)
 
 
 def _parse_foreach(

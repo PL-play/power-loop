@@ -48,11 +48,15 @@ from .spec import (
     AgentNode,
     BranchNode,
     ForeachNode,
+    LoopNode,
     ParallelNode,
     SequenceNode,
     WorkflowNode,
     WorkflowSpec,
 )
+
+#: 循环信息在 env 里的键（模板变量正则匹配不到它，不会被当成 {{变量}}）
+_LOOP_KEY = "\x00loop"
 
 __all__ = ["Executor", "InProcessExecutor", "WorkflowEngine", "WorkflowRunError", "in_workflow"]
 
@@ -65,6 +69,30 @@ MAX_TOTAL_LEAVES = 10_000
 
 #: ``{{var}}``（foreach 变量等）和 ``{{node.key}}``（上游节点结构化输出里的一个键，6.45：之前不认带点的名字，
 #: YAML 的 ``${{ needs.x.outputs.k }}`` 编成 ``{{x.k}}`` 后原样送给了模型）。节点 id 可以带短横线。
+def _agent_ids(node: WorkflowNode) -> list[str]:
+    out: list[str] = []
+    if isinstance(node, AgentNode):
+        return [node.id]
+    for child in (getattr(node, "steps", None) or getattr(node, "branches", None) or ()):
+        out += _agent_ids(child)
+    if isinstance(node, BranchNode):
+        for c in node.cases.values():
+            out += _agent_ids(c)
+        if node.default is not None:
+            out += _agent_ids(node.default)
+    if isinstance(node, (ForeachNode, LoopNode)):
+        out += _agent_ids(node.body)
+    return out
+
+
+def _loop_prompt(lc: dict[str, Any], user_input: str) -> str:
+    """循环第 2 轮起给 continue_nodes 的话：上一轮为什么没过、意见是什么、在已有成果上改。"""
+    return (f"第 {lc['iteration']}/{lc['max']} 轮：上一轮没通过（{lc.get('why') or ''}）。\n"
+            f"上一轮的意见：\n{lc.get('feedback') or ''}\n\n"
+            "按意见改。你上一轮做的都还在（会话、文件），在已有成果上改，不要从头重做。改完照原来的要求交卷。\n\n"
+            f"（这一轮的任务输入照旧附在下面）\n{user_input}")
+
+
 #: 重启后在原会话接着跑时给叶子的话（6.46）
 _RESUME_PROMPT = ("进程重启打断了你，你的会话、文件和半成品都还在。先看一眼自己做到哪了（todo、产出文件），"
                   "接着把原来的任务做完，然后照原来的要求给出最终回复。")
@@ -425,7 +453,62 @@ class WorkflowEngine:
             return await self._exec_foreach(node, env, driver_sid)
         if isinstance(node, BranchNode):
             return await self._exec_branch(node, env, driver_sid)
+        if isinstance(node, LoopNode):
+            return await self._exec_loop(node, env, driver_sid)
         raise WorkflowRunError(f"unknown node type: {type(node).__name__}")
+
+    async def _exec_loop(self, node: LoopNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
+        """反复跑循环体直到 ``until`` 成立（6.46，design/170 第三批）。循环信息随 env 往下传（几个循环可以并行跑）。"""
+        replayed = self._replay.pop(node.id, None)
+        if replayed is not None:
+            # 整体重放：把最后一轮各节点的结果还原，循环之后对它们的引用照样能用
+            for nid, r in ((replayed.payload or {}).get("last") or {}).items():
+                self._results[nid] = AgentResult(node_id=nid, status=str(r.get("status") or "completed"),
+                                                 text=str(r.get("text") or ""), payload=r.get("payload"),
+                                                 session_id=r.get("session_id"))
+            self._results[node.id] = replayed
+            self._add_usage(replayed.usage)
+            return replayed
+        body_ids = _agent_ids(node.body)
+        feedback_node = str(node.until.get("ref") or "").split(".", 1)[0]
+        prev: dict[str, str] = {}
+        converged, why, iteration = False, "", 0
+        for iteration in range(1, node.max_iterations + 1):
+            if self._cancel.is_cancelled():
+                break
+            lc = {"loop_id": node.id, "iteration": iteration, "max": node.max_iterations,
+                  "continue": set(node.continue_nodes), "prev": dict(prev), "why": why,
+                  "feedback": self._loop_feedback(feedback_node) if iteration > 1 else ""}
+            await self._exec(node.body, {**env, _LOOP_KEY: lc, "loop_iteration": iteration}, driver_sid)
+            for nid in node.continue_nodes:
+                r = self._results.get(nid)
+                if r is not None and r.session_id:
+                    prev[nid] = r.session_id
+            converged, why = self._eval_when(node.until)
+            if converged:
+                break
+            logger.info("workflow loop %s: iteration %d/%d not done (%s)", node.id, iteration, node.max_iterations, why)
+        last = {nid: {"status": r.status, "text": (r.text or "")[:4000], "payload": r.payload, "session_id": r.session_id}
+                for nid in body_ids if (r := self._results.get(nid)) is not None}
+        payload = {"converged": converged, "iterations": iteration, "why": why, "last": last}
+        ok = converged or (node.on_exhausted == "continue" and not self._cancel.is_cancelled())
+        err = None if converged else (f"跑了 {iteration} 轮仍不满足 until：{why}" if not self._cancel.is_cancelled()
+                                      else "循环被取消")
+        res = AgentResult(node_id=node.id, status="completed" if ok else ("cancelled" if self._cancel.is_cancelled() else "failed"),
+                          text=f"循环 {node.id}：{'满足' if converged else '没满足'}（{iteration} 轮）：{why}",
+                          payload=payload, error=err)
+        self._results[node.id] = res
+        await self._emit_step(res)
+        return res
+
+    def _loop_feedback(self, node_id: str) -> str:
+        """上一轮 until 引用的那个节点交回的意见（结构化结果优先）。"""
+        r = self._results.get(node_id)
+        if r is None:
+            return "（上一轮没有意见）"
+        if r.payload is not None:
+            return json.dumps(r.payload, ensure_ascii=False)[:4000]
+        return (r.text or r.error or "")[:4000]
 
     async def _exec_agent(self, node: AgentNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
         # Resume: a completed node is replayed from the journal, not re-run. Pop
@@ -553,6 +636,19 @@ class WorkflowEngine:
                 logger.info("workflow leaf %s resumed in its original session %s", node.id, rs)
             except Exception as exc:  # noqa: BLE001 — 会话丢了就照常重跑
                 logger.warning("workflow leaf %s: resume in session %s failed (%s); re-running", node.id, rs, exc)
+                resumed_raw = None
+
+        lc = env.get(_LOOP_KEY)
+        if (resumed_raw is None and lc and lc["iteration"] > 1 and node.id in lc["continue"]
+                and lc["prev"].get(node.id)):
+            prev_sid = lc["prev"][node.id]
+            try:
+                resumed_raw = await self._continue_leaf(
+                    prev_sid, _loop_prompt(lc, user_input), extra_rounds=max(int(node.spec.max_rounds or 30), 10), stop=node_tok)
+                resumed_raw.setdefault("session_id", prev_sid)
+            except Exception as exc:  # noqa: BLE001 — 接不上就照常新开会话
+                logger.warning("workflow loop %s: continuing %s in %s failed (%s); fresh run",
+                               lc["loop_id"], node.id, prev_sid, exc)
                 resumed_raw = None
 
         # ── 重试循环（design/64 §1）──────────────────────────────────────────────

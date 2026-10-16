@@ -65,6 +65,7 @@ from .spec import (
     BranchNode,
     ContinuationPolicy,
     ForeachNode,
+    LoopNode,
     ParallelNode,
     RetryPolicy,
     SequenceNode,
@@ -100,6 +101,7 @@ __all__ = [
     "SequenceNode",
     "ParallelNode",
     "ForeachNode",
+    "LoopNode",
     "BranchNode",
     # engine
     "WorkflowEngine",
