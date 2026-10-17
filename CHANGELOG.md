@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+## [6.46.3] — 2026-10-17
+
+### Fixed
+- 后台 workflow 跑完、journal 已写终态后，run 立刻算「不在跑」（`is_run_live` = False）。以前要等 `on_complete`
+  （宿主在里面跑完父 agent 的整轮唤醒）返回才算结束：父 agent 醒来后 `nudge` / 续跑叶子必然被拒（「正在本进程跑」）。
+- `stop_run` 对已结束的 run、或者在 run 自己的任务里被调用时（父 agent 在唤醒那一轮里 cancel）直接返回 `finished`，
+  不再等自己、卡到宽限期后把唤醒这一轮取消掉。
+
 ## [6.46.2] — 2026-10-17
 
 ### Fixed

@@ -515,3 +515,24 @@ async def test_detached_run_populates_live_during_execution():
     assert any("a" in live for live in seen_live)   # the leaf was visibly live mid-run
     j = await journal.read(store, psid, handle.run_id)
     assert j.get("status") == "completed" and not (j.get("live") or {})
+
+
+async def test_run_is_not_live_while_its_completion_wakes_the_parent():
+    """6.46.3: the parent's whole wake turn runs inside on_complete. During it the run is already
+    over: is_run_live is False (nudge / resume of its leaves work) and stop_run — even from inside
+    that same task — returns at once instead of waiting on itself."""
+    from power_loop.workflow.runner import is_run_live, stop_run
+
+    loop = _loop()
+    psid = await loop.new_session()
+    seen: dict = {}
+
+    async def on_complete(c: WorkflowCompletion) -> None:
+        seen["live"] = is_run_live(c.run_id)
+        seen["stop"] = await asyncio.wait_for(stop_run(c.run_id, grace_s=30), 2)
+
+    wf = create_workflow(SINGLE, parent_loop=loop, parent_session_id=psid)
+    handle = await wf.start(detached=True, on_complete=on_complete)
+    await asyncio.wait_for(handle.task, 5)
+    assert seen == {"live": False, "stop": "finished"}
+    assert (await get_workflow(loop, psid, handle.run_id))["status"] == "completed"

@@ -80,6 +80,11 @@ _HANDLES: dict[str, WorkflowRunHandle] = {}
 #: runs stopped by :func:`stop_run` — they settle ``cancelled`` and must NOT wake the parent agent
 #: (the user said stop; a "your workflow finished" wake-up would contradict them).
 _STOPPED_RUNS: set[str] = set()
+#: runs whose engine finished and whose journal is final, but whose background task is still
+#: delivering the completion (``on_complete`` / wake). From here on the run is NOT live: the woken
+#: parent may nudge / resume its leaves and a stop is a no-op (6.46.3 — the parent's whole wake
+#: turn ran inside that task, so ``nudge`` was refused and ``cancel`` deadlocked on itself).
+_SETTLED_RUNS: set[str] = set()
 
 
 def get_run_handle(run_id: str) -> WorkflowRunHandle | None:
@@ -94,8 +99,10 @@ async def stop_run(run_id: str, *, grace_s: float = 60.0, reason: str = "stopped
     if handle is None:
         return "unknown"
     task = handle.task
-    if task is None or task.done():
+    if task is None or task.done() or run_id in _SETTLED_RUNS:
         return "finished"
+    if task is asyncio.current_task():
+        return "finished"      # called from inside the run's own completion delivery — never wait on ourselves
     _STOPPED_RUNS.add(run_id)
     handle.cancel(reason)
     done, _ = await asyncio.wait({task}, timeout=grace_s)
@@ -370,6 +377,9 @@ def spawn_background(
             status = "failed"
             note = _wake_note(run_id, "failed", repr(exc))
             _publish(loop, parent_sid, run_id, "failed", "failed", level="error")
+        # The journal is final: the run is over even though this task still delivers the wake below.
+        _LIVE_RUN_IDS.discard(run_id)
+        _SETTLED_RUNS.add(run_id)
         if run_id in _STOPPED_RUNS:
             return  # stopped by request — journaled as cancelled, no wake (design/124 §8.4)
         if on_complete is not None:
@@ -386,6 +396,7 @@ def spawn_background(
     # In-process liveness (workflow-durability-3): mark live now, discard when the task settles —
     # a crashed run is therefore NOT marked live, so resume-after-crash still works.
     _LIVE_RUN_IDS.add(run_id)
+    _SETTLED_RUNS.discard(run_id)      # a resumed run starts unsettled again
     task.add_done_callback(lambda _t: _LIVE_RUN_IDS.discard(run_id))
     handle = WorkflowRunHandle(run_id=run_id, task=task, cancel_token=cancel_token)
     _HANDLES[run_id] = handle
@@ -394,6 +405,7 @@ def spawn_background(
         if _HANDLES.get(run_id) is handle:
             _HANDLES.pop(run_id, None)
         _STOPPED_RUNS.discard(run_id)
+        _SETTLED_RUNS.discard(run_id)
 
     task.add_done_callback(_forget)
     return handle
