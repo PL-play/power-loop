@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+## [6.48.0] — 2026-10-18
+
+### Changed
+- Background tool submissions now queue per store/session instead of failing at eight running calls. Eight submitted tools execute concurrently; queued calls start FIFO without polling or result collection. Already-running calls transferred with `adopt` retain their existing execution.
+- Queued tasks participate in wait, active-job listing and cancellation. Cancelling a queued task prevents invocation and completion wake; idle admission gates are reclaimed.
+- The queue lives in the current process. Hosts must reconcile stale queued/running rows on restart rather than replaying external side effects.
+
 ## [6.47.0] — 2026-10-18
 
 ### Added

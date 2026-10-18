@@ -1272,7 +1272,7 @@ class StatefulAgentLoop:
             jobs.append({"id": "send", "kind": "foreground", "title": "当前这一轮",
                          "status": "running", "started_at": None, "origin": ""})
         for t in await store.list_background_tasks(session_id):
-            if t.status != "running":
+            if t.status not in ("queued", "running"):
                 continue
             jobs.append({"id": f"bg:{t.task_id}", "kind": "background",
                          "title": str(t.command or "")[:80], "status": t.status,

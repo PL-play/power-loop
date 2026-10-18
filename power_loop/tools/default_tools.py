@@ -1262,6 +1262,7 @@ class BackgroundManager:
         # agent when they settle — the user said stop).
         self._stop_tokens: dict[str, Any] = {}
         self._stopped: set[str] = set()
+        self._tool_slots: dict[tuple[Any, int, str | None], tuple[asyncio.Semaphore, int]] = {}
         # Live daemon threads (so shutdown can drain them) and terminal write-backs that
         # could not be delivered to their owning loop (so a later check / shutdown can
         # still persist them instead of leaving the row stuck at 'running' forever).
@@ -1274,7 +1275,7 @@ class BackgroundManager:
         Running tasks are never evicted. Caller must hold ``self._lock``."""
         while len(self.tasks) > _MAX_BG_TASKS:
             for tid, t in self.tasks.items():  # insertion order = oldest first
-                if t.get("status") != "running":
+                if t.get("status") not in ("queued", "running"):
                     del self.tasks[tid]
                     self._threads.pop(tid, None)
                     break
@@ -1527,9 +1528,9 @@ class BackgroundManager:
         计费/活动打标上下文天然跟着走，不需要捕获重播。结果持久化进同一张
         background 任务表（command 字段以 ``tool:`` 前缀区分）；完成后调用宿主注册的
         ``on_tool_task_complete``（best-effort），由宿主决定要不要唤醒睡着的 agent。
-        进程重启 = 任务丢失，行卡 running，由 check 的 flush_orphaned 语义外**另行**
-        诚实兜底：这里在启动时登记 in-memory，check 未命中 in-memory 且行仍 running
-        时按孤儿报告（复用 shell 分支已有的自愈路径）。
+        每个 store/sid 的新调用最多 8 个同时执行，超出后按接收顺序等待。
+        队列驻留当前进程；宿主重启时应把旧 queued/running 行标为 interrupted，
+        不自动重放可能已经产生外部副作用的调用。adopt 接管已经执行的调用，不重新排队。
         """
         from power_loop.core.agent_context import get_current_loop
 
@@ -1579,21 +1580,21 @@ class BackgroundManager:
                 + ("\n可以后台跑的是：" + "、".join(_others) if _others else "")
             )
         store, sid = _current_store_and_session()
-        if store is not None and sid is not None:
-            rows = await store.list_background_tasks(sid)
-            running = sum(1 for r in rows if r.status == "running" and r.command.startswith("tool:"))
-            if running >= 8:
-                raise ValueError("后台工具任务已达并发上限（8）——先 check 收结果再发新的。")
         task_id = str(uuid.uuid4())[:8]
         args = dict(args or {})
         label = f"tool:{name} " + json.dumps(args, ensure_ascii=False)[:160]
-        with self._lock:
-            self.tasks[task_id] = {"command": label, "status": "running", "result": None}
         if store is not None and sid is not None:
             await store.upsert_background_task(
-                sid, task_id=task_id, command=label, status="running",
-                return_code=None, output_tail="(running)",
+                sid, task_id=task_id, command=label, status="queued",
+                return_code=None, output_tail="(queued)",
             )
+        with self._lock:
+            self.tasks[task_id] = {"command": label, "status": "queued", "result": None}
+        # One FIFO admission gate per store/session/event loop. No await between lookup
+        # and registration: concurrent submissions cannot oversubscribe the limit.
+        key = (asyncio.get_running_loop(), id(store), sid)
+        gate, users = self._tool_slots.get(key, (asyncio.Semaphore(8), 0))
+        self._tool_slots[key] = (gate, users + 1)
 
         # Its own ROOT stop token: a background task outlives the send that started it (the
         # UI stop button stops the foreground, not this); only a stop by id reaches it.
@@ -1609,13 +1610,34 @@ class BackgroundManager:
         async def _invoke() -> Any:
             ctok = set_current_cancel_token(tok)
             try:
-                return await registry.invoke_async(name, args)
+                async with gate:
+                    if store is not None and sid is not None:
+                        await store.upsert_background_task(
+                            sid, task_id=task_id, command=label, status="running",
+                            return_code=None, output_tail="(running)",
+                        )
+                    with self._lock:
+                        self.tasks[task_id]["status"] = "running"
+                    return await registry.invoke_async(name, args)
             finally:
                 reset_current_cancel_token(ctok)
 
-        self._supervise(task_id, label, store, sid, _invoke())
+        worker = self._supervise(task_id, label, store, sid, _invoke())
+
+        def release_pool(_task: Any) -> None:
+            semaphore, count = self._tool_slots[key]
+            if count == 1:
+                del self._tool_slots[key]
+            else:
+                self._tool_slots[key] = (semaphore, count - 1)
+
+        worker.add_done_callback(release_pool)
+        # Start supervision before exposing the id, including for immediate cancellation.
+        await asyncio.sleep(0)
         return (
-            f"后台任务已启动：task_id={task_id}（{label[:80]}）。"
+            f"后台任务已接收：task_id={task_id}（{label[:80]}）。"
+            f"当前状态：{self.tasks[task_id]['status']}。"
+            "同一会话最多同时执行 8 个后台工具，超出的自动排队，空出名额后自动执行，无需 check 释放名额。"
             "**完成时结果会自动送到你面前，不用去取。** 现在去做别的；"
             "手上没有别的可做就 pass_turn 停轮等它——用 check 反复问「好了没」只会空烧回合，"
             "任务不会因此快一点，用户还得等你。"
@@ -1752,6 +1774,10 @@ class BackgroundManager:
         if worker.done():
             return "finished"
         self._stopped.add(task_id)
+        if self.tasks.get(task_id, {}).get("status") == "queued":
+            worker.cancel()
+            await asyncio.wait({worker}, timeout=5)
+            return "stopped"
         tok = self._stop_tokens.get(task_id)
         if tok is not None and hasattr(tok, "cancel"):
             tok.cancel("stopped")
@@ -1784,10 +1810,10 @@ class BackgroundManager:
         ids = [str(x) for x in (task_ids or []) if str(x).strip()]
         if not ids:
             if store is not None and sid is not None:
-                ids = [r.task_id for r in await store.list_background_tasks(sid) if str(r.status) == "running"]
+                ids = [r.task_id for r in await store.list_background_tasks(sid) if str(r.status) in ("queued", "running")]
             else:
                 with self._lock:
-                    ids = [tid for tid, tk in self.tasks.items() if tk.get("status") == "running"]
+                    ids = [tid for tid, tk in self.tasks.items() if tk.get("status") in ("queued", "running")]
         if not ids:
             return "没有在跑的后台任务。"
         timeout_s = max(1.0, min(float(timeout_s or 600.0), 3600.0))
@@ -1797,7 +1823,7 @@ class BackgroundManager:
             end = loop.time() + timeout_s
             while loop.time() < end:
                 states = [(await self._status_of(store, sid, tid))[0] for tid in ids]
-                if all(s not in ("running", "unknown") for s in states):
+                if all(s not in ("queued", "running", "unknown") for s in states):
                     return
                 futs = {self._workers[tid] for tid in ids if tid in self._workers and not self._workers[tid].done()}
                 await asyncio.wait(futs or {asyncio.ensure_future(asyncio.sleep(1.0))}, timeout=1.0,
@@ -1810,7 +1836,7 @@ class BackgroundManager:
         pending = 0
         for tid in ids:
             status, tail = await self._status_of(store, sid, tid)
-            pending += status == "running"
+            pending += status in ("queued", "running")
             lines.append(f"{tid}: [{status}] {tail[-1500:] if tail else ''}".rstrip())
         head = ("等的时候来了新消息，先停下来等（任务照常在跑）。" if steered
                 else f"还有 {pending} 件没做完（等了 {int(timeout_s)} 秒，任务照常在跑）。" if pending
