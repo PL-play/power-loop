@@ -121,8 +121,8 @@ def _loop_prompt(lc: dict[str, Any], user_input: str) -> str:
     """循环第 2 轮起给 continue_nodes 的话：上一轮为什么没过、意见是什么、在已有成果上改。"""
     return (f"第 {lc['iteration']}/{lc['max']} 轮：上一轮没通过（{lc.get('why') or ''}）。\n"
             f"上一轮的意见：\n{lc.get('feedback') or ''}\n\n"
-            "按意见改。你上一轮做的都还在（会话、文件），在已有成果上改，不要从头重做。改完照原来的要求交卷。\n\n"
-            "先用 todo 列出本轮审核意见对应的修复与复验任务；上一轮已完成待办只代表历史成果。"
+            "按你的节点职责处理反馈：开发节点局部修复，审核节点独立复验、不能代改。上一轮会话和文件都还在，不从头重做；按原来的要求交卷。\n\n"
+            "先用 todo 列出本轮审核意见对应的修复或复验任务；上一轮已完成待办只代表历史成果。"
             "完成待办后还需提交本轮最终结果；若审核缺少具体问题，先读取审核报告核实。\n\n"
             f"（这一轮的任务输入照旧附在下面）\n{user_input}")
 
@@ -219,15 +219,16 @@ class InProcessExecutor:
         ContinuationPolicy）钳制。"""
         import contextlib as _ctxlib
 
-        from power_loop.runtime.spec import _USAGE_SINK, _add_usage
+        from power_loop.runtime.spec import _USAGE_SINK, _add_usage, workflow_continuation_loop
 
+        leaf_loop = await workflow_continuation_loop(parent_loop, session_id)
         sink: dict[str, int] = {}   # 续跑这几轮里派的子 agent 的用量也算进来（design/170 §5）
         sink_tok = _USAGE_SINK.set(sink)
         try:
             with _ctxlib.ExitStack() as guards:
                 for _name, guard in getattr(parent_loop, "_child_run_guards", ()) or ():
                     guards.enter_context(guard())
-                res = await parent_loop.follow_up(
+                res = await leaf_loop.follow_up(
                     user_input, session_id=session_id,
                     stop_event=stop_event, max_rounds=extra_rounds,
                 )
@@ -784,7 +785,7 @@ class WorkflowEngine:
         self._steering[node.id] = []
         node_tok = self._cancel.child()
         self._node_tokens.setdefault(node.id, []).append(node_tok)
-        # 重启后接着跑（6.46）：这个节点上次有叶子会话、没做完 → 先在原会话补轮；补不了再照常开新会话。
+        # 重启后接着跑（6.46）：这个节点上次有叶子会话、没做完 → 先在原会话补轮；失败保留会话，不隐式重放。
         resumed_raw: dict[str, Any] | None = None
         rs = self._resume_sessions.pop(node.id, None) if not self._emit_suppressed else None
         if rs:
@@ -795,9 +796,10 @@ class WorkflowEngine:
                     rs, prompt, extra_rounds=rounds, stop=node_tok)
                 resumed_raw.setdefault("session_id", rs)
                 logger.info("workflow leaf %s resumed in its original session %s", node.id, rs)
-            except Exception as exc:  # noqa: BLE001 — 会话丢了就照常重跑
-                logger.warning("workflow leaf %s: resume in session %s failed (%s); re-running", node.id, rs, exc)
-                resumed_raw = None
+            except Exception as exc:  # noqa: BLE001 — 保留原会话，防止重复副作用
+                logger.warning("workflow leaf %s: resume in session %s failed (%s); preserving original session", node.id, rs, exc)
+                resumed_raw = {"status": "failed", "session_id": rs,
+                               "error": f"continuation failed without replay: {exc}"}
 
         lc = env.get(_LOOP_KEY)
         if (resumed_raw is None and lc and lc["iteration"] > 1 and node.id in lc["continue"]
@@ -808,10 +810,11 @@ class WorkflowEngine:
                 resumed_raw = await self._continue_leaf(
                     prev_sid, _loop_prompt(lc, user_input), extra_rounds=max(int(node.spec.max_rounds or 30), 10), stop=node_tok)
                 resumed_raw.setdefault("session_id", prev_sid)
-            except Exception as exc:  # noqa: BLE001 — 接不上就照常新开会话
-                logger.warning("workflow loop %s: continuing %s in %s failed (%s); fresh run",
+            except Exception as exc:  # noqa: BLE001 — 续跑失败不能变成首次执行
+                logger.warning("workflow loop %s: continuing %s in %s failed (%s); preserving original session",
                                lc["loop_id"], node.id, prev_sid, exc)
-                resumed_raw = None
+                resumed_raw = {"status": "failed", "session_id": prev_sid,
+                               "error": f"continuation failed without replay: {exc}"}
 
         # ── 重试循环（design/64 §1）──────────────────────────────────────────────
         # 每次 attempt 都起**新的叶子会话**（失败会话的上下文可能已被半截的工具调用污染）。
@@ -847,7 +850,7 @@ class WorkflowEngine:
                 finally:
                     if cb_tok is not None:
                         _ON_CHILD_SESSION.reset(cb_tok)
-            if attempt >= max_attempts or not self._should_retry(raw, triggers):
+            if resumed_raw is not None or attempt >= max_attempts or not self._should_retry(raw, triggers):
                 break
             # 取消/预算耗尽时不再重试:那不是「这次没跑好」,是整个 run 该停了。
             if node_tok.is_cancelled() or (

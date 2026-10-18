@@ -248,6 +248,63 @@ def _add_usage(into: dict[str, int], usage: dict[str, Any] | None) -> None:
             into[k] = int(into.get(k, 0)) + int(v)
 
 
+def _child_config(spec: AgentSpec, parent_loop: Any) -> AgentLoopConfig:
+    response_format = output_response_format(spec.output_schema) if spec.output_schema else None
+
+    # Inherit the parent's transport resilience: the child reuses the parent's
+    # LLM client (same connection pool), and a delegation often fires after a
+    # long tool phase — right when pooled keep-alive connections have gone
+    # stale. Without the parent's retry policy a single httpx.ReadError on the
+    # child's FIRST streaming call killed the whole delegation ("Error: ").
+    parent_config = getattr(parent_loop, "config", None)
+    child_config = AgentLoopConfig(
+        system_prompt=spec.system_prompt,
+        max_rounds=int(spec.max_rounds),
+        # max_tokens=None → 跟父：子运行和父用的是同一个模型（model=None 时），
+        # 父的预算容得下它的思考，子的也该容得下。
+        max_tokens=int(spec.max_tokens) if spec.max_tokens else int(
+            getattr(parent_config, "max_tokens", 0) or 4000),
+        temperature=float(spec.temperature),
+        model=spec.model,
+        response_format=response_format,
+        retry_policy=getattr(parent_config, "retry_policy", None),
+    )
+    # HOST config seam (subagent_config_factory, PROVISIONAL 3.14): the parent's
+    # config may rewrite the child's default config — e.g. hand heavy leaves a
+    # context strategy (representation/fold/microcompact). The factory's output
+    # is used AS IS; it received the spec-derived default, so an increment via
+    # dataclasses.replace is the intended usage. A raising factory fails THIS
+    # delegation (surfaced as the tool error), never the parent loop.
+    _config_factory = getattr(parent_config, "subagent_config_factory", None)
+    if _config_factory is not None:
+        child_config = _config_factory(spec, child_config)
+        if not isinstance(child_config, AgentLoopConfig):
+            raise TypeError(
+                "subagent_config_factory must return an AgentLoopConfig "
+                f"(got {type(child_config).__name__})"
+            )
+
+    return child_config
+
+
+async def workflow_continuation_loop(parent_loop: Any, session_id: str) -> Any:
+    """Rebuild a leaf with its persisted spec and host context policy."""
+    from power_loop.agent.stateful_loop import StatefulAgentLoop
+
+    store = await parent_loop._ensure_store()
+    contract = await store.get_runtime_state(session_id, "workflow_execution_contract")
+    if not isinstance(contract, dict) or contract.get("version") != 1:
+        raise ValueError("leaf execution contract missing; cannot safely continue this legacy session")
+    spec = AgentSpec.from_dict(contract["spec"])
+    loop = StatefulAgentLoop(
+        llm=parent_loop.llm, store=store, config=_child_config(spec, parent_loop),
+        tool_registry=filtered_registry(parent_loop.tool_registry, contract["tools"]),
+        hooks=parent_loop._runner.hooks, event_bus=parent_loop._runner.event_bus,
+    )
+    loop._child_run_guards = getattr(parent_loop, "_child_run_guards", ())
+    return loop
+
+
 async def run_agent_spec(
     spec: AgentSpec | dict[str, Any] | str,
     user_input: str,
@@ -319,40 +376,7 @@ async def run_agent_spec(
                 "depth": parent_row.spawn_depth + 1,
             }
 
-    response_format = output_response_format(spec.output_schema) if spec.output_schema else None
-
-    # Inherit the parent's transport resilience: the child reuses the parent's
-    # LLM client (same connection pool), and a delegation often fires after a
-    # long tool phase — right when pooled keep-alive connections have gone
-    # stale. Without the parent's retry policy a single httpx.ReadError on the
-    # child's FIRST streaming call killed the whole delegation ("Error: ").
-    parent_config = getattr(parent_loop, "config", None)
-    child_config = AgentLoopConfig(
-        system_prompt=spec.system_prompt,
-        max_rounds=int(spec.max_rounds),
-        # max_tokens=None → 跟父：子运行和父用的是同一个模型（model=None 时），
-        # 父的预算容得下它的思考，子的也该容得下。
-        max_tokens=int(spec.max_tokens) if spec.max_tokens else int(
-            getattr(parent_config, "max_tokens", 0) or 4000),
-        temperature=float(spec.temperature),
-        model=spec.model,
-        response_format=response_format,
-        retry_policy=getattr(parent_config, "retry_policy", None),
-    )
-    # HOST config seam (subagent_config_factory, PROVISIONAL 3.14): the parent's
-    # config may rewrite the child's default config — e.g. hand heavy leaves a
-    # context strategy (representation/fold/microcompact). The factory's output
-    # is used AS IS; it received the spec-derived default, so an increment via
-    # dataclasses.replace is the intended usage. A raising factory fails THIS
-    # delegation (surfaced as the tool error), never the parent loop.
-    _config_factory = getattr(parent_config, "subagent_config_factory", None)
-    if _config_factory is not None:
-        child_config = _config_factory(spec, child_config)
-        if not isinstance(child_config, AgentLoopConfig):
-            raise TypeError(
-                "subagent_config_factory must return an AgentLoopConfig "
-                f"(got {type(child_config).__name__})"
-            )
+    child_config = _child_config(spec, parent_loop)
 
     child_sid = await store.create_session(
         # The FACTORY-adjusted prompt, not spec.system_prompt: a send resolves the prompt as
@@ -405,6 +429,12 @@ async def run_agent_spec(
             sub_registry = sub_registry.subset(
                 n for n in sub_registry.names() if n in _send_filter
             )
+
+    await store.set_runtime_state(child_sid, "workflow_execution_contract", {
+        "version": 1,
+        "spec": {f.name: getattr(spec, f.name) for f in fields(spec)},
+        "tools": sub_registry.names() if sub_registry is not None else [],
+    })
 
     # Build a sibling loop sharing the same store + registry-subset.
     from power_loop.agent.stateful_loop import StatefulAgentLoop

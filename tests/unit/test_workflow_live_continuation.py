@@ -124,3 +124,24 @@ async def test_accepted_terminal_window_steering_is_processed_before_review():
     result = await run
     assert result.status == "completed"
     assert seen[0] == "flushed" and "new evidence" in seen[1]
+
+
+@pytest.mark.asyncio
+async def test_rework_exception_never_replays_side_effectful_leaf():
+    calls = []
+    class Executor:
+        async def run_agent(self, spec, user_input, **kwargs):
+            calls.append(spec.name)
+            return {"status": "completed", "session_id": spec.name,
+                    "final_text": '{"pass": false}' if spec.name == "review" else "artifact created"}
+        async def continue_agent(self, *args, **kwargs):
+            raise RuntimeError("transport interrupted after mutation")
+    review = {**leaf("review"), "output_schema": {"name": "Review", "schema": {
+        "type": "object", "properties": {"pass": {"type": "boolean"}}, "required": ["pass"]}}}
+    spec = WorkflowSpec.from_json({"name": "r", "input": "", "root": {
+        "type": "loop", "id": "repair", "max_iterations": 2, "continue_nodes": ["dev"],
+        "until": {"ref": "review.pass"}, "body": {"type": "sequence", "steps": [leaf("dev"), review]}}})
+    result = await WorkflowEngine(Parent(), executor=Executor(), close_driver=False).run(spec)
+    assert result.status == "failed"
+    assert calls.count("dev") == 1
+    assert result.results["dev"].session_id == "dev"

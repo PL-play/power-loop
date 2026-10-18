@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+## [6.50.0] — 2026-10-18
+
+- Persist each child execution spec and effective tool list. Workflow continuations reconstruct the leaf loop, preserving model/output constraints and reapplying the host context-policy factory instead of inheriting the parent's tool registry.
+- Continuation and resume exceptions preserve the original session and fail explicitly; they never silently replay a side-effectful leaf in a new session, including under first-run retry policies.
+- Review-loop instructions distinguish developer repairs from independent reviewer verification.
+- Legacy sessions without a saved execution contract fail explicitly on continuation. Hosts can retain custom executors for their own migration policy; new sessions persist the contract automatically.
+
 ## [6.49.0] — 2026-10-18
 
 - Background tool calls retain their original tool, arguments and full result in session runtime state; check/wait expose a versioned result envelope.
