@@ -433,3 +433,23 @@ async def test_driver_closed_but_linked_leaves_survive_as_audit_trail() -> None:
     assert res2.status == "completed"
     assert await _count() == base + 2 + 3  # driver + 2 leaves all retained
     await store.close()
+
+@pytest.mark.parametrize("status", ["hit_round_limit", "failed", "budget_exceeded", "cancelled"])
+async def test_failed_development_blocks_review_and_loop(status):
+    calls = []
+    class Executor:
+        async def run_agent(self, spec, user_input, **kwargs):
+            calls.append(spec.name)
+            return {"status": status if spec.name == "dev" else "completed",
+                    "final_text": 'some logs exist', "session_id": None, "usage": {}}
+    spec = WorkflowSpec.from_json({"name": "blocked", "input": "x", "root": {
+        "type": "loop", "id": "cycle", "max_iterations": 2, "on_exhausted": "continue",
+        "until": {"ref": "review.pass", "op": "truthy"}, "body": {"type": "sequence", "steps": [
+            {"type": "agent", "id": "dev", "spec": {"name": "dev", "system_prompt": "p"}},
+            {"type": "agent", "id": "review", "spec": {"name": "review", "system_prompt": "p"}},
+        ]}}})
+    result = await WorkflowEngine(_loop(), executor=Executor()).run(spec)
+    assert calls == ["dev"]
+    assert result.results["cycle"].status == "failed"
+    assert "review" not in result.results
+    assert result.status != "completed"

@@ -514,7 +514,10 @@ class WorkflowEngine:
             lc = {"loop_id": node.id, "iteration": iteration, "max": node.max_iterations,
                   "continue": set(node.continue_nodes), "prev": dict(prev), "why": why,
                   "feedback": self._loop_feedback(feedback_node) if iteration > 1 else ""}
-            await self._exec(node.body, {**env, _LOOP_KEY: lc, "loop_iteration": iteration}, driver_sid)
+            body_result = await self._exec(node.body, {**env, _LOOP_KEY: lc, "loop_iteration": iteration}, driver_sid)
+            if body_result is not None and body_result.status not in ("completed", "skipped") and body_result.node_id not in self._tolerated:
+                why = f"上游 {body_result.node_id} 未完成：{body_result.status}；审核与下一轮已阻断"
+                break
             for nid in node.continue_nodes:
                 r = self._results.get(nid)
                 if r is not None and r.session_id:
@@ -526,7 +529,9 @@ class WorkflowEngine:
         last = {nid: {"status": r.status, "text": (r.text or "")[:4000], "payload": r.payload, "session_id": r.session_id}
                 for nid in body_ids if (r := self._results.get(nid)) is not None}
         payload = {"converged": converged, "iterations": iteration, "why": why, "last": last}
-        ok = converged or (node.on_exhausted == "continue" and not self._cancel.is_cancelled())
+        broken = any(r.status not in ("completed", "skipped") and nid not in self._tolerated
+                     for nid in body_ids if (r := self._results.get(nid)) is not None)
+        ok = converged or (node.on_exhausted == "continue" and not broken and not self._cancel.is_cancelled())
         err = None if converged else (f"跑了 {iteration} 轮仍不满足 until：{why}" if not self._cancel.is_cancelled()
                                       else "循环被取消")
         res = AgentResult(node_id=node.id, status="completed" if ok else ("cancelled" if self._cancel.is_cancelled() else "failed"),
@@ -789,7 +794,7 @@ class WorkflowEngine:
 
         res = AgentResult(
             node_id=node.id,
-            status=str(raw.get("status")),
+            status="failed" if err else str(raw.get("status")),
             text=raw.get("final_text") or "",
             payload=payload,
             usage=dict(raw.get("usage") or {}),
@@ -804,7 +809,6 @@ class WorkflowEngine:
         self._add_usage(res.usage)
         if self._budget is not None:
             self._budget.commit(res.usage)
-        await self._emit_step(res)
 
         # ── 兜底节点：所有 attempt 用尽仍失败时跑，成功则**顶替**本节点的结果供下游引用 ──
         if res.status != "completed" and node.fallback is not None and not self._cancelled:
@@ -825,6 +829,7 @@ class WorkflowEngine:
         # continue_on_error:失败但明确放行——记下来,run 终态判定跳过它。被单独取消的节点同样放行。
         if (res.status == "failed" and node.continue_on_error) or node.id in self._node_cancelled:
             self._tolerated.add(node.id)
+        await self._emit_step(res)
         return res
 
     def _session_cb(self, node_id: str) -> Callable[[str], Awaitable[None]]:
@@ -952,6 +957,8 @@ class WorkflowEngine:
             last = await self._exec(step, env, driver_sid)
             if self._budget_hit or self._cancelled:
                 break
+            if last is not None and last.status not in ("completed", "skipped") and last.node_id not in self._tolerated:
+                break
         return last
 
     async def _gather_branches(
@@ -1014,7 +1021,9 @@ class WorkflowEngine:
         for r in gathered:
             if isinstance(r, BaseException):
                 self._errors.append(f"parallel branch error: {r}")
-        return next((r for r in reversed(gathered) if isinstance(r, AgentResult)), None)
+        broken = next((r for r in gathered if isinstance(r, AgentResult)
+                       and r.status not in ("completed", "skipped") and r.node_id not in self._tolerated), None)
+        return broken or next((r for r in reversed(gathered) if isinstance(r, AgentResult)), None)
 
     async def _exec_foreach(self, node: ForeachNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         # Resume: a foreach is replayed atomically via its journaled aggregate.
