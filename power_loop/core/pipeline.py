@@ -1222,6 +1222,11 @@ class AgentPipeline:
         attempt_box = [0]
 
         async def _do_call() -> LLMResponse:
+            from power_loop.workflow.admission import request_slot
+            async with request_slot(self.cancel_token):
+                return await _perform_call()
+
+        async def _perform_call() -> LLMResponse:
             # STREAM_STARTED/COMPLETED are emitted **per attempt** and paired in this call's own
             # finally (M-pipeline-runner-1): the terminal used to live in the OUTER finally, which
             # ran once, so N retry attempts emitted N STARTED but only 1 COMPLETED — unbalanced

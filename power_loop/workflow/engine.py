@@ -698,6 +698,8 @@ class WorkflowEngine:
                     "attempts": int(old.get("attempts", 0)) + 1,
                     "queue_s": float(old.get("queue_s", 0)) + lease.queue_s,
                     "idle_s": float(old.get("idle_s", 0)) + lease.idle_s,
+                    "metrics": {key: old.get("metrics", {}).get(key, 0) + lease.metrics.get(key, 0)
+                                for key in old.get("metrics", {}).keys() | lease.metrics.keys()},
                     "elapsed_s": float(old.get("elapsed_s", 0)) + monotonic() - started,
                 })
             except Exception:
@@ -1226,14 +1228,17 @@ class WorkflowEngine:
 
     async def _exec_parallel(self, node: ParallelNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         sem = asyncio.Semaphore(node.max_concurrency)
+        request_sem = asyncio.Semaphore(node.max_concurrency)
 
         async def one(branch: WorkflowNode) -> AgentResult | None:
             if node.concurrency_scope == "leaf":
-                from power_loop.workflow.admission import GATES
+                from power_loop.workflow.admission import GATES, REQUEST_GATES
                 token = GATES.set((*GATES.get(), sem))
+                requests = REQUEST_GATES.set((*REQUEST_GATES.get(), request_sem))
                 try:
                     return await self._exec(branch, dict(env), driver_sid)
                 finally:
+                    REQUEST_GATES.reset(requests)
                     GATES.reset(token)
             async with sem:
                 return await self._exec(branch, dict(env), driver_sid)

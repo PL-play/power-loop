@@ -8,6 +8,11 @@
 
 ## [Unreleased]
 
+## [6.52.0] — 2026-10-19
+
+- Leaf-scoped workflows also limit main model requests through a separate, inherited admission pool; nested helpers share the cap without holding request slots while waiting for tools. Cancellation while queued does not leak capacity.
+- Add host counters to admission telemetry, including model queue/request duration. Branch-mode behavior is unchanged.
+
 ## [6.51.0] — 2026-10-19
 
 - Add opt-in parallel `concurrency_scope="leaf"`; preserve the default branch admission semantics. Waiting leaves are cancellable and acquire slots fairly.

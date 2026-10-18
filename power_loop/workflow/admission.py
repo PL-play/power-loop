@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from time import monotonic
 
 GATES: ContextVar[tuple[asyncio.Semaphore, ...]] = ContextVar("workflow_leaf_gates", default=())
+REQUEST_GATES: ContextVar[tuple[asyncio.Semaphore, ...]] = ContextVar("workflow_request_gates", default=())
 CURRENT: ContextVar[Lease | None] = ContextVar("workflow_leaf_lease", default=None)
 
 
@@ -22,6 +23,7 @@ class Lease:
         self.held = []
         self.queue_s = 0.0
         self.idle_s = 0.0
+        self.metrics: dict[str, float] = {}
 
     async def acquire(self):
         started = monotonic()
@@ -89,3 +91,31 @@ async def idle():
         lease.idle_s += monotonic() - started
         if completed:
             await lease.acquire()
+
+
+def count_metric(name: str, value: float = 1):
+    lease = CURRENT.get()
+    if lease is not None:
+        lease.metrics[name] = lease.metrics.get(name, 0) + value
+
+
+@asynccontextmanager
+async def request_slot(stop=None):
+    """Limit model requests including nested helpers; never hold across tool waits."""
+    gates = REQUEST_GATES.get()
+    if not gates:
+        yield
+        return
+    lease = Lease(gates, stop)
+    try:
+        await lease.acquire()
+    except AdmissionCancelled as exc:
+        raise asyncio.CancelledError() from exc
+    count_metric("model_queue_s", lease.queue_s)
+    started = monotonic()
+    try:
+        yield
+    finally:
+        count_metric("model_request_s", monotonic() - started)
+        count_metric("model_requests")
+        lease.release()
