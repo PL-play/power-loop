@@ -23,7 +23,7 @@ class _EchoLLM(LLMService):
     async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,
                        on_chunk_think=None, on_stream_end=None) -> LLMResponse:
         sp = (request.system_prompt or "").lower()
-        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user"), "")
+        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user" and not str(m.get("name") or "").startswith("runtime_")), "")
         txt = json.dumps({"label": "urgent", "items": ["a", "b"]}) if "classify" in sp else f"echo::{last}"
         return LLMResponse(raw_text=txt, content_text=txt)
 
@@ -187,7 +187,7 @@ class _SlowLLM(LLMService):
         sp = (request.system_prompt or "").lower()
         if "slow" in sp:
             await asyncio.sleep(self.delay)
-        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user"), "")
+        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user" and not str(m.get("name") or "").startswith("runtime_")), "")
         txt = json.dumps({"pass": False, "n": 2}) if "classify" in sp else f"echo::{last[:200]}"
         return LLMResponse(raw_text=txt, content_text=txt)
 
@@ -339,7 +339,7 @@ class _LoopLLM(LLMService):
     async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,
                        on_chunk_think=None, on_stream_end=None) -> LLMResponse:
         sp = (request.system_prompt or "").lower()
-        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user"), "")
+        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user" and not str(m.get("name") or "").startswith("runtime_")), "")
         if "review" in sp:
             self.reviews += 1
             ok = self.reviews >= self.pass_on
@@ -448,7 +448,7 @@ class _IterLLM(LLMService):
         import re
 
         sp = (request.system_prompt or "").lower()
-        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user"), "")
+        last = next((str(m.get("content") or "") for m in reversed(request.messages or []) if m.get("role") == "user" and not str(m.get("name") or "").startswith("runtime_")), "")
         if "review" in sp:
             m = re.search(r"scene=(\w+) it=(\d+)", last)
             scene, it = (m.group(1), int(m.group(2))) if m else ("?", 0)
@@ -521,3 +521,23 @@ async def test_one_foreach_iteration_failing_fails_run_deterministically():
     assert [it["converged"] for it in items] == [False, True, True]
     res2 = await create_workflow(spec("continue", ["never", "a", "b"]), parent_loop=loop()).run()
     assert res2.status == "completed", res2.errors
+
+
+async def test_rework_archives_previous_todo_and_is_idempotent():
+    from power_loop.workflow.engine import WorkflowEngine
+    loop = _loop()
+    store = await loop.ensure_store()
+    sid = await loop.new_session()
+    old = {'items': [{'id': '1', 'text': 'original', 'status': 'completed'}]}
+    await store.set_runtime_state(sid, 'todo', old)
+    engine = WorkflowEngine(loop)
+    lc = {'loop_id': 'review-loop', 'iteration': 2, 'why': 'review.pass=false'}
+    await engine._prepare_rework(sid, 'dev', lc)
+    new = await store.get_runtime_state(sid, 'todo')
+    assert new['counts']['completed'] == 0
+    assert new['items'][0]['status'] == 'in_progress'
+    state = await store.get_runtime_state(sid, 'workflow_rework')
+    assert await store.get_runtime_state(sid, state['previous_todo_ref']) == old
+    await store.set_runtime_state(sid, 'todo', old)
+    await engine._prepare_rework(sid, 'dev', lc)
+    assert await store.get_runtime_state(sid, 'todo') == old

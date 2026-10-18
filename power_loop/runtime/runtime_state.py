@@ -107,8 +107,30 @@ class BackgroundRuntimeProjector(RuntimeProjector):
         updates = await store.list_unseen_background_updates(session_id)
         if not updates:
             return []
-        chunks: list[str] = ["<background_updates>"]
+        from power_loop.runtime.background import ACTIVE_STATUSES, encode_results, load_record, summarize_record
+        durable = []
+        legacy = []
         for task in updates:
+            record = await load_record(store, session_id, task.task_id)
+            if record is not None and task.status not in ACTIVE_STATUSES:
+                if "result" not in record:
+                    record = {**record, "result": "（完整结果未保存，以下为台账预览）\n" + (task.output_tail or "")}
+                durable.append(summarize_record({**record, "status": task.status}))
+            else:
+                legacy.append(task)
+        messages = []
+        for record in durable:
+            # Stable per-task messages remain deduplicable if another task finishes
+            # between a failed model request and its retry.
+            message = {"role": "user", "name": "background_tool_results",
+                       "content": encode_results([record]), "_persist": True}
+            if self.mark_seen:
+                message["_ack"] = ("background_seen", [record["task_id"]])
+            messages.append(message)
+        if not legacy:
+            return messages
+        chunks: list[str] = ["<background_updates>"]
+        for task in legacy:
             output = (task.output_tail or "(running)").strip()
             chunks.append(
                 "\n".join(
@@ -132,8 +154,8 @@ class BackgroundRuntimeProjector(RuntimeProjector):
             # succeeded. The pipeline strips this private marker before the request and calls
             # :meth:`acknowledge` only after a successful call — a failed / degraded / aborted
             # call must not swallow the updates (design/124 Z7).
-            msg["_ack"] = ("background_seen", [task.task_id for task in updates])
-        return [msg]
+            msg["_ack"] = ("background_seen", [task.task_id for task in legacy])
+        return [*messages, msg]
 
     async def acknowledge(self, *, store: Any, session_id: str, ack: Any) -> None:
         """Mark the projected tasks seen — called by the pipeline once the model saw them."""

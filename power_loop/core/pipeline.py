@@ -1128,9 +1128,9 @@ class AgentPipeline:
     async def _runtime_messages_for_round(self, round_index: int) -> list[LoopMessage]:
         """Build transient runtime-state messages for the next LLM call.
 
-        These messages are deliberately not appended through ``_append_message``:
-        the store's runtime state is the authority, and the message is just the
-        current projection the model needs for this round.
+        Current state projections are ephemeral. Completed background tool results
+        opt into durable history with ``_persist`` so later sends retain their
+        original-tool summary after the notification is acknowledged.
         """
         if self.store is None or self.session_id is None:
             todo_snap = self.ctx.todo.snapshot_for_prompt()
@@ -1153,7 +1153,11 @@ class AgentPipeline:
                 ack = m.pop("_ack", None)
                 if ack is not None and hasattr(projector, "acknowledge"):
                     self._pending_acks.append((projector, ack))
-                messages.append(m)
+                if m.pop("_persist", False):
+                    if not any(_persist_key(old) == _persist_key(m) for old in self.history):
+                        await self._append_message(m, round_index=round_index)
+                else:
+                    messages.append(m)
         return messages
 
     async def _acknowledge_runtime(self) -> None:

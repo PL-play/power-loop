@@ -60,3 +60,31 @@ async def test_failed_call_does_not_swallow_background_update() -> None:
             assert all("_ack" not in m for m in call), "private marker leaked to the provider"
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_typed_background_result_persists_once_across_failed_request_and_next_send():
+    from power_loop.runtime.background import record_key
+    store = await SessionStore.open(':memory:')
+    try:
+        llm = _FailThenOk(fail_first=1)
+        loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(
+            system_prompt='S', max_rounds=2, compactor=None,
+            retry_policy=LLMRetryPolicy(max_attempts=1)))
+        sid = await loop.new_session()
+        await store.set_runtime_state(sid, record_key('bg-7'), {
+            'task_id': 'bg-7', 'tool': 'image', 'args': {'prompt': 'test'},
+            'status': 'completed', 'result': 'image.webp', 'result_ref': record_key('bg-7')})
+        await store.upsert_background_task(sid, task_id='bg-7', command='image',
+                                           status='completed', output_tail='image.webp')
+        await loop.send('hi', sid)
+        await loop.send('retry', sid)
+        await loop.send('next', sid)
+        for call in llm.calls:
+            results = [m for m in call if m.get('name') == 'background_tool_results']
+            assert len(results) == 1
+            assert 'image.webp' in results[0]['content']
+            assert '_persist' not in results[0] and '_ack' not in results[0]
+        assert not await store.list_unseen_background_updates(sid)
+    finally:
+        await store.close()

@@ -1583,13 +1583,17 @@ class BackgroundManager:
         task_id = str(uuid.uuid4())[:8]
         args = dict(args or {})
         label = f"tool:{name} " + json.dumps(args, ensure_ascii=False)[:160]
+        record = {"task_id": task_id, "tool": name, "args": args, "status": "queued",
+                  "result_ref": "background_tool:" + task_id}
+        if store is not None and sid is not None and hasattr(store, "set_runtime_state"):
+            await store.set_runtime_state(sid, record["result_ref"], record)
         if store is not None and sid is not None:
             await store.upsert_background_task(
                 sid, task_id=task_id, command=label, status="queued",
                 return_code=None, output_tail="(queued)",
             )
         with self._lock:
-            self.tasks[task_id] = {"command": label, "status": "queued", "result": None}
+            self.tasks[task_id] = {"command": label, "status": "queued", "result": None, "tool_record": record}
         # One FIFO admission gate per store/session/event loop. No await between lookup
         # and registration: concurrent submissions cannot oversubscribe the limit.
         key = (asyncio.get_running_loop(), id(store), sid)
@@ -1666,14 +1670,15 @@ class BackgroundManager:
                         status = "failed"
                 else:
                     output = str(result if result is not None else "")
-                output = output[:8000]
+                if output.lstrip().lower().startswith("error:"):
+                    status = "failed"
             except asyncio.CancelledError:
                 status, output = "cancelled", "(cancelled)"
                 await self._settle(task_id, label, store, sid, status, output, notify=False)
                 raise
             except Exception as exc:  # noqa: BLE001 — 失败是任务结果，不是崩溃
                 status = "failed"
-                output = f"{type(exc).__name__}: {exc}"[:2000]
+                output = f"{type(exc).__name__}: {exc}"
             await self._settle(task_id, label, store, sid, status, output, notify=True)
 
         task = asyncio.ensure_future(_worker())
@@ -1693,12 +1698,21 @@ class BackgroundManager:
             if task is not None:
                 task["status"] = status
                 task["result"] = output or "(no output)"
+        record = (task or {}).get("tool_record")
+        if record is not None and task is not None:
+            record = {**record, "status": status, "result": output}
+            task["tool_record"] = record
+            if store is not None and sid is not None and hasattr(store, "set_runtime_state"):
+                try:
+                    await store.set_runtime_state(sid, record["result_ref"], record)
+                except Exception:  # noqa: BLE001 — still settle the task and notify the host
+                    logger.warning("tool task %s: full result write-back failed", task_id, exc_info=True)
         if store is not None and sid is not None:
             try:
                 await store.upsert_background_task(
                     sid, task_id=task_id, command=label, status=status,
                     return_code=0 if status == "completed" else 1,
-                    output_tail=output or "(no output)",
+                    output_tail=output[:8000] or "(no output)",
                 )
             except Exception:  # noqa: BLE001
                 logger.warning("tool task %s: status write-back failed", task_id, exc_info=True)
@@ -1721,8 +1735,12 @@ class BackgroundManager:
         store, sid = _current_store_and_session()
         task_id = str(uuid.uuid4())[:8]
         label = f"tool:{tool_name} " + json.dumps(dict(args or {}), ensure_ascii=False)[:160]
+        record = {"task_id": task_id, "tool": tool_name, "args": dict(args or {}),
+                  "status": "running", "result_ref": "background_tool:" + task_id}
+        if store is not None and sid is not None and hasattr(store, "set_runtime_state"):
+            await store.set_runtime_state(sid, record["result_ref"], record)
         with self._lock:
-            self.tasks[task_id] = {"command": label, "status": "running", "result": None}
+            self.tasks[task_id] = {"command": label, "status": "running", "result": None, "tool_record": record}
         if store is not None and sid is not None:
             await store.upsert_background_task(
                 sid, task_id=task_id, command=label, status="running",
@@ -1788,6 +1806,19 @@ class BackgroundManager:
         await asyncio.wait({worker}, timeout=5)
         return "forced"
 
+    async def _tool_result(self, store: Any, sid: str | None, task_id: str) -> dict[str, Any] | None:
+        from power_loop.runtime.background import load_record
+        record = await load_record(store, sid, task_id)
+        memory_record = self.tasks.get(task_id, {}).get("tool_record")
+        if record is None or ("result" not in record and memory_record and "result" in memory_record):
+            record = memory_record
+        if record is not None:
+            status, tail = await self._status_of(store, sid, task_id)
+            if status not in ("queued", "pending", "running") and "result" not in record:
+                record = {**record, "result": tail, "legacy": True}
+            return {**record, "status": status}
+        return None
+
     async def _status_of(self, store: Any, sid: str | None, task_id: str) -> tuple[str, str]:
         """(status, 输出尾巴)：优先读 store 里这个会话的行，没有就读进程内记录。"""
         if store is not None and sid is not None:
@@ -1841,10 +1872,17 @@ class BackgroundManager:
         head = ("等的时候来了新消息，先停下来等（任务照常在跑）。" if steered
                 else f"还有 {pending} 件没做完（等了 {int(timeout_s)} 秒，任务照常在跑）。" if pending
                 else "都做完了。")
-        return head + "\n" + "\n".join(lines)
+        from power_loop.runtime.background import encode_results
+        records = [r for tid in ids if (r := await self._tool_result(store, sid, tid)) is not None]
+        return head + "\n" + "\n".join(lines) + ("\n" + encode_results(records) if records else "")
 
     async def check(self, task_id: str | None = None) -> str:
         store, sid = _current_store_and_session()
+        if task_id:
+            record = await self._tool_result(store, sid, task_id)
+            if record is not None:
+                from power_loop.runtime.background import encode_results
+                return f"[{record['status']}] {record['tool']}\n" + encode_results([record])
         if store is not None and sid is not None:
             # Recover any terminal status a daemon thread couldn't deliver to a now-gone
             # loop, so a stuck 'running' row self-heals on the next read.

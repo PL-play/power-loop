@@ -181,6 +181,10 @@ async def node_start(
         if jn is None or _is_terminal(jn.get("status")):
             return MUTATE_SKIP
         live = dict(jn.get("live") or {})
+        if node_id not in live:
+            attempts = dict(jn.get("node_attempts") or {})
+            attempts[node_id] = int(attempts.get(node_id) or 0) + 1
+            jn["node_attempts"] = attempts
         live[node_id] = _now_ms()
         jn["live"] = live
         jn["updated_at_ms"] = _now_ms()

@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+## [6.49.0] — 2026-10-18
+
+- Background tool calls retain their original tool, arguments and full result in session runtime state; check/wait expose a versioned result envelope.
+- Automatic completions use the host's original-tool distiller and persist one summary per task in history; acknowledge only after model success. Submission receipts remain distinct from completion.
+- Review-loop continuations archive previous todos and initialize the new iteration once, without resetting budget continuations; continued leaves emit lifecycle events.
+- Workflow journals track node execution attempts so observers can distinguish live rework from an earlier completed step.
+
 ## [6.48.0] — 2026-10-18
 
 ### Changed

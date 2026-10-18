@@ -122,6 +122,8 @@ def _loop_prompt(lc: dict[str, Any], user_input: str) -> str:
     return (f"第 {lc['iteration']}/{lc['max']} 轮：上一轮没通过（{lc.get('why') or ''}）。\n"
             f"上一轮的意见：\n{lc.get('feedback') or ''}\n\n"
             "按意见改。你上一轮做的都还在（会话、文件），在已有成果上改，不要从头重做。改完照原来的要求交卷。\n\n"
+            "先用 todo 列出本轮审核意见对应的修复与复验任务；上一轮已完成待办只代表历史成果。"
+            "完成待办后还需提交本轮最终结果；若审核缺少具体问题，先读取审核报告核实。\n\n"
             f"（这一轮的任务输入照旧附在下面）\n{user_input}")
 
 
@@ -802,6 +804,7 @@ class WorkflowEngine:
                 and lc["prev"].get(node.id)):
             prev_sid = lc["prev"][node.id]
             try:
+                await self._prepare_rework(prev_sid, node.id, lc)
                 resumed_raw = await self._continue_leaf(
                     prev_sid, _loop_prompt(lc, user_input), extra_rounds=max(int(node.spec.max_rounds or 30), 10), stop=node_tok)
                 resumed_raw.setdefault("session_id", prev_sid)
@@ -1037,6 +1040,27 @@ class WorkflowEngine:
         except Exception:  # noqa: BLE001
             return []
 
+    async def _prepare_rework(self, session_id: str, node_id: str, lc: dict[str, Any]) -> None:
+        """Archive the previous todo only for a new review iteration, never for a budget continuation."""
+        from power_loop.runtime.todos import render_todos, todo_counts, validate_todos
+
+        if not hasattr(self._loop, "ensure_store"):
+            return
+        store = await self._loop.ensure_store()
+        key = f"workflow_rework:{lc['loop_id']}:{node_id}:{lc['iteration']}"
+        if await store.get_runtime_state(session_id, key, default=None):
+            return
+        old = await store.get_runtime_state(session_id, "todo", default={})
+        await store.set_runtime_state(session_id, key + ":previous_todo", old)
+        items = validate_todos([{"text": f"第 {lc['iteration']} 轮：核实审核意见，列出修复与复验任务", "status": "in_progress"}])
+        await store.set_runtime_state(session_id, "todo", {
+            "items": items, "rendered": render_todos(items), "counts": todo_counts(items),
+        })
+        state = {"iteration": lc["iteration"], "node_id": node_id, "loop_id": lc["loop_id"],
+                 "reason": lc.get("why"), "previous_todo_ref": key + ":previous_todo"}
+        await store.set_runtime_state(session_id, "workflow_rework", state)
+        await store.set_runtime_state(session_id, key, state)
+
     async def _continue_leaf(self, session_id: str, prompt: str, *, extra_rounds: int,
                              stop: CancellationToken | None = None) -> dict[str, Any]:
         """原会话补轮。走 executor 的 ``continue_agent``（host 可换实现，如加自己的 guards）；
@@ -1044,8 +1068,25 @@ class WorkflowEngine:
         fn = getattr(self._executor, "continue_agent", None)
         if fn is None:
             fn = InProcessExecutor().continue_agent
-        return await fn(session_id, prompt, parent_loop=self._loop,
-                        extra_rounds=extra_rounds, stop_event=stop or self._cancel)
+        from power_loop.contracts.event_payloads import SubagentCompletedPayload, SubagentTaskStartPayload
+        from power_loop.contracts.events import AgentEventType
+        from power_loop.core.agent_context import get_session_id
+        from power_loop.runtime.spec import _publish_subagent_event
+
+        parent_sid = get_session_id()
+        _publish_subagent_event(self._loop, parent_sid, AgentEventType.SUBAGENT_TASK_START,
+                               SubagentTaskStartPayload(task=prompt, preset="core", sub_session_id=session_id, depth=1))
+        result = None
+        try:
+            result = await fn(session_id, prompt, parent_loop=self._loop,
+                              extra_rounds=extra_rounds, stop_event=stop or self._cancel)
+            return result
+        finally:
+            _publish_subagent_event(self._loop, parent_sid, AgentEventType.SUBAGENT_COMPLETED,
+                                   SubagentCompletedPayload(sub_session_id=session_id,
+                                       status=(result or {}).get("status", "failed"),
+                                       rounds=int((result or {}).get("rounds") or 0),
+                                       final_text=str((result or {}).get("final_text") or "")))
 
     @staticmethod
     def _should_retry(raw: dict[str, Any], triggers: set[str]) -> bool:
