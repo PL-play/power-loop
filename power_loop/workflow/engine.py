@@ -352,6 +352,7 @@ class WorkflowEngine:
         # 单节点取消（6.46）：每个节点一个子令牌——取消它只停这个节点，run 和别的节点照跑。
         self._node_tokens: dict[str, list[CancellationToken]] = {}
         self._node_cancelled: set[str] = set()
+        self._admission_tokens: dict[str, list[CancellationToken]] = {}
         # 叶子会话建好时的观察者（runner 把「节点 → 会话」记进 journal）；resume 时有会话的节点在原会话接着跑。
         self._on_node_session = on_node_session
         self._resume_sessions: dict[str, str] = dict(resume_sessions or {})
@@ -668,6 +669,42 @@ class WorkflowEngine:
         return (r.text or r.error or "")[:4000]
 
     async def _exec_agent(self, node: AgentNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
+        from time import monotonic
+
+        from power_loop.workflow.admission import AdmissionCancelled, admit
+        started = monotonic()
+        token = self._cancel.child()
+        waiting = self._admission_tokens.setdefault(node.id, [])
+        waiting.append(token)
+        try:
+            async with admit(token) as lease:
+                waiting.remove(token)
+                result = await self._exec_agent_body(node, env, driver_sid)
+        except AdmissionCancelled:
+            result = AgentResult(node_id=node.id, status="cancelled", text="", error="cancelled while queued")
+            self._results[node.id] = result
+            if not self._cancel.is_cancelled():
+                self._tolerated.add(node.id)
+            await self._emit_step(result)
+            return result
+        finally:
+            if token in waiting:
+                waiting.remove(token)
+        if result.session_id and hasattr(self._loop, "ensure_store"):
+            try:
+                store = await self._loop.ensure_store()
+                old = await store.get_runtime_state(result.session_id, "workflow_admission", {})
+                await store.set_runtime_state(result.session_id, "workflow_admission", {
+                    "attempts": int(old.get("attempts", 0)) + 1,
+                    "queue_s": float(old.get("queue_s", 0)) + lease.queue_s,
+                    "idle_s": float(old.get("idle_s", 0)) + lease.idle_s,
+                    "elapsed_s": float(old.get("elapsed_s", 0)) + monotonic() - started,
+                })
+            except Exception:
+                logger.warning("workflow admission metric persistence failed", exc_info=True)
+        return result
+
+    async def _exec_agent_body(self, node: AgentNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
         # Resume: a completed node is replayed from the journal, not re-run. Pop
         # so a body id that somehow leaked in can only ever replay once.
         replayed = self._replay.pop(node.id, None)
@@ -986,7 +1023,7 @@ class WorkflowEngine:
         """只取消一个节点（6.46）：它在跑就在下一个检查点停下，run 和别的节点照跑；被取消的节点按「放行的失败」记。
         返回取消了几个在跑的叶子（foreach 的迭代共用一个 id，会一起停）。"""
         n = 0
-        for tok in self._node_tokens.get(node_id) or []:
+        for tok in [*(self._node_tokens.get(node_id) or []), *(self._admission_tokens.get(node_id) or [])]:
             if not tok.is_cancelled():
                 tok.cancel(reason)
                 n += 1
@@ -1191,6 +1228,13 @@ class WorkflowEngine:
         sem = asyncio.Semaphore(node.max_concurrency)
 
         async def one(branch: WorkflowNode) -> AgentResult | None:
+            if node.concurrency_scope == "leaf":
+                from power_loop.workflow.admission import GATES
+                token = GATES.set((*GATES.get(), sem))
+                try:
+                    return await self._exec(branch, dict(env), driver_sid)
+                finally:
+                    GATES.reset(token)
             async with sem:
                 return await self._exec(branch, dict(env), driver_sid)
 

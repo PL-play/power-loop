@@ -196,6 +196,7 @@ class ParallelNode:
     id: str | None = None
     max_concurrency: int = 5
     on_error: str = "halt"  # "halt" | "continue"
+    concurrency_scope: str = "branch"  # branch | leaf (opt-in)
 
 
 @dataclass(frozen=True)
@@ -458,6 +459,7 @@ def _node_to_dict(node: WorkflowNode) -> dict[str, Any]:
         out = {
             "type": "parallel",
             "branches": [_node_to_dict(b) for b in node.branches],
+            "concurrency_scope": node.concurrency_scope,
             "max_concurrency": node.max_concurrency,
             "on_error": node.on_error,
         }
@@ -975,7 +977,10 @@ def _parse_sequence(
 def _parse_parallel(
     data: dict, path: str, problems: list[str], ids: set[str], body_ids: set[str]
 ) -> ParallelNode | None:
-    _check_unknown(data, {"type", "id", "branches", "max_concurrency", "on_error"}, path, problems)
+    _check_unknown(data, {"type", "id", "branches", "max_concurrency", "on_error", "concurrency_scope"}, path, problems)
+    scope = data.get("concurrency_scope", "branch")
+    if scope not in ("branch", "leaf"):
+        problems.append(f"{path}.concurrency_scope must be branch or leaf")
     branches_raw = data.get("branches")
     if not isinstance(branches_raw, list) or not branches_raw:
         problems.append(f"{path}: 'branches' must be a non-empty list")
@@ -995,6 +1000,7 @@ def _parse_parallel(
         id=data.get("id"),
         branches=tuple(b for b in branches if b),
         max_concurrency=mc,
+        concurrency_scope=scope,
         on_error=on_err,
     )
 

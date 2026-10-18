@@ -8,6 +8,12 @@
 
 ## [Unreleased]
 
+## [6.51.0] — 2026-10-19
+
+- Add opt-in parallel `concurrency_scope="leaf"`; preserve the default branch admission semantics. Waiting leaves are cancellable and acquire slots fairly.
+- Add host-only idle admission scope for post-send settlement, releasing leaf slots during background completion and safely reacquiring them afterwards.
+- Persist leaf admission queue/idle/elapsed metrics without failing execution when telemetry cannot be saved.
+
 ## [6.50.0] — 2026-10-18
 
 - Persist each child execution spec and effective tool list. Workflow continuations reconstruct the leaf loop, preserving model/output constraints and reapplying the host context-policy factory instead of inheriting the parent's tool registry.
