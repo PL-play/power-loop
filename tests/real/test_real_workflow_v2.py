@@ -53,7 +53,7 @@ LOOP_SPEC = {
                  "If you later get review feedback, fix the key accordingly and reply with ONLY the fixed key.")},
               "input": "Write the exit key that leads to the pier."},
              {"type": "agent", "id": "review", "spec": {"name": "review", "max_tokens": 2048, "system_prompt": (
-                 "You check an exit key. Rule: only lowercase letters, digits and hyphens; underscores are NOT allowed. "
+                 "You check an exit key. Rule: use to-<scene> with a hyphen preserving the word boundary; replace underscores with hyphens. Only lowercase letters, digits and hyphens are allowed. "
                  'Respond ONLY with JSON: {"pass": <true|false>, "problems": ["..."]}.')},
               "inputs_from": ["dev"], "input": "Check this key.",
               "output_schema": {"name": "Review", "schema": {"type": "object", "required": ["pass", "problems"], "properties": {
