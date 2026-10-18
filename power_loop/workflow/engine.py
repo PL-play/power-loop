@@ -386,8 +386,14 @@ class WorkflowEngine:
         # journaling (those leaves share one id and aren't individually
         # replayable). The foreach's aggregate is journaled instead.
         self._emit_suppressed = 0
+        self._frames: dict[int, dict[str, Any]] = {}
+        self._repairs: dict[int, asyncio.Task[Any]] = {}
+        self._resume_instructions: dict[str, tuple[str, int]] = {}
+        self._replay_no_charge: set[str] = set()
+        self._steering: dict[str, list[asyncio.Task[Any]]] = {}
 
     async def run(self, spec: WorkflowSpec) -> WorkflowResult:
+        self._spec = spec
         if self._budget is None and spec.budget is not None:
             self._budget = SharedBudget(
                 spec.budget.max_tokens, stop_at_remaining_pct=spec.budget.stop_at_remaining_pct
@@ -477,7 +483,113 @@ class WorkflowEngine:
 
     # ── node dispatch ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _children(node: WorkflowNode) -> list[WorkflowNode]:
+        if isinstance(node, SequenceNode):
+            return list(node.steps)
+        if isinstance(node, ParallelNode):
+            return list(node.branches)
+        if isinstance(node, (LoopNode, ForeachNode)):
+            return [node.body]
+        if isinstance(node, BranchNode):
+            return list(node.cases.values()) + ([node.default] if node.default else [])
+        return []
+
+    async def steer_node(self, node_id: str, sid: str, message: str):
+        """Accept steering only while this engine owns execution, never launch an idle send."""
+        import uuid
+        pending = self._steering.get(node_id)
+        if pending is None:
+            raise WorkflowRunError("node is settling; retry nudge after its journal step settles")
+        task = asyncio.create_task(self._loop.follow_up(
+            message, session_id=sid, mode="steer", enqueue_only=True,
+            item_id=f"workflow-steer-{uuid.uuid4().hex}"))
+        pending.append(task)  # registered before any await; the leaf joins delivery before settling
+        return await asyncio.shield(task)
+
+    async def continue_node(self, node_id: str, message: str, rounds: int) -> AgentResult | None:
+        """Recover a settled branch while siblings run, using the original leaf session.
+
+        Active dependent scopes are rejected before executing anything. Foreach IDs are
+        ambiguous and require iteration-aware orchestration instead of guessing a session.
+        """
+        def path_to(node):
+            if isinstance(node, AgentNode) and node.id == node_id:
+                return [node]
+            for child in self._children(node):
+                path = path_to(child)
+                if path:
+                    return [node, *path]
+            return None
+
+        path = path_to(self._spec.root)
+        if not path or any(isinstance(n, ForeachNode) for n in path):
+            raise WorkflowRunError("node is missing or requires an explicit foreach iteration")
+        leaf = path[-1]
+        frame = self._frames.get(id(leaf))
+        if not frame or frame["active"]:
+            raise WorkflowRunError("node is active or has not settled; deliver a steering message to its sid")
+        scope = leaf
+        for parent in reversed(path[:-1]):
+            pf = self._frames.get(id(parent))
+            if not pf or pf["active"]:
+                if not isinstance(parent, ParallelNode):
+                    raise WorkflowRunError("dependent scope is still active; wait for its current step to settle")
+                break
+            scope = parent
+        key = id(scope)
+        if key in self._repairs:
+            raise WorkflowRunError("this branch already has a continuation in progress")
+        prior = self._results.get(node_id)
+        if prior is None or not prior.session_id:
+            raise WorkflowRunError("node has no resumable session")
+        sf = self._frames[key]
+
+        async def repair():
+            from .resume import continuation_replay
+            repaired_spec = replace(self._spec, root=scope)
+            for key in _agent_ids(scope):
+                self._replay.pop(key, None)
+            invalidated: set[str] = set()
+            replay = continuation_replay(repaired_spec, node_id, dict(self._results), invalidated=invalidated)
+            self._replay.update(replay)
+            self._replay_no_charge.update(replay)
+            for invalid_id in invalidated:
+                self._replay.pop(invalid_id, None)
+                old = self._results.pop(invalid_id, None)
+                await self._emit_step(AgentResult(
+                    node_id=invalid_id, status="pending", text="",
+                    session_id=old.session_id if old else None,
+                    error="invalidated by node continuation"))
+            self._resume_sessions[node_id] = prior.session_id
+            self._resume_instructions[node_id] = (message, rounds)
+            guard = _IN_WORKFLOW.set(True)
+            try:
+                return await self._exec(scope, sf["env"], sf["driver"])
+            finally:
+                _IN_WORKFLOW.reset(guard)
+
+        task = asyncio.create_task(repair(), name=f"workflow-continue-{node_id}")
+        self._repairs[key] = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            # Keep the task registered until completed, even if the caller disconnects.
+            if task.done():
+                self._repairs.pop(key, None)
+
     async def _exec(self, node: WorkflowNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
+        if ITERATION_ENV_KEY in env:
+            return await self._exec_dispatch(node, env, driver_sid)
+        frame = {"active": True, "env": dict(env), "driver": driver_sid, "result": None}
+        self._frames[id(node)] = frame
+        try:
+            frame["result"] = await self._exec_dispatch(node, env, driver_sid)
+            return frame["result"]
+        finally:
+            frame["active"] = False
+
+    async def _exec_dispatch(self, node: WorkflowNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         if isinstance(node, AgentNode):
             return await self._exec_agent(node, env, driver_sid)
         if isinstance(node, SequenceNode):
@@ -502,7 +614,9 @@ class WorkflowEngine:
                                                  text=str(r.get("text") or ""), payload=r.get("payload"),
                                                  session_id=r.get("session_id"))
             self._results[node.id] = replayed
-            self._add_usage(replayed.usage)
+            if node.id not in self._replay_no_charge:
+                self._add_usage(replayed.usage)
+            self._replay_no_charge.discard(node.id)
             return replayed
         body_ids = _agent_ids(node.body)
         feedback_node = str(node.until.get("ref") or "").split(".", 1)[0]
@@ -557,7 +671,9 @@ class WorkflowEngine:
         if replayed is not None:
             self._results[node.id] = replayed
             self._last = replayed
-            self._add_usage(replayed.usage)
+            if node.id not in self._replay_no_charge:
+                self._add_usage(replayed.usage)
+            self._replay_no_charge.discard(node.id)
             return replayed
 
         if self._cancel.is_cancelled():
@@ -663,6 +779,7 @@ class WorkflowEngine:
             except Exception:  # noqa: BLE001 — observability must not fail the run
                 pass
 
+        self._steering[node.id] = []
         node_tok = self._cancel.child()
         self._node_tokens.setdefault(node.id, []).append(node_tok)
         # 重启后接着跑（6.46）：这个节点上次有叶子会话、没做完 → 先在原会话补轮；补不了再照常开新会话。
@@ -670,8 +787,10 @@ class WorkflowEngine:
         rs = self._resume_sessions.pop(node.id, None) if not self._emit_suppressed else None
         if rs:
             try:
+                prompt, rounds = self._resume_instructions.pop(
+                    node.id, (_RESUME_PROMPT, max(int(node.spec.max_rounds or 30), 10)))
                 resumed_raw = await self._continue_leaf(
-                    rs, _RESUME_PROMPT, extra_rounds=max(int(node.spec.max_rounds or 30), 10), stop=node_tok)
+                    rs, prompt, extra_rounds=rounds, stop=node_tok)
                 resumed_raw.setdefault("session_id", rs)
                 logger.info("workflow leaf %s resumed in its original session %s", node.id, rs)
             except Exception as exc:  # noqa: BLE001 — 会话丢了就照常重跑
@@ -781,6 +900,22 @@ class WorkflowEngine:
                 raw = {**raw, "error": raw.get("error") or f"节点被单独取消：{node_tok.reason}"}
             else:
                 self._cancelled = True
+        # Close intake, then join every accepted delivery. Any input arriving after the
+        # final round drain is flushed before schema validation, journaling or review.
+        accepted_steering = self._steering.pop(node.id, [])
+        if accepted_steering:
+            await asyncio.gather(*accepted_steering)
+            sid = raw.get("session_id")
+            pending = await self._loop.inbox_pending(sid) if sid else {}
+            if pending.get("pending", 0):
+                more = await self._continue_leaf(
+                    str(sid), "继续处理收件箱中的补充要求，完成后按原任务格式交付。",
+                    extra_rounds=max(int(node.spec.max_rounds or 30), 10), stop=node_tok)
+                combined_usage = dict(raw.get("usage") or {})
+                for key, value in (more.get("usage") or {}).items():
+                    combined_usage[key] = combined_usage.get(key, 0) + value
+                raw = {**more, "session_id": sid, "usage": combined_usage}
+
         payload: dict[str, Any] | None = None
         err: str | None = None
         if node.output_schema is not None and raw.get("status") == "completed":
@@ -1018,6 +1153,15 @@ class WorkflowEngine:
         gathered = await self._gather_branches(
             [one(b) for b in node.branches], on_error=node.on_error
         )
+        # A closed branch may have been repaired while siblings were executing.
+        # Join accepted repairs before releasing dependent sequence/assembly steps.
+        for branch in node.branches:
+            task = self._repairs.get(id(branch))
+            if task is not None:
+                await asyncio.shield(task)
+        gathered = [self._frames.get(id(b), {}).get("result", r)
+                    if not isinstance(r, BaseException) and ITERATION_ENV_KEY not in env else r
+                    for b, r in zip(node.branches, gathered, strict=True)]
         for r in gathered:
             if isinstance(r, BaseException):
                 self._errors.append(f"parallel branch error: {r}")

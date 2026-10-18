@@ -785,6 +785,7 @@ class StatefulAgentLoop:
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
         max_rounds: int | None = None,
+        enqueue_only: bool = False,
     ) -> StatefulResult | FollowUpQueued:
         """Put ``items`` in front of the session's model — now, or as soon as it can take them.
 
@@ -798,6 +799,8 @@ class StatefulAgentLoop:
           them. Returns :class:`FollowUpQueued`.
         * idle → a fresh send runs with the waiting items as its input (everything pending —
           including items a cancelled run left behind — oldest first). Returns its result.
+        * ``enqueue_only=True`` → persist and return without starting an idle send;
+          the orchestration owner must drain it, including the terminal window.
         * nothing new (all duplicates) → :class:`FollowUpQueued` with ``accepted=0``.
 
         ``stop_event`` / ``tools`` / ``system_prompt`` / ``max_rounds`` apply only to a run this
@@ -824,7 +827,7 @@ class StatefulAgentLoop:
                 duplicates=len(rows) - len(accepted), accepted_ids=tuple(accepted),
             )
 
-        if not accepted or self._lock_for(sid).locked():
+        if enqueue_only or not accepted or self._lock_for(sid).locked():
             return await _queued()
         if self.config.distributed_sessions:
             # Idle HERE, but another process may be driving this session: its run claims the
@@ -847,6 +850,7 @@ class StatefulAgentLoop:
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
         max_rounds: int | None = None,
+        enqueue_only: bool = False,
         kind: str = INBOX_KIND_USER,
         mode: str = "queue",
         item_id: str | None = None,
@@ -865,7 +869,7 @@ class StatefulAgentLoop:
         return await self.deliver(
             InboxItem(content=user_input, kind=kind, mode=mode, item_id=item_id),
             session_id, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-            max_rounds=max_rounds,
+            max_rounds=max_rounds, enqueue_only=enqueue_only,
         )
 
     def pending_follow_up_count(self, session_id: str) -> int:

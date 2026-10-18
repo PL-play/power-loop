@@ -420,6 +420,13 @@ class ProjectedRepresentation:
             source_seq_hi=max(seqs) if seqs else None,
         )
 
+    def distill_tool_call(
+        self, name: str, args: Any, result: Any, tool_registry: ToolRegistry | None
+    ) -> str:
+        """Public single-call projection seam shared with the in-send context fuse."""
+        entry = self._project_tool(name, args, result, tool_registry)
+        return json.dumps(entry, ensure_ascii=False, default=str)
+
     def _project_tool(
         self, name: str | None, args: Any, result: Any, tool_registry: ToolRegistry | None
     ) -> dict[str, Any]:

@@ -10,7 +10,6 @@ import pytest
 
 import power_loop
 from power_loop import AgentEventBus, AgentEventType, AgentLoopConfig, StatefulAgentLoop
-from power_loop.core.pipeline import AgentPipeline
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -19,6 +18,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMTokenUsage,
 )
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.core.pipeline import AgentPipeline
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -135,7 +135,7 @@ async def test_context_checkpoint_off_by_default(tmp_path):
 
 @pytest.mark.asyncio
 async def test_insend_distill_replaces_oldest_tool_rows_progressively(tmp_path):
-    big = "R" * 400  # > 300 字符才算「值得蒸馏」
+    big = "R" * 2000  # > 300 字符才算「值得蒸馏」
     llm = _Scripted(responses=[
         _tool_resp("c1", prompt=10),     # round 0 → prepare_round(1)：10 < 50，不动
         _tool_resp("c2", prompt=100),    # round 1 → prepare_round(2)：100 ≥ 50，蒸馏最早 1 条(c1)
@@ -165,7 +165,7 @@ async def test_insend_distill_replaces_oldest_tool_rows_progressively(tmp_path):
     # round 3 请求：c2 也被蒸馏，c3 原文——每轮只推进一批
     r3 = _tool_rows(llm.seen[3])
     assert [x.startswith("[distilled #1 seq=") for x in r3] == [True, True, False]
-    assert len(r3[0]) < 400
+    assert len(r3[0]) < 2000
     # 存储里的原文不动（pl_messages 是真相；这里通过再次装配上一 send 的投影/原文侧面验证不抛错）
     res2 = await loop.send("again", session_id=sid)
     assert res2.status == "completed"
@@ -174,7 +174,7 @@ async def test_insend_distill_replaces_oldest_tool_rows_progressively(tmp_path):
 
 @pytest.mark.asyncio
 async def test_insend_distill_respects_hot_tail(tmp_path):
-    big = "R" * 400
+    big = "R" * 2000
     llm = _Scripted(responses=[_tool_resp("c1", prompt=100), _tool_resp("c2", prompt=100), _resp("done")])
     kwargs: dict[str, Any] = {}
     rep_cls = getattr(power_loop, "ProjectedRepresentation", None)
@@ -218,17 +218,17 @@ async def test_insend_distill_only_parses_the_rows_it_picks(tmp_path, monkeypatc
                 calls.append(x)
             return real_loads(x, *a, **kw)
 
-    def _spy(self, batch, hot_tail):
+    def _spy(self, batch, hot_tail, **kwargs):
         inside.append(True)
         try:
-            return real_distill(self, batch, hot_tail)
+            return real_distill(self, batch, hot_tail, **kwargs)
         finally:
             inside.pop()
 
     monkeypatch.setattr(pipeline_mod, "json", _CountingJson)
     monkeypatch.setattr(pipeline_mod.AgentPipeline, "_distill_oldest_tool_rows", _spy)
 
-    big = "R" * 400
+    big = "R" * 2000
     llm = _Scripted(responses=[
         _tool_resp("c1", prompt=10),    # prepare_round(1)：10 < 50，不触发
         _tool_resp("c2", prompt=100),   # prepare_round(2)：触发，选 1 条
@@ -263,7 +263,7 @@ async def test_insend_distill_protects_everything_when_fewer_rows_than_hot_tail(
     本意是「不足 hot_tail 条就全保住」：保险丝的前提是有旧结果可回收，没有旧的就什么都
     不该动，让它涨到切 send 阈值优雅收尾（断片比切 send 贵得多）。
     """
-    big = "R" * 400
+    big = "R" * 2000
     llm = _Scripted(responses=[
         _tool_resp("c1", prompt=100),   # 从 prepare_round(1) 起每轮都超阈值
         _tool_resp("c2", prompt=100),
@@ -341,14 +341,12 @@ async def test_insend_distill_also_slims_tool_call_arguments(tmp_path):
 
     last = _args_of(llm.seen[-1])
     assert last, "最后一次请求里应当有工具调用"
-    slimmed = [a for a in last if "⟨已移出上下文" in a]
+    slimmed = [a for a in last if "_distilled" in a]
     assert slimmed, f"参数没有被回收：{[a[:80] for a in last]}"
     import json as _json
     for a in slimmed:
         d = _json.loads(a)                      # 仍是合法 JSON
-        assert d["mode"] == "overwrite"         # 短字段原样保留
-        assert d["path"] in ("a.txt", "b.txt", "c.txt")
-        assert "recall_send" in d["content"]    # 长字段换成带坐标的指针
+        assert "recall_send" in d["_distilled"]  # args/result represented together
         assert body not in a
     assert any(body in a for a in last), "热的那次调用参数不该被动"
     await loop.aclose()
@@ -356,14 +354,14 @@ async def test_insend_distill_also_slims_tool_call_arguments(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_insend_distill_measures_growth_within_the_send_not_the_whole_context(tmp_path):
+async def test_insend_distill_measures_total_context(tmp_path):
     """6.27.0：触发量 = 本 send 内的增长，不是整个上下文。
 
     真实事故（conv-237）：系统提示词 + 技能 + 工具目录一开局 3 万 token，trigger 配 30000，按整体判
     第 1 轮就超、之后 44 次连烧；模型自己刚发的 send_message 参数被瘦成占位符，模型照着占位符
     又发了九条进聊天。这里整个上下文一直远超阈值（4 万），但 send 内只涨了 20，保险丝不该动。
     """
-    big = "R" * 400
+    big = "R" * 2000
     llm = _Scripted(responses=[
         _tool_resp("c1", prompt=40000),   # 第一轮真实 prompt = 基线
         _tool_resp("c2", prompt=40010),   # 增长 10 < 50
@@ -383,7 +381,7 @@ async def test_insend_distill_measures_growth_within_the_send_not_the_whole_cont
     sid = await loop.new_session()
     assert (await loop.send("hi", session_id=sid)).status == "completed"
     for req in llm.seen[1:]:
-        assert all(not r.startswith("[distilled #") for r in _tool_rows(req)), "整体大但 send 内没涨，不该蒸馏"
+        assert all(r.startswith("[distilled #") for r in _tool_rows(req)), "总上下文超过阈值即触发"
     # 同样的配置，send 内真涨了就该动（基线 100 → 100+60）
     llm2 = _Scripted(responses=[_tool_resp("c1", prompt=100), _tool_resp("c2", prompt=160), _resp("done")])
     loop2 = StatefulAgentLoop(
@@ -403,7 +401,7 @@ async def test_insend_distill_measures_growth_within_the_send_not_the_whole_cont
 async def test_insend_distill_keeps_arguments_of_registered_speech_tools(tmp_path):
     """6.27.0：insend_distill_keep_tools 里的工具，调用参数永不瘦身（结果照旧）。
 
-    send_message 的参数就是模型的发言；瘦成「⟨已移出上下文 N 字符…⟩」后，模型下一轮照着这个样子
+    send_message 的参数就是模型的发言；瘦成「_distilled N 字符…⟩」后，模型下一轮照着这个样子
     再发一遍——占位符进了聊天。write_file 的正文该瘦照瘦。
     """
     speech = "S" * 3000
@@ -444,13 +442,14 @@ async def test_insend_distill_keeps_arguments_of_registered_speech_tools(tmp_pat
     assert (await loop.send("hi", session_id=sid)).status == "completed"
     last = _args_of(llm.seen[-1])
     assert any(speech in a for a in last), "发言参数被瘦身了——模型会照着占位符再发一遍"
-    assert any("⟨已移出上下文" in a for a in last), "write_file 的正文仍该瘦身"
+    assert any("_distilled" in a for a in last), "write_file 的正文仍该瘦身"
     await loop.aclose()
 
 
 def test_insend_distill_never_touches_rows_before_this_send():
     """6.27.0：保险丝只动本 send 追加的行；run 之前就在历史里的（上一 send 的逐字行）归跨 send 投影管。"""
     import json as _json
+
     from power_loop.core.pipeline import AgentPipeline
 
     json_dumps = _json.dumps
@@ -478,7 +477,7 @@ def test_insend_distill_never_touches_rows_before_this_send():
     p._send_start_len = 4
     p._distill_oldest_tool_rows(10, 0)
     assert p.history[2]["content"] == old_result and p.history[1]["tool_calls"][0]["function"]["arguments"] == old_args
-    assert p.history[5]["content"].startswith("[distilled #3") and "⟨已移出上下文" in p.history[4]["tool_calls"][0]["function"]["arguments"]
+    assert p.history[5]["content"].startswith("[distilled #3") and "_distilled" in p.history[4]["tool_calls"][0]["function"]["arguments"]
 
 
 # ── 上下文画像：排查上下文暴涨时，第一个要问的是「大头在哪」──────────────
@@ -486,8 +485,8 @@ def test_insend_distill_never_touches_rows_before_this_send():
 
 def _bare_pipeline() -> AgentPipeline:
     """只为调纯函数：画像不碰 llm / store / sink，给足构造参数就行。"""
-    from power_loop.core.state import ContextManager
     from power_loop.core.hooks import AgentHooks
+    from power_loop.core.state import ContextManager
 
     return AgentPipeline(
         llm=_Scripted(responses=[]), config=AgentLoopConfig(system_prompt="t", max_rounds=2),
@@ -534,3 +533,18 @@ def test_context_profile_only_looks_at_this_send():
     ]
     assert "read_file" not in p._context_profile(1)
     assert "res:grep=2K" in p._context_profile(1)
+
+
+@pytest.mark.asyncio
+async def test_fuse_never_stops_at_legacy_checkpoint_even_with_only_protected_calls(tmp_path):
+    llm = _Scripted(responses=[_tool_resp("c1", prompt=100000), _resp("done")])
+    loop = StatefulAgentLoop(
+        llm=llm, db_path=str(tmp_path / "exclusive.db"),
+        config=AgentLoopConfig(system_prompt="t", max_rounds=4,
+                               context_checkpoint_tokens=50000, insend_distill_tokens=80000,
+                               insend_distill_hot_tail=8, representation=power_loop.ProjectedRepresentation()),
+        tool_registry=_echo_registry("R" * 2000))
+    sid = await loop.new_session()
+    assert (await loop.send("hi", session_id=sid)).status == "completed"
+    assert _tool_rows(llm.seen[1]) == ["R" * 2000]
+    await loop.aclose()

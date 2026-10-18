@@ -106,14 +106,10 @@ class AgentLoopConfig:
     #: 真实大小）≥ 它 → 以 ``context_checkpoint`` 优雅收尾本 send（COMPLETE_DECIDE 先给宿主收尾窗口）
     #: → 正常投影 → 宿主的续接机制在新 send 里接着干。与 ``max_tokens_per_run``（累计费用上限）正交。
     context_checkpoint_tokens: int | None = None
-    #: ``insend_distill_tokens``：send 内保险丝——**本 send 内新增**的上下文 ≥ 它时（6.27.0 起量的是
-    #: 增量：上一轮真实 prompt_tokens 减去本 send 第一轮的 prompt_tokens；拿不到真实用量就估算本 send
-    #: 新增的行），把当前 send 里热尾之外的冷工具结果**在内存里替换成它的投影行**（同一套
-    #: ToolDefinition.project 蒸馏 + ``recall_send`` 坐标），不落盘、不改 pl_messages。None → 关。
-    #: 6.27.0 之前量的是整个上下文（系统提示词 + 历史 + 本 send），一开局就可能超阈值、每轮都烧。
+    #: Total prompt threshold for in-send semantic distillation. When enabled,
+    #: context_checkpoint_tokens is ignored: fuse and cut are exclusive policies.
     insend_distill_tokens: int | None = None
-    #: 每次触发只蒸馏**最早**的 n 条尚未蒸馏的工具结果（逐轮递进：下一轮仍超阈值就再蒸馏下 n 条），
-    #: 且永远不动最近 ``hot_tail`` 条。触发依据优先用上一轮供应商返回的真实 prompt_tokens。
+    #: Deprecated compatibility field; does not limit the number of distilled calls.
     insend_distill_batch: int = 10
     insend_distill_hot_tail: int = 8
     #: 6.27.0 这些工具的**调用参数永不瘦身**（结果照旧）。给「模型自己说的话」用：send_message /

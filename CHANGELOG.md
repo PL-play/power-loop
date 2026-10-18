@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+## [6.47.0] — 2026-10-18
+
+### Added
+- Public `ProjectedRepresentation.distill_tool_call` extension for host semantic distillation.
+- Node continuation in live workflows, with original-session execution and blocked review/loop recovery; completed parallel siblings retain their results.
+- Targeted `resume_detached(..., continuation=(node_id, message, rounds))` and enqueue-only inbox delivery for orchestration-owned steering.
+
+### Fixed
+- In-send fuse triggers on total prompt tokens, protects the newest complete tool calls by ID (arguments and results), and scans until the target or candidate exhaustion. Legacy `insend_distill_batch` is accepted but ignored.
+- Fuse and context checkpoint are exclusive; enabling the fuse disables the legacy checkpoint cutoff.
+- Nested arguments no longer starve later distillation candidates. In-memory replacements do not mutate audit objects.
+- Continuation invalidates stale downstream reviews and aggregate results. Accepted terminal-window steering is drained before schema validation and downstream execution.
+
+
 ## [6.46.4] — 2026-10-18
 
 ### Fixed

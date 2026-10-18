@@ -260,6 +260,60 @@ async def resume_run(
     return result
 
 
+def continuation_replay(spec: WorkflowSpec, node_id: str, results: dict[str, AgentResult],
+                        *, invalidated: set[str] | None = None) -> dict[str, AgentResult]:
+    """Invalidate the target, its downstream sequence, and enclosing aggregates.
+
+    Parallel siblings retain their completed results. Foreach body IDs cannot identify
+    an iteration and are rejected. Old reviews downstream of changed work never replay.
+    """
+    invalid: set[str] = set()
+    found = False
+
+    def all_ids(node):
+        own = {node.id} if getattr(node, "id", None) else set()
+        for c in WorkflowEngine._children(node):
+            own.update(all_ids(c))
+        return own
+
+    def visit(node, in_foreach=False):
+        nonlocal found
+        if isinstance(node, AgentNode):
+            if node.id == node_id:
+                if in_foreach:
+                    raise WorkflowRunError("foreach continuation needs an iteration-specific target")
+                found = True
+                invalid.add(node.id)
+                return True
+            return False
+        affected = False
+        for child in WorkflowEngine._children(node):
+            if affected and isinstance(node, SequenceNode):
+                invalid.update(all_ids(child))
+            affected = visit(child, in_foreach or isinstance(node, ForeachNode)) or affected
+        if affected and getattr(node, "id", None):
+            invalid.add(node.id)
+        return affected
+
+    visit(spec.root)
+    if not found:
+        raise WorkflowRunError(f"unknown continuation node {node_id}")
+    if invalidated is not None:
+        invalidated.update(invalid)
+    scope_ids = all_ids(spec.root)
+    replay = {k: v for k, v in results.items()
+              if k in scope_ids and k not in invalid and v.status not in ("pending", "running")}
+    def prune(node):
+        if isinstance(node, (LoopNode, ForeachNode)) and node.id in replay:
+            for key in all_ids(node.body):
+                replay.pop(key, None)
+        else:
+            for c in WorkflowEngine._children(node):
+                prune(c)
+    prune(spec.root)
+    return replay
+
+
 async def resume_detached(
     loop: Any,
     parent_sid: str,
@@ -271,6 +325,7 @@ async def resume_detached(
     force: bool = False,
     on_complete: OnComplete | None = None,
     file_io: Any | None = None,
+    continuation: tuple[str, str, int] | None = None,
 ) -> WorkflowRunHandle:
     """Resume a run on a background task; wake the parent on completion.
 
@@ -285,25 +340,48 @@ async def resume_detached(
     if await store.get_session(parent_sid) is None:
         raise WorkflowRunError("parent session not found; cannot resume detached run")
     spec, replay, j = await rehydrate(store, parent_sid, run_id)
+    invalidated: set[str] = set()
+    if continuation is not None:
+        nid, message, rounds = continuation
+        all_results = {str(st["node_id"]): AgentResult(
+            node_id=str(st["node_id"]), status=str(st.get("status") or "failed"),
+            text=st.get("text") or "", payload=st.get("payload"), usage=st.get("usage") or {},
+            session_id=st.get("session_id"),
+        ) for st in j.get("steps", [])}
+        replay = continuation_replay(spec, nid, all_results, invalidated=invalidated)
+        if not (j.get("live_sessions") or {}).get(nid):
+            raise WorkflowRunError("continuation node has no recorded session")
     _guard_resumable(run_id, force)
-    await _mark_resuming(store, parent_sid, run_id, j)
-    cancel_token = CancellationToken()
+    _LIVE_RUN_IDS.add(run_id)  # reserve before the first journal-write await
+    try:
+        await _mark_resuming(store, parent_sid, run_id, j)
+        for invalid_id in invalidated:
+            await journal.record_step(store, parent_sid, run_id, node_id=invalid_id,
+                                      status="pending", error="invalidated by node continuation",
+                                      session_id=(j.get("live_sessions") or {}).get(invalid_id))
+        cancel_token = CancellationToken()
 
-    def _build_engine() -> WorkflowEngine:
-        return WorkflowEngine(
-            loop, executor=executor, budget=budget,
-            on_step=make_on_step(store, parent_sid, run_id),
-            on_node_start=make_on_node_start(store, parent_sid, run_id),
-            on_node_session=make_on_node_session(store, parent_sid, run_id),
-            resume_sessions=resume_sessions(spec, replay, j),
-            replay=replay, run_id=run_id, stop_event=cancel_token,
-            allowed_tools=_journaled_clamp(j),
-            file_io=file_io,
+        def _build_engine() -> WorkflowEngine:
+            engine = WorkflowEngine(
+                loop, executor=executor, budget=budget,
+                on_step=make_on_step(store, parent_sid, run_id),
+                on_node_start=make_on_node_start(store, parent_sid, run_id),
+                on_node_session=make_on_node_session(store, parent_sid, run_id),
+                resume_sessions=resume_sessions(spec, replay, j),
+                replay=replay, run_id=run_id, stop_event=cancel_token,
+                allowed_tools=_journaled_clamp(j),
+                file_io=file_io,
+            )
+            if continuation is not None:
+                engine._resume_instructions[continuation[0]] = (continuation[1], continuation[2])
+            return engine
+
+        return spawn_background(
+            loop, parent_sid, run_id, store=store,
+            build_engine=_build_engine, run_spec=spec,
+            cancel_token=cancel_token, eager_wake=eager_wake, task_set=_RESUME_TASKS,
+            on_complete=on_complete,
         )
-
-    return spawn_background(
-        loop, parent_sid, run_id, store=store,
-        build_engine=_build_engine, run_spec=spec,
-        cancel_token=cancel_token, eager_wake=eager_wake, task_set=_RESUME_TASKS,
-        on_complete=on_complete,
-    )
+    except BaseException:
+        _LIVE_RUN_IDS.discard(run_id)
+        raise

@@ -145,6 +145,21 @@ def make_on_node_session(store: Any, parent_sid: str, run_id: str):
 _ENGINES: dict[str, Any] = {}
 
 
+async def steer_node(run_id: str, node_id: str, sid: str, message: str):
+    engine = _ENGINES.get(run_id)
+    if engine is None:
+        raise RuntimeError("run is settling; retry nudge to resume the persisted workflow")
+    return await engine.steer_node(node_id, sid, message)
+
+
+async def continue_node(run_id: str, node_id: str, message: str, rounds: int = 8):
+    """Continue one settled branch in its live engine; active leaves use follow_up."""
+    engine = _ENGINES.get(run_id)
+    if engine is None:
+        raise RuntimeError("run has no live engine; resume its persisted journal first")
+    return await engine.continue_node(node_id, message, rounds)
+
+
 def cancel_node(run_id: str, node_id: str, reason: str = "cancelled by host") -> int | None:
     """只取消某个 run 里的一个节点（6.46）。返回停了几个在跑的叶子；None = 这个 run 不在本进程跑。"""
     eng = _ENGINES.get(run_id)

@@ -318,3 +318,45 @@ async def test_resume_budget_precharge_includes_replayed_foreach(loop: StatefulA
     result = await resume_run(loop, sid, run_id, executor=ex2, budget=SharedBudget(21))
     assert result.status == "budget_exceeded"
     assert ex2.ran("write") == 0  # never spawned — budget already consumed by replay
+
+
+async def test_targeted_detached_resume_preserves_other_failed_branch(loop):
+    from power_loop.workflow import resume_detached
+
+    def leaf(n):
+        return {"type": "agent", "id": n, "spec": {"name": n, "system_prompt": n}}
+
+    spec = WorkflowSpec.from_json({"name": "targeted", "input": "", "root": {
+        "type": "parallel", "on_error": "continue", "branches": [
+            {"type": "sequence", "steps": [leaf("dev"), leaf("review")]}, leaf("other")]}})
+    sid = await loop.new_session()
+    await journal_mod.seed(loop.store, sid, "targeted", spec.name, spec=spec.to_dict())
+    for nid in ("dev", "other"):
+        await journal_mod.node_session(loop.store, sid, "targeted", node_id=nid, session_id=nid + "-sid")
+        await journal_mod.record_step(loop.store, sid, "targeted", node_id=nid,
+                                      status="context_checkpoint", session_id=nid + "-sid")
+    await journal_mod.update(loop.store, sid, "targeted", status="failed")
+    ran = []
+
+    class Executor:
+        async def continue_agent(self, session_id, message, **kwargs):
+            ran.append(session_id)
+            assert session_id == "dev-sid" and message == "finish dev"
+            return {"status": "completed", "final_text": "fixed", "session_id": session_id}
+
+        async def run_agent(self, spec, user_input, **kwargs):
+            ran.append(spec.name)
+            assert spec.name == "review"
+            return {"status": "completed", "final_text": "verified", "session_id": "review-sid"}
+
+    async def complete(info):
+        pass
+
+    handle = await resume_detached(loop, sid, "targeted", executor=Executor(),
+                                   continuation=("dev", "finish dev", 8), on_complete=complete)
+    await handle.task
+    journal = await journal_mod.read(loop.store, sid, "targeted")
+    states = {x['node_id']: x['status'] for x in journal['steps']}
+    assert states == {"dev": "completed", "review": "completed", "other": "context_checkpoint"}
+    assert journal['status'] == "failed"  # unrelated failure is preserved, not hidden or rerun
+    assert ran == ["dev-sid", "review"]

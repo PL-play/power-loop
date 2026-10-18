@@ -882,76 +882,6 @@ class AgentPipeline:
 
     _DISTILL_MARK = "[distilled #"
 
-    #: 参数被瘦身后留在原位的标记（值本身仍是合法 JSON 字符串，工具早已执行完，
-    #: 这里只影响模型回看时读到什么）。
-    _ARGS_MARK = "⟨已移出上下文"
-    #: 单个参数字段超过它才瘦身：短字段（路径、开关、行号）留着才看得出这次调用干了什么。
-    _ARGS_KEEP_CHARS = 200
-
-    def _has_heavy_args(self, idx: int) -> bool:
-        """这一行是 assistant，且它的某个 tool_calls 参数里有还没瘦过的大字段。"""
-        m = self.history[idx]
-        if m.get("role") != "assistant":
-            return False
-        keep = set(getattr(self.config, "insend_distill_keep_tools", ()) or ())
-        for tc in m.get("tool_calls") or []:
-            fn = (tc or {}).get("function") or {}
-            if str(fn.get("name") or "") in keep:
-                continue
-            raw = fn.get("arguments")
-            if (
-                isinstance(raw, str)
-                and len(raw) > 300
-                and self._ARGS_MARK not in raw
-            ):
-                return True
-        return False
-
-    def _distill_tool_call_args(self, idx: int, seqs: list[Any]) -> int:
-        """把一行 assistant 的 tool_calls 参数里的大字段换成指针，**保持合法 JSON**。
-
-        为什么不套用投影那套逐工具规则：那边产出的是给人读的一行散文，而这里改的是
-        供应商要按 JSON 解析的 ``function.arguments``。所以规则通用——短字段原样留下
-        （路径、模式、行号这些才看得出这次调用干了什么），只有超过 ``_ARGS_KEEP_CHARS``
-        的长字符串换成一句带 ``recall_send`` 坐标的说明。工具早已执行完，改它不影响任何
-        副作用，只影响模型回看时读到什么。返回释放的估算 token。"""
-        m = self.history[idx]
-        seq = seqs[idx] if idx < len(seqs) else None
-        coord = (
-            f"recall_send(send_index={self.send_index}, seq={seq})"
-            if (self.send_index is not None and seq is not None)
-            else "recall_send"
-        )
-        freed = 0
-        keep = set(getattr(self.config, "insend_distill_keep_tools", ()) or ())
-        for tc in m.get("tool_calls") or []:
-            fn = (tc or {}).get("function") or {}
-            if str(fn.get("name") or "") in keep:
-                continue   # 模型自己的发言（send_message 之类）：瘦成占位符它会照样再发一遍
-            raw = fn.get("arguments")
-            if not isinstance(raw, str) or len(raw) <= 300 or self._ARGS_MARK in raw:
-                continue
-            try:
-                args = json.loads(raw)
-            except (TypeError, ValueError):
-                continue
-            if not isinstance(args, dict):
-                continue
-            slim = {
-                k: (
-                    f"{self._ARGS_MARK} {len(v)} 字符，需要时 {coord} 回取⟩"
-                    if isinstance(v, str) and len(v) > self._ARGS_KEEP_CHARS
-                    else v
-                )
-                for k, v in args.items()
-            }
-            new_raw = json.dumps(slim, ensure_ascii=False)
-            if len(new_raw) >= len(raw):
-                continue  # 没省下就别动（改了反而打断前缀缓存）
-            fn["arguments"] = new_raw
-            freed += (len(raw) - len(new_raw)) // 4
-        return freed
-
     def _context_profile(self, start: int, limit: int = 4) -> str:
         """本 send 的上下文被谁占着——`工具名:来源=字符数`，最大的几个。
 
@@ -978,106 +908,65 @@ class AgentPipeline:
         top = sorted(buckets.items(), key=lambda kv: -kv[1])[:limit]
         return " ".join(f"{k}={v // 1000}K" for k, v in top if v >= 1000) or "(无大项)"
 
-    def _distill_oldest_tool_rows(self, batch: int, hot_tail: int) -> int:
-        """把当前 send 里**最早的 batch 条**工具占用在内存里换成指针（6.10.0；6.25.0 起含调用参数）。
+    def _distill_oldest_tool_rows(self, batch: int, hot_tail: int, *, target_tokens: int | None = None) -> int:
+        """Distill complete calls oldest first; ``batch`` is ignored for compatibility.
 
-        「工具占用」有两块：结果在 tool 行、**参数在 assistant 行的 tool_calls 里**。两块按位置
-        统一排队、一起算进 batch，最早的先回收。
-
-        投影行 = 与 end-of-send 投影**同一套** ``ToolDefinition.project`` 蒸馏（找不到钩子就截断），
-        带 ``recall_send(send_index, seq)`` 坐标——原文永远在 pl_messages，要用就回取。不落盘、不改
-        数据库、不改行数（sink 的 index↔seq 对齐不受影响）。最近 ``hot_tail`` 条永不动。verbatim
-        模式不做（那边有就地压缩器）。返回本批释放的估算 token（≈字符/4）。"""
+        Protect invocation IDs, not result rows: parallel results may arrive out of order.
+        Only replace in-memory copies, keeping persisted audit records and seq alignment intact.
+        """
         rep = self.config.representation
-        if getattr(rep, "kind", "projection") == "verbatim":
+        distill = getattr(rep, "distill_tool_call", None)
+        if getattr(rep, "kind", "projection") == "verbatim" or distill is None:
             return 0
-        project_tool = getattr(rep, "_project_tool", None)
         seqs = getattr(self.sink, "_history_seqs", None) or []
-        # 6.27.0 只动**本 send** 追加的行：run 之前就在历史里的（上一个 send 留下的逐字行）归跨 send
-        # 投影管，保险丝碰它们等于两套机制抢同一段历史。
         start = min(int(getattr(self, "_send_start_len", 0) or 0), len(self.history))
-        tool_idx = [
-            i for i, m in enumerate(self.history)
-            if i >= start and m.get("role") == "tool" and isinstance(m.get("content"), str)
-        ]
-        # max(0, …)：本 send 的工具行少于 hot_tail 时，切片起点会是负数，Python 把它当成
-        # 「倒数第 |x| 条」绕回去——5 条工具行配 hot_tail=8 时只保住最后 3 条，最早 2 条
-        # 照样被蒸馏，而那 2 条正是模型手边的东西。本意是「不足 hot_tail 条就全保住」：
-        # 保险丝的前提是有旧结果可回收，没有旧的就什么都不该动，让它涨到切 send 阈值
-        # 优雅收尾即可（断片比切 send 贵得多）。
-        protected = (
-            set(tool_idx[max(0, len(tool_idx) - hot_tail):]) if hot_tail > 0 else set()
-        )
-        # 热尾的起点：它之后的任何一行（工具结果、assistant 的调用参数）都算「手边的东西」。
-        protect_from = min(protected) if protected else len(self.history)
-        result_ok = {
-            i for i in tool_idx
-            if i not in protected
-            and not str(self.history[i].get("content")).startswith(self._DISTILL_MARK)
-            and len(self.history[i].get("content") or "") > 300
-        }
-        # 工具在上下文里占两块：结果在 tool 行，**参数在 assistant 行的 tool_calls 里**。
-        # 参数从来没被保险丝碰过，而实测它占全库上下文的 29%——write_file 一个人 12.6MB，
-        # 单次最大 5.4 万字符：文件已经落盘了，正文却还在 prompt 里一轮轮重发。
-        # 跨 send 的投影早就把两块一起收掉了，缺的只是 send 内这一层。
-        candidates: list[tuple[str, int]] = sorted(
-            [("result", i) for i in result_ok]
-            + [("args", i) for i in range(start, protect_from) if self._has_heavy_args(i)],
-            key=lambda x: x[1],
-        )
-        picked_all = candidates[: max(1, batch)]
-        picked = [i for kind, i in picked_all if kind == "result"]
-        picked_args = [i for kind, i in picked_all if kind == "args"]
-        if not picked_all:
-            return 0
-        # tool_call_id → (name, args) 从前面的 assistant(tool_calls) 行反查。
-        # 只解析**本批选中的**那几个 id：以前是每次触发都把全历史所有 assistant 行的所有
-        # tool_calls 的 arguments 反序列化一遍建全表，只为查其中 batch 条（默认 10）。
-        # 保险丝一旦启动几乎每轮都触发，于是每轮做一次 O(历史) 的 json.loads。
-        wanted = {str(self.history[i].get("tool_call_id") or "") for i in picked}
-        wanted.discard("")
-        call_meta: dict[str, tuple[str, Any]] = {}
-        for m in self.history if wanted else ():
-            if m.get("role") != "assistant":
+        calls = []
+        results = {}
+        for i in range(start, len(self.history)):
+            row = self.history[i]
+            if row.get("role") == "assistant":
+                for j, tc in enumerate(row.get("tool_calls") or []):
+                    if tc.get("id"):
+                        calls.append((str(tc["id"]), i, j))
+            elif row.get("role") == "tool":
+                results[str(row.get("tool_call_id") or "")] = i
+        protected = {cid for cid, _, _ in calls[-hot_tail:]} if hot_tail > 0 else set()
+        keep = set(self.config.insend_distill_keep_tools or ())
+        freed_chars = 0
+        for cid, i, j in calls:
+            if cid in protected or cid not in results:
                 continue
-            for tc in m.get("tool_calls") or []:
-                cid = str((tc or {}).get("id") or "")
-                if cid not in wanted or cid in call_meta:
-                    continue
-                fn = (tc or {}).get("function") or {}
-                args = fn.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except (TypeError, ValueError):
-                        args = {"raw": args[:200]}
-                call_meta[cid] = (str(fn.get("name") or "tool"), args)
-            if len(call_meta) == len(wanted):
-                break
-        freed = 0
-        for i in picked:
-            m = self.history[i]
-            name, args = call_meta.get(str(m.get("tool_call_id") or ""), ("tool", {}))
-            content = str(m.get("content") or "")
-            if project_tool is not None:
-                try:
-                    d = project_tool(name, args, content, getattr(self, "tool_registry", None))
-                    parts = [f"{k}={v}" for k, v in (d or {}).items() if k != "name" and v not in (None, "")]
-                    line = f"{name}(" + ", ".join(str(x)[:200] for x in parts) + ")"
-                except Exception:  # noqa: BLE001 — 蒸馏钩子出错就退回截断
-                    line = f"{name}: {content[:200]}…"
-            else:
-                line = f"{name}: {content[:200]}…"
+            ri = results[cid]
+            content = self.history[ri].get("content")
+            tc = self.history[i]["tool_calls"][j]
+            fn = tc.get("function") or {}
+            raw = fn.get("arguments")
+            name = str(fn.get("name") or "tool")
+            if (name in keep or not isinstance(content, str) or not isinstance(raw, str)
+                    or content.startswith(self._DISTILL_MARK)):
+                continue
+            try:
+                args = json.loads(raw)
+                line = distill(name, args, content, getattr(self, "tool_registry", None))
+            except Exception:  # a broken projector must not stop the run or starve later calls
+                logger.warning("in-send distillation failed for %s", name, exc_info=True)
+                continue
             seq = seqs[i] if i < len(seqs) else None
             coord = (f"recall_send(send_index={self.send_index}, seq={seq})"
-                     if (self.send_index is not None and seq is not None) else "recall_send")
-            new_content = (f"{self._DISTILL_MARK}{self.send_index} seq={seq} — 原文已从上下文移出，"
-                           f"需要时 {coord} 回取] {line}")
-            freed += max(0, (len(content) - len(new_content)) // 4)
-            m["content"] = new_content
-        for i in picked_args:
-            freed += self._distill_tool_call_args(i, seqs)
-        return freed
+                     if self.send_index is not None and seq is not None else "recall_send")
+            new_content = f"{self._DISTILL_MARK}{self.send_index} seq={seq}; {coord}] {line}"
+            new_raw = json.dumps({"_distilled": coord}, ensure_ascii=False)
+            saved = len(raw) + len(content) - len(new_raw) - len(new_content)
+            if saved <= 0:
+                continue
+            new_calls = list(self.history[i]["tool_calls"])
+            new_calls[j] = {**tc, "function": {**fn, "arguments": new_raw}}
+            self.history[i] = {**self.history[i], "tool_calls": new_calls}
+            self.history[ri] = {**self.history[ri], "content": new_content}
+            freed_chars += saved
+            if target_tokens is not None and freed_chars // 4 >= target_tokens:
+                break
+        return freed_chars // 4
 
     def _estimate_history_tokens(self) -> int:
         """Current history token estimate, maintained incrementally (SCALE-4).
@@ -1131,42 +1020,22 @@ class AgentPipeline:
         if irr is not None and int(irr) > 0 and self._retire_stale_images(round_index, int(irr)):
             self._tok_len = -1
 
-        # ── 6.10.0 send 内保险丝：最早的 n 条工具结果 → 投影行（内存替换，pl_messages 不动）──
-        # 触发依据 = 上一轮供应商返回的真实 prompt_tokens（就是当前上下文的真实大小；第一轮
-        # 还没有就用估算）。每轮最多蒸馏一批（最早的 n 条、跳过已蒸馏的、不动最近 hot_tail 条）；
-        # 下一轮真实 prompt 仍超阈值就再蒸馏下一批——逐轮递进，只蒸馏到够用为止。
+        # Fuse uses total prompt size, including the fixed prompt and history prefix.
         dt = self.config.insend_distill_tokens
         if dt is not None and int(dt) > 0 and round_index > 0:
-            # 6.27.0：量的是**本 send 内的增长**，不是整个上下文。系统提示词 + 技能 + 工具目录 + 历史
-            # 一开局就可能有几万 token，按整体判的话第一轮就超阈值、之后每轮都烧（真实事故：一个
-            # 会话 44 次触发，模型自己的发言参数被瘦成占位符，再被照样发进聊天）。保险丝的本意是
-            # 「这一个 send 跑得太长」才出手：第一轮的真实 prompt_tokens 是基线，之后每轮减它。
             real = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0)
-            if real > 0:
-                if self._send_baseline_prompt is None:
-                    self._send_baseline_prompt = real
-                growth = real - int(self._send_baseline_prompt)
-            else:
-                start = min(int(getattr(self, "_send_start_len", 0) or 0), len(self.history))
-                growth = estimate_tokens(self.history[start:])
-            if growth >= int(dt):
+            if real and self._send_baseline_prompt is None:
+                self._send_baseline_prompt = real  # diagnostics only; never subtracted from trigger
+            total = real or self._estimate_history_tokens()
+            if total >= int(dt):
                 freed = self._distill_oldest_tool_rows(
-                    int(self.config.insend_distill_batch or 10),
-                    int(self.config.insend_distill_hot_tail or 0),
+                    0, int(self.config.insend_distill_hot_tail or 0),
+                    target_tokens=max(1, total - int(dt) + 1),
                 )
                 if freed:
-                    self._tok_len = -1  # content shrank in place; force a fresh estimate
-                start_i = min(int(getattr(self, "_send_start_len", 0) or 0), len(self.history))
-                # freed==0 也要记：那是「保险丝烧完了、再触发也没用」的静默状态，
-                # 而它的表现和「一切正常」一模一样——上下文继续涨，日志里一个字都没有。
-                logger.info(
-                    "insend distill: send grew %d >= %d tokens; freed ~%d this round "
-                    "(send %s, round %d, prompt %d, rows %d) | 大头: %s%s",
-                    growth, int(dt), freed, self.send_index, round_index, real,
-                    len(self.history) - start_i, self._context_profile(start_i),
-                    "" if freed else "  ← 没有可回收的了：剩下的要么在热尾、要么已蒸馏、要么是"
-                                     "模型自己的正文（保险丝只动工具结果与调用参数）",
-                )
+                    self._tok_len = -1
+                logger.info("insend distill: total prompt %d >= %d; freed ~%d tokens",
+                            total, int(dt), freed)
         if self.config.microcompact_enabled:
             self.ctx.microcompact(
                 self.history,
@@ -1665,6 +1534,7 @@ class AgentPipeline:
             ckpt = self.config.context_checkpoint_tokens
             if (
                 ckpt is not None
+                and (self.config.insend_distill_tokens or 0) <= 0
                 and int(ckpt) > 0
                 and round_idx > 0
                 and not self._terminal_grace_active
