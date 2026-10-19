@@ -931,6 +931,8 @@ class AgentPipeline:
             elif row.get("role") == "tool":
                 results[str(row.get("tool_call_id") or "")] = i
         protected = {cid for cid, _, _ in calls[-hot_tail:]} if hot_tail > 0 else set()
+        # Optional host protection for individual calls (e.g. bash loading persistent skills).
+        protected.update(getattr(self, "_context_protected_call_ids", ()))
         keep = set(self.config.insend_distill_keep_tools or ())
         freed_chars = 0
         for cid, i, j in calls:
@@ -951,7 +953,8 @@ class AgentPipeline:
             except Exception:  # a broken projector must not stop the run or starve later calls
                 logger.warning("in-send distillation failed for %s", name, exc_info=True)
                 continue
-            seq = seqs[i] if i < len(seqs) else None
+            # recall_send needs the result row; it includes the matching call arguments.
+            seq = seqs[ri] if ri < len(seqs) else None
             coord = (f"recall_send(send_index={self.send_index}, seq={seq})"
                      if self.send_index is not None and seq is not None else "recall_send")
             new_content = f"{self._DISTILL_MARK}{self.send_index} seq={seq}; {coord}] {line}"
@@ -1022,11 +1025,17 @@ class AgentPipeline:
 
         # Fuse uses total prompt size, including the fixed prompt and history prefix.
         dt = self.config.insend_distill_tokens
-        if dt is not None and int(dt) > 0 and round_index > 0:
+        if dt is not None and int(dt) > 0 and (
+            round_index > 0 or getattr(self, "_context_prompt_tokens_estimate", None) is not None
+        ):
             real = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0)
             if real and self._send_baseline_prompt is None:
                 self._send_baseline_prompt = real  # diagnostics only; never subtracted from trigger
-            total = real or self._estimate_history_tokens()
+            # Optional host estimate after context retirement. Never mutate provider
+            # usage: the latter is billing evidence for the previous request.
+            current_estimate = getattr(self, "_context_prompt_tokens_estimate", None)
+            total = (max(0, int(current_estimate)) if current_estimate is not None
+                     else real or self._estimate_history_tokens())
             if total >= int(dt):
                 freed = self._distill_oldest_tool_rows(
                     0, int(self.config.insend_distill_hot_tail or 0),

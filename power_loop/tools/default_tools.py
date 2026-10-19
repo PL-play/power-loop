@@ -491,6 +491,9 @@ class BashSession:
         # head+tail (via _truncate_lines), so a command emitting millions of lines must not buffer
         # them all. Keep the first _BASH_HEAD_KEEP fully + the last _BASH_TAIL_KEEP in a ring,
         # dropping the middle (both bounds comfortably exceed _truncate_lines' 30+170 window).
+        from power_loop.runtime.bash_capture import current_bash_capture
+
+        capture = current_bash_capture.get()
         head: list[str] = []
         tail: deque[str] = deque(maxlen=_BASH_TAIL_KEEP)
         dropped = 0
@@ -499,6 +502,8 @@ class BashSession:
 
         def _accumulate(line: str) -> None:
             nonlocal dropped
+            if capture is not None:
+                capture.write_line(line)
             if len(head) < _BASH_HEAD_KEEP:
                 head.append(line)
                 return

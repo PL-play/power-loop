@@ -89,7 +89,7 @@ def _registry(tmp_path) -> ToolRegistry:
 async def test_images_are_retired_after_retention_rounds(tmp_path):
     llm = _Scripted(responses=[_tool("c1"), _tool("c2"), _tool("c3"), _resp("done")])
     loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
-                             config=AgentLoopConfig(system_prompt="t", max_rounds=8, image_retention_rounds=1),
+                             config=AgentLoopConfig(system_prompt="t", max_rounds=8),
                              tool_registry=_registry(tmp_path))
     sid = await loop.new_session()
     res = await loop.send("hi", session_id=sid)
@@ -117,3 +117,39 @@ async def test_retention_off_keeps_images(tmp_path):
     rows = _attachment_rows(llm.seen[2])
     assert rows and all(any(k == "attachment" for k in row) for row in rows)
     await loop.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("projected", [True, False])
+async def test_cross_send_image_representation(tmp_path, projected):
+    """Projected history is text; verbatim history currently restores untracked attachments."""
+    from power_loop.runtime.representation import ProjectedRepresentation, VerbatimRepresentation
+
+    llm = _Scripted(responses=[_tool("c1"), _tool("c2"), _resp("done"),
+                              _tool("c3"), _resp("done")])
+    config = AgentLoopConfig(
+        system_prompt="t", max_rounds=8,
+        representation=ProjectedRepresentation() if projected else VerbatimRepresentation(),
+    )
+    assert config.image_retention_rounds == 1
+    loop = StatefulAgentLoop(llm=llm, db_path=str(tmp_path / "s.db"),
+                             config=config, tool_registry=_registry(tmp_path))
+    sid = await loop.new_session()
+    try:
+        await loop.send("look", session_id=sid)
+        # The first image has already retired before this send finishes.
+        assert "image retired" in str(llm.seen[2])
+        await loop.send("continue", session_id=sid)
+        first = _attachment_rows(llm.seen[3])
+        second = _attachment_rows(llm.seen[4])
+        if projected:
+            assert first == []
+            assert len(second) == 1  # only the freshly requested picture
+        else:
+            # Characterize the gap: restored historical attachments are not registered
+            # in _image_rounds, so even the next iteration leaves both old images live.
+            assert len(first) == 2
+            assert all("attachment" in row for row in first)
+            assert all("attachment" in row for row in second[:2])
+    finally:
+        await loop.aclose()

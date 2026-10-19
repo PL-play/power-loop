@@ -8,6 +8,12 @@
 
 ## [Unreleased]
 
+## [6.53.0] — 2026-10-19
+
+- Add opt-in normalized bash output capture before preview truncation. Default tool behavior is unchanged without a capture context.
+- Allow host-protected call IDs and a separate current-view prompt estimate in the in-send fuse; provider billing usage remains unchanged. An explicit estimate also permits checking the first round after recovery.
+- Fix in-send fuse recall coordinates to reference each tool result row, allowing recall_send to restore both the original result and its matching arguments, including parallel calls with reordered results.
+
 ## [6.52.0] — 2026-10-19
 
 - Leaf-scoped workflows also limit main model requests through a separate, inherited admission pool; nested helpers share the cap without holding request slots while waiting for tools. Cancellation while queued does not leak capacity.

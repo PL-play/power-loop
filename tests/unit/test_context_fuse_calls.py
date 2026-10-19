@@ -37,3 +37,11 @@ def test_nested_candidates_do_not_starve_and_hot_tail_tracks_call_ids():
     assert after[20:] == original[0]["tool_calls"][20:]
     assert audit_calls == original[0]["tool_calls"]
     assert p._distill_oldest_tool_rows(1, 8) == 0
+
+    # Each compacted call points at its own result, even with parallel results reversed.
+    for i in range(8, 20):
+        ri = next(n for n, row in enumerate(original)
+                  if row.get("tool_call_id") == str(i))
+        coordinate = f"recall_send(send_index=1, seq={ri})"
+        assert coordinate in after[i]["function"]["arguments"]
+        assert coordinate in p.history[ri]["content"]
