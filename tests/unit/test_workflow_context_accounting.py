@@ -52,7 +52,7 @@ async def test_nested_workflow_late_summary_keeps_owner_ancestry_and_raw_evidenc
     llm = _Scripted([_tool_resp('nested-call', 'nested', '{}'),
                      _tool_resp('bash-call', 'inspect_artifact', '{"description":"critical inspection"}'),
                      LLMResponse(raw_text='inner done'), LLMResponse(raw_text='outer done')])
-    cfg = ToolContextConfig(overrides={'inspect_artifact': {'between_sends': 'llm_summary'}},
+    cfg = ToolContextConfig(summary_min_chars=0, overrides={'inspect_artifact': {'between_sends': 'llm_summary'}},
                             summary_llm=SlowSummary(), deliver_usage=deliver)
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(tool_context=cfg, representation=ProjectedRepresentation(), compactor=None))
@@ -110,7 +110,7 @@ async def _crash_workflow(path):
             await asyncio.Event().wait()
     registry = ToolRegistry()
     registry.register(ToolDefinition('inspect_artifact', 'inspect'), lambda: 'critical.py exit42\n' * 200)
-    config = ToolContextConfig(overrides={'inspect_artifact': {'between_sends': 'llm_summary'}},
+    config = ToolContextConfig(summary_min_chars=0, overrides={'inspect_artifact': {'between_sends': 'llm_summary'}},
                                summary_llm=PendingProvider())
     loop = StatefulAgentLoop(store=store, tool_registry=registry,
         llm=_Scripted([_tool_resp('inspect', 'inspect_artifact', '{}'), LLMResponse(raw_text='finished')]),

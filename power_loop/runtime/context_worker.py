@@ -79,7 +79,8 @@ class SummaryWorker:
         try:
             response = await asyncio.wait_for((engine.config.summary_llm or engine.llm).complete(LLMRequest(
                 messages=[{'role': 'user', 'content': payload['input']}], system_prompt=payload['prompt'],
-                model=payload['model'], max_tokens=payload['max_tokens'], temperature=0)), payload['timeout_s'])
+                model=payload['model'], max_tokens=payload['max_tokens'], temperature=0,
+                extra=payload.get('request_extra', {}))), payload['timeout_s'])
             usage = getattr(response, 'token_usage', None)
             record['usage'] = usage.as_dict() if hasattr(usage, 'as_dict') else usage
             record['usage_unknown'] = not isinstance(record['usage'], dict) or not any(

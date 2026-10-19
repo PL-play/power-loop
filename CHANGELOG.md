@@ -8,6 +8,12 @@
 
 ## [Unreleased]
 
+## [6.54.3] — 2026-10-20
+
+- Disable thinking by default for DeepSeek auxiliary tool summaries without changing main-agent requests; persist effective request options and separate cache/executor identities.
+- Preserve original arguments/results without LLM calls when the tool result is under 8000 Unicode characters; threshold applies to prefetch and all summary triggers, including background delegation. Rule distillation is unchanged.
+- Expose host overrides for summary request options and minimum result length; retain accounting for rejected summary candidates.
+
 ## [6.54.2] — 2026-10-20
 
 - Persist workflow ancestry in leaf metadata and auxiliary receipts, including ordinary nested subagents. Closed synthetic driver rows no longer sever late billing attribution.

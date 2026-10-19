@@ -13,7 +13,7 @@ async def test_real_summary_is_metered_and_reused():
     store = await SessionStore.open(':memory:')
     try:
         sid = await store.create_session()
-        config = ToolContextConfig(overrides={'bash': {'between_sends': 'llm_summary', 'timeout_s': 90}})
+        config = ToolContextConfig(summary_min_chars=0, overrides={'bash': {'between_sends': 'llm_summary', 'timeout_s': 90}})
         engine = ToolContextEngine(config=config, store=store, owner_session_id=sid,
                                    owner_send_index=2, llm=llm, model=None)
         await engine.start()
@@ -54,7 +54,7 @@ async def test_real_workflow_summary_is_attributed_after_node_completion():
     registry = ToolRegistry()
     registry.register(ToolDefinition('inspect_evidence', 'inspect fixed evidence'),
         lambda: 'successful checks\n' * 200 + 'critical.py failed: missing secret; exit 42; deployment blocked')
-    config = ToolContextConfig(summary_llm=summary_llm,
+    config = ToolContextConfig(summary_min_chars=0, summary_llm=summary_llm,
         overrides={'inspect_evidence': {'between_sends': 'llm_summary', 'timeout_s': 90}})
     loop = StatefulAgentLoop(store=store, tool_registry=registry,
         llm=_Scripted([_tool_resp('c', 'inspect_evidence', '{}'), LLMResponse(raw_text='evidence recorded')]),

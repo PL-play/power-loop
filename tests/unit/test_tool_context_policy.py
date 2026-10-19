@@ -25,7 +25,7 @@ async def env():
                       lambda **kw: 'result' * 300)
     llm = _Scripted([LLMResponse(raw_text='verified exact-file.txt', token_usage=LLMTokenUsage(
         prompt_tokens=100, completion_tokens=20, total_tokens=120, prompt_cached_tokens=50))])
-    config = ToolContextConfig(overrides={'bash': {'between_sends': 'llm_summary'}})
+    config = ToolContextConfig(summary_min_chars=0, overrides={'bash': {'between_sends': 'llm_summary'}})
     engine = ToolContextEngine(config=config, store=store, owner_session_id=sid, owner_send_index=2,
                                registry=registry, llm=llm, model='test')
     await engine.start()
@@ -391,3 +391,48 @@ asyncio.run(main())
         assert await cache.claim('executor') is None
     finally:
         await store.close()
+
+
+async def test_summary_disables_deepseek_thinking_without_changing_main_config(env):
+    store, sid, registry, llm, config, _, source = env
+    requests = []
+    complete = llm.complete
+    async def capture(request, **kwargs):
+        requests.append(request)
+        return await complete(request, **kwargs)
+    llm.complete = capture
+    config = replace(config, overrides={'bash': {'between_sends': 'llm_summary'}})
+    engine = ToolContextEngine(config=config, store=store, owner_session_id=sid,
+                               owner_send_index=3, llm=llm, model='deepseek-flash', registry=registry)
+    await engine.start()
+    job = await generate(engine, source)
+    assert job['payload']['request_extra'] == {'extra_body': {'thinking': {'type': 'disabled'}}}
+    assert requests[-1].extra == job['payload']['request_extra']
+    inherited = ToolContextEngine(config=replace(config, summary_request_extra={}), store=store,
+        owner_session_id=sid, owner_send_index=4, llm=llm, model='deepseek-flash', registry=registry)
+    assert inherited.cache_key(source, inherited.policy(source)) != engine.cache_key(source, engine.policy(source))
+    assert inherited.executor_key != engine.executor_key
+    assert config.summary_request_extra is None
+
+
+async def test_default_small_summary_preserves_original_without_enqueue_or_rule(env):
+    store, sid, registry, llm, _, _, source = env
+    cfg = ToolContextConfig(overrides={'bash': {'between_sends': 'llm_summary',
+                                               'insend_fuse': 'llm_summary'}})
+    engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid,
+                               owner_send_index=5, registry=registry, llm=llm, model='test')
+    await engine.start()
+    below = replace(source, result='汉' * 7999)
+    assert not await engine.submit(below)
+    assert await engine.distill(below, 'between_sends') is None
+    assert await engine.distill(below, 'insend_fuse') is None
+    assert not llm.calls
+    assert await engine.submit(replace(source, result='汉' * 8000))
+    # Rule strategies ignore the LLM admission threshold.
+    assert await engine.distill(below, 'age_retirement') is None
+    cfg.overrides['bash']['age_retirement'] = 'rule'
+    # Engine snapshots overrides at start, so build the rule engine explicitly.
+    rule_engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid,
+        owner_send_index=6, registry=registry, llm=llm, model='test')
+    await rule_engine.start()
+    assert 'checks' in await rule_engine.distill(below, 'age_retirement')

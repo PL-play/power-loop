@@ -42,11 +42,16 @@ class ToolContextConfig:
     cache_max_entries: int = 10000
     cache_max_bytes: int = 67108864
     usage_metadata: Callable[[], dict[str, Any]] | None = None
+    summary_min_chars: int = 8000
     summary_llm: Any = None
+    # None selects provider-aware non-thinking defaults; {} explicitly inherits transport.
+    summary_request_extra: dict[str, Any] | None = None
     rule: Callable[[str, Mapping[str, Any], str, Any], Any] | None = None
     deliver_usage: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.summary_min_chars, bool) or not isinstance(self.summary_min_chars, int) or self.summary_min_chars < 0:
+            raise ValueError("summary_min_chars must be a nonnegative integer")
         if self.summary_budget_s < 0 or self.delivery_budget_s <= 0:
             raise ValueError("summary budget must be nonnegative and delivery budget positive")
         if self.cache_ttl_s <= 0 or self.cache_max_entries < 1 or self.cache_max_bytes < 1:
@@ -76,7 +81,14 @@ class ToolContextEngine:
                  registry: Any = None, rule: Any = None, lineage: dict[str, Any] | None = None):
         transport = config.summary_llm or llm
         transport_config = getattr(transport, '_cfg', None)
+        summary_model = model or getattr(transport_config, 'model', None) or ''
+        self.summary_request_extra = (dict(config.summary_request_extra)
+            if config.summary_request_extra is not None else
+            {'extra_body': {'thinking': {'type': 'disabled'}}}
+            if 'deepseek' in summary_model.lower() else {})
         identity = _hash({'declared': config.model_identity,
+                          'summary_request_extra': self.summary_request_extra,
+                          'summary_min_chars': config.summary_min_chars,
                           'transport': type(transport).__module__ + '.' + type(transport).__qualname__,
                           'endpoint': getattr(transport_config, 'base_url', None),
                           'model': model or getattr(transport_config, 'model', None)})
@@ -187,6 +199,8 @@ class ToolContextEngine:
         strategy = getattr(policy, trigger)
         if trigger != 'between_sends' and source.name == 'bash' and source.arguments.get('context_policy') == 'keep':
             strategy = 'preserve'
+        if strategy == 'llm_summary' and len(source.result) < self.config.summary_min_chars:
+            return None  # short original: preserve both arguments and result, no rule fallback
         if strategy == 'preserve' or not getattr(self, '_implementation_matches', True):
             return None
         # A recall without durable coordinates would misrepresent recoverability.
@@ -245,6 +259,8 @@ class ToolContextEngine:
                 accepted = await self.submit(target) or accepted
             return accepted
         policy = self.policy(source)
+        if len(source.result) < self.config.summary_min_chars:
+            return False
         if (not self._implementation_matches or source.seq is None
                 or source.send_index is None or not any(getattr(policy, t) == 'llm_summary'
                 for t in ('age_retirement', 'insend_fuse', 'between_sends'))):
@@ -255,6 +271,7 @@ class ToolContextEngine:
                    'input': _json({'arguments': dict(source.arguments), 'result': source.result}),
                    'prompt': policy.prompt, 'max_tokens': policy.max_tokens,
                    'timeout_s': policy.timeout_s, 'model': self.model,
+                   'request_extra': self.summary_request_extra,
                    'attribution': {**(self.config.usage_metadata() if self.config.usage_metadata else {}),
                                    **self.lineage}}
         accepted = await self.cache.enqueue(self.cache_key(source, policy), self.executor_key, payload,

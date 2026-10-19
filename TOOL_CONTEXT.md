@@ -88,3 +88,21 @@ metadata before execution; it survives synthetic driver cleanup and propagates t
 subagents. Detached resumes recover it from retained sessions. Older sessions without this metadata
 cannot reconstruct a deleted driver chain. Inclusive billing must deduplicate attempt_id across
 this chain; it is not an instruction to add a new charge at every ancestor.
+
+### Summary thinking configuration
+
+Summary requests use their own request options; the main agent's requests are unchanged.
+For DeepSeek models the default is `extra_body.thinking.type=disabled`.
+`ToolContextConfig.summary_request_extra` may override these provider-specific options;
+`None` selects defaults and `{}` explicitly inherits the transport settings. Unknown model
+families receive no guessed vendor flags. Hosts must supply supported options for them.
+Effective summary options participate in model/cache/executor identity and are frozen in
+queued job payloads, so recovery cannot silently mix thinking and non-thinking jobs.
+Already queued jobs retain their original options.
+
+`summary_min_chars` defaults to **8000 Unicode characters of the original tool result**
+(not tokens, bytes, or JSON-escaped length). Below this threshold `llm_summary` preserves
+both arguments and result, without enqueueing or falling back to a lossy rule. Exactly
+8000 is eligible. The check applies both to prefetch and every distillation trigger,
+including delegated background tool results. Rule-only tools are unaffected. Hosts may
+set this nonnegative integer to 0 to disable the admission threshold.
