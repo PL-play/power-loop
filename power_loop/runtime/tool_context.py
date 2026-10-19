@@ -15,7 +15,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
-from power_loop.contracts.context_policy import ToolContextPolicy, Trigger
+from power_loop.contracts.context_policy import ToolContextPolicy, Trigger, contains_preserve_marker
 
 STATE_KEY = 'tool_context.v1'
 active_engine: ContextVar[ToolContextEngine | None] = ContextVar('tool_context_engine', default=None)
@@ -212,7 +212,7 @@ class ToolContextEngine:
                            'rule_version': self.config.rule_version})
         cached = self.state['operations'].get(operation)
         if cached is not None:
-            return cached['text']
+            return None if contains_preserve_marker(cached['text']) else cached['text']
         # Interrupted attempts are not blindly reissued: rule fallback becomes stable.
         text = None
         if strategy == 'llm_summary':
@@ -321,7 +321,7 @@ class ToolContextEngine:
 
     @staticmethod
     def _valid(text: Any, original: str, source: ToolSource) -> bool:
-        return (isinstance(text, str) and bool(text.strip()) and text.strip() != '<preserve>'
+        return (isinstance(text, str) and bool(text.strip()) and not contains_preserve_marker(text)
                 and len(text) + len(source.recall) + 4 < len(original))
 
     async def _record_stats(self, attempt: dict[str, Any]) -> None:

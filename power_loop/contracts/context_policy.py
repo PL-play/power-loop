@@ -1,6 +1,7 @@
 """Host-side tool context policy. Never included in model-facing tool schemas."""
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -41,3 +42,8 @@ class ToolContextPolicy:
     def override(self, fields: Mapping[str, object]) -> ToolContextPolicy:
         """Field-level overrides retain unspecified tool defaults; typos fail closed."""
         return replace(self, **dict(fields))
+
+
+def contains_preserve_marker(text: object) -> bool:
+    """Ambiguous preservation markers must never become a compressed view."""
+    return isinstance(text, str) and re.search(r"</?preserve(?:\s|>)", text, re.IGNORECASE) is not None

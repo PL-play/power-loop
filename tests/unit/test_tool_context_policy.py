@@ -436,3 +436,25 @@ async def test_default_small_summary_preserves_original_without_enqueue_or_rule(
         owner_send_index=6, registry=registry, llm=llm, model='test')
     await rule_engine.start()
     assert 'checks' in await rule_engine.distill(below, 'age_retirement')
+
+
+@pytest.mark.parametrize('candidate', ['<preserve>', '<preserve>summary</preserve>',
+                                      '<PRESERVE>summary</PRESERVE>', '</preserve>',
+                                      '<preserve reason="constraints">summary'])
+async def test_preservation_markers_never_become_cached_summaries(env, candidate):
+    store, sid, _, llm, _, engine, source = env
+    llm.responses[0].raw_text = candidate
+    await generate(engine, source)
+    assert await engine.cache.get(engine.cache_key(source, engine.policy(source))) is None
+    assert not engine._valid(candidate, 'x' * 10000, source)
+    # Rejected candidates still incur a real accounted request.
+    assert (await store.get_session_stats(sid)).total_tokens == 120
+
+
+async def test_old_operation_with_preserve_marker_is_not_reused(env):
+    _, _, _, _, _, engine, source = env
+    await generate(engine, source)
+    assert await engine.distill(source, 'between_sends')
+    for operation in engine.state['operations'].values():
+        operation['text'] = '<preserve>previously accepted candidate</preserve>'
+    assert await engine.distill(source, 'between_sends') is None

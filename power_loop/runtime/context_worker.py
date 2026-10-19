@@ -10,6 +10,7 @@ from typing import Any
 
 from power_loop._vendor.llm_client.attempt_scope import single_attempt
 from power_loop._vendor.llm_client.interface import LLMRequest
+from power_loop.contracts.context_policy import contains_preserve_marker
 from power_loop.runtime.store.context_cache import ContextCache
 
 logger = logging.getLogger(__name__)
@@ -88,7 +89,7 @@ class SummaryWorker:
             record.update(outcome='success', success=True)
             text = getattr(response, 'content_text', '') or getattr(response, 'raw_text', '')
             if (not getattr(response, 'tool_calls', None) and isinstance(text, str) and text.strip()
-                    and text.strip() != '<preserve>' and len(text) + 128 < len(payload['input'])):
+                    and not contains_preserve_marker(text) and len(text) + 128 < len(payload['input'])):
                 summary = text
         except asyncio.CancelledError:
             record['outcome'] = 'cancelled'

@@ -8,6 +8,10 @@
 
 ## [Unreleased]
 
+## [6.54.4] — 2026-10-20
+
+- Reject ambiguous preserve-tagged summary candidates at generation, shared-cache validation, and operation-cache reuse. Keep accounting for rejected requests.
+
 ## [6.54.3] — 2026-10-20
 
 - Disable thinking by default for DeepSeek auxiliary tool summaries without changing main-agent requests; persist effective request options and separate cache/executor identities.
