@@ -123,14 +123,27 @@ class ContextCache:
                              (token, lease_until, row['cache_key']))
             return {**dict(row), 'payload': payload, 'lease_token': token, 'lease_until': lease_until}
 
-    async def begin_attempt(self, job: dict, record: dict) -> None:
-        await self.db.execute(f'''INSERT INTO {self.attempts}
-            (attempt_id,cache_key,owner_session_id,outcome,record_json,created_at) VALUES (?,?,?,'started',?,?)''',
-            (record['attempt_id'], job['cache_key'], record['owner_session_id'], dumps(record), now_ms()))
+    async def begin_attempt(self, job: dict, record: dict) -> bool:
+        async with self.db.transaction() as tx:
+            await self._lock(tx)
+            live = await tx.fetchone(f"SELECT 1 FROM {self.cache} WHERE cache_key=? AND status='running' "
+                                    "AND lease_token=? AND lease_until>=?",
+                                    (job['cache_key'], job['lease_token'], now_ms()))
+            if live is None:
+                return False  # stale worker must not issue an unowned provider request
+            await tx.execute(f'''INSERT INTO {self.attempts}
+                (attempt_id,cache_key,owner_session_id,outcome,record_json,created_at) VALUES (?,?,?,'started',?,?)''',
+                (record['attempt_id'], job['cache_key'], record['owner_session_id'], dumps(record), now_ms()))
+            return True
 
     async def finish(self, job: dict, record: dict, summary: str | None, result_hash: str | None) -> None:
         async with self.db.transaction() as tx:
-            await tx.execute(f'UPDATE {self.attempts} SET outcome=?, record_json=? WHERE attempt_id=?',
+            await self._lock(tx)
+            previous = await tx.fetchone(f'SELECT record_json FROM {self.attempts} WHERE attempt_id=?',
+                                         (record['attempt_id'],))
+            old = json.loads(previous['record_json'])
+            record['revision'] = int(old.get('revision', 0)) + 1
+            await tx.execute(f'UPDATE {self.attempts} SET outcome=?, record_json=?, accounted=0, delivered=0 WHERE attempt_id=?',
                              (record['outcome'], dumps(record), record['attempt_id']))
             status = 'ready' if summary is not None else 'failed'
             if record['outcome'] in ('cancelled', 'interrupted'):
@@ -150,28 +163,35 @@ class ContextCache:
         rows = await self.db.fetchall(f'SELECT * FROM {self.attempts} WHERE {pending} ORDER BY created_at LIMIT 100')
         done = 0
         for row in rows:
-            record = json.loads(row['record_json'])
-            if row['outcome'] == 'started':
-                job = await self.db.fetchone(f'SELECT status,lease_until FROM {self.cache} WHERE cache_key=?', (row['cache_key'],))
-                if job and job['status'] == 'running' and int(job['lease_until']) >= now_ms():
-                    continue
-                record.update(outcome='interrupted', success=False, usage_unknown=True, finished_at=time.time())
-                await self.db.execute(f'UPDATE {self.attempts} SET outcome=?,record_json=? WHERE attempt_id=?',
-                                      ('interrupted', dumps(record), row['attempt_id']))
+            # Re-read under the same short scheduler lock as finish(). A stale
+            # scan must never overwrite a completed provider receipt.
+            async with self.db.transaction() as tx:
+                await self._lock(tx)
+                row = await tx.fetchone(f'SELECT * FROM {self.attempts} WHERE attempt_id=?', (row['attempt_id'],))
+                record = json.loads(row['record_json'])
+                if row['outcome'] == 'started':
+                    job = await tx.fetchone(f'SELECT status,lease_until FROM {self.cache} WHERE cache_key=?', (row['cache_key'],))
+                    if job and job['status'] == 'running' and int(job['lease_until']) >= now_ms():
+                        continue
+                    record.update(outcome='interrupted', success=False, usage_unknown=True,
+                                  finished_at=time.time(), revision=int(record.get('revision', 0)) + 1)
+                    await tx.execute(f'UPDATE {self.attempts} SET outcome=?,record_json=? WHERE attempt_id=?',
+                                     ('interrupted', dumps(record), row['attempt_id']))
+            receipt = dumps(record)
             if not row['accounted']:
                 # Session deletion does not delete the request ledger.
                 if await self.store.get_session(record['owner_session_id']) is not None:
                     usage = dict(record.get('usage') or {})
                     usage['total_tokens'] = usage.get('total_tokens') or (usage.get('prompt_tokens') or 0) + (usage.get('completion_tokens') or 0)
-                    await self.store.record_auxiliary_usage(record['owner_session_id'], record['attempt_id'], usage)
-                await self.db.execute(f'UPDATE {self.attempts} SET accounted=1 WHERE attempt_id=?', (row['attempt_id'],))
+                    await self.store.record_auxiliary_usage(record['owner_session_id'], record['attempt_id'], usage, revision=int(record.get('revision', 0)))
+                await self.db.execute(f'UPDATE {self.attempts} SET accounted=1 WHERE attempt_id=? AND record_json=?', (row['attempt_id'], receipt))
             if receiver is not None and not row['delivered']:
                 import asyncio
                 try:
                     await asyncio.wait_for(receiver(record), delivery_timeout)
                 except Exception:
                     break  # outage: keep the outbox, do not hammer API for every row
-                await self.db.execute(f'UPDATE {self.attempts} SET delivered=1 WHERE attempt_id=?', (row['attempt_id'],))
+                await self.db.execute(f'UPDATE {self.attempts} SET delivered=1 WHERE attempt_id=? AND record_json=?', (row['attempt_id'], receipt))
             done += 1
         return done
 

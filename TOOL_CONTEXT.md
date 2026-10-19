@@ -60,7 +60,11 @@ it no longer makes sends wait for generation.
 ## Lifecycle and recovery
 
 The worker belongs to the store, not a send or child loop. Close the store to stop workers cleanly.
-Outbox delivery must be idempotent on attempt_id and return only after durable acknowledgement.
+Outbox delivery must be idempotent on `(attempt_id, revision)` and return only after durable acknowledgement.
+Keep one charge row per attempt_id; accept only newer revisions. A late provider result can correct
+an interrupted/unknown receipt without representing a second request. Session stats apply the same
+versioned delta. Pre-6.54.1 stats receipts without usage snapshots remain immutable; their ledger can
+still receive corrections, so historical aggregate repair requires a separate reconciliation.
 `ContextCache.reconcile(receiver)` repairs stats and pending delivery independently of model work.
 DeepTalk runs a separate ten-second scan that rebinds pending jobs to unchanged model/config and
 retries delivery even when no new send arrives. Generic hosts must restore worker bindings after a

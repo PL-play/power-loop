@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+## [6.54.1] — 2026-10-20
+
+- Serialize recovery transitions with provider completion and re-read receipts before accounting: stale scans no longer overwrite successful summaries as interrupted.
+- Version durable usage receipts. Late known usage corrects session statistics by delta without counting a second request; acknowledgements cannot hide newer revisions. Hosts must accept monotonic revisions per attempt_id.
+- Reject expired worker leases before provider invocation. Add hard-process-exit, store-reopen, stale-scan, late-ACK and PostgreSQL out-of-order accounting tests.
+
+
 ## [6.54.0] — 2026-10-20
 
 - Add opt-in per-tool context policies, with independent age/fuse/between-send triggers and rule/preserve/LLM-summary selection. Bash keep is limited to the current send; skill loads preserve in-send evidence.

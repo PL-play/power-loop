@@ -72,7 +72,8 @@ class SummaryWorker:
                   'target_tool': payload['name'], 'model': payload['model'],
                   'model_identity': engine.model_identity, 'outcome': 'started', 'started_at': time.time(),
                   'usage': None, 'usage_unknown': True, 'success': False}
-        await self.cache.begin_attempt(job, record)
+        if not await self.cache.begin_attempt(job, record):
+            return
         token = single_attempt.set(True)
         summary = None
         try:

@@ -253,3 +253,141 @@ async def test_cancelled_job_stays_uncertain_after_cache_eviction(env):
         await SummaryWorker(engine.store).execute(job, engine)
     await engine.cache.prune(max_entries=0, max_bytes=0)
     assert not await engine.submit(source)
+
+
+async def test_reconcile_stale_scan_cannot_overwrite_success(env, monkeypatch):
+    store, sid, _, _, _, engine, source = env
+    await engine.submit(source)
+    job = await engine.cache.claim(engine.executor_key)
+    record = {'attempt_id': 'race', 'owner_session_id': sid, 'outcome': 'started', 'usage': None}
+    await engine.cache.begin_attempt(job, record)
+    fetchall = engine.cache.db.fetchall
+
+    async def stale_scan(sql, *args):
+        rows = await fetchall(sql, *args)
+        if sql.startswith('SELECT * FROM ' + engine.cache.attempts):
+            await engine.cache.finish(job, {**record, 'outcome': 'success',
+                'usage': {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}}, None, None)
+        return rows
+
+    monkeypatch.setattr(engine.cache.db, 'fetchall', stale_scan)
+    received = []
+    async def receiver(record):
+        received.append(record)
+    await engine.cache.reconcile(receiver)
+    assert received[0]['outcome'] == 'success'
+    assert (await store.get_session_stats(sid)).total_tokens == 120
+
+
+async def test_late_receipt_corrects_unknown_without_second_call(env):
+    store, sid, _, _, _, engine, source = env
+    await engine.submit(source)
+    job = await engine.cache.claim(engine.executor_key)
+    record = {'attempt_id': 'late', 'owner_session_id': sid, 'outcome': 'started', 'usage': None}
+    await engine.cache.begin_attempt(job, record)
+    await engine.cache.db.execute(f'UPDATE {engine.cache.cache} SET lease_until=0')
+    received = []
+    async def receiver(receipt):
+        received.append(receipt.copy())
+        if len(received) == 1:
+            # Provider completes while the old interrupted receipt is being ACKed.
+            await engine.cache.finish(job, {**record, 'outcome': 'success', 'usage_unknown': False,
+                'usage': {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}}, None, None)
+    await engine.cache.reconcile(receiver)
+    row = await engine.cache.db.fetchone(f'SELECT * FROM {engine.cache.attempts}')
+    assert row['accounted'] == 0 and row['delivered'] == 0
+    await engine.cache.reconcile(receiver)
+    await engine.cache.reconcile(receiver)
+    assert [r['revision'] for r in received] == [1, 2]
+    assert [r['outcome'] for r in received] == ['interrupted', 'success']
+    stats = await store.get_session_stats(sid)
+    assert stats.total_tokens == 120 and stats.llm_calls == 1
+    # An out-of-order accounting receipt cannot undo the correction.
+    await store.record_auxiliary_usage(sid, 'late', {}, revision=1)
+    assert (await store.get_session_stats(sid)).total_tokens == 120
+
+
+async def test_durable_pending_and_receipt_survive_store_reopen(tmp_path):
+    from power_loop.runtime.store.context_cache import ContextCache
+    path = str(tmp_path / 'recovery.db')
+    store = await SessionStore.open(path)
+    sid = await store.create_session()
+    cache = ContextCache(store)
+    await cache.enqueue('pending', 'executor', {'owner_session_id': sid, 'timeout_s': 60}, 60)
+    await store.close()
+    store = await SessionStore.open(path)
+    cache = ContextCache(store)
+    job = await cache.claim('executor')
+    assert job['cache_key'] == 'pending'
+    record = {'attempt_id': 'recovery', 'owner_session_id': sid, 'outcome': 'started', 'usage': None}
+    await cache.begin_attempt(job, record)
+    await cache.db.execute(f'UPDATE {cache.cache} SET lease_until=0')
+    await store.close()
+    store = await SessionStore.open(path)
+    cache = ContextCache(store)
+    try:
+        receipts = []
+        async def receiver(record):
+            receipts.append(record)
+        await cache.reconcile(receiver)
+        await cache.reconcile(receiver)
+        assert len(receipts) == 1 and receipts[0]['outcome'] == 'interrupted'
+        assert receipts[0]['usage_unknown']
+        assert await cache.claim('executor') is None
+        stats = await store.get_session_stats(sid)
+        assert stats.llm_calls == 1 and stats.total_tokens == 0
+    finally:
+        await store.close()
+
+
+async def test_stale_worker_does_not_issue_provider_request(env):
+    _, _, _, llm, _, engine, source = env
+    await engine.submit(source)
+    job = await engine.cache.claim(engine.executor_key)
+    await engine.cache.db.execute(f'UPDATE {engine.cache.cache} SET lease_until=0')
+    await SummaryWorker(engine.store).execute(job, engine)
+    assert not llm.calls
+    assert not await engine.cache.db.fetchall(f'SELECT * FROM {engine.cache.attempts}')
+
+
+async def test_hard_process_exit_preserves_started_attempt(tmp_path):
+    import subprocess
+    import sys
+
+    from power_loop.runtime.store.context_cache import ContextCache
+
+    path = str(tmp_path / 'hard-exit.db')
+    script = '''
+import asyncio, os, sys
+from power_loop.runtime.store.store import SessionStore
+from power_loop.runtime.store.context_cache import ContextCache
+async def main():
+    store = await SessionStore.open(sys.argv[1])
+    sid = await store.create_session()
+    cache = ContextCache(store)
+    await cache.enqueue('crash', 'executor', {'owner_session_id': sid, 'timeout_s': 60}, 60)
+    job = await cache.claim('executor')
+    await cache.begin_attempt(job, {'attempt_id': 'hard-crash', 'owner_session_id': sid,
+        'parent_session_id': 'parent', 'workflow_run_id': 'workflow', 'node_id': 'review',
+        'outcome': 'started', 'usage': None})
+    os._exit(23)
+asyncio.run(main())
+'''
+    result = await asyncio.to_thread(subprocess.run, [sys.executable, '-c', script, path],
+                                    capture_output=True, text=True, timeout=20)
+    assert result.returncode == 23, result.stderr
+    store = await SessionStore.open(path)
+    cache = ContextCache(store)
+    try:
+        await cache.db.execute(f'UPDATE {cache.cache} SET lease_until=0')
+        received = []
+        async def receiver(record):
+            received.append(record)
+        await cache.reconcile(receiver)
+        await cache.reconcile(receiver)
+        assert len(received) == 1 and received[0]['usage_unknown']
+        assert received[0]['parent_session_id'] == 'parent'
+        assert received[0]['workflow_run_id'] == 'workflow' and received[0]['node_id'] == 'review'
+        assert await cache.claim('executor') is None
+    finally:
+        await store.close()

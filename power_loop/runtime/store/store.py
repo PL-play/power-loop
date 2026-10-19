@@ -1465,19 +1465,27 @@ class SessionStore:
             await tx.execute(sql, params)
 
     async def record_auxiliary_usage(
-        self, session_id: str, attempt_id: str, usage: Mapping[str, Any],
+        self, session_id: str, attempt_id: str, usage: Mapping[str, Any], *, revision: int = 0,
     ) -> None:
-        """Idempotent auxiliary-call stats, atomic with its receipt; no send/round increment."""
+        """Apply a versioned receipt delta; corrections never count a second call."""
         now = _now_ms()
         key = "tool_context_usage:" + attempt_id
         async with self._db.transaction() as tx:
             await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
             found = await tx.fetchone(
-                f"SELECT 1 FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key=?",
+                f"SELECT value_json FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key=?",
                 (session_id, key),
             )
-            if found is not None:
-                return
+            old = _loads(found['value_json']) if found is not None else None
+            if old is not None and ("revision" not in old or int(old["revision"]) >= revision):
+                return  # legacy receipts remain immutable; new receipts support corrections
+            values = {"prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                      "completion_tokens": int(usage.get("completion_tokens") or 0),
+                      "total_tokens": int(usage.get("total_tokens") or 0),
+                      "cached_tokens": int(usage.get("prompt_cached_tokens") or usage.get("cached_tokens")
+                                           or usage.get("cache_hit_tokens") or 0)}
+            previous = old.get("usage", {}) if old else {}
+            delta = {key: value - int(previous.get(key, 0)) for key, value in values.items()}
             sql = self._db.dialect.upsert(
                 self.t.session_stats, ("session_id",), ("updated_at",),
                 add_cols=("sends", "rounds", "llm_calls", "tool_calls", "prompt_tokens",
@@ -1485,15 +1493,13 @@ class SessionStore:
                 insert_only_cols=("first_send_at", "last_send_at"),
             )
             await tx.execute(sql, (
-                session_id, now, 0, 0, 1, 0, int(usage.get("prompt_tokens") or 0),
-                int(usage.get("completion_tokens") or 0), int(usage.get("total_tokens") or 0),
-                int(usage.get("prompt_cached_tokens") or usage.get("cached_tokens")
-                    or usage.get("cache_hit_tokens") or 0), now, now,
+                session_id, now, 0, 0, 0 if old else 1, 0, delta["prompt_tokens"],
+                delta["completion_tokens"], delta["total_tokens"], delta["cached_tokens"], now, now,
             ))
             sql = self._db.dialect.upsert(
                 self.t.session_runtime_state, ("session_id", "state_key"), ("value_json", "updated_at"),
             )
-            await tx.execute(sql, (session_id, key, _dumps({"recorded": True}), now))
+            await tx.execute(sql, (session_id, key, _dumps({"recorded": True, "revision": revision, "usage": values}), now))
 
     async def get_session_stats(self, session_id: str) -> SessionStatsRow | None:
         row = await self._db.fetchone(
