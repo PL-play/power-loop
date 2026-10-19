@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+## [6.54.2] — 2026-10-20
+
+- Persist workflow ancestry in leaf metadata and auxiliary receipts, including ordinary nested subagents. Closed synthetic driver rows no longer sever late billing attribution.
+- Restore ancestry from retained leaf sessions when detached workflow execution resumes without the original caller.
+- Add real-engine nested workflow/late-summary, detached continuation, hard-process-exit reconciliation and subagent inheritance coverage; verify one real provider summary through a workflow leaf.
+
+
 ## [6.54.1] — 2026-10-20
 
 - Serialize recovery transitions with provider completion and re-read receipts before accounting: stale scans no longer overwrite successful summaries as interrupted.

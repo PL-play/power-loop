@@ -79,3 +79,12 @@ rewritten by late billing; query the ledger for final totals.
 Upgrade all processes sharing a store before provisioning v9; it adds tables without rewriting
 messages. Structural checks do not prove summary quality. Validate task artifacts before broad
 activation; the historical 1014 benchmark has not yet been rerun with this implementation.
+
+## Workflow ownership (6.54.2)
+
+Receipts keep the actual owner_session_id and direct workflow_run_id/node_id/node_attempt.
+`workflow_ancestry` is an ordered list of enclosing workflow leaf identities, frozen in leaf
+metadata before execution; it survives synthetic driver cleanup and propagates through ordinary
+subagents. Detached resumes recover it from retained sessions. Older sessions without this metadata
+cannot reconstruct a deleted driver chain. Inclusive billing must deduplicate attempt_id across
+this chain; it is not an instruction to add a new charge at every ancestor.

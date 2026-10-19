@@ -408,6 +408,23 @@ class WorkflowEngine:
             for r in self._replay.values():
                 self._budget.commit(r.usage)
         driver_sid = await self._loop.new_session(metadata={"kind": "wf_driver", "workflow": spec.name})
+        # Driver rows are deliberately ephemeral. Freeze execution ancestry in
+        # each leaf so late receipts and restarts don't depend on those rows.
+        from power_loop.core.agent_context import get_session_id
+        caller_sid = get_session_id()
+        caller = await self._loop.store.get_session(caller_sid) if caller_sid else None
+        from power_loop.runtime.lineage import workflow_ancestry
+        self._workflow_ancestry = workflow_ancestry(caller)
+        if not self._workflow_ancestry:
+            # A detached resume has no ambient caller. Retained leaf sessions
+            # remain authoritative for the original ancestry of this run.
+            candidates = list(self._resume_sessions.values()) + [r.session_id for r in self._replay.values() if r.session_id]
+            for sid in candidates:
+                prior = await self._loop.store.get_session(sid)
+                if prior and prior.metadata.get("workflow_run_id") == self._run_id:
+                    self._workflow_ancestry = list(prior.metadata.get("workflow_ancestry") or [])
+                    break
+
         try:
             env: dict[str, Any] = {"input": spec.input}
             status = "completed"
@@ -808,6 +825,7 @@ class WorkflowEngine:
             metadata={
                 **node.spec.metadata,
                 **self._step_idempotency(node.id),
+                "workflow_ancestry": self._workflow_ancestry,
                 **({"output_file": output_file} if output_file else {}),
                 # foreach 迭代号（6.8.1）：body 各迭代共享一个 node_id，观测端（活动面板）
                 # 没有它就把 N 路并发画成同一个节点反复亮灭——看起来像串行循环。

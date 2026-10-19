@@ -1710,7 +1710,7 @@ class StatefulAgentLoop:
                     rule=getattr(self.config.representation, "distill_tool_call", None),
                     lineage={"parent_session_id": session.parent_session_id if session else None,
                              **{k: v for k, v in (session.metadata if session else {}).items()
-                                if k in ("workflow_run_id", "workflow_node_id", "workflow_iteration", "attempt")}},
+                                if k in ("workflow_run_id", "workflow_node_id", "workflow_iteration", "attempt", "workflow_ancestry")}},
                 )
                 engine.lineage["node_id"] = engine.lineage.get("workflow_node_id")
                 engine.lineage["node_attempt"] = engine.lineage.get("attempt")

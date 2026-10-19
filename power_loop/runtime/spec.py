@@ -363,6 +363,7 @@ async def run_agent_spec(
     # module default for any custom store that predates the attribute.
     store = await parent_loop._ensure_store()
     max_depth = getattr(store, "max_spawn_depth", MAX_SPAWN_DEPTH)
+    parent_row = None
     if parent_sid is not None:
         parent_row = await store.get_session(parent_sid)
         if parent_row is not None and parent_row.spawn_depth + 1 > max_depth:
@@ -378,6 +379,10 @@ async def run_agent_spec(
             }
 
     child_config = _child_config(spec, parent_loop)
+    child_metadata = {**dict(spec.metadata), "spec_name": spec.name}
+    if "workflow_ancestry" not in child_metadata:
+        from power_loop.runtime.lineage import workflow_ancestry
+        child_metadata["workflow_ancestry"] = workflow_ancestry(parent_row)
 
     child_sid = await store.create_session(
         # The FACTORY-adjusted prompt, not spec.system_prompt: a send resolves the prompt as
@@ -396,7 +401,7 @@ async def run_agent_spec(
         lifecycle=SubagentLifecycle(spec.lifecycle),
         # Stamp spec_name into METADATA (not just config) so the blackboard author label is the spec
         # name, not the raw session UUID (subagent-coordination-3): blackboard._author reads metadata.
-        metadata={**dict(spec.metadata), "spec_name": spec.name},
+        metadata=child_metadata,
     )
     # 子会话建好就告诉设了回调的那一层（6.46：workflow 引擎把「节点 → 叶子会话」记进 journal，重启后 resume 接着原会话跑）。
     # 只告诉最外层：这次子运行期间把回调清掉，叶子自己再派的子 agent 不会被当成叶子会话。
