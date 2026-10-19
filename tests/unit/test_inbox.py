@@ -324,7 +324,8 @@ async def test_v7_store_migrates_with_queued_rows_kept(tmp_path: Any) -> None:
 
     s2 = await SessionStore.open(path)
     try:
-        assert s2.schema_version == 8
+        from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION
+        assert s2.schema_version == CURRENT_SCHEMA_VERSION
         rows = await s2.inbox_items(sid)
         assert [(r["item_id"], r["kind"], r["mode"], r["status"], r["content"]) for r in rows] == [
             ("v7:1", "user", "queue", "pending", "parked one"),

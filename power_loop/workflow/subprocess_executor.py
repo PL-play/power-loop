@@ -222,6 +222,10 @@ class SubprocessExecutor:
         driver_sid: str,
         stop_event: Any = None,
     ) -> dict[str, Any]:
+        if getattr(getattr(parent_loop, "config", None), "tool_context", None) is not None:
+            raise ValueError(
+                "SubprocessExecutor cannot serialize tool-context transports/callbacks; "
+                "use InProcessExecutor for durable asynchronous tool summaries")
         spec = spec if isinstance(spec, AgentSpec) else AgentSpec.from_json(spec)
         db_path = self._db_path_for(spec)
         bootstrap = self._bootstrap_dict

@@ -1,0 +1,77 @@
+# Tool context policy — asynchronous summaries (provisional)
+
+Opt in using `AgentLoopConfig(tool_context=ToolContextConfig(...))`. Tool definitions declare
+`ToolContextPolicy`; application overrides change specified fields only. Host metadata is not
+part of the model-facing tool schema. The default remains disabled.
+
+```python
+from power_loop import ToolContextConfig
+config = ToolContextConfig(
+    cache_scope="tenant:123:permission-version:4",  # otherwise isolated by session
+    overrides={"read_file": {"between_sends": "llm_summary"}},
+    cache_ttl_s=604800, cache_max_entries=10000, cache_max_bytes=67108864,
+)
+```
+
+Triggers: `age_retirement`, `insend_fuse`, `between_sends`; transformations: `preserve`, `rule`,
+`llm_summary`. Rule precedence: explicit host rule, ToolDefinition.project, representation adapter.
+Bash's explicit `context_policy=keep` preserves parameters/results only within the current send.
+The load_skill definition preserves in-send evidence. This API does not change bash's schema or
+output capture. Existing cross-send fold remains a separate mechanism.
+
+## Critical path
+
+After a tool result is durably appended, eligible summary work is enqueued. A shared store worker
+performs model calls independently (two global active jobs, one per owner session). No model
+request or usage delivery is awaited by a send. At a context boundary, ready cache -> rules ->
+full original. Rules must shrink safely or the full paired arguments/result remain. Selected
+representations are persisted; late results do not rewrite them. Cached text excludes recall
+coordinates; the current source's coordinate is appended when used.
+
+A result's `usage` is an as-of-return snapshot, including known auxiliary attempts started in that
+invocation and `auxiliary_pending`. It cannot promise final cost for work that outlives the send.
+The durable attempt ledger/session statistics are the eventual accounting authority; already
+returned workflow results are not retroactively mutated. Session ownership and source send are
+separate. An application can rebuild aggregate reports from the attempt ledger.
+
+## Storage and deduplication
+
+Store schema v9 adds `context_cache` (queue + derived cache) and `context_attempts` (request ledger).
+The key hashes permission scope, tool name, canonical full arguments/result, prompt/policy version,
+model/endpoint identity and output budget. Call IDs/seq/session coordinates are excluded. A unique
+key and transactionally serialized admission prevent simultaneous duplicate requests. `cache_scope`
+is an application permission boundary: never share it across principals with different access.
+Summary hashes are verified on reads. API keys are never stored in keys or job payloads.
+
+Queued payloads freeze source/model/prompt and attribution. Provider attempts are recorded before
+calling; terminal receipts survive cache eviction and session deletion. Expired running leases,
+cancellation and ambiguous transport failures are uncertain and are not automatically reissued,
+even after cache eviction. Explicit HTTP 429/503 gets one retry after 30 seconds, each attempt
+separately recorded. Permanent failures and invalid/nonshrinking summaries fall back. Bundled SDK
+hidden retries are disabled; custom transports must make one provider attempt per complete().
+
+TTL and approximate LRU bound cache storage, with entry/byte admission limits. Active jobs are not
+evicted; capacity pressure rejects new summary work without affecting tool execution. Summary
+completion can temporarily overshoot byte capacity until the next bounded sweep. Access timestamps
+are updated at most once a minute. Ledger rows are never part of cache eviction. `ContextCache.stats()`
+reports statuses, counts and bytes. The legacy summary_budget_s field is retained for compatibility;
+it no longer makes sends wait for generation.
+
+## Lifecycle and recovery
+
+The worker belongs to the store, not a send or child loop. Close the store to stop workers cleanly.
+Outbox delivery must be idempotent on attempt_id and return only after durable acknowledgement.
+`ContextCache.reconcile(receiver)` repairs stats and pending delivery independently of model work.
+DeepTalk runs a separate ten-second scan that rebinds pending jobs to unchanged model/config and
+retries delivery even when no new send arrives. Generic hosts must restore worker bindings after a
+restart; credentials/callback implementations are not serialized. Missing/changed bindings leave
+jobs pending until TTL, not executed against a different provider.
+
+In-process children inherit policies. SubprocessExecutor explicitly rejects enabled policies:
+its isolated SQLite execution does not yet transport these callbacks and jobs. Existing fold
+accounting remains unchanged. Already committed historical workflow result snapshots are not
+rewritten by late billing; query the ledger for final totals.
+
+Upgrade all processes sharing a store before provisioning v9; it adds tables without rewriting
+messages. Structural checks do not prove summary quality. Validate task artifacts before broad
+activation; the historical 1014 benchmark has not yet been rerun with this implementation.

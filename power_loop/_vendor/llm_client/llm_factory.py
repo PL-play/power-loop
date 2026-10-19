@@ -142,8 +142,9 @@ class OpenAICompatibleChatLLMService(LLMService):
         return self._capabilities
 
     def _ensure_client(self) -> Any:
+        from .attempt_scope import single_attempt
         if self._client is not None:
-            return self._client
+            return self._client.with_options(max_retries=0) if single_attempt.get() else self._client
         _normalize_proxy_env_inplace()
 
         self._client = AsyncOpenAI(
@@ -152,7 +153,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             timeout=self._cfg.timeout_s,
             http_client=env_proxy_http_client(DefaultAsyncHttpxClient),
         )
-        return self._client
+        return self._client.with_options(max_retries=0) if single_attempt.get() else self._client
 
     async def close(self) -> None:
         """
@@ -454,7 +455,8 @@ class OpenAICompatibleChatLLMService(LLMService):
         Lightweight retry wrapper inspired by LangChain's ergonomics.
         """
         last_err: Exception | None = None
-        attempts = max(1, int(self._cfg.max_retries) + 1)
+        from .attempt_scope import single_attempt
+        attempts = 1 if single_attempt.get() else max(1, int(self._cfg.max_retries) + 1)
         for i in range(attempts):
             try:
                 return await fn()

@@ -1023,6 +1023,17 @@ class AgentPipeline:
         if irr is not None and int(irr) > 0 and self._retire_stale_images(round_index, int(irr)):
             self._tok_len = -1
 
+        from power_loop.runtime.tool_context import active_engine
+        context_engine = active_engine.get()
+        if context_engine is not None:
+            retired = await context_engine.prepare_history(self, "age_retirement")
+            if retired:
+                self._tok_len = -1
+            anchor = getattr(self, "_tool_context_prompt_anchor", None)
+            if anchor is not None:
+                self._context_prompt_tokens_estimate = max(
+                    0, anchor[0] + self._estimate_history_tokens() - anchor[1])
+
         # Fuse uses total prompt size, including the fixed prompt and history prefix.
         dt = self.config.insend_distill_tokens
         if dt is not None and int(dt) > 0 and (
@@ -1037,10 +1048,14 @@ class AgentPipeline:
             total = (max(0, int(current_estimate)) if current_estimate is not None
                      else real or self._estimate_history_tokens())
             if total >= int(dt):
-                freed = self._distill_oldest_tool_rows(
-                    0, int(self.config.insend_distill_hot_tail or 0),
-                    target_tokens=max(1, total - int(dt) + 1),
-                )
+                if context_engine is not None:
+                    freed = await context_engine.prepare_history(
+                        self, "insend_fuse", target_tokens=max(1, total - int(dt) + 1))
+                else:
+                    freed = self._distill_oldest_tool_rows(
+                        0, int(self.config.insend_distill_hot_tail or 0),
+                        target_tokens=max(1, total - int(dt) + 1),
+                    )
                 if freed:
                     self._tok_len = -1
                 logger.info("insend distill: total prompt %d >= %d; freed ~%d tokens",
@@ -1772,6 +1787,10 @@ class AgentPipeline:
 
             # ── Post-LLM processing ──
             usage = self.ctx.update_usage(response)
+            if self.config.tool_context is not None:
+                prompt = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0)
+                self._tool_context_prompt_anchor = (prompt, self._estimate_history_tokens()) if prompt else None
+                self._context_prompt_tokens_estimate = None
             self._emit(AgentEventType.STATUS_CHANGED, _round_usage_payload(
                 round_index=round_idx, max_rounds=int(self.config.max_rounds), usage=usage,
             ), round_index=round_idx)
@@ -2214,6 +2233,15 @@ class AgentPipeline:
                     {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": _truncate_result(output)},
                     round_index=round_idx,
                 )
+
+                from power_loop.runtime.tool_context import ToolSource, active_engine
+                context_engine = active_engine.get()
+                if context_engine is not None:
+                    seqs = getattr(self.sink, "_history_seqs", None) or []
+                    if seqs:
+                        await context_engine.submit(ToolSource(
+                            self.session_id, self.send_index, seqs[-1], call_id,
+                            tool_name, tool_args, str(self.history[-1].get("content") or "")))
 
                 if _stopped:
                     # design/124 §8.4: the run was stopped mid-tool — this call is settled; the

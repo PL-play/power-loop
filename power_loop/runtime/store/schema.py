@@ -83,7 +83,7 @@ def validate_table_prefix(prefix: str) -> str:
 #:   session), ``kind``/``mode``/``status``, and is marked ``delivered`` in the SAME transaction
 #:   that writes it into the transcript — so a cancelled run neither loses nor double-delivers
 #:   queued steering. Rebuilt as ``…_v8`` + copy + rename (v7 rows become pending user items).
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -92,7 +92,7 @@ _STORE_TABLES: tuple[str, ...] = (
     "sessions", "messages", "compactions", "usage_rounds", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
     "timers", "notes", "project_messages", "hook_events",
-    "session_leases", "follow_up_queue",
+    "session_leases", "follow_up_queue", "context_cache", "context_attempts",
 )
 
 
@@ -159,6 +159,9 @@ async def _migration_steps(
         steps += db.dialect.leases_ddl(prefix)
     if from_version < 8:
         steps += await _inbox_v8_steps(tx, db, prefix)
+    if from_version < 9:
+        from .context_cache import context_cache_ddl
+        steps += context_cache_ddl(db.dialect.name, prefix)
     return steps
 
 
@@ -296,10 +299,12 @@ def provisioning_ddl(db: Database, prefix: str) -> list[str]:
             f"INSERT INTO {vtable} (id, version) VALUES (1, {CURRENT_SCHEMA_VERSION}) "
             "ON CONFLICT(id) DO NOTHING"
         )
+    from .context_cache import context_cache_ddl
     return [
         f"CREATE TABLE IF NOT EXISTS {vtable} "
         f"(id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL)",
         *db.dialect.ddl(prefix),
+        *context_cache_ddl(db.dialect.name, prefix),
         stamp,
     ]
 
@@ -530,7 +535,8 @@ async def ensure_schema(
                 # so a permission failure surfaces the full provisioning script instead of a
                 # raw driver error.
                 try:
-                    for stmt in db.dialect.ddl(prefix):
+                    from .context_cache import context_cache_ddl
+                    for stmt in db.dialect.ddl(prefix) + context_cache_ddl(db.dialect.name, prefix):
                         await tx.execute(stmt)
                 except Exception as exc:
                     raise StoreSchemaError(

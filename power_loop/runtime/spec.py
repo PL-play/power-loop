@@ -268,6 +268,7 @@ def _child_config(spec: AgentSpec, parent_loop: Any) -> AgentLoopConfig:
         model=spec.model,
         response_format=response_format,
         retry_policy=getattr(parent_config, "retry_policy", None),
+        tool_context=getattr(parent_config, "tool_context", None),
     )
     # HOST config seam (subagent_config_factory, PROVISIONAL 3.14): the parent's
     # config may rewrite the child's default config — e.g. hand heavy leaves a

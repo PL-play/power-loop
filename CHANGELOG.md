@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+## [6.54.0] — 2026-10-20
+
+- Add opt-in per-tool context policies, with independent age/fuse/between-send triggers and rule/preserve/LLM-summary selection. Bash keep is limited to the current send; skill loads preserve in-send evidence.
+- Precompute summaries asynchronously after durable tool results. Readers never wait for a model; pending/failed summaries fall back to rules or the original paired arguments/result. Selected views remain frozen when late summaries arrive.
+- Schema v9 adds shared summary cache/jobs and an independent request ledger. Canonical scoped keys, cross-process admission, leases, bounded capacity, TTL/LRU eviction, explicit transient backoff and uncertain-outcome suppression prevent duplicate spend.
+- Record auxiliary usage before provider calls, reconcile session statistics idempotently, and provide durable delivery receipts. Suppress bundled SDK hidden retries within metered summary requests. Returned usage is an as-of-return snapshot; late costs remain attributable in the ledger.
+- In-process children/workflow inherit policies. SubprocessExecutor rejects enabled policies instead of silently losing nonserializable transports/callbacks.
+- All processes sharing a store must upgrade before schema v9 is provisioned. No existing message rows are rewritten.
+
 ## [6.53.0] — 2026-10-19
 
 - Add opt-in normalized bash output capture before preview truncation. Default tool behavior is unchanged without a capture context.

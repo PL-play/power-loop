@@ -108,6 +108,7 @@ class AgentLoopConfig:
     context_checkpoint_tokens: int | None = None
     #: Total prompt threshold for in-send semantic distillation. When enabled,
     #: context_checkpoint_tokens is ignored: fuse and cut are exclusive policies.
+    tool_context: Any = None  # ToolContextConfig: opt-in async per-tool preparation + ledger
     insend_distill_tokens: int | None = None
     #: Deprecated compatibility field; does not limit the number of distilled calls.
     insend_distill_batch: int = 10

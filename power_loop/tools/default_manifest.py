@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from power_loop.contracts.context_policy import ToolContextPolicy
 from power_loop.contracts.tools import ToolDefinition
 
 DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
@@ -160,6 +161,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ),
     ToolDefinition(
         name="load_skill",
+        context_policy=ToolContextPolicy(insend_fuse="preserve"),
         description="Load specialized knowledge by name.",
         input_schema={
             "type": "object",

@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "6.53.0"
+__version__ = "6.54.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -52,6 +52,7 @@ from power_loop.agent.system_prompt import (
     format_tool_catalog,
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult
+from power_loop.contracts.context_policy import ToolContextPolicy
 from power_loop.contracts.errors import (
     CancellationRequested,
     CompactionFailed,
@@ -237,6 +238,7 @@ from power_loop.runtime.structured import (
     parse_structured,
 )
 from power_loop.runtime.timers import TimerDelivery, TimerRunner
+from power_loop.runtime.tool_context import ToolContextConfig
 from power_loop.tools import (
     DEFAULT_TOOL_HANDLERS,
     ToolRegistry,
@@ -301,6 +303,8 @@ STABLE_API = (
 )
 
 __all__ = [
+    "ToolContextPolicy",
+    "ToolContextConfig",
 	"__version__",
 	"STABLE_API",
 	"StatefulAgentLoop",

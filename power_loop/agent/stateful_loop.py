@@ -1691,7 +1691,51 @@ class StatefulAgentLoop:
             return None
         return self.tool_registry.subset(tools)
 
-    async def _run_loop(
+    async def _run_loop(self, sid: str, **kwargs: Any) -> StatefulResult:
+        from power_loop.runtime.tool_context import ToolContextEngine, active_engine
+
+        store = await self._ensure_store()
+        engine = None
+        token = active_engine.set(None)  # child must never use its parent's ledger
+        try:
+            if self.config.tool_context is not None:
+                session = await store.get_session(sid)
+                registry = kwargs.get("tools")
+                if not hasattr(registry, "get"):
+                    registry = getattr(self, "tool_registry", None)
+                engine = ToolContextEngine(
+                    config=self.config.tool_context, store=store, owner_session_id=sid,
+                    owner_send_index=await self._current_send_index(store, sid),
+                    llm=self.llm, model=self.config.model, registry=registry,
+                    rule=getattr(self.config.representation, "distill_tool_call", None),
+                    lineage={"parent_session_id": session.parent_session_id if session else None,
+                             **{k: v for k, v in (session.metadata if session else {}).items()
+                                if k in ("workflow_run_id", "workflow_node_id", "workflow_iteration", "attempt")}},
+                )
+                engine.lineage["node_id"] = engine.lineage.get("workflow_node_id")
+                engine.lineage["node_attempt"] = engine.lineage.get("attempt")
+                await engine.start()
+                from power_loop.runtime.context_worker import SummaryWorker
+                if not hasattr(store, "_summary_worker"):
+                    store._summary_worker = SummaryWorker(store)
+                engine.worker = store._summary_worker
+                store._summary_worker.bind(engine)
+                active_engine.set(engine)
+            result = await self._run_loop_impl(sid, **kwargs)
+            try:
+                await store.bump_session_stats(
+                    sid, result.usage, rounds=result.rounds, tool_calls=result.tool_calls,
+                )
+            except Exception:
+                logger.exception("session_stats bump failed for %s (continuing)", sid)
+            if engine is not None:
+                for key, value in (await engine.usage_snapshot()).items():
+                    result.usage[key] = result.usage.get(key, 0) + value
+            return result
+        finally:
+            active_engine.reset(token)
+
+    async def _run_loop_impl(
         self,
         sid: str,
         *,
@@ -1706,6 +1750,12 @@ class StatefulAgentLoop:
         # 3.0: projection-style representation drives the derived-layer path; verbatim → None
         # (in-place compactor path). The fold trigger/keep come from config.fold_strategy.
         projector = self.config.projection_representation
+        from power_loop.runtime.tool_context import active_engine
+        engine = active_engine.get()
+        if engine is not None and projector is not None:
+            import copy
+            projector = copy.copy(projector)
+            projector.version = engine.projection_version(int(getattr(projector, "version", 0) or 0))
         fold_strategy = self.config.fold_strategy
         # The current send's authoritative index (set by _persist_user_input; inherited by
         # resume()/follow-up). Read up-front so projection mode can partition history by it.
@@ -2106,14 +2156,6 @@ class StatefulAgentLoop:
             # the cache; drop any live entry now so it can't be served stale. (The contiguity
             # guard in _cache_append is the correctness backstop; this is prompt cleanup.)
             self._cache_invalidate(sid)
-        try:
-            # The async store offloads its own blocking I/O, so this no longer
-            # needs an explicit thread hop (H1.9/C8).
-            await store.bump_session_stats(
-                sid, result.usage, rounds=result.rounds, tool_calls=result.tool_calls,
-            )
-        except Exception:
-            logger.exception("session_stats bump failed for %s (continuing)", sid)
         # Send-context projection (v2): at end-of-send, project the finished send's pl_messages
         # rows into pl_project_messages so the NEXT send reads them as plain-text history. Derived
         # + best-effort: a failure never affects the send result (pl_messages is the source of truth).
@@ -2262,6 +2304,10 @@ class StatefulAgentLoop:
             projected = projector.project_send(
                 rows, send_index=send_index, tool_registry=getattr(self, "tool_registry", None)
             )
+            from power_loop.runtime.tool_context import active_engine
+            engine = active_engine.get()
+            if engine is not None:
+                projected = await engine.prepare_projection(projected, rows, send_index)
             if not projected.rows:
                 return False
             await store.write_send_projection_rows(
@@ -2299,8 +2345,9 @@ class StatefulAgentLoop:
         for children. Defers on a still-in-flight status (the resume re-finalizes under the SAME
         ``send_index``; the idempotent UPSERT then overwrites). Best-effort — the caller swallows
         failures, since ``pl_messages`` remains the source of truth."""
-        if session_row is not None and session_row.parent_session_id is not None:
-            return  # a spawned sub-agent run, not a top-level send
+        if (session_row is not None and session_row.parent_session_id is not None
+                and self.config.tool_context is None):
+            return  # legacy behavior; policy-enabled children prepare their own context
         if status in ("waiting_for_input", "pending_tools"):
             return  # send not finished; the resume will re-finalize under the same send_index
         # 只取本 send 的行：这里要投影的就是这一个 send，从前是读全表再在 Python 里过滤，
@@ -2309,6 +2356,10 @@ class StatefulAgentLoop:
         if not rows:
             return
         projected = projector.project_send(rows, send_index=send_index, tool_registry=tool_registry)
+        from power_loop.runtime.tool_context import active_engine
+        engine = active_engine.get()
+        if engine is not None:
+            projected = await engine.prepare_projection(projected, rows, send_index)
         version = int(getattr(projector, "version", 0) or 0)
         proj_rows_to_write = [(pr.kind, pr.content, pr.rendered_text) for pr in projected.rows]
 

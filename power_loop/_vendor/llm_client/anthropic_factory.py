@@ -70,6 +70,7 @@ class AnthropicMessagesLLMService(LLMService):
         return dict(self._last_usage or {})
 
     def _ensure_client(self) -> AsyncAnthropic:
+        from .attempt_scope import single_attempt
         if self._client is None:
             self._client = AsyncAnthropic(
                 api_key=self._cfg.api_key,
@@ -78,7 +79,7 @@ class AnthropicMessagesLLMService(LLMService):
                 max_retries=self._cfg.max_retries,
                 http_client=env_proxy_http_client(DefaultAsyncHttpxClient),
             )
-        return self._client
+        return self._client.with_options(max_retries=0) if single_attempt.get() else self._client
 
     async def close(self) -> None:
         if self._client is None:

@@ -134,6 +134,8 @@ class _Tables:
         self.hook_events = f"{prefix}hook_events"
         self.session_leases = f"{prefix}session_leases"
         self.follow_up_queue = f"{prefix}follow_up_queue"
+        self.context_cache = f"{prefix}context_cache"
+        self.context_attempts = f"{prefix}context_attempts"
 
 
 # Logical export schema: (logical_name, physical(t)->table, explicit_columns). Explicit
@@ -241,6 +243,8 @@ class SessionStore:
             await self._db.backup(dest_path)
 
     async def close(self) -> None:
+        if hasattr(self, "_summary_worker"):
+            await self._summary_worker.close()
         await self._db.close()
 
     async def __aenter__(self) -> SessionStore:
@@ -1459,6 +1463,37 @@ class SessionStore:
         )
         async with self._db.transaction() as tx:
             await tx.execute(sql, params)
+
+    async def record_auxiliary_usage(
+        self, session_id: str, attempt_id: str, usage: Mapping[str, Any],
+    ) -> None:
+        """Idempotent auxiliary-call stats, atomic with its receipt; no send/round increment."""
+        now = _now_ms()
+        key = "tool_context_usage:" + attempt_id
+        async with self._db.transaction() as tx:
+            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            found = await tx.fetchone(
+                f"SELECT 1 FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key=?",
+                (session_id, key),
+            )
+            if found is not None:
+                return
+            sql = self._db.dialect.upsert(
+                self.t.session_stats, ("session_id",), ("updated_at",),
+                add_cols=("sends", "rounds", "llm_calls", "tool_calls", "prompt_tokens",
+                          "completion_tokens", "total_tokens", "cached_tokens"),
+                insert_only_cols=("first_send_at", "last_send_at"),
+            )
+            await tx.execute(sql, (
+                session_id, now, 0, 0, 1, 0, int(usage.get("prompt_tokens") or 0),
+                int(usage.get("completion_tokens") or 0), int(usage.get("total_tokens") or 0),
+                int(usage.get("prompt_cached_tokens") or usage.get("cached_tokens")
+                    or usage.get("cache_hit_tokens") or 0), now, now,
+            ))
+            sql = self._db.dialect.upsert(
+                self.t.session_runtime_state, ("session_id", "state_key"), ("value_json", "updated_at"),
+            )
+            await tx.execute(sql, (session_id, key, _dumps({"recorded": True}), now))
 
     async def get_session_stats(self, session_id: str) -> SessionStatsRow | None:
         row = await self._db.fetchone(

@@ -4,6 +4,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from power_loop.contracts.context_policy import ToolContextPolicy
+
 
 @dataclass(frozen=True)
 class ToolDefinition:
@@ -46,8 +48,11 @@ class ToolDefinition:
     #:
     #: 未执行的后续工具调用一律不再开始，补「为先处理新消息未执行」。
     interrupt: str = "finish"
+    context_policy: ToolContextPolicy | None = None
 
     def __post_init__(self) -> None:
+        if self.context_policy is not None and not isinstance(self.context_policy, ToolContextPolicy):
+            raise TypeError("context_policy must be ToolContextPolicy or None")
         if self.interrupt not in ("finish", "abort", "background"):
             raise ValueError(
                 f"ToolDefinition.interrupt must be finish/abort/background, got {self.interrupt!r}")
