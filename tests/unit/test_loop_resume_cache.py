@@ -511,7 +511,7 @@ async def test_store_and_config_kwargs_conflict_raises():
 async def test_loop_opens_owned_store_via_dsn(tmp_path):
     db = str(tmp_path / "owned.db")
     loop = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="hi")]),
-                             dsn=f"sqlite://{db}",
+                             dsn=f"sqlite:///{db}",
                              config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
     sid = await loop.new_session()
     r = await loop.send("hello", session_id=sid)
@@ -519,7 +519,7 @@ async def test_loop_opens_owned_store_via_dsn(tmp_path):
     await loop.aclose()
     # reopen with VERIFY (schema now exists) on a fresh loop → resumes
     loop2 = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="again")]),
-                              dsn=f"sqlite://{db}", schema=SchemaPolicy.VERIFY,
+                              dsn=f"sqlite:///{db}", schema=SchemaPolicy.VERIFY,
                               config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
     hist = await loop2.get_messages(sid)
     assert [m.get("content") for m in hist] == ["hello", "hi"]
@@ -529,10 +529,10 @@ async def test_loop_opens_owned_store_via_dsn(tmp_path):
 async def test_loop_table_prefix_isolation(tmp_path):
     db = str(tmp_path / "prefixed.db")
     a = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="A")]),
-                          dsn=f"sqlite://{db}", table_prefix="alpha_",
+                          dsn=f"sqlite:///{db}", table_prefix="alpha_",
                           config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
     b = StatefulAgentLoop(llm=_SeqLLM(responses=[LLMResponse(raw_text="B")]),
-                          dsn=f"sqlite://{db}", table_prefix="beta_",
+                          dsn=f"sqlite:///{db}", table_prefix="beta_",
                           config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
     sa = await a.new_session()
     await a.send("in alpha", session_id=sa)
@@ -546,7 +546,7 @@ async def test_loop_table_prefix_isolation(tmp_path):
 
 async def test_owned_store_schema_verify_on_fresh_db_raises_with_ddl(tmp_path):
     db = str(tmp_path / "fresh.db")
-    loop = StatefulAgentLoop(llm=_SeqLLM(), dsn=f"sqlite://{db}", schema=SchemaPolicy.VERIFY,
+    loop = StatefulAgentLoop(llm=_SeqLLM(), dsn=f"sqlite:///{db}", schema=SchemaPolicy.VERIFY,
                              config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None))
     with pytest.raises(StoreSchemaError) as ei:
         await loop.new_session()
