@@ -109,6 +109,8 @@ class AgentLoopConfig:
     #: Total prompt threshold for in-send semantic distillation. When enabled,
     #: context_checkpoint_tokens is ignored: fuse and cut are exclusive policies.
     tool_context: Any = None  # ToolContextConfig: opt-in async per-tool preparation + ledger
+    #: Plain in-send fuse, used only WITHOUT ``tool_context`` (with it, the tool-context fuse
+    #: ``trigger_tokens``/``target_tokens``/``hot_tail`` is the single fuse).
     insend_distill_tokens: int | None = None
     #: Deprecated compatibility field; does not limit the number of distilled calls.
     insend_distill_batch: int = 10
@@ -117,6 +119,9 @@ class AgentLoopConfig:
     #: post_update 这类工具的参数就是模型的发言，瘦成占位符后模型会照着占位符的样子再发一遍
     #: （真实事故：九条「⟨已移出上下文 N 字符…⟩」被当正文发进了聊天）。宿主按工具名登记。
     insend_distill_keep_tools: tuple[str, ...] = ()
+    #: Cap on one tool result as written to history and the audit log (head + tail kept);
+    #: None = no cap. recall_send can only return what was written.
+    tool_result_max_chars: int | None = 20000
     #: 6.11.0 同轮并发：同一轮里 ≥2 个 ``async_capable`` 工具调用并发执行（上限 = 本值），结果仍按
     #: 原顺序回填；TOOL_BEFORE 仍按序先跑完（闸类 hook 语义不变）。非 async_capable 工具永远串行。
     #: 0/1 = 关。

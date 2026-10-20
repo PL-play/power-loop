@@ -243,42 +243,34 @@ from power_loop import Representation, ProjectedSend, ProjectedRow  # 写自己�
 策略快照，下一send才使用新设置。保险丝用`AgentLoopConfig.insend_distill_tokens=None`关闭。
 宿主应单独保留用户填写的阈值，不应把None解释成重新启用某个默认阈值。
 
-## 确定性归档 v2（显式启用）
+## 工具上下文：一套机制（7.0）
 
-`ToolContextConfig(schema_version=2)` 为独立策略版本；省略仍是 v1，不能自动迁移运行中的 send。
-v2 默认正常循环不按年龄退场、不生成付费摘要。图片仍由 `image_retention_rounds` 独立管理。
-DeepTalk 应用默认 bash 一级截断、load_skill 一级保留；库本身不猜应用的必保工具。
+开启 `AgentLoopConfig(tool_context=ToolContextConfig(...))` 后，工具调用的上下文只有一套规则，没有版本开关。
+原有机制全部保留并按配置生效：send 间投影、压缩 / 压缩点（fold）、`max_context_rows`、切 send、microcompact、
+逐字模式 compactor。在此基础上有三处优化：
 
-- `general`：send 间和二级容量兜底规则，默认 `archive`。
-- `insend_fuse="inherit"`：继承 general；显式 preserve 是一级软保护。
-- `hard_preserve=True`：两级均保留完整参数和结果。
-- `age_retirement="preserve"`：关闭按轮退场，保留轮数等配置值。
-- `llm_summary` 保留扩展接口、预计算和记账能力；v2 默认不启用。
+1. **一个保险丝，高低水位**：上下文估算达到 `trigger_tokens` 时整理到 `target_tokens`。
+   一级用每个工具的 `insend_fuse` 规则，最近 `hot_tail` 次调用（默认 8）不动；
+   一级不够时二级退回 `general`，热尾也不再保护。`hard_preserve` 和 bash `context_policy=keep` 两级都不动。
+   开了工具上下文时，`insend_distill_tokens`（无工具上下文时的简单保险丝）不再运行；保险丝运行时切 send 不生效。
+2. **send 内和 send 间规则各自独立**：每个工具只有两条规则——`general`（send 间，也是保险丝退路）和
+   `insend_fuse`（只在保险丝一级用，`inherit` = 同 general）。默认 `general="rule"`、`insend_fuse="inherit"`。
+   `hard_preserve` 只管保险丝；send 间照 `general` 处理。
+3. **send 间连续同种工具合并成一组**：中间夹了别的工具、或插进来的用户消息才断开；助手正文和思考不断开；
+   同一轮并行的同名调用算连续。组条目 `{name, s, n, group_id, seqs}`，用
+   `recall_send(send_index=..., group_id=...)` 按组取回原文。`merge_consecutive=False` 关闭。
 
-容量配置：trigger_tokens=500000、target_tokens=350000、window_tokens=1000000、
-reserve_tokens=40000、margin_tokens=32000。这些是面向已确认 1M 路由的候选，必须核对实际模型。
-必须满足 target < trigger <= window - reserve - margin；实际请求输出额度更大时采用更大的预留，
-配置失效则返回可恢复的 capacity blocked 原因。计数是带 provider prompt 锚点的估算，不是精确 tokenizer，
-计入 reasoning_content（若实际存在），与计费用量分开。图片编码和模型特有计数误差仍需容量余量。
+蒸馏结果不加任何前缀，只放内容本身，末尾一句取回备注 `（原文 recall_send(...)）`。被改写的调用参数只留
+精简内容（bash 留 description），不放标记字段。
 
-先用一级覆盖整理至低位目标，仍不足则用 general。无可压缩内容且高于安全上限时停止发起模型请求；
-低于安全上限则可以继续。相同无进展候选不反复扫描。v2 关闭旧 microcompact、fold 和历史行数丢弃旁路。
-关闭 capacity_enabled 不会删除配置，但也关闭了本机制的发送前容量保护，需由调用方负责容量。
+- `rule`：宿主代码蒸馏（`ToolContextConfig.rule`、`ToolDefinition.project` 或 representation 适配器）。
+  send 间保留投影器的条目原样。
+- `archive`：只留「做什么」（bash = 描述 +（exit 码），load_skill = 技能名）+ 取回备注。
+- `truncate`：bash 留描述、截到 `argument_max_chars` 的命令、exit 行、截到 `result_max_chars` 的输出 + 取回备注；
+  其它工具按参数 / 结果分别预览。
+- `preserve`：原样。`llm_summary`：预计算摘要，未就绪时用 rule。
 
-原文保留在 messages；派生补丁、组成员和事件在原有 session_runtime_state 的工具上下文状态中持久化，
-无需业务表迁移。先提交派生状态再改内存；恢复同一个 send 使用已冻结的策略快照。
-工具描述和来源不会升级为系统指令。
-
-bash 的 schema 要求 1–1000 字符 description；默认 retire，keep 仅为 send 内一级软保护。
-send 间只保留完整描述和 recall，不留命令/结果片段。load_skill 保留技能身份与 recall。
-小型原文若归档反而更大则原样保留。
-一级 bash 截断仅在显式策略生效时独立处理输入/输出（默认 200/300 字符）；保留完整描述并显式说明截断。
-
-连续同名、已完成且无助手正文的单调用块可以合并。send 内含 reasoning_content 或并行批次的块不合并；
-保留合法 call/result 配对，不伪造一次新执行。宿主保存精确成员坐标，不用 seq 范围推测成员。
-`recall_send(send_index=..., group_id=...)` 返回分页目录；
-`item` 选择成员，`char_offset/char_limit` 按字符分页取原始 JSON，跟随 next_char_offset 可恢复全部原文。
-v2 的 `recall_send(seq=...)` 同样支持原文分页。
-
-background_run 必须通过 action=tool 指定注册工具，裸 bash 使用 tool=bash 和完整 args。
-首次返回保留目标结果；整理按目标工具策略；recall 附上后台任务的规范原始记录。
+工具结果写入历史和审计表时按 `AgentLoopConfig.tool_result_max_chars`（默认 20000，保留头尾；None 不截）截断。
+压缩行（compact）始终用当前投影器渲染，不因版本号不同而把整段原文铺回。
+旧的 `schema_version`、`between_sends` 字段已删除；存量配置里的 `between_sends` 读取时忽略。
+运行时状态子键 `archive_v2` 读取时迁到 `archive`，已发出的 group_id 仍可取回。

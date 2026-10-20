@@ -8,14 +8,15 @@ part of the model-facing tool schema. The default remains disabled.
 from power_loop import ToolContextConfig
 config = ToolContextConfig(
     cache_scope="tenant:123:permission-version:4",  # otherwise isolated by session
-    overrides={"read_file": {"between_sends": "llm_summary"}},
+    overrides={"read_file": {"general": "llm_summary"}},
     cache_ttl_s=604800, cache_max_entries=10000, cache_max_bytes=67108864,
 )
 ```
 
-Triggers: `age_retirement`, `insend_fuse`, `between_sends`; transformations: `preserve`, `rule`,
-`llm_summary`. Rule precedence: explicit host rule, ToolDefinition.project, representation adapter.
-Bash's explicit `context_policy=keep` preserves parameters/results only within the current send.
+Rules per tool: `general` (between sends and fuse fallback), `insend_fuse` (fuse level 1),
+`age_retirement`; transformations: `preserve`, `rule`, `llm_summary`, `truncate`, `archive`.
+See docs/*/user-guide/send-context-projection.md, "one mechanism". Rule precedence: explicit host rule, ToolDefinition.project, representation adapter.
+Bash's explicit `context_policy=keep` preserves parameters/results within the current send (both fuse levels).
 The load_skill definition preserves in-send evidence. This API does not change bash's schema or
 output capture. Existing cross-send fold remains a separate mechanism.
 

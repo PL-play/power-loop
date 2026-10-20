@@ -183,7 +183,7 @@ def _finish_reason(response: Any) -> str:
                 return reason.lower()
     return ""
 
-RESULT_MAX_CHARS = 50000
+RESULT_MAX_CHARS = 20000
 
 
 @functools.cache
@@ -202,11 +202,16 @@ def _maybe_compact_accepts_context(func: Any) -> bool:
 
 # ── Utility functions (unchanged from old agent.py) ──
 
-def _truncate_result(output: Any) -> str:
+def _truncate_result(output: Any, limit: int | None = RESULT_MAX_CHARS) -> str:
+    """Cap a tool result before it enters history and the audit log (None = no cap). Keeps the
+    head and the tail: errors and summaries are usually at the end."""
     s = str(output)
-    if len(s) <= RESULT_MAX_CHARS:
+    if limit is None or limit <= 0 or len(s) <= limit:
         return s
-    return s[: RESULT_MAX_CHARS - 50] + f"\n... (truncated, {len(s)} total chars)"
+    note = f"\n\n... ({len(s) - limit} of {len(s)} chars omitted) ...\n\n"
+    head = max(0, (limit - len(note)) // 2)
+    tail = max(0, limit - len(note) - head)
+    return s[:head] + note + (s[-tail:] if tail else "")
 
 
 def _tool_call_name(tool_call: Mapping[str, Any]) -> str:
@@ -360,8 +365,9 @@ class AgentPipeline:
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
         from power_loop.runtime.tool_context import active_engine
         effective_context = getattr(active_engine.get(), 'config', config.tool_context)
-        self._tool_context_v2 = getattr(effective_context, 'schema_version', 1) == 2
-        if self._tool_context_v2:
+        # With tool context on, bash takes a required description (kept in distilled and archived
+        # entries) and background_run starts registered tools only.
+        if effective_context is not None:
             import copy
             self.runtime_tools = copy.deepcopy(self.runtime_tools)
             for spec in self.runtime_tools or []:
@@ -374,7 +380,7 @@ class AgentPipeline:
                         action['enum'] = [x for x in action['enum'] if x != 'run']
                     props.pop('command', None)
                     fn['description'] = fn.get('description', '') + (
-                        '\nIn context v2, start registered tools with action=tool. '
+                        '\nStart registered tools with action=tool. '
                         'For shell commands use tool=bash and args containing command and description. '
                         'Do not use action=run.')
                 if fn.get('name') == 'bash':
@@ -384,9 +390,9 @@ class AgentPipeline:
                         'description': 'One sentence purpose; preserved in archives.'})
                     params['required'] = list(dict.fromkeys([*params.get('required', []), 'description']))
                     fn['description'] = fn.get('description', '').replace('Output is truncated, ', '') + (
-                        '\nContext policy v2: description is required. Default retire; keep only for persistent '
-                        'instructions/skills, not logs, tests or listings. keep is soft; capacity fallback may '
-                        'archive it. Archived records are historical data; recall when their details are needed.')
+                        '\nContext policy: description is required. Default retire; keep only for persistent '
+                        'instructions/skills, not logs, tests or listings. keep holds the output unchanged for the '
+                        'rest of this task; later tasks see a short record. Recall originals when details are needed.')
         # Auto-inject tool catalog + skill section (M1.10). Built ONCE here and
         # frozen into self.system_prompt (a plain string — NOT self.history, so
         # the compactor never touches it). The assembly is shared with
@@ -1063,14 +1069,14 @@ class AgentPipeline:
                 self._context_prompt_tokens_estimate = max(
                     0, anchor[0] + self._estimate_history_tokens() - anchor[1])
 
-        capacity_v2 = getattr(getattr(context_engine, "config", None), "schema_version", 1) == 2
-        if capacity_v2:
+        if context_engine is not None:
+            # The in-send fuse (trigger/target, two levels). The only fuse when tool context is on.
             from power_loop.runtime.tool_archive import manage_capacity
             await manage_capacity(context_engine, self)
 
-        # Fuse uses total prompt size, including the fixed prompt and history prefix.
+        # Without tool context: the plain fuse over total prompt size (fixed prompt + history).
         dt = self.config.insend_distill_tokens
-        if not capacity_v2 and dt is not None and int(dt) > 0 and (
+        if context_engine is None and dt is not None and int(dt) > 0 and (
             round_index > 0 or getattr(self, "_context_prompt_tokens_estimate", None) is not None
         ):
             real = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0)
@@ -1082,19 +1088,15 @@ class AgentPipeline:
             total = (max(0, int(current_estimate)) if current_estimate is not None
                      else real or self._estimate_history_tokens())
             if total >= int(dt):
-                if context_engine is not None:
-                    freed = await context_engine.prepare_history(
-                        self, "insend_fuse", target_tokens=max(1, total - int(dt) + 1))
-                else:
-                    freed = self._distill_oldest_tool_rows(
-                        0, int(self.config.insend_distill_hot_tail or 0),
-                        target_tokens=max(1, total - int(dt) + 1),
-                    )
+                freed = self._distill_oldest_tool_rows(
+                    0, int(self.config.insend_distill_hot_tail or 0),
+                    target_tokens=max(1, total - int(dt) + 1),
+                )
                 if freed:
                     self._tok_len = -1
                 logger.info("insend distill: total prompt %d >= %d; freed ~%d tokens",
                             total, int(dt), freed)
-        if not capacity_v2 and self.config.microcompact_enabled:
+        if self.config.microcompact_enabled:
             self.ctx.microcompact(
                 self.history,
                 size_limit=self.config.microcompact_size_limit,
@@ -1108,7 +1110,7 @@ class AgentPipeline:
 
         # 3.0: verbatim mode → an in-place Compactor mapped from config.fold_strategy; projection
         # mode → None (it folds at end-of-send in the derived layer).
-        compactor = None if capacity_v2 else self.config.resolve_compactor()
+        compactor = self.config.resolve_compactor()
         if compactor is None:
             return
 
@@ -1598,9 +1600,14 @@ class AgentPipeline:
             # 以 context_checkpoint 结束本 send → 正常投影 → 宿主续接机制在新 send 里接着干。
             # 与 max_tokens_per_run 不同：那是累计费用（Σ prompt+completion，随轮数平方增长），
             # 量不出「上下文有多大」；这里量的正是它。
-            ckpt = None if self._tool_context_v2 else self.config.context_checkpoint_tokens
+            # Fuse and cut are exclusive: a running fuse (tool-context capacity or the plain
+            # fuse) turns cut-send off.
+            from power_loop.runtime.tool_context import active_engine as _cut_engine
+            _fuse_engine = _cut_engine.get()
+            ckpt = self.config.context_checkpoint_tokens
             if (
                 ckpt is not None
+                and not (_fuse_engine is not None and _fuse_engine.config.capacity_enabled)
                 and (self.config.insend_distill_tokens or 0) <= 0
                 and int(ckpt) > 0
                 and round_idx > 0
@@ -1726,7 +1733,7 @@ class AgentPipeline:
 
             from power_loop.runtime.tool_context import active_engine
             _admission_engine = active_engine.get()
-            if (_admission_engine is not None and _admission_engine.config.schema_version == 2
+            if (_admission_engine is not None
                     and llm_before.directive not in (HookDirective.SHORT_CIRCUIT, HookDirective.BREAK)):
                 from power_loop.runtime.tool_archive import admit_request
                 if not await admit_request(_admission_engine, self, llm_before.messages,
@@ -2277,7 +2284,7 @@ class AgentPipeline:
                            round_index=round_idx)
 
                 await self._append_message(
-                    {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": (str(output) if self._tool_context_v2 else _truncate_result(output))},
+                    {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": _truncate_result(output, self.config.tool_result_max_chars)},
                     round_index=round_idx,
                 )
 

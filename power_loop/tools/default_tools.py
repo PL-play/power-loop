@@ -31,7 +31,7 @@ from power_loop.tools.command_rules import CommandRules, dangerous_command_reaso
 
 logger = logging.getLogger(__name__)
 
-RESULT_MAX_CHARS = 50000
+RESULT_MAX_CHARS = 20000
 TEXT_FILE_MAX_BYTES = 5 * 1024 * 1024
 READ_DEFAULT_LIMIT = 2000
 READ_MAX_LIMIT = 20000
@@ -92,12 +92,12 @@ def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(parsed, maximum))
 
 
-def _truncate_chars(text: str, limit: int = RESULT_MAX_CHARS) -> str:
-    from power_loop.runtime.tool_context import active_engine
-    engine = active_engine.get()
-    if engine is not None and engine.config.schema_version == 2:
-        return text
-    if len(text) <= limit:
+def _truncate_chars(text: str, limit: int | None = None) -> str:
+    if limit is None:
+        from power_loop.core.agent_context import get_current_loop
+        config = getattr(get_current_loop(), 'config', None)
+        limit = getattr(config, 'tool_result_max_chars', RESULT_MAX_CHARS) if config is not None else RESULT_MAX_CHARS
+    if not limit or len(text) <= limit:
         return text
     head = limit // 2
     tail = limit - head - 80
@@ -700,7 +700,7 @@ def run_bash(command: str | None = None, restart: bool = False, timeout: int = 1
         return scope_err
     from power_loop.runtime.tool_context import active_engine
     engine = active_engine.get()
-    if engine is not None and engine.config.schema_version == 2:
+    if engine is not None:
         if not isinstance(description, str) or not description.strip() or len(description) > 1000:
             return 'Error: bash description is required (1–1000 characters). Command was not executed.'
         if context_policy not in ('retire', 'keep'):
@@ -1972,8 +1972,8 @@ async def run_background(
     if operation == "run":
         from power_loop.runtime.tool_context import active_engine
         engine = active_engine.get()
-        if engine is not None and engine.config.schema_version == 2:
-            raise ValueError('Use background_run action=tool, tool=bash, args={command, description, context_policy}; v2 requires a registered target tool.')
+        if engine is not None:
+            raise ValueError('Use background_run action=tool, tool=bash, args={command, description, context_policy}; tool context requires a registered target tool.')
         if not (command or "").strip():
             raise ValueError("background_run action=run requires command")
         return await BG.run(str(command))
@@ -2295,7 +2295,7 @@ async def run_recall_send(send_index: int, seq: int | None = None, *, group_id: 
                     "Use the exact «sS» coordinate from the summary line, or omit seq to list the whole send.")
         from power_loop.runtime.tool_context import active_engine
         engine = active_engine.get()
-        if char_offset or (engine is not None and engine.config.schema_version == 2):
+        if char_offset or engine is not None:
             from power_loop.runtime.tool_archive import recall_original
             return await recall_original(store, sid, target, hit, char_offset, char_limit)
         return _render_recall_row(hit, rows, cap=RECALL_SEND_ROW_CHARS, head=f"send #{target} · seq {want}")

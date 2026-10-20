@@ -8,6 +8,35 @@
 
 ## [Unreleased]
 
+## [7.0.0] — 2026-10-20
+
+One tool-context mechanism; the version switch is gone (design/184).
+
+**Breaking (STABLE `ToolContextConfig` / `ToolContextPolicy`):**
+- Removed `ToolContextConfig.schema_version` and `ToolContextPolicy.between_sends`. Stored `between_sends`
+  overrides are ignored on read. `merge_archives` is renamed `merge_consecutive`.
+- `ToolContextPolicy` defaults: `general="rule"`, `insend_fuse="inherit"` (was `archive` / `rule`).
+- `AgentLoopConfig.tool_result_max_chars` (default 20000, head + tail kept, None = no cap) replaces the fixed
+  50000 cut; it applies with tool context too.
+
+**Changed:**
+- With tool context: one fuse (`trigger_tokens` → `target_tokens`). Level 1 = each tool's `insend_fuse`,
+  newest `hot_tail` calls protected (new field, default 8); level 2 = `general`. `hard_preserve` and bash
+  `context_policy=keep` stay unchanged at both levels. The plain `insend_distill_tokens` fuse runs only
+  without tool context.
+- Fold / compact points, `max_context_rows`, cut-send (off while the fuse is enabled), microcompact and the
+  verbatim compactor are no longer disabled by tool context.
+- Between sends every tool uses `general`; `rule` keeps the projector's entry. Consecutive calls of one tool
+  merge into a group entry `{name, s, n, group_id, seqs}` (breaks: another tool, injected user line).
+  No more `archive_v2_text`.
+- Distilled text has no prefix, only content plus a trailing `（原文 recall_send(...)）`. Rewritten call
+  arguments are slim (bash keeps `description`), no `_distilled` key.
+- bash: `archive` = description + exit code; `truncate` = description, command cut to `argument_max_chars`,
+  exit line, output cut to `result_max_chars`.
+- Compact rows always render through the projector (no verbatim fallback on a version mismatch).
+- Runtime state sub-key `archive_v2` is adopted as `archive`; issued group ids stay recallable.
+  `STATE_KEY` is now `TOOL_CONTEXT_STATE_KEY` (stored name unchanged).
+
 ## [6.55.0] — 2026-10-20
 
 - Add opt-in deterministic context policy v2: general archive policies, two-level capacity fuse, hysteresis and recoverable admission blocking.

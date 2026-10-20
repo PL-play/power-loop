@@ -166,7 +166,7 @@ class ToolRegistry:
 
         from power_loop.runtime.tool_context import active_engine
         context_engine = active_engine.get()
-        if name == 'bash' and context_engine is not None and context_engine.config.schema_version == 2:
+        if name == 'bash' and context_engine is not None:
             description = args.get('description')
             if not isinstance(description, str) or not description.strip() or len(description) > 1000:
                 raise ToolValidationError(name, 'description is required (1–1000 characters)')

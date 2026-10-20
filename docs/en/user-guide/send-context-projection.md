@@ -249,29 +249,36 @@ their policy snapshot; new sends pick up configuration changes. Disable the capa
 with `AgentLoopConfig.insend_distill_tokens=None`; hosts should retain the stored threshold
 separately and must not reinterpret an explicit disabled state as a default threshold.
 
-## Deterministic archive v2 (opt-in)
+## Tool context: one mechanism (7.0)
 
-Set `ToolContextConfig(schema_version=2)`; omitted versions retain v1 behavior.
-Normal text loops do not retire tools or request LLM summaries by default. Image retention remains independent.
-`general` is the between-send and second-level capacity policy; `insend_fuse="inherit"` uses it at level one.
-Explicit preserve and bash keep are soft level-one exemptions; `hard_preserve=True` survives both levels.
-The host registers its message/card tools as hard-preserved. Summary extensions and accounting remain available.
+With `AgentLoopConfig(tool_context=ToolContextConfig(...))` there is one set of tool-context rules and no
+version switch. All existing mechanisms stay and follow their configuration: between-sends projection,
+fold / compact points, `max_context_rows`, cut-send, microcompact and the verbatim compactor. Three
+optimizations sit on top:
 
-The high/low candidates are 500000/350000 tokens for a verified 1000000-token route, with 40000 output reserve
-and 32000 margin. Validate against the actual model and output budget. Counts are heuristic, provider-anchored,
-and separate from billing; provider reasoning fields are counted when present.
-After two levels, safe requests continue; unsafe irreducible requests return a recoverable capacity-blocked reason.
-The same no-progress candidate set is not repeatedly processed. Legacy microcompact, folds and row caps are bypassed.
-Disabling capacity_enabled also disables this mechanism's final admission guard.
+1. **One fuse with high/low water marks.** At `trigger_tokens` the history is reduced to `target_tokens`.
+   Level 1 applies each tool's `insend_fuse` rule and leaves the newest `hot_tail` calls (default 8)
+   alone; level 2 falls back to `general` without the hot tail. `hard_preserve` and bash
+   `context_policy=keep` are untouched at both levels. With tool context on, the plain
+   `insend_distill_tokens` fuse does not run, and cut-send is off while the fuse is enabled.
+2. **Independent in-send and between-sends rules.** A tool has `general` (between sends, and the fuse
+   fallback) and `insend_fuse` (fuse level 1 only; `inherit` = general). Defaults: `general="rule"`,
+   `insend_fuse="inherit"`. `hard_preserve` only affects the fuse.
+3. **Consecutive calls of one tool merge between sends.** Another tool or an injected user line breaks
+   a run; assistant text and reasoning do not; parallel same-name calls are consecutive. A group entry is
+   `{name, s, n, group_id, seqs}`; `recall_send(send_index=..., group_id=...)` pages its originals.
+   Disable with `merge_consecutive=False`.
 
-Immutable raw rows remain in messages. Paired view patches, exact group membership and capacity events are committed
-to the existing tool-context runtime state before editing memory. Resumed sends replay their frozen policy and view.
-Bash requires a 1–1000-character description; between sends only its full description and recall reference remain.
-Small originals that would grow are retained. Explicit level-one truncation retains the description and labels each
-truncated side. Background execution uses registered target tools, returns full target results initially, and delegates
-archival to their policies; raw shell execution must use tool=bash.
+Distilled text has no prefix: only the content, then one recall note. Rewritten call arguments keep only
+a slim form (bash keeps its description) and no marker key.
 
-Only complete adjacent same-tool blocks with no assistant body may group; in-send reasoning and parallel batches
-are boundaries. Grouping preserves a legal call/result pair and never implies new execution.
-recall_send(group_id=...) lists exact members with offset/limit; item selects a member.
-Original JSON supports char_offset/char_limit and next_char_offset for lossless paging, also with seq in v2.
+- `rule`: host code distillation; between sends the projector's entry is kept as is.
+- `archive`: what the call was for (bash: description + exit code; load_skill: skill name) + recall note.
+- `truncate`: bash keeps description, command cut to `argument_max_chars`, exit line, output cut to
+  `result_max_chars`, recall note; other tools get independent argument/result previews.
+- `preserve`: unchanged. `llm_summary`: precomputed summary, rule while not ready.
+
+Tool results are capped when written by `AgentLoopConfig.tool_result_max_chars` (default 20000, head and
+tail kept; None = no cap). Compact rows always render through the current projector. The removed
+`schema_version` and `between_sends` fields are gone; stored `between_sends` overrides are ignored. The
+runtime-state sub-key `archive_v2` is adopted as `archive`; issued group ids stay recallable.

@@ -345,8 +345,6 @@ class DefaultDeterministicProjector:
 
     def _render_project(self, content: dict[str, Any] | None) -> str:
         content = content or {}
-        if 'archive_v2_text' in content:
-            return str(content['archive_v2_text'])
         parts: list[str] = []
         tools = content.get("tools") or []
         if tools:

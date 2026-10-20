@@ -54,35 +54,39 @@ def test_side_disabled_without_losing_other_limit():
 
 
 @pytest.mark.parametrize('trigger', ['age_retirement', 'insend_fuse'])
-async def test_off_on_keep_idempotence_and_zero_saving_recount(trigger):
+async def test_off_on_keep_idempotence_and_recount(trigger):
     store = await SessionStore.open(':memory:')
     try:
         sid = await store.create_session()
-        cfg = ToolContextConfig(overrides={'bash': {'age_retirement': 'preserve', 'insend_fuse': 'preserve',
+        cfg = ToolContextConfig(hot_tail=0, overrides={'bash': {'age_retirement': 'preserve', 'insend_fuse': 'preserve',
             'retention_rounds': 16, 'argument_max_chars': 200, 'result_max_chars': 300}})
         engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid, owner_send_index=1, llm=None, model='test')
         await engine.start()
-        raw = args(170)  # near threshold: notices can make the working view larger
-        p = SimpleNamespace(history=[{'role': 'assistant', 'tool_calls': [
-            {'id': 'c', 'function': {'name': 'bash', 'arguments': raw}}]},
-            {'role': 'tool', 'tool_call_id': 'c', 'content': 'y' * 301}],
-            sink=SimpleNamespace(_history_seqs=[2, 3]), send_index=1,
-            config=SimpleNamespace(insend_distill_hot_tail=0, insend_distill_keep_tools=()),
-            _tok_len=-1, _tok_total=0)
-        engine.state.setdefault('exposures', {})['3'] = 16
+        raw = args(170)
+        history = [{'role': 'assistant', 'tool_calls': [{'id': 'c', 'function': {'name': 'bash', 'arguments': raw}}]},
+                   {'role': 'tool', 'tool_call_id': 'c', 'content': 'y' * 1000}]
+        seqs = [await store.append_message(sid, send_index=2, **row) for row in history]
+        p = SimpleNamespace(history=history, sink=SimpleNamespace(_history_seqs=seqs), send_index=2,
+                            config=SimpleNamespace(), _tok_len=-1, _tok_total=0)
+        engine.state['archive'] = {'exposures': {f'2:{seqs[1]}': 16}}
         original = json.dumps(p.history)
         await engine.prepare_history(p, trigger)
         assert json.dumps(p.history) == original
         cfg.overrides['bash'][trigger] = 'truncate'
-        cfg.overrides['bash']['between_sends'] = 'truncate'
+        cfg.overrides['bash']['general'] = 'truncate'
         # In-flight sends retain their snapshot; the switch takes effect next send.
-        assert getattr(engine.policy(ToolSource(sid, 1, 3, 'c', 'bash', {}, '')), trigger) == 'preserve'
+        assert getattr(engine.policy(ToolSource(sid, 2, seqs[1], 'c', 'bash', {}, '')), trigger) == 'preserve'
         engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid, owner_send_index=2, llm=None, model='test')
         await engine.start()
-        engine.state.setdefault('exposures', {})['3'] = 16
-        p.send_index = 2
+        engine.state['archive'] = {'exposures': {f'2:{seqs[1]}': 16}}
         AgentPipeline._estimate_history_tokens(p)
         await engine.prepare_history(p, trigger)
+        assert json.dumps(p.history) != original
+        content = p.history[1]['content']
+        assert content.startswith('y' * 300 + '…（输出共 1000 字，只留前 300 字）')
+        assert content.endswith(f'（原文 recall_send(send_index=2, seq={seqs[1]})）')
+        assert json.loads(p.history[0]['tool_calls'][0]['function']['arguments']) == {
+            'description': '完整目的', 'command': 'x' * 170}
         assert p._tok_len == -1
         assert AgentPipeline._estimate_history_tokens(p) == estimate_tokens(p.history)
         changed = json.dumps(p.history)
@@ -90,7 +94,7 @@ async def test_off_on_keep_idempotence_and_zero_saving_recount(trigger):
         assert json.dumps(p.history) == changed
         source = ToolSource(sid, 1, 3, 'keep', 'bash', {'command': 'x' * 500, 'description': 'rules', 'context_policy': 'keep'}, 'y' * 500)
         assert await engine.distill(source, trigger) is None
-        assert await engine.distill(source, 'between_sends') is not None
+        assert await engine.distill(source, 'general') is not None
         assert cfg.overrides['bash']['retention_rounds'] == 16
     finally:
         await store.close()
@@ -106,7 +110,7 @@ async def test_background_uses_target_limits_and_keep():
         registry = ToolRegistry()
         registry.register(ToolDefinition('bash', ''), lambda **kw: '')
         config = ToolContextConfig(overrides={'bash': {'insend_fuse': 'truncate',
-            'between_sends': 'truncate', 'argument_max_chars': 200, 'result_max_chars': 300}})
+            'general': 'truncate', 'argument_max_chars': 200, 'result_max_chars': 300}})
         engine = ToolContextEngine(config=config, store=store, owner_session_id=sid,
                                    owner_send_index=1, llm=None, model='test', registry=registry)
         await engine.start()
@@ -120,7 +124,7 @@ async def test_background_uses_target_limits_and_keep():
         record['args']['context_policy'] = 'keep'
         await store.set_runtime_state(sid, record_key('job'), record)
         assert await engine.distill(wrapped, 'insend_fuse') is None
-        assert await engine.distill(wrapped, 'between_sends') is not None
+        assert await engine.distill(wrapped, 'general') is not None
     finally:
         await store.close()
 
@@ -148,3 +152,27 @@ def test_incomplete_archive_is_preserved():
     result = json.dumps({'capture_complete': True, 'truncated': False,
                          'output': 'x' * 350, 'output_chars': 3000})
     assert truncate_pair(args(500), result, ToolContextPolicy(), 'recall') is None
+
+
+def test_bash_insend_view_keeps_description_exit_and_cuts_command_and_output():
+    from power_loop.runtime.tool_truncation import truncate_bash
+    policy = ToolContextPolicy(argument_max_chars=20, result_max_chars=50)
+    arguments = {'command': 'python -m pytest ' + 'tests/x.py ' * 20, 'description': '跑测试'}
+    result = 'exit_code=1\n' + 'F' * 400
+    args_text, text = truncate_bash(arguments, result, policy, 'recall_send(send_index=3, seq=9)')
+    args = json.loads(args_text)
+    assert args['description'] == '跑测试'
+    assert args['command'].startswith(arguments['command'][:20] + '…（命令共')
+    lines = text.split('\n')
+    assert lines[0] == 'exit_code=1'
+    assert lines[1] == 'F' * 50 + '…（输出共 400 字，只留前 50 字）'
+    assert lines[-1] == '（原文 recall_send(send_index=3, seq=9)）'
+    assert truncate_bash({'command': 'ls', 'description': 'd'}, 'exit_code=0\nok', policy, 'r') is None
+
+
+def test_bash_general_is_description_exit_code_and_recall_only():
+    from power_loop.runtime.tool_archive import archive_text, slim_arguments
+    source = ToolSource('s', 2, 7, 'c', 'bash', {'command': 'rm -rf build && make', 'description': '重新构建'},
+                        'exit_code=2\nmake: *** error')
+    assert archive_text(source) == '重新构建（exit 2）\n（原文 recall_send(send_index=2, seq=7)）'
+    assert json.loads(slim_arguments(source)) == {'description': '重新构建'}

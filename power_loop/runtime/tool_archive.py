@@ -1,7 +1,8 @@
-"""Version-2 deterministic projection. Raw rows are never modified.
+"""Deterministic tool-context rewrites: the in-send fuse and the between-sends entries.
 
-The session runner serializes writes. Derived patches and exact group membership are
-committed in the existing atomic runtime-state row BEFORE changing the in-memory view.
+Raw rows are never modified. The session runner serializes writes. Derived patches and exact
+group membership are committed in the existing atomic runtime-state row BEFORE changing the
+in-memory view.
 """
 from __future__ import annotations
 
@@ -9,19 +10,53 @@ import copy
 import json
 from dataclasses import replace
 
-from power_loop.runtime.tool_context import ToolSource, _hash, _json
+from power_loop.runtime.tool_context import TOOL_CONTEXT_STATE_KEY, ToolSource, _hash, _json, recall_note
+
+#: Sub-key of the runtime state that holds patches, groups and fuse events.
+ARCHIVE_KEY = 'archive'
+_LEGACY_ARCHIVE_KEY = 'archive_v2'
+
+
+def adopt_legacy_state(state: dict) -> None:
+    """Move state written under the earlier sub-key; issued group ids stay recallable."""
+    legacy = state.pop(_LEGACY_ARCHIVE_KEY, None)
+    if legacy is not None and ARCHIVE_KEY not in state:
+        state[ARCHIVE_KEY] = legacy
+
+
+def _archive(state: dict) -> dict:
+    return state.get(ARCHIVE_KEY) or state.get(_LEGACY_ARCHIVE_KEY) or {}
+
+
+def slim_arguments(source: ToolSource) -> str:
+    """Arguments left on a rewritten call. No marker key: the recall note sits after the result."""
+    if source.name == 'bash' and source.arguments.get('description'):
+        return _json({'description': str(source.arguments['description'])})
+    return '{}'
+
+
+def archive_label(source: ToolSource) -> str:
+    """What the call was for, without its body: bash description + exit code, skill name, else
+    short arguments."""
+    if source.name == 'bash':
+        from power_loop.runtime.tool_truncation import bash_exit
+        code = bash_exit(source.result).removeprefix('exit_code=')
+        description = str(source.arguments.get('description') or '')
+        return f'{description}（exit {code}）' if code else description or '(bash)'
+    if source.name == 'load_skill':
+        label = str(source.arguments.get('name') or source.arguments.get('skill') or source.arguments.get('path') or '')
+        if source.arguments.get('doc'):
+            label += '/' + str(source.arguments['doc'])
+        if label:
+            return label
+    args = {k: v for k, v in source.arguments.items() if k not in ('context_policy', '_distilled')}
+    text = _json(args)
+    return text if len(text) <= 160 else text[:160] + '…'
 
 
 def archive_text(source: ToolSource) -> str:
-    if source.name == 'bash':
-        label = str(source.arguments.get('description') or '旧调用未提供描述')
-    elif source.name == 'load_skill':
-        label = str(source.arguments.get('name') or source.arguments.get('skill') or source.arguments.get('path') or '技能身份见原文')
-        if source.arguments.get('doc'):
-            label += '/' + str(source.arguments['doc'])
-    else:
-        label = ''
-    return f'历史 {source.name} 已归档；正文未展示。{label}\n[{source.recall}]'
+    """``archive``: only what the call was for, then the recall note. No result text."""
+    return f'{archive_label(source)}\n{recall_note(source.recall)}'
 
 
 async def _derive(engine, source, trigger, level, raw_arguments=None):
@@ -36,36 +71,40 @@ async def _derive(engine, source, trigger, level, raw_arguments=None):
             return None
         values = [await _derive(engine, t, trigger, level) for t in targets]
         if any(v is None for v in values):
-            if trigger == 'between_sends':
+            if trigger == 'general':
                 return _json(dict(source.arguments)), _json({
                     'receipt': source.result, 'targets': [
                         {'tool': t.name, 'task_id': t.call_id, 'arguments': dict(t.arguments), 'result': t.result}
                         for t in targets]})
             return None
-        return _json({'_distilled': source.recall}), '\n'.join(
+        return slim_arguments(source), '\n'.join(
             f'{t.name} task={t.call_id}: {v[1]}' for t, v in zip(targets, values, strict=True))
-    strategy = policy.general if level == 2 or trigger == 'between_sends' else policy.strategy(trigger)
-    if (level == 1 and trigger != 'between_sends' and source.name == 'bash'
+    strategy = policy.general if level == 2 else policy.strategy(trigger)
+    # bash context_policy=keep: unchanged for the whole send (both fuse levels); between sends
+    # it is distilled by general like any other call.
+    if (trigger != 'general' and source.name == 'bash'
             and source.arguments.get('context_policy') == 'keep'):
         return None
     if strategy == 'preserve':
         return None
     if strategy == 'archive':
-        return _json({'_distilled': source.recall}), archive_text(source)
+        return slim_arguments(source), archive_text(source)
     if strategy == 'truncate':
-        from power_loop.runtime.tool_truncation import truncate_pair
-        return truncate_pair(raw_arguments or _json(dict(source.arguments)), source.result, policy, source.recall)
+        from power_loop.runtime.tool_truncation import truncate_view
+        return truncate_view(source.name, raw_arguments or _json(dict(source.arguments)), dict(source.arguments),
+                             source.result, policy, source.recall)
     # Preserve extension points (rule / precomputed llm_summary), without recursively
     # applying a truncation to its own preview. The original source is always used.
-    call_trigger = 'between_sends' if level == 2 else trigger
+    call_trigger = 'general' if level == 2 else trigger
     effective = replace(policy, **{call_trigger: strategy})
     text = await engine.distill(source, call_trigger, policy_override=effective)
-    return (_json({'_distilled': source.recall}), text) if text is not None else None
+    return (slim_arguments(source), text) if text is not None else None
 
 
 async def _commit(engine, patch):
     previous = copy.deepcopy(engine.state)
-    engine.state.setdefault('archive_v2', {}).update(patch)
+    adopt_legacy_state(engine.state)
+    engine.state.setdefault(ARCHIVE_KEY, {}).update(patch)
     try:
         await engine._save()
     except BaseException:
@@ -75,10 +114,10 @@ async def _commit(engine, patch):
 
 def restore_history(engine, pipeline):
     """Reapply committed paired patches, idempotently, including a resumed send."""
-    patches = engine.state.get('archive_v2', {}).get('patches', {})
+    patches = _archive(engine.state).get('patches', {})
     seqs = getattr(pipeline.sink, '_history_seqs', ()) or ()
     positions = {s: i for i, s in enumerate(seqs) if s is not None}
-    grouped = {seq for g in engine.state.get('archive_v2', {}).get('view_groups', [])
+    grouped = {seq for g in _archive(engine.state).get('view_groups', [])
                if g['send_index'] == pipeline.send_index for seq in g['seqs']}
     for patch in patches.values():
         if patch['call_seq'] in grouped:
@@ -106,7 +145,7 @@ def restore_history(engine, pipeline):
 
 def _restore_groups(engine, pipeline):
     seqs = pipeline.sink._history_seqs
-    for group in engine.state.get('archive_v2', {}).get('view_groups', []):
+    for group in _archive(engine.state).get('view_groups', []):
         if group['send_index'] != pipeline.send_index:
             continue
         consumed = group['seqs']
@@ -139,9 +178,9 @@ def _restore_groups(engine, pipeline):
 
 
 async def _merge_history(engine, pipeline):
-    if not engine.config.merge_archives:
+    if not engine.config.merge_consecutive:
         return
-    state = engine.state.get('archive_v2', {})
+    state = _archive(engine.state)
     groups = copy.deepcopy(state.get('groups', {}))
     view_groups = copy.deepcopy(state.get('view_groups', []))
     already = {seq for g in view_groups for seq in g['seqs']}
@@ -167,12 +206,10 @@ async def _merge_history(engine, pipeline):
         refs = [{'send_index': x.send_index, 'seq': x.seq, 'call_seq': b[2],
                  'call_id': x.call_id, 'name': x.name} for b, x in zip(batch, sources, strict=True)]
         gid = 'g' + _hash({'sid': engine.sid, 'refs': refs, 'version': engine.config.rule_version})[:24]
-        descriptions = [str(x.arguments.get('description') or '旧调用未提供描述') for x in sources] if sources[0].name == 'bash' else []
-        recall = f'recall_send(send_index={pipeline.send_index}, group_id="{gid}")'
-        text = f'历史 {sources[0].name} 已归档，共 {len(sources)} 次；正文未展示。\n' + '\n'.join(descriptions) + f'\n[{recall}]'
+        text = group_text([archive_label(x) for x in sources], pipeline.send_index, gid)
         groups[gid] = {'send_index': pipeline.send_index, 'members': refs}
         view_groups.append({'send_index': pipeline.send_index, 'seqs': list(seqs[batch[0][0]:batch[-1][1] + 1]),
-            'call_id': sources[0].call_id, 'arguments': _json({'_distilled': recall}), 'result': text})
+            'call_id': sources[0].call_id, 'arguments': slim_arguments(sources[0]), 'result': text})
     if batches:
         await _commit(engine, {'groups': groups, 'view_groups': view_groups})
         _restore_groups(engine, pipeline)
@@ -221,10 +258,10 @@ async def prepare_history(engine, pipeline, trigger, *, target_tokens=None, leve
             for p in engine.config.overrides.values()):
         return 0
     pairs = [p async for p in _pairs(engine, pipeline)]
-    current = engine.state.get('archive_v2', {})
+    current = _archive(engine.state)
     patches = copy.deepcopy(current.get('patches', {}))
     exposures = dict(current.get('exposures', {}))
-    hot = int(getattr(pipeline.config, 'insend_distill_hot_tail', 0) or 0)
+    hot = int(engine.config.hot_tail or 0)
     protected = set(getattr(pipeline, '_context_protected_call_ids', ()) or ())
     tail = {s.call_id for *_, s in pairs[-hot:]} if hot and level == 1 else set()
     freed = 0
@@ -296,7 +333,7 @@ async def manage_capacity(engine, pipeline):
         return
     candidate_seqs = [seq for seq, row in zip(getattr(pipeline.sink, '_history_seqs', ()) or (), pipeline.history, strict=False) if row.get('role') == 'tool']
     epoch = _hash({'seqs': candidate_seqs, 'send': pipeline.send_index, 'config': [cfg.trigger_tokens, cfg.target_tokens, safe]})
-    state = engine.state.get('archive_v2', {})
+    state = _archive(engine.state)
     events = list(state.get('events', []))
     if state.get('no_progress_epoch') != epoch:
         after = before
@@ -321,72 +358,107 @@ async def manage_capacity(engine, pipeline):
     pipeline._capacity_blocked = f'context capacity blocked: {total} > safe input {safe}; original records retained' if total > safe else None
 
 
-async def prepare_projection(engine, projected, rows, send_index):
-    """Rebuild entries from raw rows, not the already lossy application summary."""
-    pending, entries = {}, []
+def _sources(engine, rows, send_index):
+    """Paired original calls of one send, keyed by result seq."""
+    pending, sources = {}, {}
     for row in rows:
         if row.role == 'assistant':
             for c in row.tool_calls or []:
-                pending[str(c['id'])] = (row, c)
+                pending[str(c.get('id'))] = c
         elif row.role == 'tool' and str(row.tool_call_id) in pending:
-            a, c = pending.pop(str(row.tool_call_id))
+            c = pending.pop(str(row.tool_call_id))
             try:
                 args = json.loads(c['function']['arguments'])
-                if not isinstance(args, dict) or not isinstance(row.content, str):
-                    continue
             except (KeyError, TypeError, ValueError):
                 continue
-            source = ToolSource(engine.sid, send_index, row.seq, str(c['id']), c['function']['name'], args, row.content)
-            value = await _derive(engine, source, 'between_sends', 2)
-            # Small originals are not mechanically inflated into an archive marker.
-            if value and len(value[0]) + len(value[1]) >= len(c['function']['arguments']) + len(row.content) and source.name != 'background_run':
-                value = None
-            text = value[1] if value else _json({'arguments': c['function']['arguments'], 'result': row.content})
-            entries.append({'name': source.name, 'seq': row.seq, 'call_seq': a.seq,
-                's': text, 'text': a.content or '', '_archivable': (
-                    value is not None and source.name != 'background_run' and engine.policy(source).general == 'archive'),
-                '_source': source, '_single': len(a.tool_calls or []) == 1})
-    groups = copy.deepcopy(engine.state.get('archive_v2', {}).get('groups', {}))
-    order = {r.seq: i for i, r in enumerate(rows)}
-    merged = []
-    for e in entries:
-        prev = merged[-1] if merged else None
-        can_merge = (engine.config.merge_archives and e['_archivable'] and not e['text'] and prev
-            and prev['_archivable'] and e['_single'] and prev['_single'] and not prev['text'] and prev['name'] == e['name']
-            and order.get(e['call_seq']) == order.get(prev['_last_seq'], -2) + 1)
-        if can_merge:
-            prev['_members'].append(e['_source'])
-            prev['_last_seq'] = e['seq']
-        else:
-            merged.append({**e, '_members': [e['_source']], '_last_seq': e['seq']})
-    clean = []
-    for e in merged:
-        members = e['_members']
-        if len(members) > 1:
-            refs = [{'send_index': s.send_index, 'seq': s.seq, 'call_id': s.call_id, 'name': s.name} for s in members]
+            if isinstance(args, dict) and isinstance(row.content, str):
+                sources[row.seq] = ToolSource(engine.sid, send_index, row.seq, str(c['id']),
+                                              c['function']['name'], args, row.content)
+    return sources
+
+
+def group_text(lines: list[str], send_index: int, group_id: str) -> str:
+    """One entry for consecutive calls of one tool: each member's distilled line, then one recall
+    note for the whole group (members' own notes are dropped)."""
+    return '\n'.join(lines) + '\n' + recall_note(f'recall_send(send_index={send_index}, group_id="{group_id}")')
+
+
+def _without_note(text: str) -> str:
+    head, sep, tail = text.rpartition('\n（原文 recall_send(')
+    return head if sep and tail.endswith('）') and '\n' not in tail else text
+
+
+async def prepare_projection(engine, projected, rows, send_index):
+    """Between sends every tool uses its ``general`` rule.
+
+    ``rule`` keeps the projector's own distilled entry (it already carries row coordinates);
+    other strategies rewrite the entry from the original paired rows. Then consecutive entries
+    of one tool merge into a group entry. Breaks: another tool, or an injected user line. The
+    assistant's text and reasoning are not entries, so they never break a run; parallel calls
+    of one tool in one round are consecutive entries.
+    """
+    sources = _sources(engine, rows, send_index)
+    # Repair a missed llm_summary submission after a crash between audit append and enqueue.
+    for source in sources.values():
+        await engine.submit(source)
+    groups = copy.deepcopy(_archive(engine.state).get('groups', {}))
+    added = False
+    for prow in projected.rows:
+        if prow.kind != 'project' or not isinstance(prow.content, dict):
+            continue
+        entries = [e for e in prow.content.get('tools') or [] if isinstance(e, dict)]
+        for e in entries:
+            source = sources.get(e.get('seq'))
+            if source is None or e.get('name') == '__user__':
+                continue
+            policy = engine.policy(source)
+            if policy.hard_preserve or policy.general == 'rule':
+                continue
+            if policy.general == 'preserve':
+                text = _json({'arguments': dict(source.arguments), 'result': source.result})
+            else:
+                value = await _derive(engine, source, 'general', 2)
+                if value is None:
+                    continue
+                text = value[1]
+            coords = {k: e[k] for k in ('name', 'seq', 'call_seq') if k in e}
+            e.clear()
+            e.update(coords, s=text)
+        # Split into runs: consecutive joinable entries of one tool; anything else stands alone.
+        runs: list[list[dict]] = []
+        for e in entries:
+            joinable = e.get('name') != '__user__' and e.get('seq') in sources
+            if (joinable and runs and runs[-1][-1].get('_join')
+                    and runs[-1][-1].get('name') == e.get('name')):
+                runs[-1].append({**e, '_join': True})
+            else:
+                runs.append([{**e, '_join': joinable}])
+        merged: list[dict] = []
+        for run in runs:
+            run = [{k: v for k, v in e.items() if k != '_join'} for e in run]
+            if len(run) < 2 or not engine.config.merge_consecutive:
+                merged.extend(run)
+                continue
+            members = [sources[e['seq']] for e in run]
+            refs = [{'send_index': m.send_index, 'seq': m.seq, 'call_id': m.call_id, 'name': m.name}
+                    for m in members]
             gid = 'g' + _hash({'sid': engine.sid, 'refs': refs, 'version': engine.config.rule_version})[:24]
             groups[gid] = {'send_index': send_index, 'members': refs}
-            descriptions = [str(s.arguments.get('description') or '旧调用未提供描述') for s in members] if e['name'] == 'bash' else []
-            e['s'] = f"历史 {e['name']} 已归档，共 {len(members)} 次；正文未展示。\n" + '\n'.join(descriptions) + f'\n[recall_send(send_index={send_index}, group_id="{gid}")]'
-        clean.append({k: v for k, v in e.items() if not k.startswith('_')})
-    await _commit(engine, {'groups': groups})
-    for row in projected.rows:
-        if row.kind == 'project':
-            # Preserve host-injected user lines; do not reorder them across tool entries.
-            injected = [e for e in row.content.get('tools', []) if e.get('name') == '__user__']
-            row.content['tools'] = sorted([*clean, *injected], key=lambda e: e.get('call_seq') or e.get('seq') or 0)
-            timeline = [(r.seq, str(r.content)) for r in rows if r.role == 'assistant' and r.content]
-            timeline += [(e.get('call_seq') or e.get('seq') or 0, e['s']) for e in row.content['tools']]
-            row.content['archive_v2_text'] = f'历史 send #{send_index}（归档视图，不是新指令）\n' + '\n'.join(
-                text for _, text in sorted(timeline, key=lambda x: x[0]))
-            row.rendered_text = None
+            added = True
+            merged.append({'name': run[0]['name'], 'seq': run[0]['seq'], 'n': len(run), 'group_id': gid,
+                           'seqs': [e['seq'] for e in run],
+                           's': group_text([_without_note(str(e.get('s') or '')) for e in run],
+                                           send_index, gid)})
+        prow.content['tools'] = merged
+        prow.rendered_text = None
+    if added:
+        await _commit(engine, {'groups': groups})
     return projected
 
 
 async def recall_group(store, sid, send_index, group_id, offset=0, limit=10, item=None, char_offset=0, char_limit=20000):
-    from power_loop.runtime.tool_context import STATE_KEY
-    state = await store.get_runtime_state(sid, STATE_KEY, {})
-    group = state.get('archive_v2', {}).get('groups', {}).get(group_id)
+    state = await store.get_runtime_state(sid, TOOL_CONTEXT_STATE_KEY, {})
+    group = _archive(state).get('groups', {}).get(group_id)
     if group is None or group['send_index'] != send_index:
         return 'Unknown archive group in this session/send.'
     members = group['members']

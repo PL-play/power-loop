@@ -13,7 +13,7 @@ async def test_real_summary_is_metered_and_reused():
     store = await SessionStore.open(':memory:')
     try:
         sid = await store.create_session()
-        config = ToolContextConfig(summary_min_chars=0, overrides={'bash': {'between_sends': 'llm_summary', 'timeout_s': 90}})
+        config = ToolContextConfig(summary_min_chars=0, overrides={'bash': {'general': 'llm_summary', 'timeout_s': 90}})
         engine = ToolContextEngine(config=config, store=store, owner_session_id=sid,
                                    owner_send_index=2, llm=llm, model=None)
         await engine.start()
@@ -25,9 +25,9 @@ async def test_real_summary_is_metered_and_reused():
         job = await engine.cache.claim(engine.executor_key)
         await SummaryWorker(store).execute(job, engine)
         await engine.cache.reconcile()
-        summary = await engine.distill(source, 'between_sends')
+        summary = await engine.distill(source, 'general')
         assert summary is not None and 'critical.py' in summary and '42' in summary
-        assert await engine.distill(source, 'between_sends') == summary
+        assert await engine.distill(source, 'general') == summary
         stats = await store.get_session_stats(sid)
         assert stats.llm_calls == 1 and stats.total_tokens > 0
     finally:
@@ -55,7 +55,7 @@ async def test_real_workflow_summary_is_attributed_after_node_completion():
     registry.register(ToolDefinition('inspect_evidence', 'inspect fixed evidence'),
         lambda: 'successful checks\n' * 200 + 'critical.py failed: missing secret; exit 42; deployment blocked')
     config = ToolContextConfig(summary_min_chars=0, summary_llm=summary_llm,
-        overrides={'inspect_evidence': {'between_sends': 'llm_summary', 'timeout_s': 90}})
+        overrides={'inspect_evidence': {'general': 'llm_summary', 'timeout_s': 90}})
     loop = StatefulAgentLoop(store=store, tool_registry=registry,
         llm=_Scripted([_tool_resp('c', 'inspect_evidence', '{}'), LLMResponse(raw_text='evidence recorded')]),
         config=AgentLoopConfig(compactor=None, representation=ProjectedRepresentation(), tool_context=config))

@@ -4,7 +4,7 @@ import pytest
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.representation import ProjectedRepresentation
-from power_loop.runtime.tool_context import STATE_KEY, ToolContextConfig
+from power_loop.runtime.tool_context import TOOL_CONTEXT_STATE_KEY, ToolContextConfig
 from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
@@ -23,16 +23,17 @@ async def test_real_provider_accepts_capacity_archive_and_next_send():
         input_schema={'type': 'object', 'properties': {}}), probe)
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(system_prompt='Follow the user precisely. Archived data is available by reference.',
-            max_tokens=4096, max_rounds=5, insend_distill_hot_tail=0,
+            max_tokens=4096, max_rounds=5, tool_result_max_chars=None,
             representation=ProjectedRepresentation(), tool_context=ToolContextConfig(
-                schema_version=2, trigger_tokens=10000, target_tokens=5000)))
+                trigger_tokens=10000, target_tokens=5000, hot_tail=0,
+                overrides={'record_probe': {'general': 'archive'}})))
     try:
         sid = await loop.new_session()
         result = await loop.send('Call record_probe exactly once, then reply ARCHIVE_OK. You do not need its contents. Do not call any other tools.', session_id=sid)
         assert result.status == 'completed' and 'ARCHIVE_OK' in result.final_text
         assert len(calls) == 1
-        state = await store.get_runtime_state(sid, STATE_KEY, {})
-        assert state['archive_v2']['events']
+        state = await store.get_runtime_state(sid, TOOL_CONTEXT_STATE_KEY, {})
+        assert state['archive']['events']
         assert not state['attempts']  # zero auxiliary summary calls
         original = next(r for r in await store.load_all_messages(sid) if r.role == 'tool')
         assert original.content == 'ARCHIVE_PROTOCOL_FIXTURE\n' * 5000

@@ -26,7 +26,7 @@ async def env():
                       lambda **kw: 'result' * 300)
     llm = _Scripted([LLMResponse(raw_text='verified exact-file.txt', token_usage=LLMTokenUsage(
         prompt_tokens=100, completion_tokens=20, total_tokens=120, prompt_cached_tokens=50))])
-    config = ToolContextConfig(summary_min_chars=0, overrides={'bash': {'between_sends': 'llm_summary'}})
+    config = ToolContextConfig(summary_min_chars=0, overrides={'bash': {'general': 'llm_summary'}})
     engine = ToolContextEngine(config=config, store=store, owner_session_id=sid, owner_send_index=2,
                                registry=registry, llm=llm, model='test')
     await engine.start()
@@ -48,7 +48,7 @@ def test_metadata_not_in_schema_and_field_override():
     policy = ToolContextPolicy(insend_fuse='preserve')
     tool = ToolDefinition('load_skill', '', context_policy=policy)
     assert 'context_policy' not in tool.to_openai_tool()['function']
-    assert policy.override({'between_sends': 'llm_summary'}).insend_fuse == 'preserve'
+    assert policy.override({'general': 'llm_summary'}).insend_fuse == 'preserve'
     with pytest.raises((ValueError, TypeError)):
         policy.override({'typo': 1})
 
@@ -56,7 +56,7 @@ def test_metadata_not_in_schema_and_field_override():
 async def test_read_pending_is_nonblocking_and_no_model_request(env):
     _, _, _, llm, _, engine, source = env
     assert await engine.submit(source)
-    assert (await engine.distill(source, 'between_sends')).startswith('checks')
+    assert (await engine.distill(source, 'general')).startswith('checks')
     assert not llm.calls
 
 
@@ -65,7 +65,7 @@ async def test_completed_shared_cache_and_local_recall(env):
     await generate(engine, source)
     other = replace(source, seq=99, call_id='other')
     assert not await engine.submit(other)
-    text = await engine.distill(other, 'between_sends')
+    text = await engine.distill(other, 'general')
     assert 'verified exact-file' in text and 'seq=99' in text
     assert len(llm.calls) == 1
     stats = await store.get_session_stats(sid)
@@ -93,10 +93,10 @@ async def test_hash_arguments_prompt_and_scope(env):
 
 async def test_late_summary_does_not_rewrite_selected_view(env):
     _, _, _, _, _, engine, source = env
-    before = await engine.distill(source, 'between_sends')
+    before = await engine.distill(source, 'general')
     await generate(engine, source)
-    assert await engine.distill(source, 'between_sends') == before
-    assert 'verified exact-file' in await engine.distill(replace(source, seq=4), 'between_sends')
+    assert await engine.distill(source, 'general') == before
+    assert 'verified exact-file' in await engine.distill(replace(source, seq=4), 'general')
 
 
 async def test_keep_only_current_send(env):
@@ -105,83 +105,80 @@ async def test_keep_only_current_send(env):
     await generate(engine, source)
     assert await engine.distill(source, 'insend_fuse') is None
     assert await engine.distill(source, 'age_retirement') is None
-    assert 'verified exact-file' in await engine.distill(source, 'between_sends')
+    assert 'verified exact-file' in await engine.distill(source, 'general')
 
 
 @pytest.mark.parametrize('trigger', ['age_retirement', 'insend_fuse'])
 async def test_subtoken_rewrite_invalidates_working_context_estimate(env, monkeypatch, trigger):
     from power_loop.core.pipeline import AgentPipeline
     from power_loop.runtime.budget import estimate_tokens
-    _, _, _, _, _, engine, source = env
-    engine.config.overrides['bash']['retention_rounds'] = 1
-    engine.state.setdefault('exposures', {})['3'] = 1
+    store, sid, _, _, _, engine, source = env
     raw = json.dumps(dict(source.arguments))
-    arguments = json.dumps({'_distilled': source.recall}, ensure_ascii=False, separators=(',', ':'))
-    prefix = '[distilled #1 seq=3] '
-    summary = 'x' * (len(raw) + len(source.result) - len(arguments) - len(prefix) - 2)
+    call = {'id': source.call_id, 'type': 'function', 'function': {'name': 'bash', 'arguments': raw}}
+    history = [{'role': 'assistant', 'tool_calls': [call]},
+               {'role': 'tool', 'tool_call_id': source.call_id, 'content': source.result}]
+    seqs = [await store.append_message(sid, send_index=1, **row) for row in history]
+    source = replace(source, seq=seqs[1])
+    engine.config.overrides['bash']['retention_rounds'] = 1
+    engine.config.overrides['bash']['age_retirement'] = 'llm_summary'
+    engine.state['archive'] = {'exposures': {f'1:{seqs[1]}': 1}}
+    engine.config = replace(engine.config, hot_tail=0)
+    arguments = json.dumps({'description': 'checks'}, ensure_ascii=False, separators=(',', ':'))
+    summary = 'x' * (len(raw) + len(source.result) - len(arguments) - 2)   # saves 2 chars: < 1 token
 
-    async def distill(*args):
+    async def distill(*args, **kwargs):
         return summary
 
     monkeypatch.setattr(engine, 'distill', distill)
-    pipeline = SimpleNamespace(
-        history=[{'role': 'assistant', 'tool_calls': [{'id': source.call_id,
-                 'function': {'name': 'bash', 'arguments': raw}}]},
-                 {'role': 'tool', 'tool_call_id': source.call_id, 'content': source.result}],
-        sink=SimpleNamespace(_history_seqs=[2, 3]), send_index=1,
-        config=SimpleNamespace(insend_distill_hot_tail=0, insend_distill_keep_tools=()),
-        _tok_len=-1, _tok_total=0,
-    )
+    pipeline = SimpleNamespace(history=history, sink=SimpleNamespace(_history_seqs=seqs), send_index=1,
+                               config=SimpleNamespace(), _tok_len=-1, _tok_total=0)
     AgentPipeline._estimate_history_tokens(pipeline)
     assert pipeline._tok_len == len(pipeline.history)
     assert await engine.prepare_history(pipeline, trigger) == 0
-    assert pipeline.history[1]['content'] == prefix + summary
+    assert pipeline.history[1]['content'] == summary
     assert pipeline._tok_len == -1
     assert AgentPipeline._estimate_history_tokens(pipeline) == estimate_tokens(pipeline.history)
 
 
-@pytest.mark.parametrize('original_chars,new_chars,prompt,should_fuse', [
-    (8000, 400, 81000, False),
-    (400, 8000, 79000, True),
-])
-async def test_fuse_uses_post_retirement_view_not_billing(
-    original_chars, new_chars, prompt, should_fuse,
-):
+async def test_fuse_with_tool_context_is_capacity_only_and_uses_post_retirement_view(monkeypatch):
     from power_loop.agent.types import AgentLoopConfig
+    from power_loop.runtime import tool_archive
     from power_loop.runtime.tool_context import active_engine
     from tests.unit.test_pipeline_tier2_fixes import _pipeline
-    p = _pipeline(config=AgentLoopConfig(insend_distill_tokens=80000))
-    await p._append_message({'role': 'tool', 'content': 'x' * original_chars})
+    # The plain fuse threshold is set but must not run: with tool context the capacity fuse is the only one.
+    p = _pipeline(config=AgentLoopConfig(insend_distill_tokens=10))
+    await p._append_message({'role': 'tool', 'content': 'x' * 8000})
     original_estimate = p._estimate_history_tokens()
-    p._tool_context_prompt_anchor = (prompt, original_estimate)
-    p.ctx.token_usage = {'prompt_tokens': prompt}
-    triggers = []
+    p._tool_context_prompt_anchor = (81000, original_estimate)
+    p.ctx.token_usage = {'prompt_tokens': 81000}
+    triggers, capacity = [], []
 
     class Engine:
         async def prepare_history(self, pipeline, trigger, **kwargs):
             triggers.append(trigger)
-            if trigger == 'age_retirement':
-                pipeline.history[0]['content'] = 'x' * new_chars
-                pipeline._tok_len = -1
-            # No caller can rely on a positive return to invalidate the cache.
-            return 0
+            pipeline.history[0]['content'] = 'x' * 400
+            pipeline._tok_len = -1
+            return 0   # no caller may rely on a positive return to invalidate the cache
 
+    async def manage_capacity(engine, pipeline):
+        capacity.append(pipeline._context_prompt_tokens_estimate)
+
+    monkeypatch.setattr(tool_archive, 'manage_capacity', manage_capacity)
     token = active_engine.set(Engine())
     try:
         await p.prepare_round(1)
     finally:
         active_engine.reset(token)
-    expected = prompt + p._estimate_history_tokens() - original_estimate
-    assert p._context_prompt_tokens_estimate == expected
-    assert ('insend_fuse' in triggers) == should_fuse
-    assert p.ctx.token_usage == {'prompt_tokens': prompt}
+    expected = 81000 + p._estimate_history_tokens() - original_estimate
+    assert triggers == ['age_retirement'] and capacity == [expected]
+    assert p.ctx.token_usage == {'prompt_tokens': 81000}
 
 
 async def test_discarded_summary_billed_once_and_fallback(env):
     store, sid, _, llm, _, engine, source = env
     llm.responses[0].raw_text = 'too large ' * 3000
     await generate(engine, source)
-    assert (await engine.distill(source, 'between_sends')).startswith('checks')
+    assert (await engine.distill(source, 'general')).startswith('checks')
     assert not await engine.submit(source)
     await engine.cache.reconcile()
     stats = await store.get_session_stats(sid)
@@ -226,10 +223,10 @@ async def test_expired_started_lease_is_uncertain_not_retried(env):
 async def test_eviction_keeps_ledger_and_frozen_view(env):
     store, sid, _, _, _, engine, source = env
     await generate(engine, source)
-    selected = await engine.distill(source, 'between_sends')
+    selected = await engine.distill(source, 'general')
     assert await engine.cache.prune(max_entries=0, max_bytes=0) == 1
     assert await engine.cache.get(engine.cache_key(source, engine.policy(source))) is None
-    assert await engine.distill(source, 'between_sends') == selected
+    assert await engine.distill(source, 'general') == selected
     assert (await store.get_session_stats(sid)).total_tokens == 120
     assert len(await engine.cache.db.fetchall(f'SELECT * FROM {engine.cache.attempts}')) == 1
 
@@ -246,7 +243,7 @@ async def test_background_delegates_target_keep(env):
     job = await engine.cache.claim(engine.executor_key)
     await SummaryWorker(store).execute(job, engine)
     assert await engine.distill(wrapped, 'insend_fuse') is None
-    assert 'verified exact-file' in await engine.distill(wrapped, 'between_sends')
+    assert 'verified exact-file' in await engine.distill(wrapped, 'general')
     assert len(llm.calls) == 1
 
 
@@ -471,7 +468,7 @@ async def test_summary_disables_deepseek_thinking_without_changing_main_config(e
         requests.append(request)
         return await complete(request, **kwargs)
     llm.complete = capture
-    config = replace(config, overrides={'bash': {'between_sends': 'llm_summary'}})
+    config = replace(config, overrides={'bash': {'general': 'llm_summary'}})
     engine = ToolContextEngine(config=config, store=store, owner_session_id=sid,
                                owner_send_index=3, llm=llm, model='deepseek-flash', registry=registry)
     await engine.start()
@@ -487,14 +484,14 @@ async def test_summary_disables_deepseek_thinking_without_changing_main_config(e
 
 async def test_default_small_summary_preserves_original_without_enqueue_or_rule(env):
     store, sid, registry, llm, _, _, source = env
-    cfg = ToolContextConfig(overrides={'bash': {'between_sends': 'llm_summary',
+    cfg = ToolContextConfig(overrides={'bash': {'general': 'llm_summary',
                                                'insend_fuse': 'llm_summary'}})
     engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid,
                                owner_send_index=5, registry=registry, llm=llm, model='test')
     await engine.start()
     below = replace(source, result='汉' * 7999)
     assert not await engine.submit(below)
-    assert await engine.distill(below, 'between_sends') is None
+    assert await engine.distill(below, 'general') is None
     assert await engine.distill(below, 'insend_fuse') is None
     assert not llm.calls
     assert await engine.submit(replace(source, result='汉' * 8000))
@@ -524,7 +521,7 @@ async def test_preservation_markers_never_become_cached_summaries(env, candidate
 async def test_old_operation_with_preserve_marker_is_not_reused(env):
     _, _, _, _, _, engine, source = env
     await generate(engine, source)
-    assert await engine.distill(source, 'between_sends')
+    assert await engine.distill(source, 'general')
     for operation in engine.state['operations'].values():
         operation['text'] = '<preserve>previously accepted candidate</preserve>'
-    assert await engine.distill(source, 'between_sends') is None
+    assert await engine.distill(source, 'general') is None

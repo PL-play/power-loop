@@ -37,3 +37,35 @@ def truncate_pair(raw: str, result: str, policy: ToolContextPolicy, recall: str)
 
     return (preview(raw, a, '参数') if clip_a else raw,
             preview(output, r, '输出') if clip_r else result)
+
+
+def bash_exit(result: str) -> str:
+    """The exit line bash writes first (``exit_code=N``, maybe with a timeout note), or ''."""
+    first = (result or '').split('\n', 1)[0]
+    return first if first.startswith('exit_code=') else ''
+
+
+def truncate_bash(arguments: dict, result: str, policy: ToolContextPolicy, recall: str) -> tuple[str, str] | None:
+    """In-send bash view: description, command and output cut to the configured lengths, exit
+    line, then the recall note. No label before the content."""
+    from power_loop.runtime.tool_context import recall_note
+    command = str(arguments.get('command') or '')
+    exit_line = bash_exit(result)
+    output = result.split('\n', 1)[1] if exit_line and '\n' in result else ('' if exit_line else result)
+    a, r = policy.argument_max_chars, policy.result_max_chars
+    clip_a = policy.argument_truncation_enabled and a is not None and len(command) > a
+    clip_r = policy.result_truncation_enabled and r is not None and len(output) > r
+    if not clip_a and not clip_r:
+        return None
+    args = {'description': str(arguments.get('description') or ''),
+            'command': command[:a] + f'…（命令共 {len(command)} 字）' if clip_a else command}
+    body = output[:r] + f'…（输出共 {len(output)} 字，只留前 {r} 字）' if clip_r else output
+    text = '\n'.join(x for x in (exit_line, body, recall_note(recall)) if x)
+    return json.dumps(args, ensure_ascii=False, separators=(',', ':')), text
+
+
+def truncate_view(name: str, raw: str, arguments: dict, result: str, policy: ToolContextPolicy,
+                  recall: str) -> tuple[str, str] | None:
+    if name == 'bash':
+        return truncate_bash(arguments, result, policy, recall)
+    return truncate_pair(raw, result, policy, recall)
