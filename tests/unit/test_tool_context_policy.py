@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,6 +106,75 @@ async def test_keep_only_current_send(env):
     assert await engine.distill(source, 'insend_fuse') is None
     assert await engine.distill(source, 'age_retirement') is None
     assert 'verified exact-file' in await engine.distill(source, 'between_sends')
+
+
+@pytest.mark.parametrize('trigger', ['age_retirement', 'insend_fuse'])
+async def test_subtoken_rewrite_invalidates_working_context_estimate(env, monkeypatch, trigger):
+    from power_loop.core.pipeline import AgentPipeline
+    from power_loop.runtime.budget import estimate_tokens
+    _, _, _, _, _, engine, source = env
+    engine.config.overrides['bash']['retention_rounds'] = 1
+    engine.state.setdefault('exposures', {})['3'] = 1
+    raw = json.dumps(dict(source.arguments))
+    arguments = json.dumps({'_distilled': source.recall}, ensure_ascii=False, separators=(',', ':'))
+    prefix = '[distilled #1 seq=3] '
+    summary = 'x' * (len(raw) + len(source.result) - len(arguments) - len(prefix) - 2)
+
+    async def distill(*args):
+        return summary
+
+    monkeypatch.setattr(engine, 'distill', distill)
+    pipeline = SimpleNamespace(
+        history=[{'role': 'assistant', 'tool_calls': [{'id': source.call_id,
+                 'function': {'name': 'bash', 'arguments': raw}}]},
+                 {'role': 'tool', 'tool_call_id': source.call_id, 'content': source.result}],
+        sink=SimpleNamespace(_history_seqs=[2, 3]), send_index=1,
+        config=SimpleNamespace(insend_distill_hot_tail=0, insend_distill_keep_tools=()),
+        _tok_len=-1, _tok_total=0,
+    )
+    AgentPipeline._estimate_history_tokens(pipeline)
+    assert pipeline._tok_len == len(pipeline.history)
+    assert await engine.prepare_history(pipeline, trigger) == 0
+    assert pipeline.history[1]['content'] == prefix + summary
+    assert pipeline._tok_len == -1
+    assert AgentPipeline._estimate_history_tokens(pipeline) == estimate_tokens(pipeline.history)
+
+
+@pytest.mark.parametrize('original_chars,new_chars,prompt,should_fuse', [
+    (8000, 400, 81000, False),
+    (400, 8000, 79000, True),
+])
+async def test_fuse_uses_post_retirement_view_not_billing(
+    original_chars, new_chars, prompt, should_fuse,
+):
+    from power_loop.agent.types import AgentLoopConfig
+    from power_loop.runtime.tool_context import active_engine
+    from tests.unit.test_pipeline_tier2_fixes import _pipeline
+    p = _pipeline(config=AgentLoopConfig(insend_distill_tokens=80000))
+    await p._append_message({'role': 'tool', 'content': 'x' * original_chars})
+    original_estimate = p._estimate_history_tokens()
+    p._tool_context_prompt_anchor = (prompt, original_estimate)
+    p.ctx.token_usage = {'prompt_tokens': prompt}
+    triggers = []
+
+    class Engine:
+        async def prepare_history(self, pipeline, trigger, **kwargs):
+            triggers.append(trigger)
+            if trigger == 'age_retirement':
+                pipeline.history[0]['content'] = 'x' * new_chars
+                pipeline._tok_len = -1
+            # No caller can rely on a positive return to invalidate the cache.
+            return 0
+
+    token = active_engine.set(Engine())
+    try:
+        await p.prepare_round(1)
+    finally:
+        active_engine.reset(token)
+    expected = prompt + p._estimate_history_tokens() - original_estimate
+    assert p._context_prompt_tokens_estimate == expected
+    assert ('insend_fuse' in triggers) == should_fuse
+    assert p.ctx.token_usage == {'prompt_tokens': prompt}
 
 
 async def test_discarded_summary_billed_once_and_fallback(env):

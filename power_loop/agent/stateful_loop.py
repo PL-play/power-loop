@@ -1986,7 +1986,7 @@ class StatefulAgentLoop:
             # compact 行永远保留；当前 send 永远完整；更早的按「整块」从最老端丢（先 legacy，
             # 再一个 send 一块），单块超预算也整块保留，绝不切开一个 send。
             kept_legacy_rows = legacy_rows
-            cap = getattr(self.config, "max_context_rows", None)
+            cap = None if engine is not None and engine.config.schema_version == 2 else getattr(self.config, "max_context_rows", None)
             if cap and int(cap) > 0:
                 # chunks[0] = the legacy prefix (oldest), then one chunk per past send.
                 chunks: list[list[LoopMessage]] = [legacy_msgs, *send_chunks]
@@ -2029,7 +2029,7 @@ class StatefulAgentLoop:
             # 逐字模式一轮可能有多条消息（assistant(tool_calls) + 每个调用一条 tool 结果），
             # 从最老端按条丢会切出孤儿 tool 结果——这不要紧：下面 align_tool_calls 是
             # mode-agnostic 的兜底，孤儿会被清掉/补占位，发出去的历史始终合法。
-            _cap = getattr(self.config, "max_context_rows", None)
+            _cap = None if engine is not None and engine.config.schema_version == 2 else getattr(self.config, "max_context_rows", None)
             if _cap and int(_cap) > 0 and current_send_index is not None:
                 _hist_idx = [
                     i for i, r in enumerate(active_rows)
@@ -2396,6 +2396,8 @@ class StatefulAgentLoop:
         prior compact forward so nothing is lost; the folded rows REMAIN (recall_send). Returns
         ``((content, rendered_text, from_send, to_send), note_ops)`` or ``(None, ())``. Soft-fails
         (no fold, rows already written) on any error/timeout — pl_messages stays the source of truth."""
+        if self.config.tool_context is not None and self.config.tool_context.schema_version == 2:
+            return None, ()  # v2 has a single capacity owner; never silently fold hard-preserved text
         fold_strategy = self.config.fold_strategy
         try:
             keep = int(getattr(fold_strategy, "keep_last_sends", 0) or 0)

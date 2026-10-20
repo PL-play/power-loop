@@ -49,7 +49,27 @@ class ToolContextConfig:
     rule: Callable[[str, Mapping[str, Any], str, Any], Any] | None = None
     deliver_usage: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
+    schema_version: int = 1
+    capacity_enabled: bool = True
+    trigger_tokens: int = 500000
+    target_tokens: int = 350000
+    window_tokens: int = 1000000
+    reserve_tokens: int = 40000
+    margin_tokens: int = 32000
+    merge_archives: bool = True
+
     def __post_init__(self) -> None:
+        if self.schema_version not in (1, 2) or isinstance(self.schema_version, bool):
+            raise ValueError('schema_version must be 1 or 2')
+        for key in ('capacity_enabled', 'merge_archives'):
+            if not isinstance(getattr(self, key), bool):
+                raise ValueError(f'{key} must be boolean')
+        for key in ('trigger_tokens', 'target_tokens', 'window_tokens', 'reserve_tokens', 'margin_tokens'):
+            value = getattr(self, key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f'{key} must be a positive integer')
+        if not 0 < self.target_tokens < self.trigger_tokens <= self.window_tokens - self.reserve_tokens - self.margin_tokens:
+            raise ValueError('require target < trigger <= window - reserve - margin')
         if isinstance(self.summary_min_chars, bool) or not isinstance(self.summary_min_chars, int) or self.summary_min_chars < 0:
             raise ValueError("summary_min_chars must be a nonnegative integer")
         if self.summary_budget_s < 0 or self.delivery_budget_s <= 0:
@@ -115,13 +135,14 @@ class ToolContextEngine:
         send_key = str(self.send_index)
         effective = {}
         for definition in self.registry.definitions() if self.registry else []:
-            if definition.context_policy is not None:
-                effective[definition.name] = asdict(definition.context_policy)
+            default = (ToolContextPolicy(insend_fuse='inherit', between_sends='inherit')
+                       if self.config.schema_version == 2 else ToolContextPolicy())
+            effective[definition.name] = asdict(definition.context_policy or default)
         for name, patch in self.config.overrides.items():
             effective[name] = {**effective.get(name, {}), **patch}
         snapshot = snapshots.get(send_key)
         if snapshot is None:
-            snapshot = {'overrides': effective, 'rule_version': self.config.rule_version,
+            snapshot = {'capacity': {k: getattr(self.config, k) for k in ('schema_version', 'capacity_enabled', 'trigger_tokens', 'target_tokens', 'window_tokens', 'reserve_tokens', 'margin_tokens', 'merge_archives')}, 'overrides': effective, 'rule_version': self.config.rule_version,
                         'model_identity': self.model_identity, 'model': self.model}
             snapshots[send_key] = snapshot
             await self._save()
@@ -129,7 +150,7 @@ class ToolContextEngine:
             effective = snapshot['overrides']
         self._implementation_matches = (snapshot['rule_version'] == self.config.rule_version
             and snapshot['model_identity'] == self.model_identity and snapshot['model'] == self.model)
-        self.config = replace(self.config, overrides=effective)
+        self.config = replace(self.config, overrides=effective, **snapshot.get('capacity', {'schema_version': 1}))
         # Session ownership excludes another live runner. A started row here belongs to
         # an interrupted invocation; provider billing is unknowable without reconciliation.
         changed = False
@@ -143,7 +164,7 @@ class ToolContextEngine:
             await self._record_stats(attempt)
 
     def projection_version(self, original: int) -> int:
-        return int(_hash({'original': original, 'overrides': self.config.overrides,
+        return int(_hash({'original': original, 'schema_version': self.config.schema_version, 'overrides': self.config.overrides,
                           'rule': self.config.rule_version, 'model': self.model,
                           'model_identity': self.model_identity})[:7], 16)
 
@@ -172,7 +193,8 @@ class ToolContextEngine:
     def policy(self, source: ToolSource) -> ToolContextPolicy:
         registered = self.registry.get(source.name) if self.registry else None
         policy = getattr(getattr(registered, 'definition', None), 'context_policy', None)
-        policy = policy or ToolContextPolicy()
+        policy = policy or (ToolContextPolicy(insend_fuse='inherit', between_sends='inherit')
+                            if self.config.schema_version == 2 else ToolContextPolicy())
         return policy.override(self.config.overrides.get(source.name, {}))
 
     def _rule(self, source: ToolSource) -> str | None:
@@ -191,12 +213,14 @@ class ToolContextEngine:
         except Exception:
             return None
 
-    async def distill(self, source: ToolSource, trigger: Trigger) -> str | None:
+    async def distill(self, source: ToolSource, trigger: Trigger, *, policy_override=None) -> str | None:
         """Return summary including engine-owned recall, or None to preserve arguments+result."""
         if source.name == 'background_run':
             return await self._background(source, trigger)
-        policy = self.policy(source)
-        strategy = getattr(policy, trigger)
+        policy = policy_override or self.policy(source)
+        strategy = policy.strategy(trigger)
+        if policy.hard_preserve:
+            return None
         if trigger != 'between_sends' and source.name == 'bash' and source.arguments.get('context_policy') == 'keep':
             strategy = 'preserve'
         if strategy == 'llm_summary' and len(source.result) < self.config.summary_min_chars:
@@ -206,6 +230,13 @@ class ToolContextEngine:
         # A recall without durable coordinates would misrepresent recoverability.
         if source.seq is None or source.send_index is None:
             return None
+        if strategy == 'archive':
+            from power_loop.runtime.tool_archive import archive_text
+            return archive_text(source)
+        if strategy == 'truncate':
+            from power_loop.runtime.tool_truncation import truncate_pair
+            pair = truncate_pair(_json(dict(source.arguments)), source.result, policy, source.recall)
+            return _json({'arguments': pair[0], 'result': pair[1]}) if pair else None
         original = _json({'arguments': dict(source.arguments), 'result': source.result})
         operation = _hash({'source': asdict(source), 'trigger': trigger, 'policy': asdict(policy),
                            'model': self.model, 'model_identity': self.model_identity,
@@ -262,7 +293,7 @@ class ToolContextEngine:
         if len(source.result) < self.config.summary_min_chars:
             return False
         if (not self._implementation_matches or source.seq is None
-                or source.send_index is None or not any(getattr(policy, t) == 'llm_summary'
+                or source.send_index is None or not any(policy.strategy(t) == 'llm_summary'
                 for t in ('age_retirement', 'insend_fuse', 'between_sends'))):
             return False
         payload = {'owner_session_id': self.sid, 'owner_send_index': self.send_index,
@@ -307,7 +338,7 @@ class ToolContextEngine:
     async def _background(self, source: ToolSource, trigger: Trigger) -> str | None:
         sources = await self._background_sources(source)
         for target in sources:
-            if (getattr(self.policy(target), trigger) == 'preserve'
+            if (self.policy(target).strategy(trigger) == 'preserve'
                     or (trigger != 'between_sends' and target.name == 'bash'
                         and target.arguments.get('context_policy') == 'keep')):
                 return None
@@ -346,6 +377,9 @@ class ToolContextEngine:
 
     async def prepare_projection(self, projected: Any, rows: list[Any], send_index: int) -> Any:
         """Replace tool entries using original paired rows, after the legacy projector ran."""
+        if self.config.schema_version == 2:
+            from power_loop.runtime.tool_archive import prepare_projection
+            return await prepare_projection(self, projected, rows, send_index)
         self._summary_deadline = time.monotonic() + self.config.summary_budget_s
         pending: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         sources = {}
@@ -395,6 +429,9 @@ class ToolContextEngine:
                 or getattr(getattr(registered, 'definition', None), 'context_policy', None) is not None)
 
     async def prepare_history(self, pipeline: Any, trigger: Trigger, *, target_tokens: int | None = None) -> int:
+        if self.config.schema_version == 2:
+            from power_loop.runtime.tool_archive import prepare_history
+            return await prepare_history(self, pipeline, trigger, target_tokens=target_tokens)
         self._summary_deadline = time.monotonic() + self.config.summary_budget_s
         history = pipeline.history
         seqs = getattr(pipeline.sink, '_history_seqs', None) or []
@@ -430,7 +467,7 @@ class ToolContextEngine:
                 args = json.loads(raw)
             except (ValueError, TypeError):
                 continue
-            if not isinstance(args, dict):
+            if not isinstance(args, dict) or '_distilled' in args:
                 continue
             source = ToolSource(self.sid, pipeline.send_index, seq, str(call.get('id')), name, args, result)
             policy = self.policy(source)
@@ -450,21 +487,39 @@ class ToolContextEngine:
                     continue
             if source.call_id in protected or name in pipeline.config.insend_distill_keep_tools:
                 continue
-            summary = await self.distill(source, trigger)
-            if summary is None:
+            if policy.hard_preserve:
                 continue
-            content = f'[distilled #{pipeline.send_index} seq={seq}] {summary}'
-            arguments = _json({'_distilled': source.recall})
+            truncating = policy.strategy(trigger) == 'truncate' and name != 'background_run'
+            if truncating:
+                if (not getattr(self, '_implementation_matches', True)
+                        or (name == 'bash' and args.get('context_policy') == 'keep')):
+                    continue
+                from power_loop.runtime.tool_truncation import truncate_pair
+                pair = truncate_pair(raw, result, policy, source.recall)
+                if pair is None:
+                    continue
+                arguments, content = pair
+                if content != result:
+                    content = f'[distilled #{pipeline.send_index} seq={seq}] {content}'
+            else:
+                summary = await self.distill(source, trigger)
+                if summary is None:
+                    continue
+                content = f'[distilled #{pipeline.send_index} seq={seq}] {summary}'
+                arguments = _json({'_distilled': source.recall})
             saved = len(raw) + len(result) - len(arguments) - len(content)
-            if saved <= 0:
+            if saved <= 0 and not truncating:
                 continue
             calls = list(history[ai]['tool_calls'])
             calls[ci] = {**call, 'function': {**fn, 'arguments': arguments}}
             history[ai] = {**history[ai], 'tool_calls': calls}
             history[ri] = {**history[ri], 'content': content}
+            # A content rewrite does not change len(history). Even a sub-token
+            # saving must invalidate the cached working-context estimate.
+            pipeline._tok_len = -1
             freed += saved
             if target_tokens is not None and freed // 4 >= target_tokens:
                 break
         if exposures_changed:
             await self._save()
-        return freed // 4
+        return max(0, freed // 4)

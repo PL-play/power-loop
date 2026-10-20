@@ -93,6 +93,10 @@ def _clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
 
 
 def _truncate_chars(text: str, limit: int = RESULT_MAX_CHARS) -> str:
+    from power_loop.runtime.tool_context import active_engine
+    engine = active_engine.get()
+    if engine is not None and engine.config.schema_version == 2:
+        return text
     if len(text) <= limit:
         return text
     head = limit // 2
@@ -683,7 +687,8 @@ def close_all_bash_sessions() -> None:
         _BASH_SESSIONS.clear()
 
 
-def run_bash(command: str | None = None, restart: bool = False, timeout: int = 120) -> str:
+def run_bash(command: str | None = None, restart: bool = False, timeout: int = 120,
+             description: str | None = None, context_policy: str = "retire") -> str:
     bash = _bash_for_current_workspace()
     if restart:
         return bash.restart()
@@ -693,6 +698,25 @@ def run_bash(command: str | None = None, restart: bool = False, timeout: int = 1
     scope_err = _validate_bash_command_scope(command)
     if scope_err:
         return scope_err
+    from power_loop.runtime.tool_context import active_engine
+    engine = active_engine.get()
+    if engine is not None and engine.config.schema_version == 2:
+        if not isinstance(description, str) or not description.strip() or len(description) > 1000:
+            return 'Error: bash description is required (1–1000 characters). Command was not executed.'
+        if context_policy not in ('retire', 'keep'):
+            return 'Error: context_policy must be retire or keep. Command was not executed.'
+        import tempfile
+
+        from power_loop.runtime.bash_capture import BashOutputCapture
+        with tempfile.TemporaryDirectory(prefix='power-loop-bash-') as folder:
+            capture = BashOutputCapture(Path(folder) / 'output.txt')
+            with capture:
+                result = bash.execute(command, timeout=timeout)
+            if capture.error:
+                return f'Error: complete bash capture failed ({capture.error}); command may have executed.\n{result}'
+            if capture.lines:
+                return result.split('\n', 1)[0] + '\n' + capture.path.read_text(encoding='utf-8')
+            return result
     return bash.execute(command, timeout=timeout)
 
 
@@ -1946,6 +1970,10 @@ async def run_background(
     """Execute one action of the merged ``background_run`` tool."""
     operation = str(action or "").strip().lower()
     if operation == "run":
+        from power_loop.runtime.tool_context import active_engine
+        engine = active_engine.get()
+        if engine is not None and engine.config.schema_version == 2:
+            raise ValueError('Use background_run action=tool, tool=bash, args={command, description, context_policy}; v2 requires a registered target tool.')
         if not (command or "").strip():
             raise ValueError("background_run action=run requires command")
         return await BG.run(str(command))
@@ -2226,7 +2254,9 @@ RECALL_SEND_TOTAL_CHARS = 12_000
 RECALL_SEND_MIN_ROW_CHARS = 240
 
 
-async def run_recall_send(send_index: int, seq: int | None = None) -> str:
+async def run_recall_send(send_index: int, seq: int | None = None, *, group_id: str | None = None,
+                          offset: int = 0, limit: int = 10, item: int | None = None,
+                          char_offset: int = 0, char_limit: int = 20000) -> str:
     """Re-expand one past send the send-context projection summarized.
 
     When ``AgentLoopConfig.history_projector`` is set, finished sends appear in context as a
@@ -2245,6 +2275,10 @@ async def run_recall_send(send_index: int, seq: int | None = None) -> str:
     except (TypeError, ValueError):
         return f"Invalid send_index: {send_index!r} (expected an integer)."
 
+    if group_id is not None:
+        from power_loop.runtime.tool_archive import recall_group
+        return await recall_group(store, sid, target, group_id, offset, limit, item, char_offset, char_limit)
+
     rows = [r for r in await store.load_all_messages(sid) if r.send_index == target]
     if not rows:
         return f"No messages found for send #{target} in this session."
@@ -2259,6 +2293,11 @@ async def run_recall_send(send_index: int, seq: int | None = None) -> str:
             lo, hi = min(r.seq for r in rows), max(r.seq for r in rows)
             return (f"No row seq {want} in send #{target} (its rows span seq {lo}–{hi}). "
                     "Use the exact «sS» coordinate from the summary line, or omit seq to list the whole send.")
+        from power_loop.runtime.tool_context import active_engine
+        engine = active_engine.get()
+        if char_offset or (engine is not None and engine.config.schema_version == 2):
+            from power_loop.runtime.tool_archive import recall_original
+            return await recall_original(store, sid, target, hit, char_offset, char_limit)
         return _render_recall_row(hit, rows, cap=RECALL_SEND_ROW_CHARS, head=f"send #{target} · seq {want}")
 
     def _tc_name(tc: dict[str, Any]) -> str:
@@ -2464,7 +2503,9 @@ async def _h_recall_compacted(**kw: Any) -> Any:
 
 
 async def _h_recall_send(**kw: Any) -> Any:
-    return await run_recall_send(kw["send_index"], kw.get("seq"))
+    return await run_recall_send(kw["send_index"], kw.get("seq"), group_id=kw.get("group_id"),
+                                 offset=kw.get("offset", 0), limit=kw.get("limit", 10), item=kw.get("item"),
+                                 char_offset=kw.get("char_offset", 0), char_limit=kw.get("char_limit", 20000))
 
 
 async def _h_background_run(**kw: Any) -> Any:
@@ -2473,7 +2514,7 @@ async def _h_background_run(**kw: Any) -> Any:
 
 
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
-    "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120)),
+    "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120), kw.get("description"), kw.get("context_policy", "retire")),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"], kw.get("overwrite", True)),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"], kw.get("replace_all", False)),

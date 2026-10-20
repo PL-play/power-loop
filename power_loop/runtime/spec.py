@@ -257,6 +257,8 @@ def _child_config(spec: AgentSpec, parent_loop: Any) -> AgentLoopConfig:
     # stale. Without the parent's retry policy a single httpx.ReadError on the
     # child's FIRST streaming call killed the whole delegation ("Error: ").
     parent_config = getattr(parent_loop, "config", None)
+    from power_loop.runtime.tool_context import active_engine
+    context_policy = getattr(active_engine.get(), "config", getattr(parent_config, "tool_context", None))
     child_config = AgentLoopConfig(
         system_prompt=spec.system_prompt,
         max_rounds=int(spec.max_rounds),
@@ -268,7 +270,8 @@ def _child_config(spec: AgentSpec, parent_loop: Any) -> AgentLoopConfig:
         model=spec.model,
         response_format=response_format,
         retry_policy=getattr(parent_config, "retry_policy", None),
-        tool_context=getattr(parent_config, "tool_context", None),
+        tool_context=context_policy,
+        image_retention_rounds=getattr(parent_config, "image_retention_rounds", 1),
     )
     # HOST config seam (subagent_config_factory, PROVISIONAL 3.14): the parent's
     # config may rewrite the child's default config — e.g. hand heavy leaves a

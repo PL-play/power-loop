@@ -358,6 +358,35 @@ class AgentPipeline:
         self._tool_tokens: dict[asyncio.Future, CancellationToken] = {}
 
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
+        from power_loop.runtime.tool_context import active_engine
+        effective_context = getattr(active_engine.get(), 'config', config.tool_context)
+        self._tool_context_v2 = getattr(effective_context, 'schema_version', 1) == 2
+        if self._tool_context_v2:
+            import copy
+            self.runtime_tools = copy.deepcopy(self.runtime_tools)
+            for spec in self.runtime_tools or []:
+                fn = spec.get('function', {})
+                if fn.get('name') == 'background_run':
+                    params = fn.setdefault('parameters', {})
+                    props = params.setdefault('properties', {})
+                    action = props.get('action', {})
+                    if 'enum' in action:
+                        action['enum'] = [x for x in action['enum'] if x != 'run']
+                    props.pop('command', None)
+                    fn['description'] = fn.get('description', '') + (
+                        '\nIn context v2, start registered tools with action=tool. '
+                        'For shell commands use tool=bash and args containing command and description. '
+                        'Do not use action=run.')
+                if fn.get('name') == 'bash':
+                    params = fn.setdefault('parameters', {})
+                    props = params.setdefault('properties', {})
+                    props.setdefault('description', {'type': 'string', 'minLength': 1, 'maxLength': 1000,
+                        'description': 'One sentence purpose; preserved in archives.'})
+                    params['required'] = list(dict.fromkeys([*params.get('required', []), 'description']))
+                    fn['description'] = fn.get('description', '').replace('Output is truncated, ', '') + (
+                        '\nContext policy v2: description is required. Default retire; keep only for persistent '
+                        'instructions/skills, not logs, tests or listings. keep is soft; capacity fallback may '
+                        'archive it. Archived records are historical data; recall when their details are needed.')
         # Auto-inject tool catalog + skill section (M1.10). Built ONCE here and
         # frozen into self.system_prompt (a plain string — NOT self.history, so
         # the compactor never touches it). The assembly is shared with
@@ -1034,9 +1063,14 @@ class AgentPipeline:
                 self._context_prompt_tokens_estimate = max(
                     0, anchor[0] + self._estimate_history_tokens() - anchor[1])
 
+        capacity_v2 = getattr(getattr(context_engine, "config", None), "schema_version", 1) == 2
+        if capacity_v2:
+            from power_loop.runtime.tool_archive import manage_capacity
+            await manage_capacity(context_engine, self)
+
         # Fuse uses total prompt size, including the fixed prompt and history prefix.
         dt = self.config.insend_distill_tokens
-        if dt is not None and int(dt) > 0 and (
+        if not capacity_v2 and dt is not None and int(dt) > 0 and (
             round_index > 0 or getattr(self, "_context_prompt_tokens_estimate", None) is not None
         ):
             real = int((self.ctx.token_usage or {}).get("prompt_tokens", 0) or 0)
@@ -1060,7 +1094,7 @@ class AgentPipeline:
                     self._tok_len = -1
                 logger.info("insend distill: total prompt %d >= %d; freed ~%d tokens",
                             total, int(dt), freed)
-        if self.config.microcompact_enabled:
+        if not capacity_v2 and self.config.microcompact_enabled:
             self.ctx.microcompact(
                 self.history,
                 size_limit=self.config.microcompact_size_limit,
@@ -1074,7 +1108,7 @@ class AgentPipeline:
 
         # 3.0: verbatim mode → an in-place Compactor mapped from config.fold_strategy; projection
         # mode → None (it folds at end-of-send in the derived layer).
-        compactor = self.config.resolve_compactor()
+        compactor = None if capacity_v2 else self.config.resolve_compactor()
         if compactor is None:
             return
 
@@ -1564,7 +1598,7 @@ class AgentPipeline:
             # 以 context_checkpoint 结束本 send → 正常投影 → 宿主续接机制在新 send 里接着干。
             # 与 max_tokens_per_run 不同：那是累计费用（Σ prompt+completion，随轮数平方增长），
             # 量不出「上下文有多大」；这里量的正是它。
-            ckpt = self.config.context_checkpoint_tokens
+            ckpt = None if self._tool_context_v2 else self.config.context_checkpoint_tokens
             if (
                 ckpt is not None
                 and (self.config.insend_distill_tokens or 0) <= 0
@@ -1625,6 +1659,9 @@ class AgentPipeline:
 
             # ── Business logic: prepare round ──
             await self.prepare_round(round_idx)
+            if getattr(self, '_capacity_blocked', None):
+                await self._finalize('capacity_blocked', rounds=round_idx)
+                return self._make_result('degraded', final_text=self._capacity_blocked, rounds=round_idx)
 
             await self._emit_sink(self.sink.on_round_started, round_idx)
             self._emit(AgentEventType.ROUND_STARTED, RoundStartedPayload(round_index=round_idx), round_index=round_idx)
@@ -1686,6 +1723,16 @@ class AgentPipeline:
                 llm_before.messages.append(dict(_img))
             for _img in _ephemeral_imgs:
                 llm_before.messages.append(_img)
+
+            from power_loop.runtime.tool_context import active_engine
+            _admission_engine = active_engine.get()
+            if (_admission_engine is not None and _admission_engine.config.schema_version == 2
+                    and llm_before.directive not in (HookDirective.SHORT_CIRCUIT, HookDirective.BREAK)):
+                from power_loop.runtime.tool_archive import admit_request
+                if not await admit_request(_admission_engine, self, llm_before.messages,
+                        llm_before.system_prompt, llm_before.tools, llm_before.max_tokens):
+                    await self._finalize('capacity_blocked', rounds=round_idx)
+                    return self._make_result('degraded', final_text=self._capacity_blocked, rounds=round_idx)
 
             if llm_before.directive == HookDirective.SHORT_CIRCUIT:
                 response = llm_before.output
@@ -2230,7 +2277,7 @@ class AgentPipeline:
                            round_index=round_idx)
 
                 await self._append_message(
-                    {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": _truncate_result(output)},
+                    {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": (str(output) if self._tool_context_v2 else _truncate_result(output))},
                     round_index=round_idx,
                 )
 

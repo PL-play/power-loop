@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+## [6.55.0] — 2026-10-20
+
+- Add opt-in deterministic context policy v2: general archive policies, two-level capacity fuse, hysteresis and recoverable admission blocking.
+- Persist immutable-source view patches, frozen per-send policies and exact archive groups; support lossless paged recall and restart recovery.
+- Preserve normal-loop text by default; retain configurable age retirement, independent argument/result previews and asynchronous summaries.
+- Require bash descriptions in v2; deliver full bash/background target results, respect hard preservation and avoid legacy compaction bypasses.
+- Inherit resolved parent policies and image retention in child agents; count provider reasoning separately from billing.
+- Validate with 1673 unit passes (isolated PostgreSQL), focused regressions and a real-provider archive/next-send smoke test.
+
 ## [6.54.4] — 2026-10-20
 
 - Reject ambiguous preserve-tagged summary candidates at generation, shared-cache validation, and operation-cache reuse. Keep accounting for rejected requests.

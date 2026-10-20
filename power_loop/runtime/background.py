@@ -31,6 +31,11 @@ def summarize_record(record: dict[str, Any]) -> dict[str, Any]:
     rep = getattr(config, 'representation', None)
     distill = getattr(rep, 'distill_tool_call', None)
     result = str(record.get('result') or '')
+    from power_loop.runtime.tool_context import active_engine
+    engine = active_engine.get()
+    if engine is not None and engine.config.schema_version == 2:
+        return {k: record.get(k) for k in ('task_id', 'tool', 'status', 'result_ref')} | {
+            'arguments': record.get('args') or {}, 'summary': result, 'representation': 'original'}
     summary = result[:750]
     if callable(distill):
         try:

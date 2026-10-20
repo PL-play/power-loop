@@ -105,6 +105,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to run."},
+                "description": {"type": "string", "minLength": 1, "maxLength": 1000, "description": "One sentence describing the purpose. Required by context policy v2; retained in archives."},
+                "context_policy": {"type": "string", "enum": ["retire", "keep"], "default": "retire", "description": "Default retire. keep only for reading persistent instructions/skills needed throughout this send; not tests, listings, logs or temporary findings. keep is soft protection: capacity fallback can archive it."},
                 "restart": {"type": "boolean", "description": "Restart the persistent bash session instead of running command."},
                 "timeout": {"type": "integer", "description": "Seconds to wait before timing out. Range: 1-600."},
             },
@@ -325,6 +327,12 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "type": "object",
             "properties": {
                 "send_index": {"type": "integer", "description": "The #N of the past send."},
+                "char_offset": {"type": "integer", "minimum": 0, "description": "Original JSON character page offset. Follow next_char_offset until null."},
+                "char_limit": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "Maximum characters per original JSON page; default 20000."},
+                "group_id": {"type": "string", "description": "Archived group ID; omit item to list exact members."},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "item": {"type": "integer", "minimum": 0, "description": "Zero-based group item; restores original arguments and result, never executes it."},
                 "seq": {"type": "integer", "description": "Optional: the sS row coordinate from a summary line → return that single row in full."},
             },
             "required": ["send_index"],

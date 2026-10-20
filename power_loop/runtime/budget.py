@@ -39,6 +39,7 @@ def estimate_message_tokens(message: dict[str, Any]) -> int:
         body = ""
     else:
         body = json.dumps(content, ensure_ascii=False)
+    body += str(message.get("reasoning_content") or "")
     tool_calls = message.get("tool_calls") or []
     if tool_calls:
         body += json.dumps(tool_calls, ensure_ascii=False)

@@ -522,6 +522,8 @@ class ProjectedRepresentation:
         }
 
     def render_project_row(self, r: ProjectMessageRow) -> LoopMessage:
+        if isinstance(r.content, dict) and 'archive_v2_text' in r.content:
+            return {'role': 'assistant', 'content': r.content['archive_v2_text']}
         return {
             "role": "assistant",
             "content": self._send_tag(self.render_config.project_tag, r.send_index)

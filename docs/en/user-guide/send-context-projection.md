@@ -18,6 +18,17 @@ config = AgentLoopConfig(
 
 ## Why
 
+`ToolContextEngine` can also apply tool policies for age retirement and the capacity
+fuse within the current send. These rewrite the working view, not the original audit
+messages. Bash `context_policy=keep` protects both in-send paths (including delegated
+background calls), but does not block between-send distillation.
+Every argument or result rewrite invalidates the working-context token cache, even
+when the estimated saving rounds down to zero. The fuse uses the post-retirement view,
+including descriptions, truncation notices and recall pointers, not cumulative billed
+tokens. Its estimate anchors to the latest provider prompt usage and adds working-history
+changes; it remains approximate, so the trigger is not a hard context cap. Original
+provider usage remains unchanged for billing.
+
 A "send" is one `loop.send()` (the user turn + the agent's whole tool loop). By default every past send stays in context **verbatim** — full OpenAI tool-call structure and untruncated tool results — and grows every send. Projection collapses each *finished* send to a short, structured-then-rendered plain-text summary:
 
 - **`pl_messages` stays an immutable, append-only audit log** — never folded, never `compacted_out`. (Contrast: verbatim mode's in-place fold rewrites a span into a `compact_note`.)
@@ -221,3 +232,46 @@ The 2.x `history_projector=` / `compactor=` kwargs still work — a legacy `Defa
 
 - [Compaction](compaction.md) — the fold-strategy axis (works under both representations).
 - [Example 40](../../../examples/40_send_context_projection.py) — end-to-end (`ProjectedRepresentation` × `LLMSummaryFold` + `recall_send`).
+
+## Disable previews without discarding thresholds
+
+Set `age_retirement='preserve'` to disable age retirement while retaining `retention_rounds`.
+The opt-in `'truncate'` strategy uses independent `argument_max_chars` and `result_max_chars`
+(defaults 200/300 Unicode characters; `None` leaves that side intact).
+`argument_truncation_enabled=False` and `result_truncation_enabled=False` independently
+turn off previews while retaining custom thresholds for later re-enabling. Descriptions
+remain complete; previews carry a truncation notice and recall pointer. Unchanged sides
+remain verbatim. This applies to history, never to commands before execution, and does
+not replace tools' initial output limits.
+
+Hosts provide per-tool overrides through `ToolContextConfig.overrides`. Active sends keep
+their policy snapshot; new sends pick up configuration changes. Disable the capacity fuse
+with `AgentLoopConfig.insend_distill_tokens=None`; hosts should retain the stored threshold
+separately and must not reinterpret an explicit disabled state as a default threshold.
+
+## Deterministic archive v2 (opt-in)
+
+Set `ToolContextConfig(schema_version=2)`; omitted versions retain v1 behavior.
+Normal text loops do not retire tools or request LLM summaries by default. Image retention remains independent.
+`general` is the between-send and second-level capacity policy; `insend_fuse="inherit"` uses it at level one.
+Explicit preserve and bash keep are soft level-one exemptions; `hard_preserve=True` survives both levels.
+The host registers its message/card tools as hard-preserved. Summary extensions and accounting remain available.
+
+The high/low candidates are 500000/350000 tokens for a verified 1000000-token route, with 40000 output reserve
+and 32000 margin. Validate against the actual model and output budget. Counts are heuristic, provider-anchored,
+and separate from billing; provider reasoning fields are counted when present.
+After two levels, safe requests continue; unsafe irreducible requests return a recoverable capacity-blocked reason.
+The same no-progress candidate set is not repeatedly processed. Legacy microcompact, folds and row caps are bypassed.
+Disabling capacity_enabled also disables this mechanism's final admission guard.
+
+Immutable raw rows remain in messages. Paired view patches, exact group membership and capacity events are committed
+to the existing tool-context runtime state before editing memory. Resumed sends replay their frozen policy and view.
+Bash requires a 1–1000-character description; between sends only its full description and recall reference remain.
+Small originals that would grow are retained. Explicit level-one truncation retains the description and labels each
+truncated side. Background execution uses registered target tools, returns full target results initially, and delegates
+archival to their policies; raw shell execution must use tool=bash.
+
+Only complete adjacent same-tool blocks with no assistant body may group; in-send reasoning and parallel batches
+are boundaries. Grouping preserves a legal call/result pair and never implies new execution.
+recall_send(group_id=...) lists exact members with offset/limit; item selects a member.
+Original JSON supports char_offset/char_limit and next_char_offset for lossless paging, also with seq in v2.

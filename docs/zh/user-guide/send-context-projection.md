@@ -18,6 +18,14 @@ config = AgentLoopConfig(
 
 ## 为什么
 
+当前 send 还可以由 `ToolContextEngine` 按工具策略执行轮次退场和容量保险丝。
+这只改写工作上下文，不改写原始审计消息。bash 的 `context_policy=keep` 保护这两条
+send 内路径（异步调用遵循目标工具），不阻止跨 send 蒸馏。
+每次改写参数或结果，都必须使工作上下文 token 估算缓存失效，即使净释放量取整后为 0。
+保险丝按退场后的表示重新估算，包含描述、截断提示和 recall；它不使用累计计费 token。
+估算以最近一次 provider prompt usage 为锚点加上工作历史变化，仍属近似值；触发阈值不是
+硬性上下文上限，provider usage 原值保留用于计费。
+
 一次 send = 一次 `loop.send()`（用户这一轮 + agent 的整个工具循环）。默认下每个历史 send 都**逐字**留在上下文里——完整的 OpenAI 工具调用结构 + 未截断的工具结果——而且每多一个 send 就更长。投影把每个*已结束*的 send 折成一条「结构化存储、再渲染成纯文本」的简短摘要：
 
 - **`pl_messages` 始终是不可变、append-only 的审计日志**——永不折叠、永不 `compacted_out`。（对比：逐字模式的就地折叠会把一段区间改写成一条 `compact_note`。）
@@ -221,3 +229,56 @@ from power_loop import Representation, ProjectedSend, ProjectedRow  # 写自己�
 
 - [压缩](compaction.md) —— fold-strategy 轴（在两种 representation 下都可用）。
 - [示例 40](../../../examples/40_send_context_projection.py) —— 端到端（`ProjectedRepresentation` × `LLMSummaryFold` + `recall_send`）。
+
+## 保留阈值但关闭历史截断
+
+工具策略的`age_retirement='preserve'`关闭轮次退场，不必删除`retention_rounds`。
+显式选择`'truncate'`才启用独立参数/结果预览；`argument_max_chars`和`result_max_chars`
+默认200/300，单位是Unicode字符，`None`表示该侧不截断。
+`argument_truncation_enabled=False`或`result_truncation_enabled=False`可以独立关闭一侧，
+同时保留其自定义字符数，重新设为True即可恢复。描述完整保留，任何实际截断附提示与recall，
+未超限侧原样保留。此策略只改写历史，不截断待执行命令，不替代工具自身首次输出限制。
+
+按Agent挂载覆盖这些字段，仍由宿主传入`ToolContextConfig.overrides`；正在运行的send保持
+策略快照，下一send才使用新设置。保险丝用`AgentLoopConfig.insend_distill_tokens=None`关闭。
+宿主应单独保留用户填写的阈值，不应把None解释成重新启用某个默认阈值。
+
+## 确定性归档 v2（显式启用）
+
+`ToolContextConfig(schema_version=2)` 为独立策略版本；省略仍是 v1，不能自动迁移运行中的 send。
+v2 默认正常循环不按年龄退场、不生成付费摘要。图片仍由 `image_retention_rounds` 独立管理。
+DeepTalk 应用默认 bash 一级截断、load_skill 一级保留；库本身不猜应用的必保工具。
+
+- `general`：send 间和二级容量兜底规则，默认 `archive`。
+- `insend_fuse="inherit"`：继承 general；显式 preserve 是一级软保护。
+- `hard_preserve=True`：两级均保留完整参数和结果。
+- `age_retirement="preserve"`：关闭按轮退场，保留轮数等配置值。
+- `llm_summary` 保留扩展接口、预计算和记账能力；v2 默认不启用。
+
+容量配置：trigger_tokens=500000、target_tokens=350000、window_tokens=1000000、
+reserve_tokens=40000、margin_tokens=32000。这些是面向已确认 1M 路由的候选，必须核对实际模型。
+必须满足 target < trigger <= window - reserve - margin；实际请求输出额度更大时采用更大的预留，
+配置失效则返回可恢复的 capacity blocked 原因。计数是带 provider prompt 锚点的估算，不是精确 tokenizer，
+计入 reasoning_content（若实际存在），与计费用量分开。图片编码和模型特有计数误差仍需容量余量。
+
+先用一级覆盖整理至低位目标，仍不足则用 general。无可压缩内容且高于安全上限时停止发起模型请求；
+低于安全上限则可以继续。相同无进展候选不反复扫描。v2 关闭旧 microcompact、fold 和历史行数丢弃旁路。
+关闭 capacity_enabled 不会删除配置，但也关闭了本机制的发送前容量保护，需由调用方负责容量。
+
+原文保留在 messages；派生补丁、组成员和事件在原有 session_runtime_state 的工具上下文状态中持久化，
+无需业务表迁移。先提交派生状态再改内存；恢复同一个 send 使用已冻结的策略快照。
+工具描述和来源不会升级为系统指令。
+
+bash 的 schema 要求 1–1000 字符 description；默认 retire，keep 仅为 send 内一级软保护。
+send 间只保留完整描述和 recall，不留命令/结果片段。load_skill 保留技能身份与 recall。
+小型原文若归档反而更大则原样保留。
+一级 bash 截断仅在显式策略生效时独立处理输入/输出（默认 200/300 字符）；保留完整描述并显式说明截断。
+
+连续同名、已完成且无助手正文的单调用块可以合并。send 内含 reasoning_content 或并行批次的块不合并；
+保留合法 call/result 配对，不伪造一次新执行。宿主保存精确成员坐标，不用 seq 范围推测成员。
+`recall_send(send_index=..., group_id=...)` 返回分页目录；
+`item` 选择成员，`char_offset/char_limit` 按字符分页取原始 JSON，跟随 next_char_offset 可恢复全部原文。
+v2 的 `recall_send(seq=...)` 同样支持原文分页。
+
+background_run 必须通过 action=tool 指定注册工具，裸 bash 使用 tool=bash 和完整 args。
+首次返回保留目标结果；整理按目标工具策略；recall 附上后台任务的规范原始记录。
