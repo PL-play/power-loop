@@ -274,3 +274,9 @@ from power_loop import Representation, ProjectedSend, ProjectedRow  # 写自己�
 压缩行（compact）始终用当前投影器渲染，不因版本号不同而把整段原文铺回。
 旧的 `schema_version`、`between_sends` 字段已删除；存量配置里的 `between_sends` 读取时忽略。
 运行时状态子键 `archive_v2` 读取时迁到 `archive`，已发出的 group_id 仍可取回。
+
+## 历史按需读取与不带历史的运行（7.1）
+
+- 会话完成一次性迁移检查后，每次 send 只读：没有 send 编号的旧行、当前 send、最新压缩点、最近 `max_context_rows` 条投影，以及窗口内缺投影的 send 的原始行。读取量和会话总长度无关；给模型的内容与整段读取一致。
+- `send(history=False)`：这次运行只看自己的输入，不读以前的 send、压缩点、投影，跑完也不写投影、不折叠；原始消息照常存。适合一个会话反复做互不相关的一次性运行。
+- `send(metadata={...})`：写进本次用户行的 `meta["send"]`，用来标记这次运行属于宿主的哪个 agent 或哪次调用。

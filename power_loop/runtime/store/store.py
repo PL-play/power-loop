@@ -465,6 +465,18 @@ class SessionStore:
         messages.sort(key=_logical_order_key)
         return messages
 
+    async def load_unsent_messages(self, session_id: str) -> list[MessageRow]:
+        """Active rows with no ``send_index``: rows predating send indexing and in-place
+        ``compact_note`` rows. Lets a reader assemble history without scanning every send."""
+        rows = await self._db.fetchall(
+            f"SELECT * FROM {self.t.messages} WHERE session_id=? AND state=? AND send_index IS NULL "
+            "ORDER BY seq ASC",
+            (session_id, MessageState.ACTIVE.value),
+        )
+        messages = [_row_to_message(r) for r in rows]
+        messages.sort(key=_logical_order_key)
+        return messages
+
     async def load_all_messages(self, session_id: str) -> list[MessageRow]:
         rows = await self._db.fetchall(
             f"SELECT * FROM {self.t.messages} WHERE session_id=? ORDER BY seq ASC", (session_id,)
@@ -654,32 +666,38 @@ class SessionStore:
             )
 
     async def _query_project_messages(
-        self, fetchall: Callable[..., Any], session_id: str, after_send_index: int | None
+        self, fetchall: Callable[..., Any], session_id: str, after_send_index: int | None,
+        last_rows: int | None = None,
     ) -> list[ProjectMessageRow]:
-        if after_send_index is None:
+        where, params = "WHERE session_id=?", [session_id]
+        if after_send_index is not None:
+            where += " AND send_index>?"
+            params.append(int(after_send_index))
+        if last_rows is None:
             rows = await fetchall(
-                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? ORDER BY send_index ASC",
-                (session_id,),
+                f"SELECT * FROM {self.t.project_messages} {where} ORDER BY send_index ASC",
+                tuple(params),
             )
         else:
             rows = await fetchall(
-                f"SELECT * FROM {self.t.project_messages} WHERE session_id=? AND send_index>? "
-                "ORDER BY send_index ASC",
-                (session_id, int(after_send_index)),
+                f"SELECT * FROM {self.t.project_messages} {where} ORDER BY send_index DESC LIMIT ?",
+                (*params, max(0, int(last_rows))),
             )
         out = [_row_to_project_message(r) for r in rows]
         out.sort(key=lambda m: (m.send_index, _PROJECT_KIND_ORDER.get(m.kind, 9)))
         return out
 
     async def load_project_messages(
-        self, session_id: str, *, after_send_index: int | None = None
+        self, session_id: str, *, after_send_index: int | None = None, last_rows: int | None = None
     ) -> list[ProjectMessageRow]:
         """Projection rows for a session in CONVERSATION order: by ``send_index``, and WITHIN a
         send ``user`` before ``project`` (a kind-alphabetical sort would put the assistant reply
         before the user turn — reversed). ``after_send_index`` (exclusive) returns only rows with
         ``send_index > after_send_index`` — the read cursor a ``compact`` row's ``compact_to_send``
-        provides (everything newer than the latest fold)."""
-        return await self._query_project_messages(self._db.fetchall, session_id, after_send_index)
+        provides (everything newer than the latest fold). ``last_rows`` keeps only the newest
+        that many rows (still returned in conversation order); a send may then be partial."""
+        return await self._query_project_messages(
+            self._db.fetchall, session_id, after_send_index, last_rows)
 
     async def _query_latest_project_compact(
         self, fetchone: Callable[..., Any], session_id: str

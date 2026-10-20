@@ -282,3 +282,9 @@ Tool results are capped when written by `AgentLoopConfig.tool_result_max_chars` 
 tail kept; None = no cap). Compact rows always render through the current projector. The removed
 `schema_version` and `between_sends` fields are gone; stored `between_sends` overrides are ignored. The
 runtime-state sub-key `archive_v2` is adopted as `archive`; issued group ids stay recallable.
+
+## Bounded history reads and history-free runs (7.1)
+
+- Once a session is projection-native, a send reads only: rows without a send index, the in-flight send, the latest compact, the newest `max_context_rows` projection rows, and raw rows of past sends inside that window whose projection is missing. Read cost no longer grows with the session; the prompt equals the full read.
+- `send(history=False)`: the run sees only its own input; past sends, compact rows and projections are neither read nor written for it. Raw rows are still stored.
+- `send(metadata={...})`: stored as the user row's `meta["send"]`, to tag which host agent or call the send belongs to.

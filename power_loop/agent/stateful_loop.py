@@ -26,7 +26,7 @@ import os
 import threading
 import uuid
 from collections import OrderedDict
-from collections.abc import Coroutine, Sequence
+from collections.abc import Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -727,6 +727,8 @@ class StatefulAgentLoop:
         heal_pending: bool = False,
         max_rounds: int | None = None,
         response_format: dict[str, Any] | None = None,
+        history: bool = True,
+        metadata: Mapping[str, Any] | None = None,
     ) -> StatefulResult:
         """Append one user input to the session and run the loop.
 
@@ -746,6 +748,11 @@ class StatefulAgentLoop:
           because a loop is often **shared across callers** — a host that wants
           JSON from one send must not flip the whole loop into JSON mode for
           every other session using it. ``None`` = whatever the config says.
+        - ``history=False``: this run sees only its own input — earlier sends, compact rows and
+          projections are neither read nor written for this send (its raw rows are still stored).
+          For hosts that reuse one session for many independent one-shot runs.
+        - ``metadata``: JSON-serialisable tag stored with this send's user row
+          (``meta["send"]``), e.g. which host-side agent or call the send belongs to.
 
         Raises :class:`SessionPendingError` if the session has unresolved
         tool_calls (a previous run died mid tool-call); the caller must call
@@ -770,10 +777,11 @@ class StatefulAgentLoop:
                 await self._raise_if_pending(sid)
             # Cross-process turn: the in-process lock above only covers THIS interpreter.
             async with self._session_lease(sid):
-                await self._persist_user_input(sid, user_input)
+                await self._persist_user_input(sid, user_input, send_meta=metadata)
                 return await self._run_loop(
                     sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
                     max_rounds=max_rounds, response_format=response_format,
+                    with_history=history,
                 )
 
     async def deliver(
@@ -1559,7 +1567,8 @@ class StatefulAgentLoop:
         raw = await store.get_runtime_state(sid, "send_index", default=0)
         return self._coerce_send_index(raw)
 
-    async def _persist_user_input(self, sid: str, user_input: str | LoopMessage) -> None:
+    async def _persist_user_input(self, sid: str, user_input: str | LoopMessage, *,
+                                  send_meta: Mapping[str, Any] | None = None) -> None:
         store = await self._ensure_store()
         inbox = None
         if isinstance(user_input, dict) and "_inbox" in user_input:
@@ -1583,6 +1592,8 @@ class StatefulAgentLoop:
         if inbox:
             meta = {**(meta or {}), "inbox": {k: inbox[k] for k in ("item_ids", "kinds")
                                               if k in inbox}}
+        if send_meta:
+            meta = {**(meta or {}), "send": dict(send_meta)}
         # Allocate the next monotonic SEND index for this session (atomic RMW under the
         # session_state row lock — never resets, unlike round_index). This is the single
         # send-begin point (exactly one user row per send; resume()/follow-up drains do
@@ -1745,6 +1756,7 @@ class StatefulAgentLoop:
         system_prompt: str | None = None,
         max_rounds: int | None = None,
         response_format: dict[str, Any] | None = None,
+        with_history: bool = True,
     ) -> StatefulResult:
         store = await self._ensure_store()
         # 3.0: projection-style representation drives the derived-layer path; verbatim → None
@@ -1799,255 +1811,301 @@ class StatefulAgentLoop:
         except Exception:
             logger.exception("session %s: history-mode bookkeeping failed (continuing)", sid)
 
-        projection_active = projector is not None
-        active_rows: list[Any] | None = None
-        if projection_active:
-            active_rows = await store.load_active_messages(sid)
-            migrated = (
-                session_row is not None and session_row.metadata.get("projection_migrated") is not None
-            )
-            if current_send_index is None:
-                # resume()/submit_input() before any send() — no in-flight send to partition by.
-                logger.warning(
-                    "session %s: projection mode degrading to verbatim rendering (no allocated "
-                    "send_index — resume before any send); best-effort.", sid,
-                )
-                projection_active = False
-            elif not migrated and self.config.migrate_history_on_switch:
-                # One-time migration: a session with prior NON-projection history opened in
-                # projection mode. Fold that prior history into the projection table so it becomes
-                # projection-native (a compact + the recent keep_last_sends as project rows) rather
-                # than rendering it verbatim forever. Only when the projection table is EMPTY (a
-                # genuine switch / in-place-compacted / never-projected session) — an incidental
-                # missing/stale row on an already-projected session is left to the verbatim
-                # fallback below.
-                has_note = any(r.name == "compact_note" for r in active_rows)
-                has_prior = any(
-                    r.send_index is not None and r.send_index < current_send_index
-                    and r.name != "compact_note"
-                    for r in active_rows
-                )
-                if has_note or has_prior:
-                    if await store.load_project_messages(sid):
-                        # Already projection-native (normal session, or a version bump handled by
-                        # the verbatim fallback) — mark resolved so we don't re-check every send.
-                        try:
-                            await store.merge_session_metadata(sid, {"projection_migrated": 0})
-                        except Exception:
-                            logger.exception("session %s: migration bookkeeping failed", sid)
-                        migrated = True
-                    else:
-                        try:
-                            # Writes the rows AND the projection_migrated marker in one tx (atomic).
-                            await self._migrate_prior_history_to_projection(
-                                store, sid, projector,
-                                current_send_index=current_send_index, active_rows=active_rows,
-                            )
-                            migrated = True
-                            logger.info(
-                                "session %s: migrated prior history into the projection table "
-                                "(mode switch).", sid,
-                            )
-                        except Exception:
-                            # Best-effort: fall back to verbatim this send (and retry next send).
-                            logger.exception(
-                                "session %s: projection migration failed (continuing best-effort)",
-                                sid,
-                            )
-            # A compact_note that migration did NOT fold in (migration off/failed) can't be
-            # send_index-partitioned → degrade to verbatim. Once migrated, the note is represented
-            # by the projection compact and is excluded from the partition below.
-            if (
-                projection_active
-                and not migrated
-                and any(r.name == "compact_note" for r in active_rows)
-            ):
-                logger.warning(
-                    "session %s: projection mode degrading to verbatim rendering (in-place "
-                    "compaction history present, not migrated); best-effort.", sid,
-                )
-                projection_active = False
-
-        if projection_active:
-            # ── Projection mode (v2): history = rendered projections of FINISHED sends + the
-            # in-flight send's structured rows. pl_messages is NEVER compacted here (compactor is
-            # None, enforced by AgentLoopConfig), so it stays in seq order; we partition by the
-            # send_index stamped on every row. (active_rows loaded above; current_send_index set.)
-            assert current_send_index is not None and active_rows is not None
-            # Rows predating the projection era (pre-v2 / export→import) carry send_index=NULL —
-            # render them VERBATIM as a temporally-first prefix (never dropped, never lumped into
-            # the current send). compact_note rows are in-place-compactor artifacts: in projection
-            # mode they are represented by the projection compact (after migration) and must never
-            # be rendered verbatim, so they are excluded from both the prefix and the partition.
-            legacy_rows = [
-                r for r in active_rows if r.send_index is None and r.name != "compact_note"
-            ]
-            current_rows = [
-                r for r in active_rows
-                if r.send_index == current_send_index and r.name != "compact_note"
-            ]
-            # pl_messages is the immutable audit log and is NEVER compacted in projection mode, so
-            # every past send's rows are still present here — the FALLBACK source whenever a send's
-            # projection row is missing (a best-effort end-of-send projection write failed/crashed)
-            # or was written by a DIFFERENT projector version (the user changed the projector).
-            # Without this fallback such a send would be silently dropped from context forever.
-            version = int(getattr(projector, "version", 0) or 0)
-            active_by_send: dict[int, list[Any]] = {}
-            for r in active_rows:
-                if r.send_index is not None and r.name != "compact_note":
-                    active_by_send.setdefault(r.send_index, []).append(r)
-
-            def _verbatim(send_idx: int) -> list[LoopMessage]:
-                return [_row_to_loop_message(m) for m in active_by_send.get(send_idx, [])]
-
-            compact = await store.latest_project_compact(sid)
-            cutoff = compact.compact_to_send if compact is not None else None
-            proj_rows = [
-                r
-                for r in await store.load_project_messages(sid, after_send_index=cutoff)
-                if r.send_index < current_send_index
-            ]
-            # Only rows written by the CURRENT projector version are faithfully renderable by it;
-            # rows from another version fall back to verbatim (below), keyed per send.
-            cur_proj_by_send: dict[int, list[Any]] = {}
-            for r in proj_rows:
-                if int(r.projector_version or 0) == version:
-                    cur_proj_by_send.setdefault(r.send_index, []).append(r)
-
-            # ── 6.9.0 self-heal: project past sends that have NO current-version projection ──
-            # A send killed mid-flight (process restart / crash) never reaches its end-of-send
-            # projection, so its raw rows used to ride VERBATIM into every later send forever
-            # (真实事故: one interrupted 80-round send = 182K chars ≈ 115K tokens, every following
-            # round took 2–3 minutes and the agent looked dead). Projection is deterministic and
-            # LLM-free, so heal lazily HERE: project + persist (idempotent upsert, short lock),
-            # then render like any other send. The verbatim fallback below now only covers a
-            # projection that itself fails.
-            _lo0 = compact.compact_to_send if compact is not None else 0
-            _missing = [
-                si for si in sorted(active_by_send)
-                if (_lo0 or 0) < si < current_send_index and si not in cur_proj_by_send
-            ]
-            if _missing:
-                _healed_any = False
-                for si in _missing:
-                    healed = await self._heal_send_projection(
-                        store, sid, send_index=si, rows=active_by_send[si], projector=projector,
-                    )
-                    if healed:
-                        _healed_any = True
-                if _healed_any:
-                    proj_rows = [
-                        r
-                        for r in await store.load_project_messages(sid, after_send_index=cutoff)
-                        if r.send_index < current_send_index
-                    ]
-                    cur_proj_by_send = {}
-                    for r in proj_rows:
-                        if int(r.projector_version or 0) == version:
-                            cur_proj_by_send.setdefault(r.send_index, []).append(r)
-
-            # Attach recency + cross-send-dedup context ONCE over the full ordered project-row set
-            # (the ONLY place with global send ordering + the current cursor). A recency-aware
-            # render_project_row then renders the most-recent sends richly and collapses older ones;
-            # the isolated old-span render inside the fold path is left unstamped → cold, so its
-            # summary still shrinks. No-op for representations without the method (verbatim).
-            if hasattr(projector, "stamp_render_context"):
-                projector.stamp_render_context(proj_rows, current_send_index)
-
-            # (1) folded-history compact: always rendered by the projector. A compact row is summary
-            # text, not tied to the per-send rendering rules, so a projector version change must not
-            # replace it with the verbatim originals of its whole span. Kept in its OWN list — the
-            # recent-rows cap below must never drop the compact summary.
-            compact_msgs: list[LoopMessage] = []
-            if compact is not None:
-                compact_msgs.extend(projector.render([compact]))
-            # (2) each uncompacted past send in order: projected when a current-version row exists,
-            # else verbatim fallback (missing or stale projection). Collected as PER-SEND chunks so
-            # the cap can drop whole sends only (a verbatim-fallback send carries raw tool-protocol
-            # rows — cutting inside one would orphan tool results).
-            lo = cutoff or 0
-            send_chunks: list[list[LoopMessage]] = []
-            for si2 in sorted(s for s in active_by_send if lo < s < current_send_index):
-                rows_for_send = cur_proj_by_send.get(si2)
-                send_chunks.append(
-                    list(projector.render(rows_for_send)) if rows_for_send else _verbatim(si2)
-                )
-
-            legacy_msgs = [_row_to_loop_message(r) for r in legacy_rows]
-            current_msgs = [_row_to_loop_message(r) for r in current_rows]
-            # ── History-rows cap (max_context_rows) ──
-            # 上限管的是**历史**消息的条数，**不含当前 send**：当前 send 内的膨胀由 send 内
-            # 保险丝（insend_distill）与切 send 阈值负责，两件事分开才可预期。
-            # 6.24.0 之前当前 send 也计入总数，于是一个 120 轮的 send 会把历史整段挤掉——
-            # 历史的预算随着本轮跑多久而变，没法解释。
-            # compact 行永远保留；当前 send 永远完整；更早的按「整块」从最老端丢（先 legacy，
-            # 再一个 send 一块），单块超预算也整块保留，绝不切开一个 send。
-            kept_legacy_rows = legacy_rows
-            cap = getattr(self.config, "max_context_rows", None)
-            if cap and int(cap) > 0:
-                # chunks[0] = the legacy prefix (oldest), then one chunk per past send.
-                chunks: list[list[LoopMessage]] = [legacy_msgs, *send_chunks]
-                total = sum(len(c) for c in chunks)
-                drop = 0
-                while drop < len(chunks) and total > int(cap):
-                    total -= len(chunks[drop])
-                    drop += 1
-                if drop > 0:
-                    legacy_msgs, kept_legacy_rows = [], []
-                    send_chunks = chunks[drop:]
-
-            prefix_msgs = [m for chunk in send_chunks for m in chunk]
-            history = legacy_msgs + compact_msgs + prefix_msgs + current_msgs
-            # Sink index↔seq map: legacy + in-flight rows carry real seqs; the rendered prefix
-            # (projected OR verbatim-fallback) has no foldable DB row (None). Compaction is off in
-            # projection mode, so this map is only kept aligned for the appends, never used to fold.
-            hist_seqs: list[int | None] = (
-                [r.seq for r in kept_legacy_rows]
-                + [None] * (len(compact_msgs) + len(prefix_msgs))
-                + [r.seq for r in current_rows]
-            )
-            hist_ords: list[int | None] = list(hist_seqs)
+        if not with_history:
+            # send(history=False): this run sees only its own send — no past sends, no compact, no
+            # projection read — and writes no projection or fold at the end (nothing will read it).
+            projection_active = False
+            cache_eligible = False
+            own = ([r for r in await store.load_active_messages(sid, send_index=current_send_index)
+                    if r.name != "compact_note"] if current_send_index is not None else [])
+            history = [_row_to_loop_message(r) for r in own]
+            hist_seqs = [r.seq for r in own]
+            hist_ords = list(hist_seqs)
         else:
-            # ── Default / degraded-verbatim mode: full verbatim history (+ window cache + in-place
-            # compactor). When degrading from projection, active_rows is already loaded above and
-            # the cache is bypassed (cache_eligible is False whenever a projector is configured). ──
-            cache_token: tuple[int, int] | None = None
-            if cache_eligible:
-                state = await store.get_state(sid)
-                if state is not None:
-                    cache_token = (state.next_seq, state.last_compact_seq)
-                    active_rows = self._cache_get(sid, state.next_seq, state.last_compact_seq)
-            if active_rows is None:
-                active_rows = await store.load_active_messages(sid)
-                if cache_eligible and cache_token is not None:
-                    self._cache_put(sid, cache_token[0], active_rows, cache_token[1])
-            # ── History-rows cap，逐字模式（6.24.0）──
-            # 与投影分支同一条语义：只管**历史**的条数，当前 send 与 compact 笔记永远保留。
-            # 逐字模式一轮可能有多条消息（assistant(tool_calls) + 每个调用一条 tool 结果），
-            # 从最老端按条丢会切出孤儿 tool 结果——这不要紧：下面 align_tool_calls 是
-            # mode-agnostic 的兜底，孤儿会被清掉/补占位，发出去的历史始终合法。
-            _cap = getattr(self.config, "max_context_rows", None)
-            if _cap and int(_cap) > 0 and current_send_index is not None:
-                _hist_idx = [
-                    i for i, r in enumerate(active_rows)
-                    if getattr(r, "name", None) != "compact_note"
-                    and r.send_index is not None
-                    and r.send_index < current_send_index
+            projection_active = projector is not None
+            active_rows: list[Any] | None = None
+            # Bounded read: once a session is projection-native (the one-time migration check left its
+            # marker) history needs only the rows with no send index, the in-flight send, the latest
+            # compact and the newest projection rows — never a scan of every past send. Sessions
+            # without the marker take the full read once (the migration check needs it).
+            bounded = (
+                projection_active and current_send_index is not None and session_row is not None
+                and session_row.metadata.get("projection_migrated") is not None
+                and hasattr(store, "load_unsent_messages")
+            )
+            if projection_active:
+                if bounded:
+                    active_rows = [
+                        *await store.load_unsent_messages(sid),
+                        *await store.load_active_messages(sid, send_index=current_send_index),
+                    ]
+                else:
+                    active_rows = await store.load_active_messages(sid)
+                migrated = (
+                    session_row is not None and session_row.metadata.get("projection_migrated") is not None
+                )
+                if current_send_index is None:
+                    # resume()/submit_input() before any send() — no in-flight send to partition by.
+                    logger.warning(
+                        "session %s: projection mode degrading to verbatim rendering (no allocated "
+                        "send_index — resume before any send); best-effort.", sid,
+                    )
+                    projection_active = False
+                elif not migrated and self.config.migrate_history_on_switch:
+                    # One-time migration: a session with prior NON-projection history opened in
+                    # projection mode. Fold that prior history into the projection table so it becomes
+                    # projection-native (a compact + the recent keep_last_sends as project rows) rather
+                    # than rendering it verbatim forever. Only when the projection table is EMPTY (a
+                    # genuine switch / in-place-compacted / never-projected session) — an incidental
+                    # missing/stale row on an already-projected session is left to the verbatim
+                    # fallback below.
+                    has_note = any(r.name == "compact_note" for r in active_rows)
+                    has_prior = any(
+                        r.send_index is not None and r.send_index < current_send_index
+                        and r.name != "compact_note"
+                        for r in active_rows
+                    )
+                    if has_note or has_prior:
+                        if await store.load_project_messages(sid):
+                            # Already projection-native (normal session, or a version bump handled by
+                            # the verbatim fallback) — mark resolved so we don't re-check every send.
+                            try:
+                                await store.merge_session_metadata(sid, {"projection_migrated": 0})
+                            except Exception:
+                                logger.exception("session %s: migration bookkeeping failed", sid)
+                            migrated = True
+                        else:
+                            try:
+                                # Writes the rows AND the projection_migrated marker in one tx (atomic).
+                                await self._migrate_prior_history_to_projection(
+                                    store, sid, projector,
+                                    current_send_index=current_send_index, active_rows=active_rows,
+                                )
+                                migrated = True
+                                logger.info(
+                                    "session %s: migrated prior history into the projection table "
+                                    "(mode switch).", sid,
+                                )
+                            except Exception:
+                                # Best-effort: fall back to verbatim this send (and retry next send).
+                                logger.exception(
+                                    "session %s: projection migration failed (continuing best-effort)",
+                                    sid,
+                                )
+                # A compact_note that migration did NOT fold in (migration off/failed) can't be
+                # send_index-partitioned → degrade to verbatim. Once migrated, the note is represented
+                # by the projection compact and is excluded from the partition below.
+                if (
+                    projection_active
+                    and not migrated
+                    and any(r.name == "compact_note" for r in active_rows)
+                ):
+                    logger.warning(
+                        "session %s: projection mode degrading to verbatim rendering (in-place "
+                        "compaction history present, not migrated); best-effort.", sid,
+                    )
+                    projection_active = False
+
+            if projection_active:
+                # ── Projection mode (v2): history = rendered projections of FINISHED sends + the
+                # in-flight send's structured rows. pl_messages is NEVER compacted here (compactor is
+                # None, enforced by AgentLoopConfig), so it stays in seq order; we partition by the
+                # send_index stamped on every row. (active_rows loaded above; current_send_index set.)
+                assert current_send_index is not None and active_rows is not None
+                # Rows predating the projection era (pre-v2 / export→import) carry send_index=NULL —
+                # render them VERBATIM as a temporally-first prefix (never dropped, never lumped into
+                # the current send). compact_note rows are in-place-compactor artifacts: in projection
+                # mode they are represented by the projection compact (after migration) and must never
+                # be rendered verbatim, so they are excluded from both the prefix and the partition.
+                legacy_rows = [
+                    r for r in active_rows if r.send_index is None and r.name != "compact_note"
                 ]
-                _over = len(_hist_idx) - int(_cap)
-                if _over > 0:
-                    _drop = set(_hist_idx[:_over])
-                    active_rows = [r for i, r in enumerate(active_rows) if i not in _drop]
-            history = [_row_to_loop_message(r) for r in active_rows]
-            # Mirror loaded seqs into the sink so the compactor can translate in-memory indices
-            # back to store rows when it folds. Pass the parallel logical positions too: a
-            # compact_note's identity seq is high, but it sits at its logical ``ord``.
-            hist_seqs = [r.seq for r in active_rows]
-            hist_ords = [
-                int(r.meta["ord"]) if r.name == "compact_note" and r.meta.get("ord") is not None
-                else r.seq
-                for r in active_rows
-            ]
+                current_rows = [
+                    r for r in active_rows
+                    if r.send_index == current_send_index and r.name != "compact_note"
+                ]
+                # pl_messages is the immutable audit log and is NEVER compacted in projection mode, so
+                # every past send's rows are still present here — the FALLBACK source whenever a send's
+                # projection row is missing (a best-effort end-of-send projection write failed/crashed)
+                # or was written by a DIFFERENT projector version (the user changed the projector).
+                # Without this fallback such a send would be silently dropped from context forever.
+                version = int(getattr(projector, "version", 0) or 0)
+                active_by_send: dict[int, list[Any]] = {}
+                for r in active_rows:
+                    if r.send_index is not None and r.name != "compact_note":
+                        active_by_send.setdefault(r.send_index, []).append(r)
+
+                def _verbatim(send_idx: int) -> list[LoopMessage]:
+                    return [_row_to_loop_message(m) for m in active_by_send.get(send_idx, [])]
+
+                compact = await store.latest_project_compact(sid)
+                cutoff = compact.compact_to_send if compact is not None else None
+                cap = getattr(self.config, "max_context_rows", None)
+                limit = int(cap) + 2 if bounded and cap and int(cap) > 0 else None
+
+                async def _load_proj_rows() -> list[Any]:
+                    raw = await store.load_project_messages(
+                        sid, after_send_index=cutoff,
+                        **({"last_rows": limit} if limit is not None else {}))
+                    rows = [r for r in raw if r.send_index < current_send_index]
+                    if limit is not None and len(raw) >= limit and rows:
+                        # The oldest send in a LIMIT window may be partial: drop it (the cap below
+                        # only ever keeps whole sends from the newest end anyway).
+                        oldest = min(r.send_index for r in rows)
+                        rows = [r for r in rows if r.send_index != oldest]
+                    return rows
+
+                proj_rows = await _load_proj_rows()
+                if bounded:
+                    # Past sends inside the window whose current-version projection is missing need
+                    # their raw rows (heal or verbatim fallback); nothing older is read.
+                    window_lo = (min(r.send_index for r in proj_rows)
+                                 if limit is not None and proj_rows else (cutoff or 0) + 1)
+                    if limit is not None:  # every send renders at least one row
+                        window_lo = max(window_lo, current_send_index - limit)
+                    have = {r.send_index for r in proj_rows if int(r.projector_version or 0) == version}
+                    for si in range(window_lo, current_send_index):
+                        if si not in have:
+                            rows = [r for r in await store.load_active_messages(sid, send_index=si)
+                                    if r.name != "compact_note"]
+                            if rows:
+                                active_by_send[si] = rows
+                # Only rows written by the CURRENT projector version are faithfully renderable by it;
+                # rows from another version fall back to verbatim (below), keyed per send.
+                cur_proj_by_send: dict[int, list[Any]] = {}
+                for r in proj_rows:
+                    if int(r.projector_version or 0) == version:
+                        cur_proj_by_send.setdefault(r.send_index, []).append(r)
+
+                # ── 6.9.0 self-heal: project past sends that have NO current-version projection ──
+                # A send killed mid-flight (process restart / crash) never reaches its end-of-send
+                # projection, so its raw rows used to ride VERBATIM into every later send forever
+                # (真实事故: one interrupted 80-round send = 182K chars ≈ 115K tokens, every following
+                # round took 2–3 minutes and the agent looked dead). Projection is deterministic and
+                # LLM-free, so heal lazily HERE: project + persist (idempotent upsert, short lock),
+                # then render like any other send. The verbatim fallback below now only covers a
+                # projection that itself fails.
+                _lo0 = compact.compact_to_send if compact is not None else 0
+                _missing = [
+                    si for si in sorted(active_by_send)
+                    if (_lo0 or 0) < si < current_send_index and si not in cur_proj_by_send
+                ]
+                if _missing:
+                    _healed_any = False
+                    for si in _missing:
+                        healed = await self._heal_send_projection(
+                            store, sid, send_index=si, rows=active_by_send[si], projector=projector,
+                        )
+                        if healed:
+                            _healed_any = True
+                    if _healed_any:
+                        proj_rows = await _load_proj_rows()
+                        cur_proj_by_send = {}
+                        for r in proj_rows:
+                            if int(r.projector_version or 0) == version:
+                                cur_proj_by_send.setdefault(r.send_index, []).append(r)
+
+                # Attach recency + cross-send-dedup context ONCE over the full ordered project-row set
+                # (the ONLY place with global send ordering + the current cursor). A recency-aware
+                # render_project_row then renders the most-recent sends richly and collapses older ones;
+                # the isolated old-span render inside the fold path is left unstamped → cold, so its
+                # summary still shrinks. No-op for representations without the method (verbatim).
+                if hasattr(projector, "stamp_render_context"):
+                    projector.stamp_render_context(proj_rows, current_send_index)
+
+                # (1) folded-history compact: always rendered by the projector. A compact row is summary
+                # text, not tied to the per-send rendering rules, so a projector version change must not
+                # replace it with the verbatim originals of its whole span. Kept in its OWN list — the
+                # recent-rows cap below must never drop the compact summary.
+                compact_msgs: list[LoopMessage] = []
+                if compact is not None:
+                    compact_msgs.extend(projector.render([compact]))
+                # (2) each uncompacted past send in order: projected when a current-version row exists,
+                # else verbatim fallback (missing or stale projection). Collected as PER-SEND chunks so
+                # the cap can drop whole sends only (a verbatim-fallback send carries raw tool-protocol
+                # rows — cutting inside one would orphan tool results).
+                lo = cutoff or 0
+                send_chunks: list[list[LoopMessage]] = []
+                for si2 in sorted(s for s in {*active_by_send, *cur_proj_by_send} if lo < s < current_send_index):
+                    rows_for_send = cur_proj_by_send.get(si2)
+                    send_chunks.append(
+                        list(projector.render(rows_for_send)) if rows_for_send else _verbatim(si2)
+                    )
+
+                legacy_msgs = [_row_to_loop_message(r) for r in legacy_rows]
+                current_msgs = [_row_to_loop_message(r) for r in current_rows]
+                # ── History-rows cap (max_context_rows) ──
+                # 上限管的是**历史**消息的条数，**不含当前 send**：当前 send 内的膨胀由 send 内
+                # 保险丝（insend_distill）与切 send 阈值负责，两件事分开才可预期。
+                # 6.24.0 之前当前 send 也计入总数，于是一个 120 轮的 send 会把历史整段挤掉——
+                # 历史的预算随着本轮跑多久而变，没法解释。
+                # compact 行永远保留；当前 send 永远完整；更早的按「整块」从最老端丢（先 legacy，
+                # 再一个 send 一块），单块超预算也整块保留，绝不切开一个 send。
+                kept_legacy_rows = legacy_rows
+                if cap and int(cap) > 0:
+                    # chunks[0] = the legacy prefix (oldest), then one chunk per past send.
+                    chunks: list[list[LoopMessage]] = [legacy_msgs, *send_chunks]
+                    total = sum(len(c) for c in chunks)
+                    drop = 0
+                    while drop < len(chunks) and total > int(cap):
+                        total -= len(chunks[drop])
+                        drop += 1
+                    if drop > 0:
+                        legacy_msgs, kept_legacy_rows = [], []
+                        send_chunks = chunks[drop:]
+
+                prefix_msgs = [m for chunk in send_chunks for m in chunk]
+                history = legacy_msgs + compact_msgs + prefix_msgs + current_msgs
+                # Sink index↔seq map: legacy + in-flight rows carry real seqs; the rendered prefix
+                # (projected OR verbatim-fallback) has no foldable DB row (None). Compaction is off in
+                # projection mode, so this map is only kept aligned for the appends, never used to fold.
+                hist_seqs: list[int | None] = (
+                    [r.seq for r in kept_legacy_rows]
+                    + [None] * (len(compact_msgs) + len(prefix_msgs))
+                    + [r.seq for r in current_rows]
+                )
+                hist_ords: list[int | None] = list(hist_seqs)
+            else:
+                # ── Default / degraded-verbatim mode: full verbatim history (+ window cache + in-place
+                # compactor). When degrading from projection, active_rows is already loaded above and
+                # the cache is bypassed (cache_eligible is False whenever a projector is configured). ──
+                cache_token: tuple[int, int] | None = None
+                if cache_eligible:
+                    state = await store.get_state(sid)
+                    if state is not None:
+                        cache_token = (state.next_seq, state.last_compact_seq)
+                        active_rows = self._cache_get(sid, state.next_seq, state.last_compact_seq)
+                if active_rows is None:
+                    active_rows = await store.load_active_messages(sid)
+                    if cache_eligible and cache_token is not None:
+                        self._cache_put(sid, cache_token[0], active_rows, cache_token[1])
+                # ── History-rows cap，逐字模式（6.24.0）──
+                # 与投影分支同一条语义：只管**历史**的条数，当前 send 与 compact 笔记永远保留。
+                # 逐字模式一轮可能有多条消息（assistant(tool_calls) + 每个调用一条 tool 结果），
+                # 从最老端按条丢会切出孤儿 tool 结果——这不要紧：下面 align_tool_calls 是
+                # mode-agnostic 的兜底，孤儿会被清掉/补占位，发出去的历史始终合法。
+                _cap = getattr(self.config, "max_context_rows", None)
+                if _cap and int(_cap) > 0 and current_send_index is not None:
+                    _hist_idx = [
+                        i for i, r in enumerate(active_rows)
+                        if getattr(r, "name", None) != "compact_note"
+                        and r.send_index is not None
+                        and r.send_index < current_send_index
+                    ]
+                    _over = len(_hist_idx) - int(_cap)
+                    if _over > 0:
+                        _drop = set(_hist_idx[:_over])
+                        active_rows = [r for i, r in enumerate(active_rows) if i not in _drop]
+                history = [_row_to_loop_message(r) for r in active_rows]
+                # Mirror loaded seqs into the sink so the compactor can translate in-memory indices
+                # back to store rows when it folds. Pass the parallel logical positions too: a
+                # compact_note's identity seq is high, but it sits at its logical ``ord``.
+                hist_seqs = [r.seq for r in active_rows]
+                hist_ords = [
+                    int(r.meta["ord"]) if r.name == "compact_note" and r.meta.get("ord") is not None
+                    else r.seq
+                    for r in active_rows
+                ]
 
         # ── Robustness backstop (mode-agnostic, always on): repair tool-call/result misalignment
         # in the assembled prompt so a corrupt row (crash mid-tool, bad import/edit, projection

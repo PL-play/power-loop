@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+## [7.1.0] — 2026-10-20
+
+- History is read in bounded slices once a session is projection-native: rows without a send index,
+  the in-flight send, the latest compact, the newest `max_context_rows` projection rows, and raw rows
+  only for past sends inside that window whose projection is missing. Per-send read cost no longer
+  grows with the session. Same prompt as the full read (tested).
+- `SessionStore.load_unsent_messages()`; `load_project_messages(last_rows=)`.
+- `send(history=False)`: the run sees only its own input; no past sends, compact or projections are
+  read, and no projection or fold is written for that send (raw rows are still stored). For hosts that
+  reuse one session for many independent one-shot runs.
+- `send(metadata=...)`: a JSON tag stored with the send's user row (`meta["send"]`).
+
 ## [7.0.0] — 2026-10-20
 
 One tool-context mechanism; the version switch is gone (design/184).
