@@ -419,6 +419,14 @@ class OpenAICompatibleChatLLMService(LLMService):
         return raw
 
     def _usage_obj(self, usage: Any = None) -> LLMTokenUsage:
+        def _cost_or_none(v: Any) -> float | None:
+            if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+                return None
+            try:
+                return float(v)
+            except ValueError:
+                return None
+
         d = self._last_usage if usage is None else self._usage_dict_from_any(usage)
 
         def _int_or_none(v: Any) -> int | None:
@@ -448,6 +456,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             reasoning_tokens=_int_or_none(d.get("reasoning_tokens")),
             accepted_tokens=_int_or_none(d.get("accepted_tokens")),
             rejected_tokens=_int_or_none(d.get("rejected_tokens")),
+            cost=_cost_or_none(d.get("cost")),
         )
 
     async def _with_retries(self, fn, *, method: str) -> Any:

@@ -202,6 +202,19 @@ def _maybe_compact_accepts_context(func: Any) -> bool:
 
 # ── Utility functions (unchanged from old agent.py) ──
 
+def _llm_endpoint(llm: Any) -> str:
+    """The base URL that serves this LLM (unwrapping retry / proxy wrappers), or ""."""
+    for _ in range(5):
+        if llm is None:
+            break
+        cfg = getattr(llm, "_cfg", None) or getattr(llm, "config", None)
+        url = getattr(cfg, "base_url", None)
+        if url:
+            return str(url)
+        llm = getattr(llm, "inner", None) or getattr(llm, "_inner", None) or getattr(llm, "llm", None)
+    return ""
+
+
 def _truncate_result(output: Any, limit: int | None = RESULT_MAX_CHARS) -> str:
     """Cap a tool result before it enters history and the audit log (None = no cap). Keeps the
     head and the tail: errors and summaries are usually at the end."""
@@ -1333,6 +1346,7 @@ class AgentPipeline:
                             success=False, error_type=type(exc).__name__,
                             prompt_tokens=p_est, completion_tokens=c_est,
                             total_tokens=p_est + c_est, estimated=True, outcome=outcome,
+                            endpoint=_llm_endpoint(self.llm),
                         ),
                         round_index=round_index, stream_id="main",
                     )
@@ -1364,6 +1378,9 @@ class AgentPipeline:
                         prompt_cached_tokens=getattr(usage, "prompt_cached_tokens", None),
                         prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
                         estimated=estimated,
+                        endpoint=_llm_endpoint(self.llm),
+                        provider_cost=getattr(usage, "cost", None),
+                        prompt_image_tokens=getattr(usage, "prompt_image_tokens", None),
                     ),
                     round_index=round_index, stream_id="main",
                 )

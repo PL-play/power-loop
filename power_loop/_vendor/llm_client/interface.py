@@ -204,6 +204,10 @@ class LLMTokenUsage:
     accepted_tokens: int | None = None
     rejected_tokens: int | None = None
 
+    #: Charge the provider itself reported for this call (e.g. OpenRouter's ``usage.cost``), in the
+    #: provider's billing currency. ``None`` = not reported; hosts then price tokens themselves.
+    cost: float | None = None
+
     def as_dict(self) -> dict[str, int | None]:
         return dict(self.__dict__)
 

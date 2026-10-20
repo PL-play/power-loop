@@ -8,6 +8,12 @@
 
 ## [Unreleased]
 
+## [7.2.0] — 2026-10-20
+
+- `LLMTokenUsage.cost`: the charge the provider itself reported (e.g. OpenRouter `usage.cost`), `None` when not reported.
+- `LlmCallCompletedPayload` gains `endpoint` (base URL that served the call), `provider_cost` and
+  `prompt_image_tokens`, so hosts can price per connection and per period, and prefer the provider's own charge.
+
 ## [7.1.0] — 2026-10-20
 
 - History is read in bounded slices once a session is projection-native: rows without a send index,
