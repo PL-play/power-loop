@@ -115,3 +115,41 @@ async def test_each_send_starts_unpassed(store):
     assert (await loop.send("a", session_id=sid)).passed
     second = await loop.send("b", session_id=sid)
     assert not second.passed and second.final_text == "第二次正常答"
+
+
+async def test_pass_progress_counts_texts_and_work_tools_so_a_host_can_refuse_an_empty_pass(store):
+    reg = _registry()
+    seen = []
+
+    def guarded(reason: str = "") -> str:
+        prog = P.pass_progress()
+        seen.append(dict(prog))
+        if not prog["texts"] and not prog["work_tools"] and len(seen) == 1:
+            return "还没写出答案：先把答案写成正文，再结束"      # 宿主拒绝空着结束（只拒一次）
+        P.request_pass(reason)
+        return "好"
+
+    reg.register(ToolDefinition(name="pass_turn", description="应用里的说明", input_schema={"type": "object", "properties": {}}), guarded)
+    llm = _Script(responses=[_call("c1", "pass_turn", {"reason": "答完了"}),
+                             _call("c2", "pass_turn", {"reason": "答完了"}, text="答案是 12 元。")])
+    loop = StatefulAgentLoop(llm=llm, config=AgentLoopConfig(max_rounds=10), store=store, tool_registry=reg)
+    r = await loop.send("x", session_id=await loop.new_session())
+    assert seen == [{"texts": 0, "work_tools": 0}, {"texts": 1, "work_tools": 0}]
+    assert r.passed and r.final_text == "答案是 12 元。"
+
+
+async def test_pass_progress_counts_other_tools_but_not_pass_turn(store):
+    got = []
+    reg = _registry()
+
+    def spy(reason: str = "") -> str:
+        got.append(P.pass_progress())
+        P.request_pass(reason)
+        return "好"
+
+    reg.register(ToolDefinition(name="pass_turn", description="d", input_schema={"type": "object", "properties": {}}), spy)
+    llm = _Script(responses=[_call("c1", "lookup", {}), _call("c2", "pass_turn", {"reason": "存好了"})])
+    loop = StatefulAgentLoop(llm=llm, config=AgentLoopConfig(max_rounds=10), store=store, tool_registry=reg)
+    await loop.send("x", session_id=await loop.new_session())
+    assert got == [{"texts": 0, "work_tools": 1}]
+    assert P.pass_progress() is None   # send 外没有状态

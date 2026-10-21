@@ -1906,6 +1906,8 @@ class AgentPipeline:
             if assistant_text:
                 self._step_texts.append({"step": round_idx + 1, "text": assistant_text,
                                          "tools": [_tool_call_name(tc) for tc in (tool_calls or [])]})
+            from power_loop.core import pass_turn as _pass_state
+            _pass_state.note_step(bool(assistant_text), [_tool_call_name(tc) for tc in (tool_calls or [])])
 
             # Any productive round (said something OR called a tool) clears the empty streak.
             if assistant_text or tool_calls:

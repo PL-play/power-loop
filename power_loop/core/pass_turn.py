@@ -43,7 +43,7 @@ _state: ContextVar[dict[str, Any] | None] = ContextVar("power_loop_pass_turn", d
 
 def begin() -> Token:
     """一个 send 开始：装一份新的状态。返回还原用的 token。"""
-    return _state.set({"passed": False, "reason": None, "new_input_after_pass": False})
+    return _state.set({"passed": False, "reason": None, "new_input_after_pass": False, "texts": 0, "work_tools": 0})
 
 
 def end(token: Token) -> None:
@@ -62,6 +62,25 @@ def request_pass(reason: str = "") -> bool:
     st["passed"] = True
     st["reason"] = (reason or "").strip()[:REASON_MAX]
     return True
+
+
+def note_step(wrote_text: bool, tool_names: list[str]) -> None:
+    """pipeline 每一轮调一次：记下这次 send 写过几段字、调过几次别的工具（pass_turn 不算）。"""
+    st = _state.get()
+    if st is None:
+        return
+    if wrote_text:
+        st["texts"] = st.get("texts", 0) + 1
+    st["work_tools"] = st.get("work_tools", 0) + sum(1 for n in tool_names if n != PASS_TURN_TOOL.name)
+
+
+def pass_progress() -> dict[str, int] | None:
+    """这次 send 到现在：写过几段字（texts）、调过几次别的工具（work_tools）。宿主覆盖 pass_turn 时用来判断
+    「还什么都没交就要结束」。不在 send 里返回 None。"""
+    st = _state.get()
+    if st is None:
+        return None
+    return {"texts": int(st.get("texts", 0)), "work_tools": int(st.get("work_tools", 0))}
 
 
 def pass_requested() -> bool:
