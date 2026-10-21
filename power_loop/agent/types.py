@@ -464,3 +464,9 @@ class AgentLoopResult:
     usage: dict[str, int] = field(default_factory=dict)
     #: Tool invocations executed during this run.
     tool_calls: int = 0
+    #: design/188：这一轮是不是调 pass_turn 明确结束的、理由；停的那一刻是否有刚折进来的新输入。
+    passed: bool = False
+    pass_reason: str | None = None
+    new_input_after_pass: bool = False
+    #: 每一步写的文字（不只是最后一段）：[{step, text, tools}]，按顺序。
+    texts: list[dict[str, Any]] = field(default_factory=list)

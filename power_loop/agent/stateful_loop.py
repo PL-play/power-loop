@@ -64,6 +64,7 @@ from power_loop.core.agent_context import (
 )
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
+from power_loop.core.pass_turn import ensure_pass_turn
 from power_loop.core.pipeline import (
     AgentPipeline,
     _tool_call_args,
@@ -132,6 +133,12 @@ class StatefulResult:
     usage: dict[str, int] = field(default_factory=dict)
     #: Tool invocations executed during this send.
     tool_calls: int = 0
+    #: design/188：调 pass_turn 明确结束的、理由；停的那一刻有没有刚折进来的新输入。
+    passed: bool = False
+    pass_reason: str | None = None
+    new_input_after_pass: bool = False
+    #: 每一步写的文字：[{step, text, tools}]，按顺序（不只是最后一段）。
+    texts: list[dict[str, Any]] = field(default_factory=list)
 
 
 class _SyncLoopRunner:
@@ -1415,7 +1422,8 @@ class StatefulAgentLoop:
             base,
             inject_tool_descriptions=self.config.inject_tool_descriptions,
             tool_catalog_header=self.config.tool_catalog_header,
-            tool_registry=self.tool_registry,
+            # pipeline 会补上永远在的 pass_turn（design/188）：预览也补，才和模型看到的一样
+            tool_registry=ensure_pass_turn(self.tool_registry) if self.tool_registry is not None else None,
             skills_dir=self.config.skills_dir,
         )
 
@@ -2232,6 +2240,10 @@ class StatefulAgentLoop:
             pending_interactions=result.pending_interactions,
             usage=result.usage,
             tool_calls=result.tool_calls,
+            passed=result.passed,
+            pass_reason=result.pass_reason,
+            new_input_after_pass=result.new_input_after_pass,
+            texts=result.texts,
         )
 
     async def _migrate_prior_history_to_projection(

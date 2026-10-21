@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+## [7.3.0] — 2026-10-21
+
+### Added
+- **pass_turn 内置**（`power_loop.core.pass_turn`）：「这一步做完了，结束这一轮」。只要宿主给了工具表，pipeline 就补上它（宿主去不掉）；
+  调用后在下一轮开始前硬停，不再调模型。宿主可以用同名工具覆盖说明和处理，处理里调 `power_loop.request_pass(理由)` 才算数。
+  不给工具表（工具全由宿主执行、`pending_tools`）的模式不补。
+- 结果上新字段（`AgentLoopResult` / `StatefulResult`）：`passed`、`pass_reason`、`new_input_after_pass`（停的那一刻有刚折进来的
+  转向输入，宿主决定要不要另起一轮）、`texts`（每一步写的文字 `[{step, text, tools}]`，不只是最后一段）。
+- 顶层导出 `request_pass`、`PASS_TURN_TOOL`。
+
+### Changed
+- 结束有两种，都正常：只写字不调工具（自然结束），或调 pass_turn（明确结束）。明确结束时最后一轮没写字，`final_text` 取最后一段写过的文字。
+- 系统提示词的工具目录里总会有 pass_turn 一行；`resolve_system_prompt` 的预览同样补上，和模型看到的一致。
+
 ## [7.2.0] — 2026-10-20
 
 - `LLMTokenUsage.cost`: the charge the provider itself reported (e.g. OpenRouter `usage.cost`), `None` when not reported.

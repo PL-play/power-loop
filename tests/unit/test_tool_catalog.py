@@ -167,9 +167,11 @@ class TestPipelineAutoInjection:
         p = _make_pipeline(registry=None)
         assert p.system_prompt == "You are an assistant."
 
-    def test_empty_registry_no_injection(self):
+    def test_empty_registry_still_gets_pass_turn(self):
+        """design/188：pass_turn 永远在——空工具表也会有它，目录里写的就是它一个。"""
         p = _make_pipeline(registry=ToolRegistry())
-        assert p.system_prompt == "You are an assistant."
+        assert p.system_prompt.startswith("You are an assistant.")
+        assert "pass_turn" in p.system_prompt and p.tool_registry.names() == ["pass_turn"]
 
     def test_default_system_prompt_gets_catalog(self):
         # When system_prompt is None, DEFAULT_AGENT_SYSTEM_PROMPT is used

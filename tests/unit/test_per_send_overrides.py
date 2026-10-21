@@ -35,7 +35,8 @@ class _Recorder(LLMService):
             (t.get("function") or {}).get("name")
             for t in (request.tools or [])
         ]
-        self.seen_tools.append([n for n in names if n])
+        # pass_turn 永远在（design/188，单独测）：这里只看业务工具
+        self.seen_tools.append([n for n in names if n and n != "pass_turn"])
         self.seen_system.append(request.system_prompt)
         self.seen_format.append(request.response_format)
         return LLMResponse(raw_text="ok")

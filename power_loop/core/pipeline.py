@@ -353,7 +353,10 @@ class AgentPipeline:
     ) -> None:
         self.llm = llm
         self.config = config
-        self.tool_registry = tool_registry
+        # design/188：pass_turn 永远在（宿主可以用同名工具覆盖说明和处理）。
+        # 没有工具表 = 工具全由宿主执行（调用原样交回，pending_tools）：那种模式不补，宿主自己处理
+        from power_loop.core.pass_turn import ensure_pass_turn
+        self.tool_registry = ensure_pass_turn(tool_registry) if tool_registry is not None else None
         self.hooks = hooks
         self.bus = bus
         self.ctx = ctx
@@ -845,6 +848,11 @@ class AgentPipeline:
                      pending_interactions: list | None = None) -> AgentLoopResult:
         self._completed_rounds = rounds  # for MemorySnapshot
         self._log_send_summary(status, rounds)
+        st = getattr(self, "_pass_state", None) or {}
+        texts = list(getattr(self, "_step_texts", []) or [])
+        # 明确结束（pass_turn）时最后一轮往往没有文字：答案取最后一段写过的文字
+        if st.get("passed") and not final_text and texts:
+            final_text = texts[-1]["text"]
         return AgentLoopResult(
             status=status,  # type: ignore[arg-type]
             final_text=final_text,
@@ -854,6 +862,10 @@ class AgentPipeline:
             messages=self.history,
             usage=dict(self.ctx.usage_totals),
             tool_calls=int(self.ctx.tool_calls),
+            passed=bool(st.get("passed")),
+            pass_reason=st.get("reason"),
+            new_input_after_pass=bool(st.get("new_input_after_pass")),
+            texts=texts,
         )
 
     async def _persist_pending_interaction(
@@ -1516,6 +1528,17 @@ class AgentPipeline:
 
     async def run(self, messages: list[LoopMessage]) -> AgentLoopResult:
         """Run the full agent loop. Returns when done, cancelled, or hit round limit."""
+        from power_loop.core import pass_turn as _pass
+
+        token = _pass.begin()          # pass_turn 的状态按 send 隔离（子 agent 内联跑也不串）
+        self._pass_state = _pass.current()
+        self._step_texts: list[dict[str, Any]] = []
+        try:
+            return await self._run(messages)
+        finally:
+            _pass.end(token)
+
+    async def _run(self, messages: list[LoopMessage]) -> AgentLoopResult:
         self.history = [dict(m) for m in messages]
         self._image_rounds = {}   # 6.12.0：本 send 新入的图片行 id(row) → round_index
         self._tok_len = -1  # SCALE-4: wholesale (re)assignment invalidates the estimate
@@ -1662,6 +1685,14 @@ class AgentPipeline:
                 drained_count = len(drained)
                 for msg in drained:
                     await self._append_message(msg, round_index=round_idx)
+
+            # ── pass_turn：上一轮调了 → 这一轮开始前硬停（design/188，不再调模型）──
+            if self._pass_state and self._pass_state.get("passed"):
+                if drained_count:
+                    # 停的这一刻有刚折进来的新输入：不撤销停，留痕交给宿主（另起一轮处理）
+                    self._pass_state["new_input_after_pass"] = True
+                await self._finalize("pass_turn")
+                return self._make_result("completed", rounds=round_idx)
 
             # ── Hook: ROUND_START ──
             round_ctx = RoundStartCtx(
@@ -1870,6 +1901,11 @@ class AgentPipeline:
             assistant_text = (getattr(response, "raw_text", "") or getattr(response, "content_text", "") or "").strip()
             tool_calls = response.get_tool_calls()
             self._emit(AgentEventType.ROUND_TOOLS_PRESENT, RoundToolsPresentPayload(has_tools=bool(tool_calls)), round_index=round_idx)
+
+            # 每一步的文字（design/188）：模型每一轮都可能写字，全部留着交给宿主（不只是最后一段）
+            if assistant_text:
+                self._step_texts.append({"step": round_idx + 1, "text": assistant_text,
+                                         "tools": [_tool_call_name(tc) for tc in (tool_calls or [])]})
 
             # Any productive round (said something OR called a tool) clears the empty streak.
             if assistant_text or tool_calls:

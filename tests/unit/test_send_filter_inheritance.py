@@ -54,8 +54,9 @@ class _Capturing(LLMService):
         on_chunk_think: Callable[[str], Any] | None = None,
         on_stream_end: Callable[[LLMResponse], Any] | None = None,
     ) -> LLMResponse:
+        # pass_turn 永远在（design/188，单独测）：这里只看业务工具
         self.seen_tools.append(
-            sorted(t["function"]["name"] for t in (request.tools or []))
+            sorted(t["function"]["name"] for t in (request.tools or []) if t["function"]["name"] != "pass_turn")
         )
         if self._idx >= len(self.responses):
             return LLMResponse(raw_text="done")
