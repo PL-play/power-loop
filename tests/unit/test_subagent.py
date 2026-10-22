@@ -155,64 +155,52 @@ def test_filtered_registry_whitelist_subset() -> None:
 
 
 @pytest.mark.asyncio
-async def test_spawn_agent_creates_child_session_and_returns_text(store: SessionStore) -> None:
-    """Parent LLM calls spawn_agent → child runs once → parent emits final."""
-    parent_llm = _Scripted(responses=[
-        _spawn_call("tc1", "summarize topic X"),
-        LLMResponse(raw_text="parent done"),
-    ])
-    child_llm_responses = [LLMResponse(raw_text="child summary")]
+async def test_spawn_agent_creates_retained_child_and_returns_async_receipt(store):
+    import asyncio
+    import json
 
-    # We share one fake LLM but advance scripted; combine queues by injecting
-    # extra responses after the spawn round. Parent sees 2 calls; child sees 1.
-    parent_llm.responses.insert(1, child_llm_responses[0])
-    # Reorder: 1st = spawn_call (parent), 2nd = child summary, 3rd = parent done
-    parent_llm.responses = [
-        _spawn_call("tc1", "summarize topic X"),
-        LLMResponse(raw_text="child summary"),
-        LLMResponse(raw_text="parent done"),
-    ]
-
-    registry = ToolRegistry()
-    register_spawn_agent(registry)
-
-    loop = StatefulAgentLoop(
-        llm=parent_llm, store=store, tool_registry=registry,
-        config=AgentLoopConfig(max_rounds=4),
-    )
+    from power_loop.core.agent_context import reset_current_loop, reset_session_id, set_current_loop, set_session_id
+    from power_loop.runtime.delegation import _TASKS
+    from power_loop.tools.spawn_agent import _handle_spawn_agent
+    loop = StatefulAgentLoop(llm=_Scripted(responses=[LLMResponse(raw_text="child summary")]),
+                             store=store, config=AgentLoopConfig(max_rounds=4))
     sid = await loop.new_session()
-    r = await loop.send("kick off", session_id=sid)
-    assert r.status == "completed"
-    assert r.final_text == "parent done"
-
-    # Child session should be EPHEMERAL-deleted on success.
-    children = await store.list_children(r.session_id)
-    assert children == []
+    tok, stok = set_current_loop(loop), set_session_id(sid)
+    try:
+        receipt = json.loads(await _handle_spawn_agent(task="summarize topic X"))
+        assert receipt["status"] == "queued" and receipt["mode"] == "create"
+        while _TASKS:
+            await asyncio.gather(*list(_TASKS))
+    finally:
+        reset_current_loop(tok)
+        reset_session_id(stok)
+    child = await store.get_session(receipt["session_id"])
+    assert child.parent_session_id == sid and child.lifecycle == SubagentLifecycle.LINKED
+    record = await store.get_runtime_state(sid, "subagent:run:" + receipt["run_id"])
+    assert record["result"]["final_text"] == "child summary"
 
 
 @pytest.mark.asyncio
-async def test_spawn_agent_honors_name_and_system_prompt_override(store: SessionStore) -> None:
-    parent_llm = _Scripted(responses=[
-        _spawn_call_kwargs("tc2", {
-            "task": "summarize this",
-            "name": "summarizer",
-            "system_prompt": "You summarize.",
-            "max_rounds": 2,
-        }),
-        LLMResponse(raw_text="child output: ok"),  # child round 1
-        LLMResponse(raw_text="parent wraps up"),    # parent round 2
-    ])
-    registry = ToolRegistry()
-    register_spawn_agent(registry)
+async def test_spawn_agent_honors_name_and_system_prompt_override(store):
+    import asyncio
+    import json
 
-    loop = StatefulAgentLoop(
-        llm=parent_llm, store=store, tool_registry=registry,
-        config=AgentLoopConfig(max_rounds=3),
-    )
-    sid = await loop.new_session()
-    r = await loop.send("go", session_id=sid)
-    assert r.status == "completed"
-    assert r.final_text == "parent wraps up"
+    from power_loop.core.agent_context import reset_current_loop, reset_session_id, set_current_loop, set_session_id
+    from power_loop.runtime.delegation import _TASKS
+    from power_loop.tools.spawn_agent import _handle_spawn_agent
+    loop = StatefulAgentLoop(llm=_Scripted(), store=store, config=AgentLoopConfig(max_rounds=3))
+    parent = await loop.new_session()
+    tok, stok = set_current_loop(loop), set_session_id(parent)
+    try:
+        receipt = json.loads(await _handle_spawn_agent(task="summarize", name="summarizer",
+                                                        system_prompt="You summarize.", max_rounds=2))
+        while _TASKS:
+            await asyncio.gather(*list(_TASKS))
+    finally:
+        reset_current_loop(tok)
+        reset_session_id(stok)
+    child = await store.get_session(receipt["session_id"])
+    assert child.system_prompt == "You summarize." and child.metadata["spec_name"] == "summarizer"
 
 
 @pytest.mark.asyncio
@@ -526,7 +514,10 @@ async def test_subagent_inherits_parent_max_tokens(store: SessionStore) -> None:
 
     parent_loop.llm = _Recording(responses=[LLMResponse(raw_text="child")])
     from power_loop.core.agent_context import (
-        reset_current_loop, reset_session_id, set_current_loop, set_session_id,
+        reset_current_loop,
+        reset_session_id,
+        set_current_loop,
+        set_session_id,
     )
     tok_loop, tok_sid = set_current_loop(parent_loop), set_session_id(sid)
     try:

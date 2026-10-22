@@ -2,7 +2,7 @@
 
 [中文](../../zh/user-guide/subagents.md) | [User Guide](../index.md)
 
-Sub-agents let the parent agent delegate tasks to specialized child agents. Each child gets its own `StatefulAgentLoop` with a custom system prompt and tool whitelist.
+Sub-agents let the parent agent delegate tasks to specialized child agents. Each child gets its own `StatefulAgentLoop` with a custom system prompt and tool whitelist. Since 8.0, the model-facing tool is always asynchronous: `action=create` creates a child and `action=nudge` continues or steers the same child. Host code can still await `run_agent_spec` synchronously.
 
 ## Two Paths
 
@@ -35,7 +35,8 @@ loop = StatefulAgentLoop(
 sid = await loop.new_session()
 result = await loop.send("Find where authentication logic is defined in this project.", session_id=sid)
 # LLM: spawn_agent(task="search for auth code", tools=["grep", "read_file", "glob"])
-# → child runs its own loop → parent gets the result
+# → immediate JSON receipt with session_id/run_id; completion arrives in the parent task_done inbox.
+# Hosts own idle-parent wake routing; the generic library persists the inbox without driving a host loop.
 ```
 
 ### Structured results: `output_schema`
@@ -48,10 +49,11 @@ a bare JSON Schema, or either one as a JSON string. The root must be `{"type": "
 - `strict` defaults to **false** here: schemas an LLM writes rarely follow strict-mode rules (every key required,
   no extra keys at any level), and a native provider rejects those with 400. Pass `"strict": true` for schemas
   that do follow them.
-- On completion the tool returns `结构化结果：{compact JSON}` when the reply parses (fences, trailing commas and
-  surrounding prose are tolerated), or `结构化结果解析失败（reason），原文：…` with up to 4000 characters of the
-  reply. The child session is deleted afterwards, so there is no repair round; the parent decides what to do.
-- A child that did not complete (round limit, stopped) is reported as before, without parsing.
+- The completion envelope contains final_text, execution status, usage and per-run messages/projection ranges. Validated structured data is in payload; invalid output is repaired once in the retained child, then reported as failed if still invalid.
+- `spawn_agent(action="nudge", sub_session="sess_...", message="additional input")` retains the original role, tool permissions and output contract. Each idle continuation gets a new run_id; running children receive steering.
+- `recall_send(sub_session="sess_...", source="messages", seq=37)` reads an original child record; `source="projection", ids=[lo,hi]` reads projections. Defaults are 20 records and an 8000-character total response budget. Follow returned cursors to continue.
+- `output_file="records/child.jsonl"` exports the full selection to a new workspace file without overwriting; omit character pagination. The response contains path/count, not the file body.
+- Fresh stores have identity projection IDs; old stores are not migrated and explicitly report ID lookup as unavailable.
 
 ## Declarative: AgentSpec
 

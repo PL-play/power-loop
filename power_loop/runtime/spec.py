@@ -273,6 +273,20 @@ def _child_config(spec: AgentSpec, parent_loop: Any) -> AgentLoopConfig:
         tool_context=context_policy,
         image_retention_rounds=getattr(parent_config, "image_retention_rounds", 1),
     )
+    # A child starts with its parent's context policy, but owns its mutable representation
+    # and per-session archive/fuse state. Hosts may resolve model-specific limits below.
+    import copy
+    context_fields = (
+        "representation", "fold_strategy", "max_context_rows", "context_budget_tokens",
+        "context_checkpoint_tokens", "insend_distill_tokens", "insend_distill_batch",
+        "insend_distill_hot_tail", "insend_distill_keep_tools", "tool_result_max_chars",
+        "microcompact_enabled", "microcompact_size_limit", "microcompact_hot_tail",
+        "microcompact_spill_dir", "context_strategy", "context_cut_tokens",
+    )
+    child_config = replace(child_config, **{
+        name: copy.copy(getattr(parent_config, name)) for name in context_fields
+        if parent_config is not None and hasattr(parent_config, name) and hasattr(child_config, name)
+    })
     # HOST config seam (subagent_config_factory, PROVISIONAL 3.14): the parent's
     # config may rewrite the child's default config — e.g. hand heavy leaves a
     # context strategy (representation/fold/microcompact). The factory's output
@@ -300,9 +314,12 @@ async def workflow_continuation_loop(parent_loop: Any, session_id: str) -> Any:
     if not isinstance(contract, dict) or contract.get("version") != 1:
         raise ValueError("leaf execution contract missing; cannot safely continue this legacy session")
     spec = AgentSpec.from_dict(contract["spec"])
+    from power_loop.core.agent_context import get_effective_tools
+    effective = get_effective_tools()
+    tools = [name for name in contract["tools"] if effective is None or name in effective]
     loop = StatefulAgentLoop(
         llm=parent_loop.llm, store=store, config=_child_config(spec, parent_loop),
-        tool_registry=filtered_registry(parent_loop.tool_registry, contract["tools"]),
+        tool_registry=filtered_registry(parent_loop.tool_registry, tools),
         hooks=parent_loop._runner.hooks, event_bus=parent_loop._runner.event_bus,
     )
     loop._child_run_guards = getattr(parent_loop, "_child_run_guards", ())
@@ -398,6 +415,7 @@ async def run_agent_spec(
             "max_tokens": child_config.max_tokens,
             "temperature": child_config.temperature,
             "model": spec.model,
+            "context_projection": child_config.projection_representation is not None,
         },
         parent_session_id=parent_sid,
         spawn_tool_call_id=spawn_tool_call_id,
@@ -406,16 +424,6 @@ async def run_agent_spec(
         # name, not the raw session UUID (subagent-coordination-3): blackboard._author reads metadata.
         metadata=child_metadata,
     )
-    # 子会话建好就告诉设了回调的那一层（6.46：workflow 引擎把「节点 → 叶子会话」记进 journal，重启后 resume 接着原会话跑）。
-    # 只告诉最外层：这次子运行期间把回调清掉，叶子自己再派的子 agent 不会被当成叶子会话。
-    _session_cb = _ON_CHILD_SESSION.get()
-    if _session_cb is not None:
-        try:
-            _r = _session_cb(child_sid)
-            if hasattr(_r, "__await__"):
-                await _r
-        except Exception:  # noqa: BLE001 — 观测回调失败不毁子运行
-            pass
 
     child_row = await store.get_session(child_sid)
     depth = child_row.spawn_depth if child_row is not None else 1
@@ -444,6 +452,18 @@ async def run_agent_spec(
         "spec": {f.name: getattr(spec, f.name) for f in fields(spec)},
         "tools": sub_registry.names() if sub_registry is not None else [],
     })
+
+    # 子会话建好就告诉设了回调的那一层（6.46：workflow 引擎把「节点 → 叶子会话」记进 journal，重启后 resume 接着原会话跑）。
+    # 只告诉最外层：这次子运行期间把回调清掉，叶子自己再派的子 agent 不会被当成叶子会话。
+    _session_cb = _ON_CHILD_SESSION.get()
+    if _session_cb is not None:
+        try:
+            _r = _session_cb(child_sid)
+            if hasattr(_r, "__await__"):
+                await _r
+        except Exception:  # noqa: BLE001 — 观测回调失败不毁子运行
+            pass
+
 
     # Build a sibling loop sharing the same store + registry-subset.
     from power_loop.agent.stateful_loop import StatefulAgentLoop
@@ -511,30 +531,31 @@ async def run_agent_spec(
                     result = replace(result, final_text=str(row.content).strip())
                     break
 
-    # ── Sub-agent lifecycle events (source="subagent", on the parent stream) ──
-    # TEXT only when the child produced an answer; LIMIT for the round-limit
-    # failure mode it specifically models; COMPLETED is the terminal marker
-    # always emitted last.
-    if result.status == "completed":
+    if not spec.metadata.get("managed_subagent"):
+        # ── Sub-agent lifecycle events (source="subagent", on the parent stream) ──
+        # TEXT only when the child produced an answer; LIMIT for the round-limit
+        # failure mode it specifically models; COMPLETED is the terminal marker
+        # always emitted last.
+        if result.status == "completed":
+            _publish_subagent_event(
+                parent_loop, parent_sid, AgentEventType.SUBAGENT_TEXT,
+                SubagentTextPayload(
+                    sub_session_id=child_sid, status=result.status,
+                    rounds=result.rounds, final_text=result.final_text or "",
+                ),
+            )
+        elif result.status in ("hit_round_limit", "context_checkpoint"):
+            _publish_subagent_event(
+                parent_loop, parent_sid, AgentEventType.SUBAGENT_LIMIT,
+                SubagentLimitPayload(sub_session_id=child_sid, max_rounds=int(spec.max_rounds)),
+            )
         _publish_subagent_event(
-            parent_loop, parent_sid, AgentEventType.SUBAGENT_TEXT,
-            SubagentTextPayload(
+            parent_loop, parent_sid, AgentEventType.SUBAGENT_COMPLETED,
+            SubagentCompletedPayload(
                 sub_session_id=child_sid, status=result.status,
                 rounds=result.rounds, final_text=result.final_text or "",
             ),
         )
-    elif result.status in ("hit_round_limit", "context_checkpoint"):
-        _publish_subagent_event(
-            parent_loop, parent_sid, AgentEventType.SUBAGENT_LIMIT,
-            SubagentLimitPayload(sub_session_id=child_sid, max_rounds=int(spec.max_rounds)),
-        )
-    _publish_subagent_event(
-        parent_loop, parent_sid, AgentEventType.SUBAGENT_COMPLETED,
-        SubagentCompletedPayload(
-            sub_session_id=child_sid, status=result.status,
-            rounds=result.rounds, final_text=result.final_text or "",
-        ),
-    )
 
     # Lifecycle cleanup.
     if spec.lifecycle == SubagentLifecycle.EPHEMERAL.value:

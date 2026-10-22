@@ -202,12 +202,13 @@ class SqliteDialect:
         p = prefix
         return [
             f"""CREATE TABLE IF NOT EXISTS {p}project_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL, send_index INTEGER NOT NULL, kind TEXT NOT NULL,
                 content_json TEXT NOT NULL, rendered_text TEXT,
                 source_seq_lo INTEGER, source_seq_hi INTEGER,
                 compact_from_send INTEGER, compact_to_send INTEGER,
                 projector_version INTEGER NOT NULL DEFAULT 0, token_estimate INTEGER,
-                created_at INTEGER NOT NULL, PRIMARY KEY (session_id, send_index, kind))""",
+                created_at INTEGER NOT NULL, UNIQUE (session_id, send_index, kind))""",
             f"CREATE INDEX IF NOT EXISTS {p}idx_project_messages_session_kind "
             f"ON {p}project_messages(session_id, kind, send_index)",
         ]
@@ -413,12 +414,13 @@ class PostgresDialect:
         p = prefix
         return [
             f"""CREATE TABLE IF NOT EXISTS {p}project_messages (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 session_id TEXT NOT NULL, send_index BIGINT NOT NULL, kind TEXT NOT NULL,
                 content_json TEXT NOT NULL, rendered_text TEXT,
                 source_seq_lo BIGINT, source_seq_hi BIGINT,
                 compact_from_send BIGINT, compact_to_send BIGINT,
                 projector_version BIGINT NOT NULL DEFAULT 0, token_estimate BIGINT,
-                created_at BIGINT NOT NULL, PRIMARY KEY (session_id, send_index, kind))""",
+                created_at BIGINT NOT NULL, UNIQUE (session_id, send_index, kind))""",
             f"CREATE INDEX IF NOT EXISTS {p}idx_project_messages_session_kind "
             f"ON {p}project_messages(session_id, kind, send_index)",
         ]
@@ -591,12 +593,13 @@ class MySQLDialect:
         opts = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
         return [
             f"""CREATE TABLE IF NOT EXISTS {p}project_messages (
+                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
                 session_id VARCHAR(255) NOT NULL, send_index BIGINT NOT NULL, kind VARCHAR(32) NOT NULL,
                 content_json LONGTEXT NOT NULL, rendered_text LONGTEXT,
                 source_seq_lo BIGINT, source_seq_hi BIGINT,
                 compact_from_send BIGINT, compact_to_send BIGINT,
                 projector_version BIGINT NOT NULL DEFAULT 0, token_estimate BIGINT,
-                created_at BIGINT NOT NULL, PRIMARY KEY (session_id, send_index, kind),
+                created_at BIGINT NOT NULL, UNIQUE KEY (session_id, send_index, kind),
                 KEY {p}idx_project_messages_session_kind (session_id, kind, send_index)) {opts}""",
         ]
 

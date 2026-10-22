@@ -234,6 +234,7 @@ class ProjectMessageRow:
     projector_version: int
     token_estimate: int | None
     created_at: int
+    id: int | None = None  # absent on legacy stores; never fabricate external coordinates
 
 
 @dataclass

@@ -483,6 +483,65 @@ class SessionStore:
         )
         return [_row_to_message(r) for r in rows]
 
+    async def history_records(
+        self, session_id: str, *, source: str = "messages", lo: int = 0,
+        hi: int | None = None, after: int = 0, limit: int = 20,
+        send_index: int | None = None, _fetchall: Any = None,
+    ) -> list[dict[str, Any]]:
+        """Bounded, session-scoped audit read. Never substitute active history for originals."""
+        if source not in {"messages", "projection"}:
+            raise ValueError("source must be messages or projection")
+        from dataclasses import asdict
+
+        table = self.t.messages if source == "messages" else self.t.project_messages
+        coord = "seq" if source == "messages" else "id"
+        if source == "projection" and _fetchall is None:
+            from power_loop.runtime.store.schema import _column_exists
+            async with self._db.transaction() as tx:
+                if not await _column_exists(tx, self._db.dialect.name, table, "id"):
+                    raise ValueError("projection_ids_unavailable: legacy schema; no migration performed")
+        where = f"session_id=? AND {coord}>=? AND {coord}>?"
+        params: list[Any] = [session_id, lo, after]
+        if hi is not None:
+            where += f" AND {coord}<=?"
+            params.append(hi)
+        if send_index is not None:
+            where += " AND send_index=?"
+            params.append(send_index)
+        rows = await (_fetchall or self._db.fetchall)(
+            f"SELECT * FROM {table} WHERE {where} ORDER BY {coord} ASC LIMIT ?",
+            (*params, max(1, min(limit, 1000))),
+        )
+        decode = _row_to_message if source == "messages" else _row_to_project_message
+        return [asdict(decode(r)) for r in rows]
+
+    async def history_bounds(
+        self, session_id: str, *, source: str = "messages", after_seq: int | None = None,
+    ) -> list[int] | None:
+        """Coordinates for one execution's tail, including all its repair sends."""
+        if source == "messages":
+            row = await self._db.fetchone(
+                f"SELECT min(seq) AS lo, max(seq) AS hi FROM {self.t.messages} "
+                "WHERE session_id=? AND seq>?", (session_id, after_seq or 0),
+            )
+        elif source == "projection":
+            from power_loop.runtime.store.schema import _column_exists
+            async with self._db.transaction() as tx:
+                if not await _column_exists(tx, self._db.dialect.name, self.t.project_messages, "id"):
+                    raise ValueError("projection_ids_unavailable: legacy schema")
+            where = "session_id=?"
+            params: tuple[Any, ...] = (session_id,)
+            if after_seq is not None:
+                where += " AND kind IN ('user','project') AND source_seq_hi>?"
+                params += (after_seq,)
+            row = await self._db.fetchone(
+                f"SELECT min(id) AS lo, max(id) AS hi FROM {self.t.project_messages} "
+                f"WHERE {where}", params,
+            )
+        else:
+            raise ValueError("source must be messages or projection")
+        return [int(row["lo"]), int(row["hi"])] if row and row["lo"] is not None else None
+
     async def get_message(self, session_id: str, seq: int) -> MessageRow | None:
         row = await self._db.fetchone(
             f"SELECT * FROM {self.t.messages} WHERE session_id=? AND seq=?", (session_id, seq)
@@ -1928,7 +1987,7 @@ def _row_to_project_message(row: Row) -> ProjectMessageRow:
         source_seq_lo=row["source_seq_lo"], source_seq_hi=row["source_seq_hi"],
         compact_from_send=row["compact_from_send"], compact_to_send=row["compact_to_send"],
         projector_version=row["projector_version"], token_estimate=row["token_estimate"],
-        created_at=row["created_at"],
+        created_at=row["created_at"], id=int(row["id"]) if "id" in row.keys() else None,
     )
 
 

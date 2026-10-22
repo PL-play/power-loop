@@ -8,6 +8,24 @@
 
 ## [Unreleased]
 
+## [8.0.0] — 2026-10-22
+
+### Breaking changes (design/191)
+- Public `register_spawn_agent` / `SPAWN_AGENT_DEFINITION`: model-visible calls are always
+  asynchronous, return JSON acceptance receipts and later durable task_done results, default to
+  linked child sessions, and accept `action=create|nudge`. Host code can still synchronously await
+  the unchanged `run_agent_spec` mechanism. Nudge retains the original child execution contract.
+- New stores use an identity primary key on project_messages and preserve the existing
+  session/send/kind unique key. No old-store migration/backfill is performed. Legacy projections
+  still render; ID-based recall reports that the old schema has no IDs.
+- `recall_send` supports authorized direct children, projection IDs, bounded record/character
+  pagination (20 records, 8000 text characters by default), and exclusive streamed JSONL export.
+  Large legacy send maps now use the bounded JSON listing instead of an unbounded text map.
+- Child sessions inherit context policies and write end-of-send projections even without a fuse.
+  Subagent results carry per-execution message/projection ranges; only final_text is shortened
+  by their tool-context representation. Standalone subagents participate in jobs list/stop.
+
+
 ## [7.3.0] — 2026-10-21
 
 ### Added

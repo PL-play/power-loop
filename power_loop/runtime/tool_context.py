@@ -237,6 +237,11 @@ class ToolContextEngine:
 
     async def distill(self, source: ToolSource, trigger: Trigger, *, policy_override=None) -> str | None:
         """Return summary including engine-owned recall, or None to preserve arguments+result."""
+        if source.name == 'spawn_agent':
+            from power_loop.runtime.delegation import result_view
+            view = result_view(source.result, self.policy(source).result_max_chars or 600)
+            if view is not None:
+                return view
         if source.name == 'background_run':
             return await self._background(source, trigger)
         policy = policy_override or self.policy(source)

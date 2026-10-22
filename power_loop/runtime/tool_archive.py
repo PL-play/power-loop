@@ -85,6 +85,11 @@ async def _derive(engine, source, trigger, level, raw_arguments=None):
     if (trigger != 'general' and source.name == 'bash'
             and source.arguments.get('context_policy') == 'keep'):
         return None
+    if source.name == 'spawn_agent':
+        from power_loop.runtime.delegation import result_view
+        view = result_view(source.result, policy.result_max_chars or 600)
+        if view is not None:
+            return _json(dict(source.arguments)), view
     if strategy == 'preserve':
         return None
     if strategy == 'archive':
@@ -412,6 +417,13 @@ async def prepare_projection(engine, projected, rows, send_index):
             if source is None or e.get('name') == '__user__':
                 continue
             policy = engine.policy(source)
+            if source.name == 'spawn_agent':
+                from power_loop.runtime.delegation import result_view
+                view = result_view(source.result, policy.result_max_chars or 600)
+                if view is not None:
+                    e['s'] = view
+                    e.pop('result', None)
+                    continue
             if policy.hard_preserve or policy.general == 'rule':
                 continue
             if policy.general == 'preserve':

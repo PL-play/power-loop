@@ -1,18 +1,7 @@
-"""spawn_agent — the meta-tool the LLM uses to delegate work.
+"""Asynchronous create/nudge meta-tool with durable child completion results.
 
-A single imperative flavour of subagent invocation on top of
-:func:`power_loop.runtime.spec.run_agent_spec`: simple kwargs
-(``task`` plus optional ``name`` / ``system_prompt`` / ``tools`` /
-``max_rounds`` / ``output_schema``), the library builds an :class:`AgentSpec`
-with sensible defaults. With ``output_schema`` the child is asked for one JSON
-object and the tool returns it parsed (design/126 §2). The former declarative
-``run_agent`` (full AgentSpec JSON) was merged into this tool in 4.0.0 —
-``system_prompt`` was its only capability that mattered in practice; hosts
-that need a fully declarative spec call :func:`run_agent_spec` directly.
-
-The tool requires an active :class:`StatefulAgentLoop` context (set by
-:meth:`StatefulAgentLoop._run_loop`). Calling it outside one returns a
-clear error string.
+Host code may synchronously await run_agent_spec. Model-visible calls always return
+acceptance receipts and deliver results to the parent's durable task_done inbox.
 """
 
 from __future__ import annotations
@@ -26,7 +15,6 @@ from power_loop.runtime.spec import (
     AgentSpec,
     AgentSpecError,
     normalize_output_schema,
-    run_agent_spec,
 )
 from power_loop.runtime.structured import StructuredOutputError, parse_structured
 
@@ -35,18 +23,23 @@ DEFAULT_MAX_ROUNDS = 20
 SPAWN_AGENT_DEFINITION = ToolDefinition(
     name="spawn_agent",
     description=(
-        "Spawn a sub-agent to handle a delegated task in an isolated session "
-        "and return its final text. The sub-agent inherits the parent's tool "
-        "registry (filterable via the 'tools' arg); give it a custom persona "
-        "via 'system_prompt' when the default task-completion prompt isn't "
-        "enough."
+        "Delegate work in an isolated child session, always asynchronously. create (default) "
+        "starts a task; nudge continues the same child or steers it if running. "
+        "Returns session_id/run_id and acceptance, not completion. Results arrive in your "
+        "task_done inbox with final_text, status, usage and messages/projection ranges. "
+        "Read them with recall_send(sub_session=session_id, source='messages'|'projection', "
+        "ids=the_range). You may pass_turn while waiting."
     ),
     input_schema={
         "type": "object",
         "properties": {
+            "action": {"type": "string", "enum": ["create", "nudge"], "default": "create",
+                       "description": "create needs task; nudge needs sub_session and message and retains the original execution contract."},
+            "sub_session": {"type": "string", "description": "nudge only: direct child's session_id from a previous receipt; deleted children cannot continue."},
+            "message": {"type": "string", "description": "nudge only: correction, additional input or follow-up question."},
             "task": {
                 "type": "string",
-                "description": "The task description / instructions for the sub-agent.",
+                "description": "create requires task: clear instructions, input locations and expected result.",
             },
             "name": {
                 "type": "string",
@@ -79,9 +72,9 @@ SPAWN_AGENT_DEFINITION = ToolDefinition(
                 ),
             },
         },
-        "required": ["task"],
+        "required": [],
     },
-    required_params=("task",),
+    required_params=(),
     # design/124 §7.3: a sub-agent is long, useful work — a steer moves it to the background
     # (its result is delivered when it finishes) instead of killing it or blocking the turn.
     interrupt="background",
@@ -104,6 +97,20 @@ async def _handle_spawn_agent(**kwargs: Any) -> str:
             "Error: spawn_agent must be invoked from inside an active "
             "StatefulAgentLoop run."
         )
+    action = kwargs.get("action", "create")
+    if action == "nudge":
+        from power_loop.runtime.delegation import nudge
+        sid, message = str(kwargs.get("sub_session") or "").strip(), str(kwargs.get("message") or "").strip()
+        if not sid or not message:
+            return "Error: nudge requires sub_session and message."
+        if any(k in kwargs for k in ("task", "name", "system_prompt", "tools", "max_rounds", "output_schema")):
+            return "Error: nudge retains the original contract; provide only sub_session and message."
+        try:
+            return json.dumps(await nudge(loop, sid, message, finalize=lambda sid, raw: _finalize(loop, sid, raw)), ensure_ascii=False)
+        except ValueError as exc:
+            return "Error: " + str(exc)
+    if action != "create":
+        return "Error: action must be create or nudge."
     task = str(kwargs.get("task") or "").strip()
     if not task:
         return "Error: spawn_agent requires 'task'."
@@ -125,13 +132,50 @@ async def _handle_spawn_agent(**kwargs: Any) -> str:
             tools=kwargs.get("tools"),
             max_rounds=int(kwargs.get("max_rounds") or DEFAULT_MAX_ROUNDS),
             output_schema=output_schema,
+            lifecycle="linked",
         )
     except AgentSpecError as exc:
         return f"Error: spawn_agent 参数有误，子 agent 没有启动：{exc}"
-    result = await run_agent_spec(spec, task, parent_loop=loop)
-    if output_schema is not None and result.get("status") == "completed":
-        return _format_structured_result(result.get("final_text") or "", output_schema["schema"])
-    return _format_subagent_result(result)
+    from power_loop.runtime.delegation import start
+    try:
+        result = await start(loop, spec, task, finalize=lambda sid, raw: _finalize(loop, sid, raw))
+        return json.dumps(result, ensure_ascii=False)
+    except ValueError as exc:
+        return "Error: " + str(exc)
+
+
+async def _finalize(loop, sid, raw):
+    from power_loop.runtime.spec import workflow_continuation_loop
+    store = await loop.ensure_store()
+    contract = await store.get_runtime_state(sid, "workflow_execution_contract")
+    schema = contract["spec"].get("output_schema")
+    if schema is None or raw.get("status") != "completed":
+        return raw
+    result = dict(raw)
+    for attempt in range(2):
+        try:
+            result["payload"] = parse_structured(result.get("final_text") or "", schema=schema["schema"])
+            return result
+        except StructuredOutputError as exc:
+            result["error"] = "structured_output: " + exc.reason
+        if attempt == 0 and str(result.get("final_text") or "").strip():
+            child = await workflow_continuation_loop(loop, sid)
+            import contextlib
+            with contextlib.ExitStack() as guards:
+                for _, guard in getattr(loop, "_child_run_guards", ()):
+                    guards.enter_context(guard())
+                repaired = await child.send("Rewrite the previous answer as the requested JSON object. Do not gather new facts.",
+                                            session_id=sid, tools=[], max_rounds=1)
+            result["final_text"] = repaired.final_text
+            result["rounds"] += repaired.rounds
+            usage = dict(result.get("usage") or {})
+            for name, value in (repaired.usage or {}).items():
+                usage[name] = usage.get(name, 0) + value
+            result["usage"] = usage
+        else:
+            break
+    result["status"] = "failed"
+    return result
 
 
 def _format_subagent_result(result: dict[str, Any]) -> str:

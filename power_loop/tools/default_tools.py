@@ -2254,9 +2254,11 @@ RECALL_SEND_TOTAL_CHARS = 12_000
 RECALL_SEND_MIN_ROW_CHARS = 240
 
 
-async def run_recall_send(send_index: int, seq: int | None = None, *, group_id: str | None = None,
-                          offset: int = 0, limit: int = 10, item: int | None = None,
-                          char_offset: int = 0, char_limit: int = 20000) -> str:
+async def run_recall_send(send_index: int | None = None, seq: int | None = None, *, sub_session: str | None = None,
+                          source: str = "messages", ids: list[int] | None = None, id: int | None = None,
+                          cursor: str | None = None, output_file: str | None = None, group_id: str | None = None,
+                          offset: int = 0, limit: int = 20, item: int | None = None,
+                          char_offset: int | None = None, char_limit: int | None = None) -> str:
     """Re-expand one past send the send-context projection summarized.
 
     When ``AgentLoopConfig.history_projector`` is set, finished sends appear in context as a
@@ -2269,6 +2271,28 @@ async def run_recall_send(send_index: int, seq: int | None = None, *, group_id: 
     ctx = get_tool_runtime_context(required=True)
     store, sid = ctx.store, ctx.session_id
     assert store is not None and sid is not None  # required=True guarantees this
+
+    if group_id is not None and (source != "messages" or ids is not None or id is not None
+                                 or cursor is not None or output_file is not None):
+        return "Error: group_id requires messages/send_index; use record ids for export or projection."
+    if group_id is None and (sub_session is not None or source != "messages" or ids is not None
+                             or id is not None or send_index is None or cursor or output_file):
+        from power_loop.runtime.recall import recall
+        return await recall(store, sid, sub_session=sub_session, source=source, ids=ids, seq=seq,
+                            id=id, send_index=send_index, cursor=cursor, limit=limit,
+                            char_offset=char_offset, char_limit=char_limit, output_file=output_file)
+    if sub_session is not None:
+        from power_loop.runtime.recall import authorize
+        try:
+            sid, unavailable = await authorize(store, sid, sub_session)
+            if unavailable:
+                return json.dumps({"status": "unavailable", "reason": unavailable})
+        except ValueError as exc:
+            return json.dumps({"status": "error", "error": str(exc)})
+    char_offset = char_offset or 0
+    char_limit = 8000 if char_limit is None else char_limit
+    if char_offset < 0 or not 256 <= char_limit <= 32000 or not 1 <= limit <= 100:
+        return "Error: invalid pagination (limit 1–100; char_limit 256–32000; offset >= 0)."
 
     try:
         target = int(send_index)
@@ -2283,6 +2307,9 @@ async def run_recall_send(send_index: int, seq: int | None = None, *, group_id: 
     if not rows:
         return f"No messages found for send #{target} in this session."
 
+    if seq is None and (len(rows) > limit or sum(len(str(r.content or "")) for r in rows) > char_limit):
+        from power_loop.runtime.recall import recall
+        return await recall(store, sid, send_index=target, limit=limit, char_limit=char_limit)
     if seq is not None:
         try:
             want = int(seq)
@@ -2298,7 +2325,7 @@ async def run_recall_send(send_index: int, seq: int | None = None, *, group_id: 
         if char_offset or engine is not None:
             from power_loop.runtime.tool_archive import recall_original
             return await recall_original(store, sid, target, hit, char_offset, char_limit)
-        return _render_recall_row(hit, rows, cap=RECALL_SEND_ROW_CHARS, head=f"send #{target} · seq {want}")
+        return _render_recall_row(hit, rows, cap=min(char_limit, RECALL_SEND_ROW_CHARS), head=f"send #{target} · seq {want}")
 
     def _tc_name(tc: dict[str, Any]) -> str:
         # ``function`` is normally a dict, but a malformed/imported tool_call can carry a
@@ -2503,9 +2530,7 @@ async def _h_recall_compacted(**kw: Any) -> Any:
 
 
 async def _h_recall_send(**kw: Any) -> Any:
-    return await run_recall_send(kw["send_index"], kw.get("seq"), group_id=kw.get("group_id"),
-                                 offset=kw.get("offset", 0), limit=kw.get("limit", 10), item=kw.get("item"),
-                                 char_offset=kw.get("char_offset", 0), char_limit=kw.get("char_limit", 20000))
+    return await run_recall_send(**kw)
 
 
 async def _h_background_run(**kw: Any) -> Any:

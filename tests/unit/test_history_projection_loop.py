@@ -247,7 +247,7 @@ async def test_identity_projector_matches_verbatim(store: SessionStore) -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_session_not_projected(store: SessionStore) -> None:
+async def test_child_session_projected_without_tool_context(store: SessionStore) -> None:
     llm = _Scripted(responses=[LLMResponse(raw_text="child done")])
     loop = _projector_loop(store, llm, DefaultDeterministicProjector())
     parent = await store.create_session()
@@ -257,7 +257,7 @@ async def test_child_session_not_projected(store: SessionStore) -> None:
     )
     await loop.send("go", session_id=child)
     # The writer skips child sub-agent sessions (by parent_session_id, not scope).
-    assert await store.load_project_messages(child) == []
+    assert {(r.send_index, r.kind) for r in await store.load_project_messages(child)} == {(1, "user"), (1, "project")}
 
 
 @pytest.mark.asyncio

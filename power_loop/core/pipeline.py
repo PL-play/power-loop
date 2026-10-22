@@ -2338,8 +2338,13 @@ class AgentPipeline:
                                                     tool_call_id=call_id, failed=failed),
                            round_index=round_idx)
 
+                stored_output = _truncate_result(output, self.config.tool_result_max_chars)
+                if tool_name == "spawn_agent":
+                    from power_loop.runtime.delegation import result_view
+                    # Structured receipts/results cannot be cut through their metadata or JSON.
+                    stored_output = result_view(str(output), self.config.tool_result_max_chars or 20000) or stored_output
                 await self._append_message(
-                    {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": _truncate_result(output, self.config.tool_result_max_chars)},
+                    {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": stored_output},
                     round_index=round_idx,
                 )
 

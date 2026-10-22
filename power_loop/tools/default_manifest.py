@@ -315,30 +315,33 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
         name="recall_send",
         description=(
-            "Re-expand an earlier send shown in your context only as a compact summary. Each "
-            "summarized tool line carries a coordinate «#N·sS» (send_index N, row seq S). To get "
-            "ONE original tool result in full (a file you read, a skill you loaded, a vision answer, "
-            "a command's output), call recall_send(send_index=N, seq=S) — that returns just that row "
-            "with a large cap. Without seq you get a MAP of send #N — every row with its seq, "
-            "bodies trimmed to fit one small budget; use it to FIND the coordinate, then call again "
-            "with seq. Read-only, current session."
+            "Read stored messages or projections from your session or a direct child. "
+            "Use sub_session from spawn_agent; source='messages' with seq=N reads one original, "
+            "source='projection' with id=N reads one projection; ids=[lo,hi] lists a range. "
+            "Defaults: 20 records, 8000 characters; follow next_cursor for lists or "
+            "next_char_offset for one record. output_file exports all selected stored records "
+            "as JSONL to a NEW workspace file and returns only its path/count. Never re-executes tools."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "send_index": {"type": "integer", "description": "The #N of the past send."},
-                "char_offset": {"type": "integer", "minimum": 0, "description": "Original JSON character page offset. Follow next_char_offset until null."},
-                "char_limit": {"type": "integer", "minimum": 1, "maximum": 100000, "description": "Maximum characters per original JSON page; default 20000."},
-                "group_id": {"type": "string", "description": "Archived group ID; omit item to list exact members."},
-                "offset": {"type": "integer", "minimum": 0},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                "item": {"type": "integer", "minimum": 0, "description": "Zero-based group item; restores original arguments and result, never executes it."},
-                "seq": {"type": "integer", "description": "Optional: the sS row coordinate from a summary line → return that single row in full."},
+                "sub_session": {"type": "string", "description": "Direct child session_id from spawn_agent. Omit for your own session; ownership is checked."},
+                "source": {"type": "string", "enum": ["messages", "projection"], "default": "messages", "description": "messages=original records (seq); projection=stored summaries (id)."},
+                "ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 2, "maxItems": 2, "description": "Inclusive [start,end] from the completion result's messages or projection field. Do not combine with seq/id/send_index."},
+                "seq": {"type": "integer", "minimum": 1, "description": "One original message; source=messages. send_index is optional."},
+                "id": {"type": "integer", "minimum": 1, "description": "One projection record; requires source=projection."},
+                "send_index": {"type": "integer", "minimum": 1, "description": "Existing #N send coordinate. Selects its records; may combine with seq, not ids."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "Maximum listed records per page, also bounded by char_limit. File export includes the full selection."},
+                "cursor": {"type": "string", "description": "next_cursor from a list; repeat the same session/source/selection."},
+                "char_offset": {"type": "integer", "minimum": 0, "description": "For one record: next_char_offset (default 0)."},
+                "char_limit": {"type": "integer", "minimum": 256, "maximum": 32000, "description": "Total text budget per response, default 8000; not per listed record."},
+                "output_file": {"type": "string", "description": "Export full selected records as UTF-8 JSONL to this new workspace-relative path; existing files are refused. Omit cursor/char_offset/char_limit."},
+                "group_id": {"type": "string", "description": "Existing archived group; requires send_index. Omit item to list members."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Archived group member offset, default 0."},
+                "item": {"type": "integer", "minimum": 0, "description": "Archived group member index; requires group_id and send_index."},
             },
-            "required": ["send_index"],
         },
-        required_params=("send_index",),
-        # 可异步：只读：回看本会话的历史行（design/95）
+        required_params=(),
         async_capable=True,
     ),
     ToolDefinition(

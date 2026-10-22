@@ -1302,6 +1302,8 @@ class StatefulAgentLoop:
                              "title": str(w.get("workflow") or "")[:80],
                              "status": "running" if is_run_live(rid) else "orphaned",
                              "started_at": ts, "origin": _origin(ts)})
+        from power_loop.runtime.delegation import running_jobs
+        jobs.extend(running_jobs(store, session_id))
         for tm in await store.list_timers(session_id, statuses=("armed",)):
             jobs.append({"id": f"timer:{tm.timer_id}", "kind": "timer",
                          "title": str(tm.note or "")[:80], "status": "armed",
@@ -1343,6 +1345,9 @@ class StatefulAgentLoop:
                     result = "stopped"
         elif kind == "wf" and ref:
             result = await stop_run(ref, grace_s=pol.workflow_s, reason="stopped")
+        elif kind == "sub" and ref:
+            from power_loop.runtime.delegation import stop
+            result = await stop(store, session_id, ref, pol.workflow_s)
         elif kind == "timer" and ref.isdigit():
             result = "stopped" if await self.cancel_timer(session_id, int(ref)) else "finished"
         return {"id": job_id, "result": result}
@@ -2407,14 +2412,10 @@ class StatefulAgentLoop:
     ) -> None:
         """Project the just-finished send's ``pl_messages`` rows into ``pl_project_messages`` (v2).
 
-        Skips sub-agent CHILD sessions (their transcript lives in their own pl_session) by
-        ``parent_session_id`` — NOT ``scope``, which ``_finalize`` hardcodes to ``'main'`` even
-        for children. Defers on a still-in-flight status (the resume re-finalizes under the SAME
+        Includes child sessions regardless of their tool-context/fuse setting.
+        Defers on a still-in-flight status (the resume re-finalizes under the SAME
         ``send_index``; the idempotent UPSERT then overwrites). Best-effort — the caller swallows
         failures, since ``pl_messages`` remains the source of truth."""
-        if (session_row is not None and session_row.parent_session_id is not None
-                and self.config.tool_context is None):
-            return  # legacy behavior; policy-enabled children prepare their own context
         if status in ("waiting_for_input", "pending_tools"):
             return  # send not finished; the resume will re-finalize under the same send_index
         # 只取本 send 的行：这里要投影的就是这一个 send，从前是读全表再在 Python 里过滤，

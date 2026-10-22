@@ -2,7 +2,7 @@
 
 [English](../../en/user-guide/subagents.md) | [用户手册](../index.md)
 
-子代理让父 Agent 将任务委托给专门的子 Agent。每个子代理拥有独立的 `StatefulAgentLoop` 和自定义 system prompt、工具白名单。
+子代理让父 Agent 将任务委托给专门的子 Agent。8.0 起模型侧 `spawn_agent` 始终异步，`action=create` 创建、`action=nudge` 在原有子会话续跑或插话；宿主同步机制 `run_agent_spec` 仍保留。每个子代理拥有独立的 `StatefulAgentLoop` 和自定义 system prompt、工具白名单。
 
 ## 两种路径
 
@@ -35,7 +35,8 @@ loop = StatefulAgentLoop(
 sid = await loop.new_session()
 result = await loop.send("找到项目中的认证逻辑代码。", session_id=sid)
 # LLM: spawn_agent(task="搜索认证代码", tools=["grep", "read_file", "glob"])
-# → 子代理跑自己的循环 → 父代理拿到结果
+# → 立即返回 session_id/run_id 接收回执；子代理完成后结果进入父的 task_done 收件箱。
+# 空闲父会话的自动唤醒由宿主接线；通用库只持久入箱，不擅自驱动宿主会话。
 ```
 
 ### 结构化结果：`output_schema`
@@ -47,9 +48,11 @@ result = await loop.send("找到项目中的认证逻辑代码。", session_id=s
   `response_format: json_schema`，否则写进那一次请求的 system prompt。
 - 这里 `strict` 默认 **false**：LLM 自己写的 schema 很少符合 strict 规范（每层所有键必填、禁止多余字段），
   原生服务端遇到会直接 400。确实符合规范的 schema 可以写 `"strict": true`。
-- 子代理完成后：解析成功返回 `结构化结果：{紧凑 JSON}`（容忍代码围栏、尾逗号、前后的说明文字）；失败返回
-  `结构化结果解析失败（原因），原文：…`，原文最多 4000 字。子会话用完即删，所以不做修复轮，由主代理决定怎么办。
-- 子代理没正常完成（撞轮数、被停止）时照旧返回状态和原文，不去解析。
+- 子代理完成结果为结构化信封，包含 `final_text`、状态、`usage`、本次 `messages`/`projection` 范围；成功的结构化数据在 `payload` 中，失败附原因。默认 linked 保留子会话，修复和续跑使用同一上下文。
+- `spawn_agent(action="nudge", sub_session="sess_...", message="补充指令")` 始终异步；运行中是插话，空闲时是新 run，保留原角色、工具和输出约束。
+- `recall_send(sub_session="sess_...", source="messages", seq=37)` 可直接查子消息；`source="projection", ids=[lo,hi]` 查投影。默认 20 条、总字符预算 8000，继续读取按返回的游标。
+- `output_file="records/child.jsonl"` 将选中完整已存记录导出到新文件，不覆盖，不再向上下文返回正文；省略字符分页参数。
+- 新建投影表有自增 ID；不迁移旧数据。旧结构只能继续渲染，按 ID 查询明确报告不可用。
 
 ## 声明式：AgentSpec
 

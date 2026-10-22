@@ -180,13 +180,13 @@ async def test_recall_send_seq_returns_single_row_in_full_with_its_call(store):
     rows = await store.load_all_messages(sid)
     tool_seq = next(r.seq for r in rows if r.role == "tool")
     with _active(store, sid):
-        out = await run_recall_send(1, tool_seq)
+        out = await run_recall_send(1, tool_seq, char_limit=20000)
         assert out.startswith(f"send #1 · seq {tool_seq} — original row ({len(big)} chars)")
         assert "[seq 2 · assistant call · load_skill]" in out and '{"name": "x"}' in out
         assert big in out  # NOT cut at 2000
         # send-level view still caps each body
         whole = await run_recall_send(1)
-        assert big not in whole and "…[truncated:" in whole
+        assert big not in whole and '"truncated":true' in whole
         # wrong seq → says the span, doesn't guess
         bad = await run_recall_send(1, 999)
         assert bad.startswith("No row seq 999 in send #1") and "span seq" in bad
@@ -208,22 +208,14 @@ async def test_recall_send_seq_caps_huge_row_and_counts_remainder(store, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_send_level_listing_fits_one_budget(monkeypatch, tmp_path):
-    """列整份 send 是「地图」不是「载荷」。真实日志里不带 seq 的调用平均 31.5K 字符、带 seq 的
-    1.5K——找一样东西的目录比东西本身还贵。所以整份列表共用一个预算：行全在（连同 seq 坐标和
-    真实体量），正文一起缩到放得下。"""
-    from power_loop.tools import default_tools as dt
-
-    rows = [
-        SimpleNamespace(send_index=3, seq=s, role="tool", name=f"t{s}", round_index=1,
-                        tool_calls=None, tool_call_id=None, content="x" * 9000, meta=None)
-        for s in range(1, 9)
-    ]
-    store = SimpleNamespace(load_all_messages=_amake(rows))
-    monkeypatch.setattr(dt, "get_tool_runtime_context",
-                        lambda **_: SimpleNamespace(store=store, session_id="s1"))
-
-    out = await dt.run_recall_send(3)
-    assert len(out) < dt.RECALL_SEND_TOTAL_CHARS * 1.6          # 一个预算，不是 8×9000
-    assert all(f"[seq {s} ·" in out for s in range(1, 9))       # 每一行都还在
-    assert "seq=1" in out and "9000 chars" in out               # 坐标 + 真实体量都给了
+async def test_send_level_listing_fits_one_budget(store):
+    import json
+    sid = await store.create_session()
+    for i in range(8):
+        await store.append_message(sid, role="tool", content="x" * 9000, name=f"t{i}", send_index=3)
+    with _active(store, sid):
+        out = await run_recall_send(3)
+    data = json.loads(out)
+    assert len(out) < 8000
+    assert [r["seq"] for r in data["records"]] == list(range(1, 9))
+    assert all(r["truncated"] and r["total_chars"] > 9000 for r in data["records"])

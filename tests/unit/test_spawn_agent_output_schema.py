@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -31,13 +32,11 @@ from power_loop.runtime.spec import (
     run_agent_spec,
 )
 from power_loop.runtime.store.store import MAX_SPAWN_DEPTH
-from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import (
     _RAW_TEXT_CAP,
     SPAWN_AGENT_DEFINITION,
     _format_structured_result,
     _handle_spawn_agent,
-    register_spawn_agent,
 )
 from power_loop.workflow import WorkerBootstrap, run_spec_isolated
 
@@ -92,7 +91,15 @@ async def _call_tool(loop: StatefulAgentLoop, parent_sid: str, **kwargs: Any) ->
     tok_loop = set_current_loop(loop)
     tok_sid = set_session_id(parent_sid)
     try:
-        return await _handle_spawn_agent(**kwargs)
+        out = await _handle_spawn_agent(**kwargs)
+        if out.startswith("Error:"):
+            return out
+        receipt = json.loads(out)
+        from power_loop.runtime.delegation import _TASKS
+        while _TASKS:
+            await asyncio.gather(*list(_TASKS))
+        record = await (await loop.ensure_store()).get_runtime_state(parent_sid, "subagent:run:" + receipt["run_id"])
+        return json.dumps(record["result"], ensure_ascii=False)
     finally:
         reset_current_loop(tok_loop)
         reset_session_id(tok_sid)
@@ -106,7 +113,7 @@ def test_tool_schema_exposes_optional_output_schema() -> None:
     assert props["output_schema"]["type"] == "object"
     assert "JSON Schema" in props["output_schema"]["description"]
     assert "output_schema" not in SPAWN_AGENT_DEFINITION.input_schema["required"]
-    assert SPAWN_AGENT_DEFINITION.required_params == ("task",)
+    assert SPAWN_AGENT_DEFINITION.required_params == ()
 
 
 # ── normalization ───────────────────────────────────────────────────────
@@ -192,7 +199,7 @@ async def test_child_request_carries_non_strict_response_format(store: SessionSt
     rf = llm.seen[0].response_format
     assert rf == {"type": "json_schema", "json_schema": {"name": "Output", "schema": LABEL_SCHEMA}}
     assert "strict" not in rf["json_schema"]
-    assert out == '结构化结果：{"label":"紧急"}'
+    assert json.loads(out)["payload"] == {"label": "紧急"}
 
 
 @pytest.mark.asyncio
@@ -215,7 +222,7 @@ async def test_structured_success_from_fenced_prose(store: SessionStore) -> None
     loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
     parent = await loop.new_session()
     out = await _call_tool(loop, parent, task="classify", output_schema=LABEL_SCHEMA)
-    assert out == '结构化结果：{"label":"urgent","score":3}'
+    assert json.loads(out)["payload"] == {"label": "urgent", "score": 3}
 
 
 @pytest.mark.asyncio
@@ -224,7 +231,8 @@ async def test_structured_failure_returns_reason_and_text(store: SessionStore) -
     loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
     parent = await loop.new_session()
     out = await _call_tool(loop, parent, task="classify", output_schema=LABEL_SCHEMA)
-    assert out == "结构化结果解析失败（回复里没有 JSON 对象），原文：这张工单很紧急"
+    assert json.loads(out)["status"] == "failed"
+    assert "structured_output" in json.loads(out)["error"]
 
 
 def test_structured_failure_reasons_and_cap() -> None:
@@ -247,42 +255,19 @@ async def test_non_completed_status_keeps_plain_format(store: SessionStore) -> N
     llm = _Capturing()
     loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=1))
     out = await _call_tool(loop, cur, task="x", output_schema=LABEL_SCHEMA)
-    assert out.startswith("[sub-agent status=rejected]")
+    assert out.startswith("Error:") and "depth" in out
     assert "结构化结果" not in out
 
 
 @pytest.mark.asyncio
-async def test_parent_loop_receives_structured_tool_result(store: SessionStore) -> None:
-    """End to end: the parent LLM passes output_schema as a JSON string (as models sometimes do);
-    the tool result the parent sees next is the parsed object."""
-    spawn = LLMResponse(
-        raw_text="",
-        tool_calls=[{
-            "id": "tc1",
-            "type": "function",
-            "function": {
-                "name": "spawn_agent",
-                "arguments": json.dumps({"task": "classify", "output_schema": json.dumps(LABEL_SCHEMA)}),
-            },
-        }],
-    )
-    llm = _Capturing(responses=[
-        spawn,
-        LLMResponse(raw_text='{"label": "urgent"}'),  # child
-        LLMResponse(raw_text="parent done"),
-    ])
-    registry = ToolRegistry()
-    register_spawn_agent(registry)
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=registry, config=AgentLoopConfig(max_rounds=4),
-    )
+async def test_parent_inbox_receives_structured_completion(store):
+    llm = _Capturing(responses=[LLMResponse(raw_text='{"label":"urgent"}')])
+    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=4))
     sid = await loop.new_session()
-    r = await loop.send("go", session_id=sid)
-    assert r.final_text == "parent done"
-    assert llm.seen[0].response_format is None and llm.seen[2].response_format is None
-    assert llm.seen[1].response_format["type"] == "json_schema"
-    tool_msgs = [m for m in llm.seen[2].messages if m.get("role") == "tool"]
-    assert any('结构化结果：{"label":"urgent"}' in str(m.get("content")) for m in tool_msgs)
+    result = json.loads(await _call_tool(loop, sid, task="classify", output_schema=LABEL_SCHEMA))
+    assert result["payload"] == {"label": "urgent"}
+    assert result["messages"] is not None
+    assert (await store.inbox_counts(sid))["pending"] == 1
 
 
 # ── strict flag in run_agent_spec / the isolated worker ─────────────────
