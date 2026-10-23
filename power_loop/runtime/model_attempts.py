@@ -327,6 +327,11 @@ async def _no_inflight(manager, tx, row, *, except_attempt=None):
             continue
         exited = phases["finished"].get(identity)
         if exited is None or exited[1].get("status") != "returned":
+            if identity not in phases["dispatched"]:
+                from .model_budgets import is_closed_unstarted
+
+                if await is_closed_unstarted(manager, tx, phases["prepared"][identity][1]):
+                    continue
             raise JobError("unresolved_prior_attempt")
 
 
@@ -565,9 +570,19 @@ async def start_call(pipeline, request, *, round_index, retry_index, model):
     except Exception:
         # Same key recall only; prepare never sends a provider request.
         attempt = await prepare(binding, **args)
-    from .model_budgets import reserve
+    from .model_budgets import close_unreserved, reserve
 
-    await reserve(attempt, request, service=getattr(pipeline, "llm", None))
+    try:
+        await reserve(attempt, request, service=getattr(pipeline, "llm", None))
+    except Exception:
+        try:
+            await close_unreserved(attempt)
+        except Exception:
+            # Preserve the original admission error. Failed proof leaves the
+            # attempt unresolved; it never authorizes a retry or zero charge.
+            binding.resource_evidence["budget_pending"] = True
+            log.exception("Unreserved attempt closure remains pending: %s", attempt.attempt_id)
+        raise
     try:
         await dispatch(attempt)
     except JobError:

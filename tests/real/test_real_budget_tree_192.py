@@ -10,10 +10,13 @@ import asyncio
 import json
 from collections import Counter
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, LLMProviderConfig, LLMRequest, SessionStore, StatefulAgentLoop
+from power_loop.core.agent_context import reset_session_id, set_session_id
+from power_loop.runtime import model_attempts, model_budgets
 from power_loop.runtime.budget_contracts import (
     BudgetAck,
     BudgetConfig,
@@ -23,6 +26,7 @@ from power_loop.runtime.budget_contracts import (
     LocalBudgetScope,
 )
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow.facade import WorkflowToolPorts, register_workflow_tool
@@ -181,7 +185,7 @@ async def test_real_workflow_owner_cap_blocks_review_before_its_provider_request
                     "type": "agent",
                     "id": role,
                     "spec": {
-                            "name": role,
+                        "name": role,
                         "system_prompt": "TREE-"
                         + role
                         + ": Calculate 19+23. Reply exactly 42 in plain assistant text, without tools or pass_turn.",
@@ -226,6 +230,90 @@ async def test_real_workflow_owner_cap_blocks_review_before_its_provider_request
     finally:
         if accepted:
             await asyncio.wait_for(asyncio.gather(*(a.handle.task for a in accepted), return_exceptions=True), 10)
+        await runtime.shutdown(timeout_s=5)
+        await report(store, provider, record_property)
+        await provider.close()
+        await store.close()
+
+
+async def test_real_same_original_send_can_continue_after_proven_local_preparation_failure(tmp_path, record_property):
+    store = await SessionStore.open(str(tmp_path / "unreserved.db"), schema="tasks")
+    provider, host = BoundedProvider(limit=1), RealBudgetHost()
+    host.service = provider
+    runtime = TaskRuntime(
+        JobManager(store),
+        tenant_id="real-local-close",
+        principal_id="host",
+        executor_id="executor",
+        boot_id="boot",
+        lease_ms=300000,
+        boot_contract_hash="a" * 64,
+        budget_config=BudgetConfig(
+            "original-allowance",
+            (LocalBudgetScope("authority", max_calls=1), LocalBudgetScope("root", max_calls=1, binding="root")),
+            host,
+        ),
+    )
+    sid = await store.create_session()
+    actor = runtime.actor(sid)
+    token = set_session_id(sid)
+    try:
+        model_name = LLMProviderConfig.from_env().model
+        registration = await runtime.manager.register_job(
+            actor, kind="send", session_id=sid, system_key="original-send", request={"model_attempt_protocol": 1}
+        )
+        binding = await runtime.claim(actor, registration)
+        request = LLMRequest(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Calculate 19+23. Reply exactly 42 in assistant text, without tools or pass_turn.",
+                }
+            ],
+            max_tokens=2048,
+        )
+        pipeline = SimpleNamespace(session_id=sid, llm=provider)
+        prepare = host.prepare
+
+        async def unavailable(*args, **kwargs):
+            raise OSError("test: trusted metadata not ready; no paid request")
+
+        async with asyncio.timeout(90):
+            async with runtime.execution(binding):
+                await model_attempts.enable(binding)
+                host.prepare = unavailable
+                with pytest.raises(OSError, match="trusted metadata not ready"):
+                    await model_attempts.start_call(pipeline, request, round_index=0, retry_index=1, model=model_name)
+                host.prepare = prepare
+                assert provider.calls == host.reserve_calls == 0
+                attempt = await model_attempts.start_call(
+                    pipeline, request, round_index=1, retry_index=1, model=model_name
+                )
+                response = await provider.complete(request)
+                record_property("original_provider_response", response.raw_text)
+                assert response.raw_text.strip() == "42"
+                usage = {
+                    k: getattr(response.token_usage, k)
+                    for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                    if getattr(response.token_usage, k) is not None
+                }
+                await model_attempts.observe(attempt, usage=usage, estimated=False)
+                page = await list_attempts(runtime.manager, actor, binding.lease.job_id)
+                assert {item["status"] for item in page["items"]} == {"not_dispatched", "returned"}
+                assert len(page["items"]) == 2 and provider.calls == host.reserve_calls == len(host.applied) == 1
+                assert all(item["generation"] == str(binding.lease.generation) for item in page["items"])
+                rows = await runtime.manager.db.fetchall(
+                    f"SELECT counters_json FROM {runtime.manager.prefix}task_budget_scopes"
+                )
+                assert all(
+                    json.loads(row["counters_json"])["used_calls"] == 1
+                    and json.loads(row["counters_json"])["held_calls"] == 0
+                    for row in rows
+                )
+                assert (await model_budgets.get_budget(runtime.manager, actor, attempt.attempt_id))["ack"]
+            await runtime.manager.close_model_execution(actor, binding.lease, evidence={"exit": "completed"})
+    finally:
+        reset_session_id(token)
         await runtime.shutdown(timeout_s=5)
         await report(store, provider, record_property)
         await provider.close()

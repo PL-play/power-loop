@@ -32,6 +32,11 @@ async def _summary(manager, tx, job, raw, phases):
                 observed.get("status") not in ("returned", "unknown")):
             raise JobError("model_attempt_evidence_corrupt")
         state = observed["status"]
+    elif dispatched is None:
+        from .model_budgets import is_closed_unstarted
+
+        if await is_closed_unstarted(manager, tx, data):
+            state = "not_dispatched"
     return {"attempt_id": identity, "generation": str(data["scope"]["generation"]),
         "round_index": data["round_index"], "retry_index": data["retry_index"], "model": data["model"],
         "max_tokens": data["max_tokens"], "request_fingerprint": data["request_hash"], "status": state,

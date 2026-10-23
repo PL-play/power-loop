@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-REQUIRED_REAL_CASES = 81
+REQUIRED_REAL_CASES = 82
 
 
 class RunnerInterrupted(BaseException):

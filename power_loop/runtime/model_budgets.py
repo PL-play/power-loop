@@ -149,7 +149,8 @@ async def _save_counters(manager, tx, row, counters):
 async def _read(manager, tx, attempt_id, *, required=True):
     row = await tx.fetchone(f"SELECT * FROM {manager.prefix}task_budget_attempts WHERE attempt_id=?", (attempt_id,))
     if row is None:
-        if required:
+        marker = "mb_" + _hash([attempt_id, 1])[:48]
+        if required or await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (marker,)):
             raise JobError("budget_attempt_missing")
         return None
     value = _object(row["state_json"], row["state_hash"])
@@ -545,19 +546,105 @@ async def _refund_local(manager, tx, policy, state):
         await _save_counters(manager, tx, row, counters)
 
 
+async def _original_preparation(attempt, tx, job):
+    runtime, manager, owner = attempt.binding.runtime, attempt.binding.runtime.manager, attempt.binding.lease
+    if (owner.executor_id, owner.boot_id) != (runtime.executor_id, runtime.boot_id) or (
+        job["executor_id"],
+        job["boot_id"],
+        job["generation"],
+    ) != (owner.executor_id, owner.boot_id, owner.generation):
+        raise JobError("budget_release_requires_original_owner")
+    from .model_attempts import _read as read_model
+
+    saved = await read_model(manager, tx, "prepared", attempt.attempt_id)
+    if (
+        saved[1] != attempt.prepared
+        or saved[1]["scope"] != asdict(owner)
+        or saved[1]["session_id"] != attempt.binding.actor.session_id
+        or saved[1]["scope"]["job_id"] != job["job_id"]
+    ):
+        raise JobError("budget_release_requires_original_owner")
+
+
+async def close_unreserved(attempt):
+    """Seal only proven absence of a reservation; never issue an API release.
+
+    A missing mutable row alone is insufficient: its original first journal
+    event must also be absent. Already reserved/uncertain work remains owned by
+    close_unstarted and its original host tombstone/ACK protocol.
+    """
+    runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
+    async with manager._write() as tx:
+        policy = await _policy(runtime, tx)
+        if policy is None:
+            return None
+        job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
+        await _original_preparation(attempt, tx, job)
+        state = await _read(manager, tx, attempt.attempt_id, required=False)
+        if state is not None:
+            if state["job_id"] != job["job_id"] or state["context"] != _context(attempt, job):
+                raise JobError("budget_release_requires_original_owner")
+            return (
+                state["ack"]
+                if state["phase"] == "released"
+                and isinstance(state["ack"], dict)
+                and state["ack"].get("no_reservation") is True
+                else None
+            )
+        from .model_attempts import _read as read_model
+
+        if await read_model(manager, tx, "dispatched", attempt.attempt_id, required=False):
+            raise JobError("budget_release_not_permitted")
+        state = {
+            "version": 0,
+            "attempt_id": attempt.attempt_id,
+            "job_id": job["job_id"],
+            "policy_key": policy["policy_key"],
+            "context": _context(attempt, job),
+            "plan": None,
+            "plan_hash": None,
+            "phase": "released",
+            "pending": False,
+            "started_at_ms": manager.now(),
+            "host_intent": False,
+            "grant": None,
+            "observation": None,
+            "submission": None,
+            "ack": {"local_only": True, "dispatch_not_authorized": True, "no_reservation": True},
+        }
+        if policy["manifest"]["version"] == 2:
+            state["scopes"] = []  # No scope was reserved, so none may be refunded.
+        await _save(manager, tx, state, job, new=True)
+        return state["ack"]
+
+
+async def is_closed_unstarted(manager, tx, prepared):
+    """Read original release evidence without granting another dispatch."""
+    state = await _read(manager, tx, prepared["attempt_id"], required=False)
+    if state is None or state["phase"] != "released" or state["pending"] or state["ack"] is None:
+        return False
+    if (
+        state["context"]["prepared_hash"] != _hash(prepared)
+        or state["context"]["session_id"] != prepared["session_id"]
+        or state["job_id"] != prepared["scope"]["job_id"]
+        or state["context"]["generation"] != prepared["scope"]["generation"]
+    ):
+        raise JobError("budget_evidence_corrupt")
+    return True
+
+
 async def close_unstarted(attempt):
     """Close dispatch first; only a confirmed original API release frees risk."""
+    local = await close_unreserved(attempt)
+    if local is not None:
+        return local
     runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
     async with manager._write() as tx:
         policy = await _policy(runtime, tx)
         job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
+        await _original_preparation(attempt, tx, job)
         state = await _read(manager, tx, attempt.attempt_id)
-        owner = attempt.binding.lease
-        if (owner.executor_id, owner.boot_id) != (runtime.executor_id, runtime.boot_id) or (
-            job["executor_id"],
-            job["boot_id"],
-            job["generation"],
-        ) != (owner.executor_id, owner.boot_id, owner.generation):
+        if state["job_id"] != job["job_id"] or state["context"] != _context(attempt, job):
             raise JobError("budget_release_requires_original_owner")
         if state["phase"] == "released":
             return state["ack"]

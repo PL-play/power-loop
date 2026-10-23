@@ -78,9 +78,9 @@ async def test_roots_are_independent_but_authority_cap_is_shared_across_sends(tr
     assert set(roots) == {(root1.lease.job_id, 1), (root2.lease.job_id, 1)}
     assert next(counter["used_calls"] for _, limits, counter in values if limits["key"] == "authority") == 2
     c.binding, c.actor, c.sid = root1, actor1, actor1.session_id
-    # The original rejected attempt was prepared but never dispatched. Reusing
-    # that failed send is also blocked by the existing attempt-recovery gate.
-    with pytest.raises(JobError, match="unresolved_prior_attempt"):
+    # The rejected preparation now has durable non-dispatch closure. Its
+    # original root allowance is still spent, so admission fails on that cap.
+    with pytest.raises(JobError, match="budget_max_calls_exhausted"):
         await start(c)
     assert c.host.reserve_calls == 2
 
