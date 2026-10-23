@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 from dataclasses import asdict
 
@@ -26,7 +27,8 @@ pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize("ending", ["natural", "pass_turn"])
-async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and_original_task_resumes(tmp_path, record_property, ending):
+@pytest.mark.parametrize("structured", [False, True])
+async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and_original_task_resumes(tmp_path, record_property, monkeypatch, ending, structured):
     store = await SessionStore.open(str(tmp_path / "owner-wait.db"), schema="tasks")
     manager = JobManager(store)
     runtime = TaskRuntime(manager, tenant_id="real-owner-wait", principal_id="host", executor_id="executor", boot_id="boot")
@@ -35,6 +37,21 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
     register_wait_handoff_tool(registry)
     provider = BoundedProvider(limit=14)
     continuing, consuming = False, False
+    finalized = []
+    spawn_tools = importlib.import_module("power_loop.tools.spawn_agent")
+    original_finalize = spawn_tools._finalize
+
+    async def final_schema(sid, raw):
+        if structured and raw.get("status") == "completed":
+            owner_row = await manager.db.fetchone(f"SELECT job_id FROM {manager.jobs} WHERE session_id=? AND kind='subagent'", (sid,))
+            facts = await manager.db.fetchall(f"SELECT event_type FROM {manager.events} WHERE job_id=? AND event_type IN ('owner_waiting','owner_wait_resumed')", (owner_row["job_id"],))
+            assert sorted(f["event_type"] for f in facts) == ["owner_wait_resumed", "owner_waiting"]
+            inputs = await manager.db.fetchall(f"SELECT delivery_status FROM {manager.events} WHERE job_id=? AND event_type='operation' AND action='nudge'", (owner_row["job_id"],))
+            assert inputs and all(item["delivery_status"] == "handled" for item in inputs)
+            finalized.append({"session_id": sid, "raw_status": raw["status"], "provider_calls": provider.calls})
+        return await original_finalize(loop, sid, raw)
+
+    monkeypatch.setattr(spawn_tools, "_finalize", lambda _loop, sid, raw: final_schema(sid, raw))
 
     async def arm():
         source, sid = _SEND.get(), get_session_id()
@@ -51,6 +68,10 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
         input_schema={"type": "object", "properties": {}, "additionalProperties": False}), arm)
     ending_prompt = ("After arm_wait acceptance, write READY-42 as final assistant text without tools or pass_turn."
         if ending == "natural" else "After arm_wait acceptance, call pass_turn exactly once to end this turn without any other tool.")
+    if structured:
+        ending_prompt = ("After arm_wait acceptance, write the JSON object with answer=42 as this turn's text without tools or pass_turn. "
+            "If the original task later continues, return the same answer JSON after processing that input." if ending == "natural" else
+            "After arm_wait acceptance, call pass_turn exactly once. When the original task later continues, return the JSON object with answer=42.")
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=5, max_tokens=2048,
             system_prompt="Initially create exactly one requested child, then write WAITING without pass_turn. "
@@ -70,8 +91,10 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
     before = set(delegation._TASKS)
     try:
         async with asyncio.timeout(150):
+            schema_instruction = ("Include output_schema=" + json.dumps({"name": "Answer", "schema": {"type": "object", "properties": {
+                "answer": {"type": "integer"}}, "required": ["answer"], "additionalProperties": False}}) + ". " if structured else "")
             await loop.send("Use spawn_agent create once with tools=['arm_wait'], max_rounds=4, task='Compute 19+23', "
-                "system_prompt='Call arm_wait exactly once. " + ending_prompt + "'. Then reply WAITING.", parent)
+                "system_prompt='Call arm_wait exactly once. " + ending_prompt + "'. " + schema_instruction + "Then reply WAITING.", parent)
             owner = None
             for _ in range(500):
                 if registrations:
@@ -82,6 +105,10 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
                     assert owner.outcome is None, owner
                 await asyncio.sleep(.02)
             assert owner is not None and owner.status == "waiting" and owner.resource_state == "running"
+            assert not finalized
+            if structured:
+                contract = await store.get_runtime_state(owner.session_id, "workflow_execution_contract")
+                assert contract["spec"]["output_schema"]["schema"]["required"] == ["answer"]
             [source] = await manager.db.fetchall(f"SELECT job_id,status,resource_state FROM {manager.jobs} WHERE control_owner_job_id=? AND kind='send'", (owner.job_id,))
             assert source["status"] == "model_closed" and source["resource_state"] == "stopped"
             [entry] = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE event_type='owner_waiting' AND job_id=?", (owner.job_id,))
@@ -103,6 +130,8 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
                 await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 30)
             owner = await manager.get_job(runtime.actor(parent), owner.job_id)
             assert owner.outcome == "succeeded" and owner.resource_state == "stopped", owner
+            if structured:
+                assert owner.result["payload"] == {"answer": 42} and len(finalized) == 1
             assert len(await store.list_children(parent)) == 1
             assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='owner_wait_resumed'")) == 1
             consuming = True
@@ -112,6 +141,7 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
             record_property("original_waiting_entry", entry["payload_json"])
             record_property("original_owner_result", json.dumps(owner.result))
             record_property("supervision_tree", json.dumps(rows))
+            record_property("final_schema_observations", json.dumps(finalized))
     finally:
         for registration in registrations:
             owner = await manager.get_job(runtime.actor(parent), registration.job.control_owner_job_id)

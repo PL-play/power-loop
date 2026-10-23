@@ -1364,3 +1364,21 @@ host wake delivery, lost-ACK transition recovery, all in-flight short-deadline
 termination and restart orchestration remain work in progress. Unknown fees
 and provider execution remain unresolved until their existing independent
 evidence protocols confirm them; waiting never provides zero-cost proof.
+
+### Final schema validation follows necessary waiting
+
+Standalone child settlement first collects necessary waits and accepted input
+in the original session. A waiting placeholder does not trigger final JSON
+repair. The finalizer runs once when that model phase has no pending input;
+its completion is followed by another responsibility/input check. A new
+model result permits another finalization phase, using the existing time,
+round and original-pool limits. Existing one-time empty-answer completion
+still revalidates the new answer afterward.
+
+Schema-shaped text from a failed, cancelled, timed-out, degraded or
+round-limited repair is not a successful result. The repair's status, rounds
+and incurred usage are retained. If input arrived at its last pass, that
+signal is preserved and the original collector processes it before accepting
+the JSON payload. Successful repair clears only this module's temporary
+structured_output error. These are execution/result rules, not authority to
+restart a task, expand its budget or settle uncertain provider fees.

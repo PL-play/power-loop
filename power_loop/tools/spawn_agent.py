@@ -155,6 +155,8 @@ async def _finalize(loop, sid, raw):
     for attempt in range(2):
         try:
             result["payload"] = parse_structured(result.get("final_text") or "", schema=schema["schema"])
+            if str(result.get("error", "")).startswith("structured_output:"):
+                result.pop("error")
             return result
         except StructuredOutputError as exc:
             result["error"] = "structured_output: " + exc.reason
@@ -174,6 +176,15 @@ async def _finalize(loop, sid, raw):
             for name, value in (repaired.usage or {}).items():
                 usage[name] = usage.get(name, 0) + value
             result["usage"] = usage
+            result["new_input_after_pass"] = bool(getattr(repaired, "new_input_after_pass", False))
+            if repaired.status != "completed":
+                result.pop("payload", None)
+                result["status"] = repaired.status
+                result["error"] = "structured_output_repair_ended: " + str(repaired.status)
+                return result
+            if result["new_input_after_pass"]:
+                result.pop("payload", None)
+                return result
         else:
             break
     result["status"] = "failed"

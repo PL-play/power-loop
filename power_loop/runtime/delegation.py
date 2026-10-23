@@ -162,10 +162,9 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
         await bind_window(loop, window, sid)
         deadline = min(deadline, window.deadline)
     await await_children(store, sid, running.token, max(0.0, deadline - asyncio.get_running_loop().time()))
-    if finalize is not None:
-        raw = await asyncio.wait_for(finalize(sid, raw), timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
     # A nudge racing finalization is already durable. Consume it in this run before returning.
     continuation = None
+    needs_finalize = True
     while raw.get("status") == "completed":
         if running.task_binding is not None:
             from .owner_waits import WaitDeadline, wait_ready
@@ -180,6 +179,12 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
             if resumed == "history":
                 raw["new_input_after_pass"] = True
         if not (raw.get("new_input_after_pass") or (await store.inbox_counts(sid))["pending"]):
+            if needs_finalize and finalize is not None:
+                raw = await asyncio.wait_for(finalize(sid, raw), timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+                needs_finalize = False
+                # A callback can race accepted input too. Recheck original
+                # responsibilities before delivering or repairing anything else.
+                continue
             break
         if running.token.is_cancelled():
             break
@@ -212,8 +217,7 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
         for key, value in (extra.usage or {}).items():
             usage[key] = usage.get(key, 0) + value
         raw["usage"] = usage
-        if finalize is not None:
-            raw = await asyncio.wait_for(finalize(sid, raw), timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+        needs_finalize = True
     from .subagent_output import ensure_answer
     before_answer = raw
     raw = await ensure_answer(loop, running, sid, raw, deadline)
