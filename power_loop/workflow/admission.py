@@ -24,8 +24,14 @@ class Lease:
         self.queue_s = 0.0
         self.idle_s = 0.0
         self.metrics: dict[str, float] = {}
+        self.owner_task = None
 
     async def acquire(self):
+        task = asyncio.current_task()
+        if self.owner_task is None:
+            self.owner_task = task
+        elif self.owner_task is not task:
+            raise RuntimeError("admission_lease_task_changed")
         started = monotonic()
         try:
             for gate in self.gates:
@@ -78,7 +84,7 @@ async def idle():
     Do not use inside individual parallel tools: sibling tools may still run.
     """
     lease = CURRENT.get()
-    if lease is None or not lease.held:
+    if lease is None or lease.owner_task is not asyncio.current_task() or not lease.held:
         yield
         return
     lease.release()

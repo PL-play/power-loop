@@ -599,6 +599,8 @@ class JobManager:
                     await for_node(self, tx, parent_row)
             if parent is None and session_id != actor.session_id:
                 raise JobError("root_session_required")
+            if parent_row is not None and parent_row["kind"] in ("subagent", "workflow_node") and parent_row["status"] == "waiting":
+                raise JobError("owner_waiting_requires_input")
             job_id = "job_" + secrets.token_hex(16)
             root = parent_row["root_job_id"] if parent_row else job_id
             scope = job_id
@@ -873,7 +875,10 @@ class JobManager:
                 from .executor_registry import check_execution
                 await check_execution(self, tx, row)
             if effective_outcome == "succeeded":
+                from .owner_waits import references
                 from .timer_waits import has_required_wait
+
+                await references(self, tx, actor, row, success=True)
 
                 if require_children_stopped or await has_required_wait(self, tx, actor, row):
                     from .wait_effects import settle_owner_tx

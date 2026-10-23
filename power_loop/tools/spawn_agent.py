@@ -159,13 +159,15 @@ async def _finalize(loop, sid, raw):
         except StructuredOutputError as exc:
             result["error"] = "structured_output: " + exc.reason
         if attempt == 0 and str(result.get("final_text") or "").strip():
+            from power_loop.runtime.delegation import readmit_session
             child = await workflow_continuation_loop(loop, sid)
             import contextlib
             with contextlib.ExitStack() as guards:
                 for _, guard in getattr(loop, "_child_run_guards", ()):
                     guards.enter_context(guard())
-                repaired = await child.send("Rewrite the previous answer as the requested JSON object. Do not gather new facts.",
-                                            session_id=sid, tools=[], max_rounds=1)
+                async with readmit_session(loop, sid):
+                    repaired = await child.send("Rewrite the previous answer as the requested JSON object. Do not gather new facts.",
+                                                session_id=sid, tools=[], max_rounds=1)
             result["final_text"] = repaired.final_text
             result["rounds"] += repaired.rounds
             usage = dict(result.get("usage") or {})

@@ -20,15 +20,19 @@ async def ensure_answer(loop, running, sid, raw, deadline, *, max_extra_rounds=N
         remaining = min(remaining, max_extra_rounds)
     if remaining <= 0:
         return {**raw, "status": "failed", "error": "subagent_output_missing"}
+    if asyncio.get_running_loop().time() >= deadline:
+        raise TimeoutError("original subagent output deadline reached")
     with contextlib.ExitStack() as guards:
         for _, guard in getattr(loop, "_child_run_guards", ()):
             guards.enter_context(guard())
-        extra = await asyncio.wait_for(child.follow_up(
-            "Your previous turn did not contain a final answer. There is no outstanding delegated task. "
-            "Use the work already completed in this session and return the requested final answer as assistant text. "
-            "Do not repeat completed actions or call pass_turn.", session_id=sid,
-            stop_event=running.token, max_rounds=remaining, tools=[]),
-            timeout=max(0.0, deadline-asyncio.get_running_loop().time()))
+        from .delegation import readmit
+        async with asyncio.timeout(max(0.0, deadline-asyncio.get_running_loop().time())):
+            async with readmit(running):
+                extra = await child.follow_up(
+                    "Your previous turn did not contain a final answer. There is no outstanding delegated task. "
+                    "Use the work already completed in this session and return the requested final answer as assistant text. "
+                    "Do not repeat completed actions or call pass_turn.", session_id=sid,
+                    stop_event=running.token, max_rounds=remaining, tools=[])
     usage = dict(raw.get("usage") or {})
     for name, value in (extra.usage or {}).items():
         usage[name] = usage.get(name, 0) + value

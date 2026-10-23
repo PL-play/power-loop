@@ -386,6 +386,8 @@ async def prepare(binding, *, nonce, round_index, retry_index, request_hash, mod
                 raise JobError("model_attempt_conflict")
             return Attempt(binding, identity, data)
         row = await manager._fence(tx, binding.actor, binding.lease)
+        from .owner_waits import require_dispatch
+        await require_dispatch(manager, tx, row)
         tracking = await _read(manager, tx, "tracking", scope)
         if (
             row["kind"] != "send"
@@ -411,6 +413,8 @@ async def dispatch(attempt):
     async with manager._write() as tx:
         # Even exact dispatch replays must not revive a closed/cancelled lease.
         row = await manager._fence(tx, binding.actor, binding.lease)
+        from .owner_waits import require_dispatch
+        await require_dispatch(manager, tx, row)
         await _no_unknown_sends(manager, tx, row)
         saved = await _read(manager, tx, "prepared", attempt.attempt_id)
         if saved[1] != data or data["scope"] != _scope(binding.lease) or data["session_id"] != binding.actor.session_id:
@@ -438,6 +442,8 @@ async def _recall_dispatch(attempt):
     manager = binding.runtime.manager
     async with manager._write() as tx:
         row = await manager._fence(tx, binding.actor, binding.lease)
+        from .owner_waits import require_dispatch
+        await require_dispatch(manager, tx, row)
         await _no_unknown_sends(manager, tx, row)
         await _no_inflight(manager, tx, row, except_attempt=attempt.attempt_id)
         prepared = await _read(manager, tx, "prepared", attempt.attempt_id)

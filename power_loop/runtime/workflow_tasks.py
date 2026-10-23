@@ -293,8 +293,7 @@ async def collect_node(runtime, loop, raw, stop_event, *, timeout_s=1800, max_ro
 
 async def ensure_node_answer(runtime, loop, raw, stop_event, *, timeout_s=30):
     """A completed text node must actually deliver text, not only pass_turn.reason."""
-    from types import SimpleNamespace
-
+    from .delegation import Running
     from .subagent_output import ensure_answer
     from .task_runtime import _OWNER
 
@@ -341,7 +340,7 @@ async def ensure_node_answer(runtime, loop, raw, stop_event, *, timeout_s=30):
                 "completion_unresolved": True,
                 "error": "node_output_completion_failed:" + type(exc).__name__,
             }
-    running = SimpleNamespace(task_binding=binding, answer_attempted=False, token=stop_event)
+    running = Running(binding.lease.job_id, task_binding=binding, token=stop_event)
     try:
         from .completion import WINDOW
 

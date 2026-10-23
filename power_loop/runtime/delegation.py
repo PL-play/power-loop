@@ -47,10 +47,57 @@ class Running:
     canonical_result: dict | None = None
     canonical_attempted: bool = False
     answer_attempted: bool = False
+    admission: Any = field(default=None, repr=False)
+    admission_lease: Any = field(default=None, repr=False)
+    admission_task: Any = field(default=None, repr=False)
 
 
 _RUNNING: dict[tuple[int, str], Running] = {}
 _TASKS: set[asyncio.Task] = set()
+
+
+async def _acquire_admission(run):
+    if run.admission is None:
+        return False
+    if run.admission_task is not None:
+        if run.admission_task is not asyncio.current_task():
+            from .jobs import JobError
+            raise JobError("subagent_admission_owner_changed")
+        return False
+    from power_loop.workflow.admission import Lease
+    lease = Lease((run.admission,), run.token)
+    await lease.acquire()
+    run.admission_lease, run.admission_task = lease, asyncio.current_task()
+    return True
+
+
+def _release_admission(run):
+    if run.admission_lease is not None:
+        run.admission_lease.release()
+    run.admission_lease, run.admission_task = None, None
+
+
+@contextlib.asynccontextmanager
+async def readmit(run):
+    acquired = await _acquire_admission(run)
+    try:
+        if run.task_binding is not None:
+            from .owner_waits import check_deadline
+            await check_deadline(run.task_binding)
+        yield
+    finally:
+        if acquired:
+            _release_admission(run)
+
+
+@contextlib.asynccontextmanager
+async def readmit_session(loop, sid):
+    run = _RUNNING.get((id(await loop.ensure_store()), sid))
+    if run is None:
+        yield
+    else:
+        async with readmit(run):
+            yield
 
 
 def _retain(task):
@@ -119,8 +166,21 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
         raw = await asyncio.wait_for(finalize(sid, raw), timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
     # A nudge racing finalization is already durable. Consume it in this run before returning.
     continuation = None
-    while raw.get("status") == "completed" and (
-            raw.get("new_input_after_pass") or (await store.inbox_counts(sid))["pending"]):
+    while raw.get("status") == "completed":
+        if running.task_binding is not None:
+            from .owner_waits import WaitDeadline, wait_ready
+            try:
+                resumed = await wait_ready(loop, {**raw, "session_id": sid}, running.token, deadline=deadline)
+            except WaitDeadline as exc:
+                raw = {**raw, "status": "timed_out", "error": str(exc)}
+                break
+            if resumed == "cancelled":
+                raw = {**raw, "status": "cancelled", "error": "cancelled during original task wait"}
+                break
+            if resumed == "history":
+                raw["new_input_after_pass"] = True
+        if not (raw.get("new_input_after_pass") or (await store.inbox_counts(sid))["pending"]):
+            break
         if running.token.is_cancelled():
             break
         if remaining_rounds <= 0:
@@ -131,15 +191,16 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
         with contextlib.ExitStack() as guards:
             for _, guard in getattr(loop, "_child_run_guards", ()):
                 guards.enter_context(guard())
-            if raw.get("new_input_after_pass"):
-                work = continuation.follow_up(
-                    "New input arrived at your last pass and is already in this session's history. "
-                    "Process it and finish the original task without repeating completed actions.",
-                    session_id=sid, stop_event=running.token, max_rounds=remaining_rounds)
-            else:
-                work = continuation.flush_follow_ups(sid, stop_event=running.token,
-                                                    max_rounds=remaining_rounds)
-            extra = await asyncio.wait_for(work, timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+            async with asyncio.timeout(max(0.0, deadline - asyncio.get_running_loop().time())):
+                async with readmit(running):
+                    if raw.get("new_input_after_pass"):
+                        extra = await continuation.follow_up(
+                            "New input arrived at your last pass and is already in this session's history. "
+                            "Process it and finish the original task without repeating completed actions.",
+                            session_id=sid, stop_event=running.token, max_rounds=remaining_rounds)
+                    else:
+                        extra = await continuation.flush_follow_ups(sid, stop_event=running.token,
+                                                                  max_rounds=remaining_rounds)
         if extra is None:
             raise RuntimeError("subagent settlement returned no result with required input pending")
         remaining_rounds -= max(1, int(extra.rounds))
@@ -224,7 +285,8 @@ async def _complete(loop, parent, sid, run, raw, after_seq, lifecycle, finalize,
             # for reconciliation instead of inventing a second terminal result.
             log.exception("subagent canonical result requires reconciliation: %s", run.run_id)
             return None
-        failed = {**raw, "status": "cancelled" if isinstance(exc, asyncio.CancelledError) or run.token.is_cancelled() else "failed",
+        expired = getattr(exc, "code", None) == "owner_wait_deadline_exceeded"
+        failed = {**raw, "status": "cancelled" if isinstance(exc, asyncio.CancelledError) or run.token.is_cancelled() else "timed_out" if expired else "failed",
                   "error": f"subagent finalization: {type(exc).__name__}: {exc}"}
         try:
             result = await _save_result(store, parent, sid, run, failed, after_seq, lifecycle)
@@ -255,7 +317,7 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
         return runtime.receipt(registration)
     parent_run = _RUNNING.get((id(store), parent))
     ready = asyncio.get_running_loop().create_future()
-    run = Running(secrets.token_hex(8), token=CancellationToken(), parent=parent, title=spec.name)
+    run = Running(secrets.token_hex(8), token=CancellationToken(), parent=parent, title=spec.name, admission=admission)
     if registration is not None:
         run.run_id = registration.operation.operation_id[3:]
     if parent_run is not None:
@@ -279,8 +341,7 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
         ready.set_result(sid)
         if admission is not None:
             run.phase = "queued"
-            await admission.acquire()
-            admitted = True
+            admitted = await _acquire_admission(run)
             run.phase = "running"
 
     async def execute_body():
@@ -319,7 +380,7 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
             _ON_CHILD_SESSION.reset(token)
             _USAGE_SINK.reset(usage)
             if admitted:
-                admission.release()
+                _release_admission(run)
         await _complete(loop, parent, sid, run, raw, 0, spec.lifecycle, finalize, on_complete)
 
     async def execute():
@@ -370,7 +431,7 @@ async def nudge(loop, sid: str, message: str, *, on_complete=None, finalize=None
         lifecycle = record.get("lifecycle", "linked")
         before = await store.history_bounds(sid)
         after_seq = before[1] if before else 0
-        run = Running(secrets.token_hex(8), token=CancellationToken(), parent=parent, title=str(row.metadata.get("spec_name") or "subagent"))
+        run = Running(secrets.token_hex(8), token=CancellationToken(), parent=parent, title=str(row.metadata.get("spec_name") or "subagent"), admission=admission)
         run.projection_expected = child_loop.config.projection_representation is not None
         parent_run = _RUNNING.get((id(store), parent))
         if parent_run is not None:
@@ -391,8 +452,7 @@ async def nudge(loop, sid: str, message: str, *, on_complete=None, finalize=None
             try:
                 if admission is not None:
                     run.phase = "queued"
-                    await admission.acquire()
-                    admitted = True
+                    admitted = await _acquire_admission(run)
                 run.phase = "running"
                 raw = await InProcessExecutor().continue_agent(
                     sid, message, parent_loop=loop, extra_rounds=child_loop.config.max_rounds,
@@ -402,7 +462,7 @@ async def nudge(loop, sid: str, message: str, *, on_complete=None, finalize=None
                        "final_text": "", "rounds": 0, "usage": {}, "error": str(exc)}
             finally:
                 if admitted:
-                    admission.release()
+                    _release_admission(run)
             await _complete(loop, parent, sid, run, raw, after_seq, lifecycle, finalize, on_complete)
 
         run.task = asyncio.create_task(execute(), name="subagent-" + run.run_id)
@@ -451,6 +511,8 @@ async def stop(store, parent, run_id, grace_s):
 
 async def await_children(store, parent, stop_event=None, timeout_s=1800):
     """Owning executors must collect asynchronous descendants before settling a leaf."""
+    from power_loop.workflow.admission import idle
+
     deadline = asyncio.get_running_loop().time() + timeout_s
     token = CancellationToken.from_any(stop_event)
     while True:
@@ -464,7 +526,8 @@ async def await_children(store, parent, stop_event=None, timeout_s=1800):
             raise ValueError("cancelled while waiting for subagents")
         if asyncio.get_running_loop().time() >= deadline:
             raise ValueError("subagents still pending after completion wait")
-        await asyncio.wait([run.task for run in runs], timeout=0.1)
+        async with idle():
+            await asyncio.wait([run.task for run in runs], timeout=0.1)
 
 
 def completion_view(loop, result):

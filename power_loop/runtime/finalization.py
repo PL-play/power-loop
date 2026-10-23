@@ -217,6 +217,9 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         from .completion_windows import event_id, read_row
         if await read_row(manager, tx, row) is not None:
             refs.append(await _reference(manager, tx, event_id(manager, row["job_id"])))
+        from .owner_waits import references
+        refs.extend([await _reference(manager, tx, ref["event_id"]) for ref in
+            await references(manager, tx, actor, row, success=row["outcome"] == "succeeded")])
     if row["kind"] == "send":
         model = membership["model"]
         if (row["status"] != "model_closed" or model is None or model["payload"].get("resource_state") != "stopped"):

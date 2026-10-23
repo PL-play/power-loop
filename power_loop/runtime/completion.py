@@ -140,9 +140,8 @@ async def collect_required(loop, raw, stop_event=None, *, window=None, resolve_l
             store = await loop.ensure_store()
             while True:
                 if drain_on_error or raw.get("status") == "completed":
-                    async with idle():
-                        await delegation.await_children(store, sid, stop_event,
-                            max(0, window.deadline - asyncio.get_running_loop().time()))
+                    await delegation.await_children(store, sid, stop_event,
+                        max(0, window.deadline - asyncio.get_running_loop().time()))
                 if token.is_cancelled():
                     return {**raw, "status": "cancelled", "error": "cancelled during completion settlement"}
                 if raw.get("status") != "completed":
@@ -165,6 +164,13 @@ async def collect_required(loop, raw, stop_event=None, *, window=None, resolve_l
                         prompts.append("Final background results are available. Process them and finish the original task.")
                 if raw.get("new_input_after_pass"):
                     prompts.append("Process the new input already in this session and finish the original task. Do not repeat completed actions.")
+                if not prompts:
+                    from .owner_waits import wait_ready
+                    resumed = await wait_ready(loop, raw, stop_event, deadline=window.deadline)
+                    if resumed == "cancelled":
+                        return {**raw, "status": "cancelled", "error": "cancelled during original task wait"}
+                    if resumed == "history":
+                        prompts.append("Process the accepted original input already in this session and finish the original task without repeating completed actions.")
                 pending = (await loop.inbox_pending(sid)).get("pending", 0) if hasattr(loop, "inbox_pending") else 0
                 if not prompts and not pending:
                     return raw
@@ -177,9 +183,10 @@ async def collect_required(loop, raw, stop_event=None, *, window=None, resolve_l
                 with contextlib.ExitStack() as guards:
                     for _, guard in getattr(loop, "_child_run_guards", ()) or ():
                         guards.enter_context(guard())
-                    more = (await child.follow_up("\n\n".join(prompts), session_id=sid,
-                        stop_event=stop_event, max_rounds=allowance) if prompts else
-                        await child.flush_follow_ups(sid, stop_event=stop_event, max_rounds=allowance))
+                    async with delegation.readmit_session(loop, sid):
+                        more = (await child.follow_up("\n\n".join(prompts), session_id=sid,
+                            stop_event=stop_event, max_rounds=allowance) if prompts else
+                            await child.flush_follow_ups(sid, stop_event=stop_event, max_rounds=allowance))
                 if more is None or not hasattr(more, "status"):
                     return {**raw, "status": "failed", "completion_unresolved": True, "error": "completion settlement returned no result"}
                 _merge(raw, more)
@@ -188,10 +195,14 @@ async def collect_required(loop, raw, stop_event=None, *, window=None, resolve_l
                     return {**raw, "status": "failed", "completion_unresolved": True, "error": "completion round allowance exceeded"}
                 if raw["status"] != "completed":
                     raw["completion_unresolved"] = True
-    except TimeoutError:
+    except TimeoutError as exc:
+        from .owner_waits import WaitDeadline
+        if isinstance(exc, WaitDeadline):
+            return {**raw, "status": "timed_out", "completion_unresolved": True, "error": str(exc)}
         return {**raw, "status": "failed", "completion_unresolved": True, "error": "completion settlement timed out"}
     except Exception as exc:
-        return {**raw, "status": "cancelled" if token.is_cancelled() else "failed",
+        expired = getattr(exc, "code", None) == "owner_wait_deadline_exceeded"
+        return {**raw, "status": "cancelled" if token.is_cancelled() else "timed_out" if expired else "failed",
             "completion_unresolved": True, "error": "completion check failed: " + str(exc)}
     finally:
         window._collecting = False

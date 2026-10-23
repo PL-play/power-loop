@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import pytest
 
 from power_loop.core.agent_context import get_session_id
+from power_loop.runtime.delegation import Running
 
 from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import finish, jobs, managed
@@ -85,8 +86,8 @@ async def test_supplement_does_not_receive_a_second_round_allowance(monkeypatch,
     async def restore(*args):
         return child
     monkeypatch.setattr("power_loop.runtime.subagent_output.workflow_continuation_loop", restore)
-    running = SimpleNamespace(task_binding=SimpleNamespace(lease=SimpleNamespace(generation=1)),
-                              answer_attempted=mode == "already_attempted", token=CancellationToken())
+    running = Running("original-test-run", task_binding=SimpleNamespace(lease=SimpleNamespace(generation=1)),
+                      answer_attempted=mode == "already_attempted", token=CancellationToken())
     raw = {"status": "completed", "final_text": "", "rounds": 0 if mode == "expired_deadline" else 1}
     deadline = asyncio.get_running_loop().time()+5
     if mode == "expired_deadline":
@@ -144,7 +145,7 @@ async def test_empty_completed_supplement_is_failed_without_a_second_attempt(mon
     async def restore(*args):
         return SimpleNamespace(config=SimpleNamespace(max_rounds=2), follow_up=follow)
     monkeypatch.setattr("power_loop.runtime.subagent_output.workflow_continuation_loop", restore)
-    running = SimpleNamespace(task_binding=None, answer_attempted=False, token=CancellationToken())
+    running = Running("original-test-run", token=CancellationToken())
     raw = {"status": "completed", "final_text": "", "rounds": 1}
     value = await ensure_answer(SimpleNamespace(), running, "original", raw, asyncio.get_running_loop().time()+5)
     assert value["status"] == "failed" and value["error"] == "subagent_output_missing"

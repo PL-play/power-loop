@@ -193,7 +193,7 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
     after_seq = before[1] if before else 0
     await manager.check_execution(binding.actor, binding.lease)
     run = delegation.Running(operation.result["run_id"], token=delegation.CancellationToken(),
-        parent=source.actor.session_id, title=job.title, task_binding=binding)
+        parent=source.actor.session_id, title=job.title, task_binding=binding, admission=admission)
     run.projection_expected = child.config.projection_representation is not None
     delegation._RUNNING[(id(store), sid)] = run
 
@@ -204,8 +204,7 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
                 try:
                     if admission is not None:
                         run.phase = "queued"
-                        await admission.acquire()
-                        acquired = True
+                        acquired = await delegation._acquire_admission(run)
                     run.phase = "running"
                     with contextlib.ExitStack() as guards:
                         for _, guard in getattr(loop, "_child_run_guards", ()):
@@ -234,7 +233,7 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
                     raw = {"status": "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed", "error": str(exc)}
                 finally:
                     if acquired:
-                        admission.release()
+                        delegation._release_admission(run)
                 await delegation._complete(loop, run.parent, sid, run, raw, after_seq, "linked", finalize, on_complete)
         except BaseException as exc:
             await delegation._complete(loop, run.parent, sid, run,

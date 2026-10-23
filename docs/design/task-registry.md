@@ -1332,3 +1332,35 @@ the exact typed lease and still checks the original scope and physical session.
 The operation is idempotent and transactional, leaves resource state unchanged
 and is not stop/completion or dispatch authority. Missing/corrupt window proof,
 wrong generation, unknown resource and expired execution lease are not bypassed.
+
+### Retained original controller waiting
+
+The explicit managed-wait path now enters persistent waiting after a natural
+model exit or an actual pass_turn. The common collector and standalone child
+settlement save the original raw result, wait creation references and stopped
+model-member evidence in an immutable owner_waiting event. The owner remains
+physically running with its original heartbeat and cancellation token; no task
+completion is delivered while it is waiting. This is an opt-in SDK path and
+does not enable finite-task timers in the default host.
+
+A validated nudge to the same owner generation and physical session, together
+with its durable inbox item, permits an owner_wait_resumed transition. Before
+that transition the library revalidates the wait call/receipt and actual model
+exit, attempt tracking and quiescence. Inputs are still consumed through the
+normal processing protocol; accepting input does not settle a wait. Success
+and supervision proofs retain the waiting and resume references too.
+
+Only the actual leaf task can release its leaf admission slots. An inherited
+context in another task cannot release a still-running parent. Standalone
+children retain their original pool and reacquire it for continuation, empty
+answer completion and structured-output repair. Queue cancellation does not
+borrow another permit. Admission and the actual model-attempt dispatch both
+recheck the original wait policy; a decision before expiry does not authorize
+a new paid call after expiry. Waiting polls perform no model requests.
+
+The current implementation covers a retained live controller and persisted
+facts, not cross-process resumption authority. Defer review cycles, formal
+host wake delivery, lost-ACK transition recovery, all in-flight short-deadline
+termination and restart orchestration remain work in progress. Unknown fees
+and provider execution remain unresolved until their existing independent
+evidence protocols confirm them; waiting never provides zero-cost proof.
