@@ -70,6 +70,9 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
             "AND action='nudge' AND delivery_status<>'handled' ORDER BY event_id", (send["control_owner_job_id"],))
         observed = []
         for event in [*results, *inputs]:
+            if event["event_type"] == "operation":
+                from .wait_effects import validate_input
+                await validate_input(manager, tx, actor, event)
             job = (await input_target(manager, tx, actor, send, event) if event["event_type"] == "operation"
                    else await manager._authorize(tx, actor, event["job_id"]))
             if event["event_type"] == "operation":
@@ -274,6 +277,11 @@ async def require_event_handled(manager, tx, result, *, session_id, owner_job_id
     from .jobs import JobError, _hash
     if result["delivery_status"] != "handled":
         raise JobError("required_result_unhandled")
+    if result.get("action") == "nudge":
+        from .jobs import JobActor
+        from .wait_effects import validate_input
+        row = await manager._row(tx, owner_job_id)
+        await validate_input(manager, tx, JobActor(row["tenant_id"], row["principal_id"], session_id), result)
     event = {"event_id": result["event_id"], "job_id": result["job_id"], "revision": int(result["job_version"]),
              "result_hash": _hash(json.loads(result["payload_json"]))}
     event_id = "decision_" + _hash([event["event_id"], event["revision"], event["result_hash"]])[:48]

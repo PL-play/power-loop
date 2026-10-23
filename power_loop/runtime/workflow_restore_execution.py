@@ -239,6 +239,44 @@ async def confirm_input(runtime, binding, sid, message):
             raise JobError("workflow_node_input_unsettled")
 
 
+async def validate_system_input(manager, tx, actor, event):
+    """Read an original restored-node input, including historical generations.
+
+    This is not a new admission or a lease. It preserves the existing native
+    restore protocol when other system-input adapters share nudge processing.
+    """
+    from .execution_membership import _lease, scope
+    from .jobs import JobActor
+    from .node_inputs import descriptor
+
+    payload = json.loads(event["payload_json"])
+    request = payload.get("request", {})
+    if (not isinstance(request, dict) or set(payload) != {"job_id", "mode", "request"}
+            or payload.get("mode") != "restore_input" or event["call_ref_json"] is not None
+            or event["tool_call_id"] is not None or event["receipt_ref_json"] is not None):
+        raise JobError("wait_effect_input_evidence_missing")
+    target = _lease(request.get("target"))
+    row = await manager._row(tx, target["job_id"])
+    if (row is None or row["kind"] != "workflow_node" or event["job_id"] != target["job_id"]
+            or (row["tenant_id"], row["principal_id"]) != (actor.tenant_id, actor.principal_id)):
+        raise JobError("workflow_node_input_unsettled")
+    original = await scope(manager, tx, target["job_id"], target["generation"])
+    if _hash(original["lease"]) != _hash(target):
+        raise JobError("workflow_node_input_unsettled")
+    historical = {**row, **target}
+    data, _ = await authority(manager, tx, historical, request.get("session_id"), historical=True)
+    node = await descriptor(manager, tx, historical, data["session_id"], historical=True)
+    expected = {"target": original["lease"], "session_id": data["session_id"], "message": request.get("message"),
+        "node": node, "restore_operation_id": data["operation_id"], "workflow": data["workflow"]}
+    caller = JobActor(actor.tenant_id, actor.principal_id, data["driver_sid"])
+    key = manager._origin_key(caller, "nudge", None, None, "restore-input:" + data["operation_id"] + ":" + data["node_id"])
+    if (event["event_type"] != "operation" or event["action"] != "nudge" or event["caller_session_id"] != caller.session_id
+            or event["operation_key"] != key or event["request_hash"] != _hash(expected) or _hash(request) != _hash(expected)
+            or payload["job_id"] != target["job_id"] or _hash(original["owner"]) != _hash(data["workflow"])
+            or not isinstance(expected["message"], str) or not expected["message"].strip()):
+        raise JobError("workflow_node_input_unsettled")
+
+
 async def settle(runtime, binding, status):
     from .processing import require_inputs_handled
     manager = runtime.manager

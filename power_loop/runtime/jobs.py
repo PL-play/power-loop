@@ -837,6 +837,8 @@ class JobManager:
                 from .timer_waits import has_required_wait
 
                 if require_children_stopped or await has_required_wait(self, tx, actor, row):
+                    from .wait_effects import settle_owner_tx
+                    await settle_owner_tx(self, tx, actor, row)
                     await self._require_scope_ready(tx, row)
             await tx.execute(f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,"
                 "result_status='pending_delivery',resource_state=?,intake='closed',lease_until_ms=NULL,"

@@ -81,7 +81,7 @@ async def prepare_binding(manager, tx, actor, source, request, *, caller, sessio
         raise JobError("wait_source_required")
     _lease(asdict(caller))
     now = manager.now()
-    if not now < desired.due_at_ms <= policy.deadline_at_ms <= now + policy.max_wait_ms:
+    if not now < desired.due_at_ms < policy.deadline_at_ms <= now + policy.max_wait_ms:
         raise JobError("wait_deadline_out_of_bounds")
     if (source is None or source["kind"] != "send" or source["session_id"] != actor.session_id
             or session_id != actor.session_id or independent or call_ref is None):
@@ -266,7 +266,7 @@ async def _prepare_due(manager, tx, actor, job_id):
     job, creation, saved = await _read(manager, tx, actor, job_id)
     desired, policy = _request(saved["request"])
     binding = saved["binding"]
-    if manager.now() > policy.deadline_at_ms:
+    if manager.now() >= policy.deadline_at_ms:
         raise JobError("wait_deadline_exceeded")
     if (job["generation"] != 0 or job["status"] != "queued" or job["resource_state"] != "not_started"
             or job["intake"] != "open" or job["supervision_status"] != "open" or job["outcome"] is not None):

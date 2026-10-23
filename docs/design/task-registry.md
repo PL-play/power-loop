@@ -1192,3 +1192,43 @@ defer review cycles, timer cancellation/deadline/supervision finalization and
 formal host wake adapter remain separate implementation gates. The tool is
 explicit opt-in and is hidden from finite child registries; the default child
 timer entry remains unavailable until that complete protocol is installed.
+
+### Original-decision system effects (partial SDK protocol)
+
+After the original main decision and its raw tool receipt commit, a trusted
+host may call `runtime.wait_effects.apply(manager, main_actor, due_event_id)`.
+It verifies that exact decision/observation/receipt and records one stable
+effect. An exact replay reads the original effect before considering any new
+execution, including after the main send closes. It never dispatches a model,
+creates a replacement job or reuses a closed main lease.
+
+For `continue`, the transaction inserts one system-origin `nudge` operation
+and one relay inbox item for the original owner/session/node route with the
+frozen continuation text. The system operation has no raw model call/receipt;
+its immutable handoff points to the one original `wait_decision` operation.
+The existing actual-input observation, model response, input acknowledgement
+and input-closure protocol processes it. Missing/modified effect or input
+provenance fails closed before a child model request.
+
+Enqueueing returns `status="input_enqueued"` and does not release the required
+wait. Once the original model send has actually consumed this input and closed
+with valid processing evidence, the owner's success transaction can resolve
+the timer and persist its canonical logical result atomically with that owner
+result. Rollback preserves both as unresolved. The timer remains generation 0:
+it did not run a model or claim an executor. `unstarted` plus `logical_wait`
+identifies this condition result; it does not invent provider usage or close
+supervision. Recalling a handled effect verifies the original resolution proof.
+
+For `cancel`, the system effect records the original owner's generation-bound
+stop barrier and returns `status="stop_requested"`. This mechanical request
+remains possible after deadline or lease loss. It cannot stop a later owner
+generation. Actual retained executors observe their durable cancellation via
+their existing supervision mechanism; acceptance is not physical-stop proof.
+
+For `defer`, `status="review_scheduled"` records the original decision's next
+review time without changing the original admission, due event or deadline.
+This is durable pending review responsibility, not an automatic periodic
+driver. Due times and new continue/defer effects must be strictly before the
+original deadline. Cancelled-wait termination, review-cycle driving, persistent
+owner waiting, timer supervision finalization and formal host wake integration
+remain implementation gates. No default child timer is enabled by these ports.
