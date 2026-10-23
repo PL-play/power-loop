@@ -56,6 +56,18 @@ class Attempt:
     prepared: dict
 
 
+def event_identity(attempt):
+    if attempt is None:
+        return {}
+    return {
+        "model_attempt_id": attempt.attempt_id,
+        "model_attempt_store_id": attempt.binding.runtime.manager.store.store_id,
+        "model_attempt_job_id": attempt.prepared["scope"]["job_id"],
+        "model_attempt_generation": attempt.prepared["scope"]["generation"],
+        "budget_managed": attempt.binding.runtime._original_budget_config is not None,
+    }
+
+
 def event_id(manager, phase, identity):
     if phase not in _PHASES:
         raise JobError("invalid_model_attempt_phase")

@@ -44,6 +44,11 @@ class LlmCallStartedPayload(BaseEventPayload):
     round_index: int = 0
     attempt: int = 1
     model: str = ""
+    model_attempt_id: str | None = None
+    model_attempt_store_id: str | None = None
+    model_attempt_job_id: str | None = None
+    model_attempt_generation: int | None = None
+    budget_managed: bool = False
 
 
 @dataclass
@@ -87,6 +92,13 @@ class LlmCallCompletedPayload(BaseEventPayload):
     provider_cost: float | None = None
     #: 7.2: image input tokens, when the provider splits them out (``None`` = not reported).
     prompt_image_tokens: int | None = None
+    #: Durable physical-call identity; absent on legacy, untracked calls.
+    #: The budget marker never grants execution or business billing authority.
+    model_attempt_id: str | None = None
+    model_attempt_store_id: str | None = None
+    model_attempt_job_id: str | None = None
+    model_attempt_generation: int | None = None
+    budget_managed: bool = False
 
 
 @dataclass

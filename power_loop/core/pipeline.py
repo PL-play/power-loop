@@ -1331,7 +1331,7 @@ class AgentPipeline:
             attempt_box[0] += 1
             attempt = attempt_box[0]
             call_id = f"r{round_index}.a{attempt}"
-            from power_loop.runtime.model_attempts import observe, response_observation, start_call
+            from power_loop.runtime.model_attempts import event_identity, observe, response_observation, start_call
             try:
                 await check_dispatch(self.session_id)
                 model_attempt = await start_call(self, request, round_index=round_index, retry_index=attempt, model=model_name)
@@ -1339,6 +1339,7 @@ class AgentPipeline:
                 # Durable admission failure is not permission for the retry
                 # policy to allocate a replacement request/identity.
                 raise LLMNonRetryable(attempts=attempt, last_error=exc) from exc
+            durable_identity = event_identity(model_attempt)
             streamed["text"].clear()
             streamed["think"].clear()
             self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
@@ -1350,7 +1351,7 @@ class AgentPipeline:
                 self._emit(
                     AgentEventType.LLM_CALL_STARTED,
                     LlmCallStartedPayload(call_id=call_id, round_index=round_index,
-                                          attempt=attempt, model=model_name),
+                                          attempt=attempt, model=model_name, **durable_identity),
                     round_index=round_index, stream_id="main",
                 )
                 t0 = time.perf_counter()
@@ -1389,6 +1390,7 @@ class AgentPipeline:
                             prompt_tokens=p_est, completion_tokens=c_est,
                             total_tokens=p_est + c_est, estimated=True, outcome=outcome,
                             endpoint=_llm_endpoint(self.llm),
+                            **durable_identity,
                         ),
                         round_index=round_index, stream_id="main",
                     )
@@ -1427,6 +1429,7 @@ class AgentPipeline:
                         endpoint=_llm_endpoint(self.llm),
                         provider_cost=getattr(usage, "cost", None),
                         prompt_image_tokens=getattr(usage, "prompt_image_tokens", None),
+                        **durable_identity,
                     ),
                     round_index=round_index, stream_id="main",
                 )
