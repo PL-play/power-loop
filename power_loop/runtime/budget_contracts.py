@@ -11,7 +11,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Protocol
 
-from .jobs import JobError, _hash, _json
+from .jobs import KINDS, JobError, _hash, _json
 
 
 def identifier(value):
@@ -76,15 +76,38 @@ class LocalBudgetScope:
     max_calls: int | None = None
     max_tokens: int | None = None
     max_inflight: int | None = None
+    binding: str = "authority"
+    owner_kinds: tuple[str, ...] | None = None
 
     def __post_init__(self):
         values = (self.max_calls, self.max_tokens, self.max_inflight)
         if (
             not identifier(self.key)
+            or self.binding not in ("authority", "root", "owner")
+            or self.owner_kinds is not None
+            and (
+                self.binding != "owner"
+                or type(self.owner_kinds) is not tuple
+                or not self.owner_kinds
+                or any(type(k) is not str or k not in KINDS for k in self.owner_kinds)
+                or len(set(self.owner_kinds)) != len(self.owner_kinds)
+            )
             or all(v is None for v in values)
             or any(v is not None and not uint(v) for v in values)
         ):
             raise JobError("invalid_local_budget_scope")
+        if self.owner_kinds is not None:
+            object.__setattr__(self, "owner_kinds", tuple(sorted(self.owner_kinds)))
+
+    def manifest(self):
+        value = asdict(self)
+        value.pop("binding")
+        value.pop("owner_kinds")
+        if self.binding != "authority":
+            value["binding"] = self.binding
+        if self.owner_kinds is not None:
+            value["owner_kinds"] = list(self.owner_kinds)
+        return value
 
 
 @dataclass(frozen=True)
@@ -194,8 +217,8 @@ class BudgetConfig:
 
     def manifest(self):
         return {
-            "version": 1,
+            "version": 2 if any(s.binding != "authority" for s in self.scopes) else 1,
             "provider_key": self.provider_key,
-            "scopes": [asdict(s) for s in self.scopes],
+            "scopes": [s.manifest() for s in self.scopes],
             "max_pending": self.max_pending,
         }

@@ -12,10 +12,11 @@ import copy
 import json
 from dataclasses import asdict
 
+from . import budget_scopes
 from .budget_contracts import BudgetAck, BudgetConfig, BudgetGrant, BudgetPlan, BudgetSubmission
 from .jobs import JobError, _hash, _json
 
-_COUNTERS = ("used_calls", "held_calls", "used_tokens", "held_tokens", "inflight")
+_COUNTERS = budget_scopes.COUNTERS
 
 
 def policy_key(runtime):
@@ -89,6 +90,8 @@ async def _policy(runtime, tx, *, create=False, job=None):
             (key, runtime.tenant_id, runtime.principal_id, _hash(manifest), _json(manifest), 1, manager.now()),
         )
         for limits in manifest["scopes"]:
+            if limits.get("binding", "authority") != "authority":
+                continue
             counters = dict.fromkeys(_COUNTERS, 0)
             await tx.execute(
                 f"INSERT INTO {manager.prefix}task_budget_scopes "
@@ -116,17 +119,18 @@ async def ensure_policy(binding):
         job = await runtime.manager._fence(tx, binding.actor, binding.lease)
         policy = await _policy(runtime, tx, create=True, job=job)
         if policy:
-            for limits in policy["manifest"]["scopes"]:
+            for limits in await budget_scopes.resolve(runtime, tx, policy, job, create=True):
                 await _scope(runtime.manager, tx, policy["policy_key"], limits)
     return policy is not None
 
 
 async def _scope(manager, tx, key, limits):
     row = await tx.fetchone(
-        f"SELECT * FROM {manager.prefix}task_budget_scopes WHERE scope_key=?", (scope_key(key, limits["key"]),)
+        f"SELECT * FROM {manager.prefix}task_budget_scopes WHERE scope_key=?", (budget_scopes.scope_key(key, limits),)
     )
     if row is None or row["policy_key"] != key or _object(row["limits_json"], row["limits_hash"]) != limits:
         raise JobError("budget_scope_missing_or_changed")
+    await budget_scopes.check_marker(manager, tx, key, limits)
     counters = _object(row["counters_json"], row["counters_hash"])
     if set(counters) != set(_COUNTERS) or any(type(v) is not int or v < 0 for v in counters.values()):
         raise JobError("budget_counters_corrupt")
@@ -311,7 +315,8 @@ async def reserve(attempt, logical_request, *, service):
         if await _read(manager, tx, attempt.attempt_id, required=False):
             raise JobError("budget_attempt_already_reserved")
         await _check_pending(manager, tx, policy)
-        for limits in policy["manifest"]["scopes"]:
+        limits_set = await budget_scopes.resolve(runtime, tx, policy, job, create=True)
+        for limits in limits_set:
             row, counters = await _scope(manager, tx, policy["policy_key"], limits)
             for maximum, consumed in (
                 ("max_calls", counters["used_calls"] + counters["held_calls"] + 1),
@@ -341,6 +346,8 @@ async def reserve(attempt, logical_request, *, service):
             "submission": None,
             "ack": None,
         }
+        if policy["manifest"]["version"] == 2:
+            state["scopes"] = limits_set
         await _save(manager, tx, state, job, new=True)
     async with manager._write() as tx:
         job = await manager._fence(tx, attempt.binding.actor, attempt.binding.lease)
@@ -397,6 +404,14 @@ async def authorize_dispatch(attempt, tx, job):
     grant = BudgetGrant(**state["grant"])
     if (grant.attempt_id, grant.request_hash, grant.state) != (attempt.attempt_id, state["plan_hash"], "reserved"):
         raise JobError("budget_grant_mismatch")
+    for limits in budget_scopes.frozen(policy, state):
+        _, counters = await _scope(manager, tx, state["policy_key"], limits)
+        if (
+            counters["held_calls"] < 1
+            or counters["held_tokens"] < state["plan"]["token_bound"]
+            or counters["inflight"] < 1
+        ):
+            raise JobError("budget_reservation_hold_missing")
     state.update(phase="dispatch_authorized")
     await _save(manager, tx, state, job)
 
@@ -435,7 +450,7 @@ async def observe(attempt, observation):
             if tokens is None and usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
                 tokens = usage["prompt_tokens"] + usage["completion_tokens"]
         bound = state["plan"]["token_bound"]
-        for limits in policy["manifest"]["scopes"]:
+        for limits in budget_scopes.frozen(policy, state):
             row, counters = await _scope(manager, tx, state["policy_key"], limits)
             counters["held_calls"] -= 1
             counters["used_calls"] += 1
@@ -522,7 +537,7 @@ async def deliver(attempt):
 
 
 async def _refund_local(manager, tx, policy, state):
-    for limits in policy["manifest"]["scopes"]:
+    for limits in budget_scopes.frozen(policy, state):
         row, counters = await _scope(manager, tx, state["policy_key"], limits)
         counters["held_calls"] -= 1
         counters["held_tokens"] -= state["plan"]["token_bound"]

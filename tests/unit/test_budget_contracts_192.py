@@ -105,3 +105,45 @@ def test_plan_submission_and_grant_detach_nested_host_objects():
 def test_opaque_metadata_is_size_bounded_before_persistence(body):
     with pytest.raises(JobError, match="invalid_budget_payload"):
         BudgetPlan(10, body)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"binding": "session"},
+        {"binding": True},
+        {"binding": "root", "owner_kinds": ("workflow",)},
+        {"binding": "owner", "owner_kinds": []},
+        {"binding": "owner", "owner_kinds": ()},
+        {"binding": "owner", "owner_kinds": ("invalid",)},
+        {"binding": "owner", "owner_kinds": ("workflow", "workflow")},
+    ],
+)
+def test_scope_templates_cannot_be_freeform_model_selected_bindings(values):
+    with pytest.raises(JobError, match="invalid_local_budget_scope"):
+        LocalBudgetScope("s", max_calls=1, **values)
+
+
+def test_authority_manifest_keeps_original_v1_shape_and_tree_mode_is_explicit():
+    old = BudgetConfig("binding", (LocalBudgetScope("s", max_calls=1),), Host())
+    assert old.manifest() == {
+        "version": 1,
+        "provider_key": "binding",
+        "max_pending": 100,
+        "scopes": [{"key": "s", "max_calls": 1, "max_tokens": None, "max_inflight": None}],
+    }
+    tree = BudgetConfig(
+        "binding",
+        (LocalBudgetScope("s", max_calls=1, binding="owner", owner_kinds=("workflow_node", "workflow")),),
+        Host(),
+    )
+    assert tree.manifest()["version"] == 2
+    assert tree.manifest()["scopes"][0]["owner_kinds"] == ["workflow", "workflow_node"]
+    assert (
+        tree.manifest()
+        == BudgetConfig(
+            "binding",
+            (LocalBudgetScope("s", max_calls=1, binding="owner", owner_kinds=("workflow", "workflow_node")),),
+            Host(),
+        ).manifest()
+    )

@@ -110,7 +110,7 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
         from power_loop.core.pass_turn import default_handler
         from power_loop.tools.spawn_agent import _handle_spawn_agent
 
-        if actual is not default_handler and actual is not _h_recall_send and actual is not _handle_spawn_agent:
+        if actual not in (default_handler, _h_recall_send, _handle_spawn_agent, run_workflow_tool):
             raise JobError("budget_tool_adapter_unavailable:" + tool_name)
     await check_dispatch(session_id)
 

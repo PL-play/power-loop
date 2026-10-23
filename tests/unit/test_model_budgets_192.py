@@ -560,7 +560,7 @@ async def test_duplicate_parallel_close_returns_one_original_release_and_never_r
     assert (await budgets.get_budget(c.manager, c.actor, a.attempt_id))["phase"] == "released"
 
 
-@pytest.mark.parametrize("name", ["generate_image", "bash", "jobs"])
+@pytest.mark.parametrize("name", ["generate_image", "bash", "jobs", "workflow"])
 async def test_unadapted_or_name_spoofed_tool_is_rejected_before_its_side_effect(budget_case, name):
     from power_loop import ToolDefinition
     from power_loop.runtime.task_runtime import check_tool_dispatch
