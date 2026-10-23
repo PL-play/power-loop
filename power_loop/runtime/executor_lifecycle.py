@@ -3,6 +3,7 @@
 The durable registry remains authoritative. Local handles only allow this process
 to signal its own work; their disappearance never proves remote/provider stop.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +29,16 @@ def _observe(task):
         task.exception()
 
 
+def _create_task(coroutine, *, name):
+    try:
+        task = asyncio.create_task(coroutine, name=name)
+    except BaseException:
+        coroutine.close()
+        raise
+    task.add_done_callback(_observe)
+    return task
+
+
 class ExecutorLifecycle:
     def __init__(self, runtime, contract_hash):
         if not registry._digest(contract_hash):
@@ -38,14 +49,18 @@ class ExecutorLifecycle:
         self.store_id = self.store.store_id
         self.database = self.manager.db
         self.tables = (self.manager.prefix, self.manager.jobs, self.manager.events)
-        self.identity = registry.ExecutorIdentity(runtime.tenant_id, runtime.principal_id,
-            runtime.executor_id, runtime.boot_id)
+        self.identity = registry.ExecutorIdentity(
+            runtime.tenant_id, runtime.principal_id, runtime.executor_id, runtime.boot_id
+        )
         self.contract_hash = contract_hash
         self.closed = False
         self.failure = None
         self._start_task = None
         self._heartbeat_task = None
         self._shutdown_task = None
+        self._shutdown_deadline = None
+        self._shutdown_grace = None
+        self._shutdown_reason = None
         self._control_task = None
         self._version = None
         self._owned_tasks = {}
@@ -57,10 +72,15 @@ class ExecutorLifecycle:
         except JobError:
             self.closed = True
             self.failure = "executor_binding_mismatch"
-        if (self.runtime.manager is not self.manager or self.manager.store is not self.store or
-                self.store.store_id != self.store_id or
-                any(getattr(self.runtime, key) != getattr(self.identity, key)
-                    for key in ("tenant_id", "principal_id", "executor_id", "boot_id"))):
+        if (
+            self.runtime.manager is not self.manager
+            or self.manager.store is not self.store
+            or self.store.store_id != self.store_id
+            or any(
+                getattr(self.runtime, key) != getattr(self.identity, key)
+                for key in ("tenant_id", "principal_id", "executor_id", "boot_id")
+            )
+        ):
             self.closed = True
             self.failure = "executor_binding_mismatch"
         if self.closed:
@@ -69,8 +89,13 @@ class ExecutorLifecycle:
     async def start(self):
         self.check_admission()
         if self._start_task is None:
-            self._start_task = asyncio.create_task(self._startup(), name="executor-start-"+self.identity.boot_id)
-            self._start_task.add_done_callback(_observe)
+            try:
+                self._start_task = _create_task(self._startup(), name="executor-start-" + self.identity.boot_id)
+            except BaseException:
+                self.closed = True
+                self.failure = "executor_startup_failed"
+                self._signal(self._locals(), force=False)
+                raise
         # Cancelling one caller does not revoke an already accepted registration.
         await asyncio.shield(self._start_task)
         self.check_admission()
@@ -88,28 +113,33 @@ class ExecutorLifecycle:
             return await function(self.manager, self.identity, **kwargs)
 
     def _check_manager_binding(self):
-        if (self.manager.store is not self.store or self.store.store_id != self.store_id or
-                self.manager.db is not self.database or
-                (self.manager.prefix, self.manager.jobs, self.manager.events) != self.tables):
+        if (
+            self.manager.store is not self.store
+            or self.store.store_id != self.store_id
+            or self.manager.db is not self.database
+            or (self.manager.prefix, self.manager.jobs, self.manager.events) != self.tables
+        ):
             raise JobError("executor_binding_mismatch")
 
     async def _startup(self):
         try:
-            await self._idempotent(registry.register, contract_hash=self.contract_hash,
-                startup_lease_ms=self.runtime.lease_ms)
+            await self._idempotent(
+                registry.register, contract_hash=self.contract_hash, startup_lease_ms=self.runtime.lease_ms
+            )
             self.check_admission()
-            await self._idempotent(registry.activate, expected_version=1,
-                system_key="runtime-startup", lease_ms=self.runtime.lease_ms)
+            await self._idempotent(
+                registry.activate, expected_version=1, system_key="runtime-startup", lease_ms=self.runtime.lease_ms
+            )
             self.check_admission()
             current = await registry.get(self.manager, self.identity)
             if not current["admission_open"]:
                 raise JobError("executor_not_accepting")
             self._version = current["version"]
-            self._heartbeat_task = asyncio.create_task(self._heartbeat(), name="executor-heartbeat-"+self.identity.boot_id)
-            self._heartbeat_task.add_done_callback(_observe)
+            self._heartbeat_task = _create_task(self._heartbeat(), name="executor-heartbeat-" + self.identity.boot_id)
         except BaseException:
             self.closed = True
             self.failure = "executor_startup_failed"
+            self._signal(self._locals(), force=False)
             raise
 
     async def _heartbeat(self):
@@ -119,8 +149,12 @@ class ExecutorLifecycle:
                 if self.closed:
                     return
                 self.check_admission()
-                receipt = await self._idempotent(registry.heartbeat, expected_version=self._version,
-                    system_key="runtime-heartbeat:"+str(self._version), lease_ms=self.runtime.lease_ms)
+                receipt = await self._idempotent(
+                    registry.heartbeat,
+                    expected_version=self._version,
+                    system_key="runtime-heartbeat:" + str(self._version),
+                    lease_ms=self.runtime.lease_ms,
+                )
                 self._version = receipt["executor"]["version"]
         except asyncio.CancelledError:
             raise
@@ -159,11 +193,25 @@ class ExecutorLifecycle:
     def _begin_shutdown(self, timeout_s, grace_s, reason):
         self._validate_shutdown(timeout_s, grace_s, reason)
         self.closed = True
+        if self._shutdown_deadline is None:
+            self._shutdown_deadline = asyncio.get_running_loop().time() + timeout_s
+            self._shutdown_grace = grace_s
+            self._shutdown_reason = reason
+        if self._shutdown_task is not None and self._shutdown_task.done() and self._control_task is None:
+            # Task allocation failed before any durable drain RPC was created.
+            # An explicit retry may create that same mechanical operation, with
+            # the original deadline/reason and no repeated business execution.
+            self._shutdown_task = None
         if self._shutdown_task is None:
-            deadline = asyncio.get_running_loop().time()+timeout_s
-            self._shutdown_task = asyncio.create_task(self._shutdown(deadline, grace_s, reason),
-                name="executor-shutdown-"+self.identity.boot_id)
-            self._shutdown_task.add_done_callback(_observe)
+            try:
+                self._shutdown_task = _create_task(
+                    self._shutdown(self._shutdown_deadline, self._shutdown_grace, self._shutdown_reason),
+                    name="executor-shutdown-" + self.identity.boot_id,
+                )
+            except BaseException:
+                self.failure = self.failure or "executor_shutdown_failed"
+                self._signal(self._locals(), force=False)
+                raise
         return self._shutdown_task
 
     async def shutdown(self, *, timeout_s=30.0, grace_s=1.0, reason="host shutdown"):
@@ -196,20 +244,34 @@ class ExecutorLifecycle:
             except BaseException as exc:
                 error = exc.code if isinstance(exc, JobError) else type(exc).__name__
         locals_ = {v["task"] for v in self._locals() if not v["task"].done()}
-        pending = locals_ | {t for t in (self._start_task, self._heartbeat_task, self._control_task, self._shutdown_task)
-            if t is not None and not t.done()}
-        confirmed = receipt is not None and boot is not None and boot["state"] == "draining" and not boot["admission_open"]
-        return {"admission_open": not self.closed and boot is not None and boot["admission_open"],
-            "boot": boot, "durable_drain_confirmed": confirmed, "control_error": error,
+        pending = locals_ | {
+            t
+            for t in (self._start_task, self._heartbeat_task, self._control_task, self._shutdown_task)
+            if t is not None and not t.done()
+        }
+        confirmed = (
+            receipt is not None and boot is not None and boot["state"] == "draining" and not boot["admission_open"]
+        )
+        return {
+            "admission_open": not self.closed and boot is not None and boot["admission_open"],
+            "boot": boot,
+            "durable_drain_confirmed": confirmed,
+            "control_error": error,
             "local_failure": self.failure,
             "control_pending": control is not None and not control.done(),
-            "local_tasks_pending": len(locals_), "pending_handles": len(pending),
+            "local_tasks_pending": len(locals_),
+            "pending_handles": len(pending),
             "store_safe_to_close": confirmed and not pending and error is None,
-            "physical_stop_confirmed": False, "billing_settled": False}
+            "physical_stop_confirmed": False,
+            "billing_settled": False,
+        }
 
     def _locals(self):
-        return [*self.runtime._local_executions.values(), *self.runtime._model_executions.values(),
-            *self._owned_tasks.values()]
+        return [
+            *self.runtime._local_executions.values(),
+            *self.runtime._model_executions.values(),
+            *self._owned_tasks.values(),
+        ]
 
     def _signal(self, entries, *, force):
         signals, tokens, tasks = 0, set(), {}
@@ -249,11 +311,15 @@ class ExecutorLifecycle:
 
     async def _shutdown(self, deadline, grace_s, reason):
         clock = asyncio.get_running_loop().time
-        self._control_task = asyncio.create_task(self._drain(reason), name="executor-drain-"+self.identity.boot_id)
-        self._control_task.add_done_callback(_observe)
+        try:
+            self._control_task = _create_task(self._drain(reason), name="executor-drain-" + self.identity.boot_id)
+        except BaseException:
+            self.failure = self.failure or "executor_shutdown_failed"
+            self._signal(self._locals(), force=False)
+            raise
         # A hung store cannot consume an unbounded stop window. Retain this
         # exact control task after the deadline, rather than inventing no-commit.
-        await asyncio.wait({self._control_task}, timeout=min(1.0, max(0.0, deadline-clock())))
+        await asyncio.wait({self._control_task}, timeout=min(1.0, max(0.0, deadline - clock())))
         entries = self._locals()
         signals = self._signal(entries, force=False)
         heartbeat = self._heartbeat_task
@@ -262,9 +328,9 @@ class ExecutorLifecycle:
         current = asyncio.current_task()
         tasks = {v["task"] for v in entries if v["task"] is not current and not v["task"].done()}
         if tasks:
-            waiting = tasks-self._shutdown_waiters
+            waiting = tasks - self._shutdown_waiters
             if waiting:
-                await asyncio.wait(waiting, timeout=min(grace_s, max(0.0, deadline-clock())))
+                await asyncio.wait(waiting, timeout=min(grace_s, max(0.0, deadline - clock())))
         # Refresh handles admitted while the durable operation was in flight.
         entries = self._locals()
         signals += self._signal(entries, force=True)
@@ -274,9 +340,9 @@ class ExecutorLifecycle:
         if not self._control_task.done():
             tasks.add(self._control_task)
         if tasks:
-            waiting = tasks-self._shutdown_waiters
+            waiting = tasks - self._shutdown_waiters
             if waiting:
-                await asyncio.wait(waiting, timeout=max(0.0, deadline-clock()))
+                await asyncio.wait(waiting, timeout=max(0.0, deadline - clock()))
         receipt, error = None, None
         if self._control_task.done():
             try:
@@ -284,9 +350,16 @@ class ExecutorLifecycle:
             except BaseException as exc:
                 error = exc.code if isinstance(exc, JobError) else type(exc).__name__
         pending = [t for t in tasks if not t.done()]
-        return {"admission_open": False, "durable_drain_confirmed": receipt is not None,
-            "drain_receipt": receipt, "control_error": error, "local_signals": signals,
+        return {
+            "admission_open": False,
+            "durable_drain_confirmed": receipt is not None,
+            "drain_receipt": receipt,
+            "control_error": error,
+            "local_signals": signals,
             "local_tasks_pending": sum(t in {v["task"] for v in entries} for t in pending),
-            "control_pending": not self._control_task.done(), "pending_handles": len(pending),
+            "control_pending": not self._control_task.done(),
+            "pending_handles": len(pending),
             "store_safe_to_close": not pending and receipt is not None,
-            "physical_stop_confirmed": False, "billing_settled": False}
+            "physical_stop_confirmed": False,
+            "billing_settled": False,
+        }

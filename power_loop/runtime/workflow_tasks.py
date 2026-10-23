@@ -3,6 +3,7 @@
 Execution evidence precedes the legacy journal/inbox/wake. This does not yet
 provide B2's final completion decision or B3's cross-process resume protocol.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -48,8 +49,10 @@ def node_metadata(runtime):
 def validate_new_workflow(spec, *, eager_wake=False):
     from power_loop.workflow.engine import WorkflowEngine
     from power_loop.workflow.spec import LoopNode
+
     if eager_wake:
         raise JobError("task_adapter_unavailable:eager_workflow_wake")
+
     def check(node):
         if isinstance(node, LoopNode) and node.continue_nodes:
             raise JobError("task_adapter_unavailable:workflow_session_rebind")
@@ -57,6 +60,7 @@ def validate_new_workflow(spec, *, eager_wake=False):
             check(child)
         if getattr(node, "fallback", None) is not None:
             check(node.fallback)
+
     check(spec.root)
 
 
@@ -67,10 +71,16 @@ async def admit_workflow(runtime, sid, request):
     assistant_seq, call_id = current_invocation(sid)
     if assistant_seq is None or not call_id:
         raise JobError("persisted_tool_call_required")
-    return await runtime.manager.register_job(execution.actor, kind="workflow", title=request["spec"]["name"][:200],
-        parent=execution.lease, independent=True,
-        call_ref=await runtime.manager.store.message_ref(sid, assistant_seq), tool_call_id=call_id,
-        request=request)
+    return await runtime.manager.register_job(
+        execution.actor,
+        kind="workflow",
+        title=request["spec"]["name"][:200],
+        parent=execution.lease,
+        independent=True,
+        call_ref=await runtime.manager.store.message_ref(sid, assistant_seq),
+        tool_call_id=call_id,
+        request=request,
+    )
 
 
 @asynccontextmanager
@@ -84,6 +94,7 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
     key = hashlib.sha256(json.dumps([node.id, route], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     actor = runtime.actor(driver_sid)
     from .node_resume import _PREPARED
+
     prepared = _PREPARED.get()
     restore_token = None
     if prepared is None and getattr(engine, "_restore_operation_id", None):
@@ -92,6 +103,7 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
 
         from .spec import workflow_continuation_loop
         from .workflow_restore_execution import authority, claim_node
+
         token = secrets.token_hex(16)
         cancelled = None
         try:
@@ -104,6 +116,7 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
             if grant["token"] != token:
                 raise
             from .jobs import JobLease
+
             lease, sid = JobLease(**grant["node"]), grant["session_id"]
             if isinstance(exc, asyncio.CancelledError):
                 cancelled = exc
@@ -117,19 +130,38 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
                 await runtime.manager.bind_node_session(actor, lease, sid)
             except Exception:
                 await runtime.manager.check_execution(actor, lease)
-                grant, _ = await authority(runtime.manager, runtime.manager.db,
-                    await runtime.manager._row(runtime.manager.db, lease.job_id), sid)
+                grant, _ = await authority(
+                    runtime.manager,
+                    runtime.manager.db,
+                    await runtime.manager._row(runtime.manager.db, lease.job_id),
+                    sid,
+                )
                 if grant["token"] != token:
                     raise JobError("workflow_node_authority_mismatch") from None
         except BaseException as exc:
             from power_loop.workflow.result import AgentResult
-            result = AgentResult(node_id=node.id, session_id=sid, text="", status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed", error=str(exc))
+
+            result = AgentResult(
+                node_id=node.id,
+                session_id=sid,
+                text="",
+                status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                error=str(exc),
+            )
             saved = await runtime.record_scope(restored_binding, result.to_dict())
             result.status, result.usage = saved["status"], saved.get("usage", {})
             engine._results[node.id] = result
             raise
-        prepared = SimpleNamespace(engine=engine, node_id=node.id, binding=restored_binding,
-            sid=sid, child=child, contract=source["contract"], pending=False, restored=True)
+        prepared = SimpleNamespace(
+            engine=engine,
+            node_id=node.id,
+            binding=restored_binding,
+            sid=sid,
+            child=child,
+            contract=source["contract"],
+            pending=False,
+            restored=True,
+        )
     if prepared is not None:
         if prepared.engine is not engine or prepared.node_id != node.id or prepared.binding.actor != actor:
             raise JobError("node_resume_execution_mismatch")
@@ -138,8 +170,14 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
             engine._task_nodes[prepared.sid] = binding
             restore_token = _PREPARED.set(prepared)
     else:
-        registration = await runtime.manager.register_job(actor, kind="workflow_node", parent=workflow.lease,
-            system_key="node:" + key, title=node.id[:200], request={"node": _node_to_dict(node), "route": route})
+        registration = await runtime.manager.register_job(
+            actor,
+            kind="workflow_node",
+            parent=workflow.lease,
+            system_key="node:" + key,
+            title=node.id[:200],
+            request={"node": _node_to_dict(node), "route": route},
+        )
         if registration.replayed:
             raise JobError("task_node_requires_reconciliation")
         binding = await runtime.claim(actor, registration)
@@ -155,15 +193,54 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
             yield binding
     except BaseException as exc:
         from .executor_registry import FENCE_ERRORS
-        if (not binding.stop_renewal.is_set() or getattr(exc, "code", None) in FENCE_ERRORS or
-                getattr(exc, "code", None) in ("required_execution_unsettled", "required_result_unhandled", "required_input_unhandled")):
-            saved = await runtime.record_scope(binding, {**getattr(exc, "execution_result", {}), "node_id": node.id,
-                "status": "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed", "error_type": type(exc).__name__})
+
+        if (
+            not binding.stop_renewal.is_set()
+            or isinstance(getattr(exc, "execution_result", None), dict)
+            or getattr(exc, "code", None) in FENCE_ERRORS
+            or getattr(exc, "code", None)
+            in ("required_execution_unsettled", "required_result_unhandled", "required_input_unhandled")
+        ):
+            # A containing workflow's lost supervision can cancel this shared
+            # task after the node has stopped its own renewal. Preserve that
+            # actual cause instead of classifying it as a user node stop.
+            parent_error = workflow.resource_evidence.get("supervision_error")
+            if parent_error is not None:
+                binding.resource_evidence["supervision_error"] = parent_error
+            failure = {
+                **getattr(exc, "execution_result", {}),
+                "node_id": node.id,
+                "status": "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                "error_type": type(exc).__name__,
+            }
+            # A containing workflow heartbeat can cancel this shared task while
+            # the stopped node's negative result is being saved. Shield only
+            # that original mechanical write, never model/tool execution.
+            coroutine = runtime.record_scope(binding, failure)
+            try:
+                write = asyncio.create_task(coroutine, name="node-failure-" + binding.lease.job_id)
+            except BaseException:
+                coroutine.close()
+                raise
+            runtime.track_task(write, job_id=binding.lease.job_id)
+            cancelled = None
+            try:
+                saved = await asyncio.shield(write)
+            except asyncio.CancelledError as interrupted:
+                if write.cancelled():
+                    raise
+                cancelled = interrupted
+                done, _ = await asyncio.wait({write}, timeout=5)
+                if not done:
+                    raise  # Retained original task; control remains unresolved.
+                saved = write.result()
             prior = engine._results.get(node.id)
             if prior is not None:
                 prior.status = saved["status"]
                 prior.error = str(exc)
                 prior.usage = saved.get("usage", prior.usage)
+            if cancelled is not None:
+                raise cancelled from exc
         raise
     finally:
         for sid, active in list(engine._task_nodes.items()):
@@ -178,17 +255,28 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
 async def collect_node(runtime, loop, raw, stop_event, *, timeout_s=1800, max_rounds=30):
     """The owning node reuses one collector window across all settlement checks."""
     from .task_runtime import _OWNER
+
     scope = _OWNER.get()
     if scope is not None and scope.runtime is runtime:
-        unresolved = await runtime.manager.db.fetchone(f"SELECT job_id FROM {runtime.manager.jobs} WHERE control_owner_job_id=? "
-            "AND control_owner_generation=? AND resource_state='unknown' LIMIT 1", (scope.lease.job_id, scope.lease.generation))
+        unresolved = await runtime.manager.db.fetchone(
+            f"SELECT job_id FROM {runtime.manager.jobs} WHERE control_owner_job_id=? "
+            "AND control_owner_generation=? AND resource_state='unknown' LIMIT 1",
+            (scope.lease.job_id, scope.lease.generation),
+        )
         if unresolved:
             status = "cancelled" if raw.get("status") == "cancelled" or stop_event.is_cancelled() else "failed"
-            return {**raw, "status": status, "completion_unresolved": True, "error": "unresolved_provider_or_tool_attempt"}
+            return {
+                **raw,
+                "status": status,
+                "completion_unresolved": True,
+                "error": "unresolved_provider_or_tool_attempt",
+            }
     from .completion import WINDOW, CompletionWindow, collect_required
+
     window = WINDOW.get()
     if window is None:
         from .task_runtime import _OWNER
+
         scope = _OWNER.get()
         key = "completion_window"
         window = scope.resource_evidence.get(key) if scope is not None and scope.runtime is runtime else None
@@ -211,8 +299,12 @@ async def ensure_node_answer(runtime, loop, raw, stop_event, *, timeout_s=30):
     from .task_runtime import _OWNER
 
     binding = _OWNER.get()
-    if (raw.get("status") != "completed" or (raw.get("final_text") or "").strip() or
-            binding is None or binding.runtime is not runtime):
+    if (
+        raw.get("status") != "completed"
+        or (raw.get("final_text") or "").strip()
+        or binding is None
+        or binding.runtime is not runtime
+    ):
         return raw
     sid = raw.get("session_id")
     if stop_event.is_cancelled():
@@ -226,10 +318,15 @@ async def ensure_node_answer(runtime, loop, raw, stop_event, *, timeout_s=30):
     if binding.lease.generation > 1:
         from .completion import WINDOW, finish_text
         from .node_resume import _PREPARED
+
         prepared, window = _PREPARED.get(), WINDOW.get()
         if prepared is None or prepared.binding is not binding or prepared.sid != sid or window is None:
-            return {**raw, "status": "failed", "completion_unresolved": True,
-                "error": "node_output_completion_contract_missing"}
+            return {
+                **raw,
+                "status": "failed",
+                "completion_unresolved": True,
+                "error": "node_output_completion_contract_missing",
+            }
         # Only the original owning engine's admitted generation and session may
         # supplement. Reuse its remaining ceiling, deadline and one-answer flag;
         # never start a replacement business attempt to repair missing output.
@@ -238,27 +335,43 @@ async def ensure_node_answer(runtime, loop, raw, stop_event, *, timeout_s=30):
             async with asyncio.timeout(timeout_s):
                 return await finish_text(loop, raw, stop_event, window=window)
         except Exception as exc:
-            return {**raw, "status": "failed", "completion_unresolved": True,
-                "error": "node_output_completion_failed:"+type(exc).__name__}
+            return {
+                **raw,
+                "status": "failed",
+                "completion_unresolved": True,
+                "error": "node_output_completion_failed:" + type(exc).__name__,
+            }
     running = SimpleNamespace(task_binding=binding, answer_attempted=False, token=stop_event)
     try:
         from .completion import WINDOW
+
         window = WINDOW.get()
-        deadline = asyncio.get_running_loop().time()+timeout_s
+        deadline = asyncio.get_running_loop().time() + timeout_s
         if window is not None and window.deadline is not None:
             deadline = min(deadline, window.deadline)
-        value = await ensure_answer(loop, running, sid, raw, deadline,
-            max_extra_rounds=window.allowance(raw) if window is not None else None)
+        value = await ensure_answer(
+            loop, running, sid, raw, deadline, max_extra_rounds=window.allowance(raw) if window is not None else None
+        )
         if window is not None and running.answer_attempted:
             window.remaining -= max(1, int(value.get("rounds") or 0) - int(raw.get("rounds") or 0))
     except Exception as exc:
-        return {**raw, "status": "failed", "completion_unresolved": True, "error": "node_output_completion_failed:"+type(exc).__name__}
+        return {
+            **raw,
+            "status": "failed",
+            "completion_unresolved": True,
+            "error": "node_output_completion_failed:" + type(exc).__name__,
+        }
     if value.get("status") != "completed":
         value = {**value, "completion_unresolved": True}
     if value.get("error") == "subagent_output_missing":
         value = {**value, "error": "node_output_missing"}
     if value.get("status") == "completed" and not (value.get("final_text") or "").strip():
-        return {**value, "status": "cancelled" if stop_event.is_cancelled() else "failed", "completion_unresolved": True, "error": "node_output_missing"}
+        return {
+            **value,
+            "status": "cancelled" if stop_event.is_cancelled() else "failed",
+            "completion_unresolved": True,
+            "error": "node_output_missing",
+        }
     return value
 
 
@@ -272,19 +385,36 @@ async def execute_background(loop, parent_sid, run_id, registration, build_engin
 
     async def deliver(result, saved):
         from .workflow_results import project
+
         result.status = saved["status"]
-        await project(loop, runtime.actor(parent_sid), registration.job.job_id,
-                      binding.lease.generation if binding else 0, lease=binding.lease if binding else None)
+        await project(
+            loop,
+            runtime.actor(parent_sid),
+            registration.job.job_id,
+            binding.lease.generation if binding else 0,
+            lease=binding.lease if binding else None,
+        )
         if on_complete is not None and saved["status"] != "cancelled" and run_id not in runner._STOPPED_RUNS:
             from .workflow_results import run_callback
-            await run_callback(loop, runtime.actor(parent_sid), registration.job.job_id,
-                               binding.lease.generation if binding else 0, on_complete)
+
+            await run_callback(
+                loop,
+                runtime.actor(parent_sid),
+                registration.job.job_id,
+                binding.lease.generation if binding else 0,
+                on_complete,
+            )
 
     def failed(exc):
-        status = "cancelled" if isinstance(exc, asyncio.CancelledError) or getattr(exc, "code", None) == "cancel_requested" else "failed"
+        status = (
+            "cancelled"
+            if isinstance(exc, asyncio.CancelledError) or getattr(exc, "code", None) == "cancel_requested"
+            else "failed"
+        )
         snapshot = getattr(exc, "execution_result", None)
-        if isinstance(snapshot, dict):
+        if isinstance(snapshot, dict) and "name" in snapshot and "results" in snapshot:
             from .workflow_results import workflow_result
+
             # A graph can finish its declared safe steps while an earlier
             # request remains unknown. Retain its real outputs, never replace
             # completed work/usage with an empty error-only workflow.
@@ -292,17 +422,16 @@ async def execute_background(loop, parent_sid, run_id, registration, build_engin
             result.status = status
             result.errors.append(f"{type(exc).__name__}: {exc}")
             return result
-        return WorkflowResult(name=run_spec.name,
-            status=status,
-            errors=[f"{type(exc).__name__}: {exc}"])
+        return WorkflowResult(name=run_spec.name, status=status, errors=[f"{type(exc).__name__}: {exc}"])
 
     try:
         binding = await runtime.claim(runtime.actor(parent_sid), registration)
     except BaseException as exc:
         try:
             result = failed(exc)
-            saved = await runtime.manager.record_unstarted_result(runtime.actor(parent_sid), registration.job.job_id,
-                outcome=result.status, result=result.to_dict())
+            saved = await runtime.manager.record_unstarted_result(
+                runtime.actor(parent_sid), registration.job.job_id, outcome=result.status, result=result.to_dict()
+            )
             await deliver(result, saved)
         except BaseException:
             # A claim may have committed before losing its ACK. Only generation
@@ -315,6 +444,7 @@ async def execute_background(loop, parent_sid, run_id, registration, build_engin
         async with runtime.execution(binding, context=_WORKFLOW):
             try:
                 import inspect
+
                 candidate = build_engine()
                 engine = await candidate if inspect.isawaitable(candidate) else candidate
                 engine._task_execution = binding
@@ -328,7 +458,11 @@ async def execute_background(loop, parent_sid, run_id, registration, build_engin
             await deliver(result, saved)
     except BaseException as exc:
         # An ambiguous result commit/projected completion must never be rewritten.
-        if not binding.stop_renewal.is_set() or getattr(exc, "code", None) in ("required_execution_unsettled", "required_result_unhandled", "required_input_unhandled"):
+        if not binding.stop_renewal.is_set() or getattr(exc, "code", None) in (
+            "required_execution_unsettled",
+            "required_result_unhandled",
+            "required_input_unhandled",
+        ):
             try:
                 result = failed(exc)
                 saved = await runtime.record_scope(binding, result.to_dict())

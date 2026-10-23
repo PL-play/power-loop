@@ -160,6 +160,8 @@ def main() -> int:
         "tests/unit/test_completion_window_192.py",
         "tests/unit/test_finalization_192.py",
         "tests/unit/test_model_attempts_192.py",
+        "tests/unit/test_budget_contracts_192.py",
+        "tests/unit/test_model_budgets_192.py",
         "tests/unit/test_model_attempt_transport_192.py",
         "tests/unit/test_model_attempt_edges_192.py",
         "tests/unit/test_answer_freshness_192.py",

@@ -1,12 +1,15 @@
 """Actual background receipt -> wait -> same-session evidence consumption."""
+
 from __future__ import annotations
 
 import asyncio
 import secrets
+from dataclasses import replace
 
 import pytest
 
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition, create_default_tool_registry
+from power_loop.core.pass_turn import PASS_TURN_TOOL
 from power_loop.runtime.completion import CompletionWindow, collect_required
 from power_loop.tools import default_tools
 
@@ -16,43 +19,91 @@ pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize("ending", ["natural", "pass_turn"])
-async def test_real_common_collector_waits_for_background_and_reentry_makes_no_new_request(tmp_path, monkeypatch, record_property, ending):
+async def test_real_common_collector_waits_for_background_and_reentry_makes_no_new_request(
+    tmp_path, monkeypatch, record_property, ending
+):
     store = await SessionStore.open(str(tmp_path / "completion.db"))
     provider = BoundedProvider(limit=8)
     manager = default_tools.BackgroundManager()
     monkeypatch.setattr(default_tools, "BG", manager)
     monkeypatch.setattr(default_tools, "_TOOL_TASK_ON_COMPLETE", None)
     registry = create_default_tool_registry(include=["background_run"], workspace_dir=tmp_path)
+    if ending == "natural":
+        # Pipeline always provides pass_turn. This host policy rejects that
+        # ending in the natural branch; the model must still write the actual
+        # WAITING/evidence response. The pass branch uses the real default.
+        def natural_response_only(reason=""):
+            return "This host requires a natural assistant response. Write WAITING while work is pending, or its exact evidence code after completion, without tool calls."
+
+        registry.register(
+            replace(
+                PASS_TURN_TOOL,
+                description="This host requires natural assistant completion. Do not call pass_turn; write the requested visible answer directly.",
+            ),
+            natural_response_only,
+            overwrite=True,
+        )
     entered, release = asyncio.Event(), asyncio.Event()
     proof = "BACKGROUND-" + secrets.token_hex(8)
+
     async def evidence():
         entered.set()
         await release.wait()
         return proof
-    registry.register(ToolDefinition(name="local_evidence", description="Read a local result code.",
-        input_schema={"type": "object", "properties": {}}, async_capable=True), evidence)
-    loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,
-        config=AgentLoopConfig(max_rounds=4, max_tokens=2048,
+
+    registry.register(
+        ToolDefinition(
+            name="local_evidence",
+            description="Read a local result code.",
+            input_schema={"type": "object", "properties": {}},
+            async_capable=True,
+        ),
+        evidence,
+    )
+    loop = StatefulAgentLoop(
+        llm=provider,
+        store=store,
+        tool_registry=registry,
+        config=AgentLoopConfig(
+            max_rounds=4,
+            max_tokens=2048,
             system_prompt="Follow the requested tool sequence. A background acceptance receipt is not a result. "
-                "When final background evidence arrives, report its exact BACKGROUND code in assistant text, "
-                "without any tool call, polling or pass_turn. Never start replacement work."))
+            "When final background evidence arrives, report its exact BACKGROUND code in assistant text, "
+            "without any tool call, polling or pass_turn. Never start replacement work.",
+        ),
+    )
     sid = await loop.new_session()
     collection = None
     try:
         async with asyncio.timeout(180):
-            ending_instruction = "then call pass_turn to wait" if ending == "pass_turn" else "then reply WAITING without tools or pass_turn"
-            first = await loop.send("Use background_run action=tool tool=local_evidence args={} exactly once, "
-                + ending_instruction + ". Do not call local_evidence directly, check, wait, or list.", sid)
+            ending_instruction = (
+                "then call pass_turn to wait"
+                if ending == "pass_turn"
+                else "then reply WAITING without tools or pass_turn"
+            )
+            first = await loop.send(
+                "Use background_run action=tool tool=local_evidence args={} exactly once, "
+                + ending_instruction
+                + ". Do not call local_evidence directly, check, wait, or list.",
+                sid,
+            )
             assert first.status == "completed" and first.passed == (ending == "pass_turn")
             await entered.wait()
-            raw = {"session_id": sid, "status": first.status, "final_text": first.final_text,
-                "rounds": first.rounds, "usage": first.usage}
+            raw = {
+                "session_id": sid,
+                "status": first.status,
+                "final_text": first.final_text,
+                "rounds": first.rounds,
+                "usage": first.usage,
+            }
             window = CompletionWindow(60, 3)
+
             async def original_loop(owner, session):
                 # This is a main-session collector, not a workflow leaf. Its
                 # trusted resolver preserves the actual original loop/config.
                 assert owner is loop and session == sid
                 return loop
+
             before = provider.calls
             collection = asyncio.create_task(collect_required(loop, raw, window=window, resolve_loop=original_loop))
             await asyncio.sleep(0.02)
