@@ -124,9 +124,12 @@ async def admit(manager, actor, job_id, *, caller, workflow, call_ref, tool_call
         from .finalization import require_node_consumed
         await require_node_consumed(manager, tx, job)
         now = manager.now()
-        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,status='running',supervision_status='open',"
+        from .executor_registry import ExecutorIdentity, require_accepting
+        executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
+            required=job["executor_key"] is not None or source["executor_key"] is not None or wf["executor_key"] is not None)
+        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,status='running',supervision_status='open',"
             "intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,version=version+1,updated_at=? WHERE job_id=?",
-            (target.generation, executor_id, boot_id, now+lease_ms, now, job_id))
+            (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id))
         payload = {"job_id": job_id, "session_id": node["session_id"], "run_id": node["workflow_run_id"],
             "mode": "continue", "status": "accepted", "generation": target.generation,
             "result_event_id": result_id(job_id, target.generation), "request": request}

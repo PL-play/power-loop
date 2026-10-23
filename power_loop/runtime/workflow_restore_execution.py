@@ -182,9 +182,13 @@ async def claim_node(runtime, workflow_binding, node_id, driver_sid, token):
         if _hash(old) != source["binding_hash"]:
             raise JobError("workflow_node_authority_mismatch")
         lease = JobLease(row["job_id"], wf["executor_id"], wf["boot_id"], reservation["generation"])
-        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,status='running',supervision_status='open',intake='open',resource_state='running',"
+        from .executor_registry import ExecutorIdentity, require_accepting
+        executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, lease.executor_id, lease.boot_id),
+            required=row["executor_key"] is not None or wf["executor_key"] is not None)
+        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,status='running',supervision_status='open',intake='open',resource_state='running',"
             "outcome=NULL,result_json=NULL,result_status='none',control_owner_generation=?,control_owner_executor_id=?,control_owner_boot_id=?,version=version+1,updated_at=? WHERE job_id=?",
-            (lease.generation, lease.executor_id, lease.boot_id, manager.now()+runtime.lease_ms, wf["generation"], wf["executor_id"], wf["boot_id"], manager.now(), row["job_id"]))
+            (lease.generation, lease.executor_id, lease.boot_id, executor["executor_key"] if executor else None,
+                manager.now()+runtime.lease_ms, wf["generation"], wf["executor_id"], wf["boot_id"], manager.now(), row["job_id"]))
         await put(manager, tx, manager._node_session_event_id(row["job_id"], sid, lease.generation), row["job_id"], "node_session", row["version"]+1,
             {**old, "generation": lease.generation}, versioned=False)
         data = {"version": 1, "operation_id": op["event_id"], "workflow": request["target"], "node": asdict(lease),

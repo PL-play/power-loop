@@ -9,6 +9,14 @@
 ## [Unreleased]
 
 ### Added
+- Add experimental protocol3 executor boot records, immutable host operation
+  receipts and durable drain admission barriers, with explicit protocol2 maintenance
+  migration. Preserve original registered execution bindings through continuations
+  and reject success commits after boot fencing. Test hosts exercise actual process
+  termination and real provider paths; automatic host startup/shutdown and external
+  resource reconciliation remain under development.
+- Add real-provider file shards to the acceptance runner, with pre-dispatch canonical
+  collection, exact case identity validation, exclusive evidence and per-case progress.
 - Persist managed model-call preparation, dispatch and response observations in
   the task event ledger. Fence each original send, reconcile lost ACKs without
   repeating a request, and retain uncertain remote execution after exceptions

@@ -99,3 +99,40 @@ def test_streamed_success_returns_child_exit(tmp_path):
     code = runner.stream_run([sys.executable, "-c", "print('done')"], repo=tmp_path,
         env=os.environ.copy(), log_path=log, sanitize=lambda value: value)
     assert code == 0 and log.read_text() == "done\n"
+
+
+def test_real_shards_cover_canonical_parameterized_cases_without_omission_or_overlap():
+    scopes = [f"tests/real/test_{i}.py" for i in range(7)]
+    collected = "\n".join(f"{scope}::test_flow[{variant}]" for scope in scopes for variant in ("natural", "pass_turn"))
+    cases = runner.real_case_ids(collected)
+    groups = [runner.selected_real_cases(cases, runner.unit_partition(scopes, f"{i}/4")) for i in range(1,5)]
+    assert len(cases) == 14 and sum(map(len, groups)) == 14
+    assert set(c for group in groups for c in group) == set(cases)
+    assert len(set(c for group in groups for c in group)) == 14
+
+
+@pytest.mark.parametrize("output", ["", "no tests collected", "tests/real/../bad.py::test_bad",
+    "tests/real/test_a.py::test_a\ntests/real/test_a.py::test_a"])
+def test_real_collection_refuses_empty_duplicate_or_invalid_case_identities(output):
+    with pytest.raises(ValueError):
+        runner.real_case_ids(output)
+
+
+def test_real_selection_distinguishes_module_names_and_classes():
+    output = "tests/real/test_a.py::TestFlow::test_call[pass]\ntests/real/test_a_more.py::test_call"
+    cases = runner.real_case_ids(output)
+    assert runner.selected_real_cases(cases, ["tests/real/test_a.py"]) == [("tests.real.test_a.TestFlow", "test_call[pass]")]
+    with pytest.raises(ValueError, match="missing or empty"):
+        runner.selected_real_cases(cases, ["tests/real/absent.py"])
+
+
+@pytest.mark.parametrize("args", [["--real-shard", "0/4"], ["--real-shard", "1/4", "--unit-shard", "1/4"],
+    ["--real-shard", "1/4", "--real-only"], ["--real-shard", "1/4", "--full"]])
+def test_invalid_real_selection_cannot_start_docker_or_any_provider(args, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("selection must fail before external work")
+    monkeypatch.setattr(runner.subprocess, "check_output", forbidden)
+    monkeypatch.setattr(sys, "argv", [str(path), *args])
+    with pytest.raises(SystemExit) as raised:
+        runner.main()
+    assert raised.value.code == 2

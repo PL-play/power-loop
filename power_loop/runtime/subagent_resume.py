@@ -84,10 +84,13 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, sessi
         from .execution_membership import require_current, start
         await require_current(manager, tx, job)
         now = manager.now()
-        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,"
+        from .executor_registry import ExecutorIdentity, require_accepting
+        executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
+            required=job["executor_key"] is not None or source["executor_key"] is not None)
+        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,"
             "status='running',supervision_status='open',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
             "version=version+1,updated_at=? WHERE job_id=?",
-            (target.generation, executor_id, boot_id, now+lease_ms, now, job_id))
+            (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id))
         payload = {"job_id": job_id, "session_id": session_id, "mode": "continue", "status": "accepted",
                    "generation": target.generation, "result_event_id": result_id(job_id, target.generation), "request": request}
         operation = await manager._insert_operation(tx, job_id=job_id, version=job["version"]+1,

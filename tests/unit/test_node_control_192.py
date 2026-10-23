@@ -142,7 +142,12 @@ async def test_node_selector_is_exact_and_invalid_selection_never_stops_whole_ru
         assert not handle.task.done() and not model.entered["REVIEW"].is_set()
         model.release["BUILD"].set()
     else:
-        assert receipt["job_id"] == node["job_id"] and receipt["local_signals"] > 0
+        # Heartbeat can observe the committed stop before signal_local runs.
+        # Zero new local signals is valid; the original stop receipt and actual
+        # cancelled node below prove the selected scope was stopped.
+        assert receipt["job_id"] == node["job_id"] and receipt["cancel_requested"]
+        assert type(receipt["local_signals"]) is int and receipt["local_signals"] >= 0
+        assert receipt["signal_error"] is None
     await asyncio.wait_for(model.entered["REVIEW"].wait(), 3)
     model.release["REVIEW"].set()
     await asyncio.wait_for(handle.task, 5)
@@ -397,3 +402,21 @@ async def test_legacy_node_control_uses_only_proven_handle_without_cancelling_pa
     model.release.set()
     await asyncio.wait_for(handle.task, 5)
     assert len(notified) == 1 and (await runner.journal.read(store, sid, run_id))["status"] == "completed"
+
+
+async def test_exact_node_selector_retains_receipt_when_heartbeat_wins_local_signal(managed_workflow, monkeypatch):
+    _, manager, runtime, _, model, sid, _, _ = managed_workflow
+    original = task_control.signal_local
+    signals = []
+    async def after_heartbeat(*args):
+        await asyncio.wait_for(model.entered["REVIEW"].wait(), 4)
+        result = await original(*args)
+        signals.append(result)
+        return result
+    monkeypatch.setattr(task_control, "signal_local", after_heartbeat)
+    await test_node_selector_is_exact_and_invalid_selection_never_stops_whole_run(managed_workflow, monkeypatch, "exact_job")
+    assert signals == [0]
+    [node] = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='workflow_node' AND title='BUILD'")
+    saved = await manager.get_job(runtime.actor(sid), node["job_id"])
+    assert saved.outcome == "cancelled" and saved.resource_state == "unknown"
+    assert saved.supervision_status == "open"

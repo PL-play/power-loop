@@ -7,11 +7,12 @@ This is an unreleased development interface, not part of `STABLE_API`.
 
 Default `AUTO_CREATE` and `VERIFY` remain schema v9. A fresh store explicitly opened
 with `schema=SchemaPolicy.TASKS` uses experimental schema v10: raw message identity
-primary key, unique `(session_id,seq)`, `task_store`, `jobs`, and `job_events`.
-The current experimental task protocol is **2**, with persisted execution roles
-and separate control-owner bindings. Protocol-1 experimental stores are refused
-without modification; they were never a serving-mode migration target. No
-implicit v10/protocol-1 upgrade is performed.
+primary key, unique `(session_id,seq)`, task/job events and executor boot records.
+The current experimental task protocol is **3**, adding persistent boot control
+to protocol2 execution roles and control-owner bindings. Protocol2 requires an
+explicit maintenance upgrade preserving identities. Protocol1 experimental stores
+are refused without modification; they were never a serving-mode migration target.
+No implicit task protocol upgrade is performed.
 `COMPATIBLE` verifies an existing v9/v10 store without creating or migrating it.
 Normal old-mode entry refuses v10. The original 8.0 binary also refuses its stamp.
 
@@ -1042,3 +1043,40 @@ are detected; whole JSON responses are bounded. Reads never ACK inputs, settle
 billing, clear unknown resource responsibility or run a model. Unsupported
 provider queries are explicit. The phase ledger is not a hard-budget reservation
 or API billing ledger and does not prove arbitrary tools stopped.
+
+### Registered executor boots (protocol3, implementation in progress)
+
+New experimental task stores retain schema-v10 but require task protocol3. They
+add task_executors/task_executor_events and jobs.executor_key. Existing protocol2
+stores require explicit migrate_task_schema(..., maintenance=True) with writers
+stopped; opening a store does not upgrade it. Preserve original store/message/job
+identities and v1 execution history. Normal default storage remains v9.
+
+The host-only runtime.executor_registry ports register a typed tenant/principal/
+executor/boot and immutable contract hash as starting. Activation checks live prior
+boot admission and unsettled execution responsibility before accepting. Heartbeats
+cannot revive expired or draining boots. Each operation has an immutable original
+request/receipt; replay recalls that decision without extending leases or reviving
+execution. The ports are not model tools and receipts grant no execution authority.
+
+Drain atomically closes boot admission, snapshots exact active and unclaimed child
+executions, and records mechanical cancellation. An oversized snapshot still closes
+admission with scope_incomplete=true; it does not claim all stop work completed.
+Stop signalling and external resource confirmation are separate from acceptance.
+A stopped cache cannot hide a still-unconfirmed original model attempt.
+
+Registered claims retain executor_key and execution_scope-v2 binding to the original
+registration event. Current dispatch and control owners check the live boot; old
+history validates the original binding without requiring that boot to stay live.
+Missing control rows or binding evidence cannot downgrade a controlled execution.
+Child admission and subagent/node/workflow continuation keep the registered contract,
+including node claims during whole-workflow restoration. Success commit also checks
+boot admission, preserving completed text/usage in a negative disposition when the
+boot expires after the last model response.
+
+Legacy unregistered v1 executions retain their old declared capabilities and cannot
+be retroactively adopted by registering the same boot. Test hosts explicitly start
+registered boots through these ports. TaskRuntime automatic startup/boot heartbeats,
+one total shutdown deadline, startup resource reconciliation, formal host integration
+and external stop/fee evidence remain required work. This increment does not activate
+production runtime, close uncertain resources, settle bills or complete B3.

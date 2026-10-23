@@ -327,7 +327,8 @@ class TaskRuntime:
             await self.manager.record_execution_result(binding.actor, binding.lease, outcome=outcome,
                 result=result, resource_state="unknown" if unknown else "stopped", require_children_stopped=True)
         except JobError as exc:
-            if exc.code in ("required_execution_unsettled", "required_result_unhandled", "required_input_unhandled"):
+            from .executor_registry import FENCE_ERRORS
+            if exc.code in FENCE_ERRORS or exc.code in ("required_execution_unsettled", "required_result_unhandled", "required_input_unhandled"):
                 exc.execution_result = result
             raise
         return (await self.manager.get_job(binding.actor, binding.lease.job_id)).result

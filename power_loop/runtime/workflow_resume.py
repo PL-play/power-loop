@@ -38,6 +38,7 @@ async def _source(manager, tx, actor, caller, ref):
     if (row["kind"] != "send" or row["session_id"] != actor.session_id or row["execution_role"] != "main" or
             type(index) is not int or index < 1 or index != ref.send_index):
         raise JobError("resume_caller_mismatch")
+    return row
 
 
 async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, generation, node_id, message,
@@ -77,7 +78,7 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, gener
             if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE operation_key=?",
                     (manager._origin_key(actor, action, call_ref, tool_call_id, None),)):
                 raise JobError("operation_conflict")
-        await _source(manager, tx, actor, caller, call_ref)
+        source = await _source(manager, tx, actor, caller, call_ref)
         row = await manager._authorize(tx, actor, job_id)
         from .workflow_restore import prepare
         plan = await prepare(manager, tx, actor, row, generation=generation, node_id=node_id, message=message)
@@ -107,10 +108,13 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, gener
         if resource_evidence is not None:
             request["resource_evidence"] = resource_evidence
         now = manager.now()
-        updated = await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,session_id=NULL,"
+        from .executor_registry import ExecutorIdentity, require_accepting
+        executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
+            required=row["executor_key"] is not None or source["executor_key"] is not None)
+        updated = await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,session_id=NULL,"
             "status='running',supervision_status='open',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
             "version=version+1,updated_at=? WHERE job_id=?",
-            (target.generation, executor_id, boot_id, now+lease_ms, now, job_id))
+            (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id))
         from .workflow_controller import proof
         current = await manager._row(tx, job_id)
         if updated != 1 or _hash(proof(current)) != _hash(asdict(target)) or current["session_id"] is not None or current["result_json"] is not None:

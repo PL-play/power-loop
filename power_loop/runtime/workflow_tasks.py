@@ -154,7 +154,9 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
         async with runtime.execution(binding, owner=True, cancel_token=cancel_token):
             yield binding
     except BaseException as exc:
-        if not binding.stop_renewal.is_set() or getattr(exc, "code", None) in ("required_execution_unsettled", "required_result_unhandled", "required_input_unhandled"):
+        from .executor_registry import FENCE_ERRORS
+        if (not binding.stop_renewal.is_set() or getattr(exc, "code", None) in FENCE_ERRORS or
+                getattr(exc, "code", None) in ("required_execution_unsettled", "required_result_unhandled", "required_input_unhandled")):
             saved = await runtime.record_scope(binding, {**getattr(exc, "execution_result", {}), "node_id": node.id,
                 "status": "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed", "error_type": type(exc).__name__})
             prior = engine._results.get(node.id)

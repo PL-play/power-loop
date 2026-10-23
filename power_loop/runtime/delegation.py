@@ -78,8 +78,9 @@ async def _save_result(store, parent, sid, run, raw, after_seq, lifecycle):
             try:
                 result = await run.task_binding.runtime.record_subagent(run.task_binding, result)
             except Exception as exc:
-                run.canonical_attempted = run.task_binding.stop_renewal.is_set() and getattr(exc, "code", None) not in (
-                    "required_execution_unsettled", "required_result_unhandled", "required_input_unhandled")
+                from .executor_registry import FENCE_ERRORS
+                run.canonical_attempted = (run.task_binding.stop_renewal.is_set() and getattr(exc, "code", None) not in FENCE_ERRORS and
+                    getattr(exc, "code", None) not in ("required_execution_unsettled", "required_result_unhandled", "required_input_unhandled"))
                 raise
             run.canonical_attempted = True
             run.canonical_result = result

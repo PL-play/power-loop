@@ -199,6 +199,8 @@ class JobManager:
                     current["control_owner_boot_id"]) != (owner["generation"], owner["executor_id"], owner["boot_id"]):
                 raise JobError("stale_parent_execution")
             self._execution_open(owner)
+            from .executor_registry import check_execution
+            await check_execution(self, tx, owner)
             current = owner
         raise JobError("job_depth_exceeded")
 
@@ -223,6 +225,8 @@ class JobManager:
         self._check_proof(row, lease)
         await self._supervision_barriers(tx, row)
         self._execution_open(row)
+        from .executor_registry import check_execution
+        await check_execution(self, tx, row)
         await self._control_owners(tx, row)
         return row
 
@@ -614,6 +618,10 @@ class JobManager:
             if row["status"] != "queued" or row["version"] != expected_version:
                 raise JobError("job_claim_conflict")
             await self._control_owners(tx, row)
+            from .executor_registry import ExecutorIdentity, require_accepting
+            inherited = await self._row(tx, row["control_owner_job_id"] or row["parent_job_id"]) if row["parent_job_id"] else None
+            executor = await require_accepting(self, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
+                required=row["executor_key"] is not None or inherited is not None and inherited["executor_key"] is not None)
             if row["kind"] == "workflow_node":
                 workflow = await self._row(tx, row["parent_job_id"])
                 from .workflow_controller import for_node, has_binding
@@ -626,8 +634,8 @@ class JobManager:
                 await validate_dispatch(self, tx, row)
             generation = int(row["generation"]) + 1
             await tx.execute(f"UPDATE {self.jobs} SET status='running',version=version+1,generation=?,"
-                "executor_id=?,boot_id=?,lease_until_ms=?,resource_state='running',updated_at=? WHERE job_id=?",
-                (generation, executor_id, boot_id, self.now() + lease_ms, self.now(), job_id))
+                "executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,resource_state='running',updated_at=? WHERE job_id=?",
+                (generation, executor_id, boot_id, executor["executor_key"] if executor else None, self.now() + lease_ms, self.now(), job_id))
             from .execution_membership import start
             await start(self, tx, await self._row(tx, job_id))
             return JobLease(job_id, executor_id, boot_id, generation)
@@ -813,6 +821,9 @@ class JobManager:
                             effective_result["status"] = "cancelled"
                         break
                     ancestor = await self._row(tx, ancestor["parent_job_id"]) if ancestor["parent_job_id"] else None
+            if effective_outcome == "succeeded" and row["executor_key"] is not None:
+                from .executor_registry import check_execution
+                await check_execution(self, tx, row)
             if require_children_stopped and effective_outcome == "succeeded":
                 await self._require_scope_ready(tx, row)
             await tx.execute(f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,"

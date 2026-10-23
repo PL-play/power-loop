@@ -1,7 +1,8 @@
 """Explicit, experimental v10 task schema. Normal AUTO_CREATE remains v9.
 
 No live store is migrated by opening it. A maintenance caller must close writers
-and explicitly invoke migrate_task_schema; the old binary refuses the v10 stamp.
+and explicitly invoke migrate_task_schema; old binaries reject the v10 stamp or
+the unknown task protocol. Protocol3 adds executor boot control to protocol2.
 """
 from __future__ import annotations
 
@@ -21,8 +22,9 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 10
-TASK_PROTOCOL_VERSION = 2
-TASK_TABLES = ("task_store", "jobs", "job_events")
+TASK_PROTOCOL_VERSION = 3
+_PROTOCOL_2_TABLES = ("task_store", "jobs", "job_events")
+TASK_TABLES = (*_PROTOCOL_2_TABLES, "task_executors", "task_executor_events")
 
 
 def message_identity_ddl(statement: str, name: str) -> str:
@@ -58,7 +60,7 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             kind {small} NOT NULL, execution_role {small} NOT NULL, title {body} NOT NULL,
             completion_scope_job_id {small} NOT NULL, blocks_completion INTEGER NOT NULL,
             status {small} NOT NULL, version {integer} NOT NULL, generation {integer} NOT NULL,
-            executor_id {small}, boot_id {small}, lease_until_ms {integer},
+            executor_id {small}, boot_id {small}, executor_key {small}, lease_until_ms {integer},
             cancel_requested_at {integer}, cancel_reason {body},
             intake {small} NOT NULL, resource_state {small} NOT NULL,
             supervision_status {small} NOT NULL, result_status {small} NOT NULL,
@@ -71,14 +73,26 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             caller_session_id {sid}, tool_call_id {sid}, call_ref_json {body},
             receipt_ref_json {body}, payload_json {body} NOT NULL,
             delivery_status {small} NOT NULL, created_at {integer} NOT NULL){opts}""",
+        f"""CREATE TABLE IF NOT EXISTS {prefix}task_executors (
+            executor_key {small} PRIMARY KEY, tenant_id {sid} NOT NULL, principal_id {sid} NOT NULL,
+            executor_id {small} NOT NULL, boot_id {small} NOT NULL, contract_hash {small} NOT NULL,
+            state {small} NOT NULL, version {integer} NOT NULL, lease_until_ms {integer} NOT NULL,
+            created_at {integer} NOT NULL, updated_at {integer} NOT NULL){opts}""",
+        f"""CREATE TABLE IF NOT EXISTS {prefix}task_executor_events (
+            event_id {small} PRIMARY KEY, executor_key {small} NOT NULL, action {small} NOT NULL,
+            operation_key {small} NOT NULL UNIQUE, request_hash {small} NOT NULL,
+            payload_json {body} NOT NULL, created_at {integer} NOT NULL){opts}""",
         # All names stay below MySQL's 64-character identifier limit at prefix=24.
         f"CREATE INDEX {prefix}idx_jobs_parent ON {prefix}jobs(parent_job_id, created_at, job_id)",
         f"CREATE INDEX {prefix}idx_jobs_root ON {prefix}jobs(root_job_id, created_at, job_id)",
         f"CREATE INDEX {prefix}idx_jobs_owner ON {prefix}jobs(created_by_session_id, status)",
         f"CREATE INDEX {prefix}idx_jobs_scope ON {prefix}jobs(completion_scope_job_id, status)",
         f"CREATE INDEX {prefix}idx_jobs_lease ON {prefix}jobs(executor_id, lease_until_ms)",
+        f"CREATE INDEX {prefix}idx_jobs_executor ON {prefix}jobs(executor_key)",
         f"CREATE INDEX {prefix}idx_job_events_job ON {prefix}job_events(job_id, created_at, event_id)",
         f"CREATE INDEX {prefix}idx_job_events_delivery ON {prefix}job_events(delivery_status, created_at)",
+        f"CREATE INDEX {prefix}idx_executor_scope ON {prefix}task_executors(tenant_id,principal_id,executor_id)",
+        f"CREATE INDEX {prefix}idx_executor_events ON {prefix}task_executor_events(executor_key,created_at,event_id)",
     ]
 
 
@@ -108,20 +122,30 @@ async def verify_task_schema(db: Database, prefix: str) -> None:
         await _verify_task_schema_tx(tx, db, prefix)
 
 
-async def _verify_task_schema_tx(tx, db, prefix):
-    missing = [t for t in (*_STORE_TABLES, *TASK_TABLES)
+async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSION):
+    tables = _PROTOCOL_2_TABLES if protocol == 2 else TASK_TABLES
+    missing = [t for t in (*_STORE_TABLES, *tables)
                if not await _table_exists_tx(tx, db.dialect.name, prefix + t)]
     if missing:
         raise StoreSchemaError(f"task schema incomplete: {missing}")
     if not await _column_exists(tx, db.dialect.name, prefix + "messages", "id"):
         raise StoreSchemaError("task schema has no raw message IDs")
     row = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1")
-    if row is None or row["protocol_version"] != TASK_PROTOCOL_VERSION:
+    if row is None or row["protocol_version"] != protocol:
         raise StoreSchemaError("task store identity/protocol missing or unsupported")
     for column in ("execution_role", "control_owner_job_id", "control_owner_generation",
                    "control_owner_executor_id", "control_owner_boot_id"):
         if not await _column_exists(tx, db.dialect.name, prefix + "jobs", column):
             raise StoreSchemaError("task control owner schema incomplete")
+    if protocol == 3:
+        if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
+            raise StoreSchemaError("task executor binding schema incomplete")
+        for table, columns in (("task_executors", ("executor_key", "tenant_id", "principal_id", "executor_id", "boot_id",
+                "contract_hash", "state", "version", "lease_until_ms", "created_at", "updated_at")),
+                ("task_executor_events", ("event_id", "executor_key", "action", "operation_key", "request_hash", "payload_json", "created_at"))):
+            for column in columns:
+                if not await _column_exists(tx, db.dialect.name, prefix + table, column):
+                    raise StoreSchemaError("task executor schema incomplete")
 
 
 async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
@@ -160,7 +184,7 @@ async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
 
 
 async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = False) -> None:
-    """Explicit v9→v10 migration; caller must stop/close all other writers first.
+    """Explicit v9→v10 or task protocol2→3 maintenance migration.
 
     SQLite/PG are transactional. MySQL uses an atomic ALTER for the raw table;
     the following idempotent steps allow an interrupted DDL run to be resumed.
@@ -177,6 +201,16 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
             if row is None or int(row["version"]) not in (9, TASK_SCHEMA_VERSION):
                 raise StoreSchemaError("task migration supports schema v9 only")
             if int(row["version"]) == TASK_SCHEMA_VERSION:
+                identity = await tx.fetchone(f"SELECT protocol_version FROM {prefix}task_store WHERE id=1")
+                if identity and identity["protocol_version"] == 2:
+                    await _verify_task_schema_tx(tx, db, prefix, protocol=2)
+                    if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
+                        kind = "VARCHAR(64)" if db.dialect.name == "mysql" else "TEXT"
+                        await tx.execute(f"ALTER TABLE {prefix}jobs ADD COLUMN executor_key {kind}")
+                    await _run_task_ddl(tx, db, prefix)
+                    if await tx.execute(f"UPDATE {prefix}task_store SET protocol_version=? WHERE id=1 AND protocol_version=2",
+                            (TASK_PROTOCOL_VERSION,)) != 1:
+                        raise StoreSchemaError("task executor migration conflict")
                 await _verify_task_schema_tx(tx, db, prefix)
                 return
             table = prefix + "messages"

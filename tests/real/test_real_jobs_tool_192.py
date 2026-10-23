@@ -27,8 +27,20 @@ async def test_real_jobs_backend_valueerror_stays_private_and_is_not_an_empty_ta
     runtime = TaskRuntime(JobManager(store), tenant_id="real-jobs-errors", principal_id="host",
         executor_id="executor", boot_id="boot") if native else None
     provider = BoundedProvider(limit=4)
+    # This host requires a user-visible outcome for the privacy scenario.
+    # pass_turn is always present in the library; an instruction alone cannot
+    # enforce this host rule. Reject premature pass without requesting it.
+    from power_loop.core.pass_turn import PASS_TURN_TOOL, default_handler
+    registry = create_default_tool_registry(include=["jobs"])
+    async def require_visible_outcome(reason=""):
+        messages = await store.load_all_messages(sid)
+        last_tool = max((m.seq for m in messages if m.role == "tool" and m.name == "jobs"), default=0)
+        if not any(m.role == "assistant" and m.seq > last_tool and (m.content or "").strip() for m in messages):
+            return "A user-visible assistant response is required. Report that the task directory is unavailable, without another jobs call."
+        return default_handler(reason)
+    registry.register(PASS_TURN_TOOL, require_visible_outcome)
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime,
-        tool_registry=create_default_tool_registry(include=["jobs"]),
+        tool_registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=3, max_tokens=2048,
             system_prompt="Call jobs action=list exactly once when asked. On any error, do not retry, create work or infer an empty task list. "
                 "Give an actual assistant response explaining that the directory is unavailable. Do not use pass_turn."))

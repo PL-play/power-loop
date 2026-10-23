@@ -73,8 +73,11 @@ async def scope(manager, reader, job_id, generation):
         raise JobError("execution_membership_missing")
     data = _event(row, job_id, "execution_scope")
     proof = _lease(data.get("lease"))
-    if (set(data) != {"version", "lease", "owner", "tenant_id", "principal_id", "kind", "execution_role", "parent_job_id", "created_by_session_id", "session_id"} or
-            type(data.get("version")) is not int or data["version"] != 1 or
+    keys = {"version", "lease", "owner", "tenant_id", "principal_id", "kind", "execution_role", "parent_job_id", "created_by_session_id", "session_id"}
+    if data.get("version") == 2:
+        keys.add("executor_binding")
+    if (set(data) != keys or
+            type(data.get("version")) is not int or data["version"] not in (1, 2) or
             proof["job_id"] != job_id or proof["generation"] != generation or data.get("kind") not in KINDS or
             data.get("execution_role") not in ("main", "workflow", "workflow_node", "subagent") or
             any(not isinstance(data.get(k), str) or not data[k] for k in ("tenant_id", "principal_id", "created_by_session_id")) or
@@ -82,6 +85,9 @@ async def scope(manager, reader, job_id, generation):
         raise JobError("execution_membership_corrupt")
     if data["owner"] is not None:
         _lease(data["owner"])
+    if data["version"] == 2:
+        from .executor_registry import validate_binding
+        await validate_binding(manager, reader, data)
     return data
 
 
@@ -95,7 +101,9 @@ async def require_current(manager, tx, row):
     current = _snapshot(row)
     # A workflow driver is bound after claim; the execution lease/ownership is
     # immutable independently of that deferred physical-session binding.
-    if _hash({k: v for k, v in data.items() if k != "session_id"}) != _hash({k: v for k, v in current.items() if k != "session_id"}):
+    normalized = {k: v for k, v in data.items() if k != "executor_binding"}
+    normalized["version"] = 1
+    if _hash({k: v for k, v in normalized.items() if k != "session_id"}) != _hash({k: v for k, v in current.items() if k != "session_id"}):
         raise JobError("execution_membership_mismatch")
     return data
 
@@ -113,6 +121,10 @@ async def _insert(manager, tx, event_id, job_id, kind, version, payload):
 async def start(manager, tx, row):
     """Atomic with claim/admission; no execution capability is granted here."""
     data = _snapshot(row)
+    if row["executor_key"] is not None:
+        from .executor_registry import registration_binding
+        data["version"] = 2
+        data["executor_binding"] = await registration_binding(manager, tx, row)
     _lease(data["lease"])
     if data["owner"] is not None:
         owner = _lease(data["owner"])
