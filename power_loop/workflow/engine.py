@@ -851,6 +851,9 @@ class WorkflowEngine:
             self._results[node.id] = result
             if result.status == "cancelled" and self._cancel.is_cancelled():
                 self._cancelled = True
+            from power_loop.runtime.finalization import consume_node, try_finalize
+            await consume_node(runtime, self._task_execution, binding, result.to_dict())
+            await try_finalize(runtime.manager, self._task_execution.actor, binding.lease.job_id, binding.lease.generation)
             await self._emit_step(result)
             return result
 

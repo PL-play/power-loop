@@ -7,6 +7,7 @@ adapters fail closed until they participate in the same durable protocol.
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
@@ -270,6 +271,15 @@ class TaskRuntime:
                 evidence["last_assistant_ref"] = (await self.manager.store.message_ref(sid, last["seq"])).to_dict()
             await self.manager.close_model_execution(actor, binding.lease, evidence=evidence,
                 resource_state=binding.resource_evidence.get("resource_state", "stopped"))
+            from .finalization import after_send
+            try:
+                await after_send(self.manager, actor, binding.lease)
+            except Exception:
+                # The model exit is already durable. A failed mechanical
+                # close leaves supervision open for reconciliation; it must
+                # not turn that completed business send into a retry.
+                logging.getLogger(__name__).exception(
+                    "supervision remains open after model exit: %s", binding.lease.job_id)
 
     async def admit_subagent(self, sid: str, spec, task: str) -> JobRegistration:
         execution = _SEND.get()

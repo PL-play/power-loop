@@ -170,6 +170,7 @@ async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_
             audit = await manager.get_job(actor, audit["job_id"])
             assert audit.outcome == "succeeded" and "42" in audit.result["final_text"]
             assert audit.result_status == "handled"
+            assert audit.supervision_status == "closed"
             if ending == "empty_child_pass":
                 rows = await store.load_all_messages(audit.session_id)
                 first_assistant = next(r for r in rows if r.role == "assistant")
@@ -189,6 +190,9 @@ async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_
             final = await loop.flush_follow_ups(sid)
             assert final and final.status == "completed" and "42" in final.final_text
             assert (await manager.get_job(actor, handle.job_id)).result_status == "handled"
+            assert (await manager.get_job(actor, handle.job_id)).supervision_status == "open"  # opaque callback has no business ACK
+            nodes = await manager.db.fetchall(f"SELECT supervision_status FROM {manager.jobs} WHERE kind='workflow_node'")
+            assert nodes and all(node["supervision_status"] == "closed" for node in nodes)
             assert len(handles) == 1
     finally:
         provider.release_children.set()

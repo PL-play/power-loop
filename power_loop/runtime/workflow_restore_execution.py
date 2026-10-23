@@ -182,7 +182,7 @@ async def claim_node(runtime, workflow_binding, node_id, driver_sid, token):
         if _hash(old) != source["binding_hash"]:
             raise JobError("workflow_node_authority_mismatch")
         lease = JobLease(row["job_id"], wf["executor_id"], wf["boot_id"], reservation["generation"])
-        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,status='running',intake='open',resource_state='running',"
+        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,status='running',supervision_status='open',intake='open',resource_state='running',"
             "outcome=NULL,result_json=NULL,result_status='none',control_owner_generation=?,control_owner_executor_id=?,control_owner_boot_id=?,version=version+1,updated_at=? WHERE job_id=?",
             (lease.generation, lease.executor_id, lease.boot_id, manager.now()+runtime.lease_ms, wf["generation"], wf["executor_id"], wf["boot_id"], manager.now(), row["job_id"]))
         await put(manager, tx, manager._node_session_event_id(row["job_id"], sid, lease.generation), row["job_id"], "node_session", row["version"]+1,
@@ -191,6 +191,8 @@ async def claim_node(runtime, workflow_binding, node_id, driver_sid, token):
             "node_id": node_id, "driver_sid": driver_sid, "session_id": sid, "source_hash": _hash(source), "token": token}
         await put(manager, tx, identity(manager, "node", row["job_id"], lease.generation), row["job_id"], "workflow_node_authority", row["version"]+1, data)
         await start(manager, tx, await manager._row(tx, row["job_id"]))
+        from .finalization import reopen
+        await reopen(manager, tx, row, asdict(lease), op["event_id"])
         await authority(manager, tx, await manager._row(tx, row["job_id"]), sid, workflow=control)
         return lease, sid
 

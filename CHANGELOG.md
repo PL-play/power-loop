@@ -9,12 +9,20 @@
 ## [Unreleased]
 
 ### Added
+- Add proof-backed mechanical supervision closure for successful registered
+  model sends, engine-consumed nodes, handled subagents and durable-inbox
+  workflows. Atomically close verified scopes and retain immutable event,
+  membership and consumer-exit references. Original-task continuations reopen
+  necessary historical supervision without restarting ancestor sends. Preserve
+  old node generations when restoring a workflow after a live-node continuation.
+  Unconfirmed provider exits, opaque business notifications and unadapted
+  resources remain open; this is not billing settlement or production activation.
 - Share the required-work collector and bounded text finalization with host
   executors. Managed nodes retain one completion window across checks, clamp
   supplemental rounds to their original contract, explicitly check deadlines
   before model dispatch, and leave usage to the generation's canonical ledger.
   Host adapters delegate generic settlement; durable background/timer admission,
-  final supervision closure and business wake receipts remain separate work.
+  external-resource supervision closure and business wake receipts remain separate work.
 - Persist trusted resource bindings in new workflow profile-v2 admissions and
   reauthorize the original resources before engine construction. Preserve v1
   interpretation and exact-call replay without resolving a replacement pool.

@@ -45,7 +45,7 @@ jobs:
 """
 
 
-@pytest.mark.parametrize("fault", ["none", "admission_ack", "dispatch_ack", "membership_relabel"])
+@pytest.mark.parametrize("fault", ["none", "admission_ack", "dispatch_ack", "membership_relabel", "whole_restore"])
 async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp_path, monkeypatch, record_property, fault):
     store = await SessionStore.open(str(tmp_path / "native-yaml-resume.db"), schema="tasks")
     manager = JobManager(store)
@@ -82,6 +82,13 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
         return json.dumps(reply)
     for name, fn in (("launch_workflow", launch), ("correct_node", correct)):
         registry.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"}), fn)
+    if fault == "whole_restore":
+        from power_loop.workflow.resume import resume_detached
+        async def restore_whole():
+            handle = await resume_detached(get_current_loop(), parent, handles[0].run_id,
+                continuation=("calculate", "Correction: the newest code is VERSION-44. Output only VERSION-44.", 3))
+            handles.append(handle)
+            return json.dumps({"job_id": handle.job_id, "run_id": handle.run_id, "status": "accepted"})
     counts = {"admit": 0, "dispatch": 0}
     for name, key in (("resume_workflow_node", "admit"), ("claim_resume_dispatch", "dispatch")):
         original = getattr(manager, name)
@@ -145,6 +152,24 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
             assert row["delivery_status"] == "handled"
             final = await loop.flush_follow_ups(parent, max_rounds=3)
             assert final.status == "completed" and "VERSION-43" in final.final_text
+            if fault == "whole_restore":
+                registry.register(ToolDefinition(name="restore_workflow", description="Continue the completed original workflow for the user's next correction, reusing its tasks and sessions.", input_schema={"type": "object"}), restore_whole)
+                saved_wf = await manager.get_result_revision(actor, wf.job_id, 1)
+                assert (await manager.get_job(actor, wf.job_id)).supervision_status == "closed"
+                await loop.send("New request: the newest code is VERSION-44. Call restore_workflow exactly once to continue the completed original workflow. "
+                    "Do not launch a replacement workflow or call correct_node. Then reply WAITING without any more tools or pass_turn.", parent)
+                assert len(handles) == 2 and handles[1].job_id == wf.job_id and handles[1].run_id == handles[0].run_id
+                await handles[1].task
+                current = await manager.get_job(actor, wf.job_id)
+                assert current.generation == 2 and current.outcome == "succeeded", current.result
+                assert current.result["final"]["text"].strip() == "VERSION-44", current.result
+                assert (await manager.get_job(actor, job.job_id)).generation == 3
+                assert current.result["results"]["calculate"]["session_id"] == new.result["session_id"]
+                assert await manager.get_result_revision(actor, wf.job_id, 1) == saved_wf
+                assert await manager.get_result_revision(actor, job.job_id, 1) == old
+                final = await loop.flush_follow_ups(parent, max_rounds=3)
+                assert final.status == "completed" and "VERSION-44" in final.final_text
+                assert (await manager.get_job(actor, wf.job_id)).supervision_status == "closed"
     finally:
         sibling_release.set()
         resume_release.set()

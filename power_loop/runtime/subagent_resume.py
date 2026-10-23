@@ -55,8 +55,9 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, sessi
         await manager._supervision_barriers(tx, job)
         if job["generation"] != expected_generation:
             raise JobError("resume_generation_changed")
-        if (job["status"] != "settling" or job["outcome"] != "succeeded" or job["resource_state"] != "stopped" or
-                job["intake"] != "closed" or job["supervision_status"] != "open"):
+        from .finalization import require_resumable
+        await require_resumable(manager, tx, job)
+        if (job["outcome"] != "succeeded" or job["resource_state"] != "stopped" or job["intake"] != "closed"):
             raise JobError("resume_target_unsettled")
         from .processing import require_handled
         try:
@@ -84,7 +85,7 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, sessi
         await require_current(manager, tx, job)
         now = manager.now()
         await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,"
-            "status='running',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
+            "status='running',supervision_status='open',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
             "version=version+1,updated_at=? WHERE job_id=?",
             (target.generation, executor_id, boot_id, now+lease_ms, now, job_id))
         payload = {"job_id": job_id, "session_id": session_id, "mode": "continue", "status": "accepted",
@@ -103,6 +104,8 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, sessi
             (execution_id(job_id, target.generation), job_id, "execution", job["version"]+1,
              _json({"operation_id": operation.operation_id, "run_id": payload["run_id"], "target": request["target"]}), "not_applicable", now))
         await start(manager, tx, await manager._row(tx, job_id))
+        from .finalization import reopen
+        await reopen(manager, tx, job, asdict(target), operation.operation_id)
         return _operation(await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (operation.operation_id,))), False
 
 

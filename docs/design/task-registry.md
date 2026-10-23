@@ -66,6 +66,7 @@ attribution; `JobLease(job_id,executor_id,boot_id,generation)` is an execution p
 | `bind_receipt(actor,operation_id,receipt_ref,caller=lease)` | Binds an actually persisted tool row; rejects foreign, mismatched, reused-call or replacement receipts |
 | `record_result(actor,lease,outcome,result,resource_state='unknown')` | Durable execution evidence/event; status remains settling and supervision open; **not** B2 final success |
 | `close_model_execution(actor,lease)` | Ends only a send's model phase; retains supervision, cancellation and descendant budget obligations |
+| `finalize_supervision(actor,job_id,generation=...)` | Atomically verifies original evidence/consumption and closes eligible supervision; generation-fenced, idempotent, no dispatch, no billing settlement |
 | `request_cancel(actor,job_id,system_key,reason)` | Persistent cancellation/intake barrier; queued cannot start; running/unknown only reports cancelling, not confirmed stop |
 | `resume_subagent(actor,job_id,caller,call_ref,tool_call_id,session_id,message,expected_generation,executor_id,boot_id,contract,lease_ms)` | Atomic success-only standalone new generation, immutable result history, operation and original inbox; trusted host arguments |
 | `claim_resume_dispatch(actor,operation_id,caller,token)` | Persistent one-dispatch claim; same-token recall is identity evidence, never permission to bypass execution fencing |
@@ -940,3 +941,48 @@ original generation evidence and remaining reconciliation obligations still
 govern completion; this collector is not a final supervision-close protocol or
 a provider-wide hard budget. Root wake handoff, English constraints and durable
 background/timer integration remain required work.
+
+### Mechanical supervision closure and reopening
+
+The experimental `runtime.finalization` adapter verifies stopped resources,
+closed intake, sealed original membership, exact canonical results and actual
+consumption before publishing `supervision_closed`. It prepares the complete
+proof tree and performs bottom-up view CAS/event writes in one control
+transaction. Proof references retain event ID/job/type/revision, request hash,
+delivery marker and payload hash. Repeated reads validate the retained DAG with
+cycle/depth/count bounds; they do not rewrite history or run models.
+
+An original owning workflow engine saves `node_result_consumed` and the node's
+handled marker together before freezing closure references. A physical node SID
+cannot use its input-processing decision to gain authority over the logical
+node. Successful model exits trigger eligible mechanical closure; closure errors
+retain open supervision and cannot turn completed business work into a retry.
+Main-session processing is still required for independent subagent/workflow
+results. A durable inbox workflow must also retain its original delivery and
+projection proofs. Opaque callback return is not a business receipt.
+
+Continuation admissions accept verified successful closed scopes as well as
+previously settling scopes. They reopen the target's new generation and necessary
+historical ancestor supervision in the same transaction, preserving immutable
+`supervision_reopened` references to the old closure and new operation/lease.
+Ancestor sends retain their original model_closed status, generation and lease;
+this does not grant model-dispatch authority. One ancestor generation can close
+again in a later supervision epoch, so closure identity includes view version.
+The host scope-stop helper records a future admission barrier on an already
+closed scope without corrupting its verified terminal status. Model-tool
+already_closed stop receipts retain their existing separate contract.
+
+When a workflow previously continued a live logical node, recovery validates each
+old member's retained closure and selects the latest admitted generation for that
+logical node's current result. It never counts old/new members as duplicate
+logical nodes or loses the old obligations/results/usage. Original task and
+physical session identities and the prior dependency replay contract remain.
+
+This slice does not finish cancellation dispositions, unstarted-task closure,
+external resource stop proofs, business wake receipts, background/timer adapters,
+durable hard budgets/billing or restart/compatibility recovery. Failed,
+cancelled or interrupted provider sends cannot close from Python exit alone.
+Unadapted responsibility remains visible as open rather than falsely settled.
+Directory `active` omits fully closed obligations; `terminal` still selects
+business outcomes and can overlap active when responsibility remains open.
+MySQL testing remains paused and default production storage/runtime is unchanged.

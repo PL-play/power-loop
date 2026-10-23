@@ -118,6 +118,7 @@ def main() -> int:
         "tests/unit/test_workflow_restore_resources_192.py",
         "tests/unit/test_workflow_bound_restore_192.py",
         "tests/unit/test_completion_window_192.py",
+        "tests/unit/test_finalization_192.py",
         "tests/unit/test_workflow_completion_scope_192.py",
         "tests/unit/test_workflow_restore_plan_192.py",
         "tests/unit/test_workflow_restore_history_192.py",
@@ -235,8 +236,8 @@ def main() -> int:
                      if any(name in c.get("classname", "") for name in ("test_real_legacy_workflow_history_192", "test_real_task_events_192", "test_real_workflow_node_facade_192", "test_real_workflow_resources_192", "test_real_workflow_resource_profile_192", "test_real_workflow_continuation_budget_192")))
         cases.extend(c for c in ET.parse(report).getroot().iter("testcase")
                      if "test_real_completion_window_192" in c.get("classname", ""))
-        if len(cases) != 64 or any(c.find("skipped") is not None for c in cases):
-            print("Task acceptance failed: all sixty-four configured real LLM cases must actually run.")
+        if len(cases) != 65 or any(c.find("skipped") is not None for c in cases):
+            print("Task acceptance failed: all sixty-five configured real LLM cases must actually run.")
             return 1
         return code
     except RunnerInterrupted as exc:

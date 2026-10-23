@@ -108,7 +108,7 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, gener
             request["resource_evidence"] = resource_evidence
         now = manager.now()
         updated = await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,session_id=NULL,"
-            "status='running',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
+            "status='running',supervision_status='open',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
             "version=version+1,updated_at=? WHERE job_id=?",
             (target.generation, executor_id, boot_id, now+lease_ms, now, job_id))
         from .workflow_controller import proof
@@ -142,6 +142,8 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, gener
             stored = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (rid,))
             if stored is None or _hash(json.loads(stored["payload_json"])) != _hash(reserved):
                 raise JobError("workflow_restore_admission_mismatch")
+        from .finalization import reopen
+        await reopen(manager, tx, row, asdict(target), op.operation_id)
         await _reset_journal(manager, tx, actor, request)
         await execution(manager, tx, current, expected_operation=op.operation_id)
         return _operation(await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (op.operation_id,))), False

@@ -100,6 +100,9 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
             before_restore = pool.spent
             consumed = await loop.flush_follow_ups(parent)
             assert "42" in consumed.final_text
+            first_closed = await manager.get_job(actor, first.job_id)
+            creator = await manager.get_job(actor, first.parent_job_id)
+            assert first_closed.supervision_status == creator.supervision_status == "closed"
             old = await manager.get_result_revision(actor, first.job_id, 1)
             old_nodes = {n["job_id"]: n for n in await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='workflow_node'")}
             provider.release_children.clear()
@@ -108,6 +111,9 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
                 "Call repair_workflow exactly once to continue the completed original workflow with this correction. Then reply WAITING without other tools or pass_turn. "
                 "Do not call launch_workflow; wait for the new generation's completion result.", parent)
             assert accepted.status == "completed" and len(handles) == 2
+            reopened_creator = await manager.get_job(actor, creator.job_id)
+            assert reopened_creator.supervision_status == "open" and reopened_creator.status == "model_closed"
+            assert reopened_creator.generation == creator.generation
             new = handles[1]
             assert new.run_id == handles[0].run_id and new.job_id == handles[0].job_id and new.operation_id != handles[0].operation_id
             provider.release_children.set()
@@ -135,6 +141,8 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
             final = await loop.flush_follow_ups(parent)
             assert final.status == "completed" and "43" in final.final_text
             assert (await manager.get_job(actor, first.job_id)).result_status == "handled"
+            assert (await manager.get_job(actor, first.job_id)).supervision_status == "closed"
+            assert (await manager.get_job(actor, creator.job_id)).supervision_status == "closed"
             assert (await journal.read(store, parent, new.run_id))["task_generation"] == 2
     finally:
         provider.release_children.set()

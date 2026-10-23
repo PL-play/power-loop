@@ -528,11 +528,22 @@ async def test_missing_original_invocation_does_not_admit_steering(managed, monk
     await finish(managed)
 
 
-async def test_workflow_node_can_nudge_its_own_subagent_without_changing_owner_or_role(managed_workflow, monkeypatch):
+@pytest.mark.parametrize("max_rounds", [3, 4])
+async def test_workflow_node_can_nudge_its_own_subagent_without_changing_owner_or_role(managed_workflow, monkeypatch, max_rounds):
     store, manager, runtime, loop, model, parent, state, _ = managed_workflow
     model.hold = {"AUDIT"}
     model.spawn_from_build = True
     state["spec"]["root"]["steps"][0] = leaf("BUILD", tools=["spawn_agent"])
+    state["spec"]["root"]["steps"][0]["spec"]["max_rounds"] = max_rounds
+    node_exited = asyncio.Event()
+    original_close = manager.close_model_execution
+    async def close_model(actor, *args, **kwargs):
+        result = await original_close(actor, *args, **kwargs)
+        session = await store.get_session(actor.session_id)
+        if session and session.metadata.get("workflow_node_id") == "BUILD":
+            node_exited.set()
+        return result
+    monkeypatch.setattr(manager, "close_model_execution", close_model)
     original = model.complete
 
     async def complete(request, **kwargs):
@@ -550,9 +561,16 @@ async def test_workflow_node_can_nudge_its_own_subagent_without_changing_owner_o
     assert (await loop.send("run with node-owned audit", parent)).status == "completed"
     await asyncio.wait_for(model.entered["AUDIT"].wait(), 2)
     assert model.counts["REVIEW"] == 0
+    await asyncio.wait_for(node_exited.wait(), 3)
     await settle(managed_workflow)
     wf = await manager.get_job(runtime.actor(parent), state["handles"][0].job_id)
-    assert wf.outcome == "succeeded" and model.counts["REVIEW"] == 1
+    if max_rounds == 3:
+        assert wf.outcome == "failed" and model.counts["REVIEW"] == 0, wf.result
+        assert model.counts["BUILD"] == 3
+        assert wf.result["results"]["BUILD"]["error"] == "completion settlement round budget exhausted"
+        assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='node_session'")) == 1
+        return
+    assert wf.outcome == "succeeded" and model.counts["REVIEW"] == 1, wf.result
     [event] = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE action='nudge'")
     [child] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='subagent'")
     assert child["execution_role"] == "subagent" and child["control_owner_job_id"] is not None

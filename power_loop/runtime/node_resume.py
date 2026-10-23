@@ -81,8 +81,9 @@ async def admit(manager, actor, job_id, *, caller, workflow, call_ref, tool_call
         await manager._control_owners(tx, job)
         if job["generation"] != generation:
             raise JobError("resume_generation_changed")
-        if (job["status"] != "settling" or job["outcome"] != "succeeded" or job["resource_state"] != "stopped" or
-                job["intake"] != "closed" or job["supervision_status"] != "open"):
+        from .finalization import require_resumable
+        await require_resumable(manager, tx, job)
+        if (job["outcome"] != "succeeded" or job["resource_state"] != "stopped" or job["intake"] != "closed"):
             raise JobError("resume_target_unsettled")
         from .node_inputs import descriptor, is_closed
         if _hash(await descriptor(manager, tx, job, node["session_id"])) != _hash(node) or not await is_closed(manager, tx, job, node["session_id"]):
@@ -120,8 +121,10 @@ async def admit(manager, actor, job_id, *, caller, workflow, call_ref, tool_call
             raise JobError("resume_input_pending")
         from .execution_membership import require_current, start
         await require_current(manager, tx, job)
+        from .finalization import require_node_consumed
+        await require_node_consumed(manager, tx, job)
         now = manager.now()
-        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,status='running',"
+        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,status='running',supervision_status='open',"
             "intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,version=version+1,updated_at=? WHERE job_id=?",
             (target.generation, executor_id, boot_id, now+lease_ms, now, job_id))
         payload = {"job_id": job_id, "session_id": node["session_id"], "run_id": node["workflow_run_id"],
@@ -140,6 +143,8 @@ async def admit(manager, actor, job_id, *, caller, workflow, call_ref, tool_call
                 (node["session_id"], "nudge:"+op.operation_id, "relay", "steer", "pending", message, now)):
             raise JobError("nudge_inbox_conflict")
         await start(manager, tx, await manager._row(tx, job_id))
+        from .finalization import reopen
+        await reopen(manager, tx, job, asdict(target), op.operation_id)
         return op, False
 
 

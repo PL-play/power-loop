@@ -78,12 +78,18 @@ async def test_real_finished_subagent_resumes_original_session_without_overwriti
             assert result.status == "completed" and "42" in result.final_text
             old = await manager.get_result_revision(runtime.actor(parent), create["job_id"], 1)
             assert old["payload"]["result"]["final_text"].strip() == "42" and old["delivery_status"] == "handled"
+            first_closed = await manager.get_job(runtime.actor(parent), create["job_id"])
+            creator = await manager.get_job(runtime.actor(parent), first_closed.parent_job_id)
+            assert first_closed.supervision_status == creator.supervision_status == "closed"
             provider.release_children.clear()
             provider.child_entered.clear()
             second = await loop.send(f"Use spawn_agent action=nudge exactly once with sub_session='{create['session_id']}', "
                 "message='New follow-up: compute 20+23 instead of 19+23. Reply only with the resulting number.'. "
                 "After acceptance reply WAITING without more tools or pass_turn. Do not create a new agent.", parent)
             assert second.status == "completed"
+            reopened = await manager.get_job(runtime.actor(parent), creator.job_id)
+            assert reopened.supervision_status == "open" and reopened.status == "model_closed"
+            assert reopened.generation == creator.generation
             [first_receipt, resume] = await _receipts(store, manager, parent)
             assert first_receipt == create
             assert resume["mode"] == "continue" and resume["generation"] == 2
@@ -102,6 +108,8 @@ async def test_real_finished_subagent_resumes_original_session_without_overwriti
             final = await loop.flush_follow_ups(parent, max_rounds=3)
             assert final.status == "completed" and "43" in final.final_text
             assert (await manager.get_job(runtime.actor(parent), current.job_id)).result_status == "handled"
+            assert (await manager.get_job(runtime.actor(parent), current.job_id)).supervision_status == "closed"
+            assert (await manager.get_job(runtime.actor(parent), creator.job_id)).supervision_status == "closed"
             assert len(await store.list_children(parent)) == 1
             per_execution = await manager.execution_usage(runtime.actor(parent), current.job_id, generation=2)
             assert per_execution == current.result["usage"] and per_execution["total_tokens"] > 0

@@ -445,6 +445,15 @@ class JobManager:
         row = await self._authorize(self.db, actor, job_id)
         return _record(row if include_result else {**row, "result_json": None})
 
+    async def finalize_supervision(self, actor: JobActor, job_id: str, *, generation: int) -> dict:
+        from .finalization import finalize
+        try:
+            return await finalize(self, actor, job_id, generation=generation)
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            if isinstance(exc, JobError):
+                raise
+            raise JobError("finalization_evidence_corrupt") from exc
+
     async def execution_usage(self, actor: JobActor, job_id: str, *, generation: int | None = None) -> dict:
         """Sum each persisted model-send exit once, never recursive scope rollups.
 
@@ -821,7 +830,11 @@ class JobManager:
                 return _operation(old)
             row = await self._authorize(tx, actor, job_id)
             if row["cancel_requested_at"] is None:
-                status = "cancelled" if row["resource_state"] == "not_started" else "cancelling"
+                # Host scope-stop remains a future admission barrier even on
+                # a settled scope. Preserve its verified terminal view; no
+                # physical execution is restarted by recording that barrier.
+                status = row["status"] if row["supervision_status"] == "closed" else (
+                    "cancelled" if row["resource_state"] == "not_started" else "cancelling")
                 await tx.execute(f"UPDATE {self.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,"
                     "intake='closed',version=version+1,updated_at=? WHERE job_id=?", (status, self.now(), reason, self.now(), job_id))
                 row = await self._row(tx, job_id)

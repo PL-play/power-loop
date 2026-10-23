@@ -66,9 +66,19 @@ async def _stopped_tree(manager, tx, row, seen=None, depth=0):
         lease = edge["payload"]["member"]
         child = await manager._row(tx, lease["job_id"])
         anchor = await scope(manager, tx, lease["job_id"], lease["generation"])
-        if (child is None or _hash(proof(child)) != _hash(lease) or
+        if (child is None or _hash(anchor["lease"]) != _hash(lease) or
                 _hash(anchor["owner"]) != _hash(proof(row)) or
                 (child["tenant_id"], child["principal_id"]) != (row["tenant_id"], row["principal_id"])):
+            raise JobError("workflow_restore_execution_unsettled")
+        if child["generation"] > lease["generation"]:
+            # The immutable old member is still an obligation. Validate its
+            # saved closure rather than comparing it to a later execution.
+            from .finalization import closed
+            _, closure = await closed(manager, tx, child, lease["generation"])
+            if _hash(closure["scope"]) != _hash(lease):
+                raise JobError("workflow_restore_execution_unsettled")
+            continue
+        if _hash(proof(child)) != _hash(lease):
             raise JobError("workflow_restore_execution_unsettled")
         if child["kind"] == "subagent":
             await require_handled(manager, tx, child)
@@ -103,8 +113,12 @@ async def _prepare(manager, tx, actor, row, *, generation, node_id, message):
         raise JobError("workflow_restore_target_mismatch")
     if row["generation"] != generation:
         raise JobError("resume_generation_changed")
-    if (row["status"] != "settling" or row["outcome"] != "succeeded" or row["result_status"] != "handled" or
-            row["supervision_status"] != "open"):
+    from .finalization import require_resumable
+    try:
+        await require_resumable(manager, tx, row)
+    except JobError as exc:
+        raise JobError("workflow_restore_target_unsettled") from exc
+    if row["outcome"] != "succeeded" or row["result_status"] != "handled":
         raise JobError("workflow_restore_target_unsettled")
     await manager._supervision_barriers(tx, row)
     capabilities = await read(manager, tx, row)
@@ -134,7 +148,14 @@ async def _prepare(manager, tx, actor, row, *, generation, node_id, message):
         _, prior = await execution(manager, tx, row)
         replayed = {nid: prior["plan"]["nodes"][nid] for nid in prior["plan"]["replay"]}
         references.extend(n["lease"] for n in replayed.values())
+    latest = {}
     for lease in references:
+        previous = latest.get(lease["job_id"])
+        if previous is not None and previous["generation"] == lease["generation"] and _hash(previous) != _hash(lease):
+            raise JobError("workflow_restore_node_mismatch")
+        if previous is None or lease["generation"] > previous["generation"]:
+            latest[lease["job_id"]] = lease
+    for lease in latest.values():
         child = await manager._row(tx, lease["job_id"])
         if child["kind"] != "workflow_node":
             raise JobError("workflow_restore_node_mismatch")
