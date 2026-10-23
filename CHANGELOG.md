@@ -9,6 +9,12 @@
 ## [Unreleased]
 
 ### Added
+- Add a trusted, host-only workflow resource preparation registry with exact
+  adapter versions, immutable original scope/config/contract bindings, explicit
+  authorization, await-safe revocation, bounded resolution and private host
+  errors. Reject class-only history and substituted workspace/budget identities.
+  This foundation does not yet connect profile-v2, native host restoration,
+  durable resource admission, notification acceptance, or hard billing.
 - Route native workflow nudge/steer through the shared library facade and saved
   node/session bindings. Select exact foreach routes by node job or SID and the
   latest actual retry by node name. Carry the selected job/generation into real

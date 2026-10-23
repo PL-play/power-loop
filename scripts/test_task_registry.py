@@ -59,6 +59,7 @@ def main() -> int:
         "tests/unit/test_workflow_result_delivery_192.py",
         "tests/unit/test_workflow_projection_atomic_192.py",
         "tests/unit/test_workflow_profile_192.py",
+        "tests/unit/test_workflow_resources_192.py",
         "tests/unit/test_workflow_restore_plan_192.py",
         "tests/unit/test_workflow_restore_history_192.py",
         "tests/unit/test_workflow_resume_admission_192.py",
@@ -109,6 +110,7 @@ def main() -> int:
     scopes.append("tests/real/test_real_legacy_workflow_history_192.py")
     scopes.append("tests/real/test_real_task_events_192.py")
     scopes.append("tests/real/test_real_workflow_node_facade_192.py")
+    scopes.append("tests/real/test_real_workflow_resources_192.py")
     command = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
                "-o", "junit_family=legacy", "--tb=short", "-k", "not mysql",
                "--ignore=tests/unit/test_store_parity_mysql.py", *scopes, "--junitxml=" + str(report)]
@@ -126,9 +128,9 @@ def main() -> int:
         cases = [c for c in ET.parse(report).getroot().iter("testcase")
                  if any(name in c.get("classname", "") for name in ("test_real_task_registry_192", "test_real_workflow_task_runtime_192", "test_real_nudge_runtime_192", "test_real_node_nudge_runtime_192", "test_real_subagent_resume_192", "test_real_workflow_continuation_plan", "test_real_node_resume_192", "test_real_workflow_delivery_192", "test_real_workflow_restore_192", "test_real_workflow_native_restore_192", "test_real_task_query_192", "test_real_jobs_tool_192", "test_real_workflow_facade_192", "test_real_task_sessions_192", "test_real_workflow_control_192", "test_real_node_control_192", "test_real_task_history_192"))]
         cases.extend(c for c in ET.parse(report).getroot().iter("testcase")
-                     if any(name in c.get("classname", "") for name in ("test_real_legacy_workflow_history_192", "test_real_task_events_192", "test_real_workflow_node_facade_192")))
-        if len(cases) != 55 or any(c.find("skipped") is not None for c in cases):
-            print("Task acceptance failed: all fifty-five configured real LLM cases must actually run.")
+                     if any(name in c.get("classname", "") for name in ("test_real_legacy_workflow_history_192", "test_real_task_events_192", "test_real_workflow_node_facade_192", "test_real_workflow_resources_192")))
+        if len(cases) != 56 or any(c.find("skipped") is not None for c in cases):
+            print("Task acceptance failed: all fifty-six configured real LLM cases must actually run.")
             return 1
         return result.returncode
     finally:

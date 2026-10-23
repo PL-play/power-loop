@@ -845,3 +845,27 @@ and exception/cancellation cleanup. A small receipt budget is rejected before
 publishing the file. Reads never run models/tools, acknowledge results, close
 supervision, or establish billing settlement. Legacy unqualified recall retains
 its prior contract; legacy workflow history adapters remain required work.
+
+## Trusted host resource preparation (foundation only)
+
+`runtime.workflow_resources` defines private immutable resource bindings and an
+explicit host-only registry. Match exact adapter key/version and original
+tenant/principal/main, resource revision, config/contract hashes, workspace,
+budget scope and notification mode. Class-only historical profiles cannot be
+converted into this evidence. A changed binding cannot substitute a current
+executor, workspace or fresh budget pool.
+
+Adapters implement async side-effect-free prepare/resolve and explicit current
+authorization of the actual resource objects. Registry revocation, including
+same-version re-registration across awaits, invalidates in-flight resolution.
+Resolution is bounded and cancellable; private factory errors become fixed
+codes. Adapter code is trusted Python, not a sandbox; resource preparation must
+not dispatch models, write business artifacts or reserve/charge money.
+
+The registry grants no task admission, stop, billing or delivery authority. Its
+binding protocol version is separate from workflow execution profile versions.
+Profile-v2, original create fingerprints and native restore plan/admission/
+dispatch/engine integration remain required. A prepared resource is not proof
+that a prior execution stopped, a callback was accepted by a business system,
+or a shared budget is durably settled. Existing profile-v1 restore restrictions
+and SDK defaults are unchanged; no model tool parameters expose this registry.
