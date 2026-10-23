@@ -266,7 +266,9 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "timer_id. Timers survive restarts. Workflows, sub-agents, background tasks and card "
             "submissions wake you automatically when they finish — don't set timers to watch them; "
             "use timers only when real time must pass. Requires the host to run a TimerRunner; "
-            "without one, wake-ups don't fire."
+            "without one, wake-ups don't fire. Under finite single-level delegation, only the main "
+            "session may create these reminders. Child tasks must ask their owner to arrange a "
+            "managed continuation; a timer is not permission to run outside the owning task."
         ),
         input_schema={
             "type": "object",

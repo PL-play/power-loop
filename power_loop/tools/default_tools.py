@@ -2135,7 +2135,11 @@ async def run_schedule_wakeup(
 
 
 async def _schedule_wakeup(delay_seconds: int, note: str, every_seconds: int | None = None) -> str:
+    from power_loop.core.agent_context import get_current_loop
+    from power_loop.runtime.execution_roles import require_timer_creation
     from power_loop.runtime.task_runtime import reject_unregistered_adapter
+
+    await require_timer_creation(get_current_loop())
     reject_unregistered_adapter("timer")
     import time as _time
 

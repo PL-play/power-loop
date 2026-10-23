@@ -1236,7 +1236,10 @@ class StatefulAgentLoop:
         scheduler polling ``store.due_timers()``) is running."""
         import time as _time
 
+        from power_loop.runtime.execution_roles import require_timer_creation
         from power_loop.runtime.task_runtime import reject_unregistered_adapter
+
+        await require_timer_creation(self, sid=session_id)
         reject_unregistered_adapter("timer", self)
 
         store = await self._ensure_store()

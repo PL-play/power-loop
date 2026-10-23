@@ -27,7 +27,7 @@ async def runtime(tmp_path):
     for event in model.releases.values():
         event.set()
     registry = ToolRegistry()
-    for name in ("workflow", "spawn_agent", "run_agent", "create_workflow", "local_read"):
+    for name in ("workflow", "spawn_agent", "run_agent", "create_workflow", "local_read", "schedule_wakeup"):
         registry.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"}),
                           lambda: "unused")
     loop = StatefulAgentLoop(llm=model, store=store, tool_registry=registry,
@@ -57,6 +57,7 @@ async def test_child_role_overrides_authored_metadata_and_filters_inherited_tool
     contract = await store.get_runtime_state(sid, "workflow_execution_contract")
     assert contract["tools"] == ["local_read"] and contract["delegation_policy"] == "single_level"
     assert loop.tool_registry.has("spawn_agent")  # Parent registry was not mutated.
+    assert loop.tool_registry.has("schedule_wakeup")
     # Even a subsequently weaker parent/config cannot widen the saved child policy.
     loop.config = replace(loop.config, delegation_policy="legacy")
     restored = await workflow_continuation_loop(loop, sid)
@@ -100,6 +101,7 @@ async def test_workflow_node_can_delegate_and_role_survives_driver_cleanup(runti
     assert await session_role(store, node_sid) == "workflow_node"
     node = await workflow_continuation_loop(loop, node_sid)
     assert node.tool_registry.has("spawn_agent") and not node.tool_registry.has("workflow")
+    assert not node.tool_registry.has("schedule_wakeup")
     token = set_session_id(node_sid)
     try:
         receipt = await delegation.start(node, spec(), "audit")

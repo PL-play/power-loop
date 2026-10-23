@@ -230,6 +230,13 @@ class TimerRunner:
             self._emit(timer, "cancelled")
             return
 
+        from .execution_roles import require_timer_creation
+
+        # Old finite child timers also lack a durable owner/wait binding. Keep
+        # their original rows for explicit reconciliation/cancellation instead
+        # of executing them, invoking host delivery, or marking them delivered.
+        await require_timer_creation(self._loop, sid=timer.session_id)
+
         # ── Orchestrator veto point ──
         ctx = TimerFireCtx(
             session_id=timer.session_id,

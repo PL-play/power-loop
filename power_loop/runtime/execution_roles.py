@@ -55,6 +55,28 @@ async def require_orchestration(loop, tool: str, *, sid: str | None = None) -> N
 
 def role_tools(names, role: str) -> list[str]:
     blocked = set(WORKFLOW_TOOLS) if role != "main" else set()
+    # Finite child waits need a durable owner/decision handoff. Legacy timers
+    # would otherwise outlive the child or resume a node outside its engine.
+    if role != "main":
+        blocked.add("schedule_wakeup")
     if role == "subagent":
         blocked.add("spawn_agent")
     return [name for name in names if name not in blocked]
+
+
+async def require_timer_creation(loop, *, sid: str | None = None) -> None:
+    """Reject finite child timers until managed waiting participates in closure.
+
+    Check both the caller and an explicit SDK target, so a child using a host
+    wrapper cannot arm a main-session reminder instead. Existing timers remain
+    readable/cancellable; legacy delegation preserves its original behavior.
+    """
+    if loop is None or not finite_delegation(loop):
+        return
+    sessions = {value for value in (get_session_id(), sid) if value}
+    if not sessions:
+        raise ValueError("execution_role_unavailable")
+    store = await loop._ensure_store()
+    for session in sessions:
+        if await session_role(store, session) != "main":
+            raise ValueError("execution_role_forbids_timer")
