@@ -30,7 +30,7 @@ def _budget(spec, budget):
             "continuation_policy": "host_adapter_required"}
 
 
-def capture(spec, *, executor=None, budget=None, file_io=None, completion_callback=False):
+def capture(spec, *, executor=None, budget=None, file_io=None, completion_callback=False, resource_binding=None, allowed_tools=None):
     from power_loop.workflow.engine import InProcessExecutor
     if type(completion_callback) is not bool:
         raise JobError("workflow_profile_mismatch")
@@ -39,14 +39,34 @@ def capture(spec, *, executor=None, budget=None, file_io=None, completion_callba
         "budget": _budget(spec, budget),
         "file_io": {"kind": "none"} if file_io is None else _external(file_io),
         "notification": {"kind": "opaque_callback", "settlement": "library_exit_only"} if completion_callback else {"kind": "durable_inbox"}}
-    return validate(data, spec=spec, completion_callback=completion_callback)
+    if resource_binding is not None:
+        from .workflow_resources import WorkflowResourceBinding
+        if type(resource_binding) is not WorkflowResourceBinding:
+            raise JobError("workflow_profile_mismatch")
+        data.update(version=2, protocol="task-workflow-profile-v2", resource_binding=resource_binding.to_dict())
+    return validate(data, spec=spec, completion_callback=completion_callback, allowed_tools=allowed_tools)
 
 
-def validate(data, *, spec, completion_callback):
+def validate(data, *, spec, completion_callback, allowed_tools=None):
     """Strict types and complete shape; absent historical fields stay unknown."""
     if data is None:
         raise JobError("workflow_profile_unknown")
     try:
+        if isinstance(data, dict) and type(data.get("version")) is int and data["version"] == 2:
+            from .workflow_resources import WorkflowResourceBinding, execution_contract
+            if (set(data) != {"version", "protocol", "executor", "budget", "file_io", "notification", "resource_binding"} or
+                    data["protocol"] != "task-workflow-profile-v2"):
+                raise ValueError("incomplete resource profile")
+            binding = WorkflowResourceBinding.from_dict(data["resource_binding"])
+            base = {key: value for key, value in data.items() if key != "resource_binding"}
+            base.update(version=1, protocol="task-workflow-profile-v1")
+            base = validate(base, spec=spec, completion_callback=completion_callback)
+            if (binding.contract_sha256 != execution_contract(spec, allowed_tools) or
+                    (binding.workspace_id is not None) != (base["file_io"]["kind"] != "none") or
+                    (binding.budget_scope_id is not None) != (base["budget"]["kind"] in ("runtime_soft", "external")) or
+                    (binding.notification_mode == "host_receipt") != completion_callback):
+                raise ValueError("resource capability mismatch")
+            return json.loads(_json(data))
         if (not isinstance(data, dict) or set(data) != {"version", "protocol", "executor", "budget", "file_io", "notification"} or
                 type(data["version"]) is not int or data["version"] != 1 or data["protocol"] != "task-workflow-profile-v1" or
                 type(completion_callback) is not bool):
@@ -91,6 +111,8 @@ def require_native(data):
     Call only with a validated profile. Host objects/callbacks need explicit
     adapters; class names and callback return cannot prove portable effects.
     """
+    if data.get("version") == 2:
+        raise JobError("workflow_profile_adapter_required:resource_binding")
     for key, allowed in (("executor", {"native_in_process"}), ("budget", {"unbounded", "spec_soft"}),
                          ("file_io", {"none"}), ("notification", {"durable_inbox"})):
         if data[key]["kind"] not in allowed:
@@ -98,11 +120,12 @@ def require_native(data):
     return data
 
 
-def creation_request(spec, allowed_tools, *, executor=None, budget=None, file_io=None, completion_callback=False):
+def creation_request(spec, allowed_tools, *, executor=None, budget=None, file_io=None, completion_callback=False, resource_binding=None):
     # A detached task must never reread a mutated Workflow after admission awaits.
     return json.loads(_json({"spec": spec.to_dict(), "allowed_tools": sorted(allowed_tools) if allowed_tools is not None else None,
         "completion_callback": completion_callback,
-        "execution_profile": capture(spec, executor=executor, budget=budget, file_io=file_io, completion_callback=completion_callback)}))
+        "execution_profile": capture(spec, executor=executor, budget=budget, file_io=file_io,
+            completion_callback=completion_callback, resource_binding=resource_binding, allowed_tools=allowed_tools)}))
 
 
 async def read(manager, reader, row):
@@ -122,7 +145,14 @@ async def read(manager, reader, row):
         if event["request_hash"] != fingerprint:
             raise JobError("workflow_profile_creation_mismatch")
         spec = WorkflowSpec.from_json(request["spec"])
-        return validate(request.get("execution_profile"), spec=spec, completion_callback=request.get("completion_callback"))
+        data = validate(request.get("execution_profile"), spec=spec,
+            completion_callback=request.get("completion_callback"), allowed_tools=request["allowed_tools"])
+        if data["version"] == 2:
+            from .workflow_resources import WorkflowResourceBinding, WorkflowResourceScope, execution_contract
+            WorkflowResourceBinding.from_dict(data["resource_binding"]).require(
+                WorkflowResourceScope(row["tenant_id"], row["principal_id"], row["created_by_session_id"]),
+                execution_contract(spec, request["allowed_tools"]))
+        return data
     except (TypeError, ValueError, KeyError, WorkflowSpecError) as exc:
         if isinstance(exc, JobError):
             raise

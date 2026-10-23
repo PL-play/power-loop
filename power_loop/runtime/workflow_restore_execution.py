@@ -306,6 +306,16 @@ async def validate_engine(runtime, binding, engine, spec):
                 _hash({k: v.to_dict() for k, v in engine._replay.items()}) != _hash(replay) or
                 _hash(engine._resume_sessions) != _hash(sessions) or engine._replay_no_charge != set(replay)):
             raise JobError("workflow_restore_engine_mismatch")
+        from .workflow_restore_resources import admission
+        resources = getattr(engine, "_restore_resources", None)
+        admission(resources, manager, runtime.actor(row["created_by_session_id"]), request["plan"]["profile"],
+            prior_usage=request["prior_usage"], previous=request.get("resource_evidence"))
+        if resources is not None:
+            if (engine._executor is not resources.resources.executor or engine._file_io is not resources.resources.file_io or
+                    resources.resources.budget is not None and engine._budget is not resources.resources.budget):
+                raise JobError("workflow_restore_engine_mismatch")
+            if resources.resources.budget is not None:
+                return
         if spec.budget is not None:
             if engine._budget is None or engine._budget.max_tokens != spec.budget.max_tokens or engine._budget.spent != request["prior_usage"].get("total_tokens", 0):
                 raise JobError("workflow_restore_engine_mismatch")

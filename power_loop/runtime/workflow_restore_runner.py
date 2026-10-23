@@ -22,6 +22,8 @@ async def start(loop, parent_sid, run_id, *, continuation, executor=None, budget
     from power_loop.workflow.spec import WorkflowSpec
 
     from .workflow_restore_execution import settle
+    from .workflow_restore_resources import prepare as prepare_resources
+    from .workflow_restore_resources import reauthorize
     from .workflow_resume import admit, claim_dispatch, dispatch_id
     from .workflow_tasks import _WORKFLOW
     source = _SEND.get()
@@ -69,11 +71,12 @@ async def start(loop, parent_sid, run_id, *, continuation, executor=None, budget
             maximum = int(plan["nodes"][node_id]["contract"]["spec"]["max_rounds"])
             if rounds > maximum:
                 raise JobError("continuation_rounds_exceed_original_contract")
+            resources = await prepare_resources(runtime, source.actor, plan)
             args = dict(caller=source.lease, call_ref=ref, tool_call_id=call_id, generation=job.generation,
                 node_id=node_id, message=message, executor_id=runtime.executor_id, boot_id=runtime.boot_id,
                 plan_hash=_hash(plan), lease_ms=runtime.lease_ms, rounds=rounds)
             try:
-                operation, repeated = await admit(manager, source.actor, job.job_id, **args)
+                operation, repeated = await admit(manager, source.actor, job.job_id, resources=resources, **args)
             except Exception:
                 operation = await manager.operation_for_call(source.actor, ref, call_id)
                 if operation is None or operation.result.get("mode") != "workflow_continue" or operation.result["request"]["plan_hash"] != _hash(plan):
@@ -87,9 +90,13 @@ async def start(loop, parent_sid, run_id, *, continuation, executor=None, budget
                 return
             request = operation.result["request"]
             binding = Execution(runtime, source.actor, JobLease(**request["target"]))
+            if resources is not None:
+                await reauthorize(resources, runtime, source.actor, request["plan"]["profile"],
+                    prior_usage=request["prior_usage"], minimum_spent=request["resource_evidence"]["budget_spent"])
             dispatch_token = secrets.token_hex(16)
             try:
-                claimed = await claim_dispatch(manager, source.actor, operation.operation_id, caller=source.lease, token=dispatch_token)
+                claimed = await claim_dispatch(manager, source.actor, operation.operation_id,
+                    caller=source.lease, token=dispatch_token, resources=resources)
             except Exception:
                 saved = await manager.db.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (dispatch_id(operation.operation_id),))
                 if saved is None or json.loads(saved["payload_json"]).get("token") != dispatch_token:
@@ -114,18 +121,24 @@ async def start(loop, parent_sid, run_id, *, continuation, executor=None, budget
             binding.resource_evidence["workflow_run_id"] = run_id
             async with runtime.execution(binding, context=_WORKFLOW):
                 spec = WorkflowSpec.from_json(request["plan"]["spec"])
-                pool = None
-                if spec.budget:
+                if resources is not None:
+                    await reauthorize(resources, runtime, source.actor, request["plan"]["profile"],
+                        prior_usage=request["prior_usage"], minimum_spent=request["resource_evidence"]["budget_spent"])
+                pool = resources.resources.budget if resources is not None else None
+                if pool is None and spec.budget:
                     pool = SharedBudget(spec.budget.max_tokens, stop_at_remaining_pct=spec.budget.stop_at_remaining_pct)
                     pool.commit(request["prior_usage"])
                 replay = {nid: AgentResult(**request["plan"]["nodes"][nid]["result"]) for nid in request["plan"]["replay"]}
-                engine = runner.WorkflowEngine(loop, budget=pool, stop_event=cancel, run_id=run_id,
+                engine = runner.WorkflowEngine(loop, budget=pool,
+                    executor=resources.resources.executor if resources is not None else None,
+                    stop_event=cancel, run_id=run_id,
                     allowed_tools=frozenset(request["plan"]["allowed_tools"]) if request["plan"]["allowed_tools"] is not None else None,
                     on_step=runner.make_on_step(store, parent_sid, run_id), on_node_start=runner.make_on_node_start(store, parent_sid, run_id),
                     replay=replay, resume_sessions={nid: request["plan"]["nodes"][nid]["binding"]["session_id"] for nid in request["affected"]})
                 engine._task_execution = binding
                 engine._restore_operation_id = operation.operation_id
                 engine._restore_request = request
+                engine._restore_resources = resources
                 engine._replay_no_charge.update(replay)
                 for nid in request["affected"]:
                     limit = int(request["plan"]["nodes"][nid]["contract"]["spec"]["max_rounds"])

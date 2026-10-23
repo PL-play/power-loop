@@ -9,12 +9,27 @@
 ## [Unreleased]
 
 ### Added
+- Persist trusted resource bindings in new workflow profile-v2 admissions and
+  reauthorize the original resources before engine construction. Preserve v1
+  interpretation and exact-call replay without resolving a replacement pool.
+  Host-only SDK/facade configuration admits concrete local managed resources;
+  external resource control remains unfinished.
+- Restore bound workflows through original plan/admission/dispatch/engine checks,
+  reauthorizing actual resources outside transactions and retaining immutable
+  admission evidence. Preserve task/node/session identities, original contracts,
+  operation replay and other scopes' shared-pool spend. Soft pools require the
+  original local object; absent continuity requires reconciliation, not a fresh
+  allowance. Durable cross-process budget resources and host effects remain pending.
+- Add deterministic full-unit file shards, real-only acceptance, exclusive
+  source-fingerprinted runner metadata, streamed sanitized logs, and owned
+  child/database cleanup on SIGINT/SIGTERM. Interrupted runs never count as
+  passed acceptance, and every completed group must retain the same source.
 - Add a trusted, host-only workflow resource preparation registry with exact
   adapter versions, immutable original scope/config/contract bindings, explicit
   authorization, await-safe revocation, bounded resolution and private host
   errors. Reject class-only history and substituted workspace/budget identities.
-  This foundation does not yet connect profile-v2, native host restoration,
-  durable resource admission, notification acceptance, or hard billing.
+  Resource preparation alone does not grant durable admission, external host
+  execution, notification acceptance, or hard billing.
 - Route native workflow nudge/steer through the shared library facade and saved
   node/session bindings. Select exact foreach routes by node job or SID and the
   latest actual retry by node name. Carry the selected job/generation into real
@@ -221,6 +236,10 @@
   `scripts/test_task_registry.py`. MySQL verification paused by user request.
 
 ### Fixed
+- Account automatic workflow continuations by cumulative usage deltas and settle
+  restored nodes against their actual execution generation. Neither continuation
+  responses nor earlier generations are charged twice to the soft token pool;
+  replayed outputs add no new usage. Hard reservations/API billing remain separate.
 - Isolate experimental workflow-node session/input-closure evidence by generation
   while preserving first-generation IDs. Validate complete physical bindings against
   frozen admissions before model sends, steering and duplicate binding/closure;

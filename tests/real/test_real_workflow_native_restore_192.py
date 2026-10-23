@@ -11,8 +11,15 @@ from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import workflow_restore_execution
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
+from power_loop.runtime.workflow_resources import (
+    WorkflowResourceAdapter,
+    WorkflowResourceBinding,
+    WorkflowResourceRegistry,
+    WorkflowResources,
+    execution_contract,
+)
 from power_loop.tools.registry import ToolRegistry
-from power_loop.workflow import create_workflow, journal
+from power_loop.workflow import InProcessExecutor, SharedBudget, WorkflowSpec, create_workflow, journal
 from power_loop.workflow.resume import resume_detached
 
 from .test_real_async_boundaries_192 import BoundedProvider
@@ -21,7 +28,8 @@ pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
 @pytest.mark.parametrize("fault", ["none", "node_ack"])
-async def test_real_native_restoration_recomputes_original_nodes_and_main_consumes_new_result(tmp_path, record_property, monkeypatch, fault):
+@pytest.mark.parametrize("resource_mode", ["native", "bound"])
+async def test_real_native_restoration_recomputes_original_nodes_and_main_consumes_new_result(tmp_path, record_property, monkeypatch, fault, resource_mode):
     store = await SessionStore.open(str(tmp_path / "native-restore.db"), schema="tasks")
     manager = JobManager(store)
     runtime = TaskRuntime(manager, tenant_id="native-restore", principal_id="host", executor_id="executor", boot_id="boot")
@@ -40,8 +48,24 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
         {"type": "agent", "id": "review", "inputs_from": ["calculate"], "input": "Check the supplied calculation result and report its verified number.",
          "spec": {"name": "review", "tools": [], "max_rounds": 2, "system_prompt": "Review the newest calculation result supplied by the user. Return its number only. Do not use pass_turn."}},
     ]}}
+    pool = SharedBudget(1000000)
+    pool.commit({"total_tokens": 13})
+    resource_binding = None
+    if resource_mode == "bound":
+        resource_registry = WorkflowResourceRegistry()
+        runtime.workflow_resources = resource_registry
+        resource_binding = WorkflowResourceBinding("real-restore", "1.0.0", "original-resources", 1,
+            runtime.tenant_id, runtime.principal_id, parent, "a"*64,
+            execution_contract(WorkflowSpec.from_json(spec), None), budget_scope_id="original-shared-pool")
+        resources = WorkflowResources(resource_binding, InProcessExecutor(), budget=pool)
+        async def prepared(*args):
+            return resources
+        async def authorized(*args):
+            return True
+        resource_registry.register("real-restore", "1.0.0", WorkflowResourceAdapter(prepared, prepared, authorized))
     async def launch():
-        handle = await create_workflow(spec, parent_loop=get_current_loop(), parent_session_id=get_session_id()).start(detached=True)
+        handle = await create_workflow(spec, parent_loop=get_current_loop(), parent_session_id=get_session_id(),
+            resource_binding=resource_binding).start(detached=True)
         handles.append(handle)
         return json.dumps({"job_id": handle.job_id, "operation_id": handle.operation_id, "run_id": handle.run_id, "status": "accepted"})
     async def repair():
@@ -70,6 +94,10 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
             actor = runtime.actor(parent)
             first = await manager.get_job(actor, handles[0].job_id)
             assert first.outcome == "succeeded" and first.result["final"]["text"].strip() == "42", first.result
+            if resource_mode == "bound":
+                assert pool.spent == 13 + first.result["usage"]["total_tokens"]
+                pool.commit({"total_tokens": 7})  # another scope's spend cannot disappear
+            before_restore = pool.spent
             consumed = await loop.flush_follow_ups(parent)
             assert "42" in consumed.final_text
             old = await manager.get_result_revision(actor, first.job_id, 1)
@@ -98,6 +126,10 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
             op = await manager.get_operation(actor, new.operation_id)
             assert op.call_ref["id"] != op.receipt_ref["id"] and sorted(claims) == ["calculate", "review"]
             assert current.result["usage"] == await manager.execution_usage(actor, first.job_id, generation=2)
+            if resource_mode == "bound":
+                assert pool.spent == before_restore + current.result["usage"]["total_tokens"]
+                assert (await manager.get_workflow_profile(actor, first.job_id))["resource_binding"] == resource_binding.to_dict()
+                assert op.result["request"]["resource_evidence"]["budget_spent"] == before_restore
             lifetime = await manager.execution_usage(actor, first.job_id)
             assert lifetime["total_tokens"] == first.result["usage"]["total_tokens"]+current.result["usage"]["total_tokens"]
             final = await loop.flush_follow_ups(parent)

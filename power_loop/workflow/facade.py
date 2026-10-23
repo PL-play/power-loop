@@ -61,6 +61,7 @@ class WorkflowToolPorts:
     on_accepted: Callable[..., Any] | None = None
     allow_inline_spec: bool = True
     observer_timeout_s: float = 2.0
+    resource_adapter: tuple[str, str] | None = None
 
     def __post_init__(self):
         if type(self.allow_inline_spec) is not bool:
@@ -69,6 +70,12 @@ class WorkflowToolPorts:
         if (isinstance(value, bool) or not isinstance(value, (int, float)) or
                 not math.isfinite(value) or not 0 < value <= 30):
             raise WorkflowToolInputError("invalid_workflow_observer_timeout")
+        if self.resource_adapter is not None:
+            if (type(self.resource_adapter) is not tuple or len(self.resource_adapter) != 2 or
+                    any(type(value) is not str or not value.strip() for value in self.resource_adapter)):
+                raise WorkflowToolInputError("invalid_workflow_resource_adapter")
+            if any(value is not None for value in (self.executor_factory, self.budget_factory, self.file_io_factory, self.on_complete)):
+                raise WorkflowToolInputError("workflow_resource_ports_conflict")
 
 
 @dataclass(frozen=True)
@@ -199,11 +206,23 @@ async def submit_workflow(arguments: Mapping[str, Any], ports: WorkflowToolPorts
     await check_dispatch(sid)
     prepared = await prepare_workflow(options, ports)
     warning = await _observe(ports.on_compiled, ports, copy.deepcopy(prepared.spec.to_dict()))
+    resource_binding = None
+    if ports.resource_adapter is not None:
+        from power_loop.runtime.jobs import JobError
+        from power_loop.runtime.workflow_resources import WorkflowResourceScope, execution_contract
+        runtime = getattr(loop, "task_runtime", None)
+        resources = getattr(runtime, "workflow_resources", None)
+        if resources is None:
+            raise JobError("workflow_resource_registry_required")
+        bound = await resources.prepare(*ports.resource_adapter,
+            scope=WorkflowResourceScope(runtime.tenant_id, runtime.principal_id, sid),
+            contract_sha256=execution_contract(prepared.spec, prepared.allowed_tools))
+        resource_binding = bound.binding
     wf = create_workflow(prepared.spec, parent_loop=loop, parent_session_id=sid,
         executor=ports.executor_factory(loop, sid) if ports.executor_factory else None,
         budget=ports.budget_factory(loop, sid) if ports.budget_factory else None,
         file_io=ports.file_io_factory(loop, sid) if ports.file_io_factory else None,
-        allowed_tools=prepared.allowed_tools)
+        allowed_tools=prepared.allowed_tools, resource_binding=resource_binding)
     handle = await wf.start(detached=True, on_complete=ports.on_complete)
     if not isinstance(handle, WorkflowRunHandle):
         raise TypeError("asynchronous workflow admission must return a WorkflowRunHandle")

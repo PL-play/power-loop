@@ -440,10 +440,63 @@ async def run_detached(
     submitted_cancel = workflow._cancel
     submitted_spec, submitted_tools = workflow.spec, workflow._allowed_tools
     submitted_request = None
+    resource_binding = getattr(workflow, "_resource_binding", None)
+    resource_registry = None
+    if resource_binding is not None:
+        from power_loop.runtime.jobs import JobError
+        from power_loop.runtime.workflow_resources import (
+            WorkflowResourceScope,
+            execution_contract,
+            require_managed_creation,
+        )
+
+        from .spec import WorkflowSpec
+        if runtime is None:
+            raise JobError("workflow_resource_registry_required")
+        if on_complete is not None or resource_binding.notification_mode != "durable_inbox":
+            raise JobError("workflow_resource_notification_adapter_required")
+        # Freeze before the first resolver await, including SDK-owned mutable IR.
+        submitted_spec = WorkflowSpec.from_json(json.dumps(submitted_spec.to_dict(), ensure_ascii=False))
+        submitted_tools = frozenset(submitted_tools) if submitted_tools is not None else None
+        resource_registry = runtime.workflow_resources
+        resource_scope = WorkflowResourceScope(runtime.tenant_id, runtime.principal_id, parent_sid)
+        resource_contract = execution_contract(submitted_spec, submitted_tools)
+        resource_binding.require(resource_scope, resource_contract)
+        from power_loop.runtime.invocation import current_invocation
+        seq, call_id = current_invocation(parent_sid)
+        original = None
+        if seq is not None and call_id:
+            source = await runtime.manager.store.message_ref(parent_sid, seq)
+            operation = await runtime.manager.operation_for_call(runtime.actor(parent_sid), source, call_id)
+            if operation is not None:
+                saved = await runtime.manager.get_workflow_profile(runtime.actor(parent_sid), operation.job_id)
+                original = operation.result.get("request")
+                if (operation.action != "create" or saved.get("version") != 2 or
+                        saved["resource_binding"] != resource_binding.to_dict() or
+                        original["spec"] != submitted_spec.to_dict() or
+                        original["allowed_tools"] != (sorted(submitted_tools) if submitted_tools is not None else None) or
+                        original["completion_callback"] is not False):
+                    raise JobError("operation_conflict")
+        if original is not None:
+            # Exact durable call replay uses original admission evidence, even
+            # if the adapter was revoked or the shared pool has since spent.
+            submitted_request = original
+        else:
+            if resource_registry is None:
+                raise JobError("workflow_resource_registry_required")
+            resources = await resource_registry.resolve(resource_binding, scope=resource_scope, contract_sha256=resource_contract)
+            require_managed_creation(resources)
+            if runtime.workflow_resources is not resource_registry:
+                raise JobError("workflow_resource_adapter_changed")
+            submitted_executor, submitted_budget, submitted_file_io = resources.executor, resources.budget, resources.file_io
+            if submitted_budget is not None:
+                resource_registry.retain_soft_pool(resource_binding, submitted_budget)
     if runtime is not None:
         from power_loop.runtime.workflow_profile import creation_request
-        submitted_request = creation_request(submitted_spec, submitted_tools, executor=submitted_executor,
-            budget=submitted_budget, file_io=submitted_file_io, completion_callback=on_complete is not None)
+        if submitted_request is None:
+            submitted_request = creation_request(submitted_spec, submitted_tools, executor=submitted_executor,
+                budget=submitted_budget, file_io=submitted_file_io, completion_callback=on_complete is not None,
+                resource_binding=resource_binding)
     store = await loop._ensure_store()
     if await store.get_session(parent_sid) is None:
         raise WorkflowRunError("parent session not found; cannot start detached run")
@@ -481,17 +534,47 @@ async def run_detached(
                 system_key="journal-admission:" + run_id, reason="workflow journal admission failed")
         raise
 
-    def _build_engine() -> WorkflowEngine:
+    def _engine(executor, budget, file_io) -> WorkflowEngine:
         return WorkflowEngine(
-            loop, executor=submitted_executor, budget=submitted_budget,
+            loop, executor=executor, budget=budget,
             on_step=make_on_step(store, parent_sid, run_id),
             on_node_start=make_on_node_start(store, parent_sid, run_id),
             on_node_session=make_on_node_session(store, parent_sid, run_id),
             stop_event=submitted_cancel, run_id=run_id,
             history_owner_sid=parent_sid,
             allowed_tools=submitted_tools,
-            file_io=submitted_file_io,
+            file_io=file_io,
         )
+
+    async def _bound_engine():
+        from power_loop.runtime.workflow_profile import capture
+        from power_loop.runtime.workflow_tasks import current_workflow
+        if runtime.workflow_resources is not resource_registry:
+            raise JobError("workflow_resource_adapter_changed")
+        execution = current_workflow(runtime)
+        if execution is None:
+            raise JobError("task_workflow_admission_required")
+        saved = await runtime.manager.get_workflow_profile(runtime.actor(parent_sid), registration.job.job_id)
+        if saved != submitted_request["execution_profile"]:
+            raise JobError("workflow_profile_creation_mismatch")
+        resolved = await resource_registry.resolve(resource_binding, scope=resource_scope, contract_sha256=resource_contract)
+        require_managed_creation(resolved)
+        if resolved.budget is not None:
+            resource_registry.require_soft_pool(resource_binding, resolved.budget)
+        actual = capture(submitted_spec, executor=resolved.executor, budget=resolved.budget,
+            file_io=resolved.file_io, resource_binding=resolved.binding, allowed_tools=submitted_tools)
+        # Shared pool spend may grow across admission; capacity/config may not.
+        if saved["budget"]["kind"] == "runtime_soft" and actual["budget"]["kind"] == "runtime_soft":
+            if actual["budget"]["spent_at_admission"] < saved["budget"]["spent_at_admission"]:
+                raise JobError("workflow_resource_budget_rewound")
+            actual["budget"]["spent_at_admission"] = saved["budget"]["spent_at_admission"]
+        if actual != saved or runtime.workflow_resources is not resource_registry:
+            raise JobError("workflow_resource_binding_mismatch")
+        await runtime.manager.check_execution(execution.actor, execution.lease)
+        return _engine(resolved.executor, resolved.budget, resolved.file_io)
+
+    def _build_engine():
+        return _bound_engine() if resource_binding is not None else _engine(submitted_executor, submitted_budget, submitted_file_io)
 
     handle = spawn_background(
         loop, parent_sid, run_id, store=store,

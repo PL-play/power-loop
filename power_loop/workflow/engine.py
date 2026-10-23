@@ -1132,6 +1132,23 @@ class WorkflowEngine:
         # ── 耗尽续跑（6.7.0，ContinuationPolicy）：hit_round_limit + 门条件成立 → 原会话补轮。
         # 与 retry 正交：retry 起新会话防污染，这里恰恰要**同一会话**接着成果做——引擎在
         # 耗尽时已逼叶子写下「做了什么+还剩什么」，续命提示再喂它自己的剩余 todo。
+        # Each continuation's usage is part of raw's cumulative usage. Charge
+        # that cumulative evidence once, including before checking another
+        # continuation's budget. Final canonical usage may add required child
+        # work, but cannot charge already-accounted requests again.
+        accounted_usage: dict[str, int] = {}
+
+        def account_usage(usage):
+            totals = {key: int(value or 0) for key, value in (usage or {}).items()}
+            delta = {key: value - accounted_usage.get(key, 0) for key, value in totals.items()}
+            if any(value < 0 for value in delta.values()):
+                raise WorkflowRunError("workflow usage regressed during continuation settlement")
+            self._add_usage(delta)
+            if self._budget is not None:
+                self._budget.commit(delta)
+            accounted_usage.update(totals)
+
+        account_usage(raw.get("usage"))
         cont = node.continuation
         if cont is not None:
             for c_i in range(1, cont.max_continuations + 1):
@@ -1163,9 +1180,7 @@ class WorkflowEngine:
                     "rounds": int(raw.get("rounds") or 0) + int(more.get("rounds") or 0),
                     "usage": merged_usage,
                 }
-                self._add_usage(more.get("usage") or {})
-                if self._budget is not None:
-                    self._budget.commit(more.get("usage") or {})
+                account_usage(merged_usage)
 
         if str(raw.get("status")) == "cancelled":
             if node_tok.is_cancelled() and not self._cancel.is_cancelled():
@@ -1201,7 +1216,8 @@ class WorkflowEngine:
                 raw = await ensure_node_answer(runtime, self._loop, raw, node_tok)
             from power_loop.runtime.task_runtime import _OWNER
             scope = _OWNER.get()
-            raw["usage"] = await runtime.manager.execution_usage(scope.actor, scope.lease.job_id)
+            raw["usage"] = await runtime.manager.execution_usage(scope.actor, scope.lease.job_id,
+                generation=scope.lease.generation)
 
         payload: dict[str, Any] | None = None
         err: str | None = None
@@ -1228,9 +1244,7 @@ class WorkflowEngine:
         )
         self._results[node.id] = res
         self._last = res
-        self._add_usage(res.usage)
-        if self._budget is not None:
-            self._budget.commit(res.usage)
+        account_usage(res.usage)
 
         # ── 兜底节点：所有 attempt 用尽仍失败时跑，成功则**顶替**本节点的结果供下游引用 ──
         if res.status not in ("completed", "cancelled") and node.fallback is not None and not self._cancelled:

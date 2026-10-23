@@ -28,6 +28,11 @@ def _digest(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+def execution_contract(spec, allowed_tools):
+    """Bind resources to the frozen effective spec and tool ceiling."""
+    return _hash({"spec": spec.to_dict(), "allowed_tools": sorted(allowed_tools) if allowed_tools is not None else None})
+
+
 async def _host_call(function, *args):
     try:
         return await function(*args)
@@ -149,6 +154,28 @@ class WorkflowResourceAdapter:
             raise TypeError("workflow resource adapter ports must be async functions")
 
 
+def require_managed_creation(resources):
+    """New bindings do not themselves prove external stop/effect control.
+
+    Current native creation has concrete local task cancellation and send usage
+    evidence. External executors, file effects, custom budgets and business
+    receipts need their additional lifecycle adapters before execution opens.
+    Resource preparation remains available independently of this admission gate.
+    """
+    from power_loop.workflow.engine import InProcessExecutor
+    from power_loop.workflow.result import SharedBudget
+
+    if type(resources) is not WorkflowResources:
+        raise JobError("workflow_resources_invalid")
+    for name, supported in (("executor", type(resources.executor) is InProcessExecutor),
+            ("file_io", resources.file_io is None),
+            ("budget", resources.budget is None or type(resources.budget) is SharedBudget),
+            ("notification", resources.on_complete is None)):
+        if not supported:
+            raise JobError("workflow_resource_adapter_required:" + name)
+    return resources
+
+
 class WorkflowResourceRegistry:
     """Exact key/version registration; no fallback and revocation across awaits.
 
@@ -162,6 +189,31 @@ class WorkflowResourceRegistry:
             raise ValueError("workflow resource timeout must be in (0, 30]")
         self._timeout_s = timeout_s
         self._entries = {}
+        # Soft pools have no durable balance provider. Retain the original
+        # object for local continuity; a new process must reconcile explicitly,
+        # never construct a pool from one workflow's minimum recorded spend.
+        self._soft_pools = {}
+
+    def _soft_pool_key(self, binding):
+        if type(binding) is not WorkflowResourceBinding or binding.budget_scope_id is None:
+            raise JobError("workflow_resource_binding_invalid")
+        return (binding.tenant_id, binding.principal_id, binding.main_session_id, binding.budget_scope_id)
+
+    def retain_soft_pool(self, binding, pool):
+        from power_loop.workflow.result import SharedBudget
+        key = self._soft_pool_key(binding)
+        if type(pool) is not SharedBudget:
+            raise JobError("workflow_resources_invalid")
+        if key in self._soft_pools and self._soft_pools[key] is not pool:
+            raise JobError("workflow_resource_budget_substituted")
+        self._soft_pools[key] = pool
+
+    def require_soft_pool(self, binding, pool):
+        key = self._soft_pool_key(binding)
+        if key not in self._soft_pools:
+            raise JobError("workflow_resource_budget_requires_reconciliation")
+        if self._soft_pools[key] is not pool:
+            raise JobError("workflow_resource_budget_substituted")
 
     def register(self, key: str, version: str, adapter: WorkflowResourceAdapter):
         if not _identifier(key) or not _identifier(version) or type(adapter) is not WorkflowResourceAdapter:

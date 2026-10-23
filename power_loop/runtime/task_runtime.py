@@ -118,15 +118,20 @@ class TaskRuntime:
     """Trusted host configuration, shared by loops using the same opened store."""
 
     def __init__(self, manager: JobManager, *, tenant_id: str, principal_id: str,
-                 executor_id: str, boot_id: str, lease_ms: int = 30000):
+                 executor_id: str, boot_id: str, lease_ms: int = 30000, workflow_resources=None):
         JobActor(tenant_id, principal_id, "validation")
         if not all(isinstance(v, str) and 0 < len(v) <= 64 for v in (executor_id, boot_id)):
             raise JobError("invalid_executor")
         if isinstance(lease_ms, bool) or not isinstance(lease_ms, int) or not 300 <= lease_ms <= 300000:
             raise JobError("invalid_lease_duration")
+        if workflow_resources is not None:
+            from .workflow_resources import WorkflowResourceRegistry
+            if type(workflow_resources) is not WorkflowResourceRegistry:
+                raise JobError("workflow_resource_registry_invalid")
         self.manager = manager
         self.tenant_id, self.principal_id = tenant_id, principal_id
         self.executor_id, self.boot_id, self.lease_ms = executor_id, boot_id, lease_ms
+        self.workflow_resources = workflow_resources
         self._workflow_handles: dict = {}
         self._local_executions: dict = {}
 

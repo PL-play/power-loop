@@ -41,7 +41,7 @@ async def _source(manager, tx, actor, caller, ref):
 
 
 async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, generation, node_id, message,
-                executor_id, boot_id, plan_hash=None, lease_ms=30000, rounds=None):
+                executor_id, boot_id, plan_hash=None, lease_ms=30000, rounds=None, resources=None):
     """All new authority is reserved in one transaction, not physical execution."""
     if type(generation) is not int or not 1 <= generation < 2**63-1:
         raise JobError("invalid_result_generation")
@@ -102,6 +102,10 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, gener
                 raise JobError("workflow_restore_usage_unknown")
             prior_usage = {k: prior_usage.get(k, 0)+previous["prior_usage"].get(k, 0) for k in prior_usage.keys() | previous["prior_usage"].keys()}
         request["prior_usage"] = prior_usage
+        from .workflow_restore_resources import admission
+        resource_evidence = admission(resources, manager, actor, plan["profile"], prior_usage=prior_usage)
+        if resource_evidence is not None:
+            request["resource_evidence"] = resource_evidence
         now = manager.now()
         updated = await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,lease_until_ms=?,session_id=NULL,"
             "status='running',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
@@ -204,6 +208,8 @@ async def execution(manager, tx, row, generation=None, *, expected_operation=Non
                 payload["run_id"] != data["run_id"] or data["run_id"] != request["plan"]["run_id"] or
                 payload["execution_id"] != op["event_id"][3:]):
             raise JobError("workflow_restore_execution_mismatch")
+        from .workflow_restore_resources import validate_evidence
+        validate_evidence(request["plan"]["profile"], request.get("resource_evidence"))
         return op, request
     except (TypeError, ValueError, KeyError, AttributeError) as exc:
         if isinstance(exc, JobError):
@@ -211,7 +217,7 @@ async def execution(manager, tx, row, generation=None, *, expected_operation=Non
         raise JobError("workflow_restore_execution_mismatch") from exc
 
 
-async def claim_dispatch(manager, actor, operation_id, *, caller, token):
+async def claim_dispatch(manager, actor, operation_id, *, caller, token, resources=None):
     if not isinstance(token, str) or not 0 < len(token) <= 64 or not isinstance(caller, JobLease):
         raise JobError("invalid_dispatch_token")
     async with manager._write() as tx:
@@ -237,6 +243,9 @@ async def claim_dispatch(manager, actor, operation_id, *, caller, token):
         await manager._validate_call(tx, actor, ref, saved["tool_call_id"])
         await _source(manager, tx, actor, caller, ref)
         await manager._fence(tx, actor, JobLease(**request["target"]))
+        from .workflow_restore_resources import admission
+        admission(resources, manager, actor, request["plan"]["profile"],
+            prior_usage=request["prior_usage"], previous=request.get("resource_evidence"))
         evidence = {"version": 1, "operation_id": operation_id, "target": request["target"], "driver_sid": request["driver_sid"], "token": token}
         if await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (key, row["job_id"], "workflow_dispatch", row["version"], _hash(evidence), _json(evidence), "claimed", manager.now())) != 1:

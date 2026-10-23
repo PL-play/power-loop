@@ -49,6 +49,7 @@ class Workflow:
         parent_session_id: str | None = None,
         allowed_tools: Iterable[str] | None | Any = _CAPTURE,
         file_io: Any | None = None,
+        resource_binding: Any | None = None,
     ) -> None:
         self.spec = spec
         self._loop = parent_loop
@@ -57,6 +58,16 @@ class Workflow:
         self._parent_sid = parent_session_id
         # 叶子产出文件 / 文件引用的宿主端口（5.2.0）。透传给引擎；None = 不启用。
         self._file_io = file_io
+        self._resource_binding = None
+        if resource_binding is not None:
+            from power_loop.runtime.jobs import JobError
+            from power_loop.runtime.workflow_resources import WorkflowResourceBinding
+            if executor is not None or budget is not None or file_io is not None:
+                raise JobError("workflow_resource_ports_conflict")
+            self._resource_binding = (WorkflowResourceBinding.from_dict(resource_binding)
+                if isinstance(resource_binding, dict) else resource_binding)
+            if type(self._resource_binding) is not WorkflowResourceBinding:
+                raise JobError("workflow_resource_binding_invalid")
         # Per-send capability clamp, CAPTURED AT SUBMISSION (contextvars are
         # unreliable inside a detached task): every leaf's tools are intersected
         # with this set by the engine. None = unrestricted.
@@ -91,6 +102,9 @@ class Workflow:
         from power_loop.core.agent_context import get_current_cancel_token
         from power_loop.runtime.execution_roles import require_orchestration
         from power_loop.runtime.task_runtime import reject_unregistered_adapter
+        if self._resource_binding is not None:
+            from power_loop.runtime.jobs import JobError
+            raise JobError("workflow_resource_requires_detached_task_runtime")
         reject_unregistered_adapter("synchronous_workflow", self._loop)
         await require_orchestration(self._loop, "workflow", sid=self._parent_sid)
 
@@ -139,6 +153,7 @@ def create_workflow(
     parent_session_id: str | None = None,
     allowed_tools: Iterable[str] | None | Any = _CAPTURE,
     file_io: Any | None = None,
+    resource_binding: Any | None = None,
 ) -> Workflow:
     """Validate ``spec_json`` and return a runnable :class:`Workflow`.
 
@@ -159,5 +174,5 @@ def create_workflow(
     return Workflow(
         spec, parent_loop=parent_loop, executor=executor, budget=budget,
         parent_session_id=parent_session_id, allowed_tools=allowed_tools,
-        file_io=file_io,
+        file_io=file_io, resource_binding=resource_binding,
     )

@@ -864,8 +864,52 @@ not dispatch models, write business artifacts or reserve/charge money.
 
 The registry grants no task admission, stop, billing or delivery authority. Its
 binding protocol version is separate from workflow execution profile versions.
-Profile-v2, original create fingerprints and native restore plan/admission/
-dispatch/engine integration remain required. A prepared resource is not proof
+Profile-v2 creation and restoration additionally bind original create fingerprints
+and actual plan/admission/dispatch/engine checks. A prepared resource is not proof
 that a prior execution stopped, a callback was accepted by a business system,
 or a shared budget is durably settled. Existing profile-v1 restore restrictions
 and SDK defaults are unchanged; no model tool parameters expose this registry.
+
+### Bound creation profiles
+
+Trusted hosts may configure `TaskRuntime(workflow_resources=registry)` and select
+an adapter with `WorkflowToolPorts.resource_adapter=(key, version)`. Direct SDK
+creation accepts `resource_binding`, mutually exclusive with explicit executor,
+budget and file ports. The model/YAML parameter schema never exposes this seam;
+bound execution requires the managed detached path.
+
+New admissions freeze the actual effective spec/tool contract before resolving
+resources and save the immutable binding in profile-v2 and the original create
+fingerprint. Original profile-v1 interpretation is retained. Before building a
+driver/engine, re-read that profile, resolve and reauthorize the same identity,
+check the actual lease, and reject changed capacity/floor or rewound pool spend.
+Exact original-call replay uses saved evidence without resolving or replenishing
+resources; no handle means reconciliation, not replacement dispatch.
+
+This slice admits only concrete locally managed InProcessExecutor/SharedBudget
+and inbox capabilities. External executors, file effects, custom budgets and
+business notification require additional stop/effect/receipt adapters. Binding
+evidence alone cannot authorize those effects. None of this establishes hard
+budget settlement or cross-process recovery.
+
+### Bound restoration (local managed resources)
+
+Restore plans may read validated bound profiles without invoking host code.
+Admission additionally requires resources prepared from the original binding;
+host resolution/authorization never runs in the store transaction. Recompute
+the original plan, retain profile/binding hashes and observed spend in the same
+new-generation admission, then reauthorize and fence the actual dispatch and
+engine objects. Exact-call replay returns the original receipt without resolving
+resources, replenishing pools or granting another dispatch.
+
+An in-memory SharedBudget has no durable balance authority. The registry retains
+its original object across local creation/restoration, keyed by original owner
+and budget scope. A newly constructed equal-looking pool cannot erase other
+scopes' consumption; a fresh process/registry without that continuity requires
+reconciliation. This temporary local safeguard must be supplemented by the
+durable BudgetProvider protocol for cross-process shared-budget recovery.
+Spec-owned pools retain prior canonical usage; original runtime pools are reused
+without adding that historical usage again. Each restored node settles against
+its actual execution generation, while unaffected canonical outputs replay
+without new requests or charges. Failed authorization after admission retains
+explicit cancellation/reconciliation responsibility and starts no child request.

@@ -107,7 +107,11 @@ async def _prepare(manager, tx, actor, row, *, generation, node_id, message):
             row["supervision_status"] != "open"):
         raise JobError("workflow_restore_target_unsettled")
     await manager._supervision_barriers(tx, row)
-    capabilities = require_native(await read(manager, tx, row))
+    capabilities = await read(manager, tx, row)
+    if capabilities["version"] == 1:
+        require_native(capabilities)
+    # A bound profile may be previewed without invoking host code. Admission
+    # separately requires prepared original resources; the plan grants no lease.
     await require_current(manager, tx, row)
     membership = await _stopped_tree(manager, tx, row)
     delivery = await require_closed(manager, tx, actor, row["job_id"], generation, consumed=True)

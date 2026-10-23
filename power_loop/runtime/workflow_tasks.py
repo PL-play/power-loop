@@ -287,7 +287,9 @@ async def execute_background(loop, parent_sid, run_id, registration, build_engin
     try:
         async with runtime.execution(binding, context=_WORKFLOW):
             try:
-                engine = build_engine()
+                import inspect
+                candidate = build_engine()
+                engine = await candidate if inspect.isawaitable(candidate) else candidate
                 engine._task_execution = binding
                 runner._ENGINES[run_id] = engine
                 result = await engine.run(run_spec)
