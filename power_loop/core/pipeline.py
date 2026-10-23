@@ -1581,7 +1581,11 @@ class AgentPipeline:
         try:
             return await self._run(messages)
         finally:
-            _pass.end(token)
+            try:
+                from power_loop.runtime.task_runtime import preserve_model_usage
+                preserve_model_usage(self.session_id, self.ctx.usage_totals)
+            finally:
+                _pass.end(token)
 
     async def _run(self, messages: list[LoopMessage]) -> AgentLoopResult:
         self.history = [dict(m) for m in messages]

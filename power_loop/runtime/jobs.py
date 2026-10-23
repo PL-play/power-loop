@@ -199,6 +199,8 @@ class JobManager:
                     current["control_owner_boot_id"]) != (owner["generation"], owner["executor_id"], owner["boot_id"]):
                 raise JobError("stale_parent_execution")
             self._execution_open(owner)
+            from .completion_windows import require_time
+            await require_time(self, tx, owner)
             from .executor_registry import check_execution
             await check_execution(self, tx, owner)
             current = owner
@@ -225,6 +227,8 @@ class JobManager:
         self._check_proof(row, lease)
         await self._supervision_barriers(tx, row)
         self._execution_open(row)
+        from .completion_windows import require_time
+        await require_time(self, tx, row)
         from .executor_registry import check_execution
         await check_execution(self, tx, row)
         await self._control_owners(tx, row)
@@ -334,7 +338,20 @@ class JobManager:
         Rebinding an old session to another node execution is deliberately refused.
         """
         async with self._write() as tx:
-            row = await self._fence(tx, actor, lease)
+            try:
+                row = await self._fence(tx, actor, lease)
+            except JobError as exc:
+                if exc.code not in ("completion_window_evidence_corrupt", "completion_window_creation_missing"):
+                    raise
+                # A new derived deadline check must not obscure an original
+                # malformed node contract's precise route/binding diagnostic.
+                # This read-only probe cannot grant admission; if the original
+                # contract is valid, retain the window error unchanged.
+                original = await self._authorize(tx, actor, lease.job_id)
+                self._check_proof(original, lease)
+                from .node_inputs import session_data
+                await session_data(self, tx, original, session_id)
+                raise
             from .workflow_restore_execution import controls_node, has_authority
             restored = await has_authority(self, tx, row)
             if row["kind"] != "workflow_node" or (restored and not await controls_node(self, tx, row, actor, session_id)) or (
@@ -614,7 +631,7 @@ class JobManager:
                 role, owner["job_id"] if owner else None, owner["generation"] if owner else None,
                 owner["executor_id"] if owner else None, owner["boot_id"] if owner else None))
             payload = {"job_id": job_id, "status": "queued"}
-            if kind in ("send", "workflow", "workflow_node", "timer") and request is not None:
+            if kind in ("send", "subagent", "workflow", "workflow_node", "timer") and request is not None:
                 # Recovery must not reread a potentially edited YAML/file or
                 # reconstruct a full execution contract from a request hash.
                 payload["request"] = request_data
@@ -664,6 +681,9 @@ class JobManager:
                 (generation, executor_id, boot_id, executor["executor_key"] if executor else None, self.now() + lease_ms, self.now(), job_id))
             from .execution_membership import start
             await start(self, tx, await self._row(tx, job_id))
+            if row["kind"] in ("subagent", "workflow_node"):
+                from .completion_windows import admit
+                await admit(self, tx, await self._row(tx, job_id))
             return JobLease(job_id, executor_id, boot_id, generation)
 
     async def register_operation(self, actor: JobActor, lease: JobLease, *, action: str,

@@ -1283,3 +1283,52 @@ compatibility reconciliation rather than inference from the current cache.
 Persistent owner waiting and slot release, defer review cycles, automatic
 deadline handling, restart/shutdown orchestration and the formal authorized
 host wake adapter remain required before enabling default finite-task timers.
+
+### Original UTC completion window
+
+New TaskRuntime subagent and workflow-node admissions declare
+`completion_window_protocol=1` in their retained create request. The first
+owner claim atomically writes its execution scope and one `completion_window`
+event containing the original owner identity, create-operation hash, admitted
+UTC millisecond and a fixed 1,800,000 ms deadline. Subagent create events now
+retain their complete submitted request too; ordinary acceptance receipts
+remain small. Failed admission writes or verification roll back the claim,
+scope and window together.
+
+Reading a window, reopening a store, reconstructing a local collector and
+restoring the same job never allocate another full time window. The original
+event remains authoritative across that job's later execution generations.
+The process-local CompletionWindow limits its monotonic deadline by the
+remaining original UTC time; rebinding cannot extend its existing deadline,
+including on a wall-clock correction. Workflow leaf admission, the common
+collector and standalone-child settlement use that limit. Existing round and
+money budgets remain independent and do not increase.
+
+A trusted WaitPolicy may shorten the original owner's deadline, but cannot
+exceed it. Original wait recall rechecks this bound. Execution fences check
+the current finite owner and its control-owner chain before further work,
+including provider dispatch. The original window is also a supervision-proof
+reference. A reached deadline remains readable and does not block mechanical
+stop requests or recording actual exit/usage evidence. It does not itself
+establish physical stop, quiescence, zero cost or released risk.
+
+A new protocol marker without its window, a malformed marker, a changed
+origin or damaged window fails closed. A legacy owner with no protocol marker
+has no invented original UTC deadline and keeps its explicit legacy behavior;
+this does not enable a new finite-task timer. The deadline port does not
+replace durable waiting, slot release, defer review/deadline driving or formal
+host wake and restart orchestration.
+
+The model pipeline retains its own cumulative counters in a finally block.
+If a later admission or processing error prevents a normal send result, the
+original model-exit record preserves those counters instead of losing already
+incurred rounds. Successful sends keep their existing result usage. This
+observation path dispatches no replacement request and performs no monetary
+settlement; per-attempt evidence and financial reconciliation remain separate.
+
+An original node's input-close bookkeeping accepts a verified original
+completion-deadline error as well as a durable cancellation. It first validates
+the exact typed lease and still checks the original scope and physical session.
+The operation is idempotent and transactional, leaves resource state unchanged
+and is not stop/completion or dispatch authority. Missing/corrupt window proof,
+wrong generation, unknown resource and expired execution lease are not bypassed.

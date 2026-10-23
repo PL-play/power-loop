@@ -213,6 +213,10 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         raise JobError("finalization_execution_unsettled")
     refs = [await _reference(manager, tx, scope_id(manager, row["job_id"], generation)),
         await _reference(manager, tx, seal_id(manager, row["job_id"], generation))]
+    if row["kind"] in ("subagent", "workflow_node"):
+        from .completion_windows import event_id, read_row
+        if await read_row(manager, tx, row) is not None:
+            refs.append(await _reference(manager, tx, event_id(manager, row["job_id"])))
     if row["kind"] == "send":
         model = membership["model"]
         if (row["status"] != "model_closed" or model is None or model["payload"].get("resource_state") != "stopped"):

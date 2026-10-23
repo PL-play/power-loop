@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 
-from .jobs import JobError, _hash
+from .jobs import JobError, JobLease, _hash
 
 
 def event_id(manager, prefix, job_id, sid, generation=1):
@@ -125,16 +125,21 @@ async def input_target(manager, reader, actor, send, event):
 
 async def close(runtime, binding, sid):
     """Serialize persistent input closure with admission; model sends stay open."""
+    from .execution_membership import _lease
+
+    if not isinstance(binding.lease, JobLease):
+        raise JobError("execution_lease_required")
+    _lease(asdict(binding.lease))
     manager = runtime.manager
     async with manager._write() as tx:
         try:
             job = await manager._fence(tx, binding.actor, binding.lease)
         except JobError as exc:
-            if exc.code != "cancel_requested":
+            if exc.code not in ("cancel_requested", "owner_completion_deadline_exceeded"):
                 raise
             # Closing this exact attempt is exit bookkeeping, not permission
-            # to dispatch another send. A durable cancellation must not block
-            # its input-closure marker and escape into the parent workflow.
+            # to dispatch another send. A durable cancellation or its original
+            # verified completion deadline must not block this input marker.
             job = await manager._authorize(tx, binding.actor, binding.lease.job_id)
             manager._check_proof(job, binding.lease)
             if job["kind"] != "workflow_node" or job["resource_state"] not in ("running", "unknown"):

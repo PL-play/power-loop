@@ -95,6 +95,10 @@ async def prepare_binding(manager, tx, actor, source, request, *, caller, sessio
     if (owner is None or owner["kind"] not in ("subagent", "workflow_node")
             or source["execution_role"] != owner["kind"]):
         raise JobError("wait_owner_required")
+    from .completion_windows import read_row
+    window = await read_row(manager, tx, owner)
+    if window is not None and policy.deadline_at_ms > window["deadline_at_ms"]:
+        raise JobError("wait_deadline_exceeds_owner_window")
     physical = await tx.fetchone(f"SELECT parent_session_id,metadata_json FROM {manager.store.t.sessions} WHERE session_id=?",
                                 (session_id,))
     meta = _object(physical["metadata_json"] or "{}") if physical else {}
@@ -195,6 +199,13 @@ async def _read(manager, tx, actor, job_id):
         raise JobError("wait_evidence_corrupt")
     source_scope = await scope(manager, tx, binding["source"]["job_id"], binding["source"]["generation"])
     owner_scope = await scope(manager, tx, owner["job_id"], owner["generation"])
+    from .completion_windows import read_row
+    owner_row = await manager._row(tx, owner["job_id"])
+    if owner_row is None:
+        raise JobError("wait_evidence_corrupt")
+    window = await read_row(manager, tx, owner_row)
+    if window is not None and data["request"]["policy"]["deadline_at_ms"] > window["deadline_at_ms"]:
+        raise JobError("wait_deadline_exceeds_owner_window")
     root = await manager._row(tx, binding["root_job_id"])
     route = binding["route"]
     if (source_scope["lease"] != binding["source"] or source_scope["owner"] != owner

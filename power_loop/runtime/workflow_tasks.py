@@ -176,7 +176,7 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
             parent=workflow.lease,
             system_key="node:" + key,
             title=node.id[:200],
-            request={"node": _node_to_dict(node), "route": route},
+            request={"node": _node_to_dict(node), "route": route, "completion_window_protocol": 1},
         )
         if registration.replayed:
             raise JobError("task_node_requires_reconciliation")

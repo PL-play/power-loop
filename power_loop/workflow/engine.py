@@ -871,6 +871,13 @@ class WorkflowEngine:
             if node.continuation is not None:
                 ceiling += node.continuation.max_continuations * node.continuation.extra_rounds
         completion_token = WINDOW.set(CompletionWindow(round_ceiling=ceiling, multi_session=True)) if owns_completion else None
+        if owns_completion:
+            from power_loop.runtime.completion_windows import bind_window
+            try:
+                await bind_window(self._loop, WINDOW.get(), driver_sid)
+            except BaseException:
+                WINDOW.reset(completion_token)
+                raise
         started = monotonic()
         token = node_stop if node_stop is not None else self._cancel.child()
         waiting = self._admission_tokens.setdefault(node.id, [])

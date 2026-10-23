@@ -108,6 +108,12 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
         remaining_rounds = _SETTLEMENT_ROUNDS
     if deadline is None:
         deadline = asyncio.get_running_loop().time() + _SETTLEMENT_TIMEOUT_S
+    if running.task_binding is not None:
+        from .completion import CompletionWindow
+        from .completion_windows import bind_window
+        window = CompletionWindow()
+        await bind_window(loop, window, sid)
+        deadline = min(deadline, window.deadline)
     await await_children(store, sid, running.token, max(0.0, deadline - asyncio.get_running_loop().time()))
     if finalize is not None:
         raw = await asyncio.wait_for(finalize(sid, raw), timeout=max(0.0, deadline - asyncio.get_running_loop().time()))

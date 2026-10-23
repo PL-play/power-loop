@@ -31,6 +31,7 @@ class CompletionWindow:
     multi_session: bool = False
     remaining: int = field(init=False)
     deadline: float | None = field(default=None, init=False)
+    utc_deadline_at_ms: int | None = field(default=None, init=False)
     session_id: str | None = field(default=None, init=False)
     _loop: object = field(default=None, init=False, repr=False)
     _collecting: bool = field(default=False, init=False, repr=False)
@@ -44,12 +45,23 @@ class CompletionWindow:
             raise ValueError("invalid_completion_limits")
         self.remaining = self.max_rounds
 
-    def bind(self, sid):
+    def bind(self, sid, *, deadline_at_ms=None, now_ms=None):
         loop = asyncio.get_running_loop()
         if self._loop is not None and (self._loop is not loop or not self.multi_session and self.session_id != sid):
             raise ValueError("completion_scope_changed")
+        bound = None
+        if deadline_at_ms is not None or now_ms is not None:
+            if (type(deadline_at_ms) is not int or not 0 < deadline_at_ms < 2**63
+                    or type(now_ms) is not int or not 0 < now_ms < 2**63):
+                raise ValueError("invalid_completion_deadline")
+            if self.utc_deadline_at_ms is not None and self.utc_deadline_at_ms != deadline_at_ms:
+                raise ValueError("completion_deadline_changed")
+            self.utc_deadline_at_ms = deadline_at_ms
+            bound = loop.time() + max(0, (deadline_at_ms - now_ms) / 1000)
         if self.deadline is None:
             self._loop, self.session_id, self.deadline = loop, sid, loop.time() + self.timeout_s
+        if bound is not None:
+            self.deadline = min(self.deadline, bound)
 
     def allowance(self, raw):
         if self.round_ceiling is None:
@@ -112,7 +124,8 @@ async def collect_required(loop, raw, stop_event=None, *, window=None, resolve_l
     if not sid:
         return raw
     window = window or WINDOW.get() or CompletionWindow()
-    window.bind(sid)
+    from .completion_windows import bind_window
+    await bind_window(loop, window, sid)
     token = CancellationToken.from_any(stop_event)
     if token.is_cancelled():
         return {**raw, "status": "cancelled", "error": "cancelled during completion settlement"}

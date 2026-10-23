@@ -145,6 +145,13 @@ def mark_unconfirmed_resource() -> None:
         execution.resource_evidence["resource_state"] = "unknown"
 
 
+def preserve_model_usage(session_id, usage):
+    """Retain this pipeline's counters even when a later checkpoint raises."""
+    execution = _SEND.get()
+    if execution is not None and execution.actor.session_id == session_id:
+        execution.resource_evidence["model_usage_totals"] = dict(usage)
+
+
 async def bind_tool_receipt(store, sid: str, assistant_seq: int | None, call_id: str, receipt_seq: int) -> None:
     execution = _SEND.get()
     if (
@@ -448,6 +455,7 @@ class TaskRuntime:
         except BaseException as exc:
             evidence["exit"] = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
             evidence["error_type"] = type(exc).__name__
+            evidence.setdefault("usage", dict(binding.resource_evidence.get("model_usage_totals", {})))
             raise
         finally:
             if binding.resource_evidence.get("model_attempts_inflight"):
@@ -495,7 +503,7 @@ class TaskRuntime:
             independent=role.execution_role == "main",
             call_ref=await self.manager.store.message_ref(sid, assistant_seq),
             tool_call_id=call_id,
-            request={"spec": asdict(spec), "input": task},
+            request={"spec": asdict(spec), "input": task, "completion_window_protocol": 1},
         )
 
     async def bind_subagent(self, parent: str, registration: JobRegistration, sid: str) -> Execution:
