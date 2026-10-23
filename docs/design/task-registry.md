@@ -913,3 +913,30 @@ without adding that historical usage again. Each restored node settles against
 its actual execution generation, while unaffected canonical outputs replay
 without new requests or charges. Failed authorization after admission retains
 explicit cancellation/reconciliation responsibility and starts no child request.
+
+## Shared completion window
+
+`runtime.completion` provides the required-work collector used by both the
+native node adapter and host executor adapters. A managed owning engine installs
+one `CompletionWindow` per logical node execution; host generic completion steps
+defer to that owner. Direct legacy host execution delegates to the same collector
+and text finalizer. This does not enable unregistered background/timer adapters.
+
+Repeated checks share their original deadline and remaining supplemental rounds.
+Managed supplemental work is also limited by the frozen original AgentSpec,
+ContinuationPolicy and accepted continuation rounds. Retry sessions may share
+their owning window; parallel nodes and new generations do not share it.
+An explicit deadline check precedes each model call, including after host
+resolution. Zero reported rounds still consume conservative allowance without
+altering reported token usage. A concurrent collector or a repeated final-answer
+attempt cannot allocate another supplement. Known usage survives limit and
+result-persistence failures.
+
+`completion_unresolved` is intra-execution control evidence: result/ACK handling
+and final-answer repair must not be interpreted as a business failure eligible
+for retry, fallback or automatic continuation. Normal initial business failures
+retain their declared policies. Persistent task results, required-result gates,
+original generation evidence and remaining reconciliation obligations still
+govern completion; this collector is not a final supervision-close protocol or
+a provider-wide hard budget. Root wake handoff, English constraints and durable
+background/timer integration remain required work.

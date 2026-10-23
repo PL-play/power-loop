@@ -857,7 +857,17 @@ class WorkflowEngine:
     async def _exec_agent_admitted(self, node: AgentNode, env: dict[str, Any], driver_sid: str, *, node_stop=None) -> AgentResult:
         from time import monotonic
 
+        from power_loop.runtime.completion import WINDOW, CompletionWindow
         from power_loop.workflow.admission import AdmissionCancelled, admit
+        managed = getattr(self._loop, "task_runtime", None) is not None
+        owns_completion = managed
+        ceiling = None
+        if managed:
+            hint = self._resume_instructions.get(node.id)
+            ceiling = int(hint[1]) if hint else int(node.spec.max_rounds or 30)
+            if node.continuation is not None:
+                ceiling += node.continuation.max_continuations * node.continuation.extra_rounds
+        completion_token = WINDOW.set(CompletionWindow(round_ceiling=ceiling, multi_session=True)) if owns_completion else None
         started = monotonic()
         token = node_stop if node_stop is not None else self._cancel.child()
         waiting = self._admission_tokens.setdefault(node.id, [])
@@ -874,6 +884,8 @@ class WorkflowEngine:
             await self._emit_step(result)
             return result
         finally:
+            if completion_token is not None:
+                WINDOW.reset(completion_token)
             if token in waiting:
                 waiting.remove(token)
         if result.session_id and hasattr(self._loop, "ensure_store"):
@@ -1112,6 +1124,10 @@ class WorkflowEngine:
                 raw = await collect_node(runtime, self._loop, raw, node_tok)
                 if getattr(self, "_restore_operation_id", None) and raw.get("status") == "completed" and not (raw.get("final_text") or "").strip():
                     raw = {**raw, "status": "failed", "error": "restored_node_output_missing"}
+            else:
+                from power_loop.runtime.completion import WINDOW, collect_required
+                if WINDOW.get() is not None:
+                    raw = await collect_required(self._loop, raw, node_tok)
             if resumed_raw is not None or attempt >= max_attempts or not self._should_retry(raw, triggers):
                 break
             # 取消/预算耗尽时不再重试:那不是「这次没跑好」,是整个 run 该停了。
@@ -1152,6 +1168,8 @@ class WorkflowEngine:
         cont = node.continuation
         if cont is not None:
             for c_i in range(1, cont.max_continuations + 1):
+                if raw.get("completion_unresolved"):
+                    break
                 if str(raw.get("status")) not in ("hit_round_limit", "context_checkpoint") or not raw.get("session_id"):
                     break
                 if node_tok.is_cancelled() or (
@@ -1211,7 +1229,7 @@ class WorkflowEngine:
             from power_loop.runtime.node_inputs import finish_attempt
             await finish_attempt(runtime, self, raw)
             raw = await collect_node(runtime, self._loop, raw, node_tok)
-            if type(self._executor) is InProcessExecutor and not (node.output_file or spec.metadata.get("output_file")):
+            if (type(self._executor) is InProcessExecutor or getattr(self._executor, "completion_owner", None) == "power_loop") and not (node.output_file or spec.metadata.get("output_file")):
                 from power_loop.runtime.workflow_tasks import ensure_node_answer
                 raw = await ensure_node_answer(runtime, self._loop, raw, node_tok)
             from power_loop.runtime.task_runtime import _OWNER
@@ -1247,7 +1265,7 @@ class WorkflowEngine:
         account_usage(res.usage)
 
         # ── 兜底节点：所有 attempt 用尽仍失败时跑，成功则**顶替**本节点的结果供下游引用 ──
-        if res.status not in ("completed", "cancelled") and node.fallback is not None and not self._cancelled:
+        if res.status not in ("completed", "cancelled") and node.fallback is not None and not self._cancelled and not raw.get("completion_unresolved"):
             logger.info("workflow leaf %s failed; running fallback", node.id)
             fb = await self._exec(node.fallback, env, driver_sid)
             if fb is not None and fb.status == "completed":
@@ -1391,6 +1409,8 @@ class WorkflowEngine:
         """这次 attempt 该不该重试。``failed``=状态不是 completed **也不是 hit_round_limit**
         （耗尽单列——它有自己的触发名与 ContinuationPolicy 原会话续跑，新会话重跑只会同预算
         再耗尽一次）;``empty``=完成但没正文;``hit_round_limit``=显式要旧行为时用。"""
+        if raw.get("completion_unresolved"):
+            return False  # Never re-run business work to repair result/ACK persistence.
         status = str(raw.get("status") or "")
         if status in ("hit_round_limit", "context_checkpoint"):
             return "hit_round_limit" in triggers

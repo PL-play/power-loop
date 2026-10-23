@@ -7,7 +7,7 @@ import contextlib
 from .spec import workflow_continuation_loop
 
 
-async def ensure_answer(loop, running, sid, raw, deadline):
+async def ensure_answer(loop, running, sid, raw, deadline, *, max_extra_rounds=None):
     binding = running.task_binding
     if ((binding is not None and binding.lease.generation != 1) or running.answer_attempted or
             raw.get("status") != "completed" or (raw.get("final_text") or "").strip() or
@@ -16,6 +16,8 @@ async def ensure_answer(loop, running, sid, raw, deadline):
     running.answer_attempted = True
     child = await workflow_continuation_loop(loop, sid)
     remaining = int(child.config.max_rounds or 3) - int(raw.get("rounds") or 0)
+    if max_extra_rounds is not None:
+        remaining = min(remaining, max_extra_rounds)
     if remaining <= 0:
         return {**raw, "status": "failed", "error": "subagent_output_missing"}
     with contextlib.ExitStack() as guards:

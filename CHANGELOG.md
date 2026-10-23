@@ -9,6 +9,12 @@
 ## [Unreleased]
 
 ### Added
+- Share the required-work collector and bounded text finalization with host
+  executors. Managed nodes retain one completion window across checks, clamp
+  supplemental rounds to their original contract, explicitly check deadlines
+  before model dispatch, and leave usage to the generation's canonical ledger.
+  Host adapters delegate generic settlement; durable background/timer admission,
+  final supervision closure and business wake receipts remain separate work.
 - Persist trusted resource bindings in new workflow profile-v2 admissions and
   reauthorize the original resources before engine construction. Preserve v1
   interpretation and exact-call replay without resolving a replacement pool.
@@ -236,6 +242,9 @@
   `scripts/test_task_registry.py`. MySQL verification paused by user request.
 
 ### Fixed
+- Preserve unresolved result-processing/final-answer failures as control evidence:
+  do not restart business work through retry, fallback or automatic continuation
+  to repair a missing persistence ACK. Retain known usage and original sessions.
 - Account automatic workflow continuations by cumulative usage deltas and settle
   restored nodes against their actual execution generation. Neither continuation
   responses nor earlier generations are charged twice to the soft token pool;

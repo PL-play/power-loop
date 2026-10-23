@@ -21,7 +21,7 @@ from .test_real_async_boundaries_192 import BoundedProvider
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("ending", ["natural", "pass_turn", "decision_write_failure", "empty_child_pass"])
+@pytest.mark.parametrize("ending", ["natural", "pass_turn", "decision_write_failure", "empty_child_pass", "node_answer_write_failure"])
 async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_path, record_property, ending, monkeypatch):
     store = await SessionStore.open(str(tmp_path / "real-workflow-runtime.db"), schema="tasks")
     manager = JobManager(store)
@@ -57,6 +57,38 @@ async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_
          "spec": {"name": "review", "tools": [], "max_rounds": 2,
                   "system_prompt": "Read the supplied calculation result. Reply with its correct number only in final assistant text. Do not call pass_turn."}},
     ]}}
+    if ending == "decision_write_failure":
+        # A lost processing decision is not permission to restart business
+        # work, even when the original leaf explicitly permits failed retries.
+        spec["root"]["steps"][0]["retry"] = {"max_attempts": 3, "on": ["failed"], "backoff_s": 0}
+    if ending == "node_answer_write_failure":
+        node = spec["root"]["steps"][0]
+        node["spec"].update(tools=[], system_prompt="On your FIRST turn use pass_turn once and leave assistant text empty. "
+            "When later asked for the final answer, return exactly 42 as assistant text without tools or pass_turn.")
+        node["input"] = "The result code is 42. Follow your first-turn/final-answer instructions."
+        node["fallback"] = {"type": "agent", "id": "rescue", "input": "Return 42.", "spec": {
+            "name": "rescue", "tools": [], "max_rounds": 2, "system_prompt": "Return exactly 42."}}
+        original_complete = provider.inner.complete
+        calc_requests, calc_sid = 0, None
+        async def first_node_pass(request, **kwargs):
+            nonlocal calc_requests, calc_sid
+            current = await store.get_session(get_session_id())
+            if current is not None and current.metadata.get("workflow_node_id") == "calculate":
+                calc_requests += 1
+                calc_sid = get_session_id()
+                if calc_requests == 1:
+                    extra = dict(request.extra or {})
+                    extra["extra_body"] = {**extra.get("extra_body", {}), "thinking": {"type": "disabled"}}
+                    request = replace(request, tool_choice={"type": "function", "function": {"name": "pass_turn"}},
+                        extra=extra, system_prompt=request.system_prompt + " On this first call use pass_turn and no assistant text.")
+            return await original_complete(request, **kwargs)
+        monkeypatch.setattr(provider.inner, "complete", first_node_pass)
+        original_append = store.append_message
+        async def lose_final_answer(session_id, **kwargs):
+            if session_id == calc_sid and calc_requests >= 2 and kwargs.get("role") == "assistant":
+                raise RuntimeError("test: final answer persistence unavailable")
+            return await original_append(session_id, **kwargs)
+        monkeypatch.setattr(store, "append_message", lose_final_answer)
 
 
     if ending == "empty_child_pass":
@@ -120,13 +152,17 @@ async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_
             assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='workflow_projected'", (handle.job_id,))) == 1
             wf = await manager.get_job(actor, handle.job_id)
             assert await manager.get_workflow_profile(actor, handle.job_id) == original_profile
-            if ending == "decision_write_failure":
+            if ending in ("decision_write_failure", "node_answer_write_failure"):
                 assert wf.result["status"] == "failed" and wf.outcome == "failed", wf.result
                 nodes = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='workflow_node'")
                 assert len(nodes) == 1 and nodes[0]["outcome"] == "failed"
                 decisions = await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='processing_decision'")
                 assert not decisions and len(completions) == 1
                 assert (await store.inbox_counts(sid))["pending"] == 1
+                if ending == "node_answer_write_failure":
+                    assert calc_requests == 2
+                    assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='node_session'")) == 1
+                    record_property("node_answer_provider_requests", calc_requests)
                 return
             assert wf.result["status"] == "completed" and "42" in wf.result["final"]["text"], wf.result
             assert wf.result["results"]["calculate"]["usage"]["total_tokens"] > 0

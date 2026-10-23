@@ -117,6 +117,8 @@ def main() -> int:
         "tests/unit/test_workflow_resource_profile_192.py",
         "tests/unit/test_workflow_restore_resources_192.py",
         "tests/unit/test_workflow_bound_restore_192.py",
+        "tests/unit/test_completion_window_192.py",
+        "tests/unit/test_workflow_completion_scope_192.py",
         "tests/unit/test_workflow_restore_plan_192.py",
         "tests/unit/test_workflow_restore_history_192.py",
         "tests/unit/test_workflow_resume_admission_192.py",
@@ -170,6 +172,7 @@ def main() -> int:
     scopes.append("tests/real/test_real_workflow_resources_192.py")
     scopes.append("tests/real/test_real_workflow_resource_profile_192.py")
     scopes.append("tests/real/test_real_workflow_continuation_budget_192.py")
+    scopes.append("tests/real/test_real_completion_window_192.py")
     run_real = args.unit_shard is None
     if args.real_only:
         scopes = [scope for scope in scopes if scope.startswith("tests/real/")]
@@ -230,8 +233,10 @@ def main() -> int:
                  if any(name in c.get("classname", "") for name in ("test_real_task_registry_192", "test_real_workflow_task_runtime_192", "test_real_nudge_runtime_192", "test_real_node_nudge_runtime_192", "test_real_subagent_resume_192", "test_real_workflow_continuation_plan", "test_real_node_resume_192", "test_real_workflow_delivery_192", "test_real_workflow_restore_192", "test_real_workflow_native_restore_192", "test_real_task_query_192", "test_real_jobs_tool_192", "test_real_workflow_facade_192", "test_real_task_sessions_192", "test_real_workflow_control_192", "test_real_node_control_192", "test_real_task_history_192"))]
         cases.extend(c for c in ET.parse(report).getroot().iter("testcase")
                      if any(name in c.get("classname", "") for name in ("test_real_legacy_workflow_history_192", "test_real_task_events_192", "test_real_workflow_node_facade_192", "test_real_workflow_resources_192", "test_real_workflow_resource_profile_192", "test_real_workflow_continuation_budget_192")))
-        if len(cases) != 61 or any(c.find("skipped") is not None for c in cases):
-            print("Task acceptance failed: all sixty-one configured real LLM cases must actually run.")
+        cases.extend(c for c in ET.parse(report).getroot().iter("testcase")
+                     if "test_real_completion_window_192" in c.get("classname", ""))
+        if len(cases) != 64 or any(c.find("skipped") is not None for c in cases):
+            print("Task acceptance failed: all sixty-four configured real LLM cases must actually run.")
             return 1
         return code
     except RunnerInterrupted as exc:

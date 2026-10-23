@@ -174,44 +174,23 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
 
 
 async def collect_node(runtime, loop, raw, stop_event, *, timeout_s=1800, max_rounds=30):
-    """Consume required child results on their original model session, bounded."""
-    from power_loop.workflow.admission import idle
-
-    from . import delegation
-    from .spec import workflow_continuation_loop
-
-    sid = raw.get("session_id")
-    if not sid:
-        return raw
-    store = runtime.manager.store
-    deadline = asyncio.get_running_loop().time() + timeout_s
-    remaining = max_rounds
-    while True:
-        async with idle():
-            await delegation.await_children(store, sid, stop_event, max(0, deadline - asyncio.get_running_loop().time()))
-        if raw.get("status") != "completed" or stop_event.is_cancelled():
-            return raw
-        pending = (await store.inbox_counts(sid))["pending"]
-        if not pending and not raw.get("new_input_after_pass"):
-            return raw
-        if remaining <= 0:
-            raise JobError("node_settlement_round_limit")
-        child = await workflow_continuation_loop(loop, sid)
-        if raw.get("new_input_after_pass"):
-            work = child.follow_up("Process the new input already in this session and finish the original task. Do not repeat completed actions.",
-                                   session_id=sid, stop_event=stop_event, max_rounds=remaining)
-        else:
-            work = child.flush_follow_ups(sid, stop_event=stop_event, max_rounds=remaining)
-        more = await asyncio.wait_for(work, max(0, deadline - asyncio.get_running_loop().time()))
-        if more is None:
-            raise JobError("node_settlement_missing_result")
-        remaining -= max(1, int(more.rounds))
-        usage = dict(raw.get("usage") or {})
-        for key, value in (more.usage or {}).items():
-            usage[key] = usage.get(key, 0) + value
-        raw = {**raw, "status": more.status, "final_text": more.final_text,
-               "rounds": int(raw.get("rounds") or 0) + int(more.rounds), "usage": usage,
-               "new_input_after_pass": bool(more.new_input_after_pass)}
+    """The owning node reuses one collector window across all settlement checks."""
+    from .completion import WINDOW, CompletionWindow, collect_required
+    window = WINDOW.get()
+    if window is None:
+        from .task_runtime import _OWNER
+        scope = _OWNER.get()
+        key = "completion_window"
+        window = scope.resource_evidence.get(key) if scope is not None and scope.runtime is runtime else None
+        if window is None:
+            window = CompletionWindow(timeout_s, max_rounds, multi_session=True)
+            if scope is not None and scope.runtime is runtime:
+                scope.resource_evidence[key] = window
+    window.remaining = min(window.remaining, max_rounds)
+    window.timeout_s = min(window.timeout_s, timeout_s)
+    if window.deadline is not None:
+        window.deadline = min(window.deadline, asyncio.get_running_loop().time() + timeout_s)
+    return await collect_required(loop, raw, stop_event, window=window, drain_on_error=True)
 
 
 async def ensure_node_answer(runtime, loop, raw, stop_event, *, timeout_s=30):
@@ -230,19 +209,29 @@ async def ensure_node_answer(runtime, loop, raw, stop_event, *, timeout_s=30):
         return {**raw, "status": "cancelled"}
     key = "node_answer:" + str(sid)
     if not sid or binding.resource_evidence.get(key):
-        return {**raw, "status": "failed", "error": "node_output_missing"}
+        return {**raw, "status": "failed", "completion_unresolved": True, "error": "node_output_missing"}
     # The original engine owns this task. Mark before any await so re-entry
     # cannot allocate a second supplement. Restart admission remains closed.
     binding.resource_evidence[key] = True
     running = SimpleNamespace(task_binding=binding, answer_attempted=False, token=stop_event)
     try:
-        value = await ensure_answer(loop, running, sid, raw, asyncio.get_running_loop().time()+timeout_s)
+        from .completion import WINDOW
+        window = WINDOW.get()
+        deadline = asyncio.get_running_loop().time()+timeout_s
+        if window is not None and window.deadline is not None:
+            deadline = min(deadline, window.deadline)
+        value = await ensure_answer(loop, running, sid, raw, deadline,
+            max_extra_rounds=window.allowance(raw) if window is not None else None)
+        if window is not None and running.answer_attempted:
+            window.remaining -= max(1, int(value.get("rounds") or 0) - int(raw.get("rounds") or 0))
     except Exception as exc:
-        return {**raw, "status": "failed", "error": "node_output_completion_failed:"+type(exc).__name__}
+        return {**raw, "status": "failed", "completion_unresolved": True, "error": "node_output_completion_failed:"+type(exc).__name__}
+    if value.get("status") != "completed":
+        value = {**value, "completion_unresolved": True}
     if value.get("error") == "subagent_output_missing":
         value = {**value, "error": "node_output_missing"}
     if value.get("status") == "completed" and not (value.get("final_text") or "").strip():
-        return {**value, "status": "cancelled" if stop_event.is_cancelled() else "failed", "error": "node_output_missing"}
+        return {**value, "status": "cancelled" if stop_event.is_cancelled() else "failed", "completion_unresolved": True, "error": "node_output_missing"}
     return value
 
 
