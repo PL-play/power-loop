@@ -13,6 +13,7 @@ from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import WorkflowSpec, create_workflow, runner
 
+from ._required_response import consume_completed_result, require_visible_response
 from .test_real_async_boundaries_192 import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
@@ -59,6 +60,7 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
             system_prompt="Follow the requested tool sequence exactly. Accepted is not completed. Never launch replacement tasks. "
                           "When completion arrives output the final VERSION code without tools or pass_turn."))
     parent = await loop.new_session()
+    require_visible_response(registry, store, parent)
     sibling_entered, sibling_release = asyncio.Event(), asyncio.Event()
     resume_entered, resume_release = asyncio.Event(), asyncio.Event()
     complete = provider.complete
@@ -83,7 +85,10 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
         replies.append(reply)
         return json.dumps(reply)
     for name, fn in (("launch_workflow", launch), ("correct_node", correct)):
-        registry.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"}), fn)
+        description = ("Start the predefined original workflow once; this tool takes no arguments."
+            if name == "launch_workflow" else "Correct the calculate node of the existing workflow after launch_workflow returns its run_id/job_id. A queued receipt is durable acceptance and authorizes this correction; it does not need a separate status=accepted receipt. Takes no arguments.")
+        registry.register(ToolDefinition(name=name, description=description,
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False}), fn)
     if fault == "whole_restore":
         from power_loop.workflow.resume import resume_detached
         async def restore_whole():
@@ -152,7 +157,7 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
             assert op.call_ref["id"] != op.receipt_ref["id"]
             row = await manager.db.fetchone(f"SELECT delivery_status FROM {manager.events} WHERE event_id=?", (op.operation_id,))
             assert row["delivery_status"] == "handled"
-            final = await loop.flush_follow_ups(parent, max_rounds=3)
+            final = await consume_completed_result(loop, parent, max_rounds=3, result_node="review")
             assert final.status == "completed" and "VERSION-43" in final.final_text
             if fault == "whole_restore":
                 registry.register(ToolDefinition(name="restore_workflow", description="Continue the completed original workflow for the user's next correction, reusing its tasks and sessions.", input_schema={"type": "object"}), restore_whole)
@@ -169,7 +174,7 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
                 assert current.result["results"]["calculate"]["session_id"] == new.result["session_id"]
                 assert await manager.get_result_revision(actor, wf.job_id, 1) == saved_wf
                 assert await manager.get_result_revision(actor, job.job_id, 1) == old
-                final = await loop.flush_follow_ups(parent, max_rounds=3)
+                final = await consume_completed_result(loop, parent, max_rounds=3, result_node="review")
                 assert final.status == "completed" and "VERSION-44" in final.final_text
                 assert (await manager.get_job(actor, wf.job_id)).supervision_status == "closed"
     finally:
@@ -177,6 +182,11 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
         resume_release.set()
         if handles:
             await asyncio.wait_for(asyncio.gather(*(h.task for h in handles), return_exceptions=True), 30)
+        for saved in await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions}"):
+            rows = await store.load_all_messages(saved["session_id"])
+            record_property("retained_transcript", json.dumps({"session_id": saved["session_id"], "messages": [
+                {"id": str(m.id), "seq": m.seq, "role": m.role, "content": m.content, "name": m.name,
+                 "tool_calls": m.tool_calls} for m in rows]}, ensure_ascii=False))
         provider.report(record_property)
         await provider.close()
         await store.close()

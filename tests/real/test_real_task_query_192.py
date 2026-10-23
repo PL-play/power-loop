@@ -13,6 +13,7 @@ from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
+from ._required_response import require_visible_response
 from .test_real_async_boundaries_192 import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
@@ -29,6 +30,7 @@ async def test_real_model_queries_reopened_task_history_and_reads_actual_saved_o
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=4, max_tokens=2048,
             system_prompt="Use the directory tools in the requested order. Read saved outputs; do not start replacement work or guess output."))
     sid = await loop.new_session()
+    require_visible_response(registry, store, sid)
     actor = runtime.actor(sid)
     root = await manager.register_job(actor, kind="send", session_id=sid, system_key="original-send")
     root_lease = await manager.claim_job(actor, root.job.job_id, executor_id="old-executor", boot_id="old-boot", expected_version=1)
@@ -71,6 +73,9 @@ async def test_real_model_queries_reopened_task_history_and_reads_actual_saved_o
             assert await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? ORDER BY event_id", (saved.job.job_id,)) == before
             assert len(await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='background_command'")) == 1
     finally:
+        record_property("main_transcript", json.dumps([{"id": str(m.id), "seq": m.seq, "role": m.role,
+            "content": m.content, "name": m.name, "tool_calls": m.tool_calls}
+            for m in await store.load_all_messages(sid)], ensure_ascii=False))
         provider.report(record_property)
         await provider.close()
         await reopened.close()

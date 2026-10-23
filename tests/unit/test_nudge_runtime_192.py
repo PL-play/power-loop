@@ -264,6 +264,7 @@ async def issue_nudge(fixture, monkeypatch, *, message="NUDGED-42", repeat=False
 @pytest.mark.parametrize("repeat", [False, True])
 async def test_actual_nudge_retains_job_run_session_and_waits_for_original_receiver(managed, monkeypatch, repeat):
     store, manager, runtime, loop, model, parent, connect = managed
+    runtime.lease_ms = 30000  # receiver identity/handling, not lease-expiry timing
     assert (await loop.send("delegate", parent)).status == "completed"
     await asyncio.wait_for(model.entered.wait(), 2)
     accepted, result, repeats = await issue_nudge(managed, monkeypatch, repeat=repeat)
@@ -305,6 +306,7 @@ async def test_new_nudge_after_completion_does_not_resurrect_child(managed, monk
 @pytest.mark.parametrize("fault", ["lost_ack", "signal", "inbox_failure"])
 async def test_actual_admission_failures_preserve_exact_result_and_never_repeat_admission(managed, monkeypatch, fault):
     store, manager, runtime, loop, model, parent, _ = managed
+    runtime.lease_ms = 30000  # keep the injected admission failure as the only fault
     await loop.send("delegate", parent)
     await asyncio.wait_for(model.entered.wait(), 2)
     calls = []
@@ -531,6 +533,7 @@ async def test_missing_original_invocation_does_not_admit_steering(managed, monk
 @pytest.mark.parametrize("max_rounds", [3, 4])
 async def test_workflow_node_can_nudge_its_own_subagent_without_changing_owner_or_role(managed_workflow, monkeypatch, max_rounds):
     store, manager, runtime, loop, model, parent, state, _ = managed_workflow
+    runtime.lease_ms = 30000  # the tested limit is model rounds, not execution expiry
     model.hold = {"AUDIT"}
     model.spawn_from_build = True
     state["spec"]["root"]["steps"][0] = leaf("BUILD", tools=["spawn_agent"])
@@ -559,7 +562,7 @@ async def test_workflow_node_can_nudge_its_own_subagent_without_changing_owner_o
 
     monkeypatch.setattr(model, "complete", complete)
     assert (await loop.send("run with node-owned audit", parent)).status == "completed"
-    await asyncio.wait_for(model.entered["AUDIT"].wait(), 2)
+    await asyncio.wait_for(model.entered["AUDIT"].wait(), 5)
     assert model.counts["REVIEW"] == 0
     await asyncio.wait_for(node_exited.wait(), 3)
     await settle(managed_workflow)

@@ -319,4 +319,5 @@ def reserve(loop, engine, source, ref, call_id, node_id, sid, message, *, expect
         ready.cancel()
         raise
     engine._repairs[id(node)] = task
+    runtime.track_task(task)
     return ready

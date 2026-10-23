@@ -154,8 +154,11 @@ async def test_node_answer_scope_and_failure_boundaries(managed_workflow, monkey
     token = _OWNER.set(None if mode == "no_scope" else binding)
     try:
         value = await ensure_node_answer(object() if mode == "other_runtime" else runtime, loop, raw, stop)
-        if mode in ("no_scope", "other_runtime", "later_generation", "nonempty", "failed"):
+        if mode in ("no_scope", "other_runtime", "nonempty", "failed"):
             assert value is raw and not calls
+        elif mode == "later_generation":
+            assert value["status"] == "failed" and value["completion_unresolved"] and not calls
+            assert value["error"] == "node_output_completion_contract_missing"
         else:
             assert value["status"] == ("cancelled" if mode == "cancelled" else "failed")
             assert calls == ([1] if mode == "timeout" else [])

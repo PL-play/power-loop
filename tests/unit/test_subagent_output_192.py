@@ -16,6 +16,9 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 @pytest.mark.parametrize("ending", ["recover", "empty", "provider_error", "repeat_pass", "exhausted", "cancel"])
 async def test_empty_initial_managed_child_gets_one_guarded_non_business_answer(managed, monkeypatch, ending):
     store, manager, runtime, loop, model, parent, _ = managed
+    # This tests output recovery, not heartbeat expiry. Real PG admission and
+    # result transactions must not race an unrelated one-second test lease.
+    runtime.lease_ms = 30000
     original = model.complete
     requests, guarded = [], []
     @contextmanager

@@ -1125,8 +1125,6 @@ class WorkflowEngine:
             if runtime is not None:
                 from power_loop.runtime.workflow_tasks import collect_node
                 raw = await collect_node(runtime, self._loop, raw, node_tok)
-                if getattr(self, "_restore_operation_id", None) and raw.get("status") == "completed" and not (raw.get("final_text") or "").strip():
-                    raw = {**raw, "status": "failed", "error": "restored_node_output_missing"}
             else:
                 from power_loop.runtime.completion import WINDOW, collect_required
                 if WINDOW.get() is not None:

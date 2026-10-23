@@ -1080,3 +1080,67 @@ registered boots through these ports. TaskRuntime automatic startup/boot heartbe
 one total shutdown deadline, startup resource reconciliation, formal host integration
 and external stop/fee evidence remain required work. This increment does not activate
 production runtime, close uncertain resources, settle bills or complete B3.
+
+
+### Optional automatic boot lifecycle (implementation under verification)
+
+A trusted host may construct TaskRuntime with boot_contract_hash (a lowercase
+SHA-256 digest) to enable automatic startup before the first send, claim or
+execution. The same startup task is shared by concurrent callers; cancelling a
+waiter does not revoke persisted admission. It calls the original register and
+activate ports and independently renews the boot while idle. Failed startup or
+heartbeat closes local admission; the same object cannot silently start again.
+Without this option, existing unregistered experimental runtimes keep their old
+behavior. Opening the task schema alone does not enable this lifecycle.
+
+The host owns the shared runtime, not an individual child loop. It can explicitly
+await runtime.start(), then await runtime.shutdown(timeout_s=30, grace_s=1,
+reason="host shutdown") during application teardown. Closing one child loop must
+not shut down every other loop sharing that runtime. The first shutdown call owns
+one monotonic deadline, fixed original control key and reason. Repeated calls
+observe that operation rather than allocating another full stop window.
+
+Shutdown closes local admission, attempts the durable boot drain, then signals
+original cooperative tokens and bounds local task exit under the remaining total
+deadline. Hung or failed control storage does not prevent local stop; its original
+control handle remains pending for reconciliation. Never/callable read-only tokens
+are not counted as successful local signals. A low-level execution with an
+unwritable token fails supervision and stops its containing task after lease loss;
+normal shared workflow-node cancellation still uses the original writable node
+token and preserves its parent and siblings.
+
+Adapter handles cover child admission queues, resumed subagents, live-node repair,
+whole workflows and their delivery work. Model handles remain retained through
+model-exit/usage writes. A shutdown caller is protected from self-cancellation and
+self-wait. A timed-out task remains pending; a repeated cancellation cannot cut off
+its already running exit bookkeeping. The returned physical_stop_confirmed and
+billing_settled are always false. store_safe_to_close is false while local/control
+handles remain or durable drain is unconfirmed. These local observations do not
+replace provider evidence or authorize replay of unknown work.
+
+Identity, manager object and store binding are retained at construction. Runtime
+field mutation cannot downgrade a new root or drain another identity; local
+admission closes and control uses the original manager and boot. Formal DeepTalk
+startup/shutdown, external resource reconciliation, hard budget grants and the
+remaining design/192 requirements are separate work, not implied by this option.
+
+
+executor_status() is a read-only host re-observation port for a shutdown that
+returned with pending control or local work. It reads the original boot and
+retained handles, and can confirm a late drain ACK/exit without changing the
+original shutdown snapshot, allocating a new deadline or issuing another stop.
+Manager store/database/table binding drift rejects control redirection; local
+stop remains possible and uncertain persistence stays explicit.
+
+Different controlled runtimes cannot enter execution/model/claim on the same
+asyncio.Task: cancelling it would otherwise stop an independent boot. Weak task
+references distinguish actual task identity from inherited ContextVars, so a new
+independent Task is allowed. Uncontrolled legacy nesting remains unchanged.
+
+A resumed workflow node that returns completed with empty text uses the owning
+engine's admitted _PREPARED binding/session and original CompletionWindow for
+one bounded, non-business final answer. Its current execution fence remains
+required. No allowance, missing proof, another empty answer or a provider error
+leaves a negative result and the original usage/history; it never replaces the
+business task. The existing core round-limit finalizer can itself make an extra
+provider request, so a round ceiling is not a hard paid-request budget.

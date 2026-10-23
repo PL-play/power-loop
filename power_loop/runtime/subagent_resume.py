@@ -250,4 +250,5 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
         await runtime.record_subagent(binding, {"status": "failed", "error": "resume dispatch failed before execution"})
         raise
     delegation._retain(run.task)
+    runtime.track_task(run.task, cancel_token=run.token, job_id=binding.lease.job_id)
     return receipt(operation, False)

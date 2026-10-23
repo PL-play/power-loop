@@ -22,6 +22,7 @@ from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import InProcessExecutor, SharedBudget, WorkflowSpec, create_workflow, journal
 from power_loop.workflow.resume import resume_detached
 
+from ._required_response import consume_completed_result, require_visible_response
 from .test_real_async_boundaries_192 import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
@@ -29,7 +30,7 @@ pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 @pytest.mark.parametrize("fault", ["none", "node_ack"])
 @pytest.mark.parametrize("resource_mode", ["native", "bound"])
-async def test_real_native_restoration_recomputes_original_nodes_and_main_consumes_new_result(tmp_path, record_property, monkeypatch, fault, resource_mode):
+async def test_real_native_restoration_recomputes_original_nodes_and_main_consumes_new_result(tmp_path, record_property, monkeypatch, fault, resource_mode, force_empty=False):
     store = await SessionStore.open(str(tmp_path / "native-restore.db"), schema="tasks")
     manager = JobManager(store)
     runtime = TaskRuntime(manager, tenant_id="native-restore", principal_id="host", executor_id="executor", boot_id="boot")
@@ -40,6 +41,7 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
             system_prompt="Follow the requested tool sequence exactly. An acceptance receipt is not a result. "
                 "Never create replacement tasks. When a task_done result arrives, report its final number in assistant text without tools or pass_turn."))
     parent = await loop.new_session()
+    require_visible_response(registry, store, parent)
     provider.root_sid, provider.hold_children = parent, True
     handles = []
     spec = {"name": "native-calculation-repair", "root": {"type": "sequence", "steps": [
@@ -48,6 +50,11 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
         {"type": "agent", "id": "review", "inputs_from": ["calculate"], "input": "Read the newest supplied calculate result and return that numeric value only. The arithmetic expression may be absent; no independent verification is requested.",
          "spec": {"name": "review", "tools": [], "max_rounds": 2, "system_prompt": "Extract the numeric value of the newest supplied calculate result. Return that number only as plain assistant text without Markdown or pass_turn. Do not require absent operands or recompute the old expression."}},
     ]}}
+    if force_empty:
+        spec["root"]["steps"][0]["spec"]["system_prompt"] = (
+            "Calculate the newest arithmetic requested by the user. Follow the latest output instructions. "
+            "If explicitly asked to first call pass_turn without text, do so once; when a final-answer request arrives, "
+            "write the latest numeric result as plain assistant text. Never repeat completed actions.")
     pool = SharedBudget(1000000)
     pool.commit({"total_tokens": 13})
     resource_binding = None
@@ -69,8 +76,12 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
         handles.append(handle)
         return json.dumps({"job_id": handle.job_id, "operation_id": handle.operation_id, "run_id": handle.run_id, "status": "accepted"})
     async def repair():
+        correction = "Correction: compute 20+23 instead of 19+23. Return the new number only."
+        if force_empty:
+            correction += (" For this test, first call pass_turn exactly once with reason='Computed 43' and no assistant text. "
+                "A later final-answer request will ask you to write the actual result 43; do not write it before that request.")
         handle = await resume_detached(get_current_loop(), parent, handles[0].run_id,
-            continuation=("calculate", "Correction: compute 20+23 instead of 19+23. Return the new number only.", 2))
+            continuation=("calculate", correction, 2))
         handles.append(handle)
         return json.dumps({"job_id": handle.job_id, "operation_id": handle.operation_id, "run_id": handle.run_id, "generation": 2, "status": "accepted"})
     for name, fn in (("launch_workflow", launch), ("repair_workflow", repair)):
@@ -98,7 +109,7 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
                 assert pool.spent == 13 + first.result["usage"]["total_tokens"]
                 pool.commit({"total_tokens": 7})  # another scope's spend cannot disappear
             before_restore = pool.spent
-            consumed = await loop.flush_follow_ups(parent)
+            consumed = await consume_completed_result(loop, parent)
             assert "42" in consumed.final_text
             first_closed = await manager.get_job(actor, first.job_id)
             creator = await manager.get_job(actor, first.parent_job_id)
@@ -121,6 +132,13 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
             current = await manager.get_job(actor, new.job_id)
             assert current.outcome == "succeeded" and current.generation == 2, current.result
             assert current.result["results"]["calculate"]["text"].strip() == "43" and current.result["final"]["text"].strip() == "43", current.result
+            if force_empty:
+                messages = await store.load_all_messages(current.result["results"]["calculate"]["session_id"])
+                corrected = next(i for i,m in enumerate(messages) if m.role == "user" and "Correction: compute 20+23" in str(m.content))
+                first_reply = next(m for m in messages[corrected+1:] if m.role == "assistant")
+                assert not (first_reply.content or "").strip()
+                assert [c["function"]["name"] for c in first_reply.tool_calls or []] == ["pass_turn"]
+                assert any(m.role == "assistant" and (m.content or "").strip() == "43" for m in messages[corrected+1:])
             assert await manager.get_result_revision(actor, first.job_id, 1) == old
             new_nodes = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='workflow_node'")
             assert len(new_nodes) == 2 and set(n["job_id"] for n in new_nodes) == set(old_nodes)
@@ -138,7 +156,7 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
                 assert op.result["request"]["resource_evidence"]["budget_spent"] == before_restore
             lifetime = await manager.execution_usage(actor, first.job_id)
             assert lifetime["total_tokens"] == first.result["usage"]["total_tokens"]+current.result["usage"]["total_tokens"]
-            final = await loop.flush_follow_ups(parent)
+            final = await consume_completed_result(loop, parent)
             assert final.status == "completed" and "43" in final.final_text
             assert (await manager.get_job(actor, first.job_id)).result_status == "handled"
             assert (await manager.get_job(actor, first.job_id)).supervision_status == "closed"
@@ -148,6 +166,16 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
         provider.release_children.set()
         if handles:
             await asyncio.wait_for(asyncio.gather(*(h.task for h in handles), return_exceptions=True), 15)
+        sessions = await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions}")
+        for saved in sessions:
+            rows = await store.load_all_messages(saved["session_id"])
+            record_property("retained_transcript",json.dumps({"session_id":saved["session_id"],"messages":[{"id":str(m.id),"seq":m.seq,"role":m.role,"content":m.content,"name":m.name,"tool_calls":m.tool_calls} for m in rows]},ensure_ascii=False))
         provider.report(record_property)
         await provider.close()
         await store.close()
+
+
+@pytest.mark.parametrize("resource_mode", ["native", "bound"])
+async def test_real_restored_empty_pass_finishes_in_original_session_with_remaining_rounds(tmp_path, record_property, monkeypatch, resource_mode):
+    await test_real_native_restoration_recomputes_original_nodes_and_main_consumes_new_result(
+        tmp_path, record_property, monkeypatch, "none", resource_mode, force_empty=True)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
@@ -27,6 +28,22 @@ class Execution:
 
 _SEND: ContextVar[Execution | None] = ContextVar("power_loop_task_send", default=None)
 _OWNER: ContextVar[Execution | None] = ContextVar("power_loop_task_owner", default=None)
+_TASK_OWNERS: ContextVar[tuple] = ContextVar("power_loop_task_owners", default=())
+
+
+def _check_task_owner(runtime):
+    task = asyncio.current_task()
+    for task_ref, owner in _TASK_OWNERS.get():
+        if (task_ref() is task and owner is not runtime and
+                (owner._lifecycle is not None or runtime._lifecycle is not None)):
+            raise JobError("executor_task_owner_conflict")
+
+
+def _enter_task_owner(runtime):
+    _check_task_owner(runtime)
+    task = asyncio.current_task()
+    current = tuple((ref, owner) for ref, owner in _TASK_OWNERS.get() if ref() is task)
+    return _TASK_OWNERS.set((*current, (weakref.ref(task), runtime)))
 
 
 def reject_unregistered_adapter(name: str, loop=None) -> None:
@@ -39,6 +56,7 @@ def reject_unregistered_adapter(name: str, loop=None) -> None:
 async def check_dispatch(session_id: str | None) -> None:
     execution = _SEND.get()
     if execution is not None and execution.actor.session_id == session_id:
+        execution.runtime.check_local_admission()
         if execution.resource_evidence.get("resource_state") == "unknown":
             raise JobError("unresolved_prior_attempt")
         await execution.runtime.manager.check_execution(execution.actor, execution.lease)
@@ -119,7 +137,8 @@ class TaskRuntime:
     """Trusted host configuration, shared by loops using the same opened store."""
 
     def __init__(self, manager: JobManager, *, tenant_id: str, principal_id: str,
-                 executor_id: str, boot_id: str, lease_ms: int = 30000, workflow_resources=None):
+                 executor_id: str, boot_id: str, lease_ms: int = 30000, workflow_resources=None,
+                 boot_contract_hash: str | None = None):
         JobActor(tenant_id, principal_id, "validation")
         if not all(isinstance(v, str) and 0 < len(v) <= 64 for v in (executor_id, boot_id)):
             raise JobError("invalid_executor")
@@ -135,11 +154,43 @@ class TaskRuntime:
         self.workflow_resources = workflow_resources
         self._workflow_handles: dict = {}
         self._local_executions: dict = {}
+        self._model_executions: dict = {}
+        from .executor_lifecycle import ExecutorLifecycle
+        self._lifecycle = ExecutorLifecycle(self, boot_contract_hash) if boot_contract_hash is not None else None
+
+    def check_local_admission(self):
+        if self._lifecycle is not None:
+            self._lifecycle.check_admission()
+
+    async def ensure_started(self):
+        if self._lifecycle is not None:
+            await self._lifecycle.start()
+
+    async def start(self):
+        if self._lifecycle is None:
+            raise JobError("executor_lifecycle_not_configured")
+        await self._lifecycle.start()
+
+    async def shutdown(self, *, timeout_s=30.0, grace_s=1.0, reason="host shutdown"):
+        if self._lifecycle is None:
+            raise JobError("executor_lifecycle_not_configured")
+        return await self._lifecycle.shutdown(timeout_s=timeout_s, grace_s=grace_s, reason=reason)
+
+    async def executor_status(self):
+        if self._lifecycle is None:
+            raise JobError("executor_lifecycle_not_configured")
+        return await self._lifecycle.status()
+
+    def track_task(self, task, *, cancel_token=None, job_id=None):
+        if self._lifecycle is not None:
+            self._lifecycle.track_task(task, cancel_token=cancel_token, job_id=job_id)
 
     def actor(self, sid: str) -> JobActor:
         return JobActor(self.tenant_id, self.principal_id, sid)
 
     async def claim(self, actor: JobActor, registration: JobRegistration) -> Execution:
+        _check_task_owner(self)
+        await self.ensure_started()
         lease = await self.manager.claim_job(actor, registration.job.job_id, executor_id=self.executor_id,
             boot_id=self.boot_id, expected_version=registration.job.version, lease_ms=self.lease_ms)
         return Execution(self, actor, lease)
@@ -147,9 +198,13 @@ class TaskRuntime:
     @asynccontextmanager
     async def execution(self, binding: Execution, *, owner: bool = False, context=None, cancel_token=None):
         """Renew only while this attempt runs; a failed renewal stops dispatch."""
+        _check_task_owner(self)
+        await self.ensure_started()
+        self.check_local_admission()
         await self.manager.check_execution(binding.actor, binding.lease)
         variable = context if context is not None else _OWNER if owner else _SEND
         token = variable.set(binding)
+        owner_token = _enter_task_owner(self)
         task = asyncio.current_task()
         local = {"binding": binding, "task": task, "signalled": False, "cancel_token": cancel_token}
         local_key = id(local)
@@ -177,8 +232,14 @@ class TaskRuntime:
                         # own operation, never the task hosting the parent.
                         if not isinstance(exc, JobError) or exc.code != "cancel_requested":
                             lost.append(exc)
-                        local["signalled"] = True
-                        cancel_token.cancel("task supervision lost")
+                        from .executor_lifecycle import signal_token
+                        local["signalled"] = signal_token(cancel_token, "task supervision lost")
+                        if not local["signalled"]:
+                            # A malformed/read-only host token cannot leave an
+                            # unconfirmed executor running indefinitely. It is
+                            # a supervision failure, not tolerated node cancel.
+                            lost.append(JobError("task_cancel_signal_unavailable"))
+                            local["signalled"] = bool(task.cancel("task supervision lost"))
                     else:
                         if not isinstance(exc, JobError) or exc.code != "cancel_requested":
                             lost.append(exc)
@@ -199,11 +260,29 @@ class TaskRuntime:
         finally:
             self._local_executions.pop(local_key, None)
             heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
-            variable.reset(token)
+            try:
+                await asyncio.gather(heartbeat, return_exceptions=True)
+            finally:
+                variable.reset(token)
+                _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
     async def model_send(self, loop, sid: str, send_index: int, *, cancel_token=None):
+        owner_token = _enter_task_owner(self)
+        local = None
+        try:
+            await self.ensure_started()
+            local = {"task": asyncio.current_task(), "cancel_token": cancel_token, "signalled": False}
+            self._model_executions[id(local)] = local
+            async with self._model_send(loop, sid, send_index, cancel_token=cancel_token) as evidence:
+                yield evidence
+        finally:
+            if local is not None:
+                self._model_executions.pop(id(local), None)
+            _TASK_OWNERS.reset(owner_token)
+
+    @asynccontextmanager
+    async def _model_send(self, loop, sid: str, send_index: int, *, cancel_token=None):
         from .execution_roles import session_role
         if await loop.ensure_store() is not self.manager.store:
             raise JobError("task_store_mismatch")

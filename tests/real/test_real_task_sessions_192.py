@@ -14,6 +14,7 @@ from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow.facade import WorkflowToolPorts, register_workflow_tool
 
+from ._required_response import consume_completed_result, require_visible_response
 from .test_real_async_boundaries_192 import BoundedProvider
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
@@ -43,6 +44,7 @@ async def test_real_parent_reads_original_retained_node_binding_without_replacem
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=5, max_tokens=2048,
             system_prompt="Follow the requested workflow and audit tool order. Create only when explicitly asked. A read binding is not execution permission."))
     sid = await loop.new_session()
+    require_visible_response(registry, store, sid)
     provider.root_sid, provider.hold_children = sid, True
     spec = {"name": "session-audit", "root": {"type": "agent", "id": "calculate", "input": "19+23",
         "spec": {"name": "calculate", "system_prompt": "Compute the supplied arithmetic. Return only the number.", "tools": [], "max_rounds": 2}}}
@@ -54,7 +56,7 @@ async def test_real_parent_reads_original_retained_node_binding_without_replacem
             await asyncio.wait_for(provider.child_entered.wait(), 10)
             provider.release_children.set()
             await asyncio.wait_for(admitted[0].handle.task, 90)
-            consumed = await loop.flush_follow_ups(sid, max_rounds=2)
+            consumed = await consume_completed_result(loop, sid, max_rounds=2)
             assert consumed and "42" in consumed.final_text
             [node] = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='workflow_node'")
             [event] = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE event_type='node_session'")

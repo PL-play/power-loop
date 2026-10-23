@@ -325,6 +325,8 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
 
     run.task = asyncio.create_task(execute(), name="subagent-" + run.run_id)
     _retain(run.task)
+    if runtime is not None:
+        runtime.track_task(run.task, cancel_token=run.token, job_id=registration.job.job_id)
     sid = await asyncio.shield(ready)
     receipt = {"session_id": sid, "run_id": run.run_id, "mode": "create", "status": "queued"}
     if registration is not None:

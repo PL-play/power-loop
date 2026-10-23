@@ -212,7 +212,7 @@ async def ensure_node_answer(runtime, loop, raw, stop_event, *, timeout_s=30):
 
     binding = _OWNER.get()
     if (raw.get("status") != "completed" or (raw.get("final_text") or "").strip() or
-            binding is None or binding.runtime is not runtime or binding.lease.generation != 1):
+            binding is None or binding.runtime is not runtime):
         return raw
     sid = raw.get("session_id")
     if stop_event.is_cancelled():
@@ -223,6 +223,23 @@ async def ensure_node_answer(runtime, loop, raw, stop_event, *, timeout_s=30):
     # The original engine owns this task. Mark before any await so re-entry
     # cannot allocate a second supplement. Restart admission remains closed.
     binding.resource_evidence[key] = True
+    if binding.lease.generation > 1:
+        from .completion import WINDOW, finish_text
+        from .node_resume import _PREPARED
+        prepared, window = _PREPARED.get(), WINDOW.get()
+        if prepared is None or prepared.binding is not binding or prepared.sid != sid or window is None:
+            return {**raw, "status": "failed", "completion_unresolved": True,
+                "error": "node_output_completion_contract_missing"}
+        # Only the original owning engine's admitted generation and session may
+        # supplement. Reuse its remaining ceiling, deadline and one-answer flag;
+        # never start a replacement business attempt to repair missing output.
+        try:
+            await runtime.manager.check_execution(binding.actor, binding.lease)
+            async with asyncio.timeout(timeout_s):
+                return await finish_text(loop, raw, stop_event, window=window)
+        except Exception as exc:
+            return {**raw, "status": "failed", "completion_unresolved": True,
+                "error": "node_output_completion_failed:"+type(exc).__name__}
     running = SimpleNamespace(task_binding=binding, answer_attempted=False, token=stop_event)
     try:
         from .completion import WINDOW

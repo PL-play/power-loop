@@ -9,6 +9,11 @@
 ## [Unreleased]
 
 ### Added
+- Add opt-in TaskRuntime boot startup and idle heartbeats via a trusted contract
+  digest, with one shutdown deadline, retained original adapter/control handles,
+  lost-ACK recall and fail-closed local admission. Observe actual token cancellation
+  rather than counting read-only tokens as stopped. Formal host integration and
+  external resource/budget reconciliation remain under development.
 - Add experimental protocol3 executor boot records, immutable host operation
   receipts and durable drain admission barriers, with explicit protocol2 maintenance
   migration. Preserve original registered execution bindings through continuations

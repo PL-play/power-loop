@@ -207,18 +207,23 @@ async def signal_local(runtime, actor, operation):
     selected = [local for local in selected if id(local) in live_ids and not local["binding"].stop_renewal.is_set()]
     selected_ids = {id(local) for local in selected}
     signalled_tokens = set()
+    from .executor_lifecycle import signal_token
     for local in selected:
         token = local.get("cancel_token")
         if token is not None and id(token) not in signalled_tokens:
             signalled_tokens.add(id(token))
-            count += not token.is_cancelled()
-            local["signalled"] = True
-            token.cancel("durable task cancellation requested")
+            try:
+                was_cancelled = token.is_cancelled()
+            except Exception:
+                was_cancelled = False
+            if signal_token(token, "durable task cancellation requested"):
+                count += not was_cancelled
+                local["signalled"] = True
     for task in tasks:
         if task is asyncio.current_task() or task.done() or task.cancelling():
             continue
         members = [local for local in current if local["task"] is task]
-        if any(local.get("cancel_token") is not None for local in selected if local["task"] is task):
+        if any(local["signalled"] for local in selected if local["task"] is task):
             # The operation's cooperative token also covers its provider/tool
             # race. Task.cancel would bypass node-result bookkeeping and make
             # a containing parallel gather treat this as whole-run failure.
