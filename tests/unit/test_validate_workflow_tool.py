@@ -71,6 +71,21 @@ async def test_missing_spec_argument():
     assert "requires 'spec'" in await _handler()()
 
 
+async def test_parse_failure_with_policy_installed_is_not_mislabeled_as_policy_rejection():
+    called = []
+    def transform(spec):
+        called.append(spec)
+        return spec
+    out = await _handler(spec_transform=transform)(spec={"name": "", "root": {"type": "missing"}})
+    assert out.startswith("INVALID —") and "platform policy" not in out
+    assert not called and out.count("- ") >= 2
+
+
+async def test_file_only_alias_retains_actionable_missing_source_error():
+    from power_loop.workflow import WorkflowToolPorts
+    assert "requires 'file'" in await _handler(ports=WorkflowToolPorts(allow_inline_spec=False))()
+
+
 async def test_unknown_inputs_from_ref_rejected():
     """3.16.1 regression: an inputs_from ref to a nonexistent node used to pass
     validation and be silently dropped at runtime (found via live smoke)."""

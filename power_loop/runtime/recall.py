@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any
 
 
+class RecallInputError(ValueError):
+    """Library-owned validation, distinct from arbitrary backend ValueError."""
+
+
 def dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -31,7 +35,7 @@ async def authorize(store: Any, parent: str, child: str | None) -> tuple[str, st
 
 def _integer(value: Any, name: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
-        raise ValueError(f"{name} must be an integer in [{minimum},{maximum}]")
+        raise RecallInputError(f"{name} must be an integer in [{minimum},{maximum}]")
     return value
 
 
@@ -51,6 +55,8 @@ async def recall(
     send_index: int | None = None, limit: int = 20, cursor: str | None = None,
     char_offset: int | None = None, char_limit: int | None = None,
     output_file: str | None = None,
+    _scope_id: str | None = None, _export_options: dict | None = None, _strict_errors: bool = False,
+    _all_records: bool = False,
 ) -> str:
     """Return valid JSON envelopes; cursor binds the selection and captured upper bound."""
     try:
@@ -58,37 +64,39 @@ async def recall(
         if unavailable:
             return dumps({"status": "unavailable", "reason": unavailable, "session_id": sid})
         if source not in {"messages", "projection"}:
-            raise ValueError("source must be messages or projection")
+            raise RecallInputError("source must be messages or projection")
         limit = _integer(limit, "limit", 1, 100)
         offset = _integer(0 if char_offset is None else char_offset, "char_offset", 0, 2**63 - 1)
         budget = _integer(8000 if char_limit is None else char_limit, "char_limit", 256, 32000)
         if seq is not None and source != "messages" or id is not None and source != "projection":
-            raise ValueError("seq selects messages; id selects projection")
+            raise RecallInputError("seq selects messages; id selects projection")
         single = seq if source == "messages" else id
         if ids is not None and (single is not None or send_index is not None):
-            raise ValueError("choose ids OR a single record OR send_index")
-        if ids is None and single is None and send_index is None:
-            raise ValueError("select ids=[lo,hi], seq (messages), id (projection), or send_index")
+            raise RecallInputError("choose ids OR a single record OR send_index")
+        if ids is None and single is None and send_index is None and not _all_records:
+            raise RecallInputError("select ids=[lo,hi], seq (messages), id (projection), or send_index")
         if send_index is not None:
             _integer(send_index, "send_index", 1, 2**63 - 1)
         lo, hi = 0, None
         if ids is not None:
             if not isinstance(ids, list) or len(ids) != 2:
-                raise ValueError("ids must be [inclusive_start,inclusive_end]")
+                raise RecallInputError("ids must be [inclusive_start,inclusive_end]")
             lo, hi = [_integer(x, "ids", 1, 2**63 - 1) for x in ids]
             if lo > hi:
-                raise ValueError("ids start exceeds end")
+                raise RecallInputError("ids start exceeds end")
         if single is not None:
             lo = hi = _integer(single, "record coordinate", 1, 2**63 - 1)
         elif offset:
-            raise ValueError("char_offset requires seq or id")
+            raise RecallInputError("char_offset requires seq or id")
         if output_file is not None and not str(output_file).strip():
-            raise ValueError("output_file must be a new workspace path")
+            raise RecallInputError("output_file must be a new workspace path")
         if output_file is not None and (cursor is not None or char_offset is not None or char_limit is not None):
-            raise ValueError("output_file exports full records; omit cursor/char_offset/char_limit")
+            raise RecallInputError("output_file exports full records; omit cursor/char_offset/char_limit")
         coord = "seq" if source == "messages" else "id"
         selection = {"session_id": sid, "source": source, "ids": ids, "single": single,
                      "send_index": send_index}
+        if _scope_id is not None:
+            selection["authority"] = _scope_id
         signature = hashlib.sha256(dumps(selection).encode()).hexdigest()
         after = 0
         if cursor:
@@ -101,7 +109,7 @@ async def recall(
                 if ids is not None and hi > ids[1] or after < lo - 1:
                     raise ValueError
             except (ValueError, TypeError, KeyError, UnicodeError):
-                raise ValueError("invalid cursor for this session/selection") from None
+                raise RecallInputError("invalid cursor for this session/selection") from None
         else:
             bounds = await store.history_bounds(sid, source=source)
             if bounds is None:
@@ -112,7 +120,7 @@ async def recall(
         if not rows:
             return dumps({"status": "unavailable", "reason": "records_not_found"})
         if output_file:
-            return await _export(store, sid, source, lo, hi, send_index, output_file)
+            return await _export(store, sid, source, lo, hi, send_index, output_file, **(_export_options or {}))
         if single is not None:
             text = dumps(_screen(rows[0]))
             def envelope(size):
@@ -130,7 +138,7 @@ async def recall(
                 else:
                     right = middle - 1
             if not left and offset < len(text):
-                raise ValueError("char_limit is too small for record metadata; increase it")
+                raise RecallInputError("char_limit is too small for record metadata; increase it")
             return envelope(left)
         shown = []
         # Reserve room for envelope/cursor. Each preview includes ALL large fields in its budget.
@@ -162,43 +170,57 @@ async def recall(
                     shown[0]["preview"] = ""
                     shown[0]["truncated"] = True
                     continue
-                raise ValueError("char_limit is too small for list metadata; increase it")
+                raise RecallInputError("char_limit is too small for list metadata; increase it")
             shown.pop()
     except (ValueError, OSError) as exc:
+        if _strict_errors:
+            raise
         return dumps({"status": "error", "error": str(exc)})
 
 
-async def _export(store, sid, source, lo, hi, send_index, output_file):
+async def _export(store, sid, source, lo, hi, send_index, output_file, *,
+                  authorize=None, read_records=None, transform=None,
+                  max_records=None, max_bytes=None, workspace_only=False,
+                  transaction=None, configure_snapshot=True):
     from power_loop.runtime.env import safe_path
 
     directory, filename = os.path.split(output_file)
     if not filename or filename in {".", ".."}:
-        raise ValueError("output_file must name a new file")
+        raise RecallInputError("output_file must name a new file")
     # Resolve/check the parent but preserve the final component: a dangling symlink is an
     # existing target too, not permission to write through it to a different path.
     target = safe_path(directory or ".", "w") / filename
-    safe_path(str(target), "w")
+    checked = safe_path(str(target), "w")
+    if workspace_only:
+        from power_loop.runtime.env import get_runtime_env
+        if not checked.is_relative_to(get_runtime_env().require_workspace_dir().resolve()):
+            raise RecallInputError("output_file must stay inside the workspace")
     if target.exists() or target.is_symlink():
-        raise ValueError("output_file already exists; choose a new path")
+        raise RecallInputError("output_file already exists; choose a new path")
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".recall-", dir=target.parent)
     stream = os.fdopen(fd, "wb")
     count = size = 0
     try:
         # One read snapshot, no transaction spans an LLM/network request. Stream batches to disk.
-        async with store._db.transaction() as tx:
-            if store._db.dialect.name == "postgres":
+        async with (transaction if transaction is not None else store._db.transaction()) as tx:
+            if configure_snapshot and store._db.dialect.name == "postgres":
                 await tx.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            if authorize is not None:
+                await authorize(tx)
             with stream:
                 after = 0
                 while True:
-                    batch = await store.history_records(
+                    batch = await read_records(tx, after, 100) if read_records is not None else await store.history_records(
                         sid, source=source, lo=lo, hi=hi, after=after, limit=100,
                         send_index=send_index, _fetchall=tx.fetchall)
                     if not batch:
                         break
                     for row in batch:
-                        encoded = (dumps({"source": source, **row}) + "\n").encode("utf-8")
+                        value = transform(row) if transform is not None else row
+                        encoded = (dumps({"source": source, **value}) + "\n").encode("utf-8")
+                        if max_records is not None and count >= max_records or max_bytes is not None and size+len(encoded) > max_bytes:
+                            raise RecallInputError("export_limit_exceeded")
                         stream.write(encoded)
                         size += len(encoded)
                         count += 1
@@ -206,7 +228,7 @@ async def _export(store, sid, source, lo, hi, send_index, output_file):
                 stream.flush()
                 os.fsync(stream.fileno())
         if not count:
-            raise ValueError("records_not_found")
+            raise RecallInputError("records_not_found")
         # link is atomic and fails if another writer created the target; never replace it.
         os.link(temporary, target)
     finally:

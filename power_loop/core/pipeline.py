@@ -635,18 +635,22 @@ class AgentPipeline:
 
     def _start_tool(
         self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore | None = None,
+        *, tool_call_id: str | None = None,
     ) -> asyncio.Future:
         """Run one tool call as its own task with its OWN stop token (a child of the run's —
         design/124 §8.2), exposed to the handler as the current cancel token. Stopping the run
         reaches it; stopping just this call (e.g. once it was moved to the background) leaves
         the run alone."""
         tok = self.cancel_token.child()
+        assistant_seq = getattr(self.sink, "persisted_assistant_seq", None)
 
         async def _run() -> tuple[str, bool]:
             if sem is None:
-                return await self.execute_tool(tool_name, tool_args, cancel_token=tok)
+                return await self.execute_tool(tool_name, tool_args, cancel_token=tok,
+                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq)
             async with sem:
-                return await self.execute_tool(tool_name, tool_args, cancel_token=tok)
+                return await self.execute_tool(tool_name, tool_args, cancel_token=tok,
+                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq)
 
         fut = asyncio.ensure_future(_run())
         self._tool_tokens[fut] = tok
@@ -1312,6 +1316,8 @@ class AgentPipeline:
                 return await _perform_call()
 
         async def _perform_call() -> LLMResponse:
+            from power_loop.runtime.task_runtime import check_dispatch
+            await check_dispatch(self.session_id)
             # STREAM_STARTED/COMPLETED are emitted **per attempt** and paired in this call's own
             # finally (M-pipeline-runner-1): the terminal used to live in the OUTER finally, which
             # ran once, so N retry attempts emitted N STARTED but only 1 COMPLETED — unbalanced
@@ -1435,12 +1441,13 @@ class AgentPipeline:
         return bool(rt is not None and async_capable_for(rt.definition, tool_args))
 
     def _spawn_tool_task(
-        self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore
+        self, tool_name: str, tool_args: dict[str, Any], sem: asyncio.Semaphore,
+        *, tool_call_id: str | None = None,
     ) -> asyncio.Future:
         """同轮并发的一个成员：受信号量限流地跑 execute_tool（自带子停止标记，见 _start_tool）。
         contextvars 随 task 自动拷贝（PEP 567），计费 / 活动打标 / 运行时上下文零处理。异常原样
         留在 task 里，轮到它时再由串行路径的 HumanInputRequired / TOOL_ERROR 分支处理。"""
-        return self._start_tool(tool_name, tool_args, sem)
+        return self._start_tool(tool_name, tool_args, sem, tool_call_id=tool_call_id)
 
     @staticmethod
     def _cancel_pre_tasks(pre: dict[int, tuple[asyncio.Future, Any]]) -> None:
@@ -1452,6 +1459,7 @@ class AgentPipeline:
     async def execute_tool(
         self, tool_name: str, tool_args: dict[str, Any], *, count: bool = True,
         cancel_token: CancellationToken | None = None,
+        tool_call_id: str | None = None, assistant_seq: int | None = None,
     ) -> tuple[str, bool]:
         """Execute a single tool and return ``(output_string, failed)``.
 
@@ -1477,7 +1485,13 @@ class AgentPipeline:
             # derives from it). Default: a fresh child of the run's token.
             _ctok = set_current_cancel_token(cancel_token or self.cancel_token.child())
             try:
-                result = await self.tool_registry.invoke_async(tool_name, tool_args)
+                from power_loop.runtime.invocation import invocation_context
+                with invocation_context(self.session_id,
+                        assistant_seq if assistant_seq is not None else getattr(self.sink, "persisted_assistant_seq", None),
+                        tool_call_id):
+                    from power_loop.runtime.task_runtime import check_tool_dispatch
+                    await check_tool_dispatch(self.session_id, tool_name, self.tool_registry, tool_args)
+                    result = await self.tool_registry.invoke_async(tool_name, tool_args)
             finally:
                 reset_current_cancel_token(_ctok)
         except (ToolNotFound, ToolValidationError) as exc:
@@ -1788,6 +1802,10 @@ class AgentPipeline:
                         llm_before.system_prompt, llm_before.tools, llm_before.max_tokens):
                     await self._finalize('capacity_blocked', rounds=round_idx)
                     return self._make_result('degraded', final_text=self._capacity_blocked, rounds=round_idx)
+
+            from power_loop.runtime.task_runtime import prepare_model_processing
+            await prepare_model_processing(self, llm_before.messages, round_idx,
+                provider_call=llm_before.directive not in (HookDirective.SHORT_CIRCUIT, HookDirective.BREAK))
 
             if llm_before.directive == HookDirective.SHORT_CIRCUIT:
                 response = llm_before.output
@@ -2222,7 +2240,7 @@ class AgentPipeline:
                         # 起批：本调用 + 后面所有 eligible 调用一起起任务。后者的 TOOL_BEFORE 在这里
                         # 按序先跑（保序），判 SKIP 的不起任务，轮到它时直接落 SKIP 结果。
                         _pre_sem = _pre_sem or asyncio.Semaphore(_conc)
-                        pre_task = self._spawn_tool_task(tool_name, tool_args, _pre_sem)
+                        pre_task = self._spawn_tool_task(tool_name, tool_args, _pre_sem, tool_call_id=call_id)
                         for j in _eligible:
                             if j <= i or j in _pre or j in _pre_skip:
                                 continue
@@ -2239,7 +2257,8 @@ class AgentPipeline:
                                        ToolCallStartedPayload(name=tb_j.tool_name, tool_input=tb_j.tool_args,
                                                               tool_call_id=str(tc_j.get("id") or "")),
                                        round_index=round_idx)
-                            _pre[j] = (self._spawn_tool_task(tb_j.tool_name, tb_j.tool_args, _pre_sem), tb_j)
+                            _pre[j] = (self._spawn_tool_task(tb_j.tool_name, tb_j.tool_args, _pre_sem,
+                                                          tool_call_id=str(tc_j.get("id") or "")), tb_j)
 
                 # ── Business logic: execute tool ──
                 failed = False
@@ -2251,7 +2270,7 @@ class AgentPipeline:
                         # design/124 §7.3 / §8.4: race the call against steering (if its mode
                         # allows) and against a stop (always).
                         _work = (pre_task if pre_task is not None
-                                 else self._start_tool(tool_name, tool_args))
+                                 else self._start_tool(tool_name, tool_args, tool_call_id=call_id))
                         _res, _why = await self._race(_work, steer=_steerable)
                         if _why == "done":
                             output, failed = _res
@@ -2264,7 +2283,7 @@ class AgentPipeline:
                     elif pre_task is not None:
                         output, failed = await pre_task
                     else:
-                        output, failed = await self.execute_tool(tool_name, tool_args)
+                        output, failed = await self.execute_tool(tool_name, tool_args, tool_call_id=call_id)
                 except HumanInputRequired as exc:
                     self._cancel_pre_tasks(_pre)
                     interaction = exc.to_pending(tool_call_id=call_id, tool_name=tool_name)
@@ -2302,7 +2321,7 @@ class AgentPipeline:
                             # count=False: this is a retry of the SAME logical tool
                             # call, already counted on the first dispatch.
                             output, failed = await self.execute_tool(
-                                tool_name, tool_args, count=False
+                                tool_name, tool_args, count=False, tool_call_id=call_id
                             )
                         except Exception as retry_exc:
                             output = f"Error (retry failed): {retry_exc}"

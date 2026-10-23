@@ -1,29 +1,20 @@
-"""LLM-facing workflow tools.
+"""Compatibility names for the shared asynchronous workflow model boundary.
 
-``create_workflow`` — author + run a :class:`WorkflowSpec` JSON (validated on
-submission). Synchronous by default; ``detached: true`` runs it in the background
-and returns a run id, so the agent can ``pass_turn`` and be woken on completion
-(requires the host to run a ``TimerRunner`` and to have called
-:func:`power_loop.workflow.register_wake_guard`).
-
-``workflow_status`` — list runs or fetch one run's status/detail (D4).
+The low-level SDK still supports direct awaited execution. Model create calls
+always return admission; durable completion delivery depends on the runtime or
+host callback/timer runner.
 """
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
 from power_loop.contracts.tools import ToolDefinition
-from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime.spec import AgentSpec
 
-from .api import create_workflow
-from .engine import in_workflow
-from .introspect import get_workflow, list_workflows
-from .result import WorkflowRunHandle
+from .facade import WorkflowPolicyError, WorkflowToolPorts, prepare_workflow, run_workflow_tool
 from .spec import WorkflowSpec, WorkflowSpecError
 
 __all__ = [
@@ -105,11 +96,11 @@ def _build_create_workflow_description() -> str:
         "never a parallel sibling, a later node, or a node inside a foreach body "
         "(reference the foreach's own aggregate id instead).\n"
         "\n"
-        "DETACHED: set \"detached\": true to run in the background — returns a "
-        "run id immediately and you may pass_turn; when the run finishes you "
-        "will be woken, then call workflow_status(run_id=..., detail=true) to "
-        "read the results. Without it (default) the call blocks and returns a "
-        "per-step summary.\n"
+        "ASYNCHRONOUS: returns an accepted receipt and run id immediately. "
+        "You may pass_turn; read actual results with workflow_status. Runtime owner-inbox "
+        "delivery or a host completion callback/timer runner handles completion; a wake "
+        "is not guaranteed without that host infrastructure. The old detached=true input "
+        "is accepted for compatibility; detached=false, wait and sync are rejected.\n"
         "\n"
         "EXAMPLE: {\"name\":\"research\",\"input\":\"topic X\",\"root\":{\"type\":"
         "\"sequence\",\"steps\":[{\"type\":\"agent\",\"id\":\"plan\",\"spec\":"
@@ -155,15 +146,11 @@ CREATE_WORKFLOW_DEFINITION = ToolDefinition(
                 "type": "string",
                 "description": "Optional initial input, overrides spec.input (available as {{input}}).",
             },
-            "detached": {
-                "type": "boolean",
-                "description": "Run in the background and wake you on completion (default false = run now).",
-            },
         },
         "required": ["spec"],
     },
     required_params=("spec",),
-    # design/124 §7.3: a synchronously awaited workflow moves to the background on steer.
+    # Admission can perform async storage; execution itself never blocks the tool.
     interrupt="background",
 )
 
@@ -216,79 +203,18 @@ def _make_create_workflow_handler(
     executor_factory: Callable[[Any, str | None], Any] | None = None,
     budget_factory: Callable[[Any, str | None], Any] | None = None,
     spec_transform: Callable[[WorkflowSpec], WorkflowSpec] | None = None,
+    ports: WorkflowToolPorts | None = None,
 ) -> Callable[..., Any]:
-    """Build the ``create_workflow`` tool handler, with optional HOST injection
-    points (PROVISIONAL, 3.14) — see :func:`register_workflow_tools`."""
+    selected = ports or WorkflowToolPorts(executor_factory=executor_factory,
+        budget_factory=budget_factory, spec_transform=spec_transform)
 
     async def _handle(**kwargs: Any) -> str:
-        loop = get_current_loop()
-        if loop is None:
-            return (
-                "Error: create_workflow must be invoked from inside an active "
-                "StatefulAgentLoop run."
-            )
-        if in_workflow():
-            return (
-                "Error: nested workflow creation is not allowed in this tier. "
-                "Express the additional steps as nodes inside the current WorkflowSpec."
-            )
-        spec_payload = kwargs.get("spec")
-        if spec_payload is None:
-            return "Error: create_workflow requires 'spec'."
-        try:
-            spec = WorkflowSpec.from_json(spec_payload)
-        except WorkflowSpecError as exc:
-            return f"Error: {exc}"  # aggregated problems — the model can repair and retry
-        if kwargs.get("input"):
-            spec = replace(spec, input=str(kwargs["input"]))
-
-        parent_sid = get_session_id()
-        if spec_transform is not None:
-            # Host policy rewrite (clamps, forced budgets/models …). A
-            # WorkflowSpecError raised here reads exactly like a validation
-            # failure — aggregated problems back to the model, which can repair
-            # and retry. Any other exception is a host bug and propagates (the
-            # pipeline surfaces it as this tool call's error).
-            try:
-                spec = spec_transform(spec)
-            except WorkflowSpecError as exc:
-                return f"Error: {exc}"
-            if not isinstance(spec, WorkflowSpec):
-                raise TypeError(
-                    "spec_transform must return a WorkflowSpec "
-                    f"(got {type(spec).__name__})"
-                )
-        wf = create_workflow(
-            spec,
-            parent_loop=loop,
-            executor=executor_factory(loop, parent_sid) if executor_factory else None,
-            budget=budget_factory(loop, parent_sid) if budget_factory else None,
-            parent_session_id=parent_sid,
-        )
-
-        if kwargs.get("detached"):
-            if not parent_sid:
-                return (
-                    "Error: detached workflows require an active session; "
-                    "run without 'detached'."
-                )
-            handle = await wf.start(detached=True)
-            # start(detached=True) always returns a WorkflowRunHandle (the union's other
-            # arm is the non-detached path); narrow so .run_id is well-typed.
-            assert isinstance(handle, WorkflowRunHandle)
-            return (
-                f"Started detached workflow '{spec.name}' as run {handle.run_id}. "
-                f"You will be woken with the result when it finishes — you may pass_turn now. "
-                f"Check progress with workflow_status(run_id='{handle.run_id}')."
-            )
-        result = await wf.run()
-        return result.summary()
+        # The alias fixes its action; a raw model argument cannot change it.
+        return await run_workflow_tool({**kwargs, "action": "create"}, ports=selected)
 
     return _handle
 
 
-#: Default handler (no host injection) — the pre-3.14 behavior, kept as a
-#: module-level symbol for direct use in tests/embedding.
 _handle_create_workflow = _make_create_workflow_handler()
 
 
@@ -337,57 +263,32 @@ def _spec_summary(spec: WorkflowSpec) -> str:
 
 
 def _make_validate_workflow_handler(
-    *,
-    spec_transform: Callable[[WorkflowSpec], WorkflowSpec] | None = None,
+    *, spec_transform: Callable[[WorkflowSpec], WorkflowSpec] | None = None,
+    ports: WorkflowToolPorts | None = None,
 ) -> Callable[..., Any]:
-    """Build the ``validate_workflow`` handler.
-
-    Runs the SAME checks ``create_workflow`` would — strict parse/validation
-    AND the host's ``spec_transform`` policy pass — but never executes anything,
-    so a "valid" verdict here is a guarantee create_workflow will accept the
-    spec (it may still fail at runtime, e.g. a leaf hitting its round limit).
-    """
+    selected = ports or WorkflowToolPorts(spec_transform=spec_transform)
 
     async def _handle(**kwargs: Any) -> str:
-        payload = kwargs.get("spec")
-        if payload is None:
-            return "Error: validate_workflow requires 'spec'."
+        if kwargs.get("spec") is None and kwargs.get("file") is None:
+            return "Error: validate_workflow requires 'spec'." if selected.allow_inline_spec else "Error: validate_workflow requires 'file'."
         try:
-            spec = WorkflowSpec.from_json(payload)
+            prepared = await prepare_workflow(kwargs, selected)
+        except WorkflowPolicyError as exc:
+            return f"INVALID (platform policy) — {exc}"
         except WorkflowSpecError as exc:
             return f"INVALID — {exc}"
-        if spec_transform is not None:
-            try:
-                spec = spec_transform(spec)
-            except WorkflowSpecError as exc:
-                return f"INVALID (platform policy) — {exc}"
-            if not isinstance(spec, WorkflowSpec):
-                raise TypeError(
-                    "spec_transform must return a WorkflowSpec "
-                    f"(got {type(spec).__name__})"
-                )
-        return f"VALID. {_spec_summary(spec)}. Ready for create_workflow."
+        except ValueError as exc:
+            return f"Error: {exc}"
+        return f"VALID. {_spec_summary(prepared.spec)}. Ready for create_workflow."
 
     return _handle
 
 
 async def _handle_workflow_status(**kwargs: Any) -> str:
-    loop = get_current_loop()
-    if loop is None:
-        return "Error: workflow_status must be invoked from inside an active StatefulAgentLoop run."
-    parent_sid = get_session_id()
-    if not parent_sid:
-        return "Error: no active session."
-    run_id = kwargs.get("run_id")
-    if run_id:
-        j = await get_workflow(loop, parent_sid, str(run_id), detail=bool(kwargs.get("detail")))
-        if j is None:
-            return f"No workflow run '{run_id}' found."
-        return json.dumps(j, ensure_ascii=False, indent=2)
-    runs = await list_workflows(loop, parent_sid)
-    if not runs:
-        return "No workflow runs."
-    return "\n".join(f"{r['run_id']}  {r['status']:<14} {r['workflow']} ({r['steps']} steps)" for r in runs)
+    action = "status" if kwargs.get("run_id") not in (None, "") else "list"
+    if action == "list":
+        kwargs = {key: value for key, value in kwargs.items() if key not in ("run_id", "detail")}
+    return await run_workflow_tool({**kwargs, "action": action})
 
 
 def register_workflow_tools(
@@ -398,6 +299,7 @@ def register_workflow_tools(
     budget_factory: Callable[[Any, str | None], Any] | None = None,
     spec_transform: Callable[[WorkflowSpec], WorkflowSpec] | None = None,
     description_suffix: str | None = None,
+    ports: WorkflowToolPorts | None = None,
 ) -> None:
     """Register the ``create_workflow`` + ``workflow_status`` tools on ``registry``.
 
@@ -407,8 +309,9 @@ def register_workflow_tools(
     Do NOT grant these tools to sub-agents spawned inside a workflow — nested
     runs are refused in this tier.
 
-    HOST injection points (all optional; omitting all three = pre-3.14 behavior;
-    PROVISIONAL, 3.14). Each is evaluated PER TOOL INVOCATION with
+    Model submission is asynchronous. Optional ports supply the shared host
+    capabilities; do not combine ports with the older individual factory arguments.
+    HOST injection points (PROVISIONAL). Each is evaluated PER TOOL INVOCATION with
     ``(loop, parent_session_id)`` from the invoking run's context:
 
     * ``executor_factory`` → the run's :class:`~power_loop.workflow.engine.Executor`
@@ -426,13 +329,15 @@ def register_workflow_tools(
       enforces policy limits, or whose wake delivery has its own protocol,
       states those HOST facts here so the model writes within them first try.
     """
+    if ports is not None and any((executor_factory, budget_factory, spec_transform)):
+        raise ValueError("workflow_ports_and_individual_seams_are_mutually_exclusive")
     handler = (
         _make_create_workflow_handler(
             executor_factory=executor_factory,
             budget_factory=budget_factory,
-            spec_transform=spec_transform,
+            spec_transform=spec_transform, ports=ports,
         )
-        if (executor_factory or budget_factory or spec_transform)
+        if (executor_factory or budget_factory or spec_transform or ports is not None)
         else _handle_create_workflow
     )
     create_def = CREATE_WORKFLOW_DEFINITION
@@ -446,6 +351,6 @@ def register_workflow_tools(
     # zero execution. Registered as a bundle with the other two.
     registry.register(
         VALIDATE_WORKFLOW_DEFINITION,
-        _make_validate_workflow_handler(spec_transform=spec_transform),
+        _make_validate_workflow_handler(spec_transform=spec_transform, ports=ports),
         overwrite=overwrite,
     )

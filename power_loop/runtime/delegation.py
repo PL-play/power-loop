@@ -18,6 +18,7 @@ from power_loop.core.agent_context import get_session_id
 from power_loop.runtime.cancellation import CancellationToken
 from power_loop.runtime.recall import authorize, dumps
 from power_loop.runtime.spec import (
+    _CHILD_ADMISSION,
     _ON_CHILD_SESSION,
     _USAGE_SINK,
     AgentSpec,
@@ -27,6 +28,8 @@ from power_loop.runtime.spec import (
 
 log = logging.getLogger(__name__)
 RESULT_PREFIX = "[subagent_result]\n"
+_SETTLEMENT_ROUNDS = 30
+_SETTLEMENT_TIMEOUT_S = 1800.0
 
 
 @dataclass
@@ -40,6 +43,10 @@ class Running:
     phase: str = "running"
     descendant_usage: dict = field(default_factory=dict)
     projection_expected: bool = True
+    task_binding: Any = None
+    canonical_result: dict | None = None
+    canonical_attempted: bool = False
+    answer_attempted: bool = False
 
 
 _RUNNING: dict[tuple[int, str], Running] = {}
@@ -66,6 +73,20 @@ async def _save_result(store, parent, sid, run, raw, after_seq, lifecycle):
     result = {**raw, "usage": usage, "session_id": sid, "run_id": run.run_id, "messages": messages,
               "projection": projection, "history_status": "available" if messages else "empty",
               "projection_status": projection_status}
+    if run.task_binding is not None:
+        if run.canonical_result is None:
+            try:
+                result = await run.task_binding.runtime.record_subagent(run.task_binding, result)
+            except Exception as exc:
+                run.canonical_attempted = run.task_binding.stop_renewal.is_set() and getattr(exc, "code", None) not in (
+                    "required_execution_unsettled", "required_result_unhandled", "required_input_unhandled")
+                raise
+            run.canonical_attempted = True
+            run.canonical_result = result
+        else:
+            # A compatibility projection/delivery failure cannot rewrite the
+            # already durable execution result into a different failed result.
+            result = run.canonical_result
     # Persist ownership/prepared result BEFORE any destructive cleanup.
     key = "subagent:run:" + run.run_id
     await store.set_runtime_state(parent, key, {"phase": "prepared", "result": result})
@@ -78,41 +99,64 @@ async def _save_result(store, parent, sid, run, raw, after_seq, lifecycle):
     return result
 
 
-async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finalize, on_complete):
+async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finalize, on_complete,
+                  *, remaining_rounds=None, deadline=None):
     store = await loop.ensure_store()
     running.phase = "settling"
-    children = [r.task for (key, _), r in list(_RUNNING.items())
-                if key == id(store) and r.parent == sid and r.task is not None]
-    if children:
-        await asyncio.gather(*children)
+    if remaining_rounds is None:
+        remaining_rounds = _SETTLEMENT_ROUNDS
+    if deadline is None:
+        deadline = asyncio.get_running_loop().time() + _SETTLEMENT_TIMEOUT_S
+    await await_children(store, sid, running.token, max(0.0, deadline - asyncio.get_running_loop().time()))
     if finalize is not None:
-        raw = await finalize(sid, raw)
+        raw = await asyncio.wait_for(finalize(sid, raw), timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
     # A nudge racing finalization is already durable. Consume it in this run before returning.
     continuation = None
-    while (await store.inbox_counts(sid))["pending"]:
+    while raw.get("status") == "completed" and (
+            raw.get("new_input_after_pass") or (await store.inbox_counts(sid))["pending"]):
         if running.token.is_cancelled():
+            break
+        if remaining_rounds <= 0:
+            raw = {**raw, "status": "hit_round_limit", "error": "subagent settlement round budget exhausted"}
             break
         if continuation is None:
             continuation = await workflow_continuation_loop(loop, sid)
         with contextlib.ExitStack() as guards:
             for _, guard in getattr(loop, "_child_run_guards", ()):
                 guards.enter_context(guard())
-            extra = await continuation.flush_follow_ups(sid, stop_event=running.token)
+            if raw.get("new_input_after_pass"):
+                work = continuation.follow_up(
+                    "New input arrived at your last pass and is already in this session's history. "
+                    "Process it and finish the original task without repeating completed actions.",
+                    session_id=sid, stop_event=running.token, max_rounds=remaining_rounds)
+            else:
+                work = continuation.flush_follow_ups(sid, stop_event=running.token,
+                                                    max_rounds=remaining_rounds)
+            extra = await asyncio.wait_for(work, timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
         if extra is None:
-            break
+            raise RuntimeError("subagent settlement returned no result with required input pending")
+        remaining_rounds -= max(1, int(extra.rounds))
         raw["final_text"] = str(extra.final_text or "")
         raw["status"] = extra.status
+        raw["new_input_after_pass"] = bool(getattr(extra, "new_input_after_pass", False))
         raw["rounds"] = int(raw.get("rounds", 0)) + int(extra.rounds)
         usage = dict(raw.get("usage") or {})
         for key, value in (extra.usage or {}).items():
             usage[key] = usage.get(key, 0) + value
         raw["usage"] = usage
         if finalize is not None:
-            raw = await finalize(sid, raw)
+            raw = await asyncio.wait_for(finalize(sid, raw), timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
+    from .subagent_output import ensure_answer
+    before_answer = raw
+    raw = await ensure_answer(loop, running, sid, raw, deadline)
+    if raw is not before_answer and finalize is not None:
+        raw = await asyncio.wait_for(finalize(sid, raw), timeout=max(0.0, deadline - asyncio.get_running_loop().time()))
     # From the final pending check through cleanup, nudge uses our gate (below).
     async with _gate(store, sid):
         child_active = any(key == id(store) and r.parent == sid for (key, _), r in _RUNNING.items())
-        if ((await store.inbox_counts(sid))["pending"] or child_active) and not running.token.is_cancelled():
+        if (raw.get("status") == "completed" and
+                (raw.get("new_input_after_pass") or (await store.inbox_counts(sid))["pending"] or child_active) and
+                not running.token.is_cancelled()):
             # Re-enter outside the gate; callers can enqueue without losing accepted input.
             again = True
         else:
@@ -130,18 +174,23 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
                 for name, value in result.get("usage", {}).items():
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
                         parent_run.descendant_usage[name] = parent_run.descendant_usage.get(name, 0) + value
+            # Remain active until the owner result is durably enqueued. Otherwise
+            # await_children can observe no task and no inbox in this window.
+            await loop.deliver(InboxItem(RESULT_PREFIX + completion_view(loop, result), kind="task_done",
+                                        item_id="subagent:" + running.run_id), parent, enqueue_only=True)
             _RUNNING.pop((id(store), sid), None)
             _publish_completion(loop, parent, sid, result)
     if again:
-        return await _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finalize, on_complete)
+        return await _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finalize, on_complete,
+                             remaining_rounds=remaining_rounds, deadline=deadline)
     try:
-        if running.suppress_wake:
-            return result
-        # Inbox delivery is durable and deduplicated before asking the host to wake an idle
-        # parent. A failed/skipped wake still leaves the result for its next normal send.
-        await loop.deliver(InboxItem(RESULT_PREFIX + completion_view(loop, result), kind="task_done",
-                                    item_id="subagent:" + running.run_id), parent, enqueue_only=True)
-        if on_complete is not None:
+        # Stopping a child suppresses an external wake, never the owner's result.
+        if on_complete is not None and running.task_binding is not None and not running.suppress_wake:
+            binding = running.task_binding
+            saved = await binding.runtime.manager.get_job(binding.actor, binding.lease.job_id)
+            if saved.generation != binding.lease.generation or saved.cancel_requested_at is not None or saved.outcome == "cancelled":
+                running.suppress_wake = True
+        if on_complete is not None and not running.suppress_wake:
             await on_complete(parent, result)
         record = await store.get_runtime_state(parent, "subagent:run:" + running.run_id)
         await store.set_runtime_state(parent, "subagent:run:" + running.run_id, {**record, "notified": True})
@@ -163,16 +212,20 @@ async def _complete(loop, parent, sid, run, raw, after_seq, lifecycle, finalize,
     try:
         return await _finish(loop, parent, sid, run, raw, after_seq, lifecycle, finalize, on_complete)
     except BaseException as exc:
-        failed = {**raw, "status": "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+        if run.task_binding is not None and run.canonical_attempted and run.canonical_result is None:
+            # Commit acknowledgement may have been lost. Keep the canonical job
+            # for reconciliation instead of inventing a second terminal result.
+            log.exception("subagent canonical result requires reconciliation: %s", run.run_id)
+            return None
+        failed = {**raw, "status": "cancelled" if isinstance(exc, asyncio.CancelledError) or run.token.is_cancelled() else "failed",
                   "error": f"subagent finalization: {type(exc).__name__}: {exc}"}
         try:
             result = await _save_result(store, parent, sid, run, failed, after_seq, lifecycle)
             _publish_completion(loop, parent, sid, result)
-            if not run.suppress_wake:
-                await loop.deliver(InboxItem(RESULT_PREFIX + completion_view(loop, result), kind="task_done",
-                                            item_id="subagent:" + run.run_id), parent, enqueue_only=True)
-                if on_complete is not None:
-                    await on_complete(parent, result)
+            await loop.deliver(InboxItem(RESULT_PREFIX + completion_view(loop, result), kind="task_done",
+                                        item_id="subagent:" + run.run_id), parent, enqueue_only=True)
+            if on_complete is not None and not run.suppress_wake:
+                await on_complete(parent, result)
             return result
         except Exception:
             log.exception("subagent finalization failed; original records retained: %s", run.run_id)
@@ -183,13 +236,21 @@ async def _complete(loop, parent, sid, run, raw, after_seq, lifecycle, finalize,
 
 async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=None,
                 admission: asyncio.Semaphore | None = None) -> dict[str, Any]:
+    from .execution_roles import require_orchestration
+    await require_orchestration(loop, "spawn_agent")
     parent = get_session_id()
     if parent is None:
         raise ValueError("spawn_agent requires an active parent session")
     store = await loop.ensure_store()
+    runtime = getattr(loop, "task_runtime", None)
+    registration = await runtime.admit_subagent(parent, spec, task) if runtime is not None else None
+    if registration is not None and registration.replayed:
+        return runtime.receipt(registration)
     parent_run = _RUNNING.get((id(store), parent))
     ready = asyncio.get_running_loop().create_future()
     run = Running(secrets.token_hex(8), token=CancellationToken(), parent=parent, title=spec.name)
+    if registration is not None:
+        run.run_id = registration.operation.operation_id[3:]
     if parent_run is not None:
         run.token = parent_run.token.child()
 
@@ -197,6 +258,9 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
 
     async def created(sid):
         nonlocal admitted
+        if runtime is not None:
+            run.task_binding = await runtime.bind_subagent(parent, registration, sid)
+            await scopes.enter_async_context(runtime.execution(run.task_binding, owner=True))
         session = await store.get_session(sid)
         run.projection_expected = session.config.get("context_projection", True)
         _RUNNING[(id(store), sid)] = run
@@ -212,8 +276,9 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
             admitted = True
             run.phase = "running"
 
-    async def execute():
-        token = _ON_CHILD_SESSION.set(created)
+    async def execute_body():
+        token = _ON_CHILD_SESSION.set(created if runtime is None else None)
+        required = _CHILD_ADMISSION.set(created if runtime is not None else None)
         usage = _USAGE_SINK.set(None)
         sid = None
         try:
@@ -225,26 +290,54 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
                 raise ValueError(raw.get("final_text") or "child session was not created")
         except BaseException as exc:
             if not ready.done():
+                if runtime is not None:
+                    try:
+                        if run.task_binding is not None:
+                            await runtime.record_subagent(run.task_binding, {"status": "failed", "error_type": type(exc).__name__})
+                        else:
+                            await runtime.manager.request_cancel(runtime.actor(parent), registration.job.job_id,
+                                system_key="admission:" + registration.operation.operation_id, reason="subagent admission failed")
+                    except Exception:
+                        log.exception("subagent admission requires reconciliation: %s", run.run_id)
+                for key, value in list(_RUNNING.items()):
+                    if value is run:
+                        _RUNNING.pop(key, None)
                 ready.set_exception(exc)
                 return
             sid = ready.result()
             raw = {"status": "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
                    "final_text": "", "rounds": 0, "usage": {}, "error": str(exc)}
         finally:
+            _CHILD_ADMISSION.reset(required)
             _ON_CHILD_SESSION.reset(token)
             _USAGE_SINK.reset(usage)
             if admitted:
                 admission.release()
         await _complete(loop, parent, sid, run, raw, 0, spec.lifecycle, finalize, on_complete)
 
+    async def execute():
+        nonlocal scopes
+        async with contextlib.AsyncExitStack() as scopes:
+            await execute_body()
+
+    scopes = None
+
     run.task = asyncio.create_task(execute(), name="subagent-" + run.run_id)
     _retain(run.task)
     sid = await asyncio.shield(ready)
-    return {"session_id": sid, "run_id": run.run_id, "mode": "create", "status": "queued"}
+    receipt = {"session_id": sid, "run_id": run.run_id, "mode": "create", "status": "queued"}
+    if registration is not None:
+        receipt.update(job_id=registration.job.job_id, operation_id=registration.operation.operation_id)
+    return receipt
 
 
 async def nudge(loop, sid: str, message: str, *, on_complete=None, finalize=None,
                 admission: asyncio.Semaphore | None = None) -> dict[str, Any]:
+    from .execution_roles import require_orchestration
+    await require_orchestration(loop, "spawn_agent")
+    if getattr(loop, "task_runtime", None) is not None:
+        from .nudges import steer
+        return await steer(loop, sid, message, on_complete=on_complete, finalize=finalize, admission=admission)
     parent = get_session_id()
     if parent is None:
         raise ValueError("nudge requires an active parent session")
@@ -333,6 +426,10 @@ async def stop(store, parent, run_id, grace_s):
                 if key == id(store) and run.parent == parent and run.run_id == run_id), None)
     if run is None:
         return "finished"
+    if run.task_binding is not None:
+        binding = run.task_binding
+        await binding.runtime.manager.request_cancel(binding.runtime.actor(parent), binding.lease.job_id,
+            system_key="stop:" + run.run_id, reason="subagent stopped")
     run.suppress_wake = True
     run.token.cancel("stopped")
     try:

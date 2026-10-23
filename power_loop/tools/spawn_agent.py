@@ -100,8 +100,8 @@ async def _handle_spawn_agent(**kwargs: Any) -> str:
     action = kwargs.get("action", "create")
     if action == "nudge":
         from power_loop.runtime.delegation import nudge
-        sid, message = str(kwargs.get("sub_session") or "").strip(), str(kwargs.get("message") or "").strip()
-        if not sid or not message:
+        sid, message = str(kwargs.get("sub_session") or "").strip(), kwargs.get("message")
+        if not sid or not isinstance(message, str) or not message.strip():
             return "Error: nudge requires sub_session and message."
         if any(k in kwargs for k in ("task", "name", "system_prompt", "tools", "max_rounds", "output_schema")):
             return "Error: nudge retains the original contract; provide only sub_session and message."

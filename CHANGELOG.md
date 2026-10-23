@@ -8,6 +8,227 @@
 
 ## [Unreleased]
 
+### Added
+- Route native workflow nudge/steer through the shared library facade and saved
+  node/session bindings. Select exact foreach routes by node job or SID and the
+  latest actual retry by node name. Carry the selected job/generation into real
+  input or continuation admission, preserve original tools/rounds and session,
+  and replay the original call receipt after physical cleanup without dispatch.
+  DeepTalk forwards these native actions directly; legacy control and the
+  remaining workflow actions still require their separate adapters.
+- Extend jobs get with bounded operations/results views, exact event reads,
+  character chunks and exclusive workspace JSONL exports. Preserve every saved
+  call/receipt and canonical result generation (including unstarted generation
+  zero), without exposing operation credentials or request payloads. Recall
+  later operation originals using their separately authorized source send;
+  historical steering resolves only a unique durable descriptor. Event reads
+  survive damaged mutable result caches via explicit metadata-only job reads.
+  Audit reads never replay work or acknowledge a child's pending inputs.
+- Persist legacy workflow driver/session/node/route/attempt bindings before child
+  provider dispatch, including foreach, loop, retry and fallback sessions. Read
+  retained history through the library workflow facade after driver cleanup;
+  recover pre-index history only from owned journals and validated original
+  execution contracts. Keep incomplete/deleted history explicit, scope SID-only
+  lookup to the owner, and share bounded raw/projection recall and exclusive
+  snapshot JSONL export. Platform leaves/logs and their schemas delegate to the
+  library. These read bindings do not grant execution, stop or billing authority.
+- Add task-qualified recall_send and native workflow leaves/logs using durable
+  task/session authority. Preserve exact raw IDs versus seq/projection coordinates,
+  original send limits, retained sessions and multi-generation bindings. Recall
+  exact creation call/receipt references only with their caller-send authority.
+  Bound pages and UTF-8 JSONL exports, reauthorize snapshots, refuse overwrite and
+  clean failed exports. Legacy unqualified recall keeps its existing behavior;
+  legacy workflow history uses the separate scoped compatibility adapter above.
+- Keep jobs backend ValueError details private, including exceptions with a
+  misleading code attribute. Only typed library JobError codes are public;
+  unknown stop failures remain reconciliation-required with control unknown.
+- Add scoped native workflow-node cancellation through workflow or jobs, using
+  operation tokens across admission, sends and heartbeat loss. Preserve parent
+  and sibling tasks, exact route/job selection, original stop call/receipt,
+  cancelled-node exit bookkeeping and review continuation; cancellation never
+  retries the node or launches its fallback. Legacy node control uses the exact
+  engine retained by its proven handle. Remote stop and billing remain pending.
+- Share durable model-stop invocation/ACK handling between jobs and the workflow
+  whole-run cancel action. Qualify the control-only dispatch lane by actual owned
+  handler/action, and recheck create/validate before host preparation. Scope
+  legacy stop by journal/store/parent, retain asynchronous local stop control,
+  preserve cancellation journal exits and refuse foreign SDK workflow stops.
+  Platform native control routes to the library. Remote recovery and remaining
+  lifecycle/billing guarantees are still pending.
+- Add an independent experimental task/session audit-authority port using
+  persistent lineage, execution snapshots and original node-session descriptors.
+  Preserve retained sessions across driver cleanup and execution generations,
+  restrict send bindings to their original send index, report deleted sessions,
+  and refuse forged/unbounded scopes. Logical tasks do not grant access to their
+  caller's history. Message recall/export and workflow log routing are subsequent
+  adapters, not implied by this read-only port.
+- Add the library workflow submission facade and typed host ports for source
+  loading, policy, executor/budget/files, tool clamps and presentation callbacks.
+  Create/validate share frozen compilation and policy; async admission survives
+  bounded presentation failures without starting replacement work. Native
+  inspection reads the authorized task registry; legacy journal views identify
+  their weaker physical-state guarantee. Platform create/validate now reuse this
+  submission boundary; remaining control actions and host restore adapters are
+  still in development.
+- Unreleased major-version model contract: `create_workflow` is now an alias of
+  the shared asynchronous submission path, returning an admission JSON rather
+  than waiting for a result. Explicit `wait`, `sync` and `detached=false` are
+  rejected; old `detached=true` remains accepted. `workflow_status` uses the same
+  authorized inspection router. Low-level host `Workflow.run()` remains separate.
+- Provide the library-owned opt-in jobs definition/handler for persistent
+  authorized reads and durable model-origin cancellation, with raw call/receipt
+  identity, generation checks, ACK readback and typed pending-control results.
+  Retain one local cancellation per actual task, protect exit bookkeeping from
+  heartbeat recancellation, and suppress known cancelled/superseded subagent
+  external callbacks while preserving owner results. A library-handler-only
+  control lane permits safe query/cancel after lease expiry; business/provider
+  dispatch remains fenced. Preserve legacy best-effort adapters and existing
+  presets; external recovery, billing and recall/export are not implied.
+- Add experimental bounded persistent task directory queries with authorized
+  descendant trees, explicit active reasons/history filters, scoped cursor
+  membership checks, whole-response limits, validated message IDs and immutable
+  result excerpts. Billing remains explicitly unavailable; this read port does
+  not yet register the generic jobs tool or provide its stop/recall adapters.
+- Connect experimental `resume_detached` to owned native whole-workflow restore:
+  preserve workflow/node identities, grant frozen cross-driver node authority,
+  recompute affected dependencies, replay unaffected output without new charges,
+  and block success on unresolved reservations/required children. Reconcile lost
+  acknowledgements by the original token, isolate generation cleanup, preserve
+  result history and charge prior actual usage to spec soft budgets. This first
+  text sequence/parallel slice does not enable host/custom adapters, hard budgets,
+  cross-process recovery or the generic model-visible tool facade.
+- Add experimental atomic workflow-continuation admission and single-token dispatch responsibility, retaining original node/history and canonical replay evidence. These storage ports do not yet enable the public engine restore adapter.
+- Experimental task runtime: freeze workflow creation execution profiles and captured runtime ports before admission awaits; validate original call fingerprints on authorized reads. Add restoration previews that verify immutable execution membership, closed delivery/consumption, retained node bindings/contracts and dependency invalidation without dispatching work. External host ports/budgets/callbacks require adapters; whole-workflow execution resume remains closed.
+- Commit experimental workflow journal, canonical inbox projection and closed
+  receipt atomically under task-control/session-state locks. Verify closure and
+  actual main consumption inside a future admission transaction, with no late
+  old-generation view writes. Record host callback presence and immutable callback
+  claim/exits; pending, failed, cancelled or corrupt callbacks cannot count as
+  settled. Projection retries never reexecute callbacks or models. Driver/node
+  restore, host wake acknowledgement and automatic recovery remain separate.
+- Freeze canonical workflow delivery revisions with generation, result event ID,
+  revision/hash and effective cancellation. Repair journal/inbox projections
+  idempotently without executing models, tools or callbacks; verify actual views
+  and reject stale/corrupt evidence. Always use execution-ledger scope usage,
+  including empty ledgers, and exclude stale workflow results from request
+  snapshots. Whole-workflow restore and cross-generation takeover remain closed.
+- Require an actual final text answer from experimental native workflow text
+  nodes after required tasks/inputs settle. Empty pass output gets at most one
+  original-session supplement within the saved remaining rounds, with no business
+  tools; still-empty/failed/exhausted output cannot start downstream. Preserve
+  file/custom-executor contracts, generation-specific adapters, guards and all
+  actual usage. Never use pass_turn.reason as the delivered answer.
+- Persist generation-qualified experimental workflow controller bindings atomically
+  with the driver SID. Validate frozen claim/admission/role evidence and the live
+  driver at node/send admission, claim and every actual dispatch, including required
+  subagents. Repeated binding cannot heal corrupt history or adopt another driver.
+  Historical reads and actual exit evidence survive driver deletion. Ordinary bind
+  still refuses new workflow generations without the full resume protocol.
+- Freeze execution scope/control-owner membership atomically with each experimental
+  claim or resumed generation. Seal direct members with exit evidence and read
+  generation usage through immutable edges; keep lifetime supervision totals
+  separate. Historical usage survives live owner rebinding without scope rollup
+  duplication. Incomplete/corrupt history refuses new-generation admission; legacy
+  exit evidence remains saveable. This does not enable finished-workflow restore.
+- Move the GHA-style YAML workflow compiler into `power_loop.workflow.yaml`, with
+  native `WorkflowSpec.from_yaml` and optional `power-loop[workflow]` dependency.
+  Inject readers; keep host charter resolution/policy outside the compiler. Native
+  text delivery avoids file-report instructions; legacy compiler entry points keep
+  file delivery. Carry explicit tool limits, including empty lists, in executable IR.
+- Resume a successful single leaf of an original active parallel workflow through
+  its original engine/job/SID and a new node generation. Atomically admit exact
+  caller/workflow/result/journal/contract/plan evidence, claim one dispatch, and join
+  owned repairs before downstream. Preserve historical input decisions/results and
+  generation usage. Unowned/ambiguous dispatch cannot fabricate stopped evidence.
+  Finished workflows, dependent-scope recomputation and cross-process recovery stay closed.
+- Complete empty first-generation managed subagent output in its original session
+  with one bounded final-answer supplement, original guards/remaining rounds and
+  no business tools. Preserve finalization/usage, and reject empty/exhausted output
+  rather than letting a parent guessed answer mask missing child evidence. This
+  also repairs legacy async children; no serving activation or hard-budget guarantee.
+- Add a pure workflow continuation dependency plan covering sequence tails,
+  aggregates, declared references, input templates, known output-file references
+  and fallback ownership. Freeze live repair decisions before admission, reject
+  active/out-of-scope consumers, close branch intake before joining repairs, and
+  stop/drain owned repairs before driver cleanup. Preserve unrelated failures
+  without retrying side effects and avoid double-counting replayed foreach usage.
+  This prepares dependency repair; experimental finished-node/run continuation,
+  controller rebinding and published-result revisions remain unavailable.
+- Support opt-in success-only continuation of a handled standalone subagent on the
+  original job/session with a new execution generation, immutable result revision,
+  frozen saved contract and caller/target proofs, and a persistent single dispatch
+  claim. Reconcile lost admission/dispatch ACKs by reads, reject stale credentials,
+  and separate per-generation usage from lifetime/parent totals. Empty completed
+  turns receive one bounded original-session final-answer supplement with no
+  business tools; empty/failing output cannot report success. Workflow-node restart,
+  recovery, hard budgets and serving activation remain unavailable.
+- Support opt-in active workflow-node nudge through the original engine and exact
+  durable run/node/iteration route/attempt/SID binding. Persist operation/inbox and
+  per-attempt input closure; drain accepted race input before validation/review.
+  Require original receiver decisions and complete execution proof, recall lost
+  acknowledgements without replay, and block business retries with unresolved input.
+  Finished-node continuation, generation/result revision and recovery remain closed.
+- Support opt-in active linked-subagent nudge with atomic operation/inbox admission,
+  original caller-send binding, exact replay/lost-ACK lookup, and original-session
+  input decisions required before scope success. Keep the original job/run/owner
+  through queueing, model execution and finalization; preserve message whitespace.
+  Other finished-task resume and cross-process recovery remain blocked.
+- Add experimental per-request result snapshots and transactional processing
+  decisions with original assistant/send/revision proofs, resolved tool/async
+  receipts and follow-up work links. TaskRuntime records handled decisions and
+  recalls lost acknowledgements without repeating a model or side effect; node
+  success requires the corresponding successful model exit. This is partial B2,
+  not final workflow closure, delivery recovery, nudge/resume or serving activation.
+- Extend the experimental `TaskRuntime` to fresh detached workflows and logical
+  node scopes, with durable driver/physical-session binding, frozen contracts,
+  nested iteration identities, bounded required-child processing, and single-count
+  model usage rollups. Canonical node results precede step journals and workflow
+  results precede owner inbox/wake. Optional result-transaction guards reject live
+  required work and child results not delivered to/observed by the original node.
+  Generation-zero failures can close as unstarted; ambiguous claimed work cannot.
+  This remains opt-in and unreleased; finished workflow resume and external adapters
+  remain unavailable in the new backend pending completion/recovery protocols.
+- Experimental host-selected `TaskRuntime` adapters automatically register model sends
+  and standalone linked subagent creates, bind actual call/receipt rows, renew leases,
+  and persist execution results before legacy projection/wake. Required child admission
+  fails closed; replay never dispatches twice. Cancel/expiry retain execution evidence
+  and usage; stopped execution closes intake. This partial adapter explicitly rejects
+  unadapted async/continuation entry points and is not enabled in serving hosts.
+- Host opt-in `delegation_policy='single_level'`: persisted main/node/subagent roles,
+  finite-role tool filtering and dispatch guards, including continuation/restore.
+  Generic library callers retain the legacy default.
+- Experimental task protocol 2 separates persistent supervision ancestry from live
+  control-owner leases. `close_model_execution` closes only a send's model phase;
+  independent jobs survive it and node children retain their node owner. Protocol-1
+  experimental stores fail closed; normal schema v9 remains unchanged.
+- `queue_node_continuation` / engine `start_node_continuation` let host tools accept
+  a repair without waiting, while the owning engine joins it before downstream.
+  This legacy journal path is not the new durable operation/recovery adapter.
+- Experimental, opt-in `SchemaPolicy.TASKS` v10 storage and `COMPATIBLE` v9/v10 bridge
+  reads; normal v9 mode remains unchanged. Raw `MessageRef` identities keep seq APIs,
+  exact bigint strings, explicit migration and cross-session lookup isolation.
+- Experimental `runtime.jobs.JobManager` registration/operation/receipt/result ports
+  with atomic replay/claim, retained supervision, execution and ancestor fences.
+  These ports do not yet replace runtime controllers or implement the final success gate.
+- Tool runtime context now includes actual persisted `assistant_seq` and `tool_call_id`
+  for serial, batched and resumed invocation. Isolated PostgreSQL/real LLM runner:
+  `scripts/test_task_registry.py`. MySQL verification paused by user request.
+
+### Fixed
+- Isolate experimental workflow-node session/input-closure evidence by generation
+  while preserving first-generation IDs. Validate complete physical bindings against
+  frozen admissions before model sends, steering and duplicate binding/closure;
+  reject corrupt records and numeric-type coercion without overwriting evidence.
+  Finished-node resume stays unavailable until its owning-engine admission exists.
+- Preserve `new_input_after_pass` through child execution and workflow continuations.
+  Standalone subagents process input already drained into history at a pass boundary,
+  with a shared settlement round/time limit across continuations and nested work.
+- Stopping a subagent suppresses external wake only: its owner still receives the
+  durable cancelled/failed result. Keep it supervised until that result is enqueued.
+- Failed finalization cannot be replaced by an unrelated successful inbox continuation.
+  These are local execution fixes; design/192's durable JobManager, atomic completion
+  gate, crash recovery and hard budget protocol remain pending.
+
 ## [8.0.0] — 2026-10-22
 
 ### Breaking changes (design/191)

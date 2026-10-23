@@ -233,6 +233,8 @@ async def resume_run(
     ``executor`` / ``budget`` if the original run used one. A ``budget`` is
     pre-charged with the tokens already spent by replayed steps.
     """
+    from power_loop.runtime.task_runtime import reject_unregistered_adapter
+    reject_unregistered_adapter("workflow_resume", loop)
     store = await loop._ensure_store()
     spec, replay, j = await rehydrate(store, parent_sid, run_id)
     _guard_resumable(run_id, force)
@@ -244,6 +246,7 @@ async def resume_run(
         on_node_session=make_on_node_session(store, parent_sid, run_id),
         resume_sessions=resume_sessions(spec, replay, j),
         replay=replay, run_id=run_id,
+        history_owner_sid=parent_sid,
         allowed_tools=_journaled_clamp(j),
         file_io=file_io,
     )
@@ -267,51 +270,12 @@ def continuation_replay(spec: WorkflowSpec, node_id: str, results: dict[str, Age
     Parallel siblings retain their completed results. Foreach body IDs cannot identify
     an iteration and are rejected. Old reviews downstream of changed work never replay.
     """
-    invalid: set[str] = set()
-    found = False
+    from .continuation import plan_continuation, replay_results
 
-    def all_ids(node):
-        own = {node.id} if getattr(node, "id", None) else set()
-        for c in WorkflowEngine._children(node):
-            own.update(all_ids(c))
-        return own
-
-    def visit(node, in_foreach=False):
-        nonlocal found
-        if isinstance(node, AgentNode):
-            if node.id == node_id:
-                if in_foreach:
-                    raise WorkflowRunError("foreach continuation needs an iteration-specific target")
-                found = True
-                invalid.add(node.id)
-                return True
-            return False
-        affected = False
-        for child in WorkflowEngine._children(node):
-            if affected and isinstance(node, SequenceNode):
-                invalid.update(all_ids(child))
-            affected = visit(child, in_foreach or isinstance(node, ForeachNode)) or affected
-        if affected and getattr(node, "id", None):
-            invalid.add(node.id)
-        return affected
-
-    visit(spec.root)
-    if not found:
-        raise WorkflowRunError(f"unknown continuation node {node_id}")
+    plan = plan_continuation(spec, node_id)
     if invalidated is not None:
-        invalidated.update(invalid)
-    scope_ids = all_ids(spec.root)
-    replay = {k: v for k, v in results.items()
-              if k in scope_ids and k not in invalid and v.status not in ("pending", "running")}
-    def prune(node):
-        if isinstance(node, (LoopNode, ForeachNode)) and node.id in replay:
-            for key in all_ids(node.body):
-                replay.pop(key, None)
-        else:
-            for c in WorkflowEngine._children(node):
-                prune(c)
-    prune(spec.root)
-    return replay
+        invalidated.update(plan.invalidated)
+    return replay_results(spec, plan, results)
 
 
 async def resume_detached(
@@ -336,6 +300,15 @@ async def resume_detached(
     ``on_complete`` to take over the wake in-process (timer-free); it supersedes
     ``eager_wake`` and skips the durable timer (see :func:`run_detached`).
     """
+    from power_loop.runtime.execution_roles import require_orchestration
+    from power_loop.runtime.task_runtime import reject_unregistered_adapter
+    if getattr(loop, "task_runtime", None) is not None:
+        await require_orchestration(loop, "workflow", sid=parent_sid)
+        from power_loop.runtime.workflow_restore_runner import start
+        return await start(loop, parent_sid, run_id, continuation=continuation, executor=executor, budget=budget,
+            force=force, file_io=file_io, eager_wake=eager_wake, on_complete=on_complete)
+    reject_unregistered_adapter("workflow_resume", loop)
+    await require_orchestration(loop, "workflow", sid=parent_sid)
     store = await loop._ensure_store()
     if await store.get_session(parent_sid) is None:
         raise WorkflowRunError("parent session not found; cannot resume detached run")
@@ -369,6 +342,7 @@ async def resume_detached(
                 on_node_session=make_on_node_session(store, parent_sid, run_id),
                 resume_sessions=resume_sessions(spec, replay, j),
                 replay=replay, run_id=run_id, stop_event=cancel_token,
+                history_owner_sid=parent_sid,
                 allowed_tools=_journaled_clamp(j),
                 file_io=file_io,
             )

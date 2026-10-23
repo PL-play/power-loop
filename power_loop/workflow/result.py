@@ -199,6 +199,8 @@ class WorkflowRunHandle:
     run_id: str
     task: asyncio.Task[None]
     cancel_token: Any | None = None  # CancellationToken; flipped by cancel()
+    job_id: str | None = None  # opt-in task-runtime admission
+    operation_id: str | None = None
 
     def cancel(self, reason: str = "cancelled") -> None:
         """Request cooperative cancellation of this detached run."""

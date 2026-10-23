@@ -20,6 +20,8 @@ class ToolRuntimeContext:
     store: Any | None
     loop: Any | None
     config: Any | None
+    assistant_seq: int | None = None
+    tool_call_id: str | None = None
 
     @property
     def has_session_store(self) -> bool:
@@ -38,7 +40,10 @@ def get_tool_runtime_context(*, required: bool = False) -> ToolRuntimeContext:
     session_id = get_session_id()
     store = getattr(loop, "store", None) if loop is not None else None
     config = getattr(loop, "config", None) if loop is not None else None
-    ctx = ToolRuntimeContext(session_id=session_id, store=store, loop=loop, config=config)
+    from power_loop.runtime.invocation import current_invocation
+    assistant_seq, tool_call_id = current_invocation(session_id)
+    ctx = ToolRuntimeContext(session_id=session_id, store=store, loop=loop, config=config,
+                             assistant_seq=assistant_seq, tool_call_id=tool_call_id)
     if required and not ctx.has_session_store:
         raise RuntimeError("No active StatefulAgentLoop session/store is available for this tool call.")
     return ctx

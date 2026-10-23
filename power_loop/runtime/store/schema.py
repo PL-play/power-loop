@@ -272,6 +272,8 @@ class SchemaPolicy(str, Enum):
 
     AUTO_CREATE = "auto_create"  # create tables/indexes if missing, then stamp
     VERIFY = "verify"            # verify only; raise (with DDL) if missing/stale
+    TASKS = "tasks"              # explicit experimental v10, fresh or already v10 only
+    COMPATIBLE = "compatible"    # bridge: verify existing v9/v10, never migrate/create
 
 
 def _coerce_policy(policy: SchemaPolicy | str | None, create_schema: bool | None) -> SchemaPolicy:
@@ -469,6 +471,21 @@ async def ensure_schema(
     eff = _coerce_policy(policy, create_schema)
     validate_table_prefix(prefix)
     vtable = f"{prefix}schema_migrations"
+
+    if eff is SchemaPolicy.TASKS:
+        from .task_schema import ensure_task_schema
+        return await ensure_task_schema(db, prefix, create=True)
+    if eff is SchemaPolicy.COMPATIBLE:
+        from .task_schema import TASK_SCHEMA_VERSION, ensure_task_schema
+        if not await _table_exists(db, vtable):
+            raise StoreSchemaError("compatible mode requires an existing v9/v10 store")
+        row = await db.fetchone(f"SELECT version FROM {vtable} WHERE id=1")
+        version = int(row["version"]) if row else 0
+        if version == TASK_SCHEMA_VERSION:
+            return await ensure_task_schema(db, prefix, create=False)
+        if version != CURRENT_SCHEMA_VERSION:
+            raise StoreSchemaError("compatible mode supports existing v9/v10 only")
+        eff = SchemaPolicy.VERIFY
 
     if eff is SchemaPolicy.VERIFY:
         # Probe the version table via the CATALOG (never via SELECT … FROM, which would

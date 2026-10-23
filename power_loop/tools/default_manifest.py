@@ -4,6 +4,7 @@ from collections.abc import Sequence
 
 from power_loop.contracts.context_policy import ToolContextPolicy
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.tools.jobs import JOBS_DEFINITION
 
 DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
@@ -321,15 +322,21 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
             "Defaults: 20 records, 8000 characters; follow next_cursor for lists or "
             "next_char_offset for one record. output_file exports all selected stored records "
             "as JSONL to a NEW workspace file and returns only its path/count. Never re-executes tools."
+            " Native task history: supply job_id from jobs; sub_session selects an exact bound session, "
+            "including retained descendant nodes. message_id/message_ids select exact global raw IDs; "
+            "ids remains a seq range for messages. Task mode requires char_limit>=1024."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "sub_session": {"type": "string", "description": "Direct child session_id from spawn_agent. Omit for your own session; ownership is checked."},
+                "job_id": {"type": "string", "description": "Native task authority from jobs; omit for legacy current/direct-child recall. Multiple bound sessions require sub_session."},
+                "message_id": {"oneOf": [{"type": "string", "pattern": "^[0-9]+$"}, {"type": "integer", "minimum": 1}], "description": "Task mode: one global original-message ID, source=messages. Decimal strings preserve bigint precision."},
+                "message_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"oneOf": [{"type": "string", "pattern": "^[0-9]+$"}, {"type": "integer", "minimum": 1}]}, "description": "Task mode: exact global raw IDs; not a seq range. Mutually exclusive with ids/seq/id/message_id."},
                 "source": {"type": "string", "enum": ["messages", "projection"], "default": "messages", "description": "messages=original records (seq); projection=stored summaries (id)."},
-                "ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 2, "maxItems": 2, "description": "Inclusive [start,end] from the completion result's messages or projection field. Do not combine with seq/id/send_index."},
-                "seq": {"type": "integer", "minimum": 1, "description": "One original message; source=messages. send_index is optional."},
-                "id": {"type": "integer", "minimum": 1, "description": "One projection record; requires source=projection."},
+                "ids": {"type": "array", "items": {"oneOf": [{"type": "integer", "minimum": 1}, {"type": "string", "pattern": "^[0-9]+$"}]}, "minItems": 2, "maxItems": 2, "description": "Inclusive [start,end] from messages (seq) or projection (id). Native task mode also accepts decimal strings. Do not combine with seq/id/message_id(s)."},
+                "seq": {"oneOf": [{"type": "integer", "minimum": 1}, {"type": "string", "pattern": "^[0-9]+$"}], "description": "One original message; source=messages. Native task mode accepts a decimal string."},
+                "id": {"oneOf": [{"type": "integer", "minimum": 1}, {"type": "string", "pattern": "^[0-9]+$"}], "description": "One projection record; source=projection. Native task mode accepts a decimal string."},
                 "send_index": {"type": "integer", "minimum": 1, "description": "Existing #N send coordinate. Selects its records; may combine with seq, not ids."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20, "description": "Maximum listed records per page, also bounded by char_limit. File export includes the full selection."},
                 "cursor": {"type": "string", "description": "next_cursor from a list; repeat the same session/source/selection."},
@@ -445,6 +452,9 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
 
 # Indexed lookup for selective registration.
 DEFAULT_TOOL_DEFINITIONS_MAP: dict[str, ToolDefinition] = {d.name: d for d in DEFAULT_TOOL_DEFINITIONS}
+
+# Explicitly selectable built-in; do not widen existing presets or role lists.
+DEFAULT_TOOL_DEFINITIONS_MAP["jobs"] = JOBS_DEFINITION
 
 # ---------------------------------------------------------------------------
 # Tool presets (matching zero-code's BASE_TOOLS / EXPLORE_TOOLS categories)

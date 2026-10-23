@@ -161,6 +161,7 @@ class MessageRow:
     #: resets). NULL on rows written before schema v2 / outside a send. Default keeps legacy
     #: constructors (and the SQLite-only store) working.
     send_index: int | None = None
+    id: int | None = None  # v10; legacy rows never manufacture a global identity
 
 
 @dataclass

@@ -273,6 +273,17 @@ class WorkflowBudget:
 
 @dataclass(frozen=True)
 class WorkflowSpec:
+    @classmethod
+    def from_yaml(cls, text, *, args=None, load_file=None, read_workspace=None, output_mode="text"):
+        """Compile GHA-style YAML using optional ``power-loop[workflow]``.
+
+        Readers are host-injected; compilation performs no filesystem/database IO.
+        Null input defaults require an explicit value in ``args``.
+        """
+        from .yaml import compile_workflow_document
+        return compile_workflow_document(text, args, load_file=load_file or (lambda _skill, _path: None),
+            read_workspace=read_workspace, output_mode=output_mode)
+
     name: str
     root: WorkflowNode
     input: str = ""

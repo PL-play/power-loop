@@ -240,6 +240,9 @@ _USAGE_SINK: ContextVar[dict[str, int] | None] = ContextVar("power_loop_usage_si
 
 #: 子会话建好时的回调（6.46）：``cb(child_session_id)``，可以是协程函数。workflow 引擎用它记「节点 → 叶子会话」。
 _ON_CHILD_SESSION: ContextVar[Any] = ContextVar("power_loop_on_child_session", default=None)
+# Required durable admission is separate from best-effort observation. A failed
+# admission must abort before entering the child's model loop.
+_CHILD_ADMISSION: ContextVar[Any] = ContextVar("power_loop_child_admission", default=None)
 
 
 def _add_usage(into: dict[str, int], usage: dict[str, Any] | None) -> None:
@@ -302,25 +305,42 @@ def _child_config(spec: AgentSpec, parent_loop: Any) -> AgentLoopConfig:
                 f"(got {type(child_config).__name__})"
             )
 
-    return child_config
+    # The host factory may adjust context/model settings, not widen delegation.
+    return replace(child_config, delegation_policy=getattr(parent_config, "delegation_policy", "legacy"))
 
 
-async def workflow_continuation_loop(parent_loop: Any, session_id: str) -> Any:
+async def workflow_continuation_loop(parent_loop: Any, session_id: str, *, expected_contract=None) -> Any:
     """Rebuild a leaf with its persisted spec and host context policy."""
     from power_loop.agent.stateful_loop import StatefulAgentLoop
+
+    from .node_resume import _PREPARED
+    prepared = _PREPARED.get()
+    if prepared is not None and prepared.sid == session_id:
+        expected_contract = prepared.contract
 
     store = await parent_loop._ensure_store()
     contract = await store.get_runtime_state(session_id, "workflow_execution_contract")
     if not isinstance(contract, dict) or contract.get("version") != 1:
         raise ValueError("leaf execution contract missing; cannot safely continue this legacy session")
+    if expected_contract is not None and contract != expected_contract:
+        raise ValueError("leaf execution contract changed during continuation admission")
     spec = AgentSpec.from_dict(contract["spec"])
     from power_loop.core.agent_context import get_effective_tools
     effective = get_effective_tools()
     tools = [name for name in contract["tools"] if effective is None or name in effective]
+    from .execution_roles import finite_delegation, role_tools, session_role
+    child_config = _child_config(spec, parent_loop)
+    if contract.get("delegation_policy", "legacy") not in ("legacy", "single_level"):
+        raise ValueError("invalid_saved_delegation_policy")
+    if contract.get("delegation_policy") == "single_level":
+        child_config = replace(child_config, delegation_policy="single_level")
+    if finite_delegation(parent_loop) or child_config.delegation_policy == "single_level":
+        tools = role_tools(tools, await session_role(store, session_id))
     loop = StatefulAgentLoop(
-        llm=parent_loop.llm, store=store, config=_child_config(spec, parent_loop),
+        llm=parent_loop.llm, store=store, config=child_config,
         tool_registry=filtered_registry(parent_loop.tool_registry, tools),
         hooks=parent_loop._runner.hooks, event_bus=parent_loop._runner.event_bus,
+        task_runtime=getattr(parent_loop, "task_runtime", None),
     )
     loop._child_run_guards = getattr(parent_loop, "_child_run_guards", ())
     return loop
@@ -335,6 +355,7 @@ async def run_agent_spec(
     stop_event: CancellationLike = None,
     llm: Any | None = None,
     inherit_send_filter: bool = True,
+    execution_role: str = "subagent",
 ) -> dict[str, Any]:
     """Materialize ``spec`` as a child session under ``parent_loop`` and run it.
 
@@ -382,6 +403,17 @@ async def run_agent_spec(
     # The effective ceiling lives on the store (configurable); fall back to the
     # module default for any custom store that predates the attribute.
     store = await parent_loop._ensure_store()
+    if getattr(parent_loop, "task_runtime", None) is not None and _CHILD_ADMISSION.get() is None:
+        raise ValueError("task_owner_required")
+    from .execution_roles import finite_delegation, require_orchestration, role_tools, session_role
+    if execution_role not in ("subagent", "workflow_node"):
+        raise ValueError("invalid_execution_role")
+    if finite_delegation(parent_loop):
+        if execution_role == "workflow_node":
+            if not parent_sid or await session_role(store, parent_sid) != "workflow":
+                raise ValueError("execution_role_forbids_workflow_node")
+        else:
+            await require_orchestration(parent_loop, "spawn_agent")
     max_depth = getattr(store, "max_spawn_depth", MAX_SPAWN_DEPTH)
     parent_row = None
     if parent_sid is not None:
@@ -400,6 +432,8 @@ async def run_agent_spec(
 
     child_config = _child_config(spec, parent_loop)
     child_metadata = {**dict(spec.metadata), "spec_name": spec.name}
+    # Reserved host role never comes from user-authored spec metadata.
+    child_metadata["execution_role"] = execution_role
     if "workflow_ancestry" not in child_metadata:
         from power_loop.runtime.lineage import workflow_ancestry
         child_metadata["workflow_ancestry"] = workflow_ancestry(parent_row)
@@ -438,6 +472,8 @@ async def run_agent_spec(
     )
 
     sub_registry = filtered_registry(parent_loop.tool_registry, spec.tools)
+    if finite_delegation(parent_loop) and sub_registry is not None:
+        sub_registry = sub_registry.subset(role_tools(sub_registry.names(), execution_role))
     if inherit_send_filter and sub_registry is not None:
         from power_loop.core.agent_context import get_effective_tools
 
@@ -449,12 +485,18 @@ async def run_agent_spec(
 
     await store.set_runtime_state(child_sid, "workflow_execution_contract", {
         "version": 1,
+        "delegation_policy": child_config.delegation_policy,
         "spec": {f.name: getattr(spec, f.name) for f in fields(spec)},
         "tools": sub_registry.names() if sub_registry is not None else [],
     })
 
     # 子会话建好就告诉设了回调的那一层（6.46：workflow 引擎把「节点 → 叶子会话」记进 journal，重启后 resume 接着原会话跑）。
     # 只告诉最外层：这次子运行期间把回调清掉，叶子自己再派的子 agent 不会被当成叶子会话。
+    _admission = _CHILD_ADMISSION.get()
+    if getattr(parent_loop, "task_runtime", None) is not None and _admission is None:
+        raise ValueError("task_owner_required")
+    if _admission is not None:
+        await _admission(child_sid)
     _session_cb = _ON_CHILD_SESSION.get()
     if _session_cb is not None:
         try:
@@ -478,6 +520,7 @@ async def run_agent_spec(
         tool_registry=sub_registry,
         hooks=parent_loop._runner.hooks,
         event_bus=parent_loop._runner.event_bus,
+        task_runtime=getattr(parent_loop, "task_runtime", None),
     )
     # Child-run guards propagate: a grandchild spawned DURING this child's run
     # ticks the same task-local host state, so it must enter the same guards.
@@ -498,11 +541,13 @@ async def run_agent_spec(
             _my_sink: dict[str, int] = {}
             _sink_tok = _USAGE_SINK.set(_my_sink)
             _cb_tok = _ON_CHILD_SESSION.set(None)
+            _admission_tok = _CHILD_ADMISSION.set(None)
             try:
                 result = await child_loop.send(
                     user_input, session_id=child_sid, stop_event=stop_event
                 )
             finally:
+                _CHILD_ADMISSION.reset(_admission_tok)
                 _ON_CHILD_SESSION.reset(_cb_tok)
                 _USAGE_SINK.reset(_sink_tok)
             _total_usage: dict[str, int] = {}
@@ -573,6 +618,9 @@ async def run_agent_spec(
         "status": result.status,
         "final_text": result.final_text,
         "rounds": result.rounds,
+        # A pass can drain input into history without making another model call.
+        # Owning executors must consume that history before accepting the result.
+        "new_input_after_pass": result.new_input_after_pass,
         "depth": depth,
         # 自己 + 它下面所有子 agent 的用量（_USAGE_SINK）
         "usage": _total_usage,

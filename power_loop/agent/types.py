@@ -191,6 +191,9 @@ class AgentLoopConfig:
     #: retry_policy; overriding those is on you. Signature:
     #: ``(AgentSpec, AgentLoopConfig) -> AgentLoopConfig``.
     subagent_config_factory: Callable[[AgentSpec, AgentLoopConfig], AgentLoopConfig] | None = None
+    #: Host-only delegation policy. single_level allows main/workflow nodes to
+    #: delegate, but delegated agents cannot create another workflow or agent.
+    delegation_policy: str = "legacy"
 
     # ── Microcompact (large tool-output spill-to-disk) ──
     #
@@ -288,6 +291,8 @@ class AgentLoopConfig:
         return mt
 
     def __post_init__(self) -> None:
+        if self.delegation_policy not in ("legacy", "single_level"):
+            raise ValueError("delegation_policy must be legacy or single_level")
         self._map_legacy_axes()
         self._validate_context_config()
         # record_hook_events is a closed enum; normalize case and reject typos loudly (consistent

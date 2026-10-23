@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
@@ -85,10 +86,104 @@ _STOPPED_RUNS: set[str] = set()
 #: parent may nudge / resume its leaves and a stop is a no-op (6.46.3 — the parent's whole wake
 #: turn ran inside that task, so ``nudge`` was refused and ``cancel`` deadlocked on itself).
 _SETTLED_RUNS: set[str] = set()
+_LOCAL_STOP_TASKS: set[asyncio.Task] = set()
 
 
 def get_run_handle(run_id: str) -> WorkflowRunHandle | None:
     return _HANDLES.get(run_id)
+
+
+async def _owned_legacy_control(loop, parent_sid, run_id, reason, expected_generation):
+    """Prove the exact process-local handle before any legacy control."""
+    from power_loop.runtime.jobs import JobError
+
+    if not isinstance(run_id, str) or not re.fullmatch(r"[a-f0-9]{8,64}", run_id):
+        raise JobError("workflow_run_id_required")
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+        raise JobError("invalid_cancel_reason")
+    if expected_generation is not None:
+        raise JobError("legacy_generation_unavailable")
+    store = await loop._ensure_store()
+    if await journal.read(store, parent_sid, run_id) is None:
+        raise JobError("workflow_run_not_found")
+    base = {"version": 1, "backend": "legacy", "run_id": run_id,
+        "control_guarantee": "legacy_best_effort", "durable_intent": False,
+        "resource_stop_confirmed": False}
+    handle = _HANDLES.get(run_id)
+    if handle is None:
+        return base, None
+    if (getattr(handle, "_origin_store", None) is not store or
+            getattr(handle, "_origin_parent_sid", None) != parent_sid):
+        raise JobError("workflow_control_owner_mismatch")
+    if getattr(handle, "_task_runtime", None) is not None:
+        raise JobError("native_workflow_requires_durable_control")
+    return base, handle
+
+
+async def request_owned_node_stop(loop, parent_sid, run_id, node, *, reason="Stopped by request", expected_generation=None):
+    """Signal the engine retained by the proven handle, never a global ID lookup."""
+    from power_loop.runtime.jobs import JobError
+
+    if not isinstance(node, str) or not node.strip() or len(node) > 1000:
+        raise JobError("invalid_workflow_node")
+    base, handle = await _owned_legacy_control(loop, parent_sid, run_id, reason, expected_generation)
+    base = {**base, "node": node, "resource_state": "unknown", "local_signals": 0}
+    if handle is None:
+        return {**base, "status": "control_unavailable", "control_pending": True}
+    if handle.task.done() or run_id in _SETTLED_RUNS:
+        return {**base, "status": "already_finished", "control_pending": False}
+    engine = getattr(handle, "_origin_engine", None)
+    count = engine.cancel_node(node, reason) if engine is not None else 0
+    return {**base, "status": "accepted" if count else "control_unavailable", "control_pending": True,
+        "local_signals": count}
+
+
+async def request_owned_stop(loop, parent_sid, run_id, *, reason="Stopped by request", expected_generation=None):
+    """Legacy asynchronous control with exact process-local ownership.
+
+    No durable intent, remote liveness or physical-stop guarantee is invented.
+    Native model control must use the task registry instead.
+    """
+    base, handle = await _owned_legacy_control(loop, parent_sid, run_id, reason, expected_generation)
+    if handle is None:
+        return {**base, "status": "control_unavailable", "control_pending": True, "resource_state": "unknown"}
+    if handle.task.done() or run_id in _SETTLED_RUNS:
+        return {**base, "status": "already_finished", "control_pending": False, "resource_state": "unknown"}
+    previous = getattr(handle, "_local_stop_task", None)
+    if previous is None:
+        # Suppress callbacks before yielding to a background control coroutine.
+        _STOPPED_RUNS.add(run_id)
+        handle.cancel(reason)
+        grace = float(loop.config.stop_policy.workflow_s)
+
+        async def stop_original():
+            if _HANDLES.get(run_id) is not handle:
+                return "superseded"
+            return await stop_run(run_id, grace_s=grace, reason=reason)
+
+        control = asyncio.create_task(stop_original(), name="workflow-stop-"+run_id)
+        handle._local_stop_task = control
+        _LOCAL_STOP_TASKS.add(control)
+
+        def finished(task):
+            _LOCAL_STOP_TASKS.discard(task)
+            if not task.cancelled() and task.exception() is not None:
+                logger.error("legacy workflow stop requires reconciliation: %s", run_id)
+
+        control.add_done_callback(finished)
+    return {**base, "status": "accepted", "control_pending": True, "resource_state": "unknown",
+        "replayed_local_request": previous is not None}
+
+
+def remember_handle(runtime, handle):
+    for key in list(runtime._workflow_handles):
+        if len(runtime._workflow_handles) < 254:
+            break
+        if runtime._workflow_handles[key].task.done():
+            runtime._workflow_handles.pop(key)
+    for key in (handle.operation_id, handle.run_id):
+        if len(runtime._workflow_handles) < 256:
+            runtime._workflow_handles[key] = handle
 
 
 async def stop_run(run_id: str, *, grace_s: float = 60.0, reason: str = "stopped") -> str:
@@ -103,6 +198,11 @@ async def stop_run(run_id: str, *, grace_s: float = 60.0, reason: str = "stopped
         return "finished"
     if task is asyncio.current_task():
         return "finished"      # called from inside the run's own completion delivery — never wait on ourselves
+    runtime = getattr(handle, "_task_runtime", None)
+    registration = getattr(handle, "_task_registration", None)
+    if runtime is not None and registration is not None:
+        await runtime.manager.request_cancel(runtime.actor(registration.job.created_by_session_id),
+            registration.job.job_id, system_key="stop-run:" + run_id, reason=reason)
     _STOPPED_RUNS.add(run_id)
     handle.cancel(reason)
     done, _ = await asyncio.wait({task}, timeout=grace_s)
@@ -145,11 +245,18 @@ def make_on_node_session(store: Any, parent_sid: str, run_id: str):
 _ENGINES: dict[str, Any] = {}
 
 
-async def steer_node(run_id: str, node_id: str, sid: str, message: str):
+async def steer_node(run_id: str, node_id: str, sid: str, message: str, *, expected_job=None):
     engine = _ENGINES.get(run_id)
     if engine is None:
+        from power_loop.core.agent_context import get_current_loop
+        loop = get_current_loop()
+        if loop is not None and getattr(loop, "task_runtime", None) is not None:
+            from power_loop.runtime.node_inputs import steer
+            return await steer(loop, None, run_id, node_id, sid, message, expected_job=expected_job)
         raise RuntimeError("run is settling; retry nudge to resume the persisted workflow")
-    return await engine.steer_node(node_id, sid, message)
+    if expected_job is None:
+        return await engine.steer_node(node_id, sid, message)
+    return await engine.steer_node(node_id, sid, message, expected_job=expected_job)
 
 
 async def continue_node(run_id: str, node_id: str, message: str, rounds: int = 8):
@@ -158,6 +265,19 @@ async def continue_node(run_id: str, node_id: str, message: str, rounds: int = 8
     if engine is None:
         raise RuntimeError("run has no live engine; resume its persisted journal first")
     return await engine.continue_node(node_id, message, rounds)
+
+
+def queue_node_continuation(run_id: str, node_id: str, message: str, rounds: int = 8) -> None:
+    """Register the repair in its owning engine before returning acceptance.
+
+    No await boundary may separate registering this dependency from accepting it.
+    Persistent operation admission/restart recovery belongs to the new registry
+    adapter; this is the existing journal/engine path, not a durable job queue.
+    """
+    engine = _ENGINES.get(run_id)
+    if engine is None:
+        raise RuntimeError("run has no live engine; resume its persisted journal first")
+    engine.start_node_continuation(node_id, message, rounds)
 
 
 def cancel_node(run_id: str, node_id: str, reason: str = "cancelled by host") -> int | None:
@@ -266,7 +386,7 @@ async def _wake(loop: Any, parent_sid: str, note: str) -> None:
 
 async def _run_on_complete(
     on_complete: OnComplete, parent_sid: str, run_id: str, status: str, note: str
-) -> None:
+) -> bool:
     """Invoke the host completion callback in place of the durable-timer wake.
 
     The host owns delivery (die-with-process, no timer fallback). A raising
@@ -280,11 +400,13 @@ async def _run_on_complete(
                 parent_session_id=parent_sid, run_id=run_id, status=status, note=note,
             )
         )
+        return True
     except Exception:  # noqa: BLE001 — a lost wake is recoverable by re-request; a crash is not
         logger.warning(
             "workflow %s on_complete callback failed (wake lost; caller must re-request)",
             run_id, exc_info=True,
         )
+        return False
 
 
 async def run_detached(
@@ -313,35 +435,78 @@ async def run_detached(
     if not parent_sid:
         raise WorkflowRunError("detached run requires a parent_session_id on the workflow")
     loop = workflow._loop
+    runtime = getattr(loop, "task_runtime", None)
+    submitted_executor, submitted_budget, submitted_file_io = workflow._executor, workflow._budget, workflow._file_io
+    submitted_cancel = workflow._cancel
+    submitted_spec, submitted_tools = workflow.spec, workflow._allowed_tools
+    submitted_request = None
+    if runtime is not None:
+        from power_loop.runtime.workflow_profile import creation_request
+        submitted_request = creation_request(submitted_spec, submitted_tools, executor=submitted_executor,
+            budget=submitted_budget, file_io=submitted_file_io, completion_callback=on_complete is not None)
     store = await loop._ensure_store()
     if await store.get_session(parent_sid) is None:
         raise WorkflowRunError("parent session not found; cannot start detached run")
 
-    run_id = secrets.token_hex(8)
-    await journal.seed(
-        store, parent_sid, run_id, workflow.spec.name, spec=workflow.spec.to_dict(),
-        allowed_tools=(
-            sorted(workflow._allowed_tools) if workflow._allowed_tools is not None else None
-        ),
-    )
+    registration = None
+    if runtime is not None:
+        from power_loop.runtime.jobs import JobError
+        from power_loop.runtime.workflow_tasks import admit_workflow, validate_new_workflow
+
+        from .spec import WorkflowSpec
+        submitted_spec = WorkflowSpec.from_json(submitted_request["spec"])
+        validate_new_workflow(submitted_spec, eager_wake=eager_wake)
+        registration = await admit_workflow(runtime, parent_sid, submitted_request)
+        frozen_request = registration.operation.result["request"]
+        submitted_spec = WorkflowSpec.from_json(json.dumps(frozen_request["spec"], ensure_ascii=False))
+        submitted_tools = frozenset(frozen_request["allowed_tools"]) if frozen_request["allowed_tools"] is not None else None
+        run_id = registration.operation.operation_id[3:]
+        if registration.replayed:
+            handle = runtime._workflow_handles.get(registration.operation.operation_id) or runtime._workflow_handles.get(run_id) or get_run_handle(run_id)
+            if handle is None or handle.operation_id != registration.operation.operation_id:
+                raise JobError("workflow_admission_requires_reconciliation")
+            return handle
+    else:
+        run_id = secrets.token_hex(8)
+    try:
+        await journal.seed(
+            store, parent_sid, run_id, submitted_spec.name, spec=submitted_spec.to_dict(),
+            allowed_tools=(
+                sorted(submitted_tools) if submitted_tools is not None else None
+            ),
+        )
+    except BaseException:
+        if registration is not None:
+            await runtime.manager.request_cancel(runtime.actor(parent_sid), registration.job.job_id,
+                system_key="journal-admission:" + run_id, reason="workflow journal admission failed")
+        raise
 
     def _build_engine() -> WorkflowEngine:
         return WorkflowEngine(
-            loop, executor=workflow._executor, budget=workflow._budget,
+            loop, executor=submitted_executor, budget=submitted_budget,
             on_step=make_on_step(store, parent_sid, run_id),
             on_node_start=make_on_node_start(store, parent_sid, run_id),
             on_node_session=make_on_node_session(store, parent_sid, run_id),
-            stop_event=workflow._cancel, run_id=run_id,
-            allowed_tools=workflow._allowed_tools,
-            file_io=getattr(workflow, "_file_io", None),
+            stop_event=submitted_cancel, run_id=run_id,
+            history_owner_sid=parent_sid,
+            allowed_tools=submitted_tools,
+            file_io=submitted_file_io,
         )
 
-    return spawn_background(
+    handle = spawn_background(
         loop, parent_sid, run_id, store=store,
-        build_engine=_build_engine, run_spec=workflow.spec,
-        cancel_token=workflow._cancel, eager_wake=eager_wake, task_set=workflow._tasks,
+        build_engine=_build_engine, run_spec=submitted_spec,
+        cancel_token=submitted_cancel, eager_wake=eager_wake, task_set=workflow._tasks,
         on_complete=on_complete,
+        task_registration=registration,
     )
+    if registration is not None:
+        handle.job_id, handle.operation_id = registration.job.job_id, registration.operation.operation_id
+        handle._task_runtime, handle._task_registration = runtime, registration
+        # A bounded in-process replay accelerator; durable admission remains the
+        # authority. Missing handles after restart never authorize re-dispatch.
+        remember_handle(runtime, handle)
+    return handle
 
 
 def spawn_background(
@@ -356,6 +521,7 @@ def spawn_background(
     eager_wake: bool,
     task_set: set[Any],
     on_complete: OnComplete | None = None,
+    task_registration=None,
 ) -> WorkflowRunHandle:
     """Drive a workflow engine on a background task; journal + wake on finish.
 
@@ -372,14 +538,31 @@ def spawn_background(
     :class:`WorkflowCompletion` is handed to it instead (in-process, timer-free).
     """
 
+    runtime = getattr(loop, "task_runtime", None)
+    if runtime is not None and task_registration is None:
+        from power_loop.runtime.jobs import JobError
+        raise JobError("task_workflow_admission_required")
+
     async def _bg() -> None:
+        if task_registration is not None:
+            from power_loop.runtime.workflow_tasks import execute_background
+            try:
+                await execute_background(loop, parent_sid, run_id, task_registration, build_engine, run_spec, on_complete)
+            finally:
+                if _HANDLES.get(run_id) is handle:
+                    _LIVE_RUN_IDS.discard(run_id)
+                    _SETTLED_RUNS.add(run_id)
+            return
         status = "failed"
         try:
             engine = build_engine()
+            handle._origin_engine = engine
             _ENGINES[run_id] = engine
             try:
                 result = await engine.run(run_spec)
             finally:
+                if getattr(handle, "_origin_engine", None) is engine:
+                    del handle._origin_engine
                 if _ENGINES.get(run_id) is engine:
                     _ENGINES.pop(run_id, None)
             await journal.finalize(store, parent_sid, run_id, result)
@@ -387,6 +570,16 @@ def spawn_background(
             note = _wake_note(run_id, status)
             _publish(loop, parent_sid, run_id, "completed", status,
                      level=("error" if status == "failed" else "info"))
+        except asyncio.CancelledError:
+            # A forced legacy task exit is real business interruption, even
+            # when a provider could not return a final AgentResult. Preserve
+            # existing steps/usage and never claim its remote resources stopped.
+            try:
+                await journal.update(store, parent_sid, run_id, status="cancelled",
+                    error="workflow_execution_cancelled", finished_at_ms=journal._now_ms())
+            except Exception:
+                logger.exception("legacy cancellation journal requires reconciliation: %s", run_id)
+            raise
         except Exception as exc:  # noqa: BLE001 — capture everything; the task must not die silently
             await journal.fail(store, parent_sid, run_id, exc)
             status = "failed"
@@ -412,15 +605,16 @@ def spawn_background(
     # a crashed run is therefore NOT marked live, so resume-after-crash still works.
     _LIVE_RUN_IDS.add(run_id)
     _SETTLED_RUNS.discard(run_id)      # a resumed run starts unsettled again
-    task.add_done_callback(lambda _t: _LIVE_RUN_IDS.discard(run_id))
+    task.add_done_callback(lambda _t: _LIVE_RUN_IDS.discard(run_id) if _HANDLES.get(run_id) is handle else None)
     handle = WorkflowRunHandle(run_id=run_id, task=task, cancel_token=cancel_token)
+    handle._origin_store, handle._origin_parent_sid = store, parent_sid
     _HANDLES[run_id] = handle
 
     def _forget(_t: Any) -> None:
         if _HANDLES.get(run_id) is handle:
             _HANDLES.pop(run_id, None)
-        _STOPPED_RUNS.discard(run_id)
-        _SETTLED_RUNS.discard(run_id)
+            _STOPPED_RUNS.discard(run_id)
+            _SETTLED_RUNS.discard(run_id)
 
     task.add_done_callback(_forget)
     return handle

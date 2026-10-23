@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
@@ -17,7 +18,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMService,
     LLMStreamChunk,
 )
-from power_loop.core.agent_context import reset_current_loop, set_current_loop
+from power_loop.core.agent_context import reset_current_loop, reset_session_id, set_current_loop, set_session_id
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import register_workflow_tools
 from power_loop.workflow.result import SharedBudget
@@ -76,11 +77,24 @@ def _registered_handler(**seams: Any):
     return rt.handler
 
 
-async def _invoke(handler, loop: StatefulAgentLoop, **kwargs: Any) -> str:
+async def _invoke(handler, loop: StatefulAgentLoop, **kwargs: Any) -> tuple[dict, dict | None]:
+    from power_loop.workflow import journal
+    from power_loop.workflow.runner import get_run_handle
+    sid = await loop.new_session()
     token = set_current_loop(loop)
+    stok = set_session_id(sid)
     try:
-        return await handler(**kwargs)
+        out = await handler(**kwargs)
+        receipt = json.loads(out)
+        saved = None
+        if receipt.get("status") == "accepted":
+            handle = get_run_handle(receipt["run_id"])
+            assert handle is not None
+            await handle.task
+            saved = await journal.read(await loop._ensure_store(), sid, receipt["run_id"])
+        return receipt, saved
     finally:
+        reset_session_id(stok)
         reset_current_loop(token)
 
 
@@ -107,12 +121,13 @@ async def test_executor_factory_receives_context_and_is_used():
 
     loop = _loop()
     handler = _registered_handler(executor_factory=executor_factory)
-    out = await _invoke(handler, loop, spec=SPEC)
-    assert "completed" in out
+    out, saved = await _invoke(handler, loop, spec=SPEC)
+    assert out["status"] == "accepted" and saved["status"] == "completed"
+    assert saved["steps"][0]["text"] == "stubbed"
     # Evaluated per invocation, with the invoking loop.
     assert len(calls) == 1 and calls[0][0] is loop
-    out2 = await _invoke(handler, loop, spec=SPEC)
-    assert "completed" in out2
+    out2, saved2 = await _invoke(handler, loop, spec=SPEC)
+    assert out2["status"] == "accepted" and saved2["status"] == "completed"
     assert len(calls) == 2
 
 
@@ -132,14 +147,15 @@ async def test_budget_factory_budget_is_enforced():
         budget_factory=budget_factory,
         executor_factory=lambda loop, sid: _CostlyExec(),
     )
-    out = await _invoke(handler, _loop(), spec={
+    out, saved = await _invoke(handler, _loop(), spec={
         "name": "wf",
         "root": {"type": "sequence", "steps": [
             {"type": "agent", "id": "s1", "spec": {"name": "a", "system_prompt": "p"}},
             {"type": "agent", "id": "s2", "spec": {"name": "b", "system_prompt": "p"}},
         ]},
     })
-    assert "budget_exceeded" in out
+    assert out["status"] == "accepted" and saved["status"] == "budget_exceeded"
+    assert [step["status"] for step in saved["steps"]] == ["completed", "budget_exceeded"]
 
 
 async def test_spec_transform_rewrites_spec():
@@ -148,8 +164,8 @@ async def test_spec_transform_rewrites_spec():
         return replace(spec, name=f"clamped-{spec.name}")
 
     handler = _registered_handler(spec_transform=spec_transform)
-    out = await _invoke(handler, _loop(), spec=SPEC)
-    assert "clamped-wf" in out
+    out, saved = await _invoke(handler, _loop(), spec=SPEC)
+    assert out["workflow"] == saved["spec"]["name"] == "clamped-wf"
 
 
 async def test_spec_transform_rejection_reads_like_validation_error():
@@ -157,12 +173,12 @@ async def test_spec_transform_rejection_reads_like_validation_error():
         raise WorkflowSpecError(["policy: leaf 'a' requests a forbidden tool"])
 
     handler = _registered_handler(spec_transform=spec_transform)
-    out = await _invoke(handler, _loop(), spec=SPEC)
-    assert out.startswith("Error:")
-    assert "forbidden tool" in out
+    out, saved = await _invoke(handler, _loop(), spec=SPEC)
+    assert out["error"]["code"] == "invalid_workflow_spec" and saved is None
+    assert "forbidden tool" in out["error"]["problems"][0]
 
 
-async def test_spec_transform_bad_return_type_raises():
+async def test_spec_transform_bad_return_type_reports_admission_failure_without_execution():
     handler = _registered_handler(spec_transform=lambda spec: {"nope": 1})
-    with pytest.raises(TypeError, match="spec_transform must return"):
-        await _invoke(handler, _loop(), spec=SPEC)
+    out, saved = await _invoke(handler, _loop(), spec=SPEC)
+    assert out["error"]["code"] == "workflow_admission_requires_reconciliation" and saved is None

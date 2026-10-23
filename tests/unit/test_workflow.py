@@ -16,7 +16,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, StatefulAgentLoop
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
-from power_loop.core.agent_context import reset_current_loop, set_current_loop
+from power_loop.core.agent_context import reset_current_loop, reset_session_id, set_current_loop, set_session_id
 from power_loop.workflow import (
     AgentNode,
     SequenceNode,
@@ -324,33 +324,46 @@ async def test_engine_budget_stops_spawning():
 async def test_tool_requires_active_loop():
     out = await _handle_create_workflow(spec={"name": "w", "root": {
         "type": "agent", "id": "a", "spec": {"name": "a", "system_prompt": "p"}}})
-    assert out.startswith("Error:")
-    assert "active StatefulAgentLoop" in out
+    assert json.loads(out)["error"]["code"] == "active_session_required"
 
 
 async def test_tool_reports_validation_error_for_repair():
     loop = _loop()
+    sid = await loop.new_session()
     token = set_current_loop(loop)
+    stok = set_session_id(sid)
     try:
         out = await _handle_create_workflow(spec={"name": "", "root": {"type": "nope"}})
     finally:
+        reset_session_id(stok)
         reset_current_loop(token)
-    assert out.startswith("Error:")
-    assert "WorkflowSpec" in out  # aggregated problems the model can read & fix
+    error = json.loads(out)["error"]
+    assert error["code"] == "invalid_workflow_spec" and len(error["problems"]) >= 2
 
 
-async def test_tool_runs_and_returns_summary():
+async def test_tool_returns_admission_and_saves_result_asynchronously():
+    from power_loop.workflow import journal
+    from power_loop.workflow.runner import get_run_handle
     loop = _loop()
+    sid = await loop.new_session()
     token = set_current_loop(loop)
+    stok = set_session_id(sid)
     try:
         out = await _handle_create_workflow(
             spec={"name": "wf", "root": {"type": "agent", "id": "a",
                   "spec": {"name": "a", "system_prompt": "Summarize."}}},
             input="hello",
         )
+        receipt = json.loads(out)
+        assert receipt["status"] == "accepted" and receipt["workflow"] == "wf"
+        handle = get_run_handle(receipt["run_id"])
+        assert handle is not None
+        await handle.task
+        saved = await journal.read(await loop._ensure_store(), sid, receipt["run_id"])
+        assert saved["status"] == "completed" and saved["spec"]["input"] == "hello"
     finally:
+        reset_session_id(stok)
         reset_current_loop(token)
-    assert "workflow 'wf' -> completed" in out
 
 
 # ── per-subagent LLM override (B1) + output_schema enforcement ────────────────

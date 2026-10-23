@@ -38,6 +38,7 @@ dependencies = []
 anthropic = ["anthropic>=0.42.0"]
 openai = ["openai>=1.52.0"]
 skills = ["pyyaml>=6.0"]          # YAML frontmatter parsing in load_skill (degrades to none without it)
+workflow = ["pyyaml>=6.0"]        # GHA-style YAML workflow compiler; core IR stays stdlib-only
 pdf = ["pypdf>=5.3.0"]            # PDF input parsing in the multimodal helper
 images = ["Pillow>=10"]           # enforce ModelCapabilities.max_image_edge (without it an oversized image is sent at original size, with a warning)
 prometheus = ["prometheus-client>=0.19"]  # contrib.metrics_sink PrometheusBackend (OBS-4)

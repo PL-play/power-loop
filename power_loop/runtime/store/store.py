@@ -189,6 +189,8 @@ class SessionStore:
         self.max_spawn_depth = max_spawn_depth  # validated by the property setter
         self.table_prefix = validate_table_prefix(table_prefix)
         self.t = _Tables(self.table_prefix)
+        self._schema_version = CURRENT_SCHEMA_VERSION
+        self.store_id: str | None = None
 
     @property
     def max_spawn_depth(self) -> int:
@@ -222,12 +224,31 @@ class SessionStore:
         from power_loop.runtime.store.backends.sqlite import SqliteDatabase
 
         db = SqliteDatabase.open(path)
-        await ensure_schema(db, table_prefix, policy=schema, create_schema=create_schema)
-        return cls(db, max_spawn_depth=max_spawn_depth, table_prefix=table_prefix)
+        try:
+            version = await ensure_schema(db, table_prefix, policy=schema, create_schema=create_schema)
+            store = cls(db, max_spawn_depth=max_spawn_depth, table_prefix=table_prefix)
+            await store._initialize_identity(version)
+            return store
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await db.close()
+            raise
+
+    async def _initialize_identity(self, version: int) -> None:
+        self._schema_version = version
+        if version >= 10:
+            row = await self._db.fetchone(f"SELECT store_id FROM {self.table_prefix}task_store WHERE id=1")
+            if row is None:
+                raise ValueError("task store identity missing")
+            self.store_id = str(row["store_id"])
 
     @property
     def schema_version(self) -> int:
-        return CURRENT_SCHEMA_VERSION
+        return self._schema_version
+
+    @property
+    def has_message_ids(self) -> bool:
+        return self.schema_version >= 10 and self.store_id is not None
 
     # ── maintenance (optional capability; no-op on backends that lack it) ──────
     async def checkpoint(self, *, mode: str = "TRUNCATE") -> None:
@@ -333,6 +354,27 @@ class SessionStore:
             )
 
     # ── messages ──────────────────────────────────────────────────────────────
+    async def message_ref(self, session_id: str, seq: int | str):
+        from power_loop.runtime.message_ref import MessageRef, integer_id
+
+        row = await self._db.fetchone(f"SELECT * FROM {self.t.messages} WHERE session_id=? AND seq=?",
+                                     (session_id, integer_id(seq, "seq")))
+        if row is None:
+            raise ValueError("message_not_found")
+        return MessageRef(self.store_id, session_id,
+                          int(row["id"]) if "id" in row.keys() else None,
+                          int(row["seq"]), row["role"], row["tool_call_id"],
+                          row["send_index"], row["round_index"])
+
+    async def message_by_id(self, session_id: str, message_id: int | str) -> MessageRow | None:
+        from power_loop.runtime.message_ref import integer_id
+
+        if not self.has_message_ids:
+            raise ValueError("message_ids_unsupported: legacy schema")
+        row = await self._db.fetchone(f"SELECT * FROM {self.t.messages} WHERE session_id=? AND id=?",
+                                     (session_id, integer_id(message_id)))
+        return _row_to_message(row) if row else None
+
     async def append_message(
         self,
         session_id: str,
@@ -487,6 +529,7 @@ class SessionStore:
         self, session_id: str, *, source: str = "messages", lo: int = 0,
         hi: int | None = None, after: int = 0, limit: int = 20,
         send_index: int | None = None, _fetchall: Any = None,
+        record_ids: list[int] | None = None, exclude_compact: bool = False,
     ) -> list[dict[str, Any]]:
         """Bounded, session-scoped audit read. Never substitute active history for originals."""
         if source not in {"messages", "projection"}:
@@ -508,6 +551,13 @@ class SessionStore:
         if send_index is not None:
             where += " AND send_index=?"
             params.append(send_index)
+        if record_ids is not None:
+            if not record_ids or len(record_ids) > 100:
+                raise ValueError("record_ids must contain 1..100 exact IDs")
+            where += " AND id IN (" + ",".join("?" for _ in record_ids) + ")"
+            params.extend(record_ids)
+        if source == "projection" and exclude_compact:
+            where += " AND kind IN ('user','project')"
         rows = await (_fetchall or self._db.fetchall)(
             f"SELECT * FROM {table} WHERE {where} ORDER BY {coord} ASC LIMIT ?",
             (*params, max(1, min(limit, 1000))),
@@ -517,24 +567,26 @@ class SessionStore:
 
     async def history_bounds(
         self, session_id: str, *, source: str = "messages", after_seq: int | None = None,
+        _fetchone: Any = None,
     ) -> list[int] | None:
         """Coordinates for one execution's tail, including all its repair sends."""
         if source == "messages":
-            row = await self._db.fetchone(
+            row = await (_fetchone or self._db.fetchone)(
                 f"SELECT min(seq) AS lo, max(seq) AS hi FROM {self.t.messages} "
                 "WHERE session_id=? AND seq>?", (session_id, after_seq or 0),
             )
         elif source == "projection":
             from power_loop.runtime.store.schema import _column_exists
-            async with self._db.transaction() as tx:
-                if not await _column_exists(tx, self._db.dialect.name, self.t.project_messages, "id"):
-                    raise ValueError("projection_ids_unavailable: legacy schema")
+            if _fetchone is None:
+                async with self._db.transaction() as tx:
+                    if not await _column_exists(tx, self._db.dialect.name, self.t.project_messages, "id"):
+                        raise ValueError("projection_ids_unavailable: legacy schema")
             where = "session_id=?"
             params: tuple[Any, ...] = (session_id,)
             if after_seq is not None:
                 where += " AND kind IN ('user','project') AND source_seq_hi>?"
                 params += (after_seq,)
-            row = await self._db.fetchone(
+            row = await (_fetchone or self._db.fetchone)(
                 f"SELECT min(id) AS lo, max(id) AS hi FROM {self.t.project_messages} "
                 f"WHERE {where}", params,
             )
@@ -1921,10 +1973,10 @@ class SessionStore:
         cascade-deleted when that unrelated parent is closed — destroying the
         just-restored session (C2)."""
         version = int(data.get("schema_version", 0))
-        if version > CURRENT_SCHEMA_VERSION:
+        if version > self.schema_version:
             raise ValueError(
                 f"export schema_version {version} is newer than this power_loop build "
-                f"supports (max {CURRENT_SCHEMA_VERSION})"
+                f"supports (max {self.schema_version})"
             )
         tables = data["tables"]
         new_id = new_session_id or _new_session_id()
@@ -1977,6 +2029,7 @@ def _row_to_message(row: Row) -> MessageRow:
         tool_call_id=row["tool_call_id"], round_index=row["round_index"],
         state=MessageState(row["state"]), meta=_loads(row["meta_json"]) or {},
         created_at=row["created_at"], send_index=row["send_index"],
+        id=int(row["id"]) if "id" in row.keys() and row["id"] is not None else None,
     )
 
 

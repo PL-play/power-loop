@@ -16,6 +16,7 @@ the matching extra only when their scheme is used.
 
 from __future__ import annotations
 
+import contextlib
 import re
 
 from power_loop.runtime.store.db import Database
@@ -39,8 +40,15 @@ async def open_store(
     (:class:`SchemaPolicy`, default AUTO_CREATE). ``create_schema`` (bool) is a deprecated
     alias (True→AUTO_CREATE, False→VERIFY)."""
     db = await _make_database(dsn)
-    await ensure_schema(db, table_prefix, policy=schema, create_schema=create_schema)
-    return SessionStore(db, max_spawn_depth=max_spawn_depth, table_prefix=table_prefix)
+    try:
+        version = await ensure_schema(db, table_prefix, policy=schema, create_schema=create_schema)
+        store = SessionStore(db, max_spawn_depth=max_spawn_depth, table_prefix=table_prefix)
+        await store._initialize_identity(version)
+        return store
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await db.close()
+        raise
 
 
 _SCHEME_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9.+-]*)://")

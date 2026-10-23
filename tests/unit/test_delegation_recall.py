@@ -276,14 +276,19 @@ async def test_projection_failure_is_not_business_failure(setup, monkeypatch):
     assert result["projection"] is None and result["projection_status"] == "failed"
 
 
-async def test_stop_during_finalization_does_not_leave_running_job_or_wake(setup):
+async def test_stop_during_finalization_keeps_owner_result_without_external_wake(setup):
     store, loop, _, parent = setup
     entered = asyncio.Event()
+    wakes = []
+
+    async def notified(*args):
+        wakes.append(args)
+
     async def blocked(sid, result):
         entered.set()
         await asyncio.Event().wait()
     receipt = await delegation.start(loop, AgentSpec(name="x", system_prompt="x", lifecycle="linked"),
-                                      "task", finalize=blocked)
+                                      "task", finalize=blocked, on_complete=notified)
     await entered.wait()
     assert any(j["id"] == "sub:" + receipt["run_id"] for j in await loop.list_jobs(parent))
     status = await delegation.stop(store, parent, receipt["run_id"], 0.01)
@@ -292,4 +297,8 @@ async def test_stop_during_finalization_does_not_leave_running_job_or_wake(setup
     assert not delegation.running_jobs(store, parent)
     record = await store.get_runtime_state(parent, "subagent:run:" + receipt["run_id"])
     assert record["result"]["status"] == "cancelled"
-    assert (await store.inbox_counts(parent))["pending"] == 0
+    assert (await store.inbox_counts(parent))["pending"] == 1
+    [item] = await store.inbox_items(parent)
+    payload = json.loads(item["content"].removeprefix(delegation.RESULT_PREFIX))
+    assert payload["status"] == "cancelled" and payload["run_id"] == receipt["run_id"]
+    assert not wakes

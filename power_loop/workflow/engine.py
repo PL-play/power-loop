@@ -62,6 +62,7 @@ _LOOP_KEY = "\x00loop"
 #: 当前 foreach 迭代自己的结果表（6.46.1）。body 的节点在每次迭代里 id 都一样，并行迭代共用全局结果表时，
 #: 体内的 inputs_from / when / 循环的 until 会读到别的迭代的结果。每个迭代在自己的 task 里开一层，嵌套的迭代再往里叠一层。
 _ITER_SCOPE: ContextVar[ChainMap[str, AgentResult] | None] = ContextVar("pl_wf_iter_scope", default=None)
+_DEFER_STEP: ContextVar[str | None] = ContextVar("pl_wf_defer_task_step", default=None)
 
 
 class _ScopedResults(dict):
@@ -194,7 +195,8 @@ class InProcessExecutor:
         token = set_session_id(driver_sid)
         try:
             raw = await run_agent_spec(
-                spec, user_input, parent_loop=parent_loop, stop_event=stop_event
+                spec, user_input, parent_loop=parent_loop, stop_event=stop_event,
+                execution_role="workflow_node",
             )
         finally:
             reset_session_id(token)
@@ -228,10 +230,19 @@ class InProcessExecutor:
             with _ctxlib.ExitStack() as guards:
                 for _name, guard in getattr(parent_loop, "_child_run_guards", ()) or ():
                     guards.enter_context(guard())
-                res = await leaf_loop.follow_up(
-                    user_input, session_id=session_id,
-                    stop_event=stop_event, max_rounds=extra_rounds,
-                )
+                from power_loop.runtime.node_resume import _PREPARED
+                prepared = _PREPARED.get()
+                if prepared is not None and prepared.sid == session_id and prepared.pending:
+                    prepared.pending = False
+                    res = await prepared.child.flush_follow_ups(session_id, stop_event=stop_event,
+                        max_rounds=min(extra_rounds, prepared.child.config.max_rounds))
+                    if res is None or (res.status == "completed" and not (res.final_text or "").strip() and not getattr(prepared, "restored", False)):
+                        raise WorkflowRunError("node resume produced no final answer")
+                else:
+                    res = await leaf_loop.follow_up(
+                        user_input, session_id=session_id,
+                        stop_event=stop_event, max_rounds=extra_rounds,
+                    )
         finally:
             _USAGE_SINK.reset(sink_tok)
         status = str(getattr(res, "status", "failed") or "failed")
@@ -241,6 +252,7 @@ class InProcessExecutor:
             "status": status,
             "final_text": str(getattr(res, "final_text", "") or ""),
             "rounds": int(getattr(res, "rounds", 0) or 0),
+            "new_input_after_pass": bool(getattr(res, "new_input_after_pass", False)),
             "usage": usage,
             "session_id": session_id,
         }
@@ -318,8 +330,10 @@ class WorkflowEngine:
         file_io: WorkflowFileIO | None = None,
         on_node_session: Callable[[str, str], Awaitable[None]] | None = None,
         resume_sessions: dict[str, str] | None = None,
+        history_owner_sid: str | None = None,
     ) -> None:
         self._loop = parent_loop
+        self._history_owner_sid = history_owner_sid
         self._executor = executor or InProcessExecutor()
         self._budget = budget
         # Capability clamp: every leaf's tools are intersected with this set at
@@ -392,11 +406,27 @@ class WorkflowEngine:
         self._emit_suppressed = 0
         self._frames: dict[int, dict[str, Any]] = {}
         self._repairs: dict[int, asyncio.Task[Any]] = {}
+        self._continuation_barriers: set[int] = set()
+        self._accept_continuations = True
         self._resume_instructions: dict[str, tuple[str, int]] = {}
         self._replay_no_charge: set[str] = set()
         self._steering: dict[str, list[asyncio.Task[Any]]] = {}
+        self._task_execution = None
+        self._task_nodes: dict[str, Any] = {}
 
     async def run(self, spec: WorkflowSpec) -> WorkflowResult:
+        runtime = getattr(self._loop, "task_runtime", None)
+        if runtime is not None:
+            from power_loop.runtime.jobs import JobError
+            from power_loop.runtime.workflow_tasks import current_workflow
+            if (self._task_execution is None or current_workflow(runtime) is not self._task_execution or
+                    self._run_id != self._task_execution.resource_evidence.get("workflow_run_id")):
+                raise JobError("task_workflow_admission_required")
+            if (self._replay or self._resume_sessions) and not getattr(self, "_restore_operation_id", None):
+                raise JobError("task_adapter_unavailable:workflow_resume")
+            if getattr(self, "_restore_operation_id", None):
+                from power_loop.runtime.workflow_restore_execution import validate_engine
+                await validate_engine(runtime, self._task_execution, self, spec)
         self._spec = spec
         if self._budget is None and spec.budget is not None:
             self._budget = SharedBudget(
@@ -404,10 +434,32 @@ class WorkflowEngine:
             )
         # On resume, pre-charge the (fresh) budget with tokens already spent by
         # replayed steps so the shared ceiling accounts for the whole run.
-        if self._budget is not None and self._replay:
+        if self._budget is not None and self._replay and not getattr(self, "_restore_operation_id", None):
             for r in self._replay.values():
                 self._budget.commit(r.usage)
-        driver_sid = await self._loop.new_session(metadata={"kind": "wf_driver", "workflow": spec.name})
+        driver_meta = {"kind": "wf_driver", "workflow": spec.name}
+        if runtime is None and self._run_id and self._history_owner_sid:
+            driver_meta.update(workflow_run_id=self._run_id, legacy_workflow_owner_sid=self._history_owner_sid)
+        if runtime is not None:
+            driver_meta.update(task_owner_job_id=self._task_execution.lease.job_id,
+                               workflow_run_id=self._run_id, execution_role="workflow",
+                               task_workflow_generation=self._task_execution.lease.generation)
+        if runtime is not None and getattr(self, "_restore_operation_id", None):
+            from power_loop.runtime.workflow_restore_execution import create_driver
+            try:
+                driver_sid = await create_driver(runtime, self._task_execution, self._restore_operation_id)
+            except Exception:
+                from power_loop.runtime.workflow_controller import physical
+                from power_loop.runtime.workflow_restore_execution import driver_proof
+                async with runtime.manager._write() as tx:
+                    row = await runtime.manager._fence(tx, self._task_execution.actor, self._task_execution.lease)
+                    op, request, _ = await driver_proof(runtime.manager, tx, row)
+                    if op["event_id"] != self._restore_operation_id:
+                        raise JobError("workflow_restore_driver_mismatch") from None
+                    driver_sid = request["driver_sid"]
+                    await physical(runtime.manager, tx, row, driver_sid, self._run_id)
+        else:
+            driver_sid = await self._loop.new_session(metadata=driver_meta)
         # Driver rows are deliberately ephemeral. Freeze execution ancestry in
         # each leaf so late receipts and restarts don't depend on those rows.
         from power_loop.core.agent_context import get_session_id
@@ -426,6 +478,20 @@ class WorkflowEngine:
                     break
 
         try:
+            if runtime is None and self._run_id and self._history_owner_sid:
+                from .legacy_history import register_driver
+                await register_driver(self._loop.store, self._history_owner_sid, self._run_id, driver_sid, spec)
+            if runtime is not None:
+                try:
+                    await runtime.manager.bind_workflow_driver(self._task_execution.actor, self._task_execution.lease, driver_sid)
+                except Exception:
+                    if not getattr(self, "_restore_operation_id", None):
+                        raise
+                    control = await runtime.manager.get_workflow_controller(self._task_execution.actor,
+                        self._task_execution.lease.job_id, self._task_execution.lease.generation)
+                    if control["session_id"] != driver_sid:
+                        raise JobError("workflow_restore_driver_mismatch") from None
+                    await runtime.manager.check_execution(self._task_execution.actor, self._task_execution.lease)
             env: dict[str, Any] = {"input": spec.input}
             status = "completed"
             guard = _IN_WORKFLOW.set(True)
@@ -442,9 +508,20 @@ class WorkflowEngine:
                 status = "failed"
                 self._errors.append(str(exc))
             finally:
-                _IN_WORKFLOW.reset(guard)
-                if watchdog is not None:
-                    watchdog.cancel()
+                self._accept_continuations = False
+                # Repairs are owned work. On errors/cancellation, stop and join
+                # them before the driver can disappear or the run can settle.
+                try:
+                    repairs = list(self._repairs.values())
+                    for task in repairs:
+                        if not task.done():
+                            task.cancel()
+                    if repairs:
+                        await asyncio.gather(*repairs, return_exceptions=True)
+                finally:
+                    _IN_WORKFLOW.reset(guard)
+                    if watchdog is not None:
+                        watchdog.cancel()
             if self._timed_out:
                 status = "failed"
                 self._errors.append(f"run 超时（{int(spec.timeout_s or 0)} 秒）：没跑完的节点已停，没开始的不再启动")
@@ -516,9 +593,17 @@ class WorkflowEngine:
             return list(node.cases.values()) + ([node.default] if node.default else [])
         return []
 
-    async def steer_node(self, node_id: str, sid: str, message: str):
+    async def steer_node(self, node_id: str, sid: str, message: str, *, expected_job=None):
         """Accept steering only while this engine owns execution, never launch an idle send."""
         import uuid
+
+        from power_loop.runtime.task_runtime import reject_unregistered_adapter
+        if getattr(self._loop, "task_runtime", None) is not None:
+            from power_loop.runtime.node_inputs import steer
+            return await steer(self._loop, self, self._run_id, node_id, sid, message, expected_job=expected_job)
+        if expected_job is not None:
+            raise WorkflowRunError("native node expectation requires a task runtime")
+        reject_unregistered_adapter("workflow_nudge", self._loop)
         pending = self._steering.get(node_id)
         if pending is None:
             raise WorkflowRunError("node is settling; retry nudge after its journal step settles")
@@ -528,12 +613,17 @@ class WorkflowEngine:
         pending.append(task)  # registered before any await; the leaf joins delivery before settling
         return await asyncio.shield(task)
 
-    async def continue_node(self, node_id: str, message: str, rounds: int) -> AgentResult | None:
+    def start_node_continuation(self, node_id: str, message: str, rounds: int) -> asyncio.Task:
         """Recover a settled branch while siblings run, using the original leaf session.
 
         Active dependent scopes are rejected before executing anything. Foreach IDs are
         ambiguous and require iteration-aware orchestration instead of guessing a session.
         """
+        from power_loop.runtime.task_runtime import reject_unregistered_adapter
+        reject_unregistered_adapter("workflow_nudge", self._loop)
+        if not self._accept_continuations or self._cancel.is_cancelled():
+            raise WorkflowRunError("run is settling; resume the persisted workflow")
+
         def path_to(node):
             if isinstance(node, AgentNode) and node.id == node_id:
                 return [node]
@@ -543,6 +633,8 @@ class WorkflowEngine:
                     return [node, *path]
             return None
 
+        from .continuation import plan_continuation, replay_results, subtree_ids, walk, within
+        plan = plan_continuation(self._spec, node_id)
         path = path_to(self._spec.root)
         if not path or any(isinstance(n, ForeachNode) for n in path):
             raise WorkflowRunError("node is missing or requires an explicit foreach iteration")
@@ -559,23 +651,43 @@ class WorkflowEngine:
                 break
             scope = parent
         key = id(scope)
+        if any(id(n) in self._continuation_barriers for n in path):
+            raise WorkflowRunError("dependent scope is settling; continuation intake is closed")
+        scope_path = plan.target_path[:next(i for i, n in enumerate(path) if n is scope)]
+        scope_ids = subtree_ids(scope)
+        if any(p < plan.target_path and not within(plan.target_path, p) for p in plan.affected_paths):
+            raise WorkflowRunError("continuation affects earlier work; dependency order requires full replanning")
+        # Full-spec analysis catches references outside the chosen repair scope.
+        # A live repair cannot rewrite another settled branch or race a consumer.
+        for occurrence, candidate in walk(self._spec.root):
+            frame = self._frames.get(id(candidate))
+            if (occurrence in plan.affected_paths and frame and frame["active"] and
+                    not within(scope_path, occurrence)):
+                raise WorkflowRunError("dependent scope is still active; wait for its current step to settle")
+        if (plan.invalidated - scope_ids) & self._results.keys():
+            raise WorkflowRunError("continuation affects results outside this branch; resume the persisted workflow")
+        if key in self._repairs and self._repairs[key].done():
+            self._repairs[key].result()  # Do not silently discard failed repairs.
+            self._repairs.pop(key)
         if key in self._repairs:
             raise WorkflowRunError("this branch already has a continuation in progress")
         prior = self._results.get(node_id)
         if prior is None or not prior.session_id:
             raise WorkflowRunError("node has no resumable session")
         sf = self._frames[key]
+        # Freeze the invalidation/replay decision before returning acceptance.
+        # The task must not recompute it from a later mutable result table.
+        repaired_spec = replace(self._spec, root=scope)
+        invalidated = plan.invalidated & scope_ids
+        replay = replay_results(repaired_spec, plan, dict(self._results))
 
         async def repair():
-            from .resume import continuation_replay
-            repaired_spec = replace(self._spec, root=scope)
-            for key in _agent_ids(scope):
-                self._replay.pop(key, None)
-            invalidated: set[str] = set()
-            replay = continuation_replay(repaired_spec, node_id, dict(self._results), invalidated=invalidated)
+            for replay_id in scope_ids:
+                self._replay.pop(replay_id, None)
             self._replay.update(replay)
             self._replay_no_charge.update(replay)
-            for invalid_id in invalidated:
+            for invalid_id in sorted(invalidated):
+                self._tolerated.discard(invalid_id)
                 self._replay.pop(invalid_id, None)
                 old = self._results.pop(invalid_id, None)
                 await self._emit_step(AgentResult(
@@ -590,14 +702,26 @@ class WorkflowEngine:
             finally:
                 _IN_WORKFLOW.reset(guard)
 
-        task = asyncio.create_task(repair(), name=f"workflow-continue-{node_id}")
+        coroutine = repair()
+        try:
+            task = asyncio.create_task(coroutine, name=f"workflow-continue-{node_id}")
+        except BaseException:
+            coroutine.close()
+            raise
         self._repairs[key] = task
+        return task
+
+    async def continue_node(self, node_id: str, message: str, rounds: int) -> AgentResult | None:
+        """Host/test await API; model tools use start_node_continuation."""
+        task = self.start_node_continuation(node_id, message, rounds)
         try:
             return await asyncio.shield(task)
         finally:
             # Keep the task registered until completed, even if the caller disconnects.
             if task.done():
-                self._repairs.pop(key, None)
+                for key, registered in list(self._repairs.items()):
+                    if registered is task:
+                        self._repairs.pop(key, None)
 
     async def _exec(self, node: WorkflowNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         if ITERATION_ENV_KEY in env:
@@ -649,7 +773,10 @@ class WorkflowEngine:
             lc = {"loop_id": node.id, "iteration": iteration, "max": node.max_iterations,
                   "continue": set(node.continue_nodes), "prev": dict(prev), "why": why,
                   "feedback": self._loop_feedback(feedback_node) if iteration > 1 else ""}
-            body_result = await self._exec(node.body, {**env, _LOOP_KEY: lc, "loop_iteration": iteration}, driver_sid)
+            from power_loop.runtime.workflow_tasks import ROUTE_KEY
+            body_env = {**env, _LOOP_KEY: lc, "loop_iteration": iteration,
+                        ROUTE_KEY: [*env.get(ROUTE_KEY, []), {"loop": node.id, "iteration": iteration}]}
+            body_result = await self._exec(node.body, body_env, driver_sid)
             if body_result is not None and body_result.status not in ("completed", "skipped") and body_result.node_id not in self._tolerated:
                 why = f"上游 {body_result.node_id} 未完成：{body_result.status}；审核与下一轮已阻断"
                 break
@@ -686,17 +813,59 @@ class WorkflowEngine:
         return (r.text or r.error or "")[:4000]
 
     async def _exec_agent(self, node: AgentNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
+        runtime = getattr(self._loop, "task_runtime", None)
+        if runtime is None:
+            return await self._exec_agent_admitted(node, env, driver_sid)
+        if getattr(self, "_restore_operation_id", None) and node.id in self._replay:
+            return await self._exec_agent_body(node, env, driver_sid)
+        from power_loop.runtime.jobs import JobError
+        from power_loop.runtime.workflow_tasks import node_execution
+        node_stop = self._cancel.child()
+        async with node_execution(runtime, self, node, env, driver_sid, cancel_token=node_stop) as binding:
+            token = _DEFER_STEP.set(node.id)
+            try:
+                try:
+                    result = await self._exec_agent_admitted(node, env, driver_sid, node_stop=node_stop)
+                except JobError as exc:
+                    if exc.code != "cancel_requested":
+                        raise
+                    # A durable node stop can win before its local signal or
+                    # heartbeat reaches the provider-admission checkpoint.
+                    # Only this exact node's stop may be tolerated; an ancestor
+                    # stop or another lost lease must still stop the workflow.
+                    current = await runtime.manager._authorize(runtime.manager.db, binding.actor, binding.lease.job_id)
+                    runtime.manager._check_proof(current, binding.lease)
+                    if current["cancel_requested_at"] is None:
+                        raise
+                    node_stop.cancel("durable node cancellation requested")
+                    sessions = [sid for sid, active in self._task_nodes.items() if active is binding]
+                    result = AgentResult(node_id=node.id, session_id=sessions[-1] if sessions else None,
+                        status="cancelled", text="", error="node cancelled before dispatch")
+                    self._tolerated.add(node.id)
+                    self._last = result
+                saved = await runtime.record_scope(binding, result.to_dict())
+            finally:
+                _DEFER_STEP.reset(token)
+            result.status = saved["status"]
+            result.usage = saved.get("usage", result.usage)
+            self._results[node.id] = result
+            if result.status == "cancelled" and self._cancel.is_cancelled():
+                self._cancelled = True
+            await self._emit_step(result)
+            return result
+
+    async def _exec_agent_admitted(self, node: AgentNode, env: dict[str, Any], driver_sid: str, *, node_stop=None) -> AgentResult:
         from time import monotonic
 
         from power_loop.workflow.admission import AdmissionCancelled, admit
         started = monotonic()
-        token = self._cancel.child()
+        token = node_stop if node_stop is not None else self._cancel.child()
         waiting = self._admission_tokens.setdefault(node.id, [])
         waiting.append(token)
         try:
             async with admit(token) as lease:
                 waiting.remove(token)
-                result = await self._exec_agent_body(node, env, driver_sid)
+                result = await self._exec_agent_body(node, env, driver_sid, node_stop=token)
         except AdmissionCancelled:
             result = AgentResult(node_id=node.id, status="cancelled", text="", error="cancelled while queued")
             self._results[node.id] = result
@@ -723,7 +892,7 @@ class WorkflowEngine:
                 logger.warning("workflow admission metric persistence failed", exc_info=True)
         return result
 
-    async def _exec_agent_body(self, node: AgentNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
+    async def _exec_agent_body(self, node: AgentNode, env: dict[str, Any], driver_sid: str, *, node_stop=None) -> AgentResult:
         # Resume: a completed node is replayed from the journal, not re-run. Pop
         # so a body id that somehow leaked in can only ever replay once.
         replayed = self._replay.pop(node.id, None)
@@ -826,6 +995,8 @@ class WorkflowEngine:
                 **node.spec.metadata,
                 **self._step_idempotency(node.id),
                 "workflow_ancestry": self._workflow_ancestry,
+                **({"legacy_workflow_owner_sid": self._history_owner_sid}
+                   if self._history_owner_sid and getattr(self._loop, "task_runtime", None) is None else {}),
                 **({"output_file": output_file} if output_file else {}),
                 # foreach 迭代号（6.8.1）：body 各迭代共享一个 node_id，观测端（活动面板）
                 # 没有它就把 N 路并发画成同一个节点反复亮灭——看起来像串行循环。
@@ -833,6 +1004,10 @@ class WorkflowEngine:
                    if ITERATION_ENV_KEY in env else {}),
             },
         )
+        runtime = getattr(self._loop, "task_runtime", None)
+        if runtime is not None:
+            from power_loop.runtime.workflow_tasks import node_metadata
+            spec = replace(spec, metadata={**spec.metadata, **node_metadata(runtime)})
         if self._on_node_start is not None:
             try:
                 await self._on_node_start(node.id)
@@ -840,7 +1015,7 @@ class WorkflowEngine:
                 pass
 
         self._steering[node.id] = []
-        node_tok = self._cancel.child()
+        node_tok = (node_stop if node_stop is not None else self._cancel).child()
         self._node_tokens.setdefault(node.id, []).append(node_tok)
         # 重启后接着跑（6.46）：这个节点上次有叶子会话、没做完 → 先在原会话补轮；失败保留会话，不隐式重放。
         resumed_raw: dict[str, Any] | None = None
@@ -849,6 +1024,16 @@ class WorkflowEngine:
             try:
                 prompt, rounds = self._resume_instructions.pop(
                     node.id, (_RESUME_PROMPT, max(int(node.spec.max_rounds or 30), 10)))
+                if runtime is not None and getattr(self, "_restore_operation_id", None):
+                    from power_loop.runtime.node_resume import _PREPARED
+                    from power_loop.runtime.workflow_restore_execution import accept_input, confirm_input
+                    prepared = _PREPARED.get()
+                    prompt = "Continue this node for the new workflow execution using its original contract.\n"+user_input+"\n\n"+prompt
+                    try:
+                        await accept_input(runtime, prepared.binding, rs, prompt)
+                    except Exception:
+                        await confirm_input(runtime, prepared.binding, rs, prompt)
+                    prepared.pending = True
                 resumed_raw = await self._continue_leaf(
                     rs, prompt, extra_rounds=rounds, stop=node_tok)
                 resumed_raw.setdefault("session_id", rs)
@@ -896,6 +1081,19 @@ class WorkflowEngine:
             if attempt == 1 and resumed_raw is not None:
                 raw = resumed_raw
             else:
+                admission = None
+                if runtime is None and self._history_owner_sid and self._run_id:
+                    from power_loop.runtime.spec import _CHILD_ADMISSION
+                    from power_loop.runtime.workflow_tasks import ROUTE_KEY
+
+                    from .legacy_history import register_session
+                    previous_admission = _CHILD_ADMISSION.get()
+                    async def admitted(sid, *, _attempt=attempt, _previous=previous_admission):
+                        if _previous is not None:
+                            await _previous(sid)
+                        await register_session(self._loop.store, self._history_owner_sid, self._run_id, driver_sid,
+                            node, sid, env.get(ROUTE_KEY, []), _attempt)
+                    admission = _CHILD_ADMISSION.set(admitted)
                 cb_tok = (_ON_CHILD_SESSION.set(self._session_cb(node.id))
                           if self._on_node_session is not None and not self._emit_suppressed else None)
                 try:
@@ -905,8 +1103,15 @@ class WorkflowEngine:
                         stop_event=node_tok,
                     )
                 finally:
+                    if admission is not None:
+                        _CHILD_ADMISSION.reset(admission)
                     if cb_tok is not None:
                         _ON_CHILD_SESSION.reset(cb_tok)
+            if runtime is not None:
+                from power_loop.runtime.workflow_tasks import collect_node
+                raw = await collect_node(runtime, self._loop, raw, node_tok)
+                if getattr(self, "_restore_operation_id", None) and raw.get("status") == "completed" and not (raw.get("final_text") or "").strip():
+                    raw = {**raw, "status": "failed", "error": "restored_node_output_missing"}
             if resumed_raw is not None or attempt >= max_attempts or not self._should_retry(raw, triggers):
                 break
             # 取消/预算耗尽时不再重试:那不是「这次没跑好」,是整个 run 该停了。
@@ -914,6 +1119,12 @@ class WorkflowEngine:
                 self._budget is not None and not self._budget.can_spawn()
             ):
                 break
+            if runtime is not None:
+                from power_loop.runtime.node_inputs import finish_attempt
+                await finish_attempt(runtime, self, raw)
+                raw = await collect_node(runtime, self._loop, raw, node_tok)
+                if not self._should_retry(raw, triggers):
+                    break
             logger.info(
                 "workflow leaf %s attempt %d/%d failed (%s); retrying",
                 node.id, attempt, max_attempts, raw.get("status"),
@@ -979,6 +1190,19 @@ class WorkflowEngine:
                     combined_usage[key] = combined_usage.get(key, 0) + value
                 raw = {**more, "session_id": sid, "usage": combined_usage}
 
+        if runtime is not None:
+            from power_loop.runtime.workflow_tasks import collect_node
+            raw = await collect_node(runtime, self._loop, raw, node_tok)
+            from power_loop.runtime.node_inputs import finish_attempt
+            await finish_attempt(runtime, self, raw)
+            raw = await collect_node(runtime, self._loop, raw, node_tok)
+            if type(self._executor) is InProcessExecutor and not (node.output_file or spec.metadata.get("output_file")):
+                from power_loop.runtime.workflow_tasks import ensure_node_answer
+                raw = await ensure_node_answer(runtime, self._loop, raw, node_tok)
+            from power_loop.runtime.task_runtime import _OWNER
+            scope = _OWNER.get()
+            raw["usage"] = await runtime.manager.execution_usage(scope.actor, scope.lease.job_id)
+
         payload: dict[str, Any] | None = None
         err: str | None = None
         if node.output_schema is not None and raw.get("status") == "completed":
@@ -1009,7 +1233,7 @@ class WorkflowEngine:
             self._budget.commit(res.usage)
 
         # ── 兜底节点：所有 attempt 用尽仍失败时跑，成功则**顶替**本节点的结果供下游引用 ──
-        if res.status != "completed" and node.fallback is not None and not self._cancelled:
+        if res.status not in ("completed", "cancelled") and node.fallback is not None and not self._cancelled:
             logger.info("workflow leaf %s failed; running fallback", node.id)
             fb = await self._exec(node.fallback, env, driver_sid)
             if fb is not None and fb.status == "completed":
@@ -1178,6 +1402,8 @@ class WorkflowEngine:
         }
 
     async def _emit_step(self, res: AgentResult) -> None:
+        if _DEFER_STEP.get() == res.node_id:
+            return
         # Inside a foreach body, per-iteration leaves are not journaled (they
         # share one id and aren't individually replayable); the aggregate is.
         if self._on_step is None or self._emit_suppressed > 0:
@@ -1266,10 +1492,15 @@ class WorkflowEngine:
         )
         # A closed branch may have been repaired while siblings were executing.
         # Join accepted repairs before releasing dependent sequence/assembly steps.
-        for branch in node.branches:
-            task = self._repairs.get(id(branch))
-            if task is not None:
-                await asyncio.shield(task)
+        barrier_ids = {id(branch) for branch in node.branches}
+        self._continuation_barriers.update(barrier_ids)
+        try:
+            for branch in node.branches:
+                task = self._repairs.get(id(branch))
+                if task is not None:
+                    await asyncio.shield(task)
+        finally:
+            self._continuation_barriers.difference_update(barrier_ids)
         gathered = [self._frames.get(id(b), {}).get("result", r)
                     if not isinstance(r, BaseException) and ITERATION_ENV_KEY not in env else r
                     for b, r in zip(node.branches, gathered, strict=True)]
@@ -1288,7 +1519,9 @@ class WorkflowEngine:
             replayed = self._replay.pop(node.id, None)
             if replayed is not None:
                 self._results[node.id] = replayed
-                self._add_usage(replayed.usage)  # aggregate carries summed leaf usage
+                if node.id not in self._replay_no_charge:
+                    self._add_usage(replayed.usage)  # aggregate carries summed leaf usage
+                self._replay_no_charge.discard(node.id)
                 return replayed
 
         items = self._resolve_items(node)
@@ -1298,6 +1531,8 @@ class WorkflowEngine:
             # ITERATION_ENV_KEY：body 的所有迭代共享同一个 node_id，宿主的 FileIO 端口靠它
             # 给每次迭代分不同的产出文件——不区分的话 N 个并发迭代会追加进同一个文件，互相搅乱。
             child_env = {**env, node.as_var: item, ITERATION_ENV_KEY: index}
+            from power_loop.runtime.workflow_tasks import ROUTE_KEY
+            child_env[ROUTE_KEY] = [*env.get(ROUTE_KEY, []), {"foreach": node.id, "index": index}]
             outer = _ITER_SCOPE.get()
             scope: ChainMap[str, AgentResult] = ChainMap() if outer is None else outer.new_child()
             tok = _ITER_SCOPE.set(scope)

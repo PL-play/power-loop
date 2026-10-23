@@ -4,6 +4,7 @@ introspection (D4). Fake LLM only; no real provider."""
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -416,7 +417,7 @@ async def test_workflow_status_tool_lists_and_gets():
         detail = await _handle_workflow_status(run_id=handle.run_id, detail=True)
         assert "completed" in detail
         missing = await _handle_workflow_status(run_id="does-not-exist")
-        assert "No workflow run" in missing
+        assert json.loads(missing)["error"]["code"] == "workflow_run_id_required"
     finally:
         reset_session_id(stok)
         reset_current_loop(tok)
@@ -431,7 +432,8 @@ async def test_create_workflow_tool_detached_returns_runid():
     finally:
         reset_session_id(stok)
         reset_current_loop(tok)
-    assert "Started detached workflow" in out
+    receipt = json.loads(out)
+    assert receipt["status"] == "accepted" and receipt["run_id"]
     # drain the background task so it doesn't outlive the test
     pending = [t for t in asyncio.all_tasks()
                if t is not asyncio.current_task() and t.get_name().startswith("workflow-")]

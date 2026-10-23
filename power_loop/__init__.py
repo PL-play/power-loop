@@ -254,6 +254,7 @@ from power_loop.tools.default_manifest import (
     TOOL_PRESETS,
     get_tool_definitions,
 )
+from power_loop.tools.jobs import JOBS_DEFINITION, register_jobs_tools
 from power_loop.tools.registry import AsyncToolInSyncContext
 from power_loop.tools.spawn_agent import (
     SPAWN_AGENT_DEFINITION,
@@ -523,6 +524,8 @@ __all__ = [
 	"build_explore_subagent_system_prompt",
 	"format_tool_catalog",
 	"register_spawn_agent",
+	"register_jobs_tools",
+	"JOBS_DEFINITION",
 	"SPAWN_AGENT_DEFINITION",
 	"LOAD_SKILL_DEFINITION",
 	"SkillLoader",

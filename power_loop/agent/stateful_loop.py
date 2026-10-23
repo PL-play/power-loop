@@ -73,7 +73,7 @@ from power_loop.core.pipeline import (
 )
 from power_loop.core.runner import AgentRunner
 from power_loop.runtime.budget import estimate_tokens
-from power_loop.runtime.cancellation import CancellationLike
+from power_loop.runtime.cancellation import CancellationLike, CancellationToken
 from power_loop.runtime.history_sanitize import align_tool_calls
 from power_loop.runtime.store.schema import SchemaPolicy
 from power_loop.runtime.store.store import (
@@ -297,6 +297,7 @@ class StatefulAgentLoop:
         event_bus: AgentEventBus | None = None,
         max_spawn_depth: int | None = None,
         session_cache_size: int = 256,
+        task_runtime: Any = None,
     ) -> None:
         """Bind the loop to a store. Pass EITHER a pre-opened ``store=`` (e.g. shared across
         loops) OR a store config to lazily open one: ``dsn=`` (a DSN or sqlite path; ``db_path``
@@ -318,6 +319,9 @@ class StatefulAgentLoop:
         # store is opened LAZILY on first async use via :meth:`_ensure_store`. A passed store is
         # already open.
         self.store: SessionStore | None = store
+        if task_runtime is not None and (store is None or task_runtime.manager.store is not store):
+            raise ValueError("task_runtime requires its pre-opened authoritative store")
+        self.task_runtime = task_runtime
         self._dsn = dsn if dsn is not None else (db_path if db_path is not None else DEFAULT_DB_PATH)
         self._table_prefix = table_prefix if table_prefix is not None else DEFAULT_TABLE_PREFIX
         self._schema = schema
@@ -335,6 +339,8 @@ class StatefulAgentLoop:
         # from inside a running loop (keeps the task from being GC'd before it runs).
         self._orphaned_close_task: asyncio.Future[None] | None = None
         self.config = config if config is not None else AgentLoopConfig()
+        if task_runtime is not None and self.config.delegation_policy != "single_level":
+            raise ValueError("task_runtime requires single_level delegation")
         self.tool_registry = tool_registry
         # Own a FRESH AgentHooks when the caller supplies none — NOT the shared
         # module-level DEFAULT_HOOKS singleton — so per-loop built-in hooks (e.g.
@@ -887,6 +893,12 @@ class StatefulAgentLoop:
             max_rounds=max_rounds, enqueue_only=enqueue_only,
         )
 
+    def _note_committed_inbox(self, session_id: str) -> None:
+        """Idempotent wake hint after an external atomic inbox commit; no dispatch."""
+        self._sync_sids.add(session_id)
+        entry = _session_sync(session_id, owner=id(self))
+        entry.pending_hint = max(1, entry.pending_hint)
+
     def pending_follow_up_count(self, session_id: str) -> int:
         """In-process HINT of undelivered inbox items for ``session_id`` (items this process
         accepted and no drain has claimed yet).
@@ -1069,6 +1081,8 @@ class StatefulAgentLoop:
         No-op (but still valid) if the session has no pending state — equivalent
         to "run one more round with no new user input".
         """
+        from power_loop.runtime.task_runtime import reject_unregistered_adapter
+        reject_unregistered_adapter("resume", self)
         store = await self._ensure_store()
         async with self._lock_for(session_id):
             await self._ensure_session_or_raise(session_id)
@@ -1100,6 +1114,8 @@ class StatefulAgentLoop:
         user, wait minutes or days, restart processes, then call this method
         with the collected answer.
         """
+        from power_loop.runtime.task_runtime import reject_unregistered_adapter
+        reject_unregistered_adapter("submit_input", self)
         store = await self._ensure_store()
         async with self._lock_for(session_id):
             await self._ensure_session_or_raise(session_id)
@@ -1219,6 +1235,9 @@ class StatefulAgentLoop:
         cancelled. Fires only while a ``TimerRunner`` (or an external
         scheduler polling ``store.due_timers()``) is running."""
         import time as _time
+
+        from power_loop.runtime.task_runtime import reject_unregistered_adapter
+        reject_unregistered_adapter("timer", self)
 
         store = await self._ensure_store()
         await self._ensure_session_or_raise(session_id)
@@ -1344,7 +1363,13 @@ class StatefulAgentLoop:
                         return_code=None, output_tail=(row.output_tail or "") + "\n(stopped)")
                     result = "stopped"
         elif kind == "wf" and ref:
-            result = await stop_run(ref, grace_s=pol.workflow_s, reason="stopped")
+            from power_loop.workflow import journal
+            from power_loop.workflow.runner import get_run_handle
+            handle = get_run_handle(ref)
+            if (await journal.read(store, session_id, ref) is not None and handle is not None and
+                    getattr(handle, "_origin_store", None) is store and
+                    getattr(handle, "_origin_parent_sid", None) == session_id):
+                result = await stop_run(ref, grace_s=pol.workflow_s, reason="stopped")
         elif kind == "sub" and ref:
             from power_loop.runtime.delegation import stop
             result = await stop(store, session_id, ref, pol.workflow_s)
@@ -1683,7 +1708,9 @@ class StatefulAgentLoop:
                 )
             else:
                 try:
-                    raw = await self.tool_registry.invoke_async(name, args)
+                    from power_loop.runtime.invocation import invocation_context
+                    with invocation_context(sid, pending.get("assistant_seq"), cid):
+                        raw = await self.tool_registry.invoke_async(name, args)
                     if not isinstance(raw, str):
                         raw = json.dumps(raw, ensure_ascii=False)
                     output, failed = str(raw), False
@@ -1716,6 +1743,21 @@ class StatefulAgentLoop:
         return self.tool_registry.subset(tools)
 
     async def _run_loop(self, sid: str, **kwargs: Any) -> StatefulResult:
+        if self.task_runtime is not None:
+            store = await self._ensure_store()
+            # This send can run on a task also hosting its logical node and
+            # workflow. Its lease heartbeat must stop the send's operation,
+            # not cancel the shared task and bypass its parent's bookkeeping.
+            stop = CancellationToken.from_any(kwargs.get("stop_event")).child()
+            kwargs["stop_event"] = stop
+            async with self.task_runtime.model_send(self, sid, await self._current_send_index(store, sid), cancel_token=stop) as evidence:
+                result = await self._run_with_tool_context(sid, **kwargs)
+                evidence.update(exit=result.status, usage=dict(result.usage or {}), rounds=result.rounds,
+                                new_input_after_pass=bool(result.new_input_after_pass))
+                return result
+        return await self._run_with_tool_context(sid, **kwargs)
+
+    async def _run_with_tool_context(self, sid: str, **kwargs: Any) -> StatefulResult:
         from power_loop.runtime.tool_context import ToolContextEngine, active_engine
 
         store = await self._ensure_store()

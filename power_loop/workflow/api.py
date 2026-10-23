@@ -89,6 +89,10 @@ class Workflow:
         :meth:`start` with ``detached=True`` — is not tied to the caller: it outlives the send
         and is stopped only by its own handle / ``stop_run``.)"""
         from power_loop.core.agent_context import get_current_cancel_token
+        from power_loop.runtime.execution_roles import require_orchestration
+        from power_loop.runtime.task_runtime import reject_unregistered_adapter
+        reject_unregistered_adapter("synchronous_workflow", self._loop)
+        await require_orchestration(self._loop, "workflow", sid=self._parent_sid)
 
         engine = WorkflowEngine(
             self._loop, executor=self._executor, budget=self._budget,
@@ -118,6 +122,8 @@ class Workflow:
           timer-free — it supersedes both the timer and ``eager_wake``.
         """
         if detached:
+            from power_loop.runtime.execution_roles import require_orchestration
+            await require_orchestration(self._loop, "workflow", sid=self._parent_sid)
             from .runner import run_detached  # local import avoids import cycle
 
             return await run_detached(self, eager_wake=eager_wake, on_complete=on_complete)

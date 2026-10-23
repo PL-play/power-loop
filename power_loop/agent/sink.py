@@ -149,6 +149,11 @@ class SQLiteSink:
 
     # ── messages ───────────────────────────────────────────────
 
+    @property
+    def persisted_assistant_seq(self) -> int | None:
+        """Actual DB seq, never the index of an in-memory/projected history row."""
+        return self._assistant_seq
+
     async def on_round_started(self, round_index: int) -> None:
         await self.store.set_round_index(self.session_id, round_index)
 
@@ -171,6 +176,8 @@ class SQLiteSink:
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)
+            from power_loop.runtime.task_runtime import bind_tool_receipt
+            await bind_tool_receipt(self.store, self.session_id, self._assistant_seq, tool_call_id, seq)
             # Auto-resolve pending: when the matching tool message lands,
             # drop it from the unresolved set and clear pending once empty.
             if tool_call_id and tool_call_id in self._unresolved:

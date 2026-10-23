@@ -45,6 +45,7 @@ from .engine import (
     WorkflowRunError,
     in_workflow,
 )
+from .facade import WorkflowToolPorts, register_workflow_tool, workflow_tool_definition
 from .introspect import get_workflow, list_workflows
 from .result import (
     AgentResult,
@@ -147,4 +148,7 @@ __all__ = [
     "VALIDATE_WORKFLOW_DEFINITION",
     "WORKFLOW_STATUS_DEFINITION",
     "register_workflow_tools",
+    "WorkflowToolPorts",
+    "register_workflow_tool",
+    "workflow_tool_definition",
 ]
