@@ -585,6 +585,13 @@ class JobManager:
                 owner = (await self._row(tx, parent_row["control_owner_job_id"])
                          if parent_row["kind"] == "send" and parent_row["control_owner_job_id"] else parent_row)
             now = self.now()
+            wait_binding = None
+            if kind == "timer" and "managed_wait" in request_data:
+                from .timer_waits import prepare_binding
+
+                wait_binding = await prepare_binding(self, tx, actor, parent_row, request_data,
+                    caller=parent, session_id=session_id, independent=independent, call_ref=call_ref,
+                    tool_call_id=tool_call_id)
             await tx.execute(f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
                 "session_id,created_by_session_id,kind,title,completion_scope_job_id,blocks_completion,"
                 "status,version,generation,intake,resource_state,supervision_status,result_status,created_at,updated_at,"
@@ -597,10 +604,12 @@ class JobManager:
                 role, owner["job_id"] if owner else None, owner["generation"] if owner else None,
                 owner["executor_id"] if owner else None, owner["boot_id"] if owner else None))
             payload = {"job_id": job_id, "status": "queued"}
-            if kind in ("send", "workflow", "workflow_node") and request is not None:
+            if kind in ("send", "workflow", "workflow_node", "timer") and request is not None:
                 # Recovery must not reread a potentially edited YAML/file or
                 # reconstruct a full execution contract from a request hash.
                 payload["request"] = request_data
+            if wait_binding is not None:
+                payload["wait_binding"] = wait_binding
             operation = await self._insert_operation(tx, job_id=job_id, version=1, actor=actor, action="create",
                 key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id,
                 payload=payload)
@@ -824,8 +833,11 @@ class JobManager:
             if effective_outcome == "succeeded" and row["executor_key"] is not None:
                 from .executor_registry import check_execution
                 await check_execution(self, tx, row)
-            if require_children_stopped and effective_outcome == "succeeded":
-                await self._require_scope_ready(tx, row)
+            if effective_outcome == "succeeded":
+                from .timer_waits import has_required_wait
+
+                if require_children_stopped or await has_required_wait(self, tx, actor, row):
+                    await self._require_scope_ready(tx, row)
             await tx.execute(f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,"
                 "result_status='pending_delivery',resource_state=?,intake='closed',lease_until_ms=NULL,"
                 "version=version+1,updated_at=? WHERE job_id=?",
