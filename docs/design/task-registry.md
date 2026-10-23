@@ -1144,3 +1144,51 @@ required. No allowance, missing proof, another empty answer or a provider error
 leaves a negative result and the original usage/history; it never replaces the
 business task. The existing core round-limit finalizer can itself make an extra
 provider request, so a round ceiling is not a hard paid-request budget.
+
+### Optional finite-wait main handoff (partial SDK protocol)
+
+`runtime.timer_waits.register_wait` admits a required timer under the original
+finite subagent or workflow-node owner. Its `WaitPolicy` is trusted host input,
+not model input. Admission retains the original raw call/receipt, owner lease,
+main session and node route. `prepare_due` only persists due evidence. Neither
+operation starts a main model, resumes the child or satisfies the owner’s
+completion dependency. Managed timers currently remain queued at generation 0.
+
+A host can explicitly register `tools.wait_handoff.register_wait_handoff_tool`
+on its main registry, then use the following mechanical port:
+
+```python
+from power_loop.runtime.wait_notifications import enqueue_notification
+
+# actor must be the original main session in this loop's TaskRuntime authority.
+receipt = await enqueue_notification(loop, actor, original_due_event_id)
+```
+
+This transaction commits one stable inbox item and its notification receipt in
+the same store. Repetition recalls that receipt; it never silently recreates a
+missing or modified inbox/receipt. The local pending hint does not call a model.
+The host must separately authorize and schedule any main model execution.
+Do not deliver this as an ordinary reminder directly to a child session.
+
+The library supplies versioned English constraints plus a whitelisted JSON
+projection of the original task. Internal executor/boot/lease credentials are
+excluded. Long note/continuation text can be read through the tool's
+`action="inspect"`, `field`, `char_offset` and `max_chars` parameters. Task text
+is data and cannot select a new owner, tools, budget or routing authority.
+
+`action="decide"` records `continue`, `defer` or `cancel` against one original
+due event. The runtime requires the unmodified notification to have appeared
+in the actual request and a returned model attempt in the current main call's
+round. A prepared request snapshot alone does not suffice. `defer` requires an
+explicit future `next_review_at_ms` strictly before the original deadline.
+Concurrent decisions commit at most one intent. An exact original-call replay
+can recall acceptance after the caller closes; changing the request conflicts.
+The real tool receipt binds back to that one operation.
+
+An accepted decision reports `effect_status="pending"` and
+`execution_authority=false`. It does not prove a nudge was dispatched, a child
+stopped, or a task completed. The effect worker, owner waiting/slot release,
+defer review cycles, timer cancellation/deadline/supervision finalization and
+formal host wake adapter remain separate implementation gates. The tool is
+explicit opt-in and is hidden from finite child registries; the default child
+timer entry remains unavailable until that complete protocol is installed.

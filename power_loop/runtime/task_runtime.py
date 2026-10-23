@@ -81,6 +81,7 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
 
     from power_loop.tools.default_tools import _h_recall_send
     from power_loop.tools.jobs import run_jobs
+    from power_loop.tools.wait_handoff import run_wait_handoff
     from power_loop.workflow.facade import run_workflow_tool
     from power_loop.workflow.tool import _handle_workflow_status
 
@@ -91,6 +92,8 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
         safe = True
     if actual is run_workflow_tool and isinstance(tool_args, dict):
         safe = tool_args.get("action", "help") in ("help", "status", "list", "cancel", "leaves", "logs")
+    if actual is run_wait_handoff and isinstance(tool_args, dict) and tool_args.get("action") == "inspect":
+        safe = True
     if safe:
         from .task_control import _source
 
@@ -110,7 +113,7 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
         from power_loop.core.pass_turn import default_handler
         from power_loop.tools.spawn_agent import _handle_spawn_agent
 
-        if actual not in (default_handler, _h_recall_send, _handle_spawn_agent, run_workflow_tool):
+        if actual not in (default_handler, _h_recall_send, _handle_spawn_agent, run_workflow_tool, run_wait_handoff):
             raise JobError("budget_tool_adapter_unavailable:" + tool_name)
     await check_dispatch(session_id)
 

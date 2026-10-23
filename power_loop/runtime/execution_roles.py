@@ -59,6 +59,7 @@ def role_tools(names, role: str) -> list[str]:
     # would otherwise outlive the child or resume a node outside its engine.
     if role != "main":
         blocked.add("schedule_wakeup")
+        blocked.add("wait_handoff")
     if role == "subagent":
         blocked.add("spawn_agent")
     return [name for name in names if name not in blocked]

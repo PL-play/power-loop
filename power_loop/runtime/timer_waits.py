@@ -253,67 +253,76 @@ def _ref(data):
                       data["round_index"])
 
 
-async def prepare_due(manager, actor, job_id):
+def due_event_id(manager, job_id, creation_id):
+    return "wait_due_" + _hash([manager.store.store_id, job_id, creation_id])[:48]
+
+
+async def _prepare_due(manager, tx, actor, job_id):
     """Persist one at-least-once main-decision event, without delivering it.
 
     The event is evidence only. A later notification claim and decision adapter
     must recheck the original owner, deadline, cancellation, pause and budget.
     """
+    job, creation, saved = await _read(manager, tx, actor, job_id)
+    desired, policy = _request(saved["request"])
+    binding = saved["binding"]
+    if manager.now() > policy.deadline_at_ms:
+        raise JobError("wait_deadline_exceeded")
+    if (job["generation"] != 0 or job["status"] != "queued" or job["resource_state"] != "not_started"
+            or job["intake"] != "open" or job["supervision_status"] != "open" or job["outcome"] is not None):
+        raise JobError("wait_state_changed")
+    await manager._supervision_barriers(tx, job)
+    await manager._control_owners(tx, job)
+    owner = await manager._row(tx, binding["owner"]["job_id"])
+    if owner is None:
+        raise JobError("wait_owner_required")
+    manager._check_proof(owner, JobLease(**binding["owner"]))
+    main = await tx.fetchone(f"SELECT parent_session_id,metadata_json FROM {manager.store.t.sessions} WHERE session_id=?",
+                            (binding["main_session_id"],))
+    main_meta = _object(main["metadata_json"] or "{}") if main else {}
+    if (main is None or main["parent_session_id"] is not None
+            or main_meta.get("execution_role") not in (None, "main") or main_meta.get("kind") == "wf_driver"
+            or main_meta.get("workflow_run_id") or main_meta.get("standalone_subagent")):
+        raise JobError("wait_main_session_unavailable")
+    if binding["route"]["kind"] == "workflow_node":
+        from .node_inputs import descriptor, is_closed
+        if await is_closed(manager, tx, owner, binding["session_id"]):
+            raise JobError("wait_owner_closed")
+        if _hash(await descriptor(manager, tx, owner, binding["session_id"])) != _hash(binding["route"]["node"]):
+            raise JobError("wait_route_changed")
+    else:
+        physical = await tx.fetchone(f"SELECT metadata_json FROM {manager.store.t.sessions} WHERE session_id=?",
+                                    (binding["session_id"],))
+        meta = _object(physical["metadata_json"] or "{}") if physical else {}
+        if meta.get("execution_role") != "subagent" or meta.get("standalone_subagent") is not True:
+            raise JobError("wait_session_role_mismatch")
+    if manager.now() < desired.due_at_ms:
+        return {"status": "armed", "job_id": job_id, "due_at_ms": desired.due_at_ms, "execution_authority": False}
+    if saved["receipt_ref"] is None:
+        raise JobError("wait_receipt_missing")
+    source_actor = JobActor(actor.tenant_id, actor.principal_id, binding["session_id"])
+    await manager._validate_call(tx, source_actor, _ref(saved["call_ref"]), binding["tool_call_id"])
+    await manager._validate_ref(tx, source_actor, _ref(saved["receipt_ref"]), role="tool")
+    if (saved["receipt_ref"]["tool_call_id"] != binding["tool_call_id"]
+            or saved["receipt_ref"]["send_index"] != saved["call_ref"]["send_index"]):
+        raise JobError("wait_receipt_mismatch")
+    event_id = due_event_id(manager, job_id, creation["event_id"])
+    payload = {"version": 1, "wait": saved}
+    old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
+    if old is not None:
+        if (old["job_id"] != job_id or old["event_type"] != "wait_due"
+                or old["request_hash"] != _hash(payload) or _hash(_object(old["payload_json"])) != _hash(payload)
+                or old["delivery_status"] not in ("pending_delivery", "delivered", "handled")):
+            raise JobError("wait_due_evidence_corrupt")
+    else:
+        version = job["version"] + 1
+        await tx.execute(f"UPDATE {manager.jobs} SET version=?,updated_at=? WHERE job_id=?", (version, manager.now(), job_id))
+        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                         (event_id, job_id, "wait_due", version, _hash(payload), _json(payload), "pending_delivery", manager.now()))
+    return {"status": "decision_pending", "event_id": event_id, "payload": payload, "execution_authority": False}
+
+
+async def prepare_due(manager, actor, job_id):
+    """Persist due evidence using one original control transaction."""
     async with manager._write() as tx:
-        job, creation, saved = await _read(manager, tx, actor, job_id)
-        desired, policy = _request(saved["request"])
-        binding = saved["binding"]
-        if manager.now() > policy.deadline_at_ms:
-            raise JobError("wait_deadline_exceeded")
-        if (job["generation"] != 0 or job["status"] != "queued" or job["resource_state"] != "not_started"
-                or job["intake"] != "open" or job["supervision_status"] != "open" or job["outcome"] is not None):
-            raise JobError("wait_state_changed")
-        await manager._supervision_barriers(tx, job)
-        await manager._control_owners(tx, job)
-        owner = await manager._row(tx, binding["owner"]["job_id"])
-        if owner is None:
-            raise JobError("wait_owner_required")
-        manager._check_proof(owner, JobLease(**binding["owner"]))
-        main = await tx.fetchone(f"SELECT parent_session_id,metadata_json FROM {manager.store.t.sessions} WHERE session_id=?",
-                                (binding["main_session_id"],))
-        main_meta = _object(main["metadata_json"] or "{}") if main else {}
-        if (main is None or main["parent_session_id"] is not None
-                or main_meta.get("execution_role") not in (None, "main") or main_meta.get("kind") == "wf_driver"
-                or main_meta.get("workflow_run_id") or main_meta.get("standalone_subagent")):
-            raise JobError("wait_main_session_unavailable")
-        if binding["route"]["kind"] == "workflow_node":
-            from .node_inputs import descriptor, is_closed
-            if await is_closed(manager, tx, owner, binding["session_id"]):
-                raise JobError("wait_owner_closed")
-            if _hash(await descriptor(manager, tx, owner, binding["session_id"])) != _hash(binding["route"]["node"]):
-                raise JobError("wait_route_changed")
-        else:
-            physical = await tx.fetchone(f"SELECT metadata_json FROM {manager.store.t.sessions} WHERE session_id=?",
-                                        (binding["session_id"],))
-            meta = _object(physical["metadata_json"] or "{}") if physical else {}
-            if meta.get("execution_role") != "subagent" or meta.get("standalone_subagent") is not True:
-                raise JobError("wait_session_role_mismatch")
-        if manager.now() < desired.due_at_ms:
-            return {"status": "armed", "job_id": job_id, "due_at_ms": desired.due_at_ms, "execution_authority": False}
-        if saved["receipt_ref"] is None:
-            raise JobError("wait_receipt_missing")
-        source_actor = JobActor(actor.tenant_id, actor.principal_id, binding["session_id"])
-        await manager._validate_call(tx, source_actor, _ref(saved["call_ref"]), binding["tool_call_id"])
-        await manager._validate_ref(tx, source_actor, _ref(saved["receipt_ref"]), role="tool")
-        if (saved["receipt_ref"]["tool_call_id"] != binding["tool_call_id"]
-                or saved["receipt_ref"]["send_index"] != saved["call_ref"]["send_index"]):
-            raise JobError("wait_receipt_mismatch")
-        event_id = "wait_due_" + _hash([manager.store.store_id, job_id, creation["event_id"]])[:48]
-        payload = {"version": 1, "wait": saved}
-        old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
-        if old is not None:
-            if (old["job_id"] != job_id or old["event_type"] != "wait_due"
-                    or old["request_hash"] != _hash(payload) or _hash(_object(old["payload_json"])) != _hash(payload)
-                    or old["delivery_status"] not in ("pending_delivery", "delivered", "handled")):
-                raise JobError("wait_due_evidence_corrupt")
-        else:
-            version = job["version"] + 1
-            await tx.execute(f"UPDATE {manager.jobs} SET version=?,updated_at=? WHERE job_id=?", (version, manager.now(), job_id))
-            await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                             (event_id, job_id, "wait_due", version, _hash(payload), _json(payload), "pending_delivery", manager.now()))
-        return {"status": "decision_pending", "event_id": event_id, "payload": payload, "execution_authority": False}
+        return await _prepare_due(manager, tx, actor, job_id)

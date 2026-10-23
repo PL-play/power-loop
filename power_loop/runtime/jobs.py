@@ -360,7 +360,7 @@ class JobManager:
         async with self._write() as tx:
             await self._validate_call(tx, actor, call_ref, tool_call_id)
             rows = []
-            for action in ("create", "nudge", "steer", "stop"):
+            for action in ("create", "nudge", "steer", "stop", "wait_decision"):
                 key = self._origin_key(actor, action, call_ref, tool_call_id, None)
                 row = await tx.fetchone(f"SELECT * FROM {self.events} WHERE operation_key=?", (key,))
                 if row is not None:
