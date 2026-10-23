@@ -115,6 +115,10 @@ async def apply(manager, actor, event_id):
         if old is not None:
             if old["delivery_status"] == "handled" and data["request"]["decision"] == "continue":
                 await _resolved(manager, tx, job, old)
+            elif old["delivery_status"] == "handled" and data["request"]["decision"] == "cancel":
+                from .wait_terminal import _terminated, admission
+                terminal, creation, original = await admission(manager, tx, actor, job["job_id"])
+                await _terminated(manager, tx, actor, terminal, creation, original)
             return _reply(old)
         owner = await manager._authorize(tx, actor, saved["binding"]["owner"]["job_id"])
         manager._check_proof(owner, JobLease(**saved["binding"]["owner"]))

@@ -247,6 +247,16 @@ class JobManager:
             self._check_proof(row, lease)
             if row["status"] == "model_closed":
                 return _record(row)
+            from .model_exit import SNAPSHOT, capture
+            if SNAPSHOT in evidence_data or "model_attempt_snapshot_error" in evidence_data:
+                raise JobError("reserved_model_exit_evidence")
+            try:
+                snapshot = await capture(self, tx, row)
+                if snapshot is not None:
+                    evidence_data[SNAPSHOT] = snapshot
+            except JobError as exc:
+                evidence_data["model_attempt_snapshot_error"] = exc.code
+                resource_state = "unknown"
             # Closing an already executed attempt is evidence, not permission to
             # dispatch more work. Cancellation/lease expiry must not prevent it.
             if row["resource_state"] not in ("running", "unknown"):
@@ -626,6 +636,13 @@ class JobManager:
             await self._supervision_barriers(tx, row)
             if row["status"] != "queued" or row["version"] != expected_version:
                 raise JobError("job_claim_conflict")
+            if row["kind"] == "timer":
+                creation = await tx.fetchone(f"SELECT payload_json FROM {self.events} WHERE job_id=? AND event_type='operation' AND action='create'", (job_id,))
+                data = json.loads(creation["payload_json"]) if creation else {}
+                if "wait_binding" in data or "managed_wait" in data.get("request", {}):
+                    from .timer_waits import _read
+                    await _read(self, tx, actor, job_id)
+                    raise JobError("managed_wait_has_no_executor")
             await self._control_owners(tx, row)
             from .executor_registry import ExecutorIdentity, require_accepting
             inherited = await self._row(tx, row["control_owner_job_id"] or row["parent_job_id"]) if row["parent_job_id"] else None
@@ -772,8 +789,8 @@ class JobManager:
                 raise JobError("access_denied")
             old = await tx.fetchone(f"SELECT payload_json FROM {self.events} WHERE event_id=?", (event_id,))
             if old:
-                if old["payload_json"] != _json(payload):
-                    raise JobError("result_conflict")
+                from .result_payloads import require_replay
+                require_replay(json.loads(old["payload_json"]), payload)
                 return json.loads(row["result_json"])
             if row["generation"] != 0 or row["resource_state"] != "not_started" or row["status"] not in ("queued", "cancelled"):
                 raise JobError("unstarted_result_conflict")
@@ -785,6 +802,8 @@ class JobManager:
                     break
                 ancestor = await self._row(tx, ancestor["parent_job_id"]) if ancestor["parent_job_id"] else None
             saved = {**result_data, "status": effective}
+            from .result_payloads import canonical
+            payload = canonical(payload, effective, saved)
             await tx.execute(f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,resource_state='stopped',"
                 "intake='closed',lease_until_ms=NULL,result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?",
                 (effective, _json(saved), self.now(), job_id))
@@ -809,8 +828,8 @@ class JobManager:
             self._check_proof(row, lease)
             old = await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=?", (event_id,))
             if old:
-                if old["payload_json"] != _json(payload):
-                    raise JobError("result_conflict")
+                from .result_payloads import require_replay
+                require_replay(json.loads(old["payload_json"]), payload)
                 from .execution_membership import seal
                 await seal(self, tx, row)
                 return event_id
@@ -840,6 +859,8 @@ class JobManager:
                     from .wait_effects import settle_owner_tx
                     await settle_owner_tx(self, tx, actor, row)
                     await self._require_scope_ready(tx, row)
+            from .result_payloads import canonical
+            payload = canonical(payload, effective_outcome, effective_result)
             await tx.execute(f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,"
                 "result_status='pending_delivery',resource_state=?,intake='closed',lease_until_ms=NULL,"
                 "version=version+1,updated_at=? WHERE job_id=?",

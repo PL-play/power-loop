@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-REQUIRED_REAL_CASES = 90
+REQUIRED_REAL_CASES = 92
 
 
 class RunnerInterrupted(BaseException):
@@ -235,6 +235,7 @@ def main() -> int:
     scopes.append("tests/real/test_real_timer_waits_192.py")
     scopes.append("tests/real/test_real_wait_handoff_192.py")
     scopes.append("tests/real/test_real_wait_effects_192.py")
+    scopes.append("tests/real/test_real_wait_terminal_192.py")
     all_real_scopes = [scope for scope in scopes if scope.startswith("tests/real/")]
     run_real = args.unit_shard is None
     if args.real_only:

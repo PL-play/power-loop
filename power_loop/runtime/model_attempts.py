@@ -509,8 +509,10 @@ async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amo
         await _put(manager, tx, row, "finished", attempt.attempt_id, data)
 
 
-async def require_quiescent(manager, tx, row):
+async def require_quiescent(manager, tx, row, *, include_budget=True):
     """Return immutable event IDs; absent tracking is legacy, not zero calls."""
+    if type(include_budget) is not bool:
+        raise JobError("invalid_model_quiescence_options")
     scope = _scope(JobLease(row["job_id"], row["executor_id"], row["boot_id"], row["generation"]))
     tracking = await _read(manager, tx, "tracking", scope, required=False)
     if tracking is None:
@@ -555,9 +557,9 @@ async def require_quiescent(manager, tx, row):
         ):
             raise JobError("model_attempt_unsettled")
         refs.extend([dispatched[0]["event_id"], finished[0]["event_id"]])
-    from .model_budgets import require_quiescent as budget_quiescent
-
-    refs.extend(await budget_quiescent(manager, tx, row))
+    if include_budget:
+        from .model_budgets import require_quiescent as budget_quiescent
+        refs.extend(await budget_quiescent(manager, tx, row))
     return refs
 
 

@@ -1232,3 +1232,54 @@ driver. Due times and new continue/defer effects must be strictly before the
 original deadline. Cancelled-wait termination, review-cycle driving, persistent
 owner waiting, timer supervision finalization and formal host wake integration
 remain implementation gates. No default child timer is enabled by these ports.
+
+### Unexecuted-wait termination and supervision
+
+Managed waits cannot be claimed by an executor. They remain at generation 0
+with no executor, boot or lease, including after completion. The timer-specific
+supervision proof uses version 2 and explicitly represents that unexecuted
+admission. It is not an execution credential. All existing claimed scopes keep
+the version-1 contract; other generation-zero job kinds are not admitted by
+this adapter.
+
+A successful wait must retain its original resolution, actual model-input
+processing and decision/effect evidence. A negative wait can be terminated
+through `runtime.wait_terminal.terminate(manager, actor, original_wait_job_id)`
+only after its original owner generation has a stopped negative canonical
+result and a sealed execution membership whose admitted resources have all
+stopped. Local cancellation, lease expiry and a stop request do not establish
+that fact. Unknown provider requests or missing member evidence keep the wait
+unresolved. This port never starts a model, stops a later owner generation or
+settles money.
+
+The common tree finalizer invokes this adapter in its original transaction,
+including for a cancelled owner's unclaimed waits. A valid old generic
+unstarted result can be explicitly adopted without rewriting its payload.
+Business result acknowledgement may happen later; physical termination binds
+immutable event content rather than that mutable delivery status. Repeated
+closure verifies the complete original proof instead of trusting cached
+`closed` or `handled` fields. Missing evidence or any failed write rolls back
+the affected tree-closing transaction.
+
+`close_model_execution` captures the actual tracked model-attempt identities
+in the same transaction as the model-close record and membership seal. The
+reserved `model_attempt_snapshot` field is library-generated. A damaged ledger
+produces unknown resource state and a snapshot error; callers cannot supply a
+replacement snapshot. Controlled negative exits require the complete snapshot
+and provider-quiescent evidence before supervision closure. A legacy bare
+negative exit remains unresolved. Removing attempts after capture invalidates
+the proof. Physical checks may explicitly use `include_budget=False`; normal
+finalization retains the default budget checks. Neither path invents a zero
+provider fee or releases an uncertain reservation.
+
+New canonical result events store the effective outcome and result. When
+ancestor cancellation or generic unstarted normalization changes the original
+submission, `requested` retains that exact submission for replay. Replaying
+the original request returns the same event; a changed request conflicts.
+Unchanged submissions preserve the old wire shape. Historical events are not
+rewritten, and historical effective/requested contradictions require explicit
+compatibility reconciliation rather than inference from the current cache.
+
+Persistent owner waiting and slot release, defer review cycles, automatic
+deadline handling, restart/shutdown orchestration and the formal authorized
+host wake adapter remain required before enabling default finite-task timers.

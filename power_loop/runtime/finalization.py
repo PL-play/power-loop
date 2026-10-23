@@ -52,13 +52,24 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
     state["visiting"].add(event_id)
     data = _object(event["payload_json"])
     if (event["event_type"] != "supervision_closed" or event["delivery_status"] != "not_applicable" or
-            set(data) != {"version", "scope", "proof", "proof_hash"} or type(data["version"]) is not int or data["version"] != 1 or
+            set(data) != {"version", "scope", "proof", "proof_hash"} or type(data["version"]) is not int or data["version"] not in (1, 2) or
+            not isinstance(data["scope"], dict) or not isinstance(data["proof"], dict) or
             data["scope"]["job_id"] != event["job_id"] or data["proof_hash"] != _hash(data["proof"]) or
             event["request_hash"] != _hash(data) or event["event_id"] != _identity(manager, "closed",
                 [event["job_id"], data["scope"]["generation"], event["job_version"], data["proof_hash"]])):
         raise JobError("finalization_evidence_corrupt")
     from .execution_membership import _lease as validate_lease
-    validate_lease(data["scope"])
+    if data["version"] == 1:
+        validate_lease(data["scope"])
+    else:
+        row = await manager._row(tx, event["job_id"])
+        if (row is None or row["kind"] != "timer" or data["proof"].get("kind") != "timer" or data["proof"].get("outcome") != row["outcome"]
+                or type(data["scope"].get("generation")) is not int
+                or data["scope"]["generation"] != 0 or _hash(data["scope"]) != _hash(_lease(row))):
+            raise JobError("finalization_evidence_corrupt")
+        from .wait_terminal import references
+        if _hash(data["proof"].get("references")) != _hash(await references(manager, tx, row)):
+            raise JobError("finalization_evidence_changed")
     from .jobs import KINDS
     proof = data["proof"]
     if (not isinstance(proof, dict) or set(proof) != {"kind", "outcome", "references"} or
@@ -96,7 +107,7 @@ async def closed(manager, tx, row, generation=None):
             if (row["status"] != expected_status or row["resource_state"] != "stopped" or row["intake"] != "closed" or
                     data["proof"]["kind"] != row["kind"] or data["proof"]["outcome"] != row["outcome"]):
                 raise JobError("finalization_execution_changed")
-            if row["kind"] != "send":
+            if row["kind"] != "send" and data["version"] == 1:
                 result = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (result_id(row["job_id"], generation),))
                 if result is None or _hash(_object(result["payload_json"])["result"]) != _hash(_object(row["result_json"])):
                     raise JobError("finalization_execution_changed")
@@ -169,9 +180,34 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         return ref
     if generation != row["generation"]:
         raise JobError("finalization_generation_changed")
+    if generation == 0 and row["kind"] == "timer" and (row["resource_state"] != "stopped" or row["outcome"] != "succeeded"):
+        from .wait_terminal import terminate_tx
+        await terminate_tx(manager, tx, actor, row["job_id"])
+        row = await manager._row(tx, row["job_id"])
+    if row["kind"] == "send":
+        exit = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", ("model_closed_" + row["job_id"],))
+        if exit and _object(exit["payload_json"]).get("evidence", {}).get("model_attempt_snapshot_error"):
+            from .model_exit import capture
+            await capture(manager, tx, row)  # Keep the original precise corruption error.
+            raise JobError("model_exit_snapshot_incomplete")
     if row["resource_state"] != "stopped" or row["intake"] != "closed":
         raise JobError("finalization_execution_unsettled")
     state["visiting"].add(key)
+    if generation == 0:
+        if row["kind"] != "timer":
+            raise JobError("finalization_adapter_required")
+        from .wait_terminal import references
+        refs = await references(manager, tx, row)
+        proof = {"kind": "timer", "outcome": row["outcome"], "references": refs}
+        data = {"version": 2, "scope": _lease(row), "proof": proof, "proof_hash": _hash(proof)}
+        version = row["version"] + 1
+        event_id = _identity(manager, "closed", [row["job_id"], 0, version, data["proof_hash"]])
+        ref = {"event_id": event_id, "job_id": row["job_id"], "event_type": "supervision_closed", "revision": version,
+            "request_hash": _hash(data), "delivery_status": "not_applicable", "payload_hash": _hash(data)}
+        state["plans"].append((row, version, data, ref))
+        state["visiting"].remove(key)
+        state["done"][key] = ref
+        return ref
     membership = await read(manager, tx, row, generation)
     if not membership["sealed"] or _hash(membership["scope"]["lease"]) != _hash(_lease(row)):
         raise JobError("finalization_execution_unsettled")
@@ -179,9 +215,16 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         await _reference(manager, tx, seal_id(manager, row["job_id"], generation))]
     if row["kind"] == "send":
         model = membership["model"]
-        if (row["status"] != "model_closed" or model is None or model["payload"].get("resource_state") != "stopped" or
-                model["payload"].get("evidence", {}).get("exit") != "completed"):
+        if (row["status"] != "model_closed" or model is None or model["payload"].get("resource_state") != "stopped"):
             raise JobError("finalization_model_exit_unconfirmed")
+        from .model_exit import SNAPSHOT, require_stopped
+        evidence = model["payload"].get("evidence", {})
+        if evidence.get("exit") != "completed" and evidence.get("exit") not in ("failed", "cancelled", "interrupted", "hit_round_limit", "timed_out", "budget_exceeded", "degraded"):
+            raise JobError("finalization_model_exit_unconfirmed")
+        if evidence.get("exit") != "completed" and SNAPSHOT not in evidence:
+            raise JobError("finalization_model_exit_unconfirmed")
+        if SNAPSHOT in evidence:
+            await require_stopped(manager, tx, row, model["payload"])
         refs.append(await _reference(manager, tx, model["event_id"]))
         from .model_attempts import require_quiescent
         refs.extend([await _reference(manager, tx, key) for key in await require_quiescent(manager, tx, row)])
@@ -225,10 +268,14 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         child = await manager._row(tx, job_id)
         if child is None or (child["tenant_id"], child["principal_id"]) != (row["tenant_id"], row["principal_id"]):
             raise JobError("invalid_finalization_tree")
-        child_scope = await read(manager, tx, child, child_generation)
-        if (_hash(child_scope["scope"]["lease"]) != _hash(lease) or
-                (job_id, child_generation) in owned and _hash(child_scope["scope"]["owner"]) != _hash(_lease(row))):
-            raise JobError("invalid_finalization_tree")
+        if child_generation == 0:
+            if child["kind"] != "timer" or _hash(lease) != _hash(_lease(child)) or (job_id, 0) in owned:
+                raise JobError("invalid_finalization_tree")
+        else:
+            child_scope = await read(manager, tx, child, child_generation)
+            if (_hash(child_scope["scope"]["lease"]) != _hash(lease) or
+                    (job_id, child_generation) in owned and _hash(child_scope["scope"]["owner"]) != _hash(_lease(row))):
+                raise JobError("invalid_finalization_tree")
         refs.append(await _prepare(manager, tx, actor, child, child_generation, state, depth+1))
     refs = list({ref["event_id"]: ref for ref in refs}.values())
     proof = {"kind": row["kind"], "outcome": row["outcome"], "references": refs}
@@ -254,10 +301,12 @@ async def _publish(manager, tx, plans):
 
 
 async def finalize(manager, actor, job_id, *, generation):
-    if type(generation) is not int or not 1 <= generation < 2**63:
+    if type(generation) is not int or not 0 <= generation < 2**63:
         raise JobError("invalid_result_generation")
     async with manager._write() as tx:
         row = await manager._authorize(tx, actor, job_id)
+        if generation == 0 and row["kind"] != "timer":
+            raise JobError("invalid_result_generation")
         if row["generation"] != generation:
             raise JobError("finalization_generation_changed")
         state = {"done": {}, "visiting": set(), "plans": []}
