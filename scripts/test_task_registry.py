@@ -119,6 +119,10 @@ def main() -> int:
         "tests/unit/test_workflow_bound_restore_192.py",
         "tests/unit/test_completion_window_192.py",
         "tests/unit/test_finalization_192.py",
+        "tests/unit/test_model_attempts_192.py",
+        "tests/unit/test_model_attempt_transport_192.py",
+        "tests/unit/test_model_attempt_edges_192.py",
+        "tests/unit/test_answer_freshness_192.py",
         "tests/unit/test_workflow_completion_scope_192.py",
         "tests/unit/test_workflow_restore_plan_192.py",
         "tests/unit/test_workflow_restore_history_192.py",
@@ -174,6 +178,8 @@ def main() -> int:
     scopes.append("tests/real/test_real_workflow_resource_profile_192.py")
     scopes.append("tests/real/test_real_workflow_continuation_budget_192.py")
     scopes.append("tests/real/test_real_completion_window_192.py")
+    scopes.append("tests/real/test_real_model_attempts_192.py")
+    scopes.append("tests/real/test_real_answer_freshness_192.py")
     run_real = args.unit_shard is None
     if args.real_only:
         scopes = [scope for scope in scopes if scope.startswith("tests/real/")]
@@ -235,9 +241,9 @@ def main() -> int:
         cases.extend(c for c in ET.parse(report).getroot().iter("testcase")
                      if any(name in c.get("classname", "") for name in ("test_real_legacy_workflow_history_192", "test_real_task_events_192", "test_real_workflow_node_facade_192", "test_real_workflow_resources_192", "test_real_workflow_resource_profile_192", "test_real_workflow_continuation_budget_192")))
         cases.extend(c for c in ET.parse(report).getroot().iter("testcase")
-                     if "test_real_completion_window_192" in c.get("classname", ""))
-        if len(cases) != 65 or any(c.find("skipped") is not None for c in cases):
-            print("Task acceptance failed: all sixty-five configured real LLM cases must actually run.")
+                     if any(name in c.get("classname", "") for name in ("test_real_completion_window_192", "test_real_model_attempts_192", "test_real_answer_freshness_192")))
+        if len(cases) != 69 or any(c.find("skipped") is not None for c in cases):
+            print("Task acceptance failed: all sixty-nine configured real LLM cases must actually run.")
             return 1
         return code
     except RunnerInterrupted as exc:

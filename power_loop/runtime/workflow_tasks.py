@@ -175,6 +175,14 @@ async def node_execution(runtime, engine, node, env, driver_sid, *, cancel_token
 
 async def collect_node(runtime, loop, raw, stop_event, *, timeout_s=1800, max_rounds=30):
     """The owning node reuses one collector window across all settlement checks."""
+    from .task_runtime import _OWNER
+    scope = _OWNER.get()
+    if scope is not None and scope.runtime is runtime:
+        unresolved = await runtime.manager.db.fetchone(f"SELECT job_id FROM {runtime.manager.jobs} WHERE control_owner_job_id=? "
+            "AND control_owner_generation=? AND resource_state='unknown' LIMIT 1", (scope.lease.job_id, scope.lease.generation))
+        if unresolved:
+            status = "cancelled" if raw.get("status") == "cancelled" or stop_event.is_cancelled() else "failed"
+            return {**raw, "status": status, "completion_unresolved": True, "error": "unresolved_provider_or_tool_attempt"}
     from .completion import WINDOW, CompletionWindow, collect_required
     window = WINDOW.get()
     if window is None:
@@ -254,8 +262,19 @@ async def execute_background(loop, parent_sid, run_id, registration, build_engin
                                binding.lease.generation if binding else 0, on_complete)
 
     def failed(exc):
+        status = "cancelled" if isinstance(exc, asyncio.CancelledError) or getattr(exc, "code", None) == "cancel_requested" else "failed"
+        snapshot = getattr(exc, "execution_result", None)
+        if isinstance(snapshot, dict):
+            from .workflow_results import workflow_result
+            # A graph can finish its declared safe steps while an earlier
+            # request remains unknown. Retain its real outputs, never replace
+            # completed work/usage with an empty error-only workflow.
+            result = workflow_result(snapshot)
+            result.status = status
+            result.errors.append(f"{type(exc).__name__}: {exc}")
+            return result
         return WorkflowResult(name=run_spec.name,
-            status="cancelled" if isinstance(exc, asyncio.CancelledError) or getattr(exc, "code", None) == "cancel_requested" else "failed",
+            status=status,
             errors=[f"{type(exc).__name__}: {exc}"])
 
     try:

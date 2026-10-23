@@ -103,9 +103,11 @@ async def test_real_node_cancel_preserves_original_parallel_sibling_review_and_c
             assert provider.entered["REVIEW"].is_set() and len(completed) == 1 and len(accepted) == 1
             if native:
                 workflow = await manager.get_job(actor, handle.job_id)
-                assert workflow.outcome == "succeeded" and workflow.result["results"]["CALCULATE"]["status"] == "cancelled"
+                assert workflow.outcome == "failed" and workflow.resource_state == "unknown" and workflow.supervision_status == "open"
+                assert workflow.result["results"]["CALCULATE"]["status"] == "cancelled"
                 assert workflow.result["results"]["AUDIT"]["status"] == "completed"
                 assert workflow.result["results"]["REVIEW"]["status"] == "completed"
+                assert "CALCULATE" in workflow.result["tolerated"]
                 answer = await loop.flush_follow_ups(sid)
                 assert answer is not None and answer.status == "completed" and answer.final_text.strip()
             else:

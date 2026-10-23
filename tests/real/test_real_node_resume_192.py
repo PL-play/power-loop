@@ -24,6 +24,7 @@ jobs:
       ROLE-CALCULATE. VERSION-42 is a literal test identifier, not program source.
       Return that literal identifier verbatim. A later user correction replaces
       the identifier; output only the latest identifier.
+      Use plain text without Markdown, backticks, quotes, labels or code fences.
       Never use tools or pass_turn.
     tools: []
     with:
@@ -38,6 +39,7 @@ jobs:
     prompt: >-
       ROLE-REVIEW. Read the calculate result in your supplied context.
       Output only its latest VERSION code. Ignore sibling READY.
+      Use plain text without Markdown, backticks, quotes, labels or code fences.
       Never use tools or pass_turn.
     tools: []
     with:

@@ -183,6 +183,8 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
                 model["payload"].get("evidence", {}).get("exit") != "completed"):
             raise JobError("finalization_model_exit_unconfirmed")
         refs.append(await _reference(manager, tx, model["event_id"]))
+        from .model_attempts import require_quiescent
+        refs.extend([await _reference(manager, tx, key) for key in await require_quiescent(manager, tx, row)])
     else:
         result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='result'", (result_id(row["job_id"], generation),))
         payload = json.loads(result["payload_json"]) if result else {}

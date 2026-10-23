@@ -260,7 +260,7 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
         nonlocal admitted
         if runtime is not None:
             run.task_binding = await runtime.bind_subagent(parent, registration, sid)
-            await scopes.enter_async_context(runtime.execution(run.task_binding, owner=True))
+            await scopes.enter_async_context(runtime.execution(run.task_binding, owner=True, cancel_token=run.token))
         session = await store.get_session(sid)
         run.projection_expected = session.config.get("context_projection", True)
         _RUNNING[(id(store), sid)] = run

@@ -986,3 +986,59 @@ Unadapted responsibility remains visible as open rather than falsely settled.
 Directory `active` omits fully closed obligations; `terminal` still selects
 business outcomes and can overlap active when responsibility remains open.
 MySQL testing remains paused and default production storage/runtime is unchanged.
+
+### Durable managed model-call observations
+
+New managed sends declare model-attempt protocol version 1 in their original
+creation request and save tracking before executing. Each actual core call
+prepares a unique attempt under the original send lease, persists dispatch
+admission, and appends an immutable response observation. Round/retry coordinates
+are descriptive: queued steering or round-limit responses can share coordinates,
+so every actual call has a separate nonce-derived identity. Only the logical
+request fingerprint and bounded model metadata are retained, without prompt,
+tool arguments, credentials or raw response bodies.
+
+Dispatch checks original execution, owners and historical cancellation barriers
+in its control transaction. A lost write ACK is recalled with the same identity
+by that live caller; this is not a restart/replay capability. Returned responses
+retain all available token dimensions, estimated/actual distinction, provider
+response ID and reported cost as a decimal string with unknown currency left
+null. Observation persistence failures preserve actual pipeline usage and leave
+resource responsibility unknown. Late original observations may be saved after
+cancellation or lease expiry, but cannot change current outcomes, advance a new
+generation or dispatch more work. Unknown observations are not overwritten by
+later guesses; provider reconciliation requires a separate evidence protocol.
+
+For managed calls the existing `single_attempt` context disables built-in SDK
+and service retries and stream reconnection, then restores its previous value.
+Custom services must honor the same single-call contract themselves; arbitrary
+opaque transports are not sandboxed. Managed steering queues input until the
+current request returns instead of aborting it and automatically replacing an
+unconfirmed remote request. Explicit stops cancel local execution promptly while
+retaining unknown remote risk. Legacy calls keep their prior transport/steering
+policies.
+
+An unknown original execution blocks retries, fallback and business continuation
+under that owner. Previously admitted independent work retains its own execution
+authority; its historical main creator's unknown model call alone does not cancel
+it. This exception requires its own independent completion scope, no blocking
+edge and no control owner. Every historical explicit subtree stop still applies.
+Safe sibling steps declared by the graph can finish after a cancelled node; an
+unresolved overall result retains their real outputs and usage rather than
+reporting success or discarding completed work.
+
+Pass-turn and child empty-text recovery stop at the latest user input. Text from
+before a queued correction remains progress evidence, never its new answer.
+Managed node completion supplements missing text through the original bounded
+answer path; it does not create a new node/session or replay business work.
+Initial and resumed subagent owners use the run's original stop token. A durable
+cancel_requested barrier signals cancellation, while stale/expired leases and
+backend failures continue to report supervision loss.
+
+The shared jobs tool accepts `action=get, job_id=<send job>, view=attempts` with
+`limit`, `cursor` and `max_chars`. It returns authorized metadata and original
+phase event IDs, not leases/nonces/control credentials. Cursor membership changes
+are detected; whole JSON responses are bounded. Reads never ACK inputs, settle
+billing, clear unknown resource responsibility or run a model. Unsupported
+provider queries are explicit. The phase ledger is not a hard-budget reservation
+or API billing ledger and does not prove arbitrary tools stopped.

@@ -634,7 +634,8 @@ class OpenAICompatibleChatLLMService(LLMService):
         current_request = request
         restart_count = 0
         max_restarts = max(0, int(self._cfg.stream_max_restarts or 0))
-        resume_enabled = bool(self._cfg.stream_resume_on_error)
+        from .attempt_scope import single_attempt
+        resume_enabled = bool(self._cfg.stream_resume_on_error) and not single_attempt.get()
 
         def _as_dict(obj: Any) -> Any:
             if obj is None:

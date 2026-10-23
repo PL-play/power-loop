@@ -197,7 +197,7 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
     async def execute():
         acquired = False
         try:
-            async with runtime.execution(binding, owner=True):
+            async with runtime.execution(binding, owner=True, cancel_token=run.token):
                 try:
                     if admission is not None:
                         run.phase = "queued"

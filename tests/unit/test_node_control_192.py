@@ -75,7 +75,8 @@ async def test_cancel_exact_node_preserves_parent_and_sibling_after_heartbeat(ma
     workflow = await manager.get_job(runtime.actor(sid), handle.job_id)
     assert workflow.cancel_requested_at is None
     cancelled = await manager.get_job(runtime.actor(sid), node["job_id"])
-    assert cancelled.outcome == "cancelled" and cancelled.resource_state == "stopped"
+    assert cancelled.outcome == "cancelled" and cancelled.resource_state == "unknown"
+    assert cancelled.supervision_status == "open"
     if layout == "parallel":
         [other] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='workflow_node' AND title='AUDIT'")
         assert other["cancel_requested_at"] is None and other["outcome"] is None
@@ -84,7 +85,8 @@ async def test_cancel_exact_node_preserves_parent_and_sibling_after_heartbeat(ma
         model.release["REVIEW"].set()
     await asyncio.wait_for(handle.task, 5)
     final = await manager.get_job(runtime.actor(sid), handle.job_id)
-    assert final.outcome == "succeeded", final
+    assert final.outcome == "failed" and final.resource_state == "unknown" and final.supervision_status == "open", final
+    assert final.result["results"]["REVIEW"]["status"] == "completed" and "BUILD" in final.result["tolerated"]
     assert model.counts["REVIEW"] == 1
     assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='stop'")) == 1
 
@@ -108,7 +110,9 @@ async def test_heartbeat_observes_persistent_node_cancel_without_local_notificat
     assert not handle.task.cancelling() and not handle.task.done()
     model.release["REVIEW"].set()
     await asyncio.wait_for(handle.task, 5)
-    assert (await manager.get_job(runtime.actor(sid), handle.job_id)).outcome == "succeeded"
+    final = await manager.get_job(runtime.actor(sid), handle.job_id)
+    assert final.outcome == "failed" and final.resource_state == "unknown" and final.supervision_status == "open"
+    assert final.result["results"]["REVIEW"]["status"] == "completed"
 
 
 @pytest.mark.parametrize("mode", ["exact_job", "missing", "outside", "both", "blank", "old_generation"])
@@ -142,7 +146,9 @@ async def test_node_selector_is_exact_and_invalid_selection_never_stops_whole_ru
     await asyncio.wait_for(model.entered["REVIEW"].wait(), 3)
     model.release["REVIEW"].set()
     await asyncio.wait_for(handle.task, 5)
-    assert (await manager.get_job(runtime.actor(sid), handle.job_id)).outcome == "succeeded"
+    final = await manager.get_job(runtime.actor(sid), handle.job_id)
+    assert final.outcome == ("failed" if not error else "succeeded")
+    assert final.result["results"]["REVIEW"]["status"] == "completed"
 
 
 @pytest.mark.parametrize("fault", ["same_call_replay", "commit_ack"])
@@ -170,7 +176,9 @@ async def test_node_stop_replays_one_original_intent_and_receipt(managed_workflo
     _, receipt = await issue(loop, model, sid, monkeypatch, "workflow", {"action": "cancel", "run_id": handle.run_id, "node": "BUILD"})
     assert receipt["replayed"]
     await asyncio.wait_for(handle.task, 5)
-    assert (await manager.get_job(runtime.actor(sid), handle.job_id)).outcome == "succeeded"
+    final = await manager.get_job(runtime.actor(sid), handle.job_id)
+    assert final.outcome == "failed" and final.resource_state == "unknown" and final.supervision_status == "open"
+    assert final.result["results"]["REVIEW"]["status"] == "completed"
     assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='stop'")) == 1
 
 
@@ -278,7 +286,9 @@ async def test_cancelled_node_does_not_start_fallback_or_retry_business_work(man
     assert receipt["cancel_requested"]
     await asyncio.wait_for(handle.task, 5)
     assert model.counts["BUILD"] == 1 and model.counts["FALLBACK"] == 0 and model.counts["REVIEW"] == 1
-    assert (await manager.get_job(runtime.actor(sid), handle.job_id)).outcome == "succeeded"
+    final = await manager.get_job(runtime.actor(sid), handle.job_id)
+    assert final.outcome == "failed" and final.resource_state == "unknown" and final.supervision_status == "open"
+    assert final.result["results"]["REVIEW"]["status"] == "completed"
 
 
 async def test_settling_node_stop_keeps_original_result_and_does_not_cancel_review(managed_workflow, monkeypatch):

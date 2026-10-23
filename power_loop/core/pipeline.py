@@ -854,9 +854,16 @@ class AgentPipeline:
         self._log_send_summary(status, rounds)
         st = getattr(self, "_pass_state", None) or {}
         texts = list(getattr(self, "_step_texts", []) or [])
-        # 明确结束（pass_turn）时最后一轮往往没有文字：答案取最后一段写过的文字
+        # Recover an earlier answer only within the latest input. A queued
+        # correction followed by an empty pass must not reuse stale text.
         if st.get("passed") and not final_text and texts:
-            final_text = texts[-1]["text"]
+            for message in reversed(self.history):
+                if message.get("role") == "user":
+                    break
+                content = message.get("content")
+                if message.get("role") == "assistant" and isinstance(content, str) and content.strip():
+                    final_text = content.strip()
+                    break
         return AgentLoopResult(
             status=status,  # type: ignore[arg-type]
             final_text=final_text,
@@ -1317,7 +1324,6 @@ class AgentPipeline:
 
         async def _perform_call() -> LLMResponse:
             from power_loop.runtime.task_runtime import check_dispatch
-            await check_dispatch(self.session_id)
             # STREAM_STARTED/COMPLETED are emitted **per attempt** and paired in this call's own
             # finally (M-pipeline-runner-1): the terminal used to live in the OUTER finally, which
             # ran once, so N retry attempts emitted N STARTED but only 1 COMPLETED — unbalanced
@@ -1325,6 +1331,14 @@ class AgentPipeline:
             attempt_box[0] += 1
             attempt = attempt_box[0]
             call_id = f"r{round_index}.a{attempt}"
+            from power_loop.runtime.model_attempts import observe, response_observation, start_call
+            try:
+                await check_dispatch(self.session_id)
+                model_attempt = await start_call(self, request, round_index=round_index, retry_index=attempt, model=model_name)
+            except Exception as exc:
+                # Durable admission failure is not permission for the retry
+                # policy to allocate a replacement request/identity.
+                raise LLMNonRetryable(attempts=attempt, last_error=exc) from exc
             streamed["text"].clear()
             streamed["think"].clear()
             self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
@@ -1341,9 +1355,15 @@ class AgentPipeline:
                 )
                 t0 = time.perf_counter()
                 try:
-                    resp = await self.llm.complete(
-                        request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
-                    )
+                    from power_loop._vendor.llm_client.attempt_scope import single_attempt
+                    attempt_token = single_attempt.set(True) if model_attempt is not None else None
+                    try:
+                        resp = await self.llm.complete(
+                            request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
+                        )
+                    finally:
+                        if attempt_token is not None:
+                            single_attempt.reset(attempt_token)
                 except BaseException as exc:
                     # No usage chunk will ever come for this attempt, but it was billed: prompt
                     # in full once the provider started on it, plus what it streamed before the
@@ -1351,11 +1371,15 @@ class AgentPipeline:
                     # output (402, 401, 400…) was never processed → prompt 0.
                     outcome = _failure_outcome(exc)
                     produced = "".join(streamed["text"]), "".join(streamed["think"])
-                    rejected = _status_of(exc) is not None and not any(produced)
+                    # Managed attempts lack a provider rejection receipt: an
+                    # HTTP status alone cannot release their unknown risk.
+                    rejected = model_attempt is None and _status_of(exc) is not None and not any(produced)
                     p_est = 0 if rejected else estimate_prompt_tokens(
                         messages=messages, system_prompt=system_prompt, tools=tools)
                     c_est = estimate_completion_tokens(text=produced[0], think=produced[1])
                     self.ctx.add_unreported_usage(p_est, c_est)
+                    await observe(model_attempt, usage={"prompt_tokens": p_est, "completion_tokens": c_est,
+                        "total_tokens": p_est + c_est}, estimated=True, error=exc)
                     self._emit(
                         AgentEventType.LLM_CALL_COMPLETED,
                         LlmCallCompletedPayload(
@@ -1368,6 +1392,8 @@ class AgentPipeline:
                         ),
                         round_index=round_index, stream_id="main",
                     )
+                    if model_attempt is not None and isinstance(exc, Exception):
+                        raise LLMNonRetryable(attempts=attempt, last_error=exc) from exc
                     raise
                 usage = getattr(resp, "token_usage", None)
                 estimated = usage is None or getattr(usage, "prompt_tokens", None) is None
@@ -1384,6 +1410,8 @@ class AgentPipeline:
                                           total_tokens=p_est + c_est)
                     resp.token_usage = usage
                     self.ctx.note_estimated_call(p_est + c_est)
+                if model_attempt is not None:
+                    await observe(model_attempt, **response_observation(usage, resp), estimated=estimated)
                 self._emit(
                     AgentEventType.LLM_CALL_COMPLETED,
                     LlmCallCompletedPayload(
@@ -1831,7 +1859,8 @@ class AgentPipeline:
                     # DURING the call interrupts it, and only a bounded number of times.
                     # design/124 §8.4: a STOP interrupts the model call too (immediately — its
                     # output is discarded like a steered one, the run ends cancelled).
-                    _steer_ok = (self._steer_event is not None and not self._steer_event.is_set()
+                    from power_loop.runtime.model_attempts import is_managed
+                    _steer_ok = (not is_managed(self.session_id) and self._steer_event is not None and not self._steer_event.is_set()
                                  and self._steer_aborts < self.MAX_STEER_ABORTS)
                     if _steer_ok or not self.cancel_token.is_never:
                         _llm_work = asyncio.ensure_future(_llm_call)

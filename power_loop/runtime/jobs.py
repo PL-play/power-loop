@@ -160,18 +160,27 @@ class JobManager:
 
     async def _supervision_barriers(self, tx, row):
         """Historical ancestors retain stop/unknown barriers, not model leases."""
-        current, seen = row, set()
+        current, seen, independent_creator = row, set(), False
         for _ in range(64):
             if current is None or current["job_id"] in seen:
                 raise JobError("invalid_job_lineage")
             seen.add(current["job_id"])
             if current["cancel_requested_at"] is not None:
                 raise JobError("cancel_requested")
-            if current["resource_state"] == "unknown":
+            if current["resource_state"] == "unknown" and not independent_creator:
                 raise JobError("unresolved_prior_attempt")
             if not current["parent_job_id"]:
                 return
+            child = current
             current = await self._row(tx, current["parent_job_id"])
+            # Previously admitted independent work has its own execution
+            # authority. An uncertain creator's *model* request is a separate
+            # action, not authority to replay it or to cancel that child. A
+            # persistent subtree stop still applies at every ancestor above.
+            independent_creator = bool(current is not None and current["kind"] == "send" and
+                current["execution_role"] == "main" and current["status"] == "model_closed" and
+                child["kind"] in ("workflow", "subagent") and child["control_owner_job_id"] is None and
+                not child["blocks_completion"] and child["completion_scope_job_id"] == child["job_id"])
         raise JobError("job_depth_exceeded")
 
     async def _control_owners(self, tx, row):

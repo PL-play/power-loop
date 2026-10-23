@@ -180,7 +180,8 @@ class TaskRuntime:
                         local["signalled"] = True
                         cancel_token.cancel("task supervision lost")
                     else:
-                        lost.append(exc)
+                        if not isinstance(exc, JobError) or exc.code != "cancel_requested":
+                            lost.append(exc)
                         task.cancel("task supervision lost")
 
         heartbeat = asyncio.create_task(renew(), name="job-lease-" + binding.lease.job_id)
@@ -234,7 +235,7 @@ class TaskRuntime:
         registration = await self.manager.register_job(registering_actor, kind="send", session_id=sid,
             parent=owner.lease if owner else None,
             system_key=f"send:{sid}:{send_index}" if registering_actor != actor else f"send:{send_index}",
-            request={"send_index": send_index})
+            request={"send_index": send_index, "model_attempt_protocol": 1})
         if registration.replayed:
             # No automatic replay of a possibly side-effecting pending attempt.
             raise JobError("task_send_requires_reconciliation")
@@ -242,6 +243,8 @@ class TaskRuntime:
         evidence = {"exit": "interrupted", "session_id": sid, "send_index": send_index}
         try:
             async with self.execution(binding, cancel_token=cancel_token):
+                from .model_attempts import enable
+                await enable(binding)
                 yield evidence
                 snapshot = binding.resource_evidence.get("processing_snapshot_id")
                 if snapshot and evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass"):
@@ -265,6 +268,8 @@ class TaskRuntime:
             evidence["error_type"] = type(exc).__name__
             raise
         finally:
+            if binding.resource_evidence.get("model_attempts_inflight"):
+                binding.resource_evidence["resource_state"] = "unknown"
             last = await self.manager.db.fetchone(f"SELECT MAX(seq) AS seq FROM {self.manager.store.t.messages} "
                 "WHERE session_id=? AND role='assistant' AND send_index=?", (sid, send_index))
             if last is not None and last["seq"] is not None:

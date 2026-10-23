@@ -229,7 +229,12 @@ async def test_heartbeat_failure_stops_the_attempt_and_records_failure(managed, 
     monkeypatch.setattr(manager, "renew_execution", broken)
     await asyncio.wait_for(asyncio.gather(*list(delegation._TASKS), return_exceptions=True), 4)
     [child] = [j for j in await jobs(managed) if j.kind == "subagent"]
-    assert child.outcome in ("failed", "cancelled") and child.resource_state == "stopped"
+    assert child.outcome in ("failed", "cancelled") and child.resource_state == "unknown"
+    assert child.supervision_status == "open"
+    [attempt] = await manager.db.fetchall(f"SELECT e.payload_json FROM {manager.events} e JOIN {manager.jobs} j ON j.job_id=e.job_id "
+        "WHERE j.control_owner_job_id=? AND e.event_type='model_attempt_finished'", (child.job_id,))
+    evidence = json.loads(attempt["payload_json"])
+    assert evidence["status"] == "unknown" and evidence["error_type"] == "CancelledError" and evidence["estimated"]
     assert model.child_calls == 1
 
 
@@ -336,10 +341,21 @@ async def test_slow_result_projection_does_not_renew_or_cancel_already_stopped_e
     assert (await store.inbox_counts(sid))["pending"] == 1
 
 
-async def test_cancelled_caller_model_phase_does_not_cancel_already_accepted_independent_child(managed, monkeypatch):
+@pytest.mark.parametrize("scope_stop", [False, True])
+async def test_cancelled_caller_model_phase_does_not_cancel_already_accepted_independent_child(managed, monkeypatch, scope_stop):
     _, manager, runtime, loop, model, sid, _ = managed
     original = model.complete
     finishing_parent = asyncio.Event()
+    stop_observed = asyncio.Event()
+    original_renew = manager.renew_execution
+
+    async def renew(*args, **kwargs):
+        try:
+            return await original_renew(*args, **kwargs)
+        except JobError as exc:
+            if exc.code == "cancel_requested":
+                stop_observed.set()
+            raise
 
     async def gate_parent(request, **kwargs):
         if get_session_id() == sid and model.root_calls == 1:
@@ -348,6 +364,7 @@ async def test_cancelled_caller_model_phase_does_not_cancel_already_accepted_ind
         return await original(request, **kwargs)
 
     monkeypatch.setattr(model, "complete", gate_parent)
+    monkeypatch.setattr(manager, "renew_execution", renew)
     sending = asyncio.create_task(loop.send("delegate", sid))
     try:
         await asyncio.wait_for(finishing_parent.wait(), 3)
@@ -356,10 +373,16 @@ async def test_cancelled_caller_model_phase_does_not_cancel_already_accepted_ind
         await asyncio.gather(sending, return_exceptions=True)
         child = await manager.get_job(runtime.actor(sid), accepted["job_id"])
         assert (await manager.get_job(runtime.actor(sid), child.parent_job_id)).status == "model_closed"
+        assert (await manager.get_job(runtime.actor(sid), child.parent_job_id)).resource_state == "unknown"
         assert child.cancel_requested_at is None
+        if scope_stop:
+            await manager.request_cancel(runtime.actor(sid), child.parent_job_id, system_key="stop-original-tree", reason="Stop the complete original scope")
+            await asyncio.wait_for(stop_observed.wait(), 3)
         await finish(managed)
         child = await manager.get_job(runtime.actor(sid), child.job_id)
-        assert child.outcome == "succeeded" and child.result["final_text"] == "CHILD-PROOF-42"
+        assert child.outcome == ("cancelled" if scope_stop else "succeeded")
+        if not scope_stop:
+            assert child.result["final_text"] == "CHILD-PROOF-42"
     finally:
         if not sending.done():
             sending.cancel()

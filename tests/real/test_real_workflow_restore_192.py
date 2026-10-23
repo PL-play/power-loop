@@ -36,9 +36,9 @@ async def test_real_native_profile_and_consumed_result_can_plan_retained_nodes_w
         {"type": "agent", "id": "calculate", "input": "Compute 19+23.",
          "spec": {"name": "calculate", "tools": [], "max_rounds": 2,
                   "system_prompt": "Calculate the requested arithmetic. Reply only with its final number as assistant text. Do not use pass_turn."}},
-        {"type": "agent", "id": "review", "inputs_from": ["calculate"], "input": "Check the supplied calculation and report its number.",
+        {"type": "agent", "id": "review", "inputs_from": ["calculate"], "input": "Read the supplied calculate result and return that numeric value only. The arithmetic expression is not provided; no independent verification is requested.",
          "spec": {"name": "review", "tools": [], "max_rounds": 2,
-                  "system_prompt": "Read the supplied result. Return its verified number only in assistant text. Do not use pass_turn."}},
+                  "system_prompt": "Extract the numeric value of the supplied calculate result. Return that number only as plain assistant text without Markdown or pass_turn. Do not require absent operands or recompute an expression."}},
     ]}}
 
     async def launch():

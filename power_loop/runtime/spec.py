@@ -572,6 +572,8 @@ async def run_agent_spec(
         with contextlib.suppress(Exception):
             rows = await store.load_active_messages(child_sid)
             for row in reversed(rows):
+                if row.role == "user":
+                    break  # Old answers cannot satisfy a newer correction.
                 if row.role == "assistant" and (row.content or "").strip():
                     result = replace(result, final_text=str(row.content).strip())
                     break

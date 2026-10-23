@@ -9,6 +9,18 @@
 ## [Unreleased]
 
 ### Added
+- Persist managed model-call preparation, dispatch and response observations in
+  the task event ledger. Fence each original send, reconcile lost ACKs without
+  repeating a request, and retain uncertain remote execution after exceptions
+  or local cancellation. Disable hidden SDK/service retries and stream reconnects
+  for these managed calls; legacy transport policies remain unchanged. Add the
+  authorized, bounded `jobs get view=attempts` metadata view. These observations
+  do not reserve budgets, settle provider fees or prove remote cancellation.
+- Keep pass/child empty-answer recovery within the latest user input, so queued
+  corrections cannot deliver an old answer as a current result. Repair missing
+  node text only within the original contract and session. Use original subagent
+  stop tokens for initial/resumed owners and distinguish durable cancellation
+  from genuine lease/backend supervision failures.
 - Add proof-backed mechanical supervision closure for successful registered
   model sends, engine-consumed nodes, handled subagents and durable-inbox
   workflows. Atomically close verified scopes and retain immutable event,

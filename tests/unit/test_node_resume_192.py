@@ -322,7 +322,7 @@ async def test_cancelling_resumed_execution_stops_before_workflow_settlement(rea
         release.set()
         await settle(managed_workflow)
         node = await c.manager.get_job(c.runtime.actor(c.parent), c.job_id)
-        assert node.resource_state == "stopped" and node.outcome == "cancelled"
+        assert node.resource_state == "unknown" and node.outcome == "cancelled" and node.supervision_status == "open"
         assert c.model.counts["REVIEW"] == 0
         assert not c.engine._task_nodes and all(t.done() for t in c.engine._repairs.values())
     finally:
@@ -365,7 +365,9 @@ async def test_failed_or_empty_new_generation_preserves_old_result_and_blocks_su
     await settle(managed_workflow)
     actor = c.runtime.actor(c.parent)
     node = await c.manager.get_job(actor, c.job_id)
-    assert node.generation == 2 and node.outcome == "failed" and node.resource_state == "stopped"
+    assert node.generation == 2 and node.outcome == "failed" and node.resource_state == ("unknown" if fault == "provider_error" else "stopped")
+    if fault == "provider_error":
+        assert node.supervision_status == "open"
     assert (await c.manager.get_result_revision(actor, c.job_id, 1))["payload"]["result"] == c.old.result
     assert (await c.manager.get_job(actor, c.state["handles"][0].job_id)).outcome == "failed"
 

@@ -204,6 +204,8 @@ async def with_retry(
             raise
         except LLMTimeout:
             raise  # terminal: our budget timeout must not be swallowed by retry_on
+        except LLMNonRetryable:
+            raise  # A nested durable admission refusal never authorizes a retry.
         except policy.retry_on as exc:
             last_error = exc
             if policy.give_up_on is not None:

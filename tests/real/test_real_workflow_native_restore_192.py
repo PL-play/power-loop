@@ -45,8 +45,8 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
     spec = {"name": "native-calculation-repair", "root": {"type": "sequence", "steps": [
         {"type": "agent", "id": "calculate", "input": "Compute 19+23.", "spec": {"name": "calculate", "tools": [], "max_rounds": 2,
             "system_prompt": "Calculate the newest arithmetic requested by the user. Reply only with the final number in assistant text. Do not use pass_turn."}},
-        {"type": "agent", "id": "review", "inputs_from": ["calculate"], "input": "Check the supplied calculation result and report its verified number.",
-         "spec": {"name": "review", "tools": [], "max_rounds": 2, "system_prompt": "Review the newest calculation result supplied by the user. Return its number only. Do not use pass_turn."}},
+        {"type": "agent", "id": "review", "inputs_from": ["calculate"], "input": "Read the newest supplied calculate result and return that numeric value only. The arithmetic expression may be absent; no independent verification is requested.",
+         "spec": {"name": "review", "tools": [], "max_rounds": 2, "system_prompt": "Extract the numeric value of the newest supplied calculate result. Return that number only as plain assistant text without Markdown or pass_turn. Do not require absent operands or recompute the old expression."}},
     ]}}
     pool = SharedBudget(1000000)
     pool.commit({"total_tokens": 13})

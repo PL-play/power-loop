@@ -159,7 +159,9 @@ async def test_real_main_nudges_original_workflow_node_before_review(tmp_path, r
                 messages = await store.load_all_messages(reply["session_id"])
                 assert any(call.get("function", {}).get("name") == "pass_turn" for msg in messages for call in (msg.tool_calls or []))
                 assert not next(msg for msg in messages if msg.role == "assistant").content.strip()
-                assert len(await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send' AND session_id=?", (reply["session_id"],))) >= 2
+                attempts = await manager.db.fetchall(f"SELECT e.event_id FROM {manager.events} e JOIN {manager.jobs} j ON j.job_id=e.job_id "
+                    "WHERE j.kind='send' AND j.session_id=? AND e.event_type='model_attempt_finished'", (reply["session_id"],))
+                assert len(attempts) >= 2  # queued input may be processed in the same original send
             [event] = await manager.db.fetchall(f"SELECT delivery_status FROM {manager.events} WHERE event_id=?", (reply["operation_id"],))
             assert event["delivery_status"] == "handled"
             wf = await manager.get_job(runtime.actor(parent), handles[0].job_id)
