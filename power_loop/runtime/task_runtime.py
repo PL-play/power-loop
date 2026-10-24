@@ -257,6 +257,11 @@ class TaskRuntime:
     def actor(self, sid: str) -> JobActor:
         return JobActor(self.tenant_id, self.principal_id, sid)
 
+    def root_context(self, session_id, *, namespace, payload):
+        """Bind trusted per-root provenance before entering the main send."""
+        from .root_context import bind
+        return bind(self, session_id, namespace=namespace, payload=payload)
+
     async def claim(self, actor: JobActor, registration: JobRegistration) -> Execution:
         _check_task_owner(self)
         await self.ensure_started()
@@ -411,13 +416,19 @@ class TaskRuntime:
                 owner = None
         if owner is None and await session_role(self.manager.store, sid) != "main":
             raise JobError("task_owner_required")
+        request = {"send_index": send_index, "model_attempt_protocol": 1}
+        if owner is None:
+            from .root_context import for_send
+            provenance = for_send(self, sid)
+            if provenance is not None:
+                request["host_context"] = provenance
         registration = await self.manager.register_job(
             registering_actor,
             kind="send",
             session_id=sid,
             parent=owner.lease if owner else None,
             system_key=f"send:{sid}:{send_index}" if registering_actor != actor else f"send:{send_index}",
-            request={"send_index": send_index, "model_attempt_protocol": 1},
+            request=request,
         )
         if registration.replayed:
             # No automatic replay of a possibly side-effecting pending attempt.
