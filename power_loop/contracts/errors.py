@@ -42,6 +42,16 @@ class SessionBusy(PowerLoopError):
     code = "session.busy"
 
 
+class InboxClaimChanged(PowerLoopError):
+    """The entire claimed batch must be reclaimed before it can enter history."""
+
+    code = "inbox.claim_changed"
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"inbox claim changed: {session_id}")
+
+
 class SessionPendingError(PowerLoopError):
     """Raised when a session has unresolved tool_calls from a previous run.
 

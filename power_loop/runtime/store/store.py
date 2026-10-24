@@ -23,6 +23,8 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from power_loop.contracts.errors import InboxClaimChanged
+from power_loop.runtime.message_ref import integer_id
 from power_loop.runtime.store.capabilities import Maintenance
 from power_loop.runtime.store.db import Database, Row, Transaction
 from power_loop.runtime.store.schema import (
@@ -407,6 +409,29 @@ class SessionStore:
         async with self._db.transaction() as tx:
             st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
             seq = int(st["next_seq"])
+            if inbox is not None:
+                token, raw_ids = inbox.get("claim_token"), inbox.get("ids")
+                if not isinstance(token, str) or not token or not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+                    raise InboxClaimChanged(session_id)
+                try:
+                    ids = [integer_id(i, "inbox_id") for i in raw_ids]
+                except ValueError as exc:
+                    raise InboxClaimChanged(session_id) from exc
+                if len(set(ids)) != len(ids):
+                    raise InboxClaimChanged(session_id)
+                # Conditional UPDATE serializes against void/release/reclaim on the actual
+                # queue rows. A partial match rolls back this whole transaction, including
+                # delivery markers; no stale batch may acquire a transcript row.
+                changed = await tx.execute(
+                    f"UPDATE {self.t.follow_up_queue} SET status='delivered', delivered_at=?, "
+                    "delivered_seq=?, delivered_send_index=?, claim_token=NULL "
+                    f"WHERE session_id=? AND claim_token=? AND status='claimed' "
+                    f"AND id IN ({','.join('?' for _ in ids)})",
+                    (now, seq, (int(send_index) if send_index is not None else None),
+                     session_id, token, *ids),
+                )
+                if changed != len(ids):
+                    raise InboxClaimChanged(session_id)
             await tx.execute(
                 f"INSERT INTO {self.t.messages} ("
                 "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
@@ -425,16 +450,6 @@ class SessionStore:
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
             )
-            if inbox and inbox.get("ids"):
-                ids = [int(i) for i in inbox["ids"]]
-                await tx.execute(
-                    f"UPDATE {self.t.follow_up_queue} SET status='delivered', delivered_at=?, "
-                    "delivered_seq=?, delivered_send_index=?, claim_token=NULL "
-                    f"WHERE session_id=? AND claim_token=? AND status='claimed' "
-                    f"AND id IN ({','.join('?' for _ in ids)})",
-                    (now, seq, (int(send_index) if send_index is not None else None),
-                     session_id, str(inbox.get("claim_token") or ""), *ids),
-                )
             if hook_injected:
                 # Per-session monotonic event_id; MAX+1 is race-free here because we hold the
                 # session_state lock for the whole append (serializes same-session writers).

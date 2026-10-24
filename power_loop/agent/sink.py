@@ -17,6 +17,8 @@ import logging
 from typing import Any, Protocol, runtime_checkable
 
 from power_loop.agent.types import LoopMessage
+from power_loop.contracts.errors import InboxClaimChanged
+from power_loop.core.agent_context import get_current_loop
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.store.types import (
     CONTENT_ENCODING_JSON,
@@ -234,16 +236,26 @@ class SQLiteSink:
             # Which inbox items this row carries (dedupe/audit; design/124 §6).
             meta = {**(meta or {}), "inbox": {k: inbox[k] for k in ("item_ids", "kinds")
                                               if k in inbox}}
-        seq = await self.store.append_message(
-            self.session_id,
-            role=str(role or "user"),
-            content=text,
-            name=message.get("name"),
-            round_index=round_index,
-            meta=meta,
-            send_index=message.get("send_index"),
-            inbox=inbox,
-        )
+        try:
+            seq = await self.store.append_message(
+                self.session_id,
+                role=str(role or "user"),
+                content=text,
+                name=message.get("name"),
+                round_index=round_index,
+                meta=meta,
+                send_index=message.get("send_index"),
+                inbox=inbox,
+            )
+        except InboxClaimChanged:
+            # The batch was rolled back. Release only its surviving claim rows;
+            # the pipeline will render a fresh batch, never reuse the old text.
+            await self.store.inbox_release(self.session_id, inbox["claim_token"])
+            pending = (await self.store.inbox_counts(self.session_id))["pending"]
+            loop = get_current_loop()
+            if pending and loop is not None:
+                loop._note_committed_inbox(self.session_id)
+            raise
         self._history_seqs.append(seq)
         self._history_ord.append(seq)
 

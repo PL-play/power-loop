@@ -32,6 +32,7 @@ from power_loop.agent.system_prompt import resolve_runtime_system_prompt
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
     CancellationRequested,
+    InboxClaimChanged,
     LLMNonRetryable,
     LLMRetryExhausted,
     LLMTimeout,
@@ -539,7 +540,7 @@ class AgentPipeline:
         *,
         round_index: int | None = None,
         hook_injected: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         # An inbox delivery (design/124 §6) arrives with a private ``_inbox`` marker naming the
         # claimed inbox rows it carries. Strip it BEFORE hooks/history — the history row is sent
         # verbatim to the provider — and hand it only to the sink, which marks those rows
@@ -552,6 +553,19 @@ class AgentPipeline:
             session_id=self.session_id,
         )
         await self.hooks.run_typed_async(HookPoint.MESSAGE_APPEND, ctx)
+        sink_msg = ctx.message
+        if self.send_index is not None:
+            sink_msg = {**sink_msg, "send_index": self.send_index}
+        if hook_injected is not None:
+            sink_msg = {**sink_msg, "hook_injected": hook_injected}
+        if inbox is not None:
+            sink_msg = {**sink_msg, "inbox": inbox}
+            # Persist the claim before admitting any text/images/token estimates
+            # to the in-memory request. Only a proven stale claim is retryable.
+            try:
+                await self._emit_sink(self.sink.on_message_appended, sink_msg, round_index=round_index)
+            except InboxClaimChanged:
+                return False
         self.history.append(ctx.message)
         # 6.12.0 图片保留：记下「这一行是第几轮入的图」（旁路表，按对象身份；history 行原样发给
         # 供应商，不能夹私货字段）。
@@ -568,14 +582,24 @@ class AgentPipeline:
         # LLM; an unknown field would leak / break the provider). The sink persists send_index into
         # the messages.send_index column and hook_injected into the hook_events table; neither
         # reaches the LLM.
-        sink_msg = ctx.message
-        if self.send_index is not None:
-            sink_msg = {**sink_msg, "send_index": self.send_index}
-        if hook_injected is not None:
-            sink_msg = {**sink_msg, "hook_injected": hook_injected}
-        if inbox is not None:
-            sink_msg = {**sink_msg, "inbox": inbox}
-        await self._emit_sink(self.sink.on_message_appended, sink_msg, round_index=round_index)
+        if inbox is None:
+            await self._emit_sink(self.sink.on_message_appended, sink_msg, round_index=round_index)
+        return True
+
+    async def _append_drained(self, drained: list[LoopMessage], *, round_index: int) -> int:
+        """Reclaim stale batches at most three times, without dispatching a model."""
+        committed = 0
+        for attempt in range(3):
+            stale = False
+            for msg in drained:
+                if await self._append_message(msg, round_index=round_index):
+                    committed += 1
+                else:
+                    stale = True
+            if not stale or attempt == 2 or self._drain_follow_ups is None:
+                break
+            drained = await self._drain_follow_ups()
+        return committed
 
     # ── Steering (design/124 §7) ──
 
@@ -1731,9 +1755,7 @@ class AgentPipeline:
             drained_count = 0
             if self._drain_follow_ups is not None:
                 drained = await self._drain_follow_ups()
-                drained_count = len(drained)
-                for msg in drained:
-                    await self._append_message(msg, round_index=round_idx)
+                drained_count = await self._append_drained(drained, round_index=round_idx)
 
             # ── pass_turn：上一轮调了 → 这一轮开始前硬停（design/188，不再调模型）──
             if self._pass_state and self._pass_state.get("passed"):
@@ -2096,26 +2118,10 @@ class AgentPipeline:
                         "empty LLM response persisted %d rounds — closing send (session=%s)",
                         self._empty_response_streak, self.session_id,
                     )
-                # In-flight steering arriving during this (otherwise terminal)
-                # round would never be drained at a later round-start, so it
-                # would be silently dropped. Drain here: if anything is queued,
-                # run another round to address it instead of completing.
-                #
-                # Residual micro-race (accepted-follow_up vs. terminal drain),
-                # handled BEST-EFFORT by design: a follow_up enqueued in the
-                # window *after* this drain returns empty but *before* the
-                # caller releases the session lock is still accepted into the
-                # in-process queue — within this process it is not lost (the
-                # now-idle session's next send() drains it at round start). The
-                # only loss is if the host process restarts in that window
-                # before the next send drains it: the in-process queue is not
-                # persisted, so the just-accepted item is dropped on restart.
-                # We accept this rather than add cross-restart durability here:
-                # the queue is intentionally in-process, and DeepTalk dispatch
-                # is best-effort (restart seeks to end, no replay) with
-                # consistency reestablished by api persistence + client seq
-                # sync and the next ambient/explicit wake. See agent
-                # session_folder.py ("in-process only; lost on restart").
+                # A terminal response still consumes freshly committed follow-ups. Items
+                # arriving after this drain stay in the durable inbox for a later flush;
+                # a withdrawn claim must not create a new paid round or a duplicate end.
+                round_ended = False
                 if self._drain_follow_ups is not None:
                     drained = await self._drain_follow_ups()
                     if drained:
@@ -2129,17 +2135,18 @@ class AgentPipeline:
                             round_index=round_idx, messages=self.history,
                             has_tools=False, response_text=assistant_text))
                         await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
-                        for msg in drained:
-                            await self._append_message(msg, round_index=round_idx)
-                        continue
-                self._emit(AgentEventType.ROUND_COMPLETED,
-                           RoundCompletedPayload(round_index=round_idx, has_tools=False), round_index=round_idx)
-                round_end = RoundEndCtx(
-                    round_index=round_idx, messages=self.history,
-                    has_tools=False, response_text=assistant_text,
-                )
-                await self.hooks.run_typed_async(HookPoint.ROUND_END, round_end)
-                await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
+                        round_ended = True
+                        if await self._append_drained(drained, round_index=round_idx):
+                            continue
+                if not round_ended:
+                    self._emit(AgentEventType.ROUND_COMPLETED,
+                               RoundCompletedPayload(round_index=round_idx, has_tools=False), round_index=round_idx)
+                    round_end = RoundEndCtx(
+                        round_index=round_idx, messages=self.history,
+                        has_tools=False, response_text=assistant_text,
+                    )
+                    await self.hooks.run_typed_async(HookPoint.ROUND_END, round_end)
+                    await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
                 # ── Hook: COMPLETE_DECIDE (natural completion) ──
                 if await self._complete_decide(
                     reason="completed", round_idx=round_idx, final_text=assistant_text,

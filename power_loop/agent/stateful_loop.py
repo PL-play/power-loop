@@ -50,6 +50,7 @@ from power_loop.agent.system_prompt import (
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
+    InboxClaimChanged,
     SessionBusy,
     SessionNotFoundError,
     SessionPendingError,
@@ -978,20 +979,30 @@ class StatefulAgentLoop:
             await self._ensure_session_or_raise(sid)
             await self._raise_if_pending(sid)
             async with self._session_lease(sid):
-                claimed = await self._claim_inbox(sid)
-                if not claimed:
-                    return None
-                token = claimed[0]["claim_token"]
-                first = render_inbox_rows(claimed, wrap=False)[0]
-                try:
-                    await self._persist_user_input(sid, first)
-                finally:
-                    released = await store.inbox_release(sid, token)
-                    _session_sync(sid).pending_hint += released
-                return await self._run_loop(
-                    sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                    max_rounds=max_rounds,
-                )
+                for _ in range(3):
+                    claimed = await self._claim_inbox(sid)
+                    if not claimed:
+                        return None
+                    token = claimed[0]["claim_token"]
+                    first = render_inbox_rows(claimed, wrap=False)[0]
+                    stale = False
+                    try:
+                        await self._persist_user_input(sid, first)
+                    except InboxClaimChanged:
+                        stale = True
+                        continue
+                    finally:
+                        released = await store.inbox_release(sid, token)
+                        _session_sync(sid).pending_hint += released
+                        if stale:
+                            # Another consumer may already have released/reclaimed the
+                            # batch, so our own release count alone can lose the wake hint.
+                            _session_sync(sid).pending_hint = (await store.inbox_counts(sid))["pending"]
+                    return await self._run_loop(
+                        sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+                        max_rounds=max_rounds,
+                    )
+                return None
 
     def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
         """Drive ``coro`` to completion on the loop's dedicated sync event loop.
