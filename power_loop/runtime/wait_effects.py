@@ -17,8 +17,9 @@ def effect_id(manager, decision_id):
     return "wait_effect_" + _hash([manager.store.store_id, decision_id])[:48]
 
 
-async def _decision(manager, tx, actor, event_id):
-    job, due, saved, _ = await notices.notification(manager, tx, actor, event_id)
+async def _decision(manager, tx, actor, event_id, *, _notification=None):
+    bundle = _notification if _notification is not None else await notices.notification(manager, tx, actor, event_id)
+    job, due, saved, _ = bundle
     row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (notices.decision_id(manager, event_id),))
     if row is None:
         raise JobError("wait_decision_required")
@@ -26,7 +27,7 @@ async def _decision(manager, tx, actor, event_id):
     op = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (data.get("operation_id"),))
     if op is None or not isinstance(data.get("request"), dict):
         raise JobError("wait_decision_evidence_missing")
-    accepted = await decisions._accepted(manager, tx, actor, event_id, data["request"], op)
+    accepted = await decisions._accepted(manager, tx, actor, event_id, data["request"], op, _notification=bundle)
     # A worker must not turn a decision with an uncommitted/missing tool receipt
     # into an input. The completed main model send is not its execution lease.
     if accepted.receipt_ref is None:
@@ -53,7 +54,7 @@ def _input(saved, binding):
     return request
 
 
-async def _effect(manager, tx, actor, job, saved, decision, data):
+async def _effect(manager, tx, actor, job, saved, decision, data, *, _review=True):
     key = effect_id(manager, decision["event_id"])
     row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
     if row is None:
@@ -73,6 +74,9 @@ async def _effect(manager, tx, actor, job, saved, decision, data):
     if choice == "defer":
         if payload["operation_id"] is not None:
             raise JobError("wait_effect_evidence_corrupt")
+        if _review and row["delivery_status"] == "handled":
+            from .wait_reviews import require_link
+            await require_link(manager, tx, job, saved, decision, row)
     else:
         action = "nudge" if choice == "continue" else "stop"
         op = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (payload["operation_id"],))
@@ -112,7 +116,7 @@ async def apply(manager, actor, event_id):
     async with manager._write() as tx:
         job, _, saved, decision, data = await _decision(manager, tx, actor, event_id)
         old = await _effect(manager, tx, actor, job, saved, decision, data)
-        if old is not None:
+        if old is not None and not (data["request"]["decision"] == "defer" and old["delivery_status"] == "delivered"):
             if old["delivery_status"] == "handled" and data["request"]["decision"] == "continue":
                 await _resolved(manager, tx, job, old)
             elif old["delivery_status"] == "handled" and data["request"]["decision"] == "cancel":
@@ -130,6 +134,10 @@ async def apply(manager, actor, event_id):
         elif (job["generation"] != 0 or job["resource_state"] != "not_started" or job["outcome"] is not None):
             raise JobError("wait_state_changed")
         binding = _binding(manager, decision, data)
+        if old is not None:
+            from .wait_reviews import schedule
+            await schedule(manager, tx, actor, job, saved, decision, old)
+            return _reply({**old, "delivery_status": "handled"})
         op = None
         if choice != "defer":
             action = "nudge" if choice == "continue" else "stop"
@@ -159,7 +167,14 @@ async def apply(manager, actor, event_id):
             (binding["effect_id"], job["job_id"], "wait_effect", job["version"]+1, actor.session_id, _hash(payload), _json(payload), "delivered", manager.now()))
         await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
         await tx.execute(f"UPDATE {manager.events} SET delivery_status='delivered' WHERE event_id=?", (decision["event_id"],))
-        effect = await _effect(manager, tx, actor, job, saved, {**decision, "delivery_status": "delivered"}, data)
+        if choice == "defer":
+            from .wait_reviews import schedule
+            job = await manager._row(tx, job["job_id"])
+            fresh = await _effect(manager, tx, actor, job, saved, {**decision, "delivery_status": "delivered"}, data)
+            await schedule(manager, tx, actor, job, saved, {**decision, "delivery_status": "delivered"}, fresh)
+            decision = {**decision, "delivery_status": "handled"}
+        job = await manager._row(tx, job["job_id"])
+        effect = await _effect(manager, tx, actor, job, saved, {**decision, "delivery_status": "handled" if choice == "defer" else "delivered"}, data)
         return _reply(effect)
 
 
@@ -203,9 +218,10 @@ async def settle_owner_tx(manager, tx, actor, owner):
         initial = waits._object(creation["payload_json"]) if creation else {}
         if creation is not None and "wait_binding" not in initial and "managed_wait" not in initial.get("request", {}):
             continue  # Legacy timers retain their own adapter and evidence.
-        _, _, saved = await waits._read(manager, tx, actor, row["job_id"])
+        timer, creation, saved = await waits._read(manager, tx, actor, row["job_id"])
         main = JobActor(actor.tenant_id, actor.principal_id, saved["binding"]["main_session_id"])
-        due_id = waits.due_event_id(manager, row["job_id"], saved["creation_operation_id"])
+        from .wait_reviews import history
+        due_id = (await history(manager, tx, actor, timer, creation, saved))["event_id"]
         marker = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (notices.decision_id(manager, due_id),))
         if marker is None:
             continue

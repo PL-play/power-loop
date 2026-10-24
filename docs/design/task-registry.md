@@ -1227,11 +1227,11 @@ their existing supervision mechanism; acceptance is not physical-stop proof.
 
 For `defer`, `status="review_scheduled"` records the original decision's next
 review time without changing the original admission, due event or deadline.
-This is durable pending review responsibility, not an automatic periodic
-driver. Due times and new continue/defer effects must be strictly before the
-original deadline. Cancelled-wait termination, review-cycle driving, persistent
-owner waiting, timer supervision finalization and formal host wake integration
-remain implementation gates. No default child timer is enabled by these ports.
+The defer effect atomically transfers responsibility to a separate immutable
+review cycle as described below. Due times and new continue/defer effects must
+be strictly before the original deadline. Formal host wake authorization,
+periodic scheduling and cross-process execution recovery remain separate gates.
+No default child timer is enabled by these ports.
 
 ### Unexecuted-wait termination and supervision
 
@@ -1412,3 +1412,51 @@ This is bounded confirmation by the same live controller. Cross-process
 resumption, all later-generation history combinations, defer review drivers
 and all uncertain control-outbox reconciliation still require their separate
 protocols. MySQL parity is not verified while its tests remain paused.
+
+
+### Immutable defer review cycles and the SDK driver
+
+The first `wait_due` retains its version-1 ID and payload. Each applied defer
+adds one `wait_review` event on the same timer, citing the prior due, exact
+receipted main decision and effect, monotonic cycle, accepted review time and
+stable next due ID. Review, effect and decision handoff commit atomically.
+A handled defer means responsibility moved to that durable cycle; the timer
+still has no executor, outcome or completed owner. Neither original request
+nor original policy deadline is rewritten.
+
+`timer_waits.prepare_due` validates the entire chain iteratively, then returns
+`armed` until the current review time and creates one version-2 `wait_due`
+when due. Its payload preserves the original wait and cites the review event,
+hash and cycle. Missing, forked, reordered or damaged original decision,
+observation, tool receipt or effect evidence fails closed. Old event inspection
+and exact effect replay remain historical reads; they cannot overwrite later
+cycles or restore expired execution credentials. At most 256 defers may be
+accepted for one timer; exceeding that bound rejects a new defer before its
+acceptance, while continuation, cancellation and accepted history remain valid.
+
+`await runtime.wait_reviews.drive(loop, main_actor, original_timer_job_id)`
+performs one repeatable mechanical step: retain `armed`, enqueue the current
+main notification, or apply a previously receipted main decision. It never
+starts a model, adds a replacement timer/agent/workflow, or authorizes a paid
+main wake. The host must periodically invoke it and separately authorize any
+actual main execution. Finite children still cannot directly wake themselves.
+Duplicate driver calls and store reopen reuse the same durable responsibilities.
+Missing decision receipts remain unresolved errors for retry/inspection.
+
+Owner waiting, successful input settlement, cancellation termination and
+supervision reference the latest cycle and validate all prior cycle evidence.
+Continue still requires actual original-input processing and the owner's
+canonical result transaction; cancel still requires original physical exit.
+A pre-cycle legacy delivered defer may be upgraded on the same effect only
+while original owner authority and deadline remain valid. Invalid legacy
+responsibilities are not permission to create new execution or extend a wait.
+Formal host polling/wake, short in-flight deadline interruption, cross-process
+restore and all other unfinished lifecycle gates remain required; these SDK
+ports are not enabled by default.
+
+An unapplied defer remains a separate responsibility if its owner stops before
+application (including an expired legacy delivered defer). Physical owner stop
+and logical timer termination do not acknowledge that original decision.
+Supervision returns `wait_review_unsettled` until an explicit original-negative
+responsibility reconciliation is implemented; it must not silently drop the
+accepted decision or fabricate a next review after the original deadline.

@@ -307,8 +307,10 @@ async def _prepare_due(manager, tx, actor, job_id):
         meta = _object(physical["metadata_json"] or "{}") if physical else {}
         if meta.get("execution_role") != "subagent" or meta.get("standalone_subagent") is not True:
             raise JobError("wait_session_role_mismatch")
-    if manager.now() < desired.due_at_ms:
-        return {"status": "armed", "job_id": job_id, "due_at_ms": desired.due_at_ms, "execution_authority": False}
+    from .wait_reviews import history
+    state = await history(manager, tx, actor, job, creation, saved)
+    if manager.now() < state["due_at_ms"]:
+        return {"status": "armed", "job_id": job_id, "due_at_ms": state["due_at_ms"], "execution_authority": False}
     if saved["receipt_ref"] is None:
         raise JobError("wait_receipt_missing")
     source_actor = JobActor(actor.tenant_id, actor.principal_id, binding["session_id"])
@@ -317,9 +319,7 @@ async def _prepare_due(manager, tx, actor, job_id):
     if (saved["receipt_ref"]["tool_call_id"] != binding["tool_call_id"]
             or saved["receipt_ref"]["send_index"] != saved["call_ref"]["send_index"]):
         raise JobError("wait_receipt_mismatch")
-    event_id = due_event_id(manager, job_id, creation["event_id"])
-    payload = {"version": 1, "wait": saved}
-    old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
+    event_id, payload, old = state["event_id"], state["payload"], state["event"]
     if old is not None:
         if (old["job_id"] != job_id or old["event_type"] != "wait_due"
                 or old["request_hash"] != _hash(payload) or _hash(_object(old["payload_json"])) != _hash(payload)

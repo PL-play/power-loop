@@ -20,6 +20,7 @@ from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 from power_loop.tools.wait_handoff import register_wait_handoff_tool
 from power_loop.workflow.admission import GATES, admit, idle
+from power_loop.workflow.engine import WorkflowEngine
 
 from .test_job_registry_192 import registry_store
 from .test_workflow_task_runtime_192 import leaf, managed_workflow
@@ -267,6 +268,29 @@ async def test_waiting_workflow_leaf_releases_capacity_for_sibling_and_reacquire
         {"type": "parallel", "max_concurrency": 1, "concurrency_scope": "leaf", "branches": [leaf("BUILD", tools=["arm_wait"]), leaf("AUDIT")]}, leaf("REVIEW")]}
     register_wait_handoff_tool(loop.tool_registry)
     saved, choice = [], {"event_id": None, "issued": False}
+    waiting_committed = asyncio.Event()
+    audit_admissions = []
+    original_enter = owner_waits._enter
+    original_admitted = WorkflowEngine._exec_agent_admitted
+
+    async def entered(*args, **kwargs):
+        result = await original_enter(*args, **kwargs)
+        if result is not None:
+            waiting_committed.set()
+        return result
+
+    async def admit_after_original_wait(engine, node, *args, **kwargs):
+        # Parallel branches have no start-order guarantee. Stage AUDIT before
+        # admission, so this case specifically measures release/reacquisition
+        # by a waiting BUILD rather than racing to obtain the initial slot.
+        # The actual admission, semaphore and owning executor are unchanged.
+        if node.id == "AUDIT":
+            audit_admissions.append(node.id)
+            await asyncio.wait_for(waiting_committed.wait(), 5)
+        return await original_admitted(engine, node, *args, **kwargs)
+
+    monkeypatch.setattr(owner_waits, "_enter", entered)
+    monkeypatch.setattr(WorkflowEngine, "_exec_agent_admitted", admit_after_original_wait)
 
     async def arm():
         source, sid = _SEND.get(), get_session_id()
@@ -299,6 +323,7 @@ async def test_waiting_workflow_leaf_releases_capacity_for_sibling_and_reacquire
     try:
         await loop.send("Run original workflow", parent)
         await asyncio.wait_for(model.entered["AUDIT"].wait(), 5)
+        assert audit_admissions == ["AUDIT"] and waiting_committed.is_set()
         if not saved:
             diagnostic = []
             workflow_job = await manager.get_job(task_runtime.actor(parent), state["handles"][0].job_id)

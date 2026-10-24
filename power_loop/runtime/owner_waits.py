@@ -225,7 +225,8 @@ async def _pending(manager, tx, actor, owner, sid=None):
         if saved["receipt_ref"] is None:
             raise JobError("wait_receipt_missing")
         main = JobActor(actor.tenant_id, actor.principal_id, saved["binding"]["main_session_id"])
-        due = waits.due_event_id(manager, job["job_id"], event["event_id"])
+        from .wait_reviews import history
+        due = (await history(manager, tx, actor, job, event, saved))["event_id"]
         decision = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (decision_id(manager, due),))
         if decision is not None:
             _, _, _, accepted, data = await effects._decision(manager, tx, main, due)

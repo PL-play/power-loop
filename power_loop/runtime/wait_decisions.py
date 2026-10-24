@@ -28,9 +28,9 @@ def _intent(event_id, caller, call_ref, tool_call_id, decision, reason, next_rev
         "tool_call_id": tool_call_id, "decision": decision, "reason": reason, "next_review_at_ms": next_review_at_ms}
 
 
-async def _accepted(manager, tx, actor, event_id, request, operation):
+async def _accepted(manager, tx, actor, event_id, request, operation, *, _notification=None):
     """Read exact accepted evidence, even after the caller closes or expires."""
-    _, due, saved, receipt = await notices.notification(manager, tx, actor, event_id)
+    _, due, saved, receipt = _notification if _notification is not None else await notices.notification(manager, tx, actor, event_id)
     try:
         reconstructed = _intent(event_id, JobLease(**request["caller"]), waits._ref(request["call_ref"]),
             request["tool_call_id"], request["decision"], request["reason"], request["next_review_at_ms"])
@@ -167,8 +167,12 @@ async def record_decision(manager, actor, *, event_id, caller, call_ref, tool_ca
         if current["status"] != "decision_pending" or current["event_id"] != event_id:
             raise JobError("wait_due_state_changed")
         _, policy = waits._request(saved["request"])
-        if decision == "defer" and not manager.now() < next_review_at_ms < policy.deadline_at_ms:
-            raise JobError("wait_review_out_of_bounds")
+        if decision == "defer":
+            from .wait_reviews import MAX_REVIEWS
+            if current["payload"].get("review", {}).get("cycle", 0) >= MAX_REVIEWS:
+                raise JobError("wait_review_limit_exceeded")
+            if not manager.now() < next_review_at_ms < policy.deadline_at_ms:
+                raise JobError("wait_review_out_of_bounds")
         seen = await _observation(manager, tx, actor, caller, call_ref, due, receipt)
         response = {"status": "accepted", "event_id": event_id, "decision_event_id": canonical_id,
             "decision": decision, "effect_status": "pending", "execution_authority": False}

@@ -11,7 +11,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.core.agent_context import get_session_id
-from power_loop.runtime import delegation, owner_waits
+from power_loop.runtime import delegation, owner_waits, wait_reviews
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_notifications as notices
@@ -27,14 +27,16 @@ from .test_real_async_boundaries_192 import BoundedProvider
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("ending,structured,fault", [
-    pytest.param("natural", False, None, id="False-natural"),
-    pytest.param("pass_turn", False, None, id="False-pass_turn"),
-    pytest.param("natural", True, None, id="True-natural"),
-    pytest.param("pass_turn", True, None, id="True-pass_turn"),
-    pytest.param("natural", False, "owner_waiting", id="entry_ack"),
-    pytest.param("pass_turn", True, "owner_wait_resumed", id="resume_ack")])
-async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and_original_task_resumes(tmp_path, record_property, monkeypatch, ending, structured, fault):
+@pytest.mark.parametrize("ending,structured,fault,reviews", [
+    pytest.param("natural", False, None, 0, id="False-natural"),
+    pytest.param("pass_turn", False, None, 0, id="False-pass_turn"),
+    pytest.param("natural", True, None, 0, id="True-natural"),
+    pytest.param("pass_turn", True, None, 0, id="True-pass_turn"),
+    pytest.param("natural", False, "owner_waiting", 0, id="entry_ack"),
+    pytest.param("pass_turn", True, "owner_wait_resumed", 0, id="resume_ack"),
+    pytest.param("natural", False, None, 2, id="two-reviews-natural"),
+    pytest.param("pass_turn", True, None, 2, id="two-reviews-structured-cancel")])
+async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and_original_task_resumes(tmp_path, record_property, monkeypatch, ending, structured, fault, reviews):
     store = await SessionStore.open(str(tmp_path / "owner-wait.db"), schema="tasks")
     manager = JobManager(store)
     acknowledgements_lost = []
@@ -56,7 +58,7 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
     registry, registrations = ToolRegistry(), []
     register_spawn_agent(registry)
     register_wait_handoff_tool(registry)
-    provider = BoundedProvider(limit=14)
+    provider = BoundedProvider(limit=22 if reviews else 14)
     continuing, consuming = False, False
     finalized = []
     spawn_tools = importlib.import_module("power_loop.tools.spawn_agent")
@@ -93,10 +95,14 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
         ending_prompt = ("After arm_wait acceptance, write the JSON object with answer=42 as this turn's text without tools or pass_turn. "
             "If the original task later continues, return the same answer JSON after processing that input." if ending == "natural" else
             "After arm_wait acceptance, call pass_turn exactly once. When the original task later continues, return the JSON object with answer=42.")
+    final_choice = "cancel" if reviews and ending == "pass_turn" else "continue"
+    decision_rule = ("For the first two distinct wait_handoff event_ids, choose defer with next_review_at_ms="
+        "observed_at_ms plus 15000. For the third distinct event_id choose " + final_choice + ". "
+        "Use integer arithmetic on each notification's timing fields. " if reviews else "Choose continue. ")
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=5, max_tokens=2048,
             system_prompt="Initially create exactly one requested child, then write WAITING without pass_turn. "
-                "When a wait_handoff notification arrives, decide continue using its original event_id, then write DECISION-RECORDED. "
+                "When a wait_handoff notification arrives, use its original event_id. " + decision_rule + "After acceptance write DECISION-RECORDED. "
                 "Never create replacement work. Later consume the original child result."))
     parent = await loop.new_session()
 
@@ -111,7 +117,7 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
     loop.hooks.register(HookPoint.LLM_BEFORE, text_policy, name="test.original-owner-response-shape")
     before = set(delegation._TASKS)
     try:
-        async with asyncio.timeout(150):
+        async with asyncio.timeout(220 if reviews else 150):
             schema_instruction = ("Include output_schema=" + json.dumps({"name": "Answer", "schema": {"type": "object", "properties": {
                 "answer": {"type": "integer"}}, "required": ["answer"], "additionalProperties": False}}) + ". " if structured else "")
             await loop.send("Use spawn_agent create once with tools=['arm_wait'], max_rounds=4, task='Compute 19+23', "
@@ -146,6 +152,20 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
             if remaining > 0:
                 await asyncio.sleep(remaining / 1000)
             due = await waits.prepare_due(manager, runtime.actor(parent), registration.job.job_id)
+            for cycle in range(reviews):
+                notification = await wait_reviews.drive(loop, runtime.actor(parent), registration.job.job_id)
+                assert notification["event_id"] == due["event_id"]
+                await loop.flush_follow_ups(parent)
+                applied = await wait_reviews.drive(loop, runtime.actor(parent), registration.job.job_id)
+                assert applied["decision"] == "defer" and applied["effect_status"] == "handled"
+                assert (await manager.get_job(runtime.actor(parent), owner.job_id)).status == "waiting"
+                armed = await waits.prepare_due(manager, runtime.actor(parent), registration.job.job_id)
+                assert armed["status"] == "armed"
+                await asyncio.sleep(max(0, (armed["due_at_ms"] - manager.now()) / 1000) + .01)
+                following = await waits.prepare_due(manager, runtime.actor(parent), registration.job.job_id)
+                assert following["event_id"] != due["event_id"] and following["payload"]["review"]["cycle"] == cycle + 1
+                assert await waits.read_wait(manager, runtime.actor(parent), registration.job.job_id) == original_wait
+                due = following
             await notices.enqueue_notification(loop, runtime.actor(parent), due["event_id"])
             await loop.flush_follow_ups(parent)
             continuing = True
@@ -154,19 +174,25 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
             if tasks:
                 await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 30)
             owner = await manager.get_job(runtime.actor(parent), owner.job_id)
-            assert owner.outcome == "succeeded" and owner.resource_state == "stopped", owner
-            if structured:
+            assert owner.outcome == ("cancelled" if final_choice == "cancel" else "succeeded") and owner.resource_state == "stopped", owner
+            if structured and final_choice == "continue":
                 assert owner.result["payload"] == {"answer": 42} and len(finalized) == 1
+            elif final_choice == "cancel":
+                assert not finalized
             assert len(await store.list_children(parent)) == 1
-            assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='owner_wait_resumed'")) == 1
-            assert len(await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE control_owner_job_id=? AND kind='send'", (owner.job_id,))) == 2
+            assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='owner_wait_resumed'")) == (0 if final_choice == "cancel" else 1)
+            assert len(await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE control_owner_job_id=? AND kind='send'", (owner.job_id,))) == (1 if final_choice == "cancel" else 2)
             assert acknowledgements_lost == ([fault] if fault else [])
             consuming = True
             await loop.flush_follow_ups(parent)
             rows = await manager.db.fetchall(f"SELECT kind,status,supervision_status FROM {manager.jobs}")
             assert all(r["supervision_status"] == "closed" for r in rows), rows
             history = await owner_waits.read(manager, runtime.actor(parent), owner.job_id, generation=1)
-            assert len(history["phases"]) == 1 and history["phases"][0]["resumed"] is not None
+            assert len(history["phases"]) == 1
+            assert (history["phases"][0].get("resumed") is None) == (final_choice == "cancel")
+            review_rows = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE event_type='wait_review'")
+            assert len(review_rows) == reviews
+            record_property("review_cycles", json.dumps(review_rows))
             record_property("original_waiting_entry", entry["payload_json"])
             record_property("original_owner_result", json.dumps(owner.result))
             record_property("supervision_tree", json.dumps(rows))

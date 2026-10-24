@@ -12,7 +12,7 @@ from .model_exit import content_reference, historical_row, require_stopped
 
 _NEGATIVE = frozenset({"failed", "cancelled", "timed_out", "budget_exceeded", "interrupted"})
 _EVENTS = frozenset({"operation", "wait_due", "wait_notification", "wait_decision", "wait_effect",
-    "wait_resolved", "wait_terminated", "result", "supervision_closed"})
+    "wait_review", "wait_resolved", "wait_terminated", "result", "supervision_closed"})
 
 
 def terminal_id(manager, job_id, creation_id):
@@ -125,7 +125,9 @@ async def _cancel_effect(manager, tx, saved, *, handled=False):
     # Authority comes from the admitted task row, never from a model field.
     job = await manager._row(tx, saved["job_id"])
     main = JobActor(job["tenant_id"], job["principal_id"], saved["binding"]["main_session_id"])
-    due = waits.due_event_id(manager, job["job_id"], saved["creation_operation_id"])
+    from .wait_reviews import history
+    _, creation, _ = await waits._read(manager, tx, main, job["job_id"])
+    due = (await history(manager, tx, main, job, creation, saved))["event_id"]
     decision = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (decision_id(manager, due),))
     if decision is None or waits._object(decision["payload_json"]).get("request", {}).get("decision") != "cancel":
         return None
@@ -250,4 +252,9 @@ async def references(manager, tx, job):
             ids.extend(cancelled[k] for k in ("effect_id", "decision_id", "operation_id"))
     else:
         raise JobError("wait_resolution_unsettled")
+    from .wait_reviews import history
+    state = await history(manager, tx, actor, job, creation, saved)
+    if state["pending_defer"]:
+        raise JobError("wait_review_unsettled")
+    ids.extend(state["references"])
     return [await _reference(manager, tx, identity) for identity in sorted(set(ids))]

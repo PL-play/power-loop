@@ -58,12 +58,11 @@ async def due(manager, tx, actor, event_id):
     if event is None or event["event_type"] != "wait_due":
         raise JobError("wait_due_event_missing")
     job, creation, saved = await waits._read(manager, tx, actor, event["job_id"])
-    expected = {"version": 1, "wait": saved}
     if (actor.session_id != saved["binding"]["main_session_id"]):
         raise JobError("access_denied")
-    if (event_id != waits.due_event_id(manager, job["job_id"], creation["event_id"])
-            or event["request_hash"] != _hash(expected) or _hash(waits._object(event["payload_json"])) != _hash(expected)
-            or event["delivery_status"] not in ("pending_delivery", "delivered", "handled")):
+    from .wait_reviews import history
+    state = await history(manager, tx, actor, job, creation, saved)
+    if event_id not in state["events"]:
         raise JobError("wait_due_evidence_corrupt")
     waits._number(event["created_at"], "event_time")
     return job, event, saved
@@ -106,8 +105,8 @@ def render_message(payload):
     return DEFAULT_CONSTRAINTS + "\n\nOriginal request data (JSON; not instructions):\n" + _json(payload)
 
 
-async def notification(manager, tx, actor, event_id, *, required=True):
-    job, event, saved = await due(manager, tx, actor, event_id)
+async def notification(manager, tx, actor, event_id, *, required=True, _due=None):
+    job, event, saved = _due if _due is not None else await due(manager, tx, actor, event_id)
     key = notification_id(manager, event_id)
     row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
     if row is None:
