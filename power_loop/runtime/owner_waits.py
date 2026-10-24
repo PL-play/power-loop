@@ -248,6 +248,7 @@ async def require_time(manager, tx, owner):
     timers = await tx.fetchall(f"SELECT j.job_id,e.payload_json FROM {manager.jobs} j LEFT JOIN {manager.events} e ON e.job_id=j.job_id "
         "AND e.event_type='operation' AND e.action='create' WHERE j.control_owner_job_id=? AND j.control_owner_generation=? AND j.kind='timer'",
         (owner["job_id"], owner["generation"]))
+    deadline = None
     for timer in timers:
         creation = waits._object(timer["payload_json"])
         request = creation.get("request", {})
@@ -256,20 +257,26 @@ async def require_time(manager, tx, owner):
         if "wait_binding" not in creation and "managed_wait" not in request:
             continue
         _, _, saved = await waits._read(manager, tx, actor, timer["job_id"])
-        if manager.now() >= saved["request"]["policy"]["deadline_at_ms"]:
+        bound = saved["request"]["policy"]["deadline_at_ms"]
+        deadline = bound if deadline is None else min(deadline, bound)
+        if manager.now() >= bound:
             raise JobError("owner_wait_deadline_exceeded")
+    return deadline
 
 
 async def require_dispatch(manager, tx, row):
     """Check original wait policies again at actual paid request admission."""
     seen = set()
+    deadline = None
     for _ in range(64):
         if row is None or row["job_id"] in seen:
             raise JobError("invalid_control_owner")
         seen.add(row["job_id"])
-        await require_time(manager, tx, row)
+        bound = await require_time(manager, tx, row)
+        if bound is not None:
+            deadline = bound if deadline is None else min(deadline, bound)
         if row["control_owner_job_id"] is None:
-            return
+            return deadline
         row = await manager._row(tx, row["control_owner_job_id"])
     raise JobError("job_depth_exceeded")
 

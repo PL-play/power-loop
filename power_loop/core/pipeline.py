@@ -372,6 +372,7 @@ class AgentPipeline:
         # design/124 §7: set while a steer-mode inbox item waits undelivered. The model call and
         # interruptible tools race it; the next round's drain delivers the item (and clears it).
         self._steer_event = steer_event
+        self._model_policy_due = asyncio.Event()
         self._steer_aborts = 0                     # consecutive steer-aborted model calls
         # Z8: durable LLM_BEFORE injections already written by a round whose model call a steer
         # aborted — the re-run round's hooks may produce them again; they're in history already.
@@ -623,7 +624,7 @@ class AgentPipeline:
         definition = getattr(rt, "definition", None) if rt is not None else None
         return str(getattr(definition, "interrupt", "finish") or "finish")
 
-    async def _race(self, work: asyncio.Future, *, steer: bool) -> tuple[Any, str]:
+    async def _race(self, work: asyncio.Future, *, steer: bool, policy_deadline: bool = False) -> tuple[Any, str]:
         """Await ``work`` unless steering (when ``steer``) or a stop arrives first.
         ``(result, "done")`` when it finished (its exception propagates); ``(None, "stop")`` /
         ``(None, "steer")`` otherwise — ``work`` is left RUNNING, the caller decides. A stop wins
@@ -633,6 +634,8 @@ class AgentPipeline:
             waiters["steer"] = asyncio.ensure_future(self._steer_event.wait())
         if not self.cancel_token.is_never:
             waiters["stop"] = asyncio.ensure_future(self.cancel_token.wait())
+        if policy_deadline:
+            waiters["policy_deadline"] = asyncio.ensure_future(self._model_policy_due.wait())
         if not waiters:
             return await work, "done"
         try:
@@ -646,7 +649,13 @@ class AgentPipeline:
             for w in waiters.values():
                 w.cancel()
             work.cancel()
-            await asyncio.wait({work}, timeout=5)
+            try:
+                await asyncio.wait({work}, timeout=.1 if policy_deadline else 5)
+            finally:
+                if policy_deadline and not work.done():
+                    from power_loop.runtime.task_runtime import _SEND
+                    binding = _SEND.get()
+                    binding.runtime.track_task(work, job_id=binding.lease.job_id)
             raise
         for w in waiters.values():
             if w not in done:
@@ -655,6 +664,8 @@ class AgentPipeline:
             return work.result(), "done"
         if "stop" in waiters and waiters["stop"] in done:
             return None, "stop"
+        if "policy_deadline" in waiters and waiters["policy_deadline"] in done:
+            return None, "policy_deadline"
         return None, "steer"
 
     def _start_tool(
@@ -1355,7 +1366,13 @@ class AgentPipeline:
             attempt_box[0] += 1
             attempt = attempt_box[0]
             call_id = f"r{round_index}.a{attempt}"
-            from power_loop.runtime.model_attempts import event_identity, observe, response_observation, start_call
+            from power_loop.runtime.model_attempts import (
+                event_identity,
+                observe,
+                provider_deadline,
+                response_observation,
+                start_call,
+            )
             try:
                 await check_dispatch(self.session_id)
                 model_attempt = await start_call(self, request, round_index=round_index, retry_index=attempt, model=model_name)
@@ -1368,6 +1385,7 @@ class AgentPipeline:
             streamed["think"].clear()
             self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
                        round_index=round_index, stream_id="main")
+            policy_alarm = None
             try:
                 # Per-call observability (H4.1): pair STARTED/COMPLETED by call_id so a
                 # subscriber sees per-attempt latency + per-call (not cumulative) usage,
@@ -1379,17 +1397,31 @@ class AgentPipeline:
                     round_index=round_index, stream_id="main",
                 )
                 t0 = time.perf_counter()
+                policy_clock = None
+                provider_started = False
                 try:
                     from power_loop._vendor.llm_client.attempt_scope import single_attempt
                     attempt_token = single_attempt.set(True) if model_attempt is not None else None
                     try:
-                        resp = await self.llm.complete(
-                            request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
-                        )
+                        deadline = await provider_deadline(model_attempt)
+                        if deadline is not None and deadline <= asyncio.get_running_loop().time():
+                            from power_loop.runtime.jobs import JobError
+                            raise JobError("owner_wait_deadline_exceeded")
+                        policy_clock = asyncio.timeout_at(deadline)
+                        async with policy_clock:
+                            if deadline is not None:
+                                policy_alarm = asyncio.get_running_loop().call_at(deadline, self._model_policy_due.set)
+                            provider_started = True
+                            resp = await self.llm.complete(
+                                request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
+                            )
                     finally:
                         if attempt_token is not None:
                             single_attempt.reset(attempt_token)
                 except BaseException as exc:
+                    if isinstance(exc, TimeoutError) and policy_clock is not None and policy_clock.expired():
+                        from power_loop.runtime.jobs import JobError
+                        exc = JobError("owner_wait_deadline_exceeded")
                     # No usage chunk will ever come for this attempt, but it was billed: prompt
                     # in full once the provider started on it, plus what it streamed before the
                     # failure (design/124 §11.2). A request REJECTED with an HTTP status before any
@@ -1399,7 +1431,7 @@ class AgentPipeline:
                     # Managed attempts lack a provider rejection receipt: an
                     # HTTP status alone cannot release their unknown risk.
                     rejected = model_attempt is None and _status_of(exc) is not None and not any(produced)
-                    p_est = 0 if rejected else estimate_prompt_tokens(
+                    p_est = 0 if rejected or not provider_started else estimate_prompt_tokens(
                         messages=messages, system_prompt=system_prompt, tools=tools)
                     c_est = estimate_completion_tokens(text=produced[0], think=produced[1])
                     self.ctx.add_unreported_usage(p_est, c_est)
@@ -1457,8 +1489,15 @@ class AgentPipeline:
                     ),
                     round_index=round_index, stream_id="main",
                 )
+                if policy_clock is not None and policy_clock.expired():
+                    # A provider may suppress cancellation and return late. Keep
+                    # its actual usage above, but never use it as an on-time answer.
+                    from power_loop.runtime.jobs import JobError
+                    raise LLMNonRetryable(attempts=attempt, last_error=JobError("owner_wait_deadline_exceeded"))
                 return resp
             finally:
+                if policy_alarm is not None:
+                    policy_alarm.cancel()
                 self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
                            round_index=round_index, stream_id="main")
 
@@ -1889,18 +1928,41 @@ class AgentPipeline:
                     # design/124 §8.4: a STOP interrupts the model call too (immediately — its
                     # output is discarded like a steered one, the run ends cancelled).
                     from power_loop.runtime.model_attempts import is_managed
-                    _steer_ok = (not is_managed(self.session_id) and self._steer_event is not None and not self._steer_event.is_set()
+                    _managed_call = is_managed(self.session_id)
+                    _steer_ok = (not _managed_call and self._steer_event is not None and not self._steer_event.is_set()
                                  and self._steer_aborts < self.MAX_STEER_ABORTS)
-                    if _steer_ok or not self.cancel_token.is_never:
+                    if _steer_ok or _managed_call or not self.cancel_token.is_never:
+                        self._model_policy_due.clear()
                         _llm_work = asyncio.ensure_future(_llm_call)
-                        response, _why = await self._race(_llm_work, steer=_steer_ok)
+                        response, _why = await self._race(_llm_work, steer=_steer_ok, policy_deadline=_managed_call)
+                        if _why == "policy_deadline":
+                            from power_loop.runtime.task_runtime import _SEND
+                            _binding = _SEND.get()
+                            _binding.runtime.track_task(_llm_work, job_id=_binding.lease.job_id)
+                            # The timeout already signalled the exact request once.
+                            # Keep an uncooperative call reachable, with its durable
+                            # attempt unresolved, instead of awaiting it indefinitely
+                            # or cancelling its usage cleanup a second time.
+                            await asyncio.wait({_llm_work}, timeout=.1)
+                            msg = "[timed out: original continuation policy deadline reached]"
+                            await self._finalize("timed_out", final_text=msg, rounds=round_idx + 1)
+                            return self._make_result("timed_out", final_text=msg, rounds=round_idx + 1)
                         if _why != "done":
                             # Discard the call: nothing it produced reaches history (the
                             # response is only assembled at its end), its partial usage is
                             # recorded as an estimate by call_llm's own failure path.
                             _llm_work.cancel()
-                            with contextlib.suppress(BaseException):
-                                await _llm_work
+                            if _managed_call:
+                                try:
+                                    await asyncio.wait({_llm_work}, timeout=.1)
+                                finally:
+                                    if not _llm_work.done():
+                                        from power_loop.runtime.task_runtime import _SEND
+                                        _binding = _SEND.get()
+                                        _binding.runtime.track_task(_llm_work, job_id=_binding.lease.job_id)
+                            if _llm_work.done() or not _managed_call:
+                                with contextlib.suppress(BaseException):
+                                    await _llm_work
                             if _why == "stop":
                                 raise CancellationRequested(self.cancel_token.reason)
                             await self._restart_round_for_steer(round_idx, llm_before)
@@ -1920,6 +1982,10 @@ class AgentPipeline:
                         "cancelled", final_text=f"[cancelled: {exc.reason}]", rounds=round_idx,
                     )
                 except (LLMRetryExhausted, LLMTimeout) as exc:
+                    if getattr(getattr(exc, "last_error", exc), "code", None) == "owner_wait_deadline_exceeded":
+                        msg = "[timed out: original continuation policy deadline reached]"
+                        await self._finalize("timed_out", final_text=msg, rounds=round_idx + 1)
+                        return self._make_result("timed_out", final_text=msg, rounds=round_idx + 1)
                     reason = (
                         "timeout" if isinstance(exc, LLMTimeout)
                         else "non_retryable" if isinstance(exc, LLMNonRetryable)

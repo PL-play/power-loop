@@ -349,6 +349,12 @@ class ExecutorLifecycle:
                 receipt = self._control_task.result()
             except BaseException as exc:
                 error = exc.code if isinstance(exc, JobError) else type(exc).__name__
+        # A controller can hand its still-live request to this runtime while
+        # the final bounded wait observes that controller exit. Re-read local
+        # ownership before declaring the store safe; the old task set cannot
+        # prove that no newly retained request exists.
+        entries = self._locals()
+        tasks |= {v["task"] for v in entries if v["task"] is not current and not v["task"].done()}
         pending = [t for t in tasks if not t.done()]
         return {
             "admission_open": False,

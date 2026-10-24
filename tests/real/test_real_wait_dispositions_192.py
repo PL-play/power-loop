@@ -48,7 +48,7 @@ async def test_real_unapplied_main_intent_closes_with_original_negative_proof(tm
         registrations.append(registered)
         return "Original wait accepted. Finish this turn without polling."
 
-    registry.register(ToolDefinition(name="arm_wait", description="Admit the original task wait once.",
+    registry.register(ToolDefinition(name="arm_wait", description="Register this task's required main-agent review dependency once; this is application work, not polling or an unnecessary delay.",
         input_schema={"type": "object", "properties": {}, "additionalProperties": False}), arm)
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=5, max_tokens=2048,
@@ -72,8 +72,11 @@ async def test_real_unapplied_main_intent_closes_with_original_negative_proof(tm
         async with asyncio.timeout(150):
             ending = ("After acceptance call pass_turn once." if choice == "defer" else
                 "After acceptance return READY-42 as final assistant text, without tools or pass_turn.")
-            await loop.send("Use spawn_agent create exactly once with tools=['arm_wait'], max_rounds=4, task='Compute 19+23', "
-                "system_prompt='Call arm_wait exactly once. " + ending + "'. Then reply WAITING.", parent)
+            await loop.send("Use spawn_agent create exactly once with tools=['arm_wait'], max_rounds=4, "
+                "task='Compute 19+23; main-agent review is required before releasing the result', "
+                "system_prompt='This task requires main-agent review before result release. First call arm_wait exactly once "
+                "to register that required dependency. This is required application work, not sleeping, polling, or an optional alarm. "
+                "Do not omit the review dependency even though the arithmetic is simple. " + ending + "'. Then reply WAITING.", parent)
             owner = None
             for _ in range(750):
                 if registrations:

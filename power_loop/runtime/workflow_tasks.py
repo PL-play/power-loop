@@ -264,7 +264,8 @@ async def collect_node(runtime, loop, raw, stop_event, *, timeout_s=1800, max_ro
             (scope.lease.job_id, scope.lease.generation),
         )
         if unresolved:
-            status = "cancelled" if raw.get("status") == "cancelled" or stop_event.is_cancelled() else "failed"
+            status = ("cancelled" if raw.get("status") == "cancelled" or stop_event.is_cancelled()
+                      else "timed_out" if raw.get("status") == "timed_out" else "failed")
             return {
                 **raw,
                 "status": status,

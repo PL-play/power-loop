@@ -65,10 +65,11 @@ class Provider(LLMService):
 
 
 @pytest.fixture
-async def original(registry_store):
+async def original(registry_store, request):
     store, connect = registry_store
     manager = JobManager(store)
-    runtime = TaskRuntime(manager, tenant_id="owner-wait", principal_id="host", executor_id="executor", boot_id="boot")
+    runtime = TaskRuntime(manager, tenant_id="owner-wait", principal_id="host", executor_id="executor", boot_id="boot",
+        boot_contract_hash="a" * 64 if getattr(request, "param", None) == "boot" else None)
     registry = ToolRegistry()
     register_spawn_agent(registry)
     register_wait_handoff_tool(registry)
@@ -191,6 +192,10 @@ async def test_inherited_parent_leaf_context_cannot_release_the_parent_slot():
 @pytest.mark.parametrize("after_ready", ["continue", "cancel", "deadline"])
 async def test_original_subagent_releases_its_pool_and_reacquires_before_resume(original, monkeypatch, after_ready):
     c = original
+    # This case isolates capacity handoff. Wall-clock request interruption has
+    # dedicated tests; slow PostgreSQL setup must not consume this test's policy.
+    now = c.manager.now()
+    monkeypatch.setattr(c.manager, "now", lambda: now)
     if after_ready == "cancel":
         c.runtime.lease_ms = 3000
     gate = asyncio.Semaphore(1)
@@ -228,6 +233,8 @@ async def test_original_subagent_releases_its_pool_and_reacquires_before_resume(
         await c.loop.send("Start another unrelated finite task", c.state.parent)
         await asyncio.wait_for(second.wait(), 3)
         assert gate.locked()
+        policy = await waits.read_wait(c.manager, c.runtime.actor(c.state.parent), registration.job.job_id)
+        now = policy["request"]["request"]["due_at_ms"]
         due = await prepare_due(c.manager, c.runtime.actor(c.state.parent), registration)
         c.state.choice, c.state.due_id = "continue", due["event_id"]
         await notices.enqueue_notification(c.loop, c.runtime.actor(c.state.parent), due["event_id"])
@@ -383,15 +390,18 @@ async def test_original_workflow_node_empty_pass_gets_its_answer_without_a_stand
 
 
 @pytest.mark.parametrize("ending", ["cancelled", "timed_out"])
-async def test_waiting_owner_stops_without_another_model_request_and_retains_usage(original, ending):
+async def test_waiting_owner_stops_without_another_model_request_and_retains_usage(original, ending, monkeypatch):
     c = original
-    if ending == "timed_out":
-        c.state.wait_ms = 500
+    now = [c.manager.now()]
+    monkeypatch.setattr(c.manager, "now", lambda: now[0])
     registration, owner = await entered(c)
     before = c.model.calls.copy()
     if ending == "cancelled":
         await c.manager.request_cancel(c.runtime.actor(c.state.parent), owner.job_id,
             system_key="cancel-real-waiting-controller", reason="stop original waiting task")
+    else:
+        saved = await waits.read_wait(c.manager, c.runtime.actor(c.state.parent), registration.job.job_id)
+        now[0] = saved["request"]["policy"]["deadline_at_ms"]
     await asyncio.wait_for(asyncio.gather(*set(delegation._TASKS), return_exceptions=True), 5)
     current = await c.manager.get_job(c.runtime.actor(c.state.parent), owner.job_id)
     assert current.outcome == ending and current.resource_state == "stopped", current

@@ -7,10 +7,11 @@ this model call returned. Late observations never grant dispatch authority.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 
 from .jobs import JobError, JobLease, _hash, _json
@@ -54,6 +55,7 @@ class Attempt:
     binding: object
     attempt_id: str
     prepared: dict
+    local_deadline: float | None = field(default=None, compare=False, repr=False)
 
 
 def event_identity(attempt):
@@ -414,7 +416,8 @@ async def dispatch(attempt):
         # Even exact dispatch replays must not revive a closed/cancelled lease.
         row = await manager._fence(tx, binding.actor, binding.lease)
         from .owner_waits import require_dispatch
-        await require_dispatch(manager, tx, row)
+        bound = await require_dispatch(manager, tx, row)
+        deadline = None if bound is None else asyncio.get_running_loop().time() + max(0, (bound - manager.now()) / 1000)
         await _no_unknown_sends(manager, tx, row)
         saved = await _read(manager, tx, "prepared", attempt.attempt_id)
         if saved[1] != data or data["scope"] != _scope(binding.lease) or data["session_id"] != binding.actor.session_id:
@@ -434,16 +437,22 @@ async def dispatch(attempt):
 
         await authorize_dispatch(attempt, tx, row)
         await _put(manager, tx, row, "dispatched", attempt.attempt_id, payload)
+    return deadline
 
 
 async def _recall_dispatch(attempt):
+    return (await _recall_dispatch_authority(attempt))[0]
+
+
+async def _recall_dispatch_authority(attempt):
     """Same in-flight caller recalls a lost ACK; not a restart dispatch port."""
     binding = attempt.binding
     manager = binding.runtime.manager
     async with manager._write() as tx:
         row = await manager._fence(tx, binding.actor, binding.lease)
         from .owner_waits import require_dispatch
-        await require_dispatch(manager, tx, row)
+        bound = await require_dispatch(manager, tx, row)
+        deadline = None if bound is None else asyncio.get_running_loop().time() + max(0, (bound - manager.now()) / 1000)
         await _no_unknown_sends(manager, tx, row)
         await _no_inflight(manager, tx, row, except_attempt=attempt.attempt_id)
         prepared = await _read(manager, tx, "prepared", attempt.attempt_id)
@@ -456,7 +465,7 @@ async def _recall_dispatch(attempt):
             raise JobError("model_attempt_owner_mismatch")
         saved = await _read(manager, tx, "dispatched", attempt.attempt_id, required=False)
         if saved is None:
-            return False
+            return False, None
         if (
             prepared[1] != attempt.prepared
             or saved[1]
@@ -472,7 +481,7 @@ async def _recall_dispatch(attempt):
         from .model_budgets import require_dispatch
 
         await require_dispatch(attempt, tx)
-        return True
+        return True, deadline
 
 
 async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amount=None, response_id=None):
@@ -604,12 +613,12 @@ async def start_call(pipeline, request, *, round_index, retry_index, model):
             log.exception("Unreserved attempt closure remains pending: %s", attempt.attempt_id)
         raise
     try:
-        await dispatch(attempt)
+        deadline = await dispatch(attempt)
     except JobError:
         raise
     except Exception:
         try:
-            admitted = await _recall_dispatch(attempt)
+            admitted, deadline = await _recall_dispatch_authority(attempt)
         except BaseException:
             binding.resource_evidence["resource_state"] = "unknown"
             raise
@@ -619,7 +628,17 @@ async def start_call(pipeline, request, *, round_index, retry_index, model):
         binding.resource_evidence["resource_state"] = "unknown"
         raise
     binding.resource_evidence.setdefault("model_attempts_inflight", set()).add(attempt.attempt_id)
-    return attempt
+    return replace(attempt, local_deadline=deadline)
+
+
+async def provider_deadline(attempt):
+    """Use the original validated dispatch's bound; never a fresh grant/read.
+
+    Captured before the dispatch transaction commits, so commit/ACK delay
+    consumes the original window. An ACK recall revalidates the same policy.
+    This local field is not persisted and never authorizes another request.
+    """
+    return None if attempt is None else attempt.local_deadline
 
 
 async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, response_id=None):
