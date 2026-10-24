@@ -9,6 +9,9 @@
 ## [Unreleased]
 
 ### Added
+- Add optional immutable task-generation and result-event coordinates to native
+  workflow completion callbacks. Legacy callbacks retain empty coordinates;
+  these identify saved results and grant no execution or continuation authority.
 - Add opt-in TaskRuntime boot startup and idle heartbeats via a trusted contract
   digest, with one shutdown deadline, retained original adapter/control handles,
   lost-ACK recall and fail-closed local admission. Observe actual token cancellation

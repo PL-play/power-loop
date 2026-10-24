@@ -174,6 +174,10 @@ class WorkflowCompletion:
     run_id: str
     status: str  # "completed" | "failed" | "cancelled"
     note: str
+    # Native immutable result identity. Legacy callbacks have no task revision.
+    # These are lookup coordinates, never execution/continuation authority.
+    task_generation: int | None = None
+    result_event_id: str | None = None
 
 
 @dataclass

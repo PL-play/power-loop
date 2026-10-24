@@ -287,7 +287,8 @@ async def run_callback(loop, actor, job_id, generation, callback):
     try:
         envelope = data["envelope"]
         ok = await runner._run_on_complete(callback, actor.session_id, envelope["run_id"], envelope["status"],
-                                            runner._wake_note(envelope["run_id"], envelope["status"]))
+                                            runner._wake_note(envelope["run_id"], envelope["status"]),
+                                            task_generation=generation, result_event_id=envelope["result_event_id"])
         status = "completed" if ok else "failed"
     finally:
         async with manager._write() as tx:

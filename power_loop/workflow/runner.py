@@ -386,7 +386,8 @@ async def _wake(loop: Any, parent_sid: str, note: str) -> None:
 
 
 async def _run_on_complete(
-    on_complete: OnComplete, parent_sid: str, run_id: str, status: str, note: str
+    on_complete: OnComplete, parent_sid: str, run_id: str, status: str, note: str,
+    *, task_generation: int | None = None, result_event_id: str | None = None,
 ) -> bool:
     """Invoke the host completion callback in place of the durable-timer wake.
 
@@ -399,6 +400,7 @@ async def _run_on_complete(
         await on_complete(
             WorkflowCompletion(
                 parent_session_id=parent_sid, run_id=run_id, status=status, note=note,
+                task_generation=task_generation, result_event_id=result_event_id,
             )
         )
         return True
