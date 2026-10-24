@@ -9,6 +9,11 @@
 ## [Unreleased]
 
 ### Added
+- Add experimental protocol5 host-only original-context cancellation. Persist
+  admission barriers and stops together, recall the original receipt after
+  restart, and retain closed results and uncertain resource/usage responsibilities.
+  Existing protocol2/3/4 task stores require explicit maintenance migration after
+  stopping and closing old writers; normal store opening never upgrades them.
 - Add optional immutable task-generation and result-event coordinates to native
   workflow completion callbacks. Legacy callbacks retain empty coordinates;
   these identify saved results and grant no execution or continuation authority.

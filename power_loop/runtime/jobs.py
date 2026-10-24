@@ -558,6 +558,9 @@ class JobManager:
                     raise JobError("operation_conflict")
                 job = await self._authorize(tx, actor, old["job_id"])
                 return JobRegistration(_record(job), _operation(old), True)
+            if kind == "send" and parent is None and request_data.get("host_context") is not None:
+                from .root_control import _admit
+                await _admit(self, tx, actor, request_data["host_context"])
             parent_row = await self._fence(tx, actor, parent) if parent else None
             restored_parent = False
             if parent_row:
@@ -899,25 +902,8 @@ class JobManager:
     async def request_cancel(self, actor: JobActor, job_id: str, *, system_key: str, reason: str) -> JobOperation:
         if not isinstance(reason, str) or not reason or len(reason) > 1000:
             raise JobError("invalid_cancel_reason")
+        from .root_control import _cancel_job
         key = self._origin_key(actor, "stop", None, None, system_key)
-        fingerprint = _hash([job_id, reason])
         async with self._write() as tx:
-            old = await tx.fetchone(f"SELECT * FROM {self.events} WHERE operation_key=?", (key,))
-            if old:
-                await self._authorize(tx, actor, old["job_id"])
-                if old["request_hash"] != fingerprint:
-                    raise JobError("operation_conflict")
-                return _operation(old)
-            row = await self._authorize(tx, actor, job_id)
-            if row["cancel_requested_at"] is None:
-                # Host scope-stop remains a future admission barrier even on
-                # a settled scope. Preserve its verified terminal view; no
-                # physical execution is restarted by recording that barrier.
-                status = row["status"] if row["supervision_status"] == "closed" else (
-                    "cancelled" if row["resource_state"] == "not_started" else "cancelling")
-                await tx.execute(f"UPDATE {self.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,"
-                    "intake='closed',version=version+1,updated_at=? WHERE job_id=?", (status, self.now(), reason, self.now(), job_id))
-                row = await self._row(tx, job_id)
-            return await self._insert_operation(tx, job_id=job_id, version=row["version"], actor=actor,
-                action="stop", key=key, fingerprint=fingerprint, payload={"job_id": job_id,
-                "status": row["status"], "cancel_requested": True, "resource_state": row["resource_state"]})
+            return await _cancel_job(self, tx, actor, job_id, key=key,
+                fingerprint=_hash([job_id, reason]), reason=reason)

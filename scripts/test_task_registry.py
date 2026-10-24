@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-REQUIRED_REAL_CASES = 113
+REQUIRED_REAL_CASES = 115
 
 
 class RunnerInterrupted(BaseException):
@@ -146,6 +146,7 @@ def main() -> int:
     report = out / f"{label}.xml"
     scopes = ["tests/unit"] if args.full else [
         "tests/unit/test_task_message_identity_192.py", "tests/unit/test_job_registry_192.py",
+        "tests/unit/test_root_context_192.py", "tests/unit/test_root_control_192.py",
         "tests/unit/test_execution_membership_192.py",
         "tests/unit/test_workflow_controller_192.py",
         "tests/unit/test_workflow_node_output_192.py",
@@ -212,6 +213,7 @@ def main() -> int:
         "tests/unit/test_workflow_live_continuation.py",
         "tests/unit/test_workflow_continuation_plan.py"]
     scopes.append("tests/real/test_real_task_registry_192.py")
+    scopes.append("tests/real/test_real_root_control_192.py")
     scopes.append("tests/real/test_real_workflow_task_runtime_192.py")
     scopes.append("tests/real/test_real_nudge_runtime_192.py")
     scopes.append("tests/real/test_real_node_nudge_runtime_192.py")
