@@ -1460,3 +1460,48 @@ and logical timer termination do not acknowledge that original decision.
 Supervision returns `wait_review_unsettled` until an explicit original-negative
 responsibility reconciliation is implemented; it must not silently drop the
 accepted decision or fabricate a next review after the original deadline.
+
+
+### Negative retirement of an unapplied main decision
+
+Logical termination now reconciles an unapplied original `continue`, `defer`
+or `cancel` after the original owner has a stopped negative canonical result,
+sealed execution membership and quiescent model attempts. One immutable
+`wait_disposition` binds the original creation, due, decision, actual tool
+operation/call/receipt, observation, optional legacy delivered defer effect,
+owner generation and validated `wait_terminated`. Raw call and receipt content
+hashes are retained and their native tool arguments/response must still match
+the original accepted operation. A rehashed corrupted disposition cannot
+replace those independent facts.
+
+The decision and optional legacy effect are marked handled in the same
+transaction as this disposition and the timer version update. No positive
+effect, nudge, stop, model request, usage row or financial settlement is invented.
+This records `owner_terminated_without_effect`; it does not say the main's
+requested action executed. An unknown provider request, missing original tool
+receipt or unconfirmed original exit remains unresolved.
+
+`wait_effects.apply` recalls the version-2 negative receipt before any current
+execution check, including after expiry, store reopen or original closure. It
+whitelists the original owner ID/generation without executor credentials and
+reports `execution_authority=false`, `continuation_dispatched=false` and
+`billing_settled=false`. `wait_handoff inspect` explicitly returns
+`effect_status="not_applied"` with that disposition. A pre-existing effect or
+request payload is never rewritten into a different action.
+
+The one-step `wait_reviews.drive` can reconcile a proven original negative
+result without a paid wake. Timer termination and generation-zero supervision
+share the same transaction, so failed closure publication also rolls back new
+termination/disposition/handled facts. Closed proof recall revalidates all
+original evidence. No missing disposition may be appended after a prior
+supervision proof closed. Historical original generations do not grant control
+over later execution; this port never writes the owner's row or leases.
+
+An already applied cancel keeps its existing terminal proof. A defer which
+already scheduled another review keeps its immutable cycle chain. An applied
+continue input still needs its independent processing or negative-input
+protocol; this port returns `wait_input_unsettled` rather than claiming it was
+consumed or deleting inbox history. Safe claim/void/append races and negative
+input supervision remain an explicit subsequent implementation gate, alongside
+formal host wake/polling, cross-process restore and the other unfinished goals.
+Default finite child timers remain disabled.

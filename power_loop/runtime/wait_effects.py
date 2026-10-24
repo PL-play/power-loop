@@ -115,6 +115,10 @@ async def apply(manager, actor, event_id):
     """Apply one original decision atomically, without model dispatch or new work."""
     async with manager._write() as tx:
         job, _, saved, decision, data = await _decision(manager, tx, actor, event_id)
+        from .wait_dispositions import for_event, reply
+        disposed = await for_event(manager, tx, actor, job, saved, decision, event_id)
+        if disposed is not None:
+            return reply(disposed)
         old = await _effect(manager, tx, actor, job, saved, decision, data)
         if old is not None and not (data["request"]["decision"] == "defer" and old["delivery_status"] == "delivered"):
             if old["delivery_status"] == "handled" and data["request"]["decision"] == "continue":

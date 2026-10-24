@@ -250,7 +250,10 @@ async def test_stopped_owner_does_not_silently_ack_an_unapplied_defer(handoff):
     await c.manager.close_model_execution(c.actor, c.caller, evidence={"exit": "cancelled"})
     await c.manager.record_execution_result(c.actor, c.owner, outcome="cancelled", result={"status": "cancelled"}, resource_state="stopped")
     await terminal.terminate(c.manager, c.main, h.registration.job.job_id)
-    with pytest.raises(JobError, match="wait_review_unsettled"):
-        await c.manager.finalize_supervision(c.main, h.registration.job.job_id, generation=0)
+    await c.manager.finalize_supervision(c.main, h.registration.job.job_id, generation=0)
+    [disposed] = await c.manager.db.fetchall(f"SELECT payload_json FROM {c.manager.events} WHERE event_type='wait_disposition'")
+    payload = json.loads(disposed["payload_json"])
+    assert payload["disposition"] == "owner_terminated_without_effect" and payload["effect"] is None
+    assert payload["decision_kind"] == "defer" and payload["termination"]["event_type"] == "wait_terminated"
     [decision] = await c.manager.db.fetchall(f"SELECT delivery_status FROM {c.manager.events} WHERE event_type='wait_decision'")
-    assert decision["delivery_status"] == "pending_delivery"
+    assert decision["delivery_status"] == "handled"

@@ -90,8 +90,6 @@ async def history(manager, tx, actor, job, creation, saved):
                     if not isinstance(data.get("request"), dict):
                         raise JobError("wait_decision_evidence_corrupt")
                     if data["request"].get("decision") == "defer":
-                        if decision["delivery_status"] == "handled":
-                            raise JobError("wait_review_responsibility_missing")
                         pending_defer = True
             break
         if event is None:
@@ -113,8 +111,16 @@ async def history(manager, tx, actor, job, creation, saved):
     all_due = await tx.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='wait_due'", (job["job_id"],))
     if {r["event_id"] for r in all_due} != set(expected_dues):
         raise JobError("wait_review_chain_corrupt")
-    return {"cycle": len(rows), "event_id": identity, "event": event, "payload": payload,
+    state = {"cycle": len(rows), "event_id": identity, "event": event, "payload": payload,
         "due_at_ms": due_at, "events": events, "references": sorted(refs), "pending_defer": pending_defer}
+    if pending_defer and decision["delivery_status"] == "handled":
+        from .wait_dispositions import event_ids, read_tx
+        disposed = await read_tx(manager, tx, actor, job, creation, saved, state, required=True)
+        if disposed is None:
+            raise JobError("wait_review_responsibility_missing")
+        state["pending_defer"] = False
+        state["references"] = sorted(refs | set(event_ids(disposed)))
+    return state
 
 
 async def require_link(manager, tx, job, saved, decision, effect):
@@ -164,6 +170,19 @@ async def drive(loop, actor, job_id):
     saved = await waits.read_wait(manager, actor, job_id)
     if actor.session_id != saved["binding"]["main_session_id"]:
         raise JobError("access_denied")
+    from . import wait_dispositions as dispositions
+    from . import wait_terminal as terminal
+    from .result_revisions import result_id
+    async with manager._write() as tx:
+        job, creation, saved = await waits._read(manager, tx, actor, job_id)
+        owner = saved["binding"]["owner"]
+        result = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (result_id(owner["job_id"], owner["generation"]),))
+        if result is not None and waits._object(result["payload_json"]).get("outcome") in terminal._NEGATIVE:
+            ended = await terminal.terminate_tx(manager, tx, actor, job_id)
+            job = await manager._row(tx, job_id)
+            state = await history(manager, tx, actor, job, creation, saved)
+            disposed = await dispositions.read_tx(manager, tx, actor, job, creation, saved, state)
+            return dispositions.reply(disposed) if disposed else ended
     due = await waits.prepare_due(manager, actor, job_id)
     if due["status"] == "armed":
         return due

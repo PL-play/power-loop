@@ -12,7 +12,7 @@ from .model_exit import content_reference, historical_row, require_stopped
 
 _NEGATIVE = frozenset({"failed", "cancelled", "timed_out", "budget_exceeded", "interrupted"})
 _EVENTS = frozenset({"operation", "wait_due", "wait_notification", "wait_decision", "wait_effect",
-    "wait_review", "wait_resolved", "wait_terminated", "result", "supervision_closed"})
+    "wait_review", "wait_disposition", "wait_resolved", "wait_terminated", "result", "supervision_closed"})
 
 
 def terminal_id(manager, job_id, creation_id):
@@ -120,14 +120,14 @@ def _result_projection(job, canonical):
     return legacy
 
 
-async def _cancel_effect(manager, tx, saved, *, handled=False):
+async def _cancel_effect(manager, tx, saved, *, handled=False, _state=None):
     from .wait_notifications import decision_id
     # Authority comes from the admitted task row, never from a model field.
     job = await manager._row(tx, saved["job_id"])
     main = JobActor(job["tenant_id"], job["principal_id"], saved["binding"]["main_session_id"])
     from .wait_reviews import history
     _, creation, _ = await waits._read(manager, tx, main, job["job_id"])
-    due = (await history(manager, tx, main, job, creation, saved))["event_id"]
+    due = (_state if _state is not None else await history(manager, tx, main, job, creation, saved))["event_id"]
     decision = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (decision_id(manager, due),))
     if decision is None or waits._object(decision["payload_json"]).get("request", {}).get("decision") != "cancel":
         return None
@@ -142,7 +142,7 @@ async def _cancel_effect(manager, tx, saved, *, handled=False):
         "decision_hash": decision["request_hash"], "operation_id": waits._object(effect["payload_json"])["operation_id"]}
 
 
-async def _terminated(manager, tx, actor, job, creation, saved):
+async def _terminated(manager, tx, actor, job, creation, saved, *, _state=None):
     identity = terminal_id(manager, job["job_id"], creation["event_id"])
     row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (identity,))
     if row is None:
@@ -155,7 +155,7 @@ async def _terminated(manager, tx, actor, job, creation, saved):
     legacy = _result_projection(job, canonical)
     expected = {"version": 1, "creation_id": creation["event_id"], "creation_hash": creation["request_hash"],
         "owner": saved["binding"]["owner"], "owner_outcome": outcome, "owner_exit": refs,
-        "result": content_reference(result), "legacy_result": legacy, "cancel_effect": await _cancel_effect(manager, tx, saved, handled=True)}
+        "result": content_reference(result), "legacy_result": legacy, "cancel_effect": await _cancel_effect(manager, tx, saved, handled=True, _state=_state)}
     if not legacy:
         target = "timed_out" if outcome == "timed_out" else "cancelled"
         payload = {"outcome": target, "result": {"status": target, "wait_terminated_event_id": identity, "owner_outcome": outcome},
@@ -181,6 +181,8 @@ async def terminate_tx(manager, tx, actor, job_id):
     old = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (identity,))
     if old:
         await _terminated(manager, tx, actor, job, creation, saved)
+        from .wait_dispositions import reconcile_tx
+        await reconcile_tx(manager, tx, actor, job, creation, saved)
         return {"status": "terminated", "job_id": job_id, "termination_event_id": identity, "execution_authority": False}
     outcome, refs = await _owner_exit(manager, tx, actor, saved)
     cancelled = await _cancel_effect(manager, tx, saved)
@@ -213,6 +215,8 @@ async def terminate_tx(manager, tx, actor, job_id):
     if cancelled:
         await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (cancelled["effect_id"], cancelled["decision_id"]))
     await _terminated(manager, tx, actor, job, creation, saved)
+    from .wait_dispositions import reconcile_tx
+    await reconcile_tx(manager, tx, actor, job, creation, saved)
     return {"status": "terminated", "job_id": job_id, "termination_event_id": identity, "execution_authority": False}
 
 async def references(manager, tx, job):
@@ -254,7 +258,10 @@ async def references(manager, tx, job):
         raise JobError("wait_resolution_unsettled")
     from .wait_reviews import history
     state = await history(manager, tx, actor, job, creation, saved)
-    if state["pending_defer"]:
-        raise JobError("wait_review_unsettled")
+    if job["outcome"] in _NEGATIVE:
+        from .wait_dispositions import event_ids, read_tx
+        disposed = await read_tx(manager, tx, actor, job, creation, saved, state, required=True)
+        if disposed is not None:
+            ids.extend(event_ids(disposed))
     ids.extend(state["references"])
     return [await _reference(manager, tx, identity) for identity in sorted(set(ids))]

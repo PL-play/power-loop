@@ -211,6 +211,11 @@ async def inspect(manager, actor, event_id, *, field="summary", char_offset=0, m
                 "observed_at_ms": str(manager.now()), "notification": receipt["public"],
                 "decision_status": "recorded" if decision else "pending", "effect_status": decision["delivery_status"] if decision else None,
                 "execution_authority": False}
+            if decision is not None:
+                from .wait_dispositions import for_event, reply
+                disposed = await for_event(manager, tx, actor, job, saved, decision, event_id)
+                if disposed is not None:
+                    summary.update(effect_status="not_applied", disposition=reply(disposed))
             if len(_json(summary)) > max_chars:
                 raise JobError("wait_inspection_response_too_large")
             return summary
