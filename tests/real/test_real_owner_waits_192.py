@@ -4,13 +4,14 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 
 import pytest
 
 from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.core.agent_context import get_session_id
-from power_loop.runtime import delegation
+from power_loop.runtime import delegation, owner_waits
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_notifications as notices
@@ -26,11 +27,31 @@ from .test_real_async_boundaries_192 import BoundedProvider
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("ending", ["natural", "pass_turn"])
-@pytest.mark.parametrize("structured", [False, True])
-async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and_original_task_resumes(tmp_path, record_property, monkeypatch, ending, structured):
+@pytest.mark.parametrize("ending,structured,fault", [
+    pytest.param("natural", False, None, id="False-natural"),
+    pytest.param("pass_turn", False, None, id="False-pass_turn"),
+    pytest.param("natural", True, None, id="True-natural"),
+    pytest.param("pass_turn", True, None, id="True-pass_turn"),
+    pytest.param("natural", False, "owner_waiting", id="entry_ack"),
+    pytest.param("pass_turn", True, "owner_wait_resumed", id="resume_ack")])
+async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and_original_task_resumes(tmp_path, record_property, monkeypatch, ending, structured, fault):
     store = await SessionStore.open(str(tmp_path / "owner-wait.db"), schema="tasks")
     manager = JobManager(store)
+    acknowledgements_lost = []
+    if fault:
+        write = manager._write
+        @asynccontextmanager
+        async def lose_ack():
+            changed = False
+            async with write() as tx:
+                before = await tx.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type=?", (fault,))
+                yield tx
+                after = await tx.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type=?", (fault,))
+                changed = len(after) > len(before) and not acknowledgements_lost
+            if changed:
+                acknowledgements_lost.append(fault)
+                raise OSError("actual committed owner transition ACK was lost")
+        monkeypatch.setattr(manager, "_write", lose_ack)
     runtime = TaskRuntime(manager, tenant_id="real-owner-wait", principal_id="host", executor_id="executor", boot_id="boot")
     registry, registrations = ToolRegistry(), []
     register_spawn_agent(registry)
@@ -59,7 +80,7 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
         now = manager.now()
         registration = await waits.register_wait(manager, runtime.actor(sid), caller=source.lease,
             call_ref=await store.message_ref(sid, seq), tool_call_id=call_id,
-            request=waits.WaitRequest(now + 50, "Review the original finite task.", "Continue this same calculation and report 42."),
+            request=waits.WaitRequest(now + 500, "Review the original finite task.", "Continue this same calculation and report 42."),
             policy=waits.WaitPolicy(now + 120000))
         registrations.append(registration)
         return "Original wait accepted. Finish this turn without polling."
@@ -120,6 +141,10 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
             await asyncio.sleep(.03)
             assert provider.calls == calls
             assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='result'", (owner.job_id,))
+            original_wait = await waits.read_wait(manager, runtime.actor(parent), registration.job.job_id)
+            remaining = original_wait["request"]["request"]["due_at_ms"] - manager.now()
+            if remaining > 0:
+                await asyncio.sleep(remaining / 1000)
             due = await waits.prepare_due(manager, runtime.actor(parent), registration.job.job_id)
             await notices.enqueue_notification(loop, runtime.actor(parent), due["event_id"])
             await loop.flush_follow_ups(parent)
@@ -134,14 +159,20 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
                 assert owner.result["payload"] == {"answer": 42} and len(finalized) == 1
             assert len(await store.list_children(parent)) == 1
             assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='owner_wait_resumed'")) == 1
+            assert len(await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE control_owner_job_id=? AND kind='send'", (owner.job_id,))) == 2
+            assert acknowledgements_lost == ([fault] if fault else [])
             consuming = True
             await loop.flush_follow_ups(parent)
             rows = await manager.db.fetchall(f"SELECT kind,status,supervision_status FROM {manager.jobs}")
             assert all(r["supervision_status"] == "closed" for r in rows), rows
+            history = await owner_waits.read(manager, runtime.actor(parent), owner.job_id, generation=1)
+            assert len(history["phases"]) == 1 and history["phases"][0]["resumed"] is not None
             record_property("original_waiting_entry", entry["payload_json"])
             record_property("original_owner_result", json.dumps(owner.result))
             record_property("supervision_tree", json.dumps(rows))
             record_property("final_schema_observations", json.dumps(finalized))
+            record_property("owner_transition_ack_loss", json.dumps(acknowledgements_lost))
+            record_property("verified_original_wait_history", json.dumps(history))
     finally:
         for registration in registrations:
             owner = await manager.get_job(runtime.actor(parent), registration.job.control_owner_job_id)

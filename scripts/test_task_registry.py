@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-REQUIRED_REAL_CASES = 98
+REQUIRED_REAL_CASES = 100
 
 
 class RunnerInterrupted(BaseException):
@@ -159,6 +159,7 @@ def main() -> int:
         "tests/unit/test_workflow_bound_restore_192.py",
         "tests/unit/test_completion_window_192.py",
         "tests/unit/test_owner_waits_192.py",
+        "tests/unit/test_owner_wait_recovery_192.py",
         "tests/unit/test_wait_structured_output_192.py",
         "tests/unit/test_finalization_192.py",
         "tests/unit/test_model_attempts_192.py",

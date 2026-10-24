@@ -1360,7 +1360,7 @@ a new paid call after expiry. Waiting polls perform no model requests.
 
 The current implementation covers a retained live controller and persisted
 facts, not cross-process resumption authority. Defer review cycles, formal
-host wake delivery, lost-ACK transition recovery, all in-flight short-deadline
+host wake delivery, full transition recovery, all in-flight short-deadline
 termination and restart orchestration remain work in progress. Unknown fees
 and provider execution remain unresolved until their existing independent
 evidence protocols confirm them; waiting never provides zero-cost proof.
@@ -1382,3 +1382,33 @@ signal is preserved and the original collector processes it before accepting
 the JSON payload. Successful repair clears only this module's temporary
 structured_output error. These are execution/result rules, not authority to
 restart a task, expand its budget or settle uncertain provider fees.
+
+### Confirming original wait transitions and reading their evidence
+
+The retained controller confirms a failed control transaction once using the
+same operation and identity. Only known store transport/transaction errors
+qualify: OS I/O/timeouts, selected SQLite operational codes and selected
+asyncpg connection, serialization, deadlock or shutdown SQLSTATEs. Domain
+errors, cancellation, original wait deadlines and programming errors are not
+retried. No provider request is inside this confirmation. The second attempt
+still checks the original actor, generation, lease, boot and execution fences.
+
+Timer and input collections have stable ordering. A committed resume recalls
+its frozen input references even if more authorized input arrived afterward;
+the original collector processes that additional input. Receipt, routing,
+inbox and captured model-exit/tracking evidence are revalidated. No new wait,
+owner, resume or time allowance is allocated to recover an ACK. If the original
+resume is already committed when its policy expires, it is retained and a new
+paid call is denied; a conflicting expired fact is not added to that phase.
+
+`await owner_waits.read(manager, actor, job_id, generation=1)` returns validated
+original waiting phases, their raw model output and resume/expiry references.
+The actor must have access to the original job. Reopening the store, a finished
+owner or an elapsed policy do not make this read an execution grant. Event
+roles, original nudge receipts and model-attempt snapshots are checked; simply
+recomputing a damaged tracking hash does not restore historical evidence.
+
+This is bounded confirmation by the same live controller. Cross-process
+resumption, all later-generation history combinations, defer review drivers
+and all uncertain control-outbox reconciliation still require their separate
+protocols. MySQL parity is not verified while its tests remain paused.
