@@ -823,32 +823,57 @@ class WorkflowEngine:
         node_stop = self._cancel.child()
         async with node_execution(runtime, self, node, env, driver_sid, cancel_token=node_stop) as binding:
             token = _DEFER_STEP.set(node.id)
+            retained_input_failure = False
             try:
                 try:
                     result = await self._exec_agent_admitted(node, env, driver_sid, node_stop=node_stop)
                 except JobError as exc:
-                    if exc.code != "cancel_requested":
+                    snapshot = getattr(exc, "execution_result", None)
+                    if (exc.code == "required_input_unhandled" and isinstance(snapshot, dict)
+                            and snapshot.get("status") in ("failed", "cancelled", "timed_out", "budget_exceeded", "hit_round_limit", "degraded")):
+                        # The original model phase has ended. Accepted input prevents a
+                        # replacement business attempt, not consumption of this actual
+                        # negative result by the owning workflow. Physical uncertainty
+                        # remains on the original execution ledger.
+                        result = AgentResult(node_id=node.id, session_id=snapshot.get("session_id"),
+                            status=snapshot["status"], text=snapshot.get("final_text") or "",
+                            payload=snapshot.get("payload"), usage=dict(snapshot.get("usage") or {}),
+                            error=snapshot.get("error") or exc.code)
+                        retained_input_failure = True
+                    elif exc.code == "cancel_requested":
+                        # A durable node stop can win before its local signal or
+                        # heartbeat reaches the provider-admission checkpoint.
+                        # Only this exact node's stop may be tolerated; an ancestor
+                        # stop or another lost lease must still stop the workflow.
+                        current = await runtime.manager._authorize(runtime.manager.db, binding.actor, binding.lease.job_id)
+                        runtime.manager._check_proof(current, binding.lease)
+                        if current["cancel_requested_at"] is None:
+                            raise
+                        node_stop.cancel("durable node cancellation requested")
+                        sessions = [sid for sid, active in self._task_nodes.items() if active is binding]
+                        result = AgentResult(node_id=node.id, session_id=sessions[-1] if sessions else None,
+                            status="cancelled", text="", error="node cancelled before dispatch")
+                        self._tolerated.add(node.id)
+                        self._last = result
+                    else:
                         raise
-                    # A durable node stop can win before its local signal or
-                    # heartbeat reaches the provider-admission checkpoint.
-                    # Only this exact node's stop may be tolerated; an ancestor
-                    # stop or another lost lease must still stop the workflow.
-                    current = await runtime.manager._authorize(runtime.manager.db, binding.actor, binding.lease.job_id)
-                    runtime.manager._check_proof(current, binding.lease)
-                    if current["cancel_requested_at"] is None:
-                        raise
-                    node_stop.cancel("durable node cancellation requested")
-                    sessions = [sid for sid, active in self._task_nodes.items() if active is binding]
-                    result = AgentResult(node_id=node.id, session_id=sessions[-1] if sessions else None,
-                        status="cancelled", text="", error="node cancelled before dispatch")
-                    self._tolerated.add(node.id)
-                    self._last = result
                 saved = await runtime.record_scope(binding, result.to_dict())
+                if retained_input_failure:
+                    accounted = binding.resource_evidence.get("workflow_usage_accounted", {})
+                    usage = saved.get("usage", {})
+                    delta = {key: int(usage.get(key, 0)) - int(accounted.get(key, 0)) for key in usage.keys() | accounted.keys()}
+                    if any(value < 0 for value in delta.values()):
+                        raise WorkflowRunError("workflow usage regressed during negative input settlement")
+                    self._add_usage(delta)
+                    if self._budget is not None:
+                        self._budget.commit(delta)
             finally:
                 _DEFER_STEP.reset(token)
             result.status = saved["status"]
             result.usage = saved.get("usage", result.usage)
             self._results[node.id] = result
+            if result.status not in ("completed", "skipped"):
+                self._last = result
             if result.status == "cancelled" and self._cancel.is_cancelled():
                 self._cancelled = True
             from power_loop.runtime.finalization import consume_node, try_finalize
@@ -1171,6 +1196,11 @@ class WorkflowEngine:
             if self._budget is not None:
                 self._budget.commit(delta)
             accounted_usage.update(totals)
+            if runtime is not None:
+                from power_loop.runtime.task_runtime import _OWNER
+                binding = _OWNER.get()
+                if binding is not None and binding.runtime is runtime:
+                    binding.resource_evidence["workflow_usage_accounted"] = dict(accounted_usage)
 
         account_usage(raw.get("usage"))
         cont = node.continuation

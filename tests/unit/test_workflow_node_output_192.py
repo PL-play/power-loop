@@ -8,6 +8,7 @@ import pytest
 
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime.cancellation import CancellationToken
+from power_loop.runtime.jobs import JobLease
 from power_loop.runtime.task_runtime import _OWNER, Execution
 from power_loop.runtime.workflow_tasks import ensure_node_answer
 
@@ -77,10 +78,9 @@ async def test_text_node_must_answer_on_original_sid_before_review(managed_workf
 
 
 async def test_node_answer_reentry_does_not_grant_another_attempt(managed_workflow, monkeypatch):
-    from types import SimpleNamespace
 
     _, manager, runtime, loop, _, parent, _, _ = managed_workflow
-    binding = Execution(runtime, runtime.actor(parent), SimpleNamespace(generation=1))
+    binding = Execution(runtime, runtime.actor(parent), JobLease("node-test", "executor-test", "boot-test", 1))
     token = _OWNER.set(binding)
     calls = []
     async def answer(*args, **kwargs):
@@ -125,7 +125,7 @@ async def test_exhausted_node_has_no_new_answer_allowance(managed_workflow, monk
     async def restore(*args):
         return SimpleNamespace(config=SimpleNamespace(max_rounds=1), follow_up=follow)
     monkeypatch.setattr("power_loop.runtime.subagent_output.workflow_continuation_loop", restore)
-    binding = Execution(runtime, runtime.actor(parent), SimpleNamespace(generation=1))
+    binding = Execution(runtime, runtime.actor(parent), JobLease("node-test", "executor-test", "boot-test", 1))
     token = _OWNER.set(binding)
     try:
         value = await ensure_node_answer(runtime, loop, {"status": "completed", "final_text": "", "rounds": 1,
@@ -137,10 +137,9 @@ async def test_exhausted_node_has_no_new_answer_allowance(managed_workflow, monk
 
 @pytest.mark.parametrize("mode", ["no_scope", "other_runtime", "later_generation", "nonempty", "failed", "missing_sid", "cancelled", "timeout"])
 async def test_node_answer_scope_and_failure_boundaries(managed_workflow, monkeypatch, mode):
-    from types import SimpleNamespace
 
     _, _, runtime, loop, _, parent, _, _ = managed_workflow
-    binding = Execution(runtime, runtime.actor(parent), SimpleNamespace(generation=2 if mode == "later_generation" else 1))
+    binding = Execution(runtime, runtime.actor(parent), JobLease("node-test", "executor-test", "boot-test", 2 if mode == "later_generation" else 1))
     stop = CancellationToken()
     raw = {"status": "failed" if mode == "failed" else "completed", "final_text": "answer" if mode == "nonempty" else "",
         "rounds": 1, "session_id": None if mode == "missing_sid" else "original"}

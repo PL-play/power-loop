@@ -67,19 +67,22 @@ async def test_active_owner_cannot_be_disposed_to_make_supervision_green(handoff
     assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='wait_disposition'")
 
 
-async def test_applied_but_unprocessed_continuation_keeps_its_independent_responsibility(handoff):
+async def test_applied_but_unprocessed_continuation_retains_effect_and_negative_input_proof(handoff):
     h, c = handoff, handoff.c
     await decide(h, "continue")
     original_effect = await effects.apply(c.manager, c.main, h.event_id)
-    [inbox] = await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.follow_up_queue} WHERE kind='relay'")
-    assert inbox['status'] == 'pending'
+    [effect] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='wait_effect'")
     await exited(h)
     await terminal.terminate(c.manager, c.main, h.registration.job.job_id)
-    with pytest.raises(JobError, match='wait_input_unsettled'):
-        await c.manager.finalize_supervision(c.main, h.registration.job.job_id, generation=0)
-    assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='wait_disposition'")
-    assert await c.manager.db.fetchone(f"SELECT * FROM {c.store.t.follow_up_queue} WHERE id=?", (inbox['id'],)) == inbox
-    assert await effects.apply(c.manager, c.main, h.event_id) == original_effect
+    await c.manager.finalize_supervision(c.main, h.registration.job.job_id, generation=0)
+    [queue] = await c.store.inbox_items(c.sid)
+    assert queue['status'] == 'void'
+    [current] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='wait_effect'")
+    assert current['payload_json'] == effect['payload_json'] and current['delivery_status'] == 'handled'
+    replay = await effects.apply(c.manager, c.main, h.event_id)
+    assert replay['status'] == 'owner_terminated_before_input_processed'
+    assert replay['operation_id'] == original_effect['operation_id']
+    assert not replay['execution_authority'] and not replay['billing_settled']
 
 
 async def test_expired_legacy_delivered_defer_is_retired_without_a_new_review(handoff):

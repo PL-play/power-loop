@@ -296,7 +296,9 @@ async def test_cancel_racing_result_commit_keeps_effective_cancel_and_actual_exi
     job_id = state["handles"][0].job_id
     saved = await manager.get_job(runtime.actor(sid), job_id)
     canonical = await manager.get_result_revision(runtime.actor(sid), job_id, 1)
-    assert saved.result["execution_status"] == canonical["payload"]["result"]["status"] == "completed"
+    assert saved.result == canonical["payload"]["result"]
+    assert saved.result["execution_status"] == "completed"
+    assert canonical["payload"]["outcome"] == "cancelled" and canonical["payload"]["resource_state"] == "stopped"
     assert saved.result["status"] == saved.outcome == "cancelled" and saved.result["usage"]["total_tokens"] == 20
     envelope = await workflow_results.project(loop, runtime.actor(sid), job_id, 1)
     assert envelope["status"] == "cancelled" and "cancelled" in envelope["summary"]

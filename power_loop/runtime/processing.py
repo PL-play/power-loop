@@ -278,6 +278,13 @@ async def require_event_handled(manager, tx, result, *, session_id, owner_job_id
     if result["delivery_status"] != "handled":
         raise JobError("required_result_unhandled")
     if result.get("action") == "nudge":
+        from .input_dispositions import read_tx
+        disposed = await read_tx(manager, tx, result)
+        if disposed is not None:
+            data = json.loads(disposed["payload_json"])
+            if data["session_id"] != session_id or data["owner"]["job_id"] != owner_job_id:
+                raise JobError("required_result_unhandled")
+            return
         from .jobs import JobActor
         from .wait_effects import validate_input
         row = await manager._row(tx, owner_job_id)

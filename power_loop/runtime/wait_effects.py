@@ -54,7 +54,7 @@ def _input(saved, binding):
     return request
 
 
-async def _effect(manager, tx, actor, job, saved, decision, data, *, _review=True):
+async def _effect(manager, tx, actor, job, saved, decision, data, *, _review=True, _retired_input=False):
     key = effect_id(manager, decision["event_id"])
     row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
     if row is None:
@@ -96,9 +96,12 @@ async def _effect(manager, tx, actor, job, saved, decision, data, *, _review=Tru
             inbox = await tx.fetchone(f"SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
                 (request["session_id"], "nudge:" + op["event_id"]))
             if (inbox is None or inbox["kind"] != "relay" or inbox["mode"] != "steer"
-                    or inbox["content"] != request["message"] or inbox["status"] not in ("pending", "claimed", "delivered")
+                    or inbox["content"] != request["message"] or inbox["status"] not in ("pending", "claimed", "delivered", "void")
                     or op["delivery_status"] not in ("pending_delivery", "handled")):
                 raise JobError("wait_effect_input_mismatch")
+            if inbox["status"] == "void" and not _retired_input:
+                from .input_dispositions import read_tx
+                await read_tx(manager, tx, op, required=True)
     return row
 
 
@@ -182,7 +185,7 @@ async def apply(manager, actor, event_id):
         return _reply(effect)
 
 
-async def validate_input(manager, tx, actor, event):
+async def validate_input(manager, tx, actor, event, *, _retired_input=False):
     """System handoffs must retain the original accepted decision and effect."""
     request = waits._object(event["payload_json"]).get("request", {})
     if event["call_ref_json"] is not None and "handoff" not in request:
@@ -198,7 +201,7 @@ async def validate_input(manager, tx, actor, event):
     # immutable provenance, not a lease delegated to the child.
     main = JobActor(actor.tenant_id, actor.principal_id, event["caller_session_id"])
     job, _, saved, decision, data = await _decision(manager, tx, main, binding["event_id"])
-    effect = await _effect(manager, tx, main, job, saved, decision, data)
+    effect = await _effect(manager, tx, main, job, saved, decision, data, _retired_input=_retired_input)
     if (effect is None or data["request"]["decision"] != "continue"
             or waits._object(effect["payload_json"])["operation_id"] != event["event_id"]
             or _hash(binding) != _hash(_binding(manager, decision, data))):

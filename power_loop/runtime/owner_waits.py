@@ -359,7 +359,7 @@ async def _inputs(manager, tx, actor, owner, sid):
     return sorted(ready, key=lambda item: item[0]["event_id"])
 
 
-async def _input(manager, tx, actor, owner, sid, event):
+async def _input(manager, tx, actor, owner, sid, event, *, _retired=False):
     from .wait_effects import validate_input
 
     request = waits._object(event["payload_json"]).get("request", {})
@@ -379,11 +379,14 @@ async def _input(manager, tx, actor, owner, sid, event):
                 or receipt.round_index != call.round_index or receipt.seq <= call.seq
                 or event["request_hash"] != _hash([request, call.to_dict()])):
             raise JobError("owner_wait_input_corrupt")
-    await validate_input(manager, tx, JobActor(actor.tenant_id, actor.principal_id, sid), event)
+    await validate_input(manager, tx, JobActor(actor.tenant_id, actor.principal_id, sid), event, _retired_input=_retired)
     inbox = await tx.fetchone(f"SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?", (sid, "nudge:" + event["event_id"]))
     if (inbox is None or inbox["kind"] != "relay" or inbox["mode"] != "steer" or inbox["content"] != request.get("message")
-            or inbox["status"] not in ("pending", "claimed", "delivered")):
+            or inbox["status"] not in ("pending", "claimed", "delivered", "void")):
         raise JobError("owner_wait_input_corrupt")
+    if inbox["status"] == "void" and not _retired:
+        from .input_dispositions import read_tx
+        await read_tx(manager, tx, event, required=True)
     return inbox["status"] == "delivered"
 
 

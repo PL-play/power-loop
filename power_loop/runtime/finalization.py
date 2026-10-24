@@ -86,6 +86,13 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
         if ref["event_type"] == "supervision_closed":
             child = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (ref["event_id"],))
             await _closed_event(manager, tx, child, state, depth + 1)
+        elif ref["event_type"] == "input_disposition":
+            from .input_dispositions import read_tx
+            saved = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (ref["event_id"],))
+            data_input = _object(saved["payload_json"])
+            original = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (data_input["operation"]["event_id"],))
+            if original is None or (await read_tx(manager, tx, original, required=True))["event_id"] != ref["event_id"]:
+                raise JobError("finalization_evidence_changed")
     state["visiting"].remove(event_id)
     state["done"][event_id] = data
     return data
@@ -139,6 +146,11 @@ async def _inputs(manager, tx, row, generation):
 
 
 async def _processing_references(manager, tx, event):
+    if event.get("action") == "nudge":
+        from .input_dispositions import event_ids, read_tx
+        disposed = await read_tx(manager, tx, event)
+        if disposed is not None:
+            return [await _reference(manager, tx, key) for key in event_ids(disposed)]
     decision_id = "decision_" + _hash([event["event_id"], event["job_version"], _hash(_object(event["payload_json"]))])[:48]
     decision = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='processing_decision'", (decision_id,))
     if decision is None:
@@ -214,6 +226,10 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
     refs = [await _reference(manager, tx, scope_id(manager, row["job_id"], generation)),
         await _reference(manager, tx, seal_id(manager, row["job_id"], generation))]
     if row["kind"] in ("subagent", "workflow_node"):
+        if row["outcome"] in ("failed", "cancelled", "timed_out", "budget_exceeded", "interrupted"):
+            from .input_dispositions import reconcile_owner_tx
+            await reconcile_owner_tx(manager, tx, actor, row, generation)
+            row = await manager._row(tx, row["job_id"])
         from .completion_windows import event_id, read_row
         if await read_row(manager, tx, row) is not None:
             refs.append(await _reference(manager, tx, event_id(manager, row["job_id"])))

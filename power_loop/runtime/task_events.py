@@ -97,8 +97,19 @@ async def _events(manager, tx, job, kind, upper=None):
     return [row for row in rows if upper is None or _key(row) <= tuple(upper)]
 
 
-async def _detail(manager, tx, job, event):
+async def _public_header(manager, tx, job, event):
     public = _header(manager, job, event)
+    if event["event_type"] == "operation" and event["action"] == "nudge":
+        from .input_dispositions import identity, read_tx, summary
+        if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (identity(manager, event["event_id"]),)):
+            original = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event["event_id"],))
+            proof = await read_tx(manager, tx, original, required=True)
+            public["input_disposition"] = summary(proof)
+    return public
+
+
+async def _detail(manager, tx, job, event):
+    public = await _public_header(manager, tx, job, event)
     if event["event_type"] == "operation":
         return public  # Never expose operation request/lease/dispatch payloads.
     raw = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND event_id=? AND event_type='result'",
@@ -162,8 +173,9 @@ async def read_events(manager, actor, job_id, *, view, event_id=None, limit=20, 
         elif output_file is None:
             remaining = [event for event in events if _key(event) > tuple(state["after"])]
             shown = remaining[:limit]
+            headers = [await _public_header(manager, tx, job, row) for row in shown]
             while True:
-                result = {**base, "status": "ok", "events": [_header(manager, job, row) for row in shown],
+                result = {**base, "status": "ok", "events": headers,
                     "matched_count": len(events), "truncated": len(shown) < len(remaining),
                     "next_cursor": _cursor(state, _key(shown[-1])) if shown and len(shown) < len(remaining) else None}
                 if len(dumps(result)) <= max_chars:
@@ -171,6 +183,7 @@ async def read_events(manager, actor, job_id, *, view, event_id=None, limit=20, 
                 if len(shown) <= 1:
                     raise JobError("task_event_budget_too_small")
                 shown.pop()
+                headers.pop()
     if output_file is not None:
         _bounded({**base, "status": "exported", "path": output_file, "records": _MAX_EVENTS, "bytes": _MAX_BYTES}, max_chars)
         async def authorize(tx):

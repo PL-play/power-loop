@@ -41,7 +41,19 @@ async def _expected(manager, tx, actor, job, creation, saved, state, intent):
     from .wait_terminal import _terminated
 
     main, decision, data, operation, effect = intent
-    if effect is not None and (data["request"]["decision"] != "defer"
+    input_proof, input_processing = None, None
+    if effect is not None and data["request"]["decision"] == "continue":
+        from .input_dispositions import read_tx
+        effect_data = waits._object(effect["payload_json"])
+        original_input = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (effect_data["operation_id"],))
+        input_proof = await read_tx(manager, tx, original_input)
+        if input_proof is None:
+            from .finalization import _processing_references
+            from .processing import require_event_handled
+            await require_event_handled(manager, tx, original_input,
+                session_id=saved["binding"]["session_id"], owner_job_id=saved["binding"]["owner"]["job_id"])
+            input_processing = await _processing_references(manager, tx, original_input)
+    elif effect is not None and (data["request"]["decision"] != "defer"
             or waits._object(effect["payload_json"])["operation_id"] is not None):
         raise JobError("wait_disposition_effect_already_applied")
     ended = await _terminated(manager, tx, actor, job, creation, saved, _state=state)
@@ -67,7 +79,7 @@ async def _expected(manager, tx, actor, job, creation, saved, state, intent):
         raise JobError("wait_disposition_raw_evidence_corrupt") from exc
     columns = ("id", "session_id", "seq", "role", "name", "content", "tool_calls_json", "tool_call_id", "round_index", "send_index")
     # _decision validated the actual observation and original tool receipt.
-    return {"version": 1, "disposition": "owner_terminated_without_effect", "owner": saved["binding"]["owner"],
+    payload = {"version": 1, "disposition": "owner_terminated_without_effect", "owner": saved["binding"]["owner"],
         "wait_job_id": job["job_id"], "main_session_id": main.session_id,
         "creation": content_reference(creation), "due": content_reference(state["event"]),
         "decision": content_reference(decision), "decision_kind": data["request"]["decision"],
@@ -77,6 +89,12 @@ async def _expected(manager, tx, actor, job, creation, saved, state, intent):
         "effect": content_reference(effect) if effect else None,
         "prior_delivery_status": "delivered" if effect else "pending_delivery", "termination": content_reference(ended),
         "terminated_at_ms": ended["created_at"]}
+    if input_proof is not None or input_processing is not None:
+        payload.update(version=2,
+            disposition="owner_terminated_before_input_processed" if input_proof else "owner_terminated_after_input_processed",
+            input_disposition=content_reference(input_proof) if input_proof else None,
+            input_processing=input_processing, input_operation_id=original_input["event_id"])
+    return payload
 
 
 async def read_tx(manager, tx, actor, job, creation, saved, state, *, required=False):
@@ -125,8 +143,13 @@ async def reconcile_tx(manager, tx, actor, job, creation, saved):
     if intent is None:
         return None
     main, decision, data, _, effect = intent
-    if effect is not None and data["request"]["decision"] != "defer":
-        return None  # Applied input/cancel has its own independent protocol.
+    if effect is not None and data["request"]["decision"] == "cancel":
+        return None  # Applied cancel retains its original terminal protocol.
+    if effect is not None and data["request"]["decision"] == "continue":
+        from .input_dispositions import reconcile_tx as retire_input
+        input_id = waits._object(effect["payload_json"])["operation_id"]
+        original_input = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (input_id,))
+        await retire_input(manager, tx, actor, original_input)
     if decision["delivery_status"] != ("delivered" if effect else "pending_delivery"):
         raise JobError("wait_disposition_evidence_missing")
     if job["supervision_status"] != "open":
@@ -145,6 +168,15 @@ async def reconcile_tx(manager, tx, actor, job, creation, saved):
 
 def reply(row):
     payload = waits._object(row["payload_json"])
+    if payload["version"] == 2:
+        return {"version": 3, "status": payload["disposition"], "disposition_id": row["event_id"],
+            "event_id": payload["due"]["event_id"], "wait_job_id": row["job_id"], "decision": payload["decision_kind"],
+            "operation_id": payload["input_operation_id"],
+            "input_disposition_id": payload["input_disposition"]["event_id"] if payload["input_disposition"] else None,
+            "input_was_processed": payload["input_processing"] is not None,
+            "input_was_enqueued": True, "new_execution_dispatched": False,
+            "original_owner": {"job_id": payload["owner"]["job_id"], "generation": str(payload["owner"]["generation"])},
+            "disposition_status": "handled", "execution_authority": False, "billing_settled": False}
     return {"version": 2, "status": "owner_terminated_without_effect", "disposition_id": row["event_id"],
         "event_id": payload["due"]["event_id"], "wait_job_id": row["job_id"], "decision": payload["decision_kind"],
         "original_owner": {"job_id": payload["owner"]["job_id"], "generation": str(payload["owner"]["generation"])},
@@ -168,4 +200,6 @@ def event_ids(row):
     payload = waits._object(row["payload_json"])
     return [row["event_id"], *[payload[k]["event_id"] for k in
         ("creation", "due", "decision", "operation", "observation", "termination")],
-        *([payload["effect"]["event_id"]] if payload["effect"] else [])]
+        *([payload["effect"]["event_id"]] if payload["effect"] else []),
+        *([payload["input_disposition"]["event_id"]] if payload["version"] == 2 and payload["input_disposition"] else []),
+        *([ref["event_id"] for ref in payload["input_processing"]] if payload["version"] == 2 and payload["input_processing"] else [])]

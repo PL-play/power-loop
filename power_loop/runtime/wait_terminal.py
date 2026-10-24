@@ -33,10 +33,14 @@ async def admission(manager, tx, actor, job_id):
 
 
 async def _owner_exit(manager, tx, actor, saved):
+    return await negative_owner_exit(manager, tx, actor, saved["binding"]["owner"], saved["binding"]["route"]["kind"])
+
+
+async def negative_owner_exit(manager, tx, actor, original, kind):
+    """Original sealed execution tree; history never grants execution authority."""
     from .execution_membership import read, scope_id, seal_id
     from .result_revisions import result_id
 
-    original = saved["binding"]["owner"]
     queue, seen, refs, outcome = [(original, None)], set(), {}, None
     for _ in range(64):
         if not queue:
@@ -75,7 +79,7 @@ async def _owner_exit(manager, tx, actor, saved):
                 if current["generation"] == lease["generation"] and (current["outcome"] != data["outcome"] or _hash(waits._object(current["result_json"])) != _hash(data.get("result"))):
                     raise JobError("wait_owner_exit_evidence_corrupt")
                 if parent is None:
-                    if data["outcome"] not in _NEGATIVE or scope["kind"] != saved["binding"]["route"]["kind"]:
+                    if data["outcome"] not in _NEGATIVE or scope["kind"] != kind:
                         raise JobError("wait_owner_not_negative")
                     outcome = data["outcome"]
                 ids.append(result["event_id"])
