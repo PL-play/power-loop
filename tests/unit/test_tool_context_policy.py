@@ -237,6 +237,8 @@ async def test_background_delegates_target_keep(env):
     record = {'task_id': 'task-1', 'tool': 'bash', 'args': {**source.arguments, 'context_policy': 'keep'},
               'result': source.result, 'status': 'completed'}
     await store.set_runtime_state(sid, record_key('task-1'), record)
+    from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+    engine.registry.register(ToolDefinition('background_run', ''), DEFAULT_TOOL_HANDLERS['background_run'])
     wrapped = replace(source, name='background_run', arguments={'action': 'check', 'task_id': 'task-1'},
                       result=encode_results([record]))
     assert await engine.submit(wrapped)

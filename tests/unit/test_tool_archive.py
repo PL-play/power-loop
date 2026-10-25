@@ -207,6 +207,8 @@ async def test_background_target_policy_and_original_delivery():
     try:
         reg = ToolRegistry()
         reg.register(ToolDefinition('bash', ''), lambda **kw: '')
+        from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+        reg.register(ToolDefinition('background_run', ''), DEFAULT_TOOL_HANDLERS['background_run'])
         engine.registry = reg
         record = {'task_id': 'bg1', 'tool': 'bash', 'status': 'completed',
                   'args': {'command': 'x' * 1500, 'description': 'target description', 'context_policy': 'keep'},

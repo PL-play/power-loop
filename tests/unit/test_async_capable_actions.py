@@ -60,7 +60,8 @@ def test_openai_description_names_the_allowed_actions():
     """模型看得到范围才不会拿 freeze 去后台跑（报错即出路的前一步：先别让它撞）。"""
     reg = ToolRegistry()
     reg.register(_d(RO), lambda **kw: "")
-    reg.register(ToolDefinition(name="background_run", description="bg"), lambda **kw: "")
+    from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+    reg.register(ToolDefinition(name="background_run", description="bg"), DEFAULT_TOOL_HANDLERS["background_run"])
     desc = next(t["function"]["description"] for t in reg.to_openai_tools()
                 if t["function"]["name"] == "design_reference")
     assert "可异步（仅 action=download/get/list）" in desc
@@ -82,7 +83,8 @@ async def test_background_run_refuses_side_effecting_tools_with_the_way_out(monk
     reg.register(_d(RO), lambda **kw: "")                       # design_reference：action 粒度
     reg.register(ToolDefinition(name="see_image", description="s", async_capable=True),
                  lambda **kw: "")
-    reg.register(ToolDefinition(name="background_run", description="bg"), lambda **kw: "")
+    from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+    reg.register(ToolDefinition(name="background_run", description="bg"), DEFAULT_TOOL_HANDLERS["background_run"])
     # run_tool 里是**局部导入**，所以要 patch 源模块而不是 default_tools
     from power_loop.core import agent_context
     monkeypatch.setattr(agent_context, "get_current_loop",

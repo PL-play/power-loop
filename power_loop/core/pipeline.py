@@ -383,34 +383,16 @@ class AgentPipeline:
         self.runtime_tools = tool_registry.to_openai_tools() if tool_registry is not None else None
         from power_loop.runtime.tool_context import active_engine
         effective_context = getattr(active_engine.get(), 'config', config.tool_context)
-        # With tool context on, bash takes a required description (kept in distilled and archived
-        # entries) and background_run starts registered tools only.
+        # Registered implementations own any model-facing context schema changes.
         if effective_context is not None:
             import copy
             self.runtime_tools = copy.deepcopy(self.runtime_tools)
+            from power_loop.runtime.tool_contracts import context_spec
             for spec in self.runtime_tools or []:
                 fn = spec.get('function', {})
-                if fn.get('name') == 'background_run':
-                    params = fn.setdefault('parameters', {})
-                    props = params.setdefault('properties', {})
-                    action = props.get('action', {})
-                    if 'enum' in action:
-                        action['enum'] = [x for x in action['enum'] if x != 'run']
-                    props.pop('command', None)
-                    fn['description'] = fn.get('description', '') + (
-                        '\nStart registered tools with action=tool. '
-                        'For shell commands use tool=bash and args containing command and description. '
-                        'Do not use action=run.')
-                if fn.get('name') == 'bash':
-                    params = fn.setdefault('parameters', {})
-                    props = params.setdefault('properties', {})
-                    props.setdefault('description', {'type': 'string', 'minLength': 1, 'maxLength': 1000,
-                        'description': 'One sentence purpose; preserved in archives.'})
-                    params['required'] = list(dict.fromkeys([*params.get('required', []), 'description']))
-                    fn['description'] = fn.get('description', '').replace('Output is truncated, ', '') + (
-                        '\nContext policy: description is required. Default retire; keep only for persistent '
-                        'instructions/skills, not logs, tests or listings. keep holds the output unchanged for the '
-                        'rest of this task; later tasks see a short record. Recall originals when details are needed.')
+                registered = self.tool_registry.get(fn.get('name'))
+                if registered is not None:
+                    spec.update(context_spec(registered, spec))
         # Auto-inject tool catalog + skill section (M1.10). Built ONCE here and
         # frozen into self.system_prompt (a plain string — NOT self.history, so
         # the compactor never touches it). The assembly is shared with

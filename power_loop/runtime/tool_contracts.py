@@ -38,10 +38,14 @@ class ToolRuntimeContract:
     key: str
     allowed_roles: tuple[str, ...] = ROLES
     capabilities: tuple[str, ...] = ()
+    background_allowed: bool = True
+    result_container: bool = False
 
     def __post_init__(self):
         if (
-            type(self.key) is not str
+            type(self.background_allowed) is not bool
+            or type(self.result_container) is not bool
+            or type(self.key) is not str
             or not 0 < len(self.key) <= 128
             or type(self.allowed_roles) is not tuple
             or not self.allowed_roles
@@ -68,6 +72,18 @@ class RuntimeTool(ABC):
     def format_result(self, result, max_chars):
         """Optional structure-preserving result view; None uses normal formatting."""
         return None
+
+    def context_spec(self, spec):
+        """Optional model-facing schema when tool-context preparation is enabled."""
+        return spec
+
+    def background_hint(self, definition, *, scheduler_name):
+        """Optional usage for submitting a target to this implemented scheduler."""
+        return None
+
+    async def result_sources(self, source, *, store, registry):
+        """A declared result container resolves original targets; never starts work."""
+        return []
 
     @abstractmethod
     async def __call__(self, **arguments):
@@ -188,4 +204,24 @@ def format_result(registered, result, max_chars):
     value = implementation.format_result(result, max_chars) if implementation is not None else None
     if value is not None and type(value) is not str:
         raise ToolContractError("invalid_tool_result_view")
+    return value
+
+
+def background_allowed(registered):
+    implementation = resolve(registered)
+    return implementation is None or implementation.runtime_contract.background_allowed
+
+
+def result_container(registered):
+    implementation = resolve(registered)
+    return implementation is not None and implementation.runtime_contract.result_container
+
+
+def context_spec(registered, spec):
+    implementation = resolve(registered)
+    value = implementation.context_spec(spec) if implementation is not None else spec
+    if (type(value) is not dict or value.get("type") != "function"
+            or type(value.get("function")) is not dict
+            or value["function"].get("name") != registered.definition.name):
+        raise ToolContractError("invalid_tool_context_spec")
     return value

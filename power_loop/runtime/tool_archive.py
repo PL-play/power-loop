@@ -65,7 +65,7 @@ async def _derive(engine, source, trigger, level, raw_arguments=None):
     policy = engine.policy(source)
     if policy.hard_preserve:
         return None
-    if source.name == 'background_run':
+    if engine.is_result_container(source):
         targets = await engine._background_sources(source)
         if not targets:
             return None
@@ -298,7 +298,7 @@ async def prepare_history(engine, pipeline, trigger, *, target_tokens=None, leve
         patches[key] = {'send_index': source.send_index, 'call_seq': call_seq, 'result_seq': source.seq,
             'call_id': source.call_id, 'source_hash': _hash({'arguments': dict(source.arguments), 'result': source.result}),
             'arguments': arguments, 'result': content, 'level': level, 'trigger': trigger,
-            'mergeable': source.name != 'background_run' and (
+            'mergeable': not engine.is_result_container(source) and (
                 policy.general if level == 2 else policy.strategy(trigger)) == 'archive'}
         freed += saved
         if target_tokens is not None and freed // 4 >= target_tokens:
@@ -498,8 +498,10 @@ async def recall_original(store, sid, send_index, row, char_offset=0, char_limit
     payload = {'representation': 'original', 'source': {'send_index': send_index, 'seq': row.seq},
         'arguments': (call or {}).get('function', {}).get('arguments'), 'result': row.content}
     # Background receipts can contain previews; attach the immutable canonical task result.
-    if (call or {}).get('function', {}).get('name') == 'background_run':
-        from power_loop.runtime.background import RESULT_PREFIX, load_record
+    from power_loop.runtime.background import RESULT_PREFIX, load_record
+    # Historical data reader only: aliases retain access to the same stored
+    # receipt format. This does not select or invoke any current implementation.
+    if RESULT_PREFIX in str(row.content):
         try:
             tasks = json.loads(str(row.content).split(RESULT_PREFIX, 1)[1])['tasks']
             payload['background_originals'] = [

@@ -299,3 +299,6 @@ power-loop **orchestrates; it does not, by itself, isolate.** The built-in `bash
 - **Used by:** DeepTalk — the agent runtime for a 1-on-1 relationship-IM product's in-conversation agents. *(Using it in production? PR a line here.)*
 - **Develop:** `pip install -e ".[dev]"` · `ruff check .` · `pytest -q --no-real` (drop `--no-real` for the live-LLM suite; set a `POWER_LOOP_TEST_PG_DSN` / `POWER_LOOP_TEST_MYSQL_DSN` to run the server-backend conformance suites).
 - [Docs](docs/en/index.md) · [Architecture](docs/en/architecture.md) · [Storage backends](docs/en/user-guide/storage-backends.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [License](LICENSE)
+
+Trusted host tools declare roles, admission and background behavior through the
+[RuntimeTool interface](docs/runtime-tool-contracts.md); names do not grant capabilities.

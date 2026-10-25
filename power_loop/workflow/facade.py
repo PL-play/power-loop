@@ -497,7 +497,7 @@ def workflow_runtime_tool(handler, *, key="sdk.workflow"):
     """Declare this router's implemented native actions for a trusted host wrapper."""
     from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 
-    return FunctionRuntimeTool(handler, ToolRuntimeContract(key, allowed_roles=("main",)),
+    return FunctionRuntimeTool(handler, ToolRuntimeContract(key, background_allowed=False, allowed_roles=("main",)),
         policy=lambda arguments: ToolDispatchPolicy(
             native_admitted=arguments.get("action", "help") in _ACTIONS,
             control_only=arguments.get("action", "help") in ("help", "status", "list", "cancel", "leaves", "logs")))

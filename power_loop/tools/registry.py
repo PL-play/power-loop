@@ -134,19 +134,22 @@ class ToolRegistry:
         defs = self.definitions()
         # async_capable 描述后缀（6.8.0）：仅当 background_run 真在本工具集里才追加——
         # 否则是在教模型调一个不存在的入口。文案集中在这一处，别在各工具描述里手写。
-        has_bg = any(d.name == "background_run" for d in defs)
+        from power_loop.runtime.tool_contracts import background_allowed, resolve
+
+        schedulers = [(name, implementation) for name in self.names()
+                      if (implementation := resolve(self.get(name))) is not None
+                      and "tool.background-submit.v1" in implementation.runtime_contract.capabilities]
+        scheduler = schedulers[0] if len(schedulers) == 1 else None
         out: list[dict[str, Any]] = []
         for d in defs:
             t = d.to_openai_tool()
-            if (has_bg and d.async_capable and d.name != "background_run"
+            if (scheduler is not None and d.async_capable and background_allowed(self.get(d.name))
                     and d.name not in NO_BACKGROUND_SUFFIX):
                 acts = async_capable_actions(d)
                 scope = ("（仅 action=" + "/".join(acts) + "）") if acts else ""
                 t["function"]["description"] = (
                     str(t["function"]["description"])
-                    + f"\n可异步{scope}：background_run(action=\"tool\", tool=\"{d.name}\", "
-                      "args={…}) 立即返回 task_id 不阻塞；结果完成后自动送到你面前，不用 check。"
-                      "不需要立刻用结果时优先异步。"
+                    + f"\n可异步{scope}：" + (scheduler[1].background_hint(d, scheduler_name=scheduler[0]) or "")
                 )
             out.append(t)
         return out

@@ -7,6 +7,7 @@ import pytest
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core import agent_context
 from power_loop.tools import default_tools as dt
+from power_loop.tools.registry import ToolRegistry
 
 
 @pytest.mark.asyncio
@@ -32,24 +33,24 @@ async def test_queue_is_fifo_per_session_and_cancel_does_not_invoke(monkeypatch)
 
     store = Store()
 
-    class Registry:
-        def get(self, name):
-            return ToolDefinition(name=name, description='test', async_capable=True)
+    async def invoke(**args):
+        session, i = sid.get(), args['i']
+        started.append(i)
+        active[session] = active.get(session, 0) + 1
+        peaks[session] = max(peaks.get(session, 0), active[session])
+        try:
+            await events[i].wait()
+            if i == 0:
+                raise ValueError('test failure releases slot')
+            return str(i)
+        finally:
+            active[session] -= 1
 
-        async def invoke_async(self, name, args):
-            session, i = sid.get(), args['i']
-            started.append(i)
-            active[session] = active.get(session, 0) + 1
-            peaks[session] = max(peaks.get(session, 0), active[session])
-            try:
-                await events[i].wait()
-                if i == 0:
-                    raise ValueError('test failure releases slot')
-                return str(i)
-            finally:
-                active[session] -= 1
 
-    monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=Registry()))
+    registry = ToolRegistry()
+    registry.register(ToolDefinition("image", "test", async_capable=True), invoke)
+
+    monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=registry))
     monkeypatch.setattr(dt, '_current_store_and_session', lambda: (store, sid.get()))
     manager = dt.BackgroundManager()
     notifications = []

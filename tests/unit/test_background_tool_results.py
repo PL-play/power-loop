@@ -10,6 +10,7 @@ from power_loop.core import agent_context
 from power_loop.runtime.background import RESULT_PREFIX, record_key
 from power_loop.runtime.runtime_state import BackgroundRuntimeProjector
 from power_loop.tools import default_tools as dt
+from power_loop.tools.registry import ToolRegistry
 
 
 @pytest.mark.asyncio
@@ -19,13 +20,10 @@ async def test_full_result_identity_survives_manager_recreation(monkeypatch):
     sid = sid.session_id if hasattr(sid, 'session_id') else sid
     output = 'Error: ' + 'x' * 12000 + 'END'
 
-    class Registry:
-        def get(self, name):
-            return ToolDefinition(name=name, description='test', async_capable=True)
-        async def invoke_async(self, name, args):
-            return output
+    registry = ToolRegistry()
+    registry.register(ToolDefinition('scene_pkg', 'test', async_capable=True), lambda **args: output)
 
-    monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=Registry()))
+    monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=registry))
     monkeypatch.setattr(dt, '_current_store_and_session', lambda: (store, sid))
     monkeypatch.setattr(dt, '_TOOL_TASK_ON_COMPLETE', None)
     manager = dt.BackgroundManager()

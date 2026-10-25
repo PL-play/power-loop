@@ -242,7 +242,7 @@ class ToolContextEngine:
         view = format_result(registered, source.result, self.policy(source).result_max_chars or 600)
         if view is not None:
             return view
-        if source.name == 'background_run':
+        if self.is_result_container(source):
             return await self._background(source, trigger)
         policy = policy_override or self.policy(source)
         strategy = policy.strategy(trigger)
@@ -312,7 +312,7 @@ class ToolContextEngine:
 
     async def submit(self, source: ToolSource) -> bool:
         """Persist eligible work only. No generation, no usage delivery, no waiting."""
-        if source.name == 'background_run':
+        if self.is_result_container(source):
             accepted = False
             for target in await self._background_sources(source):
                 accepted = await self.submit(target) or accepted
@@ -342,26 +342,18 @@ class ToolContextEngine:
         return accepted
 
     async def _background_sources(self, source: ToolSource) -> list[ToolSource]:
-        from power_loop.runtime.background import RESULT_PREFIX, load_record
+        from .tool_contracts import resolve
 
-        if RESULT_PREFIX not in source.result:
+        registered = self.registry.get(source.name) if self.registry else None
+        implementation = resolve(registered)
+        if implementation is None or not implementation.runtime_contract.result_container:
             return []
-        try:
-            payload = json.loads(source.result.split(RESULT_PREFIX, 1)[1])
-            sources = []
-            for task in payload['tasks']:
-                record = await load_record(self.store, self.sid, str(task['task_id']))
-                if not record or record.get('status') not in ('completed', 'failed', 'done'):
-                    return []
-                name, args = record.get('tool'), record.get('args')
-                if (not name or name == 'background_run' or not isinstance(args, dict)
-                        or self.registry is None or self.registry.get(name) is None):
-                    return []
-                sources.append(ToolSource(source.session_id, source.send_index, source.seq,
-                    str(task['task_id']), name, args, str(record.get('result') or '')))
-            return sources
-        except (ValueError, KeyError, TypeError):
-            return []
+        return await implementation.result_sources(source, store=self.store, registry=self.registry)
+
+    def is_result_container(self, source):
+        from .tool_contracts import result_container
+
+        return result_container(self.registry.get(source.name) if self.registry else None)
 
     async def _background(self, source: ToolSource, trigger: Trigger) -> str | None:
         sources = await self._background_sources(source)
@@ -411,7 +403,8 @@ class ToolContextEngine:
 
     def manages(self, name: str) -> bool:
         registered = self.registry.get(name) if self.registry else None
-        return (name == 'background_run' or name in self.config.overrides
+        from .tool_contracts import result_container
+        return (result_container(registered) or name in self.config.overrides
                 or getattr(getattr(registered, 'definition', None), 'context_policy', None) is not None)
 
     async def prepare_history(self, pipeline: Any, trigger: Trigger, *, target_tokens: int | None = None,

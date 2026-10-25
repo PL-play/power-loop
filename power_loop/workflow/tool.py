@@ -348,7 +348,7 @@ def register_workflow_tools(
     from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 
     registry.register(create_def, FunctionRuntimeTool(
-        handler, ToolRuntimeContract("sdk.workflow-create", allowed_roles=("main",)),
+        handler, ToolRuntimeContract("sdk.workflow-create", background_allowed=False, allowed_roles=("main",)),
         policy=lambda arguments: ToolDispatchPolicy(native_admitted=True),
     ), overwrite=overwrite)
     registry.register(WORKFLOW_STATUS_DEFINITION, FunctionRuntimeTool(

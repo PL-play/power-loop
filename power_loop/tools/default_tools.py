@@ -27,9 +27,11 @@ from power_loop.runtime.human_input import request_user_input
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
+from power_loop.tools.background_contract import BackgroundTool
 from power_loop.tools.command_policy import command_policy_reason
 from power_loop.tools.command_rules import CommandRules, dangerous_command_reason
 from power_loop.tools.jobs import JOBS_HANDLER
+from power_loop.tools.shell_contract import ShellTool
 
 logger = logging.getLogger(__name__)
 
@@ -1572,13 +1574,15 @@ class BackgroundManager:
         name = str(tool_name or "").strip()
         if not name:
             raise ValueError("background_run action=tool requires tool")
-        if name in ("background_run", "workflow", "spawn_agent"):
-            raise ValueError(f"{name} 不允许后台化（递归/编排类入口）")
         loop = get_current_loop()
         registry = getattr(loop, "tool_registry", None) if loop is not None else None
         reg = registry.get(name) if registry is not None else None
         if reg is None:
             raise ValueError(f"unknown tool: {name}")
+        from power_loop.runtime.tool_contracts import background_allowed, validate_registration
+
+        if not background_allowed(reg):
+            raise ValueError(f"{name} 不允许后台化（注册契约禁止）")
         definition = getattr(reg, "definition", reg)
         from power_loop.tools.registry import async_capable_actions, async_capable_for
 
@@ -1600,7 +1604,7 @@ class BackgroundManager:
             _others = []
             if registry is not None:
                 for _d in sorted(registry.definitions(), key=lambda x: x.name):
-                    if _d.name in ("background_run", "workflow", "spawn_agent"):
+                    if not background_allowed(registry.get(_d.name)):
                         continue
                     if not getattr(_d, "async_capable", False):
                         continue
@@ -1657,6 +1661,7 @@ class BackgroundManager:
                         )
                     with self._lock:
                         self.tasks[task_id]["status"] = "running"
+                    validate_registration(registry, name, reg)
                     return await registry.invoke_async(name, args)
             finally:
                 reset_current_cancel_token(ctok)
@@ -2592,13 +2597,15 @@ _h_recall_send = FunctionRuntimeTool(
     _h_recall_send, ToolRuntimeContract("sdk.recall"),
     policy=lambda arguments: ToolDispatchPolicy(native_admitted=True, control_only=arguments.get("job_id") is not None),
 )
+
+_h_background_run = BackgroundTool(_h_background_run)
 _h_schedule_wakeup = FunctionRuntimeTool(
     _h_schedule_wakeup, ToolRuntimeContract("sdk.timer", allowed_roles=("main",)),
 )
 
 
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
-    "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120), kw.get("description"), kw.get("context_policy", "retire")),
+    "bash": ShellTool(lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120), kw.get("description"), kw.get("context_policy", "retire"))),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"], kw.get("overwrite", True)),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"], kw.get("replace_all", False)),
