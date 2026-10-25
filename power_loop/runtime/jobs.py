@@ -261,8 +261,18 @@ class JobManager:
             if row["status"] == "model_closed":
                 return _record(row)
             from .model_exit import SNAPSHOT, capture
-            if SNAPSHOT in evidence_data or "model_attempt_snapshot_error" in evidence_data:
+            from .pending_calls import ERROR as PENDING_ERROR
+            from .pending_calls import SNAPSHOT as PENDING_SNAPSHOT
+            from .pending_calls import capture as capture_pending
+            if any(key in evidence_data for key in (SNAPSHOT, "model_attempt_snapshot_error", PENDING_SNAPSHOT, PENDING_ERROR)):
                 raise JobError("reserved_model_exit_evidence")
+            try:
+                pending = await capture_pending(self, tx, row)
+                if pending is not None:
+                    evidence_data[PENDING_SNAPSHOT] = pending
+            except JobError as exc:
+                evidence_data[PENDING_ERROR] = exc.code
+                resource_state = "unknown"
             try:
                 snapshot = await capture(self, tx, row)
                 if snapshot is not None:

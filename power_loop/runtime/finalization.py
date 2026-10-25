@@ -114,6 +114,9 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
         # The delivery and actual handling transcript remain part of retained
         # proof, including when this closed child is read through its parent.
         await require_closed(manager, tx, current, result)
+    if data["version"] == 1 and proof["kind"] == "send":
+        from .pending_calls import require_disposition
+        await require_disposition(manager, tx, await manager._row(tx, event["job_id"]))
     state["visiting"].remove(event_id)
     state["done"][event_id] = data
     return data
@@ -276,6 +279,10 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         if SNAPSHOT in evidence:
             await require_stopped(manager, tx, row, model["payload"])
         refs.append(await _reference(manager, tx, model["event_id"]))
+        from .pending_calls import require_disposition
+        pending_ref = await require_disposition(manager, tx, row)
+        if pending_ref is not None:
+            refs.append(pending_ref)
         from .model_attempts import require_quiescent
         refs.extend([await _reference(manager, tx, key) for key in await require_quiescent(manager, tx, row)])
     else:

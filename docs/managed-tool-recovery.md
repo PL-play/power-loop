@@ -98,3 +98,67 @@ Repair leaves the result pending delivery unless an existing valid original ACK
 already exists. Canonical processing responsibility, cancellation/inspection
 integration and formal business-host wiring remain separate unfinished parts of
 the overall async lifecycle work. Default native entry stays disabled.
+
+## Pending calls after an actual model exit (development protocol 11)
+
+A finite callback's exit checkpoint does not prove its enclosing model executor
+has exited. `close_model_execution` remains the trusted host exit port: the SDK
+calls it when its actual send unwinds; an external process owner may use it only
+after observing the exact original process exit. A lease expiry, missing PID or
+successful business lookup is insufficient. Original model-attempt evidence must
+also rule out an unfinished or unknown provider request. This is separate from
+final accounting.
+
+When the source still has pending calls, that port captures a reserved
+`pending_call_snapshot` in the same transaction as the model exit. It contains
+the original execution scope, assistant MessageRef and exact pending document.
+Call IDs, original arguments, send index and the completeness of the unresolved
+set are checked against original messages. Invalid evidence leaves an explicit
+snapshot error and an unknown resource state; it cannot silently become stopped.
+Callers cannot supply these reserved fields themselves.
+
+After the original model exit is confirmed, the host may call:
+
+```python
+from power_loop.runtime.pending_calls import retire_pending
+
+receipt = await retire_pending(loop, original_main_actor, original_send_job_id)
+```
+
+This port currently handles the original main send. It requires every captured
+pending call to have its original managed-tool registration, actual finite exit,
+known result and validated notification to that original main. It atomically
+stores a `pending_call_disposition` retaining the original pending document and
+clears only that exact pending state. It writes no tool reply, starts no model or
+business callback, grants no execution authority and creates no processing ACK.
+Unknown outcomes, missing evidence, interactive calls and unsupported or partly
+registered pending sets remain blocked. Workflow/subagent pending calls require
+their explicit owner recovery adapter; this port never promotes one to main.
+
+A commit with a lost ACK can be recalled using the same original identity.
+Concurrent connections recall one disposition; replay cannot clear a newer send's
+pending calls. Processing snapshots and retained supervision proofs include and
+revalidate the disposition. Deleting it, rewriting it or changing its original
+call evidence cannot leave an apparently valid closed parent.
+
+The original result stays `pending_delivery` after retirement. Only an actual,
+visible original-main notification followed by its persisted response and clean
+model exit can mark it handled. A hidden notice, failed model call or exhausted
+budget leaves it unhandled. The reviewing send uses the original frozen budget
+policy and its remaining authority; recovery cannot replace that policy or add
+quota. Its original raw history may contain a genuinely missing tool reply: use
+an appropriate representation, such as the SDK projected representation, rather
+than manufacturing an original response.
+
+A later cancellation preserves an already closed model phase and records the
+cancellation request independently. It must not turn that phase back into a
+running cancellation and strand its pending/result responsibility.
+
+Bounds: 32 KiB pending document, 64 pending calls, the existing 128 KiB original
+assistant tool-call bound, 4 MiB model-exit record and 256 KiB disposition. Exceeding
+a bound refuses recovery without truncating or discarding obligations.
+
+This is a component candidate, not default host activation. It does not complete
+a restart supervisor, arbitrary pending-tool recovery, workflow owner recovery,
+business API integration or final fee reconciliation. Production maintenance is
+explicit; protocol 11 prevents older writers from ignoring the new obligations.

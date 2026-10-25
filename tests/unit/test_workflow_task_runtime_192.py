@@ -258,6 +258,13 @@ async def test_node_child_results_are_processed_before_downstream_and_aggregate_
     [audit] = [r for r in rows if r.kind == "subagent"]
     [build] = [r for r in rows if r.kind == "workflow_node"]
     assert audit.control_owner_job_id == audit.completion_scope_job_id == build.job_id
+    # The child can enter before its creator's model phase has actually exited.
+    # Wait for that independent event while the child stays held and downstream
+    # remains blocked; observing child entry alone is not an exit barrier.
+    async with asyncio.timeout(3):
+        while (await manager.get_job(runtime.actor(sid), audit.parent_job_id)).status != "model_closed":
+            assert model.counts["REVIEW"] == 0 and not model.release["AUDIT"].is_set()
+            await asyncio.sleep(0.01)
     assert (await manager.get_job(runtime.actor(sid), audit.parent_job_id)).status == "model_closed"
     await settle(managed_workflow)
     workflow = await manager.get_job(runtime.actor(sid), state["handles"][0].job_id)

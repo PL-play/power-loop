@@ -217,8 +217,16 @@ async def observation(manager, tx, actor, row, result, visible=None):
         candidate = visible.get(int(message['seq']))
         if candidate is None or candidate.get('role') != message['role'] or candidate.get('content') != message['content']:
             return None
+    from .pending_calls import require_disposition
+    source = await manager._row(tx, row['parent_job_id'])
+    closed = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', ('model_closed_' + source['job_id'],))
+    extra = {}
+    if closed is not None:
+        reference = await require_disposition(manager, tx, source)
+        if reference is not None:
+            extra['pending_disposition'] = reference
     return {'delivered_seq': int(message['seq']), 'managed_delivery': {
-        'event_id': notice[0]['event_id'], 'payload_hash': _hash(notice[1]), 'message_hash': _hash(message['content'])}}
+        'event_id': notice[0]['event_id'], 'payload_hash': _hash(notice[1]), 'message_hash': _hash(message['content']), **extra}}
 
 
 async def verify_observation(manager, tx, actor, row, result, event):
