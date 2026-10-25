@@ -1768,6 +1768,14 @@ class StatefulAgentLoop:
                 result = await self._run_with_tool_context(sid, **kwargs)
                 evidence.update(exit=result.status, usage=dict(result.usage or {}), rounds=result.rounds,
                                 new_input_after_pass=bool(result.new_input_after_pass))
+                from power_loop.runtime.jobs import JobError
+                from power_loop.runtime.send_receipt import KEY, capture
+                try:
+                    evidence[KEY] = capture(result)
+                except JobError as exc:
+                    # Evidence limits cannot turn an already completed model
+                    # call into a retry. Such exits remain explicitly unreadable.
+                    evidence["stateful_result_error"] = exc.code
                 return result
         return await self._run_with_tool_context(sid, **kwargs)
 
