@@ -245,7 +245,7 @@ class _Handler(RuntimeTool):
 
     @property
     def runtime_contract(self):
-        return ToolRuntimeContract("managed-effect:" + self.adapter.contract.key)
+        return ToolRuntimeContract("managed-effect:" + self.adapter.contract.key, background_allowed=False)
 
     def dispatch_policy(self, arguments, *, runtime=None):
         self.check(runtime, self.definition.name, self.definition)
@@ -510,13 +510,16 @@ async def _evidence(manager, tx, row, kind, *, required=True):
         "observation": {"adapter", "result"},
         "tool_receipt": {"creation_id", "result_id", "result_hash", "receipt_ref", "display_hash"},
     }
+    version = value.get("version")
+    if kind == "resource_exit" and type(version) is int and version == 2:
+        fields["resource_exit"] = fields["resource_exit"] | {"completion"}
     if (
         event["job_id"] != row["job_id"]
         or event["event_type"] != "managed_effect_" + kind
         or event["delivery_status"] != "not_applicable"
         or set(value) != {"version", "lease", *fields[kind]}
         or type(value["version"]) is not int
-        or value["version"] != 1
+        or value["version"] not in ((1, 2) if kind == "resource_exit" else (1,))
         or _json(value["lease"]) != _json(_proof(row))
     ):
         raise JobError("managed_effect_evidence_corrupt")
@@ -606,6 +609,15 @@ async def require_source_resolved(manager, tx, source):
 
 
 async def _invoke(handler, execution, arguments):
+    seq, call_id = current_invocation(execution.actor.session_id)
+    slot = handler.runtime._managed_completions.reserve(execution.actor, seq, call_id)
+    try:
+        return await _invoke_original(handler, execution, arguments, slot)
+    finally:
+        handler.runtime._managed_completions.release_uncompleted(slot)
+
+
+async def _invoke_original(handler, execution, arguments, slot):
     runtime, manager, actor = handler.runtime, handler.runtime.manager, execution.actor
     seq, call_id = current_invocation(actor.session_id)
     if seq is None or not call_id:
@@ -682,28 +694,11 @@ async def _invoke(handler, execution, arguments):
             result = ManagedToolResult(result.display, result.reference, result.resolution)
     except BaseException as exc:
         error = exc
+        if type(result) is not ManagedToolResult or len(result.display) > handler.adapter.contract.max_result_chars:
+            result = None
     # The owned finite callback coroutine has actually exited. Its business
     # outcome may still be unknown; that separate obligation blocks closure.
     binding.stop_renewal.set()
-    async with manager._write() as tx:
-        row = await manager._authorize(tx, actor, binding.lease.job_id)
-        manager._check_proof(row, binding.lease)
-        await _event(
-            manager,
-            tx,
-            row,
-            "resource_exit",
-            {
-                "version": 1,
-                "lease": asdict(binding.lease),
-                "exit": "returned"
-                if error is None
-                else "cancelled"
-                if isinstance(error, asyncio.CancelledError)
-                else "raised",
-                "dispatch_started": dispatch_started,
-            },
-        )
     pending_display = (
         "managed effect outcome is unresolved; the host must reconcile the original task " + binding.lease.job_id + "."
     )
@@ -711,7 +706,7 @@ async def _invoke(handler, execution, arguments):
         pending_display = "Managed effect is pending."[: handler.adapter.contract.max_result_chars]
     if error is not None and not dispatch_started:
         result = ManagedToolResult(
-            "The managed effect was not dispatched because its preparation did not complete.",
+            "The managed effect was not dispatched because its preparation did not complete."[:handler.adapter.contract.max_result_chars],
             {"decision": "not_dispatched", "job_id": binding.lease.job_id},
             "not_dispatched",
         )
@@ -722,13 +717,21 @@ async def _invoke(handler, execution, arguments):
         "display": result.display if result is not None else pending_display,
         "usage": {},
     }
-    await manager.record_execution_result(
-        actor,
-        binding.lease,
-        outcome="succeeded" if error is None else "interrupted",
-        result=payload,
-        resource_state="stopped",
-    )
+    completion = {
+        "version": 2,
+        "lease": asdict(binding.lease),
+        "exit": "returned" if error is None else "cancelled" if isinstance(error, asyncio.CancelledError) else "raised",
+        "dispatch_started": dispatch_started,
+        "completion": {
+            "outcome": "succeeded" if error is None else "interrupted",
+            "result": payload,
+            "resource_state": "stopped",
+        },
+    }
+    handler.runtime._managed_completions.complete(slot, binding, completion)
+    from .managed_completion import _persist_local
+
+    await _persist_local(handler.runtime, actor, slot)
     if isinstance(error, asyncio.CancelledError):
         raise error
     return payload["display"]
@@ -1211,6 +1214,13 @@ async def require_closed(manager, tx, row, result_event):
         or type(exited[1].get("dispatch_started")) is not bool
     ):
         raise JobError("managed_effect_resource_exit_unconfirmed")
+    if exited[1]["version"] == 2:
+        from .managed_completion import validate_exit
+        from .result_payloads import require_replay
+
+        checkpoint = await validate_exit(manager, tx, row, found)
+        require_replay(json.loads(result_event["payload_json"]), checkpoint["completion"])
+        refs.append(await _reference(manager, tx, _id(manager, "completion", row["job_id"], row["generation"])))
     result = json.loads(result_event["payload_json"])["result"]
     if prepared is not None:
         if (

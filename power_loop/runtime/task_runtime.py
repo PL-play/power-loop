@@ -214,6 +214,9 @@ class TaskRuntime:
         self._workflow_handles: dict = {}
         self._local_executions: dict = {}
         self._model_executions: dict = {}
+        from .managed_completion import CompletionCache
+
+        self._managed_completions = CompletionCache(self)
         from .executor_lifecycle import ExecutorLifecycle
 
         self._lifecycle = ExecutorLifecycle(self, boot_contract_hash) if boot_contract_hash is not None else None
@@ -234,12 +237,19 @@ class TaskRuntime:
     async def shutdown(self, *, timeout_s=30.0, grace_s=1.0, reason="host shutdown"):
         if self._lifecycle is None:
             raise JobError("executor_lifecycle_not_configured")
-        return await self._lifecycle.shutdown(timeout_s=timeout_s, grace_s=grace_s, reason=reason)
+        result = await self._lifecycle.shutdown(timeout_s=timeout_s, grace_s=grace_s, reason=reason)
+        return self._completion_status(result)
+
+    def _completion_status(self, result):
+        result["managed_completion_pending"] = self._managed_completions.pending_count()
+        if result["managed_completion_pending"]:
+            result["store_safe_to_close"] = False
+        return result
 
     async def executor_status(self):
         if self._lifecycle is None:
             raise JobError("executor_lifecycle_not_configured")
-        return await self._lifecycle.status()
+        return self._completion_status(await self._lifecycle.status())
 
     def track_task(self, task, *, cancel_token=None, job_id=None):
         if not isinstance(task, asyncio.Task):

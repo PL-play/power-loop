@@ -34,9 +34,10 @@ from .test_real_budget_tree_192 import RealBudgetHost
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("pending", [False, True, "unclaimed", "receipt_lost"])
+@pytest.mark.parametrize("pending", [False, True, "unclaimed", "receipt_lost", "completion_exit", "completion_result"])
 async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, pending, record_property):
     unclaimed = pending in ("unclaimed", "receipt_lost")
+    completion_failure = pending in ("completion_exit", "completion_result")
     store = await SessionStore.open(str(tmp_path / "managed-tool.db"), schema="tasks")
     provider, host = BoundedProvider(limit=2), RealBudgetHost()
     host.service = provider
@@ -66,11 +67,16 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
 
         manager.reconcile_receipt = unavailable_receipt
 
+    if completion_failure:
+        from tests.unit._managed_completion_faults_192 import fail_completion_once
+
+        fail_completion_once(manager, 'exit' if pending == 'completion_exit' else 'result')
+
     class SetBeacon(ManagedTool):
         prepared = 0
         executed = 0
         queries = 0
-        resolved = not pending
+        resolved = pending is not True
 
         @property
         def contract(self):
@@ -84,7 +90,7 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
         async def execute(self, context, original_reference):
             self.executed += 1
             assert original_reference["value"] == 42
-            if pending:
+            if pending is True:
                 raise TimeoutError("Test effect committed; its immediate receipt was lost")
             return ManagedToolResult("Beacon set to 42", {"original_receipt": "beacon-42"})
 
@@ -171,6 +177,40 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
                 assert (await manager.get_job(runtime.actor(sid), child["job_id"])).supervision_status == "closed"
                 assert provider.calls == host.reserve_calls == len(host.applied) == 1
                 return
+            if completion_failure:
+                from power_loop.runtime.managed_completion import flush_local, restore_result
+
+                assert implementation.prepared == implementation.executed == 1 and implementation.queries == 0
+                [child] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='background_tool'")
+                assert child['result_json'] is None and provider.calls == host.reserve_calls == len(host.applied) == 1
+                shutdown = await runtime.shutdown(timeout_s=1, grace_s=0.01)
+                assert shutdown['managed_completion_pending'] == 1 and not shutdown['store_safe_to_close']
+                status = await runtime.executor_status()
+                assert status['managed_completion_pending'] == 1 and not status['store_safe_to_close']
+                before = await manager.db.fetchall(f'SELECT * FROM {store.t.messages} ORDER BY seq')
+                if pending == 'completion_exit':
+                    with pytest.raises(JobError, match='evidence_missing'):
+                        await restore_result(manager, runtime.actor(sid), child['job_id'])
+                    await flush_local(runtime, runtime.actor(sid), child['job_id'])
+                reader = await asyncio.create_subprocess_exec(
+                    sys.executable, str(Path(__file__).with_name('_managed_completion_reader_192.py')),
+                    str(tmp_path / 'managed-tool.db'), json.dumps(asdict(runtime.actor(sid))), child['job_id'],
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                record_property('original_completion_reader_pid', reader.pid)
+                stdout, stderr = await asyncio.wait_for(reader.communicate(), 30)
+                assert reader.returncode == 0, stderr.decode()[-2000:]
+                observed = json.loads(stdout)
+                assert observed['network_disabled'] and not observed['raw']['acknowledges_result']
+                assert not observed['repaired']['acknowledgement_created']
+                if pending == 'completion_result':
+                    assert await flush_local(runtime, runtime.actor(sid), child['job_id']) == observed['repaired']
+                assert runtime._managed_completions.pending_count() == 0
+                assert await manager.db.fetchall(f'SELECT * FROM {store.t.messages} ORDER BY seq') == before
+                current = await manager.get_job(runtime.actor(sid), child['job_id'])
+                assert current.result_status == 'pending_delivery' and current.supervision_status == 'open'
+                assert provider.calls == host.reserve_calls == len(host.applied) == implementation.executed == 1
+                assert implementation.queries == 0
+                return
             assert implementation.prepared == implementation.executed == 1
             [child] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='background_tool'")
             original = json.loads(child["result_json"])
@@ -204,4 +244,54 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
             await loop.aclose(drain_timeout_s=0.1)
         finally:
             await provider.close()
+            await store.close()
+
+
+async def test_real_worker_crash_after_exit_checkpoint_recovers_without_model_or_effect_replay(tmp_path, record_property):
+    from power_loop.runtime.jobs import JobActor
+
+    database, observation_file = tmp_path / 'crash.db', tmp_path / 'original-observations.json'
+    children = []
+    store = None
+    try:
+        worker = await asyncio.create_subprocess_exec(sys.executable,
+            str(Path(__file__).with_name('_managed_completion_crash_worker_192.py')),
+            str(database), str(observation_file), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        children.append(worker)
+        record_property('original_completion_crash_worker_pid', worker.pid)
+        stdout, stderr = await asyncio.wait_for(worker.communicate(), 150)
+        assert worker.returncode == 75, stderr.decode()[-2000:]
+        observations = json.loads(observation_file.read_text())
+        for key in ('real_provider_requests', 'reported_tokens', 'local_provider_calls_refused'):
+            record_property(key, observations[key])
+        assert observations['real_provider_requests'] == observations['effect_executions'] == 1
+        assert observations['budget_reservations'] == observations['budget_usage_observations'] == 1
+        actor, job = JobActor(**observations['actor']), observations['job_id']
+        store = await SessionStore.open(str(database), schema='compatible')
+        manager = JobManager(store)
+        before = await manager.db.fetchall(f'SELECT * FROM {store.t.messages} ORDER BY seq')
+        assert not any(row['role'] == 'tool' for row in before)
+        assert (await manager.get_job(actor, job)).result is None
+        reader = await asyncio.create_subprocess_exec(sys.executable,
+            str(Path(__file__).with_name('_managed_completion_reader_192.py')), str(database),
+            json.dumps(asdict(actor)), job, 'allow_missing_receipt',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        children.append(reader)
+        record_property('original_crash_completion_reader_pid', reader.pid)
+        stdout, stderr = await asyncio.wait_for(reader.communicate(), 30)
+        assert reader.returncode == 0, stderr.decode()[-2000:]
+        repaired = json.loads(stdout)
+        assert repaired['network_disabled'] and repaired['raw'] is None
+        assert repaired['repaired']['owned_callback_exited'] and not repaired['repaired']['acknowledgement_created']
+        assert not repaired['repaired']['execution_authority'] and not repaired['repaired']['billing_settled']
+        assert await manager.db.fetchall(f'SELECT * FROM {store.t.messages} ORDER BY seq') == before
+        result = await manager.get_job(actor, job)
+        assert result.result['display'] == 'Original beacon set' and result.result_status == 'pending_delivery'
+        assert result.supervision_status == 'open'  # no original tool ACK was fabricated
+    finally:
+        for child in children:
+            if child.returncode is None:
+                child.kill()
+                await child.wait()
+        if store is not None:
             await store.close()

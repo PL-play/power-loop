@@ -400,7 +400,7 @@ async def test_explicit_protocol_three_migration_retains_original_ids_and_reject
         ] == 3
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    assert TASK_PROTOCOL_VERSION == 8 and await c.store.message_ref(c.sid, seq) == ref
+    assert TASK_PROTOCOL_VERSION == 9 and await c.store.message_ref(c.sid, seq) == ref
     # A bridge compiled against protocol3 cannot write the migrated control row.
     import power_loop.runtime.jobs as jobs
 

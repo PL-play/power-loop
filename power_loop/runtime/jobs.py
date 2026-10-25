@@ -29,6 +29,15 @@ def _hash(value: Any) -> str:
     return hashlib.sha256(_json(value).encode()).hexdigest()
 
 
+def _result_value(outcome, result, resource_state):
+    value = json.loads(_json(dict(result)))
+    if outcome not in ("succeeded", "failed", "cancelled", "timed_out", "budget_exceeded", "interrupted"):
+        raise JobError("invalid_outcome")
+    if resource_state not in ("stopped", "unknown"):
+        raise JobError("invalid_resource_state")
+    return value
+
+
 class JobError(ValueError):
     def __init__(self, code: str):
         self.code = code
@@ -865,66 +874,74 @@ class JobManager:
             return saved
 
     async def _record_result(self, actor, lease, *, outcome, result, resource_state, evidence_only=False, require_children_stopped=False):
-        result = json.loads(_json(dict(result)))
-        if outcome not in ("succeeded", "failed", "cancelled", "timed_out", "budget_exceeded", "interrupted"):
-            raise JobError("invalid_outcome")
-        if resource_state not in ("stopped", "unknown"):
-            raise JobError("invalid_resource_state")
+        result = _result_value(outcome, result, resource_state)
+        async with self._write() as tx:
+            return await self._record_result_tx(tx, actor, lease, outcome=outcome, result=result,
+                resource_state=resource_state, evidence_only=evidence_only,
+                require_children_stopped=require_children_stopped)
+
+    async def _record_result_tx(self, tx, actor, lease, *, outcome, result, resource_state, evidence_only=False, require_children_stopped=False, publication_proof=None):
+        result = _result_value(outcome, result, resource_state)
         from .result_revisions import result_id
         event_id = result_id(lease.job_id, lease.generation)
         payload = {"outcome": outcome, "result": dict(result), "resource_state": resource_state}
         if lease.generation > 1:
             payload["generation"] = lease.generation
-        async with self._write() as tx:
-            row = await self._authorize(tx, actor, lease.job_id)
-            self._check_proof(row, lease)
-            old = await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=?", (event_id,))
-            if old:
-                from .result_payloads import require_replay
-                require_replay(json.loads(old["payload_json"]), payload)
-                from .execution_membership import seal
-                await seal(self, tx, row)
-                return event_id
-            if evidence_only:
-                if row["resource_state"] not in ("running", "unknown"):
-                    raise JobError("execution_not_running")
-            else:
-                await self._fence(tx, actor, lease)
-            effective_outcome, effective_result = outcome, dict(result)
-            if evidence_only:
-                ancestor = row
-                while ancestor is not None:
-                    if ancestor["cancel_requested_at"] is not None:
-                        effective_outcome = "cancelled"
-                        if "status" in effective_result and effective_result["status"] != "cancelled":
-                            effective_result["execution_status"] = effective_result["status"]
-                            effective_result["status"] = "cancelled"
-                        break
-                    ancestor = await self._row(tx, ancestor["parent_job_id"]) if ancestor["parent_job_id"] else None
-            if effective_outcome == "succeeded" and row["executor_key"] is not None:
-                from .executor_registry import check_execution
-                await check_execution(self, tx, row)
-            if effective_outcome == "succeeded":
-                from .owner_waits import references
-                from .timer_waits import has_required_wait
+        row = await self._authorize(tx, actor, lease.job_id)
+        self._check_proof(row, lease)
+        if publication_proof is not None:
+            from .result_proof import ResultPublicationProof
 
-                await references(self, tx, actor, row, success=True)
-
-                if require_children_stopped or await has_required_wait(self, tx, actor, row):
-                    from .wait_effects import settle_owner_tx
-                    await settle_owner_tx(self, tx, actor, row)
-                    await self._require_scope_ready(tx, row)
-            from .result_payloads import canonical
-            payload = canonical(payload, effective_outcome, effective_result)
-            await tx.execute(f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,"
-                "result_status='pending_delivery',resource_state=?,intake='closed',lease_until_ms=NULL,"
-                "version=version+1,updated_at=? WHERE job_id=?",
-                (effective_outcome, _json(effective_result), resource_state, self.now(), lease.job_id))
-            await tx.execute(f"INSERT INTO {self.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) "
-                "VALUES (?,?,?,?,?,?,?)", (event_id, lease.job_id, "result", int(row["version"]) + 1, _json(payload), "pending_delivery", self.now()))
+            if (not evidence_only or not isinstance(publication_proof, ResultPublicationProof)
+                    or await publication_proof.validate(self, tx, row, payload) is not True):
+                raise JobError("result_publication_evidence_invalid")
+        old = await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=?", (event_id,))
+        if old:
+            from .result_payloads import require_replay
+            require_replay(json.loads(old["payload_json"]), payload)
             from .execution_membership import seal
             await seal(self, tx, row)
             return event_id
+        if evidence_only:
+            if row["resource_state"] not in ("running", "unknown"):
+                raise JobError("execution_not_running")
+        else:
+            await self._fence(tx, actor, lease)
+        effective_outcome, effective_result = outcome, dict(result)
+        if evidence_only:
+            ancestor = row
+            while ancestor is not None:
+                if ancestor["cancel_requested_at"] is not None:
+                    effective_outcome = "cancelled"
+                    if "status" in effective_result and effective_result["status"] != "cancelled":
+                        effective_result["execution_status"] = effective_result["status"]
+                        effective_result["status"] = "cancelled"
+                    break
+                ancestor = await self._row(tx, ancestor["parent_job_id"]) if ancestor["parent_job_id"] else None
+        if effective_outcome == "succeeded" and row["executor_key"] is not None and publication_proof is None:
+            from .executor_registry import check_execution
+            await check_execution(self, tx, row)
+        if effective_outcome == "succeeded":
+            from .owner_waits import references
+            from .timer_waits import has_required_wait
+
+            await references(self, tx, actor, row, success=True)
+
+            if require_children_stopped or await has_required_wait(self, tx, actor, row):
+                from .wait_effects import settle_owner_tx
+                await settle_owner_tx(self, tx, actor, row)
+                await self._require_scope_ready(tx, row)
+        from .result_payloads import canonical
+        payload = canonical(payload, effective_outcome, effective_result)
+        await tx.execute(f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,"
+            "result_status='pending_delivery',resource_state=?,intake='closed',lease_until_ms=NULL,"
+            "version=version+1,updated_at=? WHERE job_id=?",
+            (effective_outcome, _json(effective_result), resource_state, self.now(), lease.job_id))
+        await tx.execute(f"INSERT INTO {self.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) "
+            "VALUES (?,?,?,?,?,?,?)", (event_id, lease.job_id, "result", int(row["version"]) + 1, _json(payload), "pending_delivery", self.now()))
+        from .execution_membership import seal
+        await seal(self, tx, row)
+        return event_id
 
     async def request_cancel(self, actor: JobActor, job_id: str, *, system_key: str, reason: str) -> JobOperation:
         if not isinstance(reason, str) or not reason or len(reason) > 1000:

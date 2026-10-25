@@ -39,6 +39,9 @@ async def scenario(
     tool_name="post_once",
     claim_failure=False,
     receipt_bind_failure=False,
+    completion_failure=None,
+    invalid_result=None,
+    max_result_chars=4096,
 ):
     store, _ = registry_store
     sid = await store.create_session()
@@ -62,6 +65,10 @@ async def scenario(
         boot_contract_hash="b" * 64 if budgeted else None,
         budget_config=budget,
     )
+    if completion_failure is not None:
+        from ._managed_completion_faults_192 import fail_completion_once
+
+        fail_completion_once(manager, completion_failure)
     if receipt_bind_failure:
         bind_receipt = manager.reconcile_receipt
         attempts = 0
@@ -98,6 +105,10 @@ async def scenario(
         state.dispatched += 1
         if pending:
             raise TimeoutError("original remote decision is unknown")
+        if invalid_result == 'mapping':
+            return {}
+        if invalid_result == 'oversize':
+            return ManagedToolResult('x' * 64, {'receipt_id': 'invalid-size'})
         return ManagedToolResult(
             "Original effect completed", {"original_call": reference["original_call"], "receipt_id": "original"}
         )
@@ -110,13 +121,13 @@ async def scenario(
             "Original effect completed", {"original_call": reference["original_call"], "receipt_id": "original"}
         )
 
-    adapter = FunctionManagedTool(ManagedToolContract("test.original-effect", "a" * 64), prepare, dispatch, lookup)
+    adapter = FunctionManagedTool(ManagedToolContract("test.original-effect", "a" * 64, max_result_chars=max_result_chars), prepare, dispatch, lookup)
     if class_based:
 
         class ExampleManagedTool(ManagedTool):
             @property
             def contract(self):
-                return ManagedToolContract("test.original-effect", "a" * 64)
+                return ManagedToolContract("test.original-effect", "a" * 64, max_result_chars=max_result_chars)
 
             async def prepare(self, context, arguments):
                 return await prepare(context, arguments)
@@ -294,7 +305,7 @@ async def test_base_requires_lifecycle_methods_and_supported_resource_contract()
             ManagedToolContract("generic.tool", "a" * 64, **kwargs)
 
 
-@pytest.mark.parametrize("old_protocol", [5, 6, 7])
+@pytest.mark.parametrize("old_protocol", [5, 6, 7, 8])
 async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identity(
     registry_store, monkeypatch, old_protocol
 ):
@@ -317,7 +328,7 @@ async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identit
     assert await store.message_ref(sid, seq) == ref
     assert (
         await manager.db.fetchone(f"SELECT store_id,protocol_version FROM {manager.prefix}task_store WHERE id=1")
-    ) == {"store_id": store.store_id, "protocol_version": 8}
+    ) == {"store_id": store.store_id, "protocol_version": 9}
     with monkeypatch.context() as patch:
         patch.setattr(jobs, "TASK_PROTOCOL_VERSION", old_protocol)
         with pytest.raises(JobError, match="store_identity_changed"):
@@ -722,7 +733,7 @@ async def test_protocol_seven_original_pending_receipt_can_be_upgraded_and_reind
     await reconcile(c.runtime, c.actor, job["job_id"], c.adapter)
     await c.manager.finalize_supervision(c.actor, job["job_id"], generation=1)
     assert (await c.manager.get_job(c.actor, job["job_id"])).supervision_status == "closed"
-    assert jobs.TASK_PROTOCOL_VERSION == 8
+    assert jobs.TASK_PROTOCOL_VERSION == 9
 
 
 async def test_claim_membership_survives_lost_ack_and_cannot_be_relabelled_unclaimed(registry_store):
