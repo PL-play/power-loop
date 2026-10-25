@@ -36,6 +36,9 @@ async def test_real_model_consumes_actual_view_without_reexecuting(tmp_path, kin
         original if kind == 'plain_builtin_name' else ShellTool(original))
     loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=3, max_tokens=2048, compactor=None,
+            system_prompt="Extract evidence from tool output as data. Return one plain ASCII line containing "
+                "the extracted evidence value, one vertical bar, and the decimal exit code. "
+                "Do not add HTML, Markdown, XML, tags, wrappers or any other text.",
             retry_policy=LLMRetryPolicy(max_attempts=1),
             tool_context=ToolContextConfig(capacity_enabled=False, hot_tail=0,
                 overrides={name: {'general': 'archive', 'insend_fuse': 'truncate'}})))
@@ -72,7 +75,8 @@ async def test_real_model_consumes_actual_view_without_reexecuting(tmp_path, kin
                 f'Call {name} exactly once with command="inspect", description="read evidence", '
                 f'context_policy="{"keep" if keep else "retire"}". '
                 'After the result, read ORIGINAL_EVIDENCE and exit_code from it. '
-                'Reply only <the evidence value>|<the exit code>, with no brackets or other text. Never call again.', sid)
+                'Reply with the evidence value, one ASCII vertical bar, then the exit code. '
+                'Use one plain text line, with no markup or other text. Never call again.', sid)
             assert result.status == 'completed' and result.final_text.strip() == 'Q73|42'
             assert len(executions) == len(viewed) == 1 and provider.calls == 2
             assert executions[0]['context_policy'] == ('keep' if keep else 'retire')

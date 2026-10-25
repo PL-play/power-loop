@@ -7,7 +7,7 @@ from dataclasses import replace
 
 import pytest
 
-from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import delegation
 from power_loop.runtime.jobs import JobManager
@@ -128,6 +128,16 @@ async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_
 
     registry.register(ToolDefinition(name="launch_workflow", description="Start the predefined calculation/review workflow asynchronously, once.",
                                      input_schema={"type": "object", "properties": {}}), launch)
+    async def root_phase_tools(ctx):
+        if get_session_id() != sid:
+            return
+        if not handles:
+            ctx.tools = [registry.get("launch_workflow").definition.to_openai_tool()]
+        elif ending != "pass_turn":
+            # Natural-finish phases deliberately offer no yield/delegation tool.
+            # The provider response stays real; lifecycle assertions stay exact.
+            ctx.tools = []
+    loop.hooks.register(HookPoint.LLM_BEFORE, root_phase_tools, name="test.workflow.root-phase-tools")
     before = set(delegation._TASKS)
     try:
         async with asyncio.timeout(180):

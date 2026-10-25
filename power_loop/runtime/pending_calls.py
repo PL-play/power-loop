@@ -54,9 +54,11 @@ async def _verify(manager, tx, source, snapshot):
         expected_keys = {'version', 'scope', 'assistant_ref', 'pending'}
         if snapshot.get('version') == 2:
             expected_keys.add('call_plan')
+        elif snapshot.get('version') == 3:
+            expected_keys.add('call_plan_abort')
         if (set(snapshot) != expected_keys
-                or type(snapshot['version']) is not int or snapshot['version'] not in (1, 2)
-                or snapshot['scope'] != proof(source) or source['kind'] != 'send'
+                or type(snapshot['version']) is not int or snapshot['version'] not in (1, 2, 3)
+                or _hash(snapshot['scope']) != _hash(proof(source)) or source['kind'] != 'send'
                 or type(calls) is not list or not 0 < len(calls) <= 64
                 or any(type(i) is not str or not i for i in ids) or len(set(ids)) != len(ids)
                 or type(pending.get('tool_call_ids')) is not list or sorted(pending['tool_call_ids']) != sorted(ids)
@@ -67,7 +69,13 @@ async def _verify(manager, tx, source, snapshot):
         from .tool_call_plans import identity as plan_identity
         from .tool_call_plans import read as read_plan
         from .tool_call_plans import required as plan_required
-        if await plan_required(manager, tx, source):
+        if snapshot['version'] == 3:
+            from .tool_call_abort import identity as abort_identity
+            from .tool_call_abort import read as read_abort
+            abort = await read_abort(manager, tx, source, ref, required=True)
+            if _hash(snapshot.get('call_plan_abort')) != _hash({'event_id': abort_identity(manager, source, ref), 'payload_hash': _hash(abort)}):
+                raise ValueError()
+        elif await plan_required(manager, tx, source):
             plan = await read_plan(manager, tx, source, ref)
             if snapshot['version'] != 2 or snapshot.get('call_plan') != {'event_id': plan_identity(manager, source, ref), 'payload_hash': _hash(plan)}:
                 raise ValueError()
@@ -109,10 +117,15 @@ async def capture(manager, tx, source):
     ref = MessageRef(manager.store.store_id, row['session_id'], row['id'], row['seq'], row['role'],
                      row['tool_call_id'], row['send_index'], row['round_index'])
     snapshot = {'version': 1, 'scope': proof(source), 'assistant_ref': ref.to_dict(), 'pending': pending}
+    from .tool_call_abort import identity as abort_identity
+    from .tool_call_abort import read as read_abort
     from .tool_call_plans import identity as plan_identity
     from .tool_call_plans import read as read_plan
     from .tool_call_plans import required as plan_required
-    if await plan_required(manager, tx, source):
+    abort = await read_abort(manager, tx, source, ref)
+    if abort is not None:
+        snapshot.update(version=3, call_plan_abort={'event_id': abort_identity(manager, source, ref), 'payload_hash': _hash(abort)})
+    elif await plan_required(manager, tx, source):
         plan = await read_plan(manager, tx, source, ref)
         snapshot.update(version=2, call_plan={'event_id': plan_identity(manager, source, ref), 'payload_hash': _hash(plan)})
     await _verify(manager, tx, source, snapshot)

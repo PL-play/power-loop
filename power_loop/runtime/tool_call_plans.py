@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass
 
 from .jobs import JobError, _hash, _json
@@ -135,7 +136,7 @@ async def read(manager, tx, source, ref, *, optional=False):
     return value
 
 
-async def prepare(pipeline):
+async def _prepare(pipeline, attempt):
     from .managed_effects import _document, _verify_call
     from .task_runtime import _SEND
     from .tool_contracts import policy, resolve, validate_registration
@@ -197,6 +198,12 @@ async def prepare(pipeline):
                 await _source(manager, tx, actor, binding.lease, ref, entry['call_id'])
         else:
             await manager._fence(tx, actor, binding.lease)
+        from .tool_call_abort import _freeze
+        from .tool_call_abort import read as read_abort
+        attempt['value'] = _freeze(pipeline, binding, source, ref, entries)
+        pipeline._native_abort_attempt = attempt['value']
+        if await read_abort(manager, tx, source, ref) is not None:
+            raise JobError('tool_call_batch_aborted')
         existing = await read(manager, tx, source, ref, optional=True)
         if existing is not None:
             comparable = [{**e, 'job_id': None, 'operation_id': None} for e in existing['entries']]
@@ -232,6 +239,29 @@ async def prepare(pipeline):
         tuple((entry['call_id'], original) for entry, original in zip(entries, originals, strict=True)))
 
 
+async def prepare(pipeline):
+    attempt = {}
+    try:
+        await _prepare(pipeline, attempt)
+    except Exception:
+        if attempt.get('value') is not None:
+            from .tool_call_abort import _record
+            try:
+                await _record(attempt['value'])
+            except Exception as exc:
+                # Preserve the original failure. Without this positive durable
+                # checkpoint, source exit/pending recovery remains unknown.
+                logging.getLogger(__name__).warning(
+                    'Pre-admission abort checkpoint unavailable; original pending remains unresolved',
+                    extra={'source_job_id': attempt['value'].execution.lease.job_id,
+                           'assistant_seq': attempt['value'].ref.seq,
+                           'failure_type': type(exc).__name__[:128]},
+                )
+        raise
+    finally:
+        pipeline._native_abort_attempt = None
+
+
 async def dispatch(pipeline, name, arguments, registered):
     from .invocation import current_invocation
     from .task_runtime import _SEND
@@ -253,6 +283,9 @@ async def dispatch(pipeline, name, arguments, registered):
             await _source(manager, tx, actor, binding.lease, ref, call_id)
         else:
             await manager._fence(tx, actor, binding.lease)
+        from .tool_call_abort import read as read_abort
+        if await read_abort(manager, tx, source, ref) is not None:
+            raise JobError('tool_call_batch_aborted')
         plan = await read(manager, tx, source, ref)
         retained = _retained(pipeline, manager, source, ref, plan)
         original_bindings = dict(retained.registrations)

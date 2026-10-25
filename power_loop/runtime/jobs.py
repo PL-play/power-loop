@@ -720,6 +720,8 @@ class JobManager:
                     await _read(self, tx, actor, job_id)
                     raise JobError("managed_wait_has_no_executor")
             await self._control_owners(tx, row)
+            from .tool_call_abort import require_claim
+            await require_claim(self, tx, row)
             from .executor_registry import ExecutorIdentity, require_accepting
             inherited = await self._row(tx, row["control_owner_job_id"] or row["parent_job_id"]) if row["parent_job_id"] else None
             executor = await require_accepting(self, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
