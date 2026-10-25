@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
+from power_loop import AgentLoopConfig, StatefulAgentLoop, ToolDefinition
 from power_loop._vendor.llm_client.interface import (
     LLMRequest,
     LLMResponse,
@@ -29,7 +29,6 @@ from power_loop._vendor.llm_client.interface import (
     LLMStreamChunk,
 )
 from power_loop.tools.registry import ToolRegistry
-from power_loop import ToolDefinition
 
 
 @dataclass

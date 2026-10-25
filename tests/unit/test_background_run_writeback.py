@@ -25,6 +25,7 @@ from power_loop.runtime.env import RuntimeEnv, runtime_env_context
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.stub_provider import EchoLLMService
 from power_loop.tools.default_tools import BackgroundManager
+from power_loop.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.unit
 
@@ -121,23 +122,22 @@ async def _fire(loop: StatefulAgentLoop, command: str) -> str:
 
 # ── 6.8.0 action=tool：async_capable 工具后台化 ──────────────────────────────────
 
-class _ToolTaskReg:
+
+
+class _ToolTaskReg(ToolRegistry):
     def __init__(self, defs):
-        self._defs = {d.name: d for d in defs}
+        from functools import partial
+
+        from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+
+        super().__init__()
         self.calls = []
+        for definition in defs:
+            handler = (DEFAULT_TOOL_HANDLERS["background_run"] if definition.name == "background_run"
+                       else partial(self._invoke_original, definition.name))
+            self.register(definition, handler)
 
-    def get(self, name):
-        d = self._defs.get(name)
-        if d is None:
-            return None
-        class _R:  # RegisteredTool 形状：.definition
-            definition = d
-        return _R()
-
-    def definitions(self):
-        return list(self._defs.values())
-
-    async def invoke_async(self, name, args):
+    async def _invoke_original(self, name, **args):
         self.calls.append((name, dict(args)))
         await asyncio.sleep(0.01)
         if args.get("boom"):
@@ -196,7 +196,6 @@ async def test_action_tool_runs_async_capable_tool_and_notifies(monkeypatch):
 
 def test_async_capable_suffix_only_with_background_run_mounted():
     from power_loop.contracts.tools import ToolDefinition
-    from power_loop.tools.registry import ToolRegistry
 
     async def _h(**kw):
         return "x"
@@ -204,7 +203,8 @@ def test_async_capable_suffix_only_with_background_run_mounted():
     def _mk(*defs):
         r = ToolRegistry()
         for d in defs:
-            r.register(d, _h)
+            from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+            r.register(d, DEFAULT_TOOL_HANDLERS["background_run"] if d.name == "background_run" else _h)
         return r
 
     gen = ToolDefinition(name="generate_image", description="生成图片。", async_capable=True)
@@ -226,7 +226,6 @@ def test_fast_readonly_tools_get_no_background_suffix_but_stay_async_capable():
     """read_file/grep/glob/recall_send 从没被 background_run 跑过：不追加后缀，
     但 async_capable 不动（同轮并发靠它）。后缀本身不再教模型去 check 取结果。"""
     from power_loop.contracts.tools import ToolDefinition
-    from power_loop.tools.registry import ToolRegistry
 
     async def _h(**kw):
         return "x"
@@ -237,7 +236,8 @@ def test_fast_readonly_tools_get_no_background_suffix_but_stay_async_capable():
         ToolDefinition(name="generate_image", description="生成图片。", async_capable=True),
         ToolDefinition(name="background_run", description="bg。"),
     ):
-        r.register(d, _h)
+        from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+        r.register(d, DEFAULT_TOOL_HANDLERS["background_run"] if d.name == "background_run" else _h)
     out = {t["function"]["name"]: t["function"]["description"] for t in r.to_openai_tools()}
     assert "可异步" not in out["read_file"]
     assert r.get("read_file").definition.async_capable is True

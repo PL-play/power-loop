@@ -109,6 +109,8 @@ async def test_background_uses_target_limits_and_keep():
         sid = await store.create_session()
         registry = ToolRegistry()
         registry.register(ToolDefinition('bash', ''), lambda **kw: '')
+        from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
+        registry.register(ToolDefinition('background_run', ''), DEFAULT_TOOL_HANDLERS['background_run'])
         config = ToolContextConfig(overrides={'bash': {'insend_fuse': 'truncate',
             'general': 'truncate', 'argument_max_chars': 200, 'result_max_chars': 300}})
         engine = ToolContextEngine(config=config, store=store, owner_session_id=sid,
