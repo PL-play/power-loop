@@ -10,7 +10,7 @@ class SkillTool(RuntimeTool):
 
     @property
     def runtime_contract(self):
-        return ToolRuntimeContract('sdk.skill-reader')
+        return ToolRuntimeContract('sdk.skill-reader', capabilities=('skill.read.v1',))
 
     def __call__(self, **arguments):
         return self.handler(**arguments)

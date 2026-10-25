@@ -164,12 +164,17 @@ def section_todo_discipline(ctx: SystemPromptContext) -> str | None:
 def section_skills(ctx: SystemPromptContext) -> str | None:
     if not ctx.skill_descriptions or ctx.skill_descriptions == "(no skills available)":
         return None
-    lines = [
-        "# Skills",
-        f"Skills directory: {ctx.skills_dir or '(default)'}",
-        "Use load_skill(name) to load a skill by name.",
-        ctx.skill_descriptions,
-    ]
+    from power_loop.runtime.tool_contracts import capability_tools
+    from power_loop.tools.registry import ToolRegistry
+
+    names = []
+    if isinstance(ctx.tool_definitions, ToolRegistry):
+        selected = set(ctx.tool_names) if ctx.tool_names else None
+        names = [tool.definition.name for tool in capability_tools(ctx.tool_definitions, "skill.read.v1")
+                 if selected is None or tool.definition.name in selected]
+    instruction = (f"Read skill instructions with {', '.join(names)}; follow the registered tool schemas."
+                   if names else "Consult the skill files when their instructions are needed.")
+    lines = ["# Skills", f"Skills directory: {ctx.skills_dir or '(default)'}", instruction, ctx.skill_descriptions]
     return "\n".join(lines)
 
 
@@ -406,7 +411,7 @@ DEFAULT_EXPLORE_SUBAGENT_SYSTEM_PROMPT = (
 ).build(SystemPromptContext())
 
 
-def build_skill_section(skills_dir: str | None) -> str:
+def build_skill_section(skills_dir: str | None, *, tool_registry=None) -> str:
     """Render the auto-injected skill-catalog section for ``skills_dir``.
 
     Returns ``""`` when no skills_dir is set or loading fails. Lazy-imports
@@ -422,6 +427,7 @@ def build_skill_section(skills_dir: str | None) -> str:
             SystemPromptContext(
                 skills_dir=str(loader.skills_dir),
                 skill_descriptions=loader.get_descriptions(),
+                tool_definitions=tool_registry,
             )
         )
         return section or ""
@@ -452,7 +458,7 @@ def resolve_runtime_system_prompt(
         catalog = format_tool_catalog(tool_registry, header=tool_catalog_header)
         if catalog:
             out = f"{out}\n\n{catalog}"
-    skill = build_skill_section(skills_dir)
+    skill = build_skill_section(skills_dir, tool_registry=tool_registry)
     if skill:
         out = f"{out}\n\n{skill}"
     return out

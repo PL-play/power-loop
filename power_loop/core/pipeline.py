@@ -922,9 +922,9 @@ class AgentPipeline:
     def _retire_stale_images(self, round_index: int, keep_rounds: int) -> int:
         """把当前 send 里「入上下文已超过 keep_rounds 轮」的图片附件块在内存里换成占位文字。
 
-        图片行是 user 行（see_image / 用户发图），带 ``round_index``（``_append_message`` 记的）。
+        图片行是 user 行（图片工具 / 用户发图），带 ``round_index``（``_append_message`` 记的）。
         第 r 轮入的图在第 r+keep_rounds 轮之前都以原图参与请求，之后换成
-        ``[image retired: <name> — 已看过；要再看调 see_image]``。不改 pl_messages、不改行数。
+        ``[image retired: <name> — 已看过；需要时按原坐标回取图片]``。不改 pl_messages、不改行数。
         返回替换了几个块。"""
         n = 0
         rounds = getattr(self, "_image_rounds", None) or {}
@@ -956,7 +956,7 @@ class AgentPipeline:
                     if blind and att.get("kind") == "image":
                         tail = "当前模型看不了图片，没看到过它的内容"
                     else:
-                        tail = "已看过；要再看调 see_image"
+                        tail = "已看过；需要时按原坐标回取图片"
                     new_blocks.append({"type": "text",
                                        "text": f"{self._IMAGE_RETIRED_MARK}: {name}{coord} — {tail}]"})
                     n += 1
@@ -1859,7 +1859,7 @@ class AgentPipeline:
                 await self._append_message(_pm, round_index=round_idx)
                 llm_before.messages.append(dict(_pm))
 
-            # Image recall: a tool (see_image / recall_send / an image generator) can put
+            # Image recall: a tool (an image viewer / a recall tool / an image generator) can put
             # pictures in front of the model. DURABLE ones become real `user` rows — the image
             # stays in view for the rest of the send (cheap: it sits in the provider's cached
             # prefix) and is distilled to `[image: … · file_uuid=…]` across sends, so nothing
@@ -2033,7 +2033,7 @@ class AgentPipeline:
                 self._step_texts.append({"step": round_idx + 1, "text": assistant_text,
                                          "tools": [_tool_call_name(tc) for tc in (tool_calls or [])]})
             from power_loop.core import pass_turn as _pass_state
-            _pass_state.note_step(bool(assistant_text), [_tool_call_name(tc) for tc in (tool_calls or [])])
+            _pass_state.note_step(bool(assistant_text), [_tool_call_name(tc) for tc in (tool_calls or [])], registry=self.tool_registry)
 
             # Any productive round (said something OR called a tool) clears the empty streak.
             if assistant_text or tool_calls:

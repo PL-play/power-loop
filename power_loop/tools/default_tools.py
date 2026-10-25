@@ -2512,7 +2512,7 @@ def _render_recall_row(hit: Any, rows: list[Any], *, cap: int, head: str) -> str
         else:
             blocks.append(
                 "[这一行有图，但没能放进上下文（会话不可用或本轮排队已满）；"
-                "可以用 see_image 直接看它的路径。]"
+                "可以按原路径使用可用的图片查看工具。]"
             )
     return f"{head} — original row ({total} chars):\n\n" + "\n\n".join(blocks)
 

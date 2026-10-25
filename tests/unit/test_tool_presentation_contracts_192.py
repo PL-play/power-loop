@@ -214,7 +214,7 @@ async def test_alias_archive_restart_and_group_recall_preserve_originals(store):
     group_id = next(iter(groups))
     original_group = json.loads(await recall_group(store, sid, 1, group_id, item=1))
     assert original_group['result'] == original.result
-    assert original_group['arguments'] == dict(original.arguments)
+    assert original_group['arguments'] == json.dumps(dict(original.arguments))
     restarted = ToolContextEngine(config=config, store=store, owner_session_id=sid, owner_send_index=1,
                                   llm=None, model='test', registry=registry.subset([original.name]))
     await restarted.start()

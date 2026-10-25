@@ -165,3 +165,21 @@ without inheriting a shell, skill reader or platform-specific class. Business
 message routing and conversation authorization remain host responsibilities.
 SDK job kinds, execution roles, built-in catalogs, persisted state keys and
 historical named configuration are data contracts, not tool-name admission.
+
+Skill-reader guidance uses `skill.read.v1` on the actual registry and respects
+selected tool names. The default skill reader declares it; an ordinary handler
+named `load_skill` supplies no implemented reader guidance. Runtime prompt
+assembly passes its registry to the skill section rather than advertising a
+fixed entry name. Standalone SDK catalog helpers keep their catalog-preview role.
+
+Yield statistics use `task.yield.v1`. An implemented yield call is excluded from
+`pass_progress().work_tools` under aliases and wrappers. A plain handler called
+`pass_turn` counts as a work call; its name cannot stop the loop. Actual yielding
+still requires the existing `request_pass()` effect. Declaring the capability
+only describes statistics and grants no native admission or control permission.
+The host's guarded yield tool explicitly declares the capability while retaining
+its own business checks. Without a registry, the statistics helper cannot infer
+semantic yield from a name.
+
+Image placeholders retain the original filename and opaque host recall reference.
+Their wording does not assume any platform-specific image tool is installed.
