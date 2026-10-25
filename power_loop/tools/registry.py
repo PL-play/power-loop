@@ -41,13 +41,6 @@ class RegisteredTool:
     runtime_binding: tuple[str, str, object] | None = None
 
 
-#: 快速只读工具：async_capable 照旧（同轮并发靠它），但描述里不追加「可异步」后缀——
-#: 它们单次毫秒级，历史上从没被 background_run 跑过，后缀只是在诱导多余的后台化。
-NO_BACKGROUND_SUFFIX: frozenset[str] = frozenset(
-    {"read_file", "grep", "glob", "recall_send", "recall_compacted", "load_skill", "list_skills"}
-)
-
-
 def async_capable_for(definition: Any, args: Mapping[str, Any] | None = None) -> bool:
     """这次调用可不可以异步跑（6.15.0：``async_capable`` 支持 action 粒度）。
 
@@ -132,8 +125,7 @@ class ToolRegistry:
 
     def to_openai_tools(self) -> list[dict[str, Any]]:
         defs = self.definitions()
-        # async_capable 描述后缀（6.8.0）：仅当 background_run 真在本工具集里才追加——
-        # 否则是在教模型调一个不存在的入口。文案集中在这一处，别在各工具描述里手写。
+        # Only a unique registered scheduler may advertise background submission.
         from power_loop.runtime.tool_contracts import background_allowed, resolve
 
         schedulers = [(name, implementation) for name in self.names()
@@ -144,7 +136,7 @@ class ToolRegistry:
         for d in defs:
             t = d.to_openai_tool()
             if (scheduler is not None and d.async_capable and background_allowed(self.get(d.name))
-                    and d.name not in NO_BACKGROUND_SUFFIX):
+                    and d.background_hint):
                 acts = async_capable_actions(d)
                 scope = ("（仅 action=" + "/".join(acts) + "）") if acts else ""
                 t["function"]["description"] = (

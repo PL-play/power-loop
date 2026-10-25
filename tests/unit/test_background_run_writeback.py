@@ -232,7 +232,7 @@ def test_fast_readonly_tools_get_no_background_suffix_but_stay_async_capable():
 
     r = ToolRegistry()
     for d in (
-        ToolDefinition(name="read_file", description="读。", async_capable=True),
+        ToolDefinition(name="read_file", description="读。", async_capable=True, background_hint=False),
         ToolDefinition(name="generate_image", description="生成图片。", async_capable=True),
         ToolDefinition(name="background_run", description="bg。"),
     ):

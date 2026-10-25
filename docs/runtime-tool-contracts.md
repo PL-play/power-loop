@@ -84,3 +84,47 @@ Product routing, message normalization, API clients, user allowlists and host
 presentation remain in the host. The SDK may implement its own generic resource
 kinds and built-in data formats, but must not import a platform's business code
 to decide execution authority.
+
+## Progress and presentation
+
+Progress tracking uses the implemented `task.progress.v1` capability. Only a
+successful call through its registered `RuntimeTool` resets progress reminders
+and sets the existing `used_todo` event field. That field keeps its public name
+for compatibility. A plain handler named `todo` supplies no progress capability;
+a registered implementation keeps the capability under an alias. The built-in
+progress handler declares this capability, without granting native admission.
+
+`ToolDefinition.usage_hint` holds optional model-facing guidance (up to 4096
+characters). `background_hint=False` suppresses background submission guidance
+for a quick tool while preserving `async_capable` and all execution policies.
+Both are presentation metadata, not permissions. An actual registry's guide
+reads its own definitions; it never substitutes a same-named built-in. Built-in
+catalog previews without a registry remain available to existing prompt-builder
+callers. The default runtime prompt uses the actual registry and includes the
+tool catalog once when catalog injection is enabled.
+
+```python
+from dataclasses import replace
+
+# Preserve the implemented handler and metadata when giving a built-in an alias.
+source = defaults.get("read_file")
+registry.register(replace(source.definition, name="read_notes"), source.handler)
+
+# A host-defined quick tool supplies its own guidance and presentation policy.
+registry.register(
+    ToolDefinition(
+        "read_status",
+        "Read current status.",
+        async_capable=True,
+        usage_hint="Read once before requesting a change.",
+        background_hint=False,
+    ),
+    read_status,
+)
+```
+
+Ordinary host wrappers should use `functools.wraps` to preserve the implemented
+contract. The DeepTalk progress and timer guards do this while retaining their
+product-specific validations in the host. Contracts, including presentation
+metadata, remain bound to the actual registration; an alias, wrapper or subset
+cannot authorize a changed implementation.

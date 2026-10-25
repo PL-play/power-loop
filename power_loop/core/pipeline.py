@@ -2436,7 +2436,8 @@ class AgentPipeline:
                 output = ta_ctx.output
                 failed = ta_ctx.failed
 
-                if tool_name == "todo":
+                from power_loop.runtime.tool_contracts import has_capability
+                if not failed and has_capability(self.tool_registry.get(tool_name), "task.progress.v1"):
                     used_todo = True
                     self.rounds_since_todo = 0
 

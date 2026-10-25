@@ -146,6 +146,8 @@ def snapshot(handler, definition):
                 "definition": definition.to_openai_tool(),
                 "required": definition.required_params,
                 "interrupt": definition.interrupt,
+                "usage_hint": definition.usage_hint,
+                "background_hint": definition.background_hint,
                 "async_capable": definition.async_capable
                 if type(definition.async_capable) is bool
                 else sorted(definition.async_capable),
@@ -197,6 +199,11 @@ def capability_tools(registry, capability, *, role=None):
         and capability in implementation.runtime_contract.capabilities
         and (role is None or role in implementation.runtime_contract.allowed_roles)
     ]
+
+
+def has_capability(registered, capability):
+    implementation = resolve(registered)
+    return implementation is not None and capability in implementation.runtime_contract.capabilities
 
 
 def format_result(registered, result, max_chars):

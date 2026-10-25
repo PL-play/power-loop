@@ -8,6 +8,7 @@ from power_loop.tools.jobs import JOBS_DEFINITION
 
 DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
     ToolDefinition(
+        usage_hint="create or overwrite a file. Both 'path' and 'content' are REQUIRED in one JSON object. Prefer edit_file or apply_patch for existing files.",
         name="write_file",
         description=(
             "Create a new UTF-8 text file or overwrite an existing one with the complete provided content. "
@@ -30,6 +31,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=("path", "content"),
     ),
     ToolDefinition(
+        usage_hint='returns numbered lines ("  1|code"). Use offset/limit for large files. Pass a directory path to list contents. Always read before editing.',
+        background_hint=False,
         name="read_file",
         description=(
             "Read a UTF-8 text file with stable line numbers, or list a directory — instead of bash cat/head/sed -n/ls. "
@@ -50,6 +53,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         async_capable=True,
     ),
     ToolDefinition(
+        usage_hint='str_replace (old_text -> new_text). old_text must be unique — include more context if ambiguous. Set replace_all=true to replace every occurrence. You MUST read_file before editing.',
         name="edit_file",
         description=(
             "Replace text in an existing UTF-8 file using an exact, unique old_text snippet. Read the file first, then "
@@ -72,6 +76,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=("path", "old_text", "new_text"),
     ),
     ToolDefinition(
+        usage_hint='apply a patch using @@ context lines for positioning and +/- for line changes. You MUST read_file before patching. Best for large edits.',
         name="apply_patch",
         description=(
             "Apply one or more unified-diff style hunks to an existing file. Read the file first. Prefer this for "
@@ -93,6 +98,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=("path", "patch"),
     ),
     ToolDefinition(
+        usage_hint='persistent session — cwd and env vars survive across calls. Use restart=true to reset. Avoid dangerous commands (rm -rf /, sudo).',
         name="bash",
         description=(
             "View file contents → read_file; find files → glob; search content → grep. Do not write these as "
@@ -116,6 +122,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=("command",),
     ),
     ToolDefinition(
+        usage_hint="find files by pattern (e.g. '*.py', '**/*.ts'). Prefer over bash find.",
+        background_hint=False,
         name="glob",
         description=(
             "Find files or directories by glob pattern, sorted by modification time newest first. Prefer glob over bash/find "
@@ -138,6 +146,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         async_capable=True,
     ),
     ToolDefinition(
+        usage_hint='search file contents by regex. Prefer over bash grep/rg. Supports include filter.',
+        background_hint=False,
         name="grep",
         description=(
             "Search UTF-8 text file contents by regex, returning file:line:content matches. Prefer grep over bash/rg/grep "
@@ -163,6 +173,8 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         async_capable=True,
     ),
     ToolDefinition(
+        usage_hint='load specialized knowledge before tackling unfamiliar domains.',
+        background_hint=False,
         name="load_skill",
         context_policy=ToolContextPolicy(insend_fuse="preserve"),
         description="Load specialized knowledge by name.",
@@ -178,6 +190,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         async_capable=True,
     ),
     ToolDefinition(
+        usage_hint='track multi-step tasks. Keep exactly one item in_progress at a time. Mark in_progress BEFORE starting, completed IMMEDIATELY when done.',
         name="todo",
         description=(
             "Update the current task list. Send the WHOLE list every time (it replaces the old one).\n"
@@ -293,6 +306,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         input_schema={"type": "object", "properties": {}},
     ),
     ToolDefinition(
+        background_hint=False,
         name="recall_compacted",
         description=(
             "Retrieve older messages that context compaction summarized out of your active "
@@ -316,6 +330,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         async_capable=True,
     ),
     ToolDefinition(
+        background_hint=False,
         name="recall_send",
         description=(
             "Read stored messages or projections from your session or a direct child. "
@@ -372,6 +387,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=("path",),
     ),
     ToolDefinition(
+        usage_hint='action=tool submits an eligible registered target asynchronously; action=check inspects status/output by task_id or lists all tasks.',
         name="background_run",
         description=(
             "Manage private background tasks with one action: run, tool, check, list or wait. action=run "

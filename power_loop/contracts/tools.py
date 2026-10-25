@@ -49,8 +49,15 @@ class ToolDefinition:
     #: 未执行的后续工具调用一律不再开始，补「为先处理新消息未执行」。
     interrupt: str = "finish"
     context_policy: ToolContextPolicy | None = None
+    #: Optional presentation metadata; neither field grants execution authority.
+    usage_hint: str = ""
+    background_hint: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.usage_hint) is not str or len(self.usage_hint) > 4096:
+            raise TypeError("usage_hint must be a string of at most 4096 characters")
+        if type(self.background_hint) is not bool:
+            raise TypeError("background_hint must be bool")
         if self.context_policy is not None and not isinstance(self.context_policy, ToolContextPolicy):
             raise TypeError("context_policy must be ToolContextPolicy or None")
         if self.interrupt not in ("finish", "abort", "background"):
