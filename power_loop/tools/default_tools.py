@@ -26,9 +26,10 @@ from power_loop.runtime.exec_backend import DEFAULT_SHELL_BACKEND, ShellBackend
 from power_loop.runtime.human_input import request_user_input
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
+from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 from power_loop.tools.command_policy import command_policy_reason
 from power_loop.tools.command_rules import CommandRules, dangerous_command_reason
-from power_loop.tools.jobs import run_jobs
+from power_loop.tools.jobs import JOBS_HANDLER
 
 logger = logging.getLogger(__name__)
 
@@ -2587,6 +2588,15 @@ async def _h_background_run(**kw: Any) -> Any:
                                 kw.get("tool"), kw.get("args"), kw.get("task_ids"), kw.get("timeout_s"))
 
 
+_h_recall_send = FunctionRuntimeTool(
+    _h_recall_send, ToolRuntimeContract("sdk.recall"),
+    policy=lambda arguments: ToolDispatchPolicy(native_admitted=True, control_only=arguments.get("job_id") is not None),
+)
+_h_schedule_wakeup = FunctionRuntimeTool(
+    _h_schedule_wakeup, ToolRuntimeContract("sdk.timer", allowed_roles=("main",)),
+)
+
+
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "bash": lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120), kw.get("description"), kw.get("context_policy", "retire")),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
@@ -2617,7 +2627,7 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "recall_send": _h_recall_send,
     "view_image": lambda **kw: run_view_image(kw["path"], kw.get("question") or ""),
     "background_run": _h_background_run,
-    "jobs": run_jobs,
+    "jobs": JOBS_HANDLER,
     "request_user_input": lambda **kw: request_user_input(
         kind=kw.get("kind", "text"),
         prompt=kw["prompt"],

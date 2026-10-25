@@ -58,7 +58,7 @@ class WorkerLauncher(Protocol):
     the command (``runsc``/gVisor, ``docker run``, ``firejail``, ``nsjail`` …) so
     the *child* runs confined while the orchestrator stays unconfined — the only
     way to give a sub-agent stronger isolation than its parent. This mirrors how
-    deeptalk swaps power-loop's in-process bash for a sandboxed ``ShellBackend``,
+    A host may replace the in-process bash with a sandboxed ``ShellBackend``,
     one level up: there it wraps the *shell*, here it wraps the *whole worker*.
 
     ``build`` is called once per leaf with the leaf's :class:`AgentSpec` (so the

@@ -432,12 +432,12 @@ class ProjectedRepresentation:
     ) -> dict[str, Any]:
         missing = result is _NO_RESULT
         result_str: str | None = None if missing else result
-        if name == "spawn_agent" and not missing:
-            from power_loop.runtime.delegation import result_view
-            view = result_view(str(result_str), self.max_chars if self.max_chars > 0 else len(str(result_str)))
+        rt = tool_registry.get(name) if (tool_registry is not None and name) else None
+        if not missing:
+            from .tool_contracts import format_result
+            view = format_result(rt, str(result_str), self.max_chars if self.max_chars > 0 else len(str(result_str)))
             if view is not None:
                 return {"name": name, "result": view}
-        rt = tool_registry.get(name) if (tool_registry is not None and name) else None
         proj = getattr(rt.definition, "project", None) if rt is not None else None
         if proj is not None:
             try:

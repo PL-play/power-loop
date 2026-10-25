@@ -493,6 +493,16 @@ async def _inspect(loop, sid, action, options):
     return result
 
 
+def workflow_runtime_tool(handler, *, key="sdk.workflow"):
+    """Declare this router's implemented native actions for a trusted host wrapper."""
+    from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
+
+    return FunctionRuntimeTool(handler, ToolRuntimeContract(key, allowed_roles=("main",)),
+        policy=lambda arguments: ToolDispatchPolicy(
+            native_admitted=arguments.get("action", "help") in _ACTIONS,
+            control_only=arguments.get("action", "help") in ("help", "status", "list", "cancel", "leaves", "logs")))
+
+
 def register_workflow_tool(registry, *, ports=None, overwrite=False, description_suffix=""):
     """Opt-in unified entry; no preset or role allowlist is broadened."""
     selected = ports or WorkflowToolPorts()
@@ -502,4 +512,4 @@ def register_workflow_tool(registry, *, ports=None, overwrite=False, description
         return await run_workflow_tool(arguments, ports=selected)
 
     registry.register(workflow_tool_definition(allow_inline_spec=selected.allow_inline_spec,
-        description_suffix=description_suffix), handler, overwrite=overwrite)
+        description_suffix=description_suffix), workflow_runtime_tool(handler), overwrite=overwrite)

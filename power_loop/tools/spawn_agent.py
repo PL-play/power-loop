@@ -241,7 +241,13 @@ def register_spawn_agent(registry, *, overwrite: bool = False) -> None:
         registry = create_default_tool_registry(workspace_dir="/path/to/project")
         register_spawn_agent(registry)
     """
-    registry.register(SPAWN_AGENT_DEFINITION, _handle_spawn_agent, overwrite=overwrite)
+    from power_loop.runtime.delegation import result_view
+    from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
+
+    registry.register(SPAWN_AGENT_DEFINITION, FunctionRuntimeTool(
+        _handle_spawn_agent, ToolRuntimeContract("sdk.subagent", allowed_roles=("main", "workflow_node")),
+        policy=lambda arguments: ToolDispatchPolicy(native_admitted=True), formatter=result_view,
+    ), overwrite=overwrite)
 
 
 __all__ = [

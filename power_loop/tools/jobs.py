@@ -6,6 +6,7 @@ import json
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime.jobs import JobError
+from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 
 JOBS_DEFINITION = ToolDefinition(
     name="jobs",
@@ -220,9 +221,15 @@ async def run_jobs(action="", **kwargs):
         return _json(_error("stop_requires_reconciliation" if action == "stop" else "jobs_backend_unavailable"))
 
 
+JOBS_HANDLER = FunctionRuntimeTool(
+    run_jobs, ToolRuntimeContract("sdk.jobs"),
+    policy=lambda arguments: ToolDispatchPolicy(native_admitted=True, control_only=True),
+)
+
+
 def register_jobs_tools(registry, *, overwrite=False, definition=None):
     """Explicit opt-in registration, following host include/role allowlists."""
     selected = definition or JOBS_DEFINITION
     if selected.name != "jobs" or selected.input_schema != JOBS_DEFINITION.input_schema:
         raise ValueError("jobs definition may localize description, not replace the schema")
-    registry.register(selected, run_jobs, overwrite=overwrite)
+    registry.register(selected, JOBS_HANDLER, overwrite=overwrite)

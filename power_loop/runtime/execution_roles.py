@@ -7,9 +7,6 @@ from __future__ import annotations
 
 from power_loop.core.agent_context import get_session_id
 
-WORKFLOW_TOOLS = frozenset({"workflow", "create_workflow", "validate_workflow", "workflow_status",
-                            "workflow_cancel", "workflow_delete", "run_agent"})
-
 
 def finite_delegation(loop) -> bool:
     policy = getattr(getattr(loop, "config", None), "delegation_policy", "legacy")
@@ -41,28 +38,32 @@ async def session_role(store, sid: str) -> str:
     raise ValueError("execution_role_unavailable")
 
 
-async def require_orchestration(loop, tool: str, *, sid: str | None = None) -> None:
+async def require_orchestration(loop, capability: str, *, sid: str | None = None) -> None:
+    allowed_roles = {"workflow": ("main",), "subagent": ("main", "workflow_node")}
+    if capability not in allowed_roles:
+        raise ValueError("unknown_orchestration_capability")
     if not finite_delegation(loop):
         return
     sid = get_session_id() or sid
     if not sid:
         raise ValueError("execution_role_unavailable")
     role = await session_role(await loop._ensure_store(), sid)
-    allowed = role == "main" if tool == "workflow" else role in ("main", "workflow_node")
-    if not allowed:
-        raise ValueError("execution_role_forbids_" + tool)
+    if role not in allowed_roles[capability]:
+        raise ValueError("execution_role_forbids_" + capability)
 
 
-def role_tools(names, role: str) -> list[str]:
-    blocked = set(WORKFLOW_TOOLS) if role != "main" else set()
-    # Finite child waits need a durable owner/decision handoff. Legacy timers
-    # would otherwise outlive the child or resume a node outside its engine.
-    if role != "main":
-        blocked.add("schedule_wakeup")
-        blocked.add("wait_handoff")
-    if role == "subagent":
-        blocked.add("spawn_agent")
-    return [name for name in names if name not in blocked]
+def role_tools(names, role: str, *, registry) -> list[str]:
+    from .tool_contracts import ROLES, resolve
+
+    if role not in ROLES:
+        raise ValueError("execution_role_unavailable")
+    result = []
+    for name in names:
+        registered = registry.get(name) if registry is not None else None
+        implementation = resolve(registered)
+        if implementation is None or role in implementation.runtime_contract.allowed_roles:
+            result.append(name)
+    return result
 
 
 async def require_timer_creation(loop, *, sid: str | None = None) -> None:

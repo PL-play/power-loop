@@ -1584,7 +1584,9 @@ class AgentPipeline:
                         assistant_seq if assistant_seq is not None else getattr(self.sink, "persisted_assistant_seq", None),
                         tool_call_id):
                     from power_loop.runtime.task_runtime import check_tool_dispatch
-                    await check_tool_dispatch(self.session_id, tool_name, self.tool_registry, tool_args)
+                    registered = await check_tool_dispatch(self.session_id, tool_name, self.tool_registry, tool_args)
+                    from power_loop.runtime.tool_contracts import validate_registration
+                    validate_registration(self.tool_registry, tool_name, registered)
                     result = await self.tool_registry.invoke_async(tool_name, tool_args)
             finally:
                 reset_current_cancel_token(_ctok)
@@ -2467,10 +2469,9 @@ class AgentPipeline:
                            round_index=round_idx)
 
                 stored_output = _truncate_result(output, self.config.tool_result_max_chars)
-                if tool_name == "spawn_agent":
-                    from power_loop.runtime.delegation import result_view
-                    # Structured receipts/results cannot be cut through their metadata or JSON.
-                    stored_output = result_view(str(output), self.config.tool_result_max_chars or 20000) or stored_output
+                from power_loop.runtime.tool_contracts import format_result
+                stored_output = format_result(self.tool_registry.get(tool_name), str(output),
+                    self.config.tool_result_max_chars or 20000) or stored_output
                 await self._append_message(
                     {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": stored_output},
                     round_index=round_idx,

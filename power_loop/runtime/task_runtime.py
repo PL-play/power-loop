@@ -76,25 +76,22 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
     execution = _SEND.get()
     if execution is None or execution.actor.session_id != session_id:
         await check_dispatch(session_id)
-        return
-    import inspect
-
-    from power_loop.tools.default_tools import _h_recall_send
-    from power_loop.tools.jobs import run_jobs
-    from power_loop.tools.wait_handoff import run_wait_handoff
-    from power_loop.workflow.facade import run_workflow_tool
-    from power_loop.workflow.tool import _handle_workflow_status
-
+        return registry.get(tool_name)
+    from .tool_contracts import ToolContractError
+    from .tool_contracts import policy as tool_policy
     registered = registry.get(tool_name)
-    actual = inspect.unwrap(registered.handler) if registered is not None else None
-    safe = actual is run_jobs or actual is _handle_workflow_status
-    if actual is _h_recall_send and isinstance(tool_args, dict) and tool_args.get("job_id") is not None:
-        safe = True
-    if actual is run_workflow_tool and isinstance(tool_args, dict):
-        safe = tool_args.get("action", "help") in ("help", "status", "list", "cancel", "leaves", "logs")
-    if actual is run_wait_handoff and isinstance(tool_args, dict) and tool_args.get("action") == "inspect":
-        safe = True
-    if safe:
+    try:
+        declared = tool_policy(registered, tool_args or {}, runtime=execution.runtime)
+    except ToolContractError as exc:
+        raise JobError(str(exc)) from exc
+    from .tool_contracts import resolve
+    implementation = resolve(registered)
+    if implementation is not None:
+        async with execution.runtime.manager._write() as tx:
+            source = await execution.runtime.manager._authorize(tx, execution.actor, execution.lease.job_id)
+            if source["execution_role"] not in implementation.runtime_contract.allowed_roles:
+                raise JobError("execution_role_forbids_tool")
+    if declared.control_only:
         from .task_control import _source
 
         seq, call_id = current_invocation(session_id)
@@ -104,18 +101,16 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
         ref = await manager.store.message_ref(session_id, seq)
         async with manager._write() as tx:
             await _source(manager, tx, execution.actor, execution.lease, ref, call_id)
-        return
+        return registered
     from .model_budgets import _policy as budget_policy
 
     async with execution.runtime.manager._write() as tx:
         policy = await budget_policy(execution.runtime, tx)
     if policy is not None:
-        from power_loop.core.pass_turn import default_handler
-        from power_loop.tools.spawn_agent import _handle_spawn_agent
-
-        if actual not in (default_handler, _h_recall_send, _handle_spawn_agent, run_workflow_tool, run_wait_handoff):
+        if not declared.native_admitted:
             raise JobError("budget_tool_adapter_unavailable:" + tool_name)
     await check_dispatch(session_id)
+    return registered
 
 
 async def prepare_model_processing(pipeline, messages, round_index, *, provider_call=True):

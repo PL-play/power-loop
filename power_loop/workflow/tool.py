@@ -345,12 +345,23 @@ def register_workflow_tools(
         create_def = replace(
             create_def, description=f"{create_def.description}\n\n{description_suffix.strip()}"
         )
-    registry.register(create_def, handler, overwrite=overwrite)
-    registry.register(WORKFLOW_STATUS_DEFINITION, _handle_workflow_status, overwrite=overwrite)
+    from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
+
+    registry.register(create_def, FunctionRuntimeTool(
+        handler, ToolRuntimeContract("sdk.workflow-create", allowed_roles=("main",)),
+        policy=lambda arguments: ToolDispatchPolicy(native_admitted=True),
+    ), overwrite=overwrite)
+    registry.register(WORKFLOW_STATUS_DEFINITION, FunctionRuntimeTool(
+        _handle_workflow_status, ToolRuntimeContract("sdk.workflow-query", allowed_roles=("main",)),
+        policy=lambda arguments: ToolDispatchPolicy(native_admitted=True, control_only=True),
+    ), overwrite=overwrite)
     # Dry-run checker: same validation + host policy pass as create_workflow,
     # zero execution. Registered as a bundle with the other two.
     registry.register(
         VALIDATE_WORKFLOW_DEFINITION,
-        _make_validate_workflow_handler(spec_transform=spec_transform, ports=ports),
+        FunctionRuntimeTool(
+            _make_validate_workflow_handler(spec_transform=spec_transform, ports=ports),
+            ToolRuntimeContract("sdk.workflow-validate", allowed_roles=("main",)),
+        ),
         overwrite=overwrite,
     )

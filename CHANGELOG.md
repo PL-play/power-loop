@@ -9,6 +9,14 @@
 ## [Unreleased]
 
 ### Added
+- Add experimental protocol6 generic RuntimeTool contracts for native dispatch,
+  control actions, execution-role filtering, capability discovery and structured
+  result views. Actual registration freezes the implementation contract and
+  definition; builtin and host tools use the same interface. Explicit maintenance
+  preserves original task/message identities when upgrading protocol5 stores.
+  New wait constraints use version2 generic review actions; version1 evidence
+  remains readable. Registry validation follows the actual registered schema,
+  and async callable wrappers preserve the runtime environment across awaits.
 - Add experimental protocol5 host-only original-context cancellation. Persist
   admission barriers and stops together, recall the original receipt after
   restart, and retain closed results and uncertain resource/usage responsibilities.

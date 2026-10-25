@@ -11,6 +11,7 @@ from power_loop.core.agent_context import reset_session_id, set_session_id
 from power_loop.runtime import delegation
 from power_loop.runtime.execution_roles import session_role
 from power_loop.runtime.spec import run_agent_spec, workflow_continuation_loop
+from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolRuntimeContract
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow
 from power_loop.workflow.engine import InProcessExecutor
@@ -27,9 +28,15 @@ async def runtime(tmp_path):
     for event in model.releases.values():
         event.set()
     registry = ToolRegistry()
+    def unused():
+        return "unused"
     for name in ("workflow", "spawn_agent", "run_agent", "create_workflow", "local_read", "schedule_wakeup", "wait_handoff"):
+        allowed = ("main", "workflow_node") if name == "spawn_agent" else ("main",)
+        handler = unused
+        if name != "local_read":
+            handler = FunctionRuntimeTool(handler, ToolRuntimeContract("test." + name, allowed_roles=allowed))
         registry.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"}),
-                          lambda: "unused")
+                          handler)
     loop = StatefulAgentLoop(llm=model, store=store, tool_registry=registry,
                              config=AgentLoopConfig(delegation_policy="single_level", max_rounds=2))
     sid = await loop.new_session()

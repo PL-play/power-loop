@@ -2,8 +2,8 @@
 
 No live store is migrated by opening it. A maintenance caller must close writers
 and explicitly invoke migrate_task_schema; old binaries reject the v10 stamp or
-the unknown task protocol. Protocol5 adds original-context stop barriers to
-protocol4; older writers must not register work past those barriers.
+the unknown task protocol. Protocol6 requires original finite managed-tool
+obligations before dispatch/closure; older writers must not bypass them.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 10
-TASK_PROTOCOL_VERSION = 5
+TASK_PROTOCOL_VERSION = 6
 _PROTOCOL_2_TABLES = ("task_store", "jobs", "job_events")
 _PROTOCOL_3_TABLES = (*_PROTOCOL_2_TABLES, "task_executors", "task_executor_events")
 TASK_TABLES = (*_PROTOCOL_3_TABLES, "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
@@ -276,7 +276,7 @@ async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
 
 
 async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = False) -> None:
-    """Explicit v9→v10 or task protocol2/3/4→5 maintenance migration.
+    """Explicit v9→v10 or task protocol2/3/4/5→6 maintenance migration.
 
     SQLite/PG are transactional. MySQL uses an atomic ALTER for the raw table;
     the following idempotent steps allow an interrupted DDL run to be resumed.
@@ -294,7 +294,7 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                 raise StoreSchemaError("task migration supports schema v9 only")
             if int(row["version"]) == TASK_SCHEMA_VERSION:
                 identity = await tx.fetchone(f"SELECT protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (2, 3, 4):
+                if identity and identity["protocol_version"] in (2, 3, 4, 5):
                     old_protocol = identity["protocol_version"]
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
                     if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):

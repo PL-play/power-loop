@@ -7,9 +7,21 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from power_loop.contracts.errors import ToolNotFound, ToolValidationError
-from power_loop.contracts.tools import ToolDefinition, validate_tool_args
+from power_loop.contracts.tools import ToolDefinition
 
 ToolCallable = Callable[..., Any] | Callable[..., Awaitable[Any]]
+
+
+def is_async_callable(handler):
+    return inspect.iscoroutinefunction(handler) or (
+        not inspect.isfunction(handler) and callable(handler)
+        and inspect.iscoroutinefunction(cast(Any, handler).__call__)
+    )
+
+
+def _missing(definition, args):
+    required = dict.fromkeys((*definition.required_params, *definition.input_schema.get("required", ())))
+    return [name for name in required if name not in args]
 
 
 class AsyncToolInSyncContext(TypeError):
@@ -26,6 +38,7 @@ class RegisteredTool:
     definition: ToolDefinition
     handler: ToolCallable
     is_async: bool = False
+    runtime_binding: tuple[str, str, object] | None = None
 
 
 #: 快速只读工具：async_capable 照旧（同轮并发靠它），但描述里不追加「可异步」后缀——
@@ -70,6 +83,8 @@ class ToolRegistry:
         self._tools: dict[str, RegisteredTool] = {}
 
     def register(self, definition: ToolDefinition, handler: ToolCallable, *, overwrite: bool = False) -> None:
+        from power_loop.runtime.tool_contracts import snapshot
+
         if not overwrite and definition.name in self._tools:
             raise ValueError(f"Tool already registered: {definition.name}")
         # Detect async at register time so ``invoke()`` can raise a clear
@@ -78,13 +93,10 @@ class ToolRegistry:
         # async we additionally check that. Plain sync callables that
         # *happen* to return awaitables are still handled at call time by
         # ``invoke_async``.
-        is_async = inspect.iscoroutinefunction(handler)
-        if not is_async and not inspect.isfunction(handler) and callable(handler):
-            # Callable object whose ``__call__`` is async (e.g. dataclass
-            # with ``async def __call__``). Check that explicitly.
-            is_async = inspect.iscoroutinefunction(cast(Any, handler).__call__)
+        is_async = is_async_callable(handler)
         self._tools[definition.name] = RegisteredTool(
             definition=definition, handler=handler, is_async=is_async,
+            runtime_binding=snapshot(handler, definition),
         )
 
     def unregister(self, name: str) -> None:
@@ -113,7 +125,9 @@ class ToolRegistry:
         new = ToolRegistry()
         for name, rt in self._tools.items():
             if name in wanted:
-                new.register(rt.definition, rt.handler, overwrite=True)
+                # Preserve the original registration contract; subset must not
+                # bless a changed implementation by taking a new snapshot.
+                new._tools[name] = rt
         return new
 
     def to_openai_tools(self) -> list[dict[str, Any]]:
@@ -148,11 +162,7 @@ class ToolRegistry:
         if tool is None:
             return f"Unknown tool: {name}"
 
-        err = validate_tool_args(name, args)
-        if err:
-            return err
-
-        missing = [p for p in tool.definition.required_params if p not in args]
+        missing = _missing(tool.definition, args)
         if missing:
             return f"Error: missing required parameter(s): {', '.join(missing)}"
         return None
@@ -164,17 +174,7 @@ class ToolRegistry:
         if tool is None:
             raise ToolNotFound(name)
 
-        from power_loop.runtime.tool_context import active_engine
-        context_engine = active_engine.get()
-        if name == 'bash' and context_engine is not None:
-            description = args.get('description')
-            if not isinstance(description, str) or not description.strip() or len(description) > 1000:
-                raise ToolValidationError(name, 'description is required (1–1000 characters)')
-        err = validate_tool_args(name, args)
-        if err:
-            raise ToolValidationError(name, err)
-
-        missing = [p for p in tool.definition.required_params if p not in args]
+        missing = _missing(tool.definition, args)
         if missing:
             raise ToolValidationError(
                 name, f"missing required parameter(s): {', '.join(missing)}",

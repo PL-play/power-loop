@@ -1516,3 +1516,68 @@ The host-only `power_loop.runtime.send_receipt.read(manager, actor, job_id, expe
 The returned dictionary contains the original result, model-exit event/hash, generation, optional host provenance and last assistant reference. It creates no runtime/provider, lease, send, budget, descendant completion or business response. execution_authority, resource_stop_confirmed and billing_settled are false. Reading the result is independent of whether the host has reconciled its own continuation stages, external effects and final business ACK; those need their own immutable original records before automatic recovery. Multiple-process writer coordination remains the host's responsibility.
 
 Native inbox adapters can bind their original delivery row to the uniquely registered send via its original scoped system key and delivery send index. They must verify the actual delivered transcript and original content, match the saved host root, and reject an input absorbed by another run unless a separate original handoff protocol proves that responsibility. A read-only SDK result is not authority to debit another root or resend an input.
+
+
+## Tool implementation capabilities (task protocol 6)
+
+The native runtime consumes `power_loop.runtime.tool_contracts.RuntimeTool`,
+not a catalog of tool names or concrete handler functions. Trusted host Python
+implementations inherit the base and provide `runtime_contract`,
+`dispatch_policy(arguments, runtime=...)` and `__call__`. Optional
+`format_result(result, max_chars)` protects a tool's structured result view.
+`FunctionRuntimeTool` implements the same base for existing functions.
+
+`ToolRuntimeContract` declares an implementation key, allowed execution roles
+and advertised SDK capabilities. `ToolDispatchPolicy` classifies one call as
+native-admitted and optionally control-only. A control call still needs the
+original persisted assistant invocation and an open, unsuperseded source;
+it may inspect/cancel after lease expiry without granting a new execution.
+Other calls retain normal lease, scope and budget checks. Capability declarations
+are trusted host implementation promises, never arguments or permissions
+which a model, YAML file or saved import path can invent. They do not implement
+external cancellation, paid-request accounting or business transactions.
+An implementation which owns those resources must use their SDK lifecycle
+interfaces; an arbitrary background/paid operation is not made safe by a flag.
+
+Actual registration freezes the complete runtime contract and definition
+(schema, required parameters, interruption and concurrency policies). Explicit
+`functools.wraps` formatting/environment wrappers preserve the registered
+implementation. Ordinary functions with lookalike attributes grant nothing.
+`ToolRegistry.subset` retains the original binding instead of blessing a
+mutated implementation. Callable objects with async `__call__` keep their
+runtime environment across awaits.
+
+The SDK's jobs, workflow, recall, pass, delegation, wait-review and reminder
+tools declare these same interfaces in their own implementation modules.
+The central dispatch gate imports no concrete tool handler. Child registry
+filtering uses declared roles, so renaming a workflow/delegation entry does
+not remove its restriction. Execution primitives independently enforce the
+semantic workflow/subagent resource capability; these job kinds are SDK
+lifecycle concepts, not platform tool names.
+
+Wait notifications discover exactly one registered `task.wait-review.v1`
+capability for the main role. Zero or ambiguous registrations are rejected.
+The saved actions refer to its actual registered name. New English constraints
+are version 2 and say “supplied review actions”; original version-1 messages
+are checked using their unchanged original text and saved route, even if
+the live tool is later removed. Lookup does not reconstruct a live permission.
+
+Argument validation in the registry uses the actual ToolDefinition schema and
+required_params. The public legacy `validate_tool_args(name, args)` utility
+remains source-compatible for callers which explicitly choose old builtin
+validation; it is not used for registry admission or execution. Tool-specific
+checks such as shell execution descriptions remain in the tool implementation.
+
+The logical task protocol moves from 5 to 6; maintenance upgrade is explicit
+and original IDs/references survive. Old writers refuse the new protocol.
+There are no platform package imports, platform tool lists or business class
+checks in this interface. The separate unfinished managed-message effect
+prototype is not part of this change and must receive a later logical protocol
+before any integration; its development stores are not production stores.
+Default platform native activation remains off.
+
+Admission also retains the actual RegisteredTool object and its underlying
+RuntimeTool instance. Immediately before invocation, the pipeline rechecks
+the registration and frozen metadata. Replacing/revoking a registration,
+changing its contract, or retargeting a wrapper while admission awaits
+cannot execute the new handler under an old permission decision.

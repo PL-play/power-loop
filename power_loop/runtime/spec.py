@@ -335,7 +335,7 @@ async def workflow_continuation_loop(parent_loop: Any, session_id: str, *, expec
     if contract.get("delegation_policy") == "single_level":
         child_config = replace(child_config, delegation_policy="single_level")
     if finite_delegation(parent_loop) or child_config.delegation_policy == "single_level":
-        tools = role_tools(tools, await session_role(store, session_id))
+        tools = role_tools(tools, await session_role(store, session_id), registry=parent_loop.tool_registry)
     loop = StatefulAgentLoop(
         llm=parent_loop.llm, store=store, config=child_config,
         tool_registry=filtered_registry(parent_loop.tool_registry, tools),
@@ -413,7 +413,7 @@ async def run_agent_spec(
             if not parent_sid or await session_role(store, parent_sid) != "workflow":
                 raise ValueError("execution_role_forbids_workflow_node")
         else:
-            await require_orchestration(parent_loop, "spawn_agent")
+            await require_orchestration(parent_loop, "subagent")
     max_depth = getattr(store, "max_spawn_depth", MAX_SPAWN_DEPTH)
     parent_row = None
     if parent_sid is not None:
@@ -473,7 +473,7 @@ async def run_agent_spec(
 
     sub_registry = filtered_registry(parent_loop.tool_registry, spec.tools)
     if finite_delegation(parent_loop) and sub_registry is not None:
-        sub_registry = sub_registry.subset(role_tools(sub_registry.names(), execution_role))
+        sub_registry = sub_registry.subset(role_tools(sub_registry.names(), execution_role, registry=sub_registry))
     if inherit_send_filter and sub_registry is not None:
         from power_loop.core.agent_context import get_effective_tools
 
@@ -563,8 +563,8 @@ async def run_agent_spec(
                 await store.close_session(child_sid, cascade=True)
         raise
 
-    # Empty-answer fallback: a child that "spoke" through tools (send_message,
-    # board posts) often ends its last round with a blank assistant text →
+    # Empty-answer fallback: a child that delivered through tools or shared
+    # board posts often ends its last round with a blank assistant text →
     # final_text="" and the parent gets "(no text)". Recover the last non-empty
     # assistant text from the child transcript BEFORE the ephemeral cleanup
     # below deletes it.

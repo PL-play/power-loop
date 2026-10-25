@@ -310,7 +310,7 @@ async def _complete(loop, parent, sid, run, raw, after_seq, lifecycle, finalize,
 async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=None,
                 admission: asyncio.Semaphore | None = None) -> dict[str, Any]:
     from .execution_roles import require_orchestration
-    await require_orchestration(loop, "spawn_agent")
+    await require_orchestration(loop, "subagent")
     parent = get_session_id()
     if parent is None:
         raise ValueError("spawn_agent requires an active parent session")
@@ -408,7 +408,7 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
 async def nudge(loop, sid: str, message: str, *, on_complete=None, finalize=None,
                 admission: asyncio.Semaphore | None = None) -> dict[str, Any]:
     from .execution_roles import require_orchestration
-    await require_orchestration(loop, "spawn_agent")
+    await require_orchestration(loop, "subagent")
     if getattr(loop, "task_runtime", None) is not None:
         from .nudges import steer
         return await steer(loop, sid, message, on_complete=on_complete, finalize=finalize, admission=admission)

@@ -97,5 +97,10 @@ def default_handler(reason: str = "") -> str:
 def ensure_pass_turn(registry: Any) -> Any:
     """工具表里没有 pass_turn 就补上（永远在）。"""
     if not registry.has(NAME):
-        registry.register(PASS_TURN_TOOL, default_handler)
+        from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
+
+        registry.register(PASS_TURN_TOOL, FunctionRuntimeTool(
+            default_handler, ToolRuntimeContract("sdk.pass"),
+            policy=lambda arguments: ToolDispatchPolicy(native_admitted=True),
+        ))
     return registry

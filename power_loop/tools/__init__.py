@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from collections.abc import Sequence
 from dataclasses import replace
 from functools import wraps
@@ -129,7 +128,8 @@ def _bind_handler(handler: Any, runtime_env: RuntimeEnv) -> Any:
     # await, not just while the coroutine object is constructed (else the contextvar is
     # reset before the body runs and the handler sees an empty env). So bind async and
     # sync handlers with matching wrappers.
-    if inspect.iscoroutinefunction(handler):
+    from .registry import is_async_callable
+    if is_async_callable(handler):
         @wraps(handler)
         async def _wrapped_async(**kwargs: Any) -> Any:
             with runtime_env_context(_merged()):

@@ -400,7 +400,7 @@ async def test_explicit_protocol_three_migration_retains_original_ids_and_reject
         ] == 3
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    assert TASK_PROTOCOL_VERSION == 5 and await c.store.message_ref(c.sid, seq) == ref
+    assert TASK_PROTOCOL_VERSION == 6 and await c.store.message_ref(c.sid, seq) == ref
     # A bridge compiled against protocol3 cannot write the migrated control row.
     import power_loop.runtime.jobs as jobs
 
@@ -586,13 +586,13 @@ async def test_unadapted_or_name_spoofed_tool_is_rejected_before_its_side_effect
 
 
 async def test_original_builtin_pass_is_free_and_does_not_require_another_paid_request(budget_case):
-    from power_loop.core.pass_turn import PASS_TURN_TOOL, default_handler
+    from power_loop.core.pass_turn import ensure_pass_turn
     from power_loop.runtime.task_runtime import check_tool_dispatch
     from power_loop.tools.registry import ToolRegistry
 
     c = budget_case
     registry = ToolRegistry()
-    registry.register(PASS_TURN_TOOL, default_handler)
+    ensure_pass_turn(registry)
     token = _SEND.set(c.binding)
     try:
         await check_tool_dispatch(c.sid, "pass_turn", registry, {"reason": "waiting"})

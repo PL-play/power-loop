@@ -71,4 +71,10 @@ async def run_wait_handoff(action="", **options):
 
 
 def register_wait_handoff_tool(registry, *, overwrite=False):
-    registry.register(WAIT_HANDOFF_DEFINITION, run_wait_handoff, overwrite=overwrite)
+    from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
+
+    registry.register(WAIT_HANDOFF_DEFINITION, FunctionRuntimeTool(
+        run_wait_handoff,
+        ToolRuntimeContract("sdk.wait-review", allowed_roles=("main",), capabilities=("task.wait-review.v1",)),
+        policy=lambda arguments: ToolDispatchPolicy(native_admitted=True, control_only=arguments.get("action") == "inspect"),
+    ), overwrite=overwrite)

@@ -130,6 +130,65 @@ async def test_new_notification_checks_current_eligibility_and_original_recipien
     assert h.model.calls == 0
 
 
+async def test_review_capability_can_be_registered_under_an_independent_name(handoff):
+    from dataclasses import replace
+
+    h, c = handoff, handoff.c
+    registered = h.loop.tool_registry.get("wait_handoff")
+    h.loop.tool_registry.unregister("wait_handoff")
+    h.loop.tool_registry.register(replace(registered.definition, name="review_original_task"), registered.handler)
+    await notices.enqueue_notification(h.loop, c.main, h.event_id)
+    async with c.manager._write() as tx:
+        _, _, _, receipt = await notices.notification(c.manager, tx, c.main, h.event_id)
+    assert receipt["public"]["constraint_version"] == 2
+    assert all(action["tool"] == "review_original_task" for action in receipt["public"]["actions"].values())
+    assert receipt["public"]["full_text"]["tool"] == "review_original_task"
+    assert "supplied wait_handoff actions" not in notices.render_message(receipt["public"])
+    # Historical receipt remains valid after the live capability is removed.
+    h.loop.tool_registry.unregister("review_original_task")
+    await notices.enqueue_notification(h.loop, c.main, h.event_id)
+    assert h.model.calls == 0
+
+
+async def test_ambiguous_or_forged_review_capabilities_do_not_enqueue(handoff):
+    from dataclasses import replace
+
+    h, c = handoff, handoff.c
+    registered = h.loop.tool_registry.get("wait_handoff")
+    h.loop.tool_registry.register(replace(registered.definition, name="another_review"), registered.handler)
+    with pytest.raises(JobError, match="tool_unavailable"):
+        await notices.enqueue_notification(h.loop, c.main, h.event_id)
+    assert not await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.follow_up_queue}")
+    h.loop.tool_registry.unregister("another_review")
+    h.loop.tool_registry.unregister("wait_handoff")
+    async def fake(**arguments):
+        raise AssertionError("name-only fake must never execute")
+    fake.runtime_contract = registered.handler.runtime_contract
+    h.loop.tool_registry.register(registered.definition, fake)
+    with pytest.raises(JobError, match="tool_unavailable"):
+        await notices.enqueue_notification(h.loop, c.main, h.event_id)
+    assert h.model.calls == 0
+
+
+async def test_original_version_one_constraints_remain_readable_without_rewriting(handoff):
+    h, c = handoff, handoff.c
+    await notices.enqueue_notification(h.loop, c.main, h.event_id)
+    async with c.manager._write() as tx:
+        job, event, saved, receipt = await notices.notification(c.manager, tx, c.main, h.event_id)
+        legacy_payload = notices.public_payload(event, saved, constraint_version=1)
+        message = notices.render_message(legacy_payload)
+        assert "supplied wait_handoff actions" in message
+        legacy_receipt = {**receipt, "public": legacy_payload, "message_hash": _hash(message)}
+        await tx.execute(f"UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?",
+            (_json(legacy_receipt), _hash(legacy_receipt), notices.notification_id(c.manager, h.event_id)))
+        await tx.execute(f"UPDATE {c.store.t.follow_up_queue} SET content=? WHERE session_id=? AND item_id=?",
+            (message, c.main.session_id, receipt["item_id"]))
+    await notices.enqueue_notification(h.loop, c.main, h.event_id)
+    async with c.manager._write() as tx:
+        _, _, _, restored = await notices.notification(c.manager, tx, c.main, h.event_id)
+    assert restored == legacy_receipt and h.model.calls == 0
+
+
 @pytest.mark.parametrize("point", ["inbox", "receipt"])
 async def test_enqueue_write_failure_rolls_back_inbox_receipt_and_status(handoff, monkeypatch, point):
     h, c = handoff, handoff.c
