@@ -32,6 +32,7 @@ from power_loop.tools.command_policy import command_policy_reason
 from power_loop.tools.command_rules import CommandRules, dangerous_command_reason
 from power_loop.tools.jobs import JOBS_HANDLER
 from power_loop.tools.shell_contract import ShellTool
+from power_loop.tools.skill_contract import SkillTool
 
 logger = logging.getLogger(__name__)
 
@@ -2629,7 +2630,7 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
         kw.get("case_sensitive", True),
         kw.get("include_hidden", False),
     ),
-    "load_skill": lambda **kw: run_load_skill(kw["name"]),
+    "load_skill": SkillTool(lambda **kw: run_load_skill(kw["name"])),
     "todo": _h_todo,
     "note": _h_note,
     "schedule_wakeup": _h_schedule_wakeup,

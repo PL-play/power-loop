@@ -2246,9 +2246,8 @@ class AgentPipeline:
             skip_batch = batch_ctx.directive == HookDirective.SKIP
 
             # ── Execute tools ──
-            # 6.11.0 同轮并发（design/86 修订）：模型面对「三张图」的直觉是同一轮批量发调用，
-            # 而不是先起 background_run 再回头查（conv-224：三次 design_pack_image 同轮发出、
-            # 逐个排队 3 分钟）。所以顺着它：同一轮 ≥2 个 async_capable 调用并发执行。
+            # A batch may contain multiple independent calls. Run at least two
+            # async-capable calls concurrently, up to the configured limit.
             # 不变量：TOOL_BEFORE 仍按原顺序先跑（闸类 hook 语义不变）；结果按原顺序回填；
             # TOOL_AFTER / 事件 / 落库全部串行；非 async_capable 工具永远串行。
             used_todo = False

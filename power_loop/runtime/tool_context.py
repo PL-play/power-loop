@@ -188,7 +188,7 @@ class ToolContextEngine:
             await self._record_stats(attempt)
 
     def projection_version(self, original: int) -> int:
-        return int(_hash({'original': original, 'merge': self.config.merge_consecutive, 'overrides': self.config.overrides,
+        return int(_hash({'context_presentation_protocol': 1, 'original': original, 'merge': self.config.merge_consecutive, 'overrides': self.config.overrides,
                           'rule': self.config.rule_version, 'model': self.model,
                           'model_identity': self.model_identity})[:7], 16)
 
@@ -248,7 +248,7 @@ class ToolContextEngine:
         strategy = policy.strategy(trigger)
         if policy.hard_preserve:
             return None
-        if trigger != 'general' and source.name == 'bash' and source.arguments.get('context_policy') == 'keep':
+        if self.preserves_context(source, trigger):
             strategy = 'preserve'
         if strategy == 'llm_summary' and len(source.result) < self.config.summary_min_chars:
             return None  # short original: preserve both arguments and result, no rule fallback
@@ -259,11 +259,10 @@ class ToolContextEngine:
             return None
         if strategy == 'archive':
             from power_loop.runtime.tool_archive import archive_text
-            return archive_text(source)
+            return archive_text(source, registered)
         if strategy == 'truncate':
-            from power_loop.runtime.tool_truncation import truncate_view
-            pair = truncate_view(source.name, _json(dict(source.arguments)), dict(source.arguments),
-                                 source.result, policy, source.recall)
+            from .tool_contracts import truncate_context
+            pair = truncate_context(registered, source, policy, raw_arguments=_json(dict(source.arguments)))
             return _json({'arguments': pair[0], 'result': pair[1]}) if pair else None
         original = _json({'arguments': dict(source.arguments), 'result': source.result})
         operation = _hash({'source': asdict(source), 'trigger': trigger, 'policy': asdict(policy),
@@ -350,6 +349,11 @@ class ToolContextEngine:
             return []
         return await implementation.result_sources(source, store=self.store, registry=self.registry)
 
+    def preserves_context(self, source, trigger):
+        from .tool_contracts import context_presentation
+        registered = self.registry.get(source.name) if self.registry else None
+        return trigger != 'general' and context_presentation(registered, source).keep_in_send
+
     def is_result_container(self, source):
         from .tool_contracts import result_container
 
@@ -359,8 +363,7 @@ class ToolContextEngine:
         sources = await self._background_sources(source)
         for target in sources:
             if (self.policy(target).strategy(trigger) == 'preserve'
-                    or (trigger != 'general' and target.name == 'bash'
-                        and target.arguments.get('context_policy') == 'keep')):
+                    or self.preserves_context(target, trigger)):
                 return None
         summaries = []
         for target in sources:

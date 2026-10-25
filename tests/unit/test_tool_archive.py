@@ -9,6 +9,7 @@ from power_loop.core.pipeline import AgentPipeline
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_archive import manage_capacity, prepare_history, prepare_projection, recall_group
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine
+from power_loop.tools import create_default_tool_registry
 
 ARCHIVE = {'bash': {'general': 'archive'}}
 
@@ -33,7 +34,7 @@ async def fixture(overrides=None, n=3, dsn=None, keep=False):
         window_tokens=5000, reserve_tokens=100, margin_tokens=100,
         overrides=ARCHIVE if overrides is None else overrides)
     engine = ToolContextEngine(config=config, store=store, owner_session_id=sid, owner_send_index=1,
-        llm=None, model='test')
+        llm=None, model='test', registry=create_default_tool_registry(bind=False))
     await engine.start()
     p = SimpleNamespace(history=history, sink=SimpleNamespace(_history_seqs=seqs), send_index=1,
         config=SimpleNamespace(max_tokens=100), system_prompt='', runtime_tools=[],
@@ -59,7 +60,7 @@ async def test_two_levels_durable_restore_and_full_original():
         p.history = original
         p.sink._history_seqs = list(range(1, len(original) + 1))
         resumed = ToolContextEngine(config=replace(e.config, trigger_tokens=2000), store=store,
-            owner_session_id=e.sid, owner_send_index=1, llm=None, model='test')
+            owner_session_id=e.sid, owner_send_index=1, llm=None, model='test', registry=create_default_tool_registry(bind=False))
         await resumed.start()
         assert resumed.config.trigger_tokens == 1000
         await manage_capacity(resumed, p)
@@ -206,7 +207,7 @@ async def test_background_target_policy_and_original_delivery():
     token = active_engine.set(engine)
     try:
         reg = ToolRegistry()
-        reg.register(ToolDefinition('bash', ''), lambda **kw: '')
+        reg.register(ToolDefinition('bash', ''), create_default_tool_registry(bind=False).get('bash').handler)
         from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
         reg.register(ToolDefinition('background_run', ''), DEFAULT_TOOL_HANDLERS['background_run'])
         engine.registry = reg
@@ -259,7 +260,7 @@ async def test_pg_projection_restart_and_raw_recall():
         view = copy.deepcopy(p.history)
         assert len(view) < len(raw)
         resumed = ToolContextEngine(config=engine.config, store=store,
-            owner_session_id=engine.sid, owner_send_index=1, llm=None, model='test')
+            owner_session_id=engine.sid, owner_send_index=1, llm=None, model='test', registry=create_default_tool_registry(bind=False))
         await resumed.start()
         p.history, p.sink._history_seqs = raw, seqs
         await manage_capacity(resumed, p)
@@ -349,7 +350,7 @@ async def test_between_sends_merge_breakpoints_and_rule_entries_kept():
             elif r.role == 'user':
                 entries.append({'name': '__user__', 'seq': r.seq, 's': '[系统注入] 提醒'})
         engine = ToolContextEngine(config=ToolContextConfig(), store=store, owner_session_id=sid,
-                                   owner_send_index=2, llm=None, model='test')
+                                   owner_send_index=2, llm=None, model='test', registry=create_default_tool_registry(bind=False))
         await engine.start()
         projected = SimpleNamespace(rows=[SimpleNamespace(kind='project', content={'tools': entries}, rendered_text='x')])
         await prepare_projection(engine, projected, rows, 1)
@@ -383,7 +384,7 @@ async def test_between_sends_parallel_same_tool_is_consecutive_and_merge_can_be_
             return [{'name': 'read', 'seq': r.seq, 's': f'read s{r.seq}'} for r in rows if r.role == 'tool']
         for send, (merge, expected) in enumerate(((True, 1), (False, 3)), start=2):
             engine = ToolContextEngine(config=ToolContextConfig(merge_consecutive=merge), store=store,
-                                       owner_session_id=sid, owner_send_index=send, llm=None, model='test')
+                                       owner_session_id=sid, owner_send_index=send, llm=None, model='test', registry=create_default_tool_registry(bind=False))
             await engine.start()
             projected = SimpleNamespace(rows=[SimpleNamespace(kind='project', content={'tools': entries()}, rendered_text=None)])
             await prepare_projection(engine, projected, rows, 1)
@@ -399,7 +400,7 @@ async def test_hard_preserve_is_fuse_only_between_sends_uses_general():
         rows = await _send_rows(store, sid, ['say'])
         seq = next(r.seq for r in rows if r.role == 'tool')
         engine = ToolContextEngine(config=ToolContextConfig(overrides={'say': {'hard_preserve': True, 'general': 'archive'}}),
-                                   store=store, owner_session_id=sid, owner_send_index=2, llm=None, model='test')
+                                   store=store, owner_session_id=sid, owner_send_index=2, llm=None, model='test', registry=create_default_tool_registry(bind=False))
         await engine.start()
         projected = SimpleNamespace(rows=[SimpleNamespace(kind='project', content={'tools': [{'name': 'say', 'seq': seq, 's': 'host'}]}, rendered_text=None)])
         await prepare_projection(engine, projected, rows, 1)
@@ -449,7 +450,7 @@ async def test_legacy_state_key_is_adopted_and_old_group_ids_recall():
         await store.set_runtime_state(sid, TOOL_CONTEXT_STATE_KEY, {'operations': {}, 'attempts': {}, 'archive_v2': legacy})
         assert json.loads(await recall_group(store, sid, 1, 'gOLD'))['count'] == 2
         engine = ToolContextEngine(config=ToolContextConfig(), store=store, owner_session_id=sid,
-                                   owner_send_index=2, llm=None, model='test')
+                                   owner_send_index=2, llm=None, model='test', registry=create_default_tool_registry(bind=False))
         await engine.start()
         assert 'archive_v2' not in engine.state and 'gOLD' in engine.state['archive']['groups']
         restored = json.loads(await recall_group(store, sid, 1, 'gOLD', item=1))
@@ -471,9 +472,9 @@ async def test_distilled_text_has_no_prefix_only_a_trailing_recall_note():
     from power_loop.runtime.tool_archive import archive_text
     from power_loop.runtime.tool_context import ToolSource
     bash = ToolSource('s', 1, 3, 'c', 'bash', {'command': 'pytest -q', 'description': '跑单元测试'}, 'ok')
-    assert archive_text(bash) == '跑单元测试\n（原文 recall_send(send_index=1, seq=3)）'
+    assert archive_text(bash, create_default_tool_registry(bind=False).get('bash')) == '跑单元测试\n（原文 recall_send(send_index=1, seq=3)）'
     skill = ToolSource('s', 1, 5, 'c', 'load_skill', {'name': 'pdf', 'doc': 'forms.md'}, 'x')
-    assert archive_text(skill).startswith('pdf/forms.md\n')
+    assert archive_text(skill, create_default_tool_registry(bind=False).get('load_skill')).startswith('pdf/forms.md\n')
     store, e, p = await fixture(n=3, keep=False)
     try:
         await prepare_history(e, p, 'insend_fuse', target_tokens=10**6, level=2)
