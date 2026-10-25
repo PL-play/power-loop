@@ -6,6 +6,9 @@ real; this does not claim a platform API transaction or supplier settlement.
 
 import asyncio
 import json
+import sys
+from dataclasses import asdict
+from pathlib import Path
 
 import pytest
 
@@ -17,6 +20,7 @@ from power_loop.runtime.managed_effects import (
     ManagedToolContract,
     ManagedToolPreparation,
     ManagedToolResult,
+    read_raw_receipt,
     reconcile,
     terminate_unstarted,
 )
@@ -30,8 +34,9 @@ from .test_real_budget_tree_192 import RealBudgetHost
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("pending", [False, True, "unclaimed"])
+@pytest.mark.parametrize("pending", [False, True, "unclaimed", "receipt_lost"])
 async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, pending, record_property):
+    unclaimed = pending in ("unclaimed", "receipt_lost")
     store = await SessionStore.open(str(tmp_path / "managed-tool.db"), schema="tasks")
     provider, host = BoundedProvider(limit=2), RealBudgetHost()
     host.service = provider
@@ -45,7 +50,7 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
         boot_contract_hash="d" * 64,
         budget_config=BudgetConfig("generic-real-v1", (LocalBudgetScope("authority", max_calls=2),), host),
     )
-    if pending == "unclaimed":
+    if unclaimed:
         claim = runtime.claim
 
         async def fail_before_claim(actor, registration, **kwargs):
@@ -54,6 +59,12 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
             return await claim(actor, registration, **kwargs)
 
         runtime.claim = fail_before_claim
+    if pending == "receipt_lost":
+
+        async def unavailable_receipt(*args, **kwargs):
+            raise OSError("test_raw_binding_unavailable")
+
+        manager.reconcile_receipt = unavailable_receipt
 
     class SetBeacon(ManagedTool):
         prepared = 0
@@ -116,6 +127,7 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
 
     loop.hooks.register(HookPoint.LLM_BEFORE, only_requested_tool, name="test.generic-managed-tool")
     sid = await loop.new_session()
+    reader = None
     try:
         async with asyncio.timeout(150):
             try:
@@ -123,15 +135,38 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
                     "Call set_beacon exactly once with value=42. After its result, reply only DONE. Do not call any other tool.",
                     sid,
                 )
-            except JobError as exc:
-                if pending != "unclaimed" or exc.code != "managed_effect_result_missing":
+            except OSError as exc:
+                if pending != "receipt_lost" or str(exc) != "test_raw_binding_unavailable":
                     raise
                 result = None
-            if pending == "unclaimed":
+            if unclaimed:
                 assert implementation.prepared == implementation.executed == implementation.queries == 0
                 [child] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='background_tool'")
                 assert child["generation"] == 0 and child["result_json"] is None
-                negative = await terminate_unstarted(manager, runtime.actor(sid), child["job_id"])
+                if pending == "receipt_lost":
+                    before = await manager.db.fetchall(f"SELECT * FROM {store.t.messages} ORDER BY seq")
+                    reader = await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        str(Path(__file__).with_name("_managed_receipt_reader_192.py")),
+                        str(tmp_path / "managed-tool.db"),
+                        json.dumps(asdict(runtime.actor(sid))),
+                        child["job_id"],
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    record_property("original_managed_receipt_reader_pid", reader.pid)
+                    stdout, stderr = await asyncio.wait_for(reader.communicate(), 30)
+                    assert reader.returncode == 0, stderr.decode()[-2000:]
+                    value = json.loads(stdout)
+                    assert value["network_disabled"]
+                    observed, negative = value["observed"], value["negative"]
+                    assert await read_raw_receipt(manager, runtime.actor(sid), child["job_id"]) == observed
+                    assert await manager.db.fetchall(f"SELECT * FROM {store.t.messages} ORDER BY seq") == before
+                else:
+                    observed = await read_raw_receipt(manager, runtime.actor(sid), child["job_id"])
+                    assert result.status == "degraded"
+                    negative = await terminate_unstarted(manager, runtime.actor(sid), child["job_id"])
+                assert not observed["acknowledges_result"]
                 assert negative["resolution"] == "not_dispatched" and not negative["tool_receipt_written"]
                 assert (await manager.get_job(runtime.actor(sid), child["job_id"])).supervision_status == "closed"
                 assert provider.calls == host.reserve_calls == len(host.applied) == 1
@@ -159,6 +194,9 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
             assert implementation.executed == 1
             assert (await manager.get_job(runtime.actor(sid), child["job_id"])).supervision_status == "closed"
     finally:
+        if reader is not None and reader.returncode is None:
+            reader.kill()
+            await reader.wait()
         provider.report(record_property)
         record_property("effect_executions", implementation.executed)
         record_property("effect_queries", implementation.queries)

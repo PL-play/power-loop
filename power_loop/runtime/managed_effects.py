@@ -602,14 +602,7 @@ async def require_source_resolved(manager, tx, source):
             continue
         if row["resource_state"] != "stopped":
             raise JobError("managed_effect_pending")
-        result = json.loads(row["result_json"] or "null")
-        if type(result) is not dict:
-            raise JobError("managed_effect_pending")
-        if (
-            result.get("managed_effect_pending") is True
-            and await _observation(manager, tx, row, found[1], required=False) is None
-        ):
-            raise JobError("managed_effect_pending")
+        await _require_resolved(manager, tx, row, found[1])
 
 
 async def _invoke(handler, execution, arguments):
@@ -790,14 +783,40 @@ async def require_owned_resolved(manager, tx, owner):
         if row["generation"] == 0:
             await unstarted_references(manager, tx, row)
             continue
-        result = json.loads(row["result_json"] or "null")
-        if (
-            row["resource_state"] != "stopped"
-            or type(result) is not dict
-            or result.get("managed_effect_pending") is True
-            and await _observation(manager, tx, row, found[1], required=False) is None
-        ):
-            raise JobError("managed_effect_pending")
+        await _require_resolved(manager, tx, row, found[1])
+
+
+async def _require_resolved(manager, tx, row, binding):
+    if row["resource_state"] != "stopped" or row["result_status"] != "handled":
+        raise JobError("managed_effect_pending")
+    from .result_revisions import result_id
+
+    identity = result_id(row["job_id"], row["generation"])
+    length = (
+        "length(CAST(payload_json AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(payload_json)"
+    )
+    size = await tx.fetchone(f"SELECT {length} AS n FROM {manager.events} WHERE event_id=?", (identity,))
+    if size is None or size["n"] is None or size["n"] > 65536:
+        raise JobError("managed_effect_result_missing")
+    event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (identity,))
+    payload = _document(json.loads(event["payload_json"]), 65536)
+    if (
+        event["job_id"] != row["job_id"]
+        or event["event_type"] != "result"
+        or event["delivery_status"] != "handled"
+        or payload.get("resource_state") != row["resource_state"]
+        or payload.get("outcome") != row["outcome"]
+        or type(payload.get("result")) is not dict
+        or type(payload["result"].get("managed_effect_pending")) is not bool
+        or _hash(payload.get("result")) != _hash(json.loads(row["result_json"] or "null"))
+    ):
+        raise JobError("managed_effect_result_mismatch")
+    if (
+        payload["result"].get("managed_effect_pending") is True
+        and await _observation(manager, tx, row, binding, required=False) is None
+    ):
+        raise JobError("managed_effect_pending")
+    await require_closed(manager, tx, row, event)
 
 
 async def _never_claimed(manager, tx, row):
@@ -809,14 +828,21 @@ async def _never_claimed(manager, tx, row):
     ):
         raise JobError("managed_effect_unstarted_conflict")
     history = await tx.fetchone(
-        f"SELECT event_id FROM {manager.events} WHERE job_id=? AND (event_type IN ('execution_scope','execution_member') OR event_type LIKE 'managed_effect_%' AND event_type NOT IN ('managed_effect_registered','managed_effect_unstarted')) LIMIT 1",
+        f"SELECT event_id FROM {manager.events} WHERE job_id=? AND (event_type IN ('execution_scope','execution_member') OR event_type LIKE 'managed_effect_%' AND event_type NOT IN ('managed_effect_registered','managed_effect_unstarted','managed_effect_raw_receipt')) LIMIT 1",
         (row["job_id"],),
     )
     children = await tx.fetchone(
         f"SELECT job_id FROM {manager.jobs} WHERE parent_job_id=? OR control_owner_job_id=? LIMIT 1",
         (row["job_id"], row["job_id"]),
     )
-    if history is not None or children is not None:
+    # An admitted member edge is stored on its owner, independently of the
+    # child's mutable row and scope. Losing both cannot erase that first claim.
+    from .execution_membership import member_id
+
+    membership = await tx.fetchone(
+        f"SELECT event_id FROM {manager.events} WHERE event_id=?", (member_id(manager, row["job_id"], 1),)
+    )
+    if history is not None or children is not None or membership is not None:
         raise JobError("managed_effect_unstarted_conflict")
 
 
@@ -847,6 +873,7 @@ async def unstarted_references(manager, tx, row):
         raise JobError("finalization_adapter_required")
     await _never_claimed(manager, tx, row)
     creation, binding = found
+    await raw_receipt(manager, tx, row, creation, binding, required=False)
     payload = _unstarted_payload(row)
     result_id = "result_" + row["job_id"]
     result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (result_id,))
@@ -955,13 +982,11 @@ async def terminate_unstarted(manager, actor, job):
         }
 
 
-async def bind_receipt(manager, tx, row, creation, receipt_ref):
-    found = await descriptor(manager, tx, row)
-    if found is None:
-        raise JobError("managed_effect_evidence_missing")
-    result = json.loads(row["result_json"] or "null")
-    if type(result) is not dict or type(result.get("display")) is not str:
-        raise JobError("managed_effect_result_missing")
+async def _receipt_content(manager, tx, receipt_ref, job, tool_name):
+    from .jobs import JobActor
+
+    actor = JobActor(job["tenant_id"], job["principal_id"], receipt_ref.session_id)
+    await manager._validate_ref(tx, actor, receipt_ref, role="tool", metadata_only=True)
     length = "length(CAST(content AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(content)"
     size = await tx.fetchone(
         f"SELECT {length} AS n FROM {manager.store.t.messages} WHERE session_id=? AND id=?",
@@ -970,11 +995,159 @@ async def bind_receipt(manager, tx, row, creation, receipt_ref):
     if size is None or size["n"] is None or size["n"] > 16384:
         raise JobError("managed_effect_receipt_too_large")
     raw = await tx.fetchone(
-        f"SELECT content FROM {manager.store.t.messages} WHERE session_id=? AND id=?",
+        f"SELECT content,name FROM {manager.store.t.messages} WHERE session_id=? AND id=?",
         (receipt_ref.session_id, receipt_ref.id),
     )
-    if raw["content"] != result["display"]:
+    if raw["name"] != tool_name:
         raise JobError("managed_effect_receipt_mismatch")
+    return raw["content"]
+
+
+async def raw_receipt(manager, tx, row, creation, binding, *, required=True):
+    found = await _read_event(manager, tx, _id(manager, "raw_receipt", row["job_id"], 0), required=required)
+    if found is None:
+        return None
+    event, value = found
+    try:
+        ref = _ref(value["receipt_ref"])
+        call = _ref(json.loads(creation["call_ref_json"]))
+        if (
+            set(value)
+            != {
+                "version",
+                "creation_id",
+                "creation_hash",
+                "binding",
+                "receipt_ref",
+                "content_hash",
+                "acknowledges_result",
+            }
+            or type(value["version"]) is not int
+            or value["version"] != 1
+            or value["acknowledges_result"] is not False
+            or event["job_id"] != row["job_id"]
+            or event["event_type"] != "managed_effect_raw_receipt"
+            or event["delivery_status"] != "not_applicable"
+            or value["binding"] != binding
+            or value["creation_id"] != creation["event_id"]
+            or value["creation_hash"] != creation["request_hash"]
+            or (ref.session_id, ref.send_index, ref.tool_call_id)
+            != (call.session_id, call.send_index, creation["tool_call_id"])
+            or ref.seq <= call.seq
+            or json.loads(creation["receipt_ref_json"] or "null") != ref.to_dict()
+            or _hash(await _receipt_content(manager, tx, ref, row, binding["tool_name"])) != value["content_hash"]
+        ):
+            raise ValueError()
+    except (KeyError, ValueError, TypeError):
+        raise JobError("managed_effect_raw_receipt_mismatch") from None
+    return found
+
+
+async def read_raw_receipt(manager, actor, job):
+    """Read original call/response coordinates; this acknowledges no outcome."""
+    from .task_history import _snapshot
+
+    async with _snapshot(manager) as tx:
+        row = await manager._authorize(tx, actor, job)
+        found = await descriptor(manager, tx, row)
+        if found is None:
+            raise JobError("managed_effect_evidence_missing")
+        creation, binding = found
+        event, value = await raw_receipt(manager, tx, row, creation, binding)
+        return {
+            "job_id": job,
+            "call_ref": json.loads(creation["call_ref_json"]),
+            "receipt_ref": value["receipt_ref"],
+            "content_hash": value["content_hash"],
+            "observation_id": event["event_id"],
+            "observation_hash": event["request_hash"],
+            "acknowledges_result": False,
+            "execution_authority": False,
+            "resource_stop_confirmed": False,
+            "billing_settled": False,
+        }
+
+
+async def reconcile_raw_receipt(manager, actor, job):
+    """Index one retained original tool row; never synthesize a row or execute."""
+    from .jobs import JobActor
+    from .task_history import _snapshot
+
+    async with _snapshot(manager) as tx:
+        row = await manager._authorize(tx, actor, job)
+        found = await descriptor(manager, tx, row)
+        if found is None:
+            raise JobError("managed_effect_evidence_missing")
+        creation, binding = found
+        call = _ref(json.loads(creation["call_ref_json"]))
+        if creation["receipt_ref_json"]:
+            ref = _ref(json.loads(creation["receipt_ref_json"]))
+        else:
+            rows = await tx.fetchall(
+                f"SELECT id,seq,role,tool_call_id,send_index,round_index FROM {manager.store.t.messages} WHERE session_id=? AND role='tool' AND tool_call_id=? AND send_index=? AND seq>? ORDER BY seq LIMIT 2",
+                (call.session_id, creation["tool_call_id"], call.send_index, call.seq),
+            )
+            if not rows:
+                return None
+            if len(rows) != 1:
+                raise JobError("managed_effect_receipt_ambiguous")
+            from .message_ref import MessageRef
+
+            item = rows[0]
+            ref = MessageRef(
+                manager.store.store_id,
+                call.session_id,
+                int(item["id"]),
+                int(item["seq"]),
+                item["role"],
+                item["tool_call_id"],
+                item["send_index"],
+                item["round_index"],
+            )
+        original_actor = JobActor(row["tenant_id"], row["principal_id"], call.session_id)
+        operation_id = creation["event_id"]
+    # The binding transaction rechecks original lineage, call/row coordinates
+    # and any concurrent binding. The historical source grants no execution.
+    await manager.reconcile_receipt(original_actor, operation_id, ref)
+    return await read_raw_receipt(manager, actor, job)
+
+
+async def bind_receipt(manager, tx, row, creation, receipt_ref):
+    found = await descriptor(manager, tx, row)
+    if found is None:
+        raise JobError("managed_effect_evidence_missing")
+    _, binding = found
+    content = await _receipt_content(manager, tx, receipt_ref, row, binding["tool_name"])
+    call = _ref(json.loads(creation["call_ref_json"]))
+    if (receipt_ref.session_id, receipt_ref.send_index, receipt_ref.tool_call_id) != (
+        call.session_id,
+        call.send_index,
+        creation["tool_call_id"],
+    ):
+        raise JobError("managed_effect_receipt_mismatch")
+    # Observation of a real tool row is separate from acknowledging a canonical
+    # effect result. Error rows can be indexed without inventing either result.
+    await _event(
+        manager,
+        tx,
+        {**row, "generation": 0},
+        "raw_receipt",
+        {
+            "version": 1,
+            "creation_id": creation["event_id"],
+            "creation_hash": creation["request_hash"],
+            "binding": binding,
+            "receipt_ref": receipt_ref.to_dict(),
+            "content_hash": _hash(content),
+            "acknowledges_result": False,
+        },
+    )
+    result = json.loads(row["result_json"] or "null")
+    if row["generation"] == 0 or type(result) is not dict or type(result.get("display")) is not str:
+        return
+    raw = {"content": content}
+    if raw["content"] != result["display"]:
+        return
     from .result_revisions import result_id
 
     result_event = await tx.fetchone(
@@ -1014,12 +1187,14 @@ async def require_closed(manager, tx, row, result_event):
     if found is None:
         raise JobError("finalization_adapter_required")
     creation, binding = found
+    observed_raw = await raw_receipt(manager, tx, row, creation, binding)
     await _registered(manager, tx, row, creation, binding)
     from .finalization import _reference
 
     refs = [
         await _reference(manager, tx, creation["event_id"]),
         await _reference(manager, tx, _id(manager, "registered", row["job_id"], 0)),
+        await _reference(manager, tx, observed_raw[0]["event_id"]),
     ]
     prepared = await _evidence(manager, tx, row, "prepared", required=False)
     exited = await _evidence(manager, tx, row, "resource_exit")

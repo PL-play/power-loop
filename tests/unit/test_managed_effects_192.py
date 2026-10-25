@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -37,6 +38,7 @@ async def scenario(
     class_based=False,
     tool_name="post_once",
     claim_failure=False,
+    receipt_bind_failure=False,
 ):
     store, _ = registry_store
     sid = await store.create_session()
@@ -60,11 +62,26 @@ async def scenario(
         boot_contract_hash="b" * 64 if budgeted else None,
         budget_config=budget,
     )
+    if receipt_bind_failure:
+        bind_receipt = manager.reconcile_receipt
+        attempts = 0
+
+        async def fail_one_receipt(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise OSError("test_original_receipt_store_unavailable")
+            return await bind_receipt(*args, **kwargs)
+
+        manager.reconcile_receipt = fail_one_receipt
     if claim_failure:
         claim = runtime.claim
 
         async def fail_before_claim(actor, registration, **kwargs):
             if registration.job.kind == "background_tool":
+                if claim_failure == "after":
+                    await claim(actor, registration, **kwargs)
+                    raise JobError("test_original_claim_ack_lost")
                 raise JobError("test_claim_not_started")
             return await claim(actor, registration, **kwargs)
 
@@ -173,13 +190,10 @@ async def scenario(
     try:
         try:
             result = await asyncio.wait_for(loop.send("Post the original effect once", sid), 10)
-        except JobError as exc:
-            # The actual pipeline persisted its error row but cannot yet bind a
-            # canonical managed-effect result for an unclaimed task. Observe
-            # that failure; recovery must not reinterpret it as execution.
-            if not claim_failure or exc.code != "managed_effect_result_missing":
+        except OSError as exc:
+            if not receipt_bind_failure or str(exc) != "test_original_receipt_store_unavailable":
                 raise
-            result = SimpleNamespace(status="interrupted", error=exc.code)
+            result = SimpleNamespace(status="interrupted", error=str(exc))
         return SimpleNamespace(
             store=store,
             runtime=runtime,
@@ -280,7 +294,7 @@ async def test_base_requires_lifecycle_methods_and_supported_resource_contract()
             ManagedToolContract("generic.tool", "a" * 64, **kwargs)
 
 
-@pytest.mark.parametrize("old_protocol", [5, 6])
+@pytest.mark.parametrize("old_protocol", [5, 6, 7])
 async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identity(
     registry_store, monkeypatch, old_protocol
 ):
@@ -303,7 +317,7 @@ async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identit
     assert await store.message_ref(sid, seq) == ref
     assert (
         await manager.db.fetchone(f"SELECT store_id,protocol_version FROM {manager.prefix}task_store WHERE id=1")
-    ) == {"store_id": store.store_id, "protocol_version": 7}
+    ) == {"store_id": store.store_id, "protocol_version": 8}
     with monkeypatch.context() as patch:
         patch.setattr(jobs, "TASK_PROTOCOL_VERSION", old_protocol)
         with pytest.raises(JobError, match="store_identity_changed"):
@@ -463,13 +477,20 @@ async def test_non_finite_reference_documents_are_rejected():
 
 
 async def test_unclaimed_effect_cancels_and_closes_without_callbacks_or_fake_tool_receipt(registry_store):
-    from power_loop.runtime.managed_effects import terminate_unstarted
+    from power_loop.runtime.managed_effects import read_raw_receipt, terminate_unstarted
 
     c = await scenario(registry_store, budgeted=True, claim_failure=True)
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
     assert c.model.calls == c.host.reserve_calls == 1
     [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
     assert row["generation"] == 0 and row["resource_state"] == "not_started"
+    observed = await read_raw_receipt(c.manager, c.actor, row["job_id"])
+    assert not observed["acknowledges_result"] and observed["call_ref"]["id"] != observed["receipt_ref"]["id"]
+    raw = await c.manager.db.fetchone(
+        f"SELECT * FROM {c.store.t.messages} WHERE id=?", (int(observed["receipt_ref"]["id"]),)
+    )
+    assert "test_claim_not_started" in raw["content"]
+    assert c.result.status == "degraded"
     result = await terminate_unstarted(c.manager, c.actor, row["job_id"])
     assert result["resolution"] == "not_dispatched" and not result["tool_receipt_written"]
     assert not result["execution_authority"] and not result["billing_settled"]
@@ -481,6 +502,13 @@ async def test_unclaimed_effect_cancels_and_closes_without_callbacks_or_fake_too
     )
     store = await registry_store[1](schema="compatible")
     assert await terminate_unstarted(JobManager(store), c.actor, row["job_id"]) == result
+    assert await read_raw_receipt(JobManager(store), c.actor, row["job_id"]) == observed
+    assert (
+        await c.manager.db.fetchone(
+            f"SELECT * FROM {c.store.t.messages} WHERE id=?", (int(observed["receipt_ref"]["id"]),)
+        )
+        == raw
+    )
     assert c.state.dispatched == 0 and c.model.calls == c.host.reserve_calls == 1
 
 
@@ -538,3 +566,179 @@ async def test_closed_unclaimed_effect_revalidates_original_evidence(registry_st
     with pytest.raises(JobError):
         await terminate_unstarted(c.manager, c.actor, row["job_id"])
     assert c.state.dispatched == c.state.prepared == c.state.lookups == 0
+
+
+@pytest.mark.parametrize("unclaimed", [True, False])
+async def test_retained_original_row_is_rebound_after_storage_failure_without_replay(registry_store, unclaimed):
+    from power_loop.runtime.managed_effects import read_raw_receipt, reconcile_raw_receipt
+
+    c = await scenario(registry_store, budgeted=True, claim_failure=unclaimed, receipt_bind_failure=True)
+    [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+    assert c.model.calls == c.host.reserve_calls == 1
+    with pytest.raises(JobError, match="evidence_missing"):
+        await read_raw_receipt(c.manager, c.actor, row["job_id"])
+    before = await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.messages} ORDER BY seq")
+    restored = JobManager(await registry_store[1](schema="compatible"))
+    observed = await reconcile_raw_receipt(restored, c.actor, row["job_id"])
+    assert observed["call_ref"]["id"] != observed["receipt_ref"]["id"]
+    assert not observed["acknowledges_result"] and not observed["execution_authority"]
+    assert await reconcile_raw_receipt(restored, c.actor, row["job_id"]) == observed
+    assert await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.messages} ORDER BY seq") == before
+    assert c.state.dispatched == (0 if unclaimed else 1) and c.state.lookups == 0
+    assert c.model.calls == c.host.reserve_calls == 1
+    current = await c.manager.get_job(c.actor, row["job_id"])
+    assert current.result_status == ("none" if unclaimed else "handled")
+
+
+@pytest.mark.parametrize("part", ["raw_content", "raw_send", "observation", "pending_projection"])
+async def test_raw_receipt_or_projection_tampering_cannot_release_another_model(registry_store, part):
+    from power_loop.runtime.managed_effects import read_raw_receipt, require_source_resolved
+
+    c = await scenario(registry_store, budgeted=True, pending=True)
+    [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+    observed = await read_raw_receipt(c.manager, c.actor, row["job_id"])
+    if part == "pending_projection":
+        result = json.loads(row["result_json"])
+        result["managed_effect_pending"] = False
+        await c.manager.db.execute(
+            f"UPDATE {c.manager.jobs} SET result_json=? WHERE job_id=?", (_json(result), row["job_id"])
+        )
+    elif part == "observation":
+        await c.manager.db.execute(
+            f"UPDATE {c.manager.events} SET payload_json='{{}}' WHERE event_id=?", (observed["observation_id"],)
+        )
+    else:
+        column, value = ("content", "changed") if part == "raw_content" else ("send_index", 99)
+        await c.manager.db.execute(
+            f"UPDATE {c.store.t.messages} SET {column}=? WHERE id=?", (value, int(observed["receipt_ref"]["id"]))
+        )
+    c.state.resolved = True
+    await reconcile(c.runtime, c.actor, row["job_id"], c.adapter)
+    source = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (row["parent_job_id"],))
+    async with c.manager._write() as tx:
+        with pytest.raises(JobError):
+            await require_source_resolved(c.manager, tx, source)
+    assert c.state.dispatched == c.model.calls == 1
+
+
+@pytest.mark.parametrize("missing", [True, False])
+async def test_missing_or_ambiguous_original_tool_rows_are_not_invented_or_guessed(registry_store, missing):
+    from power_loop.runtime.managed_effects import reconcile_raw_receipt
+
+    c = await scenario(registry_store, claim_failure=True, receipt_bind_failure=True)
+    [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+    [raw] = await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.messages} WHERE role='tool'")
+    if missing:
+        await c.manager.db.execute(f"DELETE FROM {c.store.t.messages} WHERE id=?", (raw["id"],))
+    else:
+        await c.store.append_message(
+            c.sid,
+            role="tool",
+            name=raw["name"],
+            content=raw["content"],
+            tool_call_id=raw["tool_call_id"],
+            send_index=raw["send_index"],
+            round_index=raw["round_index"],
+        )
+    before = await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.messages} ORDER BY seq")
+    if missing:
+        assert await reconcile_raw_receipt(c.manager, c.actor, job["job_id"]) is None
+    else:
+        with pytest.raises(JobError, match="receipt_ambiguous"):
+            await reconcile_raw_receipt(c.manager, c.actor, job["job_id"])
+    assert await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.messages} ORDER BY seq") == before
+    assert c.state.dispatched == c.state.prepared == 0 and c.model.calls == 1
+
+
+@pytest.mark.parametrize("after_commit", [False, True])
+async def test_raw_index_and_observation_are_atomic_and_lost_ack_is_queryable(
+    registry_store, monkeypatch, after_commit
+):
+    from power_loop.runtime.managed_effects import reconcile_raw_receipt
+
+    c = await scenario(registry_store, claim_failure=True, receipt_bind_failure=True)
+    [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+    manager = JobManager(await registry_store[1](schema="compatible"))
+    write = manager._write
+
+    class Proxy:
+        def __init__(self, tx):
+            self.tx = tx
+
+        def __getattr__(self, name):
+            return getattr(self.tx, name)
+
+        async def execute(self, sql, params=()):
+            if sql.startswith(f"UPDATE {manager.events} SET receipt_ref_json="):
+                raise OSError("test_index_write_failed")
+            return await self.tx.execute(sql, params)
+
+    @asynccontextmanager
+    async def fail_write():
+        async with write() as tx:
+            yield tx if after_commit else Proxy(tx)
+        if after_commit:
+            raise OSError("test_receipt_ack_lost")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(manager, "_write", fail_write)
+        with pytest.raises(OSError):
+            await reconcile_raw_receipt(manager, c.actor, job["job_id"])
+    events = await manager.db.fetchall(
+        f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='managed_effect_raw_receipt'", (job["job_id"],)
+    )
+    [operation] = await manager.db.fetchall(
+        f"SELECT * FROM {manager.events} WHERE job_id=? AND action='create'", (job["job_id"],)
+    )
+    assert bool(events) == bool(operation["receipt_ref_json"]) == after_commit
+    observed = await reconcile_raw_receipt(manager, c.actor, job["job_id"])
+    assert observed and not observed["acknowledges_result"]
+    assert c.model.calls == 1 and c.state.dispatched == c.state.lookups == 0
+
+
+async def test_protocol_seven_original_pending_receipt_can_be_upgraded_and_reindexed_without_execution(registry_store):
+    from power_loop.runtime import jobs
+    from power_loop.runtime.managed_effects import _id, read_raw_receipt, reconcile_raw_receipt
+    from power_loop.runtime.store import task_schema
+    from power_loop.runtime.store.schema import StoreSchemaError
+
+    c = await scenario(registry_store, budgeted=True, pending=True)
+    [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+    before = await read_raw_receipt(c.manager, c.actor, job["job_id"])
+    # Protocol7 retained the canonical row/index but had no independent raw
+    # observation. This pending original has no child/parent closure to rewrite.
+    await c.manager.db.execute(
+        f"DELETE FROM {c.manager.events} WHERE event_id=?", (_id(c.manager, "raw_receipt", job["job_id"], 0),)
+    )
+    await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_store SET protocol_version=7 WHERE id=1")
+    with pytest.raises(StoreSchemaError):
+        await task_schema.verify_task_schema(c.manager.db, c.manager.prefix)
+    await task_schema.migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
+    after = await reconcile_raw_receipt(c.manager, c.actor, job["job_id"])
+    assert after["call_ref"] == before["call_ref"] and after["receipt_ref"] == before["receipt_ref"]
+    assert not after["acknowledges_result"]
+    assert c.state.dispatched == c.model.calls == c.host.reserve_calls == 1 and c.state.lookups == 0
+    c.state.resolved = True
+    await reconcile(c.runtime, c.actor, job["job_id"], c.adapter)
+    await c.manager.finalize_supervision(c.actor, job["job_id"], generation=1)
+    assert (await c.manager.get_job(c.actor, job["job_id"])).supervision_status == "closed"
+    assert jobs.TASK_PROTOCOL_VERSION == 8
+
+
+async def test_claim_membership_survives_lost_ack_and_cannot_be_relabelled_unclaimed(registry_store):
+    from power_loop.runtime.execution_membership import scope_id
+    from power_loop.runtime.managed_effects import terminate_unstarted
+
+    c = await scenario(registry_store, claim_failure="after")
+    [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+    assert job["generation"] == 1 and c.state.prepared == c.state.dispatched == 0
+    await c.manager.db.execute(
+        f"DELETE FROM {c.manager.events} WHERE event_id=?", (scope_id(c.manager, job["job_id"], 1),)
+    )
+    await c.manager.db.execute(
+        f"UPDATE {c.manager.jobs} SET generation=0,executor_id=NULL,boot_id=NULL,lease_until_ms=NULL,status='queued',intake='open',resource_state='not_started' WHERE job_id=?",
+        (job["job_id"],),
+    )
+    with pytest.raises(JobError, match="unstarted_conflict"):
+        await terminate_unstarted(c.manager, c.actor, job["job_id"])
+    assert c.model.calls == 1 and c.state.dispatched == c.state.lookups == 0
