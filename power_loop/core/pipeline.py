@@ -1317,6 +1317,8 @@ class AgentPipeline:
                            StreamDeltaPayload(text=text, is_think=True),
                            round_index=round_index, stream_id="main")
 
+        from power_loop.runtime.review_tools import restrict_request
+        system_prompt, tools = await restrict_request(self, system_prompt, tools)
         request = LLMRequest(
             messages=messages,
             system_prompt=system_prompt,

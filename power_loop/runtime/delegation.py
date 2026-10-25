@@ -47,6 +47,7 @@ class Running:
     canonical_result: dict | None = None
     canonical_attempted: bool = False
     answer_attempted: bool = False
+    completion_max_chars: int | None = None
     admission: Any = field(default=None, repr=False)
     admission_lease: Any = field(default=None, repr=False)
     admission_task: Any = field(default=None, repr=False)
@@ -248,7 +249,7 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
                         parent_run.descendant_usage[name] = parent_run.descendant_usage.get(name, 0) + value
             # Remain active until the owner result is durably enqueued. Otherwise
             # await_children can observe no task and no inbox in this window.
-            await loop.deliver(InboxItem(RESULT_PREFIX + completion_view(loop, result), kind="task_done",
+            await loop.deliver(InboxItem(RESULT_PREFIX + completion_view(loop, result, max_chars=running.completion_max_chars), kind="task_done",
                                         item_id="subagent:" + running.run_id), parent, enqueue_only=True)
             _RUNNING.pop((id(store), sid), None)
             _publish_completion(loop, parent, sid, result)
@@ -295,7 +296,7 @@ async def _complete(loop, parent, sid, run, raw, after_seq, lifecycle, finalize,
         try:
             result = await _save_result(store, parent, sid, run, failed, after_seq, lifecycle)
             _publish_completion(loop, parent, sid, result)
-            await loop.deliver(InboxItem(RESULT_PREFIX + completion_view(loop, result), kind="task_done",
+            await loop.deliver(InboxItem(RESULT_PREFIX + completion_view(loop, result, max_chars=run.completion_max_chars), kind="task_done",
                                         item_id="subagent:" + run.run_id), parent, enqueue_only=True)
             if on_complete is not None and not run.suppress_wake:
                 await on_complete(parent, result)
@@ -326,6 +327,8 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
         run.run_id = registration.operation.operation_id[3:]
     if parent_run is not None:
         run.token = parent_run.token.child()
+
+    run.completion_max_chars = await _completion_cap(loop, store, parent)
 
     admitted = False
 
@@ -534,12 +537,34 @@ async def await_children(store, parent, stop_event=None, timeout_s=1800):
             await asyncio.wait([run.task for run in runs], timeout=0.1)
 
 
-def completion_view(loop, result):
-    config = getattr(loop, "config", None)
-    policy = getattr(config, "tool_context", None)
-    projection = getattr(getattr(config, "representation", None), "projection_cfg", {}) or {}
-    overrides = getattr(policy, "overrides", {}) or {}
-    cap = overrides.get("spawn_agent", {}).get("result_max_chars") or projection.get("final_text_cap") or 600
+async def _completion_cap(loop, store, parent):
+    """Capture presentation from this original invocation, including aliases."""
+    from .invocation import current_invocation
+    from .tool_contracts import validate_registration
+    seq, call_id = current_invocation(parent)
+    registry = getattr(loop, 'tool_registry', None)
+    original = await store.get_message(parent, seq) if seq is not None else None
+    if original is not None and original.role == 'assistant' and registry is not None:
+        calls = [call for call in original.tool_calls or [] if call.get('id') == call_id]
+        if len(calls) == 1:
+            name = calls[0].get('function', {}).get('name')
+            registered = registry.get(name)
+            if registered is not None:
+                validate_registration(registry, name, registered)
+                definition = registered.definition
+                policy = definition.context_policy
+                config = getattr(getattr(loop, 'config', None), 'tool_context', None)
+                patch = (getattr(config, 'overrides', {}) or {}).get(name, {})
+                if policy is not None or patch:
+                    from power_loop.contracts.context_policy import ToolContextPolicy
+                    return (policy or ToolContextPolicy()).override(patch).result_max_chars
+    return None
+
+
+def completion_view(loop, result, *, max_chars=None):
+    config = getattr(loop, 'config', None)
+    projection = getattr(getattr(config, 'representation', None), 'projection_cfg', {}) or {}
+    cap = max_chars if max_chars is not None else projection.get('final_text_cap') or 600
     return result_view(dumps(result), int(cap))
 
 

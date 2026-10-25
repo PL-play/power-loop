@@ -948,67 +948,71 @@ async def unstarted_references(manager, tx, row):
 async def terminate_unstarted(manager, actor, job):
     """Cancel a provably unclaimed effect atomically; never invoke host callbacks."""
     async with manager._write() as tx:
-        row = await manager._authorize(tx, actor, job)
-        found = await descriptor(manager, tx, row)
-        if found is None:
-            raise JobError("finalization_adapter_required")
-        await _never_claimed(manager, tx, row)
-        if row["resource_state"] == "stopped":
-            await unstarted_references(manager, tx, row)
-        else:
-            if (
-                row["resource_state"] != "not_started"
-                or row["status"] not in ("queued", "cancelled")
-                or row["intake"] not in ("open", "closed")
-            ):
-                raise JobError("managed_effect_unstarted_conflict")
-            if (
-                await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", ("result_" + job,))
-                is not None
-            ):
-                raise JobError("managed_effect_unstarted_evidence_mismatch")
-            creation, binding = found
-            payload = _unstarted_payload(row)
-            version = row["version"] + 1
-            await tx.execute(
-                f"UPDATE {manager.jobs} SET status='settling',outcome='cancelled',resource_state='stopped',intake='closed',result_status='suppressed',result_json=?,version=?,updated_at=? WHERE job_id=?",
-                (_json(payload["result"]), version, manager.now(), job),
-            )
-            await tx.execute(
-                f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
-                ("result_" + job, job, "result", version, _json(payload), "suppressed", manager.now()),
-            )
-            row = await manager._row(tx, job)
-            await _event(
-                manager,
-                tx,
-                row,
-                "unstarted",
-                {
-                    "version": 1,
-                    "decision": "never_claimed",
-                    "creation_id": creation["event_id"],
-                    "creation_hash": creation["request_hash"],
-                    "binding": binding,
-                    "result_id": "result_" + job,
-                    "result_hash": _hash(payload),
-                },
-            )
-        from .finalization import _prepare, _publish
+        return await terminate_unstarted_tx(manager, tx, actor, job)
 
-        state = {"done": {}, "visiting": set(), "plans": []}
-        reference = await _prepare(manager, tx, actor, row, 0, state)
-        await _publish(manager, tx, state["plans"])
-        return {
-            "job_id": job,
-            "generation": 0,
-            "resolution": "not_dispatched",
-            "closure": reference,
-            "execution_authority": False,
-            "billing_settled": False,
-            "tool_receipt_written": False,
-        }
 
+async def terminate_unstarted_tx(manager, tx, actor, job):
+    """Same original negative closure, within an existing SDK control transaction."""
+    row = await manager._authorize(tx, actor, job)
+    found = await descriptor(manager, tx, row)
+    if found is None:
+        raise JobError("finalization_adapter_required")
+    await _never_claimed(manager, tx, row)
+    if row["resource_state"] == "stopped":
+        await unstarted_references(manager, tx, row)
+    else:
+        if (
+            row["resource_state"] != "not_started"
+            or row["status"] not in ("queued", "cancelled")
+            or row["intake"] not in ("open", "closed")
+        ):
+            raise JobError("managed_effect_unstarted_conflict")
+        if (
+            await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", ("result_" + job,))
+            is not None
+        ):
+            raise JobError("managed_effect_unstarted_evidence_mismatch")
+        creation, binding = found
+        payload = _unstarted_payload(row)
+        version = row["version"] + 1
+        await tx.execute(
+            f"UPDATE {manager.jobs} SET status='settling',outcome='cancelled',resource_state='stopped',intake='closed',result_status='suppressed',result_json=?,version=?,updated_at=? WHERE job_id=?",
+            (_json(payload["result"]), version, manager.now(), job),
+        )
+        await tx.execute(
+            f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
+            ("result_" + job, job, "result", version, _json(payload), "suppressed", manager.now()),
+        )
+        row = await manager._row(tx, job)
+        await _event(
+            manager,
+            tx,
+            row,
+            "unstarted",
+            {
+                "version": 1,
+                "decision": "never_claimed",
+                "creation_id": creation["event_id"],
+                "creation_hash": creation["request_hash"],
+                "binding": binding,
+                "result_id": "result_" + job,
+                "result_hash": _hash(payload),
+            },
+        )
+    from .finalization import _prepare, _publish
+
+    state = {"done": {}, "visiting": set(), "plans": []}
+    reference = await _prepare(manager, tx, actor, row, 0, state)
+    await _publish(manager, tx, state["plans"])
+    return {
+        "job_id": job,
+        "generation": 0,
+        "resolution": "not_dispatched",
+        "closure": reference,
+        "execution_authority": False,
+        "billing_settled": False,
+        "tool_receipt_written": False,
+    }
 
 async def _receipt_content(manager, tx, receipt_ref, job, tool_name):
     from .jobs import JobActor

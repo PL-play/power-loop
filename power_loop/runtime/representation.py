@@ -363,7 +363,7 @@ class ProjectedRepresentation:
         seen_assistant = False
         for r in send_rows:
             if r.role == "user":
-                if seen_assistant or getattr(r, "name", None) == "background_tool_results":
+                if seen_assistant or (getattr(r, "meta", None) or {}).get("context_timeline") is True:
                     # Verbatim like the input (conversation content, not tool output).
                     tools.append({
                         "name": "__user__",

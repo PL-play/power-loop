@@ -277,3 +277,62 @@ still need their explicit next protocol. The source cannot complete merely
 because its model is known to have exited. Crashing before any checkpoint is
 saved, incomplete/oversized declarations and lost evidence stay unknown. Protocol
 upgrade requires explicit maintenance; default protocol6 remains unchanged.
+
+## Original-main aborted-batch outcomes (candidate protocol 14)
+
+`tool_call_plans.reconcile_pending(loop, actor, source_job_id)` now has an explicit
+route for a verified version3 pre-admission abort from the actual original main.
+It requires the original complete pending set, positive checkpoint and anchor,
+actual stopped model and untouched original assistant call. It rejects any later
+real tool reply for this batch. Missing evidence remains unknown. It never
+creates an intention or resource for an action that was never registered.
+
+One control transaction closes any real never-claimed generation0 intentions,
+publishes a negative `aborted_call_batch` result on the original source send,
+queues its original-main notice, records its pending disposition and clears only
+that exact pending. An already-stopped send stays `model_closed`. A publication
+proof may publish only its negative, stopped result; it cannot regress physical
+state or authorize a success. Mechanical reconciliation preserves the original
+model-attempt and budget ledgers. Its usage reference does not claim zero fees,
+acknowledgement or billing settlement.
+
+A lost commit acknowledgement recalls the same result, notice and disposition.
+Existing protocol13 per-item managed notices/dispositions keep their original
+route and decisions. Previously completed generation0 negatives remain
+`suppressed`; the batch source has its own `pending_delivery`/`handled` result.
+A reused provider call ID cannot attach an earlier call's intention to a later
+assistant message: the original MessageRef is part of the match.
+
+Retiring pending or delivering a notice is not processing. Actual original-main
+model input must contain the exact original delivered message, then preserve the
+real response and a clean exit before the source can close supervision. Hidden
+or modified notices, failed models and exhausted original quota leave the
+responsibility open. `jobs` reports the separate processing obligation without
+acknowledging it. Lost notice/result/disposition evidence blocks new work;
+discovery does not rely on the notification projection alone. It selects explicit
+SDK abort/result/notice/disposition hints before loading bounded evidence; an
+unrelated ordinary send result, including a large one, is not an abort review.
+
+During this review the SDK appends English constraints and offers only pure
+`RuntimeTool.review_spec(spec)` views provided by actual registered implementations
+(default `None`). `FunctionRuntimeTool` accepts an optional `reviewer` callback.
+SDK jobs, recall and workflow implement their own control views, including aliases
+and explicit wrappers. A view is never execution permission: actual
+`ToolDispatchPolicy.control_only` is rechecked before registering batch intentions,
+before dispatch and before registering any new resource under the main send.
+Original frozen model quota still applies. Already-admitted descendants retain
+their own existing execution and supervision duties.
+
+Presentation follows the same principle. Subagent completion captures the actual
+original registered definition/context override, rather than a fixed catalog
+name. A producer may mark a user message with `meta.context_timeline=true` for
+chronological projection. Neither field grants execution authority. The exported
+legacy `validate_tool_args(str, args)` catalog shorthand remains a compatibility
+helper, not a runtime registry check; pass an actual `ToolDefinition`, or use the
+actual `ToolRegistry.validate`, for custom/renamed tools.
+
+Explicit maintenance upgrades protocol13 to14 without rewriting original IDs or
+records. Child-owner pending batches, pre-checkpoint crashes and claimed-before-
+preparation resource exit still require their own protocols. Default SDK/host
+activation and final rollout are separate gates; this candidate does not enable
+them automatically.

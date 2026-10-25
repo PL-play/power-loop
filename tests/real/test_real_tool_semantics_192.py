@@ -46,7 +46,7 @@ async def test_real_model_reads_skill_using_actual_registered_alias(tmp_path, re
     try:
         async with asyncio.timeout(150):
             sid = await loop.new_session()
-            result = await loop.send('Read the example skill exactly once with its available reader, then reply only with its SECRET_SKILL_VALUE.', sid)
+            result = await loop.send('Read the example skill exactly once with its available reader, then extract only the value to the right of the equals sign in SECRET_SKILL_VALUE. Reply with that value alone as plain text; do not include the key, equals sign, labels, quotes or formatting.', sid)
             assert result.status == 'completed' and result.final_text.strip() == 'S42'
             assert calls == ['example'] and provider.calls == 2
     finally:

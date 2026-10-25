@@ -616,6 +616,9 @@ class JobManager:
             if ((restored_parent and not await controls_node(self, tx, parent_row, actor)) or
                     (not restored_parent and (parent_row["session_id"] or parent_row["created_by_session_id"]) != actor.session_id)):
                 raise JobError("caller_is_not_executing_parent")
+        if parent_row is not None and parent_row['kind'] == 'send' and kind != 'send':
+            from .review_tools import require_batch
+            await require_batch(self, tx, actor, control_only=False)
         role = parent_row["execution_role"] if parent_row else "main"
         if (kind == "workflow" and role != "main") or (kind == "subagent" and role not in ("main", "workflow_node")):
             raise JobError("role_forbids_delegation")
@@ -928,8 +931,17 @@ class JobManager:
             from .execution_membership import seal
             await seal(self, tx, row)
             return event_id
+        exited_model = (publication_proof is not None and row["kind"] == "send"
+                        and row["status"] == "model_closed" and row["resource_state"] == "stopped")
+        if exited_model:
+            if resource_state != "stopped":
+                raise JobError("closed_model_result_requires_stopped")
+            if outcome == "succeeded":
+                raise JobError("closed_model_negative_result_required")
+            from .pending_calls import model
+            await model(self, tx, row)
         if evidence_only:
-            if row["resource_state"] not in ("running", "unknown"):
+            if not exited_model and row["resource_state"] not in ("running", "unknown"):
                 raise JobError("execution_not_running")
         else:
             await self._fence(tx, actor, lease)
@@ -959,10 +971,10 @@ class JobManager:
                 await self._require_scope_ready(tx, row)
         from .result_payloads import canonical
         payload = canonical(payload, effective_outcome, effective_result)
-        await tx.execute(f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,"
+        await tx.execute(f"UPDATE {self.jobs} SET status=?,outcome=?,result_json=?,"
             "result_status='pending_delivery',resource_state=?,intake='closed',lease_until_ms=NULL,"
             "version=version+1,updated_at=? WHERE job_id=?",
-            (effective_outcome, _json(effective_result), resource_state, self.now(), lease.job_id))
+            ("model_closed" if exited_model else "settling", effective_outcome, _json(effective_result), resource_state, self.now(), lease.job_id))
         await tx.execute(f"INSERT INTO {self.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) "
             "VALUES (?,?,?,?,?,?,?)", (event_id, lease.job_id, "result", int(row["version"]) + 1, _json(payload), "pending_delivery", self.now()))
         from .execution_membership import seal

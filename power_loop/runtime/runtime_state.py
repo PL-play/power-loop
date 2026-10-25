@@ -128,7 +128,8 @@ class BackgroundRuntimeProjector(RuntimeProjector):
             # Stable per-task messages remain deduplicable if another task finishes
             # between a failed model request and its retry.
             message = {"role": "user", "name": "background_tool_results",
-                       "content": encode_results([record]), "_persist": True}
+                       "content": encode_results([record]), "_persist": True,
+                       "meta": {"context_timeline": True}}
             if self.mark_seen:
                 message["_ack"] = ("background_seen", [record["task_id"]])
             messages.append(message)

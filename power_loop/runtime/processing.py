@@ -68,6 +68,8 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
             (actor.session_id, actor.tenant_id, actor.principal_id))
         from .managed_delivery import candidates
         results.extend(await candidates(manager, tx, actor))
+        from .abort_outcomes import candidates as aborted_candidates
+        results.extend(await aborted_candidates(manager, tx, actor))
         inputs = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' "
             "AND action='nudge' AND delivery_status<>'handled' ORDER BY event_id", (send["control_owner_job_id"],))
         observed = []
@@ -86,6 +88,13 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
                 if event["event_id"] != result_id(job["job_id"], job["generation"]):
                     continue
                 item_id = await delivery_id(manager, tx, job) if job["kind"] == "subagent" else event["event_id"]
+            if event['event_type'] == 'result' and job['kind'] == 'send':
+                from .abort_outcomes import observation
+                actual = await observation(manager, tx, actor, job, event, visible)
+                if actual is not None:
+                    observed.append({'event_id': event['event_id'], 'job_id': event['job_id'],
+                        'revision': int(event['job_version']), 'result_hash': _hash(json.loads(event['payload_json'])), **actual})
+                continue
             if event['event_type'] == 'result' and job['kind'] == 'background_tool':
                 from .managed_delivery import observation
 
@@ -227,6 +236,11 @@ async def commit(manager, actor, caller, *, snapshot_id, response_ref, decision=
                     current is None or current["job_id"] != target["job_id"] or
                     int(current["job_version"]) != event["revision"] or _hash(json.loads(current["payload_json"])) != event["result_hash"]):
                 raise JobError("processing_revision_changed")
+            if not is_input and target['kind'] == 'send':
+                from .abort_outcomes import verify_observation
+                if send['execution_role'] != 'main':
+                    raise JobError('abort_outcome_requires_original_main')
+                await verify_observation(manager, tx, actor, target, current, event)
             if not is_input and target['kind'] == 'background_tool':
                 from .managed_delivery import verify_observation
 

@@ -96,8 +96,18 @@ DEFAULT_REQUIRED_PARAMS: dict[str, tuple[str, ...]] = {
 }
 
 
-def validate_tool_args(tool_name: str, args: Mapping[str, Any]) -> str | None:
-    required = DEFAULT_REQUIRED_PARAMS.get(tool_name)
+def validate_tool_args(tool_name: str | ToolDefinition, args: Mapping[str, Any]) -> str | None:
+    """Validate an explicit definition, or the legacy default-catalog shorthand.
+
+    The string form only describes that catalog; it is never a registry lookup,
+    lifecycle classification or execution gate. Runtime callers must validate
+    their actual ToolRegistry registration, including renamed/overridden tools.
+    """
+    if isinstance(tool_name, ToolDefinition):
+        required = tuple(dict.fromkeys((*tool_name.required_params, *tool_name.input_schema.get('required', ()))))
+        tool_name = tool_name.name
+    else:
+        required = DEFAULT_REQUIRED_PARAMS.get(tool_name)
     if not required:
         return None
     missing = [param for param in required if param not in args]

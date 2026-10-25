@@ -202,6 +202,8 @@ async def _prepare(pipeline, attempt):
         from .tool_call_abort import read as read_abort
         attempt['value'] = _freeze(pipeline, binding, source, ref, entries)
         pipeline._native_abort_attempt = attempt['value']
+        from .review_tools import require_batch
+        await require_batch(manager, tx, actor, control_only=all(control_calls))
         if await read_abort(manager, tx, source, ref) is not None:
             raise JobError('tool_call_batch_aborted')
         existing = await read(manager, tx, source, ref, optional=True)
@@ -278,6 +280,8 @@ async def dispatch(pipeline, name, arguments, registered):
         if not await required(manager, tx, source):
             return
         declared = policy(registered, arguments, runtime=binding.runtime)
+        from .review_tools import require_tool
+        await require_tool(manager, tx, actor, declared)
         if declared.control_only:
             from .task_control import _source
             await _source(manager, tx, actor, binding.lease, ref, call_id)
@@ -369,6 +373,14 @@ async def reconcile_pending(loop, actor, source_job_id):
     if runtime is None or runtime.actor(actor.session_id) != actor or await loop.ensure_store() is not runtime.manager.store:
         raise JobError('task_runtime_required')
     manager = runtime.manager
+    from .abort_outcomes import uses_batch_route
+    async with manager._write() as tx:
+        source = await manager._authorize(tx, actor, source_job_id)
+        closed = await model(manager, tx, source)
+        batch_route = await uses_batch_route(manager, tx, source, closed)
+    if batch_route:
+        from .abort_outcomes import reconcile
+        return await reconcile(loop, actor, source_job_id)
     async with manager._write() as tx:
         source = await manager._authorize(tx, actor, source_job_id)
         closed = await model(manager, tx, source)

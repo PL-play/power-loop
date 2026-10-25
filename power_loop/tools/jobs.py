@@ -224,6 +224,7 @@ async def run_jobs(action="", **kwargs):
 JOBS_HANDLER = FunctionRuntimeTool(
     run_jobs, ToolRuntimeContract("sdk.jobs"),
     policy=lambda arguments: ToolDispatchPolicy(native_admitted=True, control_only=True),
+    reviewer=lambda spec: spec,
 )
 
 

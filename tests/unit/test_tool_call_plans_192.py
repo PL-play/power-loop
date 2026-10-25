@@ -139,14 +139,10 @@ async def test_whole_plan_transaction_never_dispatches_partial_or_unacknowledged
     [source] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='send'")
     loop, reviewer = await controller(c)
     try:
-        if stage != 'commit_ack':
-            with pytest.raises(JobError):
-                await reconcile_pending(loop, c.actor, source['job_id'])
-            assert (await c.store.get_state(c.sid)).pending == pending
-            assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='pending_call_disposition'")
-            assert reviewer.calls == 0
-            return
-        await reconcile_pending(loop, c.actor, source['job_id'])
+        staged = await reconcile_pending(loop, c.actor, source['job_id'])
+        assert staged['mode'] == 'retired_for_abort_review'
+        assert len(staged['notices']) == 1 and reviewer.calls == 0
+        assert (await c.store.get_state(c.sid)).pending is None
         await retire_pending(loop, c.actor, source['job_id'])
         with pytest.raises(JobError):
             await c.manager.finalize_supervision(c.actor, source['job_id'], generation=1)

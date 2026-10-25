@@ -165,6 +165,11 @@ async def _expected(manager, tx, source, closed):
     if snapshot is None:
         raise JobError('pending_call_snapshot_required')
     pending, calls, ref = await _verify(manager, tx, source, snapshot)
+    if snapshot['version'] == 3:
+        from .abort_outcomes import expected_disposition
+        batch = await expected_disposition(manager, tx, source, closed, optional=True)
+        if batch is not None:
+            return batch
     if pending.get('pending_interactions'):
         raise JobError('pending_call_interaction_unresolved')
     actor = JobActor(source['tenant_id'], source['principal_id'], source['session_id'])
@@ -252,6 +257,10 @@ async def negative_review_references(manager, tx, source):
     record = await _object(manager, tx, manager.events, 'payload_json', 'event_id=?', (key,), 262144)
     if record is None:
         raise JobError('pending_call_disposition_required')
+    from .abort_outcomes import MODE
+    if record.get('disposition') == MODE:
+        from .abort_outcomes import handled_references
+        return await handled_references(manager, tx, source)
     from .managed_delivery import handled_references, read, result_event
     refs = []
     for call in record['calls']:

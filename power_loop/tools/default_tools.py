@@ -2594,9 +2594,16 @@ async def _h_background_run(**kw: Any) -> Any:
                                 kw.get("tool"), kw.get("args"), kw.get("task_ids"), kw.get("timeout_s"))
 
 
+def _recall_review_spec(spec):
+    parameters = spec['function']['parameters']
+    parameters['required'] = sorted(set(parameters.get('required', [])) | {'job_id'})
+    return spec
+
+
 _h_recall_send = FunctionRuntimeTool(
     _h_recall_send, ToolRuntimeContract("sdk.recall"),
     policy=lambda arguments: ToolDispatchPolicy(native_admitted=True, control_only=arguments.get("job_id") is not None),
+    reviewer=_recall_review_spec,
 )
 
 _h_todo = FunctionRuntimeTool(

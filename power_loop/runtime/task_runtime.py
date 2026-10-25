@@ -95,6 +95,9 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
             source = await execution.runtime.manager._authorize(tx, execution.actor, execution.lease.job_id)
             if source["execution_role"] not in implementation.runtime_contract.allowed_roles:
                 raise JobError("execution_role_forbids_tool")
+    from .review_tools import require_tool
+    async with execution.runtime.manager._write() as tx:
+        await require_tool(execution.runtime.manager, tx, execution.actor, declared)
     if declared.control_only:
         from .task_control import _source
 

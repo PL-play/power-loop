@@ -260,7 +260,7 @@ async def verify_observation(manager, tx, actor, row, result, event):
         raise JobError('managed_delivery_processing_mismatch')
 
 
-async def handled_references(manager, tx, row, result, notice):
+async def handled_references(manager, tx, row, result, notice, *, verifier=None):
     from .finalization import _processing_references, _reference
     from .jobs import JobActor, JobLease
     from .processing import _fingerprint, require_event_handled
@@ -270,7 +270,7 @@ async def handled_references(manager, tx, row, result, notice):
     refs = await _processing_references(manager, tx, result)
     decision = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (refs[0]['event_id'],))
     data = json.loads(decision['payload_json'])
-    await verify_observation(manager, tx, actor, row, result, data['event'])
+    await (verifier or verify_observation)(manager, tx, actor, row, result, data['event'])
     handler = await manager._row(tx, data['handler_job_id'])
     source = {'job_id': handler['job_id'], 'generation': data['generation'],
         'executor_id': handler['executor_id'], 'boot_id': handler['boot_id']}
@@ -310,6 +310,10 @@ async def negative_review_view(manager, tx, row):
         await unstarted_references(manager, tx, row)
         from .pending_calls import ERROR, SNAPSHOT, _closed, _verify
         source = await manager._row(tx, row['parent_job_id'])
+        from .abort_outcomes import review_view
+        batch_review = await review_view(manager, tx, source, child=row)
+        if batch_review is not None:
+            return batch_review
         closed = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', ('model_closed_' + source['job_id'],))
         required_review = False
         if closed is not None:
@@ -318,7 +322,8 @@ async def negative_review_view(manager, tx, row):
                 raise JobError('pending_call_snapshot_mismatch')
             if SNAPSHOT in evidence:
                 pending, _calls, _ref = await _verify(manager, tx, source, evidence[SNAPSHOT])
-                required_review = found[0]['tool_call_id'] in pending['tool_call_ids']
+                required_review = (found[0]['tool_call_id'] in pending['tool_call_ids']
+                    and _hash(json.loads(found[0]['call_ref_json'])) == _hash(evidence[SNAPSHOT]['assistant_ref']))
         notice = await read(manager, tx, row, result, required=False)
         decision_id = 'decision_' + _hash([result['event_id'], int(result['job_version']), _hash(json.loads(result['payload_json']))])[:48]
         decision = await tx.fetchone(f'SELECT event_id,payload_json FROM {manager.events} WHERE event_id=?', (decision_id,))
