@@ -69,10 +69,21 @@ async def _main(manager, tx, row):
     return root
 
 
-async def _expected(manager, tx, row, result):
-    from .managed_effects import _proof, resolved_execution
+async def resolved_review(manager, tx, row, result):
+    from .managed_effects import ManagedToolResult, descriptor, resolved_execution, unstarted_references
+    if row['generation'] != 0:
+        return await resolved_execution(manager, tx, row, result)
+    refs = await unstarted_references(manager, tx, row)
+    payload = json.loads(result['payload_json'])
+    if result['event_id'] != 'result_' + row['job_id']:
+        raise JobError('managed_delivery_evidence_mismatch')
+    return refs, ManagedToolResult.from_dict(payload['result']['managed_effect_result']), payload['result'], await descriptor(manager, tx, row)
 
-    refs, known, _, found = await resolved_execution(manager, tx, row, result)
+
+async def _expected(manager, tx, row, result):
+    from .managed_effects import _proof
+
+    refs, known, _, found = await resolved_review(manager, tx, row, result)
     root = await _main(manager, tx, row)
     creation, binding = found
     public = {'version': 1, 'job_id': row['job_id'], 'generation': row['generation'],
@@ -145,7 +156,7 @@ async def enqueue(loop, actor, job):
             raise JobError('managed_delivery_requires_original_main')
         notice = await read(manager, tx, row, result, required=False)
         if notice is None:
-            if row['supervision_status'] == 'closed':
+            if row['supervision_status'] == 'closed' and row['generation'] != 0:
                 raise JobError('managed_delivery_already_closed')
             key = identity(manager, row)
             columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
@@ -155,8 +166,18 @@ async def enqueue(loop, actor, job):
             await tx.execute(f'UPDATE {manager.events} SET caller_session_id=? WHERE event_id=?', (actor.session_id, key))
             # Any former tool receipt describes the old pending/error boundary.
             # This new, resolved outcome now has its own processing obligation.
-            await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (result['event_id'],))
-            await tx.execute(f"UPDATE {manager.jobs} SET result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job))
+            if row['generation'] != 0:
+                await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (result['event_id'],))
+                await tx.execute(f"UPDATE {manager.jobs} SET result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job))
+            else:
+                from .pending_calls import SNAPSHOT, model
+                source = await manager._row(tx, row['parent_job_id'])
+                closed = await model(manager, tx, source)
+                pending = closed['evidence'].get(SNAPSHOT, {}).get('pending', {})
+                from .managed_effects import descriptor
+                creation, _binding = await descriptor(manager, tx, row)
+                if source['supervision_status'] == 'closed' or creation['tool_call_id'] not in pending.get('tool_call_ids', []):
+                    raise JobError('managed_delivery_negative_review_not_required')
             notice = await read(manager, tx, row, result)
         inbox = await _inbox(manager, tx, row, notice)
         response = {'job_id': job, 'generation': row['generation'], 'notification_id': notice[0]['event_id'],
@@ -182,6 +203,10 @@ async def candidates(manager, tx, actor):
         row = await manager._authorize(tx, actor, notice['job_id'])
         result = await result_event(manager, tx, row)
         await read(manager, tx, row, result)
+        if row['generation'] == 0:
+            decision_id = 'decision_' + _hash([result['event_id'], int(result['job_version']), _hash(json.loads(result['payload_json']))])[:48]
+            if await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', (decision_id,)) is not None:
+                continue
         if row['result_status'] != 'handled' and result['delivery_status'] != 'handled':
             events.append(result)
     return events
@@ -241,7 +266,7 @@ async def handled_references(manager, tx, row, result, notice):
     from .processing import _fingerprint, require_event_handled
 
     actor = JobActor(row['tenant_id'], row['principal_id'], notice[1]['main_session_id'])
-    await require_event_handled(manager, tx, result, session_id=actor.session_id, owner_job_id=None)
+    await require_event_handled(manager, tx, result, session_id=actor.session_id, owner_job_id=None, allow_suppressed=row['generation'] == 0)
     refs = await _processing_references(manager, tx, result)
     decision = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (refs[0]['event_id'],))
     data = json.loads(decision['payload_json'])
@@ -268,3 +293,45 @@ async def handled_references(manager, tx, row, result, notice):
         raise JobError('managed_delivery_processing_mismatch')
     refs.extend([await _reference(manager, tx, notice[0]['event_id']), await _reference(manager, tx, snapshot['event_id'])])
     return refs
+
+
+async def negative_review_view(manager, tx, row):
+    """Read-only projection of a negative's separate review obligation."""
+    if row['kind'] != 'background_tool' or row['generation'] != 0 or row['result_status'] != 'suppressed':
+        return None
+    from .managed_effects import descriptor, unstarted_references
+    found = await descriptor(manager, tx, row)
+    if found is None:
+        return None
+    view = {'state': 'unknown', 'notice_event_id': identity(manager, row),
+            'decision_event_id': None, 'response_ref': None}
+    try:
+        result = await result_event(manager, tx, row)
+        await unstarted_references(manager, tx, row)
+        from .pending_calls import ERROR, SNAPSHOT, _closed, _verify
+        source = await manager._row(tx, row['parent_job_id'])
+        closed = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', ('model_closed_' + source['job_id'],))
+        required_review = False
+        if closed is not None:
+            evidence = (await _closed(manager, tx, source))['evidence']
+            if ERROR in evidence:
+                raise JobError('pending_call_snapshot_mismatch')
+            if SNAPSHOT in evidence:
+                pending, _calls, _ref = await _verify(manager, tx, source, evidence[SNAPSHOT])
+                required_review = found[0]['tool_call_id'] in pending['tool_call_ids']
+        notice = await read(manager, tx, row, result, required=False)
+        decision_id = 'decision_' + _hash([result['event_id'], int(result['job_version']), _hash(json.loads(result['payload_json']))])[:48]
+        decision = await tx.fetchone(f'SELECT event_id,payload_json FROM {manager.events} WHERE event_id=?', (decision_id,))
+        if not required_review:
+            if notice is not None:
+                raise JobError('managed_delivery_unexpected_negative_review')
+            return {**view, 'state': 'not_required', 'notice_event_id': None}
+        if notice is None and decision is not None:
+            raise JobError('managed_delivery_evidence_missing')
+        if decision is None:
+            return {**view, 'state': 'pending'}
+        await handled_references(manager, tx, row, result, notice)
+        return {**view, 'state': 'handled', 'decision_event_id': decision_id,
+                'response_ref': json.loads(decision['payload_json'])['response_ref']}
+    except JobError as exc:
+        return {**view, 'error': str(exc.code)[:128]}

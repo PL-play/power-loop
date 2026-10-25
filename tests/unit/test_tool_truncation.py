@@ -10,6 +10,7 @@ from power_loop.runtime.budget import estimate_tokens
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource
 from power_loop.runtime.tool_truncation import truncate_pair
+from power_loop.tools import create_default_tool_registry
 
 
 def args(n):
@@ -60,7 +61,7 @@ async def test_off_on_keep_idempotence_and_recount(trigger):
         sid = await store.create_session()
         cfg = ToolContextConfig(hot_tail=0, overrides={'bash': {'age_retirement': 'preserve', 'insend_fuse': 'preserve',
             'retention_rounds': 16, 'argument_max_chars': 200, 'result_max_chars': 300}})
-        engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid, owner_send_index=1, llm=None, model='test')
+        engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid, owner_send_index=1, llm=None, model='test', registry=create_default_tool_registry(bind=False))
         await engine.start()
         raw = args(170)
         history = [{'role': 'assistant', 'tool_calls': [{'id': 'c', 'function': {'name': 'bash', 'arguments': raw}}]},
@@ -76,7 +77,7 @@ async def test_off_on_keep_idempotence_and_recount(trigger):
         cfg.overrides['bash']['general'] = 'truncate'
         # In-flight sends retain their snapshot; the switch takes effect next send.
         assert getattr(engine.policy(ToolSource(sid, 2, seqs[1], 'c', 'bash', {}, '')), trigger) == 'preserve'
-        engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid, owner_send_index=2, llm=None, model='test')
+        engine = ToolContextEngine(config=cfg, store=store, owner_session_id=sid, owner_send_index=2, llm=None, model='test', registry=create_default_tool_registry(bind=False))
         await engine.start()
         engine.state['archive'] = {'exposures': {f'2:{seqs[1]}': 16}}
         AgentPipeline._estimate_history_tokens(p)
@@ -108,7 +109,7 @@ async def test_background_uses_target_limits_and_keep():
     try:
         sid = await store.create_session()
         registry = ToolRegistry()
-        registry.register(ToolDefinition('bash', ''), lambda **kw: '')
+        registry.register(ToolDefinition('bash', ''), create_default_tool_registry(bind=False).get('bash').handler)
         from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
         registry.register(ToolDefinition('background_run', ''), DEFAULT_TOOL_HANDLERS['background_run'])
         config = ToolContextConfig(overrides={'bash': {'insend_fuse': 'truncate',
@@ -176,5 +177,5 @@ def test_bash_general_is_description_exit_code_and_recall_only():
     from power_loop.runtime.tool_archive import archive_text, slim_arguments
     source = ToolSource('s', 2, 7, 'c', 'bash', {'command': 'rm -rf build && make', 'description': '重新构建'},
                         'exit_code=2\nmake: *** error')
-    assert archive_text(source) == '重新构建（exit 2）\n（原文 recall_send(send_index=2, seq=7)）'
-    assert json.loads(slim_arguments(source)) == {'description': '重新构建'}
+    assert archive_text(source, create_default_tool_registry(bind=False).get('bash')) == '重新构建（exit 2）\n（原文 recall_send(send_index=2, seq=7)）'
+    assert json.loads(slim_arguments(source, create_default_tool_registry(bind=False).get('bash'))) == {'description': '重新构建'}

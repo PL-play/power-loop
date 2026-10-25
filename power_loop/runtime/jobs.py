@@ -563,6 +563,15 @@ class JobManager:
             call_ref: MessageRef | None = None, tool_call_id: str | None = None,
             system_key: str | None = None, independent: bool = False,
             request: Mapping[str, Any] | None = None) -> JobRegistration:
+        prepared = self._registration_spec(actor, kind=kind, title=title, session_id=session_id, parent=parent, call_ref=call_ref, tool_call_id=tool_call_id, system_key=system_key, independent=independent, request=request)
+        async with self._write() as tx:
+            return await self._register_job_tx(tx, actor, **prepared)
+
+    def _registration_spec(self, actor: JobActor, *, kind: str, title: str = "",
+            session_id: str | None = None, parent: JobLease | None = None,
+            call_ref: MessageRef | None = None, tool_call_id: str | None = None,
+            system_key: str | None = None, independent: bool = False,
+            request: Mapping[str, Any] | None = None) -> dict:
         if kind not in KINDS or not isinstance(title, str) or len(title) > 200 or not isinstance(independent, bool):
             raise JobError("invalid_job_spec")
         if parent is None and call_ref is not None:
@@ -577,115 +586,120 @@ class JobManager:
         key = self._origin_key(actor, "create", call_ref, tool_call_id, system_key)
         fingerprint = _hash([kind, title, session_id, parent.job_id if parent else None, independent,
                              request_data, call_ref.to_dict() if call_ref else None])
-        async with self._write() as tx:
-            old = await tx.fetchone(f"SELECT * FROM {self.events} WHERE operation_key=?", (key,))
-            if old:
-                if old["request_hash"] != fingerprint:
-                    raise JobError("operation_conflict")
-                job = await self._authorize(tx, actor, old["job_id"])
-                if effect is not None and job["job_id"] != managed_effects.job_id(self, actor, call_ref, tool_call_id):
-                    raise JobError("managed_effect_evidence_corrupt")
-                if effect is not None:
-                    await managed_effects.descriptor(self, tx, job)
-                await host_send_steps.require_replay(self, tx, actor, host_step, old["job_id"])
-                return JobRegistration(_record(job), _operation(old), True)
-            await host_send_steps.require_available(self, tx, actor, host_step)
-            if effect is not None and await self._row(tx, managed_effects.job_id(self, actor, call_ref, tool_call_id)) is not None:
-                raise JobError("managed_effect_evidence_missing")
-            if kind == "send" and parent is None and request_data.get("host_context") is not None:
-                from .root_control import _admit
-                await _admit(self, tx, actor, request_data["host_context"])
-            parent_row = await self._fence(tx, actor, parent) if parent else None
-            restored_parent = False
-            if parent_row:
-                from .workflow_restore_execution import controls_node, has_authority
-                restored_parent = parent_row["kind"] == "workflow_node" and await has_authority(self, tx, parent_row)
-                if ((restored_parent and not await controls_node(self, tx, parent_row, actor)) or
-                        (not restored_parent and (parent_row["session_id"] or parent_row["created_by_session_id"]) != actor.session_id)):
-                    raise JobError("caller_is_not_executing_parent")
-            role = parent_row["execution_role"] if parent_row else "main"
-            if (kind == "workflow" and role != "main") or (kind == "subagent" and role not in ("main", "workflow_node")):
-                raise JobError("role_forbids_delegation")
-            if kind == "workflow_node" and (not parent_row or parent_row["kind"] != "workflow"):
-                raise JobError("role_forbids_workflow_node")
-            if kind == "workflow_node":
-                from .workflow_controller import current, has_binding
-                if await has_binding(self, tx, parent_row):
-                    await current(self, tx, parent_row)
-            if independent and kind == "subagent" and role == "workflow_node":
-                raise JobError("required_child_cannot_detach")
-            role = {"workflow": "workflow", "workflow_node": "workflow_node", "subagent": "subagent"}.get(kind, role)
-            if call_ref:
-                if effect is not None:
-                    await managed_effects.validate_call(self, tx, actor, parent, call_ref, tool_call_id, effect["tool_name"], effect["arguments_hash"])
-                else:
-                    await self._validate_call(tx, actor, call_ref, tool_call_id)
-            if session_id is not None:
-                session = await tx.fetchone(f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?", (session_id,))
-                granted = restored_parent and await controls_node(self, tx, parent_row, actor, session_id)
-                if session is None or (session_id != actor.session_id and session["parent_session_id"] != actor.session_id and not granted):
-                    raise JobError("session_ownership_mismatch")
-                if kind == "send" and parent_row is not None and parent_row["kind"] != "workflow_node":
-                    from .workflow_controller import validate_dispatch
-                    await validate_dispatch(self, tx, parent_row)
-                if parent_row and parent_row["kind"] == "workflow_node" and kind == "send":
-                    bound = await tx.fetchone(f"SELECT job_id FROM {self.events} WHERE event_id=? AND event_type='node_session'",
-                        (self._node_session_event_id(parent.job_id, session_id, parent_row["generation"]),))
-                    if bound is None or bound["job_id"] != parent.job_id:
-                        raise JobError("node_session_admission_required")
-                    from .node_inputs import descriptor
-                    await descriptor(self, tx, parent_row, session_id)
-                    from .workflow_controller import for_node
-                    await for_node(self, tx, parent_row)
-            if parent is None and session_id != actor.session_id:
-                raise JobError("root_session_required")
-            if parent_row is not None and parent_row["kind"] in ("subagent", "workflow_node") and parent_row["status"] == "waiting":
-                raise JobError("owner_waiting_requires_input")
-            job_id = (managed_effects.job_id(self, actor, call_ref, tool_call_id) if effect is not None else None) or host_send_steps.job_id(self, actor, host_step) or "job_" + secrets.token_hex(16)
-            root = parent_row["root_job_id"] if parent_row else job_id
-            scope = job_id
-            if not independent and parent_row:
-                scope = (parent_row["job_id"] if parent_row["kind"] in ("workflow", "workflow_node", "subagent")
-                         else parent_row["completion_scope_job_id"])
-            owner = None
-            if parent_row and not independent:
-                # A node model send is only provenance. Its durable node scope
-                # remains the owner when that model phase has already closed.
-                owner = (await self._row(tx, parent_row["control_owner_job_id"])
-                         if parent_row["kind"] == "send" and parent_row["control_owner_job_id"] else parent_row)
-            now = self.now()
-            wait_binding = None
-            if kind == "timer" and "managed_wait" in request_data:
-                from .timer_waits import prepare_binding
+        return {'kind': kind, 'title': title, 'session_id': session_id, 'parent': parent, 'call_ref': call_ref, 'tool_call_id': tool_call_id, 'system_key': system_key, 'independent': independent, 'request': request, 'request_data': request_data, 'effect': effect, 'host_step': host_step, 'key': key, 'fingerprint': fingerprint}
 
-                wait_binding = await prepare_binding(self, tx, actor, parent_row, request_data,
-                    caller=parent, session_id=session_id, independent=independent, call_ref=call_ref,
-                    tool_call_id=tool_call_id)
-            await tx.execute(f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
-                "session_id,created_by_session_id,kind,title,completion_scope_job_id,blocks_completion,"
-                "status,version,generation,intake,resource_state,supervision_status,result_status,created_at,updated_at,"
-                "parent_generation,parent_executor_id,parent_boot_id,execution_role,control_owner_job_id,"
-                "control_owner_generation,control_owner_executor_id,control_owner_boot_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, parent.job_id if parent else None,
-                root, actor.tenant_id, actor.principal_id, session_id, actor.session_id, kind, title,
-                scope, 0 if independent or parent is None else 1, "queued", 1, 0, "open", "not_started", "open", "none", now, now,
-                parent.generation if parent else None, parent.executor_id if parent else None, parent.boot_id if parent else None,
-                role, owner["job_id"] if owner else None, owner["generation"] if owner else None,
-                owner["executor_id"] if owner else None, owner["boot_id"] if owner else None))
-            payload = {"job_id": job_id, "status": "queued"}
-            if (kind in ("send", "subagent", "workflow", "workflow_node", "timer") or effect is not None) and request is not None:
-                # Recovery must not reread a potentially edited YAML/file or
-                # reconstruct a full execution contract from a request hash.
-                payload["request"] = request_data
-            if wait_binding is not None:
-                payload["wait_binding"] = wait_binding
-            operation = await self._insert_operation(tx, job_id=job_id, version=1, actor=actor, action="create",
-                key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id,
-                payload=payload)
-            await host_send_steps.record(self, tx, actor, host_step, operation)
+    async def _register_job_tx(self, tx, actor, *, kind, title, session_id, parent, call_ref, tool_call_id, system_key, independent, request, request_data, effect, host_step, key, fingerprint):
+        from . import host_send_steps, managed_effects
+
+        old = await tx.fetchone(f"SELECT * FROM {self.events} WHERE operation_key=?", (key,))
+        if old:
+            if old["request_hash"] != fingerprint:
+                raise JobError("operation_conflict")
+            job = await self._authorize(tx, actor, old["job_id"])
+            if effect is not None and job["job_id"] != managed_effects.job_id(self, actor, call_ref, tool_call_id):
+                raise JobError("managed_effect_evidence_corrupt")
             if effect is not None:
-                await managed_effects.record_registration(self, tx, await self._row(tx, job_id), operation, effect)
-            return JobRegistration(_record(await self._row(tx, job_id)), operation, False)
+                await managed_effects.descriptor(self, tx, job)
+            await host_send_steps.require_replay(self, tx, actor, host_step, old["job_id"])
+            return JobRegistration(_record(job), _operation(old), True)
+        await host_send_steps.require_available(self, tx, actor, host_step)
+        if effect is not None and await self._row(tx, managed_effects.job_id(self, actor, call_ref, tool_call_id)) is not None:
+            raise JobError("managed_effect_evidence_missing")
+        if kind == "send" and parent is None and request_data.get("host_context") is not None:
+            from .root_control import _admit
+            await _admit(self, tx, actor, request_data["host_context"])
+        parent_row = await self._fence(tx, actor, parent) if parent else None
+        restored_parent = False
+        if parent_row:
+            from .workflow_restore_execution import controls_node, has_authority
+            restored_parent = parent_row["kind"] == "workflow_node" and await has_authority(self, tx, parent_row)
+            if ((restored_parent and not await controls_node(self, tx, parent_row, actor)) or
+                    (not restored_parent and (parent_row["session_id"] or parent_row["created_by_session_id"]) != actor.session_id)):
+                raise JobError("caller_is_not_executing_parent")
+        role = parent_row["execution_role"] if parent_row else "main"
+        if (kind == "workflow" and role != "main") or (kind == "subagent" and role not in ("main", "workflow_node")):
+            raise JobError("role_forbids_delegation")
+        if kind == "workflow_node" and (not parent_row or parent_row["kind"] != "workflow"):
+            raise JobError("role_forbids_workflow_node")
+        if kind == "workflow_node":
+            from .workflow_controller import current, has_binding
+            if await has_binding(self, tx, parent_row):
+                await current(self, tx, parent_row)
+        if independent and kind == "subagent" and role == "workflow_node":
+            raise JobError("required_child_cannot_detach")
+        role = {"workflow": "workflow", "workflow_node": "workflow_node", "subagent": "subagent"}.get(kind, role)
+        if call_ref:
+            if effect is not None:
+                await managed_effects.validate_call(self, tx, actor, parent, call_ref, tool_call_id, effect["tool_name"], effect["arguments_hash"])
+            else:
+                await self._validate_call(tx, actor, call_ref, tool_call_id)
+        if session_id is not None:
+            session = await tx.fetchone(f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?", (session_id,))
+            granted = restored_parent and await controls_node(self, tx, parent_row, actor, session_id)
+            if session is None or (session_id != actor.session_id and session["parent_session_id"] != actor.session_id and not granted):
+                raise JobError("session_ownership_mismatch")
+            if kind == "send" and parent_row is not None and parent_row["kind"] != "workflow_node":
+                from .workflow_controller import validate_dispatch
+                await validate_dispatch(self, tx, parent_row)
+            if parent_row and parent_row["kind"] == "workflow_node" and kind == "send":
+                bound = await tx.fetchone(f"SELECT job_id FROM {self.events} WHERE event_id=? AND event_type='node_session'",
+                    (self._node_session_event_id(parent.job_id, session_id, parent_row["generation"]),))
+                if bound is None or bound["job_id"] != parent.job_id:
+                    raise JobError("node_session_admission_required")
+                from .node_inputs import descriptor
+                await descriptor(self, tx, parent_row, session_id)
+                from .workflow_controller import for_node
+                await for_node(self, tx, parent_row)
+        if parent is None and session_id != actor.session_id:
+            raise JobError("root_session_required")
+        if parent_row is not None and parent_row["kind"] in ("subagent", "workflow_node") and parent_row["status"] == "waiting":
+            raise JobError("owner_waiting_requires_input")
+        job_id = (managed_effects.job_id(self, actor, call_ref, tool_call_id) if effect is not None else None) or host_send_steps.job_id(self, actor, host_step) or "job_" + secrets.token_hex(16)
+        root = parent_row["root_job_id"] if parent_row else job_id
+        scope = job_id
+        if not independent and parent_row:
+            scope = (parent_row["job_id"] if parent_row["kind"] in ("workflow", "workflow_node", "subagent")
+                     else parent_row["completion_scope_job_id"])
+        owner = None
+        if parent_row and not independent:
+            # A node model send is only provenance. Its durable node scope
+            # remains the owner when that model phase has already closed.
+            owner = (await self._row(tx, parent_row["control_owner_job_id"])
+                     if parent_row["kind"] == "send" and parent_row["control_owner_job_id"] else parent_row)
+        now = self.now()
+        wait_binding = None
+        if kind == "timer" and "managed_wait" in request_data:
+            from .timer_waits import prepare_binding
+
+            wait_binding = await prepare_binding(self, tx, actor, parent_row, request_data,
+                caller=parent, session_id=session_id, independent=independent, call_ref=call_ref,
+                tool_call_id=tool_call_id)
+        await tx.execute(f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
+            "session_id,created_by_session_id,kind,title,completion_scope_job_id,blocks_completion,"
+            "status,version,generation,intake,resource_state,supervision_status,result_status,created_at,updated_at,"
+            "parent_generation,parent_executor_id,parent_boot_id,execution_role,control_owner_job_id,"
+            "control_owner_generation,control_owner_executor_id,control_owner_boot_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, parent.job_id if parent else None,
+            root, actor.tenant_id, actor.principal_id, session_id, actor.session_id, kind, title,
+            scope, 0 if independent or parent is None else 1, "queued", 1, 0, "open", "not_started", "open", "none", now, now,
+            parent.generation if parent else None, parent.executor_id if parent else None, parent.boot_id if parent else None,
+            role, owner["job_id"] if owner else None, owner["generation"] if owner else None,
+            owner["executor_id"] if owner else None, owner["boot_id"] if owner else None))
+        payload = {"job_id": job_id, "status": "queued"}
+        if (kind in ("send", "subagent", "workflow", "workflow_node", "timer") or effect is not None) and request is not None:
+            # Recovery must not reread a potentially edited YAML/file or
+            # reconstruct a full execution contract from a request hash.
+            payload["request"] = request_data
+        if wait_binding is not None:
+            payload["wait_binding"] = wait_binding
+        operation = await self._insert_operation(tx, job_id=job_id, version=1, actor=actor, action="create",
+            key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id,
+            payload=payload)
+        await host_send_steps.record(self, tx, actor, host_step, operation)
+        if effect is not None:
+            await managed_effects.record_registration(self, tx, await self._row(tx, job_id), operation, effect)
+        return JobRegistration(_record(await self._row(tx, job_id)), operation, False)
+
 
     async def claim_job(self, actor: JobActor, job_id: str, *, executor_id: str, boot_id: str,
                         expected_version: int, lease_ms: int = 30000) -> JobLease:

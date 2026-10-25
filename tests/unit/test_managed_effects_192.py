@@ -43,6 +43,13 @@ async def scenario(
     completion_failure=None,
     invalid_result=None,
     max_result_chars=4096,
+    call_count=1,
+    unstarted_failure=None,
+    configure=None,
+    inspect_prepare=None,
+    expected_error=None,
+    call_names=None,
+    argument_text="hello",
 ):
     store, _ = registry_store
     sid = await store.create_session()
@@ -66,6 +73,10 @@ async def scenario(
         boot_contract_hash="b" * 64 if budgeted else None,
         budget_config=budget,
     )
+    fault = None
+    if unstarted_failure is not None:
+        from ._unstarted_faults_192 import fail_unstarted_once
+        fault = fail_unstarted_once(manager, unstarted_failure)
     if completion_failure is not None:
         from ._managed_completion_faults_192 import fail_completion_once
 
@@ -109,6 +120,8 @@ async def scenario(
 
     async def prepare(context, arguments):
         state.prepared += 1
+        if inspect_prepare is not None:
+            await inspect_prepare(context, arguments)
         if prepare_failure:
             raise RuntimeError("prepare failed before any API dispatch")
         return ManagedToolPreparation({"original_call": context.tool_call_id, "text": arguments["text"]})
@@ -178,10 +191,10 @@ async def scenario(
                     token_usage=LLMTokenUsage(prompt_tokens=5, completion_tokens=5, total_tokens=10),
                     tool_calls=[
                         {
-                            "id": "original-call",
+                            "id": "original-call" if index == 0 else f"original-call-{index + 1}",
                             "type": "function",
-                            "function": {"name": tool_name, "arguments": '{"text":"hello"}'},
-                        }
+                            "function": {"name": name, "arguments": json.dumps({"text": argument_text}, separators=(",", ":"))},
+                        } for index, name in enumerate(call_names or [tool_name] * call_count)
                     ],
                 )
             return LLMResponse(
@@ -211,11 +224,15 @@ async def scenario(
         ),
     )
     try:
+        if configure is not None:
+            await configure(loop, state)
         try:
             result = await asyncio.wait_for(loop.send("Post the original effect once", sid), 10)
-        except OSError as exc:
+        except (OSError, JobError) as exc:
             expected_failure = (receipt_bind_failure and str(exc) == "test_original_receipt_store_unavailable"
-                                or raw_receipt_failure and str(exc) == 'test_original_raw_tool_unavailable')
+                                or raw_receipt_failure and str(exc) == 'test_original_raw_tool_unavailable'
+                                or unstarted_failure and str(exc) == 'test_unstarted_' + unstarted_failure
+                                or expected_error is not None and str(exc) == expected_error)
             if not expected_failure:
                 raise
             result = SimpleNamespace(status="interrupted", error=str(exc))
@@ -224,12 +241,14 @@ async def scenario(
             runtime=runtime,
             manager=manager,
             adapter=adapter,
+            registry=registry,
             state=state,
             model=model,
             result=result,
             sid=sid,
             actor=runtime.actor(sid),
             host=host,
+            fault=fault,
         )
     finally:
         await loop.aclose(drain_timeout_s=0.1)
@@ -290,10 +309,24 @@ async def test_failed_preparation_is_known_not_dispatched_and_does_not_stick_pen
     assert child["supervision_status"] == "closed"
 
 
-async def test_result_capacity_is_checked_before_creating_or_dispatching_effect(registry_store):
-    c = await scenario(registry_store, capacity=16)
-    assert c.state.prepared == c.state.dispatched == 0
-    assert not await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='background_tool'")
+@pytest.mark.parametrize("tool_name", ["post_once", "commit_record"])
+async def test_result_capacity_is_checked_before_claiming_or_dispatching_effect(registry_store, tool_name):
+    from power_loop.runtime.managed_effects import terminate_unstarted
+
+    c = await scenario(registry_store, capacity=16, tool_name=tool_name)
+    assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
+    [intent] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+    assert intent['generation'] == 0 and intent['executor_id'] is intent['lease_until_ms'] is None
+    assert intent['resource_state'] == 'stopped' and intent['supervision_status'] == 'closed'
+    assert intent['outcome'] == 'cancelled' and intent['result_status'] == 'suppressed'
+    assert (await terminate_unstarted(c.manager, c.actor, intent['job_id']))['resolution'] == 'not_dispatched'
+    assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type IN ('execution_scope','managed_effect_prepared','managed_effect_dispatch','managed_effect_resource_exit','managed_effect_tool_receipt')", (intent['job_id'],))
+    [raw] = await c.manager.db.fetchall(f"SELECT content FROM {c.store.t.messages} WHERE role='tool'")
+    assert raw['content'] == 'Error: managed_effect_result_capacity_unavailable'
+    from power_loop.runtime.tool_contracts import format_result
+    registered = c.registry.get(tool_name)
+    for unsafe in ['Error: ', 'Error: ' + 'a' * 129, 'Error: BAD CODE', 'Error: 错误', 'ordinary business output']:
+        assert format_result(registered, unsafe, 16) is None
 
 
 @pytest.mark.parametrize("tool_name", ["commit_record", "set_beacon"])
@@ -319,7 +352,7 @@ async def test_base_requires_lifecycle_methods_and_supported_resource_contract()
             ManagedToolContract("generic.tool", "a" * 64, **kwargs)
 
 
-@pytest.mark.parametrize("old_protocol", [5, 6, 7, 8, 9, 10])
+@pytest.mark.parametrize("old_protocol", [5, 6, 7, 8, 9, 10, 11])
 async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identity(
     registry_store, monkeypatch, old_protocol
 ):
@@ -342,7 +375,7 @@ async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identit
     assert await store.message_ref(sid, seq) == ref
     assert (
         await manager.db.fetchone(f"SELECT store_id,protocol_version FROM {manager.prefix}task_store WHERE id=1")
-    ) == {"store_id": store.store_id, "protocol_version": 11}
+    ) == {"store_id": store.store_id, "protocol_version": 12}
     with monkeypatch.context() as patch:
         patch.setattr(jobs, "TASK_PROTOCOL_VERSION", old_protocol)
         with pytest.raises(JobError, match="store_identity_changed"):
@@ -506,16 +539,17 @@ async def test_unclaimed_effect_cancels_and_closes_without_callbacks_or_fake_too
 
     c = await scenario(registry_store, budgeted=True, claim_failure=True)
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
-    assert c.model.calls == c.host.reserve_calls == 1
+    assert c.model.calls == c.host.reserve_calls == 2
     [row] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-    assert row["generation"] == 0 and row["resource_state"] == "not_started"
+    assert row["generation"] == 0 and row["resource_state"] == "stopped"
+    assert row["result_status"] == "suppressed" and row["supervision_status"] == "closed"
     observed = await read_raw_receipt(c.manager, c.actor, row["job_id"])
     assert not observed["acknowledges_result"] and observed["call_ref"]["id"] != observed["receipt_ref"]["id"]
     raw = await c.manager.db.fetchone(
         f"SELECT * FROM {c.store.t.messages} WHERE id=?", (int(observed["receipt_ref"]["id"]),)
     )
     assert "test_claim_not_started" in raw["content"]
-    assert c.result.status == "degraded"
+    assert c.result.status == "completed"
     result = await terminate_unstarted(c.manager, c.actor, row["job_id"])
     assert result["resolution"] == "not_dispatched" and not result["tool_receipt_written"]
     assert not result["execution_authority"] and not result["billing_settled"]
@@ -534,15 +568,18 @@ async def test_unclaimed_effect_cancels_and_closes_without_callbacks_or_fake_too
         )
         == raw
     )
-    assert c.state.dispatched == 0 and c.model.calls == c.host.reserve_calls == 1
+    assert c.state.dispatched == 0 and c.model.calls == c.host.reserve_calls == 2
 
 
 async def test_unclaimed_cancel_and_closure_roll_back_as_one_transaction(registry_store, monkeypatch):
     from power_loop.runtime import finalization
     from power_loop.runtime.managed_effects import terminate_unstarted
 
-    c = await scenario(registry_store, claim_failure=True)
+    c = await scenario(registry_store, claim_failure=True, receipt_bind_failure=True)
     [before] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
+
+    assert before["generation"] == 0 and before["resource_state"] == "not_started"
+    assert before["supervision_status"] == "open" and c.model.calls == 1
 
     async def fail(*args):
         raise RuntimeError("closure write failed")
@@ -747,7 +784,7 @@ async def test_protocol_seven_original_pending_receipt_can_be_upgraded_and_reind
     await reconcile(c.runtime, c.actor, job["job_id"], c.adapter)
     await c.manager.finalize_supervision(c.actor, job["job_id"], generation=1)
     assert (await c.manager.get_job(c.actor, job["job_id"])).supervision_status == "closed"
-    assert jobs.TASK_PROTOCOL_VERSION == 11
+    assert jobs.TASK_PROTOCOL_VERSION == 12
 
 
 async def test_claim_membership_survives_lost_ack_and_cannot_be_relabelled_unclaimed(registry_store):

@@ -213,6 +213,9 @@ class SQLiteSink:
         if role == "assistant":
             tool_calls = message.get("tool_calls")
             text, structured = _encode_content(message.get("content"))
+            from power_loop.runtime.task_runtime import atomic_pending_required
+            options = ({"pending_tool_calls": True}
+                       if tool_calls and atomic_pending_required(self.store, self.session_id) else {})
             seq = await self.store.append_message(
                 self.session_id,
                 role="assistant",
@@ -222,6 +225,7 @@ class SQLiteSink:
                 meta=_meta_with_content_encoding(message.get("meta"), structured=structured),
                 send_index=message.get("send_index"),
                 hook_injected=message.get("hook_injected"),
+                **options,
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)

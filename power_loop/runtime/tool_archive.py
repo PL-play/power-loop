@@ -28,41 +28,32 @@ def _archive(state: dict) -> dict:
     return state.get(ARCHIVE_KEY) or state.get(_LEGACY_ARCHIVE_KEY) or {}
 
 
-def slim_arguments(source: ToolSource) -> str:
-    """Arguments left on a rewritten call. No marker key: the recall note sits after the result."""
-    if source.name == 'bash' and source.arguments.get('description'):
-        return _json({'description': str(source.arguments['description'])})
-    return '{}'
+def slim_arguments(source: ToolSource, registered=None) -> str:
+    """Default is empty arguments; an implemented view may retain a useful label."""
+    from .tool_contracts import context_presentation
+    return context_presentation(registered, source).archive_arguments or '{}'
 
 
-def archive_label(source: ToolSource) -> str:
-    """What the call was for, without its body: bash description + exit code, skill name, else
-    short arguments."""
-    if source.name == 'bash':
-        from power_loop.runtime.tool_truncation import bash_exit
-        code = bash_exit(source.result).removeprefix('exit_code=')
-        description = str(source.arguments.get('description') or '')
-        return f'{description}（exit {code}）' if code else description or '(bash)'
-    if source.name == 'load_skill':
-        label = str(source.arguments.get('name') or source.arguments.get('skill') or source.arguments.get('path') or '')
-        if source.arguments.get('doc'):
-            label += '/' + str(source.arguments['doc'])
-        if label:
-            return label
+def archive_label(source: ToolSource, registered=None) -> str:
+    """Use the implemented label, otherwise bounded generic arguments."""
+    from .tool_contracts import context_presentation
+    label = context_presentation(registered, source).archive_label
+    if label is not None:
+        return label
     args = {k: v for k, v in source.arguments.items() if k not in ('context_policy', '_distilled')}
     text = _json(args)
     return text if len(text) <= 160 else text[:160] + '…'
 
 
-def archive_text(source: ToolSource) -> str:
-    """``archive``: only what the call was for, then the recall note. No result text."""
-    return f'{archive_label(source)}\n{recall_note(source.recall)}'
+def archive_text(source: ToolSource, registered=None) -> str:
+    return f'{archive_label(source, registered)}\n{recall_note(source.recall)}'
 
 
 async def _derive(engine, source, trigger, level, raw_arguments=None):
     if not getattr(engine, '_implementation_matches', True):
         return None
     policy = engine.policy(source)
+    registered = engine.registry.get(source.name) if engine.registry else None
     if policy.hard_preserve:
         return None
     if engine.is_result_container(source):
@@ -77,33 +68,29 @@ async def _derive(engine, source, trigger, level, raw_arguments=None):
                         {'tool': t.name, 'task_id': t.call_id, 'arguments': dict(t.arguments), 'result': t.result}
                         for t in targets]})
             return None
-        return slim_arguments(source), '\n'.join(
+        return slim_arguments(source, registered), '\n'.join(
             f'{t.name} task={t.call_id}: {v[1]}' for t, v in zip(targets, values, strict=True))
     strategy = policy.general if level == 2 else policy.strategy(trigger)
-    # bash context_policy=keep: unchanged for the whole send (both fuse levels); between sends
-    # it is distilled by general like any other call.
-    if (trigger != 'general' and source.name == 'bash'
-            and source.arguments.get('context_policy') == 'keep'):
+    if engine.preserves_context(source, trigger):
         return None
     from .tool_contracts import format_result
-    registered = engine.registry.get(source.name) if engine.registry else None
     view = format_result(registered, source.result, policy.result_max_chars or 600)
     if view is not None:
         return _json(dict(source.arguments)), view
     if strategy == 'preserve':
         return None
     if strategy == 'archive':
-        return slim_arguments(source), archive_text(source)
+        return slim_arguments(source, registered), archive_text(source, registered)
     if strategy == 'truncate':
-        from power_loop.runtime.tool_truncation import truncate_view
-        return truncate_view(source.name, raw_arguments or _json(dict(source.arguments)), dict(source.arguments),
-                             source.result, policy, source.recall)
+        from .tool_contracts import truncate_context
+        return truncate_context(registered, source, policy,
+                                raw_arguments=raw_arguments or _json(dict(source.arguments)))
     # Preserve extension points (rule / precomputed llm_summary), without recursively
     # applying a truncation to its own preview. The original source is always used.
     call_trigger = 'general' if level == 2 else trigger
     effective = replace(policy, **{call_trigger: strategy})
     text = await engine.distill(source, call_trigger, policy_override=effective)
-    return (slim_arguments(source), text) if text is not None else None
+    return (slim_arguments(source, registered), text) if text is not None else None
 
 
 async def _commit(engine, patch):
@@ -211,10 +198,10 @@ async def _merge_history(engine, pipeline):
         refs = [{'send_index': x.send_index, 'seq': x.seq, 'call_seq': b[2],
                  'call_id': x.call_id, 'name': x.name} for b, x in zip(batch, sources, strict=True)]
         gid = 'g' + _hash({'sid': engine.sid, 'refs': refs, 'version': engine.config.rule_version})[:24]
-        text = group_text([archive_label(x) for x in sources], pipeline.send_index, gid)
+        text = group_text([archive_label(x, engine.registry.get(x.name) if engine.registry else None) for x in sources], pipeline.send_index, gid)
         groups[gid] = {'send_index': pipeline.send_index, 'members': refs}
         view_groups.append({'send_index': pipeline.send_index, 'seqs': list(seqs[batch[0][0]:batch[-1][1] + 1]),
-            'call_id': sources[0].call_id, 'arguments': slim_arguments(sources[0]), 'result': text})
+            'call_id': sources[0].call_id, 'arguments': slim_arguments(sources[0], engine.registry.get(sources[0].name) if engine.registry else None), 'result': text})
     if batches:
         await _commit(engine, {'groups': groups, 'view_groups': view_groups})
         _restore_groups(engine, pipeline)

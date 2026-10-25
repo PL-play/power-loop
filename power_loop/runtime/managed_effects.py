@@ -251,6 +251,28 @@ class _Handler(RuntimeTool):
         self.check(runtime, self.definition.name, self.definition)
         return ToolDispatchPolicy(native_admitted=True)
 
+    def format_result(self, result, max_chars):
+        # A compact SDK error must stay readable even below the normal display
+        # capacity. This is a view of the actual registered implementation,
+        # not a tool-name exception or a successful result acknowledgement.
+        prefix = "Error: "
+        if type(result) is str and result.startswith(prefix):
+            code = result[len(prefix):]
+            if (0 < len(code) <= 128 and code[0].isascii() and code[0].islower()
+                    and all(c.isascii() and (c.islower() or c.isdigit() or c == '_') for c in code)):
+                return result
+        return None
+
+    def pending_call_spec(self, arguments, *, runtime=None, definition=None):
+        self.check(runtime, definition.name, definition)
+        return {"kind": "managed_effect", "request": {FIELD: {
+            "version": 1, "adapter_key": self.adapter.contract.key,
+            "contract_hash": self.adapter.contract.implementation_hash,
+            "tool_name": definition.name, "schema_hash": self.schema_hash,
+            "arguments_hash": _hash(_document(arguments, 131072)),
+            "contract": self.adapter.contract.to_dict(),
+        }}}
+
     def check(self, runtime, tool_name, definition):
         current = _authority(runtime)
         if (
@@ -589,7 +611,7 @@ async def descriptor(manager, tx, row):
         raise JobError("managed_effect_evidence_corrupt") from None
 
 
-async def require_source_resolved(manager, tx, source):
+async def require_source_resolved(manager, tx, source, *, invocation=None):
     rows = await tx.fetchall(
         f"SELECT * FROM {manager.jobs} WHERE parent_job_id=? AND kind='background_tool' ORDER BY job_id LIMIT 1001",
         (source["job_id"],),
@@ -601,6 +623,9 @@ async def require_source_resolved(manager, tx, source):
         if found is None:
             continue
         if row["generation"] == 0:
+            from .tool_call_plans import queued_for_call
+            if await queued_for_call(manager, tx, row, source, invocation):
+                continue
             await unstarted_references(manager, tx, row)
             continue
         if row["resource_state"] != "stopped":
@@ -624,7 +649,7 @@ async def _invoke_original(handler, execution, arguments, slot):
         raise JobError("persisted_tool_call_required")
     ref = await manager.store.message_ref(actor.session_id, seq)
     async with manager._write() as tx:
-        await require_source_resolved(manager, tx, await manager._row(tx, execution.lease.job_id))
+        await require_source_resolved(manager, tx, await manager._row(tx, execution.lease.job_id), invocation=(seq, call_id))
         await validate_call(
             manager, tx, actor, execution.lease, ref, call_id, handler.definition.name, _hash(arguments)
         )
@@ -639,15 +664,15 @@ async def _invoke_original(handler, execution, arguments, slot):
             "contract": handler.adapter.contract.to_dict(),
         }
     }
-    registration = await manager.register_job(
-        actor,
-        kind="background_tool",
-        title=handler.definition.name,
-        parent=execution.lease,
-        call_ref=ref,
-        tool_call_id=call_id,
-        request=request,
-    )
+    from .tool_call_plans import adopt
+    async with manager._write() as tx:
+        source = await manager._fence(tx, actor, execution.lease)
+        registration = await adopt(manager, tx, source, ref, call_id, request)
+    if registration is None:
+        registration = await manager.register_job(
+            actor, kind="background_tool", title=handler.definition.name,
+            parent=execution.lease, call_ref=ref, tool_call_id=call_id, request=request,
+        )
     if registration.replayed:
         raise JobError("managed_effect_original_requires_reconciliation")
     binding = await runtime.claim(actor, registration)
@@ -831,7 +856,7 @@ async def _never_claimed(manager, tx, row):
     ):
         raise JobError("managed_effect_unstarted_conflict")
     history = await tx.fetchone(
-        f"SELECT event_id FROM {manager.events} WHERE job_id=? AND (event_type IN ('execution_scope','execution_member') OR event_type LIKE 'managed_effect_%' AND event_type NOT IN ('managed_effect_registered','managed_effect_unstarted','managed_effect_raw_receipt')) LIMIT 1",
+        f"SELECT event_id FROM {manager.events} WHERE job_id=? AND (event_type IN ('execution_scope','execution_member') OR event_type LIKE 'managed_effect_%' AND event_type NOT IN ('managed_effect_registered','managed_effect_unstarted','managed_effect_raw_receipt','managed_effect_delivery')) LIMIT 1",
         (row["job_id"],),
     )
     children = await tx.fetchone(

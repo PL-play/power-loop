@@ -66,6 +66,5 @@ def truncate_bash(arguments: dict, result: str, policy: ToolContextPolicy, recal
 
 def truncate_view(name: str, raw: str, arguments: dict, result: str, policy: ToolContextPolicy,
                   recall: str) -> tuple[str, str] | None:
-    if name == 'bash':
-        return truncate_bash(arguments, result, policy, recall)
+    # Compatibility helper: names carry no presentation authority.
     return truncate_pair(raw, result, policy, recall)

@@ -245,8 +245,10 @@ async def commit(manager, actor, caller, *, snapshot_id, response_ref, decision=
                 "(event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?)", (decision_id, target["job_id"], "processing_decision", target["version"]+1,
                     actor.session_id, fingerprint, _json(payload), "committed", manager.now()))
-            await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (event["event_id"],))
-            if not is_input:
+            negative_review = not is_input and target['kind'] == 'background_tool' and target['generation'] == 0
+            if not negative_review:
+                await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (event["event_id"],))
+            if not is_input and not negative_review:
                 await tx.execute(f"UPDATE {manager.jobs} SET result_status='handled',version=version+1,updated_at=? WHERE job_id=?",
                                  (manager.now(), target["job_id"]))
             else:
@@ -290,9 +292,9 @@ async def require_inputs_handled(manager, tx, job):
             raise JobError("required_input_unhandled") from exc
 
 
-async def require_event_handled(manager, tx, result, *, session_id, owner_job_id):
+async def require_event_handled(manager, tx, result, *, session_id, owner_job_id, allow_suppressed=False):
     from .jobs import JobError, _hash
-    if result["delivery_status"] != "handled":
+    if type(allow_suppressed) is not bool or result["delivery_status"] not in (("handled", "suppressed") if allow_suppressed else ("handled",)):
         raise JobError("required_result_unhandled")
     if result.get("action") == "nudge":
         from .input_dispositions import read_tx

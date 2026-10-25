@@ -391,6 +391,7 @@ class SessionStore:
         send_index: int | None = None,
         hook_injected: dict[str, Any] | None = None,
         inbox: Mapping[str, Any] | None = None,
+        pending_tool_calls: bool = False,
     ) -> int:
         """Append one message and return its allocated per-session ``seq`` (allocated +
         inserted atomically in one transaction). ``send_index`` is the authoritative per-session
@@ -404,11 +405,20 @@ class SessionStore:
 
         ``inbox`` (``{"claim_token": str, "ids": [row ids]}``) marks those claimed inbox rows
         ``delivered`` — pointing at this message's seq — in the SAME transaction, so an inbox
-        item is in the transcript iff it is marked delivered (see :meth:`inbox_claim`)."""
+        item is in the transcript iff it is marked delivered (see :meth:`inbox_claim`).
+
+        ``pending_tool_calls=True`` atomically records this assistant row and its
+        unresolved calls. It refuses to overwrite existing pending state. Native
+        sinks use it so a crash before later pipeline callbacks cannot lose the
+        original intention. The default preserves ordinary raw-append behavior."""
+        if type(pending_tool_calls) is not bool or pending_tool_calls and (role != "assistant" or not tool_calls):
+            raise ValueError("invalid_pending_tool_message")
         now = _now_ms()
         async with self._db.transaction() as tx:
             st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
             seq = int(st["next_seq"])
+            if pending_tool_calls and st["pending_json"] is not None:
+                raise ValueError("pending_tool_calls_exist")
             if inbox is not None:
                 token, raw_ids = inbox.get("claim_token"), inbox.get("ids")
                 if not isinstance(token, str) or not token or not isinstance(raw_ids, (list, tuple)) or not raw_ids:
@@ -450,6 +460,13 @@ class SessionStore:
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
             )
+            if pending_tool_calls:
+                pending = {"assistant_seq": seq, "round_index": round_index,
+                           "tool_call_ids": [str(call.get("id") or "") for call in tool_calls
+                                             if isinstance(call, Mapping) and call.get("id")],
+                           "tool_calls": tool_calls}
+                await tx.execute(f"UPDATE {self.t.session_state} SET pending_json=? WHERE session_id=?",
+                                 (_dumps(pending), session_id))
             if hook_injected:
                 # Per-session monotonic event_id; MAX+1 is race-free here because we hold the
                 # session_state lock for the whole append (serializes same-session writers).

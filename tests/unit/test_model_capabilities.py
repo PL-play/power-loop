@@ -87,7 +87,7 @@ def test_undeclared_model_gets_a_placeholder_that_says_it_did_not_see_the_image(
     assert isinstance(text, str)
     assert "shot.png" in text                     # 指明是哪张图
     assert "看不了图片" in text and "没有看到" in text  # 模型不会以为自己看过
-    assert "see_image" in text                    # 给出路
+    assert "回取原图" in text and "see_image" not in text  # 不推荐宿主专有或不存在的工具
 
 
 def test_placeholder_carries_the_hosts_recall_coordinate(tmp_path) -> None:

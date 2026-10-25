@@ -41,6 +41,7 @@ the SDK lifecycle interfaces for its actual resource type.
 | `format_result(result, max_chars)` | Optional structured result view. Default preserves normal formatting. |
 | `context_spec(spec)` | Optional model-facing schema when tool-context preparation is enabled. It may adapt its own copied spec and must retain the registered name. |
 | `background_hint(definition, scheduler_name=...)` | An implemented scheduler describes how to submit a target using its actual registered name. |
+| `pending_call_spec(arguments, runtime=..., definition=...)` | Pure description of supported original-call recovery; default `None` keeps an unsupported obligation and grants no execution. |
 | `result_sources(source, store=..., registry=...)` | A declared result container reads original target results; it must not start tasks or make paid requests. |
 
 `background_allowed=False` forbids placing this entry inside another background
@@ -128,3 +129,58 @@ contract. The DeepTalk progress and timer guards do this while retaining their
 product-specific validations in the host. Contracts, including presentation
 metadata, remain bound to the actual registration; an alias, wrapper or subset
 cannot authorize a changed implementation.
+
+## Context presentation
+
+Context preparation also consumes the actual registered implementation:
+
+- `context_presentation(source)` returns `ToolContextPresentation`, with an
+  optional archival label, JSON-object argument view and strict boolean
+  `keep_in_send`. The default is a generic view without in-send preservation.
+- `truncate_context(source, policy, raw_arguments=...)` returns an optional
+  `(arguments_json, result_text)` pair. The default uses generic bounded
+  previews; `None` keeps the original pair.
+
+These methods are pure views of an existing call. They must not execute tools,
+start jobs, call a provider or acknowledge results. They grant no execution,
+role, native admission, background or recovery capabilities. Context readers
+revalidate the actual registration before using the methods. Invalid return
+shapes are rejected.
+
+The SDK shell owns its command/output truncation, purpose/exit-code labels and
+`context_policy=keep` interpretation. The SDK skill reader owns its skill/doc
+label. Both work under aliases and `functools.wraps` wrappers. A plain handler
+called `bash` or `load_skill` receives the generic presentation. The explicit
+`truncate_bash` format helper remains callable, while legacy `truncate_view`
+and archival helpers without a registered implementation use generic views.
+
+In-send preservation applies to both fuse levels and to targets of result
+containers. Between sends, normal `general` policy still applies. Group archives
+use implemented labels and keep exact original recall coordinates. Persisted
+patches remain idempotent across restarts; the projection cache version changes
+for this presentation protocol. Original message rows remain untouched and
+readable even when a current implementation is absent.
+
+Hosts can subclass `RuntimeTool` to provide the same presentation extension
+without inheriting a shell, skill reader or platform-specific class. Business
+message routing and conversation authorization remain host responsibilities.
+SDK job kinds, execution roles, built-in catalogs, persisted state keys and
+historical named configuration are data contracts, not tool-name admission.
+
+Skill-reader guidance uses `skill.read.v1` on the actual registry and respects
+selected tool names. The default skill reader declares it; an ordinary handler
+named `load_skill` supplies no implemented reader guidance. Runtime prompt
+assembly passes its registry to the skill section rather than advertising a
+fixed entry name. Standalone SDK catalog helpers keep their catalog-preview role.
+
+Yield statistics use `task.yield.v1`. An implemented yield call is excluded from
+`pass_progress().work_tools` under aliases and wrappers. A plain handler called
+`pass_turn` counts as a work call; its name cannot stop the loop. Actual yielding
+still requires the existing `request_pass()` effect. Declaring the capability
+only describes statistics and grants no native admission or control permission.
+The host's guarded yield tool explicitly declares the capability while retaining
+its own business checks. Without a registry, the statistics helper cannot infer
+semantic yield from a name.
+
+Image placeholders retain the original filename and opaque host recall reference.
+Their wording does not assume any platform-specific image tool is installed.

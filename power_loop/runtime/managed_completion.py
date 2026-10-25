@@ -46,7 +46,7 @@ class CompletionCache:
         if key in self._slots:
             raise JobError('managed_effect_original_requires_reconciliation')
         # Bounds active callbacks plus completed-but-unsaved checkpoints. Fail
-        # before registration/prepare/dispatch; never drop an unresolved entry.
+        # before claiming/prepare/dispatch; never drop an unresolved entry.
         if len(self._slots) >= 1000:
             raise JobError('managed_completion_capacity_reached')
         slot = _Slot(key, actor)

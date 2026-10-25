@@ -1,7 +1,7 @@
 # Managed finite tool recovery (development)
 
 This prototype is not connected to the default native host. The candidate task
-protocol is 9; production activation, package publication and migrations are
+protocol is 12; production activation, package publication and migrations are
 separate gates. The supported resource is one finite callback with no detached
 work or untracked paid requests. Other resource models need their actual
 lifecycle interfaces and tests.
@@ -33,7 +33,8 @@ result write fails.
 
 The SDK retains actual unsaved completions in a bounded, runtime-bound cache.
 At most 1000 active or completed-but-unsaved entries are admitted; exhaustion
-rejects a new call before registration, preparation or dispatch. It never drops
+rejects a new call before claiming, preparation or dispatch. A pre-registered
+batch intention is retained until its independently verified negative closure. It never drops
 an unresolved entry to make room. Each completion document has the same 64 KiB
 bound as the persisted checkpoint. An ordinary known result leaves no retained
 entry after successful publication.
@@ -162,3 +163,79 @@ This is a component candidate, not default host activation. It does not complete
 a restart supervisor, arbitrary pending-tool recovery, workflow owner recovery,
 business API integration or final fee reconciliation. Production maintenance is
 explicit; protocol 11 prevents older writers from ignoring the new obligations.
+
+## Whole original call batches (development protocol 12)
+
+Before any native tool callback, the SDK retains the complete original ordered
+assistant call set, its actual registrations, schema, runtime contracts and
+argument hashes. Eligible `RuntimeTool.pending_call_spec` implementations describe
+managed finite effects. The SDK atomically registers their generation-zero
+intentions together with a bounded plan and independent seal. The method is a
+pure description, not an execution or recovery callback. Plain or missing tools
+remain explicit unsupported entries; their absence never proves non-dispatch.
+
+The assistant message and its pending marker are committed in one store
+transaction for an actual native send. Plan persistence follows that original
+write. If a later sink hook, plan write, registration, commit or commit ACK fails,
+no callback can run without the complete acknowledged plan. Original raw/pending
+responsibility remains visible. A durable plan alone cannot authorize execution:
+the same send must retain its actual process-local `RegisteredTool` objects.
+Replacement with the same schema/contract, re-registering the same handler, or
+reopening in another process does not transfer that authority. Dispatch checks
+the original binding after admission waits and hooks.
+
+Generation-zero intention registration is not a resource start. A capacity or
+admission error may therefore leave an intention without claiming it. After the
+actual raw error receipt is bound, the SDK atomically closes a proven never-claimed
+intention as `not_dispatched`; no prepare/execute/recover, callback-exit proof,
+success receipt or processing ACK is invented. Compact SDK error codes retain
+their bounded error view even when the success-result capacity is insufficient.
+Generic consumers still use the registered implementation's `format_result`.
+
+After a trusted actual original-main model exit, the host may call:
+
+```python
+from power_loop.runtime.tool_call_plans import reconcile_pending
+from power_loop.runtime.pending_calls import retire_pending
+
+await reconcile_pending(loop, original_main_actor, original_send_job_id)
+await retire_pending(loop, original_main_actor, original_send_job_id)
+```
+
+Reconciliation first validates the entire captured pending set and sealed plan.
+Every member must have either an exact never-claimed proof or an actual exited
+finite execution with a known canonical result. Only then are generation-zero
+negatives closed and original-main notifications staged. These operations are
+idempotent but are not a single transaction across all notices; a later failure
+retains earlier durable records for exact replay. Unsupported members, missing
+plans, unknown execution/outcomes and workflow/subagent owners remain blocked.
+No callback or model is invoked and no missing `role=tool` row is manufactured.
+Retirement keeps the exact original pending disposition. Neither port grants new
+quota, claims a generation or acknowledges processing.
+
+A generation-zero negative permanently retains canonical `suppressed` status and
+its independent supervision-close proof. When its raw reply was lost, its
+original source still needs an actual main review before source closure. Query
+results expose this separate read-only `processing_obligation`: `not_required`,
+`pending`, `handled` or `unknown`, with original notice/decision/response pointers.
+Physically closed negatives are not permanent active zombies; a pending or
+corrupt review is still active. Querying never acknowledges a result. Only the
+actual original main's visible notice, persisted response and clean model exit
+can satisfy that obligation, under the original remaining budget. Coalesced
+notices retain exact raw-message validation; hiding one part cannot acknowledge
+the modified message's other part.
+
+The plan is limited to 64 calls and 256 KiB, with existing original-call and
+pending bounds unchanged. Explicit maintenance upgrades protocols through 11 to
+12 without rewriting original IDs; default SDK/host activation is a separate
+step. Recovery for unsupported/missing plans, claimed-before-preparation crashes
+and child-owner pending batches still needs its own supported evidence/adapter.
+This candidate is not an activation or completion of the overall async project.
+
+A wholly control-only batch uses the same original-source control gate as each
+actual registered implementation. It may inspect or request a stop after lease
+expiry, while retaining exact original message, scope and binding checks. It
+registers no managed effect and grants no new model request. A plain same-named
+handler, a batch containing a new effect, or a recovery description that would
+register an effect still requires the ordinary execution fence. This rule is
+classified by `ToolDispatchPolicy.control_only`, never by catalog names.

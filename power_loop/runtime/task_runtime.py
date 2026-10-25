@@ -58,7 +58,7 @@ def reject_unregistered_adapter(name: str, loop=None) -> None:
         raise JobError("task_adapter_unavailable:" + name)
 
 
-async def check_dispatch(session_id: str | None) -> None:
+async def check_dispatch(session_id: str | None, *, invocation=None) -> None:
     execution = _SEND.get()
     if execution is not None and execution.actor.session_id == session_id:
         execution.runtime.check_local_admission()
@@ -68,7 +68,7 @@ async def check_dispatch(session_id: str | None) -> None:
         from .managed_effects import require_source_resolved
         async with execution.runtime.manager._write() as tx:
             await require_source_resolved(execution.runtime.manager, tx,
-                await execution.runtime.manager._row(tx, execution.lease.job_id))
+                await execution.runtime.manager._row(tx, execution.lease.job_id), invocation=invocation)
 
 
 async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
@@ -113,7 +113,7 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
     if policy is not None:
         if not declared.native_admitted:
             raise JobError("budget_tool_adapter_unavailable:" + tool_name)
-    await check_dispatch(session_id)
+    await check_dispatch(session_id, invocation=current_invocation(session_id))
     return registered
 
 
@@ -151,6 +151,12 @@ def preserve_model_usage(session_id, usage):
         execution.resource_evidence["model_usage_totals"] = dict(usage)
 
 
+def atomic_pending_required(store, sid):
+    execution = _SEND.get()
+    return (execution is not None and execution.runtime.manager.store is store
+            and execution.actor.session_id == sid)
+
+
 async def bind_tool_receipt(store, sid: str, assistant_seq: int | None, call_id: str, receipt_seq: int) -> None:
     execution = _SEND.get()
     if (
@@ -166,6 +172,8 @@ async def bind_tool_receipt(store, sid: str, assistant_seq: int | None, call_id:
         await manager.reconcile_receipt(
             execution.actor, operation.operation_id, await store.message_ref(sid, receipt_seq)
         )
+        from .tool_call_plans import finish_receipt
+        await finish_receipt(manager, execution.actor, await store.message_ref(sid, assistant_seq), call_id)
 
 
 class TaskRuntime:
@@ -437,7 +445,7 @@ class TaskRuntime:
                 owner = None
         if owner is None and await session_role(self.manager.store, sid) != "main":
             raise JobError("task_owner_required")
-        request = {"send_index": send_index, "model_attempt_protocol": 1}
+        request = {"send_index": send_index, "model_attempt_protocol": 1, "tool_call_plan_protocol": 1}
         if owner is None:
             from .root_context import for_send
             provenance = for_send(self, sid)

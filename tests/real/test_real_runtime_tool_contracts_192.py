@@ -6,7 +6,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
-from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.runtime.tool_contracts import RuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
@@ -18,8 +18,9 @@ from .test_real_budget_tree_192 import RealBudgetHost
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
+@pytest.mark.parametrize("expired", [False, True])
 @pytest.mark.parametrize("name", ["read_probe", "task_snapshot"])
-async def test_real_host_control_base_needs_no_builtin_tool_name(tmp_path, record_property, name):
+async def test_real_host_control_base_needs_no_builtin_tool_name(tmp_path, record_property, name, expired):
     store = await SessionStore.open(str(tmp_path / "generic-control.db"), schema="tasks")
     provider, host = BoundedProvider(limit=2), RealBudgetHost()
     host.service = provider
@@ -32,6 +33,15 @@ async def test_real_host_control_base_needs_no_builtin_tool_name(tmp_path, recor
         boot_contract_hash="e" * 64,
         budget_config=BudgetConfig("control-v1", (LocalBudgetScope("authority", max_calls=2),), host),
     )
+
+    original_clock = runtime.manager.now
+    if expired:
+        complete = provider.complete
+        async def expire_after_real_response(request, **kwargs):
+            response = await complete(request, **kwargs)
+            runtime.manager.now = lambda: original_clock() + 600000
+            return response
+        provider.complete = expire_after_real_response
 
     class OriginalSnapshot(RuntimeTool):
         calls = 0
@@ -73,15 +83,25 @@ async def test_real_host_control_base_needs_no_builtin_tool_name(tmp_path, recor
     try:
         async with asyncio.timeout(150):
             sid = await loop.new_session()
-            result = await loop.send(
-                f"Call {name} exactly once with no arguments. After SNAPSHOT_OK reply only DONE. Never call other tools.",
-                sid,
-            )
-            assert result.status == "completed" and result.final_text.strip() == "DONE"
+            try:
+                result = await loop.send(
+                    f"Call {name} exactly once with no arguments. After SNAPSHOT_OK reply only DONE. Never call other tools.",
+                    sid,
+                )
+            except JobError as exc:
+                assert expired and exc.code == "execution_lease_expired"
+                result = None
+            if expired:
+                assert result is None or result.status == "degraded"
+                [raw] = [row for row in await store.load_all_messages(sid) if row.role == "tool"]
+                assert raw.name == name and raw.content == "SNAPSHOT_OK"
+            else:
+                assert result.status == "completed" and result.final_text.strip() == "DONE"
             assert implementation.calls == 1
-            assert provider.calls == host.reserve_calls == len(host.applied) == 2
+            assert provider.calls == host.reserve_calls == len(host.applied) == (1 if expired else 2)
             assert len(await runtime.manager.db.fetchall(f"SELECT job_id FROM {runtime.manager.jobs}")) == 1
     finally:
+        runtime.manager.now = original_clock
         provider.report(record_property)
         record_property("snapshot_queries", implementation.calls)
         try:

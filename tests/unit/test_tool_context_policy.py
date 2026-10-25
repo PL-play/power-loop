@@ -14,6 +14,7 @@ from power_loop.runtime.context_worker import SummaryWorker
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource
 from power_loop.tools.registry import ToolRegistry
+from power_loop.tools.shell_contract import ShellTool
 from tests.unit.test_stateful_loop import _Scripted, _tool_resp
 
 
@@ -23,7 +24,7 @@ async def env():
     sid = await store.create_session()
     registry = ToolRegistry()
     registry.register(ToolDefinition('bash', '', project=lambda a, r: a.get('description', 'ok')),
-                      lambda **kw: 'result' * 300)
+                      ShellTool(lambda **kw: 'result' * 300))
     llm = _Scripted([LLMResponse(raw_text='verified exact-file.txt', token_usage=LLMTokenUsage(
         prompt_tokens=100, completion_tokens=20, total_tokens=120, prompt_cached_tokens=50))])
     config = ToolContextConfig(summary_min_chars=0, overrides={'bash': {'general': 'llm_summary'}})

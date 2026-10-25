@@ -922,9 +922,9 @@ class AgentPipeline:
     def _retire_stale_images(self, round_index: int, keep_rounds: int) -> int:
         """把当前 send 里「入上下文已超过 keep_rounds 轮」的图片附件块在内存里换成占位文字。
 
-        图片行是 user 行（see_image / 用户发图），带 ``round_index``（``_append_message`` 记的）。
+        图片行是 user 行（图片工具 / 用户发图），带 ``round_index``（``_append_message`` 记的）。
         第 r 轮入的图在第 r+keep_rounds 轮之前都以原图参与请求，之后换成
-        ``[image retired: <name> — 已看过；要再看调 see_image]``。不改 pl_messages、不改行数。
+        ``[image retired: <name> — 已看过；需要时按原坐标回取图片]``。不改 pl_messages、不改行数。
         返回替换了几个块。"""
         n = 0
         rounds = getattr(self, "_image_rounds", None) or {}
@@ -956,7 +956,7 @@ class AgentPipeline:
                     if blind and att.get("kind") == "image":
                         tail = "当前模型看不了图片，没看到过它的内容"
                     else:
-                        tail = "已看过；要再看调 see_image"
+                        tail = "已看过；需要时按原坐标回取图片"
                     new_blocks.append({"type": "text",
                                        "text": f"{self._IMAGE_RETIRED_MARK}: {name}{coord} — {tail}]"})
                     n += 1
@@ -1569,6 +1569,9 @@ class AgentPipeline:
                     registered = await check_tool_dispatch(self.session_id, tool_name, self.tool_registry, tool_args)
                     from power_loop.runtime.tool_contracts import validate_registration
                     validate_registration(self.tool_registry, tool_name, registered)
+                    from power_loop.runtime.tool_call_plans import dispatch as record_tool_dispatch
+                    await record_tool_dispatch(self, tool_name, tool_args, registered)
+                    validate_registration(self.tool_registry, tool_name, registered)
                     result = await self.tool_registry.invoke_async(tool_name, tool_args)
             finally:
                 reset_current_cancel_token(_ctok)
@@ -1859,7 +1862,7 @@ class AgentPipeline:
                 await self._append_message(_pm, round_index=round_idx)
                 llm_before.messages.append(dict(_pm))
 
-            # Image recall: a tool (see_image / recall_send / an image generator) can put
+            # Image recall: a tool (an image viewer / a recall tool / an image generator) can put
             # pictures in front of the model. DURABLE ones become real `user` rows — the image
             # stays in view for the rest of the send (cheap: it sits in the provider's cached
             # prefix) and is distilled to `[image: … · file_uuid=…]` across sends, so nothing
@@ -2033,7 +2036,7 @@ class AgentPipeline:
                 self._step_texts.append({"step": round_idx + 1, "text": assistant_text,
                                          "tools": [_tool_call_name(tc) for tc in (tool_calls or [])]})
             from power_loop.core import pass_turn as _pass_state
-            _pass_state.note_step(bool(assistant_text), [_tool_call_name(tc) for tc in (tool_calls or [])])
+            _pass_state.note_step(bool(assistant_text), [_tool_call_name(tc) for tc in (tool_calls or [])], registry=self.tool_registry)
 
             # Any productive round (said something OR called a tool) clears the empty streak.
             if assistant_text or tool_calls:
@@ -2086,6 +2089,9 @@ class AgentPipeline:
                     tool_calls=sanitized_tool_calls,
                     round_index=round_idx,
                 )
+            if sanitized_tool_calls and self.tool_registry is not None:
+                from power_loop.runtime.tool_call_plans import prepare as prepare_tool_calls
+                await prepare_tool_calls(self)
 
             # ── 截断优先判定：它和「空响应打嗝」长得像，但重试方式必须相反 ──
             # provider 因 max_tokens 硬切时，工具调用的 JSON 断在半路 → 解析不出 tool_calls，
@@ -2246,9 +2252,8 @@ class AgentPipeline:
             skip_batch = batch_ctx.directive == HookDirective.SKIP
 
             # ── Execute tools ──
-            # 6.11.0 同轮并发（design/86 修订）：模型面对「三张图」的直觉是同一轮批量发调用，
-            # 而不是先起 background_run 再回头查（conv-224：三次 design_pack_image 同轮发出、
-            # 逐个排队 3 分钟）。所以顺着它：同一轮 ≥2 个 async_capable 调用并发执行。
+            # A batch may contain multiple independent calls. Run at least two
+            # async-capable calls concurrently, up to the configured limit.
             # 不变量：TOOL_BEFORE 仍按原顺序先跑（闸类 hook 语义不变）；结果按原顺序回填；
             # TOOL_AFTER / 事件 / 落库全部串行；非 async_capable 工具永远串行。
             used_todo = False

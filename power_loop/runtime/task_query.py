@@ -63,13 +63,16 @@ def _key(row):
     return row["created_at"], row["job_id"]
 
 
-def active_reasons(row):
+def active_reasons(row, *, processing=None):
     reasons = []
     if row["outcome"] is None and row["status"] != "model_closed":
         reasons.append("execution_pending")
     if row["resource_state"] in ("running", "unknown"):
         reasons.append("resource_" + row["resource_state"])
-    if row["result_status"] not in ("none", "handled", "not_applicable"):
+    if processing is not None:
+        if processing['state'] in ('pending', 'unknown'):
+            reasons.append('managed_review_' + processing['state'])
+    elif row["result_status"] not in ("none", "handled", "not_applicable"):
         reasons.append("result_" + row["result_status"])
     if row["supervision_status"] != "closed":
         reasons.append("supervision_open")
@@ -120,7 +123,7 @@ async def _forest(manager, tx, actor, root, max_depth, upper):
     return rows, depths, truncated
 
 
-def _summary(row, *, context=False):
+def _summary(row, *, context=False, processing=None):
     result = {
         "job_id": row["job_id"], "parent_job_id": row["parent_job_id"], "kind": row["kind"],
         "status": row["status"], "context_only": context,
@@ -130,10 +133,17 @@ def _summary(row, *, context=False):
     result.update({k: row[k] for k in ("session_id", "created_by_session_id", "generation", "version", "resource_state",
         "supervision_status", "result_status", "outcome", "created_at", "updated_at")})
     result.update(title=row["title"][:160], blocks_completion=bool(row["blocks_completion"]),
-        active_reason=active_reasons(row), billing_status="unavailable", cancel_requested=row["cancel_requested_at"] is not None,
+        active_reason=active_reasons(row, processing=processing), billing_status="unavailable", cancel_requested=row["cancel_requested_at"] is not None,
         controls={"request_cancel": row["supervision_status"] != "closed", "resource_stopped": row["resource_state"] == "stopped",
             "reason": "Persistent cancellation acceptance is not confirmation of physical stop."})
+    if processing is not None:
+        result['processing_obligation'] = processing
     return result
+
+
+async def _processing_view(manager, tx, row):
+    from .managed_delivery import negative_review_view
+    return await negative_review_view(manager, tx, row)
 
 
 async def _index(manager, tx, row):
@@ -233,7 +243,7 @@ async def list_jobs(manager, actor, *, root_job_id=None, scope="descendants", st
             raise JobError("query_snapshot_changed")
         upper = tuple(page["upper"]) if page else max((_key(r) for r in rows.values()), default=(0, "empty"))
         snapshot = page["snapshot_at"] if page else manager.now()
-        matches = []
+        matches, processing_views = [], {}
         for row in rows.values():
             if root_job_id is not None and (row["job_id"] == root_job_id) != (scope == "self"):
                 continue
@@ -241,7 +251,8 @@ async def list_jobs(manager, actor, *, root_job_id=None, scope="descendants", st
                 continue
             if (created_after is not None and row["created_at"] < created_after) or (created_before is not None and row["created_at"] > created_before):
                 continue
-            if ((status == "active" and not active_reasons(row)) or (status == "terminal" and row["outcome"] is None) or
+            processing_views[row['job_id']] = await _processing_view(manager, tx, row)
+            if ((status == "active" and not active_reasons(row, processing=processing_views[row['job_id']])) or (status == "terminal" and row["outcome"] is None) or
                     (isinstance(status, list) and row["status"] not in status)):
                 continue
             matches.append(row)
@@ -256,7 +267,7 @@ async def list_jobs(manager, actor, *, root_job_id=None, scope="descendants", st
             while parent in rows and parent not in selected:
                 additions[parent] = _summary(rows[parent], context=True)
                 parent = rows[parent]["parent_job_id"]
-            additions[row["job_id"]] = {**_summary(row), **await _index(manager, tx, row)}
+            additions[row["job_id"]] = {**_summary(row, processing=processing_views[row['job_id']]), **await _index(manager, tx, row)}
             combined = {n["job_id"]: n for n in envelope["nodes"]}
             for jid, node in additions.items():
                 if jid not in combined or not node["context_only"]:
@@ -278,7 +289,7 @@ async def get_job(manager, actor, job_id, *, max_chars=8000):
     _int(max_chars, "max_chars", 1024, 32000)
     async with manager._write() as tx:
         row = await manager._authorize(tx, actor, job_id)
-        output = {"version": 1, "observed_at": manager.now(), "node": {**_summary(row), **await _index(manager, tx, row)}}
+        output = {"version": 1, "observed_at": manager.now(), "node": {**_summary(row, processing=await _processing_view(manager, tx, row)), **await _index(manager, tx, row)}}
         if len(_json(output)) > max_chars:
             raise JobError("query_result_too_small")
         return output

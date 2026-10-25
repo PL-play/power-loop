@@ -159,7 +159,7 @@ def _distill_block(block: Any) -> str:
         # What survives distillation: filename + the host's recall coordinate (`ref`), never the
         # bytes. This line is ALL a later model has to go on — in particular a model that cannot
         # see images at all (the definition switched), for which it is the only way back to the
-        # original. DeepTalk puts `file_uuid=…` here, which see_image takes directly.
+        # original. The opaque reference is interpreted by the host's image reader.
         name = att.get("filename") or att.get("path") or "file"
         kind = att.get("kind") or "file"
         ref = str(att.get("ref") or "").strip()

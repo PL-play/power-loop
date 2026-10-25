@@ -200,7 +200,8 @@ def register_skill_tools(registry, *, skills_dir: str | Path | None = None) -> S
     inject the skill descriptions into the system prompt.
     """
     loader = SkillLoader(skills_dir)
-    registry.register(LOAD_SKILL_DEFINITION, loader.handle_load_skill)
+    from power_loop.tools.skill_contract import SkillTool
+    registry.register(LOAD_SKILL_DEFINITION, SkillTool(loader.handle_load_skill))
     return loader
 
 

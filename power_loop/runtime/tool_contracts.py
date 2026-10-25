@@ -58,6 +58,27 @@ class ToolRuntimeContract:
             raise ToolContractError("invalid_tool_runtime_contract")
 
 
+@dataclass(frozen=True)
+class ToolContextPresentation:
+    """Pure views of an existing call; never execution or lifecycle authority."""
+    keep_in_send: bool = False
+    archive_arguments: str | None = None
+    archive_label: str | None = None
+
+    def __post_init__(self):
+        if (type(self.keep_in_send) is not bool
+                or self.archive_label is not None and type(self.archive_label) is not str
+                or self.archive_arguments is not None and type(self.archive_arguments) is not str):
+            raise ToolContractError("invalid_tool_context_presentation")
+        if self.archive_arguments is not None:
+            try:
+                valid = type(json.loads(self.archive_arguments)) is dict
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ToolContractError("invalid_tool_context_arguments")
+
+
 class RuntimeTool(ABC):
     @property
     @abstractmethod
@@ -76,6 +97,19 @@ class RuntimeTool(ABC):
     def context_spec(self, spec):
         """Optional model-facing schema when tool-context preparation is enabled."""
         return spec
+
+    def context_presentation(self, source) -> ToolContextPresentation:
+        """Describe archival views and in-send preservation for this original call."""
+        return ToolContextPresentation()
+
+    def truncate_context(self, source, policy, *, raw_arguments):
+        """Pure argument/result preview; None preserves the existing pair."""
+        from .tool_truncation import truncate_pair
+        return truncate_pair(raw_arguments, source.result, policy, source.recall)
+
+    def pending_call_spec(self, arguments, *, runtime=None, definition=None):
+        """Pure recovery description; None is unsupported, never not-dispatched."""
+        return None
 
     def background_hint(self, definition, *, scheduler_name):
         """Optional usage for submitting a target to this implemented scheduler."""
@@ -231,4 +265,25 @@ def context_spec(registered, spec):
             or type(value.get("function")) is not dict
             or value["function"].get("name") != registered.definition.name):
         raise ToolContractError("invalid_tool_context_spec")
+    return value
+
+
+def context_presentation(registered, source):
+    implementation = resolve(registered)
+    value = implementation.context_presentation(source) if implementation is not None else ToolContextPresentation()
+    if type(value) is not ToolContextPresentation:
+        raise ToolContractError("invalid_tool_context_presentation")
+    return value
+
+
+def truncate_context(registered, source, policy, *, raw_arguments):
+    implementation = resolve(registered)
+    if implementation is None:
+        from .tool_truncation import truncate_pair
+        value = truncate_pair(raw_arguments, source.result, policy, source.recall)
+    else:
+        value = implementation.truncate_context(source, policy, raw_arguments=raw_arguments)
+    if value is not None and (type(value) is not tuple or len(value) != 2
+                              or any(type(part) is not str for part in value)):
+        raise ToolContractError("invalid_tool_context_truncation")
     return value

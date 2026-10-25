@@ -51,8 +51,11 @@ async def _verify(manager, tx, source, snapshot):
         calls = pending['tool_calls']
         ref = _ref(snapshot['assistant_ref'])
         ids = [call['id'] for call in calls]
-        if (set(snapshot) != {'version', 'scope', 'assistant_ref', 'pending'}
-                or type(snapshot['version']) is not int or snapshot['version'] != 1
+        expected_keys = {'version', 'scope', 'assistant_ref', 'pending'}
+        if snapshot.get('version') == 2:
+            expected_keys.add('call_plan')
+        if (set(snapshot) != expected_keys
+                or type(snapshot['version']) is not int or snapshot['version'] not in (1, 2)
                 or snapshot['scope'] != proof(source) or source['kind'] != 'send'
                 or type(calls) is not list or not 0 < len(calls) <= 64
                 or any(type(i) is not str or not i for i in ids) or len(set(ids)) != len(ids)
@@ -60,6 +63,15 @@ async def _verify(manager, tx, source, snapshot):
                 or type(pending.get('assistant_seq')) is not int or pending['assistant_seq'] != ref.seq
                 or type(pending.get('round_index')) is not type(ref.round_index)
                 or pending.get('round_index') != ref.round_index or ref.session_id != source['session_id']):
+            raise ValueError()
+        from .tool_call_plans import identity as plan_identity
+        from .tool_call_plans import read as read_plan
+        from .tool_call_plans import required as plan_required
+        if await plan_required(manager, tx, source):
+            plan = await read_plan(manager, tx, source, ref)
+            if snapshot['version'] != 2 or snapshot.get('call_plan') != {'event_id': plan_identity(manager, source, ref), 'payload_hash': _hash(plan)}:
+                raise ValueError()
+        elif snapshot['version'] != 1:
             raise ValueError()
         actor = JobActor(source['tenant_id'], source['principal_id'], source['session_id'])
         for call in calls:
@@ -97,6 +109,12 @@ async def capture(manager, tx, source):
     ref = MessageRef(manager.store.store_id, row['session_id'], row['id'], row['seq'], row['role'],
                      row['tool_call_id'], row['send_index'], row['round_index'])
     snapshot = {'version': 1, 'scope': proof(source), 'assistant_ref': ref.to_dict(), 'pending': pending}
+    from .tool_call_plans import identity as plan_identity
+    from .tool_call_plans import read as read_plan
+    from .tool_call_plans import required as plan_required
+    if await plan_required(manager, tx, source):
+        plan = await read_plan(manager, tx, source, ref)
+        snapshot.update(version=2, call_plan={'event_id': plan_identity(manager, source, ref), 'payload_hash': _hash(plan)})
     await _verify(manager, tx, source, snapshot)
     return snapshot
 
@@ -127,8 +145,8 @@ async def model(manager, tx, source):
 
 async def _expected(manager, tx, source, closed):
     from .finalization import _reference
-    from .managed_delivery import _inbox, read, result_event
-    from .managed_effects import descriptor, job_id, resolved_execution
+    from .managed_delivery import _inbox, read, resolved_review, result_event
+    from .managed_effects import descriptor, job_id
 
     snapshot = closed.get('evidence', {}).get(SNAPSHOT)
     if snapshot is None:
@@ -148,7 +166,7 @@ async def _expected(manager, tx, source, closed):
                 or creation['tool_call_id'] != call['id']):
             raise JobError('pending_call_source_mismatch')
         result = await result_event(manager, tx, row)
-        original, _known, _payload, _found = await resolved_execution(manager, tx, row, result)
+        original, _known, _payload, _found = await resolved_review(manager, tx, row, result)
         notice = await read(manager, tx, row, result)
         await _inbox(manager, tx, row, notice)
         original = [{k: v for k, v in item.items() if k != 'delivery_status'} for item in original]
@@ -211,3 +229,22 @@ async def retire_pending(loop, actor, source_job_id):
         reference = await require_disposition(manager, tx, source, closed)
         return {'source_job_id': source_job_id, 'disposition': reference, 'execution_authority': False,
             'acknowledgement_created': False, 'billing_settled': False}
+
+
+async def negative_review_references(manager, tx, source):
+    closed = await _closed(manager, tx, source)
+    if SNAPSHOT not in closed.get('evidence', {}):
+        return []
+    key = identity(manager, source)
+    record = await _object(manager, tx, manager.events, 'payload_json', 'event_id=?', (key,), 262144)
+    if record is None:
+        raise JobError('pending_call_disposition_required')
+    from .managed_delivery import handled_references, read, result_event
+    refs = []
+    for call in record['calls']:
+        if call['generation'] == 0:
+            row = await manager._row(tx, call['job_id'])
+            event = await result_event(manager, tx, row)
+            notice = await read(manager, tx, row, event)
+            refs.extend(await handled_references(manager, tx, row, event, notice))
+    return refs

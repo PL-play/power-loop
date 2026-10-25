@@ -27,7 +27,7 @@ class AttachmentRef:
     mime_type: str
     kind: str
     #: 宿主给的「怎么把这张图找回来」坐标，原样带进蒸馏与降级文案（DeepTalk 放
-    #: ``file_uuid=…``，模型可直接拿去 see_image）。空字符串 = 没有。
+    #: 宿主提供的不透明资源引用）。空字符串 = 没有。
     ref: str = ""
 
 
@@ -192,7 +192,7 @@ def _render_image_attachment(ref: AttachmentRef, path: Path, capabilities: Model
     为什么降级不等于回到老毛病：老实现塞的是一句含糊的
     "The current model does not support image input"，混在附件描述里，模型读过去照样按
     「我看过这张图」的语气编答案。这里的占位必须做到两件事——**说清楚模型没有看到**，并且
-    **给出把图找回来的坐标**（``ref``，DeepTalk 放 file_uuid，可直接喂给 see_image）。
+    **给出把图找回来的坐标**（``ref``，由宿主解释和回取原件）。
     调用方想要「发图给看不了图的模型就报错」，用 ``capabilities.require_image_input()`` 自查。
     """
     if capabilities.supports_image_input is True:
@@ -226,7 +226,7 @@ def _render_image_attachment(ref: AttachmentRef, path: Path, capabilities: Model
     )
     text = (
         f"[图片 {describe_attachment_ref(ref)}——**当前模型看不了图片，你没有看到它的内容**。"
-        "不要凭空描述这张图；需要看就用 see_image 之类的视觉工具，按上面的坐标取它。]"
+        "不要凭空描述这张图；需要时由可看图的工具或模型按上面的坐标回取原图。]"
     )
     return PreparedAttachment(
         ref=ref,
