@@ -65,6 +65,10 @@ async def check_dispatch(session_id: str | None) -> None:
         if execution.resource_evidence.get("resource_state") == "unknown":
             raise JobError("unresolved_prior_attempt")
         await execution.runtime.manager.check_execution(execution.actor, execution.lease)
+        from .managed_effects import require_source_resolved
+        async with execution.runtime.manager._write() as tx:
+            await require_source_resolved(execution.runtime.manager, tx,
+                await execution.runtime.manager._row(tx, execution.lease.job_id))
 
 
 async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):

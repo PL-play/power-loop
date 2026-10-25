@@ -434,12 +434,13 @@ class JobManager:
         from .execution_membership import get
         return await get(self, actor, job_id, generation)
 
-    async def _validate_ref(self, tx, actor, ref: MessageRef, *, role: str):
+    async def _validate_ref(self, tx, actor, ref: MessageRef, *, role: str, metadata_only=False):
         if not isinstance(ref, MessageRef) or ref.store_id != self.store.store_id or ref.id is None:
             raise JobError("invalid_message_ref")
         if ref.session_id != actor.session_id:
             raise JobError("access_denied")
-        row = await tx.fetchone(f"SELECT * FROM {self.store.t.messages} WHERE session_id=? AND id=?",
+        columns = "id,session_id,seq,role,tool_call_id,send_index,round_index,tool_calls_json" if metadata_only else "*"
+        row = await tx.fetchone(f"SELECT {columns} FROM {self.store.t.messages} WHERE session_id=? AND id=?",
                                (ref.session_id, ref.id))
         if (row is None or int(row["seq"]) != ref.seq or row["role"] != role or ref.role != role or
                 row["tool_call_id"] != ref.tool_call_id or row["send_index"] != ref.send_index or
@@ -459,7 +460,7 @@ class JobManager:
         return _hash([self.store.store_id, actor.tenant_id, actor.principal_id, action, origin])
 
     async def _validate_call(self, tx, actor, ref, tool_call_id):
-        row = await self._validate_ref(tx, actor, ref, role="assistant")
+        row = await self._validate_ref(tx, actor, ref, role="assistant", metadata_only=True)
         calls = json.loads(row["tool_calls_json"] or "[]")
         if not any(call.get("id") == tool_call_id for call in calls):
             raise JobError("tool_call_not_found")
@@ -548,6 +549,9 @@ class JobManager:
         if parent is None and call_ref is not None:
             raise JobError("model_operation_requires_parent_execution")
         request_data = json.loads(_json(dict(request or {})))
+        from . import managed_effects
+        effect = managed_effects.registration(request_data, kind=kind, parent=parent,
+            call_ref=call_ref, tool_call_id=tool_call_id, session_id=session_id, independent=independent)
         from . import host_send_steps
         host_step = host_send_steps.request_step(request_data, actor=actor, kind=kind,
             parent=parent, session_id=session_id, system_key=system_key)
@@ -560,9 +564,15 @@ class JobManager:
                 if old["request_hash"] != fingerprint:
                     raise JobError("operation_conflict")
                 job = await self._authorize(tx, actor, old["job_id"])
+                if effect is not None and job["job_id"] != managed_effects.job_id(self, actor, call_ref, tool_call_id):
+                    raise JobError("managed_effect_evidence_corrupt")
+                if effect is not None:
+                    await managed_effects.descriptor(self, tx, job)
                 await host_send_steps.require_replay(self, tx, actor, host_step, old["job_id"])
                 return JobRegistration(_record(job), _operation(old), True)
             await host_send_steps.require_available(self, tx, actor, host_step)
+            if effect is not None and await self._row(tx, managed_effects.job_id(self, actor, call_ref, tool_call_id)) is not None:
+                raise JobError("managed_effect_evidence_missing")
             if kind == "send" and parent is None and request_data.get("host_context") is not None:
                 from .root_control import _admit
                 await _admit(self, tx, actor, request_data["host_context"])
@@ -587,7 +597,10 @@ class JobManager:
                 raise JobError("required_child_cannot_detach")
             role = {"workflow": "workflow", "workflow_node": "workflow_node", "subagent": "subagent"}.get(kind, role)
             if call_ref:
-                await self._validate_call(tx, actor, call_ref, tool_call_id)
+                if effect is not None:
+                    await managed_effects.validate_call(self, tx, actor, parent, call_ref, tool_call_id, effect["tool_name"], effect["arguments_hash"])
+                else:
+                    await self._validate_call(tx, actor, call_ref, tool_call_id)
             if session_id is not None:
                 session = await tx.fetchone(f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?", (session_id,))
                 granted = restored_parent and await controls_node(self, tx, parent_row, actor, session_id)
@@ -609,7 +622,7 @@ class JobManager:
                 raise JobError("root_session_required")
             if parent_row is not None and parent_row["kind"] in ("subagent", "workflow_node") and parent_row["status"] == "waiting":
                 raise JobError("owner_waiting_requires_input")
-            job_id = host_send_steps.job_id(self, actor, host_step) or "job_" + secrets.token_hex(16)
+            job_id = (managed_effects.job_id(self, actor, call_ref, tool_call_id) if effect is not None else None) or host_send_steps.job_id(self, actor, host_step) or "job_" + secrets.token_hex(16)
             root = parent_row["root_job_id"] if parent_row else job_id
             scope = job_id
             if not independent and parent_row:
@@ -641,7 +654,7 @@ class JobManager:
                 role, owner["job_id"] if owner else None, owner["generation"] if owner else None,
                 owner["executor_id"] if owner else None, owner["boot_id"] if owner else None))
             payload = {"job_id": job_id, "status": "queued"}
-            if kind in ("send", "subagent", "workflow", "workflow_node", "timer") and request is not None:
+            if (kind in ("send", "subagent", "workflow", "workflow_node", "timer") or effect is not None) and request is not None:
                 # Recovery must not reread a potentially edited YAML/file or
                 # reconstruct a full execution contract from a request hash.
                 payload["request"] = request_data
@@ -651,6 +664,8 @@ class JobManager:
                 key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id,
                 payload=payload)
             await host_send_steps.record(self, tx, actor, host_step, operation)
+            if effect is not None:
+                await managed_effects.record_registration(self, tx, await self._row(tx, job_id), operation, effect)
             return JobRegistration(_record(await self._row(tx, job_id)), operation, False)
 
     async def claim_job(self, actor: JobActor, job_id: str, *, executor_id: str, boot_id: str,
@@ -737,12 +752,14 @@ class JobManager:
             op = await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=? AND event_type='operation'", (operation_id,))
             if op is None:
                 raise JobError("operation_not_found")
-            await self._authorize(tx, actor, op["job_id"])
+            target = await self._authorize(tx, actor, op["job_id"])
+            from . import managed_effects
+            effect = target["kind"] == "background_tool" and await managed_effects.descriptor(self, tx, target) is not None
             if caller is not None:
                 caller_row = await self._fence(tx, actor, caller)
                 if (caller_row["session_id"] or caller_row["created_by_session_id"]) != actor.session_id:
                     raise JobError("caller_is_not_executing_parent")
-            row = await self._validate_ref(tx, actor, receipt_ref, role="tool")
+            row = await self._validate_ref(tx, actor, receipt_ref, role="tool", metadata_only=effect)
             call = json.loads(op["call_ref_json"]) if op["call_ref_json"] else None
             if (not call or op["caller_session_id"] != actor.session_id or
                     row["tool_call_id"] != op["tool_call_id"] or receipt_ref.seq <= int(call["seq"])):
@@ -754,6 +771,8 @@ class JobManager:
             encoded = _json(receipt_ref.to_dict())
             if op["receipt_ref_json"] and op["receipt_ref_json"] != encoded:
                 raise JobError("receipt_already_bound")
+            if effect:
+                await managed_effects.bind_receipt(self, tx, target, op, receipt_ref)
             await tx.execute(f"UPDATE {self.events} SET receipt_ref_json=? WHERE event_id=?", (encoded, operation_id))
             return _operation(await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=?", (operation_id,)))
 
@@ -790,6 +809,8 @@ class JobManager:
                             decision=decision, reason=reason)
 
     async def _require_scope_ready(self, tx, row):
+        from .managed_effects import require_owned_resolved
+        await require_owned_resolved(self, tx, row)
         from .processing import require_inputs_handled
         await require_inputs_handled(self, tx, row)
         if row["kind"] == "workflow" and row["generation"] > 1:
