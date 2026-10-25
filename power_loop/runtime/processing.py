@@ -66,6 +66,8 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
             "WHERE e.event_type='result' AND j.created_by_session_id=? AND j.tenant_id=? AND j.principal_id=? "
             "AND j.kind IN ('subagent','workflow') AND j.result_status<>'handled' AND e.delivery_status<>'handled' ORDER BY e.event_id",
             (actor.session_id, actor.tenant_id, actor.principal_id))
+        from .managed_delivery import candidates
+        results.extend(await candidates(manager, tx, actor))
         inputs = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' "
             "AND action='nudge' AND delivery_status<>'handled' ORDER BY event_id", (send["control_owner_job_id"],))
         observed = []
@@ -84,6 +86,15 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
                 if event["event_id"] != result_id(job["job_id"], job["generation"]):
                     continue
                 item_id = await delivery_id(manager, tx, job) if job["kind"] == "subagent" else event["event_id"]
+            if event['event_type'] == 'result' and job['kind'] == 'background_tool':
+                from .managed_delivery import observation
+
+                actual = await observation(manager, tx, actor, job, event, visible)
+                if actual is not None:
+                    observed.append({"event_id": event["event_id"], "job_id": event["job_id"],
+                        "revision": int(event["job_version"]), "result_hash": _hash(json.loads(event["payload_json"])),
+                        **actual})
+                continue
             inbox = await tx.fetchone(f"SELECT status,delivered_seq FROM {manager.store.t.follow_up_queue} "
                                       "WHERE session_id=? AND item_id=?", (actor.session_id, item_id))
             if inbox is None or inbox["status"] != "delivered" or inbox["delivered_seq"] not in visible:
@@ -211,11 +222,17 @@ async def commit(manager, actor, caller, *, snapshot_id, response_ref, decision=
                         (target["kind"] != "workflow_node" and target["session_id"] != actor.session_id) or request.get("session_id") != actor.session_id or
                         request.get("target") != {key: target[key] for key in ("job_id", "executor_id", "boot_id", "generation")}):
                     raise JobError("processing_input_mismatch")
-            if ((not is_input and (target["created_by_session_id"] != actor.session_id or
+            if ((not is_input and ((target["kind"] != "background_tool" and target["created_by_session_id"] != actor.session_id) or
                     current is not None and current["event_id"] != result_id(target["job_id"], target["generation"]))) or
                     current is None or current["job_id"] != target["job_id"] or
                     int(current["job_version"]) != event["revision"] or _hash(json.loads(current["payload_json"])) != event["result_hash"]):
                 raise JobError("processing_revision_changed")
+            if not is_input and target['kind'] == 'background_tool':
+                from .managed_delivery import verify_observation
+
+                if send['execution_role'] != 'main':
+                    raise JobError('managed_delivery_requires_original_main')
+                await verify_observation(manager, tx, actor, target, current, event)
             if response_ref.seq <= event["delivered_seq"]:
                 raise JobError("processing_response_mismatch")
             old = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (decision_id,))

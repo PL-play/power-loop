@@ -103,6 +103,17 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
             original = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (data_input["operation"]["event_id"],))
             if original is None or (await read_tx(manager, tx, original, required=True))["event_id"] != ref["event_id"]:
                 raise JobError("finalization_evidence_changed")
+    if data["version"] == 1 and proof["kind"] == "background_tool":
+        current = await manager._row(tx, event["job_id"])
+        if current is None or current["generation"] != data["scope"]["generation"]:
+            raise JobError("finalization_evidence_changed")
+        from .managed_effects import require_closed
+        result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (result_id(current["job_id"], current["generation"]),))
+        if result is None:
+            raise JobError("finalization_evidence_missing")
+        # The delivery and actual handling transcript remain part of retained
+        # proof, including when this closed child is read through its parent.
+        await require_closed(manager, tx, current, result)
     state["visiting"].remove(event_id)
     state["done"][event_id] = data
     return data

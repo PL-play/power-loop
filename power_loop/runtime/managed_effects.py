@@ -1145,6 +1145,14 @@ async def bind_receipt(manager, tx, row, creation, receipt_ref):
             "acknowledges_result": False,
         },
     )
+    # Once the resolved outcome has its own main-inbox obligation, replaying
+    # the old tool receipt must not acknowledge that new responsibility.
+    delivery = await _read_event(manager, tx, _id(manager, "delivery", row["job_id"], row["generation"]), required=False)
+    if delivery is not None:
+        from .managed_delivery import read, result_event
+
+        await read(manager, tx, row, await result_event(manager, tx, row))
+        return
     result = json.loads(row["result_json"] or "null")
     if row["generation"] == 0 or type(result) is not dict or type(result.get("display")) is not str:
         return
@@ -1185,19 +1193,17 @@ async def bind_receipt(manager, tx, row, creation, receipt_ref):
     await tx.execute(f"UPDATE {manager.jobs} SET result_status='handled' WHERE job_id=?", (row["job_id"],))
 
 
-async def require_closed(manager, tx, row, result_event):
+async def resolved_execution(manager, tx, row, result_event):
     found = await descriptor(manager, tx, row)
     if found is None:
         raise JobError("finalization_adapter_required")
     creation, binding = found
-    observed_raw = await raw_receipt(manager, tx, row, creation, binding)
     await _registered(manager, tx, row, creation, binding)
     from .finalization import _reference
 
     refs = [
         await _reference(manager, tx, creation["event_id"]),
         await _reference(manager, tx, _id(manager, "registered", row["job_id"], 0)),
-        await _reference(manager, tx, observed_raw[0]["event_id"]),
     ]
     prepared = await _evidence(manager, tx, row, "prepared", required=False)
     exited = await _evidence(manager, tx, row, "resource_exit")
@@ -1221,7 +1227,14 @@ async def require_closed(manager, tx, row, result_event):
         checkpoint = await validate_exit(manager, tx, row, found)
         require_replay(json.loads(result_event["payload_json"]), checkpoint["completion"])
         refs.append(await _reference(manager, tx, _id(manager, "completion", row["job_id"], row["generation"])))
-    result = json.loads(result_event["payload_json"])["result"]
+    result_payload = _document(json.loads(result_event["payload_json"]), 65536)
+    result = result_payload.get("result")
+    if (result_event["job_id"] != row["job_id"] or result_event["event_type"] != "result"
+            or result_payload.get("outcome") != row["outcome"]
+            or result_payload.get("resource_state") != "stopped" or row["resource_state"] != "stopped"
+            or type(result) is not dict or _hash(result) != _hash(json.loads(row["result_json"] or "null"))
+            or type(result.get("managed_effect_pending")) is not bool):
+        raise JobError("managed_effect_result_mismatch")
     if prepared is not None:
         if (
             prepared[0]["event_type"] != "managed_effect_prepared"
@@ -1256,10 +1269,30 @@ async def require_closed(manager, tx, row, result_event):
         observed_result = ManagedToolResult.from_dict(result["managed_effect_result"])
         if prepared is None and (observed_result.resolution != "not_dispatched" or exited[1]["dispatch_started"]):
             raise JobError("managed_effect_evidence_missing")
+    refs.append(await _reference(manager, tx, exited[0]["event_id"]))
+    return refs, observed_result, result, found
+
+
+async def require_closed(manager, tx, row, result_event):
+    refs, _, result, found = await resolved_execution(manager, tx, row, result_event)
+    creation, binding = found
+    from .finalization import _reference
+    from .managed_delivery import handled_references
+    from .managed_delivery import read as read_delivery
+
+    notice = await read_delivery(manager, tx, row, result_event, required=False)
+    if notice is not None:
+        refs.extend(await handled_references(manager, tx, row, result_event, notice))
+        observed_raw = await raw_receipt(manager, tx, row, creation, binding, required=creation["receipt_ref_json"] is not None)
+        if observed_raw is not None:
+            refs.append(await _reference(manager, tx, observed_raw[0]["event_id"]))
+        return refs
+    observed_raw = await raw_receipt(manager, tx, row, creation, binding)
+    refs.append(await _reference(manager, tx, observed_raw[0]["event_id"]))
     receipt = await _evidence(manager, tx, row, "tool_receipt")
     if (
         receipt[0]["event_type"] != "managed_effect_tool_receipt"
-        or receipt[1].get("lease") != proof
+        or receipt[1].get("lease") != _proof(row)
         or receipt[1].get("result_id") != result_event["event_id"]
         or receipt[1].get("result_hash") != _hash(json.loads(result_event["payload_json"]))
         or receipt[1].get("display_hash") != _hash(result["display"])
@@ -1268,9 +1301,7 @@ async def require_closed(manager, tx, row, result_event):
         or result_event["delivery_status"] != "handled"
     ):
         raise JobError("managed_effect_receipt_mismatch")
-    refs.extend(
-        [await _reference(manager, tx, exited[0]["event_id"]), await _reference(manager, tx, receipt[0]["event_id"])]
-    )
+    refs.append(await _reference(manager, tx, receipt[0]["event_id"]))
     return refs
 
 
