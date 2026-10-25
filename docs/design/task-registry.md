@@ -1505,3 +1505,14 @@ consumed or deleting inbox history. Safe claim/void/append races and negative
 input supervision remain an explicit subsequent implementation gate, alongside
 formal host wake/polling, cross-process restore and the other unfinished goals.
 Default finite child timers remain disabled.
+
+
+## Original managed-send return receipts
+
+A managed StatefulAgentLoop freezes its complete StatefulResult before the model-send context exits. The versioned result and its hash are appended to the existing model_closed evidence and committed in that same transaction. This is an additive observation protocol: older exits without a result are explicitly unavailable, and the reader never reconstructs an alleged result from assistant text. Invalid/oversized result capture records a fixed error instead of changing an already completed model call into a retry.
+
+The host-only `power_loop.runtime.send_receipt.read(manager, actor, job_id, expected_host_context=...)` reads the original result. Capture is limited to 1 MiB of serialized UTF-8; the exit reader defaults to a 2 MiB envelope budget, checks SQL byte length before loading, and validates structure/hash, original generation/status/usage/round count/input flag, original model-attempt snapshot and quiescence, and the exact actual assistant MessageRef. Current unknown model resource state is rejected. Optional host context is frozen before awaiting, then matched against the original root creation. A different tenant/principal/session, missing exit, unresolved calls, pending tools/interactions, foreign provenance or changed raw reference cannot become a replay receipt.
+
+The returned dictionary contains the original result, model-exit event/hash, generation, optional host provenance and last assistant reference. It creates no runtime/provider, lease, send, budget, descendant completion or business response. execution_authority, resource_stop_confirmed and billing_settled are false. Reading the result is independent of whether the host has reconciled its own continuation stages, external effects and final business ACK; those need their own immutable original records before automatic recovery. Multiple-process writer coordination remains the host's responsibility.
+
+Native inbox adapters can bind their original delivery row to the uniquely registered send via its original scoped system key and delivery send index. They must verify the actual delivered transcript and original content, match the saved host root, and reject an input absorbed by another run unless a separate original handoff protocol proves that responsibility. A read-only SDK result is not authority to debit another root or resend an input.
