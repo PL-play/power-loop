@@ -90,51 +90,24 @@ def section_security(_ctx: SystemPromptContext) -> str:
 
 
 def section_tool_guide(ctx: SystemPromptContext) -> str | None:
-    """Per-tool usage hints.  Only emits tools that are actually registered."""
-    catalog: dict[str, str] = {
-        "bash": (
-            "persistent session — cwd and env vars survive across calls. "
-            "Use restart=true to reset. Avoid dangerous commands (rm -rf /, sudo)."
-        ),
-        "read_file": (
-            'returns numbered lines ("  1|code"). Use offset/limit for large files. '
-            "Pass a directory path to list contents. Always read before editing."
-        ),
-        "write_file": (
-            "create or overwrite a file. Both 'path' and 'content' are REQUIRED in one JSON object. "
-            "Prefer edit_file or apply_patch for existing files."
-        ),
-        "edit_file": (
-            "str_replace (old_text -> new_text). old_text must be unique — include more context if ambiguous. "
-            "Set replace_all=true to replace every occurrence. You MUST read_file before editing."
-        ),
-        "apply_patch": (
-            "apply a patch using @@ context lines for positioning and +/- for line changes. "
-            "You MUST read_file before patching. Best for large edits."
-        ),
-        "glob": "find files by pattern (e.g. '*.py', '**/*.ts'). Prefer over bash find.",
-        "grep": "search file contents by regex. Prefer over bash grep/rg. Supports include filter.",
-        "load_skill": "load specialized knowledge before tackling unfamiliar domains.",
-        "todo": (
-            "track multi-step tasks. Keep exactly one item in_progress at a time. "
-            "Mark in_progress BEFORE starting, completed IMMEDIATELY when done."
-        ),
-        "background_run": (
-            "action=run starts a shell command asynchronously in a background worker; "
-            "action=check inspects status/output by task_id or lists all tasks."
-        ),
-    }
+    """Render each registered definition's own presentation metadata.
 
-    names = ctx.tool_names if ctx.tool_names else list(catalog.keys())
-    lines = ["# Tool Usage"]
-    lines.append(
+    Without definitions this is a preview of the SDK built-in catalog only;
+    passing an actual registry never falls back to a same-named built-in.
+    """
+    tools = ctx.tool_definitions
+    if tools is None:
+        from power_loop.tools.default_manifest import get_tool_definitions
+        definitions = get_tool_definitions()
+    else:
+        definitions = tools.definitions() if hasattr(tools, "definitions") else tools
+    selected = set(ctx.tool_names) if ctx.tool_names else None
+    lines = ["# Tool Usage",
         "CRITICAL — File path fidelity: When passing file paths to ANY tool, "
-        "use the EXACT path string as given. NEVER rename, re-space, or re-punctuate file names."
-    )
-    for name in names:
-        hint = catalog.get(name)
-        if hint:
-            lines.append(f"- {name}: {hint}")
+        "use the EXACT path string as given. NEVER rename, re-space, or re-punctuate file names."]
+    for definition in definitions:
+        if (selected is None or definition.name in selected) and definition.usage_hint:
+            lines.append(f"- {definition.name}: {definition.usage_hint}")
     return "\n".join(lines)
 
 
@@ -164,10 +137,24 @@ def section_paths(ctx: SystemPromptContext) -> str | None:
     return "\n".join(lines)
 
 
-def section_todo_discipline(_ctx: SystemPromptContext) -> str:
+def section_todo_discipline(ctx: SystemPromptContext) -> str | None:
+    from power_loop.runtime.tool_contracts import capability_tools
+    from power_loop.tools.registry import ToolRegistry
+
+    if ctx.tool_definitions is None:
+        instruction = "Keep a task list for any task with 3+ steps."
+    else:
+        if not isinstance(ctx.tool_definitions, ToolRegistry):
+            return None
+        selected = set(ctx.tool_names) if ctx.tool_names else None
+        names = [tool.definition.name for tool in capability_tools(ctx.tool_definitions, "task.progress.v1")
+                 if selected is None or tool.definition.name in selected]
+        if not names:
+            return None
+        instruction = f"Track tasks with {', '.join(names)} for any task with 3+ steps."
     return (
         "# Todo Discipline\n"
-        "- Use the todo tool for any task with 3+ steps.\n"
+        f"- {instruction}\n"
         "- Mark a todo in_progress BEFORE you start working on it.\n"
         "- Mark it completed IMMEDIATELY when done — do not batch.\n"
         "- Only one item should be in_progress at any time."
@@ -458,7 +445,9 @@ def resolve_runtime_system_prompt(
     can never drift. Callers resolve ``base`` themselves (config vs session
     override) and pass it in; everything after is computed here once.
     """
-    out = (base or DEFAULT_AGENT_SYSTEM_PROMPT).strip()
+    default = (SystemPromptBuilder().remove("tool_catalog").build(SystemPromptContext(tool_definitions=tool_registry))
+               if tool_registry is not None and not base else DEFAULT_AGENT_SYSTEM_PROMPT)
+    out = (base or default).strip()
     if inject_tool_descriptions and tool_registry is not None:
         catalog = format_tool_catalog(tool_registry, header=tool_catalog_header)
         if catalog:

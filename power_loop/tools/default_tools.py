@@ -2598,6 +2598,10 @@ _h_recall_send = FunctionRuntimeTool(
     policy=lambda arguments: ToolDispatchPolicy(native_admitted=True, control_only=arguments.get("job_id") is not None),
 )
 
+_h_todo = FunctionRuntimeTool(
+    _h_todo, ToolRuntimeContract("sdk.progress", capabilities=("task.progress.v1",)),
+)
+
 _h_background_run = BackgroundTool(_h_background_run)
 _h_schedule_wakeup = FunctionRuntimeTool(
     _h_schedule_wakeup, ToolRuntimeContract("sdk.timer", allowed_roles=("main",)),
