@@ -46,6 +46,7 @@ class BoundedProvider(LLMService):
         self.inner = make_llm(max_tokens=2048, temperature=0)
         self.limit = limit
         self.calls = 0
+        self.refused_calls = 0
         self.responses = []
         self.root_sid = None
         self.hold_children = False
@@ -56,9 +57,10 @@ class BoundedProvider(LLMService):
         if self.hold_children and get_session_id() != self.root_sid:
             self.child_entered.set()
             await self.release_children.wait()
-        self.calls += 1
-        if self.calls > self.limit:
+        if self.calls >= self.limit:
+            self.refused_calls += 1
             raise AssertionError(f"real-provider test exceeded {self.limit} requests")
+        self.calls += 1
         response = await asyncio.wait_for(self.inner.complete(request, **kwargs), 60)
         self.responses.append(response)
         return response
@@ -71,6 +73,7 @@ class BoundedProvider(LLMService):
 
     def report(self, record_property):
         record_property("real_provider_requests", self.calls)
+        record_property("local_provider_calls_refused", self.refused_calls)
         record_property("reported_tokens", sum(
             getattr(getattr(r, "token_usage", None), "total_tokens", 0) or 0
             for r in self.responses))

@@ -1,5 +1,6 @@
 """Original completed managed sends survive reopen without a new provider call."""
 import json
+import tracemalloc
 from dataclasses import asdict, replace
 
 import pytest
@@ -158,3 +159,18 @@ async def test_later_send_does_not_replace_original_result_or_reference(root_cas
         await c.loop.send("second independent input", c.sid)
     assert len(c.model.calls) == 2
     assert await send_receipt.read(c.manager, c.actor, job, expected_host_context=source) == saved
+
+
+async def test_raw_reference_does_not_materialize_unrelated_large_message_body(root_case):
+    c = root_case
+    job, _, _ = await original(c)
+    receipt = await send_receipt.read(c.manager, c.actor, job)
+    await c.manager.db.execute(f"UPDATE {c.store.t.messages} SET content=? WHERE session_id=? AND seq=?",
+        ("x" * (16 * 1024 * 1024), c.sid, int(receipt["last_assistant_ref"]["seq"])))
+    tracemalloc.start()
+    try:
+        assert await send_receipt.read(c.manager, c.actor, job) == receipt
+        _, peak = tracemalloc.get_traced_memory()
+        assert peak < 8 * 1024 * 1024, "Reference lookup materialized an unrelated 16MiB message body"
+    finally:
+        tracemalloc.stop()

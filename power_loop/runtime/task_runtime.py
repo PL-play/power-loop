@@ -184,12 +184,16 @@ class TaskRuntime:
         workflow_resources=None,
         boot_contract_hash: str | None = None,
         budget_config=None,
+        require_host_send_steps: bool = False,
     ):
         JobActor(tenant_id, principal_id, "validation")
         if not all(isinstance(v, str) and 0 < len(v) <= 64 for v in (executor_id, boot_id)):
             raise JobError("invalid_executor")
         if isinstance(lease_ms, bool) or not isinstance(lease_ms, int) or not 300 <= lease_ms <= 300000:
             raise JobError("invalid_lease_duration")
+        if type(require_host_send_steps) is not bool:
+            raise JobError("invalid_host_send_step_requirement")
+        self.require_host_send_steps = self._original_host_step_requirement = require_host_send_steps
         if workflow_resources is not None:
             from .workflow_resources import WorkflowResourceRegistry
 
@@ -261,6 +265,11 @@ class TaskRuntime:
         """Bind trusted per-root provenance before entering the main send."""
         from .root_context import bind
         return bind(self, session_id, namespace=namespace, payload=payload)
+
+    def host_send_step(self, session_id, *, namespace, plan_hash, step_id):
+        """Bind a trusted host processing step inside its original root scope."""
+        from .host_send_steps import bind
+        return bind(self, session_id, namespace=namespace, plan_hash=plan_hash, step_id=step_id)
 
     async def claim(self, actor: JobActor, registration: JobRegistration) -> Execution:
         _check_task_owner(self)
@@ -379,6 +388,9 @@ class TaskRuntime:
     async def _model_send(self, loop, sid: str, send_index: int, *, cancel_token=None):
         from .execution_roles import session_role
 
+        if (type(self.require_host_send_steps) is not bool
+                or self.require_host_send_steps != self._original_host_step_requirement):
+            raise JobError("host_send_step_configuration_changed")
         if await loop.ensure_store() is not self.manager.store:
             raise JobError("task_store_mismatch")
         actor = self.actor(sid)
@@ -422,6 +434,13 @@ class TaskRuntime:
             provenance = for_send(self, sid)
             if provenance is not None:
                 request["host_context"] = provenance
+            from .host_send_steps import FIELD
+            from .host_send_steps import for_send as step_for_send
+            step = step_for_send(self, sid)
+            if step is None and self.require_host_send_steps:
+                raise JobError("host_send_step_required")
+            if step is not None:
+                request[FIELD] = step
         registration = await self.manager.register_job(
             registering_actor,
             kind="send",

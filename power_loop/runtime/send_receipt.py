@@ -124,7 +124,7 @@ async def read(manager, actor, job_id, *, expected_host_context=None, max_bytes=
             raise JobError("send_receipt_response_required")
         from .message_ref import MessageRef, integer_id
         try:
-            raw = await tx.fetchone(f"SELECT * FROM {manager.store.t.messages} WHERE session_id=? AND seq=?",
+            raw = await tx.fetchone(f"SELECT id,seq,role,tool_call_id,send_index,round_index FROM {manager.store.t.messages} WHERE session_id=? AND seq=?",
                 (actor.session_id, integer_id(last["seq"], "seq")))
             if raw is None:
                 raise ValueError()

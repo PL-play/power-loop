@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-REQUIRED_REAL_CASES = 116
+REQUIRED_REAL_CASES = 117
 
 
 class RunnerInterrupted(BaseException):
@@ -239,6 +239,7 @@ def main() -> int:
     scopes.append("tests/real/test_real_completion_window_192.py")
     scopes.append("tests/real/test_real_model_attempts_192.py")
     scopes.append("tests/real/test_real_send_receipt_192.py")
+    scopes.append("tests/real/test_real_host_send_steps_192.py")
     scopes.append("tests/real/test_real_answer_freshness_192.py")
     scopes.append("tests/real/test_real_executor_registry_192.py")
     scopes.append("tests/real/test_real_executor_lifecycle_192.py")

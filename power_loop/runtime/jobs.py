@@ -548,6 +548,9 @@ class JobManager:
         if parent is None and call_ref is not None:
             raise JobError("model_operation_requires_parent_execution")
         request_data = json.loads(_json(dict(request or {})))
+        from . import host_send_steps
+        host_step = host_send_steps.request_step(request_data, actor=actor, kind=kind,
+            parent=parent, session_id=session_id, system_key=system_key)
         key = self._origin_key(actor, "create", call_ref, tool_call_id, system_key)
         fingerprint = _hash([kind, title, session_id, parent.job_id if parent else None, independent,
                              request_data, call_ref.to_dict() if call_ref else None])
@@ -557,7 +560,9 @@ class JobManager:
                 if old["request_hash"] != fingerprint:
                     raise JobError("operation_conflict")
                 job = await self._authorize(tx, actor, old["job_id"])
+                await host_send_steps.require_replay(self, tx, actor, host_step, old["job_id"])
                 return JobRegistration(_record(job), _operation(old), True)
+            await host_send_steps.require_available(self, tx, actor, host_step)
             if kind == "send" and parent is None and request_data.get("host_context") is not None:
                 from .root_control import _admit
                 await _admit(self, tx, actor, request_data["host_context"])
@@ -604,7 +609,7 @@ class JobManager:
                 raise JobError("root_session_required")
             if parent_row is not None and parent_row["kind"] in ("subagent", "workflow_node") and parent_row["status"] == "waiting":
                 raise JobError("owner_waiting_requires_input")
-            job_id = "job_" + secrets.token_hex(16)
+            job_id = host_send_steps.job_id(self, actor, host_step) or "job_" + secrets.token_hex(16)
             root = parent_row["root_job_id"] if parent_row else job_id
             scope = job_id
             if not independent and parent_row:
@@ -645,6 +650,7 @@ class JobManager:
             operation = await self._insert_operation(tx, job_id=job_id, version=1, actor=actor, action="create",
                 key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id,
                 payload=payload)
+            await host_send_steps.record(self, tx, actor, host_step, operation)
             return JobRegistration(_record(await self._row(tx, job_id)), operation, False)
 
     async def claim_job(self, actor: JobActor, job_id: str, *, executor_id: str, boot_id: str,
