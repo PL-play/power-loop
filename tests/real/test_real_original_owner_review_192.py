@@ -17,14 +17,14 @@ pytestmark = [pytest.mark.real_llm,pytest.mark.asyncio]
 @pytest.mark.parametrize('allowed_calls',[2,1])
 async def test_real_original_owner_never_releases_output_before_actual_review_or_gets_extra_quota(registry_store,kind,allowed_calls,record_property):
     provider = BoundedProvider(limit=7)
-    c = await original_owner_case(registry_store,kind,allowed_calls=allowed_calls,provider=provider)
+    c = await original_owner_case(registry_store,kind,allowed_calls=allowed_calls,provider=provider,max_tokens=4096)
     initial = set(delegation._TASKS)
     try:
         result = await c.loop.send('Use launch_owned exactly once to launch the requested original child task. Then reply QUEUED.',c.state.root)
         assert result.status == 'completed'
-        await asyncio.wait_for(c.state.original.wait(),90)
+        await wait_original_phase(c,kind,initial,c.state.original,provider)
         if allowed_calls==2:
-            await asyncio.wait_for(c.state.entered.wait(),90)
+            await wait_original_phase(c,kind,initial,c.state.entered,provider)
             assert not c.state.notifications and c.state.counts['AFTER']==0 and not c.state.effects
             source = await c.manager.get_job(c.runtime.actor(c.state.root),c.state.source)
             assert source.status=='model_closed' and source.result_status=='pending_delivery'
@@ -56,3 +56,26 @@ async def test_real_original_owner_never_releases_output_before_actual_review_or
         await c.runtime.shutdown(timeout_s=3)
         await c.loop.aclose(drain_timeout_s=.1)
         await provider.close()
+
+
+async def wait_original_phase(c, kind, initial, event, provider):
+    """A dead original controller cannot later enter review. Never wait for it."""
+    if event.is_set():
+        return
+    tasks = ([c.state.handles[0].task] if kind == 'workflow_node' and c.state.handles else
+             list(set(delegation._TASKS)-initial))
+    ready = asyncio.create_task(event.wait())
+    try:
+        if tasks:
+            await asyncio.wait({ready, *tasks}, timeout=90, return_when=asyncio.FIRST_COMPLETED)
+        if not event.is_set():
+            import json
+            diagnostics = {'counts': dict(c.state.counts), 'source_job_id': c.state.source,
+                'task_states': [{'done': task.done(), 'cancelled': task.cancelled()} for task in tasks],
+                'responses': [{'text': (response.raw_text or '')[:1000],
+                    'tool_names': [call.get('function', {}).get('name') for call in response.tool_calls or []]}
+                    for response in provider.responses[-2:]]}
+            raise AssertionError('Original controller did not reach phase: ' + json.dumps(diagnostics))
+    finally:
+        ready.cancel()
+        await asyncio.gather(ready, return_exceptions=True)

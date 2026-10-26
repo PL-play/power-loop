@@ -128,7 +128,12 @@ async def _notice_value(manager, tx, source, result):
             'result': content_reference(result), 'public': public, 'message_hash': _hash(render(public))}
 
 
-async def notice(manager, tx, source, result, *, required=True):
+async def notice(manager, tx, source, result, *, required=True, original=False):
+    if not original:
+        from .controller_handoff import read as handoff
+        transferred = await handoff(manager, tx, source, result)
+        if transferred is not None:
+            return transferred
     from .tool_call_plans import _read
     value = await _read(manager, tx, notice_id(manager, source), source, 'source_abort_delivery', optional=not required)
     if value is None:
@@ -143,10 +148,16 @@ async def notice(manager, tx, source, result, *, required=True):
 
 async def _inbox(manager, tx, source, delivery):
     row = await tx.fetchone(f'SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?',
-                            (source['session_id'], delivery[0]['event_id']))
+                            (delivery[1].get('main_session_id', source['session_id']), delivery[0]['event_id']))
     if (row is None or row['kind'] != 'original_call_outcome' or row['mode'] != 'queue'
-            or row['status'] not in ('pending', 'claimed', 'delivered') or row['content'] != render(delivery[1]['public'])):
+            or row['status'] not in ('pending', 'claimed', 'delivered', 'transferred') or row['content'] != render(delivery[1]['public'])):
         raise JobError('abort_outcome_inbox_mismatch')
+    if row['status'] == 'transferred':
+        from .controller_handoff import identity
+        found = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=? AND event_type='controller_review_handoff'",
+                                  (identity(manager, source),))
+        if found is None or row['item_id'] != notice_id(manager, source):
+            raise JobError('abort_outcome_inbox_mismatch')
     return row
 
 
@@ -175,7 +186,7 @@ async def expected_disposition(manager, tx, source, closed, *, optional=False):
     _closed, snapshot, _pending, ref, checkpoint = await _original(manager, tx, source)
     if _hash(_closed) != _hash(closed):
         raise JobError('abort_outcome_exit_changed')
-    delivery = await notice(manager, tx, source, result)
+    delivery = await notice(manager, tx, source, result, original=True)
     await _inbox(manager, tx, source, delivery)
     children = []
     for call_id, row in await _children(manager, tx, source, checkpoint, ref):
@@ -230,6 +241,10 @@ async def _reconcile(loop, actor, source_job_id, *, permit):
             from .original_owner_review import require_live
             await require_live(manager,tx,actor,source,permit)
         closed, _snapshot, pending, ref, checkpoint = await _original(manager, tx, source)
+        from .controller_handoff import read as handed_off
+        existing_result = await result_event(manager, tx, source, required=False)
+        if existing_result is not None and await handed_off(manager, tx, source, existing_result) is not None:
+            raise JobError('original_owner_review_transferred')
         if actor.session_id != source['session_id'] or not await uses_batch_route(manager, tx, source, closed):
             raise JobError('abort_outcome_original_route_required')
         old = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', (identity(manager, source),))
@@ -281,10 +296,10 @@ async def _review_sources(manager, tx, actor):
     prefix = '{' + _json(FIELD) + ':'
     has_abort = f"EXISTS (SELECT 1 FROM {manager.events} a WHERE a.job_id=j.job_id AND a.event_type='tool_call_abort')"
     rows = await tx.fetchall(f"SELECT j.job_id,j.generation,j.result_status,substr(j.result_json,1,{len(prefix)}) AS result_prefix,{has_abort} AS has_abort "
-        f"FROM {manager.jobs} j WHERE j.kind='send' AND j.session_id=? AND j.tenant_id=? AND j.principal_id=? "
+        f"FROM {manager.jobs} j WHERE j.kind='send' AND (j.session_id=? OR EXISTS (SELECT 1 FROM {manager.events} h WHERE h.job_id=j.job_id AND h.event_type='controller_review_handoff' AND h.caller_session_id=?)) AND j.tenant_id=? AND j.principal_id=? "
         f"AND ((j.result_status<>'none' AND ({has_abort} OR substr(j.result_json,1,{len(prefix)})=?)) OR EXISTS "
         f"(SELECT 1 FROM {manager.events} e WHERE e.job_id=j.job_id AND e.event_type IN ('source_abort_delivery','pending_call_disposition'))) "
-        "ORDER BY j.job_id LIMIT 1001", (actor.session_id, actor.tenant_id, actor.principal_id, prefix))
+        "ORDER BY j.job_id LIMIT 1001", (actor.session_id, actor.session_id, actor.tenant_id, actor.principal_id, prefix))
     if len(rows) > 1000:
         raise JobError('abort_outcome_scope_too_large')
     selected = []
@@ -353,9 +368,11 @@ async def handled_references(manager, tx, source, result=None, delivery=None):
     from .original_owner_review import read as review_owner
     from .original_owner_review import require_handler
     binding = await review_owner(manager,tx,source)
+    transferred = delivery[0]['event_type'] == 'controller_review_handoff'
     refs = await common(manager,tx,source,result,delivery,verifier=verify_observation,
-        session_id=source['session_id'],owner_job_id=binding['owner']['job_id'] if binding else None,
-        handler_role=binding['execution_role'] if binding else 'main')
+        session_id=delivery[1]['main_session_id'] if transferred else source['session_id'],
+        owner_job_id=binding['owner']['job_id'] if binding and not transferred else None,
+        handler_role=binding['execution_role'] if binding and not transferred else 'main')
     decision = next(ref for ref in refs if ref['event_type']=='processing_decision')
     event = await tx.fetchone(f'SELECT payload_json FROM {manager.events} WHERE event_id=?',(decision['event_id'],))
     handler = await manager._row(tx,json.loads(event['payload_json'])['handler_job_id'])

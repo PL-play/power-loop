@@ -126,7 +126,18 @@ async def read(manager, tx, source):
 
 
 async def require_handler(manager,tx,source,handler):
+    from .abort_outcomes import result_event
+    from .controller_handoff import read as handoff
     from .managed_completion import _scope
+    result = await result_event(manager,tx,source,required=False)
+    transferred = await handoff(manager,tx,source,result) if result is not None else None
+    if transferred is not None:
+        from .managed_delivery import _main
+        await _main(manager,tx,handler)
+        if (handler['kind'] != 'send' or handler['execution_role'] != 'main'
+                or handler['session_id'] != transferred[1]['main_session_id']):
+            raise JobError('original_owner_review_handler_invalid')
+        return
     expected = await read(manager,tx,source)
     if handler['session_id'] != source['session_id'] or handler['kind'] != 'send':
         raise JobError('original_owner_review_handler_invalid')

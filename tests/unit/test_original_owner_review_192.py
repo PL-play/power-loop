@@ -32,7 +32,7 @@ __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='seal', hide=False, provider=None, fail_review=False):
+async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='seal', hide=False, provider=None, fail_review=False, shared_calls=12, max_tokens=2048):
     store, _ = registry_store
     manager, host = JobManager(store), Host()
     if provider is not None:
@@ -40,7 +40,7 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
         host = RealBudgetHost()
     runtime = TaskRuntime(manager, tenant_id='original-owner', principal_id='host', executor_id='original', boot_id='boot',
         lease_ms=300000, boot_contract_hash='c'*64, budget_config=BudgetConfig('original-owner-v1', (
-            LocalBudgetScope('shared', max_calls=12),
+            LocalBudgetScope('shared', max_calls=shared_calls),
             LocalBudgetScope('child', max_calls=allowed_calls, binding='owner', owner_kinds=('workflow_node','subagent'))),host))
     state = SimpleNamespace(counts=Counter(), effects=[], entered=asyncio.Event(), release=asyncio.Event(),
         handles=[], notifications=[], source=None, root=None, review_requests=[], original=asyncio.Event())
@@ -103,7 +103,7 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
     registry.register(ToolDefinition('launch_owned','Launch original child',input_schema={'type':'object'}),
         FunctionRuntimeTool(launch,ToolRuntimeContract('example.launch-owned',allowed_roles=('main',)),policy=lambda args:ToolDispatchPolicy(True)))
     loop = StatefulAgentLoop(llm=model,store=store,task_runtime=runtime,tool_registry=registry,
-        config=AgentLoopConfig(max_tokens=2048 if provider is not None else 20,max_rounds=4,delegation_policy='single_level',compactor=None))
+        config=AgentLoopConfig(max_tokens=max_tokens if provider is not None else 20,max_rounds=4,delegation_policy='single_level',compactor=None))
     from power_loop.runtime.retry import LLMRetryPolicy
     loop.config.retry_policy = LLMRetryPolicy(max_attempts=1)
     state.root = await loop.new_session()
@@ -114,6 +114,11 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
             role = 'MAIN' if sid==state.root else 'AFTER' if 'ROLE-AFTER' in ctx.system_prompt else 'BUILD'
             name = 'launch_owned' if role=='MAIN' and not state.counts[role] else 'touch_once' if role=='BUILD' and not state.counts[role] else None
             ctx.tools = [registry.get(name).definition.to_openai_tool()] if name else []
+            if role == 'BUILD':
+                ctx.system_prompt += ('\nAcknowledge only the supplied negative outcome in one short sentence. The action was not dispatched. Do not solve or retry the task.'
+                    if state.counts[role] else '\nCall the offered touch_once function once using native function calling. Do not write textual or XML calls.')
+            elif role == 'AFTER':
+                ctx.system_prompt += '\nThe failed previous node was deliberately tolerated. Return AFTER as plain text; do no other work.'
             if role=='MAIN':
                 ctx.system_prompt += ('\nRead and acknowledge the supplied original completion without starting more work.' if state.counts[role]>=2 else '\nLaunch the requested child once with launch_owned, then return QUEUED as plain text. Do not launch additional tasks.')
         loop.hooks.register(HookPoint.LLM_BEFORE,phase,name='test.owner.actual-phase-schema')

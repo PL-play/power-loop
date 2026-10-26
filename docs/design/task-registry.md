@@ -1621,3 +1621,26 @@ escalation; each unchanged problem has at most an initial alert and one escalati
 problem again before a host requests a wake. Historical reads grant no admission.
 The host schedules scans and applies its own installation, wake and budget policy;
 the library has no dependency on platform services or tool names.
+
+### Retired-controller review handoff (task protocol16)
+
+`runtime.controller_handoff.transfer_review` and its host-runtime form transfer
+only an existing child's canonical negative-result review to its original main
+session. No model is created by transfer. Original controller retirement, original
+root/owner binding, stopped descendant resources, immutable exit/notice/disposition
+records and sealed membership are checked before the new inbox entry commits.
+The original result and child role stay unchanged. A pending old notice is marked
+transferred; a previously delivered notice remains a historical delivery fact.
+Claimed notices and unconfirmed resources cannot transfer.
+
+Only an actual main request seeing the exact new notice, saving its real response
+and exiting cleanly can acknowledge the original result. Queue acceptance is not
+processing. The original main's budget gates its own request; transfer supplies no
+extra child quota, execution lease, resource-stop proof or billing settlement.
+`handoff_retired_reviews` provides a bounded mechanical owner scan for hosts.
+Host repair failure must not suppress an independently validated supervision alert.
+
+This changes review routing and therefore requires protocol16: older writers are
+rejected, and existing task stores need an explicit maintenance upgrade. Protocol15
+history and original message identities remain readable after that upgrade.
+Controller resource/owner-result closure remains separate from source-result review.
