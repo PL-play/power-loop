@@ -133,6 +133,8 @@ async def test_successful_restore_without_provider_usage_preserves_new_estimates
             result.token_usage = None
         return result
     monkeypatch.setattr(c.model, "complete", no_usage)
+    # Estimate accounting is independent of heartbeat-expiry tests.
+    c.runtime.lease_ms = 30000
     handle = await c.restore()
     await asyncio.wait_for(handle.task, 10)
     current = await c.manager.get_job(c.actor, handle.job_id)

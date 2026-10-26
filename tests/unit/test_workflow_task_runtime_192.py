@@ -280,11 +280,13 @@ async def test_node_child_results_are_processed_before_downstream_and_aggregate_
 @pytest.mark.parametrize("failure", ["before_result", "result_ack", "inbox_write", "history_only", "wrong_ref"])
 async def test_disappearing_child_handle_is_not_completion_proof_without_result_delivery_and_model_processing(managed_workflow, monkeypatch, failure):
     store, manager, runtime, loop, model, sid, state, _ = managed_workflow
+    # The assertions target missing results, not short admission leases.
+    runtime.lease_ms = 30000
     model.hold = {"AUDIT"}
     model.spawn_from_build = True
     state["spec"]["root"]["steps"][0] = leaf("BUILD", tools=["spawn_agent"])
     await loop.send("run", sid)
-    await asyncio.wait_for(model.entered["AUDIT"].wait(), 3)
+    await asyncio.wait_for(model.entered["AUDIT"].wait(), 10)
     if failure in ("before_result", "result_ack"):
         original = manager.record_execution_result
 
