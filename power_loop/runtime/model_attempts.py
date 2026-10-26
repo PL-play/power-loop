@@ -56,6 +56,7 @@ class Attempt:
     attempt_id: str
     prepared: dict
     local_deadline: float | None = field(default=None, compare=False, repr=False)
+    capture_binding: object | None = field(default=None, compare=False, repr=False)
 
 
 def event_identity(attempt):
@@ -612,6 +613,8 @@ async def start_call(pipeline, request, *, round_index, retry_index, model):
             binding.resource_evidence["budget_pending"] = True
             log.exception("Unreserved attempt closure remains pending: %s", attempt.attempt_id)
         raise
+    from .response_capture import bind
+    attempt = replace(attempt, capture_binding=await bind(attempt))
     try:
         deadline = await dispatch(attempt)
     except JobError:

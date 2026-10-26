@@ -29,6 +29,7 @@ class AgentEventType(str, Enum):
     # LLM call lifecycle (per attempt — latency / usage / retry attribution)
     LLM_CALL_STARTED = "llm_call_started"
     LLM_CALL_COMPLETED = "llm_call_completed"
+    LLM_RESPONSE_RECEIVED = "llm_response_received"
 
     # LLM retry / cancellation lifecycle
     LLM_RETRY_ATTEMPTED = "llm_retry_attempted"

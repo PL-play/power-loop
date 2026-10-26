@@ -112,3 +112,7 @@ ack = await control_runtime.reconcile_budget_usage(
 - stage失败全部回滚；并发相同请求返回同一receipt，其他竞争快照明确拒绝。记录损坏/来源事件缺失时，即使提交已冻结也拒绝交付。采集器须保留原来源记录，拒绝不等于受理。
 
 来源ID不是认证，SDK不自动向供应商取账单。生产宿主必须实现和验证新端口，并完成采集器授权、原请求匹配和金额规则。本SDK能力不能单独当作正式平台已支持崩溃账单采集；未知远端请求的停止责任继续保留。
+
+## 在原观察之前保存响应副本
+
+可选 `ResponseCaptureProvider.capture_response` 现已由SDK在原观察落库之前调用，详[任务扩展接口](task-extensions.md#可信响应采集端口)。原context/grant在dispatch前固定；响应返回后不依赖一次SDK数据库读取即可交给独立存储。采集回执与预算ACK不同，不自行登记首证、核销额度或证明退出。宿主恢复采集记录后须验证来源，按原attempt现有观察/修订状态选择正常核账或独立首证；已正常入账的同一响应不得重复结算。普通 `LLM_RESPONSE_RECEIVED` 事件仅用于观察。

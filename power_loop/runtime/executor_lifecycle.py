@@ -343,6 +343,19 @@ class ExecutorLifecycle:
             waiting = tasks - self._shutdown_waiters
             if waiting:
                 await asyncio.wait(waiting, timeout=max(0.0, deadline - clock()))
+        # A controller can exit by transferring an already-running request.
+        # Re-read after every wait and spend only the ORIGINAL remaining stop
+        # window on those handles. A single final snapshot can otherwise report
+        # pending work while there is still time to observe its actual exit.
+        while True:
+            entries = self._locals()
+            tasks |= {v["task"] for v in entries if v["task"] is not current and not v["task"].done()}
+            waiting = {t for t in tasks if not t.done()} - self._shutdown_waiters
+            remaining = deadline - clock()
+            if not waiting or remaining <= 0:
+                break
+            signals += self._signal(entries, force=True)
+            await asyncio.wait(waiting, timeout=remaining)
         receipt, error = None, None
         if self._control_task.done():
             try:

@@ -67,6 +67,18 @@ class LlmCallStartedPayload(BaseEventPayload):
 
 
 @dataclass
+class LlmResponseReceivedPayload(LlmCallStartedPayload):
+    """A provider response arrived, before observation persistence or estimates.
+
+    Best-effort telemetry only. Neither delivery nor a subscriber return value
+    authenticates usage, acknowledges durable capture, or closes execution.
+    """
+    usage: dict = field(default_factory=dict)
+    cost_amount: str | None = None
+    response_id: str | None = None
+
+
+@dataclass
 class LlmCallCompletedPayload(BaseEventPayload):
     """Emitted when an LLM call attempt finishes (success OR error).
 

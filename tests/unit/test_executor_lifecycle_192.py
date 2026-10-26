@@ -545,3 +545,47 @@ async def test_lifecycle_task_allocation_failure_stops_owned_work_and_keeps_reco
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_shutdown_waits_for_handle_handed_off_during_final_wait(host, monkeypatch):
+    _, _, runtime = host
+    await runtime.start()
+    port_entered, port_release = asyncio.Event(), asyncio.Event()
+    handed_off = asyncio.Event()
+    async def actual_port():
+        port_entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await port_release.wait()
+    port = asyncio.create_task(actual_port())
+    await port_entered.wait()
+    token = CancellationToken()
+    async def controller():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            # Original transport was already running. Its controller exits,
+            # leaving the actual handle with the same runtime for shutdown.
+            runtime.track_task(port)
+            handed_off.set()
+    control = asyncio.create_task(controller())
+    runtime.track_task(control, cancel_token=token)
+    await asyncio.sleep(0)
+    wait = asyncio.wait
+    async def intercept(tasks, **kwargs):
+        result = await wait(tasks, **kwargs)
+        if control in tasks and control.done() and handed_off.is_set():
+            # Its next event-loop turn can now finish the transport. Shutdown
+            # must observe that turn before returning a close-safe snapshot.
+            port_release.set()
+        return result
+    monkeypatch.setattr(asyncio, 'wait', intercept)
+    try:
+        result = await runtime.shutdown(timeout_s=2, grace_s=0.01)
+        assert handed_off.is_set() and result['durable_drain_confirmed']
+        assert result['pending_handles'] == 0 and result['store_safe_to_close']
+        assert port.done() and not port.cancelled()
+    finally:
+        port_release.set()
+        await asyncio.gather(control, port, return_exceptions=True)

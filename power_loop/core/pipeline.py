@@ -49,6 +49,7 @@ from power_loop.contracts.event_payloads import (
     LlmCallCompletedPayload,
     LlmCallStartedPayload,
     LlmDegradedPayload,
+    LlmResponseReceivedPayload,
     LlmRetryAttemptedPayload,
     LoopCancelledPayload,
     MemoryFailedPayload,
@@ -1370,6 +1371,7 @@ class AgentPipeline:
             self._emit(AgentEventType.STREAM_STARTED, StreamStartedPayload(),
                        round_index=round_index, stream_id="main")
             policy_alarm = None
+            response_received = False
             try:
                 # Per-call observability (H4.1): pair STARTED/COMPLETED by call_id so a
                 # subscriber sees per-attempt latency + per-call (not cumulative) usage,
@@ -1399,6 +1401,7 @@ class AgentPipeline:
                             resp = await self.llm.complete(
                                 request, on_chunk_delta_text=_on_delta, on_chunk_think=_on_think,
                             )
+                            response_received = True
                     finally:
                         if attempt_token is not None:
                             single_attempt.reset(attempt_token)
@@ -1438,6 +1441,17 @@ class AgentPipeline:
                         raise LLMNonRetryable(attempts=attempt, last_error=exc) from exc
                     raise
                 usage = getattr(resp, "token_usage", None)
+                reported = response_observation(usage, resp)
+                try:
+                    # Detached data: a telemetry subscriber cannot alter the
+                    # captured evidence or the response used by the pipeline.
+                    self._emit(AgentEventType.LLM_RESPONSE_RECEIVED,
+                        LlmResponseReceivedPayload(call_id=call_id, round_index=round_index,
+                            attempt=attempt, model=model_name, usage=dict(reported["usage"]),
+                            cost_amount=reported["cost_amount"], response_id=reported["response_id"],
+                            **durable_identity), round_index=round_index, stream_id="main")
+                except (Exception, asyncio.CancelledError) as exc:
+                    logging.getLogger(__name__).warning("Response observer failed: %s", type(exc).__name__)
                 estimated = usage is None or getattr(usage, "prompt_tokens", None) is None
                 if estimated:
                     # The provider sent no usage for a call that completed (U1: we no longer
@@ -1453,7 +1467,9 @@ class AgentPipeline:
                     resp.token_usage = usage
                     self.ctx.note_estimated_call(p_est + c_est)
                 if model_attempt is not None:
-                    await observe(model_attempt, **response_observation(usage, resp), estimated=estimated)
+                    from power_loop.runtime.response_capture import record
+                    await record(model_attempt, reported=reported,
+                        observation=response_observation(usage, resp), estimated=estimated)
                 self._emit(
                     AgentEventType.LLM_CALL_COMPLETED,
                     LlmCallCompletedPayload(
@@ -1479,11 +1495,20 @@ class AgentPipeline:
                     from power_loop.runtime.jobs import JobError
                     raise LLMNonRetryable(attempts=attempt, last_error=JobError("owner_wait_deadline_exceeded"))
                 return resp
+            except Exception as exc:
+                # Once the physical response returned, failure of capture,
+                # observation or telemetry must never buy another model call.
+                if response_received and not isinstance(exc, LLMNonRetryable):
+                    raise LLMNonRetryable(attempts=attempt, last_error=exc) from exc
+                raise
             finally:
                 if policy_alarm is not None:
                     policy_alarm.cancel()
-                self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
-                           round_index=round_index, stream_id="main")
+                try:
+                    self._emit(AgentEventType.STREAM_COMPLETED, StreamCompletedPayload(),
+                               round_index=round_index, stream_id="main")
+                except (Exception, asyncio.CancelledError) as exc:
+                    logger.warning("Stream completion observer failed: %s", type(exc).__name__)
 
         policy = self.config.retry_policy
         if policy is None:
