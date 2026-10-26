@@ -32,7 +32,7 @@ __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='seal', hide=False, provider=None, fail_review=False, shared_calls=12, max_tokens=2048):
+async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='seal', hide=False, provider=None, fail_review=False, shared_calls=12, max_tokens=2048, effect_calls=1, native_tail=None, native_first=False):
     store, _ = registry_store
     manager, host = JobManager(store), Host()
     if provider is not None:
@@ -56,8 +56,13 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
                 state.source = _SEND.get().lease.job_id
                 state.source_binding, state.owner_binding = _SEND.get(), _OWNER.get()
                 state.original.set()
-                fail_plan_once(manager,stage)
-                text, calls = '', [{'id':'original-effect','type':'function','function':{'name':'touch_once','arguments':'{}'}}]
+                if stage is not None:
+                    fail_plan_once(manager,stage)
+                text, calls = '', [{'id':'original-effect' if index == 0 else f'original-effect-{index+1}',
+                    'type':'function','function':{'name':'touch_once','arguments':'{}'}} for index in range(effect_calls)]
+                if native_tail is not None:
+                    call = {'id':'original-native','type':'function','function':{'name':native_tail,'arguments':'{}'}}
+                    calls.insert(0 if native_first else len(calls), call)
             elif role == 'BUILD':
                 assert 'ORIGINAL OUTCOME REVIEW' in request.system_prompt
                 assert not request.tools
@@ -83,18 +88,26 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
     definition = ToolDefinition('touch_once','Original finite effect',input_schema={'type':'object'})
     adapter = FunctionManagedTool(ManagedToolContract('example.original-owner','d'*64),forbidden,forbidden,forbidden)
     registry.register(definition,adapter.bind(runtime,definition))
+    if native_tail is not None:
+        state.native_calls = 0
+        async def native():
+            state.native_calls += 1
+            return 'Original native completion'
+        registry.register(ToolDefinition(native_tail,'Original native operation',input_schema={'type':'object'}),
+            FunctionRuntimeTool(native,ToolRuntimeContract('example.original-native'),policy=lambda args:ToolDispatchPolicy(True)))
+    build_tools = ['touch_once'] + ([native_tail] if native_tail is not None else [])
     async def notify(*args):
         state.notifications.append(args)
     async def launch():
         if kind == 'subagent':
             from power_loop.runtime.delegation import start
-            result = await start(get_current_loop(),AgentSpec(name='build',system_prompt='ROLE-BUILD',tools=['touch_once'],max_rounds=3,lifecycle='linked'),
+            result = await start(get_current_loop(),AgentSpec(name='build',system_prompt='ROLE-BUILD',tools=build_tools,max_rounds=3,lifecycle='linked'),
                 'Perform the original task once.',on_complete=notify)
             state.handles.append(result)
             return json.dumps(result)
         workflow = create_workflow({'name':'original-owner','root':{'type':'sequence','steps':[
             {'type':'agent','id':'BUILD','input':'Perform original action once.','continue_on_error':True,
-             'spec':{'name':'build','system_prompt':'ROLE-BUILD','tools':['touch_once'],'max_rounds':3}},
+             'spec':{'name':'build','system_prompt':'ROLE-BUILD','tools':build_tools,'max_rounds':3}},
             {'type':'agent','id':'AFTER','input':'Only after BUILD is settled.','spec':{'name':'after','system_prompt':'ROLE-AFTER','tools':[],'max_rounds':2}}
         ]}},parent_loop=get_current_loop(),parent_session_id=get_session_id())
         handle = await workflow.start(detached=True,on_complete=notify)
@@ -117,6 +130,10 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
             if role == 'BUILD':
                 ctx.system_prompt += ('\nAcknowledge only the supplied negative outcome in one short sentence. The action was not dispatched. Do not solve or retry the task.'
                     if state.counts[role] else '\nCall the offered touch_once function once using native function calling. Do not write textual or XML calls.')
+                if native_tail is not None and not state.counts[role]:
+                    ctx.tools.append(registry.get(native_tail).definition.to_openai_tool())
+                    ctx.system_prompt += (f' In this same response return two native function calls in order: touch_once, then {native_tail}. '
+                        'Both use empty arguments. Do not wait for the first result before requesting the second call.')
             elif role == 'AFTER':
                 ctx.system_prompt += '\nThe failed previous node was deliberately tolerated. Return AFTER as plain text; do no other work.'
             if role=='MAIN':

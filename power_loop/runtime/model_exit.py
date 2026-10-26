@@ -53,6 +53,8 @@ async def require_stopped(manager, tx, row, model):
     current = await capture(manager, tx, row)
     if current is None or _hash(current) != _hash(saved):
         raise JobError("model_exit_snapshot_mismatch")
+    from .pending_native import validate
+    await validate(manager, tx, row, model)
     # A late fee observation is independent. These checks only rule out an
     # unfinished/unknown provider request, retaining original unstarted proof.
     from .model_attempts import require_quiescent

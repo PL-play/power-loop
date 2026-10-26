@@ -130,6 +130,17 @@ async def require_handler(manager,tx,source,handler):
     from .controller_handoff import read as handoff
     from .managed_completion import _scope
     result = await result_event(manager,tx,source,required=False)
+    if result is not None and json.loads(result['payload_json'])['result'].get('aborted_call_batch', {}).get('version') == 2:
+        from .managed_delivery import _main
+        from .pending_owner import read as owner_transfer
+        expected = await read(manager, tx, source)
+        main = await _main(manager, tx, source)
+        if expected is not None:
+            await owner_transfer(manager, tx, source)
+        if (handler['execution_role'] != 'main' or handler['control_owner_job_id'] is not None
+                or handler['session_id'] != main['session_id']):
+            raise JobError('original_owner_review_handler_invalid')
+        return
     transferred = await handoff(manager,tx,source,result) if result is not None else None
     if transferred is not None:
         from .managed_delivery import _main

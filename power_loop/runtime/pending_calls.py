@@ -174,7 +174,15 @@ async def _expected(manager, tx, source, closed):
         raise JobError('pending_call_interaction_unresolved')
     actor = JobActor(source['tenant_id'], source['principal_id'], source['session_id'])
     refs = []
+    native_ids, native = set(), None
+    from .pending_native import FIELD as NATIVE_SNAPSHOT
+    if NATIVE_SNAPSHOT in closed.get('evidence', {}):
+        from .pending_native import undispatched
+        native = await undispatched(manager, tx, source)
+        native_ids = {entry['call_id'] for entry in native[3]}
     for call in calls:
+        if call['id'] in native_ids:
+            continue
         row = await manager._authorize(tx, actor, job_id(manager, actor, ref, call['id']))
         found = await descriptor(manager, tx, row)
         if found is None:
@@ -190,10 +198,27 @@ async def _expected(manager, tx, source, closed):
         original = [{k: v for k, v in item.items() if k != 'delivery_status'} for item in original]
         refs.append({'job_id': row['job_id'], 'generation': row['generation'], 'tool_call_id': call['id'],
             'evidence_hash': _hash(original), 'notice_id': notice[0]['event_id'], 'notice_hash': _hash(notice[1])})
-    return {'version': 1, 'snapshot': snapshot,
+    expected = {'version': 1, 'snapshot': snapshot,
         'model_exit': await _reference(manager, tx, 'model_closed_' + source['job_id']),
         'calls': refs, 'disposition': 'retired_for_result_review', 'execution_authority': False,
         'acknowledgement_created': False, 'billing_settled': False}
+    if native is not None:
+        from .abort_outcomes import _inbox as native_inbox
+        from .abort_outcomes import notice as native_notice
+        from .abort_outcomes import result_event as native_result
+        from .model_exit import content_reference
+        result = await native_result(manager, tx, source)
+        delivery = await native_notice(manager, tx, source, result, original=True)
+        await native_inbox(manager, tx, source, delivery)
+        expected.update(version=3, native_calls={'calls': sorted(native_ids),
+            'checkpoint': content_reference(native[4][0]), 'source_result': content_reference(result),
+            'notice_id': delivery[0]['event_id'], 'notice_hash': _hash(delivery[1])})
+    if source['execution_role'] != 'main':
+        from .model_exit import content_reference
+        from .pending_owner import read
+        owner = await read(manager, tx, source)
+        expected.update(version=3, owner_transfer=content_reference(owner[0]))
+    return expected
 
 
 async def require_disposition(manager, tx, source, closed=None):
@@ -224,15 +249,35 @@ async def retire_pending(loop, actor, source_job_id):
     runtime = getattr(loop, 'task_runtime', None)
     if runtime is None or runtime.actor(actor.session_id) != actor or await loop.ensure_store() is not runtime.manager.store:
         raise JobError('task_runtime_required')
+    return await retire_pending_runtime(runtime, actor, source_job_id)
+
+
+async def retire_pending_runtime(runtime, actor, source_job_id):
+    """Mechanical host form, including after the original controller exited."""
+    from .managed_completion import _host_only
+    from .task_runtime import TaskRuntime
+    _host_only()
+    if not isinstance(runtime, TaskRuntime) or runtime.actor(actor.session_id) != actor:
+        raise JobError('task_runtime_required')
+    runtime._managed_completions.check()
     manager = runtime.manager
     async with manager._write() as tx:
         source = await manager._authorize(tx, actor, source_job_id)
         closed = await model(manager, tx, source)
-        expected = await _expected(manager, tx, source, closed)
-        if source['root_job_id'] != source_job_id or source['session_id'] != actor.session_id:
-            # Child pending recovery must go through its explicit owner adapter;
-            # this original-main port cannot silently continue a workflow node.
+        from .managed_delivery import _main
+        main = await _main(manager, tx, source)
+        if main['session_id'] != actor.session_id:
             raise JobError('pending_call_requires_original_main')
+        if source['execution_role'] != 'main':
+            from .pending_owner import transfer
+            await transfer(manager, tx, actor, source)
+        elif source['root_job_id'] != source_job_id or source['session_id'] != actor.session_id:
+            raise JobError('pending_call_requires_original_main')
+        from .pending_native import FIELD as NATIVE_SNAPSHOT
+        if NATIVE_SNAPSHOT in closed.get('evidence', {}):
+            from .pending_native import prepare
+            source = await prepare(manager, tx, actor, source)
+        expected = await _expected(manager, tx, source, closed)
         key = identity(manager, source)
         old = await _object(manager, tx, manager.events, 'payload_json', 'event_id=?', (key,), 262144)
         if old is None:
@@ -263,6 +308,9 @@ async def negative_review_references(manager, tx, source):
         return await handled_references(manager, tx, source)
     from .managed_delivery import handled_references, read, result_event
     refs = []
+    if record.get('native_calls'):
+        from .abort_outcomes import handled_references as native_handled
+        refs.extend(await native_handled(manager, tx, source))
     for call in record['calls']:
         if call['generation'] == 0:
             row = await manager._row(tx, call['job_id'])
@@ -270,3 +318,112 @@ async def negative_review_references(manager, tx, source):
             notice = await read(manager, tx, row, event)
             refs.extend(await handled_references(manager, tx, row, event, notice))
     return refs
+
+
+async def recover_runtime(runtime, actor, source_job_id):
+    """Recover original v2 managed results only; never invoke their adapters."""
+    from .managed_completion import _host_only, _record_tx
+    from .managed_delivery import _main, enqueue_runtime, resolved_review, result_event
+    from .managed_effects import descriptor, job_id, terminate_unstarted_tx
+    from .result_revisions import result_id
+    from .task_runtime import TaskRuntime
+
+    _host_only()
+    if not isinstance(runtime, TaskRuntime) or runtime.actor(actor.session_id) != actor:
+        raise JobError('task_runtime_required')
+    runtime._managed_completions.check()
+    manager, jobs = runtime.manager, []
+    async with manager._write() as tx:
+        source = await manager._authorize(tx, actor, source_job_id)
+        main = await _main(manager, tx, source)
+        if actor.session_id != main['session_id']:
+            raise JobError('pending_call_requires_original_main')
+        closed = await model(manager, tx, source)
+        snapshot = closed['evidence'].get(SNAPSHOT)
+        if snapshot is None or snapshot.get('version') != 2:
+            return {'job_id': source_job_id, 'state': 'not_applicable', 'execution_authority': False}
+        if source['execution_role'] != 'main':
+            from .controller_task_exit import read as task_exit
+            from .jobs import JobLease
+            from .original_owner_review import read as original_owner
+            from .workflow_controller import proof
+            binding = await original_owner(manager, tx, source)
+            owner = await manager._authorize(tx, actor, binding['owner']['job_id'])
+            if owner['intake'] != 'closed' or _hash(proof(owner)) != _hash(binding['owner']):
+                raise JobError('pending_owner_controller_not_retired')
+            await task_exit(manager, tx, owner, JobLease(**binding['owner']))
+        pending, calls, ref = await _verify(manager, tx, source, snapshot)
+        from .tool_call_plans import read as read_plan
+        plan = await read_plan(manager, tx, source, ref)
+        native_ids = {entry['call_id'] for entry in plan['entries'] if entry['recovery'] is None}
+        if await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', (identity(manager, source),)):
+            reference = await require_disposition(manager, tx, source, closed)
+            return {'job_id': source_job_id, 'state': 'disposed', 'disposition': reference, 'execution_authority': False}
+        if _hash(await current(manager, tx, source['session_id'])) != _hash(pending):
+            raise JobError('pending_call_state_changed')
+        original_actor = JobActor(source['tenant_id'], source['principal_id'], source['session_id'])
+        for call in calls:
+            try:
+                if call['id'] in native_ids:
+                    from .pending_native import undispatched
+                    await undispatched(manager, tx, source)
+                    continue
+                row = await manager._authorize(tx, actor, job_id(manager, original_actor, ref, call['id']))
+                found = await descriptor(manager, tx, row)
+                if found is None:
+                    raise JobError('pending_call_adapter_required')
+                if row['generation'] == 0:
+                    await terminate_unstarted_tx(manager, tx, actor, row['job_id'])
+                elif await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?',
+                                       (result_id(row['job_id'], row['generation']),)) is None:
+                    await _record_tx(manager, tx, actor, row, found)
+                row = await manager._row(tx, row['job_id'])
+                result = await result_event(manager, tx, row)
+                await resolved_review(manager, tx, row, result)
+                jobs.append(row['job_id'])
+            except JobError as error:
+                # Already validated metadata can commit; the original unknown
+                # call and complete pending batch remain unresolved and intact.
+                return {'job_id': source_job_id, 'state': 'unconfirmed', 'error': error.code,
+                        'execution_authority': False, 'acknowledgement_created': False, 'billing_settled': False}
+    notices = [await enqueue_runtime(runtime, actor, job) for job in jobs]
+    disposed = await retire_pending_runtime(runtime, actor, source_job_id)
+    return {'job_id': source_job_id, 'state': 'queued_for_review', 'notices': notices, **disposed}
+
+
+async def recover_tree(runtime, actor, root_job_id, *, after_job_id='', limit=32, timeout_s=3):
+    """Bounded original-main host inspection of retained pending obligations."""
+    import asyncio
+
+    from .managed_completion import _host_only
+    from .managed_delivery import _main
+    from .task_runtime import TaskRuntime
+    _host_only()
+    if (not isinstance(runtime, TaskRuntime) or runtime.actor(actor.session_id) != actor
+            or type(limit) is not int or not 1 <= limit <= 100 or type(after_job_id) is not str or len(after_job_id) > 64
+            or type(timeout_s) not in (int, float) or not 0 < timeout_s <= 30):
+        raise JobError('invalid_pending_recovery_query')
+    runtime._managed_completions.check()
+    manager = runtime.manager
+    async with manager._write() as tx:
+        root = await manager._authorize(tx, actor, root_job_id)
+        main = await _main(manager, tx, root)
+        if main['job_id'] != root_job_id or main['session_id'] != actor.session_id:
+            raise JobError('pending_call_requires_original_main')
+        rows = await tx.fetchall(f'SELECT j.job_id FROM {manager.jobs} j JOIN {manager.store.t.session_state} s '
+            "ON s.session_id=j.session_id WHERE j.root_job_id=? AND j.kind='send' AND j.status='model_closed' "
+            "AND j.resource_state='stopped' AND j.intake='closed' AND j.supervision_status='open' "
+            'AND s.pending_json IS NOT NULL AND j.job_id>? ORDER BY j.job_id LIMIT ?', (root_job_id, after_job_id, limit+1))
+    deadline, results, scanned = asyncio.get_running_loop().time()+timeout_s, [], ''
+    for row in rows[:limit]:
+        remaining = deadline-asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        scanned = row['job_id']
+        try:
+            async with asyncio.timeout(remaining):
+                results.append(await recover_runtime(runtime, actor, scanned))
+        except (JobError, TimeoutError) as error:
+            results.append({'job_id': scanned, 'state': 'unconfirmed', 'execution_authority': False,
+                'error': error.code if isinstance(error, JobError) else 'pending_recovery_timeout'})
+    return {'results': results, 'next_cursor': scanned if scanned and len(rows) > len(results) else None}

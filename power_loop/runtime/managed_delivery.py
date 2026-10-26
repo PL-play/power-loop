@@ -137,14 +137,30 @@ async def _inbox(manager, tx, row, notice):
 
 
 async def enqueue(loop, actor, job):
-    """Atomically queue a known outcome for its original main; never starts a model."""
+    """Queue the original outcome, then provide a best-effort local inbox hint."""
     from .managed_completion import _host_only
-    from .managed_effects import _event
-
     _host_only()
     runtime = getattr(loop, 'task_runtime', None)
     if runtime is None or runtime.actor(actor.session_id) != actor or await loop.ensure_store() is not runtime.manager.store:
         raise JobError('task_runtime_required')
+    response = await enqueue_runtime(runtime, actor, job)
+    if response['inbox_status'] == 'pending':
+        try:
+            loop._note_committed_inbox(actor.session_id)
+        except Exception:
+            _LOG.exception('managed result is durably queued; local hint failed: %s', response['notification_id'])
+    return response
+
+
+async def enqueue_runtime(runtime, actor, job):
+    """Mechanical host port; no model object, callback or execution is needed."""
+    from .managed_completion import _host_only
+    from .managed_effects import _event
+    from .task_runtime import TaskRuntime
+    _host_only()
+    if not isinstance(runtime, TaskRuntime) or runtime.actor(actor.session_id) != actor:
+        raise JobError('task_runtime_required')
+    runtime._managed_completions.check()
     manager = runtime.manager
     from .managed_effects import reconcile_raw_receipt
     await reconcile_raw_receipt(manager, actor, job)
@@ -183,11 +199,6 @@ async def enqueue(loop, actor, job):
         response = {'job_id': job, 'generation': row['generation'], 'notification_id': notice[0]['event_id'],
             'main_session_id': actor.session_id, 'inbox_status': inbox['status'],
             'execution_authority': False, 'acknowledgement_created': False, 'billing_settled': False}
-    if inbox['status'] == 'pending':
-        try:
-            loop._note_committed_inbox(actor.session_id)
-        except Exception:
-            _LOG.exception('managed result is durably queued; local hint failed: %s', response['notification_id'])
     return response
 
 
@@ -247,11 +258,55 @@ async def observation(manager, tx, actor, row, result, visible=None):
     closed = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', ('model_closed_' + source['job_id'],))
     extra = {}
     if closed is not None:
+        from .pending_calls import SNAPSHOT, _closed, identity
+        source_exit = await _closed(manager, tx, source)
+        if SNAPSHOT in source_exit['evidence'] and await tx.fetchone(
+                f'SELECT event_id FROM {manager.events} WHERE event_id=?', (identity(manager, source),)) is None:
+            # The actual main may inspect/stop unresolved work before the whole
+            # original batch can be disposed. Seeing this notice is not its ACK.
+            return None
         reference = await require_disposition(manager, tx, source)
         if reference is not None:
             extra['pending_disposition'] = reference
     return {'delivered_seq': int(message['seq']), 'managed_delivery': {
         'event_id': notice[0]['event_id'], 'payload_hash': _hash(notice[1]), 'message_hash': _hash(message['content']), **extra}}
+
+
+async def pending_reviews(manager, tx, actor):
+    """Known original notices remain control-only until actual clean handling."""
+    from .model_exit import content_reference
+    from .pending_calls import require_disposition
+    sources = await tx.fetchall(f"SELECT j.* FROM {manager.jobs} j WHERE j.kind='send' AND j.supervision_status='open' "
+        f"AND EXISTS (SELECT 1 FROM {manager.events} d WHERE d.job_id=j.job_id AND d.event_type='pending_call_disposition') "
+        f"AND (j.session_id=? OR EXISTS (SELECT 1 FROM {manager.events} t WHERE t.job_id=j.job_id "
+        "AND t.event_type='pending_owner_transfer' AND t.caller_session_id=?)) AND j.tenant_id=? AND j.principal_id=? "
+        'ORDER BY j.job_id LIMIT 1001', (actor.session_id, actor.session_id, actor.tenant_id, actor.principal_id))
+    if len(sources) > 1000:
+        raise JobError('managed_delivery_scope_too_large')
+    for source in sources:
+        await manager._authorize(tx, actor, source['job_id'])
+        await require_disposition(manager, tx, source)
+    rows = await tx.fetchall(f'SELECT j.* FROM {manager.jobs} j WHERE j.tenant_id=? AND j.principal_id=? '
+        f"AND EXISTS (SELECT 1 FROM {manager.events} e WHERE e.job_id=j.job_id "
+        "AND e.event_type='managed_effect_delivery' AND e.caller_session_id=?) ORDER BY j.job_id LIMIT 1001",
+        (actor.tenant_id, actor.principal_id, actor.session_id))
+    if len(rows) > 1000:
+        raise JobError('managed_delivery_scope_too_large')
+    pending = []
+    for row in rows:
+        await manager._authorize(tx, actor, row['job_id'])
+        result = await result_event(manager, tx, row)
+        delivery = await read(manager, tx, row, result)
+        await _inbox(manager, tx, row, delivery)
+        if row['result_status'] in ('handled', 'suppressed'):
+            try:
+                await handled_references(manager, tx, row, result, delivery)
+            except JobError:
+                pass
+            else:
+                continue
+        pending.append(content_reference(result))
+    return pending
 
 
 async def verify_observation(manager, tx, actor, row, result, event):

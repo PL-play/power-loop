@@ -279,6 +279,8 @@ async def dispatch(pipeline, name, arguments, registered):
         source = await manager._authorize(tx, actor, binding.lease.job_id)
         if not await required(manager, tx, source):
             return
+        if source['status'] == 'model_closed':
+            raise JobError('tool_call_source_model_closed')
         declared = policy(registered, arguments, runtime=binding.runtime)
         from .review_tools import require_tool
         await require_tool(manager, tx, actor, declared)
