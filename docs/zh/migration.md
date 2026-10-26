@@ -170,3 +170,9 @@ Protocol20增加持久化后续用量修订；旧恢复器可能把待处理的�
 Protocol21将独立的首次财务证据与原模型退出观察分开。`expected_revision=0`只核销原调用/token预留，不释放inflight、不补造finished；真实返回可稍后只补执行投影。旧20恢复器无法验证这种无finished的财务来源，也不能正确处理迟到执行投影，必须拒绝旧写者；不能改stamp降级。
 
 表、DDL索引和schema10不变，仍要求显式维护迁移与旧进程隔离。真实旧版验收可设置 `POWER_LOOP_BRIDGE_LEGACY_PROTOCOL=20`、`POWER_LOOP_BRIDGE_LEGACY_SDK` 指向干净的20版checkout（fb0f73d），执行同一 `scripts/acceptance/test_schema_bridge.py`。正式控制宿主还必须实现可选 BudgetInitialUsageProvider；已支持后续revision不等于已支持首次独立证据。费用证据与执行证据分别保留，详[费用核对](user-guide/budget-reconciliation.md)。
+
+### 查询索引的三方言校验
+
+任务存储的SQL和DDL继续支持PostgreSQL、SQLite、MySQL；方言差异保留在存储适配/迁移分支中。打开存储时，必要索引必须同时匹配**所属表、索引名、列顺序**，另一张表上的同名同列索引不能代替。MySQL的索引名属于表，因此维护查询同时限定当前数据库和目标表，不因别表上的同名索引跳过创建。错误索引不会被普通open悄悄删除，按原维护流程修复。
+
+`EXPLAIN`执行计划检查只在测试中运行，不加入线上业务查询。测试验证有可用索引路径；小表上优化器可能选择顺序扫描，不能把测试中的索引可用性说成生产必然使用索引。MySQL测试目前按用户要求暂停，不能将代码分支或SQL生成检查称为MySQL实库验收。

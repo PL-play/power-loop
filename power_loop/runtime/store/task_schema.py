@@ -143,8 +143,8 @@ async def _run_task_ddl(tx, db, prefix):
             else:
                 exists = await tx.fetchone(
                     "SELECT 1 FROM information_schema.statistics "
-                    "WHERE table_schema=DATABASE() AND index_name=? LIMIT 1",
-                    (index,),
+                    "WHERE table_schema=DATABASE() AND table_name=? AND index_name=? LIMIT 1",
+                    (target, index),
                 )
             if exists:
                 continue
@@ -164,23 +164,34 @@ async def verify_task_schema(db: Database, prefix: str) -> None:
 
 async def _verify_query_indexes(tx, db, prefix):
     expected = {prefix+suffix: columns for suffix, (_table, columns) in _QUERY_INDEXES.items()}
+    owners = {prefix+suffix: prefix+table for suffix, (table, _columns) in _QUERY_INDEXES.items()}
     actual = {}
     if db.dialect.name == 'sqlite':
         for name in expected:
+            if not await tx.fetchone("SELECT name FROM sqlite_master WHERE type='index' AND name=? AND tbl_name=?",
+                                     (name, owners[name])):
+                continue
             rows = await tx.fetchall(f'PRAGMA index_info({name})')
             actual[name] = tuple(row['name'] for row in rows)
     else:
         placeholders = ','.join('?' for _ in expected)
         if db.dialect.name == 'postgres':
-            rows = await tx.fetchall('SELECT indexname,indexdef FROM pg_indexes WHERE schemaname=current_schema() '
+            rows = await tx.fetchall('SELECT tablename,indexname,indexdef FROM pg_indexes WHERE schemaname=current_schema() '
                 f'AND indexname IN ({placeholders})', tuple(expected))
             for row in rows:
+                if row['tablename'] != owners.get(row['indexname']):
+                    continue
                 matched = re.search(r'\(([^()]*)\)', row['indexdef'])
                 actual[row['indexname']] = tuple(x.strip().strip('"') for x in matched[1].split(',')) if matched else ()
         else:
-            rows = await tx.fetchall('SELECT index_name,column_name FROM information_schema.statistics '
-                f'WHERE table_schema=DATABASE() AND index_name IN ({placeholders}) ORDER BY index_name,seq_in_index', tuple(expected))
+            tables = tuple(sorted(set(owners.values())))
+            table_params = ','.join('?' for _ in tables)
+            rows = await tx.fetchall('SELECT table_name,index_name,column_name FROM information_schema.statistics '
+                f'WHERE table_schema=DATABASE() AND table_name IN ({table_params}) '
+                f'AND index_name IN ({placeholders}) ORDER BY table_name,index_name,seq_in_index', (*tables, *expected))
             for row in rows:
+                if row['table_name'] != owners.get(row['index_name']):
+                    continue
                 actual[row['index_name']] = (*actual.get(row['index_name'], ()), row['column_name'])
     if any(actual.get(name) != columns for name, columns in expected.items()):
         raise StoreSchemaError('task discovery indexes missing or incompatible; explicit maintenance required')
