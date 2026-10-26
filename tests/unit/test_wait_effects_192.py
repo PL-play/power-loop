@@ -14,7 +14,7 @@ from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_notifications as notices
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
-from power_loop.runtime.task_runtime import _SEND, Execution
+from power_loop.runtime.task_runtime import _SEND, Execution, TaskRuntime
 from power_loop.tools.wait_handoff import register_wait_handoff_tool
 
 from .test_wait_handoff_192 import handoff, registry_store, runtime, waiting
@@ -57,9 +57,12 @@ async def child_loop(h):
     c = h.c
     await c.manager.close_model_execution(c.actor, c.caller, evidence={"exit": "completed"})
     model = ChildModel()
-    loop = StatefulAgentLoop(llm=model, store=c.store, task_runtime=h.loop.task_runtime,
+    # The original child lease belongs to its executor, not the main wake reviewer.
+    child_runtime = TaskRuntime(c.manager, tenant_id=c.actor.tenant_id, principal_id=c.actor.principal_id,
+        executor_id=c.owner.executor_id, boot_id=c.owner.boot_id)
+    loop = StatefulAgentLoop(llm=model, store=c.store, task_runtime=child_runtime,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=3, max_tokens=20))
-    return loop, model, Execution(h.loop.task_runtime, c.actor, c.owner)
+    return loop, model, Execution(child_runtime, c.actor, c.owner)
 
 
 @pytest.mark.parametrize("choice", ["continue", "defer", "cancel"])
@@ -157,13 +160,13 @@ async def test_original_child_consumes_system_input_before_required_wait_can_res
     with pytest.raises(JobError, match="required_result_unhandled"):
         await effects.settle_owner(c.manager, c.actor, c.owner)
     loop, model, binding = await child_loop(h)
-    async with h.loop.task_runtime.execution(binding, owner=True):
+    async with loop.task_runtime.execution(binding, owner=True):
         result = await loop.flush_follow_ups(c.sid)
         assert result.status == "completed"
         assert c.request.continuation in str(model.requests[0].messages)
         # The runtime's owning-adapter result path performs the mechanical
         # input proof check; a text answer alone cannot resolve this timer.
-        saved = await h.loop.task_runtime.record_scope(binding, {"status": "completed", "final_text": result.final_text})
+        saved = await loop.task_runtime.record_scope(binding, {"status": "completed", "final_text": result.final_text})
     assert saved["status"] == "completed"
     timer = await c.manager.get_job(c.main, h.registration.job.job_id)
     assert timer.outcome == "succeeded" and timer.resource_state == "stopped" and timer.generation == 0
@@ -199,7 +202,7 @@ async def test_tampered_system_input_or_effect_never_dispatches_a_child_model(ha
     await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?",
         (_json(payload), _hash(payload["request"]), op["event_id"]))
     loop, model, binding = await child_loop(h)
-    async with h.loop.task_runtime.execution(binding, owner=True):
+    async with loop.task_runtime.execution(binding, owner=True):
         with pytest.raises(JobError):
             await loop.flush_follow_ups(c.sid)
     assert model.calls == 0
@@ -245,7 +248,7 @@ async def test_owner_success_and_required_wait_resolution_commit_or_roll_back_to
     await decide(h)
     await effects.apply(c.manager, c.main, h.event_id)
     loop, model, binding = await child_loop(h)
-    async with h.loop.task_runtime.execution(binding, owner=True):
+    async with loop.task_runtime.execution(binding, owner=True):
         answer = await loop.flush_follow_ups(c.sid)
         async with c.manager._write() as tx:
             transaction_type = type(tx)
@@ -385,7 +388,7 @@ async def test_handled_effect_replay_requires_original_resolution_not_a_bare_han
     await decide(h)
     await effects.apply(c.manager, c.main, h.event_id)
     loop, _, binding = await child_loop(h)
-    async with h.loop.task_runtime.execution(binding, owner=True):
+    async with loop.task_runtime.execution(binding, owner=True):
         result = await loop.flush_follow_ups(c.sid)
         await c.manager.record_execution_result(c.actor, c.owner, outcome="succeeded",
             result={"final_text": result.final_text}, resource_state="stopped")
@@ -412,7 +415,7 @@ async def test_cancelled_wait_cannot_be_rewritten_as_success_after_child_consume
     await effects.apply(c.manager, c.main, h.event_id)
     await c.manager.request_cancel(c.main, h.registration.job.job_id, system_key="cancel-wait", reason="stop wait")
     loop, _, binding = await child_loop(h)
-    async with h.loop.task_runtime.execution(binding, owner=True):
+    async with loop.task_runtime.execution(binding, owner=True):
         result = await loop.flush_follow_ups(c.sid)
         with pytest.raises(JobError, match="wait_state_changed"):
             await c.manager.record_execution_result(c.actor, c.owner, outcome="succeeded",

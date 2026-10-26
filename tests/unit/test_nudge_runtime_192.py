@@ -617,7 +617,10 @@ async def test_actual_call_with_another_admitted_action_cannot_accept_nudge(mana
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(delegation, "nudge", conflicting_action)
-    await issue_nudge(managed, monkeypatch)
+    # A different action was registered under this exact original call. The
+    # receipt cannot certify it as a nudge, even if the handler returns an error.
+    with pytest.raises(JobError, match="tool_call_plan_registration_changed"):
+        await issue_nudge(managed, monkeypatch)
     assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")
     await finish(managed)
 

@@ -179,6 +179,13 @@ async def test_boot_expiry_before_node_commit_cannot_advance_review_or_lose_comp
         assert first_read == [build.job_id]
         assert build.result["supervision_error"] == workflow.result["supervision_error"]
         assert build.result["supervision_error"] in ("execution_lease_expired", "executor_lease_expired")
+    # Returning the workflow result does not imply its separate exit-checkpoint
+    # writer has finished. Await actual retained tasks before dropping PG tables.
+    async with asyncio.timeout(5):
+        while runtime._adapter_tasks:
+            await asyncio.gather(*tuple(runtime._adapter_tasks))
+        checkpoint = await runtime.flush_control_checkpoints()
+    assert checkpoint == {"controller_retirement_pending": 0, "controller_task_exit_pending": 0}
     assert not runtime._adapter_tasks
 
 

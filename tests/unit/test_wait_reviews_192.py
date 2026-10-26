@@ -62,9 +62,9 @@ async def test_defer_twice_then_continue_consumes_original_input_and_preserves_a
     await decide(h, "continue")
     await effects.apply(c.manager, c.main, h.event_id)
     loop, _, execution = await child_loop(h)
-    async with h.loop.task_runtime.execution(execution, owner=True):
+    async with loop.task_runtime.execution(execution, owner=True):
         result = await loop.flush_follow_ups(c.sid)
-        await h.loop.task_runtime.record_scope(execution, {"status": "completed", "final_text": result.final_text})
+        await loop.task_runtime.record_scope(execution, {"status": "completed", "final_text": result.final_text})
     timer = await c.manager.get_job(c.main, h.registration.job.job_id)
     assert timer.outcome == "succeeded" and timer.generation == 0
     assert len(await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='wait_review'")) == 2

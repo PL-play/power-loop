@@ -329,6 +329,31 @@ async def test_cancelling_resumed_execution_stops_before_workflow_settlement(rea
         release.set()
 
 
+async def test_failure_after_resumed_result_commit_preserves_original_success(ready_node, managed_workflow, monkeypatch):
+    c = ready_node
+    record = c.runtime.record_scope
+    committed = []
+
+    async def lost_result(binding, result):
+        saved = await record(binding, result)
+        if binding.lease.job_id == c.job_id and binding.lease.generation == 2:
+            committed.append(saved)
+            raise RuntimeError("result committed; caller lost the response")
+        return saved
+
+    monkeypatch.setattr(c.runtime, "record_scope", lost_result)
+    await c.issue()
+    assert len(c.replies) == 1
+    await settle(managed_workflow)
+    actor = c.runtime.actor(c.parent)
+    node = await c.manager.get_job(actor, c.job_id)
+    assert len(committed) == 1
+    assert node.generation == 2 and node.outcome == "succeeded" and node.result == committed[0]
+    assert (await c.manager.get_result_revision(actor, c.job_id, 1))["payload"]["result"] == c.old.result
+    assert c.model.counts["BUILD"] == 2 and c.model.counts["REVIEW"] == 0
+    assert (await c.manager.get_job(actor, c.state["handles"][0].job_id)).outcome == "failed"
+
+
 @pytest.mark.parametrize("fault", ["consumer_settled", "barrier", "executor", "wrong_sid"])
 async def test_local_scope_rejection_precedes_generation_mutation(ready_node, monkeypatch, fault):
     c = ready_node

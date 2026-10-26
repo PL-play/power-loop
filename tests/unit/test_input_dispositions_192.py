@@ -118,7 +118,7 @@ async def test_consumed_input_keeps_its_actual_processing_proof_after_later_owne
     op = await _applied(h)
     await attempts.enable(Execution(h.loop.task_runtime, c.actor, c.caller))
     loop, model, binding = await child_loop(h)
-    async with h.loop.task_runtime.execution(binding, owner=True):
+    async with loop.task_runtime.execution(binding, owner=True):
         assert (await loop.flush_follow_ups(c.sid)).status == "completed"
     await c.manager.request_cancel(c.main, c.owner.job_id, system_key="later-stop", reason="later stop")
     await c.manager.record_execution_result(

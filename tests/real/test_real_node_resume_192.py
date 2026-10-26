@@ -48,7 +48,7 @@ jobs:
 """
 
 
-@pytest.mark.parametrize("fault", ["none", "admission_ack", "dispatch_ack", "membership_relabel", "whole_restore"])
+@pytest.mark.parametrize("fault", ["none", "admission_ack", "dispatch_ack", "membership_relabel", "whole_restore", "bind_error", "result_ack"])
 async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp_path, monkeypatch, record_property, fault):
     store = await SessionStore.open(str(tmp_path / "native-yaml-resume.db"), schema="tasks")
     manager = JobManager(store)
@@ -124,7 +124,35 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
                 pytest.fail("calculate did not settle")
             assert job.result["text"].strip() == "VERSION-42", job.result
             old = await manager.get_result_revision(runtime.actor(parent), job.job_id, 1)
+            committed = []
+            if fault == "bind_error":
+                bind = manager.bind_node_session
+                async def fail_binding(actor, proof, sid):
+                    if proof.job_id == job.job_id and proof.generation == 2:
+                        raise RuntimeError("original resumed binding unavailable")
+                    return await bind(actor, proof, sid)
+                monkeypatch.setattr(manager, "bind_node_session", fail_binding)
+            elif fault == "result_ack":
+                record = runtime.record_scope
+                async def lose_result_ack(binding, result):
+                    saved = await record(binding, result)
+                    if binding.lease.job_id == job.job_id and binding.lease.generation == 2:
+                        committed.append(saved)
+                        raise RuntimeError("original result committed; response lost")
+                    return saved
+                monkeypatch.setattr(runtime, "record_scope", lose_result_ack)
             await loop.send("Call correct_node once. Then reply WAITING without more tools or pass_turn. Never launch another workflow.", parent)
+            if fault == "bind_error":
+                assert not replies and counts == {"admit": 1, "dispatch": 1}
+                sibling_release.set()
+                await handles[0].task
+                new = await manager.get_job(runtime.actor(parent), job.job_id)
+                assert new.generation == 2 and new.outcome == "failed" and new.resource_state == "stopped"
+                assert new.result["usage"] == {} and not resume_entered.is_set()
+                assert await manager.get_result_revision(runtime.actor(parent), job.job_id, 1) == old
+                wf = await manager.get_job(runtime.actor(parent), handles[0].job_id)
+                assert wf.outcome == "failed" and "review" not in wf.result["results"]
+                return
             assert len(replies) == 1 and replies[0]["mode"] == "continue" and counts == {"admit": 1, "dispatch": 1}
             await asyncio.wait_for(resume_entered.wait(), 10)
             sibling_release.set()
@@ -137,6 +165,12 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
             assert new.generation == 2 and new.result["text"].strip() == "VERSION-43" and new.outcome == "succeeded", new
             assert (await manager.get_result_revision(runtime.actor(parent), job.job_id, 1)) == old
             wf = await manager.get_job(runtime.actor(parent), handles[0].job_id)
+            if fault == "result_ack":
+                assert committed == [new.result]
+                assert wf.outcome == "failed" and "review" not in wf.result["results"]
+                assert new.result["usage"]["total_tokens"] > 0
+                assert await manager.execution_usage(runtime.actor(parent), job.job_id, generation=2) == new.result["usage"]
+                return
             assert wf.outcome == "succeeded" and wf.result["final"]["text"].strip() == "VERSION-43", wf.result
             actor = runtime.actor(parent)
             snapshots = [await manager.get_execution_membership(actor, job.job_id, g) for g in (1, 2)]
@@ -182,6 +216,12 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
         resume_release.set()
         if handles:
             await asyncio.wait_for(asyncio.gather(*(h.task for h in handles), return_exceptions=True), 30)
+        async with asyncio.timeout(5):
+            while runtime._adapter_tasks:
+                await asyncio.gather(*tuple(runtime._adapter_tasks), return_exceptions=True)
+            assert await runtime.flush_control_checkpoints() == {
+                "controller_retirement_pending": 0, "controller_task_exit_pending": 0,
+            }
         for saved in await store._db.fetchall(f"SELECT session_id FROM {store.t.sessions}"):
             rows = await store.load_all_messages(saved["session_id"])
             record_property("retained_transcript", json.dumps({"session_id": saved["session_id"], "messages": [

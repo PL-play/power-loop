@@ -296,7 +296,14 @@ def reserve(loop, engine, source, ref, call_id, node_id, sid, message, *, expect
         except BaseException as exc:
             if not ready.done():
                 ready.set_exception(exc)
-            if owned and binding is not None and not binding.stop_renewal.is_set():
+            if owned and binding is not None:
+                # Exiting execution always retires renewal, including an
+                # exception before model admission. That is not a result
+                # checkpoint. Preserve an already committed result, otherwise
+                # append the original failure through the normal proof gates.
+                current = await manager.get_job(binding.actor, binding.lease.job_id)
+                if current.generation == binding.lease.generation and current.result_status != "none":
+                    raise
                 failed = AgentResult(node_id=node_id, status="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed", text="", session_id=sid, error=str(exc))
                 saved = await runtime.record_scope(binding, failed.to_dict())
                 failed.status, failed.usage = saved["status"], saved.get("usage", {})

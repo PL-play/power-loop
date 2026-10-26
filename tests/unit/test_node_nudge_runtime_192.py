@@ -365,9 +365,27 @@ async def test_unprocessed_input_cannot_release_review(live_node, managed_workfl
     await settle(managed_workflow)
     node = await c.manager.get_job(c.runtime.actor(c.parent), c.job_id)
     wf = await c.manager.get_job(c.runtime.actor(c.parent), c.state["handles"][0].job_id)
-    assert node.outcome == "failed" and wf.outcome == "failed" and c.model.counts["REVIEW"] == 0
+    assert c.model.counts["REVIEW"] == 0
+    if fault == "decision_write":
+        # A failed processing commit leaves the original send unreviewed.
+        # The node cannot publish a result until that responsibility resolves.
+        # The graph can report failure while retaining its unknown resources.
+        assert node.outcome is None and node.result_status == "none"
+        assert node.supervision_status == wf.supervision_status == "open"
+        assert wf.outcome == "failed" and wf.resource_state == "unknown"
+        assert node.status == "settling" and node.resource_state == "unknown"
+    else:
+        assert node.outcome == "failed" and wf.outcome == "failed"
     [op] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='nudge'")
     assert op["delivery_status"] != "handled"
+    # The controller's separate exit writer must finish before fixture teardown
+    # drops its tables; this does not settle the unresolved processing decision.
+    async with asyncio.timeout(5):
+        while c.runtime._adapter_tasks:
+            await asyncio.gather(*tuple(c.runtime._adapter_tasks))
+        assert await c.runtime.flush_control_checkpoints() == {
+            "controller_retirement_pending": 0, "controller_task_exit_pending": 0,
+        }
 
 
 async def test_close_is_idempotent_and_survives_store_reopen(live_node):
