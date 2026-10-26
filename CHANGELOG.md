@@ -8,6 +8,27 @@
 
 ## [Unreleased]
 
+## [9.0.0rc1] — candidate, not published
+
+### Compatibility and deployment
+- Allocate a distinct major release candidate for the design/192 async task
+  lifecycle. This avoids distributing incompatible task protocols under the
+  already-used `8.0.0` version. Stable Python exports remain covered by the
+  packaging contract tests; this major boundary is conservative for persisted
+  task data, tool execution contracts and async workflow behavior.
+- Task schema10/protocol21 requires explicit offline maintenance for older task
+  stores. Ordinary open never upgrades them. Preserve original store/task/message
+  identities and keep compatible query/cancellation/accounting available.
+- Generic jobs/workflow/YAML, single-level delegation, root wake handoff, budget
+  admission, managed effects and response capture use the documented contracts.
+  A callable's public name is not execution authority. Unsupported external
+  resource adapters remain rejected before side effects.
+- Rollback requires a protocol21-capable control build. Do not install the old
+  `8.0.0` package over upgraded stores or downgrade version stamps. MySQL remains
+  unverified in this candidate because its tests are paused.
+- The historical protocol notes below describe development increments, not the
+  protocol of this candidate. No package publication is authorized by this entry.
+
 ### Added
 - Add experimental protocol6 generic RuntimeTool contracts for native dispatch,
   control actions, execution-role filtering, capability discovery and structured
