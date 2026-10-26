@@ -5,6 +5,7 @@ lookup, missing task handle, lease expiry or a new runtime cannot invent one.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 
@@ -18,6 +19,7 @@ class _Slot:
     actor: object
     lease: object = None
     document: str | None = None
+    claim: object = None
 
 
 @dataclass
@@ -29,6 +31,7 @@ class CompletionCache:
 
         self._authority = _authority(self.runtime)
         self._slots = {}
+        self._claim_lock = asyncio.Lock()
 
     def check(self):
         from .root_context import _authority
@@ -70,7 +73,8 @@ class CompletionCache:
         slot.lease, slot.document = execution.lease, saved
 
     def release_uncompleted(self, slot):
-        if self._slots.get(slot.key) is slot and slot.document is None:
+        from .managed_claim import exited
+        if self._slots.get(slot.key) is slot and slot.document is None and not exited(slot):
             del self._slots[slot.key]
 
     def discard_saved(self, slot):
@@ -78,11 +82,17 @@ class CompletionCache:
         del self._slots[slot.key]
 
     def pending_count(self):
-        return sum(s.document is not None for s in self._slots.values())
+        from .managed_claim import exited
+        return sum(s.document is not None or exited(s) for s in self._slots.values())
+
+    def claim_exit_count(self):
+        from .managed_claim import exited
+        return sum(exited(s) for s in self._slots.values())
 
     def find(self, job):
         self.check()
-        return next((s for s in self._slots.values() if s.lease is not None and s.lease.job_id == job), None)
+        return next((s for s in self._slots.values() if (s.lease is not None and s.lease.job_id == job)
+                     or (s.claim is not None and s.claim.registration.job.job_id == job)), None)
 
 
 async def _scope(manager, tx, row):
@@ -218,6 +228,27 @@ async def _record_tx(manager, tx, actor, row, found):
 
 
 async def _persist_local(runtime, actor, slot):
+    from .managed_claim import exited, resolve_local
+
+    cache = runtime._managed_completions
+    if not exited(slot):
+        return await _persist_checkpoint(runtime, actor, slot)
+    # Original exception handling and host/shutdown retries share one writer.
+    async with cache._claim_lock:
+        cache.check()
+        attempt = slot.claim
+        if attempt.saved is not None:
+            await runtime.manager.get_job(actor, attempt.registration.job.job_id, include_result=False)
+            return attempt.saved
+        if not await resolve_local(runtime, actor, slot):
+            attempt.saved = {'job_id': attempt.registration.job.job_id, 'claim_committed': False,
+                             'execution_authority': False, 'acknowledgement_created': False}
+        else:
+            attempt.saved = await _persist_checkpoint(runtime, actor, slot)
+        return attempt.saved
+
+
+async def _persist_checkpoint(runtime, actor, slot):
     from .managed_effects import _event, _id, descriptor
 
     cache, manager = runtime._managed_completions, runtime.manager

@@ -131,25 +131,22 @@ async def test_unknown_original_effect_needs_its_observer_and_never_reexecutes(r
 
 
 @pytest.mark.parametrize('claim_failure', ['before', 'after'])
-async def test_never_claimed_and_claimed_without_exit_are_different_facts(registry_store, claim_failure):
+async def test_claim_failure_uses_actual_original_exit_without_repeating_prepare(registry_store, claim_failure):
     c = await owned_pending_case(registry_store, 'subagent', claim_failure=claim_failure)
     loop = runtime = None
     try:
         loop, runtime = await new_main(c, registry_store)
         actor = runtime.actor(c.state.root)
         result = await recover_runtime(runtime, actor, c.state.source)
-        if claim_failure == 'before':
-            assert result['state'] == 'queued_for_review'
-            await loop.send('Handle the original not-dispatched outcome; do not start work.', c.state.root)
-            assert (await runtime.manager.get_job(actor, c.state.source)).supervision_status == 'closed'
-        else:
-            assert result['state'] == 'unconfirmed'
-            c.state.resolved = True
-            await reconcile(runtime, actor, c.effect['job_id'], c.adapter)
-            assert (await recover_runtime(runtime, actor, c.state.source))['state'] == 'unconfirmed'
+        assert result['state'] == 'queued_for_review'
+        assert c.effect['generation'] == (0 if claim_failure == 'before' else 1)
+        if claim_failure == 'after':
+            from power_loop.runtime.managed_completion import restore_result
+            assert (await restore_result(runtime.manager, actor, c.effect['job_id']))['owned_callback_exited']
             with pytest.raises(JobError):
                 await terminate_unstarted(runtime.manager, actor, c.effect['job_id'])
-            assert (await c.store.get_state(c.state.source_binding.actor.session_id)).pending is not None
+        await loop.send('Handle the original not-dispatched outcome; do not start work.', c.state.root)
+        assert (await runtime.manager.get_job(actor, c.state.source)).supervision_status == 'closed'
         assert c.state.executed == c.state.prepared == len(c.state.effects) == 0
     finally:
         await cleanup(c, loop, runtime)

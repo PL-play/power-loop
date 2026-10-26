@@ -12,7 +12,7 @@ from .test_original_owner_review_192 import original_owner_case, wait_owned
 
 async def owned_pending_case(registry_store, kind, *, unknown=False, claim_failure=None, provider=None,
                              raw_fail_at=1, owner_exit_gate=None, effect_calls=1, shared_calls=12,
-                             native_tail=None, native_first=False):
+                             native_tail=None, native_first=False, configure=None, flush_checkpoints=True):
     c = await original_owner_case(registry_store, kind, stage=None, allowed_calls=1,
                                   max_tokens=4096 if provider is not None else 2048, provider=provider,
                                   effect_calls=effect_calls, shared_calls=shared_calls,
@@ -57,12 +57,15 @@ async def owned_pending_case(registry_store, kind, *, unknown=False, claim_failu
                 raise OSError('original managed claim interrupted')
             return await claim(actor, registration, **kwargs)
         c.runtime.claim = fail_claim
+    if configure is not None:
+        configure(c)
     initial = set(delegation._TASKS)
     try:
         await c.loop.send('Launch original work once.', c.state.root)
         if owner_exit_gate is None:
             await wait_owned(c, kind, initial)
-            await c.runtime.flush_control_checkpoints()
+            if flush_checkpoints:
+                await c.runtime.flush_control_checkpoints()
         else:
             import asyncio
             await asyncio.wait_for(owner_exit_gate.wait(), 5)

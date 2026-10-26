@@ -755,7 +755,10 @@ class JobManager:
                 await admit(self, tx, await self._row(tx, job_id))
                 from .original_owner_review import admit as admit_review
                 await admit_review(self,tx,await self._row(tx,job_id))
-            return JobLease(job_id, executor_id, boot_id, generation)
+            lease = JobLease(job_id, executor_id, boot_id, generation)
+            from .managed_claim import capture
+            capture(self, actor, lease, expected_version)
+            return lease
 
     async def register_operation(self, actor: JobActor, lease: JobLease, *, action: str,
             caller: JobLease, call_ref: MessageRef, tool_call_id: str,

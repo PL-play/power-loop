@@ -245,6 +245,8 @@ class TaskRuntime:
             raise JobError("controller_retirement_requires_reconciliation")
         if self._controller_task_exits.failed_count():
             raise JobError("controller_task_exit_requires_reconciliation")
+        if self._managed_completions.claim_exit_count():
+            raise JobError("managed_claim_exit_requires_reconciliation")
 
     async def ensure_started(self):
         if self._lifecycle is not None:
@@ -265,6 +267,8 @@ class TaskRuntime:
             async with asyncio.timeout(timeout_s):
                 await self._controller_retirements.flush()
                 await self._controller_task_exits.flush()
+                from .managed_claim import flush_local
+                await flush_local(self)
         return {"controller_retirement_pending": len(self._controller_retirements.pending),
                 "controller_task_exit_pending": len(self._controller_task_exits.slots)}
 
@@ -284,6 +288,8 @@ class TaskRuntime:
                 async with asyncio.timeout(min(2, remaining)):
                     await self._controller_retirements.flush()
                     await self._controller_task_exits.flush()
+                    from .managed_claim import flush_local
+                    await flush_local(self)
             except Exception as exc:
                 logging.getLogger(__name__).warning(
                     "Controller intake closure remains pending at shutdown: %s", type(exc).__name__)

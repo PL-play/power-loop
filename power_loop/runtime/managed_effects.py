@@ -675,7 +675,14 @@ async def _invoke_original(handler, execution, arguments, slot):
         )
     if registration.replayed:
         raise JobError("managed_effect_original_requires_reconciliation")
-    binding = await runtime.claim(actor, registration)
+    from .managed_claim import claiming
+    from .managed_completion import _persist_local
+    try:
+        with claiming(runtime._managed_completions, slot, registration):
+            binding = await runtime.claim(actor, registration)
+    except BaseException:
+        await _persist_local(runtime, actor, slot)
+        raise
     context = ManagedToolContext(runtime, actor, execution.lease, ref, call_id, binding.lease.job_id)
     prepared, result, error, dispatch_started = None, None, None, False
     try:
