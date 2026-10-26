@@ -448,38 +448,63 @@ async def _observe(runtime, actor, job_id, attempt_id, observation):
         if source[1] != observation:
             raise JobError("budget_observation_source_mismatch")
         state = await _read(manager, tx, attempt_id)
-        if state["phase"] != "dispatch_authorized":
-            if state["observation"] == observation:
+        if state.get("initial_usage_evidence") is not None:
+            from .budget_revisions import read_initial
+            await read_initial(manager, tx, state)
+            if state["observation"] is not None:
+                if state["observation"] == observation:
+                    return
+                raise JobError("budget_observation_conflict")
+            # Financial evidence already consumed the call/token reservation.
+            # Only an authentic original return releases execution concurrency;
+            # it never overwrites or reapplies the independent financial facts.
+            if observation["status"] == "returned":
+                for limits in budget_scopes.frozen(policy, state):
+                    row, counters = await _scope(manager, tx, state["policy_key"], limits)
+                    counters["inflight"] -= 1
+                    await _save_counters(manager, tx, row, counters)
+            state.update(observation=observation, finished_at_ms=source[0]["created_at"])
+            await _save(manager, tx, state, job)
+        else:
+            if not await _project_observation(manager, tx, policy, state, job, observation, source):
                 return
-            raise JobError("budget_observation_conflict")
-        returned = observation["status"] == "returned"
-        usage = observation["usage"]
-        tokens = None
-        if not observation["estimated"]:
-            tokens = usage.get("total_tokens")
-            if tokens is None and usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
-                tokens = usage["prompt_tokens"] + usage["completion_tokens"]
-        bound = state["plan"]["token_bound"]
-        for limits in budget_scopes.frozen(policy, state):
-            row, counters = await _scope(manager, tx, state["policy_key"], limits)
-            counters["held_calls"] -= 1
-            counters["used_calls"] += 1
-            if tokens is not None:
-                counters["held_tokens"] -= bound
-                counters["used_tokens"] += tokens
-            if returned:
-                counters["inflight"] -= 1
-            await _save_counters(manager, tx, row, counters)
-        if tokens is not None and tokens > bound:
-            await tx.execute(
-                f"UPDATE {manager.prefix}task_budget_policies SET enabled=0 WHERE policy_key=?", (state["policy_key"],)
-            )
-        # Recovery may happen hours later; never retime the original usage to
-        # the reconciler's wall clock (which could change its pricing period).
-        state.update(phase="settling", pending=True, observation=observation,
-                     finished_at_ms=source[0]["created_at"])
-        await _save(manager, tx, state, job)
     await _deliver(runtime, actor, job_id, attempt_id)
+
+
+async def _project_observation(manager, tx, policy, state, job, observation, source):
+    """First ordinary observation, when no independent financial evidence exists."""
+    if state["phase"] != "dispatch_authorized":
+        if state["observation"] == observation:
+            return False
+        raise JobError("budget_observation_conflict")
+    returned = observation["status"] == "returned"
+    usage = observation["usage"]
+    tokens = None
+    if not observation["estimated"]:
+        tokens = usage.get("total_tokens")
+        if tokens is None and usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
+            tokens = usage["prompt_tokens"] + usage["completion_tokens"]
+    bound = state["plan"]["token_bound"]
+    for limits in budget_scopes.frozen(policy, state):
+        row, counters = await _scope(manager, tx, state["policy_key"], limits)
+        counters["held_calls"] -= 1
+        counters["used_calls"] += 1
+        if tokens is not None:
+            counters["held_tokens"] -= bound
+            counters["used_tokens"] += tokens
+        if returned:
+            counters["inflight"] -= 1
+        await _save_counters(manager, tx, row, counters)
+    if tokens is not None and tokens > bound:
+        await tx.execute(
+            f"UPDATE {manager.prefix}task_budget_policies SET enabled=0 WHERE policy_key=?", (state["policy_key"],)
+        )
+    # Recovery may happen hours later; never retime the original usage to
+    # the reconciler's wall clock (which could change its pricing period).
+    state.update(phase="settling", pending=True, observation=observation,
+                 finished_at_ms=source[0]["created_at"])
+    await _save(manager, tx, state, job)
+    return True
 
 
 async def deliver(attempt):
@@ -496,6 +521,9 @@ async def _deliver(runtime, actor, job_id, attempt_id):
         state = await _read(manager, tx, attempt_id)
         if state["phase"] != "settling":
             raise JobError("budget_usage_not_ready")
+        if state.get("initial_usage_evidence") is not None:
+            from .budget_revisions import read_initial
+            await read_initial(manager, tx, state)
         if state.get("usage_revision") is not None:
             from .budget_revisions import read_revision
             await read_revision(manager, tx, state)
@@ -504,19 +532,18 @@ async def _deliver(runtime, actor, job_id, attempt_id):
         if state["ack"] is not None:
             return state["ack"]
     if state["submission"] is None:
-        from .model_attempts import event_id
-
-        observation = {
-            **state["observation"],
-            "started_at_ms": state["started_at_ms"],
-            "finished_at_ms": state["finished_at_ms"],
-            "evidence_event_id": event_id(manager, "finished", attempt_id),
-            "evidence_hash": _hash(state["observation"]),
-        }
         if state.get("usage_revision") is not None:
             from .budget_revisions import prepare
             submission = await prepare(runtime, actor, state)
         else:
+            from .model_attempts import event_id
+            observation = {
+                **state["observation"],
+                "started_at_ms": state["started_at_ms"],
+                "finished_at_ms": state["finished_at_ms"],
+                "evidence_event_id": event_id(manager, "finished", attempt_id),
+                "evidence_hash": _hash(state["observation"]),
+            }
             submission = await _host_call(
                 runtime, job_id, attempt_id,
                 "prepare_usage",
@@ -810,7 +837,7 @@ async def recovery_config(manager, actor, job_id, attempt_id, *, provider_key, p
         raise JobError("budget_policy_evidence_corrupt") from exc
 
 
-async def _reconciliation_state(runtime, actor, job_id, attempt_id):
+async def _reconciliation_state(runtime, actor, job_id, attempt_id, *, allow_missing_observation=False):
     """Read and verify original model, policy and accounting provenance."""
     if (type(job_id) is not str or not 0 < len(job_id) <= 64
             or type(attempt_id) is not str or len(attempt_id) != 56
@@ -829,7 +856,12 @@ async def _reconciliation_state(runtime, actor, job_id, attempt_id):
             raise JobError("budget_reconciliation_scope_mismatch")
         _, prepared = await read_model(manager, tx, "prepared", attempt_id)
         _, dispatched = await read_model(manager, tx, "dispatched", attempt_id)
-        _, observation = await read_model(manager, tx, "finished", attempt_id)
+        finished = await read_model(manager, tx, "finished", attempt_id,
+            required=not allow_missing_observation and state.get("initial_usage_evidence") is None)
+        observation = finished[1] if finished is not None else None
+        if state.get("initial_usage_evidence") is not None:
+            from .budget_revisions import read_initial
+            await read_initial(manager, tx, state)
         _, tracking = await read_model(manager, tx, "tracking", prepared["scope"])
         expected = {
             "version": 1, "store_id": manager.store.store_id,
@@ -846,13 +878,15 @@ async def _reconciliation_state(runtime, actor, job_id, attempt_id):
                 or tracking != {"version": 1, "scope": prepared["scope"], "session_id": job["session_id"]}
                 or dispatched != {"version": 1, "scope": prepared["scope"],
                     "attempt_id": attempt_id, "prepared_hash": _hash(prepared)}
-                or observation["scope"] != prepared["scope"]
-                or observation["prepared_hash"] != _hash(prepared)
-                or observation["dispatch_hash"] != _hash(dispatched)):
+                or observation is not None and (observation["scope"] != prepared["scope"]
+                    or observation["prepared_hash"] != _hash(prepared)
+                    or observation["dispatch_hash"] != _hash(dispatched))):
             raise JobError("budget_reconciliation_evidence_mismatch")
         if state["phase"] not in ("dispatch_authorized", "settling"):
             raise JobError("budget_usage_not_ready")
-        if state["phase"] == "settling" and state["observation"] != observation:
+        if (state["phase"] == "settling" and state["observation"] != observation
+                and not (state.get("initial_usage_evidence") is not None
+                         and state["observation"] is None and observation is not None)):
             raise JobError("budget_observation_source_mismatch")
     return state, observation
 
@@ -861,7 +895,7 @@ async def reconcile_usage(runtime, actor, job_id, attempt_id):
     state, observation = await _reconciliation_state(runtime, actor, job_id, attempt_id)
     # A crash can occur after model observation commit but before its budget
     # projection. The shared transaction applies counters at most once.
-    if state["phase"] == "dispatch_authorized":
+    if state["phase"] == "dispatch_authorized" or state["observation"] is None and observation is not None:
         await _observe(runtime, actor, job_id, attempt_id, observation)
     ack = await _deliver(runtime, actor, job_id, attempt_id)
     return {"attempt_id": attempt_id, "job_id": job_id, "revision": ack["revision"],

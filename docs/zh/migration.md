@@ -163,3 +163,10 @@ python -m pytest scripts/acceptance/test_schema_bridge.py -v
 Protocol20增加持久化后续用量修订；旧恢复器可能把待处理的新修订误当首次用量，必须通过协议版本拒绝旧写入。没有新增表/DDL索引，仍只允许显式维护迁移。保持全部旧进程退出/隔离的要求；原始SQL不受新版SDK远程保护。
 
 上面的真实旧版演练也可设置 `POWER_LOOP_BRIDGE_LEGACY_PROTOCOL=19`，并将 `POWER_LOOP_BRIDGE_LEGACY_SDK` 指向干净的19版本checkout（本轮基线118d7d2）。同一测试实际创建旧版数据再升级到当前协议；新增迟到证据路径见[费用核对](user-guide/budget-reconciliation.md)。不能降stamp来回滚；回滚控制镜像也必须理解新修订。
+
+
+### Protocol 20 → 21
+
+Protocol21将独立的首次财务证据与原模型退出观察分开。`expected_revision=0`只核销原调用/token预留，不释放inflight、不补造finished；真实返回可稍后只补执行投影。旧20恢复器无法验证这种无finished的财务来源，也不能正确处理迟到执行投影，必须拒绝旧写者；不能改stamp降级。
+
+表、DDL索引和schema10不变，仍要求显式维护迁移与旧进程隔离。真实旧版验收可设置 `POWER_LOOP_BRIDGE_LEGACY_PROTOCOL=20`、`POWER_LOOP_BRIDGE_LEGACY_SDK` 指向干净的20版checkout（fb0f73d），执行同一 `scripts/acceptance/test_schema_bridge.py`。正式控制宿主还必须实现可选 BudgetInitialUsageProvider；已支持后续revision不等于已支持首次独立证据。费用证据与执行证据分别保留，详[费用核对](user-guide/budget-reconciliation.md)。

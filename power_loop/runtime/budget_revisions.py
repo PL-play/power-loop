@@ -12,6 +12,7 @@ from . import model_budgets as budgets
 from .budget_contracts import (
     BudgetAck,
     BudgetGrant,
+    BudgetInitialUsageProvider,
     BudgetRevisionProvider,
     BudgetSubmission,
     BudgetUsageEvidence,
@@ -60,14 +61,17 @@ def validate_transition(state, evidence):
 
 
 async def stage(runtime, actor, job_id, attempt_id, *, expected_revision, evidence):
-    if not uint(expected_revision) or not 0 < expected_revision < 2**63 - 1:
+    if not uint(expected_revision) or not expected_revision < 2**63 - 1:
         raise JobError("invalid_budget_revision")
     if type(evidence) is not BudgetUsageEvidence:
         raise JobError("invalid_budget_usage_evidence")
     evidence = BudgetUsageEvidence(**asdict(evidence))  # Copy/validate nested mutable data.
-    await budgets._reconciliation_state(runtime, actor, job_id, attempt_id)
-    if (not isinstance(runtime.budget_config.provider, BudgetRevisionProvider)
-            or not callable(runtime.budget_config.provider.prepare_usage_revision)):
+    await budgets._reconciliation_state(runtime, actor, job_id, attempt_id,
+                                        allow_missing_observation=expected_revision == 0)
+    port = "prepare_initial_usage" if expected_revision == 0 else "prepare_usage_revision"
+    capability = BudgetInitialUsageProvider if expected_revision == 0 else BudgetRevisionProvider
+    if (not isinstance(runtime.budget_config.provider, capability)
+            or not callable(getattr(runtime.budget_config.provider, port, None))):
         raise JobError("budget_revision_provider_required")
     manager = runtime.manager
     event_id = "br_" + _hash([manager.store.store_id, attempt_id, evidence.evidence_id])[:48]
@@ -82,6 +86,8 @@ async def stage(runtime, actor, job_id, attempt_id, *, expected_revision, eviden
             raise JobError("budget_reconciliation_scope_mismatch")
         if state.get("usage_revision") is not None:
             await read_revision(manager, tx, state)
+        if state.get("initial_usage_evidence") is not None:
+            await read_initial(manager, tx, state)
         old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
         if old is not None:
             saved = budgets._object(old["payload_json"], old["request_hash"])
@@ -89,22 +95,39 @@ async def stage(runtime, actor, job_id, attempt_id, *, expected_revision, eviden
                     or saved["request"] != request):
                 raise JobError("budget_revision_evidence_conflict")
             return saved["receipt"]
-        if state["phase"] != "settling" or state["pending"] or state["ack"] is None:
-            raise JobError("budget_revision_pending")
-        previous_submission = BudgetSubmission(**state["submission"])
-        previous_ack = BudgetAck(**state["ack"])
-        if (previous_submission.revision != expected_revision or
-                (previous_ack.attempt_id, previous_ack.revision, previous_ack.request_hash) !=
-                (attempt_id, expected_revision, previous_submission.request_hash)):
-            raise JobError("budget_revision_changed")
-        old_total, new_total = validate_transition(state, evidence)
+        if expected_revision == 0:
+            from .model_attempts import _read as read_model
+            finished = await read_model(manager, tx, "finished", attempt_id, required=False)
+            if (state["phase"] != "dispatch_authorized" or state["pending"]
+                    or any(state[k] is not None for k in ("observation", "submission", "ack"))
+                    or finished is not None):
+                raise JobError("budget_initial_evidence_not_ready")
+            if evidence.correction_of is not None:
+                raise JobError("budget_correction_source_mismatch")
+            previous_submission = previous_ack = None
+            old_total, new_total = None, total(evidence.token_quality, evidence.usage)
+            if new_total is not None and not uint(new_total):
+                raise JobError("invalid_budget_usage_evidence")
+        else:
+            if state["phase"] != "settling" or state["pending"] or state["ack"] is None:
+                raise JobError("budget_revision_pending")
+            previous_submission = BudgetSubmission(**state["submission"])
+            previous_ack = BudgetAck(**state["ack"])
+            if (previous_submission.revision != expected_revision or
+                    (previous_ack.attempt_id, previous_ack.revision, previous_ack.request_hash) !=
+                    (attempt_id, expected_revision, previous_submission.request_hash)):
+                raise JobError("budget_revision_changed")
+            old_total, new_total = validate_transition(state, evidence)
         for limits in budget_scopes.frozen(policy, state):
             row, counters = await budgets._scope(manager, tx, state["policy_key"], limits)
+            if expected_revision == 0:
+                counters["held_calls"] -= 1
+                counters["used_calls"] += 1
             if new_total is not None:
                 if old_total is None:
                     counters["held_tokens"] -= state["plan"]["token_bound"]
                 counters["used_tokens"] += new_total - (old_total or 0)
-                await budgets._save_counters(manager, tx, row, counters)
+            await budgets._save_counters(manager, tx, row, counters)
         if new_total is not None and new_total > state["plan"]["token_bound"]:
             await tx.execute(f"UPDATE {manager.prefix}task_budget_policies SET enabled=0 WHERE policy_key=?",
                              (state["policy_key"],))
@@ -112,13 +135,18 @@ async def stage(runtime, actor, job_id, attempt_id, *, expected_revision, eviden
         receipt = {"attempt_id": attempt_id, "job_id": job_id, "revision": revision,
                    "event_id": event_id, "evidence_hash": evidence.fingerprint, "execution_authority": False}
         snapshot = {"request": request, "receipt": receipt,
-                    "previous_submission": asdict(previous_submission), "previous_ack": asdict(previous_ack)}
+                    "previous_submission": asdict(previous_submission) if previous_submission else None,
+                    "previous_ack": asdict(previous_ack) if previous_ack else None}
         await tx.execute(f"INSERT INTO {manager.events} "
             "(event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) "
             "VALUES (?,?,?,?,?,?,?,?)", (event_id, job_id, "budget_usage_revision", job["version"],
                 _hash(snapshot), _json(snapshot), "not_applicable", manager.now()))
         state.update(usage_revision={"event_id": event_id, "revision": revision, "evidence": asdict(evidence)},
-                     submission=None, ack=None, pending=True)
+                     phase="settling", submission=None, ack=None, pending=True)
+        if expected_revision == 0:
+            # Retain the independent initial accounting source through later
+            # revisions. It is never a substitute for model_attempt_finished.
+            state["initial_usage_evidence"] = dict(state["usage_revision"])
         await budgets._save(manager, tx, state, job)
         return receipt
 
@@ -132,16 +160,28 @@ async def read_revision(manager, tx, state):
             raise JobError("budget_revision_evidence_missing")
         saved = budgets._object(row["payload_json"], row["request_hash"])
         evidence = BudgetUsageEvidence(**revision["evidence"])
-        previous = BudgetSubmission(**saved["previous_submission"])
-        ack = BudgetAck(**saved["previous_ack"])
+        if not uint(revision["revision"]) or revision["revision"] < 1:
+            raise JobError("budget_revision_evidence_corrupt")
+        initial = revision["revision"] == 1
+        if initial:
+            if evidence.correction_of is not None:
+                raise JobError("budget_correction_source_mismatch")
+            if state.get("initial_usage_evidence") != revision:
+                raise JobError("budget_initial_evidence_missing")
+            if saved["previous_submission"] is not None or saved["previous_ack"] is not None:
+                raise JobError("budget_revision_evidence_conflict")
+        else:
+            previous = BudgetSubmission(**saved["previous_submission"])
+            ack = BudgetAck(**saved["previous_ack"])
+            if ((previous.attempt_id, previous.revision) != (state["attempt_id"], revision["revision"] - 1)
+                    or (ack.attempt_id, ack.revision, ack.request_hash) !=
+                    (previous.attempt_id, previous.revision, previous.request_hash)):
+                raise JobError("budget_revision_evidence_conflict")
         if (saved["request"] != {"attempt_id": state["attempt_id"], "job_id": state["job_id"],
                 "expected_revision": revision["revision"] - 1, "evidence": asdict(evidence)}
                 or saved["receipt"] != {"attempt_id": state["attempt_id"], "job_id": state["job_id"],
                     "revision": revision["revision"], "event_id": revision["event_id"],
-                    "evidence_hash": evidence.fingerprint, "execution_authority": False}
-                or (previous.attempt_id, previous.revision) != (state["attempt_id"], revision["revision"] - 1)
-                or (ack.attempt_id, ack.revision, ack.request_hash) !=
-                    (previous.attempt_id, previous.revision, previous.request_hash)):
+                    "evidence_hash": evidence.fingerprint, "execution_authority": False}):
             raise JobError("budget_revision_evidence_conflict")
         return saved, evidence
     except (TypeError, KeyError, ValueError) as exc:
@@ -150,14 +190,30 @@ async def read_revision(manager, tx, state):
         raise JobError("budget_revision_evidence_corrupt") from exc
 
 
+async def read_initial(manager, tx, state):
+    initial = state.get("initial_usage_evidence")
+    if (not isinstance(initial, dict) or initial.get("revision") != 1
+            or state.get("usage_revision") is None or state["phase"] != "settling"):
+        raise JobError("budget_initial_evidence_missing")
+    return await read_revision(manager, tx, {**state, "usage_revision": initial})
+
+
 async def prepare(runtime, actor, state):
     manager, revision = runtime.manager, state["usage_revision"]
-    if (not isinstance(runtime.budget_config.provider, BudgetRevisionProvider)
-            or not callable(runtime.budget_config.provider.prepare_usage_revision)):
+    initial = revision["revision"] == 1
+    port = "prepare_initial_usage" if initial else "prepare_usage_revision"
+    capability = BudgetInitialUsageProvider if initial else BudgetRevisionProvider
+    if (not isinstance(runtime.budget_config.provider, capability)
+            or not callable(getattr(runtime.budget_config.provider, port, None))):
         raise JobError("budget_revision_provider_required")
     async with manager._write() as tx:
         await manager._authorize(tx, actor, state["job_id"])
         saved, evidence = await read_revision(manager, tx, state)
+    if initial:
+        return await budgets._host_call(runtime, state["job_id"], state["attempt_id"], port,
+            lambda: runtime.budget_config.provider.prepare_initial_usage(
+                dict(state["context"]), BudgetGrant(**state["grant"]), evidence,
+                started_at_ms=state["started_at_ms"]))
     return await budgets._host_call(runtime, state["job_id"], state["attempt_id"],
         "prepare_usage_revision:" + str(revision["revision"]),
         lambda: runtime.budget_config.provider.prepare_usage_revision(

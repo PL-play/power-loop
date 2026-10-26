@@ -225,6 +225,16 @@ class BudgetUsageEvidence:
 
 
 @runtime_checkable
+class BudgetInitialUsageProvider(Protocol):
+    """Optional trusted accounting for a dispatched request with no exit record.
+
+    This never asserts provider return or creates execution/stop evidence.
+    """
+    async def prepare_initial_usage(self, context: dict, grant: BudgetGrant,
+        evidence: BudgetUsageEvidence, *, started_at_ms: int) -> BudgetSubmission: ...
+
+
+@runtime_checkable
 class BudgetRevisionProvider(Protocol):
     """Optional trusted bookkeeping capability, never a model-facing tool."""
     async def prepare_usage_revision(self, context: dict, grant: BudgetGrant,

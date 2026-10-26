@@ -72,11 +72,43 @@ receipt = await runtime.reconcile_budget_usage(
 
 前提与恢复规则：
 
-- 必须已有原 tracking/prepared/dispatched/finished、预算观察及已确认的首次 submission/ACK。缺少首次观察或 ACK 时明确拒绝；先核对原提交。此接口不补造崩溃丢失的观察，也不负责向供应商自动查询。
+- 后续修订必须已有原 tracking/prepared/dispatched 及已确认的前一 submission/ACK；首次来源通常为原 finished 观察，也可以是下节独立登记的首次财务证据。已有待确认的原提交必须先核对，不能用新证据替换它。本接口不补造崩溃丢失的执行观察，也不负责向供应商自动查询。
 - 每个 attempt 同时只接受一个待处理修订；并发相同 evidence_id/内容/expected_revision 返回同一个持久回执，不重复核销。不同快照、过时版本或未完成前一修订明确报错，不算受理。采集器必须保留源记录，核对后再决定如何处理，不能把拒绝当丢弃证据的许可。
-- 登记事务保存独立证据事件、冻结前一 submission/ACK、核销所有原 scope 的 token 差额并设 pending。该事务不调用提供者；失败全部回滚。新 revision 不增加 used_calls，不改消息、原观察、原执行代次或资源退出状态。实际总量超过原上限会关闭新准入，后续更正不会擅自重新启用。
+- 登记事务保存独立证据事件、冻结前一 submission/ACK、核销所有原 scope 的 token 差额并设 pending。该事务不调用提供者；失败全部回滚。后续 revision（≥2）不增加 used_calls，不改消息、原观察、原执行代次或资源退出状态。实际总量超过原上限会关闭新准入，后续更正不会擅自重新启用。
 - unknown/estimated 不降级实际事实；已知 actual 字段不能消失。修改已确认数值需要引用原证据并保留原因。估算或缺少实际总量时不释放 token 风险；确认 token 也不能释放远端执行的 inflight 风险。
 - 提交准备、API调用或本地ACK保存失败后 pending 保留。新控制实例重用原证据和冻结提交；旧准备回调及旧ACK不能覆盖新 revision。证据事件缺失时，即使 submission 已冻结，也拒绝继续提交。
 - 原任务取消、预算停用不阻止合法核账；已经关闭的 runtime 不能再登记。取消等待不取消真实端口任务，仍通过 `budget_control_tasks()` 管理它们，实际退出前不关闭 store。
 
-task schema仍是10；task protocol升到20，没有新增表或索引。旧协议必须显式维护迁移；普通打开不升级。协议19恢复器不知道修订语义，因此不能用它控制已有20数据。正式业务宿主的迟到采集与API修订适配须分别接入和验收，单独SDK测试不代表全链路上线。
+task schema仍是10；当前 task protocol 为21，没有新增表或索引。旧协议必须显式维护迁移；普通打开不升级。协议20不理解下节的独立首次财务证据，不能作为21数据的控制器。正式业务宿主的迟到采集与API修订适配须分别接入和验收，单独SDK测试不代表全链路上线。
+
+
+## 原进程崩溃、没有返回观察时的首次财务证据
+
+可信采集器已核实原供应商记录，但SDK只保留了原 tracking/prepared/dispatched 和预算grant、没有 finished 记录时，可调用同一登记接口，显式设置 `expected_revision=0`。它不是一次重试模型请求，也不创建虚假的 finished 事件。
+
+```python
+receipt = await control_runtime.stage_budget_usage_revision(
+    original_session_id,
+    job_id=original_send_job_id,
+    attempt_id=original_attempt_id,
+    expected_revision=0,
+    evidence=verified_evidence,  # BudgetUsageEvidence，已在宿主完成来源认证
+)
+ack = await control_runtime.reconcile_budget_usage(
+    original_session_id,
+    job_id=original_send_job_id,
+    attempt_id=original_attempt_id,
+)
+```
+
+提供者必须另行实现可选 `BudgetInitialUsageProvider` 的
+`prepare_initial_usage(context, grant, evidence, *, started_at_ms)`，返回原 attempt、revision=1 的 `BudgetSubmission`。旧 `BudgetRevisionProvider` 不会自动获得首次证据能力。原始开始时间由SDK传入；不能把核账时刻伪装成原调用或结束时间。宿主应记录费用证据来源及原授权/报价，但不能根据账单推断 returned/cancelled/停止成功。提交、ACK丢失恢复和实际端口句柄管理继续用原 `apply_usage`、`BudgetAck`、`budget_control_tasks()`，不需要新后台循环或消息工具。
+
+- 首次财务登记保存独立 revision1 事件，并保留 `initial_usage_evidence` 指向该证据，后续修订不覆盖原来源。原事务只将 held_calls 转为 used_calls 一次；实际token总量已知时核销原token预留。未知或估算用量仍保留token风险。
+- **inflight保持占用**，任务消息、原job状态、原grant、执行代次及控制权不变。费用ACK不构成执行退出证明，`require_quiescent`仍拒绝缺少原返回记录的任务，下游不能因此开始。
+- 如果原模型稍后真实返回，原 finished 事件照常保存；预算投影只按这份真实返回释放一次inflight，不重复应用财务调用/token，也不覆盖独立财务证据。若返回后的预算投影再次崩溃，同一恢复入口会补齐执行投影。unknown观察不会释放inflight。
+- 如果迟到真实观察与先前财务事实不一致，两者保留为不同来源。采集器核对后按原revision链提交明确更正；不能偷偷用后到的值覆盖已提交金额或token。
+- 如果 finished 已存在，使用普通观察/原提交恢复路径；`expected_revision=0`拒绝替换它。已有pending或首次ACK未知也不能重新登记revision1，必须重交冻结原提交。初始证据没有前一版本，不能带correction_of。
+- stage失败全部回滚；并发相同请求返回同一receipt，其他竞争快照明确拒绝。记录损坏/来源事件缺失时，即使提交已冻结也拒绝交付。采集器须保留原来源记录，拒绝不等于受理。
+
+来源ID不是认证，SDK不自动向供应商取账单。生产宿主必须实现和验证新端口，并完成采集器授权、原请求匹配和金额规则。本SDK能力不能单独当作正式平台已支持崩溃账单采集；未知远端请求的停止责任继续保留。
