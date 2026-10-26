@@ -228,6 +228,9 @@ class TaskRuntime:
         from .managed_completion import CompletionCache
 
         self._managed_completions = CompletionCache(self)
+        from .controller_retirement import RetirementCache
+
+        self._controller_retirements = RetirementCache(self)
         from .executor_lifecycle import ExecutorLifecycle
 
         self._lifecycle = ExecutorLifecycle(self, boot_contract_hash) if boot_contract_hash is not None else None
@@ -235,23 +238,42 @@ class TaskRuntime:
     def check_local_admission(self):
         if self._lifecycle is not None:
             self._lifecycle.check_admission()
+        self._controller_retirements.check()
+        if self._controller_retirements.failed_count():
+            raise JobError("controller_retirement_requires_reconciliation")
 
     async def ensure_started(self):
+        if self._lifecycle is not None:
+            self._lifecycle.check_admission()
+        async with asyncio.timeout(2):
+            await self._controller_retirements.flush()
         if self._lifecycle is not None:
             await self._lifecycle.start()
 
     async def start(self):
         if self._lifecycle is None:
             raise JobError("executor_lifecycle_not_configured")
-        await self._lifecycle.start()
+        await self.ensure_started()
 
     async def shutdown(self, *, timeout_s=30.0, grace_s=1.0, reason="host shutdown"):
         if self._lifecycle is None:
             raise JobError("executor_lifecycle_not_configured")
+        started = asyncio.get_running_loop().time()
         result = await self._lifecycle.shutdown(timeout_s=timeout_s, grace_s=grace_s, reason=reason)
+        remaining = max(0, timeout_s - (asyncio.get_running_loop().time() - started))
+        if remaining:
+            try:
+                async with asyncio.timeout(min(2, remaining)):
+                    await self._controller_retirements.flush()
+            except Exception as exc:
+                logging.getLogger(__name__).warning(
+                    "Controller intake closure remains pending at shutdown: %s", type(exc).__name__)
         return self._completion_status(result)
 
     def _completion_status(self, result):
+        result["controller_retirement_pending"] = len(self._controller_retirements.pending)
+        if result["controller_retirement_pending"]:
+            result["store_safe_to_close"] = False
         result["managed_completion_pending"] = self._managed_completions.pending_count()
         if result["managed_completion_pending"]:
             result["store_safe_to_close"] = False
@@ -308,8 +330,17 @@ class TaskRuntime:
     async def execution(self, binding: Execution, *, owner: bool = False, context=None, cancel_token=None):
         """Renew only while this attempt runs; a failed renewal stops dispatch."""
         _check_task_owner(self)
+        if (not isinstance(binding, Execution) or binding.runtime is not self
+                or (binding.actor.tenant_id, binding.actor.principal_id) != (self.tenant_id, self.principal_id)
+                or (binding.lease.executor_id, binding.lease.boot_id) != (self.executor_id, self.boot_id)):
+            raise JobError("execution_binding_mismatch")
+        if (owner or context is not None) and (
+                binding.stop_renewal.is_set() or self._controller_retirements.contains(binding.lease)):
+            raise JobError("controller_execution_exited")
         await self.ensure_started()
         self.check_local_admission()
+        if (owner or context is not None) and binding.stop_renewal.is_set():
+            raise JobError("controller_execution_exited")
         await self.manager.check_execution(binding.actor, binding.lease)
         variable = context if context is not None else _OWNER if owner else _SEND
         token = variable.set(binding)
@@ -380,14 +411,33 @@ class TaskRuntime:
                 # A lease/backend failure is not a user-tolerated node cancel.
                 raise JobError("task_supervision_lost") from lost[0]
         finally:
-            self._local_executions.pop(local_key, None)
             try:
-                if heartbeat is not None:
-                    heartbeat.cancel()
-                    await asyncio.gather(heartbeat, return_exceptions=True)
+                if (owner or context is not None) and self._local_executions.get(local_key) is local:
+                    binding.stop_renewal.set()
+                    # Capture before the first await: cancellation or SQL rollback
+                    # cannot erase the fact that this local controller exited.
+                    slot = self._controller_retirements.capture(binding, local)
+                    try:
+                        from .controller_retirement import retire
+                        async with asyncio.timeout(2):
+                            await retire(self, binding, local)
+                    except BaseException as exc:
+                        slot.failed = True
+                        if not isinstance(exc, Exception):
+                            raise
+                        logging.getLogger(__name__).warning(
+                            "Controller intake closure requires reconciliation: %s", type(exc).__name__)
+                    else:
+                        self._controller_retirements.discard(slot)
             finally:
-                variable.reset(token)
-                _TASK_OWNERS.reset(owner_token)
+                self._local_executions.pop(local_key, None)
+                try:
+                    if heartbeat is not None:
+                        heartbeat.cancel()
+                        await asyncio.gather(heartbeat, return_exceptions=True)
+                finally:
+                    variable.reset(token)
+                    _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
     async def model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None):

@@ -1597,3 +1597,27 @@ retains unresolved original pending/review obligations. Main and child handler
 roles remain distinct. See [managed-tool recovery](../managed-tool-recovery.md)
 for the retained-controller initial/continuation/completion scope and unimplemented
 unresolved-owner restoration paths.
+
+
+### Controller exit and task inspection
+
+An SDK controller closes its intake when its actual execution context exits.
+The `controller_retired` event records that context exit only; descendant resources,
+result processing and billing retain separate obligations. A failed receipt write
+keeps an original in-memory exit witness, rejects copied bindings, blocks new local
+admission and retries metadata writes before new work. The shutdown report exposes
+`controller_retirement_pending` and refuses `store_safe_to_close` while any remain.
+A database outage cannot persist an exit fact in another process; a new host must
+still use its new boot identity and existing recovery barriers.
+
+The experimental `runtime.task_inspection.inspect_tasks` scans a bounded page of
+one authorized original-main root. Unknown resources, unconfirmed cancellation,
+expired active leases, long running work and unhandled results produce durable
+`task_alert` events and original-main inbox entries. Explicit waits are not treated
+as runaway model execution. Alerts do not change outcomes, resource evidence,
+processing decisions, fees or execution permissions. An unread alert suppresses
+escalation; each unchanged problem has at most an initial alert and one escalation.
+`read_alert(..., pending=True)` checks the original root, event, inbox and current
+problem again before a host requests a wake. Historical reads grant no admission.
+The host schedules scans and applies its own installation, wake and budget policy;
+the library has no dependency on platform services or tool names.
