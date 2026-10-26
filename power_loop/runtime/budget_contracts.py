@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from .jobs import KINDS, JobError, _hash, _json
 
@@ -187,6 +187,49 @@ class BudgetProvider(Protocol):
     async def apply_usage(self, submission: BudgetSubmission) -> BudgetAck: ...
     async def prepare_release(self, context: dict, grant: BudgetGrant | None, proof: dict) -> BudgetSubmission: ...
     async def release(self, submission: BudgetSubmission) -> BudgetAck: ...
+
+
+@dataclass(frozen=True)
+class BudgetUsageEvidence:
+    """A complete snapshot authenticated by a trusted host collector.
+
+    Source identifiers are provenance, not proof of provider authentication.
+    Monetary facts remain opaque to the SDK and are checked by the host port.
+    """
+    evidence_id: str
+    source: str
+    source_record_id: str
+    token_quality: str
+    usage: dict
+    details: dict = field(default_factory=dict)
+    correction_of: str | None = None
+    correction_reason: str | None = None
+
+    def __post_init__(self):
+        from .model_attempts import _TOKENS
+        if (any(not identifier(v) for v in (self.evidence_id, self.source, self.source_record_id))
+                or self.token_quality not in ("unknown", "estimated", "actual")
+                or type(self.usage) is not dict or set(self.usage) - set(_TOKENS)
+                or any(not uint(v) for v in self.usage.values())
+                or (self.token_quality == "unknown") == bool(self.usage)
+                or (self.correction_of is None) != (self.correction_reason is None)
+                or self.correction_of is not None and (
+                    not digest(self.correction_of) or not identifier(self.correction_reason))):
+            raise JobError("invalid_budget_usage_evidence")
+        object.__setattr__(self, "usage", payload(self.usage))
+        object.__setattr__(self, "details", payload(self.details))
+
+    @property
+    def fingerprint(self):
+        return _hash(asdict(self))
+
+
+@runtime_checkable
+class BudgetRevisionProvider(Protocol):
+    """Optional trusted bookkeeping capability, never a model-facing tool."""
+    async def prepare_usage_revision(self, context: dict, grant: BudgetGrant,
+        previous_submission: BudgetSubmission, previous_ack: BudgetAck,
+        evidence: BudgetUsageEvidence) -> BudgetSubmission: ...
 
 
 @dataclass(frozen=True)

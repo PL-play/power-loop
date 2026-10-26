@@ -496,6 +496,11 @@ async def _deliver(runtime, actor, job_id, attempt_id):
         state = await _read(manager, tx, attempt_id)
         if state["phase"] != "settling":
             raise JobError("budget_usage_not_ready")
+        if state.get("usage_revision") is not None:
+            from .budget_revisions import read_revision
+            await read_revision(manager, tx, state)
+        elif state["submission"] is not None and state["submission"]["revision"] != 1:
+            raise JobError("budget_revision_evidence_missing")
         if state["ack"] is not None:
             return state["ack"]
     if state["submission"] is None:
@@ -508,21 +513,27 @@ async def _deliver(runtime, actor, job_id, attempt_id):
             "evidence_event_id": event_id(manager, "finished", attempt_id),
             "evidence_hash": _hash(state["observation"]),
         }
-        submission = await _host_call(
-            runtime, job_id, attempt_id,
-            "prepare_usage",
-            lambda: runtime.budget_config.provider.prepare_usage(
-                state["context"], BudgetGrant(**state["grant"]), observation
-            ),
-        )
+        if state.get("usage_revision") is not None:
+            from .budget_revisions import prepare
+            submission = await prepare(runtime, actor, state)
+        else:
+            submission = await _host_call(
+                runtime, job_id, attempt_id,
+                "prepare_usage",
+                lambda: runtime.budget_config.provider.prepare_usage(
+                    state["context"], BudgetGrant(**state["grant"]), observation
+                ),
+            )
         if type(submission) is not BudgetSubmission or (submission.attempt_id, submission.revision) != (
             attempt_id,
-            1,
+            state["usage_revision"]["revision"] if state.get("usage_revision") else 1,
         ):
             raise JobError("invalid_budget_submission")
         async with manager._write() as tx:
             job = await manager._authorize(tx, actor, job_id)
             latest = await _read(manager, tx, attempt_id)
+            if latest.get("usage_revision") != state.get("usage_revision"):
+                raise JobError("budget_revision_changed")
             if latest["submission"] is not None and latest["submission"] != asdict(submission):
                 raise JobError("budget_submission_conflict")
             if latest["submission"] is None:
@@ -799,13 +810,8 @@ async def recovery_config(manager, actor, job_id, attempt_id, *, provider_key, p
         raise JobError("budget_policy_evidence_corrupt") from exc
 
 
-async def reconcile_usage(runtime, actor, job_id, attempt_id):
-    """Replay recorded usage after restart, without reconstructing execution.
-
-    No model, reserve, dispatch, release, result ACK, or finalization is called.
-    Original unknown usage stays unknown. The caller supplies identifiers only;
-    usage and submission bytes must already exist in this store.
-    """
+async def _reconciliation_state(runtime, actor, job_id, attempt_id):
+    """Read and verify original model, policy and accounting provenance."""
     if (type(job_id) is not str or not 0 < len(job_id) <= 64
             or type(attempt_id) is not str or len(attempt_id) != 56
             or not attempt_id.startswith("attempt_")
@@ -848,6 +854,11 @@ async def reconcile_usage(runtime, actor, job_id, attempt_id):
             raise JobError("budget_usage_not_ready")
         if state["phase"] == "settling" and state["observation"] != observation:
             raise JobError("budget_observation_source_mismatch")
+    return state, observation
+
+
+async def reconcile_usage(runtime, actor, job_id, attempt_id):
+    state, observation = await _reconciliation_state(runtime, actor, job_id, attempt_id)
     # A crash can occur after model observation commit but before its budget
     # projection. The shared transaction applies counters at most once.
     if state["phase"] == "dispatch_authorized":

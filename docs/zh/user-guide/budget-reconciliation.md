@@ -35,3 +35,48 @@ receipt = await runtime.reconcile_budget_usage(
 `runtime.budget_control_tasks()` 返回实际仍在运行的预算控制 Task；即使上层等待已超时或
 取消，这些句柄仍保留。控制宿主应把它们计入自己的停机窗口，等待实际退出后再关闭传输和
 共享 store；句柄退出不证明 API 没有提交。该接口不启动 boot，不返回任何执行令牌。
+
+## 可信迟到证据与后续修订（task protocol 20）
+
+宿主可用 `BudgetUsageEvidence` 和 `TaskRuntime.stage_budget_usage_revision` 登记原 attempt 的新证据。只有可信账务采集器可以使用；没有对应的模型工具。来源字段用于追溯，不会替宿主验证供应商签名、身份或账单真实性。
+
+```python
+from power_loop.runtime.budget_contracts import BudgetUsageEvidence
+
+# confirmed_usage 保留全部已知 token 字段；金额等宿主事实放在 details。
+evidence = BudgetUsageEvidence(
+    evidence_id=stable_evidence_id,
+    source=trusted_source_name,
+    source_record_id=original_provider_record_id,
+    token_quality="actual",
+    usage=confirmed_usage,
+    details=verified_host_facts,
+    correction_of=previous_evidence_hash,  # 修改已有 actual 值时必填
+    correction_reason=correction_reason,  # 与 correction_of 同时填写
+)
+staged = await runtime.stage_budget_usage_revision(
+    original_session_id,
+    job_id=original_send_job_id,
+    attempt_id=original_attempt_id,
+    expected_revision=previous_ack_revision,
+    evidence=evidence,
+)
+receipt = await runtime.reconcile_budget_usage(
+    original_session_id, job_id=original_send_job_id, attempt_id=original_attempt_id,
+)
+```
+
+首次补充 actual 或同值确认可省略 `correction_of/correction_reason`。原观察的引用哈希是 `_hash(original_observation)`；后续引用为前一次 stage 返回的 `evidence_hash`。不要用 API 请求指纹冒充证据哈希。事件索引由 stage 回执的 `event_id` 提供；原始 source_record_id 与 evidence_id 也保存在该事件中。
+
+原 `BudgetConfig.provider` 必须实现可选 `BudgetRevisionProvider` 接口的 `prepare_usage_revision(context, grant, previous_submission, previous_ack, evidence)`，返回同一 attempt、前一 revision+1 的 `BudgetSubmission`。准备方法不得执行付费动作或创建新预留；提交复用原 `apply_usage` 及 `BudgetAck` 幂等契约。宿主在准备时校验自己的金额、币种、价格和更正规则；SDK只处理通用 token 事实及原本地 scope。普通旧 provider 不会因为方法名相似的模型工具而获得这个能力。
+
+前提与恢复规则：
+
+- 必须已有原 tracking/prepared/dispatched/finished、预算观察及已确认的首次 submission/ACK。缺少首次观察或 ACK 时明确拒绝；先核对原提交。此接口不补造崩溃丢失的观察，也不负责向供应商自动查询。
+- 每个 attempt 同时只接受一个待处理修订；并发相同 evidence_id/内容/expected_revision 返回同一个持久回执，不重复核销。不同快照、过时版本或未完成前一修订明确报错，不算受理。采集器必须保留源记录，核对后再决定如何处理，不能把拒绝当丢弃证据的许可。
+- 登记事务保存独立证据事件、冻结前一 submission/ACK、核销所有原 scope 的 token 差额并设 pending。该事务不调用提供者；失败全部回滚。新 revision 不增加 used_calls，不改消息、原观察、原执行代次或资源退出状态。实际总量超过原上限会关闭新准入，后续更正不会擅自重新启用。
+- unknown/estimated 不降级实际事实；已知 actual 字段不能消失。修改已确认数值需要引用原证据并保留原因。估算或缺少实际总量时不释放 token 风险；确认 token 也不能释放远端执行的 inflight 风险。
+- 提交准备、API调用或本地ACK保存失败后 pending 保留。新控制实例重用原证据和冻结提交；旧准备回调及旧ACK不能覆盖新 revision。证据事件缺失时，即使 submission 已冻结，也拒绝继续提交。
+- 原任务取消、预算停用不阻止合法核账；已经关闭的 runtime 不能再登记。取消等待不取消真实端口任务，仍通过 `budget_control_tasks()` 管理它们，实际退出前不关闭 store。
+
+task schema仍是10；task protocol升到20，没有新增表或索引。旧协议必须显式维护迁移；普通打开不升级。协议19恢复器不知道修订语义，因此不能用它控制已有20数据。正式业务宿主的迟到采集与API修订适配须分别接入和验收，单独SDK测试不代表全链路上线。

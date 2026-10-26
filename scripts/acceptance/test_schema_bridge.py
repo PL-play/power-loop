@@ -27,6 +27,7 @@ from tests.real.test_real_budget_tree_192 import RealBudgetHost
 
 pytestmark = pytest.mark.asyncio
 WORKER = Path(__file__).with_name("_schema_bridge_worker.py")
+LEGACY_PROTOCOL = int(os.environ.get("POWER_LOOP_BRIDGE_LEGACY_PROTOCOL", "6"))
 
 
 async def old_process(config):
@@ -34,7 +35,7 @@ async def old_process(config):
     assert (root / "power_loop/runtime/store/task_schema.py").is_file()
     env = {**os.environ, "PYTHONPATH": str(root)}
     result = await asyncio.to_thread(subprocess.run, [sys.executable, str(WORKER)],
-        cwd=root, env=env, input=json.dumps({**config, "protocol": 6}),
+        cwd=root, env=env, input=json.dumps({**config, "protocol": LEGACY_PROTOCOL}),
         capture_output=True, text=True, timeout=110)
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
@@ -46,7 +47,7 @@ async def held_writer(config):
         env={**os.environ, "PYTHONPATH": str(root)}, stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
-        proc.stdin.write((json.dumps({**config, "protocol": 6, "action": "held_writer"}) + "\n").encode())
+        proc.stdin.write((json.dumps({**config, "protocol": LEGACY_PROTOCOL, "action": "held_writer"}) + "\n").encode())
         await proc.stdin.drain()
         ready = json.loads(await asyncio.wait_for(proc.stdout.readline(), 15))
         assert ready == {"ready": True, "store_id": config["store_id"]}
@@ -83,7 +84,7 @@ class ControlHost(RealBudgetHost):
 
 @pytest.mark.parametrize("backend", ["sqlite", "postgres"])
 @pytest.mark.parametrize("real", [False, pytest.param(True, marks=pytest.mark.real_llm)])
-async def test_actual_protocol_six_upgrade_original_control_and_accounting(
+async def test_actual_legacy_protocol_upgrade_original_control_and_accounting(
         tmp_path, monkeypatch, record_property, backend, real):
     dsn = str(tmp_path / "bridge.db") if backend == "sqlite" else os.environ["POWER_LOOP_TASK_PG_DSN"]
     if backend != "sqlite":
@@ -98,7 +99,7 @@ async def test_actual_protocol_six_upgrade_original_control_and_accounting(
         record_property("reported_tokens", original["reported_tokens"])
         db = await _make_database(dsn)
         before = await snapshot(db, prefix)
-        assert before["task_store"][0]["protocol_version"] == 6
+        assert before["task_store"][0]["protocol_version"] == LEGACY_PROTOCOL
         stale = await held_writer({**config, **original})
         record_property("stale_writer_pid", stale.pid)
         for mode in ("compatible", "tasks"):

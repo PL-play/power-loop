@@ -336,6 +336,16 @@ class TaskRuntime:
         from .model_budgets import reconcile_usage
         return await reconcile_usage(self, self.actor(session_id), job_id, attempt_id)
 
+    async def stage_budget_usage_revision(self, session_id, *, job_id, attempt_id, expected_revision, evidence):
+        """Trusted host stages one original-attempt revision; no provider I/O.
+
+        On conflict the collector must retain its source evidence and reconcile;
+        rejection is not acceptance. Resume with reconcile_budget_usage.
+        """
+        from .budget_revisions import stage
+        return await stage(self, self.actor(session_id), job_id, attempt_id,
+                           expected_revision=expected_revision, evidence=evidence)
+
     def budget_control_tasks(self):
         """Original live HTTP/preparation tasks, retained even after waiter cancellation.
 
