@@ -231,15 +231,15 @@ async def commit(manager, actor, caller, *, snapshot_id, response_ref, decision=
                         (target["kind"] != "workflow_node" and target["session_id"] != actor.session_id) or request.get("session_id") != actor.session_id or
                         request.get("target") != {key: target[key] for key in ("job_id", "executor_id", "boot_id", "generation")}):
                     raise JobError("processing_input_mismatch")
-            if ((not is_input and ((target["kind"] != "background_tool" and target["created_by_session_id"] != actor.session_id) or
+            if ((not is_input and ((target["kind"] not in ("background_tool","send") and target["created_by_session_id"] != actor.session_id) or
                     current is not None and current["event_id"] != result_id(target["job_id"], target["generation"]))) or
                     current is None or current["job_id"] != target["job_id"] or
                     int(current["job_version"]) != event["revision"] or _hash(json.loads(current["payload_json"])) != event["result_hash"]):
                 raise JobError("processing_revision_changed")
             if not is_input and target['kind'] == 'send':
                 from .abort_outcomes import verify_observation
-                if send['execution_role'] != 'main':
-                    raise JobError('abort_outcome_requires_original_main')
+                from .original_owner_review import require_handler
+                await require_handler(manager,tx,target,send)
                 await verify_observation(manager, tx, actor, target, current, event)
             if not is_input and target['kind'] == 'background_tool':
                 from .managed_delivery import verify_observation

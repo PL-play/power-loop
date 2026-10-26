@@ -748,6 +748,8 @@ class JobManager:
             if row["kind"] in ("subagent", "workflow_node"):
                 from .completion_windows import admit
                 await admit(self, tx, await self._row(tx, job_id))
+                from .original_owner_review import admit as admit_review
+                await admit_review(self,tx,await self._row(tx,job_id))
             return JobLease(job_id, executor_id, boot_id, generation)
 
     async def register_operation(self, actor: JobActor, lease: JobLease, *, action: str,

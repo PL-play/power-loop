@@ -336,3 +336,46 @@ records. Child-owner pending batches, pre-checkpoint crashes and claimed-before-
 preparation resource exit still require their own protocols. Default SDK/host
 activation and final rollout are separate gates; this candidate does not enable
 them automatically.
+
+## Original child owner: retained-controller path (protocol 15 candidate)
+
+New native `workflow_node` and standalone `subagent` owners opt in through their
+original creation request and an immutable first-claim admission checkpoint.
+Each original child send freezes its actual per-call round limit; a larger
+current configuration cannot add review credit. Admission, original scopes,
+member relationship, physical session role and node-session provenance are
+revalidated together. Legacy owners retain their existing protocol.
+
+The initial `run_agent_spec` path can process a v3 pre-admission abort while its
+original SDK controller is still retained. Pure historical readers and host-only
+negative-result publication do not grant model permission. The review helper
+requires the actual original owner object, local execution binding and current
+asyncio task, an unsealed original member set, current lease, original deadline
+and remaining completion/model-budget credit. A newly constructed binding or a
+copied context in another task cannot replace this controller.
+
+Negative result publication, genuine generation-zero closure, original-child
+notice and exact pending disposition commit atomically. The notice identifies
+`review_session_id` and the original owner, without promoting the child to main.
+The helper offers no business tools, preserves original calls as projected data,
+and does not fabricate missing tool replies. Only actual notice visibility,
+response and clean model exit can acknowledge processing. Successful processing
+returns a **failed original task result** with actual usage, not a successful
+business deliverable. A workflow may continue past that failed node only through
+its existing explicit `continue_on_error` policy and after processing completes.
+
+Quota exhaustion, cancellation, hidden notice, corrupt evidence and expired or
+replaced ownership leave the original obligation unresolved. An owner cannot
+publish its result while such captured pending calls or their review remain
+unresolved. Normal cancellation without pending calls remains supported. If a
+cancellation leaves a prepared but unexecuted v2 pending call, it must remain
+pending; a cancellation token alone does not justify disposal or a premature
+child completion notice.
+
+This candidate does **not** implement cross-process owner restoration, the
+`continue_agent` exception path, or general v2 executed/known-result recovery.
+Old generations whose members are sealed cannot receive new model sends. Those
+paths need their own transition and physical-exit proof; neither a relaxed
+pending guard nor main-role promotion is an acceptable shortcut. Protocol 15
+requires explicit maintenance; the default host/runtime is not activated by
+these candidate changes.

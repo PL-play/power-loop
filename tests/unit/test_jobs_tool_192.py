@@ -314,7 +314,9 @@ async def test_backend_failure_is_explicit_and_does_not_expose_control_secrets(a
 async def test_native_backend_valueerror_is_private_even_with_a_code_attribute(managed, monkeypatch, action, spoof):
     from power_loop.runtime import task_query
 
-    _, manager, _, loop, model, sid, _ = managed
+    _, manager, runtime, loop, model, sid, _ = managed
+    # Error privacy, not heartbeat expiry: allow real SQL admission under load.
+    runtime.lease_ms = 30000
     await loop.send("delegate", sid)
     await asyncio.wait_for(model.entered.wait(), 3)
     accepted = await receipt(managed)
@@ -400,3 +402,29 @@ async def test_expired_model_send_can_cancel_but_spoofed_jobs_name_cannot_dispat
     if trusted:
         op = await manager.get_operation(runtime.actor(sid), stops[0]["event_id"])
         assert op.call_ref["id"] != op.receipt_ref["id"]
+
+
+@pytest.mark.parametrize("name", ["jobs", "inspect_tasks", "send_message"])
+async def test_native_jobs_alias_uses_registered_contract_not_catalog_name(managed, monkeypatch, name):
+    from power_loop import ToolDefinition
+    from power_loop.runtime.tool_contracts import policy
+    _, _, _, loop, model, sid, _ = managed
+    register_jobs_tools(loop.tool_registry, definition=replace(JOBS_DEFINITION, name=name))
+    calls = []
+    async def complete(request, **kwargs):
+        calls.append(request)
+        tools = [{"id": "original-aliased-jobs", "type": "function", "function": {
+            "name": name, "arguments": '{"action":"list"}'}}] if len(calls) == 1 else None
+        return LLMResponse(raw_text="" if tools else "inspected", tool_calls=tools,
+            token_usage=LLMTokenUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10))
+    monkeypatch.setattr(model, "complete", complete)
+    result = await loop.send("Inspect my task tree", sid)
+    assert result.status == "completed" and len(calls) == 2
+    replies = [row for row in await loop.store.load_all_messages(sid) if row.role == "tool"]
+    assert len(replies) == 1 and replies[0].tool_call_id == "original-aliased-jobs"
+    payload = json.loads(replies[0].content)
+    assert not payload.get("error")
+    assert policy(loop.tool_registry.get(name), {"action": "list"}).control_only
+    forged = ToolRegistry()
+    forged.register(ToolDefinition(name, "ordinary callable"), lambda **kwargs: "ordinary")
+    assert not policy(forged.get(name), {"action": "list"}).native_admitted

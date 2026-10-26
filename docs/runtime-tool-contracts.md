@@ -184,3 +184,27 @@ semantic yield from a name.
 
 Image placeholders retain the original filename and opaque host recall reference.
 Their wording does not assume any platform-specific image tool is installed.
+
+
+## Apply the same boundary across layers
+
+Execution, review schema selection, progress/yield statistics, skill-reader
+instructions, completion previews, background hints, composite-result expansion,
+context retention and archival all consume the actual registered implementation
+or explicit SDK metadata. A tool name, function/module name, catalog entry or
+lookalike attribute cannot substitute for these contracts. Schema views remain
+presentation only and do not grant execution authority.
+
+`register_jobs_tools(..., definition=...)` accepts a different registered name
+and description while retaining the implemented input schema. The name does not
+confer a capability: an ordinary callable named `jobs` or `send_message` remains
+an ordinary callable. Explicit host include lists and per-name context overrides
+still select the actual entries supplied by the host.
+
+Historical original-call verification must retain the original recorded name,
+call ID and arguments; these identify evidence and are not name-based permission.
+SDK job kinds/roles and protocol field names likewise remain data contracts.
+Workflow resource restoration uses a registered `WorkflowResourceAdapter` and
+frozen `WorkflowResourceBinding`; saved class/module strings are opaque evidence,
+never an import path or restoration authority. Business message routing and
+conversation/installation authorization belong to host implementations.

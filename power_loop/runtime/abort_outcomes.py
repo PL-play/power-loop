@@ -38,12 +38,14 @@ async def _original(manager, tx, source):
 
     closed = await model(manager, tx, source)
     snapshot = closed['evidence'].get(SNAPSHOT)
-    if (source['kind'] != 'send' or source['root_job_id'] != source['job_id'] or source['parent_job_id'] is not None
-            or snapshot is None or snapshot.get('version') != 3):
-        raise JobError('abort_outcome_requires_original_main')
-    root = await _main(manager, tx, source)
-    if root['job_id'] != source['job_id']:
-        raise JobError('abort_outcome_requires_original_main')
+    if source['kind'] != 'send' or snapshot is None or snapshot.get('version') != 3:
+        raise JobError('abort_outcome_requires_original_owner')
+    from .original_owner_review import read as review_owner
+    binding = await review_owner(manager,tx,source)
+    if binding is None:
+        root = await _main(manager,tx,source)
+        if root['job_id'] != source['job_id'] or source['parent_job_id'] is not None:
+            raise JobError('abort_outcome_requires_original_main')
     pending, calls, ref = await _verify(manager, tx, source, snapshot)
     if pending.get('pending_interactions'):
         raise JobError('pending_call_interaction_unresolved')
@@ -68,13 +70,18 @@ async def requested(manager, tx, source):
     outcome = closed['evidence'].get('exit')
     if outcome not in ('cancelled', 'interrupted', 'timed_out', 'budget_exceeded'):
         outcome = 'failed'
-    return outcome, {'status': 'not_dispatched', 'final_text': 'Original tool batch did not obtain admission.', FIELD: {
+    value = {'status': 'not_dispatched', 'final_text': 'Original tool batch did not obtain admission.', FIELD: {
         'version': 1, 'scope': proof(source), 'original_call': ref.to_dict(),
         'calls': [{'tool_call_id': e['call_id'], 'tool_name': e['tool_name'], 'arguments_hash': e['arguments_hash'],
                    'resolution': 'not_dispatched'} for e in checkpoint['entries']],
         'checkpoint': content_reference(abort), 'model_exit': content_reference(model),
         'new_effect_requests': 0, 'source_model_usage': 'retained_in_original_model_attempt_ledger',
         'execution_authority': False, 'acknowledgement_created': False, 'billing_settled': False}}
+    from .original_owner_review import read as review_owner
+    binding = await review_owner(manager,tx,source)
+    if binding is not None:
+        value[FIELD]['review_owner'] = binding
+    return outcome,value
 
 
 class _Publication(ResultPublicationProof):
@@ -115,7 +122,9 @@ async def _notice_value(manager, tx, source, result):
     public = {'version': 1, 'outcome_scope': 'original_source_batch', 'source_job_id': source['job_id'],
               'generation': source['generation'], 'outcome': payload['outcome'], 'resolution': 'not_dispatched',
               'result': content_reference(result), **payload['result'][FIELD]}
-    return {'version': 1, 'source_job_id': source['job_id'], 'main_session_id': source['session_id'],
+    route = ({'main_session_id':source['session_id']} if 'review_owner' not in payload['result'][FIELD]
+             else {'review_session_id':source['session_id'],'review_owner':payload['result'][FIELD]['review_owner']})
+    return {'version': 1, 'source_job_id': source['job_id'], **route,
             'result': content_reference(result), 'public': public, 'message_hash': _hash(render(public))}
 
 
@@ -198,20 +207,28 @@ async def uses_batch_route(manager, tx, source, closed):
     return True
 
 
-async def reconcile(loop, actor, source_job_id):
+async def reconcile(loop,actor,source_job_id):
+    return await _reconcile(loop,actor,source_job_id,permit=None)
+
+
+async def _reconcile(loop, actor, source_job_id, *, permit):
     """One original main batch: atomic negative result, notice and disposition."""
     from .managed_completion import _host_only
     from .managed_effects import terminate_unstarted_tx
     from .pending_calls import current, identity, model, require_disposition
     from .tool_call_plans import _event
     from .workflow_controller import proof
-    _host_only()
+    if permit is None:
+        _host_only()
     runtime = getattr(loop, 'task_runtime', None)
     if runtime is None or runtime.actor(actor.session_id) != actor or await loop.ensure_store() is not runtime.manager.store:
         raise JobError('task_runtime_required')
     manager = runtime.manager
     async with manager._write() as tx:
         source = await manager._authorize(tx, actor, source_job_id)
+        if permit is not None:
+            from .original_owner_review import require_live
+            await require_live(manager,tx,actor,source,permit)
         closed, _snapshot, pending, ref, checkpoint = await _original(manager, tx, source)
         if actor.session_id != source['session_id'] or not await uses_batch_route(manager, tx, source, closed):
             raise JobError('abort_outcome_original_route_required')
@@ -243,8 +260,10 @@ async def reconcile(loop, actor, source_job_id):
         result = await result_event(manager, tx, source)
         delivery = await notice(manager, tx, source, result)
         inbox = await _inbox(manager, tx, source, delivery)
+        route = ({'main_session_id':actor.session_id} if 'review_owner' not in delivery[1]
+                 else {'review_session_id':actor.session_id,'review_owner':delivery[1]['review_owner']})
         response = {'source_job_id': source_job_id, 'mode': MODE, 'disposition': disposition,
-                    'notices': [{'notification_id': delivery[0]['event_id'], 'main_session_id': actor.session_id}],
+                    'notices': [{'notification_id': delivery[0]['event_id'], **route}],
                     'execution_authority': False, 'acknowledgement_created': False, 'billing_settled': False}
     if inbox['status'] == 'pending':
         try:
@@ -295,7 +314,7 @@ async def observation(manager, tx, actor, source, result, visible=None):
     from .managed_effects import _document
     from .pending_calls import require_disposition
     delivery = await notice(manager, tx, source, result)
-    if actor.session_id != delivery[1]['main_session_id']:
+    if actor.session_id != delivery[1].get('review_session_id',delivery[1].get('main_session_id')):
         raise JobError('abort_outcome_requires_original_main')
     inbox = await _inbox(manager, tx, source, delivery)
     if inbox['status'] != 'delivered':
@@ -331,7 +350,17 @@ async def handled_references(manager, tx, source, result=None, delivery=None):
     from .managed_delivery import handled_references as common
     result = result if result is not None else await result_event(manager, tx, source)
     delivery = delivery if delivery is not None else await notice(manager, tx, source, result)
-    return [await _result_reference(manager, tx, result), *await common(manager, tx, source, result, delivery, verifier=verify_observation)]
+    from .original_owner_review import read as review_owner
+    from .original_owner_review import require_handler
+    binding = await review_owner(manager,tx,source)
+    refs = await common(manager,tx,source,result,delivery,verifier=verify_observation,
+        session_id=source['session_id'],owner_job_id=binding['owner']['job_id'] if binding else None,
+        handler_role=binding['execution_role'] if binding else 'main')
+    decision = next(ref for ref in refs if ref['event_type']=='processing_decision')
+    event = await tx.fetchone(f'SELECT payload_json FROM {manager.events} WHERE event_id=?',(decision['event_id'],))
+    handler = await manager._row(tx,json.loads(event['payload_json'])['handler_job_id'])
+    await require_handler(manager,tx,source,handler)
+    return [await _result_reference(manager,tx,result),*refs]
 
 
 async def _result_reference(manager, tx, result):

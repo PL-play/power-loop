@@ -368,6 +368,9 @@ async def test_cancelled_caller_model_phase_does_not_cancel_already_accepted_ind
     sending = asyncio.create_task(loop.send("delegate", sid))
     try:
         await asyncio.wait_for(finishing_parent.wait(), 3)
+        # This case exercises cancellation of an already running child model.
+        # A separate case covers cancellation at pre-model admission.
+        await asyncio.wait_for(model.entered.wait(), 3)
         accepted = await receipt(managed)
         sending.cancel()
         await asyncio.gather(sending, return_exceptions=True)
@@ -484,3 +487,46 @@ async def test_host_opt_in_rejects_invalid_or_mismatched_configuration(managed, 
         else:
             TaskRuntime(manager, tenant_id="test", principal_id="host", executor_id="" if case == "invalid_executor" else "exec",
                         boot_id="boot", lease_ms=0 if case == "invalid_lease" else 30000)
+
+
+@pytest.mark.parametrize("scope_stop", [False, True])
+async def test_cancel_before_child_model_admission_uses_admission_fence(managed, monkeypatch, scope_stop):
+    _, manager, runtime, loop, model, sid, _ = managed
+    runtime.lease_ms = 300000  # No heartbeat is needed to enforce admission.
+    before_model, parent_waiting, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    run, complete = StatefulAgentLoop._run_loop, model.complete
+    async def gated_run(self, active_sid, **kwargs):
+        if active_sid != sid:
+            before_model.set()
+            await release.wait()
+        return await run(self, active_sid, **kwargs)
+    async def gated_parent(request, **kwargs):
+        if get_session_id() == sid and model.root_calls == 1:
+            parent_waiting.set()
+            await asyncio.Event().wait()
+        return await complete(request, **kwargs)
+    monkeypatch.setattr(StatefulAgentLoop, "_run_loop", gated_run)
+    monkeypatch.setattr(model, "complete", gated_parent)
+    sending = asyncio.create_task(loop.send("delegate", sid))
+    try:
+        await asyncio.wait_for(parent_waiting.wait(), 5)
+        await asyncio.wait_for(before_model.wait(), 5)
+        accepted = await receipt(managed)
+        sending.cancel()
+        await asyncio.gather(sending, return_exceptions=True)
+        child = await manager.get_job(runtime.actor(sid), accepted["job_id"])
+        assert child.cancel_requested_at is None and model.child_calls == 0
+        if scope_stop:
+            await manager.request_cancel(runtime.actor(sid), child.parent_job_id,
+                system_key="stop-before-model", reason="Stop original scope before model admission")
+        release.set()
+        await finish(managed)
+        child = await manager.get_job(runtime.actor(sid), child.job_id)
+        assert child.outcome == ("cancelled" if scope_stop else "succeeded")
+        assert model.child_calls == (0 if scope_stop else 1)
+        assert child.resource_state == "stopped"
+    finally:
+        release.set()
+        if not sending.done():
+            sending.cancel()
+            await asyncio.gather(sending, return_exceptions=True)

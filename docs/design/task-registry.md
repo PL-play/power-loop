@@ -1581,3 +1581,18 @@ RuntimeTool instance. Immediately before invocation, the pipeline rechecks
 the registration and frozen metadata. Replacing/revoking a registration,
 changing its contract, or retargeting a wrapper while admission awaits
 cannot execute the new handler under an old permission decision.
+
+### Protocol 15 candidate: immutable original-owner review admission
+
+New native child owners retain an `owner_abort_review_protocol=1` creation
+contract and a first-claim `owner_review_admission` checkpoint containing the
+original creation and scope content references. Their model sends freeze the
+actual `original_round_limit`, including per-call overrides. Missing or changed
+admission evidence cannot downgrade a new source to the legacy protocol.
+
+Historical negative-result readers verify the original owner/member/physical
+session relationship; live model handling additionally requires the original
+local controller and unsealed generation. The canonical owner-result gate
+retains unresolved original pending/review obligations. Main and child handler
+roles remain distinct. See [managed-tool recovery](../managed-tool-recovery.md)
+for the retained initial-controller scope and unimplemented restoration paths.

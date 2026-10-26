@@ -14,7 +14,7 @@ __all__ = ["registry_store", "managed"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("ending", ["recover", "empty", "provider_error", "repeat_pass", "exhausted", "cancel"])
+@pytest.mark.parametrize("ending", ["recover", "empty", "provider_error", "repeat_pass", "exhausted", "cancel", "cancel_pending"])
 async def test_empty_initial_managed_child_gets_one_guarded_non_business_answer(managed, monkeypatch, ending):
     store, manager, runtime, loop, model, parent, _ = managed
     # This tests output recovery, not heartbeat expiry. Real PG admission and
@@ -48,7 +48,11 @@ async def test_empty_initial_managed_child_gets_one_guarded_non_business_answer(
             response.raw_text, response.tool_calls = "", None
         elif ending == "provider_error":
             raise RuntimeError("output provider failed")
-        if ending == "cancel" and len(requests) == 1:
+        if ending in ("cancel", "cancel_pending") and len(requests) == 1:
+            if ending == "cancel":
+                # Output cancellation with no unresolved call. The separate
+                # cancel_pending case must retain the original pending proof.
+                response.tool_calls = None
             from power_loop.runtime import delegation
             delegation._RUNNING[(id(store), get_session_id())].token.cancel("cancel before supplement")
         return response
@@ -56,6 +60,16 @@ async def test_empty_initial_managed_child_gets_one_guarded_non_business_answer(
     await loop.send("delegate", parent)
     await finish(managed)
     [child] = [j for j in await jobs(managed) if j.kind == "subagent"]
+    if ending == "cancel_pending":
+        # Cancellation is not proof that the unexecuted call was disposed or
+        # reviewed. Never publish a premature canonical child result.
+        assert child.outcome is None and child.result is None
+        assert child.supervision_status == "open"
+        assert len(requests) == 1
+        assert (await store.get_state(child.session_id)).pending
+        assert (await store.inbox_counts(parent))["pending"] == 0
+        assert guarded == ["enter", "exit"]
+        return
     assert child.outcome == ("succeeded" if ending == "recover" else "cancelled" if ending == "cancel" else "failed")
     assert len([j for j in await jobs(managed) if j.kind == "subagent"]) == 1
     if ending == "recover":

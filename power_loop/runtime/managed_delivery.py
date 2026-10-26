@@ -260,13 +260,13 @@ async def verify_observation(manager, tx, actor, row, result, event):
         raise JobError('managed_delivery_processing_mismatch')
 
 
-async def handled_references(manager, tx, row, result, notice, *, verifier=None):
+async def handled_references(manager, tx, row, result, notice, *, verifier=None, session_id=None, owner_job_id=None, handler_role='main'):
     from .finalization import _processing_references, _reference
     from .jobs import JobActor, JobLease
     from .processing import _fingerprint, require_event_handled
 
-    actor = JobActor(row['tenant_id'], row['principal_id'], notice[1]['main_session_id'])
-    await require_event_handled(manager, tx, result, session_id=actor.session_id, owner_job_id=None, allow_suppressed=row['generation'] == 0)
+    actor = JobActor(row['tenant_id'], row['principal_id'], session_id or notice[1]['main_session_id'])
+    await require_event_handled(manager, tx, result, session_id=actor.session_id, owner_job_id=owner_job_id, allow_suppressed=row['generation'] == 0)
     refs = await _processing_references(manager, tx, result)
     decision = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (refs[0]['event_id'],))
     data = json.loads(decision['payload_json'])
@@ -276,7 +276,7 @@ async def handled_references(manager, tx, row, result, notice, *, verifier=None)
         'executor_id': handler['executor_id'], 'boot_id': handler['boot_id']}
     from .execution_membership import _lease
     _lease(source)
-    if handler['execution_role'] != 'main':
+    if handler['execution_role'] != handler_role:
         raise JobError('managed_delivery_processing_mismatch')
     snapshot = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (data['snapshot_id'],))
     if snapshot is None or snapshot['event_type'] != 'processing_request' or snapshot['delivery_status'] != 'handled':

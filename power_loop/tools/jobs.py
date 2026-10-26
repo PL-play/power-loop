@@ -231,6 +231,6 @@ JOBS_HANDLER = FunctionRuntimeTool(
 def register_jobs_tools(registry, *, overwrite=False, definition=None):
     """Explicit opt-in registration, following host include/role allowlists."""
     selected = definition or JOBS_DEFINITION
-    if selected.name != "jobs" or selected.input_schema != JOBS_DEFINITION.input_schema:
-        raise ValueError("jobs definition may localize description, not replace the schema")
+    if selected.input_schema != JOBS_DEFINITION.input_schema:
+        raise ValueError("jobs definition may change name or description, not replace the schema")
     registry.register(selected, JOBS_HANDLER, overwrite=overwrite)

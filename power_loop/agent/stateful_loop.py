@@ -1764,7 +1764,8 @@ class StatefulAgentLoop:
             # not cancel the shared task and bypass its parent's bookkeeping.
             stop = CancellationToken.from_any(kwargs.get("stop_event")).child()
             kwargs["stop_event"] = stop
-            async with self.task_runtime.model_send(self, sid, await self._current_send_index(store, sid), cancel_token=stop) as evidence:
+            async with self.task_runtime.model_send(self, sid, await self._current_send_index(store, sid), cancel_token=stop,
+                                                    round_limit=kwargs.get('max_rounds')) as evidence:
                 result = await self._run_with_tool_context(sid, **kwargs)
                 evidence.update(exit=result.status, usage=dict(result.usage or {}), rounds=result.rounds,
                                 new_input_after_pass=bool(result.new_input_after_pass))

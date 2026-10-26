@@ -390,14 +390,14 @@ class TaskRuntime:
                 _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
-    async def model_send(self, loop, sid: str, send_index: int, *, cancel_token=None):
+    async def model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None):
         owner_token = _enter_task_owner(self)
         local = None
         try:
             await self.ensure_started()
             local = {"task": asyncio.current_task(), "cancel_token": cancel_token, "signalled": False}
             self._model_executions[id(local)] = local
-            async with self._model_send(loop, sid, send_index, cancel_token=cancel_token) as evidence:
+            async with self._model_send(loop, sid, send_index, cancel_token=cancel_token, round_limit=round_limit) as evidence:
                 yield evidence
         finally:
             if local is not None:
@@ -405,7 +405,7 @@ class TaskRuntime:
             _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
-    async def _model_send(self, loop, sid: str, send_index: int, *, cancel_token=None):
+    async def _model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None):
         from .execution_roles import session_role
 
         if (type(self.require_host_send_steps) is not bool
@@ -449,6 +449,18 @@ class TaskRuntime:
         if owner is None and await session_role(self.manager.store, sid) != "main":
             raise JobError("task_owner_required")
         request = {"send_index": send_index, "model_attempt_protocol": 1, "tool_call_plan_protocol": 1}
+        original_round_limit = None
+        if owner is not None:
+            from .original_owner_review import enabled
+            async with self.manager._write() as tx:
+                owning_row = await self.manager._authorize(tx,owner.actor,owner.lease.job_id)
+                declared = await enabled(self.manager,tx,owning_row)
+            if declared is not None:
+                original_round_limit = loop.config.max_rounds if round_limit is None else round_limit
+                if type(original_round_limit) is not int or not 0 <= original_round_limit <= 1000000:
+                    raise JobError('original_owner_round_limit_invalid')
+                request['original_round_limit'] = original_round_limit
+                request['owner_abort_review_protocol'] = 1
         if owner is None:
             from .root_context import for_send
             provenance = for_send(self, sid)
@@ -474,6 +486,7 @@ class TaskRuntime:
             raise JobError("task_send_requires_reconciliation")
         binding = await self.claim(actor, registration)
         evidence = {"exit": "interrupted", "session_id": sid, "send_index": send_index}
+        failure = None
         try:
             async with self.execution(binding, cancel_token=cancel_token):
                 from .model_attempts import enable
@@ -503,6 +516,7 @@ class TaskRuntime:
                         evidence["processing_decision_ack_reconciled"] = True
                     evidence["processing_decisions"] = decisions
         except BaseException as exc:
+            failure = exc
             evidence["exit"] = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
             evidence["error_type"] = type(exc).__name__
             evidence.setdefault("usage", dict(binding.resource_evidence.get("model_usage_totals", {})))
@@ -534,6 +548,9 @@ class TaskRuntime:
                 logging.getLogger(__name__).exception(
                     "supervision remains open after model exit: %s", binding.lease.job_id
                 )
+            if failure is not None:
+                from .original_owner_review import remember
+                remember(binding,owner,failure,original_round_limit)
 
     async def admit_subagent(self, sid: str, spec, task: str) -> JobRegistration:
         execution = _SEND.get()
@@ -553,7 +570,7 @@ class TaskRuntime:
             independent=role.execution_role == "main",
             call_ref=await self.manager.store.message_ref(sid, assistant_seq),
             tool_call_id=call_id,
-            request={"spec": asdict(spec), "input": task, "completion_window_protocol": 1},
+            request={"spec": asdict(spec), "input": task, "completion_window_protocol": 1, "owner_abort_review_protocol": 1},
         )
 
     async def bind_subagent(self, parent: str, registration: JobRegistration, sid: str) -> Execution:
@@ -579,6 +596,9 @@ class TaskRuntime:
         # A slow compatibility write must not renew a finished lease or turn a
         # successful canonical result into a spurious heartbeat failure.
         binding.stop_renewal.set()
+        from .original_owner_review import require_ready
+        async with self.manager._write() as tx:
+            await require_ready(self.manager,tx,await self.manager._authorize(tx,binding.actor,binding.lease.job_id))
         result = dict(result)
         recorded_usage = await self.manager.execution_usage(
             binding.actor, binding.lease.job_id, generation=binding.lease.generation

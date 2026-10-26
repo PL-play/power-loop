@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,7 +34,10 @@ def host():
     )
     registry = WorkflowResourceRegistry()
     runtime = TaskRuntime(
-        object(),
+        # Pure preparation still captures a stable runtime/store authority.
+        # No SQL or native restore admission is performed by this fixture.
+        SimpleNamespace(store=SimpleNamespace(store_id="pure-resource-preparation"),
+                        db=object(), prefix="pl_", jobs="pl_jobs", events="pl_job_events"),
         tenant_id="tenant",
         principal_id="host",
         executor_id="exec",
