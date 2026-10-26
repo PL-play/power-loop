@@ -265,10 +265,14 @@ async def test_result_commit_and_projection_failures_preserve_canonical_evidence
 
         monkeypatch.setattr(manager, "record_execution_result", failed_result)
     await finish(managed)
+    await runtime.flush_control_checkpoints()
     child = await manager.get_job(runtime.actor(sid), accepted["job_id"])
     pending = (await store.inbox_counts(sid))["pending"]
     if failure == "before_commit":
-        assert child.result is None and child.status == "running" and pending == 0
+        assert child.result is None and child.status == "settling" and pending == 0
+        assert child.resource_state == 'unknown' and child.supervision_status == 'open' and child.result_status == 'none'
+        original = await manager._row(manager.db, child.job_id)
+        assert original['intake'] == 'closed' and original['lease_until_ms'] is None
     else:
         assert child.result["status"] == "completed" and child.result["final_text"] == "CHILD-PROOF-42"
         assert child.outcome == "succeeded" and child.status == "settling"

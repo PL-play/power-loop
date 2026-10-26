@@ -41,6 +41,10 @@ async def delivery_case(managed_workflow, monkeypatch):
         patch.setattr(workflow_results, "project", unavailable)
         await loop.send("run", sid)
         await settle(managed_workflow)
+        # The controller Task ending and its durable metadata writer finishing
+        # are separate boundaries. Compete over delivery after the exit proof
+        # commits; do not synchronously open SQLite during that writer's lock.
+        await runtime.flush_control_checkpoints()
     handle = state["handles"][0]
     row = await manager._row(manager.db, handle.job_id)
     from power_loop.runtime.workflow_controller import proof

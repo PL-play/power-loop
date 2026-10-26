@@ -7,8 +7,8 @@ from .jobs import JobError, _hash
 from .model_exit import content_reference
 
 
-def identity(manager, source):
-    return 'controller_review_' + _hash([manager.store.store_id, source['job_id'], source['generation']])[:48]
+def identity(manager, source, *, legacy=False):
+    return ('controller_review_' if legacy else 'ctl_review_') + _hash([manager.store.store_id, source['job_id'], source['generation']])[:48]
 
 
 def _public(original, key, owner):
@@ -25,10 +25,16 @@ async def read(manager, tx, source, result, *, optional=True):
     from .original_owner_review import read as original_owner
     from .tool_call_plans import _read
 
-    key = identity(manager, source)
-    data = await _read(manager, tx, key, source, 'controller_review_handoff', optional=optional)
-    if data is None:
-        return None
+    candidates = await tx.fetchall(f'SELECT event_id FROM {manager.events} WHERE event_id IN (?,?)',
+        (identity(manager, source), identity(manager, source, legacy=True)))
+    if not candidates:
+        if optional:
+            return None
+        raise JobError('controller_handoff_required')
+    if len(candidates) != 1:
+        raise JobError('controller_handoff_ambiguous')
+    key = candidates[0]['event_id']
+    data = await _read(manager, tx, key, source, 'controller_review_handoff')
     binding = await original_owner(manager, tx, source)
     if binding is None:
         raise JobError('controller_handoff_original_owner_required')
@@ -37,9 +43,11 @@ async def read(manager, tx, source, result, *, optional=True):
     required = {'version', 'source_job_id', 'main_session_id', 'review_owner', 'result', 'original_notice',
                 'evidence', 'public', 'message_hash', 'execution_authority', 'resource_stop_confirmed', 'billing_settled'}
     from .abort_outcomes import render
+    from .controller_retirement import read_retirement
     from .execution_membership import seal_id
     from .pending_calls import identity as disposition_id
-    retirement = 'controller_retired_' + _hash([manager.store.store_id, binding['owner']])[:48]
+    owner = await manager._row(tx, binding['owner']['job_id'])
+    retirement = (await read_retirement(manager, tx, owner, binding['owner']))[0]['event_id']
     required_ids = {retirement, disposition_id(manager, source), seal_id(manager, binding['owner']['job_id'],
                     binding['owner']['generation']), 'model_closed_' + source['job_id']}
     if (set(data) != required or type(data['version']) is not int or data['version'] != 1
@@ -73,13 +81,13 @@ async def _quiescent(manager, tx, actor, owner, source, binding):
     from .execution_membership import seal, seal_id
     from .model_exit import require_stopped
     from .pending_calls import _closed
-    from .tool_call_plans import _read
     from .workflow_controller import proof
 
     if proof(owner) != binding['owner'] or owner['intake'] != 'closed':
         raise JobError('controller_handoff_owner_not_retired')
-    key = 'controller_retired_' + _hash([manager.store.store_id, binding['owner']])[:48]
-    data = await _read(manager, tx, key, owner, 'controller_retired')
+    from .controller_retirement import read_retirement
+    retirement, data = await read_retirement(manager, tx, owner, binding['owner'])
+    key = retirement['event_id']
     expected = {'version': 1, 'lease': binding['owner'], 'kind': owner['kind'],
         'execution_role': owner['execution_role'], 'session_id': owner['session_id'],
         'reason': 'sdk_controller_context_exited', 'execution_authority': False,

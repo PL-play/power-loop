@@ -7,6 +7,25 @@ from dataclasses import asdict, dataclass
 from .jobs import JobError, _hash
 
 
+def identity(manager, lease, *, legacy=False):
+    value = asdict(lease) if not isinstance(lease, dict) else lease
+    return ('controller_retired_' if legacy else 'ctl_retire_') + _hash([manager.store.store_id, value])[:48]
+
+
+async def read_retirement(manager, tx, owner, lease, *, optional=False):
+    from .tool_call_plans import _read
+    keys = [identity(manager, lease), identity(manager, lease, legacy=True)]
+    rows = await tx.fetchall(f'SELECT * FROM {manager.events} WHERE event_id IN (?,?)', tuple(keys))
+    if not rows:
+        if optional:
+            return None
+        raise JobError('controller_retirement_required')
+    if len(rows) != 1:
+        raise JobError('controller_retirement_ambiguous')
+    value = await _read(manager, tx, rows[0]['event_id'], owner, 'controller_retired')
+    return rows[0], value
+
+
 @dataclass(eq=False)
 class _Exit:
     actor: object
@@ -34,6 +53,7 @@ class RetirementCache:
         key = _hash(asdict(binding.lease))
         slot = self.pending.setdefault(key, _Exit(binding.actor, binding.lease))
         local['retirement'] = slot
+        self.runtime._controller_task_exits.capture(binding, local)
         return slot
 
     def contains(self, lease):
@@ -76,21 +96,29 @@ async def _persist(runtime, binding):
     manager = runtime.manager
     async with manager._write() as tx:
         row = await manager._authorize(tx, binding.actor, binding.lease.job_id)
+        if row['kind'] not in ('workflow', 'workflow_node', 'subagent'):
+            runtime._controller_task_exits.exclude(binding.lease)
+            return
         try:
             manager._check_proof(row, binding.lease)
         except JobError as exc:
             if exc.code == 'stale_execution':
                 return  # A newer admitted generation already fences this controller.
             raise
-        if row['kind'] not in ('workflow', 'workflow_node', 'subagent') or row['intake'] == 'closed':
+        if row['intake'] == 'closed' and row['resource_state'] != 'unknown':
             return
         from .tool_call_plans import _event
         data = {'version': 1, 'lease': asdict(binding.lease), 'kind': row['kind'],
                 'execution_role': row['execution_role'], 'session_id': row['session_id'],
                 'reason': 'sdk_controller_context_exited', 'execution_authority': False,
                 'resource_stop_confirmed': False, 'result_handled': False}
-        identity = 'controller_retired_' + _hash([manager.store.store_id, asdict(binding.lease)])[:48]
-        await _event(manager, tx, identity, row, 'controller_retired', data)
+        saved = await read_retirement(manager, tx, row, binding.lease, optional=True)
+        if saved is not None:
+            if _hash(saved[1]) != _hash(data):
+                raise JobError('controller_retirement_conflict')
+            return
+        key = identity(manager, binding.lease)
+        await _event(manager, tx, key, row, 'controller_retired', data)
         # Close admission atomically with the receipt. Existing SDK readers
         # already fence closed intake and unknown resources; no new permission
         # rule or inferred physical-exit proof is needed.

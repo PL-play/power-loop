@@ -205,20 +205,28 @@ async def test_failed_retirement_is_retained_and_retry_does_not_replay_work(
     c = await original_owner_case(registry_store, "subagent", allowed_calls=1)
     initial = set(delegation._TASKS)
     original = controller_retirement.retire
-    failed = False
+    original_persist = controller_retirement._persist
+    failed = blocked = False
+
+    async def retain_failure(*args):
+        if blocked:
+            raise OSError("receipt remains unavailable until explicit retry")
+        return await original_persist(*args)
 
     async def fail_once(runtime, binding, local):
-        nonlocal failed
+        nonlocal failed, blocked
         if not failed and binding.lease.job_id == c.state.owner_binding.lease.job_id:
             failed = True
             if fault == "after_commit":
                 await original(runtime, binding, local)
+            blocked = True
             if fault == "cancelled":
                 raise asyncio.CancelledError("interrupted controller receipt")
             raise OSError("controller receipt unavailable")
         return await original(runtime, binding, local)
 
     monkeypatch.setattr(controller_retirement, "retire", fail_once)
+    monkeypatch.setattr(controller_retirement, "_persist", retain_failure)
     try:
         await c.loop.send("Launch original task once.", c.state.root)
         await wait_owned(c, "subagent", initial)
@@ -234,6 +242,7 @@ async def test_failed_retirement_is_retained_and_retry_does_not_replay_work(
         assert status["controller_retirement_pending"] == 1
         assert status["store_safe_to_close"] is False
         # Concurrent new callers share one retry; lost ACK creates no duplicate.
+        blocked = False
         await asyncio.gather(*(c.runtime.ensure_started() for _ in range(8)))
         await c.runtime.ensure_started()
         status = await c.runtime.executor_status()
@@ -251,6 +260,7 @@ async def test_failed_retirement_is_retained_and_retry_does_not_replay_work(
         assert c.state.counts["BUILD"] == 1 and not c.state.effects
         assert await c.manager.execution_usage(binding.actor, binding.lease.job_id, generation=1) == usage
     finally:
+        blocked = False
         c.state.release.set()
         await c.runtime.shutdown(timeout_s=3)
         await c.loop.aclose(drain_timeout_s=0.1)

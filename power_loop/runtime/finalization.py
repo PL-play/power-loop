@@ -103,6 +103,14 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
             original = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (data_input["operation"]["event_id"],))
             if original is None or (await read_tx(manager, tx, original, required=True))["event_id"] != ref["event_id"]:
                 raise JobError("finalization_evidence_changed")
+        elif ref['event_type'] == 'controller_stopped':
+            from .controller_recovery import handled_references
+            from .controller_recovery import read as controller_stop
+            recovered = await manager._row(tx, ref['job_id'])
+            stopped = await controller_stop(manager, tx, recovered, optional=False, _closures=state)
+            if stopped[0]['event_id'] != ref['event_id']:
+                raise JobError('finalization_evidence_changed')
+            await handled_references(manager, tx, recovered, _closures=state)
     if data["version"] == 1 and proof["kind"] == "background_tool":
         current = await manager._row(tx, event["job_id"])
         if current is None or current["generation"] != data["scope"]["generation"]:
@@ -124,7 +132,7 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
     return data
 
 
-async def closed(manager, tx, row, generation=None):
+async def closed(manager, tx, row, generation=None, *, _state=None):
     """Validate saved immutable closure, including historical generations."""
     generation = row["generation"] if generation is None else generation
     events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='supervision_closed' ORDER BY job_version DESC,event_id", (row["job_id"],))
@@ -132,7 +140,7 @@ async def closed(manager, tx, row, generation=None):
         data = _object(event["payload_json"])
         if data.get("scope", {}).get("generation") != generation:
             continue
-        data = await _closed_event(manager, tx, event)
+        data = await _closed_event(manager, tx, event, state=_state)
         if generation == row["generation"] and _hash(data["scope"]) != _hash(_lease(row)):
             raise JobError("finalization_execution_changed")
         if generation == row["generation"] and row["supervision_status"] == "closed":
@@ -207,12 +215,13 @@ async def require_node_consumed(manager, tx, row):
 async def _prepare(manager, tx, actor, row, generation, state, depth=0):
     from .execution_membership import read, scope_id, seal_id
     key = (row["job_id"], generation)
+    validated = state.setdefault('validated_closures', {'visiting': set(), 'done': {}})
     if key in state["done"]:
         return state["done"][key]
     if key in state["visiting"] or depth >= 64 or len(state["done"]) + len(state["visiting"]) >= 10000:
         raise JobError("invalid_finalization_tree")
     if generation < row["generation"] or row["supervision_status"] == "closed":
-        event, _ = await closed(manager, tx, row, generation)
+        event, _ = await closed(manager, tx, row, generation, _state=validated)
         ref = await _reference(manager, tx, event["event_id"])
         state["done"][key] = ref
         return ref
@@ -292,11 +301,18 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
     else:
         result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='result'", (result_id(row["job_id"], generation),))
         payload = json.loads(result["payload_json"]) if result else {}
-        if (result is None or payload.get("resource_state") != "stopped" or payload.get("outcome") != row["outcome"] or
+        recovered = None
+        if row['kind'] in ('subagent', 'workflow_node', 'workflow'):
+            from .controller_recovery import read as controller_stop
+            recovered = await controller_stop(manager, tx, row, _closures=validated)
+        if (result is None or (payload.get("resource_state") != "stopped" and recovered is None) or payload.get("outcome") != row["outcome"] or
                 _hash(payload.get("result")) != _hash(json.loads(row["result_json"] or "null"))):
             raise JobError("finalization_result_unsettled")
         refs.append(await _reference(manager, tx, result["event_id"]))
-        if row["kind"] == "workflow_node":
+        if recovered is not None:
+            from .controller_recovery import handled_references
+            refs.extend(await handled_references(manager, tx, row, _closures=validated))
+        elif row["kind"] == "workflow_node":
             refs.append(await require_node_consumed(manager, tx, row))
         elif row["kind"] in ("workflow", "subagent"):
             from .processing import require_handled

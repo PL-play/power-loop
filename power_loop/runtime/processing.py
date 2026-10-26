@@ -70,6 +70,9 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
         results.extend(await candidates(manager, tx, actor))
         from .abort_outcomes import candidates as aborted_candidates
         results.extend(await aborted_candidates(manager, tx, actor))
+        from .controller_recovery import candidates as controller_candidates
+        results.extend(await controller_candidates(manager, tx, actor))
+        results = list({event['event_id']: event for event in results}.values())
         inputs = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' "
             "AND action='nudge' AND delivery_status<>'handled' ORDER BY event_id", (send["control_owner_job_id"],))
         observed = []
@@ -88,6 +91,15 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
                 if event["event_id"] != result_id(job["job_id"], job["generation"]):
                     continue
                 item_id = await delivery_id(manager, tx, job) if job["kind"] == "subagent" else event["event_id"]
+            if event['event_type'] == 'result' and job['kind'] in ('subagent', 'workflow_node', 'workflow'):
+                from .controller_recovery import observation as controller_observation
+                from .controller_recovery import read as controller_stop
+                if await controller_stop(manager, tx, job) is not None:
+                    actual = await controller_observation(manager, tx, actor, job, visible)
+                    if actual is not None:
+                        observed.append({'event_id': event['event_id'], 'job_id': event['job_id'],
+                            'revision': int(event['job_version']), 'result_hash': _hash(json.loads(event['payload_json'])), **actual})
+                    continue
             if event['event_type'] == 'result' and job['kind'] == 'send':
                 from .abort_outcomes import observation
                 actual = await observation(manager, tx, actor, job, event, visible)
@@ -231,11 +243,20 @@ async def commit(manager, actor, caller, *, snapshot_id, response_ref, decision=
                         (target["kind"] != "workflow_node" and target["session_id"] != actor.session_id) or request.get("session_id") != actor.session_id or
                         request.get("target") != {key: target[key] for key in ("job_id", "executor_id", "boot_id", "generation")}):
                     raise JobError("processing_input_mismatch")
-            if ((not is_input and ((target["kind"] not in ("background_tool","send") and target["created_by_session_id"] != actor.session_id) or
+            controller_review = not is_input and 'controller_result_delivery' in event
+            if ((not is_input and ((not controller_review and target["kind"] not in ("background_tool","send") and target["created_by_session_id"] != actor.session_id) or
                     current is not None and current["event_id"] != result_id(target["job_id"], target["generation"]))) or
                     current is None or current["job_id"] != target["job_id"] or
                     int(current["job_version"]) != event["revision"] or _hash(json.loads(current["payload_json"])) != event["result_hash"]):
                 raise JobError("processing_revision_changed")
+            if controller_review:
+                from .controller_recovery import verify_observation as verify_controller
+                from .managed_delivery import _main
+                main = await _main(manager, tx, target)
+                if (send['execution_role'] != 'main' or send['control_owner_job_id'] is not None
+                        or send['session_id'] != main['session_id']):
+                    raise JobError('controller_recovery_requires_original_main')
+                await verify_controller(manager, tx, actor, target, current, event)
             if not is_input and target['kind'] == 'send':
                 from .abort_outcomes import verify_observation
                 from .original_owner_review import require_handler
@@ -274,6 +295,12 @@ async def commit(manager, actor, caller, *, snapshot_id, response_ref, decision=
 
 async def require_handled(manager, tx, child):
     from .jobs import JobError
+
+    if child['kind'] in ('subagent', 'workflow_node', 'workflow'):
+        from .controller_recovery import handled_references, read
+        if await read(manager, tx, child) is not None:
+            await handled_references(manager, tx, child)
+            return
 
     result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='result'", (result_id(child["job_id"], child["generation"]),))
     if result is None or result["delivery_status"] != "handled" or child["result_status"] != "handled":

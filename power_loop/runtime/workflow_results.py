@@ -39,7 +39,7 @@ async def prepare(manager, actor, job_id, generation, *, lease=None):
         return await _prepare(manager, tx, actor, job_id, generation, lease=lease)
 
 
-async def _prepare(manager, tx, actor, job_id, generation, *, lease=None):
+async def _prepare(manager, tx, actor, job_id, generation, *, lease=None, _controller_closures=None):
     """Caller holds task control; take the normal session-state lock second."""
     key = delivery_event_id(job_id, generation)
     row = await manager._authorize(tx, actor, job_id)
@@ -84,8 +84,12 @@ async def _prepare(manager, tx, actor, job_id, generation, *, lease=None):
                 expected["execution_status"] = expected.get("status")
             expected["status"] = "cancelled"
         effective_outcome = "cancelled" if row["outcome"] == "cancelled" else payload["outcome"]
-        if (_hash(expected) != _hash(result) or row["outcome"] != effective_outcome or
-                row["resource_state"] != payload["resource_state"]):
+        resource_matches = row['resource_state'] == payload['resource_state']
+        if (not resource_matches and row['resource_state'] == 'stopped' and payload['resource_state'] == 'unknown'
+                and payload['outcome'] != 'succeeded'):
+            from .controller_recovery import read as controller_stop
+            resource_matches = await controller_stop(manager, tx, row, _closures=_controller_closures) is not None
+        if (_hash(expected) != _hash(result) or row["outcome"] != effective_outcome or not resource_matches):
             raise JobError("workflow_delivery_result_mismatch")
         projected = workflow_result(result)
     except (TypeError, ValueError, KeyError, AttributeError) as exc:
@@ -214,9 +218,9 @@ async def project(loop, actor, job_id, generation, *, lease=None):
     return data["envelope"]
 
 
-async def require_closed(manager, tx, actor, job_id, generation, *, consumed=False):
+async def require_closed(manager, tx, actor, job_id, generation, *, consumed=False, _controller_closures=None):
     """Transaction-local takeover prerequisite, not workflow resume permission."""
-    data = await _prepare(manager, tx, actor, job_id, generation)
+    data = await _prepare(manager, tx, actor, job_id, generation, _controller_closures=_controller_closures)
     expected = await _closure(manager, tx, data)
     key = _id("projected", job_id, generation)
     event = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (key,))

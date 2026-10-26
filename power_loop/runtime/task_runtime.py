@@ -231,6 +231,8 @@ class TaskRuntime:
         from .controller_retirement import RetirementCache
 
         self._controller_retirements = RetirementCache(self)
+        from .controller_task_exit import TaskExitCache
+        self._controller_task_exits = TaskExitCache(self)
         from .executor_lifecycle import ExecutorLifecycle
 
         self._lifecycle = ExecutorLifecycle(self, boot_contract_hash) if boot_contract_hash is not None else None
@@ -241,14 +243,30 @@ class TaskRuntime:
         self._controller_retirements.check()
         if self._controller_retirements.failed_count():
             raise JobError("controller_retirement_requires_reconciliation")
+        if self._controller_task_exits.failed_count():
+            raise JobError("controller_task_exit_requires_reconciliation")
 
     async def ensure_started(self):
         if self._lifecycle is not None:
             self._lifecycle.check_admission()
         async with asyncio.timeout(2):
             await self._controller_retirements.flush()
+            await self._controller_task_exits.flush()
         if self._lifecycle is not None:
             await self._lifecycle.start()
+
+    async def flush_control_checkpoints(self, *, timeout_s=2):
+        """Mechanical retry, including after shutdown; no execution admission."""
+        from .managed_completion import _host_only
+        _host_only()
+        if type(timeout_s) not in (int, float) or not 0 <= timeout_s <= 60:
+            raise JobError("invalid_controller_checkpoint_timeout")
+        if timeout_s:
+            async with asyncio.timeout(timeout_s):
+                await self._controller_retirements.flush()
+                await self._controller_task_exits.flush()
+        return {"controller_retirement_pending": len(self._controller_retirements.pending),
+                "controller_task_exit_pending": len(self._controller_task_exits.slots)}
 
     async def start(self):
         if self._lifecycle is None:
@@ -265,12 +283,18 @@ class TaskRuntime:
             try:
                 async with asyncio.timeout(min(2, remaining)):
                     await self._controller_retirements.flush()
+                    await self._controller_task_exits.flush()
             except Exception as exc:
                 logging.getLogger(__name__).warning(
                     "Controller intake closure remains pending at shutdown: %s", type(exc).__name__)
         return self._completion_status(result)
 
     def _completion_status(self, result):
+        result["controller_task_exit_pending"] = len(self._controller_task_exits.slots)
+        writer = self._controller_task_exits._writer
+        result["controller_task_exit_writer_pending"] = writer is not None and not writer.done()
+        if result["controller_task_exit_pending"] or result["controller_task_exit_writer_pending"]:
+            result["store_safe_to_close"] = False
         result["controller_retirement_pending"] = len(self._controller_retirements.pending)
         if result["controller_retirement_pending"]:
             result["store_safe_to_close"] = False
