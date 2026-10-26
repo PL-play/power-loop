@@ -1,6 +1,7 @@
 """Empty pass is consumed input, not a completed workflow text deliverable."""
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import contextmanager
 
@@ -56,7 +57,36 @@ async def test_text_node_must_answer_on_original_sid_before_review(managed_workf
     monkeypatch.setattr(model, "complete", responses)
     await loop.send("run", parent)
     await settle(managed_workflow)
+    # The run result can arrive before its original controller-exit writer.
+    # Retain the store until those actual tracked checkpoints finish.
+    async with asyncio.timeout(5):
+        while runtime._adapter_tasks:
+            await asyncio.gather(*tuple(runtime._adapter_tasks), return_exceptions=True)
+        assert await runtime.flush_control_checkpoints() == {
+            "controller_retirement_pending": 0, "controller_task_exit_pending": 0,
+        }
     nodes = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='workflow_node'")
+    if ending == "cancel":
+        # The token was cancelled after the model returned a pass_turn call,
+        # before that original call was processed. Do not invent its outcome.
+        assert len(nodes) == len(requests) == 1
+        node = await manager.get_job(runtime.actor(parent), nodes[0]["job_id"])
+        assert node.title == "BUILD" and node.outcome is None and node.result is None
+        assert node.resource_state == "unknown" and node.supervision_status == "open"
+        assert (await store.get_state(sids[0])).pending is not None
+        rows = await store.load_all_messages(sids[0])
+        assert any(m.role == "assistant" and any(c["id"] == "pass-1" for c in (m.tool_calls or [])) for m in rows)
+        assert not any(m.role == "tool" and m.tool_call_id == "pass-1" for m in rows)
+        assert model.counts["REVIEW"] == 0
+        assert [notice.status for notice in state["notifications"]] == ["failed"]
+        assert guarded.count("enter") == guarded.count("exit")
+        workflow = await manager.get_job(runtime.actor(parent), state["handles"][0].job_id)
+        assert workflow.outcome == "failed" and workflow.resource_state == "unknown"
+        assert workflow.supervision_status == "open" and workflow.result["usage"]["total_tokens"] == 10
+        assert "pending_call_disposition_required" in str(workflow.result["errors"])
+        sends = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send' AND session_id=?", (sids[0],))
+        assert len(sends) == 1
+        return
     build = next(r for r in nodes if json.loads(r["result_json"])["node_id"] == "BUILD")
     result = json.loads(build["result_json"])
     assert len(set(sids)) == 1 and len([r for r in nodes if json.loads(r["result_json"])["node_id"] == "BUILD"]) == 1
