@@ -25,6 +25,16 @@ from .schema import (
 
 TASK_SCHEMA_VERSION = 10
 TASK_PROTOCOL_VERSION = 18
+_QUERY_INDEXES = {
+    'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
+    'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
+    'idx_jobs_control_owner': ('jobs', ('control_owner_job_id', 'control_owner_generation', 'job_id')),
+    'idx_jobs_main_page': ('jobs', ('kind', 'execution_role', 'parent_job_id', 'generation', 'job_id')),
+    'idx_events_job_type': ('job_events', ('job_id', 'event_type', 'event_id')),
+    'idx_events_caller_type': ('job_events', ('caller_session_id', 'event_type', 'job_id', 'event_id')),
+    'idx_events_call': ('job_events', ('caller_session_id', 'tool_call_id', 'event_type')),
+    'idx_budget_job': ('task_budget_attempts', ('job_id', 'attempt_id')),
+}
 _PROTOCOL_2_TABLES = ("task_store", "jobs", "job_events")
 _PROTOCOL_3_TABLES = (*_PROTOCOL_2_TABLES, "task_executors", "task_executor_events")
 TASK_TABLES = (*_PROTOCOL_3_TABLES, "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
@@ -97,6 +107,10 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             state_hash {small} NOT NULL, state_json {body} NOT NULL,
             created_at {integer} NOT NULL, updated_at {integer} NOT NULL){opts}""",
         # All names stay below MySQL's 64-character identifier limit at prefix=24.
+        # Discovery and recovery are explicit indexed steps, never correlated
+        # table scans. Keep all index names under 64 chars at prefix=24.
+        *[f"CREATE INDEX {prefix}{suffix} ON {prefix}{table}({','.join(columns)})"
+          for suffix, (table, columns) in _QUERY_INDEXES.items()],
         f"CREATE INDEX {prefix}idx_jobs_parent ON {prefix}jobs(parent_job_id, created_at, job_id)",
         f"CREATE INDEX {prefix}idx_jobs_root ON {prefix}jobs(root_job_id, created_at, job_id)",
         f"CREATE INDEX {prefix}idx_jobs_owner ON {prefix}jobs(created_by_session_id, status)",
@@ -140,6 +154,30 @@ async def _run_task_ddl(tx, db, prefix):
 async def verify_task_schema(db: Database, prefix: str) -> None:
     async with db.transaction() as tx:
         await _verify_task_schema_tx(tx, db, prefix)
+
+
+async def _verify_query_indexes(tx, db, prefix):
+    expected = {prefix+suffix: columns for suffix, (_table, columns) in _QUERY_INDEXES.items()}
+    actual = {}
+    if db.dialect.name == 'sqlite':
+        for name in expected:
+            rows = await tx.fetchall(f'PRAGMA index_info({name})')
+            actual[name] = tuple(row['name'] for row in rows)
+    else:
+        placeholders = ','.join('?' for _ in expected)
+        if db.dialect.name == 'postgres':
+            rows = await tx.fetchall('SELECT indexname,indexdef FROM pg_indexes WHERE schemaname=current_schema() '
+                f'AND indexname IN ({placeholders})', tuple(expected))
+            for row in rows:
+                matched = re.search(r'\(([^()]*)\)', row['indexdef'])
+                actual[row['indexname']] = tuple(x.strip().strip('"') for x in matched[1].split(',')) if matched else ()
+        else:
+            rows = await tx.fetchall('SELECT index_name,column_name FROM information_schema.statistics '
+                f'WHERE table_schema=DATABASE() AND index_name IN ({placeholders}) ORDER BY index_name,seq_in_index', tuple(expected))
+            for row in rows:
+                actual[row['index_name']] = (*actual.get(row['index_name'], ()), row['column_name'])
+    if any(actual.get(name) != columns for name, columns in expected.items()):
+        raise StoreSchemaError('task discovery indexes missing or incompatible; explicit maintenance required')
 
 
 async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSION):
@@ -238,6 +276,8 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
                 actual.setdefault(row["budget_table"], set()).add(row["budget_column"])
         if any(not columns.issubset(actual.get(prefix + table, set())) for table, columns in required.items()):
             raise StoreSchemaError("task budget schema incomplete")
+    if protocol >= 18:
+        await _verify_query_indexes(tx, db, prefix)
 
 
 async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
@@ -309,6 +349,10 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                         != 1
                     ):
                         raise StoreSchemaError("task executor migration conflict")
+                elif identity and identity['protocol_version'] == TASK_PROTOCOL_VERSION:
+                    # Explicit maintenance can add missing candidate indexes;
+                    # ordinary open must never silently mutate a live schema.
+                    await _run_task_ddl(tx, db, prefix)
                 await _verify_task_schema_tx(tx, db, prefix)
                 return
             table = prefix + "messages"

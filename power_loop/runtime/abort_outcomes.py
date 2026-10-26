@@ -313,20 +313,36 @@ async def _review_sources(manager, tx, actor):
     # cannot make a retained canonical negative result authorize new work.
     from .pending_calls import _object, identity
     prefix = '{' + _json(FIELD) + ':'
-    has_abort = f"EXISTS (SELECT 1 FROM {manager.events} a WHERE a.job_id=j.job_id AND a.event_type='tool_call_abort')"
-    rows = await tx.fetchall(f"SELECT j.job_id,j.generation,j.result_status,substr(j.result_json,1,{len(prefix)}) AS result_prefix,{has_abort} AS has_abort "
-        f"FROM {manager.jobs} j WHERE j.kind='send' AND (j.session_id=? OR EXISTS (SELECT 1 FROM {manager.events} h WHERE h.job_id=j.job_id AND h.event_type IN ('controller_review_handoff','pending_owner_transfer') AND h.caller_session_id=?)) AND j.tenant_id=? AND j.principal_id=? "
-        f"AND ((j.result_status<>'none' AND ({has_abort} OR substr(j.result_json,1,{len(prefix)})=?)) OR EXISTS "
-        f"(SELECT 1 FROM {manager.events} e WHERE e.job_id=j.job_id AND e.event_type IN ('source_abort_delivery','pending_call_disposition'))) "
-        "ORDER BY j.job_id LIMIT 1001", (actor.session_id, actor.session_id, actor.tenant_id, actor.principal_id, prefix))
-    if len(rows) > 1000:
+    # Discover each indexed scope independently; never correlate a subquery
+    # over the complete jobs table. The union is bounded before loading bodies.
+    columns = f"j.job_id,j.generation,j.result_status,substr(j.result_json,1,{len(prefix)}) AS result_prefix"
+    own = await tx.fetchall(f"SELECT {columns} FROM {manager.jobs} j WHERE j.session_id=? "
+        "AND j.kind='send' AND j.tenant_id=? AND j.principal_id=? AND j.result_status<>'none' "
+        f"AND substr(j.result_json,1,{len(prefix)})=? ORDER BY j.job_id LIMIT 1001",
+        (actor.session_id, actor.tenant_id, actor.principal_id, prefix))
+    anchored = await tx.fetchall(f"SELECT DISTINCT {columns} FROM {manager.jobs} j "
+        f"JOIN {manager.events} e ON e.job_id=j.job_id WHERE j.session_id=? AND j.kind='send' "
+        "AND j.tenant_id=? AND j.principal_id=? "
+        "AND e.event_type IN ('tool_call_abort','source_abort_delivery','pending_call_disposition') "
+        "ORDER BY j.job_id LIMIT 1001", (actor.session_id, actor.tenant_id, actor.principal_id))
+    transferred = await tx.fetchall(f"SELECT DISTINCT {columns} FROM {manager.events} e "
+        f"JOIN {manager.jobs} j ON j.job_id=e.job_id WHERE e.caller_session_id=? "
+        "AND e.event_type IN ('controller_review_handoff','pending_owner_transfer') "
+        "AND j.kind='send' AND j.tenant_id=? AND j.principal_id=? ORDER BY j.job_id LIMIT 1001",
+        (actor.session_id, actor.tenant_id, actor.principal_id))
+    by_id = {row['job_id']: row for row in (*own, *anchored, *transferred)}
+    if len(by_id) > 1000:
         raise JobError('abort_outcome_scope_too_large')
+    if not by_id:
+        return []
+    rows = [by_id[key] for key in sorted(by_id)]
     selected = []
     for row in rows:
+        has_abort = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='tool_call_abort' LIMIT 1", (row['job_id'],))
         disposition = await _object(manager, tx, manager.events, 'payload_json', 'event_id=?', (identity(manager, row),), 262144)
         signalled = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id IN (?,?)',
                                      (notice_id(manager, row), notice_id(manager, row, native=True)))
-        if (row['result_prefix'] == prefix or row['has_abort'] and row['result_status'] != 'none' or signalled is not None
+        if (row['result_prefix'] == prefix or has_abort is not None and row['result_status'] != 'none' or signalled is not None
                 or type(disposition) is dict and disposition.get('disposition') == MODE):
             await _object(manager, tx, manager.jobs, 'result_json', 'job_id=?', (row['job_id'],), 262144)
             selected.append(await manager._authorize(tx, actor, row['job_id']))

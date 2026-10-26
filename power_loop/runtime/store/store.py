@@ -1691,18 +1691,17 @@ class SessionStore:
         if older_than_ms is not None:
             sql += " AND created_at < ?"
             params.append(_now_ms() - int(older_than_ms))
-        if keep_last and keep_last > 0:
-            # Wrap the ORDER BY/LIMIT subquery in a derived table: MySQL rejects both a
-            # LIMIT inside IN(...) (err 1235) and modifying a table referenced in its own
-            # subquery (err 1093); materializing it first is accepted by SQLite/PG/MySQL.
-            sql += (
-                f" AND (send_index, round_index) NOT IN (SELECT s, r FROM "
-                f"(SELECT send_index AS s, round_index AS r "
-                f"FROM {self.t.usage_rounds} "
-                "WHERE session_id=? ORDER BY send_index DESC, round_index DESC LIMIT ?) AS _keep)"
-            )
-            params += [session_id, int(keep_last)]
         async with self._db.transaction() as tx:
+            if keep_last and keep_last > 0:
+                # Select one indexed boundary, then delete the older range in
+                # the same transaction; do not materialize N retained keys.
+                cutoff = await tx.fetchone(f"SELECT send_index,round_index FROM {self.t.usage_rounds} "
+                    "WHERE session_id=? ORDER BY send_index DESC,round_index DESC LIMIT 1 OFFSET ?",
+                    (session_id, int(keep_last)-1))
+                if cutoff is None:
+                    return 0
+                sql += " AND (send_index < ? OR (send_index = ? AND round_index < ?))"
+                params += [cutoff['send_index'], cutoff['send_index'], cutoff['round_index']]
             return int(await tx.execute(sql, params))
 
     # ── runtime state ─────────────────────────────────────────────────────
@@ -1951,15 +1950,15 @@ class SessionStore:
         if older_than_ms is not None:
             sql += " AND created_at < ?"
             params.append(_now_ms() - int(older_than_ms))
-        if keep_recent and keep_recent > 0:
-            # Derived table (see prune_usage_rounds): MySQL rejects LIMIT-in-IN (1235) and
-            # self-referential DELETE subqueries (1093); materializing first is portable.
-            sql += (
-                f" AND seq NOT IN (SELECT s FROM (SELECT seq AS s FROM {self.t.messages} "
-                "WHERE session_id=? AND state=? ORDER BY seq DESC LIMIT ?) AS _keep)"
-            )
-            params += [session_id, MessageState.COMPACTED_OUT.value, int(keep_recent)]
         async with self._db.transaction() as tx:
+            if keep_recent and keep_recent > 0:
+                cutoff = await tx.fetchone(f"SELECT seq FROM {self.t.messages} WHERE session_id=? AND state=? "
+                    "ORDER BY seq DESC LIMIT 1 OFFSET ?",
+                    (session_id, MessageState.COMPACTED_OUT.value, int(keep_recent)-1))
+                if cutoff is None:
+                    return 0
+                sql += " AND seq < ?"
+                params.append(cutoff['seq'])
             return int(await tx.execute(sql, params))
 
     # ── export / archival (OPS-4) ─────────────────────────────────────────

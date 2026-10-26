@@ -268,10 +268,11 @@ async def enqueue(manager, tx, row, saved, *, _closures=None):
 
 
 async def candidates(manager, tx, actor):
-    rows = await tx.fetchall(f'SELECT j.* FROM {manager.jobs} j WHERE j.tenant_id=? AND j.principal_id=? '
-        "AND j.result_status<>'handled' AND EXISTS (SELECT 1 FROM " + manager.events +
-        " e WHERE e.job_id=j.job_id AND e.event_type='controller_stopped' AND e.caller_session_id=?) ORDER BY j.job_id LIMIT 1001",
-        (actor.tenant_id, actor.principal_id, actor.session_id))
+    rows = await tx.fetchall(f'SELECT DISTINCT j.* FROM {manager.events} e '
+        f'JOIN {manager.jobs} j ON j.job_id=e.job_id WHERE e.caller_session_id=? '
+        "AND e.event_type='controller_stopped' AND j.tenant_id=? AND j.principal_id=? "
+        "AND j.result_status<>'handled' ORDER BY j.job_id LIMIT 1001",
+        (actor.session_id, actor.tenant_id, actor.principal_id))
     if len(rows) > 1000:
         raise JobError('controller_recovery_scope_too_large')
     result = []
@@ -369,10 +370,11 @@ async def recover_tree(runtime, actor, root_job_id, *, after_job_id='', limit=32
         original = await _main(manager, tx, root)
         if original['job_id'] != root_job_id or original['session_id'] != actor.session_id:
             raise JobError('controller_recovery_requires_original_main')
-        rows = await tx.fetchall(f'SELECT j.job_id FROM {manager.jobs} j WHERE j.root_job_id=? '
+        rows = await tx.fetchall(f'SELECT DISTINCT j.job_id FROM {manager.jobs} j '
+            f'JOIN {manager.events} e ON e.job_id=j.job_id WHERE j.root_job_id=? '
             "AND j.intake='closed' AND j.resource_state='unknown' AND j.kind IN ('subagent','workflow_node','workflow') "
-            f"AND EXISTS (SELECT 1 FROM {manager.events} e WHERE e.job_id=j.job_id AND e.event_type='controller_task_exit') "
-            'AND j.job_id>? ORDER BY j.job_id LIMIT ?', (root_job_id, after_job_id, limit+1))
+            "AND e.event_type='controller_task_exit' AND j.job_id>? ORDER BY j.job_id LIMIT ?",
+            (root_job_id, after_job_id, limit+1))
     receipts = []
     deadline = asyncio.get_running_loop().time() + timeout_s
     scanned = ''

@@ -932,13 +932,15 @@ class SessionStore:
         if older_than_ms is not None:
             sql += " AND created_at < ?"
             params.append(_now_ms() - int(older_than_ms))
-        if keep_recent and keep_recent > 0:
-            sql += (
-                " AND seq NOT IN (SELECT seq FROM messages WHERE session_id=? AND state=? "
-                "ORDER BY seq DESC LIMIT ?)"
-            )
-            params += [session_id, MessageState.COMPACTED_OUT.value, int(keep_recent)]
         with self._lock, self._conn:
+            if keep_recent and keep_recent > 0:
+                cutoff = self._conn.execute("SELECT seq FROM messages WHERE session_id=? AND state=? "
+                    "ORDER BY seq DESC LIMIT 1 OFFSET ?",
+                    (session_id, MessageState.COMPACTED_OUT.value, int(keep_recent)-1)).fetchone()
+                if cutoff is None:
+                    return 0
+                sql += " AND seq < ?"
+                params.append(cutoff[0])
             return int(self._conn.execute(sql, params).rowcount)
 
     def prune_usage_rounds(
@@ -956,13 +958,14 @@ class SessionStore:
         if older_than_ms is not None:
             sql += " AND created_at < ?"
             params.append(_now_ms() - int(older_than_ms))
-        if keep_last and keep_last > 0:
-            sql += (
-                " AND round_index NOT IN (SELECT round_index FROM usage_rounds "
-                "WHERE session_id=? ORDER BY round_index DESC LIMIT ?)"
-            )
-            params += [session_id, int(keep_last)]
         with self._lock, self._conn:
+            if keep_last and keep_last > 0:
+                cutoff = self._conn.execute("SELECT round_index FROM usage_rounds WHERE session_id=? "
+                    "ORDER BY round_index DESC LIMIT 1 OFFSET ?", (session_id, int(keep_last)-1)).fetchone()
+                if cutoff is None:
+                    return 0
+                sql += " AND round_index < ?"
+                params.append(cutoff[0])
             return int(self._conn.execute(sql, params).rowcount)
 
     def prune_timers(

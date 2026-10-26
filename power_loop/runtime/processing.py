@@ -73,8 +73,10 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
         from .controller_recovery import candidates as controller_candidates
         results.extend(await controller_candidates(manager, tx, actor))
         results = list({event['event_id']: event for event in results}.values())
-        inputs = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' "
-            "AND action='nudge' AND delivery_status<>'handled' ORDER BY event_id", (send["control_owner_job_id"],))
+        inputs = []
+        if send['control_owner_job_id'] is not None:
+            inputs = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' "
+                "AND action='nudge' AND delivery_status<>'handled' ORDER BY event_id", (send["control_owner_job_id"],))
         observed = []
         for event in [*results, *inputs]:
             if event["event_type"] == "operation":
