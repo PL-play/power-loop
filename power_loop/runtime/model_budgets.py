@@ -764,6 +764,41 @@ async def get_budget(manager, actor, attempt_id):
         return state
 
 
+async def recovery_config(manager, actor, job_id, attempt_id, *, provider_key, provider, timeout_s=10):
+    """Bind a trusted bookkeeping provider to the original persisted policy.
+
+    This read does not enable the policy, register a boot or create an allowance.
+    The supplied provider must independently authenticate its original authority.
+    """
+    from .budget_contracts import LocalBudgetScope
+    async with manager._write() as tx:
+        await manager._authorize(tx, actor, job_id)
+        state = await _read(manager, tx, attempt_id)
+        key = "bp_" + _hash([manager.store.store_id, actor.tenant_id, actor.principal_id])[:48]
+        if state["job_id"] != job_id or state["policy_key"] != key:
+            raise JobError("budget_reconciliation_scope_mismatch")
+        row = await tx.fetchone(f"SELECT * FROM {manager.prefix}task_budget_policies WHERE policy_key=?", (key,))
+        marker = await tx.fetchone(f"SELECT payload_json,request_hash FROM {manager.events} WHERE event_id=?",
+                                  ("mb_policy_" + key[3:],))
+        if row is None or marker is None:
+            raise JobError("budget_policy_missing")
+        manifest = _object(row["manifest_json"], row["request_hash"])
+        if (_object(marker["payload_json"], marker["request_hash"]) != manifest
+                or (row["tenant_id"], row["principal_id"]) != (actor.tenant_id, actor.principal_id)
+                or manifest.get("provider_key") != provider_key):
+            raise JobError("budget_policy_conflict")
+    try:
+        scopes = tuple(LocalBudgetScope(**{**s, **({"owner_kinds": tuple(s["owner_kinds"])}
+            if s.get("owner_kinds") is not None else {})}) for s in manifest["scopes"])
+        config = BudgetConfig(provider_key, scopes, provider, timeout_s=timeout_s,
+                              max_pending=manifest["max_pending"])
+        if config.manifest() != manifest:
+            raise ValueError()
+        return config
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise JobError("budget_policy_evidence_corrupt") from exc
+
+
 async def reconcile_usage(runtime, actor, job_id, attempt_id):
     """Replay recorded usage after restart, without reconstructing execution.
 

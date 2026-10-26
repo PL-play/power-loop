@@ -336,6 +336,14 @@ class TaskRuntime:
         from .model_budgets import reconcile_usage
         return await reconcile_usage(self, self.actor(session_id), job_id, attempt_id)
 
+    def budget_control_tasks(self):
+        """Original live HTTP/preparation tasks, retained even after waiter cancellation.
+
+        Control-only hosts may wait/cancel these during their bounded shutdown;
+        task exit does not prove remote rollback or billing settlement.
+        """
+        return tuple(task for task in self._budget_handles.values() if not task.done())
+
     def track_task(self, task, *, cancel_token=None, job_id=None):
         if not isinstance(task, asyncio.Task):
             raise JobError("executor_task_handle_required")

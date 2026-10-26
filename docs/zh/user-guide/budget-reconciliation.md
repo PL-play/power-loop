@@ -24,3 +24,14 @@ receipt = await runtime.reconcile_budget_usage(
 供应商尚未返回的费用不能从此接口凭空取得。真实迟到发票/新 usage revision 仍须原供应商证据及既有 API 账务修订契约；不能传入人工猜测的金额替代记录。批量巡检与宿主调度由调用方按自己的权限范围组织；此接口不新增后台扫描器。重启后的宿主应继续保留原 provider/策略绑定，不能通过换钱包、报价或 scope“恢复”额度。
 
 若宿主正在关闭当前 runtime，机械 HTTP 句柄仍受同一停机协议管理；不要在已经 shutdown 的实例上启动补交。用新的控制实例执行核对，并等其实际 HTTP 句柄退出后再关闭 store。取消等待不等于 API 未提交；后续仍核对原 submission。
+
+## 恢复原策略与宿主停机
+
+`model_budgets.recovery_config(manager, actor, job_id, attempt_id, provider_key=..., provider=...)`
+从原策略表及独立事件校验后还原 `BudgetConfig`。宿主必须先以原历史授权验证 provider_key
+和提供者；接口不创建新策略，不把 enabled=0 改为 1，也不重置 scope 计数。替换 scope、钱包
+或提供者标识会被拒绝。
+
+`runtime.budget_control_tasks()` 返回实际仍在运行的预算控制 Task；即使上层等待已超时或
+取消，这些句柄仍保留。控制宿主应把它们计入自己的停机窗口，等待实际退出后再关闭传输和
+共享 store；句柄退出不证明 API 没有提交。该接口不启动 boot，不返回任何执行令牌。
