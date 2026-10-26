@@ -135,3 +135,25 @@ v0.2.0 与 0.1.x **不兼容**。无状态的 `AgentLoop` 已移除；一切围�
 - [快速上手](getting-started.md)
 - [快速入门](user-guide/quickstart.md)
 - [常见问题](faq.md)
+
+## 任务协议升级的真实旧版演练（design/192）
+
+`test_old_protocol_requires_explicit_upgrade_and_keeps_original_identity` 等普通回归验证协议分支；发布前还须用实际旧版生成数据，不能只修改新库的版本号当作升级证明。
+
+独立验收入口为 `scripts/acceptance/test_schema_bridge.py`（显式执行，不纳入普通 `tests/` 自动发现）。准备一个干净的 protocol 6 SDK checkout；本轮基线为 `7003235a8eb307ed02f2a08e98c868dcfd38a932`。设置：
+
+- `POWER_LOOP_BRIDGE_LEGACY_SDK`：该旧版 checkout 的绝对路径，必须含其原始测试辅助模块。
+- `POWER_LOOP_TASK_PG_DSN`：仅用于验收的 PostgreSQL 数据库，数据库名必须以 `_test` 结尾。
+- 原真实 LLM 测试配置 `POWER_LOOP_*` 或 `OPENAI_COMPAT_*`。没有模型配置时真实验收应失败，不能标为通过。
+
+从候选 SDK 根目录执行（Python 环境须包含本仓库测试依赖）：
+
+```bash
+python -m pytest scripts/acceptance/test_schema_bridge.py -v
+```
+
+共四个组合：SQLite/PostgreSQL × 程序/真实模型。原始数据由单独旧版解释器创建：实际 loop send、未提交成功的原预算用量、排队任务及原调用/回执。新版显式迁移后逐表比对消息、任务、事件、预算和执行者记录；除协议字段外迁移不改这些原件。测试还注入 DDL 后失败验证事务回滚，重复迁移验证幂等，并验证旧版重新打开被拒绝、迁移前已打开的旧 JobManager 写操作被拒绝。最后通过新接口幂等取消原排队任务、补交原用量，保持原 scope 计数、消息和 boot 不变。
+
+原模型请求最多每个真实用例一次；预算 authority 是确定性测试端口，此演练不代表供应商最终发票或业务 API 全链路验收。测试保留运行报告中的原标识与用量；服务端表使用随机前缀并清理，但整个专用测试库仍应由外层运行器建立和销毁。
+
+**部署仍须停止并隔离全部旧写者。** 此故障用例刻意保留一个空闲旧连接，证明 JobManager 协议闸有效；不证明旧版所有 SessionStore/业务 SQL 都具有同样的写保护。不能据此在真实迁移期间继续运行旧服务。迁移后的回滚应采用已验证的新协议控制版本，禁止降版本字段或用旧备份覆盖新增数据。生产迁移、备份恢复演练与控制宿主/API 的完整组合须单独放行。
