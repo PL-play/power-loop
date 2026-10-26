@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 
 from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop
@@ -95,23 +96,37 @@ async def run(config):
         assert attempt["pending"] == 1
         state = json.loads(attempt["state_json"])
         assert state["submission"] and state["ack"] is None
+        if config.get('large_ids'):
+            # Seed allocation above JavaScript's exact integer range, then use
+            # ordinary append_message for the real call and receipt below.
+            large = 2**53 + 9
+            if manager.db.dialect.name == 'sqlite':
+                await manager.db.execute('UPDATE sqlite_sequence SET seq=? WHERE name=?',
+                    (large, store.table_prefix + 'messages'))
+            elif manager.db.dialect.name == 'postgres':
+                await manager.db.execute('SELECT setval(pg_get_serial_sequence(?, ?), ?, true)',
+                    (store.table_prefix + 'messages', 'id', large))
+            else:
+                raise AssertionError('MySQL rehearsal remains paused')
         # A second original task remains queued, with a real call/receipt pair.
         queued_sid = await store.create_session()
         actor = JobActor("bridge-test", "host", queued_sid)
-        root = await manager.register_job(actor, kind="send", session_id=queued_sid, system_key="original-root")
+        coordinates = {'send_index': 1} if config.get('large_ids') else {}
+        root = await manager.register_job(actor, kind="send", session_id=queued_sid,
+            system_key="original-root", request=coordinates)
         lease = await manager.claim_job(actor, root.job.job_id, executor_id="queued-owner", boot_id="owner",
             expected_version=root.job.version)
         seq = await store.append_message(queued_sid, role="assistant", tool_calls=[{
-            "id": "original-call", "type": "function", "function": {"name": "work", "arguments": "{}"}}])
+            "id": "original-call", "type": "function", "function": {"name": "work", "arguments": "{}"}}], **coordinates)
         call = await store.message_ref(queued_sid, seq)
         reg = await manager.register_job(actor, kind="background_tool", parent=lease,
             call_ref=call, tool_call_id="original-call", independent=True)
         receipt_seq = await store.append_message(queued_sid, role="tool", tool_call_id="original-call",
-            content="accepted original task")
+            content="accepted original task", **coordinates)
         receipt = await store.message_ref(queued_sid, receipt_seq)
         await manager.reconcile_receipt(actor, reg.operation.operation_id, receipt)
         await manager.close_model_execution(actor, lease)
-        return {"protocol": TASK_PROTOCOL_VERSION, "store_id": store.store_id, "sid": sid,
+        return {"worker_pid": os.getpid(), "protocol": TASK_PROTOCOL_VERSION, "store_id": store.store_id, "sid": sid,
                 "attempt_id": attempt["attempt_id"], "job_id": attempt["job_id"],
                 "queued_sid": queued_sid, "queued_job": reg.job.job_id,
                 "operation_id": reg.operation.operation_id, "call": call.to_dict(), "receipt": receipt.to_dict(),

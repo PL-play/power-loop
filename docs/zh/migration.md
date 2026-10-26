@@ -176,3 +176,23 @@ Protocol21将独立的首次财务证据与原模型退出观察分开。`expect
 任务存储的SQL和DDL继续支持PostgreSQL、SQLite、MySQL；方言差异保留在存储适配/迁移分支中。打开存储时，必要索引必须同时匹配**所属表、索引名、列顺序**，另一张表上的同名同列索引不能代替。MySQL的索引名属于表，因此维护查询同时限定当前数据库和目标表，不因别表上的同名索引跳过创建。错误索引不会被普通open悄悄删除，按原维护流程修复。
 
 `EXPLAIN`执行计划检查只在测试中运行，不加入线上业务查询。测试验证有可用索引路径；小表上优化器可能选择顺序扫描，不能把测试中的索引可用性说成生产必然使用索引。MySQL测试目前按用户要求暂停，不能将代码分支或SQL生成检查称为MySQL实库验收。
+
+### 离线备份恢复验收（SQLite / PostgreSQL）
+
+`scripts/acceptance/test_backup_restore.py` 在原版升级演练上增加真实备份恢复，不是生产备份命令，也不由运行时调用。SQLite 使用原生 backup API；PostgreSQL 使用测试容器内同版本的 `pg_dump -Fc` / `pg_restore`，只导出本次随机前缀的表及其序列。恢复到独立空目标，不使用 `--clean`，不覆盖源库、已有文件或其它测试数据。
+
+除旧版 checkout、原测试库和真实模型配置外，设置：
+
+- `POWER_LOOP_TASK_RESTORE_PG_DSN`：旧版备份的恢复目标。
+- `POWER_LOOP_TASK_RESTORE_CURRENT_PG_DSN`：升级后备份的第二恢复目标。
+- `POWER_LOOP_BACKUP_PG_CONTAINER`：运行器已拥有的 PostgreSQL 测试容器，须与三个 DSN 指向同一服务器；容器内本地认证须可供测试用户使用。
+
+三个数据库由外层运行器预先创建，必须互不相同且名字以 `_test` 结尾。测试完成或失败后外层运行器负责销毁全部三个数据库；这是隔离副本，不能将上述变量指向业务库。环境还需要 Node.js，用于实际读取恢复后的 JSONL 并验证大整数 ID 精度。执行：
+
+```bash
+python -m pytest scripts/acceptance/test_backup_restore.py scripts/acceptance/test_schema_bridge.py -v
+```
+
+原始写者退出后才备份。逐表核验恢复内容后才打开控制 runtime；迁移前后各做一次备份恢复，保持原 store_id、消息 ID/SID+seq、调用/回执、任务、事件、预算与 boot。真实原请求每例最多一次；恢复只补交原费用及取消原排队工作，不构造新模型或新额度。验证调用/回执 ID 超过 2^53 后仍以十进制字符串完整导出，Node.js 读取无取整；恢复后追加新消息也不得复用历史 ID。
+
+原源库另行逐表核对不变，报告记录归档大小、SHA256、原标识及已退出的子进程。此证据覆盖 SDK 任务库，**不替代宿主业务库备份恢复、正式控制服务组合或生产写者隔离**。恢复副本保留同一 store_id，因此不能让原库和副本同时执行；生产切换仍须确认原写者已退出，并隔离其再次启动入口。回滚不得用旧快照覆盖上线后新增的消息或账务。
