@@ -132,7 +132,8 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
                     if state.counts[role] else '\nCall the offered touch_once function once using native function calling. Do not write textual or XML calls.')
                 if native_tail is not None and not state.counts[role]:
                     ctx.tools.append(registry.get(native_tail).definition.to_openai_tool())
-                    ctx.system_prompt += (f' In this same response return two native function calls in order: touch_once, then {native_tail}. '
+                    order = f'{native_tail}, then touch_once' if native_first else f'touch_once, then {native_tail}'
+                    ctx.system_prompt += (f' In this same response return two native function calls in order: {order}. '
                         'Both use empty arguments. Do not wait for the first result before requesting the second call.')
             elif role == 'AFTER':
                 ctx.system_prompt += '\nThe failed previous node was deliberately tolerated. Return AFTER as plain text; do no other work.'

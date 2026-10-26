@@ -1572,9 +1572,9 @@ class AgentPipeline:
                     from power_loop.runtime.tool_contracts import validate_registration
                     validate_registration(self.tool_registry, tool_name, registered)
                     from power_loop.runtime.tool_call_plans import dispatch as record_tool_dispatch
-                    await record_tool_dispatch(self, tool_name, tool_args, registered)
-                    validate_registration(self.tool_registry, tool_name, registered)
-                    result = await self.tool_registry.invoke_async(tool_name, tool_args)
+                    receipt = await record_tool_dispatch(self, tool_name, tool_args, registered)
+                    from power_loop.runtime.native_returns import invoke
+                    result = await invoke(self, registered, tool_args, receipt)
             finally:
                 reset_current_cancel_token(_ctok)
         except (ToolNotFound, ToolValidationError) as exc:
@@ -2405,6 +2405,9 @@ class AgentPipeline:
                     )
                 except Exception as exc:
                     # ── Hook: TOOL_ERROR ──
+                    from power_loop.runtime.native_returns import NativeReturnPending
+                    if isinstance(exc, NativeReturnPending):
+                        raise
                     err_ctx = ToolErrorCtx(
                         round_index=round_idx,
                         tool_call=tool_call,

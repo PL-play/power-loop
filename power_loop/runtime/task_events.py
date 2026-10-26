@@ -37,13 +37,15 @@ def _generation(job_id, event_id, *, initial=1):
 
 
 def _header(manager, job, event):
-    if event["job_id"] != job["job_id"] or event["event_type"] not in ("operation", "result"):
+    if event["job_id"] != job["job_id"] or event["event_type"] not in ("operation", "result", "native_callback_returned"):
         raise JobError("task_event_scope_mismatch")
     version = _number(event["job_version"], "event_revision")
     created = _number(event["created_at"], "event_time", minimum=0)
     data = {"store_id": manager.store.store_id, "job_id": job["job_id"], "event_id": event["event_id"],
         "event_type": event["event_type"], "revision": str(version), "created_at": str(created),
         "delivery_status": event["delivery_status"], "execution_authority": False}
+    if event['event_type'] == 'native_callback_returned':
+        return {**data, 'callback_returned': True, 'resource_stop_proven': False, 'billing_settled': False}
     if event["event_type"] == "result":
         return {**data, "generation": str(_generation(job["job_id"], event["event_id"], initial=0 if job["generation"] == 0 else 1))}
     # Later operations may originate from a different send/SID than creation.
@@ -110,6 +112,26 @@ async def _public_header(manager, tx, job, event):
 
 async def _detail(manager, tx, job, event):
     public = await _public_header(manager, tx, job, event)
+    if event['event_type'] == 'native_callback_returned':
+        from .managed_effects import _ref
+        from .native_returns import _LIMIT, read
+        from .pending_calls import _object
+        from .tool_call_plans import read as read_plan
+        raw = await _object(manager, tx, manager.events, 'payload_json', 'event_id=?', (event['event_id'],), _LIMIT)
+        if raw is None or not isinstance(raw.get('call_ref'), dict):
+            raise JobError('native_return_checkpoint_changed')
+        ref = _ref(raw['call_ref'])
+        plan = await read_plan(manager, tx, job, ref)
+        entries = [entry for entry in plan['entries'] if entry['call_id'] == raw.get('call_id')]
+        if len(entries) != 1:
+            raise JobError('native_return_checkpoint_changed')
+        saved, value = await read(manager, tx, job, ref, entries[0], plan)
+        if saved['event_id'] != event['event_id']:
+            raise JobError('native_return_checkpoint_changed')
+        # Expose the exact returned data and message/operation references,
+        # never the internal executor/boot lease or frozen execution scope.
+        return {**public, 'call_ref': ref.to_dict(), 'tool_call_id': value['call_id'],
+                'return_text': value['return_text'], 'operations': value['operations']}
     if event["event_type"] == "operation":
         return public  # Never expose operation request/lease/dispatch payloads.
     raw = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND event_id=? AND event_type='result'",
@@ -130,7 +152,7 @@ async def read_events(manager, actor, job_id, *, view, event_id=None, limit=20, 
                       char_offset=None, max_chars=8000, output_file=None):
     """List public references, or read/export selected saved events, without ACKs."""
     _text(job_id, "job", 64)
-    if view not in ("operations", "results"):
+    if view not in ("operations", "results", "returns"):
         raise JobError("invalid_task_event_view")
     if type(limit) is not int or not 1 <= limit <= 100 or type(max_chars) is not int or not 1024 <= max_chars <= 32000:
         raise JobError("invalid_task_event_budget")
@@ -150,7 +172,7 @@ async def read_events(manager, actor, job_id, *, view, event_id=None, limit=20, 
             get_runtime_env().require_workspace_dir()
         except RuntimeEnvError as exc:
             raise JobError("task_event_workspace_required") from exc
-    kind = "operation" if view == "operations" else "result"
+    kind = {"operations": "operation", "results": "result", "returns": "native_callback_returned"}[view]
     async with _snapshot(manager) as tx:
         job = await manager._authorize(tx, actor, job_id)
         query = _query(manager, actor, job, view)

@@ -24,7 +24,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 10
-TASK_PROTOCOL_VERSION = 18
+TASK_PROTOCOL_VERSION = 19
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -340,7 +340,7 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                 raise StoreSchemaError("task migration supports schema v9 only")
             if int(row["version"]) == TASK_SCHEMA_VERSION:
                 identity = await tx.fetchone(f"SELECT protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
+                if identity and identity["protocol_version"] in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18):
                     old_protocol = identity["protocol_version"]
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
                     if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):

@@ -177,8 +177,8 @@ async def _expected(manager, tx, source, closed):
     native_ids, native = set(), None
     from .pending_native import FIELD as NATIVE_SNAPSHOT
     if NATIVE_SNAPSHOT in closed.get('evidence', {}):
-        from .pending_native import undispatched
-        native = await undispatched(manager, tx, source)
+        from .pending_native import resolved
+        native = await resolved(manager, tx, source)
         native_ids = {entry['call_id'] for entry in native[3]}
     for call in calls:
         if call['id'] in native_ids:
@@ -365,8 +365,8 @@ async def recover_runtime(runtime, actor, source_job_id):
         for call in calls:
             try:
                 if call['id'] in native_ids:
-                    from .pending_native import undispatched
-                    await undispatched(manager, tx, source)
+                    from .pending_native import resolved
+                    await resolved(manager, tx, source)
                     continue
                 row = await manager._authorize(tx, actor, job_id(manager, original_actor, ref, call['id']))
                 found = await descriptor(manager, tx, row)

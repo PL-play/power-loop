@@ -307,6 +307,8 @@ async def dispatch(pipeline, name, arguments, registered):
         await _event(manager, tx, key, source, 'tool_call_dispatch_started',
             {'version': 1, 'scope': plan['scope'], 'plan_id': identity(manager, source, ref),
              'plan_hash': _hash(plan), 'entry_hash': _hash(matches[0])})
+    if matches[0]['recovery'] is None:
+        return binding.runtime._native_returns.reserve(binding, ref, plan, matches[0])
 
 
 async def queued_for_call(manager, tx, row, source, invocation):

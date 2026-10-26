@@ -76,8 +76,8 @@ async def validate(manager, tx, source, closed, *, required=False):
     return event, data
 
 
-async def undispatched(manager, tx, source):
-    """Only the native subset; other original calls may already have executed."""
+async def resolved(manager, tx, source):
+    """Native subset: actual returns or proven non-dispatch, never inferred success."""
     from .managed_effects import _ref
     from .pending_calls import SNAPSHOT, model
     from .tool_call_plans import read as read_plan
@@ -90,17 +90,22 @@ async def undispatched(manager, tx, source):
     entries = [entry for entry in plan['entries'] if entry['call_id'] in pending and entry['recovery'] is None]
     dispatches = {entry['call_id']: entry['started'] for entry in saved[1]['dispatches']}
     actor = JobActor(source['tenant_id'], source['principal_id'], source['session_id'])
+    resolved_entries = []
     for entry in entries:
         if dispatches[entry['call_id']] is not None:
-            raise JobError('pending_native_already_dispatched')
+            from .native_returns import read as read_return
+            returned = await read_return(manager, tx, source, ref, entry, plan)
+            resolved_entries.append({**entry, 'returned': returned})
+            continue
         import json
         operations = await tx.fetchall(f"SELECT call_ref_json FROM {manager.events} WHERE event_type='operation' "
             'AND caller_session_id=? AND tool_call_id=? LIMIT 1001', (actor.session_id, entry['call_id']))
         if len(operations) > 1000 or any(_hash(json.loads(event['call_ref_json'] or 'null')) == _hash(ref.to_dict()) for event in operations):
             raise JobError('pending_native_operation_conflict')
+        resolved_entries.append(entry)
     if not entries:
         raise JobError('pending_native_calls_required')
-    return closed, snapshot, ref, entries, saved
+    return closed, snapshot, ref, resolved_entries, saved
 
 
 async def requested(manager, tx, source):
@@ -109,7 +114,7 @@ async def requested(manager, tx, source):
     from .original_owner_review import read as original_owner
     from .pending_owner import read as transferred_owner
     from .workflow_controller import proof
-    closed, snapshot, ref, entries, saved = await undispatched(manager, tx, source)
+    closed, snapshot, ref, entries, saved = await resolved(manager, tx, source)
     binding = await original_owner(manager, tx, source)
     if binding is not None:
         await transferred_owner(manager, tx, source)
@@ -117,10 +122,21 @@ async def requested(manager, tx, source):
     if outcome not in ('cancelled', 'interrupted', 'timed_out', 'budget_exceeded'):
         outcome = 'failed'
     exited = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', ('model_closed_'+source['job_id'],))
-    return outcome, {'status': 'not_dispatched', 'final_text': 'Only the listed original calls were not dispatched.',
-        RESULT_FIELD: {'version': 2, 'outcome_scope': 'original_undispatched_calls', 'scope': proof(source),
-        'original_call': ref.to_dict(), 'calls': [{'tool_call_id': entry['call_id'], 'tool_name': entry['tool_name'],
-            'arguments_hash': entry['arguments_hash'], 'resolution': 'not_dispatched'} for entry in entries],
+    returned = any('returned' in entry for entry in entries)
+    calls = []
+    for entry in entries:
+        call = {'tool_call_id': entry['call_id'], 'tool_name': entry['tool_name'],
+                'arguments_hash': entry['arguments_hash'], 'resolution': 'not_dispatched'}
+        if 'returned' in entry:
+            event, data = entry['returned']
+            text = data['return_text']
+            call.update(resolution='callback_returned', return_preview=text[:512],
+                return_chars=len(text), return_truncated=len(text)>512, return_hash=_hash(text),
+                return_checkpoint=content_reference(event), operations=data['operations'])
+        calls.append(call)
+    return outcome, {'status': 'original_call_outcomes' if returned else 'not_dispatched', 'final_text': 'Original callback returns do not complete their asynchronous work.' if returned else 'Only the listed original calls were not dispatched.',
+        RESULT_FIELD: {'version': 3 if returned else 2, 'outcome_scope': 'original_native_callbacks' if returned else 'original_undispatched_calls', 'scope': proof(source),
+        'original_call': ref.to_dict(), 'calls': calls,
         'checkpoint': content_reference(saved[0]), 'model_exit': content_reference(exited),
         'new_effect_requests': 0, 'source_model_usage': 'retained_in_original_model_attempt_ledger',
         'execution_authority': False, 'acknowledgement_created': False, 'billing_settled': False}}

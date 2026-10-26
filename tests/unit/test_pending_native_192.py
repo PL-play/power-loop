@@ -63,16 +63,17 @@ async def test_original_main_reviews_only_unstarted_subset_and_separate_complete
         await cleanup(c, loop, runtime)
 
 
-async def test_started_native_with_missing_raw_receipt_stays_unknown(registry_store):
+async def test_started_native_without_original_return_checkpoint_stays_unknown(registry_store):
     c = await owned_pending_case(registry_store, 'subagent', native_tail='another_operation', native_first=True)
     loop = runtime = None
     try:
         sid = c.state.source_binding.actor.session_id
         pending = (await c.store.get_state(sid)).pending
         assert c.state.native_calls == 1 and c.state.executed == c.state.prepared == 0
+        await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE job_id=? AND event_type='native_callback_returned'", (c.state.source,))
         loop, runtime = await new_main(c, registry_store)
         result = await recover_runtime(runtime, runtime.actor(c.state.root), c.state.source)
-        assert result['state'] == 'unconfirmed' and result['error'] == 'pending_native_already_dispatched'
+        assert result['state'] == 'unconfirmed' and result['error'] == 'pending_native_return_required'
         assert (await c.store.get_state(sid)).pending == pending
         source = await runtime.manager.get_job(runtime.actor(c.state.root), c.state.source)
         assert source.result_status == 'none' and source.supervision_status == 'open'

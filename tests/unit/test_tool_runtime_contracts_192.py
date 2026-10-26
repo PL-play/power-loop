@@ -274,7 +274,7 @@ async def test_original_protocol_five_requires_explicit_upgrade_without_new_iden
     assert await store.message_ref(sid, seq) == original
     assert (
         await manager.db.fetchone(f"SELECT store_id,protocol_version FROM {manager.prefix}task_store WHERE id=1")
-    ) == {"store_id": store.store_id, "protocol_version": 18}
+    ) == {"store_id": store.store_id, "protocol_version": 19}
     with monkeypatch.context() as patch:
         patch.setattr(jobs, "TASK_PROTOCOL_VERSION", 5)
         with pytest.raises(JobError, match="store_identity_changed"):

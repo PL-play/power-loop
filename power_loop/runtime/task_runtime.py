@@ -228,6 +228,8 @@ class TaskRuntime:
         from .managed_completion import CompletionCache
 
         self._managed_completions = CompletionCache(self)
+        from .native_returns import ReturnCache
+        self._native_returns = ReturnCache(self)
         from .controller_retirement import RetirementCache
 
         self._controller_retirements = RetirementCache(self)
@@ -247,6 +249,8 @@ class TaskRuntime:
             raise JobError("controller_task_exit_requires_reconciliation")
         if self._managed_completions.claim_exit_count():
             raise JobError("managed_claim_exit_requires_reconciliation")
+        if self._native_returns.failed_count():
+            raise JobError("native_return_requires_reconciliation")
 
     async def ensure_started(self):
         if self._lifecycle is not None:
@@ -254,6 +258,8 @@ class TaskRuntime:
         async with asyncio.timeout(2):
             await self._controller_retirements.flush()
             await self._controller_task_exits.flush()
+            from .native_returns import flush_local as flush_native
+            await flush_native(self, failed_only=True)
         if self._lifecycle is not None:
             await self._lifecycle.start()
 
@@ -269,6 +275,8 @@ class TaskRuntime:
                 await self._controller_task_exits.flush()
                 from .managed_claim import flush_local
                 await flush_local(self)
+                from .native_returns import flush_local as flush_native
+                await flush_native(self)
         return {"controller_retirement_pending": len(self._controller_retirements.pending),
                 "controller_task_exit_pending": len(self._controller_task_exits.slots)}
 
@@ -290,12 +298,17 @@ class TaskRuntime:
                     await self._controller_task_exits.flush()
                     from .managed_claim import flush_local
                     await flush_local(self)
+                    from .native_returns import flush_local as flush_native
+                    await flush_native(self)
             except Exception as exc:
                 logging.getLogger(__name__).warning(
                     "Controller intake closure remains pending at shutdown: %s", type(exc).__name__)
         return self._completion_status(result)
 
     def _completion_status(self, result):
+        result['native_return_pending'] = self._native_returns.pending_count()
+        if result['native_return_pending']:
+            result['store_safe_to_close'] = False
         result["controller_task_exit_pending"] = len(self._controller_task_exits.slots)
         writer = self._controller_task_exits._writer
         result["controller_task_exit_writer_pending"] = writer is not None and not writer.done()

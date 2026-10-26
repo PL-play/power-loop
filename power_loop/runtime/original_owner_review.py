@@ -130,7 +130,7 @@ async def require_handler(manager,tx,source,handler):
     from .controller_handoff import read as handoff
     from .managed_completion import _scope
     result = await result_event(manager,tx,source,required=False)
-    if result is not None and json.loads(result['payload_json'])['result'].get('aborted_call_batch', {}).get('version') == 2:
+    if result is not None and json.loads(result['payload_json'])['result'].get('aborted_call_batch', {}).get('version') in (2, 3):
         from .managed_delivery import _main
         from .pending_owner import read as owner_transfer
         expected = await read(manager, tx, source)
