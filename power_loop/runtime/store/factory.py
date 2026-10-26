@@ -16,6 +16,7 @@ the matching extra only when their scheme is used.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import re
 
@@ -46,7 +47,7 @@ async def open_store(
         await store._initialize_identity(version)
         return store
     except BaseException:
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await db.close()
         raise
 
@@ -98,7 +99,7 @@ async def _make_database(dsn: str) -> Database:
         # ":memory:", a "sqlite://…" URL, or a bare filesystem path.
         from power_loop.runtime.store.backends.sqlite import SqliteDatabase
 
-        return SqliteDatabase.open(_sqlite_path(dsn))
+        return await SqliteDatabase.connect(_sqlite_path(dsn))
     # Unknown scheme: do NOT silently fall through to a SQLite file named after the DSN —
     # that masks a typo/misconfig and writes to the wrong place.
     raise ValueError(

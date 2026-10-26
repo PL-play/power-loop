@@ -15,6 +15,7 @@ backends that lack it.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import secrets
@@ -225,14 +226,14 @@ class SessionStore:
         is a deprecated alias kept for the 1.x line (True→AUTO_CREATE, False→VERIFY)."""
         from power_loop.runtime.store.backends.sqlite import SqliteDatabase
 
-        db = SqliteDatabase.open(path)
+        db = await SqliteDatabase.connect(path)
         try:
             version = await ensure_schema(db, table_prefix, policy=schema, create_schema=create_schema)
             store = cls(db, max_spawn_depth=max_spawn_depth, table_prefix=table_prefix)
             await store._initialize_identity(version)
             return store
         except BaseException:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await db.close()
             raise
 
