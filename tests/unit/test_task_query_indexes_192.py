@@ -113,7 +113,7 @@ async def test_task_index_ddl_names_fit_all_supported_prefixes(registry_store):
     indexes = [sql for sql in rows if sql.startswith('CREATE INDEX ')]
     assert all(len(sql.split()[2]) <= 64 for sql in indexes)
     for suffix in ['idx_jobs_root_page','idx_jobs_session_kind','idx_jobs_control_owner','idx_jobs_main_page',
-                   'idx_events_job_type','idx_events_caller_type','idx_events_call','idx_budget_job']:
+                   'idx_events_job_type','idx_events_caller_type','idx_events_call','idx_budget_job','idx_context_capacity']:
         assert any(sql.startswith('CREATE INDEX '+'x'*24+suffix+' ') for sql in indexes)
 
 

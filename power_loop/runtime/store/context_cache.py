@@ -29,6 +29,7 @@ def context_cache_ddl(name: str, prefix: str) -> list[str]:
         ('context_cache', 'context_due', 'executor_key,status,retry_at,created_at'),
         ('context_cache', 'context_running', 'status,lease_until'),
         ('context_cache', 'context_lru', 'status,accessed_at'),
+        ('context_cache', 'idx_context_capacity', 'size_bytes'),
         ('context_attempts', 'context_outbox', 'accounted,delivered,created_at'),
         ('context_attempts', 'context_attempt_key', 'cache_key,outcome'),
         ('context_attempts', 'context_attempt_owner', 'owner_session_id,created_at'),
@@ -106,13 +107,20 @@ class ContextCache:
             # An expired lease may have reached the provider: never silently reissue it.
             await tx.execute(f"UPDATE {self.cache} SET status='uncertain' WHERE status='running' AND lease_until<?", (now,))
             count = await tx.fetchone(f"SELECT COUNT(*) AS n FROM {self.cache} WHERE status='running'")
-            if int(count['n']) >= limit:
+            if int(count['n']) >= limit or per_session <= 0:
                 return None
-            row = await tx.fetchone(f'''SELECT * FROM {self.cache} c WHERE executor_key=?
-                AND status='pending' AND retry_at<=? AND expires_at>?
-                AND (SELECT COUNT(*) FROM {self.cache} r WHERE r.owner_session_id=c.owner_session_id
-                     AND r.status='running') < ? ORDER BY created_at LIMIT 1''',
-                (executor, now, now, per_session))
+            blocked = []
+            if int(count['n']) >= per_session:
+                owners = await tx.fetchall(f"SELECT owner_session_id,COUNT(*) AS n FROM {self.cache} "
+                    "WHERE status='running' GROUP BY owner_session_id")
+                blocked = [owner['owner_session_id'] for owner in owners if int(owner['n']) >= per_session]
+            predicate, params = '', [executor, now, now]
+            if blocked:
+                predicate = ' AND owner_session_id NOT IN (' + ','.join('?' for _ in blocked) + ')'
+                params.extend(blocked)
+            row = await tx.fetchone(f"SELECT * FROM {self.cache} WHERE executor_key=? "
+                "AND status='pending' AND retry_at<=? AND expires_at>? " + predicate +
+                ' ORDER BY created_at LIMIT 1', params)
             if row is None:
                 return None
             payload = json.loads(row['payload_json'])

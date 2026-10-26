@@ -34,6 +34,7 @@ _QUERY_INDEXES = {
     'idx_events_caller_type': ('job_events', ('caller_session_id', 'event_type', 'job_id', 'event_id')),
     'idx_events_call': ('job_events', ('caller_session_id', 'tool_call_id', 'event_type')),
     'idx_budget_job': ('task_budget_attempts', ('job_id', 'attempt_id')),
+    'idx_context_capacity': ('context_cache', ('size_bytes',)),
 }
 _PROTOCOL_2_TABLES = ("task_store", "jobs", "job_events")
 _PROTOCOL_3_TABLES = (*_PROTOCOL_2_TABLES, "task_executors", "task_executor_events")
@@ -129,6 +130,11 @@ async def _run_task_ddl(tx, db, prefix):
     for statement in task_tables_ddl(db.dialect.name, prefix):
         if statement.startswith("CREATE INDEX "):
             index = statement.split()[2]
+            target = statement.split()[4].split('(', 1)[0]
+            if target not in {prefix+name for name in TASK_TABLES} and not await _table_exists_tx(tx, db.dialect.name, target):
+                # Fresh stores provision base tables after task tables. Their
+                # normal DDL creates this same index; maintenance sees the table.
+                continue
             if db.dialect.name == "sqlite":
                 exists = await tx.fetchone("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (index,))
             elif db.dialect.name == "postgres":

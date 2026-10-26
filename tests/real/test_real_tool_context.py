@@ -8,7 +8,7 @@ from tests.real._llm import make_llm
 
 
 @pytest.mark.asyncio
-async def test_real_summary_is_metered_and_reused():
+async def test_real_summary_is_metered_and_reused(record_property):
     llm = make_llm(max_tokens=4096)
     store = await SessionStore.open(':memory:')
     try:
@@ -30,13 +30,15 @@ async def test_real_summary_is_metered_and_reused():
         assert await engine.distill(source, 'general') == summary
         stats = await store.get_session_stats(sid)
         assert stats.llm_calls == 1 and stats.total_tokens > 0
+        record_property('real_provider_requests', stats.llm_calls)
+        record_property('reported_tokens', stats.total_tokens)
     finally:
         await store.close()
         await llm.close()
 
 
 @pytest.mark.asyncio
-async def test_real_workflow_summary_is_attributed_after_node_completion():
+async def test_real_workflow_summary_is_attributed_after_node_completion(record_property):
     import asyncio
     import json
 
@@ -78,6 +80,8 @@ async def test_real_workflow_summary_is_attributed_after_node_completion():
         assert record['outcome'] == 'success' and not record['usage_unknown']
         assert record['owner_session_id'] == leaf and record['workflow_run_id'] == 'real-summary-workflow'
         assert record['node_id'] == 'review' and record['usage']['total_tokens'] > 0
+        record_property('real_provider_requests', 1)
+        record_property('reported_tokens', record['usage']['total_tokens'])
         summary = await cache.get(rows[0]['cache_key'])
         assert summary and 'critical.py' in summary and '42' in summary
         assert await cache.get(rows[0]['cache_key']) == summary
