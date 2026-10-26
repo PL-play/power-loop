@@ -34,6 +34,21 @@ class BaseEventPayload:
 
 
 @dataclass
+class TaskSupervisionClosedPayload(BaseEventPayload):
+    """Post-commit observation, identified by (store_id, event_id).
+
+    Revalidation may emit the same identity again. This is a best-effort hint,
+    not a durable delivery, execution capability, or billing settlement.
+    """
+
+    store_id: str = ""
+    job_id: str = ""
+    generation: int = 0
+    event_id: str = ""
+    revision: int = 0
+
+
+@dataclass
 class LlmCallStartedPayload(BaseEventPayload):
     """Emitted at the start of each LLM call *attempt* (before retry/streaming).
 

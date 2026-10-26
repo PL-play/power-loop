@@ -86,3 +86,5 @@ bus.subscribe(None, write_audit)  # 所有事件
 
 - [Hooks](hooks.md) — 改变控制流
 - [完整 Event 参考](../../events.md) — 每个 payload 字段
+
+异步任务监管收尾、策略 hook 与可靠回执的边界，参见[异步任务扩展](task-extensions.md)。

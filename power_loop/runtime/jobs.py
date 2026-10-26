@@ -6,14 +6,20 @@ settling with supervision open until those protocols are implemented.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import time
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
+
+from power_loop.contracts.event_payloads import TaskSupervisionClosedPayload
+from power_loop.contracts.events import AgentEvent, AgentEventType
+from power_loop.core.events import AgentEventBus
 
 from .message_ref import MessageRef
 from .store.task_schema import TASK_PROTOCOL_VERSION
@@ -122,7 +128,8 @@ def _operation(row) -> JobOperation:
 
 
 class JobManager:
-    def __init__(self, store, *, now_ms: Callable[[], int] | None = None):
+    def __init__(self, store, *, now_ms: Callable[[], int] | None = None,
+                 event_bus: AgentEventBus | None = None):
         if store.schema_version != 10 or not store.store_id:
             raise JobError("task_registry_unsupported")
         self.store = store
@@ -131,6 +138,8 @@ class JobManager:
         self.jobs = self.prefix + "jobs"
         self.events = self.prefix + "job_events"
         self.now = now_ms or (lambda: time.time_ns() // 1_000_000)
+        # Explicit host bus: never leak task observations to the global default.
+        self.event_bus = event_bus
 
     @asynccontextmanager
     async def _write(self):
@@ -513,11 +522,29 @@ class JobManager:
     async def finalize_supervision(self, actor: JobActor, job_id: str, *, generation: int) -> dict:
         from .finalization import finalize
         try:
-            return await finalize(self, actor, job_id, generation=generation)
+            ref = await finalize(self, actor, job_id, generation=generation)
         except (TypeError, ValueError, KeyError, AttributeError) as exc:
             if isinstance(exc, JobError):
                 raise
             raise JobError("finalization_evidence_corrupt") from exc
+        # The transaction has exited successfully. Observers cannot veto or
+        # replace its proof, and receive no mutable reference to that proof.
+        if self.event_bus is not None:
+            try:
+                self.event_bus.publish(AgentEvent(
+                    type=AgentEventType.TASK_SUPERVISION_CLOSED,
+                    session_id=actor.session_id,
+                    source="task_registry",
+                    data=TaskSupervisionClosedPayload(
+                        store_id=self.store.store_id, job_id=job_id, generation=generation,
+                        event_id=ref["event_id"], revision=ref["revision"],
+                    ),
+                ))
+            except (Exception, asyncio.CancelledError):
+                # Best effort only: log no subscriber exception text, which may
+                # include arbitrary host data. Strict buses stop later handlers.
+                logging.getLogger(__name__).warning("Task supervision observer failed (job_id=%s)", job_id)
+        return ref
 
     async def execution_usage(self, actor: JobActor, job_id: str, *, generation: int | None = None) -> dict:
         """Sum each persisted model-send exit once, never recursive scope rollups.

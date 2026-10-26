@@ -72,6 +72,9 @@ class AgentEventType(str, Enum):
     SUBAGENT_LIMIT = "subagent_limit"
     SUBAGENT_COMPLETED = "subagent_completed"
 
+    # Durable supervision validation completed; not a business/billing ACK.
+    TASK_SUPERVISION_CLOSED = "task_supervision_closed"
+
 
 @dataclass
 class AgentEvent:
