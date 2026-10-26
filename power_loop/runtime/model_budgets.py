@@ -247,19 +247,23 @@ def _context(attempt, job):
 
 async def _port(attempt, operation, call):
     """Bound waits without discarding an API call that may already have committed."""
-    runtime = attempt.binding.runtime
-    key = (attempt.attempt_id, operation)
+    return await _host_call(attempt.binding.runtime, attempt.binding.lease.job_id,
+                            attempt.attempt_id, operation, call)
+
+
+async def _host_call(runtime, job_id, attempt_id, operation, call):
+    key = (attempt_id, operation)
     task = runtime._budget_handles.get(key)
     if task is None:
         coroutine = call()
         try:
-            task = asyncio.create_task(coroutine, name="budget-" + operation + "-" + attempt.attempt_id)
+            task = asyncio.create_task(coroutine, name="budget-" + operation + "-" + attempt_id)
         except BaseException:
             if hasattr(coroutine, "close"):
                 coroutine.close()
             raise
         runtime._budget_handles[key] = task
-        runtime.track_task(task, job_id=attempt.binding.lease.job_id)
+        runtime.track_task(task, job_id=job_id)
 
         def observed(done):
             if not done.cancelled():
@@ -427,18 +431,23 @@ async def require_dispatch(attempt, tx):
 
 
 async def observe(attempt, observation):
-    runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
+    return await _observe(attempt.binding.runtime, attempt.binding.actor,
+                          attempt.binding.lease.job_id, attempt.attempt_id, observation)
+
+
+async def _observe(runtime, actor, job_id, attempt_id, observation):
+    manager = runtime.manager
     async with manager._write() as tx:
         policy = await _policy(runtime, tx)
         if policy is None:
             return
-        job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
+        job = await manager._authorize(tx, actor, job_id)
         from .model_attempts import _read as read_model
 
-        source = await read_model(manager, tx, "finished", attempt.attempt_id)
+        source = await read_model(manager, tx, "finished", attempt_id)
         if source[1] != observation:
             raise JobError("budget_observation_source_mismatch")
-        state = await _read(manager, tx, attempt.attempt_id)
+        state = await _read(manager, tx, attempt_id)
         if state["phase"] != "dispatch_authorized":
             if state["observation"] == observation:
                 return
@@ -465,18 +474,26 @@ async def observe(attempt, observation):
             await tx.execute(
                 f"UPDATE {manager.prefix}task_budget_policies SET enabled=0 WHERE policy_key=?", (state["policy_key"],)
             )
-        state.update(phase="settling", pending=True, observation=observation, finished_at_ms=manager.now())
+        # Recovery may happen hours later; never retime the original usage to
+        # the reconciler's wall clock (which could change its pricing period).
+        state.update(phase="settling", pending=True, observation=observation,
+                     finished_at_ms=source[0]["created_at"])
         await _save(manager, tx, state, job)
-    await deliver(attempt)
+    await _deliver(runtime, actor, job_id, attempt_id)
 
 
 async def deliver(attempt):
     """Replay only the frozen original API submission, never the model request."""
-    runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
+    return await _deliver(attempt.binding.runtime, attempt.binding.actor,
+                          attempt.binding.lease.job_id, attempt.attempt_id)
+
+
+async def _deliver(runtime, actor, job_id, attempt_id):
+    manager = runtime.manager
     async with manager._write() as tx:
         await _policy(runtime, tx)
-        job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
-        state = await _read(manager, tx, attempt.attempt_id)
+        job = await manager._authorize(tx, actor, job_id)
+        state = await _read(manager, tx, attempt_id)
         if state["phase"] != "settling":
             raise JobError("budget_usage_not_ready")
         if state["ack"] is not None:
@@ -488,24 +505,24 @@ async def deliver(attempt):
             **state["observation"],
             "started_at_ms": state["started_at_ms"],
             "finished_at_ms": state["finished_at_ms"],
-            "evidence_event_id": event_id(manager, "finished", attempt.attempt_id),
+            "evidence_event_id": event_id(manager, "finished", attempt_id),
             "evidence_hash": _hash(state["observation"]),
         }
-        submission = await _port(
-            attempt,
+        submission = await _host_call(
+            runtime, job_id, attempt_id,
             "prepare_usage",
             lambda: runtime.budget_config.provider.prepare_usage(
                 state["context"], BudgetGrant(**state["grant"]), observation
             ),
         )
         if type(submission) is not BudgetSubmission or (submission.attempt_id, submission.revision) != (
-            attempt.attempt_id,
+            attempt_id,
             1,
         ):
             raise JobError("invalid_budget_submission")
         async with manager._write() as tx:
-            job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
-            latest = await _read(manager, tx, attempt.attempt_id)
+            job = await manager._authorize(tx, actor, job_id)
+            latest = await _read(manager, tx, attempt_id)
             if latest["submission"] is not None and latest["submission"] != asdict(submission):
                 raise JobError("budget_submission_conflict")
             if latest["submission"] is None:
@@ -513,20 +530,20 @@ async def deliver(attempt):
                 await _save(manager, tx, latest, job)
             state = latest
     submission = BudgetSubmission(**state["submission"])
-    ack = await _port(
-        attempt,
+    ack = await _host_call(
+        runtime, job_id, attempt_id,
         "apply_usage:" + str(submission.revision),
         lambda: runtime.budget_config.provider.apply_usage(submission),
     )
     if type(ack) is not BudgetAck or (ack.attempt_id, ack.revision, ack.request_hash) != (
-        attempt.attempt_id,
+        attempt_id,
         submission.revision,
         submission.request_hash,
     ):
         raise JobError("budget_ack_mismatch")
     async with manager._write() as tx:
-        job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
-        latest = await _read(manager, tx, attempt.attempt_id)
+        job = await manager._authorize(tx, actor, job_id)
+        latest = await _read(manager, tx, attempt_id)
         if latest["submission"] != state["submission"]:
             raise JobError("budget_submission_conflict")
         if latest["ack"] is None:
@@ -745,6 +762,65 @@ async def get_budget(manager, actor, attempt_id):
         state = await _read(manager, tx, attempt_id)
         await manager._authorize(tx, actor, state["job_id"])
         return state
+
+
+async def reconcile_usage(runtime, actor, job_id, attempt_id):
+    """Replay recorded usage after restart, without reconstructing execution.
+
+    No model, reserve, dispatch, release, result ACK, or finalization is called.
+    Original unknown usage stays unknown. The caller supplies identifiers only;
+    usage and submission bytes must already exist in this store.
+    """
+    if (type(job_id) is not str or not 0 < len(job_id) <= 64
+            or type(attempt_id) is not str or len(attempt_id) != 56
+            or not attempt_id.startswith("attempt_")
+            or any(c not in "0123456789abcdef" for c in attempt_id[8:])):
+        raise JobError("invalid_budget_reconciliation_identity")
+    manager = runtime.manager
+    from .model_attempts import _read as read_model
+    async with manager._write() as tx:
+        job = await manager._authorize(tx, actor, job_id)
+        policy = await _policy(runtime, tx)
+        if policy is None:
+            raise JobError("budget_provider_required")
+        state = await _read(manager, tx, attempt_id)
+        if state["job_id"] != job_id or state["policy_key"] != policy["policy_key"]:
+            raise JobError("budget_reconciliation_scope_mismatch")
+        _, prepared = await read_model(manager, tx, "prepared", attempt_id)
+        _, dispatched = await read_model(manager, tx, "dispatched", attempt_id)
+        _, observation = await read_model(manager, tx, "finished", attempt_id)
+        _, tracking = await read_model(manager, tx, "tracking", prepared["scope"])
+        expected = {
+            "version": 1, "store_id": manager.store.store_id,
+            "tenant_id": job["tenant_id"], "principal_id": job["principal_id"],
+            "root_job_id": job["root_job_id"], "job_id": job_id,
+            "generation": prepared["scope"]["generation"], "session_id": job["session_id"],
+            "attempt_id": attempt_id, "prepared_event_id":
+                "ma_prepared_" + _hash([manager.store.store_id, attempt_id])[:48],
+            "prepared_hash": _hash(prepared), "request_hash": prepared["request_hash"],
+            "model": prepared["model"], "max_tokens": prepared["max_tokens"],
+        }
+        if (job["kind"] != "send" or prepared["scope"]["job_id"] != job_id
+                or prepared["session_id"] != job["session_id"] or state["context"] != expected
+                or tracking != {"version": 1, "scope": prepared["scope"], "session_id": job["session_id"]}
+                or dispatched != {"version": 1, "scope": prepared["scope"],
+                    "attempt_id": attempt_id, "prepared_hash": _hash(prepared)}
+                or observation["scope"] != prepared["scope"]
+                or observation["prepared_hash"] != _hash(prepared)
+                or observation["dispatch_hash"] != _hash(dispatched)):
+            raise JobError("budget_reconciliation_evidence_mismatch")
+        if state["phase"] not in ("dispatch_authorized", "settling"):
+            raise JobError("budget_usage_not_ready")
+        if state["phase"] == "settling" and state["observation"] != observation:
+            raise JobError("budget_observation_source_mismatch")
+    # A crash can occur after model observation commit but before its budget
+    # projection. The shared transaction applies counters at most once.
+    if state["phase"] == "dispatch_authorized":
+        await _observe(runtime, actor, job_id, attempt_id, observation)
+    ack = await _deliver(runtime, actor, job_id, attempt_id)
+    return {"attempt_id": attempt_id, "job_id": job_id, "revision": ack["revision"],
+            "request_hash": ack["request_hash"], "usage_acknowledged": True,
+            "execution_authority": False}
 
 
 async def require_quiescent(manager, tx, job):

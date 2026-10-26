@@ -327,6 +327,15 @@ class TaskRuntime:
             raise JobError("executor_lifecycle_not_configured")
         return self._completion_status(await self._lifecycle.status())
 
+    async def reconcile_budget_usage(self, session_id, *, job_id, attempt_id):
+        """Re-deliver this authority's saved usage, including after restart.
+
+        This control operation does not start a boot, admit a model request,
+        reconstruct an Execution, or settle a job's supervision.
+        """
+        from .model_budgets import reconcile_usage
+        return await reconcile_usage(self, self.actor(session_id), job_id, attempt_id)
+
     def track_task(self, task, *, cancel_token=None, job_id=None):
         if not isinstance(task, asyncio.Task):
             raise JobError("executor_task_handle_required")
