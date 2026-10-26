@@ -231,15 +231,16 @@ class InProcessExecutor:
                 for _name, guard in getattr(parent_loop, "_child_run_guards", ()) or ():
                     guards.enter_context(guard())
                 from power_loop.runtime.node_resume import _PREPARED
+                from power_loop.runtime.original_owner_review import invoke
                 prepared = _PREPARED.get()
                 if prepared is not None and prepared.sid == session_id and prepared.pending:
                     prepared.pending = False
-                    res = await prepared.child.flush_follow_ups(session_id, stop_event=stop_event,
+                    res = await invoke(prepared.child,session_id,prepared.child.flush_follow_ups,session_id, stop_event=stop_event,
                         max_rounds=min(extra_rounds, prepared.child.config.max_rounds))
                     if res is None or (res.status == "completed" and not (res.final_text or "").strip() and not getattr(prepared, "restored", False)):
                         raise WorkflowRunError("node resume produced no final answer")
                 else:
-                    res = await leaf_loop.follow_up(
+                    res = await invoke(leaf_loop,session_id,leaf_loop.follow_up,
                         user_input, session_id=session_id,
                         stop_event=stop_event, max_rounds=extra_rounds,
                     )

@@ -182,11 +182,32 @@ async def require_live(manager,tx,actor,source,ticket):
     await require_time(manager,tx,owner)
 
 
-async def try_handle(loop,sid,error,stop_event):
+async def invoke(loop,sid,operation,*args,_completion_window=None,_caller_consumes=False,**kwargs):
+    """Run an SDK-owned model method, then review only after its locks exit.
+
+    The review calls the original flush method directly, never this wrapper.
+    Existing callers consuming returned total rounds own window bookkeeping.
+    """
+    try:
+        return await operation(*args,**kwargs)
+    except BaseException as exc:
+        if not isinstance(exc,Exception):
+            raise
+        if _completion_window is None and not _caller_consumes:
+            result = await try_handle(loop,sid,exc,kwargs.get('stop_event'))
+        else:
+            result = await try_handle(loop,sid,exc,kwargs.get('stop_event'),
+                window=_completion_window,caller_consumes=_caller_consumes)
+        if result is None:
+            raise
+        return result
+
+
+async def try_handle(loop,sid,error,stop_event,*,window=None,caller_consumes=False):
     from .cancellation import CancellationToken
     ticket = getattr(error,'_power_loop_owner_failure',None)
     if (type(ticket) is not _Failure or ticket.error is not error or ticket.attempted
-            or isinstance(error,asyncio.CancelledError) or CancellationToken.from_any(stop_event).is_cancelled()):
+            or not isinstance(error,Exception) or CancellationToken.from_any(stop_event).is_cancelled()):
         return None
     ticket.attempted = True
     runtime,source = ticket.source.runtime,ticket.source.lease.job_id
@@ -208,15 +229,15 @@ async def try_handle(loop,sid,error,stop_event):
         if type(spent) is not int or spent >= ticket.round_limit:
             return None
         from .completion import WINDOW
-        window = WINDOW.get()
+        window = WINDOW.get() if window is None else window
         allowance = min(1,ticket.round_limit-spent)
         if window is not None:
             window.require_time()
             allowance = min(allowance,window.allowance({'rounds':spent}))
         if allowance <= 0:
             return None
-        # Two sends in this newly-created child: projection keeps original calls
-        # as data, without a fabricated missing tool reply or a migration model.
+        # Project the original session calls as data, without a fabricated
+        # missing tool reply or an extra history-migration model request.
         from .representation import ProjectedRepresentation
         original_config = loop.config
         loop.config = replace(original_config,representation=ProjectedRepresentation(),migrate_history_on_switch=False)
@@ -224,7 +245,7 @@ async def try_handle(loop,sid,error,stop_event):
             result = await loop.flush_follow_ups(sid,stop_event=stop_event,tools=[],max_rounds=allowance)
         finally:
             loop.config = original_config
-        if window is not None and result is not None:
+        if window is not None and result is not None and not caller_consumes:
             if not window.consume(result,allowance):
                 return None
         if result is None or result.status != 'completed':

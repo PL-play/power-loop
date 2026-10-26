@@ -543,13 +543,9 @@ async def run_agent_spec(
             _cb_tok = _ON_CHILD_SESSION.set(None)
             _admission_tok = _CHILD_ADMISSION.set(None)
             try:
-                try:
-                    result = await child_loop.send(user_input, session_id=child_sid, stop_event=stop_event)
-                except BaseException as original_error:
-                    from .original_owner_review import try_handle
-                    result = await try_handle(child_loop,child_sid,original_error,stop_event)
-                    if result is None:
-                        raise
+                from .original_owner_review import invoke
+                result = await invoke(child_loop,child_sid,child_loop.send,
+                    user_input,session_id=child_sid,stop_event=stop_event)
             finally:
                 _CHILD_ADMISSION.reset(_admission_tok)
                 _ON_CHILD_SESSION.reset(_cb_tok)

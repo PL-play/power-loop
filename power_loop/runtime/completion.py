@@ -13,6 +13,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from .cancellation import CancellationToken
+from .original_owner_review import invoke
 
 ACTIVE = frozenset({"queued", "pending", "running"})
 FINALIZE_PROMPT = (
@@ -184,9 +185,10 @@ async def collect_required(loop, raw, stop_event=None, *, window=None, resolve_l
                     for _, guard in getattr(loop, "_child_run_guards", ()) or ():
                         guards.enter_context(guard())
                     async with delegation.readmit_session(loop, sid):
-                        more = (await child.follow_up("\n\n".join(prompts), session_id=sid,
-                            stop_event=stop_event, max_rounds=allowance) if prompts else
-                            await child.flush_follow_ups(sid, stop_event=stop_event, max_rounds=allowance))
+                        options = dict(stop_event=stop_event,max_rounds=allowance,
+                            _completion_window=window,_caller_consumes=True)
+                        more = (await invoke(child,sid,child.follow_up,"\n\n".join(prompts),session_id=sid,**options) if prompts else
+                            await invoke(child,sid,child.flush_follow_ups,sid,**options))
                 if more is None or not hasattr(more, "status"):
                     return {**raw, "status": "failed", "completion_unresolved": True, "error": "completion settlement returned no result"}
                 _merge(raw, more)
@@ -233,8 +235,8 @@ async def finish_text(loop, raw, stop_event=None, *, window=None, resolve_loop=N
             with contextlib.ExitStack() as guards:
                 for _, guard in getattr(loop, "_child_run_guards", ()) or ():
                     guards.enter_context(guard())
-                extra = await child.send(FINALIZE_PROMPT, session_id=sid, stop_event=stop_event,
-                    tools=[], max_rounds=allowance)
+                extra = await invoke(child,sid,child.send,FINALIZE_PROMPT, session_id=sid, stop_event=stop_event,
+                    tools=[], max_rounds=allowance,_completion_window=window,_caller_consumes=True)
             _merge(raw, extra)
             within_limit = window.consume(extra, allowance)
             if not within_limit and raw["status"] == "completed":

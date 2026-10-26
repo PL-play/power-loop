@@ -192,6 +192,7 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
         if remaining_rounds <= 0:
             raw = {**raw, "status": "hit_round_limit", "error": "subagent settlement round budget exhausted"}
             break
+        from .original_owner_review import invoke
         if continuation is None:
             continuation = await workflow_continuation_loop(loop, sid)
         with contextlib.ExitStack() as guards:
@@ -200,12 +201,12 @@ async def _finish(loop, parent, sid, running, raw, after_seq, lifecycle, finaliz
             async with asyncio.timeout(max(0.0, deadline - asyncio.get_running_loop().time())):
                 async with readmit(running):
                     if raw.get("new_input_after_pass"):
-                        extra = await continuation.follow_up(
+                        extra = await invoke(continuation,sid,continuation.follow_up,
                             "New input arrived at your last pass and is already in this session's history. "
                             "Process it and finish the original task without repeating completed actions.",
                             session_id=sid, stop_event=running.token, max_rounds=remaining_rounds)
                     else:
-                        extra = await continuation.flush_follow_ups(sid, stop_event=running.token,
+                        extra = await invoke(continuation,sid,continuation.flush_follow_ups,sid, stop_event=running.token,
                                                                   max_rounds=remaining_rounds)
         if extra is None:
             raise RuntimeError("subagent settlement returned no result with required input pending")

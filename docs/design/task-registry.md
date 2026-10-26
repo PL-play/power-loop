@@ -1595,4 +1595,5 @@ session relationship; live model handling additionally requires the original
 local controller and unsealed generation. The canonical owner-result gate
 retains unresolved original pending/review obligations. Main and child handler
 roles remain distinct. See [managed-tool recovery](../managed-tool-recovery.md)
-for the retained initial-controller scope and unimplemented restoration paths.
+for the retained-controller initial/continuation/completion scope and unimplemented
+unresolved-owner restoration paths.

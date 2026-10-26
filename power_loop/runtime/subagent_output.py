@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 
+from .original_owner_review import invoke
 from .spec import workflow_continuation_loop
 
 
@@ -28,7 +29,7 @@ async def ensure_answer(loop, running, sid, raw, deadline, *, max_extra_rounds=N
         from .delegation import readmit
         async with asyncio.timeout(max(0.0, deadline-asyncio.get_running_loop().time())):
             async with readmit(running):
-                extra = await child.follow_up(
+                extra = await invoke(child,sid,child.follow_up,
                     "Your previous turn did not contain a final answer. There is no outstanding delegated task. "
                     "Use the work already completed in this session and return the requested final answer as assistant text. "
                     "Do not repeat completed actions or call pass_turn.", session_id=sid,

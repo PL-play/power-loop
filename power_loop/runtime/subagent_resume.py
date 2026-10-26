@@ -150,6 +150,7 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
     """Caller holds the original session gate. Replays never dispatch here."""
     from . import delegation
     from .nudges import receipt
+    from .original_owner_review import invoke
     from .spec import workflow_continuation_loop
     from .task_runtime import Execution
 
@@ -209,7 +210,7 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
                     with contextlib.ExitStack() as guards:
                         for _, guard in getattr(loop, "_child_run_guards", ()):
                             guards.enter_context(guard())
-                        result = await child.flush_follow_ups(sid, stop_event=run.token, max_rounds=child.config.max_rounds)
+                        result = await invoke(child,sid,child.flush_follow_ups,sid, stop_event=run.token, max_rounds=child.config.max_rounds)
                     if result is None:
                         raise JobError("resume_input_missing")
                     rounds = int(result.rounds)
@@ -219,7 +220,7 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
                             with contextlib.ExitStack() as guards:
                                 for _, guard in getattr(loop, "_child_run_guards", ()):
                                     guards.enter_context(guard())
-                                result = await child.follow_up(
+                                result = await invoke(child,sid,child.follow_up,
                                     "Your previous turn did not contain a final answer. There is no outstanding delegated task. "
                                     "Use the work already completed in this session and return the requested final answer as assistant text. "
                                     "Do not repeat completed actions or call pass_turn.", session_id=sid,

@@ -346,8 +346,8 @@ current configuration cannot add review credit. Admission, original scopes,
 member relationship, physical session role and node-session provenance are
 revalidated together. Legacy owners retain their existing protocol.
 
-The initial `run_agent_spec` path can process a v3 pre-admission abort while its
-original SDK controller is still retained. Pure historical readers and host-only
+The SDK initial, continuation and completion paths can process a v3 pre-admission
+abort while that generation's original SDK controller is still retained. Pure historical readers and host-only
 negative-result publication do not grant model permission. The review helper
 requires the actual original owner object, local execution binding and current
 asyncio task, an unsealed original member set, current lease, original deadline
@@ -372,10 +372,32 @@ cancellation leaves a prepared but unexecuted v2 pending call, it must remain
 pending; a cancellation token alone does not justify disposal or a premature
 child completion notice.
 
-This candidate does **not** implement cross-process owner restoration, the
-`continue_agent` exception path, or general v2 executed/known-result recovery.
+This candidate does **not** implement restoration of an exited controller with
+unresolved pending work across processes, or general v2 executed/known-result
+recovery. Successfully settled old generations still use their separate native
+continuation admission.
 Old generations whose members are sealed cannot receive new model sends. Those
 paths need their own transition and physical-exit proof; neither a relaxed
 pending guard nor main-role promotion is an acceptable shortcut. Protocol 15
 requires explicit maintenance; the default host/runtime is not activated by
 these candidate changes.
+
+
+The internal `original_owner_review.invoke` wrapper is used by initial spec runs,
+`InProcessExecutor.continue_agent`, native standalone continuation, required-result
+collection, empty-output completion and final-text requests. It waits for the
+original loop method to release its session lock before attempting review. The
+review directly calls the original flush method, so a failed review cannot
+recursively start another review. Fatal `BaseException` exits propagate without
+entering review machinery.
+
+When a completion collector consumes the returned total rounds, it supplies its
+original window and owns that consumption; the helper must not also debit the
+review round. Other callers retain the existing bounded review debit. Model
+ledger entries and the original per-call ceiling remain independent hard gates.
+
+A restored workflow controller may report a genuine failed/unknown result while
+an original node remains unresolved. Reading that failure notice does not prove
+the node stopped or its original outcome was handled: both source and workflow
+supervision stay open. A node with unprocessed captured outcomes still cannot
+publish its own canonical completion result.
