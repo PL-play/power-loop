@@ -11,6 +11,7 @@ import pytest
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import delegation, execution_membership
 from power_loop.runtime.jobs import JobError, JobManager
+from power_loop.runtime.native_returns import NativeReturnPending
 from power_loop.runtime.result_revisions import result_id
 
 from .test_job_registry_192 import registry_store
@@ -217,7 +218,15 @@ async def test_admission_rechecks_current_session_contract_and_actual_caller(rea
     rows = await c.store.load_all_messages(c.parent)
     c.created_call = next(r for r in rows if r.role == "assistant" and r.tool_calls)
     monkeypatch.setattr(c.manager, "resume_subagent", change)
-    await issue_nudge(c.fixture, monkeypatch)
+    if fault == "source_role":
+        # Corrupting the actual caller also invalidates the original return
+        # checkpoint. Keep its reply pending instead of accepting a new scope.
+        with pytest.raises(NativeReturnPending, match="native_return_checkpoint_pending") as pending:
+            await issue_nudge(c.fixture, monkeypatch)
+        assert isinstance(pending.value.__cause__, JobError)
+        assert pending.value.__cause__.code == "managed_completion_scope_changed"
+    else:
+        await issue_nudge(c.fixture, monkeypatch)
     code = {"pending_tools": "resume_tools_pending", "pending_input": "resume_input_pending", "session_role": "resume_session_unavailable",
         "contract_changed": "resume_contract_mismatch", "source_role": "resume_caller_mismatch", "old_call": "operation_conflict"}[fault]
     assert errors == [code] and (await latest(c)).generation == 1 and c.model.child_calls == 1
@@ -428,9 +437,12 @@ async def test_dispatch_faults_never_start_an_unclaimed_execution_and_remain_can
             errors.append(exc.code)
             raise
     monkeypatch.setattr(c.manager, "claim_resume_dispatch", fail)
-    if fault == "source_send":
-        with pytest.raises(JobError, match="processing_send_mismatch"):
+    if fault in ("source_send", "source_role"):
+        with pytest.raises(NativeReturnPending, match="native_return_checkpoint_pending") as pending:
             await issue_nudge(c.fixture, monkeypatch)
+        assert isinstance(pending.value.__cause__, JobError)
+        code = "managed_effect_call_evidence_mismatch" if fault == "source_send" else "managed_completion_scope_changed"
+        assert pending.value.__cause__.code == code
     else:
         await issue_nudge(c.fixture, monkeypatch)
     expected = {"invalid_token": "invalid_dispatch_token", "invalid_caller": "execution_lease_required", "missing_operation": "resume_dispatch_mismatch",

@@ -491,7 +491,9 @@ async def test_final_result_failure_never_rewrites_committed_success_or_fakes_no
     await settle(managed_workflow)
     workflow = await manager.get_job(runtime.actor(sid), target)
     if failure == "before_result":
-        assert workflow.result is None and workflow.status == "running"
+        assert workflow.result is None and workflow.result_status == "none"
+        assert workflow.outcome is None and workflow.status == "settling"
+        assert workflow.resource_state == "unknown" and workflow.supervision_status == "open"
     else:
         assert workflow.outcome == "succeeded" and workflow.result["status"] == "completed"
     assert (await store.inbox_counts(sid))["pending"] == 0 and not state["notifications"]

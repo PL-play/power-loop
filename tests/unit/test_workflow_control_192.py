@@ -17,6 +17,7 @@ from power_loop.core.agent_context import (
     set_session_id,
 )
 from power_loop.runtime import task_control
+from power_loop.runtime.jobs import JobError
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import journal, register_workflow_tools, runner
 from power_loop.workflow.facade import WorkflowToolPorts, register_workflow_tool, run_workflow_tool
@@ -181,15 +182,27 @@ async def test_expired_execution_can_only_use_actual_library_control_actions(man
                 "function": {"name": name, "arguments": json.dumps(params)}}])
         return await complete(request, **kwargs)
     monkeypatch.setattr(model, "complete", expired)
+    rejected = None
     try:
         await loop.send("control original", sid)
     except ValueError as exc:
+        rejected = exc
         assert "expired" in str(exc) or "supervision" in str(exc)
     finally:
         manager.now = clock
     assert issued and not paid
     rows = [m for m in await manager.store.load_all_messages(sid) if m.role == "tool" and m.name == name]
-    assert rows
+    if mode in ("create", "validate", "spoof", "create_alias"):
+        # The complete call batch is fenced before dispatch. No callback ran,
+        # so a fabricated tool return must not substitute for the pending call.
+        assert isinstance(rejected, JobError) and rejected.code == "execution_lease_expired"
+        assert not rows
+        pending = (await manager.store.get_state(sid)).pending
+        assert pending is not None
+        raw = await manager.store.load_all_messages(sid)
+        assert any(m.role == "assistant" and any(c["id"] == "expired-action" for c in (m.tool_calls or [])) for m in raw)
+    else:
+        assert rows
     if mode in ("query", "status_list", "cancel"):
         receipt = json.loads(rows[-1].content)
         assert "error" not in receipt

@@ -94,7 +94,8 @@ async def test_default_root_request_is_unchanged_and_missing_context_is_explicit
     await c.loop.send("legacy-compatible root", c.sid)
     [row] = await c.manager.db.fetchall(f"SELECT payload_json FROM {c.manager.events} WHERE action='create'")
     request = json.loads(row["payload_json"])["request"]
-    assert set(request) == {"send_index", "model_attempt_protocol"}
+    assert set(request) == {"send_index", "model_attempt_protocol", "tool_call_plan_protocol"}
+    assert request["model_attempt_protocol"] == request["tool_call_plan_protocol"] == 1
     assert await root_context.read(c.manager, c.actor, c.model.calls[0], required=False) is None
     with pytest.raises(JobError, match="root_context_missing"):
         await root_context.read(c.manager, c.actor, c.model.calls[0])
@@ -150,7 +151,10 @@ async def test_changed_runtime_authority_never_reuses_a_root_binding(root_case, 
     try:
         if when == "before-enter":
             setattr(c.runtime, field, changed)
-        with pytest.raises(JobError, match="root_context_binding_mismatch"):
+        # send first validates the runtime's original completion authority;
+        # entering a pre-created host context validates its own binding.
+        code = "managed_completion_runtime_changed" if when == "before-send" else "root_context_binding_mismatch"
+        with pytest.raises(JobError, match=code):
             with context:
                 if when == "before-send":
                     setattr(c.runtime, field, changed)
