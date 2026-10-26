@@ -336,6 +336,19 @@ class TaskRuntime:
         from .model_budgets import reconcile_usage
         return await reconcile_usage(self, self.actor(session_id), job_id, attempt_id)
 
+    async def release_unstarted_budget(self, session_id, *, job_id, attempt_id, require_cancelled=False):
+        """Recover an original unstarted reservation without an execution lease.
+
+        Atomically prevents original dispatch before any host release. A host
+        failure retains the original pending reservation for a later retry.
+        Automatic scanners must set require_cancelled=True: an unsealed attempt
+        then requires persisted cancellation of itself or an ancestor. Timeouts,
+        missing heartbeats and a new controller are not cancellation evidence.
+        """
+        from .model_budgets import release_unstarted
+        return await release_unstarted(self, self.actor(session_id), job_id, attempt_id,
+                                       require_cancelled=require_cancelled)
+
     async def stage_budget_usage_revision(self, session_id, *, job_id, attempt_id, expected_revision, evidence):
         """Trusted host stages one original-attempt revision; no provider I/O.
 

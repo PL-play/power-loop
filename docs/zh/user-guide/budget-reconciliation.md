@@ -116,3 +116,20 @@ ack = await control_runtime.reconcile_budget_usage(
 ## 在原观察之前保存响应副本
 
 可选 `ResponseCaptureProvider.capture_response` 现已由SDK在原观察落库之前调用，详[任务扩展接口](task-extensions.md#可信响应采集端口)。原context/grant在dispatch前固定；响应返回后不依赖一次SDK数据库读取即可交给独立存储。采集回执与预算ACK不同，不自行登记首证、核销额度或证明退出。宿主恢复采集记录后须验证来源，按原attempt现有观察/修订状态选择正常核账或独立首证；已正常入账的同一响应不得重复结算。普通 `LLM_RESPONSE_RECEIVED` 事件仅用于观察。
+
+## 恢复未派发的原预算预留
+
+原执行进程在预算预留中退出后，控制宿主可释放原请求，不需要重建旧执行对象：
+
+```python
+receipt = await control_runtime.release_unstarted_budget(
+    original_session_id,
+    job_id=original_job_id,
+    attempt_id=original_attempt_id,
+    require_cancelled=True,
+)
+```
+
+控制宿主必须通过 `recovery_config` 绑定原预算策略及认证原归属的 provider。SDK 检查原 prepared/tracking 证据，先在事务中关闭派发，再查询、释放原预留。已派发的请求不能通过这个接口退款；没有预算记录也不能推定零费用。API 不可达或回执丢失时保留原风险，后续重试同一 attempt，不新建额度。
+
+自动巡检必须设 `require_cancelled=True`：首次关闭派发要求任务或祖先已有持久取消；已关闭派发的释放可以重试。新宿主、租约过期和心跳缺失不等于取消。显式控制调用默认允许主动关闭尚未派发的请求，与原 dispatch 原子竞争。返回 `execution_authority=False`；该操作不启动 boot、不恢复模型、不修改任务结果，也不证明所有子资源已经退出。

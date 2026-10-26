@@ -689,27 +689,96 @@ async def is_closed_unstarted(manager, tx, prepared):
 
 
 async def close_unstarted(attempt):
-    """Close dispatch first; only a confirmed original API release frees risk."""
+    """Original running owner's closure, retaining its exact execution check."""
     local = await close_unreserved(attempt)
     if local is not None:
         return local
-    runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
+    return await _release_unstarted(attempt.binding.runtime, attempt.binding.actor,
+        attempt.binding.lease.job_id, attempt.attempt_id, original=attempt)
+
+
+async def _release_source(runtime, tx, job, attempt_id, policy):
+    """Validate persisted authority without impersonating its old executor."""
+    from .model_attempts import _read as read_model
+
+    manager = runtime.manager
+    if policy is None:
+        raise JobError("budget_provider_required")
+    state = await _read(manager, tx, attempt_id)
+    _, prepared = await read_model(manager, tx, "prepared", attempt_id)
+    _, tracking = await read_model(manager, tx, "tracking", prepared["scope"])
+    context = {
+        "version": 1, "store_id": manager.store.store_id,
+        "tenant_id": job["tenant_id"], "principal_id": job["principal_id"],
+        "root_job_id": job["root_job_id"], "job_id": job["job_id"],
+        "generation": prepared["scope"]["generation"], "session_id": job["session_id"],
+        "attempt_id": attempt_id, "prepared_event_id":
+            "ma_prepared_" + _hash([manager.store.store_id, attempt_id])[:48],
+        "prepared_hash": _hash(prepared), "request_hash": prepared["request_hash"],
+        "model": prepared["model"], "max_tokens": prepared["max_tokens"],
+    }
+    if (job["kind"] != "send" or state["job_id"] != job["job_id"]
+            or state["policy_key"] != policy["policy_key"]
+            or prepared["scope"]["job_id"] != job["job_id"]
+            or prepared["session_id"] != job["session_id"] or state["context"] != context
+            or tracking != {"version": 1, "scope": prepared["scope"], "session_id": job["session_id"]}):
+        raise JobError("budget_reconciliation_evidence_mismatch")
+    return state
+
+
+async def release_unstarted(runtime, actor, job_id, attempt_id, *, require_cancelled=False):
+    """Mechanical recovery: seal original dispatch, then release original risk.
+
+    Does not claim an execution, renew an old lease, or close supervision. A
+    missing reservation is not a refund proof. Dispatched attempts are refused.
+    """
+    if (type(job_id) is not str or not job_id or len(job_id) > 80
+            or type(attempt_id) is not str or len(attempt_id) != 56 or not attempt_id.startswith("attempt_")
+            or any(c not in "0123456789abcdef" for c in attempt_id[8:])):
+        raise JobError("invalid_budget_reconciliation_identity")
+    if type(require_cancelled) is not bool:
+        raise JobError("invalid_budget_release_guard")
+    ack = await _release_unstarted(runtime, actor, job_id, attempt_id, require_cancelled=require_cancelled)
+    return {"attempt_id": attempt_id, "job_id": job_id, "released": True,
+            "execution_authority": False, "ack": ack}
+
+
+async def _require_cancelled_lineage(manager, tx, job):
+    """Read original cancellation by indexed ancestor keys; never infer death."""
+    current, seen = job, set()
+    for _ in range(64):
+        if current is None or current["job_id"] in seen:
+            raise JobError("invalid_job_lineage")
+        seen.add(current["job_id"])
+        if current["cancel_requested_at"] is not None:
+            return
+        if current["parent_job_id"] is None:
+            raise JobError("budget_release_requires_cancellation")
+        current = await manager._row(tx, current["parent_job_id"])
+    raise JobError("job_depth_exceeded")
+
+
+async def _release_unstarted(runtime, actor, job_id, attempt_id, *, original=None, require_cancelled=False):
+    manager = runtime.manager
     async with manager._write() as tx:
         policy = await _policy(runtime, tx)
-        job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
-        await _original_preparation(attempt, tx, job)
-        state = await _read(manager, tx, attempt.attempt_id)
-        if state["job_id"] != job["job_id"] or state["context"] != _context(attempt, job):
+        job = await manager._authorize(tx, actor, job_id)
+        if original is not None:
+            await _original_preparation(original, tx, job)
+        state = await _release_source(runtime, tx, job, attempt_id, policy)
+        if original is not None and state["context"] != _context(original, job):
             raise JobError("budget_release_requires_original_owner")
+        from .model_attempts import _read as read_model
+
+        if await read_model(manager, tx, "dispatched", attempt_id, required=False):
+            raise JobError("budget_release_not_permitted")
         if state["phase"] == "released":
             return state["ack"]
         if state["phase"] not in ("local_reserved", "host_reserving", "host_reserved", "dispatch_closed"):
             raise JobError("budget_release_not_permitted")
-        from .model_attempts import _read as read_model
-
-        if await read_model(manager, tx, "dispatched", attempt.attempt_id, required=False):
-            raise JobError("budget_release_not_permitted")
         if state["phase"] != "dispatch_closed":
+            if require_cancelled:
+                await _require_cancelled_lineage(manager, tx, job)
             state.update(phase="dispatch_closed", pending=True)
             await _save(manager, tx, state, job)
         if not state["host_intent"]:
@@ -720,18 +789,18 @@ async def close_unstarted(attempt):
     provider = runtime.budget_config.provider
     if state["grant"] is None:
         plan = BudgetPlan(**state["plan"])
-        grant = await _port(attempt, "lookup", lambda: provider.lookup(plan))
+        grant = await _host_call(runtime, job_id, attempt_id, "lookup", lambda: provider.lookup(plan))
         if grant is not None and (
             type(grant) is not BudgetGrant
-            or (grant.attempt_id, grant.request_hash) != (attempt.attempt_id, state["plan_hash"])
+            or (grant.attempt_id, grant.request_hash) != (attempt_id, state["plan_hash"])
         ):
             raise JobError("budget_host_reservation_unconfirmed")
         if grant is not None and grant.state not in ("reserved", "released"):
             raise JobError("budget_release_not_permitted")
         if grant is not None:
             async with manager._write() as tx:
-                job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
-                state = await _read(manager, tx, attempt.attempt_id)
+                job = await manager._authorize(tx, actor, job_id)
+                state = await _read(manager, tx, attempt_id)
                 if state["phase"] == "released":
                     return state["ack"]
                 if state["phase"] != "dispatch_closed":
@@ -747,25 +816,25 @@ async def close_unstarted(attempt):
     if state["submission"] is None:
         proof = {
             "proof": "dispatch_not_authorized",
-            "event_id": "mb_" + _hash([attempt.attempt_id, state["version"]])[:48],
+            "event_id": "mb_" + _hash([attempt_id, state["version"]])[:48],
             "evidence_hash": _hash(state),
             "reservation_request_hash": state["plan_hash"],
         }
-        submission = await _port(
-            attempt,
+        submission = await _host_call(
+            runtime, job_id, attempt_id,
             "prepare_release",
             lambda: provider.prepare_release(
                 state["context"], BudgetGrant(**state["grant"]) if state["grant"] is not None else None, proof
             ),
         )
         if type(submission) is not BudgetSubmission or (submission.attempt_id, submission.revision) != (
-            attempt.attempt_id,
+            attempt_id,
             1,
         ):
             raise JobError("invalid_budget_submission")
         async with manager._write() as tx:
-            job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
-            latest = await _read(manager, tx, attempt.attempt_id)
+            job = await manager._authorize(tx, actor, job_id)
+            latest = await _read(manager, tx, attempt_id)
             if latest["submission"] is not None and latest["submission"] != asdict(submission):
                 raise JobError("budget_submission_conflict")
             if latest["submission"] is None:
@@ -773,17 +842,17 @@ async def close_unstarted(attempt):
                 await _save(manager, tx, latest, job)
             state = latest
     submission = BudgetSubmission(**state["submission"])
-    ack = await _port(attempt, "release", lambda: provider.release(submission))
+    ack = await _host_call(runtime, job_id, attempt_id, "release", lambda: provider.release(submission))
     if type(ack) is not BudgetAck or (ack.attempt_id, ack.revision, ack.request_hash) != (
-        attempt.attempt_id,
+        attempt_id,
         submission.revision,
         submission.request_hash,
     ):
         raise JobError("budget_ack_mismatch")
     async with manager._write() as tx:
         policy = await _policy(runtime, tx)
-        job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
-        latest = await _read(manager, tx, attempt.attempt_id)
+        job = await manager._authorize(tx, actor, job_id)
+        latest = await _read(manager, tx, attempt_id)
         if latest["phase"] == "released":
             return latest["ack"]
         if latest["phase"] != "dispatch_closed" or latest["submission"] != asdict(submission):
