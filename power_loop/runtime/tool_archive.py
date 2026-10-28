@@ -390,9 +390,6 @@ async def prepare_projection(engine, projected, rows, send_index):
     of one tool in one round are consecutive entries.
     """
     sources = _sources(engine, rows, send_index)
-    # Repair a missed llm_summary submission after a crash between audit append and enqueue.
-    for source in sources.values():
-        await engine.submit(source)
     groups = copy.deepcopy(_archive(engine.state).get('groups', {}))
     added = False
     for prow in projected.rows:

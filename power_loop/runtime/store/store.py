@@ -267,8 +267,6 @@ class SessionStore:
             await self._db.backup(dest_path)
 
     async def close(self) -> None:
-        if hasattr(self, "_summary_worker"):
-            await self._summary_worker.close()
         await self._db.close()
 
     async def __aenter__(self) -> SessionStore:

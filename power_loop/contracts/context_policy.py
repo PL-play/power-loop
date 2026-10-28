@@ -9,6 +9,7 @@ from typing import Literal
 #: ``general`` is the rule between sends and the fallback when the in-send fuse cannot reach
 #: its target; ``insend_fuse`` is only the fuse's first level (``inherit`` = same as general).
 Trigger = Literal['age_retirement', 'insend_fuse', 'general']
+#: ``llm_summary`` is retired (no background tool summaries); a stored value distills like ``rule``.
 Strategy = Literal['preserve', 'rule', 'llm_summary', 'truncate', 'archive', 'inherit']
 TRIGGERS = ('age_retirement', 'insend_fuse')
 #: Fields from earlier releases that are accepted and ignored (stored configs keep them).
@@ -28,6 +29,8 @@ class ToolContextPolicy:
     age_retirement: Strategy = 'preserve'
     insend_fuse: Strategy = 'inherit'
     retention_rounds: int | None = None
+    # prompt/version/max_tokens/timeout_s configured the retired background summaries. They
+    # stay because the per-send policy snapshot (and thus the projection version) includes them.
     prompt: str = DEFAULT_SUMMARY_PROMPT
     version: str = '1'
     max_tokens: int = 4096

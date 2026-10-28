@@ -39,7 +39,7 @@ async def _summary(manager, tx, job, raw, phases):
             state = "not_dispatched"
     return {"attempt_id": identity, "generation": str(data["scope"]["generation"]),
         "round_index": data["round_index"], "retry_index": data["retry_index"], "model": data["model"],
-        "max_tokens": data["max_tokens"], "request_fingerprint": data["request_hash"], "status": state,
+        "purpose": data.get("purpose", "llm"), "max_tokens": data["max_tokens"], "request_fingerprint": data["request_hash"], "status": state,
         "observed_usage": observed.get("usage"), "estimated": observed.get("estimated"),
         "provider_reported_cost": observed.get("provider_cost"), "provider_cost_currency": None,
         "provider_response_id": observed.get("provider_response_id"), "provider_query_supported": False,

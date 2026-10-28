@@ -305,7 +305,8 @@ async def reserve(attempt, logical_request, *, service):
     supplied = await _port(
         attempt,
         "prepare",
-        lambda: provider.prepare(copy.deepcopy(context), copy.deepcopy(logical_request), service=service),
+        lambda: provider.prepare(copy.deepcopy(context), copy.deepcopy(logical_request), service=service,
+                                 **({"purpose": attempt.prepared["purpose"]} if "purpose" in attempt.prepared else {})),
     )
     if type(supplied) is not BudgetPlan:
         raise JobError("invalid_budget_plan")

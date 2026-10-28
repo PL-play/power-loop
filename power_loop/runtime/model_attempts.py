@@ -142,8 +142,11 @@ def _validate_data(manager, phase, identity, data):
                 "model",
                 "max_tokens",
             }
+            if "purpose" in data:
+                keys |= {"purpose"}
             valid = (
-                isinstance(data.get("nonce"), str)
+                data.get("purpose", "fold") == "fold"
+                and isinstance(data.get("nonce"), str)
                 and 1 <= len(data["nonce"]) <= 64
                 and data.get("attempt_id")
                 == identity
@@ -350,8 +353,10 @@ async def _no_inflight(manager, tx, row, *, except_attempt=None):
             raise JobError("unresolved_prior_attempt")
 
 
-async def prepare(binding, *, nonce, round_index, retry_index, request_hash, model, max_tokens):
+async def prepare(binding, *, nonce, round_index, retry_index, request_hash, model, max_tokens, purpose=None):
     if (
+        purpose not in (None, "fold")
+        or 
         not isinstance(nonce, str)
         or not 1 <= len(nonce) <= 64
         or type(round_index) is not int
@@ -381,6 +386,8 @@ async def prepare(binding, *, nonce, round_index, retry_index, request_hash, mod
         "model": model,
         "max_tokens": max_tokens,
     }
+    if purpose is not None:
+        data["purpose"] = purpose
     async with manager._write() as tx:
         row = await manager._authorize(tx, binding.actor, scope["job_id"])
         old = await _read(manager, tx, "prepared", identity, required=False)
@@ -579,7 +586,7 @@ async def require_quiescent(manager, tx, row, *, include_budget=True):
     return refs
 
 
-async def start_call(pipeline, request, *, round_index, retry_index, model):
+async def start_call(pipeline, request, *, round_index, retry_index, model, purpose=None):
     from .task_runtime import _SEND
 
     binding = _SEND.get()
@@ -594,6 +601,7 @@ async def start_call(pipeline, request, *, round_index, retry_index, model):
         request_hash=_hash(values),
         model=model,
         max_tokens=request.max_tokens,
+        purpose=purpose,
     )
     try:
         attempt = await prepare(binding, **args)

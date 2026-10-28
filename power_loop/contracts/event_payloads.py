@@ -64,6 +64,8 @@ class LlmCallStartedPayload(BaseEventPayload):
     model_attempt_job_id: str | None = None
     model_attempt_generation: int | None = None
     budget_managed: bool = False
+    #: ``None`` = the loop's own round; ``"fold"`` = a history fold made inside this send.
+    purpose: str | None = None
 
 
 @dataclass
@@ -126,6 +128,7 @@ class LlmCallCompletedPayload(BaseEventPayload):
     model_attempt_job_id: str | None = None
     model_attempt_generation: int | None = None
     budget_managed: bool = False
+    purpose: str | None = None
 
 
 @dataclass

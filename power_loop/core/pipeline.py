@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import functools
 import inspect
 import json
@@ -1176,8 +1177,19 @@ class AgentPipeline:
         if compact_before.directive == HookDirective.SKIP:
             return
 
+        from power_loop.runtime.model_attempts import is_managed
+        fold_calls = None
+        compact_llm = self.llm
+        if is_managed(self.session_id):
+            # A task-managed send books its fold calls itself (purpose "fold").
+            from power_loop.runtime.fold_calls import FoldCalls
+            fold_calls = FoldCalls(session_id=self.session_id, bus=self.bus, cancel_token=self.cancel_token)
+            compact_llm = fold_calls.wrap(self.llm)
+            if getattr(compactor, "summary_llm", None) is not None:
+                compactor = copy.copy(compactor)
+                compactor.summary_llm = fold_calls.wrap(compactor.summary_llm)
         compact_kwargs: dict[str, Any] = dict(
-            llm=self.llm,
+            llm=compact_llm,
             # Reserve headroom for the ephemeral tail-injected memory block (it
             # isn't in self.history so the compactor can't see it) — fold a bit
             # earlier so history + memory stays within the window.
@@ -1190,6 +1202,8 @@ class AgentPipeline:
         if _maybe_compact_accepts_context(type(compactor).maybe_compact):
             compact_kwargs["context"] = self._build_compaction_context(round_index)
         plan = await compactor.maybe_compact(self.history, **compact_kwargs)
+        if fold_calls is not None:
+            fold_calls.raise_if_cancelled()
         if plan is None:
             return
 
@@ -2494,15 +2508,6 @@ class AgentPipeline:
                     {"role": "tool", "tool_call_id": call_id, "name": tool_name, "content": stored_output},
                     round_index=round_idx,
                 )
-
-                from power_loop.runtime.tool_context import ToolSource, active_engine
-                context_engine = active_engine.get()
-                if context_engine is not None:
-                    seqs = getattr(self.sink, "_history_seqs", None) or []
-                    if seqs:
-                        await context_engine.submit(ToolSource(
-                            self.session_id, self.send_index, seqs[-1], call_id,
-                            tool_name, tool_args, str(self.history[-1].get("content") or "")))
 
                 if _stopped:
                     # design/124 §8.4: the run was stopped mid-tool — this call is settled; the

@@ -50,6 +50,7 @@ from power_loop.agent.system_prompt import (
 )
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
+    CancellationRequested,
     InboxClaimChanged,
     SessionBusy,
     SessionNotFoundError,
@@ -1790,7 +1791,6 @@ class StatefulAgentLoop:
         token = active_engine.set(None)  # child must never use its parent's ledger
         try:
             if self.config.tool_context is not None:
-                session = await store.get_session(sid)
                 registry = kwargs.get("tools")
                 if not hasattr(registry, "get"):
                     registry = getattr(self, "tool_registry", None)
@@ -1799,18 +1799,8 @@ class StatefulAgentLoop:
                     owner_send_index=await self._current_send_index(store, sid),
                     llm=self.llm, model=self.config.model, registry=registry,
                     rule=getattr(self.config.representation, "distill_tool_call", None),
-                    lineage={"parent_session_id": session.parent_session_id if session else None,
-                             **{k: v for k, v in (session.metadata if session else {}).items()
-                                if k in ("workflow_run_id", "workflow_node_id", "workflow_iteration", "attempt", "workflow_ancestry")}},
                 )
-                engine.lineage["node_id"] = engine.lineage.get("workflow_node_id")
-                engine.lineage["node_attempt"] = engine.lineage.get("attempt")
                 await engine.start()
-                from power_loop.runtime.context_worker import SummaryWorker
-                if not hasattr(store, "_summary_worker"):
-                    store._summary_worker = SummaryWorker(store)
-                engine.worker = store._summary_worker
-                store._summary_worker.bind(engine)
                 active_engine.set(engine)
             result = await self._run_loop_impl(sid, **kwargs)
             try:
@@ -1819,9 +1809,6 @@ class StatefulAgentLoop:
                 )
             except Exception:
                 logger.exception("session_stats bump failed for %s (continuing)", sid)
-            if engine is not None:
-                for key, value in (await engine.usage_snapshot()).items():
-                    result.usage[key] = result.usage.get(key, 0) + value
             return result
         finally:
             active_engine.reset(token)
@@ -1960,12 +1947,15 @@ class StatefulAgentLoop:
                                 await self._migrate_prior_history_to_projection(
                                     store, sid, projector,
                                     current_send_index=current_send_index, active_rows=active_rows,
+                                    stop_event=stop_event,
                                 )
                                 migrated = True
                                 logger.info(
                                     "session %s: migrated prior history into the projection table "
                                     "(mode switch).", sid,
                                 )
+                            except CancellationRequested:
+                                raise
                             except Exception:
                                 # Best-effort: fall back to verbatim this send (and retry next send).
                                 logger.exception(
@@ -2300,7 +2290,10 @@ class StatefulAgentLoop:
                 await self._write_send_projection(
                     store, sid, send_index=current_send_index, status=result.status,
                     session_row=session_row, projector=projector, tool_registry=effective_registry,
+                    stop_event=stop_event,
                 )
+            except CancellationRequested:
+                raise
             except Exception:
                 logger.exception("send-context projection write failed for %s (continuing)", sid)
         return StatefulResult(
@@ -2326,6 +2319,7 @@ class StatefulAgentLoop:
         *,
         current_send_index: int,
         active_rows: list[Any],
+        stop_event: CancellationLike = None,
     ) -> None:
         """One-time best-effort migration: fold a session's prior NON-projection history into the
         projection table so it becomes projection-native (starts with a ``compact`` covering the
@@ -2375,18 +2369,14 @@ class StatefulAgentLoop:
         migration_note_ops: list[Any] = []
         folded = None
         if any(r.kind in ("user", "project") for r in to_compact):
-            from power_loop.runtime.fold import FoldContext
-
             # Same fold-timeout guard as the end-of-send path (this runs OUTSIDE the migration's
             # write lock — write_projection_migration is called afterwards with the result).
+            calls = self._fold_calls(sid, stop_event)
             folded = await self._run_fold_with_timeout(
-                self.config.fold_strategy,
-                to_compact,
-                FoldContext(
-                    session_id=sid, round_index=0, representation=projector,
-                    llm=self.llm, max_tokens=self.config.max_tokens,
-                ),
+                self.config.fold_strategy, to_compact, self._fold_context(sid, projector, calls),
             )
+            if calls is not None:
+                calls.raise_if_cancelled()
         fold_as_project: list[int] = []
         if folded is not None:
             from_send = 0 if note is not None else (min(fold) if fold else 0)
@@ -2476,6 +2466,7 @@ class StatefulAgentLoop:
         session_row: SessionRow | None,
         projector: Representation,
         tool_registry: ToolRegistry | None,
+        stop_event: CancellationLike = None,
     ) -> None:
         """Project the just-finished send's ``pl_messages`` rows into ``pl_project_messages`` (v2).
 
@@ -2509,7 +2500,8 @@ class StatefulAgentLoop:
             source_seq_lo=projected.source_seq_lo, source_seq_hi=projected.source_seq_hi,
             projector_version=version,
         )
-        plan, note_ops = await self._plan_and_run_projection_fold(sid, projector, prior, snapshot)
+        plan, note_ops = await self._plan_and_run_projection_fold(
+            sid, projector, prior, snapshot, stop_event=stop_event)
         if plan is None:
             return
         content, rendered_text, from_send, to_send = plan
@@ -2524,6 +2516,7 @@ class StatefulAgentLoop:
     async def _plan_and_run_projection_fold(
         self, sid: str, projector: Representation,
         prior: ProjectMessageRow | None, snapshot: list[ProjectMessageRow],
+        stop_event: CancellationLike = None,
     ) -> tuple[tuple[Any, str | None, int, int] | None, tuple[Any, ...]]:
         """Decide whether to fold (token threshold + keep-recent floor) and, if so, run the
         configured ``fold_strategy`` OUTSIDE any lock (bounded by ``fold_timeout_s``). Always keeps
@@ -2562,21 +2555,38 @@ class StatefulAgentLoop:
                 if (prior is not None and prior.compact_from_send is not None)
                 else min(fold_sends)
             )
-            from power_loop.runtime.fold import FoldContext
-
-            ctx = FoldContext(
-                session_id=sid, round_index=0, representation=projector,
-                llm=self.llm, max_tokens=self.config.max_tokens,
-            )
+            calls = self._fold_calls(sid, stop_event)
+            ctx = self._fold_context(sid, projector, calls)
             fr = await self._run_fold_with_timeout(fold_strategy, to_compact, ctx)
+            if calls is not None:
+                calls.raise_if_cancelled()
             if fr is None:
                 return None, ()
             return (fr.content, fr.rendered_text, from_send, fr.folded_to_send), tuple(fr.note_ops)
+        except CancellationRequested:
+            raise
         except Exception:
             logger.exception(
                 "projection fold planning failed for %s (skipping fold; rows still written)", sid,
             )
             return None, ()
+
+    def _fold_calls(self, sid: str, stop_event: CancellationLike) -> Any:
+        """A task-managed send books its fold calls itself; a plain loop calls the model directly."""
+        if self.task_runtime is None:
+            return None
+        from power_loop.runtime.fold_calls import FoldCalls
+        return FoldCalls(session_id=sid, bus=self._runner.event_bus, cancel_token=stop_event)
+
+    def _fold_context(self, sid: str, projector: Representation, calls: Any) -> Any:
+        from power_loop.runtime.fold import FoldContext
+        if calls is None:
+            return FoldContext(session_id=sid, round_index=0, representation=projector,
+                               llm=self.llm, max_tokens=self.config.max_tokens)
+        summary = getattr(self.config.fold_strategy, "summary_llm", None) or self.llm
+        return FoldContext(session_id=sid, round_index=0, representation=projector,
+                           llm=calls.wrap(self.llm), summary_llm=calls.wrap(summary),
+                           max_tokens=self.config.max_tokens)
 
     async def _run_fold_with_timeout(self, fold_strategy: Any, rows: Any, ctx: Any) -> Any | None:
         """Await ``fold_strategy.fold`` bounded by ``config.fold_timeout_s`` (None disables). A
