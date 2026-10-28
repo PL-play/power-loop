@@ -175,6 +175,62 @@ async def test_heartbeat_observes_persistent_node_cancel_without_local_notificat
     assert final.result["results"]["REVIEW"]["status"] == "completed"
 
 
+@pytest.mark.parametrize("observer", ["workflow_node", "send"])
+async def test_persistent_node_cancel_is_local_whichever_heartbeat_observes_first(
+    managed_workflow, monkeypatch, observer
+):
+    _, manager, runtime, loop, model, sid, state, _ = managed_workflow
+    runtime.lease_ms = 600  # Poll quickly, while real SQL leases remain generous.
+    claim, renew = manager.claim_job, manager.renew_execution
+    observed, release_other = asyncio.Event(), asyncio.Event()
+
+    async def claim_long(actor, job_id, **kwargs):
+        return await claim(actor, job_id, **{**kwargs, "lease_ms": 30000})
+
+    async def ordered_renew(actor, lease, **kwargs):
+        row = await manager._row(manager.db, lease.job_id)
+        target = row["kind"] == "workflow_node" or (row["kind"] == "send" and actor.session_id != sid)
+        if target and row["kind"] != observer:
+            await release_other.wait()
+        try:
+            return await renew(actor, lease, **{**kwargs, "lease_ms": 30000})
+        except JobError as exc:
+            if target and row["kind"] == observer and exc.code == "cancel_requested":
+                observed.set()
+            raise
+
+    async def no_signal(*args):
+        return 0
+
+    monkeypatch.setattr(manager, "claim_job", claim_long)
+    monkeypatch.setattr(manager, "renew_execution", ordered_renew)
+    monkeypatch.setattr(task_control, "signal_local", no_signal)
+    model.hold = {"BUILD", "REVIEW"}
+    try:
+        await loop.send("Start original workflow", sid)
+        await asyncio.wait_for(model.entered["BUILD"].wait(), 5)
+        [handle] = state["handles"]
+        register_workflow_tool(loop.tool_registry)
+        _, receipt = await issue(loop, model, sid, monkeypatch, "workflow",
+            {"action": "cancel", "run_id": handle.run_id, "node": "BUILD"})
+        assert receipt["local_signals"] == 0
+        await asyncio.wait_for(observed.wait(), 5)
+        # The other heartbeat remains blocked until classification is complete.
+        await asyncio.wait_for(model.entered["REVIEW"].wait(), 5)
+        assert not handle.task.done() and not handle.task.cancelling()
+        assert model.counts["BUILD"] == model.counts["REVIEW"] == 1
+        release_other.set()
+        model.release["REVIEW"].set()
+        await asyncio.wait_for(handle.task, 8)
+        final = await manager.get_job(runtime.actor(sid), handle.job_id)
+        assert final.cancel_requested_at is None and final.outcome == "failed"
+        assert final.resource_state == "unknown" and final.supervision_status == "open"
+        assert final.result["tolerated"] == ["BUILD"]
+        assert final.result["results"]["REVIEW"]["status"] == "completed"
+    finally:
+        release_other.set()
+
+
 @pytest.mark.parametrize("mode", ["exact_job", "missing", "outside", "both", "blank", "old_generation"])
 async def test_node_selector_is_exact_and_invalid_selection_never_stops_whole_run(managed_workflow, monkeypatch, mode):
     _, manager, runtime, loop, model, sid, state, _ = managed_workflow

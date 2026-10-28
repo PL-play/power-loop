@@ -258,6 +258,18 @@ async def collect_node(runtime, loop, raw, stop_event, *, timeout_s=1800, max_ro
 
     scope = _OWNER.get()
     if scope is not None and scope.runtime is runtime:
+        if raw.get("status") == "cancelled" and not stop_event.is_cancelled():
+            # The physical send heartbeat can observe the durable stop before
+            # the logical node heartbeat. Its private token does not propagate
+            # upward. Classify this original node's stop before returning early
+            # for unknown resources; otherwise the engine cancels the whole graph.
+            row = await runtime.manager._authorize(runtime.manager.db, scope.actor, scope.lease.job_id)
+            runtime.manager._check_proof(row, scope.lease)
+            if row["kind"] == "workflow_node" and row["cancel_requested_at"] is not None:
+                from .executor_lifecycle import signal_token
+
+                if not signal_token(stop_event, "durable node cancellation requested"):
+                    raise JobError("task_cancel_signal_unavailable")
         unresolved = await runtime.manager.db.fetchone(
             f"SELECT job_id FROM {runtime.manager.jobs} WHERE control_owner_job_id=? "
             "AND control_owner_generation=? AND resource_state='unknown' LIMIT 1",

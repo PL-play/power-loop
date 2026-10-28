@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+### Durable node cancellation
+
+- When a workflow node's physical send heartbeat observes a persisted stop first,
+  result collection now checks the original node's generation and cancellation
+  record before classifying the result. Stopping one node no longer races into
+  cancelling its workflow; unresolved execution and billing remain supervised.
+
 ### Subprocess group ownership
 
 - POSIX legacy workflow workers now run under a small SDK supervisor that owns

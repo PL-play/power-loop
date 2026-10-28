@@ -34,12 +34,46 @@ class NodeProvider(BoundedProvider):
         return await super().complete(request, **kwargs)
 
 
-@pytest.mark.parametrize(("native", "tool"), [(True, "workflow"), (True, "jobs"), (False, "workflow")])
-async def test_real_node_cancel_preserves_original_parallel_sibling_review_and_completion(tmp_path, record_property, native, tool):
+@pytest.mark.parametrize(("native", "tool", "delivery"), [
+    (True, "workflow", "local"), (True, "jobs", "local"), (False, "workflow", "local"),
+    (True, "workflow", "send_heartbeat"),
+])
+async def test_real_node_cancel_preserves_original_parallel_sibling_review_and_completion(
+    tmp_path, record_property, native, tool, delivery, monkeypatch
+):
     store = await SessionStore.open(str(tmp_path/"nodes.db"), **({"schema": "tasks"} if native else {}))
     runtime = TaskRuntime(JobManager(store), tenant_id="real-node-control", principal_id="host",
         executor_id="executor", boot_id="boot") if native else None
     provider = NodeProvider()
+    observed_send_stop, release_node_heartbeat = asyncio.Event(), asyncio.Event()
+    if delivery == "send_heartbeat":
+        from power_loop.runtime import task_control
+        from power_loop.runtime.jobs import JobError
+
+        runtime.lease_ms = 1500
+        manager = runtime.manager
+        claim, renew = manager.claim_job, manager.renew_execution
+
+        async def claim_long(actor, job_id, **kwargs):
+            return await claim(actor, job_id, **{**kwargs, "lease_ms": 300000})
+
+        async def send_first(actor, lease, **kwargs):
+            row = await manager._row(manager.db, lease.job_id)
+            if row["kind"] == "workflow_node" and row["title"] == "CALCULATE":
+                await release_node_heartbeat.wait()
+            try:
+                return await renew(actor, lease, **{**kwargs, "lease_ms": 300000})
+            except JobError as exc:
+                if row["kind"] == "send" and exc.code == "cancel_requested":
+                    observed_send_stop.set()
+                raise
+
+        async def no_signal(*args):
+            return 0
+
+        monkeypatch.setattr(manager, "claim_job", claim_long)
+        monkeypatch.setattr(manager, "renew_execution", send_first)
+        monkeypatch.setattr(task_control, "signal_local", no_signal)
     accepted, completed = [], []
     async def admission(value):
         accepted.append(value)
@@ -89,7 +123,13 @@ async def test_real_node_cancel_preserves_original_parallel_sibling_review_and_c
             raw = [m for m in messages if m.role == "tool" and m.name == tool][-1]
             receipt = json.loads(raw.content)
             assert receipt["status"] == "accepted" and receipt["control_pending"] and not receipt["resource_stop_confirmed"]
-            assert receipt["local_signals"] > 0 and not handle.task.done() and not handle.task.cancelling()
+            assert not handle.task.done() and not handle.task.cancelling()
+            if delivery == "send_heartbeat":
+                assert receipt["local_signals"] == 0
+                await asyncio.wait_for(observed_send_stop.wait(), 5)
+                record_property("first_cancel_observer", "physical_send_heartbeat")
+            else:
+                assert receipt["local_signals"] > 0
             if native:
                 assert receipt["job_id"] == node["job_id"]
                 operation = await manager.get_operation(actor, receipt["operation_id"])
@@ -115,6 +155,7 @@ async def test_real_node_cancel_preserves_original_parallel_sibling_review_and_c
                 assert view["status"] == "completed"
                 assert next(step for step in view["steps"] if step["node_id"] == "CALCULATE")["status"] == "cancelled"
     finally:
+        release_node_heartbeat.set()
         provider.release_children.set()
         try:
             await asyncio.wait_for(asyncio.gather(*(a.handle.task for a in accepted), return_exceptions=True), 15)
