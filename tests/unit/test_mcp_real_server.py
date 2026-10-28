@@ -70,31 +70,43 @@ async def test_register_then_direct_call_proxies_remote_name() -> None:
 
 
 @pytest.mark.parametrize("failure", ["exit", "cancel"])
-async def test_failed_connect_closes_original_server_before_return(monkeypatch, failure):
-    original = asyncio.create_subprocess_exec
+async def test_failed_connect_closes_original_server_before_return(monkeypatch, failure, record_property):
+    import mcp.client.stdio as stdio
+
+    original = stdio._create_platform_compatible_process
     processes = []
+    connecting_task = asyncio.current_task()
+    cancellation = None
 
     async def capture(*args, **kwargs):
+        nonlocal cancellation
         process = await original(*args, **kwargs)
         processes.append(process)
+        record_property("owned_process_pid", process.pid)
+        if failure == "cancel":
+            cancellation = asyncio.get_running_loop().call_later(.1, connecting_task.cancel)
         return process
 
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture)
+    monkeypatch.setattr(stdio, "_create_platform_compatible_process", capture)
     program = "raise SystemExit(3)" if failure == "exit" else "import time; time.sleep(60)"
     client = StdioMCPClient(sys.executable, ["-c", program])
     try:
         if failure == "cancel":
-            with pytest.raises(TimeoutError):
-                async with asyncio.timeout(.5):
-                    await client.connect()
+            with pytest.raises(asyncio.CancelledError):
+                await client.connect()
         else:
-            from mcp.shared.exceptions import McpError
-            with pytest.raises(McpError):
+            import mcp.shared.exceptions as errors
+            error_class = getattr(errors, "MCPError", getattr(errors, "McpError", None))
+            assert error_class is not None
+            with pytest.raises(error_class):
                 await client.connect()
         assert len(processes) == 1 and processes[0].returncode is not None
         assert client._stack is None and client._session is None
         await client.aclose()
     finally:
+        if cancellation is not None:
+            cancellation.cancel()
+            connecting_task.uncancel()
         # Use retained original process handles if the regression reappears.
         for process in processes:
             if process.returncode is None:

@@ -15,6 +15,8 @@
   subprocess cleanup to asynchronous-generator garbage collection.
 - Reject duplicate connections without losing the original cleanup handle.
   Real server fixtures support both MCP 1.x and 2.x server entry points.
+- Preserve tool parameter schemas with MCP 2.x's `input_schema` attribute as
+  well as MCP 1.x's `inputSchema`; real subprocess tests cover both versions.
 
 ### Shell output collection after stop
 

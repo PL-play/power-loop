@@ -166,7 +166,7 @@ class StdioMCPClient:
             McpToolSpec(
                 name=t.name,
                 description=getattr(t, "description", "") or "",
-                input_schema=dict(getattr(t, "inputSchema", None) or _EMPTY_SCHEMA),
+                input_schema=dict(getattr(t, "input_schema", getattr(t, "inputSchema", None)) or _EMPTY_SCHEMA),
             )
             for t in resp.tools
         ]
