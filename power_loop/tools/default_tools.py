@@ -1427,7 +1427,7 @@ class BackgroundManager:
                 try:
                     proc.wait(timeout=3)
                     stopped = stop_shell_target(target, task_id, variable=_BG_TAG_VAR, grace_s=0)
-                    proc.communicate(timeout=3)
+                    proc.drain_stopped_output(timeout=1)
                 except subprocess.TimeoutExpired:
                     stopped = ShellControlResult(False, "original_output_drain_unconfirmed")
                 with self._lock:
@@ -1470,7 +1470,7 @@ class BackgroundManager:
                 try:
                     proc.wait(timeout=3)
                     proof = stop_shell_target(target, task_id, variable=_BG_TAG_VAR, grace_s=0)
-                    proc.communicate(timeout=3)
+                    proc.drain_stopped_output(timeout=1)
                 except Exception:  # noqa: BLE001
                     proof = ShellControlResult(False, "failed_launch_cleanup_unconfirmed")
                 if not proof.confirmed:

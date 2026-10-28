@@ -171,3 +171,24 @@ class OwnedProcess:
                 input = None  # Popen retains the original input across drain retries.
                 if time.monotonic() >= bound:
                     raise
+
+    def drain_stopped_output(self, timeout=1):
+        """One bounded final collection after the original producer has exited.
+
+        Target cleanup can outlast communicate's cancellation deadline. Reusing
+        that expired deadline would time out before even reading an already
+        closed pipe. This call gets its own finite collection budget and closes
+        our descriptors even when a surviving external writer keeps them open.
+        """
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout <= 3:
+            raise ValueError('final output drain requires a finite budget of at most three seconds')
+        if self.process.poll() is None:
+            raise RuntimeError('original producer has not exited')
+        try:
+            output = self.process.communicate(timeout=timeout)
+            self._collect()
+            return output
+        finally:
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    stream.close()

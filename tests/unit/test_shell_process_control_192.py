@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import io
+import json
 import os
 import shlex
 import signal
@@ -194,7 +195,9 @@ async def test_timeout_kills_detached_process_and_drain_is_bounded(tmp_path, rec
     record_property('owned_process_pid', pid)
     record_property('owned_process_pid', manager.tasks[tid]['proc'].pid)
     task = await asyncio.wait_for(_settled(manager, tid), 8)
-    assert task['status'] == 'timeout'
+    stop_report = {key: task.get(key) for key in ('status', 'stop_confirmed', 'stop_error', 'result')}
+    record_property('shell_timeout_stop_report', json.dumps(stop_report))
+    assert task['status'] == 'timeout', stop_report
     await _gone(pid)
 
 
@@ -329,7 +332,9 @@ async def test_concurrent_stop_attempts_preserve_last_confirmed_result(tmp_path,
     record_property('owned_process_pid', manager.tasks[tid]['proc'].pid)
     results = await asyncio.gather(manager.cancel_task(tid, shell_term_s=0),
                                    manager.cancel_task(tid, shell_term_s=0))
-    assert results == ['unknown', 'stopped']
+    stop_report = {key: manager.tasks[tid].get(key) for key in ('status', 'stop_confirmed', 'stop_error', 'result')}
+    record_property('concurrent_stop_report', json.dumps(stop_report))
+    assert results == ['unknown', 'stopped'], stop_report
     assert manager.tasks[tid]['status'] == 'cancelled'
     await _gone(pid)
 

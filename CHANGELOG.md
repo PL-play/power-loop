@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### Shell output collection after stop
+
+- Give the exited original producer one separate, bounded final output drain.
+  A slow target cleanup no longer reuses an expired cancellation deadline and
+  falsely reports a stopped command as unconfirmed before reading closed pipes.
+- Refuse final draining while the original producer is alive; close collection
+  descriptors when the final bound expires. Uninspectable target processes still
+  remain unknown; no permission errors or resource checks are bypassed.
+
 ### Durable node cancellation
 
 - When a workflow node's physical send heartbeat observes a persisted stop first,

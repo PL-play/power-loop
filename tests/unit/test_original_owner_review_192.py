@@ -184,7 +184,10 @@ async def test_live_original_owner_reviews_aborted_batch_before_delivering_outpu
 async def wait_owned(c,kind,initial):
     from power_loop.runtime import delegation
     tasks = [c.state.handles[0].task] if kind=='workflow_node' else list(set(delegation._TASKS)-initial)
-    await asyncio.wait_for(asyncio.gather(*tasks,return_exceptions=True),150 if c.provider is not None else 12)
+    # This checks recovery/credit invariants, not a 12-second latency SLA.
+    # Independent full PG shards can take >12s for the same indexed transaction
+    # sequence; the execution's actual lease remains 300s and is not extended.
+    await asyncio.wait_for(asyncio.gather(*tasks,return_exceptions=True),150 if c.provider is not None else 30)
 
 
 @pytest.mark.parametrize('kind',['workflow_node','subagent'])
