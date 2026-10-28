@@ -7,9 +7,14 @@ pytest from collecting it as a test module.
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.mcpserver import MCPServer as Server
+except ModuleNotFoundError as exc:
+    if exc.name != "mcp.server.mcpserver":
+        raise
+    from mcp.server.fastmcp import FastMCP as Server
 
-server = FastMCP("power-loop-test-server")
+server = Server("power-loop-test-server")
 
 
 @server.tool()

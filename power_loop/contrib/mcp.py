@@ -136,6 +136,8 @@ class StdioMCPClient:
         self._stack: Any = None
 
     async def connect(self) -> StdioMCPClient:
+        if self._stack is not None:
+            raise RuntimeError("MCP client is already connected or awaiting cleanup")
         try:
             from contextlib import AsyncExitStack
 
@@ -146,10 +148,16 @@ class StdioMCPClient:
                 "StdioMCPClient needs the MCP SDK: pip install 'power-loop[mcp]'"
             ) from exc
         self._stack = AsyncExitStack()
-        params = StdioServerParameters(command=self._command, args=self._args, env=self._env)
-        read, write = await self._stack.enter_async_context(stdio_client(params))
-        self._session = await self._stack.enter_async_context(ClientSession(read, write))
-        await self._session.initialize()
+        try:
+            params = StdioServerParameters(command=self._command, args=self._args, env=self._env)
+            read, write = await self._stack.enter_async_context(stdio_client(params))
+            self._session = await self._stack.enter_async_context(ClientSession(read, write))
+            await self._session.initialize()
+        except BaseException:
+            # MCP contexts contain task-local AnyIO cancel scopes. Unwind here,
+            # in the original connecting task, not later via async-generator GC.
+            await self.aclose()
+            raise
         return self
 
     async def list_tools(self) -> list[McpToolSpec]:

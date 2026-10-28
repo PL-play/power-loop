@@ -8,6 +8,14 @@
 
 ## [Unreleased]
 
+### MCP connection cleanup
+
+- Unwind acquired stdio/session contexts in the original connecting task when
+  initialization fails or is cancelled. A failed handshake no longer leaves
+  subprocess cleanup to asynchronous-generator garbage collection.
+- Reject duplicate connections without losing the original cleanup handle.
+  Real server fixtures support both MCP 1.x and 2.x server entry points.
+
 ### Shell output collection after stop
 
 - Give the exited original producer one separate, bounded final output drain.

@@ -8,6 +8,7 @@ fake source. Skipped if the `mcp` SDK isn't installed.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -66,3 +67,36 @@ async def test_register_then_direct_call_proxies_remote_name() -> None:
         assert out == "Hello, Bob!"
     finally:
         await client.aclose()
+
+
+@pytest.mark.parametrize("failure", ["exit", "cancel"])
+async def test_failed_connect_closes_original_server_before_return(monkeypatch, failure):
+    original = asyncio.create_subprocess_exec
+    processes = []
+
+    async def capture(*args, **kwargs):
+        process = await original(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", capture)
+    program = "raise SystemExit(3)" if failure == "exit" else "import time; time.sleep(60)"
+    client = StdioMCPClient(sys.executable, ["-c", program])
+    try:
+        if failure == "cancel":
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(.5):
+                    await client.connect()
+        else:
+            from mcp.shared.exceptions import McpError
+            with pytest.raises(McpError):
+                await client.connect()
+        assert len(processes) == 1 and processes[0].returncode is not None
+        assert client._stack is None and client._session is None
+        await client.aclose()
+    finally:
+        # Use retained original process handles if the regression reappears.
+        for process in processes:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
