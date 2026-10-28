@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-ACTIVE_STATUSES = frozenset({'queued', 'pending', 'running'})
+ACTIVE_STATUSES = frozenset({'queued', 'pending', 'running', 'stopping', 'stop_unconfirmed'})
 RESULT_PREFIX = '[background_tool_results]\n'
 
 

@@ -1295,6 +1295,7 @@ class StatefulAgentLoop:
         ``wf:<run_id>`` / ``timer:<id>``), ``kind``, ``title``, ``status``, ``started_at`` (ms), and
         ``origin`` — the start of the user input of the send during which it was started, so a
         vague "stop" can be matched to the request it concerns."""
+        from power_loop.runtime.background import ACTIVE_STATUSES
         from power_loop.workflow.introspect import list_workflows
         from power_loop.workflow.runner import is_run_live
 
@@ -1320,7 +1321,7 @@ class StatefulAgentLoop:
             jobs.append({"id": "send", "kind": "foreground", "title": "当前这一轮",
                          "status": "running", "started_at": None, "origin": ""})
         for t in await store.list_background_tasks(session_id):
-            if t.status not in ("queued", "running"):
+            if t.status not in ACTIVE_STATUSES:
                 continue
             jobs.append({"id": f"bg:{t.task_id}", "kind": "background",
                          "title": str(t.command or "")[:80], "status": t.status,
@@ -1350,6 +1351,7 @@ class StatefulAgentLoop:
         the agent when it settles. ``result``: ``stopped`` (wound down in time) / ``forced`` (cut
         off at the limit) / ``finished`` (had already ended) / ``unknown`` / ``not_here`` (the
         foreground run is stopped by its caller's token, not from inside it)."""
+        from power_loop.runtime.background import ACTIVE_STATUSES
         from power_loop.tools.default_tools import BG
         from power_loop.workflow.runner import stop_run
 
@@ -1364,18 +1366,18 @@ class StatefulAgentLoop:
             row = await store.get_background_task(session_id, ref)
             if row is None:
                 result = "unknown"
-            elif row.status != "running":
+            elif row.status not in ACTIVE_STATUSES:
                 result = "finished"
             else:
                 result = await BG.cancel_task(ref, grace_s=pol.background_task_s,
                                               shell_term_s=pol.shell_term_s)
                 if result == "unknown":
-                    # Running per the ledger but not in this process (a restart orphaned it):
-                    # close the record so it stops showing as live.
+                    # Losing the original controller is not proof of exit.
+                    # Retain the obligation for control/reconciliation instead
+                    # of fabricating a stopped result after a restart.
                     await store.upsert_background_task(
-                        session_id, task_id=ref, command=row.command, status="cancelled",
-                        return_code=None, output_tail=(row.output_tail or "") + "\n(stopped)")
-                    result = "stopped"
+                        session_id, task_id=ref, command=row.command, status="stop_unconfirmed",
+                        return_code=None, output_tail=(row.output_tail or "") + "\n(stop unconfirmed)")
         elif kind == "wf" and ref:
             from power_loop.workflow import journal
             from power_loop.workflow.runner import get_run_handle

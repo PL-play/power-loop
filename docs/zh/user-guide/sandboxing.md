@@ -112,3 +112,23 @@ executor = SubprocessExecutor(
 - [Tools](tools.md) — `bash` 工具与工具预设
 - [Workflows](workflows.md) — 进程内与进程外执行器
 - [Configuration](configuration.md) — `RuntimeEnv` 与按 send 注入
+
+### 原执行目标的进程控制
+
+SDK在创建shell时绑定原argv、cwd和环境。停止时使用该绑定，不再调用launch_argv寻找或
+创建替换目标。宿主可实现 `bind_process_control(workspace_dir, *, argv, cwd, env)`，
+返回继承 `power_loop.runtime.process_control.ShellProcessControl` 的控制器。
+`stop_tagged(tag, *, variable, grace_s)` 返回 `ShellControlResult`，包含严格布尔值
+confirmed及可选错误文本。原身份、连接或实际退出不确定时必须返回未确认；不得在停止
+方法里按可复用名称寻找替换资源。
+
+默认控制器在原目标中执行随SDK提供的Python 3脚本，用Linux pidfd控制匹配原命令标签的
+进程，避免扫描PID后数字复用造成误杀。目标缺少Python、pidfd或所需权限时保留未知，
+不退回数字PID强杀。标签用于追踪配合的命令，不是对抗清除标签、远端工作等恶意行为的
+安全隔离边界；这些资源需要宿主更强的生命周期适配器。
+
+后台命令还由本地监督进程持有原组，通过专用管道取消。创建期间的取消不会丢失，停止后
+读取输出有时间上限。未确认停止继续显示在jobs中并阻止完成；重启后找不到原控制器不再
+伪报已停止。此扩展本身不放宽native受管任务的准入条件。
+
+默认控制器在提交命令前探测pidfd支持，记录原目标boot ID和探测进程的启动时间。更早的进程不可能是该命令的子进程；boot变化或无法读取的新同用户进程仍保持未确认。延迟状态回写与后续停止确认串行，旧未知结果不会覆盖新的已确认停止。

@@ -8,7 +8,7 @@ claimed it was sandboxed. It must now launch through ``env.shell_backend``.
 from __future__ import annotations
 
 import os
-import subprocess
+import shlex
 import time
 from collections.abc import Hashable
 from pathlib import Path
@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+from power_loop.tools import default_tools
 from power_loop.tools.default_tools import BackgroundManager
 
 pytestmark = pytest.mark.unit
@@ -64,7 +65,7 @@ async def test_background_run_launches_through_shell_backend(monkeypatch, tmp_pa
             captured["argv"] = argv
             captured["env"] = kw.get("env")
             captured["cwd"] = kw.get("cwd")
-            captured["new_session"] = kw.get("start_new_session")
+            captured["owned_supervision"] = True
 
         def communicate(self, input=None, timeout=None):
             captured["input"] = input
@@ -73,7 +74,7 @@ async def test_background_run_launches_through_shell_backend(monkeypatch, tmp_pa
         def poll(self):
             return 0
 
-    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(default_tools, "OwnedProcess", _FakePopen)
 
     mgr = BackgroundManager()
     with runtime_env_context(RuntimeEnv(workspace_dir=tmp_path, shell_backend=_MarkerBackend())):
@@ -85,11 +86,11 @@ async def test_background_run_launches_through_shell_backend(monkeypatch, tmp_pa
     # subprocess.run("echo hi", shell=True) on the host.
     assert captured["argv"] == ["/bin/bash", "--norc", "--noprofile"]
     # the command, preceded by the task tag every process of it inherits (a stop finds them by it)
-    assert captured["input"].splitlines()[-1] == "echo hi"
-    assert captured["input"].startswith(f"export PL_BG_TAG={task_id}")
+    assert shlex.split(captured["input"])[-1] == "echo hi"
+    assert captured["input"].startswith(f"exec env PL_BG_TAG={task_id}")
     assert captured["cwd"] == str(tmp_path)
     assert captured["env"].get("PL_SANDBOX_MARKER") == "sandbox-123"
-    assert captured["new_session"] is True   # its own process group: a stop reaches all of it
+    assert captured["owned_supervision"] is True   # its own process group: a stop reaches all of it
 
 
 async def test_background_run_executes_in_backend_environment(tmp_path) -> None:

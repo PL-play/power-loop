@@ -34,6 +34,13 @@ class ShellBackend(Protocol):
     host can tell that the execution target is still in use (e.g. keep a sandbox container from
     being reaped as idle while its persistent shell is busy with one command after another).
     Exceptions from it are logged and ignored.
+
+    Optional ``bind_process_control(workspace_dir, *, argv, cwd, env)`` returns
+    a ``runtime.process_control.ShellProcessControl`` bound to that ORIGINAL
+    launch target. It must never resolve a replacement by name during stop.
+    Without it, the SDK freezes argv/cwd/env and uses Python 3 + Linux pidfds
+    inside that target. Missing capabilities or transport errors are unknown,
+    not a successful stop. This hook does not grant native task admission.
     """
 
     def launch_argv(self, workspace_dir: Path) -> list[str]:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import difflib
 import fnmatch
 import functools
@@ -10,7 +9,7 @@ import logging
 import os
 import queue
 import re
-import signal
+import shlex
 import subprocess
 import threading
 import time
@@ -21,9 +20,11 @@ from pathlib import Path
 from typing import Any
 
 from power_loop.core.agent_context import get_ctx
+from power_loop.runtime.background import ACTIVE_STATUSES as _ACTIVE_BACKGROUND
 from power_loop.runtime.env import get_runtime_env, safe_path
 from power_loop.runtime.exec_backend import DEFAULT_SHELL_BACKEND, ShellBackend
 from power_loop.runtime.human_input import request_user_input
+from power_loop.runtime.process_control import OwnedProcess, ShellControlResult, bind_shell_control, stop_shell_target
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.skills import get_default_loader
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
@@ -450,18 +451,27 @@ class BashSession:
         except Exception:
             pass
 
-        env = self._backend.launch_env(self._cwd)
+        try:
+            env = self._backend.launch_env(self._cwd)
+            argv = self._backend.launch_argv(self._cwd)
+            cwd = self._backend.launch_cwd(self._cwd)
+            self._control_target = bind_shell_control(self._backend, self._cwd,
+                argv=argv, cwd=cwd, env=env)
 
-        self._proc = subprocess.Popen(
-            self._backend.launch_argv(self._cwd),
-            stdin=subprocess.PIPE,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            text=True,
-            bufsize=0,
-            cwd=self._backend.launch_cwd(self._cwd),
-            env=env,
-        )
+            self._proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                text=True,
+                bufsize=0,
+                cwd=cwd,
+                env=env,
+            )
+        except BaseException:
+            os.close(master_fd)
+            os.close(slave_fd)
+            raise
         os.close(slave_fd)
         self._master_fd = master_fd
         self._q = queue.Queue()
@@ -592,7 +602,9 @@ class BashSession:
             lines, exit_code = self._drain_until(sentinel, timeout=timeout)
             timed_out = exit_code is None
             if timed_out:
-                _kill_tagged(self._backend, self._cwd, tag, "KILL", var=_FG_TAG_VAR)
+                stopped = stop_shell_target(self._control_target, tag, variable=_FG_TAG_VAR, grace_s=0)
+                if not stopped.confirmed:
+                    lines.append("Process stop unconfirmed: " + str(stopped.error))
                 self._restart_locked()
 
         header = f"exit_code={exit_code or '?'}"
@@ -1239,30 +1251,12 @@ _BG_TAG_VAR = "PL_BG_TAG"
 _FG_TAG_VAR = "PL_FG_TAG"
 
 
-def _kill_tagged(backend: Any, workspace_dir: Any, task_id: str, sig: str, *, var: str = _BG_TAG_VAR) -> None:
-    """Signal every process whose environment carries ``<var>=<task_id>`` — run through the
-    task's own shell backend, so it executes where the command runs (the host, or inside the
-    sandbox container). Best-effort; a failure only means the local group signal is all we had."""
-    tag = f"{var}={task_id}"
-    script = (
-        f"for p in /proc/[0-9]*; do "
-        f"tr '\\0' '\\n' < \"$p/environ\" 2>/dev/null | grep -qx '{tag}' "
-        f"&& [ \"${{p#/proc/}}\" != \"$$\" ] && kill -{sig} \"${{p#/proc/}}\" 2>/dev/null; "
-        f"done; true\n"
-    )
-    try:
-        b = backend or DEFAULT_SHELL_BACKEND
-        wd = workspace_dir if isinstance(workspace_dir, Path) else Path(str(workspace_dir or "."))
-        subprocess.run(b.launch_argv(wd), input=script, text=True, capture_output=True,
-                       cwd=b.launch_cwd(wd), env=b.launch_env(wd), timeout=15)
-    except Exception:  # noqa: BLE001
-        logger.warning("background task %s: tagged kill failed", task_id, exc_info=True)
+class _CommandCancelledBeforeStart(Exception):
+    pass
 
 
-def _signal_group(proc: Any, sig: int) -> None:
-    """Signal ``proc``'s whole process group (it was started with start_new_session)."""
-    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-        os.killpg(proc.pid, sig)
+class _CommandStopRequested(Exception):
+    pass
 
 
 def _current_store_and_session() -> tuple[Any | None, str | None]:
@@ -1309,7 +1303,7 @@ class BackgroundManager:
         Running tasks are never evicted. Caller must hold ``self._lock``."""
         while len(self.tasks) > _MAX_BG_TASKS:
             for tid, t in self.tasks.items():  # insertion order = oldest first
-                if t.get("status") not in ("queued", "running"):
+                if t.get("status") not in _ACTIVE_BACKGROUND and tid not in self._threads:
                     del self.tasks[tid]
                     self._threads.pop(tid, None)
                     break
@@ -1331,7 +1325,7 @@ class BackgroundManager:
         if scope_err:
             return scope_err
 
-        task_id = str(uuid.uuid4())[:8]
+        task_id = uuid.uuid4().hex
         env = get_runtime_env()
         workspace_dir = env.require_workspace_dir()
         # Capture the injected ShellBackend HERE (the daemon thread below runs
@@ -1366,6 +1360,7 @@ class BackgroundManager:
                 "workspace_dir": workspace_dir,
                 "shell_backend": shell_backend,
                 "timeout_s": timeout_s,
+                "stop_finished": threading.Event(),
             }
             self._prune_locked()
 
@@ -1385,6 +1380,7 @@ class BackgroundManager:
         event_loop = None
         shell_backend: ShellBackend | None = None
         timeout_s = 300.0
+        proc = target = None
         with self._lock:
             task = self.tasks.get(task_id)
             if task is not None:
@@ -1399,53 +1395,86 @@ class BackgroundManager:
         try:
             if not isinstance(workspace_dir, Path):
                 raise RuntimeError("Background task is missing workspace_dir")
-            # Launch through the ShellBackend (same seam as `bash`): feed the command
-            # to the backend-launched shell's stdin so an installed sandbox actually
-            # contains it, instead of running shell=True on the host (C1). For the
-            # default LocalShellBackend this is an in-process bash, equivalent to the
-            # prior behavior; for a sandbox backend it runs inside the sandbox.
-            backend = shell_backend or DEFAULT_SHELL_BACKEND
-            # Popen in its OWN process group (design/124 §8.4): a stop / the timeout signals the
-            # whole group, not just the first process. The handle is kept on the task so
-            # cancel_task can reach it. (Under a sandbox backend the local process is the
-            # sandbox client; killing work INSIDE the sandbox is the backend's job.)
-            proc = subprocess.Popen(
-                backend.launch_argv(workspace_dir),
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                cwd=backend.launch_cwd(workspace_dir),
-                env=backend.launch_env(workspace_dir),
-                text=True, start_new_session=True,
-            )
             with self._lock:
-                if task_id in self.tasks:
-                    self.tasks[task_id]["proc"] = proc
+                if (self.tasks.get(task_id) or {}).get("stopped"):
+                    raise _CommandCancelledBeforeStart
+            backend = shell_backend or DEFAULT_SHELL_BACKEND
+            argv = backend.launch_argv(workspace_dir)
+            cwd, env = backend.launch_cwd(workspace_dir), backend.launch_env(workspace_dir)
+            target = bind_shell_control(backend, workspace_dir, argv=argv, cwd=cwd, env=env)
+            # Bind the exact target before launch. Cancellation uses this object,
+            # never a new backend lookup which could create a replacement target.
+            proc = OwnedProcess(argv, cwd=cwd, env=env)
+            with self._lock:
+                task = self.tasks[task_id]
+                task["proc"], task["control_target"] = proc, target
+                stopped = task.get("stopped", False)
+            if stopped:
+                proc.request_stop()
+                proc.communicate(timeout=3)
+                raise _CommandCancelledBeforeStart
             try:
-                # Tag every process of this task (children inherit the env): a stop can then find
-                # them wherever they run — including inside a sandbox, where the local process is
-                # only the sandbox client and its death doesn't reach the command.
                 out, err = proc.communicate(
-                    input=f"export {_BG_TAG_VAR}={task_id}\n{command}", timeout=timeout_s)
+                    input=f"exec env {_BG_TAG_VAR}={task_id} /bin/bash --norc --noprofile -c "
+                          + shlex.quote(command) + "\n", timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                _signal_group(proc, signal.SIGKILL)
-                out, err = proc.communicate()
+                with self._lock:
+                    cancelling = self.tasks[task_id].get("stopped", False)
+                if cancelling:
+                    self.tasks[task_id]["stop_finished"].wait(timeout=10)
+                    raise _CommandStopRequested from None
+                proc.request_stop()
+                try:
+                    proc.wait(timeout=3)
+                    stopped = stop_shell_target(target, task_id, variable=_BG_TAG_VAR, grace_s=0)
+                    proc.communicate(timeout=3)
+                except subprocess.TimeoutExpired:
+                    stopped = ShellControlResult(False, "original_output_drain_unconfirmed")
+                with self._lock:
+                    self.tasks[task_id]["stop_confirmed"] = stopped.confirmed
+                    self.tasks[task_id]["stop_error"] = stopped.error
                 raise
             output = _truncate_chars(((out or "") + (err or "")).strip())
             return_code = proc.returncode
             with self._lock:
                 stopped = bool((self.tasks.get(task_id) or {}).get("stopped"))
             if stopped:
-                status = "cancelled"
-                output = (output + "\n(stopped)").strip()
+                self.tasks[task_id]["stop_finished"].wait(timeout=10)
+                with self._lock:
+                    confirmed = self.tasks[task_id].get("stop_confirmed", False)
+                status = "cancelled" if confirmed else "stop_unconfirmed"
+                output = (output + "\n(" + status + ")").strip()
             else:
                 status = "completed" if return_code == 0 else f"failed({return_code})"
+        except _CommandStopRequested:
+            with self._lock:
+                confirmed = self.tasks[task_id].get("stop_confirmed", False)
+            output, status, return_code = "(stop requested)", "cancelled" if confirmed else "stop_unconfirmed", None
+        except _CommandCancelledBeforeStart:
+            output, status, return_code = "(cancelled before command submission)", "cancelled", None
+            with self._lock:
+                self.tasks[task_id]["stop_confirmed"] = True
         except subprocess.TimeoutExpired:
             output = f"Error: Timeout ({timeout_s:g}s)"
-            status = "timeout"
+            with self._lock:
+                confirmed = self.tasks[task_id].get("stop_confirmed", False)
+            status = "timeout" if confirmed else "stop_unconfirmed"
             return_code = None
         except Exception as e:  # pragma: no cover
             output = f"Error: {e}"
             status = "error"
             return_code = None
+
+            if proc is not None:
+                proc.request_stop()
+                try:
+                    proc.wait(timeout=3)
+                    proof = stop_shell_target(target, task_id, variable=_BG_TAG_VAR, grace_s=0)
+                    proc.communicate(timeout=3)
+                except Exception:  # noqa: BLE001
+                    proof = ShellControlResult(False, "failed_launch_cleanup_unconfirmed")
+                if not proof.confirmed:
+                    status = "stop_unconfirmed"
 
         with self._lock:
             task = self.tasks.get(task_id)
@@ -1496,7 +1525,7 @@ class BackgroundManager:
             # Only after a successful write-back (the host reads the row it is told about); a task
             # stopped by request doesn't wake anyone.
             cb = _TOOL_TASK_ON_COMPLETE
-            if delivered and cb is not None and status != "cancelled":
+            if delivered and cb is not None and status not in ("cancelled", "stopping", "stop_unconfirmed"):
                 try:
                     cb_fut = asyncio.run_coroutine_threadsafe(cb(sid, task_id, status), event_loop)
                     cb_fut.add_done_callback(functools.partial(_log_callback_failure, task_id))
@@ -1529,17 +1558,31 @@ class BackgroundManager:
                 (pending if mine else rest).append(o)
             self._orphaned = rest
         for o in pending:
-            try:
+            with self._lock:
+                current = self.tasks.get(o["task_id"])
+                if current is not None and (current.get("store") is not o["store"] or
+                                             current.get("session_id") != o["sid"]):
+                    current = None
+                gate = current.get("stop_lock") if current else None
+
+            async def save(o=o, current=current):
+                # A newer original stop may have resolved this old write-back.
+                # Serialize with that controller and use its latest proof.
+                if current is not None and current.get("stopped"):
+                    o.update(status=current["status"], output_tail=current.get("result") or "",
+                             return_code=None)
                 await store.upsert_background_task(
                     o["sid"], task_id=o["task_id"], command=o["command"],
-                    status=o["status"], return_code=o["return_code"],
-                    output_tail=o["output_tail"],
-                )
-            except Exception:  # pragma: no cover - keep for a later retry
-                logger.warning(
-                    "failed to flush deferred background status for task %s",
-                    o["task_id"], exc_info=True,
-                )
+                    status=o["status"], return_code=o["return_code"], output_tail=o["output_tail"])
+
+            try:
+                if gate is not None:
+                    async with gate:
+                        await save()
+                else:
+                    await save()
+            except Exception:  # keep the original record for a later retry
+                logger.warning("failed to flush background status for task %s", o["task_id"], exc_info=True)
                 with self._lock:
                     self._orphaned.append(o)
 
@@ -1807,30 +1850,68 @@ class BackgroundManager:
     async def _stop_shell(self, task_id: str, *, term_s: float) -> str:
         with self._lock:
             task = self.tasks.get(task_id)
-            proc = task.get("proc") if task else None
-            backend = task.get("shell_backend") if task else None
-            workspace_dir = task.get("workspace_dir") if task else None
-            if proc is not None:
-                task["stopped"] = True
+            if task is None:
+                return "unknown"
+            gate = task.setdefault("stop_lock", asyncio.Lock())
+        async with gate:
+            return await self._stop_shell_owned(task_id, term_s=term_s)
+
+    async def _stop_shell_owned(self, task_id: str, *, term_s: float) -> str:
+        with self._lock:
+            task = self.tasks.get(task_id)
+            if task is None:
+                return "unknown"
+            if task.get("status") not in _ACTIVE_BACKGROUND:
+                return "finished"
+            # Remember cancellation even while the launch is still in flight.
+            task["stopped"] = True
+            proc, target = task.get("proc"), task.get("control_target")
+            task["status"] = "stopping"
         if proc is None:
-            return "unknown"
-        if proc.poll() is not None:
-            return "finished"
-
-        async def _signal(sig: str) -> None:
-            # the local process group, and every process tagged with this task wherever it runs
-            _signal_group(proc, signal.SIGTERM if sig == "TERM" else signal.SIGKILL)
-            await asyncio.to_thread(_kill_tagged, backend, workspace_dir, task_id, sig)
-
-        await _signal("TERM")
+            return "pending"
+        proc.request_stop()
+        stopped = ShellControlResult(False, "original_stop_unconfirmed")
         try:
-            await asyncio.to_thread(proc.wait, term_s)
-            return "stopped"
-        except subprocess.TimeoutExpired:
-            await _signal("KILL")
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                await asyncio.to_thread(proc.wait, 5)
-            return "forced"
+            # Fence the local producer before scanning the original target for
+            # remote or detached descendants that outlived that producer.
+            await asyncio.to_thread(proc.wait, 3)
+            stopped = await asyncio.to_thread(stop_shell_target, target, task_id,
+                variable=_BG_TAG_VAR, grace_s=max(0, term_s))
+        except Exception:  # noqa: BLE001 — unknown resource must remain retryable
+            pass
+        finally:
+            with self._lock:
+                task["stop_confirmed"], task["stop_error"] = stopped.confirmed, stopped.error
+                task["stop_finished"].set()
+                collector = self._threads.get(task_id)
+        if collector is not None:
+            # Let the original collector persist its final state on the owning
+            # loop before any retry writes a newer control result.
+            await asyncio.to_thread(collector.join, 5)
+            if collector.is_alive():
+                return "pending"
+        with self._lock:
+            task["status"] = "cancelled" if stopped.confirmed else "stop_unconfirmed"
+            task["result"] = "(stopped)" if stopped.confirmed else "Stop unconfirmed: " + str(stopped.error)
+            store, sid = task.get("store"), task.get("session_id")
+        if store is not None and sid is not None:
+            payload = {"store": store, "sid": sid, "task_id": task_id, "command": task["command"],
+                       "status": task["status"], "return_code": proc.returncode, "output_tail": task["result"]}
+            try:
+                await store.upsert_background_task(sid, task_id=task_id,
+                    command=payload["command"], status=payload["status"],
+                    return_code=payload["return_code"], output_tail=payload["output_tail"])
+            except Exception:
+                with self._lock:
+                    self._orphaned = [o for o in self._orphaned if not
+                        (o["store"] is store and o["sid"] == sid and o["task_id"] == task_id)]
+                    self._orphaned.append(payload)
+                raise
+            else:
+                with self._lock:
+                    self._orphaned = [o for o in self._orphaned if not
+                        (o["store"] is store and o["sid"] == sid and o["task_id"] == task_id)]
+        return "stopped" if stopped.confirmed else "unknown"
 
     async def cancel_task(self, task_id: str, *, grace_s: float = 10.0,
                           shell_term_s: float = 5.0) -> str:
@@ -1894,10 +1975,10 @@ class BackgroundManager:
         ids = [str(x) for x in (task_ids or []) if str(x).strip()]
         if not ids:
             if store is not None and sid is not None:
-                ids = [r.task_id for r in await store.list_background_tasks(sid) if str(r.status) in ("queued", "running")]
+                ids = [r.task_id for r in await store.list_background_tasks(sid) if str(r.status) in _ACTIVE_BACKGROUND]
             else:
                 with self._lock:
-                    ids = [tid for tid, tk in self.tasks.items() if tk.get("status") in ("queued", "running")]
+                    ids = [tid for tid, tk in self.tasks.items() if tk.get("status") in _ACTIVE_BACKGROUND]
         if not ids:
             return "没有在跑的后台任务。"
         timeout_s = max(1.0, min(float(timeout_s or 600.0), 3600.0))
@@ -1907,7 +1988,7 @@ class BackgroundManager:
             end = loop.time() + timeout_s
             while loop.time() < end:
                 states = [(await self._status_of(store, sid, tid))[0] for tid in ids]
-                if all(s not in ("queued", "running", "unknown") for s in states):
+                if all(s not in (*_ACTIVE_BACKGROUND, "unknown") for s in states):
                     return
                 futs = {self._workers[tid] for tid in ids if tid in self._workers and not self._workers[tid].done()}
                 await asyncio.wait(futs or {asyncio.ensure_future(asyncio.sleep(1.0))}, timeout=1.0,
@@ -1920,7 +2001,7 @@ class BackgroundManager:
         pending = 0
         for tid in ids:
             status, tail = await self._status_of(store, sid, tid)
-            pending += status in ("queued", "running")
+            pending += status in _ACTIVE_BACKGROUND
             lines.append(f"{tid}: [{status}] {tail[-1500:] if tail else ''}".rstrip())
         head = ("等的时候来了新消息，先停下来等（任务照常在跑）。" if steered
                 else f"还有 {pending} 件没做完（等了 {int(timeout_s)} 秒，任务照常在跑）。" if pending

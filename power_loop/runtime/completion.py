@@ -12,10 +12,10 @@ import math
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
+from .background import ACTIVE_STATUSES as ACTIVE
 from .cancellation import CancellationToken
 from .original_owner_review import invoke
 
-ACTIVE = frozenset({"queued", "pending", "running"})
 FINALIZE_PROMPT = (
     "Your workflow task ended without a final answer. Using only the work and evidence already "
     "in this session, write the requested final result now as a non-empty plain-text assistant "

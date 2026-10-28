@@ -28,8 +28,13 @@ def _signal_owned_group(sig: int) -> None:
 
 
 def main() -> int:
-    control_fd, grace = int(sys.argv[1]), float(sys.argv[2])
-    command = sys.argv[3:]
+    args = sys.argv[1:]
+    result_fd = None
+    if args[0] == '--result-fd':
+        result_fd = int(args[1])
+        args = args[2:]
+    control_fd, grace = int(args[0]), float(args[1])
+    command = args[2:]
     if not command or grace < 0:
         raise ValueError("invalid worker guard arguments")
     _owned_group()
@@ -55,6 +60,8 @@ def main() -> int:
         while child.poll() is None and not cancelled:
             if pipe_closed(0.05):
                 cancelled = True
+        if result_fd is not None and not cancelled:
+            os.write(result_fd, str(child.returncode).encode('ascii'))
         if cancelled:
             _signal_owned_group(signal.SIGTERM)
             deadline = time.monotonic() + grace

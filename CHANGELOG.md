@@ -20,6 +20,21 @@
   detached sessions, remote launcher resources and a killed supervisor still need
   explicit host lifecycle control. Native admission restrictions remain unchanged.
 
+### Original shell target control
+
+- Background shell cancellation is recorded before process registration and uses
+  a live local supervisor, never a cached PGID. Cancellation and timeout bound
+  output draining even if escaped descendants hold the pipe open.
+- Freeze the original shell target at launch. The default target controller uses
+  Linux pidfds after rechecking the original command tag, including for detached
+  children. It does not resolve/create a replacement target during cancellation.
+- Add the optional `ShellBackend.bind_process_control` extension returning a
+  `ShellProcessControl`; host implementations report `ShellControlResult`.
+  Adapter errors, inaccessible targets and unavailable pidfds remain unknown.
+- `stop_unconfirmed` remains active in legacy jobs and workflow completion checks.
+  A missing controller after restart no longer fabricates a cancelled ledger row.
+  Native task admission remains governed by its existing lifecycle contracts.
+
 ## [9.0.0rc1] — candidate, not published
 
 ### Compatibility and deployment

@@ -113,3 +113,30 @@ See [example 30](../../../examples/30_subprocess_isolation.py) for a runnable ve
 - [Tools](tools.md) — the `bash` tool and tool presets
 - [Workflows](workflows.md) — the in-process vs out-of-process executors
 - [Configuration](configuration.md) — `RuntimeEnv` and per-send injection
+
+### Original-target process control
+
+At shell creation the SDK binds the original argv, cwd and environment. Later
+cancellation uses that bound target; it does not call `launch_argv` again. A host
+may implement `bind_process_control(workspace_dir, *, argv, cwd, env)` and return
+an instance of `power_loop.runtime.process_control.ShellProcessControl`.
+Its `stop_tagged(tag, *, variable, grace_s)` returns `ShellControlResult` with a
+strict boolean `confirmed` and an optional error string. Return unconfirmed when
+original resource identity, transport or physical exit is uncertain. Never
+resolve a replacement resource by reusable name inside this method.
+
+The default bound controller runs a bundled Python 3 helper in the original
+shell target. Linux pidfds prevent a PID discovered during a tag scan from
+becoming authority to kill a later replacement. This requires Python 3 and pidfd
+support/permission in the target. A missing capability remains unconfirmed;
+there is no fallback to numeric PID kills. Command tags track cooperative
+processes and are not a security boundary against hostile commands that remove
+their tags or create remote work. Such resources need a stronger host adapter.
+
+Background commands also have a local supervisor and an original cancellation
+pipe. Creation-time cancellation is remembered; draining output after stop is
+bounded. Failed stop confirmation remains visible in jobs and blocks completion,
+including after the original controller is lost at restart. This extension does
+not on its own admit shell work into native managed-task execution.
+
+Before submitting a command, the default controller probes pidfd support and records the original target boot ID and probe process start time. Processes older than that probe cannot be descendants of the command; a changed boot or an unreadable newer owned-user process remains unconfirmed. Deferred status writes are serialized with later stop confirmation so old unknown receipts cannot overwrite a confirmed stop.
