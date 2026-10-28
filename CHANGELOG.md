@@ -8,6 +8,18 @@
 
 ## [Unreleased]
 
+### Subprocess group ownership
+
+- POSIX legacy workflow workers now run under a small SDK supervisor that owns
+  their process group. Cancellation closes an original pipe; caller death also
+  triggers cleanup. The caller never signals a cached PGID after worker exit.
+- Preserve worker result frames and private databases; stop same-group descendants
+  even when the direct worker exits or ignores TERM. Cancellation during spawn
+  retains the original descriptors until creation settles.
+- This is local compatibility cleanup, not a native lifecycle adapter or sandbox:
+  detached sessions, remote launcher resources and a killed supervisor still need
+  explicit host lifecycle control. Native admission restrictions remain unchanged.
+
 ## [9.0.0rc1] — candidate, not published
 
 ### Compatibility and deployment

@@ -97,6 +97,16 @@ register_workflow_tools(registry)   # adds create_workflow + workflow_status
 
 ## Out-of-process (`SubprocessExecutor`)（进程外）
 
+POSIX 下，每个 worker 由 SDK 内部的监督进程持有原进程组。取消叶子时关闭专用
+控制管道；调用方进程崩溃也会关闭管道。监督进程对自己仍持有的组执行有界 TERM/KILL，
+清理原 worker 及同组孙进程。调用方不再按缓存 PGID 发信号，避免数字复用后误杀。
+worker 的结果帧和数据库格式不变，监督进程最后由信号退出属于预期。
+
+这不隔离主动创建新 session 的命令或远端资源，也不能在监督进程本身被强杀后证明
+这些资源已经停止。这类 launcher 仍需要显式生命周期适配器；旧的独立数据库
+executor 仍不允许进入 native 受管任务模式。
+
+
 **让每个叶子运行在自己的操作系统进程里，对应自己的 SQLite 文件**，这样「每文件单写者」规则得以轻松成立，且一个崩溃 / 被杀 / 超时的叶子无法破坏编排器或它的兄弟节点。
 
 ```python

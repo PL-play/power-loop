@@ -97,6 +97,19 @@ The engine runs leaves through an `Executor`. Two ship in the box.
 
 ### Out-of-process (`SubprocessExecutor`)
 
+On POSIX, a small SDK supervisor owns each worker's process group. Cancelling a
+leaf closes its private control pipe; caller process death closes it as well.
+The supervisor performs bounded TERM/KILL cleanup of its own live group, including
+same-group descendants after the direct worker exits. The caller never sends
+signals using a cached numeric PGID. Worker result frames and databases retain
+their existing format; the supervisor's final signal exit is expected.
+
+This does not contain commands that create another session or remote resources,
+and cannot prove those resources stopped if the supervisor itself is killed.
+Such launchers need an explicit lifecycle adapter. The legacy separate-database
+executor remains unavailable under native managed-task admission.
+
+
 Run **each leaf in its own OS process against its own SQLite file**, so the one-writer-per-file rule holds trivially and a crashed/killed/timed-out leaf can't corrupt the orchestrator or its siblings.
 
 ```python

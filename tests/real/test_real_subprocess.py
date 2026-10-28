@@ -11,7 +11,6 @@ Skipped when no provider env is set (or with --no-real). See tests/conftest.py.
 from __future__ import annotations
 
 import os
-import tempfile
 
 import pytest
 
@@ -27,8 +26,8 @@ from power_loop.workflow.engine import WorkflowEngine
 pytestmark = pytest.mark.real_llm
 
 
-async def test_leaf_runs_real_model_in_subprocess() -> None:
-    runs = tempfile.mkdtemp(prefix="wf_real_")
+async def test_leaf_runs_real_model_in_subprocess(tmp_path, record_property) -> None:
+    runs = str(tmp_path / "runs")
     ex = SubprocessExecutor(
         bootstrap=WorkerBootstrap(llm_from_env=True),  # child rebuilds the real provider from env
         runs_dir=runs,
@@ -45,16 +44,21 @@ async def test_leaf_runs_real_model_in_subprocess() -> None:
                  "input": "What is the capital of {{input}}?"},
     })
 
-    res = await WorkflowEngine(loop, executor=ex, run_id="real1").run(spec)
-
-    assert res.status == "completed", res.errors
-    leaf = res.results["q"]
-    assert "paris" in leaf.text.lower()
-    # The leaf ran in its own db file, inspectable afterward.
-    db_path = leaf.session_id and next(iter(os.listdir(os.path.join(runs, "real1"))), None)
-    assert db_path is not None
-    store = await SessionStore.open(os.path.join(runs, "real1", db_path))
     try:
-        assert any(m.role == "assistant" for m in await store.load_all_messages(leaf.session_id))
+        res = await WorkflowEngine(loop, executor=ex, run_id="real1").run(spec)
+        record_property("real_provider_requests", sum(r.usage.get("calls", 0) for r in res.results.values()))
+        record_property("reported_tokens", res.usage.get("total_tokens", 0))
+        assert res.status == "completed", res.errors
+        leaf = res.results["q"]
+        assert "paris" in leaf.text.lower()
+        assert leaf.usage.get("calls", 0) > 0
+        # The original child database remains inspectable after guard cleanup.
+        db_path = leaf.session_id and next(iter(os.listdir(os.path.join(runs, "real1"))), None)
+        assert db_path is not None
+        store = await SessionStore.open(os.path.join(runs, "real1", db_path))
+        try:
+            assert any(m.role == "assistant" for m in await store.load_all_messages(leaf.session_id))
+        finally:
+            await store.close()
     finally:
-        await store.close()
+        await loop.aclose()
