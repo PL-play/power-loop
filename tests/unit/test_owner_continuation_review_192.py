@@ -276,7 +276,10 @@ async def test_later_original_generation_reviews_before_output_without_mutating_
     c = await continuation_case(registry_store, kind, stage=stage)
     try:
         await complete_initial(c, kind)
-        await asyncio.wait_for(c.state.entered.wait(), 3)
+        # Review admission includes durable recovery and budget transactions.
+        # Use the same bounded phase watchdog as continuation/restoration;
+        # this test has no separate three-second latency requirement.
+        await asyncio.wait_for(c.state.entered.wait(), c.state.timeout)
         assert c.state.counts["AFTER"] == c.state.baseline_after
         assert len(c.state.notifications) == c.state.baseline_notifications and not c.state.effects
         assert (await c.store.inbox_counts(c.state.root))["pending"] == 0
@@ -306,6 +309,31 @@ async def test_later_original_generation_reviews_before_output_without_mutating_
         c.state.release.set()
         await c.runtime.shutdown(timeout_s=3)
         await c.loop.aclose(drain_timeout_s=0.1)
+
+
+async def test_slow_original_review_preserves_same_result_and_credit_invariants(registry_store, monkeypatch):
+    original_factory = continuation_case
+    delayed = []
+
+    async def slow_factory(*args, **kwargs):
+        c = await original_factory(*args, **kwargs)
+        complete = c.model.complete
+
+        async def slow_review(request, **options):
+            if get_session_id() != c.state.root and c.state.source and not delayed:
+                delayed.append(True)
+                # Deliberately exceed the former phase timeout. No additional
+                # model attempt, budget grant, or business action is introduced.
+                await asyncio.sleep(3.2)
+            return await complete(request, **options)
+
+        c.model.complete = slow_review
+        return c
+
+    monkeypatch.setitem(globals(), "continuation_case", slow_factory)
+    await test_later_original_generation_reviews_before_output_without_mutating_old_revision(
+        registry_store, "workflow_node", "commit_ack")
+    assert delayed == [True]
 
 
 @pytest.mark.parametrize("kind", ["workflow_node", "subagent"])
