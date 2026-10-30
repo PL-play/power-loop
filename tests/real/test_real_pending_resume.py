@@ -45,7 +45,7 @@ async def test_pending_blocks_then_abort_clears_then_send_works() -> None:
     store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0.2),
+            llm=make_llm(max_tokens=2048, temperature=0.2),
             store=store,
             config=AgentLoopConfig(
                 system_prompt=(
@@ -53,7 +53,7 @@ async def test_pending_blocks_then_abort_clears_then_send_works() -> None:
                     "aborted, simply acknowledge briefly and proceed with "
                     "the user's new request."
                 ),
-                max_rounds=2, max_tokens=256, temperature=0.2,
+                max_rounds=2, max_tokens=2048, temperature=0.2,
                 compactor=None,
             ),
             tool_registry=_noop_registry(),

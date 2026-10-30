@@ -7,11 +7,10 @@ What you learn / 你将学到
 - 父 LLM 自主决定 ``spawn_agent`` → 自动新建子 session，跑独立的小循环
   / parent LLM autonomously calls ``spawn_agent`` → creates child session, runs
   independent sub-loop
-- 子结果作为 ``tool`` 消息回灌父 session
-  / child result fed back to parent as a ``tool`` message
-- ``EPHEMERAL`` 生命周期：子 session 完成后从 SessionStore 物理删除（保留失败者供 debug）
-  / ``EPHEMERAL`` lifecycle: child session physically deleted on success (failures
-  preserved for debugging)
+- 子结果进入父 session 的 inbox，宿主调用 ``flush_follow_ups`` 续接
+  / child result arrives in the parent's inbox; the host resumes with ``flush_follow_ups``
+- ``LINKED`` 生命周期：完成后保留子 session，可查看记录或续接原任务
+  / ``LINKED`` lifecycle: retain the child's history for inspection or continuation
 - ``store.list_children(parent_sid)`` 查看父下还存活的子 session
   / inspect surviving child sessions under a parent
 
@@ -72,8 +71,8 @@ async def main() -> str:
             result = continued
         print(f"status        : {result.status}, rounds: {result.rounds}")
         print(f"reply         : {result.final_text}")
-        # EPHEMERAL：子会话已删，list_children 返回空
-        # EPHEMERAL: child session deleted, list_children returns empty
+        # LINKED：完成后仍保留原子会话。
+        # LINKED: the original child session remains available after completion.
         print(f"surviving subs: {await store.list_children(result.session_id)}")
         return result.final_text
     finally:

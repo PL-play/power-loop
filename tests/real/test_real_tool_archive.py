@@ -36,7 +36,7 @@ async def test_real_provider_accepts_capacity_archive_and_next_send():
         assert len(calls) == 1
         state = await store.get_runtime_state(sid, TOOL_CONTEXT_STATE_KEY, {})
         assert state['archive']['events']
-        assert not state['attempts']  # zero auxiliary summary calls
+        assert 'attempts' not in state  # archive-only state has no auxiliary summary attempts
         original = next(r for r in await store.load_all_messages(sid) if r.role == 'tool')
         assert original.content == 'ARCHIVE_PROTOCOL_FIXTURE\n' * 5000
         result = await loop.send('Do not use tools. Reply SECOND_OK.', session_id=sid)

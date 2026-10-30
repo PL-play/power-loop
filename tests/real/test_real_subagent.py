@@ -1,6 +1,6 @@
 """Real-LLM check that spawn_agent / run_agent route through StatefulAgentLoop
 correctly: parent delegates → child session is created with parent linking →
-child's answer flows back as a tool result → parent integrates it.
+child's answer arrives through the inbox → parent integrates it.
 
 Quality of the child's answer is rated by the judge agent.
 """
@@ -28,29 +28,29 @@ from power_loop.tools.spawn_agent import register_spawn_agent
 
 from ._llm import make_llm
 from .judge import assert_passes
+from .test_real_async_boundaries_192 import settle_children
 
 
 @pytest.mark.asyncio
 async def test_parent_can_spawn_subagent_via_tool() -> None:
     """End-to-end: parent LLM should choose to call spawn_agent and surface
-    the child's answer. We verify that a child session was created and
-    cleaned up (EPHEMERAL default = delete on completed)."""
+    the child's answer. The linked child remains available after completion."""
     store = await SessionStore.open(":memory:")
     try:
         registry = ToolRegistry()
         register_spawn_agent(registry)
         loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=512, temperature=0),
+            llm=make_llm(max_tokens=2048, temperature=0),
             store=store,
             config=AgentLoopConfig(
                 system_prompt=(
                     "You delegate research tasks. For any factual or "
                     "research-style question, call the `spawn_agent` tool "
-                    "with a clear task description; do not answer from "
+                    "exactly once with a clear task description; do not answer from "
                     "memory. After the sub-agent replies, summarize its "
                     "answer for the user."
                 ),
-                max_rounds=5, max_tokens=512, temperature=0,
+                max_rounds=5, max_tokens=2048, temperature=0,
                 compactor=None,
             ),
             tool_registry=registry,
@@ -59,8 +59,14 @@ async def test_parent_can_spawn_subagent_via_tool() -> None:
         sid = await loop.new_session()
         r = await loop.send(q, session_id=sid)
         assert r.status == "completed"
-        # All EPHEMERAL children should be cleaned up by now.
-        assert await store.list_children(r.session_id) == []
+        await settle_children()
+        children = await store.list_children(sid)
+        assert len(children) == 1
+        assert children[0].lifecycle is SubagentLifecycle.LINKED
+        continued = await loop.flush_follow_ups(sid, tools=[])
+        if continued is not None:
+            r = continued
+        assert r.status == "completed"
         await assert_passes(
             question=q,
             answer=r.final_text,
@@ -70,6 +76,7 @@ async def test_parent_can_spawn_subagent_via_tool() -> None:
             ),
         )
     finally:
+        await loop.aclose(drain_timeout_s=0.1)
         await store.close()
 
 
@@ -144,7 +151,7 @@ _TICKET = {
 @pytest.mark.asyncio
 async def test_spawn_agent_returns_parsed_json_without_native_json_schema() -> None:
     """deepseek-flash rejects native json_schema; undeclared capability → the schema is written
-    into the child's system prompt instead, and the tool hands back parsed, compact JSON."""
+    into the child's system prompt instead; its asynchronous result contains parsed JSON."""
     import json
 
     from power_loop.tools.spawn_agent import _handle_spawn_agent
@@ -166,9 +173,14 @@ async def test_spawn_agent_returns_parsed_json_without_native_json_schema() -> N
         finally:
             reset_current_loop(tok_loop)
             reset_session_id(tok_sid)
-        assert out.startswith("结构化结果："), out
-        value = json.loads(out[len("结构化结果："):])
+        accepted = json.loads(out)
+        assert accepted["status"] == "queued"
+        await settle_children()
+        result = (await store.get_runtime_state(parent, "subagent:run:" + accepted["run_id"]))["result"]
+        assert result["status"] == "completed", result
+        value = result["payload"]
         assert value["priority"] == "urgent", value
         assert isinstance(value["team"], str) and value["team"].strip(), value
     finally:
+        await loop.aclose(drain_timeout_s=0.1)
         await store.close()
