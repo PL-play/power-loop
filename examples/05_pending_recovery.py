@@ -39,12 +39,14 @@ from power_loop import (
     ToolDefinition,
     ToolRegistry,
 )
+from power_loop.runtime.pricing import Free
 
 
 def _build_registry() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
         ToolDefinition(
+            pricing=Free("local example tool"),
             name="echo",
             description="Echo input.",
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}},

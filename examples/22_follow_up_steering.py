@@ -28,6 +28,7 @@ from power_loop import (
     ToolDefinition,
     ToolRegistry,
 )
+from power_loop.runtime.pricing import Free
 
 DEFAULT_STEERING = (
     "Before you finish, your final answer MUST include the exact word STEERED "
@@ -44,6 +45,7 @@ Rules:
 """
 
 ECHO_TOOL = ToolDefinition(
+    pricing=Free("local example tool"),
     name="echo",
     description="Repeat the given text verbatim.",
     input_schema={

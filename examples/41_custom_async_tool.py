@@ -40,6 +40,7 @@ from power_loop import (
     ToolRegistry,
     get_tool_runtime_context,
 )
+from power_loop.runtime.pricing import Free
 
 # A stand-in for "your async system" (a DB export, an HTTP job, a render farm…). Keyed by job id.
 _JOBS: dict[str, dict[str, Any]] = {}
@@ -79,6 +80,7 @@ def _build_registry() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
         ToolDefinition(
+            pricing=Free("local example tool"),
             name="start_job",
             description="Begin a long background job; you'll be reminded to check its result.",
             input_schema={"type": "object", "properties": {"label": {"type": "string"}}, "required": ["label"]},
@@ -88,6 +90,7 @@ def _build_registry() -> ToolRegistry:
     )
     reg.register(
         ToolDefinition(
+            pricing=Free("local example tool"),
             name="check_job",
             description="Check a job's status/result by its id.",
             input_schema={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]},

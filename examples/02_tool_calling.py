@@ -5,6 +5,7 @@ What you learn / 你将学到
 - :class:`ToolDefinition` 声明工具名 / 描述 / JSON Schema / required 参数
   / declares tool name / description / JSON Schema / required params
 - :class:`ToolRegistry` 注册定义 → handler / registers definition → handler
+- 每个工具必须声明 pricing；本地查询使用 Free / every tool declares pricing; this local lookup uses Free
 - 模型看到工具描述 → 自主决定调用 → power-loop 转发参数 → handler 返回字符串 → 模型继续
   / model sees tool descriptions → decides to call → power-loop forwards args →
   handler returns string → model continues
@@ -35,6 +36,7 @@ from power_loop import (
     ToolDefinition,
     ToolRegistry,
 )
+from power_loop.runtime.pricing import Free
 
 # ── 1. 定义工具 / Define tools ──────────────────────────────────────────
 
@@ -54,6 +56,7 @@ def lookup_dish(**kwargs) -> str:
 
 
 LOOKUP_TOOL = ToolDefinition(
+    pricing=Free("local example tool"),
     name="lookup_dish",
     description="Return the signature local dish for a given city.",
     input_schema={

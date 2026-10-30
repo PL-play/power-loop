@@ -42,7 +42,7 @@ async def main() -> str:
     store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
-            llm=make_llm(),
+            llm=make_llm(max_tokens=2048),
             store=store,
             tool_registry=registry,
             config=AgentLoopConfig(
@@ -53,6 +53,7 @@ async def main() -> str:
                     "the sub-agent replies, summarize it in one sentence."
                 ),
                 max_rounds=5,
+                max_tokens=2048,
                 compactor=None,
             ),
         )
@@ -61,6 +62,14 @@ async def main() -> str:
             "Delegate this and report back: what is the capital of Japan?",
             session_id=sid,
         )
+        # 接受回执后子任务仍在运行；宿主等待完成，再消费已入箱的结果。
+        # Acceptance is asynchronous: wait for the child, then consume its inbox result.
+        async with asyncio.timeout(120):
+            while any(job["kind"] == "subagent" for job in await loop.list_jobs(sid)):
+                await asyncio.sleep(0.05)
+        continued = await loop.flush_follow_ups(sid, tools=[])
+        if continued is not None:
+            result = continued
         print(f"status        : {result.status}, rounds: {result.rounds}")
         print(f"reply         : {result.final_text}")
         # EPHEMERAL：子会话已删，list_children 返回空

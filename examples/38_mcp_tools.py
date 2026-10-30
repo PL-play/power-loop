@@ -24,6 +24,7 @@ from _helpers import make_llm
 
 from power_loop import AgentLoopConfig, StatefulAgentLoop
 from power_loop.contrib.mcp import StdioMCPClient, register_mcp_tools
+from power_loop.runtime.pricing import Free
 
 # A tiny real MCP server, launched as a subprocess over stdio (python -c …).
 _MCP_SERVER = """
@@ -50,7 +51,10 @@ async def main() -> str:
                 max_rounds=4,
             ),
         )
-        names = await register_mcp_tools(loop.tool_registry or _new_registry(loop), client, prefix="mcp_")
+        names = await register_mcp_tools(
+            loop.tool_registry or _new_registry(loop), client,
+            pricing=Free("local arithmetic MCP server"), prefix="mcp_",
+        )
         sid = await loop.new_session()
         result = await loop.send("What is 21 + 21? Use the add tool.", session_id=sid, tools=names)
         summary = f"registered {names} | answer={result.final_text!r}"

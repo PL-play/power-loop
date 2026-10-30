@@ -46,6 +46,7 @@ from power_loop.core.agent_context import (
     set_current_loop,
     set_session_id,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec
 
 # ── 1. 父 registry：提供 calculator + spawn meta-tool ─────────────────────
@@ -66,6 +67,7 @@ def _build_parent_registry() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
         ToolDefinition(
+            pricing=Free("local example tool"),
             name="calc",
             description="Evaluate a simple arithmetic expression.",
             input_schema={
@@ -94,18 +96,22 @@ async def via_meta_tool() -> str:
     store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=512, temperature=0),
+            llm=make_llm(max_tokens=2048, temperature=0),
             store=store,
             tool_registry=_build_parent_registry(),
             config=AgentLoopConfig(
                 system_prompt=(
                     "You are an orchestrator. For math sub-tasks, call "
                     "`spawn_agent` with: a `system_prompt` telling the "
-                    "sub-agent to compute and reply with the number only, "
+                    "sub-agent to compute and return the number in an assistant text response, "
+                    "without calling pass_turn, "
                     "a `tools` list whitelisting ['calc'], and "
-                    "`max_rounds` set to 3. Report the sub-agent's answer."
+                    "`max_rounds` set to 3. After acceptance, reply WAITING. "
+                    "When the subagent_result arrives, report its number in assistant text "
+                    "without calling pass_turn or starting more work."
                 ),
                 max_rounds=6,
+                max_tokens=2048,
                 compactor=None,
             ),
         )
@@ -115,6 +121,13 @@ async def via_meta_tool() -> str:
             "what is (17 + 25) × 3?",
             session_id=sid,
         )
+        # spawn_agent returns acceptance; the child result arrives through the inbox.
+        async with asyncio.timeout(120):
+            while any(job["kind"] == "subagent" for job in await loop.list_jobs(sid)):
+                await asyncio.sleep(0.05)
+        continued = await loop.flush_follow_ups(sid, tools=[])
+        if continued is not None:
+            r = continued
         print("[via_meta_tool]")
         print(f"  status : {r.status}, rounds: {r.rounds}")
         print(f"  reply  : {r.final_text}\n")
@@ -133,7 +146,7 @@ async def direct_call() -> str:
     store = await SessionStore.open(":memory:")
     try:
         parent_loop = StatefulAgentLoop(
-            llm=make_llm(max_tokens=256, temperature=0),
+            llm=make_llm(max_tokens=2048, temperature=0),
             store=store,
             tool_registry=_build_parent_registry(),
             config=AgentLoopConfig(
@@ -150,7 +163,7 @@ async def direct_call() -> str:
             system_prompt="Compute the expression. Reply with the number only.",
             tools=["calc"],                                  # 只白名单 calc / whitelist only calc
             max_rounds=3,
-            max_tokens=128,
+            max_tokens=2048,
             lifecycle=SubagentLifecycle.LINKED.value,         # 保留供审计 / preserve for audit
         )
 

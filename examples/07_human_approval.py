@@ -58,6 +58,7 @@ from power_loop import (
     ToolRegistry,
 )
 from power_loop.contracts.hook_contexts import ToolBeforeCtx
+from power_loop.runtime.pricing import Free
 
 # ── 1. 一个简单的 bash 工具 / A simple bash tool ─────────────────────────
 
@@ -77,6 +78,7 @@ def fake_bash(**kwargs) -> str:
 
 
 BASH_TOOL = ToolDefinition(
+    pricing=Free("local example tool"),
     name="bash",
     description="Run a shell command and return its stdout.",
     input_schema={

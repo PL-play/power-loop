@@ -47,6 +47,7 @@ from power_loop import (
 )
 from power_loop.contracts.hook_contexts import ToolBeforeCtx
 from power_loop.core.agent_context import get_session_id
+from power_loop.runtime.pricing import Free
 
 # ── 1. 工具：一个能记录每个 session 在干什么的 bash 替身 ────────────────
 #    Tool: a bash stub that records what each session is doing
@@ -58,6 +59,7 @@ def fake_bash(**kwargs) -> str:
 
 
 BASH_TOOL = ToolDefinition(
+    pricing=Free("local example tool"),
     name="bash",
     description="Run a shell command. Param: command (string).",
     input_schema={

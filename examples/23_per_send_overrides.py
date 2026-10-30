@@ -36,6 +36,7 @@ from power_loop import (
     create_default_tool_registry,
     runtime_env_context,
 )
+from power_loop.runtime.pricing import Free
 
 
 def _weather(**kwargs) -> str:
@@ -50,6 +51,7 @@ def _build_registry() -> ToolRegistry:
     r = ToolRegistry()
     r.register(
         ToolDefinition(
+            pricing=Free("local example tool"),
             name="get_weather",
             description="Get current weather for a city.",
             input_schema={"type": "object", "properties": {"city": {"type": "string"}},
@@ -60,6 +62,7 @@ def _build_registry() -> ToolRegistry:
     )
     r.register(
         ToolDefinition(
+            pricing=Free("local example tool"),
             name="get_stock",
             description="Get the current price for a stock ticker.",
             input_schema={"type": "object", "properties": {"ticker": {"type": "string"}},

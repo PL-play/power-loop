@@ -41,6 +41,7 @@ from power_loop import (
     ToolDefinition,
     ToolRegistry,
 )
+from power_loop.runtime.pricing import Free
 
 # ── 简单 echo 工具，让 audit 里出现 TOOL_* 事件 ───────────────────────────
 #    Simple echo tool to produce TOOL_* events in the audit log
@@ -51,6 +52,7 @@ def echo_handler(**kwargs) -> str:
 
 
 ECHO_TOOL = ToolDefinition(
+    pricing=Free("local example tool"),
     name="echo",
     description="Echo a string back.",
     input_schema={

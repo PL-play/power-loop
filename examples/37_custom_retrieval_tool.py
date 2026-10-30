@@ -23,6 +23,7 @@ import asyncio
 from _helpers import make_llm
 
 from power_loop import AgentLoopConfig, StatefulAgentLoop, ToolDefinition, ToolRegistry
+from power_loop.runtime.pricing import Free
 
 # A tiny in-memory "knowledge base". In a real app this is your vector store / DB.
 _DOCS = {
@@ -47,6 +48,7 @@ def _registry() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
         ToolDefinition(
+            pricing=Free("local example tool"),
             name="search_docs",
             description="Search the project knowledge base; returns the most relevant note(s).",
             input_schema={

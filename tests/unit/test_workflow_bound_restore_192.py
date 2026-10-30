@@ -199,6 +199,8 @@ async def test_denial_after_admission_keeps_cancellation_responsibility_and_star
 
 async def test_original_spec_budget_charges_only_new_generation_usage(managed_workflow, monkeypatch):
     c = await client(managed_workflow, monkeypatch)
+    # This checks restored usage accounting, not the two-second fixture lease.
+    c.runtime.lease_ms = 30000
     c.state["spec"]["budget"] = {"max_tokens": 50, "stop_at_remaining_pct": 0}
     initial = await finished(managed_workflow)
     pools = []
