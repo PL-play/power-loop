@@ -7,13 +7,15 @@ from power_loop import AgentEventBus, AgentHooks, AgentLoopConfig, StatefulAgent
 from power_loop._vendor.llm_client.interface import LLMResponse, LLMTokenUsage
 from power_loop.contracts.events import AgentEventType
 from power_loop.core.pipeline import _llm_endpoint
+from power_loop.llm_metrics import ProviderCost
 from power_loop.runtime.store.store import SessionStore
-from tests.unit.test_stateful_loop import _Scripted
+
+from .test_stateful_loop import _Scripted
 
 
 async def test_completed_event_carries_cost_endpoint_and_image_tokens():
     llm = _Scripted([LLMResponse(raw_text="ok", token_usage=LLMTokenUsage(
-        prompt_tokens=100, completion_tokens=5, total_tokens=105, prompt_image_tokens=40, cost=0.0021))])
+        prompt_tokens=100, completion_tokens=5, total_tokens=105, prompt_image_tokens=40), provider_cost=ProviderCost('0.0021','USD'))])
     llm._cfg = SimpleNamespace(base_url="https://openrouter.ai/api/v1")
     store = await SessionStore.open(":memory:")
     try:
@@ -24,7 +26,8 @@ async def test_completed_event_carries_cost_endpoint_and_image_tokens():
         await loop.send("hi", session_id=await loop.new_session())
         (ev,) = seen
         assert (ev.data.endpoint, ev.data.provider_cost, ev.data.prompt_image_tokens) == (
-            "https://openrouter.ai/api/v1", 0.0021, 40)
+            "https://openrouter.ai/api/v1", '0.0021', 40)
+        assert ev.data.provider_cost_currency == 'USD'
     finally:
         await store.close()
 

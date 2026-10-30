@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "9.1.0"
+__version__ = "10.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -265,6 +265,18 @@ from power_loop.tools.spawn_agent import (
     register_spawn_agent,
 )
 
+from .llm_metrics import (
+    CostExtractor,
+    DefaultCostExtractor,
+    DefaultTokenUsageExtractor,
+    FieldCostExtractor,
+    FieldTokenUsageExtractor,
+    ProviderCost,
+    ResponseExtractionError,
+    ResponseMetrics,
+    TokenUsageExtractor,
+)
+
 _logging.getLogger("power_loop").addHandler(_logging.NullHandler())
 
 
@@ -306,9 +318,27 @@ STABLE_API = (
     "ModelCapabilityError",
     "create_llm_service_from_env",
     "create_llm_service_from_config",
+    "ResponseMetrics",
+    "ProviderCost",
+    "TokenUsageExtractor",
+    "CostExtractor",
+    "DefaultTokenUsageExtractor",
+    "DefaultCostExtractor",
+    "FieldTokenUsageExtractor",
+    "FieldCostExtractor",
+    "ResponseExtractionError",
 )
 
 __all__ = [
+    "ResponseMetrics",
+    "ProviderCost",
+    "TokenUsageExtractor",
+    "CostExtractor",
+    "DefaultTokenUsageExtractor",
+    "DefaultCostExtractor",
+    "FieldTokenUsageExtractor",
+    "FieldCostExtractor",
+    "ResponseExtractionError",
     "PASS_TURN_TOOL",
     "request_pass",
     "pass_progress",

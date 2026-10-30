@@ -356,3 +356,46 @@ An optional exporter returns a small JSON snapshot which is saved as
 `host_contexts[name]` on original job creation. Replay retains the original saved
 snapshot; hosts restore it when recovering a child job. Business snapshots do not
 carry execution authority and do not replace the SDK's signed task request.
+# Response usage and supplier cost (10.0)
+
+`LLMResponse.token_usage` contains standardized token counts.
+`LLMResponse.provider_cost` is an independent `ProviderCost(amount, currency)`;
+`amount` is an exact decimal string and `None` means the supplier did not report
+money. Explicit zero is a valid supplier invoice. `LLMTokenUsage.cost` is removed.
+
+`TokenUsageExtractor` and `CostExtractor` have default implementations. OpenAI,
+Anthropic and Gemini usage shapes are recognized through the same interfaces.
+Override nested paths per connection with `LLMProviderConfig.response_extraction`:
+
+```python
+config.response_extraction = {
+    "usage": {
+        "paths": {
+            "prompt_tokens": "data.usage.input",
+            "completion_tokens": "data.usage.output",
+            "prompt_cached_tokens": "data.usage.cache",
+        },
+        "on_error": "raise",
+    },
+    "cost": {
+        "amount_path": "data.billing.amount",
+        "currency_path": "data.billing.currency",
+        "currency": "USD",  # explicit default when no currency field is present
+        "on_error": "raise",
+    },
+}
+```
+
+Blank mappings use defaults. Missing fields/container mismatches are normal
+misses. Invalid values produce structured diagnostics. `on_error="continue"`
+returns unknown supplier money, never an invented zero. The agent loop enforces
+the default raise policy after retaining original response evidence and outside
+the transport retry loop. A host can then price complete token usage, or retain
+unknown financial responsibility when neither reliable cost nor usage is known.
+
+`ResponseMetrics(config).inspect(raw_json)` validates offline with no model
+request; `extract_usage` and `extract_cost` also accept custom implementations.
+Trusted hosts may supply `usage.code` / `cost.code` snippets declaring
+`extract(response)`. This is an internal extension, not a public code editor or
+an untrusted-code execution service. Its standardized output and error policies
+are identical to field mappings.

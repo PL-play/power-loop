@@ -1485,6 +1485,8 @@ class AgentPipeline:
                     from power_loop.runtime.response_capture import record
                     await record(model_attempt, reported=reported,
                         observation=response_observation(usage, resp), estimated=estimated)
+                from power_loop.llm_metrics import enforce_extraction_policy
+                enforce_extraction_policy(resp)
                 self._emit(
                     AgentEventType.LLM_CALL_COMPLETED,
                     LlmCallCompletedPayload(
@@ -1498,7 +1500,8 @@ class AgentPipeline:
                         prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
                         estimated=estimated,
                         endpoint=_llm_endpoint(self.llm),
-                        provider_cost=getattr(usage, "cost", None),
+                        provider_cost=getattr(getattr(resp, "provider_cost", None), "amount", None),
+                        provider_cost_currency=getattr(getattr(resp, "provider_cost", None), "currency", None),
                         prompt_image_tokens=getattr(usage, "prompt_image_tokens", None),
                         **durable_identity,
                     ),

@@ -18,8 +18,10 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+from openai._streaming import SSEDecoder
 
 from .capabilities import ModelCapabilities, coerce_capabilities
+from .exact_json import configure_http_client, exact_event
 from .interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage, OpenAICompatibleChatConfig
 from .llm_utils import parse_json_from_model_output_detailed
 from .proxy_fallback import env_proxy_http_client
@@ -30,6 +32,26 @@ else:
     ChatCompletionChunk = Any
 
 logger = logging.getLogger(__name__)
+
+
+class ExactSSEDecoder(SSEDecoder):
+    async def aiter_bytes(self, iterator):
+        async for event in super().aiter_bytes(iterator):
+            yield exact_event(event)
+
+    def iter_bytes(self, iterator):
+        for event in super().iter_bytes(iterator):
+            yield exact_event(event)
+
+
+class ExactAsyncOpenAI(AsyncOpenAI):
+    def __init__(self, *args, **options):
+        client = options.get('http_client') or DefaultAsyncHttpxClient()
+        options['http_client'] = configure_http_client(client)
+        super().__init__(*args, **options)
+
+    def _make_sse_decoder(self):
+        return ExactSSEDecoder()
 
 
 _PROXY_ENV_KEYS = (
@@ -147,7 +169,7 @@ class OpenAICompatibleChatLLMService(LLMService):
             return self._client.with_options(max_retries=0) if single_attempt.get() else self._client
         _normalize_proxy_env_inplace()
 
-        self._client = AsyncOpenAI(
+        self._client = ExactAsyncOpenAI(
             base_url=self._cfg.base_url,
             api_key=self._cfg.api_key,
             timeout=self._cfg.timeout_s,
@@ -210,254 +232,12 @@ class OpenAICompatibleChatLLMService(LLMService):
         logger.debug("[llm:%s] request messages=%s kwargs=%s", method, rendered_messages, sanitized_kwargs)
 
     def _usage_dict_from_any(self, usage: Any) -> dict[str, Any]:
-        """
-        Normalize token usage from various provider shapes.
-        Supports:
-        - OpenAI usage: prompt_tokens/completion_tokens/total_tokens
-        - Some providers: input_tokens/output_tokens/total_tokens
-        - Dict payloads (from model_dump / raw json)
-        """
-        if usage is None:
-            return {
-                "prompt_tokens": None,
-                "completion_tokens": None,
-                "total_tokens": None,
-            }
+        from .usage_normalization import normalize_usage
+        return normalize_usage(usage)
 
-        raw: dict[str, Any] = {}
-
-        # dict-like
-        if isinstance(usage, dict):
-            raw = dict(usage)
-        else:
-            # object-like: prefer model_dump, then __dict__
-            if hasattr(usage, "model_dump"):
-                try:
-                    dumped = usage.model_dump()
-                    if isinstance(dumped, dict):
-                        raw = dict(dumped)
-                except Exception:
-                    raw = {}
-            if not raw:
-                try:
-                    raw = dict(usage.__dict__)
-                except Exception:
-                    raw = {}
-
-        def _safe_int_or_none(v: Any) -> int | None:
-            if v is None:
-                return None
-            if isinstance(v, bool):
-                return int(v)
-            if isinstance(v, (int, float)):
-                return int(v)
-            if isinstance(v, str):
-                s = v.strip()
-                if not s:
-                    return None
-                try:
-                    return int(float(s))
-                except Exception:
-                    return None
-            return None
-
-        def _pick_int(payload: dict[str, Any], keys: list[str]) -> int | None:
-            for key in keys:
-                if key in payload:
-                    iv = _safe_int_or_none(payload.get(key))
-                    if iv is not None:
-                        return iv
-            return None
-
-        def _as_dict(v: Any) -> dict[str, Any]:
-            if isinstance(v, dict):
-                return v
-            if hasattr(v, "model_dump"):
-                try:
-                    dumped = v.model_dump()
-                    if isinstance(dumped, dict):
-                        return dumped
-                except Exception:
-                    return {}
-            return {}
-
-        prompt = _pick_int(raw, [
-            "prompt_tokens",
-            "input_tokens",
-            "prompt_token_count",
-            "promptTokens",
-            "inputTokenCount",
-            "prompt_count",
-        ])
-        completion = _pick_int(raw, [
-            "completion_tokens",
-            "output_tokens",
-            "completion_token_count",
-            "completionTokens",
-            "outputTokenCount",
-            "generated_tokens",
-            "candidates_token_count",
-        ])
-        total = _pick_int(raw, [
-            "total_tokens",
-            "total_token_count",
-            "totalTokens",
-            "token_count",
-            "usage_tokens",
-        ])
-
-        if total is None and prompt is not None and completion is not None:
-            total = prompt + completion
-
-        prompt_details = _as_dict(raw.get("prompt_tokens_details"))
-        completion_details = _as_dict(raw.get("completion_tokens_details"))
-        output_details = _as_dict(raw.get("output_tokens_details"))
-        input_details = _as_dict(raw.get("input_tokens_details"))
-
-        prompt_audio_tokens = _pick_int(prompt_details, ["audio_tokens", "audioTokenCount"])
-        if prompt_audio_tokens is None:
-            prompt_audio_tokens = _pick_int(input_details, ["audio_tokens", "audioTokenCount"])
-        prompt_cached_tokens = _pick_int(
-            raw,
-            ["prompt_cache_hit_tokens", "cached_tokens", "cache_hit_tokens", "prompt_cached_tokens"],
-        )
-        if prompt_cached_tokens is None:
-            prompt_cached_tokens = _pick_int(prompt_details, ["cached_tokens", "cache_hit_tokens", "cacheHitTokens"])
-        prompt_cache_miss_tokens = _pick_int(raw, ["prompt_cache_miss_tokens", "cache_miss_tokens", "cacheMissTokens"])
-        if prompt_cache_miss_tokens is None:
-            prompt_cache_miss_tokens = _pick_int(prompt_details, ["cache_miss_tokens", "cacheMissTokens"])
-        prompt_text_tokens = _pick_int(prompt_details, ["text_tokens", "textTokenCount"])
-        if prompt_text_tokens is None:
-            prompt_text_tokens = _pick_int(input_details, ["text_tokens", "textTokenCount"])
-        prompt_image_tokens = _pick_int(prompt_details, ["image_tokens", "imageTokenCount"])
-        if prompt_image_tokens is None:
-            prompt_image_tokens = _pick_int(input_details, ["image_tokens", "imageTokenCount"])
-
-        completion_reasoning_tokens = _pick_int(
-            completion_details,
-            ["reasoning_tokens", "reasoningTokenCount", "reasoning_token", "reasoningTokens", "thinking_tokens"],
-        )
-        if completion_reasoning_tokens is None:
-            completion_reasoning_tokens = _pick_int(
-                output_details,
-                ["reasoning_tokens", "reasoningTokenCount", "reasoning_token", "reasoningTokens", "thinking_tokens"],
-            )
-        completion_audio_tokens = _pick_int(completion_details, ["audio_tokens", "audioTokenCount"])
-        if completion_audio_tokens is None:
-            completion_audio_tokens = _pick_int(output_details, ["audio_tokens", "audioTokenCount"])
-        completion_text_tokens = _pick_int(completion_details, ["text_tokens", "textTokenCount"])
-        if completion_text_tokens is None:
-            completion_text_tokens = _pick_int(output_details, ["text_tokens", "textTokenCount"])
-        completion_image_tokens = _pick_int(completion_details, ["image_tokens", "imageTokenCount"])
-        if completion_image_tokens is None:
-            completion_image_tokens = _pick_int(output_details, ["image_tokens", "imageTokenCount"])
-        accepted_prediction_tokens = _pick_int(
-            completion_details,
-            ["accepted_prediction_tokens", "acceptedPredictionTokens"],
-        )
-        if accepted_prediction_tokens is None:
-            accepted_prediction_tokens = _pick_int(
-                output_details,
-                ["accepted_prediction_tokens", "acceptedPredictionTokens"],
-            )
-        rejected_prediction_tokens = _pick_int(
-            completion_details,
-            ["rejected_prediction_tokens", "rejectedPredictionTokens"],
-        )
-        if rejected_prediction_tokens is None:
-            rejected_prediction_tokens = _pick_int(
-                output_details,
-                ["rejected_prediction_tokens", "rejectedPredictionTokens"],
-            )
-
-        # Provider-agnostic aliases (keep None when unknown)
-        cached_tokens = _pick_int(raw, ["cached_tokens", "cache_hit_tokens", "prompt_cache_hit_tokens"])
-        if cached_tokens is None:
-            cached_tokens = prompt_cached_tokens
-        cache_hit_tokens = _pick_int(raw, ["cache_hit_tokens", "prompt_cache_hit_tokens", "cached_tokens"])
-        if cache_hit_tokens is None:
-            cache_hit_tokens = prompt_cached_tokens
-        cache_miss_tokens = _pick_int(raw, ["cache_miss_tokens", "prompt_cache_miss_tokens"])
-        if cache_miss_tokens is None:
-            cache_miss_tokens = prompt_cache_miss_tokens
-
-        reasoning_tokens = _pick_int(
-            raw,
-            ["reasoning_tokens", "reasoning_token", "reasoningTokens", "thinking_tokens"],
-        )
-        if reasoning_tokens is None:
-            reasoning_tokens = completion_reasoning_tokens
-
-        accepted_tokens = _pick_int(raw, ["accepted_prediction_tokens"])
-        if accepted_tokens is None:
-            accepted_tokens = accepted_prediction_tokens
-        rejected_tokens = _pick_int(raw, ["rejected_prediction_tokens"])
-        if rejected_tokens is None:
-            rejected_tokens = rejected_prediction_tokens
-
-        # Keep provider-native fields, and ensure normalized aliases exist.
-        raw["prompt_tokens"] = prompt
-        raw["completion_tokens"] = completion
-        raw["total_tokens"] = total
-        raw["prompt_audio_tokens"] = prompt_audio_tokens
-        raw["prompt_cached_tokens"] = prompt_cached_tokens
-        raw["prompt_cache_miss_tokens"] = prompt_cache_miss_tokens
-        raw["prompt_text_tokens"] = prompt_text_tokens
-        raw["prompt_image_tokens"] = prompt_image_tokens
-        raw["completion_reasoning_tokens"] = completion_reasoning_tokens
-        raw["completion_audio_tokens"] = completion_audio_tokens
-        raw["completion_text_tokens"] = completion_text_tokens
-        raw["completion_image_tokens"] = completion_image_tokens
-        raw["accepted_prediction_tokens"] = accepted_prediction_tokens
-        raw["rejected_prediction_tokens"] = rejected_prediction_tokens
-        raw["cached_tokens"] = cached_tokens
-        raw["cache_hit_tokens"] = cache_hit_tokens
-        raw["cache_miss_tokens"] = cache_miss_tokens
-        raw["reasoning_tokens"] = reasoning_tokens
-        raw["accepted_tokens"] = accepted_tokens
-        raw["rejected_tokens"] = rejected_tokens
-        return raw
-
-    def _usage_obj(self, usage: Any = None) -> LLMTokenUsage:
-        def _cost_or_none(v: Any) -> float | None:
-            if isinstance(v, bool) or not isinstance(v, (int, float, str)):
-                return None
-            try:
-                return float(v)
-            except ValueError:
-                return None
-
-        d = self._last_usage if usage is None else self._usage_dict_from_any(usage)
-
-        def _int_or_none(v: Any) -> int | None:
-            try:
-                return None if v is None else int(v)
-            except Exception:
-                return None
-
-        return LLMTokenUsage(
-            prompt_tokens=_int_or_none(d.get("prompt_tokens")),
-            completion_tokens=_int_or_none(d.get("completion_tokens")),
-            total_tokens=_int_or_none(d.get("total_tokens")),
-            prompt_audio_tokens=_int_or_none(d.get("prompt_audio_tokens")),
-            prompt_cached_tokens=_int_or_none(d.get("prompt_cached_tokens")),
-            prompt_cache_miss_tokens=_int_or_none(d.get("prompt_cache_miss_tokens")),
-            prompt_text_tokens=_int_or_none(d.get("prompt_text_tokens")),
-            prompt_image_tokens=_int_or_none(d.get("prompt_image_tokens")),
-            completion_reasoning_tokens=_int_or_none(d.get("completion_reasoning_tokens")),
-            completion_audio_tokens=_int_or_none(d.get("completion_audio_tokens")),
-            completion_text_tokens=_int_or_none(d.get("completion_text_tokens")),
-            completion_image_tokens=_int_or_none(d.get("completion_image_tokens")),
-            accepted_prediction_tokens=_int_or_none(d.get("accepted_prediction_tokens")),
-            rejected_prediction_tokens=_int_or_none(d.get("rejected_prediction_tokens")),
-            cached_tokens=_int_or_none(d.get("cached_tokens")),
-            cache_hit_tokens=_int_or_none(d.get("cache_hit_tokens")),
-            cache_miss_tokens=_int_or_none(d.get("cache_miss_tokens")),
-            reasoning_tokens=_int_or_none(d.get("reasoning_tokens")),
-            accepted_tokens=_int_or_none(d.get("accepted_tokens")),
-            rejected_tokens=_int_or_none(d.get("rejected_tokens")),
-            cost=_cost_or_none(d.get("cost")),
-        )
+    def _usage_obj(self, usage: Any = None):
+        from power_loop.llm_metrics import DefaultTokenUsageExtractor
+        return DefaultTokenUsageExtractor().extract({"usage": self._last_usage if usage is None else usage})
 
     async def _with_retries(self, fn, *, method: str) -> Any:
         """
@@ -563,6 +343,8 @@ class OpenAICompatibleChatLLMService(LLMService):
         last_tool_calls: list[dict[str, Any]] = []
         final_usage: LLMTokenUsage | None = None
         last_raw_event: Any = None
+        final_cost = None
+        final_metrics = {}
 
         async for chunk in self.stream(request):
             chunks.append(chunk)
@@ -582,6 +364,10 @@ class OpenAICompatibleChatLLMService(LLMService):
                 last_tool_calls = list(chunk.tool_calls)
             if chunk.token_usage is not None:
                 final_usage = chunk.token_usage
+            if chunk.provider_cost is not None:
+                final_cost = chunk.provider_cost
+            if chunk.response_metrics:
+                final_metrics = chunk.response_metrics
             if chunk.raw_event is not None:
                 last_raw_event = chunk.raw_event
 
@@ -600,6 +386,8 @@ class OpenAICompatibleChatLLMService(LLMService):
         res.stream_chunks = chunks
         res.raw_completion = last_raw_event
         res.think = "".join(think_parts)
+        res.provider_cost = final_cost
+        res.debug['response_extraction'] = final_metrics
 
         if on_stream_end:
             res_val = on_stream_end(res)
@@ -627,6 +415,8 @@ class OpenAICompatibleChatLLMService(LLMService):
 
         last_event: ChatCompletionChunk | None = None
         final_usage: LLMTokenUsage | None = None
+        from power_loop.llm_metrics import ProviderCost, ResponseMetricAccumulator
+        response_metrics = ResponseMetricAccumulator(self._cfg.response_extraction)
         tool_call_store: dict[str, dict[str, Any]] = {}
         tool_call_order: list[str] = []
         tool_call_index_to_key: dict[int, str] = {}
@@ -912,24 +702,11 @@ class OpenAICompatibleChatLLMService(LLMService):
                         delta_tool_calls = None
                         aggregated_tool_calls = [tool_call_store[k] for k in tool_call_order]
                         logger.error("[llm:stream] failed to extract delta: %s", e)
-                    # Some providers send usage only on the final event when stream_options.include_usage is enabled.
-                    try:
-                        usage_obj = getattr(event, "usage", None)
-                        # Fallback: some SDKs/providers only expose usage via model_dump / extra fields.
-                        if usage_obj is None and hasattr(event, "model_dump"):
-                            try:
-                                dumped = event.model_dump()
-                                if isinstance(dumped, dict):
-                                    usage_obj = dumped.get("usage") or dumped.get("x_openai_usage") or dumped.get("x_usage")
-                            except Exception:
-                                pass
-                        if usage_obj is not None:
-                            # also record into last_usage so callers relying on _usage_obj() can still work
-                            self._record_usage(usage_obj, method="stream")
-                            final_usage = self._usage_obj(usage_obj)
-                    except Exception:
-                        # Don't fail streaming if usage parsing fails.
-                        pass
+                    response_metrics.add(event)
+                    extracted = response_metrics.snapshot()
+                    if extracted['usage'] is not None:
+                        final_usage = LLMTokenUsage(**extracted['usage'])
+                        self._last_usage = dict(extracted['usage'])
 
                     if delta_text or delta_think or delta_tool_calls:
                         if delta_text:
@@ -971,6 +748,7 @@ class OpenAICompatibleChatLLMService(LLMService):
                 tool_call_index_to_key.clear()
                 continue
 
+        extracted = response_metrics.snapshot()
         # Final chunk carries best-effort usage + last raw event so callers can inspect finish_reason, tool_calls, etc.
         yield LLMStreamChunk(
             delta_text="",
@@ -979,6 +757,8 @@ class OpenAICompatibleChatLLMService(LLMService):
             tool_calls=[tool_call_store[k] for k in tool_call_order],
             token_usage=final_usage,
             raw_event=last_event,
+            provider_cost=ProviderCost(**extracted['cost']) if extracted['cost'] is not None else None,
+            response_metrics=response_metrics.snapshot(),
             is_final=True,
         )
 

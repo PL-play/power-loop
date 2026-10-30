@@ -27,6 +27,8 @@ class ModelResponseCapture:
     usage: dict
     cost_amount: str | None = None
     response_id: str | None = None
+    cost_currency: str | None = None
+    response_metrics: dict = field(default_factory=dict)
 
     def __post_init__(self):
         from .model_attempts import _TOKENS, _cost, _response_id
@@ -43,6 +45,7 @@ class ModelResponseCapture:
         object.__setattr__(self, 'context', context)
         object.__setattr__(self, 'grant', BudgetGrant(**asdict(self.grant)))
         object.__setattr__(self, 'usage', payload(self.usage))
+        object.__setattr__(self, 'response_metrics', payload(self.response_metrics))
 
     @property
     def capture_id(self):

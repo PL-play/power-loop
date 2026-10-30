@@ -10,7 +10,8 @@ from typing import Any
 from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient
 
 from .capabilities import ModelCapabilities, coerce_capabilities
-from .interface import AnthropicChatConfig, LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
+from .exact_json import configure_http_client
+from .interface import AnthropicChatConfig, LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from .llm_utils import parse_json_from_model_output_detailed
 from .multimodal import render_message_content
 from .proxy_fallback import env_proxy_http_client
@@ -77,7 +78,7 @@ class AnthropicMessagesLLMService(LLMService):
                 base_url=self._cfg.base_url,
                 timeout=self._cfg.timeout_s,
                 max_retries=self._cfg.max_retries,
-                http_client=env_proxy_http_client(DefaultAsyncHttpxClient),
+                http_client=configure_http_client(env_proxy_http_client(DefaultAsyncHttpxClient) or DefaultAsyncHttpxClient()),
             )
         return self._client.with_options(max_retries=0) if single_attempt.get() else self._client
 
@@ -89,39 +90,15 @@ class AnthropicMessagesLLMService(LLMService):
         finally:
             self._client = None
 
-    def _usage_dict_from_any(self, usage: Any) -> dict[str, Any]:
-        raw = _as_dict(usage)
+    def _usage_dict_from_any(self, usage: Any = None):
+        from power_loop.llm_metrics import DefaultTokenUsageExtractor
+        result = DefaultTokenUsageExtractor().extract({"usage": self._last_usage if usage is None else usage})
+        return result.as_dict() if result is not None else {}
 
-        def _int_or_none(value: Any) -> int | None:
-            try:
-                return None if value is None else int(value)
-            except Exception:
-                return None
-
-        prompt = _int_or_none(raw.get("input_tokens") or raw.get("prompt_tokens"))
-        completion = _int_or_none(raw.get("output_tokens") or raw.get("completion_tokens"))
-        total = _int_or_none(raw.get("total_tokens"))
-        if total is None and prompt is not None and completion is not None:
-            total = prompt + completion
-        raw["prompt_tokens"] = prompt
-        raw["completion_tokens"] = completion
-        raw["total_tokens"] = total
-        return raw
-
-    def _usage_obj(self, usage: Any = None) -> LLMTokenUsage:
-        d = self._last_usage if usage is None else self._usage_dict_from_any(usage)
-
-        def _int_or_none(value: Any) -> int | None:
-            try:
-                return None if value is None else int(value)
-            except Exception:
-                return None
-
-        return LLMTokenUsage(
-            prompt_tokens=_int_or_none(d.get("prompt_tokens")),
-            completion_tokens=_int_or_none(d.get("completion_tokens")),
-            total_tokens=_int_or_none(d.get("total_tokens")),
-        )
+    def _usage_obj(self, usage: Any = None):
+        from power_loop.llm_metrics import DefaultTokenUsageExtractor
+        result = DefaultTokenUsageExtractor().extract({"usage": self._last_usage if usage is None else usage})
+        return result
 
     def _record_usage(self, usage: Any) -> None:
         self._last_usage = self._usage_dict_from_any(usage)
@@ -407,6 +384,8 @@ class AnthropicMessagesLLMService(LLMService):
             maybe = on_stream_end(result)
             if hasattr(maybe, "__await__"):
                 await maybe
+        from power_loop.llm_metrics import ResponseMetrics
+        ResponseMetrics(self._cfg.response_extraction).apply(result)
         return result
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:

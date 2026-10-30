@@ -117,8 +117,9 @@ class LlmCallCompletedPayload(BaseEventPayload):
     #: 7.2: which endpoint served the call (the transport's base URL) — hosts price per connection,
     #: and one model name can be served by several providers at different prices.
     endpoint: str = ""
-    #: 7.2: charge the provider reported for this call (``LLMTokenUsage.cost``), ``None`` if not reported.
-    provider_cost: float | None = None
+    #: Exact supplier cost from LLMResponse.provider_cost; None means unreported.
+    provider_cost: str | None = None
+    provider_cost_currency: str | None = None
     #: 7.2: image input tokens, when the provider splits them out (``None`` = not reported).
     prompt_image_tokens: int | None = None
     #: Durable physical-call identity; absent on legacy, untracked calls.

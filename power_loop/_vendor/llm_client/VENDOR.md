@@ -26,6 +26,11 @@ path and no external dependency on a separately-published `llm_client` distribut
 
 ## Re-syncing
 
+Local 10.0 changes move token normalization behind the common response metrics
+interface, separate exact supplier money, and preserve JSON decimal literals in
+both SSE and non-stream responses. Preserve these transport integrations when
+re-syncing; they are covered by the metrics transport tests.
+
 Use `scripts/sync_vendor.sh` (repo root) to re-vendor from a source checkout — it copies
 the package in, strips the unused modules, and rewrites imports to the vendored path.
 After running it, re-check: `ruff check`, `mypy power_loop`, and the

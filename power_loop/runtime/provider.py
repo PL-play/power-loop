@@ -63,6 +63,7 @@ class LLMProviderConfig:
     # an image becomes an explicit "you did not see this" placeholder at render time. The
     # declaration applies to THIS model only (a request naming another model gets none).
     capabilities: dict[str, Any] = field(default_factory=dict)
+    response_extraction: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Fail fast at config build time, not on the first complete() call.
@@ -169,6 +170,7 @@ class LLMProviderConfig:
             max_retries=self.max_retries,
             capabilities=dict(self.capabilities),
             request_extra=dict(self.extra.get("request_extra") or {}),
+            response_extraction=dict(self.response_extraction),
         )
 
     def to_anthropic(self) -> AnthropicChatConfig:
@@ -182,6 +184,7 @@ class LLMProviderConfig:
             temperature=self.temperature,
             max_retries=self.max_retries,
             capabilities=dict(self.capabilities),
+            response_extraction=dict(self.response_extraction),
         )
 
 

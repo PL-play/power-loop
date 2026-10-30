@@ -41,7 +41,7 @@ async def _summary(manager, tx, job, raw, phases):
         "round_index": data["round_index"], "retry_index": data["retry_index"], "model": data["model"],
         "purpose": data.get("purpose", "llm"), "max_tokens": data["max_tokens"], "request_fingerprint": data["request_hash"], "status": state,
         "observed_usage": observed.get("usage"), "estimated": observed.get("estimated"),
-        "provider_reported_cost": observed.get("provider_cost"), "provider_cost_currency": None,
+        "provider_reported_cost": observed.get("provider_cost"), "provider_cost_currency": observed.get('provider_cost_currency'),
         "provider_response_id": observed.get("provider_response_id"), "provider_query_supported": False,
         "error_type": observed.get("error_type"), "response_received": state == "returned",
         "prepared_event_id": raw["event_id"], "dispatched_event_id": dispatched[0]["event_id"] if dispatched else None,

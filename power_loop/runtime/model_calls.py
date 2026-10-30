@@ -150,6 +150,12 @@ class ManagedModelLLM:
                 response.token_usage = usage
             await record(attempt, reported=reported, observation=response_observation(usage, response),
                          estimated=estimated)
+            from power_loop.llm_metrics import enforce_extraction_policy
+            try:
+                enforce_extraction_policy(response)
+            except Exception as exc:
+                from power_loop.contracts.errors import LLMNonRetryable
+                raise LLMNonRetryable(attempts=1, last_error=exc) from exc
             calls.emit(AgentEventType.LLM_CALL_COMPLETED, LlmCallCompletedPayload(
                 **base, duration_ms=(time.perf_counter() - t0) * 1000.0, success=True,
                 prompt_tokens=getattr(usage, "prompt_tokens", None),
@@ -158,7 +164,8 @@ class ManagedModelLLM:
                 prompt_cached_tokens=getattr(usage, "prompt_cached_tokens", None),
                 prompt_cache_miss_tokens=getattr(usage, "prompt_cache_miss_tokens", None),
                 estimated=estimated, endpoint=_llm_endpoint(self._inner),
-                provider_cost=getattr(usage, "cost", None),
+                provider_cost=getattr(getattr(response, "provider_cost", None), "amount", None),
+                provider_cost_currency=getattr(getattr(response, "provider_cost", None), "currency", None),
                 prompt_image_tokens=getattr(usage, "prompt_image_tokens", None)))
             if policy_clock is not None and policy_clock.expired():
                 raise JobError("owner_wait_deadline_exceeded")

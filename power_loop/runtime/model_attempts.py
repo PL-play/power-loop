@@ -114,10 +114,12 @@ def _response_id(value):
 def response_observation(usage, response):
     raw = getattr(response, "raw_completion", None)
     response_id = raw.get("id") if isinstance(raw, dict) else getattr(raw, "id", None)
-    cost = getattr(usage, "cost", None)
+    cost = getattr(response, "provider_cost", None)
     return {
         "usage": {key: getattr(usage, key) for key in _TOKENS if getattr(usage, key, None) is not None},
-        "cost_amount": str(cost) if cost is not None else None,
+        "cost_amount": cost.amount if cost is not None else None,
+        "cost_currency": cost.currency if cost is not None else None,
+        "response_metrics": getattr(response, 'debug', {}).get('response_extraction', {}),
         "response_id": response_id,
     }
 
@@ -188,7 +190,9 @@ def _validate_data(manager, phase, identity, data):
                     and not set(usage) - set(_TOKENS)
                     and all(type(v) is int and 0 <= v < 2**63 for v in usage.values())
                     and _cost(data.get("provider_cost"))
-                    and data.get("provider_cost_currency") is None
+                    and (data.get("provider_cost_currency") is None or
+                         isinstance(data['provider_cost_currency'], str) and len(data['provider_cost_currency']) == 3
+                         and data['provider_cost_currency'].isalpha() and data['provider_cost_currency'].isupper())
                     and _response_id(data.get("provider_response_id"))
                     and (
                         data.get("error_type") is None
@@ -492,7 +496,8 @@ async def _recall_dispatch_authority(attempt):
         return True, deadline
 
 
-async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amount=None, response_id=None):
+async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amount=None, response_id=None,
+                 cost_currency=None, response_metrics=None):
     if status not in ("returned", "unknown") or type(estimated) is not bool or not isinstance(usage, dict):
         raise JobError("invalid_model_attempt_observation")
     if set(usage) - set(_TOKENS) or any(type(v) is not int or not 0 <= v < 2**63 for v in usage.values()):
@@ -526,7 +531,7 @@ async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amo
             "estimated": estimated,
             "error_type": error_type,
             "provider_cost": cost_amount,
-            "provider_cost_currency": None,
+            "provider_cost_currency": cost_currency,
             "provider_response_id": response_id,
         }
         await _put(manager, tx, row, "finished", attempt.attempt_id, data)
@@ -652,7 +657,8 @@ async def provider_deadline(attempt):
     return None if attempt is None else attempt.local_deadline
 
 
-async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, response_id=None):
+async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, response_id=None,
+                  cost_currency=None, response_metrics=None):
     if attempt is None:
         return
     if error is not None:
@@ -663,8 +669,12 @@ async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, re
         estimated=estimated,
         error_type=type(error).__name__ if error is not None else None,
         cost_amount=cost_amount,
+        cost_currency=cost_currency, response_metrics=response_metrics,
         response_id=response_id,
     )
+    if error is None and any(e.get('interface') == 'cost' and e.get('on_error') == 'raise'
+                             for e in (response_metrics or {}).get('errors', [])):
+        args['error_type'] = 'response_cost_extraction_failed'
     try:
         await finish(attempt, **args)
     except Exception:

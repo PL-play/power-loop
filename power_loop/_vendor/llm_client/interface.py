@@ -204,10 +204,6 @@ class LLMTokenUsage:
     accepted_tokens: int | None = None
     rejected_tokens: int | None = None
 
-    #: Charge the provider itself reported for this call (e.g. OpenRouter's ``usage.cost``), in the
-    #: provider's billing currency. ``None`` = not reported; hosts then price tokens themselves.
-    cost: float | None = None
-
     def as_dict(self) -> dict[str, int | None]:
         return dict(self.__dict__)
 
@@ -242,6 +238,8 @@ class LLMStreamChunk:
     token_usage: LLMTokenUsage | None = None
     raw_event: Any = None
     is_final: bool = False
+    provider_cost: Any = None
+    response_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -274,6 +272,7 @@ class LLMResponse:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     # Raw streamed chunks captured when complete() is implemented via stream aggregation.
     stream_chunks: list[LLMStreamChunk] = field(default_factory=list)
+    provider_cost: Any = None
 
     def get_tool_calls(self) -> list[dict[str, Any]]:
         """
@@ -537,6 +536,7 @@ class OpenAICompatibleChatConfig:
     # (e.g. DashScope ``extra_body.enable_thinking``) on for a whole loop without touching the
     # pipeline's per-call LLMRequest.
     request_extra: dict[str, Any] = field(default_factory=dict)
+    response_extraction: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_ready(self) -> bool:
@@ -556,6 +556,7 @@ class AnthropicChatConfig:
     #: transport used to carry none at all, which is how ``attachment`` blocks reached it
     #: unrendered and got dropped as "unsupported content block".
     capabilities: dict[str, Any] = field(default_factory=dict)
+    response_extraction: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_ready(self) -> bool:

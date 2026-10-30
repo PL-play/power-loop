@@ -6,6 +6,13 @@
 1.0 起,对 **STABLE** API 的破坏性变更只能出现在 major 版本,
 并且必须在此文件中显式列出受影响的 Public API。
 
+## 10.0.0 — 2026-10-30
+
+- **Breaking LLM contract:** supplier money is now `LLMResponse.provider_cost` (`ProviderCost`, exact decimal string and optional currency), separate from `LLMTokenUsage`. The former float `LLMTokenUsage.cost` field is removed. Completed events use a decimal string and an explicit currency.
+- Stable `TokenUsageExtractor` and `CostExtractor` interfaces; default implementations share the existing token normalizer and recognize common OpenAI, Anthropic and Gemini shapes. Configurable nested field mappings and trusted host code extensions use the same standardized outputs.
+- Missing fields are normal misses. Invalid values become structured extraction evidence; hosts can choose raise (default) or continue separately for usage and cost. The loop enforces failure policy after durable capture, outside transport retries, preserving the original paid response.
+- Original response evidence retains supplier currency, source fields and parsing diagnostics. Stream fragments merge within the call without borrowing a previous call's usage.
+
 ## 9.1.0 — 2026-10-30
 
 - Hosts may stop a loop at an entry or round hook with `ControlledLoopStop`. The controlled exit preserves completed tool results and skips paid memory summarization.
