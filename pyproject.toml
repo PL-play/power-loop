@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "power-loop"
 description = "Embeddable agent execution kernel — LLM loop, hooks, events, tools, dynamic sub-agents."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 keywords = ["agent", "llm", "openai", "anthropic", "tool-use", "hooks"]
 authors = [{ name = "zhangran", email = "zhangran24@126.com" }]
@@ -119,7 +119,7 @@ ignore = [
 # ── mypy ──
 # M0 基线：能跑、不破坏 import。strict 检查留给 M1 逐模块收紧（接触哪个收紧哪个）。
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 ignore_missing_imports = true
 warn_redundant_casts = true
 warn_unused_ignores = true

@@ -159,7 +159,8 @@ class Charge:
 
 @runtime_checkable
 class PricingSpec(Protocol):
-    rule_id: str
+    @property
+    def rule_id(self) -> str: ...
 
     def version(self) -> str: ...
 

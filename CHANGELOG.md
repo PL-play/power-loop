@@ -12,6 +12,10 @@
 
 ### Unified pricing and durable fee delivery
 
+- **Breaking:** require Python 3.11 or newer. Native model sends and task
+  supervision use `asyncio.timeout` / `timeout_at`; package metadata and the CI
+  minimum now match those runtime requirements.
+
 - Require an explicit `PricingSpec` on registered tool definitions, including
   `ManagedTool` and host tools. Missing declarations fail before execution;
   no-charge tools declare `Free` explicitly. **Breaking:** update tool factories

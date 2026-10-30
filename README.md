@@ -267,7 +267,7 @@ POWER_LOOP_API_KEY=sk-...
 POWER_LOOP_MODEL=gpt-4o-mini
 ```
 
-Python 3.10+. See [Getting Started](docs/en/getting-started.md). Optional extras: `postgres`, `mysql`, `skills`, `pdf`, `prometheus`, `statsd`, `otel`, `mcp`.
+Python 3.11+. See [Getting Started](docs/en/getting-started.md). Optional extras: `postgres`, `mysql`, `skills`, `pdf`, `prometheus`, `statsd`, `otel`, `mcp`.
 
 ---
 

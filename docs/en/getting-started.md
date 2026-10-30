@@ -17,7 +17,7 @@ The SDK-free core has zero runtime dependencies; the transport is pulled in by t
 you choose. To use the native Anthropic Messages API, install `'power-loop[anthropic]'`
 and set `POWER_LOOP_PROVIDER=anthropic`.
 
-Python 3.10+ required.
+Python 3.11+ required.
 
 ## 2. Set up your LLM credentials
 
