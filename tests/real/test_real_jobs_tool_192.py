@@ -10,6 +10,7 @@ from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDef
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import delegation, task_control
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.spawn_agent import register_spawn_agent
 from power_loop.workflow import create_workflow
@@ -103,7 +104,7 @@ async def test_real_jobs_list_get_stop_preserves_identity_receipt_and_pending_co
         handle = await create_workflow(spec, parent_loop=get_current_loop(), parent_session_id=get_session_id()).start(detached=True, on_complete=notified)
         handles.append(handle)
         return json.dumps({"job_id": handle.job_id, "operation_id": handle.operation_id, "run_id": handle.run_id, "status": "accepted"})
-    registry.register(ToolDefinition(name="launch_workflow", description="Start the predefined calculation/review workflow asynchronously once.", input_schema={"type": "object", "properties": {}}), launch)
+    registry.register(ToolDefinition(name="launch_workflow", description="Start the predefined calculation/review workflow asynchronously once.", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), launch)
     original = task_control.request_stop
     if fault == "stop_ack":
         async def lost(*args, **kwargs):

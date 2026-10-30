@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 
-def fail_return(c, stage, *, persistent=False):
+def fail_return(c, stage, *, persistent=False, event_type='native_callback_returned'):
     original = c.manager._write
     state = SimpleNamespace(fired=0, enabled=True)
 
@@ -18,7 +18,7 @@ def fail_return(c, stage, *, persistent=False):
         async def execute(self, sql, params=()):
             if (state.enabled and (persistent or not state.fired)
                     and sql.startswith(f'INSERT INTO {c.manager.events} ') and len(params) > 2
-                    and params[1] == c.state.source and params[2] == 'native_callback_returned'):
+                    and params[1] == c.state.source and params[2] == event_type):
                 self.flags['target'] = True
                 if stage != 'ack':
                     state.fired += 1

@@ -19,6 +19,7 @@ from power_loop import (
     ToolDefinition,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.unit
@@ -58,7 +59,7 @@ async def test_round_limit_final_call_routes_through_call_llm() -> None:
     bus.subscribe(None, events.append)
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="echo", description="e",
-                 input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
+                 input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **k: "ok")
     # round 0 makes a tool call (resolves); max_rounds=1 → the summary call fires.
     llm = _Scripted(responses=[_tool_call("c1", "echo"),
                                LLMResponse(raw_text="summary", content_text="summary")])
@@ -80,7 +81,7 @@ async def test_round_limit_summary_is_persisted_to_transcript() -> None:
     # assistant turn, so the next send's history isn't a dangling "summarize…" prompt with no answer.
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="echo", description="e",
-                 input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
+                 input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **k: "ok")
     llm = _Scripted(responses=[_tool_call("c1", "echo"),
                                LLMResponse(raw_text="here is my summary", content_text="here is my summary")])
     store = await SessionStore.open(":memory:")

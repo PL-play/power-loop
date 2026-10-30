@@ -6,6 +6,7 @@ import pytest
 from power_loop import AgentLoopConfig, StatefulAgentLoop
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.store import SessionStore
 from power_loop.tools.registry import ToolRegistry
@@ -22,7 +23,7 @@ def _script(n):
 
 async def _run(store, sends, *, cap=6, history=True, metadata=None):
     reg = ToolRegistry()
-    reg.register(ToolDefinition("echo", ""), lambda **kw: f"echo {kw}")
+    reg.register(ToolDefinition("echo", "", pricing=Free("test_fixture")), lambda **kw: f"echo {kw}")
     llm = _Scripted(_script(sends))
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=reg, config=AgentLoopConfig(
         system_prompt="S", max_tokens=100, max_rounds=5, representation=ProjectedRepresentation(),
@@ -65,7 +66,7 @@ async def test_bounded_read_never_scans_the_whole_session(monkeypatch):
 
         monkeypatch.setattr(SessionStore, "load_active_messages", spy)
         reg = ToolRegistry()
-        reg.register(ToolDefinition("echo", ""), lambda **kw: "x")
+        reg.register(ToolDefinition("echo", "", pricing=Free("test_fixture")), lambda **kw: "x")
         loop = StatefulAgentLoop(llm=_Scripted([LLMResponse(raw_text="ok")]), store=store, tool_registry=reg,
                                  config=AgentLoopConfig(system_prompt="S", max_tokens=100, max_rounds=5,
                                                         representation=ProjectedRepresentation(),
@@ -97,7 +98,7 @@ async def test_history_false_then_normal_send_heals_only_the_window():
     try:
         llm, sid = await _run(store, 3, history=False)
         reg = ToolRegistry()
-        reg.register(ToolDefinition("echo", ""), lambda **kw: "x")
+        reg.register(ToolDefinition("echo", "", pricing=Free("test_fixture")), lambda **kw: "x")
         loop = StatefulAgentLoop(llm=_Scripted([LLMResponse(raw_text="ok")]), store=store, tool_registry=reg,
                                  config=AgentLoopConfig(system_prompt="S", max_tokens=100, max_rounds=5,
                                                         representation=ProjectedRepresentation()))

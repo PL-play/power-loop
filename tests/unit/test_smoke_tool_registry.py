@@ -4,6 +4,7 @@ import uuid
 from pathlib import Path
 
 from power_loop import ToolDefinition, create_default_tool_registry
+from power_loop.runtime.pricing import Free
 
 
 def test_default_tool_registry_smoke(tmp_path: Path) -> None:
@@ -51,7 +52,7 @@ def test_default_tool_registry_smoke(tmp_path: Path) -> None:
                 "properties": {"text": {"type": "string"}},
                 "required": ["text"],
             },
-        ),
+        pricing=Free("test_fixture")),
         _echo,
     )
 

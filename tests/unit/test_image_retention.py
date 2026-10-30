@@ -18,6 +18,7 @@ from power_loop._vendor.llm_client.interface import (
 )
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime import image_recall
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -81,7 +82,7 @@ def _registry(tmp_path) -> ToolRegistry:
         image_recall.queue_image_for_next_round(get_session_id(), path=str(img), note="看这张")
         return "queued"
 
-    reg.register(ToolDefinition(name="look", description="look", input_schema={"type": "object", "properties": {}}), look)
+    reg.register(ToolDefinition(name="look", description="look", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), look)
     return reg
 
 

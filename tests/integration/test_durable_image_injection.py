@@ -24,6 +24,7 @@ from power_loop import (
     ToolRegistry,
 )
 from power_loop.runtime.image_recall import discard_queued_images, queue_image_for_next_round
+from power_loop.runtime.pricing import Free
 
 
 def _png(size: int = 8) -> bytes:
@@ -83,7 +84,7 @@ async def test_durable_injection_becomes_a_real_user_row(tmp_path) -> None:
         registry = ToolRegistry()
         registry.register(
             ToolDefinition(name="look", description="look at an image",
-                           input_schema={"type": "object", "properties": {}}),
+                           input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
             _look,
         )
         loop = StatefulAgentLoop(
@@ -132,7 +133,7 @@ async def test_ephemeral_injection_is_not_stored(tmp_path) -> None:
         registry = ToolRegistry()
         registry.register(
             ToolDefinition(name="look", description="look",
-                           input_schema={"type": "object", "properties": {}}),
+                           input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
             _look,
         )
         loop = StatefulAgentLoop(

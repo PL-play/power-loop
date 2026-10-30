@@ -10,6 +10,7 @@ from power_loop import AgentLoopConfig, AgentSpec, SessionStore, StatefulAgentLo
 from power_loop.core.agent_context import reset_session_id, set_session_id
 from power_loop.runtime import delegation
 from power_loop.runtime.execution_roles import session_role
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec, workflow_continuation_loop
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolRuntimeContract
 from power_loop.tools.registry import ToolRegistry
@@ -35,7 +36,7 @@ async def runtime(tmp_path):
         handler = unused
         if name != "local_read":
             handler = FunctionRuntimeTool(handler, ToolRuntimeContract("test." + name, allowed_roles=allowed))
-        registry.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"}),
+        registry.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"}, pricing=Free("test_fixture")),
                           handler)
     loop = StatefulAgentLoop(llm=model, store=store, tool_registry=registry,
                              config=AgentLoopConfig(delegation_policy="single_level", max_rounds=2))

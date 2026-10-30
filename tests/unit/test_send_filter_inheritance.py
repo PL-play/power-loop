@@ -29,6 +29,7 @@ from power_loop.core.agent_context import (
     reset_effective_tools,
     set_effective_tools,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow
@@ -79,7 +80,7 @@ def _tool_def(name: str) -> ToolDefinition:
     return ToolDefinition(
         name=name, description=name,
         input_schema={"type": "object", "properties": {}},
-    )
+    pricing=Free("test_fixture"))
 
 
 def _registry(*names: str) -> ToolRegistry:

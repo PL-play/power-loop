@@ -54,10 +54,13 @@ def registration_value(registered):
         return None
     from .tool_contracts import resolve
     implementation = resolve(registered)
+    from power_loop.tools.registry import validate_pricing
+    pricing = validate_pricing(registered)
     d = registered.definition
     return json.loads(_json({'schema': d.to_openai_tool(), 'required': list(d.required_params), 'interrupt': d.interrupt,
         'async_capable': d.async_capable if type(d.async_capable) is bool else sorted(d.async_capable),
         'usage_hint': d.usage_hint, 'background_hint': d.background_hint,
+        'pricing': {'rule_id': pricing.rule_id, 'version': registered.pricing_version},
         'runtime_contract': asdict(implementation.runtime_contract) if implementation is not None else None}))
 
 
@@ -264,7 +267,7 @@ async def prepare(pipeline):
         pipeline._native_abort_attempt = None
 
 
-async def dispatch(pipeline, name, arguments, registered):
+async def dispatch(pipeline, name, arguments, registered, *, budget_attempt=None):
     from .invocation import current_invocation
     from .task_runtime import _SEND
     from .tool_contracts import policy
@@ -304,9 +307,15 @@ async def dispatch(pipeline, name, arguments, registered):
         key = identity(manager, source, ref) + '_start_' + _hash(call_id)[:24]
         if await _read(manager, tx, key, source, 'tool_call_dispatch_started', optional=True) is not None:
             raise JobError('tool_call_already_dispatched')
+        if budget_attempt is not None:
+            from .tool_attempts import authorize_dispatch
+            await authorize_dispatch(budget_attempt, tx, source)
         await _event(manager, tx, key, source, 'tool_call_dispatch_started',
             {'version': 1, 'scope': plan['scope'], 'plan_id': identity(manager, source, ref),
              'plan_hash': _hash(plan), 'entry_hash': _hash(matches[0])})
+        if matches[0]['recovery'] is not None and budget_attempt is not None:
+            from .tool_attempts import observe_managed_free
+            await observe_managed_free(budget_attempt, tx, source)
     if matches[0]['recovery'] is None:
         return binding.runtime._native_returns.reserve(binding, ref, plan, matches[0])
 

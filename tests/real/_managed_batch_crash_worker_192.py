@@ -1,4 +1,5 @@
 """Real ordered two-call response; die before callbacks or after the first exit."""
+
 import asyncio
 import json
 import os
@@ -17,6 +18,7 @@ from power_loop.runtime.managed_effects import (
     ManagedToolResult,
     descriptor,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
@@ -50,7 +52,7 @@ async def main():
 
     implementation = FunctionManagedTool(ManagedToolContract('example.batch-crash', 'a' * 64), prepare, execute, query)
     definitions = [ToolDefinition(name, 'Set this beacon once with value42.', input_schema={
-        'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']}) for name in names]
+        'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']}, pricing=Free("test_fixture")) for name in names]
     registry = ToolRegistry()
     for definition in definitions:
         registry.register(definition, implementation.bind(runtime, definition))

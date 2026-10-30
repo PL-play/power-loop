@@ -14,6 +14,7 @@ from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_notifications as notices
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, Execution, TaskRuntime
 from power_loop.tools.wait_handoff import register_wait_handoff_tool
 
@@ -342,7 +343,7 @@ async def test_actual_workflow_node_consumes_original_system_input_before_review
         return result
 
     monkeypatch.setattr(model, "complete", complete)
-    loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Register a node wait", input_schema={"type": "object"}), arm)
+    loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Register a node wait", input_schema={"type": "object"}, pricing=Free("test_fixture")), arm)
     try:
         await loop.send("Start workflow", parent)
         model.release["BUILD"].set()

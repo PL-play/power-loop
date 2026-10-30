@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from power_loop.runtime.pricing import Free
+
 pytest.importorskip("mcp")
 
 from power_loop.contrib.mcp import (  # noqa: E402
@@ -40,7 +42,7 @@ async def test_stdio_client_roundtrip_against_real_server() -> None:
 
         # register into a ToolRegistry and invoke through it — a real stdio round-trip
         registry = ToolRegistry()
-        names = await register_mcp_tools(registry, client, prefix="mcp_")
+        names = await register_mcp_tools(registry, client, prefix="mcp_", pricing=Free("test_fixture"))
         assert "mcp_add" in names and "mcp_greet" in names
 
         add_out = await registry.invoke_async("mcp_add", {"a": 2, "b": 3})
@@ -62,7 +64,7 @@ async def test_register_then_direct_call_proxies_remote_name() -> None:
     client = await StdioMCPClient(sys.executable, [_SERVER]).connect()
     try:
         registry = ToolRegistry()
-        await register_mcp_tools(registry, client, prefix="srv.")
+        await register_mcp_tools(registry, client, prefix="srv.", pricing=Free("test_fixture"))
         out = await registry.invoke_async("srv_greet", {"name": "Bob"})
         assert out == "Hello, Bob!"
     finally:

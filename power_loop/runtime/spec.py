@@ -337,13 +337,24 @@ async def workflow_continuation_loop(parent_loop: Any, session_id: str, *, expec
     if finite_delegation(parent_loop) or child_config.delegation_policy == "single_level":
         tools = role_tools(tools, await session_role(store, session_id), registry=parent_loop.tool_registry)
     loop = StatefulAgentLoop(
-        llm=parent_loop.llm, store=store, config=child_config,
+        llm=_model_service(parent_loop, spec), store=store, config=child_config,
         tool_registry=filtered_registry(parent_loop.tool_registry, tools),
         hooks=parent_loop._runner.hooks, event_bus=parent_loop._runner.event_bus,
         task_runtime=getattr(parent_loop, "task_runtime", None),
     )
     loop._child_run_guards = getattr(parent_loop, "_child_run_guards", ())
     return loop
+
+
+def _model_service(parent_loop, spec, override=None):
+    binding = spec.metadata.get('model_binding')
+    if binding is None:
+        return parent_loop.llm if override is None else override
+    services = getattr(parent_loop.task_runtime, 'model_services', {})
+    service = services.get(binding)
+    if service is None or override is not None and override is not service:
+        raise ValueError('model_binding_unavailable')
+    return service
 
 
 async def run_agent_spec(
@@ -514,7 +525,7 @@ async def run_agent_spec(
     # 而不只是 ``spec.model`` 那种同一服务上的模型名覆盖。宿主的「答题子 agent」用它把模型
     # 指向后台配置的 admin_llm_models 条目；None = 沿用父 loop 的服务（原行为）。
     child_loop = StatefulAgentLoop(
-        llm=llm if llm is not None else parent_loop.llm,
+        llm=_model_service(parent_loop, spec, llm),
         store=store,
         config=child_config,
         tool_registry=sub_registry,

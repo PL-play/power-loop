@@ -22,6 +22,7 @@ from power_loop.core.agent_context import (
     set_session_id,
 )
 from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.stub_provider import EchoLLMService
 from power_loop.tools.default_tools import BackgroundManager
@@ -157,9 +158,9 @@ async def test_action_tool_runs_async_capable_tool_and_notifies(monkeypatch):
     from power_loop.tools import default_tools as dt
 
     reg = _ToolTaskReg([
-        ToolDefinition(name="generate_image", description="d", async_capable=True),
-        ToolDefinition(name="write_file", description="d"),
-        ToolDefinition(name="background_run", description="d"),
+        ToolDefinition(name="generate_image", description="d", async_capable=True, pricing=Free("test_fixture")),
+        ToolDefinition(name="write_file", description="d", pricing=Free("test_fixture")),
+        ToolDefinition(name="background_run", description="d", pricing=Free("test_fixture")),
     ])
     monkeypatch.setattr(agent_context, "get_current_loop", lambda: _ToolTaskLoop(reg))
     monkeypatch.setattr(dt, "_current_store_and_session", lambda: (None, None))
@@ -207,9 +208,9 @@ def test_async_capable_suffix_only_with_background_run_mounted():
             r.register(d, DEFAULT_TOOL_HANDLERS["background_run"] if d.name == "background_run" else _h)
         return r
 
-    gen = ToolDefinition(name="generate_image", description="生成图片。", async_capable=True)
-    bg = ToolDefinition(name="background_run", description="bg。")
-    plain = ToolDefinition(name="write_file", description="写文件。")
+    gen = ToolDefinition(name="generate_image", description="生成图片。", async_capable=True, pricing=Free("test_fixture"))
+    bg = ToolDefinition(name="background_run", description="bg。", pricing=Free("test_fixture"))
+    plain = ToolDefinition(name="write_file", description="写文件。", pricing=Free("test_fixture"))
 
     with_bg = {t["function"]["name"]: t["function"]["description"]
                for t in _mk(gen, bg, plain).to_openai_tools()}
@@ -232,9 +233,9 @@ def test_fast_readonly_tools_get_no_background_suffix_but_stay_async_capable():
 
     r = ToolRegistry()
     for d in (
-        ToolDefinition(name="read_file", description="读。", async_capable=True, background_hint=False),
-        ToolDefinition(name="generate_image", description="生成图片。", async_capable=True),
-        ToolDefinition(name="background_run", description="bg。"),
+        ToolDefinition(name="read_file", description="读。", async_capable=True, background_hint=False, pricing=Free("test_fixture")),
+        ToolDefinition(name="generate_image", description="生成图片。", async_capable=True, pricing=Free("test_fixture")),
+        ToolDefinition(name="background_run", description="bg。", pricing=Free("test_fixture")),
     ):
         from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
         r.register(d, DEFAULT_TOOL_HANDLERS["background_run"] if d.name == "background_run" else _h)

@@ -310,7 +310,8 @@ async def _complete(loop, parent, sid, run, raw, after_seq, lifecycle, finalize,
 
 
 async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=None,
-                admission: asyncio.Semaphore | None = None) -> dict[str, Any]:
+                admission: asyncio.Semaphore | None = None, llm=None,
+                inherit_send_filter=True, prepare_result=None) -> dict[str, Any]:
     from .execution_roles import require_orchestration
     await require_orchestration(loop, "subagent")
     parent = get_session_id()
@@ -360,10 +361,13 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
         try:
             # Manager owns cleanup, after repair/projection/range collection.
             raw = await run_agent_spec(replace(spec, lifecycle="linked", metadata={**spec.metadata, "managed_subagent": True}), task,
-                                       parent_loop=loop, stop_event=run.token)
+                                       parent_loop=loop, stop_event=run.token, llm=llm,
+                                       inherit_send_filter=inherit_send_filter)
             sid = ready.result() if ready.done() and not ready.cancelled() else None
             if sid is None:
                 raise ValueError(raw.get("final_text") or "child session was not created")
+            if prepare_result is not None:
+                raw = await prepare_result(sid, raw)
         except BaseException as exc:
             if not ready.done():
                 if runtime is not None:
@@ -407,6 +411,26 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
     if registration is not None:
         receipt.update(job_id=registration.job.job_id, operation_id=registration.operation.operation_id)
     return receipt
+
+
+async def run_inline(spec, task, *, parent_loop, llm=None, inherit_send_filter=True, finalize=None):
+    """Await the standard owned child; never start an unmanaged inline session."""
+    runtime = parent_loop.task_runtime
+    if runtime is None:
+        from .jobs import JobError
+        raise JobError('task_send_required')
+    parent = get_session_id()
+    receipt = await start(parent_loop, spec, task, llm=llm,
+        inherit_send_filter=inherit_send_filter, prepare_result=finalize)
+    store = await parent_loop.ensure_store()
+    running = _RUNNING.get((id(store), receipt.get('session_id')))
+    if running is not None:
+        await asyncio.shield(running.task)
+    job = await runtime.manager.get_job(runtime.actor(parent), receipt['job_id'])
+    if job.result is None:
+        from .jobs import JobError
+        raise JobError('subagent_original_result_pending')
+    return job.result
 
 
 async def nudge(loop, sid: str, message: str, *, on_complete=None, finalize=None,

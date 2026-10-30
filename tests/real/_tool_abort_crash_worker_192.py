@@ -1,4 +1,5 @@
 """Actual original process dies after its positive pre-admission checkpoint."""
+
 import asyncio
 import json
 import os
@@ -15,6 +16,7 @@ from power_loop.runtime.managed_effects import (
     ManagedToolPreparation,
     ManagedToolResult,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
@@ -48,7 +50,7 @@ async def main():
 
     implementation = FunctionManagedTool(ManagedToolContract('example.batch-crash', 'a' * 64), prepare, execute, query)
     definitions = [ToolDefinition(name, 'Set this beacon once with value42.', input_schema={
-        'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']}) for name in names]
+        'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']}, pricing=Free("test_fixture")) for name in names]
     registry = ToolRegistry()
     for definition in definitions:
         registry.register(definition, implementation.bind(runtime, definition))

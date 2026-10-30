@@ -12,6 +12,7 @@ from power_loop.runtime import delegation, model_attempts
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.model_attempt_query import list_attempts
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND
 
 from .test_job_registry_192 import registry_store
@@ -165,7 +166,7 @@ async def test_native_node_short_policy_does_not_run_downstream_or_retry_busines
         return "Original policy armed."
 
     loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Arm original node policy",
-        input_schema={"type": "object", "properties": {}}), arm)
+        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), arm)
 
     async def in_progress(request, **kwargs):
         response = await complete(request, **kwargs)

@@ -47,6 +47,7 @@ from power_loop._vendor.llm_client.interface import (
 )
 from power_loop.agent.sink import SQLiteSink
 from power_loop.runtime.compact import CompactionPlan
+from power_loop.runtime.pricing import Free
 
 pytestmark = pytest.mark.unit
 
@@ -433,7 +434,7 @@ def _blob_registry() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
         ToolDefinition(name="blob", description="returns fat content",
-                       input_schema={"type": "object", "properties": {}}),
+                       input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
         lambda **kw: "T" * 4000,
     )
     return reg

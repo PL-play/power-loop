@@ -10,6 +10,7 @@ from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDef
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import workflow_restore_execution
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.runtime.workflow_resources import (
     WorkflowResourceAdapter,
@@ -86,7 +87,7 @@ async def test_real_native_restoration_recomputes_original_nodes_and_main_consum
         return json.dumps({"job_id": handle.job_id, "operation_id": handle.operation_id, "run_id": handle.run_id, "generation": 2, "status": "accepted"})
     for name, fn in (("launch_workflow", launch), ("repair_workflow", repair)):
         description = "Start the predefined 19+23 workflow once." if name == "launch_workflow" else "Continue the completed original workflow with the user's new correction: compute 20+23, re-review, and deliver a new result. Reuses original task and sessions."
-        registry.register(ToolDefinition(name=name, description=description, input_schema={"type": "object", "properties": {}}), fn)
+        registry.register(ToolDefinition(name=name, description=description, input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), fn)
     claims = []
     original = workflow_restore_execution.claim_node
     async def claim(*args, **kwargs):

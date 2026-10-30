@@ -11,6 +11,7 @@ from power_loop import LLMResponse, LLMTokenUsage, ToolDefinition
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import node_inputs
 from power_loop.runtime.jobs import JobError
+from power_loop.runtime.pricing import Free
 from power_loop.workflow import runner
 
 from .test_job_registry_192 import registry_store
@@ -60,7 +61,7 @@ async def client(managed_workflow, monkeypatch):
             c.replies.append(value)
             return json.dumps(value)
         loop.tool_registry.register(ToolDefinition(name="nudge_node", description="Correct an active node",
-            input_schema={"type": "object"}), nudge, overwrite=True)
+            input_schema={"type": "object"}, pricing=Free("test_fixture")), nudge, overwrite=True)
         pending_call = True
         return await loop.send("Correct the running node", parent)
 

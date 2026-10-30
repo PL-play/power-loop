@@ -1,4 +1,5 @@
 """Real model; exit the process after durable callback exit, before result write."""
+
 import asyncio
 import json
 import os
@@ -17,6 +18,7 @@ from power_loop.runtime.managed_effects import (
     ManagedToolResult,
     descriptor,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
@@ -48,7 +50,7 @@ async def main():
 
     implementation = FunctionManagedTool(ManagedToolContract('example.crash', 'a' * 64), prepare, execute, query)
     definition = ToolDefinition('set_beacon', 'Set the beacon once with value 42.', input_schema={
-        'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']})
+        'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']}, pricing=Free("test_fixture"))
     registry = ToolRegistry()
     registry.register(definition, implementation.bind(runtime, definition))
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,

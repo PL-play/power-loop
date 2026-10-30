@@ -12,6 +12,7 @@ from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import completion_windows as windows
 from power_loop.runtime import delegation
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _OWNER, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -42,7 +43,7 @@ async def test_real_original_child_keeps_admitted_utc_deadline_after_store_reope
         return json.dumps({"deadline_at_ms": str(saved["deadline_at_ms"]), "status": "original-window-retained"})
 
     registry.register(ToolDefinition(name="deadline_probe", description="Read the original child deadline exactly once.",
-        input_schema={"type": "object", "properties": {}, "additionalProperties": False}), probe)
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False}, pricing=Free("test_fixture")), probe)
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=4, max_tokens=2048,
             system_prompt="Initially create exactly one requested child with spawn_agent, then reply WAITING as text without pass_turn. "

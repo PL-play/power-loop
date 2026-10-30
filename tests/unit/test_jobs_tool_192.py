@@ -18,6 +18,7 @@ from power_loop.core.agent_context import (
     set_session_id,
 )
 from power_loop.runtime import delegation, task_control
+from power_loop.runtime.pricing import Free
 from power_loop.tools.default_manifest import CORE_TOOL_NAMES, EXPLORE_TOOL_NAMES, FULL_TOOL_NAMES
 from power_loop.tools.jobs import run_jobs
 from power_loop.tools.registry import ToolRegistry
@@ -426,5 +427,5 @@ async def test_native_jobs_alias_uses_registered_contract_not_catalog_name(manag
     assert not payload.get("error")
     assert policy(loop.tool_registry.get(name), {"action": "list"}).control_only
     forged = ToolRegistry()
-    forged.register(ToolDefinition(name, "ordinary callable"), lambda **kwargs: "ordinary")
+    forged.register(ToolDefinition(name, "ordinary callable", pricing=Free("test_fixture")), lambda **kwargs: "ordinary")
     assert not policy(forged.get(name), {"action": "list"}).native_admitted

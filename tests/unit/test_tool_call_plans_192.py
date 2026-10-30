@@ -1,10 +1,12 @@
 """A whole native batch is registered before its first finite callback starts."""
+
 import json
 
 import pytest
 
 from power_loop.runtime.jobs import JobError
 from power_loop.runtime.pending_calls import retire_pending
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_call_plans import reconcile_pending
 
 from .test_job_registry_192 import registry_store
@@ -196,7 +198,7 @@ async def test_mixed_unsupported_intent_cannot_be_silently_dropped_or_partly_res
     plain_calls = []
     async def configure(loop, state):
         if registered_plain:
-            loop.tool_registry.register(ToolDefinition('inspect_note', '', input_schema={'type': 'object', 'properties': {'text': {'type': 'string'}}}),
+            loop.tool_registry.register(ToolDefinition('inspect_note', '', input_schema={'type': 'object', 'properties': {'text': {'type': 'string'}}}, pricing=Free("test_fixture")),
                                         lambda **args: plain_calls.append(args))
     c = await scenario(registry_store, budgeted=True, raw_receipt_failure=True, configure=configure,
                        call_names=['post_once', 'inspect_note', 'post_once'])

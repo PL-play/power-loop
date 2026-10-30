@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 
 from .jobs import JobError, _hash, _json
 from .model_exit import content_reference
+from .pricing import BillingReceipt, PricingError
 
 _LIMIT = 16 * 1024 * 1024
 
@@ -39,6 +40,12 @@ class _Receipt:
     entry_hash: str
     task: object
     text: str | None = None
+    billing_receipt: BillingReceipt | None = None
+    billing_saved: bool = False
+    budget_attempt: object = None
+    nested_parent: object = None
+    children: set = field(default_factory=set, repr=False)
+    finished: bool = False
     failed: bool = False
     saved: bool = False
 
@@ -60,6 +67,8 @@ class ReturnCache:
             raise JobError('native_return_runtime_changed')
 
     def key(self, slot):
+        if slot.nested_parent is not None:
+            return slot.budget_attempt.attempt_id
         return identity(self.runtime.manager, asdict(slot.binding.lease), slot.ref, slot.call_id)
 
     def require(self, slot):
@@ -79,21 +88,28 @@ class ReturnCache:
         self.slots[key] = slot
         return slot
 
-    def capture(self, slot, text):
+    def capture(self, slot, text, billing_receipt=None):
         from .task_runtime import _SEND
         self.require(slot)
         if (_SEND.get() is not slot.binding or asyncio.current_task() is not slot.task
-                or type(text) is not str or slot.text is not None):
+                or type(text) is not str or slot.text is not None
+                or (billing_receipt is not None and not isinstance(billing_receipt, BillingReceipt))):
             raise JobError('native_return_original_required')
         # No await between original callback return/serialization and retention.
+        if billing_receipt is not None:
+            if slot.billing_receipt is not None and slot.billing_receipt != billing_receipt:
+                raise PricingError('tool_billing_receipt_changed')
+            slot.billing_receipt = billing_receipt
         slot.text = text
 
     def release_unreturned(self, slot):
-        if slot.text is None:
+        slot.finished = True
+        if slot.text is None and (slot.billing_receipt is None or slot.billing_saved):
             self.slots.pop(self.key(slot), None)
 
     def pending_count(self):
-        return sum(s.text is not None for s in self.slots.values())
+        return sum(s.nested_parent is not None or s.text is not None or (s.billing_receipt is not None and not s.billing_saved)
+                   for s in self.slots.values())
 
     def failed_count(self):
         return sum(s.failed for s in self.slots.values())
@@ -136,8 +152,15 @@ async def read(manager, tx, source, ref, entry, plan, *, optional=False):
     event = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (key,))
     anchor = await _read(manager, tx, anchor_id(key), source, 'native_callback_return_anchor')
     start, operations = await _basis(manager, tx, source, ref, entry, plan)
-    if (set(data) != {'version', 'scope', 'call_ref', 'call_id', 'plan_hash', 'entry_hash', 'started', 'operations', 'return_text'}
-            or type(data['version']) is not int or data['version'] != 1
+    fields = {'version', 'scope', 'call_ref', 'call_id', 'plan_hash', 'entry_hash', 'started', 'operations', 'return_text'}
+    if data.get('version') == 2:
+        fields.add('billing_receipt')
+        try:
+            BillingReceipt.from_dict(data.get('billing_receipt'))
+        except PricingError as exc:
+            raise JobError('native_return_billing_receipt_invalid') from exc
+    if (set(data) != fields
+            or type(data['version']) is not int or data['version'] not in (1, 2)
             or data['scope'] != plan['scope'] or data['call_ref'] != ref.to_dict()
             or data['call_id'] != entry['call_id'] or data['plan_hash'] != _hash(plan)
             or data['entry_hash'] != _hash(entry) or entry['recovery'] is not None
@@ -172,6 +195,9 @@ async def persist(runtime, slot):
                 value = {'version': 1, 'scope': plan['scope'], 'call_ref': slot.ref.to_dict(), 'call_id': slot.call_id,
                          'plan_hash': slot.plan_hash, 'entry_hash': slot.entry_hash, 'started': start,
                          'operations': operations, 'return_text': slot.text}
+                if slot.billing_receipt is not None:
+                    value['version'] = 2
+                    value['billing_receipt'] = slot.billing_receipt.to_dict()
                 document = _json(value)
                 if len(document.encode()) > _LIMIT:
                     raise JobError('native_return_too_large')
@@ -195,21 +221,60 @@ async def persist(runtime, slot):
         raise
 
 
-async def invoke(pipeline, registered, arguments, slot):
+async def invoke(pipeline, registered, arguments, slot, *, budget_attempt=None):
     """Called by the pipeline after original dispatch, before formatting/hooks."""
     cache = slot.binding.runtime._native_returns if slot is not None else None
+    settlement_started = False
     try:
         from .tool_contracts import validate_registration
         validate_registration(pipeline.tool_registry, registered.definition.name, registered)
-        result = await pipeline.tool_registry.invoke_async(registered.definition.name, arguments)
-        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        from .tool_billing import receipt_context
         if slot is not None:
-            cache.capture(slot, text)
+            slot.budget_attempt = budget_attempt
+        with receipt_context(slot):
+            result = await pipeline.tool_registry.invoke_async(registered.definition.name, arguments)
+        if slot is not None:
+            from .nested_tools import join_children
+            await join_children(slot)
+        from power_loop.contracts.tools import ToolResult
+        billing_receipt = None
+        if isinstance(result, ToolResult):
+            billing_receipt = result.billing_receipt
+            result = result.content
+            if billing_receipt is not None and slot is None:
+                raise JobError('tool_billing_checkpoint_unavailable')
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+        if budget_attempt is not None and budget_attempt.observation is None:
+            from .tool_attempts import capture
+            capture(budget_attempt, billing_receipt or (slot.billing_receipt if slot is not None else None), None)
+        if slot is not None:
+            cache.capture(slot, text, billing_receipt)
             try:
                 await persist(slot.binding.runtime, slot)
             except Exception as exc:
                 raise NativeReturnPending() from exc
+        if budget_attempt is not None:
+            from .tool_attempts import finish
+            settlement_started = True
+            await finish(budget_attempt)
         return text
+    except BaseException as exc:
+        if slot is not None:
+            from .nested_tools import join_children
+            await join_children(slot, cancel=True)
+        if budget_attempt is not None and not settlement_started:
+            from .tool_attempts import capture, finish
+            try:
+                if budget_attempt.observation is None:
+                    capture(budget_attempt, slot.billing_receipt if slot is not None else None, exc)
+                await finish(budget_attempt)
+            except BaseException:
+                # The budget journal retains unsettled ownership; never rerun
+                # the callback to repair financial delivery.
+                import logging
+                logging.getLogger(__name__).warning('Tool settlement requires reconciliation',
+                    extra={'attempt_id': budget_attempt.attempt_id})
+        raise
     finally:
         if slot is not None:
             cache.release_unreturned(slot)
@@ -219,5 +284,15 @@ async def flush_local(runtime, *, failed_only=False):
     cache = runtime._native_returns
     cache.check()
     for slot in list(cache.slots.values()):
+        if slot.nested_parent is not None:
+            from .nested_tools import flush_slot
+            if slot.finished and (not failed_only or slot.failed):
+                await flush_slot(slot)
+            continue
         if slot.text is not None and (not failed_only or slot.failed):
             await persist(runtime, slot)
+        elif slot.billing_receipt is not None and (not failed_only or slot.failed):
+            from .tool_billing import persist_receipt
+            await persist_receipt(runtime, slot)
+            if slot.finished:
+                cache.release_unreturned(slot)

@@ -11,6 +11,7 @@ from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLo
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import delegation
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -127,7 +128,7 @@ async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_
         return json.dumps({"status": "queued", "job_id": handle.job_id, "operation_id": handle.operation_id, "run_id": handle.run_id})
 
     registry.register(ToolDefinition(name="launch_workflow", description="Start the predefined calculation/review workflow asynchronously, once.",
-                                     input_schema={"type": "object", "properties": {}}), launch)
+                                     input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), launch)
     async def root_phase_tools(ctx):
         if get_session_id() != sid:
             return

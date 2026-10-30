@@ -28,6 +28,7 @@ from power_loop.core.pass_turn import request_pass
 from power_loop.runtime import delegation
 from power_loop.runtime.cancellation import CancellationToken
 from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.recall import recall
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.tools.registry import ToolRegistry
@@ -281,7 +282,7 @@ async def test_standalone_child_processes_pass_boundary_input_with_a_shared_budg
 
     monkeypatch.setattr(model, "complete", complete)
     loop.tool_registry.register(ToolDefinition(name="boundary_pass", description="Test pass",
-        input_schema={"type": "object", "properties": {}}), boundary_pass)
+        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), boundary_pass)
     receipt = await delegation.start(loop, AgentSpec(name="owner", system_prompt="OWNER",
         tools=["boundary_pass"], lifecycle="linked", max_rounds=4), "work")
     await finish_children()

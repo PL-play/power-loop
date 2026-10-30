@@ -1,3 +1,4 @@
+
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ import pytest
 from power_loop.contracts.context_policy import ToolContextPolicy
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.runtime.budget import estimate_tokens
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource
 from power_loop.runtime.tool_truncation import truncate_pair
@@ -109,9 +111,9 @@ async def test_background_uses_target_limits_and_keep():
     try:
         sid = await store.create_session()
         registry = ToolRegistry()
-        registry.register(ToolDefinition('bash', ''), create_default_tool_registry(bind=False).get('bash').handler)
+        registry.register(ToolDefinition('bash', '', pricing=Free("test_fixture")), create_default_tool_registry(bind=False).get('bash').handler)
         from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-        registry.register(ToolDefinition('background_run', ''), DEFAULT_TOOL_HANDLERS['background_run'])
+        registry.register(ToolDefinition('background_run', '', pricing=Free("test_fixture")), DEFAULT_TOOL_HANDLERS['background_run'])
         config = ToolContextConfig(overrides={'bash': {'insend_fuse': 'truncate',
             'general': 'truncate', 'argument_max_chars': 200, 'result_max_chars': 300}})
         engine = ToolContextEngine(config=config, store=store, owner_session_id=sid,

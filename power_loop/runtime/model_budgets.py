@@ -19,6 +19,13 @@ from .jobs import JobError, _hash, _json
 _COUNTERS = budget_scopes.COUNTERS
 
 
+def accounting_context(state):
+    """Carry the original reserved request across hosts, recovery and revisions."""
+    from .budget_contracts import payload
+    return {**payload(state['context']),
+        'reservation_request': payload(state['plan']['request'])}
+
+
 def policy_key(runtime):
     return "bp_" + _hash([runtime.manager.store.store_id, runtime.tenant_id, runtime.principal_id])[:48]
 
@@ -226,6 +233,10 @@ async def _save(manager, tx, state, job, *, new=False):
 
 
 def _context(attempt, job):
+    from .tool_attempts import ToolAttempt
+    from .tool_attempts import context as tool_context
+    if type(attempt) is ToolAttempt:
+        return tool_context(attempt.binding.runtime.manager, job, attempt.prepared)
     manager = attempt.binding.runtime.manager
     return {
         "version": 1,
@@ -290,7 +301,7 @@ async def _check_pending(manager, tx, policy):
         raise JobError("budget_reconciliation_required")
 
 
-async def reserve(attempt, logical_request, *, service):
+async def reserve(attempt, logical_request, *, service=None, pricing=None):
     runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
     async with manager._write() as tx:
         job = await manager._fence(tx, attempt.binding.actor, attempt.binding.lease)
@@ -302,16 +313,23 @@ async def reserve(attempt, logical_request, *, service):
         await _check_pending(manager, tx, policy)
         context = _context(attempt, job)
     provider = runtime.budget_config.provider
+    from .tool_attempts import ToolAttempt
+    tool = type(attempt) is ToolAttempt
+    if tool and not callable(getattr(provider, 'prepare_tool', None)):
+        raise JobError('budget_tool_adapter_unavailable')
     supplied = await _port(
         attempt,
         "prepare",
+        (lambda: provider.prepare_tool(copy.deepcopy(context), logical_request, pricing=pricing)) if tool else
         lambda: provider.prepare(copy.deepcopy(context), copy.deepcopy(logical_request), service=service,
                                  **({"purpose": attempt.prepared["purpose"]} if "purpose" in attempt.prepared else {})),
     )
     if type(supplied) is not BudgetPlan:
         raise JobError("invalid_budget_plan")
     plan = BudgetPlan(supplied.token_bound, supplied.request)
-    if logical_request.max_tokens is None or plan.token_bound < logical_request.max_tokens:
+    if (tool and plan.token_bound != 0) or (not tool and (
+        logical_request.max_tokens is None or plan.token_bound < logical_request.max_tokens
+    )):
         raise JobError("budget_request_bound_missing")
     async with manager._write() as tx:
         job = await manager._fence(tx, attempt.binding.actor, attempt.binding.lease)
@@ -520,6 +538,9 @@ async def _deliver(runtime, actor, job_id, attempt_id):
         await _policy(runtime, tx)
         job = await manager._authorize(tx, actor, job_id)
         state = await _read(manager, tx, attempt_id)
+        if state['context'].get('kind') == 'tool':
+            from .tool_attempts import verify_state
+            await verify_state(manager, tx, job, state, finished=True)
         if state["phase"] != "settling":
             raise JobError("budget_usage_not_ready")
         if state.get("initial_usage_evidence") is not None:
@@ -538,6 +559,8 @@ async def _deliver(runtime, actor, job_id, attempt_id):
             submission = await prepare(runtime, actor, state)
         else:
             from .model_attempts import event_id
+            if state['context'].get('kind') == 'tool':
+                from .tool_attempts import event_id
             observation = {
                 **state["observation"],
                 "started_at_ms": state["started_at_ms"],
@@ -549,7 +572,7 @@ async def _deliver(runtime, actor, job_id, attempt_id):
                 runtime, job_id, attempt_id,
                 "prepare_usage",
                 lambda: runtime.budget_config.provider.prepare_usage(
-                    state["context"], BudgetGrant(**state["grant"]), observation
+                    accounting_context(state), BudgetGrant(**state["grant"]), observation
                 ),
             )
         if type(submission) is not BudgetSubmission or (submission.attempt_id, submission.revision) != (
@@ -733,6 +756,11 @@ async def release_unstarted(runtime, actor, job_id, attempt_id, *, require_cance
     Does not claim an execution, renew an old lease, or close supervision. A
     missing reservation is not a refund proof. Dispatched attempts are refused.
     """
+    if isinstance(attempt_id, str) and attempt_id.startswith('toolattempt_'):
+        from .tool_attempts import release_unstarted as release_tool
+        if type(require_cancelled) is not bool:
+            raise JobError('invalid_budget_release_guard')
+        return await release_tool(runtime, actor, job_id, attempt_id, require_cancelled=require_cancelled)
     if (type(job_id) is not str or not job_id or len(job_id) > 80
             or type(attempt_id) is not str or len(attempt_id) != 56 or not attempt_id.startswith("attempt_")
             or any(c not in "0123456789abcdef" for c in attempt_id[8:])):
@@ -962,6 +990,9 @@ async def _reconciliation_state(runtime, actor, job_id, attempt_id, *, allow_mis
 
 
 async def reconcile_usage(runtime, actor, job_id, attempt_id):
+    if isinstance(attempt_id, str) and attempt_id.startswith('toolattempt_'):
+        from .tool_attempts import reconcile
+        return await reconcile(runtime, actor, job_id, attempt_id)
     state, observation = await _reconciliation_state(runtime, actor, job_id, attempt_id)
     # A crash can occur after model observation commit but before its budget
     # projection. The shared transaction applies counters at most once.

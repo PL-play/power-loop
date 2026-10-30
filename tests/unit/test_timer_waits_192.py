@@ -14,6 +14,7 @@ from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobError, JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_query import list_jobs
 from power_loop.runtime.task_runtime import _SEND
 
@@ -365,7 +366,7 @@ async def _exercise_node_wait(managed_workflow, monkeypatch):
 
     monkeypatch.setattr(model, "complete", complete)
     loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Request a decision",
-                                input_schema={"type": "object"}), arm)
+                                input_schema={"type": "object"}, pricing=Free("test_fixture")), arm)
     try:
         await loop.send("start workflow", parent)
         model.release["BUILD"].set()

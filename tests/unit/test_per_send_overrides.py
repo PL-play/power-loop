@@ -20,6 +20,7 @@ from power_loop import (
     runtime_env_context,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
+from power_loop.runtime.pricing import Free
 
 
 @dataclass
@@ -58,7 +59,7 @@ def _noop(**_: Any) -> str:
 def _registry() -> ToolRegistry:
     r = ToolRegistry()
     for name in ("alpha", "beta", "gamma"):
-        r.register(ToolDefinition(name=name, description=name), _noop)
+        r.register(ToolDefinition(name=name, description=name, pricing=Free("test_fixture")), _noop)
     return r
 
 

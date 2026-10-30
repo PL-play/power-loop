@@ -12,6 +12,7 @@ from dataclasses import replace
 from typing import Any
 
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import AgentSpec
 
 from .facade import WorkflowPolicyError, WorkflowToolPorts, prepare_workflow, run_workflow_tool
@@ -122,7 +123,7 @@ def _build_create_workflow_description() -> str:
     )
 
 
-CREATE_WORKFLOW_DEFINITION = ToolDefinition(
+CREATE_WORKFLOW_DEFINITION = ToolDefinition(pricing=Free("composite"),
     name="create_workflow",
     description=_build_create_workflow_description(),
     input_schema={
@@ -154,7 +155,7 @@ CREATE_WORKFLOW_DEFINITION = ToolDefinition(
     interrupt="background",
 )
 
-VALIDATE_WORKFLOW_DEFINITION = ToolDefinition(
+VALIDATE_WORKFLOW_DEFINITION = ToolDefinition(pricing=Free("local"),
     name="validate_workflow",
     description=(
         "Dry-run check a WorkflowSpec JSON WITHOUT running it: full validation "
@@ -179,7 +180,7 @@ VALIDATE_WORKFLOW_DEFINITION = ToolDefinition(
 )
 
 
-WORKFLOW_STATUS_DEFINITION = ToolDefinition(
+WORKFLOW_STATUS_DEFINITION = ToolDefinition(pricing=Free("local"),
     name="workflow_status",
     description=(
         "Inspect workflows you started. With no args, lists all runs (run_id, "

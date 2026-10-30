@@ -11,6 +11,7 @@ from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDef
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import node_inputs, workflow_controller
 from power_loop.runtime.jobs import JobError, JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow, runner
@@ -118,8 +119,8 @@ async def test_real_main_nudges_original_workflow_node_before_review(tmp_path, r
             "Correction: compute 20+23 instead of 19+23. Reply only with the resulting number.")
         replies.append(reply)
         return json.dumps(reply)
-    registry.register(ToolDefinition(name="launch_workflow", description="Start the predefined workflow once", input_schema={"type": "object"}), launch)
-    registry.register(ToolDefinition(name="correct_node", description="Correct the original active calculation node", input_schema={"type": "object"}), nudge)
+    registry.register(ToolDefinition(name="launch_workflow", description="Start the predefined workflow once", input_schema={"type": "object"}, pricing=Free("test_fixture")), launch)
+    registry.register(ToolDefinition(name="correct_node", description="Correct the original active calculation node", input_schema={"type": "object"}, pricing=Free("test_fixture")), nudge)
     accept = manager.accept_nudge
     async def admit(*args, **kwargs):
         calls.append(1)

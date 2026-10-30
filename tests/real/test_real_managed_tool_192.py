@@ -24,6 +24,7 @@ from power_loop.runtime.managed_effects import (
     reconcile,
     terminate_unstarted,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
@@ -111,7 +112,7 @@ async def test_real_generic_base_admission_and_query_only_resolution(tmp_path, p
             "properties": {"value": {"type": "integer", "enum": [42]}},
             "required": ["value"],
         },
-    )
+    pricing=Free("test_fixture"))
     registry = ToolRegistry()
     registry.register(definition, implementation.bind(runtime, definition))
     loop = StatefulAgentLoop(

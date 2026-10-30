@@ -9,6 +9,7 @@ import pytest
 from power_loop._vendor.llm_client.interface import LLMResponse, LLMTokenUsage
 from power_loop.contracts.context_policy import ToolContextPolicy
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine, ToolSource
 from power_loop.tools.registry import ToolRegistry
@@ -21,7 +22,7 @@ async def env():
     store = await SessionStore.open(':memory:')
     sid = await store.create_session()
     registry = ToolRegistry()
-    registry.register(ToolDefinition('bash', '', project=lambda a, r: a.get('description', 'ok')),
+    registry.register(ToolDefinition('bash', '', project=lambda a, r: a.get('description', 'ok'), pricing=Free("test_fixture")),
                       ShellTool(lambda **kw: 'result' * 300))
     llm = _Scripted([LLMResponse(raw_text='unexpected model request', token_usage=LLMTokenUsage(
         prompt_tokens=100, completion_tokens=20, total_tokens=120))])
@@ -36,7 +37,7 @@ async def env():
 
 def test_metadata_not_in_schema_and_field_override():
     policy = ToolContextPolicy(insend_fuse='preserve')
-    tool = ToolDefinition('load_skill', '', context_policy=policy)
+    tool = ToolDefinition('load_skill', '', context_policy=policy, pricing=Free("test_fixture"))
     assert 'context_policy' not in tool.to_openai_tool()['function']
     assert policy.override({'general': 'rule'}).insend_fuse == 'preserve'
     with pytest.raises((ValueError, TypeError)):
@@ -167,7 +168,7 @@ async def test_background_delegates_target_keep(env):
               'result': source.result, 'status': 'completed'}
     await store.set_runtime_state(sid, record_key('task-1'), record)
     from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-    engine.registry.register(ToolDefinition('background_run', ''), DEFAULT_TOOL_HANDLERS['background_run'])
+    engine.registry.register(ToolDefinition('background_run', '', pricing=Free("test_fixture")), DEFAULT_TOOL_HANDLERS['background_run'])
     wrapped = replace(source, name='background_run', arguments={'action': 'check', 'task_id': 'task-1'},
                       result=encode_results([record]))
     assert await engine.distill(wrapped, 'insend_fuse') is None

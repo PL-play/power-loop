@@ -1,4 +1,5 @@
 """The original live child controller handles its abort before releasing output."""
+
 import asyncio
 import json
 from collections import Counter
@@ -19,6 +20,7 @@ from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.managed_effects import FunctionManagedTool, ManagedToolContract
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _OWNER, _SEND, TaskRuntime
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 from power_loop.tools.registry import ToolRegistry
@@ -85,7 +87,7 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
     async def forbidden(*args):
         state.effects.append(args)
         raise AssertionError('original aborted effect cannot execute')
-    definition = ToolDefinition('touch_once','Original finite effect',input_schema={'type':'object'})
+    definition = ToolDefinition('touch_once','Original finite effect',input_schema={'type':'object'}, pricing=Free("test_fixture"))
     adapter = FunctionManagedTool(ManagedToolContract('example.original-owner','d'*64),forbidden,forbidden,forbidden)
     registry.register(definition,adapter.bind(runtime,definition))
     if native_tail is not None:
@@ -93,7 +95,7 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
         async def native():
             state.native_calls += 1
             return 'Original native completion'
-        registry.register(ToolDefinition(native_tail,'Original native operation',input_schema={'type':'object'}),
+        registry.register(ToolDefinition(native_tail,'Original native operation',input_schema={'type':'object'}, pricing=Free("test_fixture")),
             FunctionRuntimeTool(native,ToolRuntimeContract('example.original-native'),policy=lambda args:ToolDispatchPolicy(True)))
     build_tools = ['touch_once'] + ([native_tail] if native_tail is not None else [])
     async def notify(*args):
@@ -113,7 +115,7 @@ async def original_owner_case(registry_store, kind, *, allowed_calls=2, stage='s
         handle = await workflow.start(detached=True,on_complete=notify)
         state.handles.append(handle)
         return json.dumps({'job_id':handle.job_id,'run_id':handle.run_id,'status':'accepted'})
-    registry.register(ToolDefinition('launch_owned','Launch original child',input_schema={'type':'object'}),
+    registry.register(ToolDefinition('launch_owned','Launch original child',input_schema={'type':'object'}, pricing=Free("test_fixture")),
         FunctionRuntimeTool(launch,ToolRuntimeContract('example.launch-owned',allowed_roles=('main',)),policy=lambda args:ToolDispatchPolicy(True)))
     loop = StatefulAgentLoop(llm=model,store=store,task_runtime=runtime,tool_registry=registry,
         config=AgentLoopConfig(max_tokens=max_tokens if provider is not None else 20,max_rounds=4,delegation_policy='single_level',compactor=None))

@@ -19,6 +19,7 @@ from power_loop._vendor.llm_client.interface import (
 )
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.pipeline import AgentPipeline
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -67,7 +68,7 @@ def _echo_registry(out: str) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
         ToolDefinition(name="echo", description="echo",
-                       input_schema={"type": "object", "properties": {"text": {"type": "string"}}}),
+                       input_schema={"type": "object", "properties": {"text": {"type": "string"}}}, pricing=Free("test_fixture")),
         lambda **kw: out,
     )
     return reg
@@ -430,7 +431,7 @@ async def test_insend_distill_keeps_arguments_of_registered_speech_tools(tmp_pat
     reg = _echo_registry("ok")
     async def _say(**kw: Any) -> str:
         return "said"
-    reg.register(ToolDefinition(name="say", description="speak", input_schema={"type": "object", "properties": {"text": {"type": "string"}}}), _say)
+    reg.register(ToolDefinition(name="say", description="speak", input_schema={"type": "object", "properties": {"text": {"type": "string"}}}, pricing=Free("test_fixture")), _say)
     loop = StatefulAgentLoop(
         llm=llm, db_path=str(tmp_path / "s.db"),
         config=AgentLoopConfig(system_prompt="t", max_rounds=8, insend_distill_tokens=50,

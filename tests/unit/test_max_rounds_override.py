@@ -15,6 +15,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMStreamChunk,
 )
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -61,7 +62,7 @@ def _echo_registry() -> ToolRegistry:
             input_schema={"type": "object", "properties": {"text": {"type": "string"}},
                           "required": ["text"]},
             required_params=("text",),
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: kw.get("text", ""),
     )
     return reg

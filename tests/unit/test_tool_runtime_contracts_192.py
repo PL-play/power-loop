@@ -12,6 +12,7 @@ from power_loop.runtime.env import RuntimeEnv, get_runtime_env
 from power_loop.runtime.execution_roles import role_tools
 from power_loop.runtime.invocation import invocation_context
 from power_loop.runtime.jobs import JobError
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, Execution, TaskRuntime, check_tool_dispatch
 from power_loop.runtime.tool_contracts import (
     FunctionRuntimeTool,
@@ -63,7 +64,7 @@ async def test_plain_handler_names_and_lookalike_attributes_grant_no_capabilitie
     plain.runtime_contract = ToolRuntimeContract("example.fake", capabilities=("example.read",))
     plain.dispatch_policy = lambda arguments: ToolDispatchPolicy(True, True)
     registry = ToolRegistry()
-    registry.register(ToolDefinition(name, ""), plain)
+    registry.register(ToolDefinition(name, "", pricing=Free("test_fixture")), plain)
     assert resolve(registry.get(name)) is None
     assert policy(registry.get(name), {}) == ToolDispatchPolicy()
     assert capability_tools(registry, "example.read") == []
@@ -72,7 +73,7 @@ async def test_plain_handler_names_and_lookalike_attributes_grant_no_capabilitie
 async def test_inherited_implementation_roles_and_result_views_follow_registration_not_names():
     registry = ToolRegistry()
     for name, roles in [("launch_research", ("main",)), ("read_notes", ("main", "subagent"))]:
-        registry.register(ToolDefinition(name, ""), Probe(roles=roles))
+        registry.register(ToolDefinition(name, "", pricing=Free("test_fixture")), Probe(roles=roles))
     assert role_tools(registry.names(), "subagent", registry=registry) == ["read_notes"]
     assert role_tools(registry.names(), "workflow_node", registry=registry) == []
     assert [tool.definition.name for tool in capability_tools(registry, "example.read", role="subagent")] == [
@@ -84,7 +85,7 @@ async def test_inherited_implementation_roles_and_result_views_follow_registrati
 @pytest.mark.parametrize("change", ["contract", "schema", "interrupt", "required"])
 async def test_changed_registration_is_not_reauthorized_by_subset_or_wrapper(change):
     registry, implementation = ToolRegistry(), Probe()
-    definition = ToolDefinition("custom", "", input_schema={"type": "object"})
+    definition = ToolDefinition("custom", "", input_schema={"type": "object"}, pricing=Free("test_fixture"))
     registry.register(definition, implementation)
     if change == "contract":
         implementation.contract = replace(implementation.contract, allowed_roles=("main", "subagent"))
@@ -117,7 +118,7 @@ async def test_explicit_wrapping_preserves_real_base_and_async_environment(tmp_p
         return await bound(**arguments)
 
     registry = ToolRegistry()
-    registry.register(ToolDefinition("renamed_async", ""), outer)
+    registry.register(ToolDefinition("renamed_async", "", pricing=Free("test_fixture")), outer)
     assert registry.get("renamed_async").is_async
     assert resolve(registry.get("renamed_async")) is implementation
     assert await registry.invoke_async("renamed_async", {}) == "original"
@@ -128,7 +129,7 @@ async def test_explicit_wrapping_preserves_real_base_and_async_environment(tmp_p
 async def test_validation_uses_actual_schema_and_required_parameters_not_name(name):
     registry = ToolRegistry()
     registry.register(
-        ToolDefinition(name, "", input_schema={"type": "object", "required": ["value"]}), lambda **kw: kw["value"]
+        ToolDefinition(name, "", input_schema={"type": "object", "required": ["value"]}, pricing=Free("test_fixture")), lambda **kw: kw["value"]
     )
     assert registry.validate(name, {"value": 42}) is None
     assert await registry.invoke_async(name, {"value": 42}) == 42
@@ -146,8 +147,8 @@ async def test_generic_control_tool_can_query_expired_original_without_new_execu
         boot_id="query-boot",
     )
     registry = ToolRegistry()
-    registry.register(ToolDefinition("original_query", ""), Probe(control_only=True))
-    registry.register(ToolDefinition("original_execute", ""), Probe())
+    registry.register(ToolDefinition("original_query", "", pricing=Free("test_fixture")), Probe(control_only=True))
+    registry.register(ToolDefinition("original_execute", "", pricing=Free("test_fixture")), Probe())
     c.now[0] += 30001
     token = _SEND.set(Execution(runtime, c.actor, c.caller))
     try:
@@ -171,7 +172,7 @@ async def test_abstract_and_invalid_policy_declarations_fail_closed():
         lambda **kw: "unused", ToolRuntimeContract("example.invalid"), policy=lambda args: True
     )
     registry = ToolRegistry()
-    registry.register(ToolDefinition("invalid", ""), implementation)
+    registry.register(ToolDefinition("invalid", "", pricing=Free("test_fixture")), implementation)
     with pytest.raises(ToolContractError, match="invalid_tool_dispatch_policy"):
         policy(registry.get("invalid"), {})
 
@@ -184,7 +185,7 @@ async def test_replaced_wrapper_target_with_equal_contract_is_not_the_registered
         return await original(**arguments)
 
     registry = ToolRegistry()
-    registry.register(ToolDefinition("probe", ""), wrapper)
+    registry.register(ToolDefinition("probe", "", pricing=Free("test_fixture")), wrapper)
     wrapper.__wrapped__ = replacement
     with pytest.raises(ToolContractError, match="binding_changed"):
         resolve(registry.get("probe"))
@@ -193,7 +194,7 @@ async def test_replaced_wrapper_target_with_equal_contract_is_not_the_registered
 @pytest.mark.parametrize("change", ["replace", "revoke", "mutate"])
 async def test_registration_change_across_admission_await_cannot_execute(change):
     registry, implementation = ToolRegistry(), Probe()
-    definition = ToolDefinition("probe", "")
+    definition = ToolDefinition("probe", "", pricing=Free("test_fixture"))
     registry.register(definition, implementation)
     admitted = registry.get("probe")
 
@@ -228,7 +229,7 @@ async def test_actual_pipeline_does_not_invoke_a_replacement_after_admission(tmp
         return "replacement"
 
     registry = ToolRegistry()
-    definition = ToolDefinition("probe", "")
+    definition = ToolDefinition("probe", "", pricing=Free("test_fixture"))
     registry.register(definition, FunctionRuntimeTool(original, ToolRuntimeContract("example.probe")))
     admit = task_runtime.check_tool_dispatch
 

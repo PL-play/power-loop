@@ -17,6 +17,7 @@ from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_notifications as notices
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -88,7 +89,7 @@ async def test_real_model_exit_precedes_durable_wait_without_a_provider_gate_and
         return "Original wait accepted. Finish this turn without polling."
 
     registry.register(ToolDefinition(name="arm_wait", description="Register one original task wait exactly once.",
-        input_schema={"type": "object", "properties": {}, "additionalProperties": False}), arm)
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False}, pricing=Free("test_fixture")), arm)
     ending_prompt = ("After arm_wait acceptance, write READY-42 as final assistant text without tools or pass_turn."
         if ending == "natural" else "After arm_wait acceptance, call pass_turn exactly once to end this turn without any other tool.")
     if structured:

@@ -1,4 +1,5 @@
 """Context behavior follows the actual registered implementation, never its name."""
+
 import json
 import os
 from dataclasses import replace
@@ -8,6 +9,7 @@ import pytest
 
 from power_loop.contracts.context_policy import ToolContextPolicy
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_archive import _derive, archive_label, slim_arguments
@@ -91,7 +93,7 @@ async def test_plain_same_named_handler_receives_no_context_special_behavior(nam
         handler.context_presentation = lambda _: ToolContextPresentation(keep_in_send=True, archive_label='FORGED')
         handler.runtime_contract = ToolRuntimeContract('forged')
     registry = ToolRegistry()
-    registry.register(ToolDefinition(name, ''), handler)
+    registry.register(ToolDefinition(name, '', pricing=Free("test_fixture")), handler)
     original, registered = source(name, keep=True), registry.get(name)
     assert context_presentation(registered, original) == ToolContextPresentation()
     assert slim_arguments(original, registered) == '{}'
@@ -155,7 +157,7 @@ class HostView(RuntimeTool):
 
 def test_host_view_extension_needs_no_sdk_business_class_and_rechecks_binding():
     registry = ToolRegistry()
-    definition = ToolDefinition('custom_view', '')
+    definition = ToolDefinition('custom_view', '', pricing=Free("test_fixture"))
     registry.register(definition, HostView())
     registered, original = registry.get('custom_view'), source('custom_view')
     assert archive_label(original, registered) == 'host view'
@@ -176,7 +178,7 @@ def test_invalid_host_view_return_is_rejected(kind):
         def truncate_context(self, source, policy, *, raw_arguments):
             return ['{}', 'preview']
     registry = ToolRegistry()
-    registry.register(ToolDefinition('invalid', ''), Invalid())
+    registry.register(ToolDefinition('invalid', '', pricing=Free("test_fixture")), Invalid())
     with pytest.raises(ToolContractError):
         if kind == 'presentation':
             context_presentation(registry.get('invalid'), source('invalid'))

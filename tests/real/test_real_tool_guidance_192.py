@@ -1,9 +1,11 @@
 """The actual provider sees implementation-owned hints and reports actual progress."""
+
 import asyncio
 
 import pytest
 
 from power_loop import AgentEventType, AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolRuntimeContract
 from power_loop.tools.registry import ToolRegistry
@@ -26,7 +28,7 @@ async def test_real_progress_and_prompt_follow_actual_declared_tool(tmp_path, re
     implementation = FunctionRuntimeTool(handler, ToolRuntimeContract('example.progress',
         capabilities=('task.progress.v1',))) if declared else handler
     registry.register(ToolDefinition(name, 'Record the requested plan once. No arguments.',
-        usage_hint='IMPLEMENTATION_PLAN_GUIDANCE: call this tool once with an empty object.'), implementation)
+        usage_hint='IMPLEMENTATION_PLAN_GUIDANCE: call this tool once with an empty object.', pricing=Free("test_fixture")), implementation)
     loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=3, max_tokens=2048, retry_policy=LLMRetryPolicy(max_attempts=1)))
     loop.event_bus.subscribe(None, events.append)

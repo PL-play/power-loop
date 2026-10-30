@@ -21,6 +21,7 @@ from power_loop import (
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 # ── Fake LLM ────────────────────────────────────────────────────────────
@@ -85,7 +86,7 @@ def _echo_registry() -> ToolRegistry:
                 "required": ["text"],
             },
             required_params=("text",),
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: kw.get("text", ""),
     )
     return reg
@@ -413,7 +414,7 @@ async def test_custom_tool_can_use_public_runtime_context(store: SessionStore) -
                 "required": ["text"],
             },
             required_params=("text",),
-        ),
+        pricing=Free("test_fixture")),
         write_custom_state,
     )
     llm = _Scripted(
@@ -725,7 +726,7 @@ async def test_pending_set_then_cleared_during_normal_tool_round(store: SessionS
         ToolDefinition(
             name="spy", description="spy",
             input_schema={"type": "object", "properties": {}}, required_params=(),
-        ),
+        pricing=Free("test_fixture")),
         _spy,
     )
 
@@ -788,7 +789,7 @@ async def test_resolve_system_prompt_default(store: SessionStore) -> None:
             name="lookup", description="Look up info",
             input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
             required_params=("q",),
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: "ok",
     )
     loop = StatefulAgentLoop(llm=_Scripted(), store=store, tool_registry=reg)
@@ -811,7 +812,7 @@ async def test_resolve_system_prompt_with_config(store: SessionStore) -> None:
             name="calc", description="Calculate",
             input_schema={"type": "object", "properties": {"expr": {"type": "string"}}},
             required_params=("expr",),
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: "42",
     )
     cfg = AgentLoopConfig(system_prompt="You are a math bot.")
@@ -831,7 +832,7 @@ async def test_resolve_system_prompt_injection_disabled(store: SessionStore) -> 
             name="ping", description="Ping",
             input_schema={"type": "object", "properties": {}},
             required_params=(),
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: "pong",
     )
     cfg = AgentLoopConfig(system_prompt="Hello.", inject_tool_descriptions=False)
@@ -859,7 +860,7 @@ async def test_resolve_system_prompt_custom_header(store: SessionStore) -> None:
             name="x", description="X tool",
             input_schema={"type": "object", "properties": {}},
             required_params=(),
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: "",
     )
     cfg = AgentLoopConfig(
@@ -881,7 +882,7 @@ async def test_resolve_system_prompt_session_override(store: SessionStore) -> No
             name="t", description="T",
             input_schema={"type": "object", "properties": {}},
             required_params=(),
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: "",
     )
     cfg = AgentLoopConfig(system_prompt="Config prompt.")
@@ -925,7 +926,7 @@ async def test_resolve_system_prompt_matches_live_prompt(store: SessionStore) ->
             name="calc", description="Calculate",
             input_schema={"type": "object", "properties": {"x": {"type": "string"}}},
             required_params=("x",),
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: "42",
     )
     llm = _CapturingLLM()

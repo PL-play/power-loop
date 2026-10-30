@@ -9,6 +9,7 @@ import pytest
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition, get_tool_runtime_context
 from power_loop.agent.follow_up import InboxItem
 from power_loop.runtime.jobs import JobActor, JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -28,7 +29,7 @@ async def test_real_tool_call_and_receipt_have_separate_recallable_message_ids(t
 
     registry.register(ToolDefinition(name="local_add", description="Add two integers locally.",
         input_schema={"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-                      "required": ["a", "b"]}), add)
+                      "required": ["a", "b"]}, pricing=Free("test_fixture")), add)
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=3, max_tokens=2048))
     sid = await loop.new_session()
@@ -78,7 +79,7 @@ async def test_real_model_admission_receipt_result_and_reopen_use_durable_regist
 
     registry.register(ToolDefinition(name="start_add", description="Accept a local addition task; result arrives later.",
         input_schema={"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
-                      "required": ["a", "b"]}), start_add)
+                      "required": ["a", "b"]}, pricing=Free("test_fixture")), start_add)
     recovered = None
     try:
         async with asyncio.timeout(120):

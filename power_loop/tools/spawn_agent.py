@@ -11,6 +11,7 @@ from typing import Any
 
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_current_loop
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import (
     AgentSpec,
     AgentSpecError,
@@ -20,7 +21,7 @@ from power_loop.runtime.structured import StructuredOutputError, parse_structure
 
 DEFAULT_MAX_ROUNDS = 20
 
-SPAWN_AGENT_DEFINITION = ToolDefinition(
+SPAWN_AGENT_DEFINITION = ToolDefinition(pricing=Free("composite"),
     name="spawn_agent",
     description=(
         "Delegate work in an isolated child session, always asynchronously. create (default) "

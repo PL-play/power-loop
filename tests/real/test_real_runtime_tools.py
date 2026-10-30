@@ -12,6 +12,7 @@ from power_loop import (
     create_default_tool_registry,
     get_tool_runtime_context,
 )
+from power_loop.runtime.pricing import Free
 
 from ._llm import make_llm
 
@@ -119,7 +120,7 @@ async def test_real_llm_custom_tool_uses_public_runtime_context(tmp_path) -> Non
                     "required": ["marker"],
                 },
                 required_params=("marker",),
-            ),
+            pricing=Free("test_fixture")),
             save_runtime_marker,
         )
         loop = StatefulAgentLoop(
@@ -166,7 +167,7 @@ async def test_real_llm_sees_custom_projector_after_tool_write(tmp_path) -> None
                     "required": ["marker"],
                 },
                 required_params=("marker",),
-            ),
+            pricing=Free("test_fixture")),
             save_runtime_marker,
         )
         loop = StatefulAgentLoop(

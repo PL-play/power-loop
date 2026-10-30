@@ -1,10 +1,12 @@
 """Pure review views follow actual implementations, never catalog names."""
+
 from copy import deepcopy
 from functools import wraps
 
 import pytest
 
 from power_loop import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_contracts import (
     FunctionRuntimeTool,
     ToolContractError,
@@ -25,7 +27,7 @@ def test_named_lookalike_reviewers_do_not_advertise_or_authorize_controls(name):
     ordinary.review_spec = lambda spec: spec
     ordinary.runtime_contract = ToolRuntimeContract('fake')
     registry = ToolRegistry()
-    definition = ToolDefinition(name, '')
+    definition = ToolDefinition(name, '', pricing=Free("test_fixture"))
     registry.register(definition, ordinary)
     assert review_spec(registry.get(name), definition.to_openai_tool()) is None
     assert policy(registry.get(name), {}) == ToolDispatchPolicy()
@@ -40,7 +42,7 @@ def test_actual_aliased_wrapped_review_schema_is_a_copy_and_grants_no_execution(
     async def wrapper(**kw):
         return await implementation(**kw)
     registry = ToolRegistry()
-    definition = ToolDefinition('read_retained', '', input_schema={'type':'object','properties':{'original_id':{'type':'string'}}})
+    definition = ToolDefinition('read_retained', '', input_schema={'type':'object','properties':{'original_id':{'type':'string'}}}, pricing=Free("test_fixture"))
     registry.register(definition, wrapper)
     spec = definition.to_openai_tool()
     before = deepcopy(spec)
@@ -54,7 +56,7 @@ def test_actual_aliased_wrapped_review_schema_is_a_copy_and_grants_no_execution(
     {'type':'function','function':{'name':'read_original','parameters':[]}}])
 def test_invalid_implementation_views_fail_closed(value):
     registry = ToolRegistry()
-    definition = ToolDefinition('read_original', '')
+    definition = ToolDefinition('read_original', '', pricing=Free("test_fixture"))
     registry.register(definition, FunctionRuntimeTool(lambda **kw: '', ToolRuntimeContract('example.bad-view'), reviewer=lambda spec:value))
     with pytest.raises(ToolContractError, match='invalid_tool_review_spec'):
         review_spec(registry.get('read_original'), definition.to_openai_tool())

@@ -1,10 +1,12 @@
 """A live model uses an aliased scheduler and the implementation-owned schema."""
+
 import asyncio
 from dataclasses import replace
 
 import pytest
 
 from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.tool_context import ToolContextConfig
 from power_loop.tools import create_default_tool_registry
@@ -32,7 +34,7 @@ async def test_real_renamed_scheduler_uses_actual_contract(tmp_path, record_prop
         return 'WORK_OK'
 
     # This plain tool happens to share an orchestration entry's customary name.
-    registry.register(ToolDefinition('workflow', '', async_capable=True), worker)
+    registry.register(ToolDefinition('workflow', '', async_capable=True, pricing=Free("test_fixture")), worker)
     manager = dt.BackgroundManager()
     monkeypatch.setattr(dt, 'BG', manager)
     loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,

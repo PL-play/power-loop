@@ -30,6 +30,7 @@ from power_loop.core.agent_context import (
     set_current_loop,
     set_session_id,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import SUBAGENT_EVENT_SOURCE, run_agent_spec
 from power_loop.tools.registry import ToolRegistry
 
@@ -131,7 +132,7 @@ async def test_round_limited_subagent_emits_limit_not_text(store: SessionStore) 
     # (rather than ending mid tool-call as pending_tools) → hit_round_limit.
     reg = ToolRegistry()
     reg.register(
-        ToolDefinition(name="echo", description="echo", input_schema={"type": "object", "properties": {}}),
+        ToolDefinition(name="echo", description="echo", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
         lambda **kw: "echoed",
     )
     parent_loop.tool_registry = reg

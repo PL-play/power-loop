@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import SharedBudget, create_workflow
 
@@ -28,7 +29,7 @@ async def test_real_continuation_budget_equals_actual_reported_requests(tmp_path
     tools.register(
         ToolDefinition(
             name="touch", description="Read the result code once.", input_schema={"type": "object", "properties": {}}
-        ),
+        , pricing=Free("test_fixture")),
         touch,
     )
     loop = StatefulAgentLoop(

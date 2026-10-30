@@ -18,6 +18,7 @@ from power_loop.runtime.managed_effects import (
     ManagedToolResult,
     reconcile,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
@@ -169,7 +170,7 @@ async def scenario(
         name=tool_name,
         description="One original finite managed effect",
         input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
-    )
+    pricing=Free("test_fixture"))
     registry = ToolRegistry()
     registry.register(definition, adapter.bind(runtime, definition))
     if fake_handler:

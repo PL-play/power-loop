@@ -5,6 +5,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+from power_loop.runtime.pricing import Free
 from power_loop.tools import default_tools as dt
 from power_loop.tools.registry import ToolRegistry
 from tests.unit.test_shell_process_control_192 import OriginalBackend, _file, _gone
@@ -30,7 +31,7 @@ async def test_real_model_probe_original_stop_and_transcript(tmp_path, monkeypat
         return message
 
     registry.register(ToolDefinition(name='launch_probe', description='Start the local test probe once.',
-        input_schema={'type': 'object', 'properties': {}}), launch_probe)
+        input_schema={'type': 'object', 'properties': {}}, pricing=Free("test_fixture")), launch_probe)
     loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=3, max_tokens=2048, compactor=None))
     try:

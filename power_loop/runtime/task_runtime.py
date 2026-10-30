@@ -114,7 +114,12 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
     async with execution.runtime.manager._write() as tx:
         policy = await budget_policy(execution.runtime, tx)
     if policy is not None:
-        if not declared.native_admitted:
+        from power_loop.tools.registry import validate_pricing
+
+        from .pricing import Free
+        pricing = validate_pricing(registered)
+        tool_port = callable(getattr(execution.runtime.budget_config.provider, 'prepare_tool', None))
+        if (not declared.native_admitted and not tool_port) or (not isinstance(pricing, Free) and not tool_port):
             raise JobError("budget_tool_adapter_unavailable:" + tool_name)
     await check_dispatch(session_id, invocation=current_invocation(session_id))
     return registered

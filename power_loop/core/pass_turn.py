@@ -16,6 +16,7 @@ from contextvars import ContextVar, Token
 from typing import Any
 
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 
 NAME = "pass_turn"
 REASON_MAX = 300
@@ -27,7 +28,7 @@ DESCRIPTION = (
     "只写字、不调工具也会结束这一轮——用它是明确地说「做完了」。reason 写一句为什么结束。"
 )
 
-PASS_TURN_TOOL = ToolDefinition(
+PASS_TURN_TOOL = ToolDefinition(pricing=Free("local"),
     name=NAME,
     description=DESCRIPTION,
     input_schema={

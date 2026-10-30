@@ -6,9 +6,10 @@ import json
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime.jobs import JobError
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 
-JOBS_DEFINITION = ToolDefinition(
+JOBS_DEFINITION = ToolDefinition(pricing=Free("local"),
     name="jobs",
     description=("Inspect your authorized tasks and descendants, including saved history and result/message references. "
         "list defaults to active obligations, which can include a finished outcome with unresolved resources or supervision. "

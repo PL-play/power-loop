@@ -13,13 +13,14 @@ from types import SimpleNamespace
 import pytest
 
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry, async_capable_actions, async_capable_for
 
 RO = frozenset({"get", "list", "download"})
 
 
 def _d(flag):
-    return ToolDefinition(name="design_reference", description="d", async_capable=flag)
+    return ToolDefinition(name="design_reference", description="d", async_capable=flag, pricing=Free("test_fixture"))
 
 
 def test_bool_true_is_still_tool_wide():
@@ -61,7 +62,7 @@ def test_openai_description_names_the_allowed_actions():
     reg = ToolRegistry()
     reg.register(_d(RO), lambda **kw: "")
     from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-    reg.register(ToolDefinition(name="background_run", description="bg"), DEFAULT_TOOL_HANDLERS["background_run"])
+    reg.register(ToolDefinition(name="background_run", description="bg", pricing=Free("test_fixture")), DEFAULT_TOOL_HANDLERS["background_run"])
     desc = next(t["function"]["description"] for t in reg.to_openai_tools()
                 if t["function"]["name"] == "design_reference")
     assert "可异步（仅 action=download/get/list）" in desc
@@ -79,12 +80,12 @@ async def test_background_run_refuses_side_effecting_tools_with_the_way_out(monk
     from power_loop.tools import default_tools as dt
 
     reg = ToolRegistry()
-    reg.register(ToolDefinition(name="write_file", description="w"), lambda **kw: "")
+    reg.register(ToolDefinition(name="write_file", description="w", pricing=Free("test_fixture")), lambda **kw: "")
     reg.register(_d(RO), lambda **kw: "")                       # design_reference：action 粒度
-    reg.register(ToolDefinition(name="see_image", description="s", async_capable=True),
+    reg.register(ToolDefinition(name="see_image", description="s", async_capable=True, pricing=Free("test_fixture")),
                  lambda **kw: "")
     from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-    reg.register(ToolDefinition(name="background_run", description="bg"), DEFAULT_TOOL_HANDLERS["background_run"])
+    reg.register(ToolDefinition(name="background_run", description="bg", pricing=Free("test_fixture")), DEFAULT_TOOL_HANDLERS["background_run"])
     # run_tool 里是**局部导入**，所以要 patch 源模块而不是 default_tools
     from power_loop.core import agent_context
     monkeypatch.setattr(agent_context, "get_current_loop",

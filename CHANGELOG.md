@@ -8,6 +8,25 @@
 
 ## [Unreleased]
 
+## [9.0.0] — 2026-10-30
+
+### Unified pricing and durable fee delivery
+
+- Require an explicit `PricingSpec` on registered tool definitions, including
+  `ManagedTool` and host tools. Missing declarations fail before execution;
+  no-charge tools declare `Free` explicitly. **Breaking:** update tool factories
+  using `ToolDefinition.pricing` / `ManagedTool.pricing` before registering them.
+- Add common `Money`, `PricedCall`, `Estimate`, `BillingReceipt` and `Charge`
+  contracts. Price rules retain an immutable version for each original call;
+  model and tool calls use the same durable attempt and receipt lifecycle.
+- Persist provider receipts before final settlement, retry original reporting
+  after lost acknowledgements, and retain unresolved fees for reconciliation.
+  Delegated and nested tools use their own original attempts without wrapper fees.
+- Add task-backed timer seams and managed model calls for context folds,
+  model probes and other host model requests. Schema 10 / protocol 21 stores
+  require explicit one-time maintenance; ordinary startup never converts old data.
+
+
 ### MCP connection cleanup
 
 - Unwind acquired stdio/session contexts in the original connecting task when
@@ -61,11 +80,8 @@
   A missing controller after restart no longer fabricates a cancelled ledger row.
   Native task admission remains governed by its existing lifecycle contracts.
 
-## [9.0.0rc1] — candidate, not published
-
-### Compatibility and deployment
-- Allocate a distinct major release candidate for the design/192 async task
-  lifecycle. This avoids distributing incompatible task protocols under the
+### Task lifecycle deployment
+- Release the design/192 async task lifecycle under a distinct major version. This avoids distributing incompatible task protocols under the
   already-used `8.0.0` version. Stable Python exports remain covered by the
   packaging contract tests; this major boundary is conservative for persisted
   task data, tool execution contracts and async workflow behavior.
@@ -78,9 +94,9 @@
   resource adapters remain rejected before side effects.
 - Rollback requires a protocol21-capable control build. Do not install the old
   `8.0.0` package over upgraded stores or downgrade version stamps. MySQL remains
-  unverified in this candidate because its tests are paused.
+  unverified in this release because its live-database tests are paused.
 - The historical protocol notes below describe development increments, not the
-  protocol of this candidate. No package publication is authorized by this entry.
+  protocol of this release.
 
 ### Added
 - Add experimental protocol6 generic RuntimeTool contracts for native dispatch,

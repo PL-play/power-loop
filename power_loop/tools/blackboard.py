@@ -20,6 +20,7 @@ from typing import Any
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.blackboard import Blackboard, BlackboardError, render_entries
 from power_loop.runtime.env import get_runtime_env
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 
 __all__ = ["register_blackboard_tools"]
@@ -122,7 +123,7 @@ def register_blackboard_tools(
     the model sees). The host must inject a ``Blackboard`` + ``blackboard_id`` on
     the per-send ``RuntimeEnv`` for the tool to operate.
     """
-    board_def = ToolDefinition(
+    board_def = ToolDefinition(pricing=Free("local"),
         name="board",
         description=(
             "The shared agent board — a PRIVATE coordination space for the agents sharing "

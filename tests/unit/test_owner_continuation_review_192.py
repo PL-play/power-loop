@@ -8,6 +8,7 @@ import pytest
 from power_loop import LLMResponse, LLMTokenUsage, ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import delegation
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 
 from .test_job_registry_192 import registry_store
@@ -181,7 +182,7 @@ async def continuation_case(
         )
 
     c.loop.tool_registry.register(
-        ToolDefinition("continue_owned", "Continue the original owner once", input_schema={"type": "object"}),
+        ToolDefinition("continue_owned", "Continue the original owner once", input_schema={"type": "object"}, pricing=Free("test_fixture")),
         FunctionRuntimeTool(
             continue_owned,
             ToolRuntimeContract("example.continue-owner", allowed_roles=("main",)),

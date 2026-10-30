@@ -14,6 +14,7 @@ import pytest
 
 from power_loop.contracts.errors import ToolValidationError
 from power_loop.contrib.mcp import MCPToolSource, McpToolSpec, register_mcp_tools
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.unit
@@ -50,7 +51,7 @@ def test_fake_source_satisfies_protocol() -> None:
 async def test_register_maps_schema_and_required() -> None:
     reg = ToolRegistry()
     src = _FakeSource(_specs())
-    names = await register_mcp_tools(reg, src)
+    names = await register_mcp_tools(reg, src, pricing=Free("test_fixture"))
     assert names == ["search", "ping"]
     search = reg.get("search")
     assert search is not None
@@ -62,7 +63,7 @@ async def test_register_maps_schema_and_required() -> None:
 async def test_invocation_proxies_to_source() -> None:
     reg = ToolRegistry()
     src = _FakeSource(_specs())
-    await register_mcp_tools(reg, src)
+    await register_mcp_tools(reg, src, pricing=Free("test_fixture"))
     out = await reg.invoke_async("search", {"q": "tea"})
     assert out == "search({'q': 'tea'})"
     assert src.calls == [("search", {"q": "tea"})]
@@ -70,7 +71,7 @@ async def test_invocation_proxies_to_source() -> None:
 
 async def test_missing_required_param_is_rejected() -> None:
     reg = ToolRegistry()
-    await register_mcp_tools(reg, _FakeSource(_specs()))
+    await register_mcp_tools(reg, _FakeSource(_specs()), pricing=Free("test_fixture"))
     with pytest.raises(ToolValidationError):
         await reg.invoke_async("search", {})  # missing required "q"
 
@@ -78,7 +79,7 @@ async def test_missing_required_param_is_rejected() -> None:
 async def test_prefix_avoids_name_collisions() -> None:
     reg = ToolRegistry()
     reg2_src = _FakeSource(_specs())
-    names = await register_mcp_tools(reg, reg2_src, prefix="mcp_")
+    names = await register_mcp_tools(reg, reg2_src, prefix="mcp_", pricing=Free("test_fixture"))
     assert names == ["mcp_search", "mcp_ping"]
     assert reg.has("mcp_search") and not reg.has("search")
     # the proxy still calls the REMOTE (unprefixed) name
@@ -92,7 +93,7 @@ async def test_names_are_made_portable_but_remote_name_is_kept() -> None:
     reg = ToolRegistry()
     src = _FakeSource([McpToolSpec(name="github.search"), McpToolSpec(name="fs/read"),
                        McpToolSpec(name="x" * 80)])
-    names = await register_mcp_tools(reg, src, prefix="gh.")
+    names = await register_mcp_tools(reg, src, prefix="gh.", pricing=Free("test_fixture"))
     assert names == ["gh_github_search", "gh_fs_read", "gh_" + "x" * 61]
     assert all(len(n) <= 64 for n in names)
     await reg.invoke_async("gh_fs_read", {})
@@ -103,7 +104,7 @@ async def test_names_that_collapse_together_are_refused() -> None:
     reg = ToolRegistry()
     src = _FakeSource([McpToolSpec(name="a.b"), McpToolSpec(name="a_b")])
     with pytest.raises(ValueError, match="both map to tool name 'a_b'"):
-        await register_mcp_tools(reg, src)
+        await register_mcp_tools(reg, src, pricing=Free("test_fixture"))
 
 
 def test_stdio_client_importable_without_mcp_sdk() -> None:

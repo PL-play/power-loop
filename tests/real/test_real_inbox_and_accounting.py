@@ -40,6 +40,7 @@ from power_loop._vendor.llm_client.multimodal import create_attachment_ref
 from power_loop.agent.follow_up import FOLLOW_UP_MESSAGE_NAME
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.cancellation import CancellationToken
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.usage_estimate import estimate_prompt_tokens, estimate_text_tokens
 from power_loop.tools.registry import ToolRegistry
 
@@ -55,7 +56,7 @@ def _wait_registry(seconds: float = 2.0) -> ToolRegistry:
         return "waited"
 
     reg.register(ToolDefinition(name="wait", description="Wait briefly before continuing.",
-                                input_schema={"type": "object", "properties": {}}), wait_tool)
+                                input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), wait_tool)
     return reg
 
 

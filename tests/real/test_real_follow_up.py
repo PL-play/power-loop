@@ -19,6 +19,7 @@ from power_loop import (
 )
 from power_loop.agent.follow_up import FOLLOW_UP_MESSAGE_NAME
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
@@ -61,7 +62,7 @@ async def test_inflight_follow_up_is_queued_merged_and_steers() -> None:
 
         reg.register(ToolDefinition(
             name="wait", description="Wait briefly before continuing.",
-            input_schema={"type": "object", "properties": {}}), wait_tool)
+            input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), wait_tool)
 
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=384, temperature=0), store=store, tool_registry=reg,

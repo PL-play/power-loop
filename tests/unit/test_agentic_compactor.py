@@ -16,6 +16,7 @@ from power_loop.runtime.compact import (
     AgenticMemoryCompactor,
     _strip_summary,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -58,7 +59,7 @@ def _note_registry(recorded: list[tuple[str, dict]]) -> ToolRegistry:
             description="manage durable notes",
             input_schema={"type": "object", "properties": {"action": {"type": "string"}}},
             required_params=("action",),
-        ),
+        pricing=Free("test_fixture")),
         fake_note,
     )
     return reg

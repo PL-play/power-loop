@@ -10,6 +10,7 @@ from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDef
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobManager, _hash
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow
@@ -48,7 +49,7 @@ async def test_real_native_profile_and_consumed_result_can_plan_retained_nodes_w
         return json.dumps({"job_id": handle.job_id, "operation_id": handle.operation_id, "run_id": handle.run_id, "status": "queued"})
 
     registry.register(ToolDefinition(name="launch_workflow", description="Start the predefined calculation and review asynchronously once.",
-        input_schema={"type": "object", "properties": {}}), launch)
+        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), launch)
     try:
         async with asyncio.timeout(120):
             result = await loop.send("Call launch_workflow exactly once, then reply WAITING without other tools or pass_turn.", sid)
@@ -92,7 +93,7 @@ async def test_real_native_profile_and_consumed_result_can_plan_retained_nodes_w
                 return json.dumps({"operation_id": operation.operation_id, "job_id": handle.job_id,
                     "run_id": handle.run_id, "generation": 2, "status": "accepted", "dispatch": "pending"})
             registry.register(ToolDefinition(name="resume_workflow", description="Register one new execution intent for the original workflow. Does not execute it yet.",
-                input_schema={"type": "object", "properties": {}}), resume_intent)
+                input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), resume_intent)
             accepted = await loop.send("Call resume_workflow exactly once, then reply WAITING without tools or pass_turn. "
                 "This registers an intent only; no new calculation or result is available yet. Do not call launch_workflow.", sid)
             assert accepted.status == "completed" and len(admissions) == 1

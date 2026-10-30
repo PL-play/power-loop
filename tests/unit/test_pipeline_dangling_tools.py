@@ -24,6 +24,7 @@ from power_loop import (
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.hooks import HookDirective, HookPoint
 from power_loop.core.hooks import AgentHooks
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.unit
@@ -61,7 +62,7 @@ def _multi_tool(*calls: tuple[str, str, str]) -> LLMResponse:
 
 def _echo_def() -> ToolDefinition:
     return ToolDefinition(name="echo", description="echo",
-                          input_schema={"type": "object", "properties": {}})
+                          input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture"))
 
 
 def _assert_no_dangling(messages: list[dict]) -> None:

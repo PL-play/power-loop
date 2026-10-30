@@ -10,6 +10,7 @@ from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDef
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import task_sessions
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow.facade import WorkflowToolPorts, register_workflow_tool
@@ -39,7 +40,7 @@ async def test_real_parent_reads_original_retained_node_binding_without_replacem
     registry = ToolRegistry()
     register_workflow_tool(registry, ports=WorkflowToolPorts(on_accepted=admitted_view, on_complete=completed))
     registry.register(ToolDefinition(name="inspect_task_sessions", description="Read the existing authorized task's original physical-session bindings. Read-only; no execution authority.",
-        input_schema={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}), inspect_bindings)
+        input_schema={"type": "object", "properties": {"job_id": {"type": "string"}}, "required": ["job_id"]}, pricing=Free("test_fixture")), inspect_bindings)
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=5, max_tokens=2048,
             system_prompt="Follow the requested workflow and audit tool order. Create only when explicitly asked. A read binding is not execution permission."))

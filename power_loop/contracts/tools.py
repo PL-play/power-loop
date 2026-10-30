@@ -5,6 +5,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from power_loop.contracts.context_policy import ToolContextPolicy
+from power_loop.runtime.pricing import BillingReceipt, PricingSpec
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """Model-visible content and separate, host-only provider billing facts."""
+
+    content: Any
+    billing_receipt: BillingReceipt | None = None
+
+    def __post_init__(self):
+        if self.billing_receipt is not None and not isinstance(self.billing_receipt, BillingReceipt):
+            raise TypeError('billing_receipt must be BillingReceipt or None')
 
 
 @dataclass(frozen=True)
@@ -52,6 +65,8 @@ class ToolDefinition:
     #: Optional presentation metadata; neither field grants execution authority.
     usage_hint: str = ""
     background_hint: bool = True
+    # Required at registration, separate from the model-facing tool schema.
+    pricing: PricingSpec | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.usage_hint) is not str or len(self.usage_hint) > 4096:

@@ -18,6 +18,7 @@ from power_loop.runtime import wait_notifications as notices
 from power_loop.runtime import wait_terminal as terminal
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -54,7 +55,7 @@ async def test_real_original_wait_ends_and_main_consumption_closes_the_complete_
         return json.dumps({"status": "accepted", "job_id": registration.job.job_id})
 
     registry.register(ToolDefinition(name="arm_wait", description="Register the original child wait exactly once.",
-        input_schema={"type": "object", "properties": {}, "additionalProperties": False}), arm)
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False}, pricing=Free("test_fixture")), arm)
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=5, max_tokens=2048,
             system_prompt=("Follow the requested original-task sequence. Initially spawn one child, then reply WAITING "

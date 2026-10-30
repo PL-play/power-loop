@@ -30,6 +30,7 @@ from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.state import ContextManager
+from power_loop.runtime.pricing import Free
 
 # ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -46,7 +47,7 @@ def _make_defs() -> list[ToolDefinition]:
                 "required": ["expr"],
             },
             required_params=("expr",),
-        ),
+        pricing=Free("test_fixture")),
         ToolDefinition(
             name="greet",
             description="Say hello",
@@ -59,11 +60,11 @@ def _make_defs() -> list[ToolDefinition]:
                 "required": ["name"],
             },
             required_params=("name",),
-        ),
+        pricing=Free("test_fixture")),
         ToolDefinition(
             name="ping",
             description="Health check",
-        ),
+        pricing=Free("test_fixture")),
     ]
 
 
@@ -138,7 +139,7 @@ class TestFormatToolCatalog:
     def test_preserves_full_description(self):
         """Descriptions are passed through as-is, not truncated."""
         long_desc = "This is a very long description that should be preserved in full"
-        defs = [ToolDefinition(name="x", description=long_desc)]
+        defs = [ToolDefinition(name="x", description=long_desc, pricing=Free("test_fixture"))]
         result = format_tool_catalog(defs)
         assert long_desc in result
 

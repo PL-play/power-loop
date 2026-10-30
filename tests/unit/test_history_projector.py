@@ -11,6 +11,7 @@ from power_loop.runtime.history_projector import (
     IdentityProjector,
     _row_to_loop_dict,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.types import MessageRow, MessageState, ProjectMessageRow
 from power_loop.tools.registry import ToolRegistry
 
@@ -57,7 +58,7 @@ def test_tool_project_hook_used_over_fallback() -> None:
         ToolDefinition(
             name="write_file", description="w",
             project=lambda args, result: {"file": args.get("path")},
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: "",
     )
     p = DefaultDeterministicProjector()
@@ -108,7 +109,7 @@ def test_project_hook_receives_none_for_missing_result() -> None:
     reg = ToolRegistry()
     reg.register(
         ToolDefinition(name="t", description="t",
-                       project=lambda args, result: (seen.append(result), {"k": "v"})[1]),
+                       project=lambda args, result: (seen.append(result), {"k": "v"})[1], pricing=Free("test_fixture")),
         lambda **kw: "",
     )
     p = DefaultDeterministicProjector()
@@ -152,7 +153,7 @@ def test_missing_result_hook_exception_falls_back_to_missing() -> None:
     def boom(args, result):
         raise ValueError("misbehaving hook")
     reg = ToolRegistry()
-    reg.register(ToolDefinition(name="broken", description="b", project=boom), lambda **kw: "")
+    reg.register(ToolDefinition(name="broken", description="b", project=boom, pricing=Free("test_fixture")), lambda **kw: "")
     p = DefaultDeterministicProjector()
     rows = [_mr(1, "user", "go"), _mr(2, "assistant", tool_calls=[_tc("c1", "broken")]),
             _mr(3, "assistant", "done")]

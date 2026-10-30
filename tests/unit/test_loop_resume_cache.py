@@ -32,6 +32,7 @@ from power_loop._vendor.llm_client.interface import (
 )
 from power_loop.runtime.compact import CompactionPlan
 from power_loop.runtime.memory import MemoryProvider
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.store import SessionStore
 from power_loop.tools.registry import ToolRegistry
 
@@ -119,7 +120,7 @@ def _echo_registry() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(
         ToolDefinition(name="echo", description="echo",
-                       input_schema={"type": "object", "properties": {"x": {"type": "string"}}}),
+                       input_schema={"type": "object", "properties": {"x": {"type": "string"}}}, pricing=Free("test_fixture")),
         lambda **kw: f"echoed:{kw.get('x', '')}",
     )
     return reg
@@ -129,7 +130,7 @@ def _blob_registry() -> ToolRegistry:
     from power_loop.contracts.tools import ToolDefinition
     reg = ToolRegistry()
     reg.register(
-        ToolDefinition(name="blob", description="fat", input_schema={"type": "object", "properties": {}}),
+        ToolDefinition(name="blob", description="fat", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
         lambda **kw: "T" * 4000,
     )
     return reg

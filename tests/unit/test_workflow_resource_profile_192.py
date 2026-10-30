@@ -12,6 +12,7 @@ from power_loop import ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import workflow_profile as profile
 from power_loop.runtime.jobs import JobError, JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.workflow_resources import (
     WorkflowResourceAdapter,
     WorkflowResourceBinding,
@@ -187,7 +188,7 @@ def install(fixture, *, fault=None, repeat=False):
             assert await workflow.start(detached=True) is handle
         return json.dumps({"run_id": handle.run_id, "status": "accepted"})
     loop.tool_registry.register(ToolDefinition(name="launch", description="Start bound workflow",
-        input_schema={"type": "object"}), launch, overwrite=True)
+        input_schema={"type": "object"}, pricing=Free("test_fixture")), launch, overwrite=True)
     return original, pool, registry, track
 
 
@@ -312,6 +313,6 @@ async def test_wrong_scope_or_contract_binding_cannot_authorize_actual_workflow(
         wf = create_workflow(state["spec"], parent_loop=loop, parent_session_id=sid, resource_binding=binding())
         return str(await wf.start(detached=True))
     loop.tool_registry.register(ToolDefinition(name="launch", description="Wrong scope",
-        input_schema={"type": "object"}), launch, overwrite=True)
+        input_schema={"type": "object"}, pricing=Free("test_fixture")), launch, overwrite=True)
     await loop.send("launch", sid)
     assert not state["handles"] and model.counts["BUILD"] == 0

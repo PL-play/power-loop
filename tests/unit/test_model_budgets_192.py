@@ -21,6 +21,7 @@ from power_loop.runtime.budget_contracts import (
     LocalBudgetScope,
 )
 from power_loop.runtime.jobs import JobError, JobManager, _hash
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.schema import StoreSchemaError
 from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, migrate_task_schema, verify_task_schema
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
@@ -574,7 +575,7 @@ async def test_unadapted_or_name_spoofed_tool_is_rejected_before_its_side_effect
 
     registry = ToolRegistry()
     registry.register(
-        ToolDefinition(name=name, description="unadapted external effect", input_schema={"type": "object"}), unadapted
+        ToolDefinition(name=name, description="unadapted external effect", input_schema={"type": "object"}, pricing=Free("test_fixture")), unadapted
     )
     token = _SEND.set(c.binding)
     try:

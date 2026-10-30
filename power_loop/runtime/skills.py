@@ -26,11 +26,12 @@ from typing import Any
 
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.env import get_runtime_env
+from power_loop.runtime.pricing import Free
 
 _yaml = import_module("yaml") if find_spec("yaml") else None
 logger = logging.getLogger(__name__)
 
-LOAD_SKILL_DEFINITION = ToolDefinition(
+LOAD_SKILL_DEFINITION = ToolDefinition(pricing=Free("local"),
     name="load_skill",
     description=(
         "Load the full content of a skill by name. "

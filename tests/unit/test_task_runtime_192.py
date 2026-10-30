@@ -18,6 +18,7 @@ from power_loop import (
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import delegation
 from power_loop.runtime.jobs import JobError, JobLease, JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -421,7 +422,7 @@ async def test_rejected_adoption_of_cancel_resistant_work_is_bounded_and_retains
             release.set()
             await work
 
-    loop.tool_registry.register(ToolDefinition(name="probe", description="test", input_schema={"type": "object"}), probe)
+    loop.tool_registry.register(ToolDefinition(name="probe", description="test", input_schema={"type": "object"}, pricing=Free("test_fixture")), probe)
     try:
         await loop.send("probe", sid)
     except JobError as exc:
@@ -474,7 +475,7 @@ async def test_unadapted_entry_is_rejected_before_external_work(managed, entry):
                 await run_agent_spec(AgentSpec(name="no", system_prompt="no"), "no", parent_loop=current)
         return "rejected safely"
 
-    loop.tool_registry.register(ToolDefinition(name="probe", description="test admission", input_schema={"type": "object"}), probe)
+    loop.tool_registry.register(ToolDefinition(name="probe", description="test admission", input_schema={"type": "object"}, pricing=Free("test_fixture")), probe)
     assert (await loop.send("probe", sid)).status == "completed"
     assert len(await jobs(managed)) == 1 and model.child_calls == 0
     assert await store.list_children(sid) == []

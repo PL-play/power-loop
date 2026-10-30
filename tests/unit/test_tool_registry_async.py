@@ -17,6 +17,7 @@ import asyncio
 import pytest
 
 from power_loop import ToolDefinition, ToolRegistry
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import AsyncToolInSyncContext
 
 DEF = ToolDefinition(
@@ -24,7 +25,7 @@ DEF = ToolDefinition(
     description="ping",
     input_schema={"type": "object", "properties": {"x": {"type": "integer"}}},
     required_params=(),
-)
+pricing=Free("test_fixture"))
 
 
 def test_async_handler_detected_at_register_time() -> None:
@@ -103,3 +104,73 @@ async def test_callable_object_with_async_dunder_call_detected() -> None:
     assert tool is not None
     assert tool.is_async is True
     assert await reg.invoke_async("ping", {"x": 7}) == "obj:7"
+
+
+@pytest.mark.parametrize('async_entry', [False, True])
+@pytest.mark.asyncio
+async def test_internal_type_error_never_repeats_side_effect(async_entry):
+    reg = ToolRegistry()
+    calls = []
+    failure = TypeError('provider response could not be decoded')
+
+    def handler(x=0):
+        calls.append(x)  # represents an already accepted external request
+        raise failure
+
+    reg.register(DEF, handler)
+    with pytest.raises(TypeError) as caught:
+        if async_entry:
+            await reg.invoke_async('ping', {'x': 7})
+        else:
+            reg.invoke('ping', {'x': 7})
+    assert caught.value is failure
+    assert calls == [7]
+
+
+@pytest.mark.parametrize('async_entry', [False, True])
+@pytest.mark.asyncio
+async def test_legacy_mapping_handler_is_bound_before_execution(async_entry):
+    reg = ToolRegistry()
+    calls = []
+
+    def handler(arguments, /):
+        calls.append(arguments)
+        return arguments['x']
+
+    reg.register(DEF, handler)
+    result = (await reg.invoke_async('ping', {'x': 8}) if async_entry
+              else reg.invoke('ping', {'x': 8}))
+    assert result == 8
+    assert calls == [{'x': 8}]
+
+
+@pytest.mark.asyncio
+async def test_invalid_signature_does_not_execute_handler():
+    reg = ToolRegistry()
+    calls = []
+
+    def handler(first, second):
+        calls.append((first, second))
+
+    reg.register(DEF, handler)
+    with pytest.raises(TypeError):
+        await reg.invoke_async('ping', {'x': 8})
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_opaque_handler_internal_error_is_not_retried():
+    reg = ToolRegistry()
+    calls = []
+
+    class OpaqueHandler:
+        __signature__ = 'not inspectable'
+
+        def __call__(self, x=0):
+            calls.append(x)
+            raise TypeError('already executed')
+
+    reg.register(DEF, OpaqueHandler())
+    with pytest.raises(TypeError, match='already executed'):
+        await reg.invoke_async('ping', {'x': 9})
+    assert calls == [9]

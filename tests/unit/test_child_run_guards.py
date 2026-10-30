@@ -18,6 +18,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMStreamChunk,
 )
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec
 
 
@@ -170,7 +171,7 @@ async def test_guards_reenter_for_grandchild(store: SessionStore) -> None:
         ToolDefinition(
             name="spawnling", description="spawn",
             input_schema={"type": "object", "properties": {}},
-        ),
+        pricing=Free("test_fixture")),
         spawnling,
     )
     loop = StatefulAgentLoop(

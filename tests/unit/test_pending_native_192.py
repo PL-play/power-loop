@@ -1,4 +1,5 @@
 """Actual model-exit snapshots distinguish an unstarted native subset."""
+
 import json
 
 import pytest
@@ -7,6 +8,7 @@ from power_loop.runtime.controller_recovery import reconcile as recover_owner
 from power_loop.runtime.jobs import JobError, _hash, _json
 from power_loop.runtime.pending_calls import recover_runtime
 from power_loop.runtime.pending_native import FIELD, identity
+from power_loop.runtime.pricing import Free
 
 from ._owned_pending_case_192 import owned_pending_case
 from .test_controller_handoff_192 import new_main
@@ -223,7 +225,7 @@ async def test_original_main_source_can_review_its_own_mixed_batch(registry_stor
         async def native(text):
             state.native_calls += 1
             return text
-        loop.tool_registry.register(ToolDefinition('arbitrary_operation', 'Native operation', input_schema={'type':'object'}),
+        loop.tool_registry.register(ToolDefinition('arbitrary_operation', 'Native operation', input_schema={'type':'object'}, pricing=Free("test_fixture")),
             FunctionRuntimeTool(native, ToolRuntimeContract('example.renamed-operation'), policy=lambda args:ToolDispatchPolicy(True)))
     c = await scenario(registry_store, budgeted=True, raw_receipt_failure=True,
         call_names=['post_once', 'arbitrary_operation'], configure=configure)

@@ -13,6 +13,7 @@ from power_loop.runtime import delegation
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -46,7 +47,7 @@ async def test_real_child_original_call_and_receipt_produce_one_due_event_withou
         return json.dumps({"status": "accepted", "job_id": registration.job.job_id})
 
     registry.register(ToolDefinition(name="arm_wait", description="Request one deferred decision from the owner.",
-        input_schema={"type": "object", "properties": {}}), arm)
+        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), arm)
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=4, max_tokens=2048,
             system_prompt="Follow the user's sequence exactly. Do not create replacements. After child acceptance "

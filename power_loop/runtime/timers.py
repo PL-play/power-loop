@@ -120,6 +120,8 @@ class TimerRunner:
         self._cancel = CancellationToken()
 
     async def start(self) -> None:
+        if getattr(self._loop, "timer_backend", None) is not None:
+            raise ValueError("A host timer backend requires its own delivery driver")
         store = await self._loop._ensure_store()
         recovered = await store.recover_stale_firing_timers(
             older_than_ms=self._stale_firing_ms

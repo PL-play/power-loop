@@ -1,4 +1,5 @@
 """A live model consumes actual implementation-owned context views under aliases."""
+
 import asyncio
 import json
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.tool_context import ToolContextConfig, active_engine
 from power_loop.tools.registry import ToolRegistry
@@ -32,7 +34,7 @@ async def test_real_model_consumes_actual_view_without_reexecuting(tmp_path, kin
     registry.register(ToolDefinition(name, 'Read a fixed local evidence record. No command execution.',
         input_schema={'type': 'object', 'properties': {
             'command': {'type': 'string'}, 'description': {'type': 'string'},
-            'context_policy': {'type': 'string'}}, 'required': ['command', 'description', 'context_policy']}),
+            'context_policy': {'type': 'string'}}, 'required': ['command', 'description', 'context_policy']}, pricing=Free("test_fixture")),
         original if kind == 'plain_builtin_name' else ShellTool(original))
     loop = StatefulAgentLoop(llm=provider, store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=3, max_tokens=2048, compactor=None,

@@ -39,6 +39,7 @@ from power_loop._vendor.llm_client.interface import (
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_current_cancel_token
 from power_loop.runtime.env import RuntimeEnv, runtime_env_context
+from power_loop.runtime.pricing import Free
 from power_loop.tools.default_tools import BG, BackgroundManager, register_tool_task_callback
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow
@@ -169,7 +170,7 @@ def _tool_loop(store, *, interrupt: str, work: Any, policy: StopPolicy | None = 
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="t", description="t",
                                 input_schema={"type": "object", "properties": {}},
-                                interrupt=interrupt), work)
+                                interrupt=interrupt, pricing=Free("test_fixture")), work)
     llm = _LLM([_call("t"), "after"])
     return _loop(store, llm, reg, policy=policy), llm
 
@@ -263,7 +264,7 @@ async def test_a_sub_agent_stops_with_its_caller(store) -> None:
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="delegate", description="d",
                                 input_schema={"type": "object", "properties": {}},
-                                interrupt="background"), delegate)
+                                interrupt="background", pricing=Free("test_fixture")), delegate)
     loop = _loop(store, llm, reg, policy=StopPolicy(subtask_s=5))
     sid = await loop.new_session()
     tok = CancellationToken()
@@ -299,7 +300,7 @@ async def test_an_awaited_workflow_stops_with_its_caller(store) -> None:
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="wf", description="w",
                                 input_schema={"type": "object", "properties": {}},
-                                interrupt="background"), run_wf)
+                                interrupt="background", pricing=Free("test_fixture")), run_wf)
     loop = _loop(store, llm, reg, policy=StopPolicy(subtask_s=5))
     sid = await loop.new_session()
     tok = CancellationToken()
@@ -361,7 +362,7 @@ async def test_background_tool_task_stops_gracefully_and_does_not_wake(store) ->
         reg = ToolRegistry()
         reg.register(ToolDefinition(name="watch", description="w",
                                     input_schema={"type": "object", "properties": {}},
-                                    async_capable=True), watcher)
+                                    async_capable=True, pricing=Free("test_fixture")), watcher)
         loop = _loop(store, _LLM(), reg)
         sid = await loop.new_session()
         from power_loop.core.agent_context import (

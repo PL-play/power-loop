@@ -9,6 +9,7 @@ import pytest
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow
@@ -54,7 +55,7 @@ async def test_real_corrected_node_does_not_deliver_old_text_after_empty_pass(tm
         handles.append(handle)
         return json.dumps({"job_id": handle.job_id, "status": "accepted"})
     for name, fn in (("launch", launch),):
-        registry.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"}), fn)
+        registry.register(ToolDefinition(name=name, description=name, input_schema={"type": "object"}, pricing=Free("test_fixture")), fn)
     try:
         async with asyncio.timeout(180):
             await loop.send("Call launch exactly once. After acceptance reply WAITING without tools or pass_turn.", parent)

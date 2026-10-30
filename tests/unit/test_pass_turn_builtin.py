@@ -12,6 +12,7 @@ from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core import pass_turn as P
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolRuntimeContract
 from power_loop.tools.registry import ToolRegistry
 
@@ -44,7 +45,7 @@ def _call(cid: str, name: str, args: dict, text: str = "") -> LLMResponse:
 
 def _registry() -> ToolRegistry:
     reg = ToolRegistry()
-    reg.register(ToolDefinition(name="lookup", description="查", input_schema={"type": "object", "properties": {}}), lambda **_k: "牛奶 12 元")
+    reg.register(ToolDefinition(name="lookup", description="查", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **_k: "牛奶 12 元")
     return reg
 
 
@@ -96,7 +97,7 @@ async def test_host_override_keeps_its_description_and_must_request_pass(store):
         P.request_pass(reason)
         return "好"
 
-    reg.register(ToolDefinition(name="pass_turn", description="宿主自己的说明", input_schema={"type": "object", "properties": {}}), FunctionRuntimeTool(guarded, ToolRuntimeContract("test.yield", capabilities=("task.yield.v1",))))
+    reg.register(ToolDefinition(name="pass_turn", description="宿主自己的说明", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), FunctionRuntimeTool(guarded, ToolRuntimeContract("test.yield", capabilities=("task.yield.v1",))))
     llm = _Script(responses=[_call("c1", "pass_turn", {"reason": "等后台"}), _call("c2", "pass_turn", {"reason": "真做完了"})])
     loop = StatefulAgentLoop(llm=llm, config=AgentLoopConfig(max_rounds=10), store=store, tool_registry=reg)
     r = await loop.send("x", session_id=await loop.new_session())
@@ -130,7 +131,7 @@ async def test_pass_progress_counts_texts_and_work_tools_so_a_host_can_refuse_an
         P.request_pass(reason)
         return "好"
 
-    reg.register(ToolDefinition(name="pass_turn", description="应用里的说明", input_schema={"type": "object", "properties": {}}), FunctionRuntimeTool(guarded, ToolRuntimeContract("test.yield", capabilities=("task.yield.v1",))))
+    reg.register(ToolDefinition(name="pass_turn", description="应用里的说明", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), FunctionRuntimeTool(guarded, ToolRuntimeContract("test.yield", capabilities=("task.yield.v1",))))
     llm = _Script(responses=[_call("c1", "pass_turn", {"reason": "答完了"}),
                              _call("c2", "pass_turn", {"reason": "答完了"}, text="答案是 12 元。")])
     loop = StatefulAgentLoop(llm=llm, config=AgentLoopConfig(max_rounds=10), store=store, tool_registry=reg)
@@ -148,7 +149,7 @@ async def test_pass_progress_counts_other_tools_but_not_pass_turn(store):
         P.request_pass(reason)
         return "好"
 
-    reg.register(ToolDefinition(name="pass_turn", description="d", input_schema={"type": "object", "properties": {}}), FunctionRuntimeTool(spy, ToolRuntimeContract("test.yield", capabilities=("task.yield.v1",))))
+    reg.register(ToolDefinition(name="pass_turn", description="d", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), FunctionRuntimeTool(spy, ToolRuntimeContract("test.yield", capabilities=("task.yield.v1",))))
     llm = _Script(responses=[_call("c1", "lookup", {}), _call("c2", "pass_turn", {"reason": "存好了"})])
     loop = StatefulAgentLoop(llm=llm, config=AgentLoopConfig(max_rounds=10), store=store, tool_registry=reg)
     await loop.send("x", session_id=await loop.new_session())

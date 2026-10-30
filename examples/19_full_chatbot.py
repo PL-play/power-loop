@@ -64,6 +64,7 @@ from power_loop import (
     ToolRegistry,
 )
 from power_loop.contracts.hook_contexts import ToolBeforeCtx
+from power_loop.runtime.pricing import Free
 
 # ── 1. Tools / 工具 ──────────────────────────────────────────────────────
 
@@ -95,7 +96,7 @@ REGISTRY.register(
         name="get_weather",
         description="Get current weather for a city. Param: city (string).",
         input_schema={"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
-    ),
+    pricing=Free("local")),
     get_weather,
 )
 REGISTRY.register(
@@ -103,7 +104,7 @@ REGISTRY.register(
         name="calculator",
         description="Evaluate a math expression. Param: expression (string, e.g. '2+3*4').",
         input_schema={"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]},
-    ),
+    pricing=Free("local")),
     calculator,
 )
 

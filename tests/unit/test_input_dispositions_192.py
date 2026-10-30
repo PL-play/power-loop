@@ -18,6 +18,7 @@ from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_terminal as terminal
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, Execution, TaskRuntime
 from power_loop.workflow.admission import GATES
 
@@ -435,7 +436,7 @@ async def test_actual_waiting_node_retires_original_nudge_after_cancelled_readmi
     c.loop.tool_registry.register(
         ToolDefinition(
             name="arm_wait", description="Admit original node wait", input_schema={"type": "object", "properties": {}}
-        ),
+        , pricing=Free("test_fixture")),
         arm,
     )
     try:
@@ -535,7 +536,7 @@ async def test_negative_input_before_usage_accounting_retains_actual_tokens_once
     c.loop.tool_registry.register(
         ToolDefinition(
             name="checkpoint", description="Original task checkpoint", input_schema={"type": "object", "properties": {}}
-        ),
+        , pricing=Free("test_fixture")),
         hold_checkpoint,
     )
     monkeypatch.setattr(c.model, "complete", complete)

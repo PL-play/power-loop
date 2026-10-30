@@ -10,6 +10,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
@@ -50,7 +51,7 @@ async def test_per_send_tools_allowlist_restricts_what_model_can_call() -> None:
         for name in ("alpha", "beta"):
             reg.register(
                 ToolDefinition(name=name, description=f"The {name} tool.",
-                               input_schema={"type": "object", "properties": {}}),
+                               input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
                 (lambda n: (lambda **kw: (calls.append(n), "ok")[1]))(name),
             )
         loop = StatefulAgentLoop(

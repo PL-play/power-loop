@@ -23,6 +23,7 @@ from power_loop import (
     StatefulAgentLoop,
 )
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.default_tools import register_tool_task_callback
 from power_loop.tools.registry import ToolRegistry
 
@@ -98,7 +99,7 @@ def _slow_registry(interrupt: str, state: dict[str, Any]) -> ToolRegistry:
         name="research", description="Slow web research on a topic (takes a while).",
         input_schema={"type": "object", "properties": {"topic": {"type": "string"}},
                       "required": ["topic"]},
-        interrupt=interrupt), research)
+        interrupt=interrupt, pricing=Free("test_fixture")), research)
     return reg
 
 

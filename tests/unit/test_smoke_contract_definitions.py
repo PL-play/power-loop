@@ -15,6 +15,7 @@ from power_loop import (
     validate_tool_args,
 )
 from power_loop.contracts.messages import AssistantMessage, ToolResultMessage, UserMessage
+from power_loop.runtime.pricing import Free
 
 
 def main() -> None:
@@ -59,7 +60,7 @@ def main() -> None:
         name="read_file",
         description="Read file content",
         required_params=("path",),
-    )
+    pricing=Free("test_fixture"))
     as_tool = tool_def.to_openai_tool()
     assert as_tool["function"]["name"] == "read_file"
     assert validate_tool_args("read_file", {"path": "README.md"}) is None

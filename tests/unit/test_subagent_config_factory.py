@@ -16,6 +16,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMService,
     LLMStreamChunk,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec
 
 
@@ -165,7 +166,7 @@ async def test_workflow_continuation_restores_leaf_contract_after_recreation(sto
     from power_loop.contracts.tools import ToolDefinition
     from power_loop.tools.registry import ToolRegistry
     registry = ToolRegistry()
-    registry.register(ToolDefinition(name="parent_only", description="parent tool", input_schema={"type": "object", "properties": {}}), lambda: "ok")
+    registry.register(ToolDefinition(name="parent_only", description="parent tool", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda: "ok")
     parent = StatefulAgentLoop(llm=llm, store=store, config=config, tool_registry=registry)
     spec = AgentSpec(name="leaf", system_prompt="leaf prompt", tools=[], model="leaf-model",
                      max_tokens=1234, lifecycle="linked")

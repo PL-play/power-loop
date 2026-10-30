@@ -19,6 +19,7 @@ from power_loop._vendor.llm_client.interface import (
     LLMTokenUsage,
 )
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -83,8 +84,8 @@ def _registry(log: list[str], *, delay: float = 0.25) -> ToolRegistry:
         return f"file:{tag}"
 
     schema = {"type": "object", "properties": {"tag": {"type": "string"}}}
-    reg.register(ToolDefinition(name="gen_image", description="slow", input_schema=schema, async_capable=True), slow)
-    reg.register(ToolDefinition(name="save_note", description="serial", input_schema=schema), serial)
+    reg.register(ToolDefinition(name="gen_image", description="slow", input_schema=schema, async_capable=True, pricing=Free("test_fixture")), slow)
+    reg.register(ToolDefinition(name="save_note", description="serial", input_schema=schema, pricing=Free("test_fixture")), serial)
     return reg
 
 

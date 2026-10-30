@@ -1,4 +1,5 @@
 """Aliases and lookalikes exercise real presentation and progress paths."""
+
 from dataclasses import replace
 
 import pytest
@@ -10,6 +11,7 @@ from power_loop.agent.system_prompt import (
     section_todo_discipline,
     section_tool_guide,
 )
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_contracts import (
     FunctionRuntimeTool,
     ToolContractError,
@@ -38,7 +40,7 @@ async def test_progress_tracking_uses_successful_actual_contract_not_name(name, 
 
     implementation = FunctionRuntimeTool(handler, ToolRuntimeContract('example.progress',
         capabilities=('task.progress.v1',))) if declared else handler
-    registry.register(ToolDefinition(name, 'progress probe'), implementation)
+    registry.register(ToolDefinition(name, 'progress probe', pricing=Free("test_fixture")), implementation)
     bus = AgentEventBus()
     bus.subscribe(None, events.append)
     pipeline = _pipeline(llm=_Scripted(responses=[_tool_call('original', name)]), tool_registry=registry, bus=bus)
@@ -56,7 +58,7 @@ async def test_background_hint_is_explicit_metadata_independent_of_concurrency_o
     defaults, registry = create_default_tool_registry(bind=False), ToolRegistry()
     scheduler = defaults.get('background_run')
     registry.register(replace(scheduler.definition, name='defer_work'), scheduler.handler)
-    definition = ToolDefinition(name, 'read something', async_capable=True, background_hint=show)
+    definition = ToolDefinition(name, 'read something', async_capable=True, background_hint=show, pricing=Free("test_fixture"))
     registry.register(definition, lambda **args: 'OK')
     spec = next(s['function'] for s in registry.to_openai_tools() if s['function']['name'] == name)
     assert ('可异步' in spec['description']) == show
@@ -80,8 +82,8 @@ async def test_usage_guide_and_default_runtime_prompt_follow_actual_definitions_
     defaults, registry = create_default_tool_registry(bind=False), ToolRegistry()
     source = defaults.get('read_file')
     registry.register(replace(source.definition, name='read_notes'), source.handler)
-    registry.register(ToolDefinition('bash', 'plain probe', usage_hint='HOST_PROBE_GUIDANCE'), lambda **args: '')
-    registry.register(ToolDefinition('background_run', 'plain other probe'), lambda **args: '')
+    registry.register(ToolDefinition('bash', 'plain probe', usage_hint='HOST_PROBE_GUIDANCE', pricing=Free("test_fixture")), lambda **args: '')
+    registry.register(ToolDefinition('background_run', 'plain other probe', pricing=Free("test_fixture")), lambda **args: '')
     guide = section_tool_guide(SystemPromptContext(tool_definitions=registry))
     assert 'read_notes:' in guide and 'returns numbered lines' in guide
     assert '- bash: HOST_PROBE_GUIDANCE' in guide
@@ -103,14 +105,14 @@ async def test_usage_guide_and_default_runtime_prompt_follow_actual_definitions_
                                        ('background_hint', 1), ('background_hint', None)])
 async def test_presentation_metadata_rejects_ambiguous_types(field, value):
     with pytest.raises(TypeError):
-        ToolDefinition('probe', '', **{field: value})
+        ToolDefinition('probe', '', **{field: value}, pricing=Free("test_fixture"))
 
 
 @pytest.mark.parametrize('field,value', [('usage_hint', 'changed'), ('background_hint', False)])
 async def test_registered_contract_freezes_presentation_metadata_too(field, value):
     implementation = FunctionRuntimeTool(lambda **args: '', ToolRuntimeContract('example.frozen'))
     registry = ToolRegistry()
-    definition = ToolDefinition('probe', '')
+    definition = ToolDefinition('probe', '', pricing=Free("test_fixture"))
     registry.register(definition, implementation)
     object.__setattr__(definition, field, value)
     with pytest.raises(ToolContractError, match='binding_changed'):
@@ -121,7 +123,7 @@ async def test_progress_prompt_names_only_actual_capabilities_and_respects_filte
     defaults, registry = create_default_tool_registry(bind=False), ToolRegistry()
     original = defaults.get('todo')
     registry.register(replace(original.definition, name='record_plan'), original.handler)
-    registry.register(ToolDefinition('todo', 'unrelated'), lambda **args: '')
+    registry.register(ToolDefinition('todo', 'unrelated', pricing=Free("test_fixture")), lambda **args: '')
     guide = section_todo_discipline(SystemPromptContext(tool_definitions=registry))
     assert 'record_plan' in guide and 'Track tasks with todo' not in guide
     assert section_todo_discipline(SystemPromptContext(tool_definitions=registry, tool_names=['todo'])) is None

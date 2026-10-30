@@ -29,6 +29,7 @@ from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.state import ContextManager
 from power_loop.runtime.budget import estimate_tokens
 from power_loop.runtime.compact import CompactionPlan
+from power_loop.runtime.pricing import Free
 
 pytestmark = pytest.mark.unit
 
@@ -116,7 +117,7 @@ async def test_tool_calls_counter_excludes_rejected_and_retry() -> None:
         calls.append("ok")
         return "ok"
 
-    reg.register(ToolDefinition(name="ok", description="d", input_schema={"type": "object"}), _ok)
+    reg.register(ToolDefinition(name="ok", description="d", input_schema={"type": "object"}, pricing=Free("test_fixture")), _ok)
 
     # unknown tool → rejected by validate, must NOT count
     p = _pipeline(tool_registry=reg)

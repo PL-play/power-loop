@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from power_loop import SessionStore
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core import agent_context
 from power_loop.runtime.background import RESULT_PREFIX, record_key
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.runtime_state import BackgroundRuntimeProjector
 from power_loop.tools import default_tools as dt
 from power_loop.tools.registry import ToolRegistry
@@ -21,7 +23,7 @@ async def test_full_result_identity_survives_manager_recreation(monkeypatch):
     output = 'Error: ' + 'x' * 12000 + 'END'
 
     registry = ToolRegistry()
-    registry.register(ToolDefinition('scene_pkg', 'test', async_capable=True), lambda **args: output)
+    registry.register(ToolDefinition('scene_pkg', 'test', async_capable=True, pricing=Free("test_fixture")), lambda **args: output)
 
     monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=registry))
     monkeypatch.setattr(dt, '_current_store_and_session', lambda: (store, sid))

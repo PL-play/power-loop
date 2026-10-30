@@ -300,6 +300,7 @@ class StatefulAgentLoop:
         max_spawn_depth: int | None = None,
         session_cache_size: int = 256,
         task_runtime: Any = None,
+        timer_backend: Any = None,
     ) -> None:
         """Bind the loop to a store. Pass EITHER a pre-opened ``store=`` (e.g. shared across
         loops) OR a store config to lazily open one: ``dsn=`` (a DSN or sqlite path; ``db_path``
@@ -323,6 +324,10 @@ class StatefulAgentLoop:
         self.store: SessionStore | None = store
         if task_runtime is not None and (store is None or task_runtime.manager.store is not store):
             raise ValueError("task_runtime requires its pre-opened authoritative store")
+        from power_loop.runtime.timer_backend import TimerBackend
+        if timer_backend is not None and not isinstance(timer_backend, TimerBackend):
+            raise ValueError('timer_backend must implement create/list/cancel')
+        self.timer_backend = timer_backend
         self.task_runtime = task_runtime
         self._dsn = dsn if dsn is not None else (db_path if db_path is not None else DEFAULT_DB_PATH)
         self._table_prefix = table_prefix if table_prefix is not None else DEFAULT_TABLE_PREFIX
@@ -950,8 +955,17 @@ class StatefulAgentLoop:
         """
         sid = session_id
         self._raise_if_closing()
-        await self._ensure_store()
+        store = await self._ensure_store()
         await self._ensure_session_or_raise(sid)
+        # A host can commit input and its cursor proof atomically instead of
+        # calling deliver(). Read the durable pending state before returning
+        # to a busy owner, so committed steering still interrupts that owner.
+        pending = await store.inbox_counts(sid)
+        entry = _session_sync(sid, owner=id(self))
+        self._sync_sids.add(sid)
+        entry.pending_hint = max(entry.pending_hint, pending['pending'])
+        if pending['steer']:
+            entry.steer.set()
         if self._lock_for(sid).locked():
             return None
         return await self._send_from_inbox(
@@ -1239,6 +1253,7 @@ class StatefulAgentLoop:
         due_at_ms: int | None = None,
         note: str,
         interval_s: int | None = None,
+        operation_id: str | None = None,
     ):
         """Create a durable wake-up for this session (external/orchestrator
         path; agents use the ``schedule_wakeup`` tool). Provide exactly one of
@@ -1246,13 +1261,11 @@ class StatefulAgentLoop:
         each delivery it re-arms at fire-time + interval (fixed-delay) until
         cancelled. Fires only while a ``TimerRunner`` (or an external
         scheduler polling ``store.due_timers()``) is running."""
-        import time as _time
-
         from power_loop.runtime.execution_roles import require_timer_creation
-        from power_loop.runtime.task_runtime import reject_unregistered_adapter
+        from power_loop.runtime.timer_backend import backend_for
+        from power_loop.runtime.timer_backend import operation_id as timer_operation_id
 
         await require_timer_creation(self, sid=session_id)
-        reject_unregistered_adapter("timer", self)
 
         store = await self._ensure_store()
         await self._ensure_session_or_raise(session_id)
@@ -1260,31 +1273,29 @@ class StatefulAgentLoop:
             raise ValueError("provide exactly one of delay_s / due_at_ms")
         if not (note or "").strip():
             raise ValueError("note is required — the agent needs to know why it woke up")
-        if due_at_ms is not None:
-            due = int(due_at_ms)
-        else:
-            assert delay_s is not None
-            due = int(_time.time() * 1000 + float(delay_s) * 1000)
         if interval_s is not None and int(interval_s) < 1:
             raise ValueError("interval_s must be >= 1 second")
-        return await store.create_timer(
-            session_id, due_at=due, note=note.strip(), interval_s=interval_s
+        return await backend_for(self, store).create(
+            session_id, delay_s=delay_s, due_at_ms=due_at_ms, note=note.strip(), interval_s=interval_s,
+            operation_id=timer_operation_id(self, session_id, operation_id),
         )
 
-    async def cancel_timer(self, session_id: str, timer_id: int) -> bool:
+    async def cancel_timer(self, session_id: str, timer_id: int, *, operation_id: str | None = None) -> bool:
         """Cancel an armed timer. Returns False when it already fired /
         was cancelled / never existed."""
         store = await self._ensure_store()
         await self._ensure_session_or_raise(session_id)
-        return await store.transition_timer(
-            session_id, int(timer_id), from_status="armed", to_status="cancelled"
-        )
+        from power_loop.runtime.timer_backend import backend_for
+        from power_loop.runtime.timer_backend import operation_id as timer_operation_id
+        return await backend_for(self, store).cancel(session_id, int(timer_id),
+            operation_id=timer_operation_id(self, session_id, operation_id))
 
-    async def list_timers(self, session_id: str):
+    async def list_timers(self, session_id: str, *, statuses: tuple[str, ...] = ("armed", "firing")):
         """Live (armed/firing) timers for this session, soonest first."""
         store = await self._ensure_store()
         await self._ensure_session_or_raise(session_id)
-        return await store.list_timers(session_id)
+        from power_loop.runtime.timer_backend import backend_for
+        return await backend_for(self, store).list(session_id, statuses=statuses)
 
     # ── work in flight: list + stop by id (design/124 §8.1 / §8.4) ────────────────────────
 
@@ -1339,7 +1350,7 @@ class StatefulAgentLoop:
                              "started_at": ts, "origin": _origin(ts)})
         from power_loop.runtime.delegation import running_jobs
         jobs.extend(running_jobs(store, session_id))
-        for tm in await store.list_timers(session_id, statuses=("armed",)):
+        for tm in await self.list_timers(session_id, statuses=("armed",)):
             jobs.append({"id": f"timer:{tm.timer_id}", "kind": "timer",
                          "title": str(tm.note or "")[:80], "status": "armed",
                          "started_at": tm.created_at, "due_at": tm.due_at,

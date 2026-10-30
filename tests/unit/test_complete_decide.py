@@ -22,6 +22,7 @@ from power_loop import (
     ToolDefinition,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 pytestmark = pytest.mark.unit
@@ -58,7 +59,7 @@ def _tool_call(cid: str, name: str) -> LLMResponse:
 def _registry() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="echo", description="e",
-                 input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
+                 input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **k: "ok")
     return reg
 
 

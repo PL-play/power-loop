@@ -22,6 +22,7 @@ from power_loop.agent.follow_up import FOLLOW_UP_MESSAGE_NAME, InboxItem
 from power_loop.contracts.errors import SessionPendingError
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.cancellation import CancellationToken
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 
@@ -60,7 +61,7 @@ def _registry() -> ToolRegistry:
     reg.register(
         ToolDefinition(name="echo", description="Echo",
                        input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
-                       required_params=("text",)),
+                       required_params=("text",), pricing=Free("test_fixture")),
         lambda **kw: str(kw.get("text") or ""),
     )
     return reg

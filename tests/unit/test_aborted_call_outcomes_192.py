@@ -1,8 +1,10 @@
 """Original-main handling of a positive aborted batch, without replacement work."""
+
 import pytest
 
 from power_loop.runtime.jobs import JobError
 from power_loop.runtime.pending_calls import retire_pending
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.tool_call_plans import reconcile_pending
 
 from ._tool_plan_faults_192 import fail_plan_once
@@ -127,7 +129,7 @@ async def test_actual_review_rejects_new_effects_even_with_a_control_schema(regi
         await c.manager.register_job(execution.actor, kind='background_tool', parent=execution.lease,
             system_key='forbidden-resource', title='Forbidden review resource')
         raise AssertionError('new resource cannot be admitted')
-    definition = ToolDefinition('inspect_original', '', input_schema={'type': 'object'})
+    definition = ToolDefinition('inspect_original', '', input_schema={'type': 'object'}, pricing=Free("test_fixture"))
     loop.tool_registry.register(definition, FunctionRuntimeTool(control, ToolRuntimeContract('example.original-control'),
         policy=lambda args: ToolDispatchPolicy(True, True), reviewer=lambda spec: spec))
     original = c.registry.get('post_once')

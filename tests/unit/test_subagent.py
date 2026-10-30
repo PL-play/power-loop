@@ -17,6 +17,7 @@ from power_loop import (
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import filtered_registry, run_agent_spec
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -142,7 +143,7 @@ def test_filtered_registry_whitelist_subset() -> None:
     parent = ToolRegistry()
     for name in ("a", "b", "c"):
         parent.register(
-            ToolDefinition(name=name, description=name, input_schema={"type": "object", "properties": {}}),
+            ToolDefinition(name=name, description=name, input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
             lambda **_kw: name,
         )
     sub = filtered_registry(parent, ["a", "c", "missing"])
@@ -370,7 +371,7 @@ async def test_subagent_empty_final_text_recovers_last_assistant_text(store: Ses
     So the child must stay blank past the retry cap for the transcript fallback to engage."""
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="echo", description="e",
-                 input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
+                 input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **k: "ok")
     spec = AgentSpec(name="quiet", system_prompt="P", max_rounds=5)
 
     parent_llm = _Scripted(responses=[LLMResponse(raw_text="parent done")])

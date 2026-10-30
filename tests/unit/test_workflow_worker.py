@@ -18,6 +18,7 @@ import pytest
 
 from power_loop import SessionStore
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import WorkerBootstrap, WorkerBootstrapError, run_spec_isolated
 from power_loop.workflow.worker import (
@@ -118,7 +119,7 @@ async def test_tool_whitelist_narrows_rebuilt_registry() -> None:
         reg = ToolRegistry()
         for name in ("alpha", "beta"):
             reg.register(ToolDefinition(name=name, description=name,
-                         input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
+                         input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **k: "ok")
         return reg
 
     boot = WorkerBootstrap(llm_factory=lambda: _FakeLLM(), registry_factory=_registry)

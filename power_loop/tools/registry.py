@@ -8,6 +8,7 @@ from typing import Any, cast
 
 from power_loop.contracts.errors import ToolNotFound, ToolValidationError
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import PricingError, PricingSpec
 
 ToolCallable = Callable[..., Any] | Callable[..., Awaitable[Any]]
 
@@ -22,6 +23,29 @@ def is_async_callable(handler):
 def _missing(definition, args):
     required = dict.fromkeys((*definition.required_params, *definition.input_schema.get("required", ())))
     return [name for name in required if name not in args]
+
+
+def _call_sync_once(handler, args):
+    """Choose the legacy mapping convention before invoking user code.
+
+    A TypeError from inside a tool is an execution failure, never evidence
+    that it is safe to repeat a potentially paid or state-changing call.
+    Opaque callables use the documented keyword convention exactly once.
+    """
+    arguments = dict(args)
+    try:
+        signature = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return handler(**arguments)
+    try:
+        signature.bind(**arguments)
+    except TypeError as keyword_error:
+        try:
+            signature.bind(arguments)
+        except TypeError:
+            raise keyword_error from None
+        return handler(arguments)
+    return handler(**arguments)
 
 
 class AsyncToolInSyncContext(TypeError):
@@ -39,6 +63,8 @@ class RegisteredTool:
     handler: ToolCallable
     is_async: bool = False
     runtime_binding: tuple[str, str, object] | None = None
+    pricing: PricingSpec | None = None
+    pricing_version: str | None = None
 
 
 def async_capable_for(definition: Any, args: Mapping[str, Any] | None = None) -> bool:
@@ -86,10 +112,16 @@ class ToolRegistry:
         # async we additionally check that. Plain sync callables that
         # *happen* to return awaitables are still handled at call time by
         # ``invoke_async``.
+        pricing = definition.pricing
+        if not isinstance(pricing, PricingSpec):
+            raise PricingError('tool_pricing_required:' + definition.name)
+        version = pricing.version()
+        if not isinstance(version, str) or not version or not isinstance(pricing.rule_id, str) or not pricing.rule_id:
+            raise PricingError('tool_pricing_identity_invalid:' + definition.name)
         is_async = is_async_callable(handler)
         self._tools[definition.name] = RegisteredTool(
             definition=definition, handler=handler, is_async=is_async,
-            runtime_binding=snapshot(handler, definition),
+            runtime_binding=snapshot(handler, definition), pricing=pricing, pricing_version=version,
         )
 
     def unregister(self, name: str) -> None:
@@ -169,6 +201,7 @@ class ToolRegistry:
         if tool is None:
             raise ToolNotFound(name)
 
+        validate_pricing(tool)
         missing = _missing(tool.definition, args)
         if missing:
             raise ToolValidationError(
@@ -192,10 +225,7 @@ class ToolRegistry:
         self._raise_if_invalid(name, args)
 
         handler = cast(Callable[..., Any], tool.handler)
-        try:
-            return handler(**dict(args))
-        except TypeError:
-            return handler(dict(args))
+        return _call_sync_once(handler, args)
 
     async def invoke_async(self, name: str, args: Mapping[str, Any]) -> Any:
         """Universal invocation entry. Raises :class:`ToolNotFound` if the
@@ -219,10 +249,7 @@ class ToolRegistry:
             return await handler(**dict(args))
 
         def _call_sync() -> Any:
-            try:
-                return handler(**dict(args))
-            except TypeError:
-                return handler(dict(args))
+            return _call_sync_once(handler, args)
 
         result = await asyncio.to_thread(_call_sync)
         if inspect.isawaitable(result):
@@ -238,3 +265,11 @@ def build_registry(definitions: list[ToolDefinition], handlers: Mapping[str, Too
             raise ValueError(f"Missing handler for tool definition: {definition.name}")
         registry.register(definition, handler)
     return registry
+
+
+def validate_pricing(registered):
+    if (registered is None or registered.pricing is None
+            or registered.definition.pricing is not registered.pricing
+            or registered.pricing.version() != registered.pricing_version):
+        raise PricingError('tool_pricing_binding_changed')
+    return registered.pricing

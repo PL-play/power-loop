@@ -186,6 +186,8 @@ def snapshot(handler, definition):
         _json(
             {
                 "definition": definition.to_openai_tool(),
+                "pricing": ({"rule_id": definition.pricing.rule_id, "version": definition.pricing.version()}
+                            if definition.pricing is not None else None),
                 "required": definition.required_params,
                 "interrupt": definition.interrupt,
                 "usage_hint": definition.usage_hint,
@@ -217,6 +219,8 @@ def validate_registration(registry, name, expected):
     """Recheck after admission awaits, immediately before invoking the handler."""
     if registry.get(name) is not expected:
         raise ToolContractError("tool_runtime_binding_changed")
+    from power_loop.tools.registry import validate_pricing
+    validate_pricing(expected)
     resolve(expected)
 
 

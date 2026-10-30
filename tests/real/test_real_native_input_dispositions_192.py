@@ -13,6 +13,7 @@ from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow, runner
@@ -115,7 +116,7 @@ async def test_real_native_node_input_is_disposed_and_original_final_result_is_r
 
     for name, fn in [("arm_wait", arm), ("launch_original", launch), ("nudge_original", nudge)]:
         registry.register(
-            ToolDefinition(name=name, description=name, input_schema={"type": "object", "properties": {}}), fn
+            ToolDefinition(name=name, description=name, input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), fn
         )
 
     async def shape(ctx):

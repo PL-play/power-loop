@@ -1,3 +1,4 @@
+
 import asyncio
 from contextvars import ContextVar
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ import pytest
 
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core import agent_context
+from power_loop.runtime.pricing import Free
 from power_loop.tools import default_tools as dt
 from power_loop.tools.registry import ToolRegistry
 
@@ -48,7 +50,7 @@ async def test_queue_is_fifo_per_session_and_cancel_does_not_invoke(monkeypatch)
 
 
     registry = ToolRegistry()
-    registry.register(ToolDefinition("image", "test", async_capable=True), invoke)
+    registry.register(ToolDefinition("image", "test", async_capable=True, pricing=Free("test_fixture")), invoke)
 
     monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=registry))
     monkeypatch.setattr(dt, '_current_store_and_session', lambda: (store, sid.get()))

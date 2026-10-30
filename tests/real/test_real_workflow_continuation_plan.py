@@ -13,6 +13,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_session_id
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow, journal, runner
 
@@ -92,7 +93,7 @@ async def test_real_tool_continuation_invalidates_review_and_waits_before_assemb
 
     for name, handler in (("launch_workflow", launch), ("repair_calculation", repair)):
         registry.register(ToolDefinition(name=name, description="Execute the predefined "+name+" once",
-            input_schema={"type": "object"}), handler)
+            input_schema={"type": "object"}, pricing=Free("test_fixture")), handler)
     try:
         async with asyncio.timeout(180):
             first = await loop.send("Call launch_workflow exactly once, then reply WAITING.", parent)

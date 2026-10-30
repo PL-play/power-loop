@@ -19,6 +19,7 @@ from power_loop import (
     StatefulAgentLoop,
 )
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
@@ -33,7 +34,7 @@ def _noop_registry() -> ToolRegistry:
             description="Echo input.",
             input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
             required_params=(),
-        ),
+        pricing=Free("test_fixture")),
         lambda **kw: kw.get("text", ""),
     )
     return reg

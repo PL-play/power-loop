@@ -7,9 +7,10 @@ from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import wait_decisions
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobError
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND
 
-WAIT_HANDOFF_DEFINITION = ToolDefinition(
+WAIT_HANDOFF_DEFINITION = ToolDefinition(pricing=Free("local"),
     name="wait_handoff",
     description=("Review an existing task's deferred continuation request. inspect reads its original request "
         "and current time; field=note or continuation supports char_offset/max_chars for full text. "

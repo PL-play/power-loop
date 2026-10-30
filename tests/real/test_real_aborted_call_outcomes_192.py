@@ -1,4 +1,5 @@
 """Actual crashed source -> negative outcome -> original-main review and budget."""
+
 import asyncio
 import json
 import sys
@@ -12,6 +13,7 @@ from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.execution_membership import scope
 from power_loop.runtime.jobs import JobActor, JobError, JobLease, JobManager
 from power_loop.runtime.managed_effects import FunctionManagedTool, ManagedToolContract
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_query import get_job
@@ -58,7 +60,7 @@ async def test_real_crashed_aborted_source_is_reviewed_without_replacement_or_ne
         adapter = FunctionManagedTool(ManagedToolContract('example.batch-crash', 'a'*64), forbidden, forbidden, forbidden)
         registry = ToolRegistry()
         definition = ToolDefinition('set_first_beacon', 'Set the beacon.', input_schema={
-            'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']})
+            'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']}, pricing=Free("test_fixture"))
         registry.register(definition, adapter.bind(runtime, definition))
         registry.register(replace(JOBS_DEFINITION, name='inspect_saved_tasks'), JOBS_HANDLER)
         loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,

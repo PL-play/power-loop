@@ -21,6 +21,7 @@ from typing import Any
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_effective_tools, get_session_id
 from power_loop.runtime.execution_roles import require_orchestration
+from power_loop.runtime.pricing import Free
 
 from .api import create_workflow
 from .engine import in_workflow
@@ -268,7 +269,7 @@ def workflow_tool_definition(*, allow_inline_spec=True, description_suffix=""):
     }
     if allow_inline_spec:
         properties["spec"] = {"type": "object", "description": "WorkflowSpec JSON. Select exactly one spec or file."}
-    return ToolDefinition(name="workflow", description=(
+    return ToolDefinition(pricing=Free("composite"), name="workflow", description=(
         "Create and inspect deterministic agent workflows. create always admits asynchronous work; "
         "the returned accepted receipt is not its result. Use validate for compilation/policy checks without execution. "
         "list/status read saved tasks; status without run_id lists owned workflows. They do not start agents. Results require actual completion and owner consumption. "

@@ -12,6 +12,7 @@ from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDef
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import workflow_results
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow, journal
@@ -45,7 +46,7 @@ async def test_real_workflow_projection_repair_preserves_usage_and_never_reexecu
         handles.append(handle)
         return json.dumps({"status": "queued", "run_id": handle.run_id, "job_id": handle.job_id})
     registry.register(ToolDefinition(name="launch_workflow", description="Launch the predefined arithmetic task once.",
-        input_schema={"type": "object", "properties": {}}), launch)
+        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), launch)
     original_build = WorkflowEngine._build_result
     def inflated_rollup(self, *args, **kwargs):
         result = original_build(self, *args, **kwargs)

@@ -36,6 +36,7 @@ from power_loop.agent.follow_up import FOLLOW_UP_MESSAGE_NAME
 from power_loop.contracts.hook_contexts import LlmBeforeCtx
 from power_loop.contracts.hooks import HookPoint
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 USAGE = LLMTokenUsage(prompt_tokens=50, completion_tokens=5, total_tokens=55)
@@ -110,9 +111,9 @@ def _registry(probe: _Probe, *, interrupt: str) -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="slow", description="slow",
                                 input_schema={"type": "object", "properties": {}},
-                                interrupt=interrupt), probe.run)
+                                interrupt=interrupt, pricing=Free("test_fixture")), probe.run)
     reg.register(ToolDefinition(name="fast", description="fast",
-                                input_schema={"type": "object", "properties": {}}),
+                                input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
                  lambda **kw: "fast result")
     return reg
 
@@ -178,7 +179,7 @@ async def test_queue_item_does_not_interrupt(store) -> None:
     llm.complete = slow_first  # type: ignore[method-assign]
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="fast", description="f",
-                                input_schema={"type": "object", "properties": {}}),
+                                input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
                  lambda **kw: "ok")
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=reg, config=AgentLoopConfig(
         system_prompt="S", max_rounds=3, compactor=None))
@@ -340,7 +341,7 @@ async def test_wait_or_steer_returns_early(store) -> None:
 
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="wait", description="w",
-                                input_schema={"type": "object", "properties": {}}), waiter)
+                                input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), waiter)
     llm = _LLM([_call("wait"), "ok"])
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=reg, config=AgentLoopConfig(
         system_prompt="S", max_rounds=3, compactor=None))
@@ -360,7 +361,7 @@ async def test_wait_or_steer_outside_a_loop_just_waits() -> None:
 
 def test_interrupt_value_is_validated() -> None:
     with pytest.raises(ValueError):
-        ToolDefinition(name="x", description="x", interrupt="later")
+        ToolDefinition(name="x", description="x", interrupt="later", pricing=Free("test_fixture"))
 
 
 @pytest.mark.asyncio

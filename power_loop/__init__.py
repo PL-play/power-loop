@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "9.0.0rc1"
+__version__ = "9.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -138,7 +138,7 @@ from power_loop.contracts.protocols import (
     HookManagerProtocol,
     ToolArgsValidator,
 )
-from power_loop.contracts.tools import ToolDefinition, validate_tool_args
+from power_loop.contracts.tools import ToolDefinition, ToolResult, validate_tool_args
 from power_loop.core.agent_context import get_effective_tools
 from power_loop.core.events import AgentEventBus
 from power_loop.core.hooks import AgentHooks
@@ -176,6 +176,7 @@ from power_loop.runtime.memory import (
     MemorySnapshot,
     tag_as_memory,
 )
+from power_loop.runtime.nested_tools import invoke_priced_tool
 from power_loop.runtime.notes import (
     DEFAULT_NOTES_POLICY,
     NoteMemory,
@@ -241,6 +242,7 @@ from power_loop.runtime.structured import (
     parse_structured,
 )
 from power_loop.runtime.timers import TimerDelivery, TimerRunner
+from power_loop.runtime.tool_billing import record_billing_receipt, tool_billing_active, tool_billing_managed
 from power_loop.runtime.tool_context import ToolContextConfig
 from power_loop.tools import (
     DEFAULT_TOOL_HANDLERS,
@@ -504,6 +506,11 @@ __all__ = [
 	"ChildRunGuard",
 	"get_effective_tools",
 	"ToolDefinition",
+	"ToolResult",
+	"record_billing_receipt",
+	"tool_billing_managed",
+	"tool_billing_active",
+	"invoke_priced_tool",
 	"validate_tool_args",
 	"ToolRegistry",
 	"AsyncToolInSyncContext",

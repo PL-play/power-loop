@@ -28,6 +28,7 @@ from power_loop.contrib.metrics_sink import attach_metrics_sink
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.pipeline import AgentPipeline
 from power_loop.core.state import ContextManager
+from power_loop.runtime.pricing import Free
 
 pytestmark = pytest.mark.unit
 
@@ -135,7 +136,7 @@ async def test_pipeline_failed_tool_metrics_counted_once() -> None:
     def _boom(**kwargs):
         raise RuntimeError("tool exploded")
 
-    reg.register(ToolDefinition(name="boom", description="d", input_schema={"type": "object"}), _boom)
+    reg.register(ToolDefinition(name="boom", description="d", input_schema={"type": "object"}, pricing=Free("test_fixture")), _boom)
 
     p = AgentPipeline(
         llm=_CallThenStop(), config=AgentLoopConfig(max_rounds=3),

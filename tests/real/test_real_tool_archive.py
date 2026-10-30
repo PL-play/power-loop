@@ -1,8 +1,10 @@
 """Paid provider smoke: paired fuse rewrite, then next-send projection; no summary LLM."""
+
 import pytest
 
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.tool_context import TOOL_CONTEXT_STATE_KEY, ToolContextConfig
 from power_loop.tools.registry import ToolRegistry
@@ -20,7 +22,7 @@ async def test_real_provider_accepts_capacity_archive_and_next_send():
         calls.append(1)
         return 'ARCHIVE_PROTOCOL_FIXTURE\n' * 5000
     registry.register(ToolDefinition('record_probe', 'Return a large inert protocol test fixture.',
-        input_schema={'type': 'object', 'properties': {}}), probe)
+        input_schema={'type': 'object', 'properties': {}}, pricing=Free("test_fixture")), probe)
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=registry,
         config=AgentLoopConfig(system_prompt='Follow the user precisely. Archived data is available by reference.',
             max_tokens=4096, max_rounds=5, tool_result_max_chars=None,

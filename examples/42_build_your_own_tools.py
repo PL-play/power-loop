@@ -45,6 +45,7 @@ from power_loop import (
     render_notes,
     run_agent_spec,
 )
+from power_loop.runtime.pricing import Free
 
 # ── 1. SUB-AGENT — recreate spawn_agent via run_agent_spec ──────────────────────────────────
 # Parity: runs a child agent to completion inside this tool call, returns its final text inline.
@@ -72,7 +73,7 @@ DELEGATE_TOOL = ToolDefinition(
     description="Delegate a self-contained sub-task to a child agent; returns its answer.",
     input_schema={"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]},
     required_params=("task",),
-)
+pricing=Free("composite"))
 
 
 # ── 2. TIMER — recreate schedule_wakeup via loop.schedule_timer ─────────────────────────────
@@ -96,7 +97,7 @@ REMIND_TOOL = ToolDefinition(
         "required": ["delay_seconds", "note"],
     },
     required_params=("delay_seconds", "note"),
-)
+pricing=Free("local"))
 
 
 # ── 3. HUMAN INPUT — recreate request_user_input via HumanInputRequired ─────────────────────
@@ -123,7 +124,7 @@ ASK_HUMAN_TOOL = ToolDefinition(
         "required": ["prompt"],
     },
     required_params=("prompt",),
-)
+pricing=Free("local"))
 
 
 # ── 4. BLACKBOARD — recreate board_* via the store's per-session runtime_state ──────────────
@@ -153,12 +154,12 @@ BOARD_WRITE_TOOL = ToolDefinition(
     description="Append a line to the shared session scratchpad (visible to all agents here).",
     input_schema={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
     required_params=("text",),
-)
+pricing=Free("local"))
 BOARD_READ_TOOL = ToolDefinition(
     name="board_read",
     description="Read the shared session scratchpad.",
     input_schema={"type": "object", "properties": {}},
-)
+pricing=Free("local"))
 
 
 # ── 5. MEMORY — recreate note add + recall via store notes + a MemoryProvider ──────────────
@@ -184,7 +185,7 @@ REMEMBER_TOOL = ToolDefinition(
         "required": ["content"],
     },
     required_params=("content",),
-)
+pricing=Free("local"))
 
 
 class CustomNotesMemory:
@@ -234,7 +235,7 @@ RUN_PIPELINE_TOOL = ToolDefinition(
     description="Run a fixed research→draft pipeline of sub-agents and return the final result.",
     input_schema={"type": "object", "properties": {"goal": {"type": "string"}}, "required": ["goal"]},
     required_params=("goal",),
-)
+pricing=Free("composite"))
 
 
 # ── 7. BACKGROUND — recreate background_run via daemon + pl_background_tasks + a RuntimeProjector ─
@@ -301,7 +302,7 @@ BG_RUN_TOOL = ToolDefinition(
     description="Run a shell command in the background; the result comes back to you on a later turn.",
     input_schema={"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
     required_params=("command",),
-)
+pricing=Free("composite"))
 
 
 # ── Registration ────────────────────────────────────────────────────────────────────────────

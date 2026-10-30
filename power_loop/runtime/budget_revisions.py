@@ -212,10 +212,10 @@ async def prepare(runtime, actor, state):
     if initial:
         return await budgets._host_call(runtime, state["job_id"], state["attempt_id"], port,
             lambda: runtime.budget_config.provider.prepare_initial_usage(
-                dict(state["context"]), BudgetGrant(**state["grant"]), evidence,
+                budgets.accounting_context(state), BudgetGrant(**state["grant"]), evidence,
                 started_at_ms=state["started_at_ms"]))
     return await budgets._host_call(runtime, state["job_id"], state["attempt_id"],
         "prepare_usage_revision:" + str(revision["revision"]),
         lambda: runtime.budget_config.provider.prepare_usage_revision(
-            dict(state["context"]), BudgetGrant(**state["grant"]),
+            budgets.accounting_context(state), BudgetGrant(**state["grant"]),
             BudgetSubmission(**saved["previous_submission"]), BudgetAck(**saved["previous_ack"]), evidence))

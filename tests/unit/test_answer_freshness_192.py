@@ -6,6 +6,7 @@ import pytest
 from power_loop import AgentLoopConfig, LLMResponse, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
@@ -29,7 +30,7 @@ async def test_empty_pass_cannot_recover_text_from_before_the_latest_input(tmp_p
         async def correct():
             await get_current_loop().follow_up("Correction: return 43.", get_session_id())
             return "Correction queued."
-        registry.register(ToolDefinition(name="correct", description="Queue correction", input_schema={"type": "object"}), correct)
+        registry.register(ToolDefinition(name="correct", description="Queue correction", input_schema={"type": "object"}, pricing=Free("test_fixture")), correct)
         loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
             config=AgentLoopConfig(delegation_policy="single_level", max_rounds=3))
         sid = await loop.new_session()
@@ -52,7 +53,7 @@ async def test_original_node_supplements_new_input_instead_of_delivering_stale_o
     async def correct():
         await get_current_loop().follow_up("Correction: the answer is now 43.", get_session_id())
         return "Correction queued."
-    loop.tool_registry.register(ToolDefinition(name="correct", description="Queue correction", input_schema={"type": "object"}), correct)
+    loop.tool_registry.register(ToolDefinition(name="correct", description="Queue correction", input_schema={"type": "object"}, pricing=Free("test_fixture")), correct)
     async def complete(request, **kwargs):
         if "ROLE-BUILD" in (request.system_prompt or ""):
             requests.append(request)

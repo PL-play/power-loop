@@ -13,6 +13,7 @@ from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, 
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime import delegation
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -104,7 +105,7 @@ async def managed_workflow(registry_store):
             assert second is handle
         return json.dumps({"run_id": handle.run_id, "job_id": handle.job_id, "operation_id": handle.operation_id, "status": "queued"})
 
-    registry.register(ToolDefinition(name="launch", description="Start a workflow", input_schema={"type": "object"}), launch)
+    registry.register(ToolDefinition(name="launch", description="Start a workflow", input_schema={"type": "object"}, pricing=Free("test_fixture")), launch)
     before = set(delegation._TASKS)
     try:
         yield store, manager, runtime, loop, model, sid, state, connect

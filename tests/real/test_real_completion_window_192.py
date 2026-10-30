@@ -11,6 +11,7 @@ import pytest
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition, create_default_tool_registry
 from power_loop.core.pass_turn import PASS_TURN_TOOL
 from power_loop.runtime.completion import CompletionWindow, collect_required
+from power_loop.runtime.pricing import Free
 from power_loop.tools import default_tools
 
 from .test_real_async_boundaries_192 import BoundedProvider
@@ -57,7 +58,7 @@ async def test_real_common_collector_waits_for_background_and_reentry_makes_no_n
             description="Read a local result code.",
             input_schema={"type": "object", "properties": {}},
             async_capable=True,
-        ),
+        pricing=Free("test_fixture")),
         evidence,
     )
     loop = StatefulAgentLoop(

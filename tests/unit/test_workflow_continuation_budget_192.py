@@ -6,6 +6,7 @@ import pytest
 
 from power_loop import LLMResponse, LLMTokenUsage, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.core.agent_context import get_session_id
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.workflow_resources import (
     WorkflowResourceAdapter,
     WorkflowResourceBinding,
@@ -145,7 +146,7 @@ async def test_native_automatic_continuation_keeps_pool_equal_to_canonical_usage
         return "done"
 
     loop.tool_registry.register(
-        ToolDefinition(name="touch", description="One local read", input_schema={"type": "object"}), touch
+        ToolDefinition(name="touch", description="One local read", input_schema={"type": "object"}, pricing=Free("test_fixture")), touch
     )
     spec = WorkflowSpec.from_json(state["spec"])
     binding = WorkflowResourceBinding(

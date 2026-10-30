@@ -9,6 +9,7 @@ import pytest
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.core.agent_context import get_current_loop, get_session_id
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import WorkflowSpec, create_workflow, runner
@@ -88,7 +89,7 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
         description = ("Start the predefined original workflow once; this tool takes no arguments."
             if name == "launch_workflow" else "Correct the calculate node of the existing workflow after launch_workflow returns its run_id/job_id. A queued receipt is durable acceptance and authorizes this correction; it does not need a separate status=accepted receipt. Takes no arguments.")
         registry.register(ToolDefinition(name=name, description=description,
-            input_schema={"type": "object", "properties": {}, "additionalProperties": False}), fn)
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False}, pricing=Free("test_fixture")), fn)
     if fault == "whole_restore":
         from power_loop.workflow.resume import resume_detached
         async def restore_whole():
@@ -194,7 +195,7 @@ async def test_real_yaml_workflow_resumes_original_finished_leaf_before_join(tmp
             final = await consume_completed_result(loop, parent, max_rounds=3, result_node="review")
             assert final.status == "completed" and "VERSION-43" in final.final_text
             if fault == "whole_restore":
-                registry.register(ToolDefinition(name="restore_workflow", description="Continue the completed original workflow for the user's next correction, reusing its tasks and sessions.", input_schema={"type": "object"}), restore_whole)
+                registry.register(ToolDefinition(name="restore_workflow", description="Continue the completed original workflow for the user's next correction, reusing its tasks and sessions.", input_schema={"type": "object"}, pricing=Free("test_fixture")), restore_whole)
                 saved_wf = await manager.get_result_revision(actor, wf.job_id, 1)
                 assert (await manager.get_job(actor, wf.job_id)).supervision_status == "closed"
                 await loop.send("New request: the newest code is VERSION-44. Call restore_workflow exactly once to continue the completed original workflow. "

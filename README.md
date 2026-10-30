@@ -227,7 +227,8 @@ Every event carries a process-wide `seq` and a monotonic clock, so streams total
 from power_loop.contrib.mcp import StdioMCPClient, register_mcp_tools   # power-loop[mcp]
 
 client = await StdioMCPClient("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/data"]).connect()
-await register_mcp_tools(registry, client, prefix="fs.")   # MCP tools → power-loop ToolDefinitions
+from power_loop.runtime.pricing import Free
+await register_mcp_tools(registry, client, pricing=Free("local_filesystem"), prefix="fs.")   # MCP tools → power-loop ToolDefinitions
 ```
 
 The seam is a tiny `MCPToolSource` Protocol, so the `mcp` SDK is optional and any client works.
@@ -302,3 +303,40 @@ power-loop **orchestrates; it does not, by itself, isolate.** The built-in `bash
 
 Trusted host tools declare roles, admission and background behavior through the
 [RuntimeTool interface](docs/runtime-tool-contracts.md); names do not grant capabilities.
+
+
+### Explicit tool pricing
+
+Every registered tool definition must provide `pricing`, including local and
+control tools: `ToolDefinition(name="local", description="...", pricing=Free("local"))`.
+Import `Free` or implement `PricingSpec` from `power_loop.runtime.pricing`.
+Registration rejects a missing declaration. The rule version is retained with the
+registration and pending call identity; changing it requires a new registration,
+and cannot silently reprice a previously planned call. Pricing metadata is not
+sent to the model as part of the tool schema.
+
+MCP registration requires either one explicit server pricing rule or a mapping
+from remote tool names to rules. Missing entries reject the batch before any tool
+is registered. An external service is not assumed free.
+
+Native callbacks can return `ToolResult(content, billing_receipt=receipt)`; only
+`content` is shown to the model. Async callbacks can instead
+`await record_billing_receipt(receipt)` immediately after receiving provider billing
+facts, before subsequent response processing might fail. Both helpers are
+provisional top-level exports; `BillingReceipt` is in `power_loop.runtime.pricing`.
+The awaited capture is bound to the original callback task and persisted call,
+and repeating the same receipt is idempotent. A different receipt is rejected.
+Receipt capture requires the native callback checkpoint path; it does not yet
+support managed recovery adapters or legacy invocation. Persisting a receipt
+does not acknowledge successful execution or settle a charge. Host budget and
+settlement wiring is still required before paid tools can be enabled.
+
+An ordinary native callback can invoke a priced internal tool with the provisional
+`await invoke_priced_tool(definition, arguments, handler)` export. Each invocation
+gets a separate budget attempt linked to its original source callback. Its price
+must already be bound, and provider facts use the same `record_billing_receipt` API.
+Internal concurrent tasks are retained and joined before the source callback ends.
+After the exact charge is locally durable, API delivery failure leaves a pending
+budget submission and preserves the real tool result. Reconciliation never calls
+the handler again or reads a replacement price. Managed recovery sources without
+an ordinary callback checkpoint still need a separate adapter.

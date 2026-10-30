@@ -10,6 +10,7 @@ from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop, ToolDef
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import task_query
 from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
@@ -53,7 +54,7 @@ async def test_real_model_queries_reopened_task_history_and_reads_actual_saved_o
             raise ValueError("only list/get")
         return json.dumps(result, ensure_ascii=False)
     registry.register(ToolDefinition(name="inspect_tasks", description="Read persistent task history. First list completed tasks; get a listed job_id to read its saved output and canonical pointer.",
-        input_schema={"type": "object", "properties": {"action": {"type": "string", "enum": ["list", "get"]}, "job_id": {"type": "string"}}, "required": ["action"]}), inspect_tasks)
+        input_schema={"type": "object", "properties": {"action": {"type": "string", "enum": ["list", "get"]}, "job_id": {"type": "string"}}, "required": ["action"]}, pricing=Free("test_fixture")), inspect_tasks)
     try:
         async with asyncio.timeout(120):
             before = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? ORDER BY event_id", (saved.job.job_id,))

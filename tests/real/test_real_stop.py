@@ -23,6 +23,7 @@ from power_loop import (
 )
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_current_loop
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
@@ -83,7 +84,7 @@ async def test_real_stop_reaches_a_running_sub_agent() -> None:
         reg.register(ToolDefinition(
             name="slow_lookup", description="Look something up (slow).",
             input_schema={"type": "object", "properties": {"topic": {"type": "string"}},
-                          "required": ["topic"]}, interrupt="abort"), slow_lookup)
+                          "required": ["topic"]}, interrupt="abort", pricing=Free("test_fixture")), slow_lookup)
 
         async def delegate(task: str = "", **kw: Any) -> str:
             out = await run_agent_spec(
@@ -96,7 +97,7 @@ async def test_real_stop_reaches_a_running_sub_agent() -> None:
         reg.register(ToolDefinition(
             name="delegate", description="Hand a research task to a sub-agent.",
             input_schema={"type": "object", "properties": {"task": {"type": "string"}},
-                          "required": ["task"]}, interrupt="background"), delegate)
+                          "required": ["task"]}, interrupt="background", pricing=Free("test_fixture")), delegate)
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=2048, temperature=0), store=store, tool_registry=reg,
             config=AgentLoopConfig(system_prompt="Delegate research tasks with the delegate tool.",

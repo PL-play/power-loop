@@ -7,6 +7,7 @@ import pytest
 from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.jobs import JobError, JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.runtime.tool_contracts import RuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
@@ -64,7 +65,7 @@ async def test_real_host_control_base_needs_no_builtin_tool_name(tmp_path, recor
     implementation, registry = OriginalSnapshot(), ToolRegistry()
     definition = ToolDefinition(
         name, "Read the original task snapshot once. No arguments.", input_schema={"type": "object", "properties": {}}
-    )
+    , pricing=Free("test_fixture"))
     registry.register(definition, implementation)
     loop = StatefulAgentLoop(
         llm=provider,

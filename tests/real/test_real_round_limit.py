@@ -10,6 +10,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
@@ -26,7 +27,7 @@ async def test_hit_round_limit_returns_and_persists_summary() -> None:
 
         reg.register(ToolDefinition(
             name="step", description="Advance one step of a long multi-step process.",
-            input_schema={"type": "object", "properties": {}}), counter)
+            input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), counter)
 
         loop = StatefulAgentLoop(
             llm=make_llm(max_tokens=384, temperature=0), store=store, tool_registry=reg,

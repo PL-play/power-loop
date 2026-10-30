@@ -25,6 +25,7 @@ from power_loop import (
     get_tool_definitions,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
+from power_loop.runtime.pricing import Free
 from power_loop.tools import DEFAULT_TOOL_HANDLERS
 
 
@@ -425,7 +426,7 @@ async def test_stop_aborts_inflight_timer_delivery_promptly(tmp_path) -> None:
 
     reg = ToolRegistry()
     reg.register(ToolDefinition(name="echo", description="e",
-                 input_schema={"type": "object", "properties": {}}), lambda **k: "ok")
+                 input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda **k: "ok")
     loop = StatefulAgentLoop(
         llm=_LoopingLLM(), db_path=str(tmp_path / "s.db"), tool_registry=reg,
         config=AgentLoopConfig(system_prompt="t", max_rounds=1000, compactor=None),

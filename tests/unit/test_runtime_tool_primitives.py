@@ -21,6 +21,7 @@ from power_loop import (
     get_tool_runtime_context,
 )
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
+from power_loop.runtime.pricing import Free
 
 
 @dataclass
@@ -114,7 +115,7 @@ async def test_custom_tool_queries_session_and_projects_state(store: SessionStor
         return "session inspected"
 
     reg.register(
-        ToolDefinition(name="inspect_session", description="Inspect current session"),
+        ToolDefinition(name="inspect_session", description="Inspect current session", pricing=Free("test_fixture")),
         inspect_session,
     )
     llm = _Scripted(
@@ -163,7 +164,7 @@ async def test_hooks_can_modify_tool_args_and_write_runtime_state(store: Session
                 "required": ["value"],
             },
             required_params=("value",),
-        ),
+        pricing=Free("test_fixture")),
         save_value,
     )
     hooks = AgentHooks()
@@ -205,7 +206,7 @@ async def test_hooks_can_modify_tool_args_and_write_runtime_state(store: Session
 async def test_events_observe_custom_tool_lifecycle(store: SessionStore) -> None:
     reg = ToolRegistry()
     reg.register(
-        ToolDefinition(name="ping_runtime", description="Ping runtime"),
+        ToolDefinition(name="ping_runtime", description="Ping runtime", pricing=Free("test_fixture")),
         lambda **_: "pong",
     )
     bus = AgentEventBus()

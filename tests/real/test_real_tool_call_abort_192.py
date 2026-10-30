@@ -1,4 +1,5 @@
 """A real original response fails before admission; a new process only reads it."""
+
 import asyncio
 import json
 import sys
@@ -11,6 +12,7 @@ from power_loop import AgentLoopConfig, HookPoint, SessionStore, StatefulAgentLo
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.managed_effects import FunctionManagedTool, ManagedToolContract
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
@@ -37,7 +39,7 @@ async def test_real_response_has_positive_abort_without_effect_or_model_replay(t
         raise AssertionError('Pre-admission abort must never invoke an effect callback')
     implementation = FunctionManagedTool(ManagedToolContract('example.abort', 'b'*64), forbidden, forbidden, forbidden)
     definition = ToolDefinition('set_beacon', 'Set a beacon once with value42.', input_schema={
-        'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']})
+        'type': 'object', 'properties': {'value': {'type': 'integer', 'enum': [42]}}, 'required': ['value']}, pricing=Free("test_fixture"))
     registry = ToolRegistry()
     registry.register(definition, implementation.bind(runtime, definition))
     loop = StatefulAgentLoop(llm=provider, store=store, task_runtime=runtime, tool_registry=registry,

@@ -9,6 +9,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, AgentSpec, SessionStore, StatefulAgentLoop, ToolDefinition, get_tool_definitions
 from power_loop.core.agent_context import reset_session_id, set_session_id
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec
 from power_loop.tools import DEFAULT_TOOL_HANDLERS
 from power_loop.tools.default_tools import run_schedule_wakeup
@@ -32,7 +33,7 @@ async def test_real_child_wrapper_timer_is_rejected_without_creating_or_scheduli
 
     registry.register(
         ToolDefinition(name="reminder_probe", description="Try to schedule the requested reminder.",
-                       input_schema={"type": "object", "properties": {}}),
+                       input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")),
         reminder_probe,
     )
     [reminder] = get_tool_definitions(include=["schedule_wakeup"])

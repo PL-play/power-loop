@@ -4,10 +4,11 @@ from collections.abc import Sequence
 
 from power_loop.contracts.context_policy import ToolContextPolicy
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.jobs import JOBS_DEFINITION
 
 DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         usage_hint="create or overwrite a file. Both 'path' and 'content' are REQUIRED in one JSON object. Prefer edit_file or apply_patch for existing files.",
         name="write_file",
         description=(
@@ -30,7 +31,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=("path", "content"),
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         usage_hint='returns numbered lines ("  1|code"). Use offset/limit for large files. Pass a directory path to list contents. Always read before editing.',
         background_hint=False,
         name="read_file",
@@ -52,7 +53,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         # 可异步：纯只读。单次快，但一轮里读 8 个文件时并发才有意义——真实日志里一个 send 把 read_file 摊成 8 轮（design/95）
         async_capable=True,
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         usage_hint='str_replace (old_text -> new_text). old_text must be unique — include more context if ambiguous. Set replace_all=true to replace every occurrence. You MUST read_file before editing.',
         name="edit_file",
         description=(
@@ -75,7 +76,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=("path", "old_text", "new_text"),
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         usage_hint='apply a patch using @@ context lines for positioning and +/- for line changes. You MUST read_file before patching. Best for large edits.',
         name="apply_patch",
         description=(
@@ -97,7 +98,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=("path", "patch"),
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         usage_hint='persistent session — cwd and env vars survive across calls. Use restart=true to reset. Avoid dangerous commands (rm -rf /, sudo).',
         name="bash",
         description=(
@@ -121,7 +122,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=("command",),
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         usage_hint="find files by pattern (e.g. '*.py', '**/*.ts'). Prefer over bash find.",
         background_hint=False,
         name="glob",
@@ -145,7 +146,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         # 可异步：纯只读的路径匹配（design/95）
         async_capable=True,
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         usage_hint='search file contents by regex. Prefer over bash grep/rg. Supports include filter.',
         background_hint=False,
         name="grep",
@@ -172,7 +173,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         # 可异步：纯只读的内容检索（design/95）
         async_capable=True,
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         usage_hint='load specialized knowledge before tackling unfamiliar domains.',
         background_hint=False,
         name="load_skill",
@@ -189,7 +190,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         # 可异步：只读：把技能文件读进来（design/95）
         async_capable=True,
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         usage_hint='track multi-step tasks. Keep exactly one item in_progress at a time. Mark in_progress BEFORE starting, completed IMMEDIATELY when done.',
         name="todo",
         description=(
@@ -230,7 +231,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=("items",),
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         name="note",
         description=(
             "Manage your persistent notes with one action: add, update, delete, or list. Notes "
@@ -268,7 +269,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=("action",),
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         name="schedule_wakeup",
         description=(
             "Manage your durable wake-up timers: action=schedule, list, or cancel (pass action "
@@ -300,12 +301,12 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=(),
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         name="current_time",
         description="Current local date and time (with weekday). Use before scheduling wake-ups or reasoning about deadlines.",
         input_schema={"type": "object", "properties": {}},
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         background_hint=False,
         name="recall_compacted",
         description=(
@@ -329,7 +330,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         # 可异步：只读：回看被折叠掉的历史（design/95）
         async_capable=True,
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         background_hint=False,
         name="recall_send",
         description=(
@@ -368,7 +369,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         required_params=(),
         async_capable=True,
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("composite"),
         name="view_image",
         description=(
             "Put ONE image file from the workspace in front of you so you can look at it yourself "
@@ -386,7 +387,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=("path",),
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("composite"),
         usage_hint='action=tool submits an eligible registered target asynchronously; action=check inspects status/output by task_id or lists all tasks.',
         name="background_run",
         description=(
@@ -429,7 +430,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         },
         required_params=("action",),
     ),
-    ToolDefinition(
+    ToolDefinition(pricing=Free("local"),
         name="request_user_input",
         description=(
             "Ask the caller or product UI for external input, then pause the agent loop. "

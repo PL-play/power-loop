@@ -17,6 +17,7 @@ from power_loop import (
 )
 from power_loop.core.agent_context import reset_session_id, set_session_id
 from power_loop.runtime.invocation import invocation_context
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -61,7 +62,7 @@ async def test_real_persisted_seq_and_call_ids_are_isolated_per_invocation(tmp_p
         return "inspected"
 
     registry.register(ToolDefinition(name="inspect", description="Inspect invocation", async_capable=True,
-        input_schema={"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}), inspect)
+        input_schema={"type": "object", "properties": {"number": {"type": "integer"}}, "required": ["number"]}, pricing=Free("test_fixture")), inspect)
     loop = StatefulAgentLoop(llm=Model(), store=store, tool_registry=registry,
         config=AgentLoopConfig(max_rounds=4, tool_batch_concurrency=concurrency))
     sid = await loop.new_session()
@@ -91,7 +92,7 @@ async def test_resume_replays_the_original_persisted_call_identity(tmp_path):
         observed.append((ctx.assistant_seq, ctx.tool_call_id))
         return "replayed"
 
-    registry.register(ToolDefinition(name="inspect", description="Resume inspector"), inspect)
+    registry.register(ToolDefinition(name="inspect", description="Resume inspector", pricing=Free("test_fixture")), inspect)
     model = Model()
     model.calls = 1  # The resumed provider round only returns its final text.
     loop = StatefulAgentLoop(llm=model, store=store, tool_registry=registry, config=AgentLoopConfig(max_rounds=2))

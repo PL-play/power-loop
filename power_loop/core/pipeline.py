@@ -1610,10 +1610,13 @@ class AgentPipeline:
                     registered = await check_tool_dispatch(self.session_id, tool_name, self.tool_registry, tool_args)
                     from power_loop.runtime.tool_contracts import validate_registration
                     validate_registration(self.tool_registry, tool_name, registered)
+                    from power_loop.runtime.tool_attempts import begin_pipeline
+                    budget_attempt = await begin_pipeline(self, registered, tool_args)
                     from power_loop.runtime.tool_call_plans import dispatch as record_tool_dispatch
-                    receipt = await record_tool_dispatch(self, tool_name, tool_args, registered)
+                    receipt = await record_tool_dispatch(self, tool_name, tool_args, registered,
+                                                         budget_attempt=budget_attempt)
                     from power_loop.runtime.native_returns import invoke
-                    result = await invoke(self, registered, tool_args, receipt)
+                    result = await invoke(self, registered, tool_args, receipt, budget_attempt=budget_attempt)
             finally:
                 reset_current_cancel_token(_ctok)
         except (ToolNotFound, ToolValidationError) as exc:

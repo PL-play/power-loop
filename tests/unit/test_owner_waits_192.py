@@ -15,6 +15,7 @@ from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_notifications as notices
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobError, JobLease, JobManager
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -87,7 +88,7 @@ async def original(registry_store, request):
         state.registrations.append(registration)
         return "Original wait admitted."
 
-    registry.register(ToolDefinition(name="arm_wait", description="Admit an original wait", input_schema={"type": "object", "properties": {}}), arm)
+    registry.register(ToolDefinition(name="arm_wait", description="Admit an original wait", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), arm)
     loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
         config=AgentLoopConfig(delegation_policy="single_level", max_rounds=4))
     state.parent = await loop.new_session()
@@ -310,7 +311,7 @@ async def test_waiting_workflow_leaf_releases_capacity_for_sibling_and_reacquire
         saved.append(registration)
         return "Original node wait admitted."
 
-    loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Admit original node wait", input_schema={"type": "object", "properties": {}}), arm)
+    loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Admit original node wait", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), arm)
     original_complete = model.complete
 
     async def provider(request, **kwargs):

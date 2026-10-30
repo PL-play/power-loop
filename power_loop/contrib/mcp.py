@@ -15,7 +15,8 @@ talks to a stdio MCP server::
     from power_loop.contrib.mcp import StdioMCPClient, register_mcp_tools
 
     client = await StdioMCPClient("npx", ["-y", "@modelcontextprotocol/server-filesystem", "/data"]).connect()
-    names = await register_mcp_tools(registry, client, prefix="fs_")
+    from power_loop.runtime.pricing import Free
+    names = await register_mcp_tools(registry, client, pricing=Free("local_filesystem"), prefix="fs_")
     ...
     await client.aclose()
 """
@@ -24,10 +25,12 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import PricingError, PricingSpec
 from power_loop.tools.registry import ToolRegistry
 
 __all__ = ["McpToolSpec", "MCPToolSource", "register_mcp_tools", "StdioMCPClient"]
@@ -71,6 +74,7 @@ async def register_mcp_tools(
     registry: ToolRegistry,
     source: MCPToolSource,
     *,
+    pricing: PricingSpec | Mapping[str, PricingSpec],
     prefix: str = "",
     overwrite: bool = False,
 ) -> list[str]:
@@ -78,7 +82,8 @@ async def register_mcp_tools(
     ``prefix``-ed to avoid collisions). Each tool's ``inputSchema`` becomes the
     ``ToolDefinition`` schema (its ``required`` list drives missing-param validation),
     and the handler proxies the call to ``source.call_tool``. Returns the registered
-    tool names. Async because enumerating an MCP server is a network round-trip.
+    tool names. Pricing is mandatory: pass one explicit server rule or a mapping
+    keyed by remote tool name. Async because discovery is a network round-trip.
 
     Registered names are made portable (characters outside ``[A-Za-z0-9_-]`` → ``_``, at most
     64 long) so the same registry works on every provider; the remote call still uses the
@@ -86,7 +91,14 @@ async def register_mcp_tools(
     instead of one silently shadowing the other."""
     registered: list[str] = []
     origin: dict[str, str] = {}
-    for spec in await source.list_tools():
+    specs = await source.list_tools()
+    prices = {}
+    for spec in specs:
+        value = pricing.get(spec.name) if isinstance(pricing, Mapping) else pricing
+        if not isinstance(value, PricingSpec):
+            raise PricingError('tool_pricing_required:' + spec.name)
+        prices[spec.name] = value
+    for spec in specs:
         schema = spec.input_schema or dict(_EMPTY_SCHEMA)
         required = tuple(schema.get("required", []) or ())
         wanted = f"{prefix}{spec.name}"
@@ -110,6 +122,7 @@ async def register_mcp_tools(
         registry.register(
             ToolDefinition(
                 name=local_name,
+                pricing=prices[spec.name],
                 description=spec.description or f"MCP tool {spec.name}",
                 input_schema=schema,
                 required_params=required,

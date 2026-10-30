@@ -1,3 +1,4 @@
+
 import copy
 import json
 from dataclasses import replace
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from power_loop.core.pipeline import AgentPipeline
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.tool_archive import manage_capacity, prepare_history, prepare_projection, recall_group
 from power_loop.runtime.tool_context import ToolContextConfig, ToolContextEngine
@@ -138,7 +140,7 @@ async def test_stateful_two_sends_result_cap_and_archive_between_sends():
     store = await SessionStore.open(':memory:')
     try:
         reg = ToolRegistry()
-        reg.register(ToolDefinition('echo', ''), lambda **kw: 'UNIQUE-RESULT' * 5000)
+        reg.register(ToolDefinition('echo', '', pricing=Free("test_fixture")), lambda **kw: 'UNIQUE-RESULT' * 5000)
         llm = _Scripted([_tool_resp('a','echo','{}'), LLMResponse(raw_text='done'), LLMResponse(raw_text='next')])
         loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=reg,
             config=AgentLoopConfig(system_prompt='S', max_tokens=100, max_rounds=5,
@@ -207,9 +209,9 @@ async def test_background_target_policy_and_original_delivery():
     token = active_engine.set(engine)
     try:
         reg = ToolRegistry()
-        reg.register(ToolDefinition('bash', ''), create_default_tool_registry(bind=False).get('bash').handler)
+        reg.register(ToolDefinition('bash', '', pricing=Free("test_fixture")), create_default_tool_registry(bind=False).get('bash').handler)
         from power_loop.tools.default_tools import DEFAULT_TOOL_HANDLERS
-        reg.register(ToolDefinition('background_run', ''), DEFAULT_TOOL_HANDLERS['background_run'])
+        reg.register(ToolDefinition('background_run', '', pricing=Free("test_fixture")), DEFAULT_TOOL_HANDLERS['background_run'])
         engine.registry = reg
         record = {'task_id': 'bg1', 'tool': 'bash', 'status': 'completed',
                   'args': {'command': 'x' * 1500, 'description': 'target description', 'context_policy': 'keep'},
@@ -305,7 +307,7 @@ async def test_pipeline_capacity_block_does_not_call_provider_again():
     store = await SessionStore.open(':memory:')
     try:
         reg = ToolRegistry()
-        reg.register(ToolDefinition('speech', ''), lambda: 'SPEECH' * 10000)
+        reg.register(ToolDefinition('speech', '', pricing=Free("test_fixture")), lambda: 'SPEECH' * 10000)
         llm = _Scripted([_tool_resp('a', 'speech', '{}')])
         loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=reg,
             config=AgentLoopConfig(system_prompt='S', max_tokens=100, max_rounds=5, context_checkpoint_tokens=10,

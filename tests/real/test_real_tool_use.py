@@ -12,6 +12,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
 from power_loop.contracts.tools import ToolDefinition
+from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 
 from ._llm import make_llm
@@ -40,7 +41,7 @@ def _build_registry(call_log: list[str]) -> ToolRegistry:
                 "required": ["city"],
             },
             required_params=("city",),
-        ),
+        pricing=Free("test_fixture")),
         lookup,
     )
     return reg

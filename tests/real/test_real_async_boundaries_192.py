@@ -30,6 +30,7 @@ from power_loop.core.agent_context import get_current_loop, get_session_id, rese
 from power_loop.core.pass_turn import request_pass
 from power_loop.runtime import delegation
 from power_loop.runtime.background import record_key
+from power_loop.runtime.pricing import Free
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.tools import default_tools
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -160,7 +161,7 @@ async def test_real_catalog_background_result_is_consumed_after_pass(
 
     registry.register(ToolDefinition(
         name="evidence", description="Read a local evidence code; may run in background.",
-        input_schema={"type": "object", "properties": {}}, async_capable=True), evidence)
+        input_schema={"type": "object", "properties": {}}, async_capable=True, pricing=Free("test_fixture")), evidence)
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=registry, config=AgentLoopConfig(
         system_prompt="Follow instructions precisely. Use the background result when it arrives.",
         max_rounds=4, max_tokens=2048, representation=ProjectedRepresentation()))
@@ -208,7 +209,7 @@ async def test_real_standalone_child_consumes_input_arriving_inside_pass(
         return "Passed control."
 
     registry.register(ToolDefinition(name="boundary_pass", description="Yield for the correction.",
-        input_schema={"type": "object", "properties": {}}), boundary_pass)
+        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), boundary_pass)
     loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=registry,
                              config=AgentLoopConfig(max_rounds=4, max_tokens=2048))
     parent = await loop.new_session()
