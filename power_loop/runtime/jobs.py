@@ -727,6 +727,10 @@ class JobManager:
             payload["request"] = request_data
         if wait_binding is not None:
             payload["wait_binding"] = wait_binding
+        from .invocation import capture_host_contexts
+        host_contexts = capture_host_contexts()
+        if host_contexts:
+            payload["host_contexts"] = host_contexts
         operation = await self._insert_operation(tx, job_id=job_id, version=1, actor=actor, action="create",
             key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id,
             payload=payload)

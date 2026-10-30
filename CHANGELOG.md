@@ -6,6 +6,12 @@
 1.0 起,对 **STABLE** API 的破坏性变更只能出现在 major 版本,
 并且必须在此文件中显式列出受影响的 Public API。
 
+## 9.1.0 — 2026-10-30
+
+- Hosts may stop a loop at an entry or round hook with `ControlledLoopStop`. The controlled exit preserves completed tool results and skips paid memory summarization.
+- Host invocation scopes wrap actual tool dispatch and resume, including the tool name. Exported JSON snapshots are retained on original job creation for durable business ancestry without changing signed task requests.
+- Focused verification covers entry and next-round stops, immutable creation snapshots, and replay after reopening the SQLite store.
+
 ## [Unreleased]
 
 ## [9.0.0] — 2026-10-30

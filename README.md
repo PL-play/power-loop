@@ -340,3 +340,19 @@ After the exact charge is locally durable, API delivery failure leaves a pending
 budget submission and preserves the real tool result. Reconciliation never calls
 the handler again or reads a replacement price. Managed recovery sources without
 an ordinary callback checkpoint still need a separate adapter.
+
+
+### Host lifecycle extensions
+
+Hosts can raise `power_loop.core.control.ControlledLoopStop(reason, message=...)`
+from session-entry or round-start hooks. The pipeline records a controlled stop,
+keeps completed work, and skips memory summarization on that exit. Hosts own
+quota policy and settlement; the SDK has no application currency or user model.
+
+`power_loop.runtime.invocation.register_invocation_scope(name, factory, exporter=...)`
+installs a synchronous context manager around each actual tool invocation. The
+factory receives `session_id`, `assistant_seq`, `tool_call_id`, and `tool_name`.
+An optional exporter returns a small JSON snapshot which is saved as
+`host_contexts[name]` on original job creation. Replay retains the original saved
+snapshot; hosts restore it when recovering a child job. Business snapshots do not
+carry execution authority and do not replace the SDK's signed task request.

@@ -1737,7 +1737,7 @@ class StatefulAgentLoop:
             else:
                 try:
                     from power_loop.runtime.invocation import invocation_context
-                    with invocation_context(sid, pending.get("assistant_seq"), cid):
+                    with invocation_context(sid, pending.get("assistant_seq"), cid, name):
                         raw = await self.tool_registry.invoke_async(name, args)
                     if not isinstance(raw, str):
                         raw = json.dumps(raw, ensure_ascii=False)

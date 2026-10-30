@@ -768,7 +768,7 @@ class AgentPipeline:
     # ── Helper: finalize session ──
 
     async def _finalize(self, reason: str, *, final_text: str | None = None,
-                        rounds: int | None = None) -> None:
+                        rounds: int | None = None, remember: bool = True) -> None:
         if self._finalized:
             return  # idempotent: SESSION_ENDED fires exactly once per run
         self._finalized = True
@@ -780,7 +780,8 @@ class AgentPipeline:
         )
         await self.hooks.run_typed_async(HookPoint.SESSION_END, ctx)
         self._emit(AgentEventType.SESSION_ENDED, SessionEndedPayload(reason=reason))
-        await self._maybe_remember(reason=reason, final_text=final_text or "")
+        if remember:
+            await self._maybe_remember(reason=reason, final_text=final_text or "")
 
     async def _emit_error_terminal(self, exc: BaseException) -> None:
         """Emit the ``AGENT_ERROR`` channel + a terminal ``SESSION_ENDED`` after an
@@ -1605,7 +1606,7 @@ class AgentPipeline:
                 from power_loop.runtime.invocation import invocation_context
                 with invocation_context(self.session_id,
                         assistant_seq if assistant_seq is not None else getattr(self.sink, "persisted_assistant_seq", None),
-                        tool_call_id):
+                        tool_call_id, tool_name):
                     from power_loop.runtime.task_runtime import check_tool_dispatch
                     registered = await check_tool_dispatch(self.session_id, tool_name, self.tool_registry, tool_args)
                     from power_loop.runtime.tool_contracts import validate_registration
@@ -1668,12 +1669,18 @@ class AgentPipeline:
     async def run(self, messages: list[LoopMessage]) -> AgentLoopResult:
         """Run the full agent loop. Returns when done, cancelled, or hit round limit."""
         from power_loop.core import pass_turn as _pass
+        from power_loop.core.control import ControlledLoopStop
 
         token = _pass.begin()          # pass_turn 的状态按 send 隔离（子 agent 内联跑也不串）
         self._pass_state = _pass.current()
         self._step_texts: list[dict[str, Any]] = []
         try:
             return await self._run(messages)
+        except ControlledLoopStop as stop:
+            await self._finalize(stop.reason, final_text=stop.message,
+                                 rounds=self._completed_rounds, remember=False)
+            return self._make_result(stop.status, final_text=stop.message,
+                                     rounds=self._completed_rounds)
         finally:
             try:
                 from power_loop.runtime.task_runtime import preserve_model_usage
