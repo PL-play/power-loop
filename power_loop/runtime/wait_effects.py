@@ -164,6 +164,7 @@ async def apply(manager, actor, event_id):
             if choice == "continue":
                 await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (op.operation_id,))
                 columns = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
+                await manager.store.signal_changes(tx, request["session_id"], "inbox")
                 inserted = await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                     (request["session_id"], "nudge:" + op.operation_id, "relay", "steer", "pending", request["message"], manager.now()))
                 if not inserted:

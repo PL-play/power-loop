@@ -264,6 +264,7 @@ async def enqueue(manager, tx, row, saved, *, _closures=None):
         raise JobError('controller_recovery_delivery_changed')
     await tx.set_event_recipient(notice_id(manager, row), data['main_session_id'])
     columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
+    await manager.store.signal_changes(tx, data['main_session_id'], "inbox")
     await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
         (data['main_session_id'], notice_id(manager, row), 'controller_result', 'queue', 'pending', render(public), manager.now()))
     await notice(manager, tx, row, _closures=_closures)

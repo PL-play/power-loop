@@ -165,6 +165,7 @@ async def prepare(manager, tx, actor, source):
         await _event(manager, tx, key, source, 'source_abort_delivery', data)
         await tx.set_event_recipient(key, actor.session_id)
         columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
+        await manager.store.signal_changes(tx, actor.session_id, "inbox")
         await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
             (actor.session_id, key, 'original_call_outcome', 'queue', 'pending', render(data['public']), manager.now()))
     return await manager._row(tx, source['job_id'])

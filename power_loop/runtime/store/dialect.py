@@ -160,7 +160,8 @@ class SqliteDialect:
             f"""CREATE TABLE IF NOT EXISTS {p}session_state (
                 session_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL DEFAULT 1,
                 round_index INTEGER NOT NULL DEFAULT 0, last_compact_seq INTEGER NOT NULL DEFAULT 0,
-                pending_json TEXT)""",
+                pending_json TEXT, inbox_version INTEGER NOT NULL DEFAULT 0,
+                background_version INTEGER NOT NULL DEFAULT 0, runtime_version INTEGER NOT NULL DEFAULT 0)""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
                 session_id TEXT NOT NULL, state_key TEXT NOT NULL, value_json TEXT,
                 updated_at INTEGER NOT NULL, PRIMARY KEY (session_id, state_key))""",
@@ -372,7 +373,8 @@ class PostgresDialect:
             f"""CREATE TABLE IF NOT EXISTS {p}session_state (
                 session_id TEXT PRIMARY KEY, next_seq BIGINT NOT NULL DEFAULT 1,
                 round_index BIGINT NOT NULL DEFAULT 0, last_compact_seq BIGINT NOT NULL DEFAULT 0,
-                pending_json TEXT)""",
+                pending_json TEXT, inbox_version BIGINT NOT NULL DEFAULT 0,
+                background_version BIGINT NOT NULL DEFAULT 0, runtime_version BIGINT NOT NULL DEFAULT 0)""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
                 session_id TEXT NOT NULL, state_key TEXT NOT NULL, value_json TEXT,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, state_key))""",
@@ -550,7 +552,9 @@ class MySQLDialect:
             f"""CREATE TABLE IF NOT EXISTS {p}session_state (
                 session_id VARCHAR(255) NOT NULL, next_seq BIGINT NOT NULL DEFAULT 1,
                 round_index BIGINT NOT NULL DEFAULT 0, last_compact_seq BIGINT NOT NULL DEFAULT 0,
-                pending_json LONGTEXT, PRIMARY KEY (session_id)) {opts}""",
+                pending_json LONGTEXT, inbox_version BIGINT NOT NULL DEFAULT 0,
+                background_version BIGINT NOT NULL DEFAULT 0, runtime_version BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (session_id)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
                 session_id VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json LONGTEXT,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, state_key)) {opts}""",

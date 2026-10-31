@@ -83,7 +83,8 @@ def validate_table_prefix(prefix: str) -> str:
 #:   session), ``kind``/``mode``/``status``, and is marked ``delivered`` in the SAME transaction
 #:   that writes it into the transcript — so a cancelled run neither loses nor double-delivers
 #:   queued steering. Rebuilt as ``…_v8`` + copy + rename (v7 rows become pending user items).
-CURRENT_SCHEMA_VERSION = 9
+# v10 was reserved for task/message identities; v11 adds committed change counters.
+CURRENT_SCHEMA_VERSION = 11
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -162,6 +163,9 @@ async def _migration_steps(
     if from_version < 9:
         from .context_cache import context_cache_ddl
         steps += context_cache_ddl(db.dialect.name, prefix)
+    if from_version < 11:
+        from .change_signals import migration_steps
+        steps += await migration_steps(tx, db, prefix)
     return steps
 
 
@@ -264,6 +268,11 @@ def migration_ddl_for_display(db: Database, prefix: str, *, from_version: int) -
         steps += db.dialect.inbox_ddl(prefix, tmp)
         steps += [db.dialect.inbox_v8_copy_sql(prefix, old, tmp), f"DROP TABLE {old}",
                   f"ALTER TABLE {tmp} RENAME TO {old}"]
+    if from_version < 11:
+        from .change_signals import COLUMNS
+        integer = "INTEGER" if db.dialect.name == "sqlite" else "BIGINT"
+        steps += [f"ALTER TABLE {prefix}session_state ADD COLUMN {column} {integer} NOT NULL DEFAULT 0"
+                  for column in COLUMNS]
     return steps
 
 
@@ -272,8 +281,8 @@ class SchemaPolicy(str, Enum):
 
     AUTO_CREATE = "auto_create"  # create tables/indexes if missing, then stamp
     VERIFY = "verify"            # verify only; raise (with DDL) if missing/stale
-    TASKS = "tasks"              # explicit experimental v10, fresh or already v10 only
-    COMPATIBLE = "compatible"    # bridge: verify existing v9/v10, never migrate/create
+    TASKS = "tasks"              # current task schema, fresh or already current only
+    COMPATIBLE = "compatible"    # verify current base/task schemas, never migrate/create
 
 
 def _coerce_policy(policy: SchemaPolicy | str | None, create_schema: bool | None) -> SchemaPolicy:
@@ -478,13 +487,13 @@ async def ensure_schema(
     if eff is SchemaPolicy.COMPATIBLE:
         from .task_schema import TASK_SCHEMA_VERSION, ensure_task_schema
         if not await _table_exists(db, vtable):
-            raise StoreSchemaError("compatible mode requires an existing v9/v10 store")
+            raise StoreSchemaError("compatible mode requires an existing current store")
         row = await db.fetchone(f"SELECT version FROM {vtable} WHERE id=1")
         version = int(row["version"]) if row else 0
         if version == TASK_SCHEMA_VERSION:
             return await ensure_task_schema(db, prefix, create=False)
         if version != CURRENT_SCHEMA_VERSION:
-            raise StoreSchemaError("compatible mode supports existing v9/v10 only")
+            raise StoreSchemaError("store requires an explicit maintenance migration")
         eff = SchemaPolicy.VERIFY
 
     if eff is SchemaPolicy.VERIFY:
@@ -565,6 +574,8 @@ async def ensure_schema(
                 await tx.execute(_version_stamp_sql(db, vtable), (CURRENT_SCHEMA_VERSION,))
                 return CURRENT_SCHEMA_VERSION
             version = int(row["version"])
+            if version == 10:
+                raise StoreSchemaError("task schema requires an explicit maintenance migration")
             if version > CURRENT_SCHEMA_VERSION:
                 raise StoreSchemaError(
                     f"store schema version {version} is newer than this power_loop build "

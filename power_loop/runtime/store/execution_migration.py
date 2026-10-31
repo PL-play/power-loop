@@ -44,7 +44,8 @@ async def import_accounting(tx, db, prefix):
     """Validate every old balance, then import without refunding or charging."""
     import json
     row = await tx.fetchone(f"SELECT store_id FROM {prefix}task_store WHERE id=1")
-    store = SimpleNamespace(store_id=row["store_id"], schema_version=10, _db=db, table_prefix=prefix)
+    from .task_schema import TASK_SCHEMA_VERSION
+    store = SimpleNamespace(store_id=row["store_id"], schema_version=TASK_SCHEMA_VERSION, _db=db, table_prefix=prefix)
     manager = JobManager(store)
     expected, groups = {}, {}
     rows = await tx.fetchall(f"SELECT * FROM {prefix}task_budget_attempts ORDER BY job_id,attempt_id")

@@ -135,6 +135,7 @@ async def reconcile_tx(manager, tx, actor, event):
     decision = "decision_" + _hash([event["event_id"], event["job_version"], _hash(waits._object(event["payload_json"]))])[:48]
     if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (decision,)):
         raise JobError("input_disposition_processing_conflict")
+    await manager.store.signal_changes(tx, request["session_id"], "inbox")
     await tx.execute(f"UPDATE {manager.store.t.follow_up_queue} SET status='void',claim_token=NULL "
         "WHERE session_id=? AND item_id=? AND status IN ('pending','claimed')",
         (request["session_id"], "nudge:" + event["event_id"]))

@@ -112,7 +112,6 @@ async def test_delivery_transaction_serializes_concurrent_void_from_another_conn
     [row] = await store.inbox_claim(sid)
     held, release, void_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original = type(store._db).transaction
-    execute_original = type(store._db).execute
 
     class HeldTransaction:
         def __init__(self, tx):
@@ -130,16 +129,12 @@ async def test_delivery_transaction_serializes_concurrent_void_from_another_conn
 
     @asynccontextmanager
     async def transaction(db):
+        if db is other._db:
+            void_started.set()  # Retraction now locks session state before its queue UPDATE.
         async with original(db) as tx:
             yield HeldTransaction(tx) if db is store._db else tx
 
-    async def execute(db, sql, params=()):
-        if db is other._db and "SET status='void'" in sql:
-            void_started.set()
-        return await execute_original(db, sql, params)
-
     monkeypatch.setattr(type(store._db), "transaction", transaction)
-    monkeypatch.setattr(type(store._db), "execute", execute)
     async with asyncio.timeout(15):
         delivery = asyncio.create_task(
             store.append_message(

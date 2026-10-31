@@ -217,6 +217,7 @@ async def accept_input(runtime, binding, sid, message):
             key=key, fingerprint=_hash(payload), payload={"job_id": row["job_id"], "mode": "restore_input", "request": payload})
         await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (op.operation_id,))
         cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
+        await manager.store.signal_changes(tx, sid, "inbox")
         if await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),
                 (sid, "nudge:"+op.operation_id, "relay", "steer", "pending", message, manager.now())) != 1:
             raise JobError("nudge_inbox_conflict")

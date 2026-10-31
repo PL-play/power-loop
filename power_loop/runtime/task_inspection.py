@@ -119,6 +119,7 @@ async def inspect_tasks(manager, actor, root_job_id, *, policy=None, limit=100, 
                      'resource_stop_confirmed': False, 'billing_settled': False}
             await _event(manager, tx, key, root, 'task_alert', value)
             columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
+            await manager.store.signal_changes(tx, actor.session_id, "inbox")
             await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                              (actor.session_id, key, 'task_alert', 'queue', 'pending', render(value), now))
             notifications.append(key)

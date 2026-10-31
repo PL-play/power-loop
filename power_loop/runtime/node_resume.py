@@ -144,6 +144,7 @@ async def admit(manager, actor, job_id, *, caller, workflow, call_ref, tool_call
             await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
                 (event_id, job_id, kind, job["version"]+1, _json(data), "not_applicable", now))
         cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
+        await manager.store.signal_changes(tx, node["session_id"], "inbox")
         if not await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),
                 (node["session_id"], "nudge:"+op.operation_id, "relay", "steer", "pending", message, now)):
             raise JobError("nudge_inbox_conflict")

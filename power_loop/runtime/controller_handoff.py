@@ -198,6 +198,8 @@ async def transfer_review_runtime(runtime, actor, source_job_id):
             await _event(manager, tx, key, source, 'controller_review_handoff', data)
             await tx.set_event_recipient(key, actor.session_id)
             columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
+            await manager.store.signal_changes(tx, actor.session_id, "inbox")
+            await manager.store.signal_changes(tx, source['session_id'], "inbox")
             await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                 (actor.session_id, key, 'original_call_outcome', 'queue', 'pending', render(public), manager.now()))
             await tx.execute(f"UPDATE {manager.store.t.follow_up_queue} SET status='transferred' WHERE session_id=? AND item_id=? AND status='pending'",

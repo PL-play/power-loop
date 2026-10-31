@@ -1,9 +1,10 @@
-"""Explicit, experimental v10 task schema. Normal AUTO_CREATE remains v9.
+"""Explicit v12 task schema; ordinary storage uses v11.
 
 No live store is migrated by opening it. A maintenance caller must close writers
-and explicitly invoke migrate_task_schema; old binaries reject the v10 stamp or
+and explicitly invoke migrate_task_schema; old binaries reject the current stamp or
 the unknown task protocol. Protocol21 permits independent initial accounting evidence without a model
-exit record. Older writers must not overwrite this evidence or release execution.
+exit record. Protocol 23 adds atomic session change counters. Older writers must
+not overwrite this evidence or release execution.
 """
 
 from __future__ import annotations
@@ -23,8 +24,8 @@ from .schema import (
     validate_table_prefix,
 )
 
-TASK_SCHEMA_VERSION = 10
-TASK_PROTOCOL_VERSION = 22
+TASK_SCHEMA_VERSION = 12
+TASK_PROTOCOL_VERSION = 23
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -315,6 +316,11 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
             for column in columns:
                 if not await _column_exists(tx, db.dialect.name, prefix + table, column):
                     raise StoreSchemaError("execution checkpoint schema incomplete")
+    if protocol >= 23:
+        from .change_signals import COLUMNS
+        for column in COLUMNS:
+            if not await _column_exists(tx, db.dialect.name, prefix + "session_state", column):
+                raise StoreSchemaError("session change counters incomplete")
 
 
 async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
@@ -328,7 +334,7 @@ async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
             if row is not None:
                 version = int(row["version"])
                 if version != TASK_SCHEMA_VERSION:
-                    raise StoreSchemaError("existing store requires explicit maintenance migration to task schema v10")
+                    raise StoreSchemaError(f"existing store requires explicit maintenance migration to task schema v{TASK_SCHEMA_VERSION}")
             else:
                 if not create:
                     raise StoreSchemaError("task schema not initialized")
@@ -367,11 +373,14 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
         await _acquire_provision_lock(tx, db, prefix)
         try:
             row = await tx.fetchone(f"SELECT version FROM {prefix}schema_migrations WHERE id=1")
-            if row is None or int(row["version"]) not in (9, TASK_SCHEMA_VERSION):
-                raise StoreSchemaError("task migration supports schema v9 only")
-            if int(row["version"]) == TASK_SCHEMA_VERSION:
+            if row is None or int(row["version"]) not in (9, 10, 11, TASK_SCHEMA_VERSION):
+                raise StoreSchemaError("task migration supports base or task schemas only")
+            from .change_signals import migration_steps
+            for statement in await migration_steps(tx, db, prefix):
+                await tx.execute(statement)
+            if int(row["version"]) in (10, TASK_SCHEMA_VERSION):
                 identity = await tx.fetchone(f"SELECT protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21):
+                if identity and identity["protocol_version"] in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22):
                     old_protocol = identity["protocol_version"]
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
                     if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
@@ -379,7 +388,8 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                         await tx.execute(f"ALTER TABLE {prefix}jobs ADD COLUMN executor_key {kind}")
                     await _run_task_ddl(tx, db, prefix)
                     from .execution_migration import import_accounting
-                    await import_accounting(tx, db, prefix)
+                    if old_protocol < 22:
+                        await import_accounting(tx, db, prefix)
                     if (
                         await tx.execute(
                             f"UPDATE {prefix}task_store SET protocol_version=? WHERE id=1 AND protocol_version=?",
@@ -393,6 +403,7 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                     # ordinary open must never silently mutate a live schema.
                     await _run_task_ddl(tx, db, prefix)
                 await _verify_task_schema_tx(tx, db, prefix)
+                await tx.execute(f"UPDATE {prefix}schema_migrations SET version=? WHERE id=1", (TASK_SCHEMA_VERSION,))
                 return
             table = prefix + "messages"
             if not await _column_exists(tx, db.dialect.name, table, "id"):

@@ -352,6 +352,7 @@ class AgentPipeline:
         sink: MessageSink | None = None,
         store: Any | None = None,
         drain_follow_ups: Any | None = None,
+        drain_follow_ups_final: Any | None = None,
         steer_event: asyncio.Event | None = None,
     ) -> None:
         self.llm = llm
@@ -371,6 +372,7 @@ class AgentPipeline:
         self.sink: MessageSink = sink if sink is not None else NullSink()
         self.store = store
         self._drain_follow_ups = drain_follow_ups
+        self._drain_follow_ups_final = drain_follow_ups_final or drain_follow_ups
         # design/124 §7: set while a steer-mode inbox item waits undelivered. The model call and
         # interruptible tools race it; the next round's drain delivers the item (and clears it).
         self._steer_event = steer_event
@@ -1292,6 +1294,7 @@ class AgentPipeline:
                         await self._append_message(m, round_index=round_index)
                 else:
                     messages.append(m)
+        self.store.note_model_versions(self.session_id)
         return messages
 
     async def _acknowledge_runtime(self) -> None:
@@ -1302,6 +1305,13 @@ class AgentPipeline:
                 await projector.acknowledge(store=self.store, session_id=self.session_id, ack=ack)
             except Exception:  # an ack failure only means the state is shown once more
                 logger.warning("runtime projection ack failed", exc_info=True)
+
+    async def _runtime_work_after_model(self):
+        for projector in (self.config.runtime_projectors if self.store is not None else ()):
+            recheck = getattr(projector, "requires_round", None)
+            if recheck is not None and await recheck(store=self.store, session_id=self.session_id):
+                return True
+        return False
 
     async def call_llm(
         self,
@@ -1839,12 +1849,14 @@ class AgentPipeline:
             # silently dropped it — the drain sat after the break check).
             drained_count = 0
             if self._drain_follow_ups is not None:
-                drained = await self._drain_follow_ups()
+                drain = (self._drain_follow_ups_final if self._pass_state and self._pass_state.get("passed")
+                         else self._drain_follow_ups)
+                drained = await drain()
                 drained_count = await self._append_drained(drained, round_index=round_idx)
 
             # ── pass_turn：上一轮调了 → 这一轮开始前硬停（design/188，不再调模型）──
             if self._pass_state and self._pass_state.get("passed"):
-                if drained_count:
+                if drained_count or await self._runtime_work_after_model():
                     # 停的这一刻有刚折进来的新输入：不撤销停，留痕交给宿主（另起一轮处理）
                     self._pass_state["new_input_after_pass"] = True
                 await self._finalize("pass_turn")
@@ -2237,8 +2249,8 @@ class AgentPipeline:
                 # arriving after this drain stay in the durable inbox for a later flush;
                 # a withdrawn claim must not create a new paid round or a duplicate end.
                 round_ended = False
-                if self._drain_follow_ups is not None:
-                    drained = await self._drain_follow_ups()
+                if self._drain_follow_ups_final is not None:
+                    drained = await self._drain_follow_ups_final()
                     if drained:
                         # Close THIS (no-tools) round in the event stream + usage before steering
                         # reopens the loop — else the round is left unterminated and its per-round
@@ -2263,6 +2275,8 @@ class AgentPipeline:
                     await self.hooks.run_typed_async(HookPoint.ROUND_END, round_end)
                     await self._emit_sink(self.sink.on_round_ended, round_idx, usage=usage)
                 # ── Hook: COMPLETE_DECIDE (natural completion) ──
+                if await self._runtime_work_after_model():
+                    continue
                 if await self._complete_decide(
                     reason="completed", round_idx=round_idx, final_text=assistant_text,
                     next_round=round_idx + 1,

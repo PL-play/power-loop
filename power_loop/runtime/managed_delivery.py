@@ -176,6 +176,7 @@ async def enqueue_runtime(runtime, actor, job):
                 raise JobError('managed_delivery_already_closed')
             key = identity(manager, row)
             columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
+            await manager.store.signal_changes(tx, actor.session_id, "inbox")
             await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                 (actor.session_id, key, 'managed_result', 'queue', 'pending', render(data['public']), manager.now()))
             await _event(manager, tx, row, 'delivery', data)

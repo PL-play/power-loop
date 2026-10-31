@@ -288,6 +288,7 @@ async def _reconcile(loop, actor, source_job_id, *, permit):
             data = await _notice_value(manager, tx, source, result)
             key = notice_id(manager, source)
             columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
+            await manager.store.signal_changes(tx, actor.session_id, "inbox")
             await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                 (actor.session_id, key, 'original_call_outcome', 'queue', 'pending', render(data['public']), manager.now()))
             await _event(manager, tx, key, source, 'source_abort_delivery', data)

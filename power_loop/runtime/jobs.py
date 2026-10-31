@@ -1,4 +1,4 @@
-"""Experimental B1 task registry, enabled only on an explicit v10 store.
+"""Task registry, enabled only on the current explicit task store.
 
 This owns registration/operation identities and execution evidence, not the B2
 success gate or B3 external cancellation adapters. A recorded result stays in
@@ -152,7 +152,8 @@ def verify_stored(fn):
 class JobManager:
     def __init__(self, store, *, now_ms: Callable[[], int] | None = None,
                  event_bus: AgentEventBus | None = None):
-        if store.schema_version != 10 or not store.store_id:
+        from .store.task_schema import TASK_SCHEMA_VERSION
+        if store.schema_version != TASK_SCHEMA_VERSION or not store.store_id:
             raise JobError("task_registry_unsupported")
         self.store = store
         self.db = store._db

@@ -176,6 +176,7 @@ async def _reset_journal(manager, tx, actor, request):
         if nid in request["affected"]:
             step.update(status="pending", text="", payload=None, usage={}, error="invalidated by workflow continuation")
         j["steps"].append(step)
+    await manager.store.signal_changes(tx, actor.session_id, "runtime")
     if await tx.execute(f"UPDATE {manager.store.t.session_runtime_state} SET value_json=?,updated_at=? WHERE session_id=? AND state_key=?",
             (_json(j), manager.now(), actor.session_id, key)) != 1:
         raise JobError("workflow_restore_journal_mismatch")

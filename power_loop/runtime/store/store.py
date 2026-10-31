@@ -27,6 +27,7 @@ from typing import Any
 
 from power_loop.contracts.errors import InboxClaimChanged
 from power_loop.runtime.message_ref import integer_id
+from power_loop.runtime.store import change_signals
 from power_loop.runtime.store.capabilities import Maintenance
 from power_loop.runtime.store.db import Database, Row, Transaction
 from power_loop.runtime.store.schema import (
@@ -210,6 +211,7 @@ class SessionStore:
         self._deferred_round: dict[str, int] = {}
         self._next_seq: dict[str, int] = {}
         self._touched: dict[str, int] = {}
+        self._change_snapshots = OrderedDict()
 
     def _remember_pending(self, session_id, pending_json):
         self._pending_written[session_id] = pending_json
@@ -241,6 +243,7 @@ class SessionStore:
             self._appended_calls[session_id] = (seq, tool_calls_json)
 
     def _forget_appended(self, session_id):
+        self._change_snapshots.pop(session_id, None)
         self._appended_calls.pop(session_id, None)
         for key in [k for k in self._appended_refs if k[0] == session_id]:
             del self._appended_refs[key]
@@ -294,7 +297,8 @@ class SessionStore:
 
     async def _initialize_identity(self, version: int) -> None:
         self._schema_version = version
-        if version >= 10:
+        from .task_schema import TASK_SCHEMA_VERSION
+        if version == TASK_SCHEMA_VERSION:
             row = await self._db.fetchone(f"SELECT store_id FROM {self.table_prefix}task_store WHERE id=1")
             if row is None:
                 raise ValueError("task store identity missing")
@@ -306,7 +310,8 @@ class SessionStore:
 
     @property
     def has_message_ids(self) -> bool:
-        return self.schema_version >= 10 and self.store_id is not None
+        from .task_schema import TASK_SCHEMA_VERSION
+        return self.schema_version == TASK_SCHEMA_VERSION and self.store_id is not None
 
     # ── maintenance (optional capability; no-op on backends that lack it) ──────
     async def checkpoint(self, *, mode: str = "TRUNCATE") -> None:
@@ -394,6 +399,27 @@ class SessionStore:
             last_compact_seq=row["last_compact_seq"],
             pending=_loads(row["pending_json"]),
         )
+
+    def begin_polling(self, session_id):
+        changes = change_signals.ChangeReader(self, session_id)
+        return changes, change_signals.ACTIVE.set(changes)
+
+    def end_polling(self, token):
+        change_signals.ACTIVE.reset(token)
+
+    def note_model_versions(self, session_id):
+        changes = change_signals.reader(self, session_id)
+        if changes is not None:
+            changes.model_versions = changes.versions
+
+    async def background_changed_during_model(self, session_id):
+        changes = change_signals.reader(self, session_id)
+        return (changes is not None and changes.versions[1] != changes.model_versions[1]
+                and bool(await self.poll_background_updates(session_id)))
+
+    async def signal_changes(self, tx, session_id, kind):
+        self._change_snapshots.pop(session_id, None)
+        await change_signals.bump(self, tx, session_id, kind)
 
     async def set_round_index(self, session_id: str, round_index: int) -> None:
         self._deferred_round.pop(session_id, None)
@@ -484,6 +510,8 @@ class SessionStore:
         pending_json = _KEEP if pending is _KEEP else (_dumps(pending) if pending else None)
         deferred_round = self._deferred_round.pop(session_id, None)
         sets, params = [], []
+        if inbox is not None:
+            sets.append("inbox_version=inbox_version+1")
         if pending_json is not _KEEP:
             sets.append("pending_json=?")
             params.append(pending_json)
@@ -499,6 +527,8 @@ class SessionStore:
                                              if isinstance(call, Mapping) and call.get("id")],
                            "tool_calls": tool_calls})
         committed = False
+        signal_columns = ','.join(change_signals.COLUMNS)
+        signal_values = None
         try:
             async with self._db.transaction() as tx:
                 seq, state_written = None, False
@@ -510,10 +540,17 @@ class SessionStore:
                         fast_sets.append("pending_json=?")
                         fast_params.append(atomic_pending(expected))
                     guard = " AND pending_json IS NULL" if pending_tool_calls else ""
-                    if await tx.execute(
-                            f"UPDATE {self.t.session_state} SET {', '.join(['next_seq=?', *fast_sets])} "
-                            f"WHERE session_id=? AND next_seq=?{guard}",
-                            (expected + 1, *fast_params, session_id, expected)) == 1:
+                    statement = (f"UPDATE {self.t.session_state} SET {', '.join(['next_seq=?', *fast_sets])} "
+                                 f"WHERE session_id=? AND next_seq=?{guard}")
+                    arguments = (expected + 1, *fast_params, session_id, expected)
+                    if mysql:
+                        matched = await tx.execute(statement, arguments) == 1
+                    else:
+                        snapshot = await tx.fetchone(statement + f" RETURNING {signal_columns}", arguments)
+                        matched = snapshot is not None
+                        if matched:
+                            signal_values = tuple(snapshot[column] for column in change_signals.COLUMNS)
+                    if matched:
                         seq, state_written = expected, True
                 if seq is not None:
                     pass
@@ -527,13 +564,14 @@ class SessionStore:
                     guard = " AND pending_json IS NULL" if pending_tool_calls else ""
                     st = await tx.fetchone(
                         f"UPDATE {self.t.session_state} SET {', '.join(['next_seq=next_seq+1', *sets])} "
-                        f"WHERE session_id=?{guard} RETURNING next_seq", (*params, session_id))
+                        f"WHERE session_id=?{guard} RETURNING next_seq,{signal_columns}", (*params, session_id))
                     if st is None:
                         if pending_tool_calls and await tx.fetchone(
                                 f"SELECT 1 AS present FROM {self.t.session_state} WHERE session_id=?", (session_id,)):
                             raise ValueError("pending_tool_calls_exist")
                         raise ValueError(f"unknown session: {session_id}")
                     seq = int(st["next_seq"]) - 1
+                    signal_values = tuple(st[column] for column in change_signals.COLUMNS)
                     state_written = None  # Allocation and plain state changes only.
                 if inbox is not None:
                     token, raw_ids = inbox.get("claim_token"), inbox.get("ids")
@@ -576,7 +614,12 @@ class SessionStore:
                     row_id = None
                 elif self._db.dialect.name == "mysql":
                     await tx.execute(insert, values)
-                    row_id = (await tx.fetchone("SELECT LAST_INSERT_ID() AS id"))["id"]
+                    snapshot = await tx.fetchone(f"SELECT LAST_INSERT_ID() AS id,{signal_columns} "
+                                                 f"FROM {self.t.session_state} WHERE session_id=?", (session_id,))
+                    row_id = snapshot["id"]
+                    signal_values = tuple(snapshot[column] for column in change_signals.COLUMNS)
+                    if state_written is False and inbox is not None:
+                        signal_values = (signal_values[0] + 1, *signal_values[1:])
                 else:
                     row_id = (await tx.fetchone(insert + " RETURNING id", values))["id"]
                 if state_written is False:
@@ -621,9 +664,15 @@ class SessionStore:
         finally:
             if not committed:
                 self._next_seq.pop(session_id, None)
+                self._change_snapshots.pop(session_id, None)
                 if deferred_round is not None:
                     self._deferred_round.setdefault(session_id, deferred_round)
         self._next_seq[session_id] = seq + 1
+        if signal_values is not None:
+            self._change_snapshots[session_id] = seq, signal_values
+            self._change_snapshots.move_to_end(session_id)
+            while len(self._change_snapshots) > 4096:
+                self._change_snapshots.popitem(last=False)
         if touched is not None:
             self._touched[session_id] = touched
         if pending_json is not _KEEP:
@@ -1266,6 +1315,7 @@ class SessionStore:
         now = _now_ms()
         accepted: list[str] = []
         async with self._db.transaction() as tx:
+            await self.signal_changes(tx, session_id, "inbox")
             for it in items:
                 item_id = str(it["item_id"])
                 meta = it.get("meta")
@@ -1292,15 +1342,20 @@ class SessionStore:
         now = _now_ms()
         q = self.t.follow_up_queue
         ready = await self._db.fetchone(
-            f"SELECT id FROM {q} WHERE session_id=? AND "
-            "(status='pending' OR (status='claimed' AND claimed_at < ?)) LIMIT 1",
-            (session_id, now - int(stale_after_ms)),
-        )
+            f"SELECT id,status,claimed_at FROM {q} WHERE session_id=? AND status IN ('pending','claimed') "
+            "ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END,claimed_at LIMIT 1", (session_id,))
+        changes = change_signals.reader(self, session_id)
         if ready is None:
-            # A concurrent enqueue remains pending for the next drain, exactly
-            # as an enqueue immediately after an empty claim transaction did.
+            if changes is not None:
+                changes.inbox_seen, changes.inbox_retry_at = changes.versions[0], None
+            return []
+        if ready["status"] == "claimed" and ready["claimed_at"] >= now - int(stale_after_ms):
+            if changes is not None:
+                changes.inbox_seen = changes.versions[0]
+                changes.inbox_retry_at = ready["claimed_at"] + int(stale_after_ms) + 1
             return []
         async with self._db.transaction() as tx:
+            await self.signal_changes(tx, session_id, "inbox")
             await tx.execute(
                 f"UPDATE {q} SET status='pending', claim_token=NULL, claimed_at=NULL "
                 "WHERE session_id=? AND status='claimed' AND claimed_at < ?",
@@ -1330,11 +1385,11 @@ class SessionStore:
     async def inbox_release(self, session_id: str, claim_token: str) -> int:
         """Return still-claimed rows of ``claim_token`` to pending (the delivery they were claimed
         for did not happen). Rows already delivered are untouched. Returns how many."""
-        return await self._db.execute(
-            f"UPDATE {self.t.follow_up_queue} SET status='pending', claim_token=NULL, "
-            "claimed_at=NULL WHERE session_id=? AND claim_token=? AND status='claimed'",
-            (session_id, claim_token),
-        )
+        async with self._db.transaction() as tx:
+            await self.signal_changes(tx, session_id, "inbox")
+            return await tx.execute(
+                f"UPDATE {self.t.follow_up_queue} SET status='pending', claim_token=NULL, "
+                "claimed_at=NULL WHERE session_id=? AND claim_token=? AND status='claimed'", (session_id, claim_token))
 
     async def inbox_void(self, session_id: str, item_ids: Sequence[str]) -> int:
         """Withdraw not-yet-delivered items (pending or claimed) so they never reach the model.
@@ -1342,11 +1397,12 @@ class SessionStore:
         if not item_ids:
             return 0
         marks = ",".join("?" for _ in item_ids)
-        return await self._db.execute(
-            f"UPDATE {self.t.follow_up_queue} SET status='void', claim_token=NULL "
-            f"WHERE session_id=? AND status IN ('pending','claimed') AND item_id IN ({marks})",
-            (session_id, *[str(i) for i in item_ids]),
-        )
+        async with self._db.transaction() as tx:
+            await self.signal_changes(tx, session_id, "inbox")
+            return await tx.execute(
+                f"UPDATE {self.t.follow_up_queue} SET status='void', claim_token=NULL "
+                f"WHERE session_id=? AND status IN ('pending','claimed') AND item_id IN ({marks})",
+                (session_id, *[str(i) for i in item_ids]))
 
     async def inbox_counts(self, session_id: str) -> dict[str, int]:
         """``{"pending": n, "steer": m}`` — undelivered items (pending + claimed) and how many of
@@ -1824,6 +1880,7 @@ class SessionStore:
             old = _loads(found['value_json']) if found is not None else None
             if old is not None and ("revision" not in old or int(old["revision"]) >= revision):
                 return  # legacy receipts remain immutable; new receipts support corrections
+            await self.signal_changes(tx, session_id, "runtime")
             values = {"prompt_tokens": int(usage.get("prompt_tokens") or 0),
                       "completion_tokens": int(usage.get("completion_tokens") or 0),
                       "total_tokens": int(usage.get("total_tokens") or 0),
@@ -1900,6 +1957,17 @@ class SessionStore:
         value = _loads(row["value_json"])
         return default if value is None else value
 
+    async def poll_runtime_state(self, session_id, key, default=None):
+        changes = change_signals.reader(self, session_id)
+        if changes is None:
+            return await self.get_runtime_state(session_id, key, default)
+        version = changes.versions[2]
+        if key not in changes.runtime or changes.runtime[key][0] != version:
+            value = await self.get_runtime_state(session_id, key) if version else None
+            changes.runtime[key] = version, value
+        value = changes.runtime[key][1]
+        return default if value is None else value
+
     async def set_runtime_state(self, session_id: str, key: str, value: Any) -> None:
         now = _now_ms()
         async with self._db.transaction() as tx:
@@ -1908,6 +1976,7 @@ class SessionStore:
             )
             if exists is None:
                 raise ValueError(f"unknown session: {session_id}")
+            await self.signal_changes(tx, session_id, "runtime")
             sql = self._db.dialect.upsert(
                 self.t.session_runtime_state,
                 ("session_id", "state_key"),
@@ -1958,6 +2027,7 @@ class SessionStore:
             new_value = fn(current)
             if new_value is MUTATE_SKIP:
                 return current
+            await self.signal_changes(tx, session_id, "runtime")
             sql = self._db.dialect.upsert(
                 self.t.session_runtime_state,
                 ("session_id", "state_key"),
@@ -1973,6 +2043,7 @@ class SessionStore:
 
     async def delete_runtime_state(self, session_id: str, key: str) -> None:
         async with self._db.transaction() as tx:
+            await self.signal_changes(tx, session_id, "runtime")
             await tx.execute(
                 f"DELETE FROM {self.t.session_runtime_state} WHERE session_id=? AND state_key=?",
                 (session_id, key),
@@ -2029,6 +2100,7 @@ class SessionStore:
             # the session_state row lock (store-core-2). Orphan sessions: nothing to lock.
             with contextlib.suppress(ValueError):
                 await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            await self.signal_changes(tx, session_id, "background")
             existing = await tx.fetchone(
                 f"SELECT last_seen_at, created_at FROM {self.t.background_tasks} "
                 "WHERE session_id=? AND task_id=?",
@@ -2092,6 +2164,15 @@ class SessionStore:
         )
         return [_row_to_background_task(r) for r in rows]
 
+    async def poll_background_updates(self, session_id):
+        changes = change_signals.reader(self, session_id)
+        if changes is None:
+            return await self.list_unseen_background_updates(session_id)
+        if changes.background_seen != changes.versions[1]:
+            changes.background = await self.list_unseen_background_updates(session_id)
+            changes.background_seen = changes.versions[1]
+        return list(changes.background)
+
     async def mark_background_seen(self, session_id: str, task_ids: list[str]) -> None:
         if not task_ids:
             return
@@ -2104,6 +2185,7 @@ class SessionStore:
             # nothing to lock — single-writer SQLite is gap-free anyway.
             with contextlib.suppress(ValueError):
                 await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            await self.signal_changes(tx, session_id, "background")
             await tx.execute(
                 f"UPDATE {self.t.background_tasks} SET last_seen_at=? "
                 f"WHERE session_id=? AND task_id IN ({placeholders})",
@@ -2230,6 +2312,8 @@ class SessionStore:
                         f"VALUES ({placeholders})",
                         [row[c] for c in present],
                     )
+            await tx.execute(f"UPDATE {self.t.session_state} SET inbox_version=inbox_version+1, "
+                             "background_version=background_version+1,runtime_version=runtime_version+1 WHERE session_id=?", (new_id,))
         return new_id
 
 # ── row converters (dict rows; backend-agnostic) ────────────────────────────────

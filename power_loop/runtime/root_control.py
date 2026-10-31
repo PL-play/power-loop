@@ -37,6 +37,7 @@ async def _save(manager, tx, actor, key, value):
     value["evidence_hash"] = _hash(value)
     sql = manager.db.dialect.upsert(manager.store.t.session_runtime_state,
         ("session_id", "state_key"), ("value_json", "updated_at"))
+    await manager.store.signal_changes(tx, actor.session_id, "runtime")
     await tx.execute(sql, (actor.session_id, key, _json(value), manager.now()))
     return value
 

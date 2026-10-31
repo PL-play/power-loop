@@ -177,6 +177,7 @@ async def _views(manager, tx, actor, data, *, write):
             type(j.get("task_generation", 1)) is not int or j.get("task_generation", 1) != max(1, envelope["generation"])):
         raise JobError("workflow_delivery_journal_mismatch")
     if write and not journal._is_terminal(j.get("status")):
+        await manager.store.signal_changes(tx, actor.session_id, "runtime")
         now = manager.now()
         j.update(status=projected.status, result=projected.to_dict(), finished_at_ms=now, updated_at_ms=now,
                  error=projected.errors[0] if projected.errors else None)
@@ -192,6 +193,7 @@ async def _views(manager, tx, actor, data, *, write):
     content = json.dumps(envelope, ensure_ascii=False)
     if write:
         cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
+        await manager.store.signal_changes(tx, actor.session_id, "inbox")
         await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),
             (actor.session_id, envelope["event_id"], "task_done", "queue", "pending", content, manager.now()))
     inbox = await tx.fetchone(f"SELECT kind,mode,status,content FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?",

@@ -76,6 +76,7 @@ async def accept(manager, actor, target, *, caller, call_ref, tool_call_id, sess
             call_ref=call_ref, tool_call_id=tool_call_id, payload=payload)
         await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (operation.operation_id,))
         cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
+        await manager.store.signal_changes(tx, session_id, "inbox")
         inserted = await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),
             (session_id, "nudge:" + operation.operation_id, "relay", "steer", "pending", message, manager.now()))
         if not inserted:

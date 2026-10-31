@@ -84,7 +84,7 @@ class TodoRuntimeProjector(RuntimeProjector):
         round_index: int,
         context: Any,
     ) -> list[RuntimeMessage]:
-        todo_state = await store.get_runtime_state(session_id, self.state_key, default={}) or {}
+        todo_state = await store.poll_runtime_state(session_id, self.state_key, default={}) or {}
         rendered = todo_state.get("rendered") if isinstance(todo_state, dict) else None
         if not isinstance(rendered, str) or not rendered.strip():
             return []
@@ -109,7 +109,7 @@ class BackgroundRuntimeProjector(RuntimeProjector):
         round_index: int,
         context: Any,
     ) -> list[RuntimeMessage]:
-        updates = await store.list_unseen_background_updates(session_id)
+        updates = await store.poll_background_updates(session_id)
         if not updates:
             return []
         from power_loop.runtime.background import ACTIVE_STATUSES, encode_results, load_record, summarize_record
@@ -168,6 +168,9 @@ class BackgroundRuntimeProjector(RuntimeProjector):
         kind, ids = ack
         if kind == "background_seen" and ids:
             await store.mark_background_seen(session_id, list(ids))
+
+    async def requires_round(self, *, store, session_id):
+        return await store.background_changed_during_model(session_id)
 
 
 def default_runtime_projectors() -> tuple[RuntimeProjector, ...]:

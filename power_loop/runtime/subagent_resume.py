@@ -102,6 +102,7 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, sessi
         await tx.execute(f"UPDATE {manager.events} SET payload_json=?,delivery_status='pending_delivery' WHERE event_id=?",
             (_json(payload), operation.operation_id))
         cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
+        await manager.store.signal_changes(tx, session_id, "inbox")
         if not await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),
                 (session_id, "nudge:"+operation.operation_id, "relay", "steer", "pending", message, now)):
             raise JobError("nudge_inbox_conflict")

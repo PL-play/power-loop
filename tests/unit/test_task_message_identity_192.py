@@ -8,7 +8,7 @@ import pytest
 
 from power_loop import SessionStore
 from power_loop.runtime.message_ref import integer_id
-from power_loop.runtime.store.schema import SchemaPolicy, StoreSchemaError
+from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION, SchemaPolicy, StoreSchemaError
 from power_loop.runtime.store.task_schema import migrate_task_schema, task_schema_preflight
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -102,7 +102,7 @@ async def test_legacy_mode_degrades_and_never_automatically_migrates(tmp_path):
     with pytest.raises(StoreSchemaError, match="maintenance migration"):
         await SessionStore.open(path, schema="tasks")
     s = await SessionStore.open(path, schema="compatible")
-    assert s.schema_version == 9 and (await s.load_all_messages(sid))[0].content == "legacy"
+    assert s.schema_version == CURRENT_SCHEMA_VERSION and (await s.load_all_messages(sid))[0].content == "legacy"
     await s.close()
 
 
@@ -114,7 +114,7 @@ async def test_explicit_migration_preserves_every_message_and_next_seq(tmp_path)
         await s.append_message(sid, role=role, content=role, meta={"kind": role})
     before = await s.export_session(sid)
     assert await task_schema_preflight(s._db, s.table_prefix) == {
-        "version": 9, "message_count": 3, "sessions_with_messages": 1, "maintenance_required": True}
+        "version": CURRENT_SCHEMA_VERSION, "message_count": 3, "sessions_with_messages": 1, "maintenance_required": True}
     with pytest.raises(StoreSchemaError, match="maintenance_required"):
         await migrate_task_schema(s._db, s.table_prefix)
     await migrate_task_schema(s._db, s.table_prefix, maintenance=True)
@@ -184,7 +184,7 @@ async def test_incomplete_schema_and_custom_migration_fail_without_destroying_hi
     with pytest.raises(StoreSchemaError, match="custom"):
         await migrate_task_schema(s._db, s.table_prefix, maintenance=True)
     assert (await s.load_all_messages(sid))[0].content == "preserve"
-    assert (await s._db.fetchone("SELECT version FROM pl_schema_migrations"))["version"] == 9
+    assert (await s._db.fetchone("SELECT version FROM pl_schema_migrations"))["version"] == CURRENT_SCHEMA_VERSION
     await s.close()
     s = await SessionStore.open(str(tmp_path / "incomplete.db"), schema="tasks")
     await s._db.execute("DROP TABLE pl_jobs")
@@ -210,6 +210,6 @@ async def test_migration_refuses_unreviewed_dependencies_or_partial_schema(tmp_p
         with pytest.raises(StoreSchemaError, match="inspection|reviewed"):
             await migrate_task_schema(s._db, s.table_prefix, maintenance=True)
         assert (await s.load_all_messages(sid))[0].content == "must survive"
-        assert (await s._db.fetchone("SELECT version FROM pl_schema_migrations"))["version"] == 9
+        assert (await s._db.fetchone("SELECT version FROM pl_schema_migrations"))["version"] == CURRENT_SCHEMA_VERSION
     finally:
         await s.close()

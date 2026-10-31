@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Coroutine, Mapping, Sequence
@@ -2240,8 +2241,12 @@ class StatefulAgentLoop:
         async with self._runner.session_async(session_id=sid):
             loop_token = set_current_loop(self)
             tools_token = set_effective_tools(_eff_tools)
+            changes, changes_token = store.begin_polling(sid)
             try:
-                async def _drain_follow_ups() -> list[LoopMessage]:
+                async def _drain_follow_ups(*, force=False) -> list[LoopMessage]:
+                    await changes.refresh(force=force)
+                    if not changes.inbox_due(time.time_ns() // 1_000_000):
+                        return []
                     return await self._drain_follow_up_messages(sid)
 
                 pipeline = AgentPipeline(
@@ -2256,6 +2261,7 @@ class StatefulAgentLoop:
                     sink=sink,
                     store=store,
                     drain_follow_ups=_drain_follow_ups,
+                    drain_follow_ups_final=lambda: _drain_follow_ups(force=True),
                     steer_event=_session_sync(sid, owner=id(self)).steer,
                 )
                 # Every row this run appends (assistant/tool/system, plus follow-up and
@@ -2278,6 +2284,7 @@ class StatefulAgentLoop:
                     await pipeline._emit_error_terminal(exc)
                     raise
             finally:
+                store.end_polling(changes_token)
                 reset_effective_tools(tools_token)
                 reset_current_loop(loop_token)
         # ── Maintain the window cache from the DURABLE store, never the pipeline's mutated

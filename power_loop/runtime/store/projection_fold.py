@@ -44,6 +44,7 @@ async def read_state(store, reader, sid):
 
 
 async def _put(store, writer, sid, key, value):
+    await store.signal_changes(writer, sid, "runtime")
     sql = store._db.dialect.upsert(
         store.t.session_runtime_state, ("session_id", "state_key"), ("value_json", "updated_at"),
     )
@@ -256,6 +257,7 @@ async def _discard_owners(store, sid, generation):
             )
             if not rows:
                 return
+            await store.signal_changes(tx, sid, "runtime")
             await tx.execute(
                 f"DELETE FROM {store.t.session_runtime_state} WHERE session_id=? "
                 f"AND state_key IN ({','.join('?' for _ in rows)})", (sid, *(r["state_key"] for r in rows)),

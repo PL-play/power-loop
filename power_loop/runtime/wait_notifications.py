@@ -173,6 +173,7 @@ async def enqueue_notification(loop, actor, event_id):
                 "wait_job_id": job["job_id"], "main_session_id": actor.session_id, "item_id": key,
                 "public": payload, "message_hash": _hash(message), "state": "enqueued"}
             columns = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
+            await manager.store.signal_changes(tx, actor.session_id, "inbox")
             await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                 (actor.session_id, key, "wait_handoff", "queue", "pending", message, manager.now()))
             await _inbox(manager, tx, receipt)
