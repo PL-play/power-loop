@@ -172,7 +172,11 @@ async def test_admission_and_model_dispatch_commit_one_original_grant(budget_cas
         await attempts.dispatch(a)
     state = await observed(c, a)
     assert state["phase"] == "settling" and not state["pending"] and state["ack"]
-    assert await counters(c) == {"used_calls": 1, "held_calls": 0, "used_tokens": 10, "held_tokens": 90, "inflight": 1}
+    # Open owners retain their full grant; checkpoint summaries hold actuals.
+    assert await counters(c) == {"used_calls": 0, "held_calls": 1, "used_tokens": 0, "held_tokens": 100, "inflight": 1}
+    from power_loop.runtime.control_runtime import current
+    [actual] = (await current(c.binding).journal.inspect(current(c.binding).identity))["summary"]["allocations"]
+    assert actual["used_calls"] == 1 and actual["used_tokens"] == 10
     from power_loop.runtime.control_runtime import flush_binding
     await flush_binding(c.binding, close=True)
     assert await counters(c) == {"used_calls": 1, "held_calls": 0, "used_tokens": 10, "held_tokens": 0, "inflight": 0}
@@ -208,10 +212,13 @@ async def test_usage_ack_loss_keeps_frozen_outbox_and_replays_without_duplicate_
 
 
 async def test_scope_counters_survive_new_sends_and_new_runtime_objects(budget_case):
+    from power_loop.runtime.control_runtime import flush_binding
     c = budget_case
     await observed(c, await start(c))
+    await flush_binding(c.binding, close=True)
     await new_send(c)
     await observed(c, await start(c))
+    await flush_binding(c.binding, close=True)
     replacement = TaskRuntime(
         c.manager,
         tenant_id="budget-tenant",
@@ -321,12 +328,12 @@ async def test_actual_component_totals_match_host_settlement_without_counting_to
     a = await start(c)
     await attempts.observe(a, usage=usage, estimated=estimated)
     current = await counters(c)
-    assert current["used_tokens"] == (0 if total is None else total)
-    assert current["held_tokens"] == 100 - (total or 0)
-    assert current["used_calls"] == 1 and current["held_calls"] == 0 and current["inflight"] == 1
+    assert current == dict(used_calls=0, held_calls=1, used_tokens=0, held_tokens=100, inflight=1)
     from power_loop.runtime.control_runtime import flush_binding
     await flush_binding(c.binding, close=True)
     closed = await counters(c)
+    assert closed["used_tokens"] == (0 if total is None else total)
+    assert closed["used_calls"] == 1 and closed["held_calls"] == 0
     assert closed["held_tokens"] == (100 if total is None else 0)
     assert closed["inflight"] == 0
     state = await budgets.get_budget(c.manager, c.actor, a.attempt_id)
@@ -407,7 +414,9 @@ async def test_explicit_protocol_three_migration_retains_original_ids_and_reject
         ] == 3
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    assert TASK_PROTOCOL_VERSION == 22 and await c.store.message_ref(c.sid, seq) == ref
+    stored = await c.manager.db.fetchone(f"SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1")
+    assert stored["protocol_version"] == TASK_PROTOCOL_VERSION
+    assert await c.store.message_ref(c.sid, seq) == ref
     # A bridge compiled against protocol3 cannot write the migrated control row.
     import power_loop.runtime.jobs as jobs
 
@@ -443,6 +452,9 @@ async def test_two_independent_requests_can_reserve_concurrently_without_oversub
         values = await asyncio.gather(*tasks)
         for case, attempt in zip((first, second), values, strict=True):
             await observed(case, attempt)
+        assert (await counters(c))["held_calls"] == 2 and (await counters(c))["inflight"] == 2
+        from power_loop.runtime.control_runtime import flush_binding
+        await asyncio.gather(*(flush_binding(case.binding, close=True) for case in (first, second)))
         assert (await counters(c))["used_calls"] == 2 and (await counters(c))["used_tokens"] == 20
     finally:
         release.set()
@@ -535,6 +547,8 @@ async def test_wrong_usage_ack_cannot_clear_a_frozen_outbox_or_apply_local_token
     c.host.apply_usage = original
     await budgets.deliver(a)
     assert not (await budgets.get_budget(c.manager, c.actor, a.attempt_id))["pending"]
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(c.binding, close=True)
     assert (await counters(c))["used_tokens"] == 10 and (await counters(c))["used_calls"] == 1
 
 

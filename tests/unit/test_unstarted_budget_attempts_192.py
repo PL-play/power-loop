@@ -86,6 +86,11 @@ async def test_exhausted_original_allowance_stays_exhausted_after_repeated_local
             await start(c)
     assert c.host.reserve_calls == len(c.host.applied) == 2
     [scope] = await c.manager.db.fetchall(f"SELECT counters_json FROM {c.manager.prefix}task_budget_scopes")
+    live = json.loads(scope["counters_json"])
+    assert live["used_calls"] + live["held_calls"] == 2
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(c.binding, close=True)
+    [scope] = await c.manager.db.fetchall(f"SELECT counters_json FROM {c.manager.prefix}task_budget_scopes")
     assert json.loads(scope["counters_json"])["used_calls"] == 2
     assert not await c.manager.db.fetchall(
         f"SELECT attempt_id FROM {c.manager.prefix}task_budget_attempts WHERE pending<>0"

@@ -15,6 +15,7 @@ from power_loop.runtime import budget_scopes, delegation
 from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
+from power_loop.runtime.control_runtime import flush_binding
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
@@ -71,17 +72,24 @@ async def test_roots_are_independent_but_authority_cap_is_shared_across_sends(tr
     await observed(c, await start(c))
     values = await rows(c)
     roots = [
-        (limits["subject_job_id"], counter["used_calls"])
+        (limits["subject_job_id"], counter["used_calls"] + counter["held_calls"])
         for _, limits, counter in values
         if limits.get("binding") == "root"
     ]
     assert set(roots) == {(root1.lease.job_id, 1), (root2.lease.job_id, 1)}
-    assert next(counter["used_calls"] for _, limits, counter in values if limits["key"] == "authority") == 2
+    assert next(counter["used_calls"] + counter["held_calls"] for _, limits, counter in values if limits["key"] == "authority") == 2
     c.binding, c.actor, c.sid = root1, actor1, actor1.session_id
     # The rejected preparation now has durable non-dispatch closure. Its
     # original root allowance is still spent, so admission fails on that cap.
     with pytest.raises(JobError, match="budget_max_calls_exhausted"):
         await start(c)
+    await flush_binding(root1, close=True)
+    await flush_binding(root2, close=True)
+    final = await rows(c)
+    assert {(limits["subject_job_id"], count["used_calls"]) for _, limits, count in final
+            if limits.get("binding") == "root"} == {(root1.lease.job_id, 1), (root2.lease.job_id, 1)}
+    assert next(count["used_calls"] for _, limits, count in final if limits["key"] == "authority") == 2
+    assert all(count["held_calls"] == 0 for _, _, count in final)
     assert c.host.reserve_calls == 2
 
 
@@ -94,6 +102,7 @@ async def test_independent_root_cannot_escape_authority_limit_by_getting_a_new_i
     c = tree_case
     await new_send(c)
     await observed(c, await start(c))
+    await flush_binding(c.binding, close=True)
     await new_send(c)
     with pytest.raises(JobError, match="budget_max_calls_exhausted"):
         await start(c)
@@ -198,6 +207,7 @@ async def test_cancelled_unstarted_attempt_refunds_exact_original_root_and_not_i
     new_root = c.binding.lease.job_id
     await observed(c, await start(c))
     await budgets.close_unstarted(old)
+    await flush_binding(c.binding, close=True)
     root_values = {
         limits["subject_job_id"]: count for _, limits, count in await rows(c) if limits.get("binding") == "root"
     }
@@ -254,10 +264,12 @@ async def test_lost_usage_ack_replays_original_frozen_tree_after_another_root_fi
     saved = await observed(c, attempt)
     assert saved["pending"] and saved["ack"] is None
     frozen_scopes, submission = saved["scopes"], saved["submission"]
+    await flush_binding(c.binding, close=True)
     c.host.apply_lost_ack = False
     await new_send(c)
     new_root = c.binding.lease.job_id
     await observed(c, await start(c))
+    await flush_binding(c.binding, close=True)
     before = {row["scope_key"]: counter for row, _, counter in await rows(c)}
     await budgets.deliver(attempt)
     await budgets.deliver(attempt)

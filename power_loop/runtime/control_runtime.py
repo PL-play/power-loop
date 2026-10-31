@@ -56,7 +56,12 @@ async def project_events(manager, tx, identity, records):
             continue
         if record["kind"] == "budget_allocation":
             from .execution_budget import project_allocation
-            await project_allocation(manager, tx, identity, record["key"], value)
+            # The full grant remains reserved while its owner is open. Its
+            # actual consumption is already in this checkpoint's summary and
+            # records; closing applies the cumulative difference exactly once.
+            # An overrun must still disable admission and book the excess now.
+            if value["closed"] or value["used_tokens"] > value["tokens"]:
+                await project_allocation(manager, tx, identity, record["key"], value)
             continue
         if record["kind"] == "event_immutable":
             event(record["key"], value["event_type"], value["payload"], value["event_metadata"])
