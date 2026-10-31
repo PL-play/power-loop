@@ -582,6 +582,7 @@ class SessionStore:
         inbox: Mapping[str, Any] | None = None,
         pending_tool_calls: bool = False,
         pending: Any = _KEEP,
+        round_usage: Mapping[str, Any] | None = None,
     ) -> int:
         """Append one message and return its allocated per-session ``seq`` (allocated +
         inserted atomically in one transaction). ``send_index`` is the authoritative per-session
@@ -753,6 +754,9 @@ class SessionStore:
                     if state_written is not True:
                         await tx.execute(f"UPDATE {self.t.session_state} SET pending_json=? WHERE session_id=?",
                                          (pending_json, session_id))
+                if round_usage is not None:
+                    await self.record_usage(session_id, round_index=round_index, send_index=send_index,
+                                            transaction=tx, **round_usage)
                 if hook_injected:
                     # Per-session monotonic event_id; MAX+1 is race-free here because we hold the
                     # session_state lock for the whole append (serializes same-session writers).
@@ -1918,6 +1922,7 @@ class SessionStore:
         cached_tokens: int | None = None,
         model: str | None = None,
         send_index: int | None = None,
+        transaction: Transaction | None = None,
     ) -> None:
         """Record per-round token usage, keyed ``(session_id, send_index, round_index)``.
 
@@ -1931,14 +1936,13 @@ class SessionStore:
             ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "model",
              "created_at"),
         )
-        async with self._db.transaction() as tx:
-            await tx.execute(
-                sql,
-                (
-                    session_id, int(send_index or 0), round_index, prompt_tokens,
-                    completion_tokens, total_tokens, cached_tokens, model, _now_ms(),
-                ),
-            )
+        values = (session_id, int(send_index or 0), round_index, prompt_tokens,
+                  completion_tokens, total_tokens, cached_tokens, model, _now_ms())
+        if transaction is not None:
+            await transaction.execute(sql, values)
+        else:
+            async with self._db.transaction() as tx:
+                await tx.execute(sql, values)
 
     # ── session statistics (cumulative, accounting-grade) ─────────────────
     async def bump_session_stats(

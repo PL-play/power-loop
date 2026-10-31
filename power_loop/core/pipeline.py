@@ -527,6 +527,7 @@ class AgentPipeline:
         *,
         round_index: int | None = None,
         hook_injected: dict[str, Any] | None = None,
+        round_usage: dict[str, Any] | None = None,
     ) -> bool:
         # An inbox delivery (design/124 §6) arrives with a private ``_inbox`` marker naming the
         # claimed inbox rows it carries. Strip it BEFORE hooks/history — the history row is sent
@@ -550,6 +551,8 @@ class AgentPipeline:
             sink_msg = {**sink_msg, "send_index": self.send_index}
         if hook_injected is not None:
             sink_msg = {**sink_msg, "hook_injected": hook_injected}
+        if round_usage:
+            sink_msg = {**sink_msg, "_round_usage": round_usage}
         if inbox is not None:
             sink_msg = {**sink_msg, "inbox": inbox}
             # Persist the claim before admitting any text/images/token estimates
@@ -2138,7 +2141,8 @@ class AgentPipeline:
                 sanitized_tool_calls, _args_cut = _sanitize_tool_calls(tool_calls)
                 assistant_msg["tool_calls"] = sanitized_tool_calls
             if not _skip_empty:
-                await self._append_message(assistant_msg, round_index=round_idx, hook_injected=hook_audit)
+                await self._append_message(assistant_msg, round_index=round_idx,
+                                           hook_injected=hook_audit, round_usage=usage)
             # 截断的第二种表现：工具调用本身在，但它的 arguments JSON 断在半路 → 降成 {} →
             # 必填校验报「缺参数」，模型据此以为自己忘了填，于是原样再写一遍、再被截断。
             # 真实事故（conv-213）：一条 "missing required parameter" 背后是 20000 token 打满。

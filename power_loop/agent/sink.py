@@ -28,6 +28,15 @@ from power_loop.runtime.store.types import (
 logger = logging.getLogger(__name__)
 
 
+def _usage_columns(usage):
+    return {
+        "prompt_tokens": _int_or_none(usage.get("prompt_tokens") or usage.get("input")),
+        "completion_tokens": _int_or_none(usage.get("completion_tokens") or usage.get("output")),
+        "total_tokens": _int_or_none(usage.get("total_tokens")),
+        "cached_tokens": _int_or_none(usage.get("cache_read_tokens") or usage.get("cached_tokens")),
+    }
+
+
 @runtime_checkable
 class MessageSink(Protocol):
     """Persistence callbacks invoked by :class:`AgentPipeline`.
@@ -108,6 +117,7 @@ class SQLiteSink:
         # where pipeline.send_index is stamped, so per-round usage rows carry the real send
         # (usage_rounds' key is (session_id, send_index, round_index) since store schema v6).
         self.send_index: int | None = None
+        self._usage_written: set[int] = set()
         # Count of compactions persisted during this sink's lifetime (one sink per send).
         # StatefulAgentLoop reads it after a run to decide whether its per-session row cache
         # can be extended with a cheap delta read (no fold this run) or must be invalidated
@@ -167,6 +177,8 @@ class SQLiteSink:
         self, message: LoopMessage, *, round_index: int | None
     ) -> None:
         role = message.get("role")
+        usage = message.get("_round_usage")
+        usage_options = {"round_usage": _usage_columns(usage)} if usage else {}
         if role == "tool":
             tool_call_id = str(message.get("tool_call_id") or "")
             text, structured = _encode_content(message.get("content"))
@@ -178,7 +190,7 @@ class SQLiteSink:
             resolves = bool(tool_call_id) and tool_call_id in self._unresolved
             needs_receipt = resolves and tool_receipt_required(
                 self.store, self.session_id, self._assistant_seq, tool_call_id)
-            options = {}
+            options = dict(usage_options)
             remaining_pending = None
             if resolves:
                 remaining = self._unresolved - {tool_call_id}
@@ -198,6 +210,8 @@ class SQLiteSink:
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)
+            if usage:
+                self._usage_written.add(round_index)
             assistant_seq = self._assistant_seq
             await bind_tool_receipt(self.store, self.session_id, assistant_seq, tool_call_id, seq)
             if resolves:
@@ -214,6 +228,7 @@ class SQLiteSink:
             from power_loop.runtime.task_runtime import atomic_pending_required
             options = ({"pending_tool_calls": True}
                        if tool_calls and atomic_pending_required(self.store, self.session_id) else {})
+            options.update(usage_options)
             seq = await self.store.append_message(
                 self.session_id,
                 role="assistant",
@@ -227,6 +242,8 @@ class SQLiteSink:
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)
+            if usage:
+                self._usage_written.add(round_index)
             if tool_calls:
                 self._assistant_seq = seq
             return
@@ -248,6 +265,7 @@ class SQLiteSink:
                 meta=meta,
                 send_index=message.get("send_index"),
                 inbox=inbox,
+                **usage_options,
             )
         except InboxClaimChanged:
             # The batch was rolled back. Release only its surviving claim rows;
@@ -260,6 +278,8 @@ class SQLiteSink:
             raise
         self._history_seqs.append(seq)
         self._history_ord.append(seq)
+        if usage:
+            self._usage_written.add(round_index)
 
     # ── pending state machine ──────────────────────────────────
 
@@ -419,20 +439,14 @@ class SQLiteSink:
     async def on_round_ended(
         self, round_index: int, *, usage: dict[str, Any] | None = None
     ) -> None:
-        if usage:
+        if usage and round_index not in self._usage_written:
             await self.store.record_usage(
                 self.session_id,
                 round_index=round_index,
                 send_index=self.send_index,
-                prompt_tokens=_int_or_none(usage.get("prompt_tokens") or usage.get("input")),
-                completion_tokens=_int_or_none(
-                    usage.get("completion_tokens") or usage.get("output")
-                ),
-                total_tokens=_int_or_none(usage.get("total_tokens")),
-                cached_tokens=_int_or_none(
-                    usage.get("cache_read_tokens") or usage.get("cached_tokens")
-                ),
+                **_usage_columns(usage),
             )
+            self._usage_written.add(round_index)
 
 
 # Meta marker recording that a row's text column holds JSON-encoded *structured* content
