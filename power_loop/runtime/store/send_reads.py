@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 
+from power_loop.contracts.errors import SessionLeaseLost
+
 ACTIVE = ContextVar("power_loop_send_reads", default=None)
 
 
@@ -24,6 +26,16 @@ def current(store, sid):
 def trusted(store, sid):
     from ..jobs import TRUST_OWN_WRITES
     return current(store, sid) if TRUST_OWN_WRITES.get() else None
+
+
+def lease_writer(store, sid):
+    """An inherited old turn never borrows a new period with the same owner ID."""
+    value = ACTIVE.get()
+    if value is None or value.store is not store or value.sid != sid or value.lease_owner_id is None:
+        return None
+    if not value.active:
+        raise SessionLeaseLost(sid)
+    return value
 
 
 def forget(store, sid, *keys):

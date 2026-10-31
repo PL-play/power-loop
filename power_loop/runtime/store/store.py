@@ -232,6 +232,7 @@ class SessionStore:
 
     def defer_round_index(self, session_id: str, round_index: int) -> None:
         """Written with the round's first append instead of its own transaction."""
+        send_reads.lease_writer(self, session_id)
         self._deferred_round[session_id] = int(round_index)
 
     def forget_turn_hints(self, session_id: str) -> None:
@@ -489,6 +490,7 @@ class SessionStore:
         await change_signals.bump(self, tx, session_id, kind)
 
     async def set_round_index(self, session_id: str, round_index: int) -> None:
+        send_reads.lease_writer(self, session_id)
         prior = send_reads.take_state(self, session_id)
         self._deferred_round.pop(session_id, None)
         async with self._db.transaction() as tx:
@@ -503,6 +505,7 @@ class SessionStore:
             send_reads.remember_state(self, session_id, replace(prior, round_index=round_index))
 
     async def set_pending(self, session_id: str, pending: dict[str, Any] | None) -> None:
+        lease_scope = send_reads.lease_writer(self, session_id)
         prior = send_reads.take_state(self, session_id)
         async with self._db.transaction() as tx:
             guard, arguments = self._lease_write_guard(session_id)
@@ -514,15 +517,17 @@ class SessionStore:
             )
             if guard and changed != 1:
                 raise SessionLeaseLost(session_id)
+        if lease_scope is not None and not lease_scope.active:
+            return
         self._remember_pending(session_id, _dumps(pending) if pending else None)
         if prior is not None:
             send_reads.remember_state(self, session_id, replace(prior, pending=_loads(_dumps(pending)) if pending else None))
 
     # ── messages ──────────────────────────────────────────────────────────────
     def _lease_write_guard(self, session_id):
-        # Keep the fence even in a child context inherited from a finished send.
-        reads = send_reads.ACTIVE.get()
-        if reads is None or reads.store is not self or reads.sid != session_id or reads.lease_owner_id is None:
+        # Recheck after awaiting transaction entry: its turn may have ended.
+        reads = send_reads.lease_writer(self, session_id)
+        if reads is None:
             return "", ()
         lock = "" if self._db.dialect.name == "sqlite" else " FOR UPDATE"
         return (f" AND EXISTS (SELECT 1 FROM {self.t.session_leases} WHERE session_id=? "
@@ -605,6 +610,7 @@ class SessionStore:
 
         ``pending`` (a dict or ``None``) replaces the pending state in the same statement
         that allocates ``seq``; it cannot depend on that seq."""
+        lease_scope = send_reads.lease_writer(self, session_id)
         if type(pending_tool_calls) is not bool or pending_tool_calls and (role != "assistant" or not tool_calls):
             raise ValueError("invalid_pending_tool_message")
         if pending is not _KEEP and pending_tool_calls:
@@ -633,7 +639,7 @@ class SessionStore:
                            "tool_call_ids": [str(call.get("id") or "") for call in tool_calls
                                              if isinstance(call, Mapping) and call.get("id")],
                            "tool_calls": tool_calls})
-        committed = False
+        committed, lease_lost = False, False
         prior = send_reads.take_state(self, session_id)
         signal_columns = ','.join(change_signals.COLUMNS)
         signal_values = None
@@ -778,12 +784,19 @@ class SessionStore:
                         ),
                     )
             committed = True
+        except SessionLeaseLost:
+            lease_lost = True
+            raise
         finally:
-            if not committed:
+            if not committed and not lease_lost and (lease_scope is None or lease_scope.active):
                 self._next_seq.pop(session_id, None)
                 self._change_snapshots.pop(session_id, None)
                 if deferred_round is not None:
                     self._deferred_round.setdefault(session_id, deferred_round)
+        if lease_scope is not None and not lease_scope.active:
+            # The SQL committed before release, but its ACK arrived in a later
+            # period. Keep that period's mutable hints and pending marker.
+            return seq
         self._next_seq[session_id] = seq + 1
         if prior is not None:
             send_reads.remember_state(self, session_id, replace(prior, next_seq=seq + 1,

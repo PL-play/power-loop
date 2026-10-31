@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -141,6 +142,142 @@ async def test_detached_child_cannot_append_after_its_lease_scope_finishes(regis
         assert not await store.load_all_messages(sid)
     finally:
         release.set()
+        await loop.aclose(drain_timeout_s=.1)
+
+
+async def test_old_child_cannot_reuse_the_same_loops_next_lease_or_consume_its_round(registry_store):
+    store, _ = registry_store
+    sid = await store.create_session()
+    loop = StatefulAgentLoop(llm=Model(), store=store,
+        config=AgentLoopConfig(distributed_sessions=True, compactor=None))
+    release = asyncio.Event()
+
+    async def late():
+        await release.wait()
+        await store.append_message(sid, role="assistant", content="stale")
+
+    try:
+        async with loop._session_lease(sid):
+            child = asyncio.create_task(late())
+        async with loop._session_lease(sid):
+            store.defer_round_index(sid, 7)
+            release.set()
+            with pytest.raises(SessionLeaseLost):
+                await child
+            await store.append_message(sid, role="assistant", content="current")
+            assert (await store.get_state(sid)).round_index == 7
+            assert [row.content for row in await store.load_all_messages(sid)] == ["current"]
+    finally:
+        release.set()
+        await loop.aclose(drain_timeout_s=.1)
+
+
+async def test_writer_waiting_for_a_transaction_cannot_restore_an_expired_turns_round(registry_store, monkeypatch):
+    store, _ = registry_store
+    sid = await store.create_session()
+    loop = StatefulAgentLoop(llm=Model(), store=store,
+        config=AgentLoopConfig(distributed_sessions=True, compactor=None))
+    entered, release = asyncio.Event(), asyncio.Event()
+    transaction = store._db.transaction
+    child = None
+    delayed = False
+
+    @asynccontextmanager
+    async def blocked():
+        nonlocal delayed
+        if asyncio.current_task() is child and not delayed:
+            delayed = True
+            entered.set()
+            await release.wait()
+        async with transaction() as tx:
+            yield tx
+
+    async def late():
+        await store.append_message(sid, role="assistant", content="stale")
+
+    monkeypatch.setattr(store._db, "transaction", blocked)
+    try:
+        async with loop._session_lease(sid):
+            store.defer_round_index(sid, 5)
+            child = asyncio.create_task(late())
+            await asyncio.wait_for(entered.wait(), 5)
+        async with loop._session_lease(sid):
+            store.defer_round_index(sid, 7)
+            await store.append_message(sid, role="assistant", content="current")
+            release.set()
+            with pytest.raises(SessionLeaseLost):
+                await child
+            assert (await store.get_state(sid)).round_index == 7
+            assert [row.content for row in await store.load_all_messages(sid)] == ["current"]
+    finally:
+        release.set()
+        if child is not None:
+            await asyncio.gather(child, return_exceptions=True)
+        await loop.aclose(drain_timeout_s=.1)
+
+
+@pytest.mark.parametrize("lost_ack", [False, True])
+@pytest.mark.parametrize("operation", ["append", "pending_clear"])
+async def test_late_commit_ack_never_overwrites_the_next_turns_pending_or_round(registry_store, monkeypatch, lost_ack, operation):
+    store, _ = registry_store
+    sid = await store.create_session()
+    loop = StatefulAgentLoop(llm=Model(), store=store,
+        config=AgentLoopConfig(distributed_sessions=True, compactor=None))
+    committed, release = asyncio.Event(), asyncio.Event()
+    transaction = store._db.transaction
+    child = None
+    delayed = False
+
+    @asynccontextmanager
+    async def delayed_ack():
+        nonlocal delayed
+        async with transaction() as tx:
+            yield tx
+        if asyncio.current_task() is child and not delayed:
+            delayed = True
+            committed.set()
+            await release.wait()
+            if lost_ack:
+                raise OSError("old_turn_committed_ack_lost")
+
+    def calls(key):
+        return [{"id": key, "type": "function", "function": {"name": "work", "arguments": "{}"}}]
+
+    async def original():
+        if operation == "pending_clear":
+            return await store.set_pending(sid, None)
+        return await store.append_message(sid, role="assistant", tool_calls=calls("old"), pending_tool_calls=True)
+
+    monkeypatch.setattr(store._db, "transaction", delayed_ack)
+    try:
+        async with loop._session_lease(sid):
+            if operation == "pending_clear":
+                await store.append_message(sid, role="assistant", tool_calls=calls("old"), pending_tool_calls=True)
+                await store.append_message(sid, role="tool", tool_call_id="old", content="aborted", pending=None)
+            store.defer_round_index(sid, 5)
+            child = asyncio.create_task(original())
+            await asyncio.wait_for(committed.wait(), 5)
+        async with loop._session_lease(sid):
+            # The new owner explicitly aborts the untouched original call.
+            if operation == "append":
+                await store.append_message(sid, role="tool", tool_call_id="old", content="aborted", pending=None)
+            store.defer_round_index(sid, 7)
+            await store.append_message(sid, role="assistant", tool_calls=calls("new"), pending_tool_calls=True)
+            release.set()
+            if lost_ack:
+                with pytest.raises(OSError, match="old_turn_committed_ack_lost"):
+                    await child
+            else:
+                assert await child == (1 if operation == "append" else None)
+            known, pending = store.known_pending(sid)
+            assert known and pending["tool_call_ids"] == ["new"]
+            state = await store.get_state(sid)
+            assert state.next_seq == 4 and state.round_index == 7
+            assert state.pending["tool_call_ids"] == ["new"]
+    finally:
+        release.set()
+        if child is not None:
+            await asyncio.gather(child, return_exceptions=True)
         await loop.aclose(drain_timeout_s=.1)
 
 
