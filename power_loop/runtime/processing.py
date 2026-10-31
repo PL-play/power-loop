@@ -42,7 +42,8 @@ async def recall(manager, actor, caller, *, snapshot_id, response_ref, decision=
     return ids
 
 
-async def prepare(manager, actor, caller, *, round_index, send_index, messages):
+async def prepare(manager, actor, caller, *, round_index, send_index, messages, report=None):
+    """``report["quiet"]`` is set when no prior-send obligation was discovered."""
     from .jobs import JobError, _hash, _json
 
     if isinstance(round_index, bool) or not isinstance(round_index, int) or round_index < 0:
@@ -60,8 +61,8 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
                 json.loads(create["payload_json"]).get("request", {}).get("send_index") != send_index):
             raise JobError("processing_send_mismatch")
         from .wait_notifications import observe_request
-        await observe_request(manager, tx, actor, caller, source=send, round_index=round_index,
-                              send_index=send_index, messages=request_rows)
+        notices = await observe_request(manager, tx, actor, caller, source=send, round_index=round_index,
+                                        send_index=send_index, messages=request_rows)
         results = await tx.fetchall(f"SELECT e.* FROM {manager.events} e JOIN {manager.jobs} j ON j.job_id=e.job_id "
             "WHERE e.event_type='result' AND j.created_by_session_id=? AND j.tenant_id=? AND j.principal_id=? "
             "AND j.kind IN ('subagent','workflow') AND j.result_status<>'handled' AND e.delivery_status<>'handled' ORDER BY e.event_id",
@@ -77,6 +78,8 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages):
         if send['control_owner_job_id'] is not None:
             inputs = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' "
                 "AND action='nudge' AND delivery_status<>'handled' ORDER BY event_id", (send["control_owner_job_id"],))
+        if report is not None:
+            report["quiet"] = not results and not inputs and not notices
         observed = []
         for event in [*results, *inputs]:
             if event["event_type"] == "operation":

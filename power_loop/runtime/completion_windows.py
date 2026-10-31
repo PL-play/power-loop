@@ -12,7 +12,8 @@ DEFAULT_TIMEOUT_MS = 1800000
 
 
 def event_id(manager, job_id):
-    return "completion_window_" + _hash([manager.store.store_id, job_id])[:48]
+    # The same key is stored on all engines; task event IDs are VARCHAR(64).
+    return "cwin_" + _hash([manager.store.store_id, job_id])[:48]
 
 
 async def _creation(manager, tx, row):

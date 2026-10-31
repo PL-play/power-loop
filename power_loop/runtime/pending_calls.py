@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 
 from .jobs import JobActor, JobError, _hash, _json
+from .jobs import verify_stored as _verify_stored
 
 SNAPSHOT = 'pending_call_snapshot'
 ERROR = 'pending_call_snapshot_error'
@@ -224,6 +225,9 @@ async def _expected(manager, tx, source, closed):
 async def require_disposition(manager, tx, source, closed=None):
     if closed is None:
         closed = await _closed(manager, tx, source)
+    elif (set(closed) != {'generation', 'resource_state', 'evidence'}
+          or type(closed['generation']) is not int or type(closed['evidence']) is not dict):
+        raise JobError('pending_call_model_exit_required')
     if ERROR in closed.get('evidence', {}):
         raise JobError('pending_call_model_exit_required')
     if SNAPSHOT not in closed.get('evidence', {}):
@@ -289,6 +293,7 @@ async def retire_pending_runtime(runtime, actor, source_job_id):
             await tx.execute(f'INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)',
                 (key, source['job_id'], 'pending_call_disposition', source['version'], _hash(expected), encoded, 'not_applicable', manager.now()))
             await tx.execute(f'UPDATE {manager.store.t.session_state} SET pending_json=NULL WHERE session_id=?', (source['session_id'],))
+            manager.store.forget_pending(source['session_id'])
         reference = await require_disposition(manager, tx, source, closed)
         return {'source_job_id': source_job_id, 'disposition': reference, 'execution_authority': False,
             'acknowledgement_created': False, 'billing_settled': False}
@@ -320,6 +325,7 @@ async def negative_review_references(manager, tx, source):
     return refs
 
 
+@_verify_stored
 async def recover_runtime(runtime, actor, source_job_id):
     """Recover original v2 managed results only; never invoke their adapters."""
     from .managed_completion import _host_only, _record_tx
@@ -391,6 +397,7 @@ async def recover_runtime(runtime, actor, source_job_id):
     return {'job_id': source_job_id, 'state': 'queued_for_review', 'notices': notices, **disposed}
 
 
+@_verify_stored
 async def recover_tree(runtime, actor, root_job_id, *, after_job_id='', limit=32, timeout_s=3):
     """Bounded original-main host inspection of retained pending obligations."""
     import asyncio

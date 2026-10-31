@@ -532,6 +532,11 @@ class AgentPipeline:
         # delivered in the same transaction as this transcript row.
         message = dict(msg)
         inbox = message.pop("_inbox", None)
+        if inbox is not None:
+            from power_loop.runtime.task_runtime import _SEND
+            execution = _SEND.get()
+            if execution is not None and execution.actor.session_id == self.session_id:
+                execution.resource_evidence["_processing_dirty"] = True
         ctx = MessageAppendCtx(
             round_index=round_index or 0,
             message=message,

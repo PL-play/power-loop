@@ -21,6 +21,7 @@ import json
 import secrets
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -86,6 +87,10 @@ def _coerce_max_spawn_depth(value: int) -> int:
     if depth < 1:
         raise ValueError(f"max_spawn_depth must be ≥ 1, got {depth}")
     return depth
+
+
+_KEEP = object()
+_TOUCH_INTERVAL_MS = 1000
 
 
 def _now_ms() -> int:
@@ -194,6 +199,56 @@ class SessionStore:
         self.t = _Tables(self.table_prefix)
         self._schema_version = CURRENT_SCHEMA_VERSION
         self.store_id: str | None = None
+        # Identity of rows this process appended. A message's id/role/indices never
+        # change after insert and seqs are never reused, so a ref can be served
+        # without rereading the row; deletes in this process drop the session.
+        self._appended_refs: OrderedDict[tuple[str, int], tuple] = OrderedDict()
+        self._appended_calls: dict[str, tuple[int, str]] = {}
+        # Pending state this process last committed (the session lease makes it the only
+        # writer while sending), a round index not yet written, and the last activity touch.
+        self._pending_written: OrderedDict[str, str | None] = OrderedDict()
+        self._deferred_round: dict[str, int] = {}
+        self._next_seq: dict[str, int] = {}
+        self._touched: dict[str, int] = {}
+
+    def _remember_pending(self, session_id, pending_json):
+        self._pending_written[session_id] = pending_json
+        self._pending_written.move_to_end(session_id)
+        while len(self._pending_written) > 4096:
+            self._pending_written.popitem(last=False)
+
+    def known_pending(self, session_id):
+        """``(True, pending)`` when this process committed the current pending state."""
+        if session_id not in self._pending_written:
+            return False, None
+        return True, _loads(self._pending_written[session_id])
+
+    def forget_pending(self, session_id):
+        self._pending_written.pop(session_id, None)
+
+    def defer_round_index(self, session_id: str, round_index: int) -> None:
+        """Written with the round's first append instead of its own transaction."""
+        self._deferred_round[session_id] = int(round_index)
+
+    def _remember_appended(self, session_id, seq, row_id, role, tool_call_id, send_index,
+                           round_index, tool_calls_json):
+        key = (session_id, seq)
+        self._appended_refs[key] = (row_id, role, tool_call_id, send_index, round_index)
+        self._appended_refs.move_to_end(key)
+        while len(self._appended_refs) > 4096:
+            self._appended_refs.popitem(last=False)
+        if tool_calls_json is not None:
+            self._appended_calls[session_id] = (seq, tool_calls_json)
+
+    def _forget_appended(self, session_id):
+        self._appended_calls.pop(session_id, None)
+        for key in [k for k in self._appended_refs if k[0] == session_id]:
+            del self._appended_refs[key]
+
+    def appended_tool_calls(self, session_id: str, seq: int) -> str | None:
+        """Stored tool_calls JSON of the latest assistant row this process appended."""
+        found = self._appended_calls.get(session_id)
+        return found[1] if found is not None and found[0] == seq else None
 
     @property
     def max_spawn_depth(self) -> int:
@@ -330,15 +385,18 @@ class SessionStore:
         )
         if row is None:
             return None
+        self._remember_pending(session_id, row["pending_json"])
+        self._next_seq[session_id] = int(row["next_seq"])
         return SessionStateRow(
             session_id=row["session_id"],
             next_seq=row["next_seq"],
-            round_index=row["round_index"],
+            round_index=self._deferred_round.get(session_id, row["round_index"]),
             last_compact_seq=row["last_compact_seq"],
             pending=_loads(row["pending_json"]),
         )
 
     async def set_round_index(self, session_id: str, round_index: int) -> None:
+        self._deferred_round.pop(session_id, None)
         async with self._db.transaction() as tx:
             await tx.execute(
                 f"UPDATE {self.t.session_state} SET round_index=? WHERE session_id=?",
@@ -353,11 +411,15 @@ class SessionStore:
                 # legacy oracle so get_state(...).pending round-trips to None, not {}.
                 (_dumps(pending) if pending else None, session_id),
             )
+        self._remember_pending(session_id, _dumps(pending) if pending else None)
 
     # ── messages ──────────────────────────────────────────────────────────────
     async def message_ref(self, session_id: str, seq: int | str):
         from power_loop.runtime.message_ref import MessageRef, integer_id
 
+        known = self._appended_refs.get((session_id, integer_id(seq, "seq")))
+        if known is not None:
+            return MessageRef(self.store_id, session_id, known[0], integer_id(seq, "seq"), *known[1:])
         row = await self._db.fetchone(f"SELECT * FROM {self.t.messages} WHERE session_id=? AND seq=?",
                                      (session_id, integer_id(seq, "seq")))
         if row is None:
@@ -391,6 +453,7 @@ class SessionStore:
         hook_injected: dict[str, Any] | None = None,
         inbox: Mapping[str, Any] | None = None,
         pending_tool_calls: bool = False,
+        pending: Any = _KEEP,
     ) -> int:
         """Append one message and return its allocated per-session ``seq`` (allocated +
         inserted atomically in one transaction). ``send_index`` is the authoritative per-session
@@ -409,83 +472,165 @@ class SessionStore:
         ``pending_tool_calls=True`` atomically records this assistant row and its
         unresolved calls. It refuses to overwrite existing pending state. Native
         sinks use it so a crash before later pipeline callbacks cannot lose the
-        original intention. The default preserves ordinary raw-append behavior."""
+        original intention. The default preserves ordinary raw-append behavior.
+
+        ``pending`` (a dict or ``None``) replaces the pending state in the same statement
+        that allocates ``seq``; it cannot depend on that seq."""
         if type(pending_tool_calls) is not bool or pending_tool_calls and (role != "assistant" or not tool_calls):
             raise ValueError("invalid_pending_tool_message")
+        if pending is not _KEEP and pending_tool_calls:
+            raise ValueError("invalid_pending_tool_message")
         now = _now_ms()
-        async with self._db.transaction() as tx:
-            st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
-            seq = int(st["next_seq"])
-            if pending_tool_calls and st["pending_json"] is not None:
-                raise ValueError("pending_tool_calls_exist")
-            if inbox is not None:
-                token, raw_ids = inbox.get("claim_token"), inbox.get("ids")
-                if not isinstance(token, str) or not token or not isinstance(raw_ids, (list, tuple)) or not raw_ids:
-                    raise InboxClaimChanged(session_id)
-                try:
-                    ids = [integer_id(i, "inbox_id") for i in raw_ids]
-                except ValueError as exc:
-                    raise InboxClaimChanged(session_id) from exc
-                if len(set(ids)) != len(ids):
-                    raise InboxClaimChanged(session_id)
-                # Conditional UPDATE serializes against void/release/reclaim on the actual
-                # queue rows. A partial match rolls back this whole transaction, including
-                # delivery markers; no stale batch may acquire a transcript row.
-                changed = await tx.execute(
-                    f"UPDATE {self.t.follow_up_queue} SET status='delivered', delivered_at=?, "
-                    "delivered_seq=?, delivered_send_index=?, claim_token=NULL "
-                    f"WHERE session_id=? AND claim_token=? AND status='claimed' "
-                    f"AND id IN ({','.join('?' for _ in ids)})",
-                    (now, seq, (int(send_index) if send_index is not None else None),
-                     session_id, token, *ids),
-                )
-                if changed != len(ids):
-                    raise InboxClaimChanged(session_id)
-            await tx.execute(
-                f"INSERT INTO {self.t.messages} ("
-                "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
-                "round_index, state, meta_json, send_index, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    session_id, seq, role, _nul_safe(name), _nul_safe(content),
-                    _dumps(tool_calls) if tool_calls else None, _nul_safe(tool_call_id), round_index,
-                    MessageState.ACTIVE.value, _dumps(meta or {}),
-                    (int(send_index) if send_index is not None else None), now,
-                ),
-            )
-            await tx.execute(
-                f"UPDATE {self.t.session_state} SET next_seq=? WHERE session_id=?",
-                (seq + 1, session_id),
-            )
-            await tx.execute(
-                f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
-            )
-            if pending_tool_calls:
-                pending = {"assistant_seq": seq, "round_index": round_index,
+        pending_json = _KEEP if pending is _KEEP else (_dumps(pending) if pending else None)
+        deferred_round = self._deferred_round.pop(session_id, None)
+        sets, params = [], []
+        if pending_json is not _KEEP:
+            sets.append("pending_json=?")
+            params.append(pending_json)
+        if deferred_round is not None:
+            sets.append("round_index=?")
+            params.append(deferred_round)
+        mysql = self._db.dialect.name == "mysql"
+        expected = self._next_seq.get(session_id)
+
+        def atomic_pending(seq):
+            return _dumps({"assistant_seq": seq, "round_index": round_index,
                            "tool_call_ids": [str(call.get("id") or "") for call in tool_calls
                                              if isinstance(call, Mapping) and call.get("id")],
-                           "tool_calls": tool_calls}
-                await tx.execute(f"UPDATE {self.t.session_state} SET pending_json=? WHERE session_id=?",
-                                 (_dumps(pending), session_id))
-            if hook_injected:
-                # Per-session monotonic event_id; MAX+1 is race-free here because we hold the
-                # session_state lock for the whole append (serializes same-session writers).
-                ev = await tx.fetchone(
-                    f"SELECT COALESCE(MAX(event_id), 0) + 1 AS nid FROM {self.t.hook_events} "
-                    "WHERE session_id=?",
-                    (session_id,),
+                           "tool_calls": tool_calls})
+        committed = False
+        try:
+            async with self._db.transaction() as tx:
+                seq, state_written = None, False
+                if expected is not None:
+                    # The lease holder knows its next seq: one conditional UPDATE allocates it and
+                    # applies every state change; a miss (another writer) takes the locking path.
+                    fast_sets, fast_params = list(sets), list(params)
+                    if pending_tool_calls:
+                        fast_sets.append("pending_json=?")
+                        fast_params.append(atomic_pending(expected))
+                    guard = " AND pending_json IS NULL" if pending_tool_calls else ""
+                    if await tx.execute(
+                            f"UPDATE {self.t.session_state} SET {', '.join(['next_seq=?', *fast_sets])} "
+                            f"WHERE session_id=? AND next_seq=?{guard}",
+                            (expected + 1, *fast_params, session_id, expected)) == 1:
+                        seq, state_written = expected, True
+                if seq is not None:
+                    pass
+                elif mysql:
+                    st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+                    seq = int(st["next_seq"])
+                    if pending_tool_calls and st["pending_json"] is not None:
+                        raise ValueError("pending_tool_calls_exist")
+                else:
+                    # One statement locks the state row, allocates the seq and applies state changes.
+                    guard = " AND pending_json IS NULL" if pending_tool_calls else ""
+                    st = await tx.fetchone(
+                        f"UPDATE {self.t.session_state} SET {', '.join(['next_seq=next_seq+1', *sets])} "
+                        f"WHERE session_id=?{guard} RETURNING next_seq", (*params, session_id))
+                    if st is None:
+                        if pending_tool_calls and await tx.fetchone(
+                                f"SELECT 1 AS present FROM {self.t.session_state} WHERE session_id=?", (session_id,)):
+                            raise ValueError("pending_tool_calls_exist")
+                        raise ValueError(f"unknown session: {session_id}")
+                    seq = int(st["next_seq"]) - 1
+                    state_written = None  # Allocation and plain state changes only.
+                if inbox is not None:
+                    token, raw_ids = inbox.get("claim_token"), inbox.get("ids")
+                    if not isinstance(token, str) or not token or not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+                        raise InboxClaimChanged(session_id)
+                    try:
+                        ids = [integer_id(i, "inbox_id") for i in raw_ids]
+                    except ValueError as exc:
+                        raise InboxClaimChanged(session_id) from exc
+                    if len(set(ids)) != len(ids):
+                        raise InboxClaimChanged(session_id)
+                    # Conditional UPDATE serializes against void/release/reclaim on the actual
+                    # queue rows. A partial match rolls back this whole transaction, including
+                    # delivery markers; no stale batch may acquire a transcript row.
+                    changed = await tx.execute(
+                        f"UPDATE {self.t.follow_up_queue} SET status='delivered', delivered_at=?, "
+                        "delivered_seq=?, delivered_send_index=?, claim_token=NULL "
+                        f"WHERE session_id=? AND claim_token=? AND status='claimed' "
+                        f"AND id IN ({','.join('?' for _ in ids)})",
+                        (now, seq, (int(send_index) if send_index is not None else None),
+                         session_id, token, *ids),
+                    )
+                    if changed != len(ids):
+                        raise InboxClaimChanged(session_id)
+                calls_json = _dumps(tool_calls) if tool_calls else None
+                stored_call_id = _nul_safe(tool_call_id)
+                stored_send = int(send_index) if send_index is not None else None
+                insert = (
+                    f"INSERT INTO {self.t.messages} ("
+                    "session_id, seq, role, name, content, tool_calls_json, tool_call_id, "
+                    "round_index, state, meta_json, send_index, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
                 )
-                await tx.execute(
-                    f"INSERT INTO {self.t.hook_events} ("
-                    "session_id, event_id, message_seq, round_index, send_index, hook_point, hook, "
-                    "position, kind, payload_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        session_id, int(ev["nid"]), seq, round_index,
-                        (int(send_index) if send_index is not None else None),
-                        str(hook_injected.get("hook_point") or ""), hook_injected.get("hook"),
-                        hook_injected.get("position"), str(hook_injected.get("kind") or ""),
-                        _dumps(hook_injected.get("payload") or {}), now,
-                    ),
+                values = (
+                    session_id, seq, role, _nul_safe(name), _nul_safe(content),
+                    calls_json, stored_call_id, round_index,
+                    MessageState.ACTIVE.value, _dumps(meta or {}), stored_send, now,
                 )
+                if not self.has_message_ids:
+                    await tx.execute(insert, values)
+                    row_id = None
+                elif self._db.dialect.name == "mysql":
+                    await tx.execute(insert, values)
+                    row_id = (await tx.fetchone("SELECT LAST_INSERT_ID() AS id"))["id"]
+                else:
+                    row_id = (await tx.fetchone(insert + " RETURNING id", values))["id"]
+                if state_written is False:
+                    await tx.execute(
+                        f"UPDATE {self.t.session_state} SET {', '.join(['next_seq=?', *sets])} WHERE session_id=?",
+                        (seq + 1, *params, session_id),
+                    )
+                if now - self._touched.get(session_id, 0) >= _TOUCH_INTERVAL_MS:
+                    # Activity time, not ordering: at most one write per session per interval.
+                    await tx.execute(
+                        f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
+                    )
+                    touched = now
+                else:
+                    touched = None
+                if pending_tool_calls:
+                    pending_json = atomic_pending(seq)
+                    if state_written is not True:
+                        await tx.execute(f"UPDATE {self.t.session_state} SET pending_json=? WHERE session_id=?",
+                                         (pending_json, session_id))
+                if hook_injected:
+                    # Per-session monotonic event_id; MAX+1 is race-free here because we hold the
+                    # session_state lock for the whole append (serializes same-session writers).
+                    ev = await tx.fetchone(
+                        f"SELECT COALESCE(MAX(event_id), 0) + 1 AS nid FROM {self.t.hook_events} "
+                        "WHERE session_id=?",
+                        (session_id,),
+                    )
+                    await tx.execute(
+                        f"INSERT INTO {self.t.hook_events} ("
+                        "session_id, event_id, message_seq, round_index, send_index, hook_point, hook, "
+                        "position, kind, payload_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            session_id, int(ev["nid"]), seq, round_index,
+                            (int(send_index) if send_index is not None else None),
+                            str(hook_injected.get("hook_point") or ""), hook_injected.get("hook"),
+                            hook_injected.get("position"), str(hook_injected.get("kind") or ""),
+                            _dumps(hook_injected.get("payload") or {}), now,
+                        ),
+                    )
+            committed = True
+        finally:
+            if not committed:
+                self._next_seq.pop(session_id, None)
+                if deferred_round is not None:
+                    self._deferred_round.setdefault(session_id, deferred_round)
+        self._next_seq[session_id] = seq + 1
+        if touched is not None:
+            self._touched[session_id] = touched
+        if pending_json is not _KEEP:
+            self._remember_pending(session_id, pending_json)
+        if row_id is not None:
+            self._remember_appended(session_id, seq, int(row_id), role, stored_call_id, stored_send,
+                                    round_index, calls_json)
         return seq
 
     async def list_hook_events(
@@ -650,6 +795,7 @@ class SessionStore:
         one transaction. ``fold_seqs`` marks the EXACT set (never a BETWEEN range, which
         could invert under a non-monotonic identity map); ``order_key`` is the note's
         logical position (``meta['ord']``). Returns ``(compact_seq, note_seq)``."""
+        self._next_seq.pop(session_id, None)
         now = _now_ms()
         async with self._db.transaction() as tx:
             st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
@@ -798,7 +944,15 @@ class SessionStore:
         """Insert (or replace, by ``(session_id, send_index, kind)``) one projection row.
         Idempotent so a resume/re-finalize of the same send is a no-op-equivalent rewrite;
         ``created_at`` is preserved across re-finalize (insert-only)."""
+        self._next_seq.pop(session_id, None)
         async with self._db.transaction() as tx:
+            # Standalone CRUD participates in the same revision fence. Low-level
+            # callers may store unattached projections, so this row can be absent.
+            suffix = "" if self._db.dialect.name == "sqlite" else " FOR UPDATE"
+            await tx.fetchone(f"SELECT next_seq FROM {self.t.session_state} WHERE session_id=?" + suffix,
+                              (session_id,))
+            from .projection_fold import invalidate
+            await invalidate(self, tx, session_id)
             await self._upsert_project_message_tx(
                 tx, session_id, send_index=send_index, kind=kind, content=content,
                 rendered_text=rendered_text, source_seq_lo=source_seq_lo,
@@ -865,31 +1019,43 @@ class SessionStore:
         source_seq_lo: int | None,
         source_seq_hi: int | None,
         projector_version: int,
+        load_snapshot: bool = True,
     ) -> tuple[ProjectMessageRow | None, list[ProjectMessageRow]]:
-        """Persist a finished send's projection ``rows`` under a SHORT session-locked transaction
-        (no I/O beyond the writes) and return a CONSISTENT snapshot for the caller to decide + run a
-        fold OUTSIDE the lock: ``(latest prior compact, the live user/project rows after its
-        cursor)``. Keeping the (possibly multi-second / hung) LLM-or-agentic fold OUT of the
-        transaction is essential — holding the session row lock / a pooled DB connection / SQLite's
-        single connection across a provider call would stall the whole store. The fold is committed
-        separately via :meth:`commit_projection_fold` under optimistic concurrency.
+        """Atomically persist one send; the optional fenced snapshot is read OUTSIDE locks.
 
-        Guarantee: all of a send's projection rows (user + project) commit together, so a crash can't
-        leave the next-send reader a half-projected send. ``rows`` is ``(kind, content, rendered_text)``.
+        Repairs use ``load_snapshot=False`` because they do not run a fold. Normal
+        finalization uses :meth:`prepare_send_projection_fold` to maintain incremental
+        statistics before deciding whether historical projection bodies are needed.
         """
-        now = _now_ms()
-        async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
-            for kind, content, rendered_text in rows:
-                await self._upsert_project_message_tx(
-                    tx, session_id, send_index=send_index, kind=kind, content=content,
-                    rendered_text=rendered_text, source_seq_lo=source_seq_lo,
-                    source_seq_hi=source_seq_hi, projector_version=projector_version, now=now,
-                )
-            prior = await self._query_latest_project_compact(tx.fetchone, session_id)
-            cutoff = prior.compact_to_send if prior is not None else None
-            snapshot = await self._query_project_messages(tx.fetchall, session_id, cutoff)
-        return prior, snapshot
+        from .projection_fold import persist, read_snapshot
+
+        await persist(self, session_id, send_index=send_index, rows=rows, source_seq_lo=source_seq_lo,
+                      source_seq_hi=source_seq_hi, projector_version=projector_version)
+        if not load_snapshot:
+            return None, []
+        for _ in range(3):
+            snapshot = await read_snapshot(self, session_id)
+            if snapshot is not None:
+                return snapshot.prior, snapshot.rows
+        raise RuntimeError("projection changed while reading fold snapshot")
+
+    async def prepare_send_projection_fold(
+        self, session_id: str, *, send_index: int, rows: list[tuple[str, Any, str | None]],
+        source_seq_lo: int | None, source_seq_hi: int | None, projector_version: int,
+        projector: Any, keep_last_sends: int, threshold: int,
+    ):
+        """Persist projections and statistics; return a fenced fold candidate only when needed.
+
+        Missing statistics and renderer changes rebuild from a paged snapshot outside
+        the session lock. Healthy finalization reads affected sends and small state.
+        """
+        from .projection_fold import prepare
+
+        return await prepare(
+            self, session_id, send_index=send_index, rows=rows, source_seq_lo=source_seq_lo,
+            source_seq_hi=source_seq_hi, projector_version=projector_version, projector=projector,
+            keep_last_sends=keep_last_sends, threshold=threshold,
+        )
 
     async def commit_projection_fold(
         self,
@@ -901,6 +1067,7 @@ class SessionStore:
         to_send: int,
         projector_version: int,
         expected_prior_to_send: int | None,
+        expected_projection_revision: str | None = None,
     ) -> bool:
         """Persist a ``compact`` fold computed OUTSIDE the lock, under OPTIMISTIC CONCURRENCY: re-take
         the session lock, re-read the latest compact, and UPSERT the new compact ONLY if the cursor
@@ -912,10 +1079,16 @@ class SessionStore:
         now = _now_ms()
         async with self._db.transaction() as tx:
             await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            from .projection_fold import invalidate, read_state
+            if expected_projection_revision is not None:
+                state = await read_state(self, tx, session_id)
+                if state is None or state["revision"] != expected_projection_revision:
+                    return False
             cur = await self._query_latest_project_compact(tx.fetchone, session_id)
             cur_to = cur.compact_to_send if cur is not None else None
             if cur_to != expected_prior_to_send:
                 return False  # a concurrent fold advanced the cursor; our snapshot/fold is stale
+            await invalidate(self, tx, session_id)
             # Delete any SUPERSEDED compact rows (send_index < the new compact): a rolled-forward
             # fold folds the prior compact's content INTO the new one, so older compacts are never
             # read again (the reader uses the latest compact + after-cursor rows). Without this they
@@ -951,6 +1124,8 @@ class SessionStore:
         now = _now_ms()
         async with self._db.transaction() as tx:
             await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            from .projection_fold import invalidate
+            await invalidate(self, tx, session_id)
             for send_index, kind, content, rendered_text in project_rows:
                 await self._upsert_project_message_tx(
                     tx, session_id, send_index=send_index, kind=kind, content=content,
@@ -1116,6 +1291,15 @@ class SessionStore:
         token = uuid.uuid4().hex
         now = _now_ms()
         q = self.t.follow_up_queue
+        ready = await self._db.fetchone(
+            f"SELECT id FROM {q} WHERE session_id=? AND "
+            "(status='pending' OR (status='claimed' AND claimed_at < ?)) LIMIT 1",
+            (session_id, now - int(stale_after_ms)),
+        )
+        if ready is None:
+            # A concurrent enqueue remains pending for the next drain, exactly
+            # as an enqueue immediately after an empty claim transaction did.
+            return []
         async with self._db.transaction() as tx:
             await tx.execute(
                 f"UPDATE {q} SET status='pending', claim_token=NULL, claimed_at=NULL "
@@ -1240,6 +1424,7 @@ class SessionStore:
                 (session_id,),
             )
         await tx.execute(f"DELETE FROM {self.t.messages} WHERE session_id=?", (session_id,))
+        self._forget_appended(session_id)
         await tx.execute(f"DELETE FROM {self.t.compactions} WHERE session_id=?", (session_id,))
         await tx.execute(f"DELETE FROM {self.t.usage_rounds} WHERE session_id=?", (session_id,))
         await tx.execute(f"DELETE FROM {self.t.session_stats} WHERE session_id=?", (session_id,))
@@ -1733,6 +1918,7 @@ class SessionStore:
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?",
                 (now, session_id),
             )
+        self._touched[session_id] = now
 
     async def mutate_runtime_state(
         self,
@@ -1782,6 +1968,7 @@ class SessionStore:
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?",
                 (now, session_id),
             )
+        self._touched[session_id] = now
         return new_value
 
     async def delete_runtime_state(self, session_id: str, key: str) -> None:
@@ -1946,6 +2133,7 @@ class SessionStore:
         """
         sql = f"DELETE FROM {self.t.messages} WHERE session_id=? AND state=?"
         params: list[Any] = [session_id, MessageState.COMPACTED_OUT.value]
+        self._forget_appended(session_id)
         if older_than_ms is not None:
             sql += " AND created_at < ?"
             params.append(_now_ms() - int(older_than_ms))
@@ -1982,6 +2170,12 @@ class SessionStore:
                 f"SELECT {collist} FROM {physical(self.t)} WHERE session_id=?",
                 (session_id,),
             )
+            if logical == "session_runtime_state":
+                # Projection bodies are not exported, so their derived statistics
+                # and key-owner cache cannot be valid in the restored session.
+                from .projection_fold import OWNER_PREFIX, STATE_KEY
+                rows = [r for r in rows if r["state_key"] != STATE_KEY
+                        and not r["state_key"].startswith(OWNER_PREFIX)]
             tables[logical] = [{c: r[c] for c in cols} for r in rows]
         if not tables["sessions"]:
             raise ValueError(f"unknown session: {session_id}")

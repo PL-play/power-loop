@@ -157,7 +157,11 @@ class SQLiteSink:
         return self._assistant_seq
 
     async def on_round_started(self, round_index: int) -> None:
-        await self.store.set_round_index(self.session_id, round_index)
+        defer = getattr(self.store, "defer_round_index", None)
+        if defer is not None:
+            defer(self.session_id, round_index)  # Written with this round's first append.
+        else:
+            await self.store.set_round_index(self.session_id, round_index)
 
     async def on_message_appended(
         self, message: LoopMessage, *, round_index: int | None
@@ -166,6 +170,21 @@ class SQLiteSink:
         if role == "tool":
             tool_call_id = str(message.get("tool_call_id") or "")
             text, structured = _encode_content(message.get("content"))
+            from power_loop.runtime.task_runtime import bind_tool_receipt, tool_receipt_required
+
+            # Operation-free calls clear pending with the message. Calls with a
+            # task operation retain it durably until receipt binding succeeds,
+            # including across process death between these two transactions.
+            resolves = bool(tool_call_id) and tool_call_id in self._unresolved
+            needs_receipt = resolves and tool_receipt_required(
+                self.store, self.session_id, self._assistant_seq, tool_call_id)
+            options = {}
+            remaining_pending = None
+            if resolves:
+                remaining = self._unresolved - {tool_call_id}
+                remaining_pending = await self._remaining_pending(remaining, round_index) if remaining else None
+                if not needs_receipt:
+                    options["pending"] = remaining_pending
             seq = await self.store.append_message(
                 self.session_id,
                 role="tool",
@@ -175,38 +194,17 @@ class SQLiteSink:
                 round_index=round_index,
                 meta=_meta_with_content_encoding(message.get("meta"), structured=structured),
                 send_index=message.get("send_index"),
+                **options,
             )
             self._history_seqs.append(seq)
             self._history_ord.append(seq)
-            from power_loop.runtime.task_runtime import bind_tool_receipt
-            await bind_tool_receipt(self.store, self.session_id, self._assistant_seq, tool_call_id, seq)
-            # Auto-resolve pending: when the matching tool message lands,
-            # drop it from the unresolved set and clear pending once empty.
-            if tool_call_id and tool_call_id in self._unresolved:
+            assistant_seq = self._assistant_seq
+            await bind_tool_receipt(self.store, self.session_id, assistant_seq, tool_call_id, seq)
+            if resolves:
+                if needs_receipt:
+                    await self.store.set_pending(self.session_id, remaining_pending)
                 self._unresolved.discard(tool_call_id)
-                if self._unresolved:
-                    remaining_tool_calls = [
-                        tc for tc in self._tool_calls
-                        if str(tc.get("id") or "") in self._unresolved
-                    ]
-                    pending = {
-                        "assistant_seq": self._assistant_seq,
-                        "round_index": round_index,
-                        "tool_call_ids": sorted(self._unresolved),
-                        "tool_calls": remaining_tool_calls,
-                    }
-                    state = await self.store.get_state(self.session_id)
-                    prior = state.pending if state is not None and state.pending else {}
-                    interactions = list(prior.get("pending_interactions") or [])
-                    remaining_interactions = [
-                        item for item in interactions
-                        if str(item.get("tool_call_id") or "") in self._unresolved
-                    ]
-                    if remaining_interactions:
-                        pending["pending_interactions"] = remaining_interactions
-                    await self.store.set_pending(self.session_id, pending)
-                else:
-                    await self.store.set_pending(self.session_id, None)
+                if not self._unresolved:
                     self._assistant_seq = None
                     self._tool_calls = []
             return
@@ -265,6 +263,24 @@ class SQLiteSink:
 
     # ── pending state machine ──────────────────────────────────
 
+    async def _remaining_pending(self, remaining: set[str], round_index: int | None) -> dict[str, Any]:
+        pending: dict[str, Any] = {
+            "assistant_seq": self._assistant_seq,
+            "round_index": round_index,
+            "tool_call_ids": sorted(remaining),
+            "tool_calls": [tc for tc in self._tool_calls if str(tc.get("id") or "") in remaining],
+        }
+        known = getattr(self.store, "known_pending", None)
+        found, prior = known(self.session_id) if known is not None else (False, None)
+        if not found:
+            state = await self.store.get_state(self.session_id)
+            prior = state.pending if state is not None else None
+        interactions = [item for item in (prior or {}).get("pending_interactions") or []
+                        if str(item.get("tool_call_id") or "") in remaining]
+        if interactions:
+            pending["pending_interactions"] = interactions
+        return pending
+
     async def on_assistant_tool_calls(
         self, *, assistant_seq: int, tool_calls: list[dict[str, Any]], round_index: int
     ) -> None:
@@ -278,15 +294,12 @@ class SQLiteSink:
         seq = self._assistant_seq if self._assistant_seq is not None else assistant_seq
         self._assistant_seq = seq
         self._tool_calls = list(tool_calls)
-        await self.store.set_pending(
-            self.session_id,
-            {
-                "assistant_seq": seq,
-                "round_index": round_index,
-                "tool_call_ids": ids,
-                "tool_calls": list(tool_calls),
-            },
-        )
+        pending = {"assistant_seq": seq, "round_index": round_index, "tool_call_ids": ids,
+                   "tool_calls": list(tool_calls)}
+        known = getattr(self.store, "known_pending", None)
+        if known is not None and known(self.session_id) == (True, pending):
+            return  # The assistant append already committed exactly this state.
+        await self.store.set_pending(self.session_id, pending)
 
     async def on_compaction(
         self,

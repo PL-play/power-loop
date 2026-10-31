@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field
 
 from .invocation import current_invocation
 from .jobs import JobError, JobLease, _hash, _json
+from .jobs import verify_stored as _verify_stored
 from .tool_contracts import RuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 
 FIELD = "managed_effect"
@@ -348,7 +349,8 @@ def job_id(manager, actor, call_ref, tool_call_id):
 
 
 def _id(manager, kind, job, generation=1):
-    return "mt_" + kind + "_" + _hash([manager.store.store_id, job, generation])[:48]
+    prefix = "mt_" + kind + "_"
+    return prefix + _hash([manager.store.store_id, job, generation])[:min(48, 64 - len(prefix))]
 
 
 async def _read_event(manager, tx, event_id, *, required=True):
@@ -648,6 +650,9 @@ async def _invoke_original(handler, execution, arguments, slot):
     if seq is None or not call_id:
         raise JobError("persisted_tool_call_required")
     ref = await manager.store.message_ref(actor.session_id, seq)
+    if execution.resource_evidence.get("_control_state") is not None:
+        from .control_runtime import current
+        current(execution).managed_check = True
     async with manager._write() as tx:
         await require_source_resolved(manager, tx, await manager._row(tx, execution.lease.job_id), invocation=(seq, call_id))
         await validate_call(
@@ -1107,6 +1112,7 @@ async def read_raw_receipt(manager, actor, job):
         }
 
 
+@_verify_stored
 async def reconcile_raw_receipt(manager, actor, job):
     """Index one retained original tool row; never synthesize a row or execute."""
     from .jobs import JobActor
@@ -1341,6 +1347,7 @@ async def require_closed(manager, tx, row, result_event):
     return refs
 
 
+@_verify_stored
 async def reconcile(runtime, actor, job, adapter):
     """Original observation only; never prepare/dispatch or claim a new lease."""
     if not isinstance(adapter, ManagedTool) or type(adapter.contract) is not ManagedToolContract:

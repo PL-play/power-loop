@@ -172,6 +172,9 @@ async def test_admission_and_model_dispatch_commit_one_original_grant(budget_cas
         await attempts.dispatch(a)
     state = await observed(c, a)
     assert state["phase"] == "settling" and not state["pending"] and state["ack"]
+    assert await counters(c) == {"used_calls": 1, "held_calls": 0, "used_tokens": 10, "held_tokens": 90, "inflight": 1}
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(c.binding, close=True)
     assert await counters(c) == {"used_calls": 1, "held_calls": 0, "used_tokens": 10, "held_tokens": 0, "inflight": 0}
 
 
@@ -194,9 +197,8 @@ async def test_usage_ack_loss_keeps_frozen_outbox_and_replays_without_duplicate_
     assert state["pending"] and state["submission"] and state["ack"] is None
     frozen = state["submission"]
     assert len(c.host.applied) == 1
-    await new_send(c)
     with pytest.raises(JobError, match="budget_reconciliation_required"):
-        await start(c)
+        await new_send(c)
     c.host.apply_lost_ack = False
     await budgets.deliver(a)
     assert len(c.host.applied) == 1 and c.host.apply_calls == 2
@@ -248,7 +250,7 @@ async def test_missing_or_corrupt_control_rows_do_not_recreate_an_allowance(budg
     else:
         await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_budget_scopes SET counters_json='{{}}'")
     with pytest.raises(JobError, match="budget_"):
-        await attempts.enable(c.binding)
+        await start(c)  # The first shared allocation must validate originals.
     assert c.host.reserve_calls == 0
 
 
@@ -320,12 +322,17 @@ async def test_actual_component_totals_match_host_settlement_without_counting_to
     await attempts.observe(a, usage=usage, estimated=estimated)
     current = await counters(c)
     assert current["used_tokens"] == (0 if total is None else total)
-    assert current["held_tokens"] == (100 if total is None else 0)
-    assert current["used_calls"] == 1 and current["held_calls"] == 0 and current["inflight"] == 0
+    assert current["held_tokens"] == 100 - (total or 0)
+    assert current["used_calls"] == 1 and current["held_calls"] == 0 and current["inflight"] == 1
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(c.binding, close=True)
+    closed = await counters(c)
+    assert closed["held_tokens"] == (100 if total is None else 0)
+    assert closed["inflight"] == 0
     state = await budgets.get_budget(c.manager, c.actor, a.attempt_id)
     assert not state["pending"] and state["observation"]["usage"] == usage
     await budgets.deliver(a)
-    assert await counters(c) == current and len(c.host.applied) == 1
+    assert await counters(c) == closed and len(c.host.applied) == 1
 
 
 async def test_actual_component_over_bound_closes_policy_and_preserves_the_whole_charge(budget_case):
@@ -351,9 +358,8 @@ async def test_invalid_pending_projection_is_rejected_by_read_and_admission_with
     )
     with pytest.raises(JobError, match="budget_evidence_corrupt"):
         await budgets.get_budget(c.manager, c.actor, a.attempt_id)
-    await new_send(c)
     with pytest.raises(JobError, match="budget_evidence_corrupt"):
-        await start(c)
+        await new_send(c)
     assert c.host.reserve_calls == 1 and await counters(c) == before
 
 
@@ -401,7 +407,7 @@ async def test_explicit_protocol_three_migration_retains_original_ids_and_reject
         ] == 3
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    assert TASK_PROTOCOL_VERSION == 21 and await c.store.message_ref(c.sid, seq) == ref
+    assert TASK_PROTOCOL_VERSION == 22 and await c.store.message_ref(c.sid, seq) == ref
     # A bridge compiled against protocol3 cannot write the migrated control row.
     import power_loop.runtime.jobs as jobs
 
@@ -458,6 +464,8 @@ async def test_unconfirmed_reservation_closes_dispatch_then_uses_host_tombstone_
     prepared = json.loads(raw["payload_json"])
     original = attempts.Attempt(c.binding, prepared["attempt_id"], prepared)
     proof = await budgets.close_unstarted(original)
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(c.binding, close=True)
     assert proof and (await counters(c))["held_tokens"] == 0
     assert (await budgets.get_budget(c.manager, c.actor, original.attempt_id))["phase"] == "released"
     assert not await c.manager.db.fetchall(
@@ -488,6 +496,8 @@ async def test_timed_out_api_task_is_retained_and_late_grant_only_allows_mechani
     prepared = json.loads(raw["payload_json"])
     original = attempts.Attempt(c.binding, prepared["attempt_id"], prepared)
     await budgets.close_unstarted(original)
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(c.binding, close=True)
     assert (await budgets.get_budget(c.manager, c.actor, original.attempt_id))["phase"] == "released"
     assert all(value == 0 for value in (await counters(c)).values())
     assert not await c.manager.db.fetchall(
@@ -557,6 +567,8 @@ async def test_duplicate_parallel_close_returns_one_original_release_and_never_r
     await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
     replies = await asyncio.gather(*(budgets.close_unstarted(a) for _ in range(8)))
     assert all(r == replies[0] for r in replies) and len(c.host.released) == 1
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(c.binding, close=True)
     assert all(v == 0 for v in (await counters(c)).values())
     assert (await budgets.get_budget(c.manager, c.actor, a.attempt_id))["phase"] == "released"
 

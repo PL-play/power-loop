@@ -179,7 +179,7 @@ async def enqueue_runtime(runtime, actor, job):
             await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                 (actor.session_id, key, 'managed_result', 'queue', 'pending', render(data['public']), manager.now()))
             await _event(manager, tx, row, 'delivery', data)
-            await tx.execute(f'UPDATE {manager.events} SET caller_session_id=? WHERE event_id=?', (actor.session_id, key))
+            await tx.set_event_recipient(key, actor.session_id)
             # Any former tool receipt describes the old pending/error boundary.
             # This new, resolved outcome now has its own processing obligation.
             if row['generation'] != 0:
@@ -300,8 +300,11 @@ async def pending_reviews(manager, tx, actor):
         'ORDER BY j.job_id LIMIT 1001', (actor.session_id, actor.tenant_id, actor.principal_id))
     if len(rows) > 1000:
         raise JobError('managed_delivery_scope_too_large')
+    from .execution_membership import mark_resolved, resolved
     pending = []
     for row in rows:
+        if resolved(manager, row['job_id'], row['version']):
+            continue
         await manager._authorize(tx, actor, row['job_id'])
         result = await result_event(manager, tx, row)
         delivery = await read(manager, tx, row, result)
@@ -312,6 +315,7 @@ async def pending_reviews(manager, tx, actor):
             except JobError:
                 pass
             else:
+                mark_resolved(manager, row['job_id'], row['version'])
                 continue
         pending.append(content_reference(result))
     return pending

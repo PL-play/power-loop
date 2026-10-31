@@ -88,8 +88,7 @@ class CaptureBinding:
 
 async def bind(attempt):
     """Freeze authority before dispatch, with no post-response SDK DB read."""
-    from . import model_budgets as budgets
-    runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
+    runtime = attempt.binding.runtime
     config = runtime._original_budget_config
     if config is None:
         return None
@@ -98,15 +97,12 @@ async def bind(attempt):
         return None
     if not callable(callback):
         raise JobError('invalid_response_capture_provider')
-    async with manager._write() as tx:
-        await budgets._policy(runtime, tx)
-        job = await manager._fence(tx, attempt.binding.actor, attempt.binding.lease)
-        state = await budgets._read(manager, tx, attempt.attempt_id)
-        grant = BudgetGrant(**state['grant'])
-        if (state['phase'] != 'host_reserved' or state['context'] != budgets._context(attempt, job)
-                or grant.request_hash != state['plan_hash'] or grant.state != 'reserved'):
-            raise JobError('response_capture_authority_mismatch')
-        return CaptureBinding(payload(state['context']), grant, state['started_at_ms'], callback)
+    from .execution_budget import get
+    state = get(attempt)
+    grant = BudgetGrant(**state['grant'])
+    if state['phase'] != 'host_reserved' or grant.request_hash != state['plan_hash'] or grant.state != 'reserved':
+        raise JobError('response_capture_authority_mismatch')
+    return CaptureBinding(payload(state['context']), grant, state['started_at_ms'], callback)
 
 
 async def record(attempt, *, reported, observation, estimated):
@@ -146,6 +142,7 @@ async def record(attempt, *, reported, observation, estimated):
                     return ResponseCaptureReceipt(**asdict(receipt))
 
                 await _port(attempt, 'capture_response', capture)
+                attempt.binding.resource_evidence['_captured_' + attempt.attempt_id] = True
         except (Exception, asyncio.CancelledError) as exc:
             # A callback cancelling itself is not a request to retry the model.
             # The ordinary observation remains independently necessary.

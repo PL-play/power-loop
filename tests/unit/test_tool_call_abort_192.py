@@ -4,6 +4,7 @@ import json
 import pytest
 
 from power_loop.runtime.jobs import JobError
+from power_loop.runtime.tool_call_plans import start_id
 
 from ._tool_plan_faults_192 import fail_plan_once
 from .test_job_registry_192 import registry_store
@@ -71,7 +72,7 @@ async def test_abort_read_and_parent_close_refuse_missing_or_conflicting_origina
     elif part == 'dispatch':
         plan_id = event['event_id'].removesuffix('_abort')
         await c.manager.db.execute(f'INSERT INTO {c.manager.events} (event_id,job_id,event_type,job_version,payload_json,request_hash,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)',
-                                  (plan_id+'_start_'+_hash(value['entries'][0]['call_id'])[:24], source['job_id'], 'tool_call_dispatch_started', source['version'], '{}', _hash({}), 'not_applicable', c.manager.now()))
+                                  (start_id(plan_id, value['entries'][0]['call_id']), source['job_id'], 'tool_call_dispatch_started', source['version'], '{}', _hash({}), 'not_applicable', c.manager.now()))
     elif part == 'source_protocol':
         creation = await c.manager.db.fetchone(f"SELECT event_id,payload_json FROM {c.manager.events} WHERE job_id=? AND event_type='operation' AND action='create'", (source['job_id'],))
         payload = json.loads(creation['payload_json'])

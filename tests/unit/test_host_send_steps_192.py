@@ -1,6 +1,7 @@
 """Original host stage registration is atomic and cannot admit another send."""
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -183,22 +184,38 @@ async def test_corrupt_original_binding_refuses_lookup_and_redispatch(root_case,
     assert len(await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs}")) == 1
 
 
-async def test_create_commit_lost_ack_keeps_original_unstarted_job_without_retry(root_case, monkeypatch):
+async def test_create_commit_lost_ack_keeps_original_admitted_job_without_retry(root_case, monkeypatch):
     c = root_case
-    original = c.manager.register_job
-    async def lose_ack(*args, **kwargs):
-        result = await original(*args, **kwargs)
-        if kwargs.get("request", {}).get(steps.FIELD):
+    original = c.manager.db.transaction
+
+    class Transaction:
+        def __init__(self, target, flags):
+            self.target, self.flags = target, flags
+
+        def __getattr__(self, name):
+            return getattr(self.target, name)
+
+        async def execute(self, statement, args=()):
+            if statement.startswith(f"INSERT INTO {c.manager.jobs} "):
+                self.flags['target'] = True
+            return await self.target.execute(statement, args)
+
+    @asynccontextmanager
+    async def lose_ack():
+        flags = {'target': False}
+        async with original() as tx:
+            yield Transaction(tx, flags)
+        if flags['target']:
             raise ConnectionError("original create committed; acknowledgement lost")
-        return result
-    monkeypatch.setattr(c.manager, "register_job", lose_ack)
+    monkeypatch.setattr(c.manager.db, "transaction", lose_ack)
     with pytest.raises(ConnectionError, match="acknowledgement lost"):
         await send(c)
     first = await lookup(c)
     assert first is not None and not c.model.calls
     [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs}")
-    assert job["status"] == "queued" and job["generation"] == 0
-    monkeypatch.setattr(c.manager, "register_job", original)
+    # Registration, claim and control admission now share this commit boundary.
+    assert job["status"] == "running" and job["generation"] == 1
+    monkeypatch.setattr(c.manager.db, "transaction", original)
     with pytest.raises(JobError, match="already_registered"):
         await send(c)
     assert await lookup(c) == first and not c.model.calls

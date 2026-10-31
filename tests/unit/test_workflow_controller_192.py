@@ -263,18 +263,24 @@ async def test_actual_workflow_never_calls_provider_after_controller_corruption(
     model.hold.clear()
     driver = []
     bind, claim = manager.bind_workflow_driver, manager.claim_job
+    async def corrupt_driver(sid):
+        reader = manager._joined_write.get() or manager.db
+        row = await reader.fetchone(f"SELECT metadata_json FROM {manager.store.t.sessions} WHERE session_id=?", (sid,))
+        metadata = {**json.loads(row["metadata_json"] or "{}"), "task_workflow_generation": True}
+        await reader.execute(f"UPDATE {manager.store.t.sessions} SET metadata_json=? WHERE session_id=?",
+                             (json.dumps(metadata), sid))
     async def bound(actor, lease, sid):
         result = await bind(actor, lease, sid)
         driver[:] = [sid]
         if stage == "driver_bind":
-            await manager.store.merge_session_metadata(sid, {"task_workflow_generation": True})
+            await corrupt_driver(sid)
         return result
     async def claimed(actor, job_id, **kwargs):
         result = await claim(actor, job_id, **kwargs)
-        job = await manager.get_job(actor, job_id)
-        if driver and ((stage == "node_claim" and job.kind == "workflow_node") or
-                (stage == "send_claim" and job.kind == "send" and job.execution_role == "workflow_node")):
-            await manager.store.merge_session_metadata(driver[0], {"task_workflow_generation": True})
+        job = await manager._authorize(manager._joined_write.get() or manager.db, actor, job_id)
+        if driver and ((stage == "node_claim" and job["kind"] == "workflow_node") or
+                (stage == "send_claim" and job["kind"] == "send" and job["execution_role"] == "workflow_node")):
+            await corrupt_driver(driver[0])
         return result
     monkeypatch.setattr(manager, "bind_workflow_driver", bound)
     monkeypatch.setattr(manager, "claim_job", claimed)

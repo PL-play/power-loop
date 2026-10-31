@@ -201,6 +201,49 @@ injection stays; `db_path=` becomes sugar for `sqlite:///…`; add `open_store(d
 
 ## Testing
 
+### Projection fold statistics (2026-10-31)
+
+`AgentLoopConfig.max_context_rows=None` is the unlimited default; `0` is also unlimited,
+and positive limits remain caller choices. This affects context assembly, independently of
+model token budgets, fold candidates and interactive history pagination.
+
+Projection finalization uses `prepare_send_projection_fold`: projection rows and a small
+renderer-specific token aggregate commit under the session-state lock. The aggregate is
+bound to store/session, renderer fingerprint, projection revision and compact cursor.
+The token heuristic remains `estimate_tokens(rendered_messages)`; it is not accounting data.
+It sums independent rendered rows exactly, including message overhead and per-message rounding.
+Recency transitions revisit only sends leaving the hot window. Deduplicating renderers keep
+generation-scoped latest-key owners and revisit only previous visible owners of new keys.
+
+Built-in representations opt into `ProjectionFoldPolicy`. Host row renderers explicitly
+declare additive rendering and dependencies; their fingerprint includes all render settings
+and a code revision. Per-row rendering is deterministic and performs no I/O; its size must
+not depend on database-generated row IDs or timestamps. Dedup keys are stable strings.
+Arbitrary undeclared renderers retain a full, lock-free snapshot check.
+This capability contract must not be inferred from inheritance alone.
+
+Below threshold, healthy finalization does not fetch historical projection bodies, except
+the bounded affected sends needed by a declared dependency. At threshold, a keyset-paged
+snapshot is read without a session lock or an open multi-statement transaction. A revision
+read before and after the snapshot detects concurrent writes. The model fold remains outside
+transactions. Commit checks the original cursor and projection revision; a strategy cannot
+advance its cursor beyond the sends it actually received. No context-row LIMIT advances a
+compact past unread candidates.
+
+All projection mutation APIs invalidate or advance this revision in their write transaction,
+including standalone upserts, repairs, migration writes and compact commits. Missing/invalid
+statistics, changed renderer versions and rewrites rebuild from a consistent snapshot outside
+locks. Dedup owners stage under a fresh generation in bounded transactions and publish with
+the aggregate only if the projection revision still matches. After publication, retired generations are removed
+in bounded batches; ownership keys use an escaped prefix match, independent of DB collation.
+Reserved `__pl_projection_fold` runtime keys are derived data and excluded from exports,
+which already exclude projection bodies. This adds no schema migration or task-protocol change.
+
+`test_projection_fold_statistics.py` runs the same threshold, long-history, rollback, repair,
+recency/dedup and revision-race cases on SQLite and an explicit isolated PostgreSQL DSN
+(`POWER_LOOP_FOLD_TEST_PG_DSN`, database name ending in `_test`). It measures finalization
+separately from send-start history loading.
+
 SQLite `:memory:` stays the fast default + the backend the unit suite uses. A backend-agnostic
 **conformance** suite (the behaviors every backend must satisfy: seq monotonicity under concurrency,
 compaction ordering, cascade, upsert accumulate, timer CAS, atomic rollback) runs against SQLite

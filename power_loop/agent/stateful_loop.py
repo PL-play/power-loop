@@ -2455,6 +2455,7 @@ class StatefulAgentLoop:
                 rows=[(pr.kind, pr.content, pr.rendered_text) for pr in projected.rows],
                 source_seq_lo=projected.source_seq_lo, source_seq_hi=projected.source_seq_hi,
                 projector_version=int(getattr(projector, "version", 0) or 0),
+                load_snapshot=False,
             )
             logger.info(
                 "projection self-heal: session %s send %d projected lazily (%d raw rows)",
@@ -2500,26 +2501,35 @@ class StatefulAgentLoop:
         version = int(getattr(projector, "version", 0) or 0)
         proj_rows_to_write = [(pr.kind, pr.content, pr.rendered_text) for pr in projected.rows]
 
-        # power-loop 3.0, THREE phases so the (multi-second / possibly-hung) LLM fold never runs
-        # inside a DB transaction or under the session lock:
-        #   1) write this send's projection rows under a SHORT lock + snapshot the live rows;
-        #   2) decide + run the fold OUTSIDE the lock (bounded by fold_timeout_s, soft-fails);
-        #   3) commit the compact under a SHORT lock with optimistic concurrency (skip if a
-        #      concurrent loop already advanced the compact cursor).
-        prior, snapshot = await store.write_send_projection_rows(
+        # Update small statistics with the projection writes; below-threshold sends
+        # do not snapshot historical bodies. Candidate/repair reads and the model
+        # fold run outside locks. Commit checks the cursor AND projection revision.
+        strategy = self.config.fold_strategy
+        keep = int(getattr(strategy, "keep_last_sends", 0) or 0)
+        ratio = float(getattr(strategy, "trigger_ratio", 0.75) or 0.75)
+        threshold = int((self.config.effective_context_budget() or 8000) * ratio)
+        policy_provider = getattr(projector, "fold_statistics_policy", None)
+        policy = policy_provider() if policy_provider else None
+        candidate = await store.prepare_send_projection_fold(
             sid, send_index=send_index, rows=proj_rows_to_write,
             source_seq_lo=projected.source_seq_lo, source_seq_hi=projected.source_seq_hi,
-            projector_version=version,
+            projector_version=version, projector=projector, keep_last_sends=keep, threshold=threshold,
         )
+        if candidate is None:
+            return
+        prior, snapshot = candidate.prior, candidate.rows
         plan, note_ops = await self._plan_and_run_projection_fold(
             sid, projector, prior, snapshot, stop_event=stop_event)
         if plan is None:
             return
+        if policy_provider and policy_provider() != policy:
+            return  # render configuration changed during the asynchronous fold
         content, rendered_text, from_send, to_send = plan
         committed = await store.commit_projection_fold(
             sid, content=content, rendered_text=rendered_text, from_send=from_send,
             to_send=to_send, projector_version=version,
             expected_prior_to_send=(prior.compact_to_send if prior is not None else None),
+            expected_projection_revision=candidate.revision,
         )
         if committed:
             await self._apply_fold_notes(store, sid, note_ops)
@@ -2572,6 +2582,9 @@ class StatefulAgentLoop:
             if calls is not None:
                 calls.raise_if_cancelled()
             if fr is None:
+                return None, ()
+            if fr.folded_to_send not in fold_sends:
+                logger.warning("projection fold returned an unprocessed cursor for %s; skipping", sid)
                 return None, ()
             return (fr.content, fr.rendered_text, from_send, fr.folded_to_send), tuple(fr.note_ops)
         except CancellationRequested:

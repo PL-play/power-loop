@@ -9,6 +9,7 @@ from dataclasses import asdict
 from types import SimpleNamespace
 
 from .jobs import JobError, JobLease, _hash, _json, _operation
+from .jobs import verify_stored as _verify_stored
 from .result_revisions import execution_id, result_id
 
 _PREPARED = ContextVar("power_loop_prepared_node_resume", default=None)
@@ -29,6 +30,7 @@ def selection(spec, node_id):
     return node, ancestors, plan
 
 
+@_verify_stored
 async def admit(manager, actor, job_id, *, caller, workflow, call_ref, tool_call_id,
                 node, message, previous_result, contract, plan, executor_id, boot_id, lease_ms=30000):
     if not isinstance(message, str) or not message.strip() or len(message) > 64000 or "\x00" in message:

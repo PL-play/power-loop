@@ -13,6 +13,7 @@ import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
+from types import SimpleNamespace
 
 from .invocation import current_invocation
 from .jobs import JobActor, JobError, JobLease, JobManager, JobRegistration
@@ -64,6 +65,19 @@ async def check_dispatch(session_id: str | None, *, invocation=None) -> None:
         execution.runtime.check_local_admission()
         if execution.resource_evidence.get("resource_state") == "unknown":
             raise JobError("unresolved_prior_attempt")
+        if execution.resource_evidence.get("_control_state") is not None:
+            from .control_runtime import current
+            control = current(execution)
+            control.require_admission()
+            if control.managed_check:
+                from .managed_effects import require_source_resolved
+                manager = execution.runtime.manager
+                async with manager._write() as tx:
+                    await require_source_resolved(manager, tx, await manager._row(tx, execution.lease.job_id),
+                                                  invocation=invocation)
+                if invocation is None:
+                    control.managed_check = False
+            return
         await execution.runtime.manager.check_execution(execution.actor, execution.lease)
         from .managed_effects import require_source_resolved
         async with execution.runtime.manager._write() as tx:
@@ -88,16 +102,15 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
         declared = tool_policy(registered, tool_args or {}, runtime=execution.runtime)
     except ToolContractError as exc:
         raise JobError(str(exc)) from exc
+    from .control_runtime import current, source
     from .tool_contracts import resolve
+    current(execution)
     implementation = resolve(registered)
     if implementation is not None:
-        async with execution.runtime.manager._write() as tx:
-            source = await execution.runtime.manager._authorize(tx, execution.actor, execution.lease.job_id)
-            if source["execution_role"] not in implementation.runtime_contract.allowed_roles:
-                raise JobError("execution_role_forbids_tool")
-    from .review_tools import require_tool
-    async with execution.runtime.manager._write() as tx:
-        await require_tool(execution.runtime.manager, tx, execution.actor, declared)
+        if source(execution)["execution_role"] not in implementation.runtime_contract.allowed_roles:
+            raise JobError("execution_role_forbids_tool")
+    if not declared.control_only and execution.resource_evidence.get("_control_review_pending"):
+        raise JobError("outcome_review_requires_control_only")
     if declared.control_only:
         from .task_control import _source
 
@@ -105,14 +118,14 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
         if seq is None or not call_id:
             raise JobError("persisted_tool_call_required")
         manager = execution.runtime.manager
+        from .control_runtime import flush_binding
+        await flush_binding(execution)
         ref = await manager.store.message_ref(session_id, seq)
         async with manager._write() as tx:
             await _source(manager, tx, execution.actor, execution.lease, ref, call_id)
         return registered
-    from .model_budgets import _policy as budget_policy
-
-    async with execution.runtime.manager._write() as tx:
-        policy = await budget_policy(execution.runtime, tx)
+    from .execution_budget import check
+    policy = check(execution)
     if policy is not None:
         from power_loop.tools.registry import validate_pricing
 
@@ -129,11 +142,23 @@ async def prepare_model_processing(pipeline, messages, round_index, *, provider_
     execution = _SEND.get()
     if execution is None or execution.actor.session_id != pipeline.session_id:
         return
-    execution.resource_evidence["processing_snapshot_id"] = None
     if not provider_call:
+        return
+    previous = execution.resource_evidence.get("processing_snapshot_id")
+    if previous is None and not execution.resource_evidence.get("_processing_dirty", True):
         return
     # Projection/rewritten rows do not get credited just because a result is
     # somewhere in the raw transcript. Match identities and actual raw content.
+    from . import session_controls
+    manager = execution.runtime.manager
+    seen = await session_controls.version(manager, manager.db, execution.actor.session_id)
+    source = execution.resource_evidence.get("_control_source") or {}
+    owned = source.get("control_owner_job_id") is not None  # Owner nudges are not session obligations.
+    if not owned and session_controls.is_clean(manager, execution.actor.session_id, seen):
+        execution.resource_evidence["processing_snapshot_id"] = None
+        execution.resource_evidence["_processing_dirty"] = False
+        execution.resource_evidence["_control_review_pending"] = False
+        return
     included = {id(message) for message in messages}
     seqs = getattr(pipeline.sink, "_history_seqs", [])
     actual = [
@@ -141,9 +166,16 @@ async def prepare_model_processing(pipeline, messages, round_index, *, provider_
         for message, seq in zip(pipeline.history, seqs, strict=False)
         if seq is not None and id(message) in included and isinstance(message.get("content"), str)
     ]
-    execution.resource_evidence["processing_snapshot_id"] = await execution.runtime.manager.prepare_processing(
-        execution.actor, execution.lease, round_index=round_index, send_index=pipeline.send_index, messages=actual
-    )
+    report = {}
+    execution.resource_evidence["processing_snapshot_id"] = await manager.prepare_processing(
+        execution.actor, execution.lease, round_index=round_index, send_index=pipeline.send_index, messages=actual,
+        report=report)
+    execution.resource_evidence["_processing_dirty"] = False
+    from .abort_outcomes import pending_reviews
+    pending = bool(await pending_reviews(manager, manager.db, execution.actor))
+    execution.resource_evidence["_control_review_pending"] = pending
+    if not pending and report.get("quiet") and not owned:
+        session_controls.mark_clean(manager, execution.actor.session_id, seen)
 
 
 def mark_unconfirmed_resource() -> None:
@@ -165,6 +197,19 @@ def atomic_pending_required(store, sid):
             and execution.actor.session_id == sid)
 
 
+def tool_receipt_required(store, sid: str, assistant_seq: int | None, call_id: str) -> bool:
+    """Only a known operation-free call may clear pending in its message append.
+
+    A missing in-memory operation list is uncertain (for example a failed return
+    checkpoint), so retain the durable marker until the receipt lookup finishes.
+    """
+    execution = _SEND.get()
+    if (execution is None or execution.runtime.manager.store is not store
+            or execution.actor.session_id != sid or assistant_seq is None):
+        return False
+    return execution.resource_evidence.get("_control_tool_operations", {}).get((assistant_seq, call_id)) != []
+
+
 async def bind_tool_receipt(store, sid: str, assistant_seq: int | None, call_id: str, receipt_seq: int) -> None:
     execution = _SEND.get()
     if (
@@ -175,6 +220,12 @@ async def bind_tool_receipt(store, sid: str, assistant_seq: int | None, call_id:
     ):
         return
     manager = execution.runtime.manager
+    known = execution.resource_evidence.get("_control_tool_operations", {}).get((assistant_seq, call_id))
+    if known == []:
+        return
+    if known is not None:
+        from .control_runtime import flush_binding
+        await flush_binding(execution)
     operation = await manager.operation_for_call(execution.actor, await store.message_ref(sid, assistant_seq), call_id)
     if operation is not None:
         await manager.reconcile_receipt(
@@ -200,6 +251,7 @@ class TaskRuntime:
         boot_contract_hash: str | None = None,
         budget_config=None,
         require_host_send_steps: bool = False,
+        checkpoint_policy=None,
     ):
         JobActor(tenant_id, principal_id, "validation")
         if not all(isinstance(v, str) and 0 < len(v) <= 64 for v in (executor_id, boot_id)):
@@ -222,6 +274,10 @@ class TaskRuntime:
         self.budget_config = budget_config
         self._original_budget_config = budget_config
         self._budget_handles = {}
+        from .execution_state import CheckpointPolicy
+        if checkpoint_policy is not None and type(checkpoint_policy) is not CheckpointPolicy:
+            raise JobError("invalid_checkpoint_policy")
+        self.checkpoint_policy = checkpoint_policy or CheckpointPolicy()
         self._adapter_tasks = set()
         self.manager = manager
         self.tenant_id, self.principal_id = tenant_id, principal_id
@@ -261,6 +317,7 @@ class TaskRuntime:
         if self._lifecycle is not None:
             self._lifecycle.check_admission()
         async with asyncio.timeout(2):
+            await self._flush_owned_checkpoints(failed_only=True)
             await self._controller_retirements.flush()
             await self._controller_task_exits.flush()
             from .native_returns import flush_local as flush_native
@@ -276,14 +333,33 @@ class TaskRuntime:
             raise JobError("invalid_controller_checkpoint_timeout")
         if timeout_s:
             async with asyncio.timeout(timeout_s):
+                await self._flush_owned_checkpoints()
                 await self._controller_retirements.flush()
                 await self._controller_task_exits.flush()
                 from .managed_claim import flush_local
                 await flush_local(self)
                 from .native_returns import flush_local as flush_native
                 await flush_native(self)
-        return {"controller_retirement_pending": len(self._controller_retirements.pending),
+        return {"execution_checkpoint_pending": self._owned_checkpoint_pending(),
+                "controller_retirement_pending": len(self._controller_retirements.pending),
                 "controller_task_exit_pending": len(self._controller_task_exits.slots)}
+
+    async def repair_execution_checkpoint(self, session_id, job_id, *, generation, retire_expired=False):
+        """Restore derived inspection state; never re-execute an unknown action."""
+        from .execution_recovery import inspect
+        return await inspect(self.manager, self.actor(session_id), job_id, generation=generation,
+                             repair=True, retire_expired=retire_expired)
+
+    def _owned_checkpoint_pending(self):
+        from .control_runtime import current
+        return sum(bool(current(binding)._pending or current(binding)._dirty)
+                   for binding in self.manager._execution_controls.values() if binding.runtime is self)
+
+    async def _flush_owned_checkpoints(self, *, failed_only=False):
+        from .control_runtime import current, flush_binding
+        for binding in tuple(self.manager._execution_controls.values()):
+            if binding.runtime is self and (not failed_only or current(binding).checkpoint_failed):
+                await flush_binding(binding)
 
     async def start(self):
         if self._lifecycle is None:
@@ -299,6 +375,7 @@ class TaskRuntime:
         if remaining:
             try:
                 async with asyncio.timeout(min(2, remaining)):
+                    await self._flush_owned_checkpoints()
                     await self._controller_retirements.flush()
                     await self._controller_task_exits.flush()
                     from .managed_claim import flush_local
@@ -311,6 +388,9 @@ class TaskRuntime:
         return self._completion_status(result)
 
     def _completion_status(self, result):
+        result['execution_checkpoint_pending'] = self._owned_checkpoint_pending()
+        if result['execution_checkpoint_pending']:
+            result['store_safe_to_close'] = False
         result['native_return_pending'] = self._native_returns.pending_count()
         if result['native_return_pending']:
             result['store_safe_to_close'] = False
@@ -415,7 +495,7 @@ class TaskRuntime:
         return Execution(self, actor, lease)
 
     @asynccontextmanager
-    async def execution(self, binding: Execution, *, owner: bool = False, context=None, cancel_token=None):
+    async def execution(self, binding: Execution, *, owner: bool = False, context=None, cancel_token=None, initialize_model=False):
         """Renew only while this attempt runs; a failed renewal stops dispatch."""
         _check_task_owner(self)
         if (not isinstance(binding, Execution) or binding.runtime is not self
@@ -429,7 +509,11 @@ class TaskRuntime:
         self.check_local_admission()
         if (owner or context is not None) and binding.stop_renewal.is_set():
             raise JobError("controller_execution_exited")
-        await self.manager.check_execution(binding.actor, binding.lease)
+        if initialize_model:
+            from .model_attempts import enable
+            await enable(binding)  # One admission transaction owns all checks.
+        else:
+            await self.manager.check_execution(binding.actor, binding.lease)
         variable = context if context is not None else _OWNER if owner else _SEND
         token = variable.set(binding)
         owner_token = _enter_task_owner(self)
@@ -448,11 +532,19 @@ class TaskRuntime:
             try:
                 while True:
                     try:
-                        await asyncio.wait_for(binding.stop_renewal.wait(), self.lease_ms / 3000)
+                        await asyncio.wait_for(binding.stop_renewal.wait(), min(self.lease_ms / 3000, self.checkpoint_policy.interval_s))
                         return
                     except TimeoutError:
                         pass
                     await self.manager.renew_execution(binding.actor, binding.lease, lease_ms=self.lease_ms)
+                    if binding.resource_evidence.get("_control_state") is not None:
+                        from .control_runtime import current
+                        control = current(binding)
+                        control.renew(self.manager.now() + self.lease_ms)
+                        binding.resource_evidence["_processing_dirty"] = True
+                        from .abort_outcomes import pending_reviews
+                        binding.resource_evidence["_control_review_pending"] = bool(await pending_reviews(self.manager, self.manager.db, binding.actor))
+                        await control.checkpoint(force=True)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -530,6 +622,7 @@ class TaskRuntime:
     @asynccontextmanager
     async def model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None):
         owner_token = _enter_task_owner(self)
+        trust_token = self.manager._trust_own_writes.set(True)
         local = None
         try:
             await self.ensure_started()
@@ -540,6 +633,7 @@ class TaskRuntime:
         finally:
             if local is not None:
                 self._model_executions.pop(id(local), None)
+            self.manager._trust_own_writes.reset(trust_token)
             _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
@@ -611,25 +705,33 @@ class TaskRuntime:
                 raise JobError("host_send_step_required")
             if step is not None:
                 request[FIELD] = step
-        registration = await self.manager.register_job(
-            registering_actor,
-            kind="send",
-            session_id=sid,
-            parent=owner.lease if owner else None,
-            system_key=f"send:{sid}:{send_index}" if registering_actor != actor else f"send:{send_index}",
-            request=request,
-        )
-        if registration.replayed:
-            # No automatic replay of a possibly side-effecting pending attempt.
-            raise JobError("task_send_requires_reconciliation")
-        binding = await self.claim(actor, registration)
+        from .model_attempts import enable
+        from .model_budgets import flush_observed_controls
+
+        await self.ensure_started()
+        self.check_local_admission()
+        await flush_observed_controls(SimpleNamespace(runtime=self))
+        # Registration, claim and control admission commit together or not at all.
+        async with self.manager.joined_write():
+            registration = await self.manager.register_job(
+                registering_actor,
+                kind="send",
+                session_id=sid,
+                parent=owner.lease if owner else None,
+                system_key=f"send:{sid}:{send_index}" if registering_actor != actor else f"send:{send_index}",
+                request=request,
+                fresh=True,
+            )
+            if registration.replayed:
+                # No automatic replay of a possibly side-effecting pending attempt.
+                raise JobError("task_send_requires_reconciliation")
+            binding = await self.claim(actor, registration)
+            binding.resource_evidence["_control_registered_payload"] = registration.operation.result
+            await enable(binding)
         evidence = {"exit": "interrupted", "session_id": sid, "send_index": send_index}
         failure = None
         try:
-            async with self.execution(binding, cancel_token=cancel_token):
-                from .model_attempts import enable
-
-                await enable(binding)
+            async with self.execution(binding, cancel_token=cancel_token, initialize_model=True):
                 yield evidence
                 snapshot = binding.resource_evidence.get("processing_snapshot_id")
                 if snapshot and evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass"):
@@ -669,7 +771,7 @@ class TaskRuntime:
             )
             if last is not None and last["seq"] is not None:
                 evidence["last_assistant_ref"] = (await self.manager.store.message_ref(sid, last["seq"])).to_dict()
-            await self.manager.close_model_execution(
+            _, finalized = await self.manager.close_and_finalize(
                 actor,
                 binding.lease,
                 evidence=evidence,
@@ -678,7 +780,8 @@ class TaskRuntime:
             from .finalization import after_send
 
             try:
-                await after_send(self.manager, actor, binding.lease)
+                if not finalized:
+                    await after_send(self.manager, actor, binding.lease)
             except Exception:
                 # The model exit is already durable. A failed mechanical
                 # close leaves supervision open for reconciliation; it must

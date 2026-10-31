@@ -34,12 +34,38 @@ def _object(raw):
 
 
 async def _reference(manager, tx, event_id):
+    from .execution_membership import trusted_ref
+    known = trusted_ref(manager, event_id)
+    if known is not None:
+        return known
     event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
     if event is None:
         raise JobError("finalization_evidence_missing")
-    return {"event_id": event_id, "job_id": event["job_id"], "event_type": event["event_type"],
+    return _event_reference(event)
+
+
+def _event_reference(event):
+    return {"event_id": event["event_id"], "job_id": event["job_id"], "event_type": event["event_type"],
         "revision": event["job_version"], "request_hash": event["request_hash"],
         "delivery_status": event["delivery_status"], "payload_hash": _hash(_object(event["payload_json"]))}
+
+
+async def _references(manager, tx, event_ids, known=None):
+    """Read the exact referenced events in bounded batches, preserving order.
+
+    ``known`` holds rows already read in this transaction.
+    """
+    event_ids = list(event_ids)
+    found = {key: known[key] for key in event_ids if known and key in known}
+    missing = [key for key in event_ids if key not in found]
+    for offset in range(0, len(missing), 100):
+        part = missing[offset:offset + 100]
+        rows = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE event_id IN (" +
+                                 ",".join("?" for _ in part) + ")", tuple(part))
+        found.update({row["event_id"]: row for row in rows})
+    if any(key not in found for key in event_ids):
+        raise JobError("finalization_evidence_missing")
+    return [_event_reference(found[key]) for key in event_ids]
 
 
 async def _closed_event(manager, tx, event, state=None, depth=0):
@@ -90,8 +116,9 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
     refs = data["proof"]["references"]
     if not isinstance(refs, list) or not refs or len(refs) > 10000:
         raise JobError("finalization_evidence_corrupt")
-    for ref in refs:
-        if await _reference(manager, tx, ref["event_id"]) != ref:
+    actual_refs = await _references(manager, tx, (ref["event_id"] for ref in refs))
+    for ref, actual in zip(refs, actual_refs, strict=True):
+        if actual != ref:
             raise JobError("finalization_evidence_changed")
         if ref["event_type"] == "supervision_closed":
             child = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (ref["event_id"],))
@@ -232,8 +259,14 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         await terminate_tx(manager, tx, actor, row["job_id"])
         row = await manager._row(tx, row["job_id"])
     if row["kind"] == "send":
-        exit = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", ("model_closed_" + row["job_id"],))
-        if exit and _object(exit["payload_json"]).get("evidence", {}).get("model_attempt_snapshot_error"):
+        from .execution_membership import _trusted
+        cached = _trusted(manager, "_membership_reads", key)
+        if cached is not None:
+            exit_evidence = (json.loads(cached)["model"] or {}).get("payload", {}).get("evidence", {})
+        else:
+            exit = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", ("model_closed_" + row["job_id"],))
+            exit_evidence = _object(exit["payload_json"]).get("evidence", {}) if exit else {}
+        if exit_evidence.get("model_attempt_snapshot_error"):
             from .model_exit import capture
             await capture(manager, tx, row)  # Keep the original precise corruption error.
             raise JobError("model_exit_snapshot_incomplete")
@@ -287,17 +320,22 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
             raise JobError("finalization_model_exit_unconfirmed")
         if evidence.get("exit") != "completed" and SNAPSHOT not in evidence:
             raise JobError("finalization_model_exit_unconfirmed")
+        known = {}
         if SNAPSHOT in evidence:
-            await require_stopped(manager, tx, row, model["payload"])
+            attempt_refs = await require_stopped(manager, tx, row, model["payload"], known=known)
+            from .model_budgets import require_quiescent as require_budget_quiescent
+            attempt_refs.extend(await require_budget_quiescent(manager, tx, row))
+        else:
+            from .model_attempts import require_quiescent
+            attempt_refs = await require_quiescent(manager, tx, row)
         refs.append(await _reference(manager, tx, model["event_id"]))
         from .pending_calls import require_disposition
-        pending_ref = await require_disposition(manager, tx, row)
+        pending_ref = await require_disposition(manager, tx, row, model["payload"])
         if pending_ref is not None:
             refs.append(pending_ref)
             from .pending_calls import negative_review_references
             refs.extend(await negative_review_references(manager, tx, row))
-        from .model_attempts import require_quiescent
-        refs.extend([await _reference(manager, tx, key) for key in await require_quiescent(manager, tx, row)])
+        refs.extend(await _references(manager, tx, attempt_refs, known))
     else:
         result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='result'", (result_id(row["job_id"], generation),))
         payload = json.loads(result["payload_json"]) if result else {}
@@ -341,7 +379,10 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         refs.append(await _reference(manager, tx, edge["event_id"]))
     # Historical provenance children also retain supervision, including
     # independent workflows that outlive their creator's model send.
-    rows = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE parent_job_id=? OR (control_owner_job_id=? AND control_owner_generation=?)", (row["job_id"], row["job_id"], generation))
+    from .execution_membership import childless
+    rows = [] if childless(manager, row["job_id"]) else await tx.fetchall(
+        f"SELECT * FROM {manager.jobs} WHERE parent_job_id=? OR (control_owner_job_id=? AND control_owner_generation=?)",
+        (row["job_id"], row["job_id"], generation))
     for child in rows:
         children[(child["job_id"], child["generation"])] = _lease(child)
     for (job_id, child_generation), lease in sorted(children.items()):
@@ -485,11 +526,17 @@ async def try_finalize(manager, actor, job_id, generation):
 async def after_send(manager, actor, lease):
     """Read the original successful consumer exits, then close eligible scopes."""
     results = []
-    exit = await manager.db.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=? AND event_type='model_closed'", ("model_closed_" + lease.job_id,))
-    decision_ids = json.loads(exit["payload_json"]).get("evidence", {}).get("processing_decisions", []) if exit else []
+    from .execution_membership import _trusted
+    cached = _trusted(manager, "_membership_reads", (lease.job_id, lease.generation))
+    if cached is not None and json.loads(cached)["model"] is not None:
+        evidence = json.loads(cached)["model"]["payload"].get("evidence", {})
+    else:
+        exit = await manager.db.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=? AND event_type='model_closed'", ("model_closed_" + lease.job_id,))
+        evidence = json.loads(exit["payload_json"]).get("evidence", {}) if exit else {}
+    decision_ids = evidence.get("processing_decisions", [])
     if not isinstance(decision_ids, list) or len(decision_ids) > 10000:
         raise JobError("finalization_consumer_evidence_corrupt")
-    targets = {lease.job_id}
+    targets, rows = {lease.job_id}, {}
     for decision_id in decision_ids:
         event = await manager.db.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='processing_decision'", (decision_id,))
         if event is None or event["caller_session_id"] != actor.session_id or json.loads(event["payload_json"]).get("handler_job_id") != lease.job_id:
@@ -498,7 +545,7 @@ async def after_send(manager, actor, lease):
     # Older creator sends may now have all their independent work settled.
     for job_id in list(targets):
         try:
-            row = await manager._authorize(manager.db, actor, job_id)
+            row = rows[job_id] = await manager._authorize(manager.db, actor, job_id)
         except JobError as exc:
             # Physical node sessions may consume their own input while the
             # logical node is authorized only to its owning engine. Do not
@@ -509,7 +556,7 @@ async def after_send(manager, actor, lease):
             targets.add(row["parent_job_id"])
     for job_id in sorted(targets):
         try:
-            row = await manager._authorize(manager.db, actor, job_id)
+            row = rows.get(job_id) or await manager._authorize(manager.db, actor, job_id)
             results.append(await try_finalize(manager, actor, job_id, row["generation"]))
         except JobError as exc:
             results.append({"status": "pending", "reason": exc.code})

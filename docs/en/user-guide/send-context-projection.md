@@ -285,6 +285,36 @@ runtime-state sub-key `archive_v2` is adopted as `archive`; issued group ids sta
 
 ## Bounded history reads and history-free runs (7.1)
 
-- Once a session is projection-native, a send reads only: rows without a send index, the in-flight send, the latest compact, the newest `max_context_rows` projection rows, and raw rows of past sends inside that window whose projection is missing. Read cost no longer grows with the session; the prompt equals the full read.
+- `AgentLoopConfig.max_context_rows` defaults to `None`: there is no SDK history-row limit.
+  Explicit `None` and `0` are unlimited; a positive integer applies the caller's history limit.
+  The current send and compact summary are retained. Token budgets and folding are separate settings.
+- For a healthy projection-native session, a positive history limit bounds the recent projection
+  window and its missing-projection repairs. Without a limit, all selected history is read;
+  its cost can grow with the selected history. Internal page sizes never silently truncate it.
 - `send(history=False)`: the run sees only its own input; past sends, compact rows and projections are neither read nor written for it. Raw rows are still stored.
 - `send(metadata={...})`: stored as the user row's `meta["send"]`, to tag which host agent or call the send belongs to.
+
+## Incremental end-of-send fold checks
+
+The writer projects only the current send's original messages. In the same short transaction,
+it updates a small fold statistic keyed by renderer settings/version, the compact cursor and a
+projection revision. It uses the existing rendered-message token heuristic, independently of billing.
+A healthy below-threshold send does not read uncompacted historical projection bodies just to
+decide whether to fold. Recency and cross-send deduplication update only affected sends.
+
+When the threshold is reached, candidate rows are read with keyset pagination **outside the
+session lock**, then the fold strategy keeps the configured recent sends and processes the older
+span. The context-row limit does not truncate this span. Commit verifies both the compact cursor
+and projection revision; a concurrent repair, rewrite or fold causes the stale result to be skipped.
+Original messages remain available for recall.
+
+Missing statistics, changed render settings and re-finalizing an existing send require a consistent
+snapshot rebuild outside the lock. The rebuilt statistic is published only if the revision still
+matches. This repair cost is distinct from normal finalization.
+
+Custom row renderers can implement `fold_statistics_policy()` returning a `ProjectionFoldPolicy`
+from `power_loop.runtime.representation`. Rendering must concatenate independent per-row messages;
+the declared dependencies may include hot/cold position and latest `tools[].k` owners. Include every
+size-affecting setting in the fingerprint and bump the policy revision when rendering changes.
+Undeclared custom renderers use a full snapshot check outside locks. Derived statistics and key-owner
+records use reserved `__pl_projection_fold` runtime-state keys and are excluded from session exports.

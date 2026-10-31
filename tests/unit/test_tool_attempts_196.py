@@ -1,5 +1,6 @@
 """Original persisted tools reserve, settle and retry without re-execution."""
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,7 +21,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def prepared(c, call_id='call-1'):
     reg = await c.manager.register_job(c.runtime.actor(c.sid), kind='send', session_id=c.sid,
-        system_key='tool-send', request={'model_attempt_protocol': 1, 'send_index': 1})
+        system_key='tool-send', request={'model_attempt_protocol': 1, 'tool_call_plan_protocol': 1, 'send_index': 1})
     binding = await c.runtime.claim(c.runtime.actor(c.sid), reg)
     from power_loop.runtime.model_attempts import enable
     await enable(binding)
@@ -35,6 +36,9 @@ async def prepared(c, call_id='call-1'):
     c.host.prepare_tool = plan
     token = _SEND.set(binding)
     try:
+        from power_loop.runtime.tool_call_plans import prepare
+        await prepare(SimpleNamespace(session_id=c.sid, sink=SimpleNamespace(persisted_assistant_seq=seq),
+                                      tool_registry=registry))
         attempt = await tools.prepare(binding, ref, call_id, registry.get('echo'), {'text': 'hello'})
     finally:
         _SEND.reset(token)
@@ -58,7 +62,11 @@ async def settle(c, attempt, error=None):
         tools.capture(attempt, None, error)
     finally:
         _SEND.reset(token)
-    return await tools.finish(attempt)
+    try:
+        return await tools.finish(attempt)
+    finally:
+        from power_loop.runtime.control_runtime import flush_binding
+        await flush_binding(attempt.binding, close=True)
 
 
 async def test_original_tool_uses_own_identity_zero_tokens_and_frozen_charge(budget_case):
@@ -215,23 +223,29 @@ async def test_real_agent_loop_bills_original_tool_and_does_not_reexecute_on_del
 
 
 async def test_unstarted_tool_refunds_once_and_cannot_dispatch_after_release(budget_case):
+    from power_loop.runtime.control_runtime import flush_binding
+    from power_loop.runtime.execution_budget import release_unstarted
     c = budget_case
     attempt, _ = await prepared(c)
     token = _SEND.set(attempt.binding)
     try:
         await tools.reserve(attempt)
+        await release_unstarted(attempt)
+        await flush_binding(attempt.binding, close=True)
         first = await budgets.release_unstarted(c.runtime, c.actor, attempt.binding.lease.job_id, attempt.attempt_id)
         assert await budgets.release_unstarted(c.runtime, c.actor, attempt.binding.lease.job_id, attempt.attempt_id) == first
         assert len(c.host.released) == 1 and (await counters(c))['held_calls'] == 0
         async with c.manager._write() as tx:
             job = await c.manager._fence(tx, attempt.binding.actor, attempt.binding.lease)
-            with pytest.raises(JobError, match='dispatch_not_authorized'):
+            with pytest.raises(JobError, match='dispatch_not_authorized|execution_control_closed|already_dispatched'):
                 await tools.authorize_dispatch(attempt, tx, job)
     finally:
         _SEND.reset(token)
 
 
 async def test_tool_release_ack_loss_replays_original_release_and_refunds_once(budget_case):
+    from power_loop.runtime.control_runtime import flush_binding
+    from power_loop.runtime.execution_budget import release_unstarted
     c = budget_case
     attempt, _ = await prepared(c)
     token = _SEND.set(attempt.binding)
@@ -249,30 +263,40 @@ async def test_tool_release_ack_loss_replays_original_release_and_refunds_once(b
         return result
     c.host.release = lose_ack
     with pytest.raises(OSError):
-        await budgets.release_unstarted(c.runtime, c.actor, attempt.binding.lease.job_id, attempt.attempt_id)
+        await release_unstarted(attempt)
+    await flush_binding(attempt.binding, close=True)
     assert (await counters(c))['held_calls'] == 1
     await budgets.release_unstarted(c.runtime, c.actor, attempt.binding.lease.job_id, attempt.attempt_id)
     assert len(set(attempts)) == 1 and (await counters(c))['held_calls'] == 0
 
 
-async def test_tool_dispatch_and_budget_authorization_rollback_together(budget_case):
+async def test_failed_dispatch_checkpoint_does_not_undo_original_memory_dispatch(budget_case, monkeypatch):
+    from power_loop.runtime.control_runtime import current, flush_binding
     c = budget_case
     attempt, _ = await prepared(c)
     token = _SEND.set(attempt.binding)
     try:
         c.host.reserve_lost_ack = True
         await tools.reserve(attempt)
-        with pytest.raises(OSError):
-            async with c.manager._write() as tx:
-                job = await c.manager._fence(tx, attempt.binding.actor, attempt.binding.lease)
-                await tools.authorize_dispatch(attempt, tx, job)
-                raise OSError('dispatch transaction rolled back')
+        await tools.authorize_dispatch(attempt, None, None)
+        control = current(attempt.binding)
+        async def unavailable(*args, **kwargs):
+            raise OSError('checkpoint rolled back')
+        with monkeypatch.context() as patch:
+            patch.setattr(control.journal, 'append', unavailable)
+            with pytest.raises(OSError, match='checkpoint'):
+                await flush_binding(attempt.binding)
+            assert control.get('budget', attempt.attempt_id)['phase'] == 'dispatch_authorized'
+            with pytest.raises(JobError, match='checkpoint_pending'):
+                control.require_admission()
     finally:
         _SEND.reset(token)
     assert c.host.reserve_calls == 1
     state = await budgets.get_budget(c.manager, c.actor, attempt.attempt_id)
-    assert state['phase'] == 'host_reserved'
-    await budgets.release_unstarted(c.runtime, c.actor, attempt.binding.lease.job_id, attempt.attempt_id)
+    assert state['phase'] == 'dispatch_authorized'
+    await flush_binding(attempt.binding, close=True)
+    with pytest.raises(JobError, match='release_not_permitted'):
+        await budgets.release_unstarted(c.runtime, c.actor, attempt.binding.lease.job_id, attempt.attempt_id)
     assert (await counters(c))['used_calls'] == 0
 
 

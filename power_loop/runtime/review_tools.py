@@ -21,15 +21,12 @@ async def require_tool(manager, tx, actor, declared):
 
 
 async def restrict_request(pipeline, system_prompt, tools):
-    from .abort_outcomes import pending_reviews
     from .task_runtime import _SEND
     from .tool_contracts import review_spec, validate_registration
     execution = _SEND.get()
     if execution is None or execution.actor.session_id != pipeline.session_id:
         return system_prompt, tools
-    manager = execution.runtime.manager
-    async with manager._write() as tx:
-        pending = await pending_reviews(manager, tx, execution.actor)
+    pending = execution.resource_evidence.get("_control_review_pending", False)
     if not pending:
         return system_prompt, tools
     selected = []

@@ -42,7 +42,9 @@ async def join_children(slot, *, cancel=False):
 
 
 async def persist_receipt(slot):
-    from . import tool_attempts as tools
+    from .control_runtime import current, queue_event
+    from .execution_tools import event_reference
+    from .tool_attempts import event_id
     cache, attempt = slot.binding.runtime._native_returns, slot.budget_attempt
     try:
         async with cache.lock:
@@ -50,16 +52,16 @@ async def persist_receipt(slot):
             if slot.billing_saved:
                 return
             if slot.billing_receipt is None:
-                raise JobError('tool_billing_receipt_missing')
-            manager = slot.binding.runtime.manager
-            async with manager._write() as tx:
-                job = await manager._authorize(tx, slot.binding.actor, slot.binding.lease.job_id)
-                manager._check_proof(job, slot.binding.lease)
-                await tools._original(manager, tx, job, attempt.prepared)
-                await tools._read(manager, tx, job, 'dispatched', attempt.attempt_id)
-                await tools._save(manager, tx, job, 'receipt', attempt.attempt_id,
-                    dict(version=1, scope=attempt.prepared['scope'], prepared_hash=_hash(attempt.prepared),
-                         billing_receipt=slot.billing_receipt.to_dict()))
+                raise JobError("tool_billing_receipt_missing")
+            control = current(slot.binding)
+            saved = control.get("attempt", attempt.attempt_id)
+            if saved is None or saved["phase"] not in ("dispatched", "finished") or saved["prepared"] != attempt.prepared:
+                raise JobError("tool_attempt_original_mismatch")
+            key = event_id(slot.binding.runtime.manager, "receipt", attempt.attempt_id)
+            queue_event(slot.binding, key, "tool_attempt_receipt", dict(version=1, scope=attempt.prepared["scope"],
+                prepared_hash=_hash(attempt.prepared), billing_receipt=slot.billing_receipt.to_dict()))
+            queue_event(slot.binding, key + "_a", "tool_attempt_anchor", {"version": 1, "source": event_reference(slot.binding, key)})
+            await control.checkpoint(force=True)
             slot.billing_saved = True
     except BaseException:
         slot.failed = True
@@ -67,52 +69,34 @@ async def persist_receipt(slot):
 
 
 async def flush_slot(slot):
-    """Retained local facts can be saved even after the original callback exits."""
-    from . import model_budgets as budgets
-    from . import tool_attempts as tools
-    runtime, attempt = slot.binding.runtime, slot.budget_attempt
-    cache, manager = runtime._native_returns, runtime.manager
+    """Retain exact original fees; a failed delivery never repeats its handler."""
+    from .control_runtime import current
+    from .execution_budget import close_unreserved, release_unstarted
+    from .tool_attempts import finish
+    cache, attempt = slot.binding.runtime._native_returns, slot.budget_attempt
     cache.require(slot)
+    control = current(slot.binding)
     try:
         if slot.billing_receipt is not None and not slot.billing_saved:
             await persist_receipt(slot)
-        async with manager._write() as tx:
-            job = await manager._authorize(tx, slot.binding.actor, slot.binding.lease.job_id)
-            manager._check_proof(job, slot.binding.lease)
-            saved = await tools._read(manager, tx, job, 'finished', attempt.attempt_id, optional=True)
-            started = await tools._read(manager, tx, job, 'dispatched', attempt.attempt_id, optional=True)
-            state = await budgets._read(manager, tx, attempt.attempt_id, required=False)
-        if saved is not None:
-            cache.slots.pop(cache.key(slot))
-            return
-        if started is None:
-            if state is not None:
-                await tools.release_unstarted(runtime, slot.binding.actor,
-                    slot.binding.lease.job_id, attempt.attempt_id)
+        saved = control.get("attempt", attempt.attempt_id)
+        if saved is None or saved["prepared"] != attempt.prepared:
+            raise JobError("tool_attempt_original_mismatch")
+        if saved["phase"] in ("prepared", "aborted"):
+            if await close_unreserved(attempt) is None:
+                await release_unstarted(attempt)
             cache.slots.pop(cache.key(slot))
             return
         if attempt.observation is None:
-            raise JobError('nested_tool_observation_required')
+            raise JobError("nested_tool_observation_required")
         try:
-            await tools.finish(attempt)
+            await finish(attempt)
         except Exception:
-            async with manager._write() as tx:
-                job = await manager._authorize(tx, slot.binding.actor, slot.binding.lease.job_id)
-                saved = await tools._read(manager, tx, job, 'finished', attempt.attempt_id, optional=True)
-            if saved is None:
+            # The failed delivery path seals its immutable fee outbox first.
+            await control.checkpoint(force=True)
+            if control.get("attempt", attempt.attempt_id)["phase"] != "finished":
                 raise
-            # The exact charge is in the durable budget outbox. Delivery
-            # failure cannot replace an actual supplier result or repeat it.
-            import logging
-            logging.getLogger(__name__).warning('Nested tool charge awaits delivery',
-                extra={'attempt_id': attempt.attempt_id})
-        finally:
-            # A lost API acknowledgement leaves a durable original submission.
-            async with manager._write() as tx:
-                job = await manager._authorize(tx, slot.binding.actor, slot.binding.lease.job_id)
-                saved = await tools._read(manager, tx, job, 'finished', attempt.attempt_id, optional=True)
-            if saved is not None:
-                cache.slots.pop(cache.key(slot))
+        cache.slots.pop(cache.key(slot))
     except BaseException:
         slot.failed = True
         raise
@@ -153,11 +137,9 @@ async def invoke_priced_tool(definition, arguments, handler):
     try:
         if not await tools.reserve(attempt):
             raise JobError('budget_tool_adapter_unavailable')
-        manager = parent.binding.runtime.manager
-        async with manager._write() as tx:
-            job = await manager._fence(tx, slot.binding.actor, slot.binding.lease)
-            require_parent(parent)
-            await tools.authorize_dispatch(attempt, tx, job)
+        from .control_runtime import source
+        require_parent(parent)
+        await tools.authorize_dispatch(attempt, None, source(slot.binding))
         try:
             with receipt_context(slot):
                 result = await registry.invoke_async(definition.name, arguments)

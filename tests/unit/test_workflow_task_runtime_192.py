@@ -325,8 +325,8 @@ async def test_disappearing_child_handle_is_not_completion_proof_without_result_
         original_close = manager.close_model_execution
 
         async def wrong_reference(actor, lease, **kwargs):
-            job = await manager.get_job(actor, lease.job_id)
-            if job.execution_role == "workflow_node" and kwargs.get("evidence", {}).get("last_assistant_ref"):
+            job = await manager._authorize(manager._joined_write.get() or manager.db, actor, lease.job_id)
+            if job["execution_role"] == "workflow_node" and kwargs.get("evidence", {}).get("last_assistant_ref"):
                 kwargs["evidence"] = {**kwargs["evidence"], "last_assistant_ref": {
                     **kwargs["evidence"]["last_assistant_ref"], "id": "999999999999"}}
             return await original_close(actor, lease, **kwargs)

@@ -14,6 +14,7 @@ import secrets
 import time
 from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -69,6 +70,10 @@ class JobLease:
     executor_id: str
     boot_id: str
     generation: int
+
+
+class _FinalizeRetry(Exception):
+    """Finalization failed after writing inside the close transaction."""
 
 
 @dataclass(frozen=True)
@@ -127,6 +132,23 @@ def _operation(row) -> JobOperation:
         json.loads(row["payload_json"]))
 
 
+
+TRUST_OWN_WRITES = ContextVar("execution_trust_own_writes", default=False)
+
+
+def verify_stored(fn):
+    """Recovery/audit entry: re-verify stored evidence even inside a live send."""
+    import functools
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        token = TRUST_OWN_WRITES.set(False)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            TRUST_OWN_WRITES.reset(token)
+    return wrapper
+
 class JobManager:
     def __init__(self, store, *, now_ms: Callable[[], int] | None = None,
                  event_bus: AgentEventBus | None = None):
@@ -140,18 +162,103 @@ class JobManager:
         self.now = now_ms or (lambda: time.time_ns() // 1_000_000)
         # Explicit host bus: never leak task observations to the global default.
         self.event_bus = event_bus
+        self._execution_controls = {}
+        self._live_budget_bindings = {}
+        self._control_notifications = ContextVar("execution_control_notifications", default=None)
+        self._control_retirements = ContextVar("execution_control_retirements", default=None)
+        self._control_commit_hooks = ContextVar("execution_control_commit_hooks", default=None)
+        self._control_rollback_hooks = ContextVar("execution_control_rollback_hooks", default=None)
+        self._control_overlay = ContextVar("execution_control_overlay", default=None)
+        # Live sends trust immutable facts this process committed; recovery and
+        # audit paths leave this unset and re-verify stored evidence.
+        self._trust_own_writes = TRUST_OWN_WRITES
+        self._joined_write = ContextVar("execution_joined_write", default=None)
+
+    @asynccontextmanager
+    async def joined_write(self):
+        """Run several control steps as one transaction (one lock, one commit).
+
+        Nested ``_write()`` calls in this context join it. Keep the body free of
+        provider/model awaits: the store control lock is held throughout.
+        """
+        async with self._write() as tx:
+            token = self._joined_write.set(tx)
+            try:
+                yield tx
+            finally:
+                self._joined_write.reset(token)
 
     @asynccontextmanager
     async def _write(self):
         # One short store control lock avoids parent/child lock inversion. No
         # transaction spans a model/provider request. B1 favours correctness over
         # multi-tenant throughput; replace only with equivalent race tests.
-        async with self.db.transaction() as tx:
-            suffix = "" if self.db.dialect.name == "sqlite" else " FOR UPDATE"
-            row = await tx.fetchone(f"SELECT store_id,protocol_version FROM {self.prefix}task_store WHERE id=1" + suffix)
-            if row is None or row["store_id"] != self.store.store_id or row["protocol_version"] != TASK_PROTOCOL_VERSION:
-                raise JobError("store_identity_changed")
-            yield tx
+        joined = self._joined_write.get()
+        if joined is not None:
+            yield joined
+            return
+        notices = set()
+        token = self._control_notifications.set(notices)
+        retirements = set()
+        retirement_token = self._control_retirements.set(retirements)
+        outer_hooks = self._control_commit_hooks.get()
+        hooks = [] if outer_hooks is None else outer_hooks
+        hooks_token = self._control_commit_hooks.set(hooks)
+        outer_undo = self._control_rollback_hooks.get()
+        undo = [] if outer_undo is None else outer_undo
+        undo_token = self._control_rollback_hooks.set(undo)
+        outer_overlay = self._control_overlay.get()
+        overlay_token = self._control_overlay.set({} if outer_overlay is None else outer_overlay)
+        try:
+            try:
+                async with self.db.transaction() as tx:
+                    suffix = "" if self.db.dialect.name == "sqlite" else " FOR UPDATE"
+                    row = await tx.fetchone(f"SELECT store_id,protocol_version FROM {self.prefix}task_store WHERE id=1" + suffix)
+                    if row is None or row["store_id"] != self.store.store_id or row["protocol_version"] != TASK_PROTOCOL_VERSION:
+                        raise JobError("store_identity_changed")
+                    from .session_controls import RecordingTransaction, bump
+                    recorder = RecordingTransaction(tx, self.events, (
+                        (self.jobs, "job_id"), (self.prefix + "task_executors", "executor_key")))
+                    yield recorder
+                    if recorder.jobs or recorder.sessions:
+                        await bump(self, tx, recorder)
+            except BaseException:
+                if outer_undo is None:
+                    for hook in reversed(undo):
+                        hook()
+                raise
+            if outer_hooks is None:
+                for hook in hooks:
+                    hook()
+            for binding in tuple(self._execution_controls.values()):
+                if notices.intersection(binding.resource_evidence.get("_control_ancestors", ())):
+                    from .control_runtime import current
+                    control = current(binding)
+                    control.cancel_requested = True
+                    control.record("lifecycle", "cancel", {"requested": True})
+            for key in retirements:
+                binding = self._execution_controls.pop(key, None)
+                if binding is not None:
+                    from .control_runtime import current
+                    current(binding).cancel_requested = True
+                    current(binding).needs_reconciliation = True
+                    from .control_runtime import forget_budget_bindings
+                    forget_budget_bindings(binding)
+        finally:
+            self._control_commit_hooks.reset(hooks_token)
+            self._control_rollback_hooks.reset(undo_token)
+            self._control_overlay.reset(overlay_token)
+            self._control_notifications.reset(token)
+            self._control_retirements.reset(retirement_token)
+
+    def after_outcome(self, commit, rollback):
+        """Defer in-memory effects of a control write until its transaction ends."""
+        hooks, undo = self._control_commit_hooks.get(), self._control_rollback_hooks.get()
+        if hooks is None:
+            commit()
+            return
+        hooks.append(commit)
+        undo.append(rollback)
 
     async def _row(self, reader, job_id):
         return await reader.fetchone(f"SELECT * FROM {self.jobs} WHERE job_id=?", (job_id,))
@@ -262,7 +369,11 @@ class JobManager:
         if resource_state not in ("stopped", "unknown"):
             raise JobError("invalid_resource_state")
         evidence_data = json.loads(_json(dict(evidence or {})))
-        async with self._write() as tx:
+        control = self._execution_controls.get((lease.job_id, lease.generation))
+        async with self.joined_write() as tx:
+            if control is not None:
+                from .control_runtime import flush_binding
+                await flush_binding(control, close=True, transaction=tx)
             row = await self._authorize(tx, actor, lease.job_id)
             if row["kind"] != "send":
                 raise JobError("not_model_send")
@@ -298,17 +409,90 @@ class JobManager:
             # dispatch more work. Cancellation/lease expiry must not prevent it.
             if row["resource_state"] not in ("running", "unknown"):
                 raise JobError("execution_not_running")
+            now = self.now()
             await tx.execute(f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
                 "resource_state=?,lease_until_ms=NULL,version=version+1,updated_at=? WHERE job_id=?",
-                (resource_state, self.now(), lease.job_id))
+                (resource_state, now, lease.job_id))
+            closed = json.loads(_json({"generation": lease.generation, "evidence": evidence_data,
+                                       "resource_state": resource_state}))
             await tx.execute(f"INSERT INTO {self.events} "
                 "(event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
                 ("model_closed_" + lease.job_id, lease.job_id, "model_closed", row["version"]+1,
-                 _json({"generation": lease.generation, "evidence": evidence_data,
-                        "resource_state": resource_state}), "not_applicable", self.now()))
-            from .execution_membership import seal
-            await seal(self, tx, row)
-            return _record(await self._row(tx, lease.job_id))
+                 _json(closed), "not_applicable", now))
+            from .execution_membership import remember_ref, seal
+            remember_ref(self, "model_closed_" + lease.job_id, lease.job_id, "model_closed", row["version"] + 1, closed)
+            await seal(self, tx, row, model={"event_id": "model_closed_" + lease.job_id,
+                                             "hash": _hash(closed), "payload": closed})
+            closed_row = {**row, "status": "model_closed", "intake": "closed", "resource_state": resource_state,
+                          "lease_until_ms": None, "version": row["version"] + 1, "updated_at": now}
+            tx.remember_row(self.jobs, "job_id", lease.job_id, closed_row)
+            result = _record(closed_row)
+            if control is not None:
+                from .control_runtime import forget_completed
+                self.after_outcome(lambda: forget_completed(control), lambda: None)
+        return result
+
+    async def close_and_finalize(self, actor: JobActor, lease: JobLease, *, evidence: Mapping[str, Any] | None = None,
+                                 resource_state: str = "stopped") -> tuple[JobRecord, bool]:
+        """Close a send and, when nothing else is affected, finalize it in the same transaction.
+
+        Returns ``(record, finalized_here)``. A finalization failure leaves
+        supervision open but never undoes the durable model exit. Otherwise the
+        caller runs ``after_send`` for consumer/parent targets.
+        """
+        try:
+            return await self._close_and_finalize(actor, lease, evidence=evidence, resource_state=resource_state)
+        except JobError:
+            raise
+        except Exception:
+            # An unknown commit outcome (lost ACK) or a finalization that failed
+            # after writing is retried once, guarded by a savepoint. The checkpoint,
+            # model exit and finalization each recognise their own committed state.
+            return await self._close_and_finalize(actor, lease, evidence=evidence, resource_state=resource_state,
+                                                  guarded=True)
+
+    async def _close_and_finalize(self, actor, lease, *, evidence, resource_state, guarded=False):
+        async with self.joined_write() as tx:
+            record = await self.close_model_execution(actor, lease, evidence=evidence, resource_state=resource_state)
+            if record.parent_job_id or (evidence or {}).get("processing_decisions"):
+                return record, False
+            finalize = self._finalize_guarded if guarded else self._finalize_unguarded
+            closure = await finalize(tx, actor, lease)
+        if closure is not None:
+            self._publish_closure(actor, lease.job_id, lease.generation, closure)
+        return record, True
+
+    async def _finalize_unguarded(self, tx, actor, lease):
+        from .finalization import finalize
+        writes = tx.writes
+        try:
+            return await finalize(self, actor, lease.job_id, generation=lease.generation)
+        except (JobError, TypeError, ValueError, KeyError, AttributeError):
+            if tx.writes != writes:
+                raise _FinalizeRetry() from None
+            return None  # Rejected before writing: nothing to undo, supervision stays open.
+
+    async def _finalize_guarded(self, tx, actor, lease):
+        from .finalization import finalize
+        hooks, undo, overlay = (self._control_commit_hooks.get(), self._control_rollback_hooks.get(),
+                                self._control_overlay.get())
+        marks, visible = (len(hooks), len(undo)), dict(overlay)
+        await tx.execute("SAVEPOINT power_loop_finalize")
+        try:
+            closure = await finalize(self, actor, lease.job_id, generation=lease.generation)
+        except Exception as exc:
+            await tx.execute("ROLLBACK TO SAVEPOINT power_loop_finalize")
+            for hook in reversed(undo[marks[1]:]):
+                hook()
+            del hooks[marks[0]:], undo[marks[1]:]
+            overlay.clear()
+            overlay.update(visible)
+            tx.forget_reads()
+            if not isinstance(exc, (JobError, TypeError, ValueError, KeyError, AttributeError)):
+                logging.getLogger(__name__).exception("supervision remains open after model exit: %s", lease.job_id)
+            closure = None
+        await tx.execute("RELEASE SAVEPOINT power_loop_finalize")
+        return closure
 
     async def check_execution(self, actor: JobActor, lease: JobLease) -> None:
         async with self._write() as tx:
@@ -499,14 +683,24 @@ class JobManager:
             raise JobError("tool_call_not_found")
 
     async def _insert_operation(self, tx, *, job_id, version, actor, action, key, fingerprint,
-                                call_ref=None, tool_call_id=None, payload=None):
+                                call_ref=None, tool_call_id=None, payload=None, ignore=False):
+        self._control_operation_revision = getattr(self, "_control_operation_revision", 0) + 1
+        notices = self._control_notifications.get()
+        if action == "stop" and notices is not None:
+            notices.add(job_id)
         operation_id = "op_" + secrets.token_hex(16)
-        await tx.execute(f"INSERT INTO {self.events} (event_id,job_id,event_type,job_version,operation_key,"
-            "request_hash,action,caller_session_id,tool_call_id,call_ref_json,payload_json,delivery_status,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (operation_id, job_id, "operation", version, key,
+        call_ref_json, payload_json = (_json(call_ref.to_dict()) if call_ref else None), _json(payload or {})
+        columns = ("event_id", "job_id", "event_type", "job_version", "operation_key", "request_hash", "action",
+                   "caller_session_id", "tool_call_id", "call_ref_json", "payload_json", "delivery_status", "created_at")
+        sql = (self.db.dialect.insert_ignore(self.events, columns) if ignore else
+               f"INSERT INTO {self.events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})")
+        inserted = await tx.execute(sql, (operation_id, job_id, "operation", version, key,
             fingerprint, action, actor.session_id, tool_call_id,
-            _json(call_ref.to_dict()) if call_ref else None, _json(payload or {}), "not_applicable", self.now()))
-        return _operation(await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=?", (operation_id,)))
+            call_ref_json, payload_json, "not_applicable", self.now()))
+        if ignore and not inserted:
+            return None
+        return _operation({"event_id": operation_id, "job_id": job_id, "action": action,
+                           "call_ref_json": call_ref_json, "receipt_ref_json": None, "payload_json": payload_json})
 
     async def get_job(self, actor: JobActor, job_id: str, *, include_result: bool = True) -> JobRecord:
         """Read authorized metadata, optionally omitting the mutable result cache.
@@ -527,6 +721,10 @@ class JobManager:
             if isinstance(exc, JobError):
                 raise
             raise JobError("finalization_evidence_corrupt") from exc
+        self._publish_closure(actor, job_id, generation, ref)
+        return ref
+
+    def _publish_closure(self, actor, job_id, generation, ref):
         # The transaction has exited successfully. Observers cannot veto or
         # replace its proof, and receive no mutable reference to that proof.
         if self.event_bus is not None:
@@ -544,7 +742,6 @@ class JobManager:
                 # Best effort only: log no subscriber exception text, which may
                 # include arbitrary host data. Strict buses stop later handlers.
                 logging.getLogger(__name__).warning("Task supervision observer failed (job_id=%s)", job_id)
-        return ref
 
     async def execution_usage(self, actor: JobActor, job_id: str, *, generation: int | None = None) -> dict:
         """Sum each persisted model-send exit once, never recursive scope rollups.
@@ -594,10 +791,11 @@ class JobManager:
             session_id: str | None = None, parent: JobLease | None = None,
             call_ref: MessageRef | None = None, tool_call_id: str | None = None,
             system_key: str | None = None, independent: bool = False,
-            request: Mapping[str, Any] | None = None) -> JobRegistration:
+            request: Mapping[str, Any] | None = None, fresh: bool = False) -> JobRegistration:
+        """``fresh`` callers treat any replay as an error: the unique key replaces the lookup."""
         prepared = self._registration_spec(actor, kind=kind, title=title, session_id=session_id, parent=parent, call_ref=call_ref, tool_call_id=tool_call_id, system_key=system_key, independent=independent, request=request)
         async with self._write() as tx:
-            return await self._register_job_tx(tx, actor, **prepared)
+            return await self._register_job_tx(tx, actor, fresh=fresh, **prepared)
 
     def _registration_spec(self, actor: JobActor, *, kind: str, title: str = "",
             session_id: str | None = None, parent: JobLease | None = None,
@@ -620,10 +818,10 @@ class JobManager:
                              request_data, call_ref.to_dict() if call_ref else None])
         return {'kind': kind, 'title': title, 'session_id': session_id, 'parent': parent, 'call_ref': call_ref, 'tool_call_id': tool_call_id, 'system_key': system_key, 'independent': independent, 'request': request, 'request_data': request_data, 'effect': effect, 'host_step': host_step, 'key': key, 'fingerprint': fingerprint}
 
-    async def _register_job_tx(self, tx, actor, *, kind, title, session_id, parent, call_ref, tool_call_id, system_key, independent, request, request_data, effect, host_step, key, fingerprint):
+    async def _register_job_tx(self, tx, actor, *, kind, title, session_id, parent, call_ref, tool_call_id, system_key, independent, request, request_data, effect, host_step, key, fingerprint, fresh=False):
         from . import host_send_steps, managed_effects
 
-        old = await tx.fetchone(f"SELECT * FROM {self.events} WHERE operation_key=?", (key,))
+        old = None if fresh else await tx.fetchone(f"SELECT * FROM {self.events} WHERE operation_key=?", (key,))
         if old:
             if old["request_hash"] != fingerprint:
                 raise JobError("operation_conflict")
@@ -669,7 +867,10 @@ class JobManager:
             else:
                 await self._validate_call(tx, actor, call_ref, tool_call_id)
         if session_id is not None:
-            session = await tx.fetchone(f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?", (session_id,))
+            # A live send's own session was just read by its role check; only others are verified here.
+            own = session_id == actor.session_id and parent is None and self._trust_own_writes.get()
+            session = {"session_id": session_id} if own else await tx.fetchone(
+                f"SELECT * FROM {self.store.t.sessions} WHERE session_id=?", (session_id,))
             granted = restored_parent and await controls_node(self, tx, parent_row, actor, session_id)
             if session is None or (session_id != actor.session_id and session["parent_session_id"] != actor.session_id and not granted):
                 raise JobError("session_ownership_mismatch")
@@ -709,6 +910,9 @@ class JobManager:
             wait_binding = await prepare_binding(self, tx, actor, parent_row, request_data,
                 caller=parent, session_id=session_id, independent=independent, call_ref=call_ref,
                 tool_call_id=tool_call_id)
+        if parent is not None:
+            from .execution_membership import note_child
+            note_child(self, parent.job_id)
         await tx.execute(f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
             "session_id,created_by_session_id,kind,title,completion_scope_job_id,blocks_completion,"
             "status,version,generation,intake,resource_state,supervision_status,result_status,created_at,updated_at,"
@@ -720,6 +924,22 @@ class JobManager:
             parent.generation if parent else None, parent.executor_id if parent else None, parent.boot_id if parent else None,
             role, owner["job_id"] if owner else None, owner["generation"] if owner else None,
             owner["executor_id"] if owner else None, owner["boot_id"] if owner else None))
+        tx.remember_row(self.jobs, "job_id", job_id, {
+            "job_id": job_id, "parent_job_id": parent.job_id if parent else None, "root_job_id": root,
+            "parent_generation": parent.generation if parent else None,
+            "parent_executor_id": parent.executor_id if parent else None,
+            "parent_boot_id": parent.boot_id if parent else None,
+            "control_owner_job_id": owner["job_id"] if owner else None,
+            "control_owner_generation": owner["generation"] if owner else None,
+            "control_owner_executor_id": owner["executor_id"] if owner else None,
+            "control_owner_boot_id": owner["boot_id"] if owner else None,
+            "tenant_id": actor.tenant_id, "principal_id": actor.principal_id, "session_id": session_id,
+            "created_by_session_id": actor.session_id, "kind": kind, "execution_role": role, "title": title,
+            "completion_scope_job_id": scope, "blocks_completion": 0 if independent or parent is None else 1,
+            "status": "queued", "version": 1, "generation": 0, "executor_id": None, "boot_id": None,
+            "executor_key": None, "lease_until_ms": None, "cancel_requested_at": None, "cancel_reason": None,
+            "intake": "open", "resource_state": "not_started", "supervision_status": "open",
+            "result_status": "none", "outcome": None, "result_json": None, "created_at": now, "updated_at": now})
         payload = {"job_id": job_id, "status": "queued"}
         if (kind in ("send", "subagent", "workflow", "workflow_node", "timer") or effect is not None) and request is not None:
             # Recovery must not reread a potentially edited YAML/file or
@@ -733,7 +953,9 @@ class JobManager:
             payload["host_contexts"] = host_contexts
         operation = await self._insert_operation(tx, job_id=job_id, version=1, actor=actor, action="create",
             key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id,
-            payload=payload)
+            payload=payload, ignore=fresh)
+        if operation is None:
+            raise JobError("task_send_requires_reconciliation")
         await host_send_steps.record(self, tx, actor, host_step, operation)
         if effect is not None:
             await managed_effects.record_registration(self, tx, await self._row(tx, job_id), operation, effect)
@@ -775,11 +997,18 @@ class JobManager:
             elif row["kind"] in ("send", "subagent") and row["session_id"] is not None:
                 from .workflow_controller import validate_dispatch
                 await validate_dispatch(self, tx, row)
-            generation = int(row["generation"]) + 1
+            generation, now = int(row["generation"]) + 1, self.now()
+            claimed = {"status": "running", "version": row["version"] + 1, "generation": generation,
+                       "executor_id": executor_id, "boot_id": boot_id,
+                       "executor_key": executor["executor_key"] if executor else None,
+                       "lease_until_ms": now + lease_ms, "resource_state": "running", "updated_at": now}
             await tx.execute(f"UPDATE {self.jobs} SET status='running',version=version+1,generation=?,"
                 "executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,resource_state='running',updated_at=? WHERE job_id=?",
-                (generation, executor_id, boot_id, executor["executor_key"] if executor else None, self.now() + lease_ms, self.now(), job_id))
-            from .execution_membership import start
+                (generation, executor_id, boot_id, claimed["executor_key"], claimed["lease_until_ms"], now, job_id))
+            tx.remember_row(self.jobs, "job_id", job_id, {**row, **claimed})
+            from .execution_membership import note_first_claim, start
+            if generation == 1:
+                note_first_claim(self, job_id)
             await start(self, tx, await self._row(tx, job_id))
             if row["kind"] in ("subagent", "workflow_node"):
                 from .completion_windows import admit
@@ -871,9 +1100,10 @@ class JobManager:
                                          require_children_stopped=require_children_stopped)
 
     async def prepare_processing(self, actor: JobActor, caller: JobLease, *, round_index: int,
-                                 send_index: int, messages: list[dict]) -> str | None:
+                                 send_index: int, messages: list[dict], report: dict | None = None) -> str | None:
         from .processing import prepare
-        return await prepare(self, actor, caller, round_index=round_index, send_index=send_index, messages=messages)
+        return await prepare(self, actor, caller, round_index=round_index, send_index=send_index, messages=messages,
+                             report=report)
 
     async def commit_processing_decision(self, actor: JobActor, caller: JobLease, *, snapshot_id: str,
                                           response_ref: MessageRef, decision: str = "consumed", reason: str) -> list[str]:

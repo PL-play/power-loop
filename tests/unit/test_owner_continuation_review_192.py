@@ -415,8 +415,9 @@ async def collected_case(registry_store, kind, monkeypatch, *, remaining=2, prov
 
     async def enqueue_after_actual_exit(actor, lease, **kwargs):
         value = await original(actor, lease, **kwargs)
-        row = await c.manager.get_job(c.runtime.actor(c.state.root), lease.job_id)
-        if row.execution_role == kind and c.state.phase == "initial" and not c.state.queued:
+        tx = c.manager._joined_write.get()
+        row = await c.manager._authorize(tx or c.manager.db, c.runtime.actor(c.state.root), lease.job_id)
+        if row["execution_role"] == kind and c.state.phase == "initial" and not c.state.queued:
             c.state.queued = True
             c.state.phase = "collect"
             from power_loop.runtime.completion import WINDOW
@@ -425,19 +426,19 @@ async def collected_case(registry_store, kind, monkeypatch, *, remaining=2, prov
             if kind == "workflow_node":
                 assert c.state.window is not None
                 c.state.window.remaining = remaining
-            c.state.child_sid = row.session_id
-            c.state.owner_id = row.control_owner_job_id
-            await c.store.inbox_put(
-                row.session_id,
-                [
-                    {
-                        "item_id": "accepted-original-collect-input",
-                        "kind": "relay",
-                        "mode": "queue",
-                        "content": "Call touch_once exactly once. Process its original outcome without repeating it.",
-                    }
-                ],
-            )
+            c.state.child_sid = row["session_id"]
+            c.state.owner_id = row["control_owner_job_id"]
+            item = {"item_id": "accepted-original-collect-input", "kind": "relay", "mode": "queue",
+                    "content": "Call touch_once exactly once. Process its original outcome without repeating it."}
+            if tx is None:
+                await c.store.inbox_put(row["session_id"], [item])
+            else:
+                # The injected input shares the actual close commit; opening
+                # another store transaction here would deadlock SQLite.
+                columns = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
+                await tx.execute(c.manager.db.dialect.insert_ignore(c.store.t.follow_up_queue, columns),
+                                 (row["session_id"], item["item_id"], item["kind"], item["mode"], "pending",
+                                  item["content"], c.manager.now()))
         return value
 
     monkeypatch.setattr(c.manager, "close_model_execution", enqueue_after_actual_exit)

@@ -144,12 +144,13 @@ async def _row(manager, tx, identity, *, required=True):
             raise JobError("executor_registration_required")
         return None
     _validate_snapshot(manager, identity, _snapshot(row))
-    _, current = await _event(manager, tx, identity, row["version"])
-    _, original = await _event(manager, tx, identity, 1)
-    if (current["response"] != _snapshot(row) or original["request"].get("action") != "register" or
-            original["response"]["state"] != "starting" or original["response"]["contract_hash"] != row["contract_hash"] or
-            original["response"]["created_at"] != row["created_at"]):
-        raise JobError("executor_evidence_corrupt")
+    if not manager._trust_own_writes.get():
+        _, current = await _event(manager, tx, identity, row["version"])
+        _, original = await _event(manager, tx, identity, 1)
+        if (current["response"] != _snapshot(row) or original["request"].get("action") != "register" or
+                original["response"]["state"] != "starting" or original["response"]["contract_hash"] != row["contract_hash"] or
+                original["response"]["created_at"] != row["created_at"]):
+            raise JobError("executor_evidence_corrupt")
     return row
 
 
@@ -292,7 +293,7 @@ async def check_execution(manager, tx, row):
     registered = await require_accepting(manager, tx, identity, required=row["executor_key"] is not None)
     if registered is not None and row["executor_key"] != registered["executor_key"]:
         raise JobError("executor_binding_missing")
-    if row["executor_key"] is not None:
+    if row["executor_key"] is not None and not manager._trust_own_writes.get():
         from .execution_membership import scope
         saved = await scope(manager, tx, row["job_id"], row["generation"])
         if saved["version"] != 2 or saved["executor_binding"]["executor_key"] != row["executor_key"]:
@@ -303,11 +304,16 @@ async def registration_binding(manager, tx, row):
     identity = identity_for(row)
     if row["executor_key"] != _key(manager, identity):
         raise JobError("executor_binding_mismatch")
-    event, data = await _event(manager, tx, identity, 1)
-    if data["request"].get("action") != "register":
-        raise JobError("executor_evidence_corrupt")
-    return {"executor_key": row["executor_key"], "registration_event_id": event["event_id"],
-        "registration_hash": _hash(data), "contract_hash": data["response"]["contract_hash"]}
+    # The registration event is immutable; read it once per process.
+    cache = manager.__dict__.setdefault("_executor_bindings", {})
+    found = cache.get(row["executor_key"]) if manager._trust_own_writes.get() else None
+    if found is None:
+        event, data = await _event(manager, tx, identity, 1)
+        if data["request"].get("action") != "register":
+            raise JobError("executor_evidence_corrupt")
+        found = cache[row["executor_key"]] = {"executor_key": row["executor_key"], "registration_event_id": event["event_id"],
+            "registration_hash": _hash(data), "contract_hash": data["response"]["contract_hash"]}
+    return dict(found)
 
 
 async def validate_binding(manager, tx, data):

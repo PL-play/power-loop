@@ -96,8 +96,12 @@ from pathlib import Path
 asyncio.run(_executor(Path({str(tmp_path)!r}), Path({str(script)!r})).run_agent(
     {{'name': 'guard', 'system_prompt': 'p'}}, 'x', parent_loop=_loop(), driver_sid='d'))
 ''')
+    owner_env = dict(os.environ)
+    owner_env['PYTHONPATH'] = os.pathsep.join(filter(None, (
+        str(Path(__file__).resolve().parents[2]), owner_env.get('PYTHONPATH', ''),
+    )))
     process = subprocess.Popen([sys.executable, str(owner)], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
+                               stderr=subprocess.DEVNULL, env=owner_env)
     record_property('owned_process_pid', process.pid)
     try:
         pids = await _pids(tmp_path / 'pids.json')

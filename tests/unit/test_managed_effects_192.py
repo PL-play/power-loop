@@ -786,7 +786,7 @@ async def test_protocol_seven_original_pending_receipt_can_be_upgraded_and_reind
     await reconcile(c.runtime, c.actor, job["job_id"], c.adapter)
     await c.manager.finalize_supervision(c.actor, job["job_id"], generation=1)
     assert (await c.manager.get_job(c.actor, job["job_id"])).supervision_status == "closed"
-    assert jobs.TASK_PROTOCOL_VERSION == 21
+    assert jobs.TASK_PROTOCOL_VERSION == 22
 
 
 async def test_claim_membership_survives_lost_ack_and_cannot_be_relabelled_unclaimed(registry_store):

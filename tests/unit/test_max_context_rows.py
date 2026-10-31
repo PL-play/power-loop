@@ -69,6 +69,33 @@ async def test_cap_disabled_keeps_everything(store: SessionStore) -> None:
     assert "u1" in joined and "u6" in joined
 
 
+@pytest.mark.parametrize("options", [{}, {"max_context_rows": None}, {"max_context_rows": 0},
+                                     {"max_context_rows": 20}], ids=["default", "none", "zero", "positive"])
+@pytest.mark.asyncio
+async def test_history_limit_is_explicit_beyond_previous_defaults(store: SessionStore, options) -> None:
+    """More than 400 rendered rows exposes both the old default and a hidden replacement cap."""
+    llm = _Scripted(responses=[LLMResponse(raw_text="done")])
+    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(
+        system_prompt="S", representation=ProjectedRepresentation(), max_tokens=1_000_000,
+        fold_strategy=LLMSummaryFold(keep_last_sends=2), **options,
+    ))
+    sid = await loop.new_session(metadata={"projection_migrated": 0})
+    for send in range(1, 212):
+        for kind, content in (("user", {"input": [f"history-user-{send:04d}"]}),
+                              ("project", {"final_text": f"history-answer-{send:04d}"})):
+            await store.upsert_project_message(sid, send_index=send, kind=kind, content=content,
+                                               projector_version=1)
+    await store.set_runtime_state(sid, "send_index", 211)
+    try:
+        assert (await loop.send("current", session_id=sid)).status == "completed"
+        prompt = str(llm.calls[0])
+        assert "history-user-0211" in prompt and "current" in prompt
+        assert ("history-user-0001" in prompt) == (options.get("max_context_rows") != 20)
+        assert len(await store.load_project_messages(sid)) == 424
+    finally:
+        await loop.aclose()
+
+
 @pytest.mark.asyncio
 async def test_cap_never_drops_the_fold_compact(store: SessionStore) -> None:
     # Aggressive fold: after a few sends the older ones live in the compact summary. The cap must

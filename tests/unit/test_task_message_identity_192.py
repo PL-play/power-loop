@@ -158,9 +158,11 @@ async def test_message_identity_rejects_imprecise_or_invalid_coordinates(value):
 async def test_bigint_is_returned_as_decimal_string(task_store):
     s = task_store
     sid = await s.create_session()
-    await s.append_message(sid, role="user", content="large")
     large = 2**53 + 9
-    await s._db.execute(f"UPDATE {s.t.messages} SET id=? WHERE session_id=?", (large, sid))
+    # Allocate a real bigint identity rather than mutating an immutable ID after
+    # the writer has already cached it.
+    await s._db.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (s.t.messages, large - 1))
+    await s.append_message(sid, role="user", content="large")
     ref = await s.message_ref(sid, 1)
     assert ref.to_dict()["id"] == str(large)
     assert (await s.message_by_id(sid, str(large))).id == large

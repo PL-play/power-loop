@@ -9,7 +9,7 @@ import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
 
-from .jobs import JobError, _hash, _json
+from .jobs import JobError, _hash
 from .model_exit import content_reference
 from .pricing import BillingReceipt, PricingError
 
@@ -20,7 +20,10 @@ def tool_billing_managed(name: str) -> bool:
     """Whether this exact callback's fee is owned by the native budget path."""
     slot = _CURRENT.get()
     attempt = slot.budget_attempt if slot is not None else None
-    return attempt is not None and attempt.call.name == name
+    if attempt is None or attempt.call.name != name:
+        return False
+    from .control_runtime import current
+    return current(attempt.binding).get("attempt", attempt.attempt_id)["budget_required"]
 
 
 def tool_billing_active() -> bool:
@@ -100,42 +103,5 @@ async def persist_receipt(runtime, slot):
     if slot.nested_parent is not None:
         from .nested_tools import persist_receipt as persist_nested_receipt
         return await persist_nested_receipt(slot)
-    from .native_returns import _LIMIT, _basis
-    from .tool_call_plans import _event
-    from .tool_call_plans import read as read_plan
-    cache, manager = runtime._native_returns, runtime.manager
-    try:
-        async with cache.lock:
-            cache.check()
-            if slot.billing_saved and slot.binding.runtime is runtime:
-                return
-            cache.require(slot)
-            if slot.billing_receipt is None:
-                raise JobError('tool_billing_receipt_missing')
-            async with manager._write() as tx:
-                source = await manager._authorize(tx, slot.binding.actor, slot.binding.lease.job_id)
-                manager._check_proof(source, slot.binding.lease)
-                plan = await read_plan(manager, tx, source, slot.ref)
-                entries = [e for e in plan['entries'] if e['call_id'] == slot.call_id]
-                if len(entries) != 1 or _hash(plan) != slot.plan_hash or _hash(entries[0]) != slot.entry_hash:
-                    raise JobError('tool_billing_original_changed')
-                start, _ = await _basis(manager, tx, source, slot.ref, entries[0], plan)
-                value = dict(version=1, scope=plan['scope'], call_ref=slot.ref.to_dict(), call_id=slot.call_id,
-                             plan_hash=slot.plan_hash, entry_hash=slot.entry_hash, started=start,
-                             billing_receipt=slot.billing_receipt.to_dict())
-                if len(_json(value).encode()) > _LIMIT:
-                    raise JobError('tool_billing_receipt_too_large')
-                old = await read_receipt(manager, tx, source, slot.ref, entries[0], plan, optional=True)
-                if old is not None:
-                    if old[1] != value:
-                        raise JobError('tool_billing_receipt_changed')
-                else:
-                    key = identity(cache.key(slot))
-                    await _event(manager, tx, key, source, 'tool_billing_receipt', value)
-                    event = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (key,))
-                    await _event(manager, tx, key + '_a', source, 'tool_billing_receipt_anchor',
-                                 {'version': 1, 'receipt': content_reference(event)})
-            slot.billing_saved = True
-    except BaseException:
-        slot.failed = True
-        raise
+    from .execution_tools import persist_billing_receipt
+    return await persist_billing_receipt(runtime, slot)

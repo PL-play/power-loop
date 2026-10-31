@@ -17,7 +17,7 @@ def identity(manager, source):
 
 async def _expected(manager, tx, source, snapshot):
     from .managed_effects import _ref
-    from .tool_call_plans import _read
+    from .tool_call_plans import _read, start_id
     from .tool_call_plans import identity as plan_id
     from .tool_call_plans import read as read_plan
     from .workflow_controller import proof
@@ -31,7 +31,7 @@ async def _expected(manager, tx, source, snapshot):
         return None
     dispatches = []
     for entry in plan['entries']:
-        key = plan_id(manager, source, ref) + '_start_' + _hash(entry['call_id'])[:24]
+        key = start_id(plan_id(manager, source, ref), entry['call_id'])
         started = await _read(manager, tx, key, source, 'tool_call_dispatch_started', optional=True)
         expected = {'version': 1, 'scope': plan['scope'], 'plan_id': plan_id(manager, source, ref),
                     'plan_hash': _hash(plan), 'entry_hash': _hash(entry)}
@@ -163,7 +163,7 @@ async def prepare(manager, tx, actor, source):
     if delivery is None:
         data, key = await _notice_value(manager, tx, source, old), notice_id(manager, source, native=True)
         await _event(manager, tx, key, source, 'source_abort_delivery', data)
-        await tx.execute(f'UPDATE {manager.events} SET caller_session_id=? WHERE event_id=?', (actor.session_id, key))
+        await tx.set_event_recipient(key, actor.session_id)
         columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
         await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
             (actor.session_id, key, 'original_call_outcome', 'queue', 'pending', render(data['public']), manager.now()))

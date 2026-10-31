@@ -11,6 +11,7 @@ import pytest
 from power_loop import CancellationToken, LLMRequest
 from power_loop.contracts.errors import LLMNonRetryable
 from power_loop.runtime import model_attempts as attempts
+from power_loop.runtime.control_runtime import flush_binding
 from power_loop.runtime.jobs import JobError, JobManager, _hash
 from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.retry import LLMRetryPolicy, with_retry
@@ -42,13 +43,18 @@ async def attempt_case(registry_store):
 
 async def prepare(c, **kwargs):
     values = dict(nonce="call-one", round_index=0, retry_index=1, request_hash="a"*64, model="test-model", max_tokens=100)
-    return await attempts.prepare(c.binding, **(values | kwargs))
+    attempt = await attempts.prepare(c.binding, **(values | kwargs))
+    # These inspection/corruption tests explicitly cross a checkpoint. The
+    # no-I/O inner loop is tested independently in test_execution_checkpoints.
+    await flush_binding(c.binding)
+    return attempt
 
 
 async def completed(c, attempt=None):
     attempt = attempt or await prepare(c)
     await attempts.dispatch(attempt)
     await attempts.finish(attempt, status="returned", usage={"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}, estimated=False)
+    await flush_binding(c.binding)
     return attempt
 
 
@@ -94,6 +100,9 @@ async def test_dispatch_is_fenced_after_prepare_and_cannot_claim_remote_start(at
     else:
         column, value = ("lease_until_ms", 0) if fault == "expired" else ("generation", 2)
         await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET {column}=? WHERE job_id=?", (value, c.binding.lease.job_id))
+        # Cross-process revocation is observed at the next bounded checkpoint.
+        from power_loop.runtime.control_runtime import current
+        await current(c.binding).before_checkpoint()
     with pytest.raises(JobError, match="cancel_requested|lease_expired|stale_execution"):
         await attempts.dispatch(attempt)
     assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'")
@@ -109,6 +118,7 @@ async def test_actual_late_observation_survives_stop_and_expiry_without_dispatch
     args = dict(status=status, usage={"total_tokens": 17}, estimated=status == "unknown", error_type="TimeoutError" if status == "unknown" else None)
     await attempts.finish(attempt, **args)
     await attempts.finish(attempt, **args)
+    await flush_binding(c.binding)
     with pytest.raises(JobError, match="model_attempt_conflict"):
         await attempts.finish(attempt, **(args | {"usage": {"total_tokens": 18}}))
     with pytest.raises(JobError, match="cancel_requested|lease_expired"):
@@ -148,7 +158,7 @@ async def test_only_proven_unstarted_attempt_is_quiescent_without_provider_respo
         await attempts.finish(attempt, status="unknown", usage={"total_tokens": 11}, estimated=True, error_type="TimeoutError")
     if ending == "prepared":
         await closed(c)
-        with pytest.raises(JobError, match="intake_closed"):
+        with pytest.raises(JobError, match="execution_control_closed"):
             await attempts.dispatch(attempt)
     else:
         with pytest.raises(JobError, match="model_attempt_unsettled"):
@@ -169,7 +179,7 @@ async def test_lost_committed_ack_reuses_original_identity_and_calls_provider_on
     _, manager, _, loop, model, sid, _ = managed
     model.root_calls = 10  # Ordinary one-call main send, no delegation.
     model.release.set()
-    write = manager._write
+    write = manager.db.transaction
     lost = []
     @asynccontextmanager
     async def lose_ack():
@@ -187,7 +197,7 @@ async def test_lost_committed_ack_reuses_original_identity_and_calls_provider_on
         if hit and not lost:
             lost.append(True)
             raise RuntimeError("test: commit completed, ACK lost")
-    monkeypatch.setattr(manager, "_write", lose_ack)
+    monkeypatch.setattr(manager.db, "transaction", lose_ack)
     result = await loop.send("one physical request only", sid)
     assert result.status == "completed" and model.root_calls == 11 and lost == [True]
     assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='model_attempt_prepared'")) == 1
@@ -269,7 +279,7 @@ async def test_wrong_original_actor_cannot_append_late_evidence(attempt_case):
     attempt = await prepare(c)
     await attempts.dispatch(attempt)
     bad = replace(c.binding, actor=replace(c.actor, session_id="unrelated"))
-    with pytest.raises(JobError, match="access_denied|owner_mismatch"):
+    with pytest.raises(JobError, match="execution_control_binding_changed"):
         await attempts.finish(replace(attempt, binding=bad), status="returned", usage={"total_tokens": 10}, estimated=False)
 
 
@@ -279,6 +289,7 @@ async def test_snapshot_and_normal_usage_are_separate_from_billing(attempt_case)
     await attempts.dispatch(attempt)
     args = dict(status="returned", usage={"total_tokens": 10, "prompt_image_tokens": 4}, estimated=False)
     await attempts.finish(attempt, **args)
+    await flush_binding(c.binding)
     [row] = await c.manager.db.fetchall(f"SELECT payload_json,request_hash FROM {c.manager.events} WHERE event_type='model_attempt_finished'")
     data = json.loads(row["payload_json"])
     assert _hash(data) == row["request_hash"] and data["usage"]["prompt_image_tokens"] == 4
@@ -318,6 +329,7 @@ async def test_attempt_view_reports_observation_state_without_inventing_a_respon
         await attempts.dispatch(attempt)
     if state in ("unknown", "returned"):
         await attempts.finish(attempt, status=state, usage={"total_tokens": 10}, estimated=state == "unknown")
+    await flush_binding(c.binding)
     result = await list_attempts(c.manager, c.actor, c.binding.lease.job_id)
     [item] = result["items"]
     assert item["status"] == ("dispatched_unconfirmed" if state == "dispatched" else state)
@@ -393,13 +405,16 @@ async def test_deleted_attempt_parent_cannot_disappear_from_closed_proof(attempt
     assert (await c.manager.get_job(c.actor, c.binding.lease.job_id)).supervision_status == "open"
 
 
-async def test_dispatch_rechecks_original_tracking_before_any_provider_call(attempt_case):
+async def test_missing_tracking_projection_is_detected_at_closure_and_repairable(attempt_case):
     c = attempt_case
     attempt = await prepare(c)
     await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_type='model_attempt_tracking'")
+    await attempts.dispatch(attempt)
+    await attempts.finish(attempt, status="returned", usage={"total_tokens": 10}, estimated=False)
     with pytest.raises(JobError, match="model_attempt_evidence_missing"):
-        await attempts.dispatch(attempt)
-    assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'")
+        await closed(c)
+    await c.runtime.repair_execution_checkpoint(c.sid, c.binding.lease.job_id, generation=1)
+    assert await c.manager.db.fetchone(f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_tracking'")
 
 
 async def test_provider_cost_and_response_id_are_observations_with_unknown_currency(attempt_case):
@@ -408,6 +423,7 @@ async def test_provider_cost_and_response_id_are_observations_with_unknown_curre
     await attempts.dispatch(attempt)
     await attempts.finish(attempt, status="returned", usage={"total_tokens": 10}, estimated=False,
         cost_amount="0.001250", response_id="completion-original-123")
+    await flush_binding(c.binding)
     [item] = (await list_attempts(c.manager, c.actor, c.binding.lease.job_id))["items"]
     assert item["provider_reported_cost"] == "0.001250" and item["provider_cost_currency"] is None
     assert item["provider_response_id"] == "completion-original-123" and item["provider_query_supported"] is False
@@ -459,8 +475,9 @@ async def test_late_original_observation_does_not_modify_superseding_generation(
     await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET generation=2,boot_id='new-boot' WHERE job_id=?", (c.binding.lease.job_id,))
     before = await c.manager._row(c.manager.db, c.binding.lease.job_id)
     await attempts.finish(attempt, status="returned", usage={"total_tokens": 10}, estimated=False)
+    await flush_binding(c.binding)
     assert await c.manager._row(c.manager.db, c.binding.lease.job_id) == before
     [event] = await c.manager.db.fetchall(f"SELECT payload_json FROM {c.manager.events} WHERE event_type='model_attempt_finished'")
     assert json.loads(event["payload_json"])["scope"]["generation"] == 1
-    with pytest.raises(JobError, match="stale_execution"):
+    with pytest.raises(JobError, match="cancel_requested|stale_execution"):
         await attempts.dispatch(attempt)

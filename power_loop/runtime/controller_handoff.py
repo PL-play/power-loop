@@ -196,7 +196,7 @@ async def transfer_review_runtime(runtime, actor, source_job_id):
                 'message_hash': _hash(render(public)), 'execution_authority': False,
                 'resource_stop_confirmed': False, 'billing_settled': False}
             await _event(manager, tx, key, source, 'controller_review_handoff', data)
-            await tx.execute(f'UPDATE {manager.events} SET caller_session_id=? WHERE event_id=?', (actor.session_id, key))
+            await tx.set_event_recipient(key, actor.session_id)
             columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
             await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                 (actor.session_id, key, 'original_call_outcome', 'queue', 'pending', render(public), manager.now()))

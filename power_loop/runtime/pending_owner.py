@@ -92,6 +92,5 @@ async def transfer(manager, tx, actor, source):
     await seal(manager, tx, owner)
     data = await _expected(manager, tx, source)
     await _event(manager, tx, identity(manager, source), source, 'pending_owner_transfer', data)
-    await tx.execute(f'UPDATE {manager.events} SET caller_session_id=? WHERE event_id=?',
-                     (actor.session_id, identity(manager, source)))
+    await tx.set_event_recipient(identity(manager, source), actor.session_id)
     return await read(manager, tx, source)

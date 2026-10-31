@@ -138,7 +138,7 @@ async def test_closed_original_source_cannot_dispatch_even_a_control_call(regist
         token = _SEND.set(binding)
         try:
             with invocation_context(binding.actor.session_id, pending['assistant_seq'], 'original-native'):
-                with pytest.raises(JobError, match='tool_call_source_model_closed'):
+                with pytest.raises(JobError, match='execution_control_closed'):
                     await dispatch(SimpleNamespace(session_id=binding.actor.session_id), 'renamed_control', {},
                                    c.loop.tool_registry.get('renamed_control'))
         finally:

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from . import budget_scopes
 from . import model_budgets as budgets
 from .budget_contracts import (
     BudgetAck,
@@ -118,16 +117,14 @@ async def stage(runtime, actor, job_id, attempt_id, *, expected_revision, eviden
                     (attempt_id, expected_revision, previous_submission.request_hash)):
                 raise JobError("budget_revision_changed")
             old_total, new_total = validate_transition(state, evidence)
-        for limits in budget_scopes.frozen(policy, state):
-            row, counters = await budgets._scope(manager, tx, state["policy_key"], limits)
-            if expected_revision == 0:
-                counters["held_calls"] -= 1
-                counters["used_calls"] += 1
-            if new_total is not None:
-                if old_total is None:
-                    counters["held_tokens"] -= state["plan"]["token_bound"]
-                counters["used_tokens"] += new_total - (old_total or 0)
-            await budgets._save_counters(manager, tx, row, counters)
+        from .execution_budget import adjust_allocation
+        changes = {"held_calls": -1, "used_calls": 1} if expected_revision == 0 else {}
+        if new_total is not None:
+            if old_total is None:
+                changes["held_tokens"] = -state["plan"]["token_bound"]
+            changes["used_tokens"] = new_total - (old_total or 0)
+        if changes:
+            await adjust_allocation(manager, tx, state, changes)
         if new_total is not None and new_total > state["plan"]["token_bound"]:
             await tx.execute(f"UPDATE {manager.prefix}task_budget_policies SET enabled=0 WHERE policy_key=?",
                              (state["policy_key"],))

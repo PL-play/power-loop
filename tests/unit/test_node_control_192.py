@@ -128,7 +128,8 @@ async def test_heartbeat_observes_persistent_node_cancel_without_local_notificat
     claim, renew = manager.claim_job, manager.renew_execution
 
     async def claim_with_scope_lease(actor, job_id, **kwargs):
-        row = await manager._row(manager.db, job_id)
+        # Send admission now claims inside its outer control transaction.
+        row = await manager._row(manager._joined_write.get() or manager.db, job_id)
         kwargs["lease_ms"] = 1500 if row["kind"] == "workflow_node" else 30000
         claims.append((job_id, row["kind"], kwargs["lease_ms"]))
         return await claim(actor, job_id, **kwargs)

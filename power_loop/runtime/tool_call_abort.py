@@ -37,7 +37,7 @@ def identity(manager, source, ref):
 async def _facts(manager, tx, source, ref, entries):
     from .managed_completion import _scope
     from .managed_effects import _never_claimed, _verify_call, descriptor
-    from .tool_call_plans import _read
+    from .tool_call_plans import _read, start_id
     from .tool_call_plans import identity as plan_identity
     from .tool_call_plans import read as read_plan
     from .tool_call_plans import required as plan_required
@@ -66,7 +66,7 @@ async def _facts(manager, tx, source, ref, entries):
         raise JobError('tool_call_abort_plan_changed')
     for entry in entries:
         await _verify_call(manager, tx, actor, source, ref, entry['call_id'], entry['tool_name'], entry['arguments_hash'])
-        started = key + '_start_' + _hash(entry['call_id'])[:24]
+        started = start_id(key, entry['call_id'])
         if await _read(manager, tx, started, source, 'tool_call_dispatch_started', optional=True) is not None:
             raise JobError('tool_call_abort_already_admitted')
         operation_key = manager._origin_key(actor, 'create', ref, entry['call_id'], None)

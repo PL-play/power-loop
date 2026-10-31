@@ -9,6 +9,7 @@ import asyncio
 import json
 
 from .jobs import JobError, JobLease, _hash
+from .jobs import verify_stored as _verify_stored
 from .model_exit import content_reference
 from .result_proof import ResultPublicationProof
 from .result_revisions import result_id
@@ -170,6 +171,7 @@ async def _interrupted_result(manager, tx, row):
         'projection_status': projection_status}
 
 
+@_verify_stored
 async def reconcile(runtime, actor, job_id):
     """Host-only original-result recovery. No model or business callback runs."""
     from .managed_completion import _host_only
@@ -208,7 +210,7 @@ async def reconcile(runtime, actor, job_id):
                 'evidence': refs, 'result': content_reference(result), 'handling_route': route,
                 'execution_authority': False, 'billing_settled': False}
             await _event(manager, tx, identity(manager, row), row, 'controller_stopped', data)
-            await tx.execute(f'UPDATE {manager.events} SET caller_session_id=? WHERE event_id=?', (actor.session_id, identity(manager, row)))
+            await tx.set_event_recipient(identity(manager, row), actor.session_id)
             await tx.execute(f"UPDATE {manager.jobs} SET resource_state='stopped',version=version+1,updated_at=? WHERE job_id=?",
                              (manager.now(), job_id))
             row = await manager._row(tx, job_id)
@@ -260,7 +262,7 @@ async def enqueue(manager, tx, row, saved, *, _closures=None):
         await _event(manager, tx, notice_id(manager, row), row, 'controller_result_delivery', data)
     elif _hash(old) != _hash(data):
         raise JobError('controller_recovery_delivery_changed')
-    await tx.execute(f'UPDATE {manager.events} SET caller_session_id=? WHERE event_id=?', (data['main_session_id'], notice_id(manager, row)))
+    await tx.set_event_recipient(notice_id(manager, row), data['main_session_id'])
     columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
     await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
         (data['main_session_id'], notice_id(manager, row), 'controller_result', 'queue', 'pending', render(public), manager.now()))
@@ -353,6 +355,7 @@ async def _original_handling(manager, tx, row, result, *, _closures=None):
     return refs
 
 
+@_verify_stored
 async def recover_tree(runtime, actor, root_job_id, *, after_job_id='', limit=32, timeout_s=3):
     """Bounded host maintenance of one original main's tree; no model admission."""
     from .managed_completion import _host_only

@@ -67,7 +67,33 @@ def _event(row, job_id, kind):
     return _object(row["payload_json"])
 
 
+def _cache(manager, name):
+    from collections import OrderedDict
+    return manager.__dict__.setdefault(name, OrderedDict())
+
+
+def _trusted(manager, name, key):
+    if not manager._trust_own_writes.get():
+        return None
+    overlay = manager._control_overlay.get()
+    if overlay and (name, key) in overlay:
+        return overlay[name, key]  # Written earlier in this still-open transaction.
+    return _cache(manager, name).get(key)
+
+
+def _remember(manager, name, key, value):
+    cache = _cache(manager, name)
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > 4096:
+        cache.popitem(last=False)
+
+
 async def scope(manager, reader, job_id, generation):
+    # Scope events are immutable; one written or validated here is not reread.
+    known = _trusted(manager, "_membership_scopes", (job_id, generation))
+    if known is not None:
+        return json.loads(known)
     row = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (scope_id(manager, job_id, generation),))
     if row is None:
         raise JobError("execution_membership_missing")
@@ -88,6 +114,10 @@ async def scope(manager, reader, job_id, generation):
     if data["version"] == 2:
         from .executor_registry import validate_binding
         await validate_binding(manager, reader, data)
+    if manager._control_commit_hooks.get() is None:
+        _remember(manager, "_membership_scopes", (job_id, generation), _json(data))
+    else:
+        _remember_after_commit(manager, reader, "_membership_scopes", (job_id, generation), _json(data))
     return data
 
 
@@ -109,13 +139,15 @@ async def require_current(manager, tx, row):
 
 
 async def _insert(manager, tx, event_id, job_id, kind, version, payload):
-    old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
-    if old is not None:
-        if _hash(_event(old, job_id, kind)) != _hash(payload):
-            raise JobError("execution_membership_conflict")
-        return
-    await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
+    columns = ("event_id", "job_id", "event_type", "job_version", "payload_json", "delivery_status", "created_at")
+    inserted = await tx.execute(manager.db.dialect.insert_ignore(manager.events, columns),
         (event_id, job_id, kind, version, _json(payload), "not_applicable", manager.now()))
+    if inserted:
+        remember_ref(manager, event_id, job_id, kind, version, payload)
+        return
+    old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
+    if old is None or _hash(_event(old, job_id, kind)) != _hash(payload):
+        raise JobError("execution_membership_conflict")
 
 
 async def start(manager, tx, row):
@@ -138,6 +170,62 @@ async def start(manager, tx, row):
         await _insert(manager, tx, member_id(manager, row["job_id"], row["generation"]), owner["job_id"], "execution_member", owner_row["version"],
             {"version": 1, "owner": owner, "member": data["lease"]})
     await _insert(manager, tx, scope_id(manager, row["job_id"], row["generation"]), row["job_id"], "execution_scope", row["version"], data)
+    _remember_after_commit(manager, tx, "_membership_scopes", (row["job_id"], row["generation"]), _json(data))
+
+
+def note_child(manager, parent_job_id):
+    """Only the executing parent can register children, so this process sees all of them."""
+    _remember_after_commit(manager, None, "_parents_with_children", parent_job_id, "1")
+
+
+def childless(manager, job_id):
+    """True when this live process ran ``job_id`` and registered no child under it."""
+    return bool(_trusted(manager, "_first_claims", job_id) is not None
+                and _trusted(manager, "_parents_with_children", job_id) is None)
+
+
+def note_first_claim(manager, job_id):
+    """This process claimed generation 1, so no earlier generation registered children."""
+    _remember_after_commit(manager, None, "_first_claims", job_id, "1")
+
+
+def resolved(manager, job_id, version):
+    """A review source this process already proved handled at this row version."""
+    return _trusted(manager, "_resolved_reviews", (job_id, int(version))) is not None
+
+
+def mark_resolved(manager, job_id, version):
+    _remember_after_commit(manager, None, "_resolved_reviews", (job_id, int(version)), "1")
+
+
+def remember_ref(manager, event_id, job_id, kind, version, payload, request_hash=None):
+    """Remember the finalization reference of an immutable event this process inserted."""
+    _remember_after_commit(manager, None, "_event_refs", event_id, _json({
+        "event_id": event_id, "job_id": job_id, "event_type": kind, "revision": version,
+        "request_hash": request_hash, "delivery_status": "not_applicable",
+        "payload_hash": _hash(json.loads(_json(payload)))}))
+
+
+def trusted_ref(manager, event_id):
+    known = _trusted(manager, "_event_refs", event_id)
+    return None if known is None else json.loads(known)
+
+
+def remember_merge(manager, name, key, items):
+    """Accumulate rows this process wrote under ``key`` (visible in-transaction, cached on commit)."""
+    overlay = manager._control_overlay.get()
+    base = overlay.get((name, key)) if overlay and (name, key) in overlay else _cache(manager, name).get(key)
+    _remember_after_commit(manager, None, name, key, {**(base or {}), **items})
+
+
+def _remember_after_commit(manager, tx, name, key, value):
+    # A rolled-back admission must not leave a cached scope behind.
+    pending = manager._control_commit_hooks.get()
+    if pending is None:
+        _remember(manager, name, key, value)  # Autocommit reader outside a control transaction.
+    else:
+        manager._control_overlay.get()[name, key] = value
+        pending.append(lambda: _remember(manager, name, key, value))
 
 
 async def members(manager, reader, data):
@@ -169,19 +257,34 @@ async def closed_model(manager, reader, data):
     return {"event_id": row["event_id"], "hash": _hash(payload), "payload": payload}
 
 
-async def seal(manager, tx, row):
-    """Freeze admitted direct members, not final supervision or provider costs."""
-    anchor = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (scope_id(manager, row["job_id"], row["generation"]),))
-    if anchor is None:
-        return  # Preserve exit evidence for uninstrumented legacy executions.
-    data = await scope(manager, tx, row["job_id"], row["generation"])
-    edges, model = await members(manager, tx, data), await closed_model(manager, tx, data)
-    await _insert(manager, tx, seal_id(manager, row["job_id"], row["generation"]), row["job_id"], "execution_membership_seal", row["version"]+1,
-        {"version": 1, "lease": data["lease"], "members_hash": _hash(edges),
-         "model": {k: model[k] for k in ("event_id", "hash")} if model else None})
+async def seal(manager, tx, row, *, model=None):
+    """Freeze admitted direct members, not final supervision or provider costs.
+
+    ``model`` is the model_closed fact written by the caller in this transaction.
+    """
+    key = (row["job_id"], row["generation"])
+    if _trusted(manager, "_membership_scopes", key) is None:
+        anchor = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (scope_id(manager, *key),))
+        if anchor is None:
+            return  # Preserve exit evidence for uninstrumented legacy executions.
+    data = await scope(manager, tx, *key)
+    edges = [] if childless(manager, row["job_id"]) else await members(manager, tx, data)
+    if model is None:
+        model = await closed_model(manager, tx, data)
+    sealed = {"version": 1, "lease": data["lease"], "members_hash": _hash(edges),
+              "model": {k: model[k] for k in ("event_id", "hash")} if model else None}
+    await _insert(manager, tx, seal_id(manager, *key), row["job_id"], "execution_membership_seal", row["version"]+1, sealed)
+    _remember_after_commit(manager, tx, "_membership_reads", key, _json(
+        {"scope": data, "members": edges, "sealed": True, "model": model}))
 
 
 async def read(manager, reader, row, generation):
+    known = _trusted(manager, "_membership_reads", (row["job_id"], generation))
+    if known is not None:
+        saved = json.loads(known)
+        if (saved["scope"]["tenant_id"], saved["scope"]["principal_id"]) != (row["tenant_id"], row["principal_id"]):
+            raise JobError("execution_membership_mismatch")
+        return saved
     data = await scope(manager, reader, row["job_id"], generation)
     if (data["tenant_id"], data["principal_id"]) != (row["tenant_id"], row["principal_id"]):
         raise JobError("execution_membership_mismatch")

@@ -49,7 +49,7 @@ async def test_composite_uses_separate_original_paid_attempts_and_only_retries_b
     store, _ = registry_store
     host, calls, child_contexts = Host(), [], []
     original_arguments = {'text': '0', 'metadata': {'value': 'original'}}
-    from power_loop.runtime import nested_tools, tool_attempts
+    from power_loop.runtime import control_runtime, nested_tools
     if fault == 'receipt_disk':
         original_persist, failures = nested_tools.persist_receipt, []
         async def persist(slot):
@@ -59,13 +59,15 @@ async def test_composite_uses_separate_original_paid_attempts_and_only_retries_b
             return await original_persist(slot)
         monkeypatch.setattr(nested_tools, 'persist_receipt', persist)
     if fault == 'finished_disk':
-        original_save, failures = tool_attempts._save, []
-        async def save(manager, tx, job, phase, attempt_id, value):
-            if phase == 'finished' and value['charge']['rule_id'] == 'inner-image' and not failures:
+        original_save, failures = control_runtime.project_events, []
+        async def save(manager, tx, identity, records):
+            if not failures and any(record['kind'] == 'attempt'
+                    and record['value'].get('observation', {}).get('charge', {}).get('rule_id') == 'inner-image'
+                    for record in records):
                 failures.append(True)
                 raise OSError('settlement checkpoint disk failure')
-            return await original_save(manager, tx, job, phase, attempt_id, value)
-        monkeypatch.setattr(tool_attempts, '_save', save)
+            return await original_save(manager, tx, identity, records)
+        monkeypatch.setattr(control_runtime, 'project_events', save)
     supplier_started = asyncio.Event()
     async def plan(context, call, *, pricing):
         if call.name == 'inner':

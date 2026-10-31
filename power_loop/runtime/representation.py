@@ -25,6 +25,7 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from hashlib import sha256
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, runtime_checkable
 
 from power_loop.runtime.store.types import (
@@ -49,7 +50,37 @@ __all__ = [
     "ProjectionRenderConfig",
     "ProjectedRow",
     "ProjectedSend",
+    "ProjectionFoldPolicy",
 ]
+
+
+@dataclass(frozen=True)
+class ProjectionFoldPolicy:
+    """Opt-in contract for incremental fold statistics.
+
+    ``render`` must concatenate independent per-row messages. A row may depend on its
+    hot/cold position and the latest send containing each ``tools[].k`` key, as stamped
+    by ``ProjectedRepresentation``. Other cross-row dependencies require a different
+    policy; an undeclared custom renderer is evaluated from a snapshot outside locks.
+    Sizes must not depend on database-assigned row ids or creation timestamps.
+    Bump ``revision`` whenever the renderer's size semantics change.
+    """
+
+    fingerprint: str
+    hot_window: int = 0
+    deduplicate: bool = False
+
+    @classmethod
+    def for_renderer(cls, renderer, *, config, revision=1, hot_window=0, deduplicate=False):
+        from power_loop.runtime.budget import CHARS_PER_TOKEN
+
+        identity = [
+            "projection-fold-statistics-v1", CHARS_PER_TOKEN,
+            type(renderer).__module__, type(renderer).__qualname__, revision,
+            renderer.kind, renderer.version, config, hot_window, deduplicate,
+        ]
+        encoded = json.dumps(identity, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return cls(sha256(encoded.encode()).hexdigest(), max(0, int(hot_window)), deduplicate)
 
 
 @dataclass
@@ -263,6 +294,11 @@ class VerbatimRepresentation:
                 out.extend((r.content or {}).get("messages") or [])
         return out
 
+    def fold_statistics_policy(self) -> ProjectionFoldPolicy | None:
+        if type(self) is not VerbatimRepresentation:
+            return None
+        return ProjectionFoldPolicy.for_renderer(self, config={})
+
 
 # ── Projection (generic structured summary; no LLM) ─────────────────────────────
 
@@ -339,6 +375,14 @@ class ProjectedRepresentation:
         _validate_representation_params(version=self.version, max_chars=self.max_chars)
         if isinstance(self.render_config, dict):
             self.render_config = ProjectionRenderConfig.from_dict(self.render_config)
+
+    def fold_statistics_policy(self) -> ProjectionFoldPolicy | None:
+        if type(self) is not ProjectedRepresentation:
+            return None  # subclasses explicitly declare their rendering dependencies
+        return ProjectionFoldPolicy.for_renderer(self, config={
+            "max_chars": self.max_chars,
+            "render": {f.name: getattr(self.render_config, f.name) for f in dataclass_fields(self.render_config)},
+        })
 
     def project_send(
         self, send_rows: list[MessageRow], *, send_index: int, tool_registry: ToolRegistry | None

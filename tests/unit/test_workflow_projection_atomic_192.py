@@ -20,6 +20,16 @@ __all__ = ["registry_store", "managed_workflow", "delivery_case"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
+class _TransactionProxy:
+    """Inject one statement fault while retaining the control transaction port."""
+
+    def __init__(self, target, execute):
+        self.target, self.execute = target, execute
+
+    def __getattr__(self, name):
+        return getattr(self.target, name)
+
+
 async def closed(c, *, consumed=False, manager=None):
     m = manager or c.manager
     async with m._write() as tx:
@@ -70,7 +80,7 @@ async def test_all_projection_writes_rollback_together_or_all_commit(delivery_ca
                         raise asyncio.CancelledError()
                     raise RuntimeError("transaction statement fault")
                 return value
-            yield SimpleNamespace(execute=execute, fetchone=tx.fetchone, fetchall=tx.fetchall)
+            yield _TransactionProxy(tx, execute)
         if fault == "commit_ack":
             raise RuntimeError("lost commit ACK")
     with monkeypatch.context() as patch:
@@ -188,7 +198,7 @@ async def test_callback_commit_faults_never_claim_false_completion_or_repeat_eff
                 if phase_hit and fault.endswith("rollback"):
                     raise RuntimeError("callback receipt rollback")
                 return value
-            yield SimpleNamespace(execute=execute, fetchone=tx.fetchone, fetchall=tx.fetchall)
+            yield _TransactionProxy(tx, execute)
         if phase_hit and fault.endswith("ack"):
             raise RuntimeError("callback receipt committed before lost ACK")
     with monkeypatch.context() as patch:
@@ -239,7 +249,7 @@ async def test_silent_closed_receipt_insert_is_not_success(delivery_case, monkey
                 if "workflow_projected" in params:
                     return 0
                 return await tx.execute(sql, params)
-            yield SimpleNamespace(execute=execute, fetchone=tx.fetchone, fetchall=tx.fetchall)
+            yield _TransactionProxy(tx, execute)
     monkeypatch.setattr(c.manager, "_write", noop)
     with pytest.raises(JobError, match="projection_receipt_mismatch"):
         await results.project(c.loop, c.actor, c.job_id, 1)

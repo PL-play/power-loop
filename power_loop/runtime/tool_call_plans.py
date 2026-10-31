@@ -6,6 +6,7 @@ import logging
 from dataclasses import asdict, dataclass
 
 from .jobs import JobError, _hash, _json
+from .jobs import verify_stored as _verify_stored
 
 FIELD = 'tool_call_plan_protocol'
 
@@ -18,6 +19,11 @@ class _BatchBindings:
     call_ref: str
     registrations: tuple
 
+
+
+def start_id(plan, call_id):
+    """Fixed-length id (fits VARCHAR(64)) of one call's dispatch-start fence in ``plan``."""
+    return "tcs_" + _hash([plan, call_id])[:48]
 
 def _retained(pipeline, manager, source, ref, plan):
     from .workflow_controller import proof
@@ -139,7 +145,7 @@ async def read(manager, tx, source, ref, *, optional=False):
     return value
 
 
-async def _prepare(pipeline, attempt):
+async def _prepare_children(pipeline, attempt):
     from .managed_effects import _document, _verify_call
     from .task_runtime import _SEND
     from .tool_contracts import policy, resolve, validate_registration
@@ -247,7 +253,8 @@ async def _prepare(pipeline, attempt):
 async def prepare(pipeline):
     attempt = {}
     try:
-        await _prepare(pipeline, attempt)
+        from .execution_tools import prepare as prepare_owned
+        await prepare_owned(pipeline, attempt)
     except Exception:
         if attempt.get('value') is not None:
             from .tool_call_abort import _record
@@ -268,56 +275,8 @@ async def prepare(pipeline):
 
 
 async def dispatch(pipeline, name, arguments, registered, *, budget_attempt=None):
-    from .invocation import current_invocation
-    from .task_runtime import _SEND
-    from .tool_contracts import policy
-
-    binding = _SEND.get()
-    if binding is None or binding.actor.session_id != pipeline.session_id:
-        return
-    manager, actor = binding.runtime.manager, binding.actor
-    seq, call_id = current_invocation(actor.session_id)
-    ref = await manager.store.message_ref(actor.session_id, seq)
-    async with manager._write() as tx:
-        source = await manager._authorize(tx, actor, binding.lease.job_id)
-        if not await required(manager, tx, source):
-            return
-        if source['status'] == 'model_closed':
-            raise JobError('tool_call_source_model_closed')
-        declared = policy(registered, arguments, runtime=binding.runtime)
-        from .review_tools import require_tool
-        await require_tool(manager, tx, actor, declared)
-        if declared.control_only:
-            from .task_control import _source
-            await _source(manager, tx, actor, binding.lease, ref, call_id)
-        else:
-            await manager._fence(tx, actor, binding.lease)
-        from .tool_call_abort import read as read_abort
-        if await read_abort(manager, tx, source, ref) is not None:
-            raise JobError('tool_call_batch_aborted')
-        plan = await read(manager, tx, source, ref)
-        retained = _retained(pipeline, manager, source, ref, plan)
-        original_bindings = dict(retained.registrations)
-        if call_id not in original_bindings or original_bindings[call_id] is not registered:
-            raise JobError('tool_call_plan_binding_changed')
-        matches = [e for e in plan['entries'] if e['call_id'] == call_id]
-        if (len(matches) != 1 or matches[0]['tool_name'] != name or matches[0]['arguments_hash'] != _hash(arguments)
-                or matches[0]['registration'] != registration_value(registered)):
-            raise JobError('tool_call_plan_binding_changed')
-        key = identity(manager, source, ref) + '_start_' + _hash(call_id)[:24]
-        if await _read(manager, tx, key, source, 'tool_call_dispatch_started', optional=True) is not None:
-            raise JobError('tool_call_already_dispatched')
-        if budget_attempt is not None:
-            from .tool_attempts import authorize_dispatch
-            await authorize_dispatch(budget_attempt, tx, source)
-        await _event(manager, tx, key, source, 'tool_call_dispatch_started',
-            {'version': 1, 'scope': plan['scope'], 'plan_id': identity(manager, source, ref),
-             'plan_hash': _hash(plan), 'entry_hash': _hash(matches[0])})
-        if matches[0]['recovery'] is not None and budget_attempt is not None:
-            from .tool_attempts import observe_managed_free
-            await observe_managed_free(budget_attempt, tx, source)
-    if matches[0]['recovery'] is None:
-        return binding.runtime._native_returns.reserve(binding, ref, plan, matches[0])
+    from .execution_tools import dispatch as dispatch_owned
+    return await dispatch_owned(pipeline, name, arguments, registered, budget_attempt=budget_attempt)
 
 
 async def queued_for_call(manager, tx, row, source, invocation):
@@ -344,7 +303,7 @@ async def adopt(manager, tx, source, ref, call_id, request):
     if len(matches) != 1 or matches[0]['recovery'] != {'kind': 'managed_effect', 'request': request}:
         raise JobError('tool_call_plan_binding_changed')
     entry = matches[0]
-    key = identity(manager, source, ref) + '_start_' + _hash(call_id)[:24]
+    key = start_id(identity(manager, source, ref), call_id)
     started = await _read(manager, tx, key, source, 'tool_call_dispatch_started')
     if started != {'version': 1, 'scope': plan['scope'], 'plan_id': identity(manager, source, ref), 'plan_hash': _hash(plan), 'entry_hash': _hash(entry)}:
         raise JobError('tool_call_plan_corrupt')
@@ -374,6 +333,7 @@ async def finish_receipt(manager, actor, ref, call_id):
     await terminate_unstarted(manager, actor, source['job_id'])
 
 
+@_verify_stored
 async def reconcile_pending(loop, actor, source_job_id):
     """Original-main host stages known outcomes/negative proofs; never executes."""
     from .managed_completion import _host_only

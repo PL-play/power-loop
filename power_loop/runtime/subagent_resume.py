@@ -8,9 +8,11 @@ import secrets
 from dataclasses import asdict
 
 from .jobs import JobError, JobLease, _hash, _json, _operation
+from .jobs import verify_stored as _verify_stored
 from .result_revisions import execution_id, result_id
 
 
+@_verify_stored
 async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, session_id, message,
                 expected_generation, executor_id, boot_id, contract, lease_ms=30000):
     if not isinstance(message, str) or not message.strip() or len(message) > 64000 or "\x00" in message:

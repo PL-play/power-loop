@@ -9,7 +9,7 @@ import asyncio
 import json
 from dataclasses import asdict, dataclass, field
 
-from .jobs import JobError, _hash, _json
+from .jobs import JobError, _hash
 from .model_exit import content_reference
 from .pricing import BillingReceipt, PricingError
 
@@ -76,12 +76,12 @@ class ReturnCache:
         if type(slot) is not _Receipt or self.slots.get(self.key(slot)) is not slot:
             raise JobError('native_return_original_required')
 
-    def reserve(self, binding, ref, plan, entry):
+    def reserve(self, binding, ref, plan, entry, *, plan_hash=None):
         from .task_runtime import _SEND
         self.check()
         if _SEND.get() is not binding or binding.runtime is not self.runtime or entry['recovery'] is not None:
             raise JobError('native_return_original_required')
-        slot = _Receipt(binding, ref, entry['call_id'], _hash(plan), _hash(entry), asyncio.current_task())
+        slot = _Receipt(binding, ref, entry['call_id'], plan_hash or _hash(plan), _hash(entry), asyncio.current_task())
         key = self.key(slot)
         if key in self.slots or len(self.slots) >= 1000:
             raise JobError('native_return_requires_reconciliation')
@@ -116,9 +116,9 @@ class ReturnCache:
 
 
 async def _basis(manager, tx, source, ref, entry, plan):
-    from .tool_call_plans import _read
+    from .tool_call_plans import _read, start_id
     from .tool_call_plans import identity as plan_id
-    key = plan_id(manager, source, ref) + '_start_' + _hash(entry['call_id'])[:24]
+    key = start_id(plan_id(manager, source, ref), entry['call_id'])
     started = await _read(manager, tx, key, source, 'tool_call_dispatch_started')
     if started != {'version': 1, 'scope': plan['scope'], 'plan_id': plan_id(manager, source, ref),
                    'plan_hash': _hash(plan), 'entry_hash': _hash(entry)}:
@@ -174,51 +174,8 @@ async def read(manager, tx, source, ref, entry, plan, *, optional=False):
 
 
 async def persist(runtime, slot):
-    from .tool_call_plans import read as read_plan
-    cache, manager = runtime._native_returns, runtime.manager
-    try:
-        async with cache.lock:
-            cache.check()
-            if slot.saved and slot.binding.runtime is runtime:
-                return
-            cache.require(slot)
-            if slot.text is None:
-                raise JobError('native_return_unconfirmed')
-            async with manager._write() as tx:
-                source = await manager._authorize(tx, slot.binding.actor, slot.binding.lease.job_id)
-                manager._check_proof(source, slot.binding.lease)
-                plan = await read_plan(manager, tx, source, slot.ref)
-                entries = [e for e in plan['entries'] if e['call_id'] == slot.call_id]
-                if len(entries) != 1 or _hash(plan) != slot.plan_hash or _hash(entries[0]) != slot.entry_hash:
-                    raise JobError('native_return_original_changed')
-                start, operations = await _basis(manager, tx, source, slot.ref, entries[0], plan)
-                value = {'version': 1, 'scope': plan['scope'], 'call_ref': slot.ref.to_dict(), 'call_id': slot.call_id,
-                         'plan_hash': slot.plan_hash, 'entry_hash': slot.entry_hash, 'started': start,
-                         'operations': operations, 'return_text': slot.text}
-                if slot.billing_receipt is not None:
-                    value['version'] = 2
-                    value['billing_receipt'] = slot.billing_receipt.to_dict()
-                document = _json(value)
-                if len(document.encode()) > _LIMIT:
-                    raise JobError('native_return_too_large')
-                old = await read(manager, tx, source, slot.ref, entries[0], plan, optional=True)
-                if old is not None:
-                    if _hash(old[1]) != _hash(value):
-                        raise JobError('native_return_checkpoint_changed')
-                else:
-                    await tx.execute(f'INSERT INTO {manager.events} '
-                        '(event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)',
-                        (cache.key(slot), source['job_id'], 'native_callback_returned', source['version'],
-                         _hash(value), document, 'not_applicable', manager.now()))
-                    event = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (cache.key(slot),))
-                    from .tool_call_plans import _event
-                    await _event(manager, tx, anchor_id(cache.key(slot)), source, 'native_callback_return_anchor',
-                                 {'version': 1, 'return': content_reference(event)})
-            del cache.slots[cache.key(slot)]
-            slot.saved = True
-    except BaseException:
-        slot.failed = True
-        raise
+    from .execution_tools import persist_return
+    return await persist_return(runtime, slot)
 
 
 async def invoke(pipeline, registered, arguments, slot, *, budget_attempt=None):

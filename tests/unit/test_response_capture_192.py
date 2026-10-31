@@ -42,6 +42,8 @@ async def test_capture_precedes_observation_and_is_bound_before_dispatch(budget_
     [packet] = seen
     assert packet.usage == FACTS['usage'] and packet.response_id == FACTS['response_id']
     assert packet.grant.attempt_id == a.attempt_id
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(a.binding, close=True)
     assert (await counters(c))['inflight'] == 0 and c.host.reserve_calls == c.host.apply_calls == 1
     assert not c.runtime.budget_control_tasks()
 
@@ -81,15 +83,18 @@ async def test_capture_does_not_depend_on_post_response_store_availability(budge
         return receipt(packet)
     c.host.capture_response = capture
     a = await start(c)
-    original = await budgets.get_budget(c.manager, c.actor, a.attempt_id)
-    def unavailable():
+    await budgets.get_budget(c.manager, c.actor, a.attempt_id)
+    def unavailable(*args, **kwargs):
         raise OSError('original store offline')
     with monkeypatch.context() as patch:
-        patch.setattr(c.manager, '_write', unavailable)
+        for name in ('transaction', 'fetchone', 'fetchall', 'execute'):
+            patch.setattr(c.manager.db, name, unavailable)
         await record(a, reported=FACTS, observation=FACTS, estimated=False)
-    assert len(seen) == 1 and c.host.apply_calls == 0
-    assert await budgets.get_budget(c.manager, c.actor, a.attempt_id) == original
-    assert c.binding.resource_evidence['resource_state'] == 'unknown'
+    # Independent capture owns the fee while control stays in memory. A
+    # temporary SDK database outage must not lose or duplicate that charge.
+    assert len(seen) == 1 and c.host.apply_calls == 1
+    saved = await budgets.get_budget(c.manager, c.actor, a.attempt_id)
+    assert not saved['pending'] and saved['observation']['usage'] == FACTS['usage']
 
 
 @pytest.mark.parametrize('waiter', ['cancel', 'timeout'])

@@ -197,9 +197,12 @@ def observation_id(manager, caller, round_index, notice_id):
 
 
 async def observe_request(manager, tx, actor, caller, *, source, round_index, send_index, messages):
-    """Called inside the original actual-input preparation transaction."""
+    """Called inside the original actual-input preparation transaction.
+
+    Returns how many delivered notices remain to be observed.
+    """
     if source["execution_role"] != "main":
-        return
+        return 0
     visible = {m["seq"]: m for m in messages}
     notices = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE event_type='wait_notification' AND caller_session_id=? AND delivery_status='delivered' LIMIT ?",
                                (actor.session_id, _SCOPE_LIMIT + 1))
@@ -232,6 +235,7 @@ async def observe_request(manager, tx, actor, caller, *, source, round_index, se
         else:
             await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                 (key, caller.job_id, "wait_observed", source["version"], actor.session_id, _hash(observed), _json(observed), "prepared", manager.now()))
+    return len(notices)
 
 
 def _message_ref(manager, row):

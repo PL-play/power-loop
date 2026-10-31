@@ -8,13 +8,13 @@ permission. All model arguments and actual prompt bodies stay outside this log.
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 from dataclasses import asdict
 
 from . import budget_scopes
 from .budget_contracts import BudgetAck, BudgetConfig, BudgetGrant, BudgetPlan, BudgetSubmission
 from .jobs import JobError, _hash, _json
+from .jobs import verify_stored as _verify_stored
 
 _COUNTERS = budget_scopes.COUNTERS
 
@@ -58,7 +58,12 @@ async def _policy(runtime, tx, *, create=False, job=None):
             raise JobError("budget_runtime_binding_changed")
     row = await tx.fetchone(f"SELECT * FROM {manager.prefix}task_budget_policies WHERE policy_key=?", (key,))
     marker_id = "mb_policy_" + key[3:]
-    marker = await tx.fetchone(f"SELECT payload_json,request_hash FROM {manager.events} WHERE event_id=?", (marker_id,))
+    from .execution_membership import _remember_after_commit, _trusted
+    known = row is not None and _trusted(manager, "_budget_markers", key)
+    if known and known == row["request_hash"]:
+        marker = {"payload_json": row["manifest_json"], "request_hash": row["request_hash"]}  # Immutable, verified.
+    else:
+        marker = await tx.fetchone(f"SELECT payload_json,request_hash FROM {manager.events} WHERE event_id=?", (marker_id,))
     if row is None:
         if marker is not None:
             raise JobError("budget_policy_missing")
@@ -117,17 +122,42 @@ async def _policy(runtime, tx, *, create=False, job=None):
         raise JobError("budget_provider_required")
     if type(config) is not BudgetConfig or config.manifest() != manifest:
         raise JobError("budget_policy_conflict")
+    _remember_after_commit(manager, None, "_budget_markers", key, row["request_hash"])
     return {**row, "manifest": manifest}
 
 
-async def ensure_policy(binding):
+async def flush_observed_controls(binding):
     runtime = binding.runtime
+    if runtime.manager._joined_write.get() is not None:
+        return  # The joined admission flushed before taking the store lock.
+    from .control_runtime import current, flush_binding
+    for active in tuple(runtime.manager._execution_controls.values()):
+        control = current(active)
+        if (active.runtime is runtime and not control.active and not control.pending_obligations
+                and (control._dirty or control._pending is not None)):
+            await flush_binding(active)
+
+
+async def ensure_policy(binding, *, transaction=None, job=None):
+    runtime = binding.runtime
+    if transaction is not None:
+        return await _ensure_policy(binding, transaction, job)
+    await flush_observed_controls(binding)
     async with runtime.manager._write() as tx:
         job = await runtime.manager._fence(tx, binding.actor, binding.lease)
-        policy = await _policy(runtime, tx, create=True, job=job)
-        if policy:
-            for limits in await budget_scopes.resolve(runtime, tx, policy, job, create=True):
-                await _scope(runtime.manager, tx, policy["policy_key"], limits)
+        return await _ensure_policy(binding, tx, job)
+
+
+async def _ensure_policy(binding, tx, job):
+    runtime = binding.runtime
+    policy = await _policy(runtime, tx, create=True, job=job)
+    if policy:
+        scopes = await budget_scopes.resolve(runtime, tx, policy, job, create=True)
+        for limits in scopes:
+            await _scope(runtime.manager, tx, policy["policy_key"], limits)
+        await _check_pending(runtime.manager, tx, policy)
+        binding.resource_evidence["_control_budget_policy"] = policy
+        binding.resource_evidence["_control_budget_scopes"] = scopes
     return policy is not None
 
 
@@ -160,6 +190,13 @@ async def _read(manager, tx, attempt_id, *, required=True):
         if required or await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (marker,)):
             raise JobError("budget_attempt_missing")
         return None
+    event_id = "mb_" + _hash([attempt_id, row["version"]])[:48]
+    event = await tx.fetchone(
+        f"SELECT payload_json,request_hash,job_id,event_type,delivery_status FROM {manager.events} WHERE event_id=?", (event_id,))
+    return _validate_row(row, event)
+
+
+def _validate_row(row, event):
     value = _object(row["state_json"], row["state_hash"])
     if type(row["pending"]) is not int or row["pending"] not in (0, 1) or type(value.get("pending")) is not bool:
         raise JobError("budget_evidence_corrupt")
@@ -172,11 +209,6 @@ async def _read(manager, tx, attempt_id, *, required=True):
         value.get("pending"),
     ) != (row["attempt_id"], row["job_id"], row["policy_key"], row["version"], row["phase"], bool(row["pending"])):
         raise JobError("budget_evidence_corrupt")
-    event_id = "mb_" + _hash([attempt_id, row["version"]])[:48]
-    event = await tx.fetchone(
-        f"SELECT payload_json,request_hash,job_id,event_type,delivery_status FROM {manager.events} WHERE event_id=?",
-        (event_id,),
-    )
     if (
         event is None
         or (event["job_id"], event["event_type"], event["delivery_status"])
@@ -188,48 +220,10 @@ async def _read(manager, tx, attempt_id, *, required=True):
 
 
 async def _save(manager, tx, state, job, *, new=False):
+    from .control_runtime import append_correction
     state["version"] += 1
-    digest, raw = _hash(state), _json(state)
-    event_id = "mb_" + _hash([state["attempt_id"], state["version"]])[:48]
-    await tx.execute(
-        f"INSERT INTO {manager.events} "
-        "(event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (event_id, job["job_id"], "model_budget_state", job["version"], digest, raw, "not_applicable", manager.now()),
-    )
-    if new:
-        await tx.execute(
-            f"INSERT INTO {manager.prefix}task_budget_attempts "
-            "(attempt_id,job_id,policy_key,version,phase,pending,state_hash,state_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                state["attempt_id"],
-                job["job_id"],
-                state["policy_key"],
-                state["version"],
-                state["phase"],
-                int(state["pending"]),
-                digest,
-                raw,
-                manager.now(),
-                manager.now(),
-            ),
-        )
-    else:
-        changed = await tx.execute(
-            f"UPDATE {manager.prefix}task_budget_attempts "
-            "SET version=?,phase=?,pending=?,state_hash=?,state_json=?,updated_at=? WHERE attempt_id=? AND version=?",
-            (
-                state["version"],
-                state["phase"],
-                int(state["pending"]),
-                digest,
-                raw,
-                manager.now(),
-                state["attempt_id"],
-                state["version"] - 1,
-            ),
-        )
-        if changed != 1:
-            raise JobError("budget_version_conflict")
+    await append_correction(manager, tx, job, state["context"]["generation"],
+                            [{"kind": "budget", "key": state["attempt_id"], "value": state}])
 
 
 def _context(attempt, job):
@@ -302,156 +296,13 @@ async def _check_pending(manager, tx, policy):
 
 
 async def reserve(attempt, logical_request, *, service=None, pricing=None):
-    runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
-    async with manager._write() as tx:
-        job = await manager._fence(tx, attempt.binding.actor, attempt.binding.lease)
-        policy = await _policy(runtime, tx)
-        if policy is None:
-            return False
-        if not policy["enabled"]:
-            raise JobError("budget_policy_closed")
-        await _check_pending(manager, tx, policy)
-        context = _context(attempt, job)
-    provider = runtime.budget_config.provider
-    from .tool_attempts import ToolAttempt
-    tool = type(attempt) is ToolAttempt
-    if tool and not callable(getattr(provider, 'prepare_tool', None)):
-        raise JobError('budget_tool_adapter_unavailable')
-    supplied = await _port(
-        attempt,
-        "prepare",
-        (lambda: provider.prepare_tool(copy.deepcopy(context), logical_request, pricing=pricing)) if tool else
-        lambda: provider.prepare(copy.deepcopy(context), copy.deepcopy(logical_request), service=service,
-                                 **({"purpose": attempt.prepared["purpose"]} if "purpose" in attempt.prepared else {})),
-    )
-    if type(supplied) is not BudgetPlan:
-        raise JobError("invalid_budget_plan")
-    plan = BudgetPlan(supplied.token_bound, supplied.request)
-    if (tool and plan.token_bound != 0) or (not tool and (
-        logical_request.max_tokens is None or plan.token_bound < logical_request.max_tokens
-    )):
-        raise JobError("budget_request_bound_missing")
-    async with manager._write() as tx:
-        job = await manager._fence(tx, attempt.binding.actor, attempt.binding.lease)
-        policy = await _policy(runtime, tx)
-        if not policy["enabled"]:
-            raise JobError("budget_policy_closed")
-        if await _read(manager, tx, attempt.attempt_id, required=False):
-            raise JobError("budget_attempt_already_reserved")
-        await _check_pending(manager, tx, policy)
-        limits_set = await budget_scopes.resolve(runtime, tx, policy, job, create=True)
-        for limits in limits_set:
-            row, counters = await _scope(manager, tx, policy["policy_key"], limits)
-            for maximum, consumed in (
-                ("max_calls", counters["used_calls"] + counters["held_calls"] + 1),
-                ("max_tokens", counters["used_tokens"] + counters["held_tokens"] + plan.token_bound),
-                ("max_inflight", counters["inflight"] + 1),
-            ):
-                if limits[maximum] is not None and consumed > limits[maximum]:
-                    raise JobError("budget_" + maximum + "_exhausted")
-            counters["held_calls"] += 1
-            counters["held_tokens"] += plan.token_bound
-            counters["inflight"] += 1
-            await _save_counters(manager, tx, row, counters)
-        state = {
-            "version": 0,
-            "attempt_id": attempt.attempt_id,
-            "job_id": job["job_id"],
-            "policy_key": policy["policy_key"],
-            "context": context,
-            "plan": asdict(plan),
-            "plan_hash": plan.request_hash,
-            "phase": "local_reserved",
-            "pending": True,
-            "started_at_ms": manager.now(),
-            "host_intent": False,
-            "grant": None,
-            "observation": None,
-            "submission": None,
-            "ack": None,
-        }
-        if policy["manifest"]["version"] == 2:
-            state["scopes"] = limits_set
-        await _save(manager, tx, state, job, new=True)
-    async with manager._write() as tx:
-        job = await manager._fence(tx, attempt.binding.actor, attempt.binding.lease)
-        state = await _read(manager, tx, attempt.attempt_id)
-        if state["phase"] != "local_reserved":
-            raise JobError("budget_dispatch_closed")
-        state.update(phase="host_reserving", host_intent=True)
-        await _save(manager, tx, state, job)
-    reserved = None
-    try:
-        reserved = await _port(attempt, "reserve", lambda: provider.reserve(plan))
-    except Exception:
-        pass  # exact current-state lookup, never a replacement reserve/attempt.
-    if reserved is not None and (
-        type(reserved) is not BudgetGrant
-        or (reserved.attempt_id, reserved.request_hash, reserved.state)
-        != (attempt.attempt_id, state["plan_hash"], "reserved")
-    ):
-        raise JobError("budget_host_reservation_unconfirmed")
-    grant = await _port(attempt, "lookup", lambda: provider.lookup(plan))
-    if (
-        type(grant) is not BudgetGrant
-        or (grant.attempt_id, grant.request_hash, grant.state) != (attempt.attempt_id, state["plan_hash"], "reserved")
-        or reserved is not None
-        and reserved.version != grant.version
-    ):
-        raise JobError("budget_host_reservation_unconfirmed")
-    async with manager._write() as tx:
-        # A receipt may be saved after cancellation, but cannot grant dispatch.
-        job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
-        state = await _read(manager, tx, attempt.attempt_id)
-        if state["phase"] != "host_reserving" or state["plan_hash"] != grant.request_hash:
-            raise JobError("budget_reservation_conflict")
-        state.update(grant=asdict(grant), phase="host_reserved", pending=False)
-        await _save(manager, tx, state, job)
-    return True
-
-
-async def authorize_dispatch(attempt, tx, job):
-    runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
-    policy = await _policy(runtime, tx)
-    if policy is None:
-        return
-    if not policy["enabled"]:
-        raise JobError("budget_policy_closed")
-    state = await _read(manager, tx, attempt.attempt_id)
-    if (
-        state["policy_key"] != policy["policy_key"]
-        or state["context"] != _context(attempt, job)
-        or state["phase"] != "host_reserved"
-        or state["pending"]
-    ):
-        raise JobError("budget_dispatch_not_authorized")
-    grant = BudgetGrant(**state["grant"])
-    if (grant.attempt_id, grant.request_hash, grant.state) != (attempt.attempt_id, state["plan_hash"], "reserved"):
-        raise JobError("budget_grant_mismatch")
-    for limits in budget_scopes.frozen(policy, state):
-        _, counters = await _scope(manager, tx, state["policy_key"], limits)
-        if (
-            counters["held_calls"] < 1
-            or counters["held_tokens"] < state["plan"]["token_bound"]
-            or counters["inflight"] < 1
-        ):
-            raise JobError("budget_reservation_hold_missing")
-    state.update(phase="dispatch_authorized")
-    await _save(manager, tx, state, job)
-
-
-async def require_dispatch(attempt, tx):
-    manager = attempt.binding.runtime.manager
-    policy = await _policy(attempt.binding.runtime, tx)
-    if policy:
-        state = await _read(manager, tx, attempt.attempt_id)
-        if state["phase"] != "dispatch_authorized" or state["context"]["prepared_hash"] != _hash(attempt.prepared):
-            raise JobError("budget_dispatch_not_authorized")
+    from .execution_budget import reserve as reserve_owned
+    return await reserve_owned(attempt, logical_request, service=service, pricing=pricing)
 
 
 async def observe(attempt, observation):
-    return await _observe(attempt.binding.runtime, attempt.binding.actor,
-                          attempt.binding.lease.job_id, attempt.attempt_id, observation)
+    from .execution_budget import observe as observe_owned
+    return await observe_owned(attempt, observation)
 
 
 async def _observe(runtime, actor, job_id, attempt_id, observation):
@@ -478,10 +329,8 @@ async def _observe(runtime, actor, job_id, attempt_id, observation):
             # Only an authentic original return releases execution concurrency;
             # it never overwrites or reapplies the independent financial facts.
             if observation["status"] == "returned":
-                for limits in budget_scopes.frozen(policy, state):
-                    row, counters = await _scope(manager, tx, state["policy_key"], limits)
-                    counters["inflight"] -= 1
-                    await _save_counters(manager, tx, row, counters)
+                from .execution_budget import adjust_allocation
+                await adjust_allocation(manager, tx, state, {"inflight": -1})
             state.update(observation=observation, finished_at_ms=source[0]["created_at"])
             await _save(manager, tx, state, job)
         else:
@@ -504,16 +353,13 @@ async def _project_observation(manager, tx, policy, state, job, observation, sou
         if tokens is None and usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
             tokens = usage["prompt_tokens"] + usage["completion_tokens"]
     bound = state["plan"]["token_bound"]
-    for limits in budget_scopes.frozen(policy, state):
-        row, counters = await _scope(manager, tx, state["policy_key"], limits)
-        counters["held_calls"] -= 1
-        counters["used_calls"] += 1
-        if tokens is not None:
-            counters["held_tokens"] -= bound
-            counters["used_tokens"] += tokens
-        if returned:
-            counters["inflight"] -= 1
-        await _save_counters(manager, tx, row, counters)
+    from .execution_budget import adjust_allocation
+    changes = {"held_calls": -1, "used_calls": 1}
+    if tokens is not None:
+        changes.update(held_tokens=-bound, used_tokens=tokens)
+    if returned:
+        changes["inflight"] = -1
+    await adjust_allocation(manager, tx, state, changes)
     if tokens is not None and tokens > bound:
         await tx.execute(
             f"UPDATE {manager.prefix}task_budget_policies SET enabled=0 WHERE policy_key=?", (state["policy_key"],)
@@ -527,9 +373,12 @@ async def _project_observation(manager, tx, policy, state, job, observation, sou
 
 
 async def deliver(attempt):
-    """Replay only the frozen original API submission, never the model request."""
-    return await _deliver(attempt.binding.runtime, attempt.binding.actor,
-                          attempt.binding.lease.job_id, attempt.attempt_id)
+    """Replay the original live owner's frozen usage submission only."""
+    from .execution_budget import get, observe
+    state = get(attempt)
+    if state["observation"] is None:
+        raise JobError("budget_usage_not_ready")
+    return await observe(attempt, state["observation"])
 
 
 async def _deliver(runtime, actor, job_id, attempt_id):
@@ -617,84 +466,14 @@ async def _deliver(runtime, actor, job_id, attempt_id):
 
 
 async def _refund_local(manager, tx, policy, state):
-    for limits in budget_scopes.frozen(policy, state):
-        row, counters = await _scope(manager, tx, state["policy_key"], limits)
-        counters["held_calls"] -= 1
-        counters["held_tokens"] -= state["plan"]["token_bound"]
-        counters["inflight"] -= 1
-        await _save_counters(manager, tx, row, counters)
-
-
-async def _original_preparation(attempt, tx, job):
-    runtime, manager, owner = attempt.binding.runtime, attempt.binding.runtime.manager, attempt.binding.lease
-    if (owner.executor_id, owner.boot_id) != (runtime.executor_id, runtime.boot_id) or (
-        job["executor_id"],
-        job["boot_id"],
-        job["generation"],
-    ) != (owner.executor_id, owner.boot_id, owner.generation):
-        raise JobError("budget_release_requires_original_owner")
-    from .model_attempts import _read as read_model
-
-    saved = await read_model(manager, tx, "prepared", attempt.attempt_id)
-    if (
-        saved[1] != attempt.prepared
-        or saved[1]["scope"] != asdict(owner)
-        or saved[1]["session_id"] != attempt.binding.actor.session_id
-        or saved[1]["scope"]["job_id"] != job["job_id"]
-    ):
-        raise JobError("budget_release_requires_original_owner")
+    from .execution_budget import adjust_allocation
+    await adjust_allocation(manager, tx, state,
+                            {"held_calls": -1, "held_tokens": -state["plan"]["token_bound"], "inflight": -1})
 
 
 async def close_unreserved(attempt):
-    """Seal only proven absence of a reservation; never issue an API release.
-
-    A missing mutable row alone is insufficient: its original first journal
-    event must also be absent. Already reserved/uncertain work remains owned by
-    close_unstarted and its original host tombstone/ACK protocol.
-    """
-    runtime, manager = attempt.binding.runtime, attempt.binding.runtime.manager
-    async with manager._write() as tx:
-        policy = await _policy(runtime, tx)
-        if policy is None:
-            return None
-        job = await manager._authorize(tx, attempt.binding.actor, attempt.binding.lease.job_id)
-        await _original_preparation(attempt, tx, job)
-        state = await _read(manager, tx, attempt.attempt_id, required=False)
-        if state is not None:
-            if state["job_id"] != job["job_id"] or state["context"] != _context(attempt, job):
-                raise JobError("budget_release_requires_original_owner")
-            return (
-                state["ack"]
-                if state["phase"] == "released"
-                and isinstance(state["ack"], dict)
-                and state["ack"].get("no_reservation") is True
-                else None
-            )
-        from .model_attempts import _read as read_model
-
-        if await read_model(manager, tx, "dispatched", attempt.attempt_id, required=False):
-            raise JobError("budget_release_not_permitted")
-        state = {
-            "version": 0,
-            "attempt_id": attempt.attempt_id,
-            "job_id": job["job_id"],
-            "policy_key": policy["policy_key"],
-            "context": _context(attempt, job),
-            "plan": None,
-            "plan_hash": None,
-            "phase": "released",
-            "pending": False,
-            "started_at_ms": manager.now(),
-            "host_intent": False,
-            "grant": None,
-            "observation": None,
-            "submission": None,
-            "ack": {"local_only": True, "dispatch_not_authorized": True, "no_reservation": True},
-        }
-        if policy["manifest"]["version"] == 2:
-            state["scopes"] = []  # No scope was reserved, so none may be refunded.
-        await _save(manager, tx, state, job, new=True)
-        return state["ack"]
+    from .execution_budget import close_unreserved as close_owned
+    return await close_owned(attempt)
 
 
 async def is_closed_unstarted(manager, tx, prepared):
@@ -713,12 +492,8 @@ async def is_closed_unstarted(manager, tx, prepared):
 
 
 async def close_unstarted(attempt):
-    """Original running owner's closure, retaining its exact execution check."""
-    local = await close_unreserved(attempt)
-    if local is not None:
-        return local
-    return await _release_unstarted(attempt.binding.runtime, attempt.binding.actor,
-        attempt.binding.lease.job_id, attempt.attempt_id, original=attempt)
+    from .execution_budget import release_unstarted as release_owned
+    return await release_owned(attempt)
 
 
 async def _release_source(runtime, tx, job, attempt_id, policy):
@@ -787,29 +562,24 @@ async def _require_cancelled_lineage(manager, tx, job):
     raise JobError("job_depth_exceeded")
 
 
-async def _release_unstarted(runtime, actor, job_id, attempt_id, *, original=None, require_cancelled=False):
+async def _release_unstarted(runtime, actor, job_id, attempt_id, *, require_cancelled=False):
     manager = runtime.manager
     async with manager._write() as tx:
         policy = await _policy(runtime, tx)
         job = await manager._authorize(tx, actor, job_id)
-        if original is not None:
-            await _original_preparation(original, tx, job)
         state = await _release_source(runtime, tx, job, attempt_id, policy)
-        if original is not None and state["context"] != _context(original, job):
-            raise JobError("budget_release_requires_original_owner")
         from .model_attempts import _read as read_model
 
         if await read_model(manager, tx, "dispatched", attempt_id, required=False):
             raise JobError("budget_release_not_permitted")
         if state["phase"] == "released":
             return state["ack"]
-        if state["phase"] not in ("local_reserved", "host_reserving", "host_reserved", "dispatch_closed"):
-            raise JobError("budget_release_not_permitted")
         if state["phase"] != "dispatch_closed":
-            if require_cancelled:
-                await _require_cancelled_lineage(manager, tx, job)
-            state.update(phase="dispatch_closed", pending=True)
-            await _save(manager, tx, state, job)
+            # An open checkpoint has an unknown suffix. Missing dispatch
+            # evidence cannot prove an external request was never made.
+            raise JobError("budget_unstarted_execution_unconfirmed")
+        from .control_runtime import require_closed
+        await require_closed(manager, tx, job_id, state["context"]["generation"])
         if not state["host_intent"]:
             await _refund_local(manager, tx, policy, state)
             state.update(phase="released", pending=False, ack={"local_only": True, "dispatch_not_authorized": True})
@@ -894,6 +664,19 @@ async def _release_unstarted(runtime, actor, job_id, attempt_id, *, original=Non
 
 async def get_budget(manager, actor, attempt_id):
     """Authorized mechanical inspection, independent of model/provider availability."""
+    binding = manager._live_budget_bindings.get(attempt_id)
+    if binding is not None:
+        # Explicit inspection is a consistency boundary, never hot admission.
+        await manager._authorize(manager.db, actor, binding.lease.job_id)
+        from .control_runtime import current, flush_binding
+        control = current(binding)
+        head = await control.journal.inspect(control.identity)
+        if head["batch_no"] > control.cursor and control._pending is None:
+            # Another trusted reconciler appended to the original journal.
+            # The old owner cannot overwrite that fact or gain new admission.
+            control.needs_reconciliation = True
+        else:
+            await flush_binding(binding)
     async with manager._write() as tx:
         state = await _read(manager, tx, attempt_id)
         await manager._authorize(tx, actor, state["job_id"])
@@ -986,9 +769,12 @@ async def _reconciliation_state(runtime, actor, job_id, attempt_id, *, allow_mis
                 and not (state.get("initial_usage_evidence") is not None
                          and state["observation"] is None and observation is not None)):
             raise JobError("budget_observation_source_mismatch")
+        from .control_runtime import require_closed
+        await require_closed(manager, tx, job_id, state["context"]["generation"])
     return state, observation
 
 
+@_verify_stored
 async def reconcile_usage(runtime, actor, job_id, attempt_id):
     if isinstance(attempt_id, str) and attempt_id.startswith('toolattempt_'):
         from .tool_attempts import reconcile
@@ -1005,15 +791,31 @@ async def reconcile_usage(runtime, actor, job_id, attempt_id):
 
 
 async def require_quiescent(manager, tx, job):
+    from .execution_membership import _trusted
+    summary = _trusted(manager, "_closed_summaries", (job["job_id"], job["generation"]))
+    if (summary is not None and job["generation"] == 1 and _trusted(manager, "_first_claims", job["job_id"])
+            and summary.get("budget_attempts") == 0 and not summary.get("budget_unsettled")):
+        return []  # This process wrote every budget attempt of this execution: none.
     rows = await tx.fetchall(
-        f"SELECT attempt_id FROM {manager.prefix}task_budget_attempts WHERE job_id=? LIMIT 10001", (job["job_id"],)
-    )
+        f"SELECT * FROM {manager.prefix}task_budget_attempts WHERE job_id=? LIMIT 10001", (job["job_id"],))
     if len(rows) > 10000:
         raise JobError("budget_attempt_limit")
-    refs = []
-    for row in rows:
-        state = await _read(manager, tx, row["attempt_id"])
+    head = await tx.fetchone(f"SELECT summary_json,summary_hash FROM {manager.prefix}execution_checkpoints WHERE job_id=? AND generation=?",
+                             (job["job_id"], job["generation"]))
+    if head is not None:
+        summary = _object(head["summary_json"], head["summary_hash"])
+        if summary["budget_attempts"] != len(rows):
+            raise JobError("budget_attempt_missing")
+        if summary["budget_unsettled"]:
+            raise JobError("budget_reconciliation_required")
+    refs = ["mb_" + _hash([row["attempt_id"], row["version"]])[:48] for row in rows]
+    events = {}
+    for offset in range(0, len(refs), 100):
+        part = refs[offset:offset + 100]
+        found = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE event_id IN (" + ",".join("?" for _ in part) + ")", tuple(part))
+        events.update({event["event_id"]: event for event in found})
+    for row, ref in zip(rows, refs, strict=True):
+        state = _validate_row(row, events.get(ref))
         if state["pending"] or state["phase"] not in ("released", "settling") or state["ack"] is None:
             raise JobError("budget_reconciliation_required")
-        refs.append("mb_" + _hash([state["attempt_id"], state["version"]])[:48])
     return refs

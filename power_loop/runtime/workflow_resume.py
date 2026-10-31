@@ -10,6 +10,7 @@ import json
 from dataclasses import asdict
 
 from .jobs import JobError, JobLease, _hash, _json, _operation
+from .jobs import verify_stored as _verify_stored
 from .message_ref import MessageRef, integer_id
 from .result_revisions import execution_id, result_id
 
@@ -41,6 +42,7 @@ async def _source(manager, tx, actor, caller, ref):
     return row
 
 
+@_verify_stored
 async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, generation, node_id, message,
                 executor_id, boot_id, plan_hash=None, lease_ms=30000, rounds=None, resources=None):
     """All new authority is reserved in one transaction, not physical execution."""

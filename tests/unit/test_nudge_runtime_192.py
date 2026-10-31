@@ -542,8 +542,12 @@ async def test_workflow_node_can_nudge_its_own_subagent_without_changing_owner_o
     original_close = manager.close_model_execution
     async def close_model(actor, *args, **kwargs):
         result = await original_close(actor, *args, **kwargs)
-        session = await store.get_session(actor.session_id)
-        if session and session.metadata.get("workflow_node_id") == "BUILD":
+        # Close now joins the finalization transaction; the observer must use
+        # that transaction instead of waiting for a second SQLite connection.
+        reader = manager._joined_write.get() or store._db
+        session = await reader.fetchone(f"SELECT metadata_json FROM {store.t.sessions} WHERE session_id=?",
+                                       (actor.session_id,))
+        if session and json.loads(session["metadata_json"] or "{}").get("workflow_node_id") == "BUILD":
             node_exited.set()
         return result
     monkeypatch.setattr(manager, "close_model_execution", close_model)

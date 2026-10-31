@@ -24,7 +24,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 10
-TASK_PROTOCOL_VERSION = 21
+TASK_PROTOCOL_VERSION = 22
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -38,7 +38,9 @@ _QUERY_INDEXES = {
 }
 _PROTOCOL_2_TABLES = ("task_store", "jobs", "job_events")
 _PROTOCOL_3_TABLES = (*_PROTOCOL_2_TABLES, "task_executors", "task_executor_events")
-TASK_TABLES = (*_PROTOCOL_3_TABLES, "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
+_PROTOCOL_21_TABLES = (*_PROTOCOL_3_TABLES, "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
+TASK_TABLES = (*_PROTOCOL_21_TABLES, "execution_checkpoints", "execution_batches", "execution_allocations",
+               "session_controls")
 
 
 def message_identity_ddl(statement: str, name: str) -> str:
@@ -55,6 +57,8 @@ def message_identity_ddl(statement: str, name: str) -> str:
 
 
 def task_tables_ddl(name: str, prefix: str) -> list[str]:
+    from ..execution_journal import control_tables_ddl
+
     sid = "VARCHAR(255)" if name == "mysql" else "TEXT"
     small = "VARCHAR(64)" if name == "mysql" else "TEXT"
     body = "LONGTEXT" if name == "mysql" else "TEXT"
@@ -107,6 +111,9 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             version {integer} NOT NULL, phase {small} NOT NULL, pending INTEGER NOT NULL,
             state_hash {small} NOT NULL, state_json {body} NOT NULL,
             created_at {integer} NOT NULL, updated_at {integer} NOT NULL){opts}""",
+        *control_tables_ddl(name, prefix),
+        f"""CREATE TABLE IF NOT EXISTS {prefix}session_controls (
+            session_id {sid} PRIMARY KEY, version {integer} NOT NULL){opts}""",
         # All names stay below MySQL's 64-character identifier limit at prefix=24.
         # Discovery and recovery are explicit indexed steps, never correlated
         # table scans. Keep all index names under 64 chars at prefix=24.
@@ -186,7 +193,7 @@ async def _verify_query_indexes(tx, db, prefix):
         else:
             tables = tuple(sorted(set(owners.values())))
             table_params = ','.join('?' for _ in tables)
-            rows = await tx.fetchall('SELECT table_name,index_name,column_name FROM information_schema.statistics '
+            rows = await tx.fetchall('SELECT table_name AS table_name,index_name AS index_name,column_name AS column_name FROM information_schema.statistics '
                 f'WHERE table_schema=DATABASE() AND table_name IN ({table_params}) '
                 f'AND index_name IN ({placeholders}) ORDER BY table_name,index_name,seq_in_index', (*tables, *expected))
             for row in rows:
@@ -198,7 +205,8 @@ async def _verify_query_indexes(tx, db, prefix):
 
 
 async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSION):
-    tables = _PROTOCOL_2_TABLES if protocol == 2 else _PROTOCOL_3_TABLES if protocol == 3 else TASK_TABLES
+    tables = (_PROTOCOL_2_TABLES if protocol == 2 else _PROTOCOL_3_TABLES if protocol == 3
+              else _PROTOCOL_21_TABLES if protocol < 22 else TASK_TABLES)
     missing = [t for t in (*_STORE_TABLES, *tables) if not await _table_exists_tx(tx, db.dialect.name, prefix + t)]
     if missing:
         raise StoreSchemaError(f"task schema incomplete: {missing}")
@@ -295,6 +303,18 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
             raise StoreSchemaError("task budget schema incomplete")
     if protocol >= 18:
         await _verify_query_indexes(tx, db, prefix)
+    if protocol >= 22:
+        for table, columns in (
+            ("execution_checkpoints", ("job_id", "generation", "identity_json", "identity_hash",
+                                       "batch_no", "chain_hash", "summary_json", "summary_hash", "admission_nonce")),
+            ("execution_batches", ("job_id", "generation", "batch_no", "previous_hash",
+                                   "payload_json", "payload_hash")),
+            ("execution_allocations", ("allocation_id", "job_id", "generation", "state_json", "state_hash")),
+            ("session_controls", ("session_id", "version")),
+        ):
+            for column in columns:
+                if not await _column_exists(tx, db.dialect.name, prefix + table, column):
+                    raise StoreSchemaError("execution checkpoint schema incomplete")
 
 
 async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
@@ -351,13 +371,15 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                 raise StoreSchemaError("task migration supports schema v9 only")
             if int(row["version"]) == TASK_SCHEMA_VERSION:
                 identity = await tx.fetchone(f"SELECT protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20):
+                if identity and identity["protocol_version"] in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21):
                     old_protocol = identity["protocol_version"]
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
                     if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
                         kind = "VARCHAR(64)" if db.dialect.name == "mysql" else "TEXT"
                         await tx.execute(f"ALTER TABLE {prefix}jobs ADD COLUMN executor_key {kind}")
                     await _run_task_ddl(tx, db, prefix)
+                    from .execution_migration import import_accounting
+                    await import_accounting(tx, db, prefix)
                     if (
                         await tx.execute(
                             f"UPDATE {prefix}task_store SET protocol_version=? WHERE id=1 AND protocol_version=?",

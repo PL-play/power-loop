@@ -89,15 +89,17 @@ class AgentLoopConfig:
     #:     projection), original detail kept in ``pl_messages`` (recall_send re-expands).
     #: Custom representations implement the ``Representation`` Protocol.
     representation: Representation = _UNSET  # resolved in __post_init__ (default or legacy-mapped)
-    #: Recent-rows context cap (3.23, PROJECTION mode only). History normally runs from the fold
+    #: Optional history-row cap. The SDK default is unlimited (None); 0 also means unlimited.
+    #: A positive value explicitly limits history, independently of token/fold budgets.
+    #: History normally runs from the fold
     #: compact to the newest message; a session whose fold lags — or whose sends are tiny and
     #: numerous — grows without bound. When set, the assembled history keeps at most this many
     #: rows: the compact summary (if any) is ALWAYS kept on top, the in-flight send is always kept
     #: in full, and older material drops in whole chunks from the oldest end (the legacy prefix
     #: first, then whole past sends) until the total fits — a chunk is never split, so a
     #: verbatim-fallback send can't orphan its tool rows. ``None``/``<=0`` disables the cap.
-    #: Verbatim mode is unaffected (its window is bounded by the in-place compactor).
-    max_context_rows: int | None = 300
+    #: The current send and compact summary are retained in either representation.
+    max_context_rows: int | None = None
     #: 6.10.0 上下文三旋钮（互相独立，都不再借用 ``max_tokens``——那是**每次请求的输出上限**）：
     #: ``context_budget_tokens``：折叠预算——投影前缀估算 token（≈字符/4）达到它就折叠更早的 send。
     #: None → 回退到 ``max_tokens``（历史行为，兼容）。

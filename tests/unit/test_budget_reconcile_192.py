@@ -12,7 +12,8 @@ from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_job_registry_192 import registry_store
-from .test_model_budgets_192 import budget_case, counters, observed, start
+from .test_model_budgets_192 import budget_case, counters, start
+from .test_model_budgets_192 import observed as observe_original
 
 __all__ = ["registry_store", "budget_case"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -27,6 +28,29 @@ async def reopened(c, **kwargs):
 
 async def reconcile(runtime, c, a):
     return await runtime.reconcile_budget_usage(c.sid, job_id=c.binding.lease.job_id, attempt_id=a.attempt_id)
+
+
+async def observed(c, attempt, **kwargs):
+    from power_loop.runtime.control_runtime import flush_binding
+    value = await observe_original(c, attempt, **kwargs)
+    await flush_binding(attempt.binding, close=True)
+    return value
+
+
+async def test_cold_reconciler_cannot_overtake_a_live_owner(budget_case):
+    c = budget_case
+    c.host.apply_lost_ack = True
+    attempt = await start(c)
+    await observe_original(c, attempt)
+    c.host.apply_lost_ack = False
+    fresh = await reopened(c)
+    before = c.host.apply_calls
+    with pytest.raises(JobError, match="execution_reconciliation_requires_quiescence"):
+        await reconcile(fresh, c, attempt)
+    assert c.host.apply_calls == before
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(attempt.binding, close=True)
+    assert (await reconcile(fresh, c, attempt))["usage_acknowledged"]
 
 
 @pytest.mark.parametrize("unknown", [False, True])
@@ -95,6 +119,8 @@ async def test_foreign_or_missing_evidence_never_calls_provider(budget_case, fau
 async def test_dispatched_without_observation_cannot_be_forged_or_released(budget_case):
     c = budget_case
     a = await start(c)
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(a.binding, close=True)
     runtime = await reopened(c)
     before = await counters(c)
     with pytest.raises(JobError, match="model_attempt_evidence_missing"):
@@ -140,6 +166,8 @@ async def test_disabled_policy_still_accepts_original_usage_without_reenabling(b
 async def test_recovery_configuration_uses_original_manifest_without_writing(budget_case, fault):
     c = budget_case
     a = await start(c)
+    from power_loop.runtime.control_runtime import flush_binding
+    await flush_binding(a.binding)
     if fault == 'marker':
         await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_id=?",
                                   ('mb_policy_' + budgets.policy_key(c.runtime)[3:],))

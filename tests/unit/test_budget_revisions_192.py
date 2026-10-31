@@ -20,7 +20,8 @@ from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_budget_reconcile_192 import reconcile, reopened
 from .test_job_registry_192 import registry_store
-from .test_model_budgets_192 import Host, counters, new_send, observed, start
+from .test_model_budgets_192 import Host, counters, new_send, start
+from .test_model_budgets_192 import observed as observe_original
 
 __all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -78,12 +79,26 @@ def evidence(tokens=12, *, key="late-1", quality="actual", correction_of=None):
 
 
 async def stage(c, a, value, *, runtime=None, expected=1):
+    # Administrative correction belongs after the original owner's boundary;
+    # its physical result may still be unknown, and is never invented here.
+    from power_loop.runtime.control_runtime import current, flush_binding
+    if not current(a.binding).closed:
+        await flush_binding(a.binding, close=True)
     return await (runtime or c.runtime).stage_budget_usage_revision(c.sid,
         job_id=c.binding.lease.job_id, attempt_id=a.attempt_id, expected_revision=expected, evidence=value)
 
 
 async def rows(c):
     return await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id")
+
+
+async def observed(c, attempt, **kwargs):
+    # Administrative corrections operate on a sealed owner. A lost owner's
+    # open prefix is covered separately by the checkpoint recovery tests.
+    from power_loop.runtime.control_runtime import flush_binding
+    value = await observe_original(c, attempt, **kwargs)
+    await flush_binding(attempt.binding, close=True)
+    return value
 
 
 async def test_unknown_original_after_cancel_and_disabled_policy_corrects_tokens_not_resource_exit(late_case):
@@ -140,7 +155,7 @@ async def test_pending_conflicting_and_stale_revisions_are_not_accepted_or_charg
     with pytest.raises(JobError, match="budget_revision_evidence_conflict"):
         await stage(c, a, evidence(14))
     assert await rows(c) == before
-    with pytest.raises(JobError, match="budget_reconciliation_required"):
+    with pytest.raises(JobError, match="execution_control_closed"):
         await start(c)
     await reconcile(c.runtime, c, a)
     with pytest.raises(JobError, match="budget_revision_changed"):

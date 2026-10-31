@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 from .jobs import JobActor, JobError, JobLease, _hash, _json
+from .jobs import verify_stored as _verify_stored
 from .model_exit import content_reference
 from .result_proof import ResultPublicationProof
 from .result_revisions import result_id
@@ -247,6 +248,7 @@ async def reconcile(loop,actor,source_job_id):
     return await _reconcile(loop,actor,source_job_id,permit=None)
 
 
+@_verify_stored
 async def _reconcile(loop, actor, source_job_id, *, permit):
     """One original main batch: atomic negative result, notice and disposition."""
     from .managed_completion import _host_only
@@ -289,13 +291,14 @@ async def _reconcile(loop, actor, source_job_id, *, permit):
             await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                 (actor.session_id, key, 'original_call_outcome', 'queue', 'pending', render(data['public']), manager.now()))
             await _event(manager, tx, key, source, 'source_abort_delivery', data)
-            await tx.execute(f'UPDATE {manager.events} SET caller_session_id=? WHERE event_id=?', (actor.session_id, key))
+            await tx.set_event_recipient(key, actor.session_id)
             expected = await expected_disposition(manager, tx, source, closed)
             encoded = _json(expected)
             if len(encoded.encode()) > 262144:
                 raise JobError('pending_call_evidence_too_large')
             await _event(manager, tx, identity(manager, source), source, 'pending_call_disposition', expected)
             await tx.execute(f'UPDATE {manager.store.t.session_state} SET pending_json=NULL WHERE session_id=?', (actor.session_id,))
+            manager.store.forget_pending(actor.session_id)
         disposition = await require_disposition(manager, tx, source, await model(manager, tx, source))
         result = await result_event(manager, tx, source)
         delivery = await notice(manager, tx, source, result)
@@ -321,7 +324,7 @@ async def _review_sources(manager, tx, actor):
     prefix = '{' + _json(FIELD) + ':'
     # Discover each indexed scope independently; never correlate a subquery
     # over the complete jobs table. The union is bounded before loading bodies.
-    columns = f"j.job_id,j.generation,j.result_status,substr(j.result_json,1,{len(prefix)}) AS result_prefix"
+    columns = f"j.job_id,j.generation,j.version,j.result_status,substr(j.result_json,1,{len(prefix)}) AS result_prefix"
     own = await tx.fetchall(f"SELECT {columns} FROM {manager.jobs} j WHERE j.session_id=? "
         "AND j.kind='send' AND j.tenant_id=? AND j.principal_id=? AND j.result_status<>'none' "
         f"AND substr(j.result_json,1,{len(prefix)})=? ORDER BY j.job_id LIMIT 1001",
@@ -341,7 +344,8 @@ async def _review_sources(manager, tx, actor):
         raise JobError('abort_outcome_scope_too_large')
     if not by_id:
         return []
-    rows = [by_id[key] for key in sorted(by_id)]
+    from .execution_membership import resolved
+    rows = [by_id[key] for key in sorted(by_id) if not resolved(manager, key, by_id[key]["version"])]
     selected = []
     for row in rows:
         has_abort = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='tool_call_abort' LIMIT 1", (row['job_id'],))
@@ -440,6 +444,8 @@ async def pending_reviews(manager, tx, actor):
             except JobError:
                 pass  # A handled projection without a clean exit is not authority.
             else:
+                from .execution_membership import mark_resolved
+                mark_resolved(manager, source['job_id'], source['version'])
                 continue
         pending.append(content_reference(result))
     from .managed_delivery import pending_reviews as managed_pending

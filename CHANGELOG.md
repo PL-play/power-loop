@@ -21,6 +21,15 @@
 
 ## [Unreleased]
 
+- `AgentLoopConfig.max_context_rows` now defaults to `None` (unlimited). Explicit
+  `None` and `0` are unlimited; positive caller limits remain effective.
+- End-of-send projection writes maintain renderer-versioned fold statistics atomically.
+  Healthy below-threshold sends no longer load all uncompacted projection bodies.
+  Candidate and repair snapshots are paged outside session locks; fold commits also
+  check the projection revision so repaired or rewritten history cannot be skipped.
+  Recency/dedup-aware renderers can declare `ProjectionFoldPolicy`; other custom
+  renderers retain an exact snapshot check outside the lock.
+
 ## [9.0.0] — 2026-10-30
 
 ### Unified pricing and durable fee delivery
