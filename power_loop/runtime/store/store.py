@@ -23,11 +23,12 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 from power_loop.contracts.errors import InboxClaimChanged
 from power_loop.runtime.message_ref import integer_id
-from power_loop.runtime.store import change_signals
+from power_loop.runtime.store import change_signals, send_reads
 from power_loop.runtime.store.capabilities import Maintenance
 from power_loop.runtime.store.db import Database, Row, Transaction
 from power_loop.runtime.store.schema import (
@@ -227,6 +228,7 @@ class SessionStore:
 
     def forget_pending(self, session_id):
         self._pending_written.pop(session_id, None)
+        send_reads.forget(self, session_id, "state")
 
     def defer_round_index(self, session_id: str, round_index: int) -> None:
         """Written with the round's first append instead of its own transaction."""
@@ -244,6 +246,7 @@ class SessionStore:
 
     def _forget_appended(self, session_id):
         self._change_snapshots.pop(session_id, None)
+        send_reads.forget(self, session_id, "session", "state")
         self._appended_calls.pop(session_id, None)
         for key in [k for k in self._appended_refs if k[0] == session_id]:
             del self._appended_refs[key]
@@ -384,6 +387,50 @@ class SessionStore:
         )
         return _row_to_session(row) if row else None
 
+    @contextlib.asynccontextmanager
+    async def send_read_scope(self, session_id):
+        existing = send_reads.current(self, session_id)
+        if existing is not None:
+            yield existing
+            return
+        snapshot = send_reads.SendReads(self, session_id)
+        token = send_reads.ACTIVE.set(snapshot)
+        try:
+            yield snapshot
+        finally:
+            snapshot.active = False
+            send_reads.ACTIVE.reset(token)
+
+    async def session_snapshot(self, session_id):
+        snapshot = send_reads.trusted(self, session_id)
+        if snapshot is not None and "session" in snapshot.rows:
+            return snapshot.rows["session"]
+        value = await self.get_session(session_id)
+        snapshot = send_reads.current(self, session_id)
+        if snapshot is not None:
+            snapshot.rows["session"] = value
+        return value
+
+    async def state_snapshot(self, session_id):
+        snapshot = send_reads.trusted(self, session_id)
+        if snapshot is not None and "state" in snapshot.rows:
+            row = snapshot.rows["state"]
+            return replace(row, round_index=self._deferred_round.get(session_id, row.round_index))
+        value = await self.get_state(session_id)
+        send_reads.remember_state(self, session_id, value)
+        return value
+
+    async def runtime_snapshot(self, session_id, key, default=None):
+        snapshot = send_reads.trusted(self, session_id)
+        if snapshot is not None and key in snapshot.runtime:
+            value = snapshot.runtime[key]
+        else:
+            value = await self.get_runtime_state(session_id, key)
+            snapshot = send_reads.current(self, session_id)
+            if snapshot is not None:
+                snapshot.runtime[key] = value
+        return default if value is None else value
+
     async def get_state(self, session_id: str) -> SessionStateRow | None:
         row = await self._db.fetchone(
             f"SELECT * FROM {self.t.session_state} WHERE session_id=?", (session_id,)
@@ -419,17 +466,25 @@ class SessionStore:
 
     async def signal_changes(self, tx, session_id, kind):
         self._change_snapshots.pop(session_id, None)
+        if kind == "runtime":
+            snapshot = send_reads.current(self, session_id)
+            if snapshot is not None:
+                snapshot.runtime.clear()
         await change_signals.bump(self, tx, session_id, kind)
 
     async def set_round_index(self, session_id: str, round_index: int) -> None:
+        prior = send_reads.take_state(self, session_id)
         self._deferred_round.pop(session_id, None)
         async with self._db.transaction() as tx:
             await tx.execute(
                 f"UPDATE {self.t.session_state} SET round_index=? WHERE session_id=?",
                 (round_index, session_id),
             )
+        if prior is not None:
+            send_reads.remember_state(self, session_id, replace(prior, round_index=round_index))
 
     async def set_pending(self, session_id: str, pending: dict[str, Any] | None) -> None:
+        prior = send_reads.take_state(self, session_id)
         async with self._db.transaction() as tx:
             await tx.execute(
                 f"UPDATE {self.t.session_state} SET pending_json=? WHERE session_id=?",
@@ -438,6 +493,8 @@ class SessionStore:
                 (_dumps(pending) if pending else None, session_id),
             )
         self._remember_pending(session_id, _dumps(pending) if pending else None)
+        if prior is not None:
+            send_reads.remember_state(self, session_id, replace(prior, pending=_loads(_dumps(pending)) if pending else None))
 
     # ── messages ──────────────────────────────────────────────────────────────
     async def message_ref(self, session_id: str, seq: int | str):
@@ -527,6 +584,7 @@ class SessionStore:
                                              if isinstance(call, Mapping) and call.get("id")],
                            "tool_calls": tool_calls})
         committed = False
+        prior = send_reads.take_state(self, session_id)
         signal_columns = ','.join(change_signals.COLUMNS)
         signal_values = None
         try:
@@ -668,6 +726,10 @@ class SessionStore:
                 if deferred_round is not None:
                     self._deferred_round.setdefault(session_id, deferred_round)
         self._next_seq[session_id] = seq + 1
+        if prior is not None:
+            send_reads.remember_state(self, session_id, replace(prior, next_seq=seq + 1,
+                pending=prior.pending if pending_json is _KEEP else _loads(pending_json),
+                round_index=deferred_round if deferred_round is not None else prior.round_index))
         if signal_values is not None:
             self._change_snapshots[session_id] = seq, signal_values
             self._change_snapshots.move_to_end(session_id)
@@ -845,6 +907,7 @@ class SessionStore:
         could invert under a non-monotonic identity map); ``order_key`` is the note's
         logical position (``meta['ord']``). Returns ``(compact_seq, note_seq)``."""
         self._next_seq.pop(session_id, None)
+        send_reads.forget(self, session_id, "state")
         now = _now_ms()
         async with self._db.transaction() as tx:
             st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
@@ -994,6 +1057,7 @@ class SessionStore:
         Idempotent so a resume/re-finalize of the same send is a no-op-equivalent rewrite;
         ``created_at`` is preserved across re-finalize (insert-only)."""
         self._next_seq.pop(session_id, None)
+        send_reads.forget(self, session_id, "state")
         async with self._db.transaction() as tx:
             # Standalone CRUD participates in the same revision fence. Low-level
             # callers may store unattached projections, so this row can be absent.
@@ -1170,6 +1234,7 @@ class SessionStore:
         ``metadata_patch`` merged into the session metadata — all in ONE transaction under the
         session lock, so a crash can't leave a half-migrated projection OR a written migration with
         an unset marker (the marker and the rows commit together)."""
+        send_reads.forget(self, session_id, "session", "state")
         now = _now_ms()
         async with self._db.transaction() as tx:
             await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
@@ -1209,6 +1274,7 @@ class SessionStore:
         return [_row_to_session(r) for r in rows]
 
     async def archive_session(self, session_id: str) -> None:
+        send_reads.forget(self, session_id, "session")
         async with self._db.transaction() as tx:
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET status=?, updated_at=? WHERE session_id=?",
@@ -1508,6 +1574,7 @@ class SessionStore:
             deleted.append(session_id)
 
     async def update_session_prompt(self, session_id: str, system_prompt: str | None) -> None:
+        send_reads.forget(self, session_id, "session")
         async with self._db.transaction() as tx:
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET system_prompt=?, updated_at=? WHERE session_id=?",
@@ -1521,6 +1588,7 @@ class SessionStore:
         inspection and switch-detection."""
         if not patch:
             return
+        send_reads.forget(self, session_id, "session")
         async with self._db.transaction() as tx:
             await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
             row = await tx.fetchone(

@@ -16,7 +16,7 @@ def finite_delegation(loop) -> bool:
 
 
 async def session_role(store, sid: str) -> str:
-    row = await store.get_session(sid)
+    row = await store.session_snapshot(sid)
     if row is None:
         raise ValueError("execution_role_unavailable")
     meta = row.metadata or {}

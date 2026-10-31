@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     from power_loop.runtime.representation import Representation
 
 logger = logging.getLogger(__name__)
+_ENTRY_INDEX_UNSET = object()
 
 
 @dataclass
@@ -541,7 +542,7 @@ class StatefulAgentLoop:
         entry = self._session_cache.get(sid)
         if entry is None:
             return
-        post_state = await store.get_state(sid)
+        post_state = await store.state_snapshot(sid)
         if post_state is None:
             return
         if post_state.last_compact_seq != entry.last_compact_seq:
@@ -784,8 +785,8 @@ class StatefulAgentLoop:
         """
         sid = session_id
         self._raise_if_closing()
-        await self._ensure_store()
-        async with self._lock_for(sid):
+        store = await self._ensure_store()
+        async with self._lock_for(sid), store.send_read_scope(sid):
             await self._ensure_session_or_raise(sid)
             if heal_pending:
                 healed = await self._heal_pending(sid)
@@ -798,11 +799,11 @@ class StatefulAgentLoop:
                 await self._raise_if_pending(sid)
             # Cross-process turn: the in-process lock above only covers THIS interpreter.
             async with self._session_lease(sid):
-                await self._persist_user_input(sid, user_input, send_meta=metadata)
+                send_index = await self._persist_user_input(sid, user_input, send_meta=metadata)
                 return await self._run_loop(
                     sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
                     max_rounds=max_rounds, response_format=response_format,
-                    with_history=history,
+                    with_history=history, _entry_send_index=send_index,
                 )
 
     async def deliver(
@@ -991,7 +992,7 @@ class StatefulAgentLoop:
         go straight back to pending and are claimed by the pipeline's round-0 drain moments
         later — still before the first model call."""
         store = await self._ensure_store()
-        async with self._lock_for(sid):
+        async with self._lock_for(sid), store.send_read_scope(sid):
             await self._ensure_session_or_raise(sid)
             await self._raise_if_pending(sid)
             async with self._session_lease(sid):
@@ -1003,7 +1004,7 @@ class StatefulAgentLoop:
                     first = render_inbox_rows(claimed, wrap=False)[0]
                     stale = False
                     try:
-                        await self._persist_user_input(sid, first)
+                        send_index = await self._persist_user_input(sid, first)
                     except InboxClaimChanged:
                         stale = True
                         continue
@@ -1016,7 +1017,7 @@ class StatefulAgentLoop:
                             _session_sync(sid).pending_hint = (await store.inbox_counts(sid))["pending"]
                     return await self._run_loop(
                         sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                        max_rounds=max_rounds,
+                        max_rounds=max_rounds, _entry_send_index=send_index,
                     )
                 return None
 
@@ -1595,12 +1596,12 @@ class StatefulAgentLoop:
 
     async def _ensure_session_or_raise(self, sid: str) -> None:
         store = await self._ensure_store()
-        if await store.get_session(sid) is None:
+        if await store.session_snapshot(sid) is None:
             raise SessionNotFoundError(sid)
 
     async def _raise_if_pending(self, sid: str) -> None:
         store = await self._ensure_store()
-        state = await store.get_state(sid)
+        state = await store.state_snapshot(sid)
         if state is not None and state.pending:
             pending = state.pending
             raise SessionPendingError(
@@ -1631,11 +1632,11 @@ class StatefulAgentLoop:
         ``current_rows`` rather than the legacy (NULL send_index) prefix — otherwise
         the tool result renders BEFORE its own assistant tool_call and align_tool_calls
         drops it as an orphan, silently losing the answer."""
-        raw = await store.get_runtime_state(sid, "send_index", default=0)
+        raw = await store.runtime_snapshot(sid, "send_index", default=0)
         return self._coerce_send_index(raw)
 
     async def _persist_user_input(self, sid: str, user_input: str | LoopMessage, *,
-                                  send_meta: Mapping[str, Any] | None = None) -> None:
+                                  send_meta: Mapping[str, Any] | None = None) -> int:
         store = await self._ensure_store()
         inbox = None
         if isinstance(user_input, dict) and "_inbox" in user_input:
@@ -1686,6 +1687,7 @@ class StatefulAgentLoop:
             ),
             new_next_seq=seq + 1,
         )
+        return send_index
 
     async def _execute_pending(self, sid: str, sink: SQLiteSink) -> None:
         """Replay leftover tool_calls. Idempotent if there is no pending."""
@@ -1771,7 +1773,14 @@ class StatefulAgentLoop:
             return None
         return self.tool_registry.subset(tools)
 
-    async def _run_loop(self, sid: str, **kwargs: Any) -> StatefulResult:
+    async def _run_loop(self, sid: str, *, _entry_send_index=_ENTRY_INDEX_UNSET, **kwargs: Any) -> StatefulResult:
+        store = await self._ensure_store()
+        async with store.send_read_scope(sid) as reads:
+            if _entry_send_index is not _ENTRY_INDEX_UNSET:
+                reads.runtime["send_index"] = _entry_send_index
+            return await self._run_loop_owned(sid, _entry_send_index=_entry_send_index, **kwargs)
+
+    async def _run_loop_owned(self, sid: str, *, _entry_send_index, **kwargs: Any) -> StatefulResult:
         if self.task_runtime is not None:
             store = await self._ensure_store()
             # This send can run on a task also hosting its logical node and
@@ -1779,7 +1788,9 @@ class StatefulAgentLoop:
             # not cancel the shared task and bypass its parent's bookkeeping.
             stop = CancellationToken.from_any(kwargs.get("stop_event")).child()
             kwargs["stop_event"] = stop
-            async with self.task_runtime.model_send(self, sid, await self._current_send_index(store, sid), cancel_token=stop,
+            send_index = (_entry_send_index if _entry_send_index is not _ENTRY_INDEX_UNSET
+                          else await self._current_send_index(store, sid))
+            async with self.task_runtime.model_send(self, sid, send_index, cancel_token=stop,
                                                     round_limit=kwargs.get('max_rounds')) as evidence:
                 result = await self._run_with_tool_context(sid, **kwargs)
                 evidence.update(exit=result.status, usage=dict(result.usage or {}), rounds=result.rounds,
@@ -1866,7 +1877,7 @@ class StatefulAgentLoop:
         # fails the run — it logs a warning and renders best-effort (the config-level
         # projector/compactor exclusion can't catch a cross-RUN switch). Loaded here once and
         # reused below for the system-prompt precedence.
-        session_row = await store.get_session(sid)
+        session_row = await store.session_snapshot(sid)
         current_mode = "projection" if projector is not None else "default"
         try:
             recorded = session_row.metadata.get("history_mode") if session_row is not None else None
@@ -2153,7 +2164,7 @@ class StatefulAgentLoop:
                 # the cache is bypassed (cache_eligible is False whenever a projector is configured). ──
                 cache_token: tuple[int, int] | None = None
                 if cache_eligible:
-                    state = await store.get_state(sid)
+                    state = await store.state_snapshot(sid)
                     if state is not None:
                         cache_token = (state.next_seq, state.last_compact_seq)
                         active_rows = self._cache_get(sid, state.next_seq, state.last_compact_seq)

@@ -651,7 +651,7 @@ class TaskRuntime:
         if owner is not None and (owner.runtime is not self or owner.actor.session_id != sid):
             if owner.runtime is self:
                 job = await self.manager.get_job(owner.actor, owner.lease.job_id)
-                session = await self.manager.store.get_session(sid)
+                session = await self.manager.store.session_snapshot(sid)
                 restored = False
                 if (
                     job.kind == "workflow_node"
