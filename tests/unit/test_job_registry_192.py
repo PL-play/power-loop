@@ -506,6 +506,7 @@ async def test_migration_failure_after_raw_table_change_rolls_back_everything(re
 
     store, connect = registry_store
     legacy = await connect(schema="auto_create", suffix="fail_")
+    original_version = legacy.schema_version
     sid = await legacy.create_session()
     await legacy.append_message(sid, role="user", content="preserve on rollback")
 
@@ -515,5 +516,5 @@ async def test_migration_failure_after_raw_table_change_rolls_back_everything(re
     monkeypatch.setattr(task_schema, "_run_task_ddl", broken)
     with pytest.raises(RuntimeError, match="late DDL failure"):
         await migrate_task_schema(legacy._db, legacy.table_prefix, maintenance=True)
-    assert (await legacy._db.fetchone(f"SELECT version FROM {legacy.table_prefix}schema_migrations"))["version"] == 9
+    assert (await legacy._db.fetchone(f"SELECT version FROM {legacy.table_prefix}schema_migrations"))["version"] == original_version
     assert (await legacy.load_all_messages(sid))[0].content == "preserve on rollback"

@@ -174,6 +174,7 @@ class JobManager:
         # audit paths leave this unset and re-verify stored evidence.
         self._trust_own_writes = TRUST_OWN_WRITES
         self._joined_write = ContextVar("execution_joined_write", default=None)
+        self._deferred_model_updates = ContextVar("execution_deferred_model_updates", default=None)
 
     @asynccontextmanager
     async def joined_write(self):
@@ -411,9 +412,15 @@ class JobManager:
             if row["resource_state"] not in ("running", "unknown"):
                 raise JobError("execution_not_running")
             now = self.now()
-            await tx.execute(f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
-                "resource_state=?,lease_until_ms=NULL,version=version+1,updated_at=? WHERE job_id=?",
-                (resource_state, now, lease.job_id))
+            deferred = self._deferred_model_updates.get()
+            if deferred is not None and row["parent_job_id"] is None and not evidence_data.get("processing_decisions"):
+                # Finalization sees this transaction's virtual closed row. Its
+                # conditional publish writes both transitions in one UPDATE.
+                deferred[lease.job_id] = (resource_state, now, row["version"], lease.generation)
+            else:
+                await tx.execute(f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
+                    "resource_state=?,lease_until_ms=NULL,version=version+1,updated_at=? WHERE job_id=?",
+                    (resource_state, now, lease.job_id))
             closed = json.loads(_json({"generation": lease.generation, "evidence": evidence_data,
                                        "resource_state": resource_state}))
             await tx.execute(f"INSERT INTO {self.events} "
@@ -453,12 +460,27 @@ class JobManager:
                                                   guarded=True)
 
     async def _close_and_finalize(self, actor, lease, *, evidence, resource_state, guarded=False):
-        async with self.joined_write() as tx:
-            record = await self.close_model_execution(actor, lease, evidence=evidence, resource_state=resource_state)
-            if record.parent_job_id or (evidence or {}).get("processing_decisions"):
-                return record, False
-            finalize = self._finalize_guarded if guarded else self._finalize_unguarded
-            closure = await finalize(tx, actor, lease)
+        deferred = {}
+        token = self._deferred_model_updates.set(deferred)
+        try:
+            async with self.joined_write() as tx:
+                record = await self.close_model_execution(actor, lease, evidence=evidence, resource_state=resource_state)
+                if record.parent_job_id or (evidence or {}).get("processing_decisions"):
+                    return record, False
+                finalize = self._finalize_guarded if guarded else self._finalize_unguarded
+                closure = await finalize(tx, actor, lease)
+                if closure is None and lease.job_id in deferred:
+                    # A legitimate unfinished child keeps supervision open;
+                    # the model exit still commits in this same transaction.
+                    state, now, version, generation = deferred[lease.job_id]
+                    changed = await tx.execute(f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
+                        "resource_state=?,lease_until_ms=NULL,version=version+1,updated_at=? "
+                        "WHERE job_id=? AND version=? AND generation=?",
+                        (state, now, lease.job_id, version, generation))
+                    if changed != 1:
+                        raise JobError("stale_execution")
+        finally:
+            self._deferred_model_updates.reset(token)
         if closure is not None:
             self._publish_closure(actor, lease.job_id, lease.generation, closure)
         return record, True

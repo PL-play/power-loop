@@ -238,6 +238,10 @@ class SessionStore:
                            round_index, tool_calls_json):
         key = (session_id, seq)
         self._appended_refs[key] = (row_id, role, tool_call_id, send_index, round_index)
+        reads = send_reads.current(self, session_id)
+        if reads is not None and role == "assistant":
+            reads.assistant_send_index = send_index
+            reads.assistant_ref = (row_id, seq, role, tool_call_id, send_index, round_index)
         self._appended_refs.move_to_end(key)
         while len(self._appended_refs) > 4096:
             self._appended_refs.popitem(last=False)
@@ -247,6 +251,9 @@ class SessionStore:
     def _forget_appended(self, session_id):
         self._change_snapshots.pop(session_id, None)
         send_reads.forget(self, session_id, "session", "state")
+        reads = send_reads.current(self, session_id)
+        if reads is not None:
+            reads.assistant_send_index, reads.assistant_ref = None, None
         self._appended_calls.pop(session_id, None)
         for key in [k for k in self._appended_refs if k[0] == session_id]:
             del self._appended_refs[key]
@@ -497,6 +504,20 @@ class SessionStore:
             send_reads.remember_state(self, session_id, replace(prior, pending=_loads(_dumps(pending)) if pending else None))
 
     # ── messages ──────────────────────────────────────────────────────────────
+    async def last_assistant_ref(self, session_id: str, send_index: int):
+        """Reuse this send's committed append; recovery reads its stored tail."""
+        from ..message_ref import MessageRef
+        reads = send_reads.trusted(self, session_id)
+        if reads is not None and reads.assistant_send_index == send_index:
+            return MessageRef(self.store_id, session_id, *reads.assistant_ref) if reads.assistant_ref is not None else None
+        row = await self._db.fetchone(f"SELECT * FROM {self.t.messages} WHERE session_id=? "
+            "AND role='assistant' AND send_index=? ORDER BY seq DESC LIMIT 1", (session_id, send_index))
+        value = None if row is None else (int(row["id"]) if self.has_message_ids else None,
+            int(row["seq"]), row["role"], row["tool_call_id"], row["send_index"], row["round_index"])
+        if reads is not None:
+            reads.assistant_send_index, reads.assistant_ref = send_index, value
+        return MessageRef(self.store_id, session_id, *value) if value is not None else None
+
     async def message_ref(self, session_id: str, seq: int | str):
         from power_loop.runtime.message_ref import MessageRef, integer_id
 
@@ -563,6 +584,10 @@ class SessionStore:
             raise ValueError("invalid_pending_tool_message")
         if pending is not _KEEP and pending_tool_calls:
             raise ValueError("invalid_pending_tool_message")
+        reads = send_reads.current(self, session_id)
+        if reads is not None and role == "assistant":
+            # An unknown append outcome requires a stored read on close.
+            reads.assistant_send_index, reads.assistant_ref = None, None
         now = _now_ms()
         pending_json = _KEEP if pending is _KEEP else (_dumps(pending) if pending else None)
         deferred_round = self._deferred_round.pop(session_id, None)

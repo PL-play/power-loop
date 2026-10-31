@@ -11,6 +11,8 @@ class SendReads:
         self.store, self.sid = store, sid
         self.active = True
         self.rows, self.runtime = {}, {}
+        self.assistant_send_index = None
+        self.assistant_ref = None
 
 
 def current(store, sid):

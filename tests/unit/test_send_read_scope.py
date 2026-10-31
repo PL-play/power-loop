@@ -38,6 +38,56 @@ async def test_committed_appends_and_pending_changes_refresh_owned_state(registr
 
 
 @pytest.mark.parametrize("fault", ["rollback", "ack_loss"])
+async def test_last_assistant_hint_is_invalidated_before_failed_or_unknown_append(registry_store, monkeypatch, fault):
+    store, _ = registry_store
+    sid = await store.create_session()
+    transaction = store._db.transaction
+
+    @asynccontextmanager
+    async def fail():
+        async with transaction() as tx:
+            yield tx
+            if fault == "rollback":
+                raise OSError("rollback")
+        raise OSError("committed_ack_lost")
+
+    async with store.send_read_scope(sid):
+        token = TRUST_OWN_WRITES.set(True)
+        try:
+            first = await store.append_message(sid, role="assistant", content="first", send_index=1)
+            assert (await store.last_assistant_ref(sid, 1)).seq == first
+            with monkeypatch.context() as patch:
+                patch.setattr(store._db, "transaction", fail)
+                with pytest.raises(OSError, match="rollback|committed_ack_lost"):
+                    await store.append_message(sid, role="assistant", content="second", send_index=1)
+            actual = await store.last_assistant_ref(sid, 1)
+            assert actual.seq == first + int(fault == "ack_loss")
+            assert actual == await store.message_ref(sid, actual.seq)
+        finally:
+            TRUST_OWN_WRITES.reset(token)
+
+
+async def test_resume_and_cold_reader_discover_stored_assistant_without_entry_hint(registry_store):
+    store, connect = registry_store
+    sid = await store.create_session()
+    first = await store.append_message(sid, role="assistant", content="old", send_index=1)
+    async with store.send_read_scope(sid):
+        token = TRUST_OWN_WRITES.set(True)
+        try:
+            assert (await store.last_assistant_ref(sid, 1)).seq == first
+            other = await connect(schema="compatible")
+            second = await other.append_message(sid, role="assistant", content="fresh", send_index=1)
+
+            @verify_stored
+            async def inspect():
+                return await store.last_assistant_ref(sid, 1)
+
+            assert (await inspect()).seq == second
+        finally:
+            TRUST_OWN_WRITES.reset(token)
+
+
+@pytest.mark.parametrize("fault", ["rollback", "ack_loss"])
 async def test_failed_append_discards_entry_hint_before_retry_or_inspection(registry_store, monkeypatch, fault):
     store, _ = registry_store
     sid = await store.create_session()

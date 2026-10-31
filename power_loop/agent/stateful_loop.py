@@ -1778,6 +1778,8 @@ class StatefulAgentLoop:
         async with store.send_read_scope(sid) as reads:
             if _entry_send_index is not _ENTRY_INDEX_UNSET:
                 reads.runtime["send_index"] = _entry_send_index
+                reads.assistant_send_index = _entry_send_index
+                reads.assistant_ref = None
             return await self._run_loop_owned(sid, _entry_send_index=_entry_send_index, **kwargs)
 
     async def _run_loop_owned(self, sid: str, *, _entry_send_index, **kwargs: Any) -> StatefulResult:

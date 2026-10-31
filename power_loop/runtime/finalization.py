@@ -418,8 +418,18 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
 async def _publish(manager, tx, plans):
     for row, version, data, ref in plans:
         status = "model_closed" if row["kind"] == "send" else row["outcome"]
-        if await tx.execute(f"UPDATE {manager.jobs} SET status=?,supervision_status='closed',version=?,updated_at=? WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'",
-                (status, version, manager.now(), row["job_id"], row["version"], row["generation"])) != 1:
+        deferred = manager._deferred_model_updates.get()
+        close = deferred.get(row["job_id"]) if deferred is not None else None
+        if close is not None:
+            resource, _now, previous_version, generation = close
+            changed = await tx.execute(f"UPDATE {manager.jobs} SET status=?,intake='closed',resource_state=?,"
+                "lease_until_ms=NULL,supervision_status='closed',version=?,updated_at=? "
+                "WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'",
+                (status, resource, version, manager.now(), row["job_id"], previous_version, generation))
+        else:
+            changed = await tx.execute(f"UPDATE {manager.jobs} SET status=?,supervision_status='closed',version=?,updated_at=? WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'",
+                (status, version, manager.now(), row["job_id"], row["version"], row["generation"]))
+        if changed != 1:
             raise JobError("finalization_execution_changed")
         await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
             (ref["event_id"], row["job_id"], "supervision_closed", version, _hash(data), _json(data), "not_applicable", manager.now()))

@@ -735,16 +735,12 @@ class TaskRuntime:
                 yield evidence
                 snapshot = binding.resource_evidence.get("processing_snapshot_id")
                 if snapshot and evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass"):
-                    last = await self.manager.db.fetchone(
-                        f"SELECT MAX(seq) AS seq FROM {self.manager.store.t.messages} "
-                        "WHERE session_id=? AND role='assistant' AND send_index=?",
-                        (sid, send_index),
-                    )
-                    if last is None or last["seq"] is None:
+                    last = await self.manager.store.last_assistant_ref(sid, send_index)
+                    if last is None:
                         raise JobError("processing_response_missing")
                     decision_args = {
                         "snapshot_id": snapshot,
-                        "response_ref": await self.manager.store.message_ref(sid, last["seq"]),
+                        "response_ref": last,
                         "reason": "Original session completed its registered processing send with no unresolved tools.",
                     }
                     try:
@@ -764,13 +760,9 @@ class TaskRuntime:
         finally:
             if binding.resource_evidence.get("model_attempts_inflight"):
                 binding.resource_evidence["resource_state"] = "unknown"
-            last = await self.manager.db.fetchone(
-                f"SELECT MAX(seq) AS seq FROM {self.manager.store.t.messages} "
-                "WHERE session_id=? AND role='assistant' AND send_index=?",
-                (sid, send_index),
-            )
-            if last is not None and last["seq"] is not None:
-                evidence["last_assistant_ref"] = (await self.manager.store.message_ref(sid, last["seq"])).to_dict()
+            last = await self.manager.store.last_assistant_ref(sid, send_index)
+            if last is not None:
+                evidence["last_assistant_ref"] = last.to_dict()
             _, finalized = await self.manager.close_and_finalize(
                 actor,
                 binding.lease,
