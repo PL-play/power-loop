@@ -52,6 +52,16 @@ class InboxClaimChanged(PowerLoopError):
         super().__init__(f"inbox claim changed: {session_id}")
 
 
+class SessionLeaseLost(PowerLoopError):
+    """A previous turn owner cannot write after expiry or takeover."""
+
+    code = "session.lease_lost"
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        super().__init__(f"session lease lost: {session_id}")
+
+
 class SessionPendingError(PowerLoopError):
     """Raised when a session has unresolved tool_calls from a previous run.
 

@@ -1534,7 +1534,10 @@ class StatefulAgentLoop:
         # process to take the session while this one is still writing.
         renew = asyncio.create_task(self._renew_lease_forever(sid, ttl_ms))
         try:
-            yield
+            async with self.store.send_read_scope(sid) as reads:
+                self.store.forget_turn_hints(sid)
+                reads.lease_owner_id = self._owner_id
+                yield
         finally:
             renew.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1545,10 +1548,9 @@ class StatefulAgentLoop:
     async def _renew_lease_forever(self, sid: str, ttl_ms: int) -> None:
         """Push the expiry out every third of the TTL until cancelled.
 
-        Renewing at TTL/3 leaves room for two consecutive failures (a blip, a slow write) before
-        the lease actually lapses. If the lease has been taken over we can only log: the run is
-        mid-flight and power-loop has no way to unwind it, which is why the TTL must be generous
-        enough that a live holder is never presumed dead.
+        Renewing at TTL/3 leaves room for transient failure. Losing ownership
+        fences subsequent turn writes; external work already in flight still
+        needs its original reconciliation and cannot be unwound here.
         """
         interval = max(0.5, (ttl_ms / 1000) / 3)
         while True:
@@ -1558,8 +1560,8 @@ class StatefulAgentLoop:
                     sid, owner_id=self._owner_id, ttl_ms=ttl_ms
                 ):
                     logger.error(
-                        "session %s lease LOST (another process took over) — this run is now "
-                        "racing it; raise config.session_lease_ttl_s if the host is merely slow",
+                        "session %s lease lost; further turn writes are fenced and "
+                        "original external work may require reconciliation",
                         sid,
                     )
                     return

@@ -13,6 +13,7 @@ class SendReads:
         self.rows, self.runtime = {}, {}
         self.assistant_send_index = None
         self.assistant_ref = None
+        self.lease_owner_id = None
 
 
 def current(store, sid):
