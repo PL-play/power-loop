@@ -1,7 +1,7 @@
 # Memory-owned execution and recoverable checkpoints
 
-Status: implementation in progress. This is the single task-execution contract;
-there is no legacy execution switch.
+This is the single task-execution contract. Execution, recovery and inspection
+share its current schema and protocol.
 
 ## Contract
 
@@ -34,6 +34,12 @@ claim and control opening in one transaction. Closing joins the final checkpoint
 model exit and eligible finalization in one transaction. The existing global
 control lock still serializes admission/close; incremental execution checkpoints
 have their own owner/version fence.
+
+An eligible root close stages its model-exit row in the current transaction's
+read view. Successful finalization publishes model exit and supervision closure
+in one conditional row update. An unfinished child permits committing the model
+exit with supervision still open. Both paths retain their original events and
+versions; rollback or an unknown commit retries the original closing evidence.
 
 `TRUST_OWN_WRITES` is scoped to a live owned send. Transaction-local immutable
 facts are staged in an overlay; commit publishes them to process caches and
@@ -111,3 +117,99 @@ Server validation uses isolated databases and must enter workflow/model assertio
 rather than count initialization failures as exercised behavior. Real process
 exit tests reopen storage without owner caches and assert that results/pending
 survive and neither model calls nor external effects are repeated.
+
+## Entry reads and round change signals
+
+Each send has a bounded lifetime for its entry session/state/runtime snapshots.
+Committed appends and mutations refresh or invalidate those snapshots. Failed or
+unknown commits invalidate mutable hints. An inherited background context cannot
+reuse an expired read scope. Public getters and `@verify_stored` recovery always
+read storage. The final assistant reference follows the same commit boundary;
+closing reuses that reference, while recovery reads the actual stored tail.
+
+`session_state` holds `inbox_version`, `background_version` and
+`runtime_version`. Every producer advances the appropriate counter in the same
+transaction as its payload. A normal append returns these counters with its
+existing sequence/identity result. The live round reads detailed queues and
+runtime projections only after a committed counter change. Claimed-input retry
+deadlines permit reclaiming work from a failed consumer without a new producer
+write.
+
+Natural completion and `pass_turn` perform a fresh final signal check. Input or
+background results committed during the last model round remain discoverable;
+explicit hard-stop semantics still apply to `pass_turn`.
+
+The current base store schema is 11; task schema is 12 with task protocol 23.
+Explicit maintenance adds and backfills the counters, including partially
+completed DDL. Old task stores require maintenance before current writers open
+them. Runtime execution reads only the current format.
+
+## Shared budget checkpoints and round accounting
+
+An open execution retains its full bounded grant in shared scope counters.
+Actual consumption is included in the execution checkpoint summary and records;
+ordinary open checkpoints do not rewrite shared counters. Close applies the
+cumulative difference under the original scope locks. Report versions make
+unknown-commit retries and repeated projection repair idempotent. Actual usage
+above the entire grant is booked immediately and closes new admission.
+
+Expired-owner retirement preserves its unknown suffix and reserved capacity.
+Actual supplier capture and financial submissions remain authoritative for paid
+usage, including a response received after the last control checkpoint. Recovery
+requires original evidence before correcting or releasing that capacity.
+
+The pipeline passes per-response usage only on the message copy sent to the
+sink. Hooks, history and later model requests do not receive that private field.
+The first response message writes `usage_rounds` in its own append transaction,
+using `(session_id, send_index, round_index)` as the idempotency key. A committed
+append marks the round locally so repeated round-end callbacks do no further
+accounting SQL. Empty response rounds persist usage immediately at round end.
+
+If the append transaction rolls back, both the message and its local usage row
+roll back. Supplier capture and financial reporting retain their separate
+originals; recovery preserves unknown grants and never repeats a model call to
+manufacture a lost response. The usage INSERT count is unchanged; joining the
+append removes one transaction per persisted response.
+
+## Cross-process session turns
+
+When processes share a session, `distributed_sessions` acquires its durable turn
+lease. Owned message allocation, pending clears and explicit round writes check
+the lease holder and validity in their existing conditional UPDATEs. PostgreSQL
+and MySQL lock the matching lease row in that statement; SQLite serializes the
+writer transaction. This adds a lease-row read/lock without a separate SQL
+round trip. A stale owner raises `SessionLeaseLost` (`session.lease_lost`).
+
+The write fence remains attached to a detached child context after its original
+turn ends. A newly acquired lease discards mutable hints from the previous
+holding period. Writers check that lifetime before touching hints and again
+after waiting for a transaction. A delayed successful commit ACK returns its
+original durable sequence without publishing mutable hints into a new turn.
+An old failed/unknown commit also cannot restore its deferred round over that
+turn. These checks cover reacquisition by the same loop owner ID.
+
+Renewal uses the database port's integer matched-row count;
+MySQL already enables `CLIENT.FOUND_ROWS`, including unchanged timestamps.
+There is no follow-up confirmation SELECT.
+
+## Remaining control costs
+
+Admission and close retain the global `task_store` lock. Executor drain and
+root-control cancellation can touch multiple roots, so replacing it requires a
+proven common lock order across those transactions. Tests cover real-process
+session contention, independent concurrent models and same-tree stop/result
+races with the existing lock.
+
+`session_controls` skips unchanged clean-session discovery. A changed or cold
+session can still scan processed historical obligations; a durable pending-only
+index has not been implemented. Unified task renewal also retains ancestor,
+deadline and executor-admission checks. Finite durable leases require ongoing
+renewal writes; total control SQL is not independent of elapsed time.
+
+`tests/unit/test_send_sql_profile.py` is the SQL regression authority. It covers
+three engines, budgeted/unbudgeted sends with 1–32 model responses, and 0 versus
+20 historical sends. Its current fixed control bounds are 19 unbudgeted and 29
+budgeted, with bounded projection/checkpoint growth. Ordinary storage has fixed
+bounds 16/18 and tool-round slopes 5/7 for SQLite/PostgreSQL versus MySQL, plus
+the existing elapsed-second activity-touch allowance. Billing bounds remain
+2/13. These limits are never increased to accommodate a regression.
