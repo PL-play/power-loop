@@ -56,6 +56,7 @@ class ControlTransaction(ControlReadView):
         self._events = manager.events
         self._jobs = manager.jobs
         self._executors = manager.prefix + "task_executors"
+        self._obligations = manager.prefix + "session_obligations"
         self._dialect = manager.db.dialect
         self.jobs: set[str] = set()
         self.sessions: set[str] = set()
@@ -123,6 +124,13 @@ class ControlTransaction(ControlReadView):
         if changed:
             self.sessions.add(session_id)
             self.obligation_routes.add(event_id)
+        return changed
+
+    async def discard_orphan_obligations(self, job_id, sessions):
+        changed = await self._execute(f"DELETE FROM {self._obligations} WHERE job_id=? AND "
+            f"NOT EXISTS (SELECT 1 FROM {self._jobs} WHERE job_id=?)", (job_id, job_id))
+        if changed:
+            self.sessions.update(sessions)
         return changed
 
     async def execute(self, sql, params=()):
