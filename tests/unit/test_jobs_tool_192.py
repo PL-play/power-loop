@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -52,7 +53,7 @@ async def test_explicit_builtin_registration_does_not_expand_default_presets():
     assert JOBS_DEFINITION.interrupt == "finish"
 
 
-@pytest.mark.parametrize("fault", ["none", "commit_ack", "signal"])
+@pytest.mark.parametrize("fault", ["none", "commit_ack", "signal", "accepted_ack", "target_ack", "completed_ack"])
 async def test_actual_native_tools_list_get_stop_bind_receipt_and_cancel_original_child(managed, monkeypatch, fault):
     store, manager, runtime, loop, model, sid, _ = managed
     register_jobs_tools(loop.tool_registry)
@@ -115,6 +116,38 @@ async def test_actual_native_tools_list_get_stop_bind_receipt_and_cancel_origina
             raise RuntimeError("local signal unavailable")
 
         monkeypatch.setattr(task_control, "signal_local", unavailable)
+    elif fault.endswith("_ack"):
+        from power_loop.runtime.managed_effects import _ref
+        from power_loop.runtime.tool_call_plans import identity, start_id
+
+        transaction = manager.db.transaction
+        lost = []
+
+        @asynccontextmanager
+        async def lose_exact_ack():
+            async with transaction() as tx:
+                yield tx
+                requests = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE event_type='task_control_request'")
+                phases = {json.loads(event["payload_json"])["phase"] for event in requests}
+                phase = "completed" if "completed" in phases else "target" if await tx.fetchone(
+                    f"SELECT event_id FROM {manager.events} WHERE action='stop'") else "accepted" if phases else None
+                hit = not lost and fault == str(phase)+"_ack"
+                if hit:
+                    # Reserve this exact injection before DB commit releases
+                    # its connection to concurrent child-exit bookkeeping.
+                    lost.append(phase)
+                    acceptance = next(event for event in requests if json.loads(event["payload_json"])["phase"] == "accepted")
+                    request = json.loads(acceptance["payload_json"])["request"]
+                    source = await manager._row(tx, acceptance["job_id"])
+                    dispatched = start_id(identity(manager, source, _ref(request["call_ref"])), request["tool_call_id"])
+                    # Permission to apply in another tree must include the
+                    # actual callback dispatch, never just its persisted plan.
+                    assert await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=? "
+                        "AND event_type='tool_call_dispatch_started'", (dispatched,))
+            if hit:
+                raise OSError("stop "+phase+" committed; ACK lost")
+
+        monkeypatch.setattr(manager.db, "transaction", lose_exact_ack)
     result = await loop.send("inspect and stop", sid, max_rounds=5)
     assert result.status == "completed" and phase == 3
     tools = [m for m in await store.load_all_messages(sid) if m.role == "tool" and m.name == "jobs"]
@@ -123,7 +156,7 @@ async def test_actual_native_tools_list_get_stop_bind_receipt_and_cancel_origina
     assert listed["backend"] == detail["backend"] == stopped["backend"] == "task_registry"
     assert listed["matched_count"] == 1 and detail["node"]["job_id"] == child_id
     assert stopped["cancel_requested"] and stopped["control_pending"] and not stopped["resource_stop_confirmed"]
-    assert stopped["replayed"] == (fault == "commit_ack")
+    assert stopped["replayed"] == fault.endswith("_ack")
     assert stopped["signal_error"] == ("local_signal_requires_reconciliation" if fault == "signal" else None)
     op = await manager.get_operation(runtime.actor(sid), stopped["operation_id"])
     assert op.call_ref["id"] != op.receipt_ref["id"] and op.receipt_ref["id"] == str(tools[-1].id)
@@ -134,6 +167,9 @@ async def test_actual_native_tools_list_get_stop_bind_receipt_and_cancel_origina
     assert model.child_calls == 1 and not runtime._local_executions
     assert callbacks == []
     assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='stop'")) == 1
+    if fault.endswith("_ack") and fault != "commit_ack":
+        assert lost == [fault.removesuffix("_ack")]
+    assert not await manager.db.fetchall(f"SELECT source_id FROM {manager.prefix}session_obligations WHERE kind='control_request'")
     assert any(x["item_id"] == "subagent:" + accepted["run_id"] for x in await store.inbox_items(sid))
 
 

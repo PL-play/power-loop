@@ -75,12 +75,14 @@ async def _desired(manager, tx, row, *, verify=False, clean=None, processed_inpu
     events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND "
         "(event_type IN ('tool_call_abort','source_abort_delivery','pending_call_disposition',"
         "'controller_review_handoff','pending_owner_transfer','managed_effect_delivery',"
-        "'controller_stopped','wait_notification','result') OR (event_type='operation' AND action='nudge'))",
+        "'controller_stopped','wait_notification','result','task_control_request') OR (event_type='operation' AND action='nudge'))",
         (row["job_id"],))
     events = [{**event, "delivery_status": "handled"} if event["event_id"] in projected_events else event
         for event in events]
     if not events:
         return set()
+    from .task_control import request_obligations
+    entries = await request_obligations(manager, tx, row, events, verify=verify)
     if row["supervision_status"] == "closed":
         if verify:
             from .finalization import closed
@@ -88,13 +90,12 @@ async def _desired(manager, tx, row, *, verify=False, clean=None, processed_inpu
         # A generation-zero managed action can be physically closed without
         # its negative outcome having been reviewed by the original main.
         if row["kind"] != "background_tool" or row["generation"] != 0:
-            return set()
+            return entries
     found = {event["event_id"]: event for event in events}
     current = found.get(result_id(row["job_id"], row["generation"]))
     if verify and row["kind"] in ("subagent", "workflow", "workflow_node", "background_tool") and row["result_status"] not in ("none", "suppressed"):
         if current is None or _hash(json.loads(current["payload_json"])["result"]) != _hash(json.loads(row["result_json"])):
             raise JobError("session_obligation_original_result_missing_or_changed")
-    entries = set()
 
     def add(session, kind, event):
         if session:
@@ -191,6 +192,11 @@ async def refresh(manager, tx, recorder):
         row = await tx.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (job_id,))
         if row is not None:
             await _replace(manager, tx, row, clean=clean.get(job_id))
+    table = manager.prefix+"session_obligations"
+    for entry in sorted(recorder.obligation_close):
+        await tx.execute(f"DELETE FROM {table} WHERE session_id=? AND kind=? AND source_id=? AND job_id=?", entry)
+    for entry in sorted(recorder.obligation_open):
+        await tx.execute(manager.db.dialect.insert_ignore(table, COLUMNS), entry)
 
 
 class _ProjectionConflict(Exception):

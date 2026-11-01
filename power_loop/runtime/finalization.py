@@ -186,8 +186,13 @@ async def closed(manager, tx, row, generation=None, *, _state=None):
 async def _inputs(manager, tx, row, generation):
     from .processing import require_event_handled
     refs = []
-    events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' AND action='nudge'", (row["job_id"],))
+    events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND "
+        "(event_type='task_control_request' OR (event_type='operation' AND action='nudge'))", (row["job_id"],))
+    from .task_control import completed_request_events
+    refs.extend(_event_reference(event) for event in completed_request_events(events))
     for event in events:
+        if event["event_type"] == "task_control_request":
+            continue
         payload = json.loads(event["payload_json"])
         request = payload.get("request", {})
         target = request.get("target", {})
@@ -336,6 +341,8 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
             from .pending_calls import negative_review_references
             refs.extend(await negative_review_references(manager, tx, row))
         refs.extend(await _references(manager, tx, attempt_refs, known))
+        from .task_control import completed_request_events, request_events
+        refs.extend(_event_reference(event) for event in completed_request_events(await request_events(manager, tx, row["job_id"])))
     else:
         result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='result'", (result_id(row["job_id"], generation),))
         payload = json.loads(result["payload_json"]) if result else {}

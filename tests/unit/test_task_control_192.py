@@ -147,7 +147,10 @@ async def test_stop_transaction_rollback_and_lost_commit_ack(control, monkeypatc
                 if hit and not fired and port != "ack":
                     fired = True
                     if port == "noop":
-                        return 1
+                        # A real failed generation/version condition returns
+                        # zero matches. Lying about a successful DB write is
+                        # an internal-code fault, not a persistence boundary.
+                        return 0
                     raise asyncio.CancelledError() if port == "cancel" else RuntimeError("test statement fault")
                 return await execute(sql, params)
             monkeypatch.setattr(tx, "_execute", wrapped)

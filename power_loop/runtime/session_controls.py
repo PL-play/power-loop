@@ -66,6 +66,8 @@ class ControlTransaction(ControlReadView):
         self.obligation_routes: set[str] = set()
         self.obligation_decisions: dict[str, dict | None] = {}
         self.obligation_processed: set[str] = set()
+        self.obligation_open: set[tuple] = set()
+        self.obligation_close: set[tuple] = set()
 
     def __getattr__(self, name):
         return getattr(self._tx, name)
@@ -132,6 +134,16 @@ class ControlTransaction(ControlReadView):
         if changed:
             self.sessions.update(sessions)
         return changed
+
+    def open_obligation(self, *, session_id, kind, source_id, job_id, opened_version):
+        self.touched_jobs.add(job_id)
+        self.sessions.add(session_id)
+        self.obligation_open.add((session_id, kind, source_id, job_id, opened_version))
+
+    def close_obligation(self, *, session_id, kind, source_id, job_id):
+        self.touched_jobs.add(job_id)
+        self.sessions.add(session_id)
+        self.obligation_close.add((session_id, kind, source_id, job_id))
 
     async def execute(self, sql, params=()):
         """Execute a declared mutation; control writers use the typed methods."""
