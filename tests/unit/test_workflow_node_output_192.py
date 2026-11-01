@@ -64,6 +64,7 @@ async def test_text_node_must_answer_on_original_sid_before_review(managed_workf
             await asyncio.gather(*tuple(runtime._adapter_tasks), return_exceptions=True)
         assert await runtime.flush_control_checkpoints() == {
             "controller_retirement_pending": 0, "controller_task_exit_pending": 0,
+            "execution_checkpoint_pending": 0,
         }
     nodes = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='workflow_node'")
     if ending == "cancel":

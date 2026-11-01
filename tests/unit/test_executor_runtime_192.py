@@ -185,7 +185,8 @@ async def test_boot_expiry_before_node_commit_cannot_advance_review_or_lose_comp
         while runtime._adapter_tasks:
             await asyncio.gather(*tuple(runtime._adapter_tasks))
         checkpoint = await runtime.flush_control_checkpoints()
-    assert checkpoint == {"controller_retirement_pending": 0, "controller_task_exit_pending": 0}
+    assert checkpoint == {"controller_retirement_pending": 0, "controller_task_exit_pending": 0,
+                          "execution_checkpoint_pending": 0}
     assert not runtime._adapter_tasks
 
 
