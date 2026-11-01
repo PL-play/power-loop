@@ -469,6 +469,7 @@ async def test_sdk_opaque_run_ids_restore_and_do_not_poison_sid_only_lookup(lega
     c = legacy_case
     c.model.hold = set()
     spec = WorkflowSpec.from_json({"name": "old-sdk", "root": leaf("BUILD")})
+    assert len(journal.run_key(run_id)) <= 255 and len(legacy_history.history_key(run_id)) <= 255
     await journal.seed(c.store, c.owner, run_id, spec.name, spec=spec.to_dict())
     # Emulate the old SDK's direct engine, which had no history index/owner marker.
     result = await WorkflowEngine(c.loop, run_id=run_id, on_step=make_on_step(c.store, c.owner, run_id)).run(spec)
@@ -482,3 +483,20 @@ async def test_sdk_opaque_run_ids_restore_and_do_not_poison_sid_only_lookup(lega
     # Model-facing explicit run selectors retain their existing shape checks.
     denied = await invoke(c.loop, c.owner, {"action": "leaves", "run_id": run_id})
     assert denied["error"]["code"] == "workflow_run_id_required"
+
+
+async def test_concurrent_long_run_ids_keep_distinct_original_journals(legacy_case):
+    c = legacy_case
+    left, right = "sdk-" + "x" * 300 + "left", "sdk-" + "x" * 300 + "right"
+    alias = legacy_history.history_key(left).removeprefix("workflow:history:")
+    await asyncio.gather(journal.seed(c.store, c.owner, left, "left-original"),
+                         journal.seed(c.store, c.owner, right, "right-original"),
+                         journal.seed(c.store, c.owner, alias, "token-as-literal-original"))
+    first, second = await journal.read(c.store, c.owner, left), await journal.read(c.store, c.owner, right)
+    literal = await journal.read(c.store, c.owner, alias)
+    assert first["run_id"] == left and first["workflow"] == "left-original"
+    assert second["run_id"] == right and second["workflow"] == "right-original"
+    assert literal["run_id"] == alias and literal["workflow"] == "token-as-literal-original"
+    index = await c.store.get_runtime_state(c.owner, journal.INDEX_KEY)
+    assert set(index) == {left, right, alias}
+    assert not any(c.model.counts.values())

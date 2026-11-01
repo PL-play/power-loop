@@ -16,9 +16,7 @@ _LIMIT = 5000
 
 
 def history_key(run_id):
-    # Preserve the conventional key for generated IDs. Long host SDK IDs must
-    # not overflow state_key merely because this prefix is longer than journal's.
-    return "workflow:history:"+(run_id if len(run_id) <= 128 else "sdk_"+_hash(run_id))
+    return "workflow:history:" + journal._run_token(run_id)
 
 
 def _object(raw):

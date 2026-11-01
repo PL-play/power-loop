@@ -70,8 +70,16 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _run_token(run_id: str) -> str:
+    """One bounded storage identity for journal and owned history keys."""
+    if len(run_id) <= 128 and not run_id.startswith("sdk_"):
+        return run_id
+    from power_loop.runtime.jobs import _hash
+    return "sdk_" + _hash(run_id)
+
+
 def run_key(run_id: str) -> str:
-    return f"{JOURNAL_PREFIX}{run_id}"
+    return f"{JOURNAL_PREFIX}{_run_token(run_id)}"
 
 
 def new_journal(
