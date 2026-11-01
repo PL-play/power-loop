@@ -145,7 +145,7 @@ def queue_event(binding, key, kind, value):
     return record
 
 
-async def append_correction(manager, tx, job, generation, records):
+async def append_correction(manager, tx, job, generation, records, *, summary_delta=None):
     """Cold reconciliation appends to the same original journal authority.
 
     It grants no lease. A running owner must use its own memory reducer; a
@@ -178,6 +178,8 @@ async def append_correction(manager, tx, job, generation, records):
     summary = json.loads(head["summary_json"])
     if not summary.get("closed"):
         raise JobError("execution_reconciliation_requires_quiescence")
+    for key, delta in (summary_delta or {}).items():
+        summary[key] += delta
     for record in records:
         if record["kind"] == "budget":
             previous = await tx.fetchone(f"SELECT state_json,state_hash FROM {manager.prefix}task_budget_attempts WHERE attempt_id=?",
@@ -331,6 +333,8 @@ async def flush_binding(binding, *, close=False, force=True, transaction=None):
     if binding.resource_evidence.get("_control_state") is None:
         return
     state = current(binding)
+    if state.closed and not retained_owner(binding):
+        return  # A cold writer already advanced this sealed owner's journal.
     if close:
         from .execution_budget import allocation_record
         state.closed = True
@@ -352,6 +356,10 @@ async def flush_binding(binding, *, close=False, force=True, transaction=None):
     else:
         await state.checkpoint(force=force, transaction=transaction,
                                defer=binding.runtime.manager.after_outcome if transaction is not None else None)
+
+
+def retained_owner(binding):
+    return binding.runtime.manager._execution_controls.get((binding.lease.job_id, binding.lease.generation)) is binding
 
 
 def forget_completed(binding):

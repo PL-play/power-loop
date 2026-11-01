@@ -301,7 +301,11 @@ async def reserve(attempt, logical_request, *, service=None, pricing=None):
 
 
 async def observe(attempt, observation):
+    from .control_runtime import current
     from .execution_budget import observe as observe_owned
+    if current(attempt.binding).closed:
+        return await _observe(attempt.binding.runtime, attempt.binding.actor,
+                              attempt.binding.lease.job_id, attempt.attempt_id, observation)
     return await observe_owned(attempt, observation)
 
 

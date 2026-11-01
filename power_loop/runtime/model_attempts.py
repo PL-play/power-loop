@@ -429,7 +429,7 @@ async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amo
     if not _cost(cost_amount) or not _response_id(response_id):
         raise JobError("invalid_model_attempt_observation")
     binding = attempt.binding
-    from .control_runtime import current
+    from .control_runtime import current, retained_owner
     control = current(binding)
     saved = control.get("attempt", attempt.attempt_id)
     if (saved is None or saved["prepared"] != attempt.prepared
@@ -448,7 +448,43 @@ async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amo
     }
     if saved["phase"] == "finished" and saved["observation"] != data:
         raise JobError("model_attempt_conflict")
+    if control.closed:
+        if retained_owner(binding):
+            # Finish any original failed/unknown close commit first. A clean
+            # sealed owner has no new RAM batch to publish after another
+            # process advances its journal for financial reconciliation.
+            while control._pending is not None or control._dirty:
+                await control.checkpoint(force=True)
+        await _finish_closed(attempt, {**saved, "phase": "finished", "observation": data})
+        return data
     control.observe(attempt.attempt_id, data)
+    return data
+
+
+async def _finish_closed(attempt, value):
+    """Append an original late return using the current sealed journal head."""
+    from .control_runtime import append_correction
+    binding = attempt.binding
+    manager = binding.runtime.manager
+    async with manager._write() as tx:
+        job = await manager._authorize(tx, binding.actor, binding.lease.job_id)
+        manager._control_retirements.get().add((binding.lease.job_id, binding.lease.generation))
+        phases = await _all(manager, tx, job["job_id"])
+        prepared = phases["prepared"].get(attempt.attempt_id)
+        dispatched = phases["dispatched"].get(attempt.attempt_id)
+        if prepared is None or dispatched is None:
+            raise JobError("model_attempt_evidence_missing")
+        if prepared[1] != attempt.prepared:
+            raise JobError("model_attempt_owner_mismatch")
+        finished = phases["finished"].get(attempt.attempt_id)
+        if finished is not None:
+            if finished[1] != value["observation"]:
+                raise JobError("model_attempt_conflict")
+            return
+        await append_correction(manager, tx, job, binding.lease.generation,
+            [{"kind": "attempt", "key": attempt.attempt_id, "value": value}],
+            summary_delta={"completed": 1, "inflight": -1,
+                           "unknown": int(value["observation"]["status"] == "unknown")})
 
 
 async def require_quiescent(manager, tx, row, *, include_budget=True, loaded=None):
@@ -593,10 +629,10 @@ async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, re
                              for e in (response_metrics or {}).get('errors', [])):
         args['error_type'] = 'response_cost_extraction_failed'
     try:
-        await finish(attempt, **args)
+        observation = await finish(attempt, **args)
     except Exception:
         try:
-            await finish(attempt, **args)
+            observation = await finish(attempt, **args)
         except Exception:
             # Retain the actual response/usage in the normal pipeline. Failed
             # evidence persistence must block further dispatch, not charge or
@@ -609,9 +645,9 @@ async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, re
         from .model_budgets import observe as observe_budget
 
         control = current(attempt.binding)
-        saved = control.get("attempt", attempt.attempt_id)
-        await observe_budget(attempt, saved["observation"])
-        await control.checkpoint(force=control.closed)
+        await observe_budget(attempt, observation)
+        if not control.closed:
+            await control.checkpoint()
     except Exception:
         # The actual model response must survive budget-delivery failure. The
         # durable pending record blocks further paid work, not jobs/read/stop.
