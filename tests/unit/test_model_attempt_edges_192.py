@@ -6,11 +6,12 @@ from dataclasses import replace
 import pytest
 
 from power_loop.runtime import model_attempts as attempts
-from power_loop.runtime.jobs import JobError
+from power_loop.runtime.control_runtime import flush_binding
+from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.model_attempt_query import list_attempts
 
 from .test_job_registry_192 import registry_store
-from .test_model_attempts_192 import attempt_case, closed, completed, prepare
+from .test_model_attempts_192 import attempt_case, completed, prepare
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 __all__ = ["attempt_case", "registry_store"]
@@ -26,17 +27,26 @@ async def test_corrupt_serialized_phase_cannot_be_used_as_control_evidence(attem
 
 async def test_corrupt_tracking_delivery_marker_refuses_dispatch(attempt_case):
     c=attempt_case
-    attempt=await prepare(c)
+    await prepare(c)
     await c.manager.db.execute(f"UPDATE {c.manager.events} SET delivery_status='handled' WHERE event_type='model_attempt_tracking'")
     with pytest.raises(JobError,match="model_attempt_evidence_corrupt"):
-        await attempts.dispatch(attempt)
+        await list_attempts(JobManager(await c.connect()),c.actor,c.binding.lease.job_id)
     assert not await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'")
 
 async def test_new_protocol_no_calls_does_not_treat_lost_tracking_as_legacy(attempt_case):
     c=attempt_case
-    await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_type='model_attempt_tracking'")
+    await flush_binding(c.binding)
+    assert await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_type='model_attempt_tracking'") == 1
+    cold = JobManager(await c.connect())
+    result = await cold.close_model_execution(c.actor,c.binding.lease,evidence={"exit":"completed"})
+    assert result.resource_state == "unknown"
+    import json
+    event = await cold.db.fetchone(f"SELECT payload_json FROM {cold.events} WHERE event_type='model_closed'")
+    evidence = json.loads(event["payload_json"])["evidence"]
+    assert evidence["model_attempt_snapshot_error"] == "model_attempt_evidence_missing"
+    assert "model_attempt_snapshot" not in evidence
     with pytest.raises(JobError,match="model_attempt_evidence_missing"):
-        await closed(c)
+        await cold.finalize_supervision(c.actor,c.binding.lease.job_id,generation=1)
 
 @pytest.mark.parametrize("case", ["new_admission","phase_bound","prepared_bound","query_bound"])
 async def test_phase_and_query_limits_are_enforced_against_real_saved_rows(attempt_case,monkeypatch,case):
@@ -75,7 +85,7 @@ async def test_invalid_observation_never_creates_a_finished_event(attempt_case,f
 async def test_known_finished_attempt_refuses_another_dispatch_and_lost_ack_recall(attempt_case):
     c=attempt_case
     attempt=await completed(c)
-    with pytest.raises(JobError,match="model_attempt_already_finished"):
+    with pytest.raises(JobError,match="model_attempt_dispatch_already_admitted"):
         await attempts.dispatch(attempt)
     with pytest.raises(JobError,match="model_attempt_dispatch_conflict"):
         await attempts._recall_dispatch(attempt)
@@ -124,8 +134,8 @@ async def test_new_physical_send_cannot_evade_same_owner_unknown_request(attempt
     await c.manager.close_model_execution(actor,binding.lease,evidence={"exit":"degraded"},resource_state="unknown")
     second=await c.manager.register_job(actor,kind="send",parent=lease,session_id=sid,system_key="second",request={"model_attempt_protocol":1,"send_index":2})
     replacement=await c.runtime.claim(actor,second)
-    await attempts.enable(replacement)
     with pytest.raises(JobError,match="unresolved_prior_attempt"):
+        await attempts.enable(replacement)
         await attempts.prepare(replacement,**(args|{"nonce":"replacement-must-not-dispatch"}))
     rows=await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='model_attempt_prepared'",(second.job.job_id,))
     assert rows==[]

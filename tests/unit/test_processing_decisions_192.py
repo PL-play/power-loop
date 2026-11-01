@@ -317,7 +317,9 @@ async def test_actual_request_assembly_does_not_credit_hidden_or_rewritten_rows(
         await prepare_model_processing(pipeline, messages, 0, provider_call=mode != "short_circuit")
     finally:
         _SEND.reset(token)
-    assert bool(binding.resource_evidence["processing_snapshot_id"]) == (mode == "included")
+    assert bool(binding.resource_evidence.get("processing_snapshot_id")) == (mode == "included")
+    if mode == "short_circuit":
+        assert "processing_snapshot_id" not in binding.resource_evidence
 
 
 @pytest.mark.parametrize("fault", ["snapshot", "decision", "response_write"])

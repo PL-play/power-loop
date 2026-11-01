@@ -37,9 +37,9 @@ async def start(c, identity=None):
     return await registry.activate(c.manager, identity, expected_version=1, system_key="startup", lease_ms=1000)
 
 
-async def root(c, *, identity=None, key="root"):
+async def root(c, *, identity=None, key="root", request=None):
     identity = identity or c.identity
-    reg = await c.manager.register_job(c.actor, kind="send", session_id=c.actor.session_id, system_key=key)
+    reg = await c.manager.register_job(c.actor, kind="send", session_id=c.actor.session_id, system_key=key, request=request)
     lease = await c.manager.claim_job(c.actor, reg.job.job_id, executor_id=identity.executor_id,
         boot_id=identity.boot_id, expected_version=reg.job.version, lease_ms=300000)
     return reg, lease
@@ -365,7 +365,7 @@ async def test_mutable_stopped_cache_cannot_hide_old_unconfirmed_model_request(b
     from power_loop.runtime.task_runtime import Execution, TaskRuntime
     c = boot
     await start(c)
-    _, lease = await root(c)
+    _, lease = await root(c, request={"model_attempt_protocol": 1, "send_index": 1})
     runtime = TaskRuntime(c.manager, tenant_id=c.identity.tenant_id, principal_id=c.identity.principal_id,
         executor_id=c.identity.executor_id, boot_id=c.identity.boot_id)
     binding = Execution(runtime, c.actor, lease)

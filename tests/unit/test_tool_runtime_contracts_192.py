@@ -138,19 +138,22 @@ async def test_validation_uses_actual_schema_and_required_parameters_not_name(na
 
 
 async def test_generic_control_tool_can_query_expired_original_without_new_execution(control):
+    from power_loop.runtime.model_attempts import enable
     c = control
     runtime = TaskRuntime(
         c.manager,
         tenant_id=c.actor.tenant_id,
         principal_id=c.actor.principal_id,
-        executor_id="control-query",
-        boot_id="query-boot",
+        executor_id=c.caller.executor_id,
+        boot_id=c.caller.boot_id,
     )
     registry = ToolRegistry()
     registry.register(ToolDefinition("original_query", "", pricing=Free("test_fixture")), Probe(control_only=True))
     registry.register(ToolDefinition("original_execute", "", pricing=Free("test_fixture")), Probe())
+    binding = Execution(runtime, c.actor, c.caller)
+    await enable(binding)
     c.now[0] += 30001
-    token = _SEND.set(Execution(runtime, c.actor, c.caller))
+    token = _SEND.set(binding)
     try:
         with invocation_context(c.actor.session_id, c.ref.seq, "stop-child"):
             await check_tool_dispatch(c.actor.session_id, "original_query", registry, {})
