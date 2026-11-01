@@ -98,7 +98,9 @@ def _decode(manager, identity, event):
                 set(data["effects"]) == {"executions", "stop_operations", "scope_incomplete"} and
                 isinstance(data["effects"]["executions"], list) and isinstance(data["effects"]["stop_operations"], list) and
                 type(data["effects"]["scope_incomplete"]) is bool and
-                len(data["effects"]["executions"]) == len(data["effects"]["stop_operations"]) <= _LIMIT)
+                len(data["effects"]["stop_operations"]) <= len(data["effects"]["executions"]) <= _LIMIT and
+                (data["effects"]["scope_incomplete"] or
+                 len(data["effects"]["executions"]) == len(data["effects"]["stop_operations"])))
             if valid:
                 for job in data["effects"]["executions"]:
                     if (not isinstance(job, dict) or set(job) != {"job_id", "generation", "kind", "executor_id", "boot_id", "resource_state"} or
@@ -330,41 +332,145 @@ async def get(manager, identity):
             "physical_stop_confirmed": False}
 
 
+async def _drain_barrier(manager, identity, operation, request):
+    """Commit admission closure without acquiring or changing any task tree."""
+    key = "edb_" + _hash([operation])[:48]
+    async with manager._write() as tx:
+        final = await _recall(manager, tx, identity, operation, request)
+        if final is not None:
+            return final, True
+        old = await _recall(manager, tx, identity, key, request)
+        if old is not None:
+            return old, False
+        row = await _row(manager, tx, identity)
+        value = {**_snapshot(row), "state": "draining", "version": row["version"]+1,
+                 "updated_at": manager.now()}
+        return await _save(manager, tx, identity, request, key, value, old=row,
+            effects={"executions": [], "stop_operations": [], "scope_incomplete": True}), False
+
+
+async def _drain_scope(manager, identity, operation, request):
+    """Freeze the retryable scope after admission closure, outside tree locks."""
+    key = "eds_" + _hash([operation])[:48]
+    original = await _recall(manager, manager.db, identity, key, request)
+    if original is not None:
+        return original
+    jobs = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? AND supervision_status<>'closed' "
+        "AND ((executor_id=? AND boot_id=?) OR (resource_state='not_started' AND parent_executor_id=? AND parent_boot_id=?)) "
+        "AND (intake='open' OR resource_state IN ('not_started','running','unknown')) ORDER BY job_id LIMIT ?",
+        (*asdict(identity).values(), identity.executor_id, identity.boot_id, _LIMIT+1))
+    if len(jobs) > _LIMIT:
+        return None
+    snapshot = [{k: job[k] for k in ("job_id", "generation", "kind", "executor_id", "boot_id", "resource_state")}
+                for job in jobs]
+    async with manager._write() as tx:
+        original = await _recall(manager, tx, identity, key, request)
+        if original is not None:
+            return original
+        row = await _row(manager, tx, identity)
+        value = {**_snapshot(row), "state": "draining", "version": row["version"]+1,
+                 "updated_at": manager.now()}
+        return await _save(manager, tx, identity, request, key, value, old=row,
+            effects={"executions": snapshot, "stop_operations": [], "scope_incomplete": True})
+
+
+async def _drain_tree(manager, identity, operation, reason, targets, creators):
+    """One tree's original stop intents commit together; retries reuse them."""
+    stops, incomplete = [], False
+    async with manager._write() as tx:
+        for target in targets:
+            job_id = target["job_id"]
+            actor = JobActor(identity.tenant_id, identity.principal_id, creators[job_id])
+            key = manager._origin_key(actor, "stop", None, None,
+                operation+":"+job_id+":"+str(target["generation"]))
+            fingerprint = _hash([target, reason])
+            old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE operation_key=?", (key,))
+            if old is not None:
+                if old["request_hash"] != fingerprint:
+                    raise JobError("executor_drain_stop_conflict")
+                try:
+                    saved = json.loads(old["payload_json"])
+                    if (old["job_id"] != job_id or old["action"] != "stop"
+                            or saved["requested_execution"] != target
+                            or saved["executor_drain_operation"] != operation
+                            or type(saved["scope_changed"]) is not bool or type(saved["scope_closed"]) is not bool):
+                        raise ValueError()
+                except (KeyError, TypeError, ValueError):
+                    raise JobError("executor_drain_stop_evidence_corrupt") from None
+                stops.append(old["event_id"])
+                incomplete |= saved["scope_changed"]
+                if not saved["scope_changed"] and not saved["scope_closed"]:
+                    # An unknown commit may have skipped the original local
+                    # notification. Replay the signal, never the database stop.
+                    manager._control_notifications.get().add(job_id)
+                continue
+            job = await manager._row(tx, job_id)
+            changed = any(job[k] != target[k] for k in ("generation", "executor_id", "boot_id"))
+            closed = not changed and job["resource_state"] == "stopped" and job["intake"] == "closed"
+            if not changed and not closed and job["cancel_requested_at"] is None:
+                status = job["status"] if job["supervision_status"] == "closed" or job["status"] == "model_closed" else (
+                    "cancelled" if job["resource_state"] == "not_started" else "cancelling")
+                now = manager.now()
+                count = await tx.write_job(job_id, f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,intake='closed',"
+                    "version=version+1,updated_at=? WHERE job_id=? AND generation=?",
+                    (status, now, reason, now, job_id, target["generation"]))
+                if count != 1:
+                    raise JobError("stale_execution")
+                job = {**job, "status": status, "cancel_requested_at": now, "cancel_reason": reason,
+                       "intake": "closed", "version": job["version"]+1, "updated_at": now}
+                tx.remember_row(manager.jobs, "job_id", job_id, job)
+            # A different generation/boot is never stopped by this old drain.
+            # Its durable intent remains incomplete, with no physical-exit claim.
+            stop = await manager._insert_operation(tx, job_id=job_id, version=job["version"], actor=actor,
+                action="stop", key=key, fingerprint=fingerprint, notify_stop=not changed and not closed,
+                payload={"job_id": job_id, "status": job["status"],
+                    "cancel_requested": not changed and job["cancel_requested_at"] is not None,
+                    "resource_state": target["resource_state"] if changed else job["resource_state"],
+                    "executor_drain_operation": operation, "requested_execution": target,
+                    "scope_changed": changed, "scope_closed": closed})
+            stops.append(stop.operation_id)
+            incomplete |= changed
+    return stops, incomplete
+
+
 async def drain(manager, identity, *, system_key, reason):
     operation = _operation_key(manager, identity, "drain", system_key)
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000 or "\x00" in reason:
         raise JobError("invalid_executor_drain_reason")
     request = {"action": "drain", "reason": reason}
+    barrier, final = await _drain_barrier(manager, identity, operation, request)
+    if final:
+        return barrier
+    scope = await _drain_scope(manager, identity, operation, request)
+    if scope is None:
+        return barrier
+    targets = scope["effects"]["executions"]
+    jobs, creators, trees = {}, {}, {}
+    ids = [target["job_id"] for target in targets]
+    for offset in range(0, len(ids), 100):
+        part = ids[offset:offset+100]
+        rows = await manager.db.fetchall(f"SELECT job_id,root_job_id,created_by_session_id FROM {manager.jobs} WHERE job_id IN (" +
+            ",".join("?" for _ in part) + ")", tuple(part))
+        jobs.update((row["job_id"], row) for row in rows)
+    if set(ids) != jobs.keys():
+        raise JobError("executor_drain_original_scope_missing")
+    for target in targets:
+        row = jobs[target["job_id"]]
+        creators[row["job_id"]] = row["created_by_session_id"]
+        trees.setdefault(row["root_job_id"], []).append(target)
+    stops, incomplete = {}, False
+    for root_id in sorted(trees):
+        group = trees[root_id]
+        done, partial = await _drain_tree(manager, identity, operation, reason, group, creators)
+        stops.update(zip((target["job_id"] for target in group), done, strict=True))
+        incomplete |= partial
     async with manager._write() as tx:
-        replay = await _recall(manager, tx, identity, operation, request)
-        if replay is not None:
-            return replay
+        original = await _recall(manager, tx, identity, operation, request)
+        if original is not None:
+            return original
         row = await _row(manager, tx, identity)
-        jobs = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? AND supervision_status<>'closed' "
-            "AND ((executor_id=? AND boot_id=?) OR (resource_state='not_started' AND parent_executor_id=? AND parent_boot_id=?)) "
-            "AND (intake='open' OR resource_state IN ('not_started','running','unknown')) ORDER BY job_id LIMIT ?",
-            (*asdict(identity).values(), identity.executor_id, identity.boot_id, _LIMIT+1))
-        if len(jobs) > _LIMIT:
-            # Persist the admission barrier even when the bounded stop snapshot
-            # cannot be completed. The caller must retain pending control work.
-            value = {**_snapshot(row), "state": "draining", "version": row["version"]+1, "updated_at": manager.now()}
-            return await _save(manager, tx, identity, request, operation, value, old=row,
-                effects={"executions": [], "stop_operations": [], "scope_incomplete": True})
-        stops, snapshot = [], []
-        for job in jobs:
-            snapshot.append({k: job[k] for k in ("job_id", "generation", "kind", "executor_id", "boot_id", "resource_state")})
-            if job["cancel_requested_at"] is None:
-                await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,intake='closed',"
-                    "version=version+1,updated_at=? WHERE job_id=?", ("cancelled" if job["resource_state"] == "not_started" else "cancelling",
-                    manager.now(), reason, manager.now(), job["job_id"]))
-            saved = await manager._row(tx, job["job_id"])
-            actor = JobActor(identity.tenant_id, identity.principal_id, job["created_by_session_id"])
-            key = manager._origin_key(actor, "stop", None, None, operation+":"+job["job_id"]+":"+str(job["generation"]))
-            stop = await manager._insert_operation(tx, job_id=job["job_id"], version=saved["version"], actor=actor,
-                action="stop", key=key, fingerprint=_hash([job["job_id"], reason]),
-                payload={"job_id": job["job_id"], "status": saved["status"], "cancel_requested": True,
-                    "resource_state": saved["resource_state"], "executor_drain_operation": operation})
-            stops.append(stop.operation_id)
-        value = {**_snapshot(row), "state": "draining", "version": row["version"]+1, "updated_at": manager.now()}
+        value = {**_snapshot(row), "state": "draining", "version": row["version"]+1,
+                 "updated_at": manager.now()}
         return await _save(manager, tx, identity, request, operation, value, old=row,
-            effects={"executions": snapshot, "stop_operations": stops, "scope_incomplete": False})
+            effects={"executions": targets, "stop_operations": [stops[target["job_id"]] for target in targets],
+                     "scope_incomplete": incomplete})

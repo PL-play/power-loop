@@ -733,10 +733,10 @@ class JobManager:
             raise JobError("tool_call_not_found")
 
     async def _insert_operation(self, tx, *, job_id, version, actor, action, key, fingerprint,
-                                call_ref=None, tool_call_id=None, payload=None, ignore=False):
+                                call_ref=None, tool_call_id=None, payload=None, ignore=False, notify_stop=True):
         self._control_operation_revision = getattr(self, "_control_operation_revision", 0) + 1
         notices = self._control_notifications.get()
-        if action == "stop" and notices is not None:
+        if action == "stop" and notify_stop and notices is not None:
             notices.add(job_id)
         operation_id = "op_" + secrets.token_hex(16)
         call_ref_json, payload_json = (_json(call_ref.to_dict()) if call_ref else None), _json(payload or {})

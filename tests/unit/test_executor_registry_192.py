@@ -114,7 +114,12 @@ async def test_lost_ack_replays_exact_original_decision_without_new_effects(boot
     async def lose_ack():
         async with write() as tx:
             yield tx
-        if not lost:
+        committed = action != "drain" or await c.manager.db.fetchone(
+            f"SELECT event_id FROM {c.manager.prefix}task_executor_events WHERE operation_key=?",
+            (registry._operation_key(c.manager, c.identity, "drain", "stop"),)) is not None
+        # Drain now has durable admission/scope steps. This original case
+        # still loses the ACK of its final receipt, preserving exact replay.
+        if committed and not lost:
             lost.append(True)
             raise RuntimeError("test: original commit ACK lost")
     fn = getattr(registry, action)
@@ -126,6 +131,7 @@ async def test_lost_ack_replays_exact_original_decision_without_new_effects(boot
         patch.setattr(c.manager, "_write", lose_ack)
         with pytest.raises(RuntimeError, match="ACK lost"):
             await fn(c.manager, c.identity, **args)
+    assert lost == [True]
     before = await registry.get(c.manager, c.identity)
     c.now[0] += 10
     replay = await fn(c.manager, c.identity, **args)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -19,6 +20,22 @@ from .test_task_runtime_192 import AdapterModel
 
 __all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
+
+
+async def assert_one_completed_drain(manager):
+    rows = await manager.db.fetchall(
+        f"SELECT payload_json,operation_key FROM {manager.prefix}task_executor_events WHERE action='drain' ORDER BY created_at,event_id")
+    assert len(rows) == 3 and len({row["operation_key"] for row in rows}) == 3
+    data = [json.loads(row["payload_json"]) for row in rows]
+    data.sort(key=lambda item: item["response"]["version"])
+    barrier, scope, final = (item["effects"] for item in data)
+    assert barrier == {"executions": [], "stop_operations": [], "scope_incomplete": True}
+    assert scope["scope_incomplete"] and scope["stop_operations"] == []
+    assert not final["scope_incomplete"]
+    assert final["executions"] == scope["executions"]
+    assert len(final["stop_operations"]) == len(set(final["stop_operations"])) == len(final["executions"])
+    assert [item["response"]["version"] for item in data] == list(range(
+        data[0]["response"]["version"], data[0]["response"]["version"] + 3))
 
 
 @pytest.fixture
@@ -93,7 +110,8 @@ async def test_lost_ack_recalls_same_boot_operation_without_duplicate_actions(ho
     assert not result["physical_stop_confirmed"] and not result["billing_settled"]
     actions = await manager.db.fetchall(f"SELECT action,operation_key FROM {manager.prefix}task_executor_events")
     assert len(actions) == len({a["operation_key"] for a in actions})
-    assert sum(a["action"] == phase for a in actions) == 1
+    assert sum(a["action"] == phase for a in actions) == (3 if phase == "drain" else 1)
+    await assert_one_completed_drain(manager)
 
 
 async def test_idle_runtime_renews_boot_without_any_model_send(host):
@@ -388,8 +406,7 @@ async def test_cancelled_shutdown_waiter_does_not_cancel_durable_control_or_stop
     release.set()
     result = await runtime.shutdown(timeout_s=10)
     assert result["durable_drain_confirmed"] and result["pending_handles"] == 0
-    rows = await manager.db.fetchall(f"SELECT action FROM {manager.prefix}task_executor_events WHERE action='drain'")
-    assert len(rows) == 1
+    await assert_one_completed_drain(manager)
 
 
 @pytest.mark.parametrize("field", ["tenant_id", "principal_id", "executor_id", "boot_id", "manager"])
@@ -429,10 +446,7 @@ async def test_late_control_ack_can_be_reobserved_without_restarting_shutdown(ho
     assert current["pending_handles"] == 0 and not current["admission_open"]
     assert not current["physical_stop_confirmed"] and not current["billing_settled"]
     assert await runtime.shutdown(timeout_s=30) is snapshot
-    [row] = await manager.db.fetchall(
-        f"SELECT count(*) AS n FROM {manager.prefix}task_executor_events WHERE action='drain'"
-    )
-    assert row["n"] == 1
+    await assert_one_completed_drain(manager)
 
 
 @pytest.mark.parametrize("field", ["store", "db", "prefix", "jobs", "events"])
@@ -537,10 +551,7 @@ async def test_lifecycle_task_allocation_failure_stops_owned_work_and_keeps_reco
         assert not state["admission_open"] and not state["physical_stop_confirmed"]
         if phase != "start":
             assert state["durable_drain_confirmed"]
-            rows = await manager.db.fetchall(
-                f"SELECT action FROM {manager.prefix}task_executor_events WHERE action='drain'"
-            )
-            assert len(rows) == 1
+            await assert_one_completed_drain(manager)
     finally:
         if not task.done():
             task.cancel()
