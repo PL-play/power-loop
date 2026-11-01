@@ -386,6 +386,7 @@ async def test_unprocessed_input_cannot_release_review(live_node, managed_workfl
             await asyncio.gather(*tuple(c.runtime._adapter_tasks))
         assert await c.runtime.flush_control_checkpoints() == {
             "controller_retirement_pending": 0, "controller_task_exit_pending": 0,
+            "execution_checkpoint_pending": 0,
         }
 
 
