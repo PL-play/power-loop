@@ -78,12 +78,22 @@ def evidence(tokens=12, *, key="late-1", quality="actual", correction_of=None):
         correction_of=correction_of, correction_reason="Supplier correction" if correction_of else None)
 
 
+async def seal_original(c, attempt):
+    """Wait for the original fixture boundary, without serializing corrections."""
+    from power_loop.runtime.control_runtime import flush_binding
+    key = (attempt.binding.lease.job_id, attempt.binding.lease.generation)
+    boundaries = c.__dict__.setdefault("_test_original_boundaries", {})
+    boundary = boundaries.setdefault(key, SimpleNamespace(lock=asyncio.Lock(), complete=False))
+    async with boundary.lock:
+        if not boundary.complete:
+            await flush_binding(attempt.binding, close=True)
+            boundary.complete = True
+
+
 async def stage(c, a, value, *, runtime=None, expected=1):
-    # Administrative correction belongs after the original owner's boundary;
-    # its physical result may still be unknown, and is never invented here.
-    from power_loop.runtime.control_runtime import current, flush_binding
-    if not current(a.binding).closed:
-        await flush_binding(a.binding, close=True)
+    # The closed bit in RAM is not proof the close transaction committed.
+    # Controllers still enter their actual staging API concurrently below.
+    await seal_original(c, a)
     return await (runtime or c.runtime).stage_budget_usage_revision(c.sid,
         job_id=c.binding.lease.job_id, attempt_id=a.attempt_id, expected_revision=expected, evidence=value)
 
@@ -95,9 +105,8 @@ async def rows(c):
 async def observed(c, attempt, **kwargs):
     # Administrative corrections operate on a sealed owner. A lost owner's
     # open prefix is covered separately by the checkpoint recovery tests.
-    from power_loop.runtime.control_runtime import flush_binding
     value = await observe_original(c, attempt, **kwargs)
-    await flush_binding(attempt.binding, close=True)
+    await seal_original(c, attempt)
     return value
 
 

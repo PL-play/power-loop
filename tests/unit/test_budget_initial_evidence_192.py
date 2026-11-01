@@ -13,7 +13,7 @@ from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_budget_reconcile_192 import reconcile, reopened
-from .test_budget_revisions_192 import RevisionHost, evidence, rows, stage
+from .test_budget_revisions_192 import RevisionHost, evidence, rows, seal_original, stage
 from .test_job_registry_192 import registry_store
 from .test_model_budgets_192 import new_send, observed, start
 
@@ -205,6 +205,7 @@ async def test_missing_initial_marker_refuses_even_frozen_submission(initial_cas
 async def test_stage_failure_rolls_back_initial_projection_and_source(initial_case, monkeypatch):
     c = initial_case
     a = await start(c)
+    await seal_original(c, a)
     before, counters = await rows(c), await counts(c)
     save = budgets._save
     async def rollback(*args, **kwargs):
@@ -220,6 +221,7 @@ async def test_existing_finished_observation_requires_original_delivery_not_repl
     c = initial_case
     a = await start(c)
     await observed(c, a)
+    await seal_original(c, a)
     before, counters = await rows(c), await counts(c)
     with pytest.raises(JobError, match='initial_evidence_not_ready'):
         await stage(c, a, evidence(), expected=0)
