@@ -329,6 +329,63 @@ async def test_cancelling_resumed_execution_stops_before_workflow_settlement(rea
         release.set()
 
 
+async def test_workflow_exit_does_not_interrupt_a_cancelled_repairs_result_write(ready_node, managed_workflow, monkeypatch):
+    from power_loop.runtime.task_runtime import _OWNER
+
+    c = ready_node
+    entered, release = asyncio.Event(), asyncio.Event()
+    writing, write_release = asyncio.Event(), asyncio.Event()
+    complete, get_job = c.model.complete, c.manager.get_job
+
+    async def held(request, **kwargs):
+        from power_loop.core.agent_context import get_session_id
+        if get_session_id() == c.sid and "NUDGED-43" in str(request.messages):
+            entered.set()
+            await release.wait()
+        return await complete(request, **kwargs)
+
+    async def delayed_result_read(*args, **kwargs):
+        row = await get_job(*args, **kwargs)
+        if (row.job_id == c.job_id and row.generation == 2 and row.result_status == "none"
+                and asyncio.current_task().get_name() == "workflow-node-resume-BUILD"
+                and _OWNER.get() is None and not writing.is_set()):
+            # The original controller has exited; its actual negative result
+            # has not yet been written. Let workflow shutdown reach its join.
+            writing.set()
+            await write_release.wait()
+        return row
+
+    async def workflow_is_joining():
+        while c.engine._accept_continuations:
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(c.model, "complete", held)
+    monkeypatch.setattr(c.manager, "get_job", delayed_result_read)
+    try:
+        await c.issue()
+        await asyncio.wait_for(entered.wait(), 3)
+        repair = next(iter(c.engine._repairs.values()))
+        await c.manager.request_cancel(c.runtime.actor(c.parent), c.state["handles"][0].job_id,
+            system_key="stop-whole-workflow", reason="test")
+        repair.cancel()
+        await asyncio.wait_for(writing.wait(), 3)
+        await asyncio.wait_for(workflow_is_joining(), 3)
+        write_release.set()
+        await asyncio.gather(repair, return_exceptions=True)
+        release.set()
+        await settle(managed_workflow)
+        actor = c.runtime.actor(c.parent)
+        node = await c.manager.get_job(actor, c.job_id)
+        assert node.generation == 2 and node.outcome == "cancelled"
+        assert node.resource_state == "unknown" and node.supervision_status == "open"
+        assert (await c.manager.get_result_revision(actor, c.job_id, 1))["payload"]["result"] == c.old.result
+        assert c.model.counts["BUILD"] == 1 and c.model.counts["REVIEW"] == 0
+        assert not c.engine._task_nodes and all(t.done() for t in c.engine._repairs.values())
+    finally:
+        write_release.set()
+        release.set()
+
+
 async def test_failure_after_resumed_result_commit_preserves_original_success(ready_node, managed_workflow, monkeypatch):
     c = ready_node
     record = c.runtime.record_scope

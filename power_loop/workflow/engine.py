@@ -515,7 +515,9 @@ class WorkflowEngine:
                 try:
                     repairs = list(self._repairs.values())
                     for task in repairs:
-                        if not task.done():
+                        # An already-cancelled repair still owns its original
+                        # result write. A second cancel can interrupt that exit.
+                        if not task.done() and not task.cancelling():
                             task.cancel()
                     if repairs:
                         await asyncio.gather(*repairs, return_exceptions=True)
