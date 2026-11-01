@@ -172,20 +172,22 @@ async def drive(loop, actor, job_id):
     from . import wait_dispositions as dispositions
     from . import wait_terminal as terminal
     from .result_revisions import result_id
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         job, creation, saved = await waits._read(manager, tx, actor, job_id)
         owner = saved["binding"]["owner"]
         result = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (result_id(owner["job_id"], owner["generation"]),))
-        if result is not None and waits._object(result["payload_json"]).get("outcome") in terminal._NEGATIVE:
-            ended = await terminal.terminate_tx(manager, tx, actor, job_id)
-            job = await manager._row(tx, job_id)
+        negative = result is not None and waits._object(result['payload_json']).get('outcome') in terminal._NEGATIVE
+    if negative:
+        ended = await terminal.terminate(manager,actor,job_id)
+        async with manager._read() as tx:
+            job,creation,saved = await waits._read(manager,tx,actor,job_id)
             state = await history(manager, tx, actor, job, creation, saved)
             disposed = await dispositions.read_tx(manager, tx, actor, job, creation, saved, state)
             return dispositions.reply(disposed) if disposed else ended
     due = await waits.prepare_due(manager, actor, job_id)
     if due["status"] == "armed":
         return due
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         decision = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (notices.decision_id(manager, due["event_id"]),))
     if decision:
         return await effects.apply(manager, actor, due["event_id"])
