@@ -26,7 +26,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from power_loop.runtime.store.db import Params, Row
+from power_loop.runtime.store.db import Params, ReadSnapshot, Row
 from power_loop.runtime.store.dialect import Dialect, MySQLDialect
 
 
@@ -113,6 +113,17 @@ class MySQLDatabase:
                 raise
             else:
                 await conn.commit()
+
+    @asynccontextmanager
+    async def read_snapshot(self) -> AsyncIterator[ReadSnapshot]:
+        async with self._pool.acquire() as conn:
+            try:
+                async with conn.cursor() as cur:
+                    await cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                    await cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+                yield ReadSnapshot(_MyTransaction(self, conn))
+            finally:
+                await conn.rollback()
 
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:
         import aiomysql

@@ -22,6 +22,19 @@ Row = Mapping[str, Any]
 Params = Sequence[Any]
 
 
+class ReadSnapshot:
+    """A stable database snapshot with no mutation port."""
+
+    def __init__(self, reader: Transaction) -> None:
+        self._reader = reader
+
+    async def fetchone(self, sql: str, params: Params = ()) -> Row | None:
+        return await self._reader.fetchone(sql, params)
+
+    async def fetchall(self, sql: str, params: Params = ()) -> list[Row]:
+        return await self._reader.fetchall(sql, params)
+
+
 @runtime_checkable
 class Transaction(Protocol):
     """A single in-flight transaction on one connection. All statements run on the
@@ -50,6 +63,10 @@ class Database(Protocol):
 
     def transaction(self) -> AbstractAsyncContextManager[Transaction]:
         """Begin a transaction; commit on clean exit, roll back on exception."""
+        ...
+
+    def read_snapshot(self) -> AbstractAsyncContextManager[ReadSnapshot]:
+        """Repeatable cold reads without reserving a database writer lock."""
         ...
 
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:

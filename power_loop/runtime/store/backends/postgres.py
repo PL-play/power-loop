@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from power_loop.runtime.store.db import Params, Row
+from power_loop.runtime.store.db import Params, ReadSnapshot, Row
 from power_loop.runtime.store.dialect import Dialect, PostgresDialect
 
 
@@ -64,6 +64,11 @@ class PostgresDatabase:
     async def transaction(self) -> AsyncIterator[_PgTransaction]:
         async with self._pool.acquire() as conn, conn.transaction():
             yield _PgTransaction(self, conn)
+
+    @asynccontextmanager
+    async def read_snapshot(self) -> AsyncIterator[ReadSnapshot]:
+        async with self._pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+            yield ReadSnapshot(_PgTransaction(self, conn))
 
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:
         async with self._pool.acquire() as conn:

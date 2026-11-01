@@ -20,7 +20,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
-from power_loop.runtime.store.db import Params, Row
+from power_loop.runtime.store.db import Params, ReadSnapshot, Row
 from power_loop.runtime.store.dialect import Dialect, SqliteDialect
 
 logger = logging.getLogger(__name__)
@@ -186,6 +186,18 @@ class SqliteDatabase:
             except BaseException:
                 await self._safe_rollback()
                 raise
+
+    @asynccontextmanager
+    async def read_snapshot(self) -> AsyncIterator[ReadSnapshot]:
+        async with self._lock:
+            self._check_open()
+            try:
+                # Deferred BEGIN takes no RESERVED writer lock. File-backed
+                # stores use WAL, so another connection can commit meanwhile.
+                await self._exec("BEGIN")
+                yield ReadSnapshot(_SqliteTransaction(self))
+            finally:
+                await self._safe_rollback()
 
     # ── autocommit reads / single writes (lock-guarded) ────────────────────────
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:

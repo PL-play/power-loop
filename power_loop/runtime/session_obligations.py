@@ -366,7 +366,10 @@ async def rebuild(manager):
 
 @verify_stored
 async def verify(manager, actor: JobActor):
-    async with manager._write() as tx:
+    from .session_controls import ControlReadView
+
+    async with manager.db.read_snapshot() as snapshot:
+        tx = ControlReadView(snapshot, manager)
         rows = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? ORDER BY job_id",
                                 (actor.tenant_id, actor.principal_id))
         expected = set()
