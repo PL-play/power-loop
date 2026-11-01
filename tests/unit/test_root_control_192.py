@@ -140,9 +140,10 @@ async def test_register_and_cancel_share_a_cross_connection_serialization_barrie
     assert not c.model.calls
 
 
-async def test_late_persistence_failure_rolls_back_root_stop_and_barrier(root_case, monkeypatch):
+async def test_final_receipt_failure_preserves_committed_stop_and_barrier_for_exact_retry(root_case, monkeypatch):
     c = root_case
     await send(c)
+    original = await c.manager.get_job(c.actor, c.model.calls[0])
     save = root_control._save
     async def broken(*args):
         await save(*args)
@@ -152,10 +153,21 @@ async def test_late_persistence_failure_rolls_back_root_stop_and_barrier(root_ca
         patch.setattr(root_control, "_save", broken)
         with pytest.raises(RuntimeError, match="receipt failure"):
             await stop(c)
-    assert (await c.manager.get_job(c.actor, c.model.calls[0])).cancel_requested_at is None
-    assert not await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='stop'")
-    await send(c)
-    assert len((await stop(c))["roots"]) == 2
+    saved = await c.manager.get_job(c.actor, c.model.calls[0])
+    assert saved.cancel_requested_at is not None
+    assert saved.status == original.status and saved.result == original.result
+    [operation] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='stop'")
+    assert not await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.session_runtime_state} WHERE state_key LIKE ?",
+                                         ("power-loop.root-stop-request.v1:%",))
+    with pytest.raises(JobError, match="root_context_cancelled"):
+        await send(c)
+    receipt = await stop(c, manager=JobManager(await c.connect()))
+    assert len(receipt["roots"]) == 1 and len(c.model.calls) == 1
+    assert receipt["roots"][0]["operation"]["operation_id"] == operation["event_id"]
+    assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='stop'") == [operation]
+    assert await c.manager.get_job(c.actor, c.model.calls[0]) == saved
+    assert all(receipt[k] is False for k in ("execution_authority", "resource_stop_confirmed", "billing_settled"))
+    assert await stop(c) == receipt
 
 
 @pytest.mark.parametrize("fault", ["hash", "missing-create", "missing-barrier", "stop-receipt"])
