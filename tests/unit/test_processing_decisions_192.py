@@ -72,7 +72,9 @@ async def test_decision_and_result_ack_survive_reopen_and_replay_after_close(pro
     ref = await c.response()
     ids = await c.commit(snapshot, ref, decision=decision)
     assert len(ids) == 1
-    await c.manager.close_model_execution(c.actor, c.caller)
+    assert (await c.manager.get_job(c.actor, job_id)).result_status == "pending_delivery"
+    await c.manager.close_model_execution(c.actor, c.caller, evidence={"exit": "completed",
+        "last_assistant_ref": ref.to_dict(), "processing_decisions": ids})
     await c.manager.request_cancel(c.actor, c.caller.job_id, system_key="late-stop", reason="stop")
     reopened = JobManager(await c.connect(), now_ms=lambda: c.now[0])
     assert (await reopened.get_job(c.actor, job_id)).result_status == "handled"
@@ -89,7 +91,10 @@ async def test_result_arriving_after_snapshot_is_not_acknowledged_by_an_unrelate
     first, row = await c.result()
     snapshot = await c.prepare([row])
     late, _ = await c.result()
-    await c.commit(snapshot, await c.response())
+    response = await c.response()
+    ids = await c.commit(snapshot, response)
+    await c.manager.close_model_execution(c.actor, c.caller, evidence={"exit": "completed",
+        "last_assistant_ref": response.to_dict(), "processing_decisions": ids})
     assert (await c.manager.get_job(c.actor, first)).result_status == "handled"
     assert (await c.manager.get_job(c.actor, late)).result_status == "pending_delivery"
 
@@ -184,7 +189,10 @@ async def test_registered_follow_up_work_is_linked_and_remains_active_after_cons
     receipt = await c.store.append_message(c.actor.session_id, role="tool", content="queued", tool_call_id="follow-up", send_index=2)
     await c.manager.bind_receipt(c.actor, reg.operation.operation_id,
         await c.store.message_ref(c.actor.session_id, receipt), caller=c.caller)
-    [decision] = await c.commit(snapshot, await c.response())
+    response = await c.response()
+    [decision] = await c.commit(snapshot, response)
+    await c.manager.close_model_execution(c.actor, c.caller, evidence={"exit": "completed",
+        "last_assistant_ref": response.to_dict(), "processing_decisions": [decision]})
     saved = await c.manager.db.fetchone(f"SELECT payload_json FROM {c.manager.events} WHERE event_id=?", (decision,))
     payload = json.loads(saved["payload_json"])
     assert payload["operation_ids"] == [reg.operation.operation_id] and payload["follow_up_job_ids"] == [reg.job.job_id]
@@ -233,12 +241,18 @@ async def test_atomic_batch_and_retry_never_partial_ack_or_duplicate_decisions(p
     with pytest.raises(RuntimeError):
         await c.commit(snapshot, ref)
     statuses = [(await c.manager.get_job(c.actor, j)).result_status for j in (first, second)]
-    assert statuses == (["pending_delivery"] * 2 if fault == "before_commit" else ["handled"] * 2)
+    assert statuses == ["pending_delivery"] * 2
+    originals = await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.events} WHERE event_type='processing_decision'")
+    assert len(originals) == (0 if fault == "before_commit" else 2)
+    assert all(row["job_id"] == c.caller.job_id for row in originals)
     monkeypatch.setattr(c.manager, "_write", original)
     ids = await c.commit(snapshot, ref)
     assert await c.commit(snapshot, ref) == ids
     decisions = await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='processing_decision'")
     assert len(decisions) == 2
+    await c.manager.close_model_execution(c.actor, c.caller, evidence={"exit": "completed",
+        "last_assistant_ref": ref.to_dict(), "processing_decisions": ids})
+    assert [(await c.manager.get_job(c.actor, j)).result_status for j in (first, second)] == ["handled"] * 2
 
 
 @pytest.mark.parametrize("change", ["response", "decision", "reason"])
@@ -292,8 +306,15 @@ async def test_cancel_and_decision_serialize_without_reviving_execution(processi
         assert isinstance(results[1], JobError) and results[1].code == "cancel_requested"
     else:
         assert not any(isinstance(r, BaseException) for r in results)
-    assert (await c.manager.get_job(c.actor, job_id)).result_status == ("pending_delivery" if first == "cancel" else "handled")
+    assert (await c.manager.get_job(c.actor, job_id)).result_status == "pending_delivery"
     assert (await c.manager.get_job(c.actor, c.caller.job_id)).status == "cancelling"
+    originals = await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='processing_decision'")
+    assert len(originals) == int(first == "decision")
+    if first == "decision":
+        await c.manager.close_model_execution(c.actor, c.caller, evidence={"exit": "completed",
+            "last_assistant_ref": ref.to_dict(), "processing_decisions": [r["event_id"] for r in originals]})
+        assert (await c.manager.get_job(c.actor, job_id)).result_status == "handled"
+        assert (await c.manager.get_job(c.actor, c.caller.job_id)).cancel_requested_at is not None
 
 
 async def test_snapshot_replay_is_frozen_and_conflicting_visibility_is_rejected(processing_case):
@@ -399,15 +420,27 @@ async def test_scope_guard_cannot_use_incomplete_or_other_execution_proof(proces
     elif invalid == "missing_decision":
         evidence["processing_decisions"] = []
     await c.manager.close_model_execution(c.actor, c.caller, evidence=evidence)
-    if invalid == "wrong_generation":
-        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET generation=generation+1 WHERE job_id=?", (c.caller.job_id,))
-    elif invalid == "wrong_owner":
-        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET control_owner_job_id=? WHERE job_id=?", (job_id, c.caller.job_id))
-    elif invalid == "new_revision":
-        await c.manager.db.execute(f"UPDATE {c.manager.events} SET job_version=job_version+1 WHERE event_id=?", ("result_" + job_id,))
-    child = await c.manager._row(c.manager.db, job_id)
-    with pytest.raises(JobError, match="required_result_unhandled"):
-        await require_handled(c.manager, c.manager.db, child)
+    changed = {
+        "wrong_generation": (c.manager.jobs, "generation", "job_id", c.caller.job_id),
+        "wrong_owner": (c.manager.jobs, "control_owner_job_id", "job_id", c.caller.job_id),
+        "new_revision": (c.manager.events, "job_version", "event_id", "result_"+job_id),
+    }.get(invalid)
+    original = None
+    if changed:
+        table, field, key, value = changed
+        original = (await c.manager.db.fetchone(f"SELECT {field} FROM {table} WHERE {key}=?", (value,)))[field]
+    try:
+        if changed:
+            damaged = job_id if invalid == "wrong_owner" else original+1
+            await c.manager.db.execute(f"UPDATE {table} SET {field}=? WHERE {key}=?", (damaged, value))
+        child = await c.manager._row(c.manager.db, job_id)
+        with pytest.raises(JobError, match="required_result_unhandled"):
+            await require_handled(c.manager, c.manager.db, child)
+        if changed:
+            assert (await c.manager.db.fetchone(f"SELECT {field} FROM {table} WHERE {key}=?", (value,)))[field] == damaged
+    finally:
+        if changed:
+            await c.manager.db.execute(f"UPDATE {table} SET {field}=? WHERE {key}=?", (original, value))
 
 
 @pytest.mark.parametrize("fault", ["lost_ack", "lost_ack_recall_failure"])
@@ -439,7 +472,10 @@ async def test_workflow_recalls_committed_decision_without_repeating_model_or_to
         monkeypatch.setattr(manager, "recall_processing_decision", fail_recall)
     await settle(managed_workflow)
     [audit] = [r for r in await records(managed_workflow) if r.kind == "subagent"]
-    assert audit.result_status == "handled" and len(calls) == 1
+    assert audit.result_status == ("handled" if fault == "lost_ack" else "pending_delivery") and len(calls) == 1
+    if fault == "lost_ack_recall_failure":
+        with pytest.raises(JobError, match="required_result_unhandled"):
+            await require_handled(manager, manager.db, await manager._row(manager.db, audit.job_id))
     assert model.counts["AUDIT"] == 1 and model.counts["BUILD"] == 3
     wf = await manager.get_job(loop.task_runtime.actor(sid), state["handles"][0].job_id)
     assert wf.outcome == ("succeeded" if fault == "lost_ack" else "failed")

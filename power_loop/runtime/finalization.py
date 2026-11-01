@@ -546,7 +546,7 @@ async def after_send(manager, actor, lease):
         event = await manager.db.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='processing_decision'", (decision_id,))
         if event is None or event["caller_session_id"] != actor.session_id or json.loads(event["payload_json"]).get("handler_job_id") != lease.job_id:
             raise JobError("finalization_consumer_evidence_corrupt")
-        targets.add(event["job_id"])
+        targets.add(json.loads(event["payload_json"])["event"]["job_id"])
     # Older creator sends may now have all their independent work settled.
     for job_id in list(targets):
         try:

@@ -26,12 +26,11 @@ async def main(dsn, prefix, evidence, mode, point):
     loop, model = await controller(c)
     if mode == "consume":
         await reconcile_pending(loop, c.actor, source["job_id"])
-    original_replace, original_transaction = session_obligations._replace, store._db.transaction
+    original_replace, original_entries, original_transaction = session_obligations._replace, session_obligations._write_entries, store._db.transaction
     armed = False
 
-    async def replace(manager, tx, row, **kwargs):
+    async def arm(manager, tx, row, entries):
         nonlocal armed
-        entries = await original_replace(manager, tx, row, **kwargs)
         if armed or row["job_id"] != source["job_id"]:
             return entries
         pending = await tx.fetchone(f"SELECT source_id FROM {manager.prefix}session_obligations WHERE job_id=? AND kind='abort'",
@@ -49,6 +48,14 @@ async def main(dsn, prefix, evidence, mode, point):
                 os._exit(152)
         return entries
 
+    async def replace(manager, tx, row, **kwargs):
+        entries = await original_replace(manager, tx, row, **kwargs)
+        return await arm(manager, tx, row, entries) if mode == "produce" else entries
+
+    async def write_entries(manager, tx, row, entries):
+        entries = await original_entries(manager, tx, row, entries)
+        return await arm(manager, tx, row, entries) if mode == "consume" else entries
+
     @asynccontextmanager
     async def transaction():
         async with original_transaction() as tx:
@@ -56,7 +63,7 @@ async def main(dsn, prefix, evidence, mode, point):
         if armed:
             os._exit(153)
 
-    session_obligations._replace, store._db.transaction = replace, transaction
+    session_obligations._replace, session_obligations._write_entries, store._db.transaction = replace, write_entries, transaction
     if mode == "produce":
         await reconcile_pending(loop, c.actor, source["job_id"])
     else:

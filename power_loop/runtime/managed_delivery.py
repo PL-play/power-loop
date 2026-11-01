@@ -295,14 +295,13 @@ async def pending_reviews(manager, tx, actor):
         result = await result_event(manager, tx, row)
         delivery = await read(manager, tx, row, result)
         await _inbox(manager, tx, row, delivery)
-        if row['result_status'] in ('handled', 'suppressed'):
-            try:
-                await handled_references(manager, tx, row, result, delivery)
-            except JobError:
-                pass
-            else:
-                mark_resolved(manager, row['job_id'], row['version'])
-                continue
+        try:
+            await handled_references(manager, tx, row, result, delivery)
+        except JobError:
+            pass
+        else:
+            mark_resolved(manager, row['job_id'], row['version'])
+            continue
         pending.append(content_reference(result))
     return pending
 

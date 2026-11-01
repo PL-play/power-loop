@@ -406,15 +406,14 @@ async def pending_reviews(manager, tx, actor):
         source = await manager._authorize(tx, actor, row['job_id'])
         result = await result_event(manager, tx, source)
         delivery = await notice(manager, tx, source, result)
-        if source['result_status'] == 'handled':
-            try:
-                await handled_references(manager, tx, source, result, delivery)
-            except JobError:
-                pass  # A handled projection without a clean exit is not authority.
-            else:
-                from .execution_membership import mark_resolved
-                mark_resolved(manager, source['job_id'], source['version'])
-                continue
+        try:
+            await handled_references(manager, tx, source, result, delivery)
+        except JobError:
+            pass  # A handled projection without a clean exit is not authority.
+        else:
+            from .execution_membership import mark_resolved
+            mark_resolved(manager, source['job_id'], source['version'])
+            continue
         pending.append(content_reference(result))
     from .managed_delivery import pending_reviews as managed_pending
     return pending + await managed_pending(manager, tx, actor)

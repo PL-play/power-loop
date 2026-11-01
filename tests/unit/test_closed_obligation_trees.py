@@ -51,19 +51,19 @@ async def test_clean_exit_is_committed_before_refreshing_a_different_root(proces
     snapshot, response = await c.prepare([message, other_message]), await c.response()
     decisions = await c.commit(snapshot, response)
     reader = JobManager(await c.connect(), now_ms=c.manager.now)
-    replace = obligations._replace
+    replace = obligations._write_entries
     observed = []
 
-    async def after_original(manager, tx, row, **kwargs):
+    async def after_original(manager, tx, row, entries):
         if row["job_id"] in (target, other_target):
             original = await reader.db.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?",
                 ("model_closed_"+c.caller.job_id,))
             assert original is not None, "target maintenance must follow the handler's actual commit"
             assert json.loads(original["payload_json"])["evidence"]["processing_decisions"] == decisions
             observed.append(row["root_job_id"])
-        return await replace(manager, tx, row, **kwargs)
+        return await replace(manager, tx, row, entries)
 
-    monkeypatch.setattr(obligations, "_replace", after_original)
+    monkeypatch.setattr(obligations, "_write_entries", after_original)
     database = c.manager.db
     c.manager.db = measured = Profiled(database)
     try:
@@ -80,17 +80,17 @@ async def test_failed_target_refresh_cannot_rollback_the_exit_and_retry_uses_its
     target, message = await c.result()
     snapshot, response = await c.prepare([message]), await c.response()
     decisions = await c.commit(snapshot, response)
-    replace = obligations._replace
+    replace = obligations._write_entries
     seen = []
 
-    async def fail_once(manager, tx, row, **kwargs):
+    async def fail_once(manager, tx, row, entries):
         if row["job_id"] == target:
-            seen.append(kwargs["clean"])
+            seen.append((await tx.fetchone(f"SELECT result_status FROM {manager.jobs} WHERE job_id=?", (target,)))["result_status"] == "handled")
             if len(seen) == 1:
                 raise OSError("target index commit unavailable")
-        return await replace(manager, tx, row, **kwargs)
+        return await replace(manager, tx, row, entries)
 
-    monkeypatch.setattr(obligations, "_replace", fail_once)
+    monkeypatch.setattr(obligations, "_write_entries", fail_once)
     with pytest.raises(OSError, match="target index commit unavailable"):
         await c.manager.close_model_execution(c.actor, c.caller, evidence={"exit": "completed",
             "last_assistant_ref": response.to_dict(), "processing_decisions": decisions})
@@ -190,12 +190,14 @@ async def test_process_death_between_exit_and_target_refresh_preserves_a_rebuild
         await obligations.verify(cold, actor)
     repair = TaskRuntime(cold, tenant_id=actor.tenant_id, principal_id=actor.principal_id,
         executor_id="cold-repair", boot_id="inspection")
+    expected_events = [{**event, "delivery_status": "handled"}
+        if event["event_id"] == "result_"+saved["source_job_id"] else event for event in events]
     for _ in range(2):
         result = await repair.repair_execution_checkpoint(actor.session_id, saved["handler_job_id"],
             generation=json.loads(closed["payload_json"])["generation"])
         assert result["repaired"] and not result["execution_authority"] and not result["replay_allowed"]
         await obligations.verify(cold, actor)
-    assert await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id") == events
+    assert await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id") == expected_events
     assert await cold.db.fetchall(f"SELECT * FROM {cold.store.t.messages} ORDER BY id") == messages
     assert not await cold.db.fetchall(f"SELECT source_id FROM {cold.prefix}session_obligations")
     for table, rows in saved["fees"].items():

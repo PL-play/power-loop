@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from .jobs import JobActor, JobError, _hash, verify_stored
 from .result_revisions import result_id
@@ -10,7 +11,7 @@ EVENTS = frozenset({
     "tool_call_abort", "source_abort_delivery", "pending_call_disposition",
     "controller_review_handoff", "pending_owner_transfer", "managed_effect_delivery",
     "controller_stopped", "wait_notification", "result", "supervision_reopened",
-    "processing_decision", "input_disposition", "node_result_consumed", "wait_decision",
+    "input_disposition", "node_result_consumed", "wait_decision",
     "managed_effect_tool_receipt",
 })
 COLUMNS = ("session_id", "kind", "source_id", "job_id", "opened_version")
@@ -30,7 +31,7 @@ def note(recorder, event):
                    and _queued_input(event, json.loads(event["payload_json"])))
     if kind in EVENTS or input_write:
         recorder.obligation_jobs.add(event["job_id"])
-        if kind == "processing_decision":
+        if kind == "result":
             recorder.obligation_processed.add(event["job_id"])
     elif kind == "model_closed":
         data = json.loads(event["payload_json"])
@@ -46,8 +47,6 @@ def note(recorder, event):
 async def _handled(manager, tx, row, result, notice, *, aborted=False, clean=None):
     # A handled flag without the original handler's clean model exit is not an
     # acknowledgement. Keep its barrier until that close commits.
-    if row["result_status"] not in ("handled", "suppressed"):
-        return False
     if clean is not None:
         return clean
     if aborted:
@@ -61,12 +60,25 @@ async def _handled(manager, tx, row, result, notice, *, aborted=False, clean=Non
     return True
 
 
-async def _desired(manager, tx, row, *, verify=False, clean=None):
+async def _processing_handled(manager, tx, row, event, session_id, owner_job_id, clean):
+    if clean is not None:
+        return clean
+    from .processing import require_event_handled
+    try:
+        await require_event_handled(manager, tx, event, session_id=session_id, owner_job_id=owner_job_id)
+    except JobError:
+        return False
+    return True
+
+
+async def _desired(manager, tx, row, *, verify=False, clean=None, processed_inputs=frozenset(), projected_events=frozenset()):
     events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND "
         "(event_type IN ('tool_call_abort','source_abort_delivery','pending_call_disposition',"
         "'controller_review_handoff','pending_owner_transfer','managed_effect_delivery',"
         "'controller_stopped','wait_notification','result') OR (event_type='operation' AND action='nudge'))",
         (row["job_id"],))
+    events = [{**event, "delivery_status": "handled"} if event["event_id"] in projected_events else event
+        for event in events]
     if not events:
         return set()
     if row["supervision_status"] == "closed":
@@ -104,7 +116,7 @@ async def _desired(manager, tx, row, *, verify=False, clean=None):
             current = await result_event(manager, tx, row)
             await notice(manager, tx, row, current)
         anchor = current or (aborts or dispositions)[0]
-        if current is not None and row["result_status"] == "handled":
+        if current is not None:
             from .abort_outcomes import notice
             delivery = await notice(manager, tx, row, current) if clean is None else None
             handled = await _handled(manager, tx, row, current, delivery, aborted=True, clean=clean)
@@ -116,21 +128,23 @@ async def _desired(manager, tx, row, *, verify=False, clean=None):
             for session in routes:
                 add(session, "disposition", event)
     if current is not None and row["kind"] in ("subagent", "workflow"):
-        if row["result_status"] != "handled" and current["delivery_status"] != "handled":
+        if not await _processing_handled(manager, tx, row, current,
+                row["created_by_session_id"], row["control_owner_job_id"], clean):
             add(row["created_by_session_id"], "result", current)
     for event in events:
         kind = event["event_type"]
         recipient = event["caller_session_id"]
         if kind == "managed_effect_delivery" and current is not None and recipient:
             from .managed_delivery import read
-            delivery = await read(manager, tx, row, current) if verify or clean is None and row["result_status"] in ("handled", "suppressed") else None
+            delivery = await read(manager, tx, row, current) if verify or clean is None else None
             if not await _handled(manager, tx, row, current, delivery, clean=clean):
                 add(recipient, "managed", event)
-        elif kind == "controller_stopped" and current is not None and row["result_status"] != "handled":
+        elif kind == "controller_stopped" and current is not None:
             if verify:
                 from .controller_recovery import notice
                 await notice(manager, tx, row)
-            add(recipient, "controller", event)
+            if not await _processing_handled(manager, tx, row, current, recipient, None, clean):
+                add(recipient, "controller", event)
         elif kind == "wait_notification" and event["delivery_status"] != "handled":
             if verify:
                 from .wait_notifications import notification
@@ -140,6 +154,9 @@ async def _desired(manager, tx, row, *, verify=False, clean=None):
         elif (kind == "operation" and event["delivery_status"] == "pending_delivery"
               and row["kind"] in ("subagent", "workflow_node")):
             data = json.loads(event["payload_json"])
+            if event["event_id"] in processed_inputs or await _processing_handled(manager, tx, row, event,
+                    data["request"]["session_id"], row["job_id"], None):
+                continue
             if verify:
                 from .wait_effects import validate_input
                 actor = JobActor(row["tenant_id"], row["principal_id"], data["request"]["session_id"])
@@ -148,8 +165,12 @@ async def _desired(manager, tx, row, *, verify=False, clean=None):
     return entries
 
 
-async def _replace(manager, tx, row, *, verify=False, clean=None):
-    entries = await _desired(manager, tx, row, verify=verify, clean=clean)
+async def _replace(manager, tx, row, *, verify=False, clean=None, processed_inputs=frozenset()):
+    entries = await _desired(manager, tx, row, verify=verify, clean=clean, processed_inputs=processed_inputs)
+    return await _write_entries(manager, tx, row, entries)
+
+
+async def _write_entries(manager, tx, row, entries):
     table = manager.prefix + "session_obligations"
     await tx.execute(f"DELETE FROM {table} WHERE job_id=?", (row["job_id"],))
     for entry in sorted(entries):
@@ -172,49 +193,116 @@ async def refresh(manager, tx, recorder):
             await _replace(manager, tx, row, clean=clean.get(job_id))
 
 
-async def refresh_closed_decisions(manager, decisions, *, verify=False):
-    """After the original close commits, discover and refresh one tree at a time.
+class _ProjectionConflict(Exception):
+    pass
 
-    An interrupted refresh leaves a conservative pending entry. The immutable
-    decision and actual close are sufficient for cold retry; no execution is
-    admitted and no additional original record is necessary.
-    """
+
+@dataclass(frozen=True)
+class _Projection:
+    row: dict
+    expected_version: int
+    changed: bool
+    result_changed: bool
+    events: tuple
+    entries: frozenset
+    sessions: frozenset
+
+
+async def refresh_closed_decisions(manager, decisions, *, verify=False):
+    """Publish target projections only after the actual handler close commits."""
+    from .execution_membership import _trusted
     from .session_controls import ControlReadView
 
+    rows, missing = [], []
+    for key in sorted(decisions):
+        known = _trusted(manager, "_processing_originals", key)
+        if known is None:
+            missing.append(key)
+        else:
+            rows.append(known)
     reader = ControlReadView(manager.db, manager)
-    roots = {}
-    keys = sorted(decisions)
-    for offset in range(0, len(keys), 100):
-        part = keys[offset:offset+100]
-        rows = await reader.fetchall(f"SELECT e.event_id,e.job_id,e.caller_session_id,e.payload_json,j.root_job_id "
-            f"FROM {manager.events} e JOIN {manager.jobs} j ON j.job_id=e.job_id "
-            "WHERE e.event_type='processing_decision' AND e.event_id IN (" +
-            ",".join("?" for _ in part) + ")", tuple(part))
-        for event in rows:
+    for offset in range(0, len(missing), 100):
+        part = missing[offset:offset+100]
+        rows.extend(await reader.fetchall(f"SELECT * FROM {manager.events} WHERE event_type='processing_decision' "
+            "AND event_id IN ("+",".join("?" for _ in part)+")", tuple(part)))
+    pending = [event for event in rows if decisions[event["event_id"]] == json.loads(event["payload_json"])["response_ref"]]
+    while pending:
+        reader = ControlReadView(manager.db, manager)
+        roots = {}
+        for event in pending:
             payload = json.loads(event["payload_json"])
-            if verify:
-                await _desired(manager, reader, await manager._row(reader, event["job_id"]), verify=True)
-            roots.setdefault(event["root_job_id"], []).append((event, payload,
-                decisions[event["event_id"]] == payload["response_ref"]))
-    for root_id in sorted(roots):
-        await _refresh_closed_tree(manager, root_id, roots[root_id])
-
-
-async def _refresh_closed_tree(manager, root_id, entries):
-    async with manager._write() as tx:
-        jobs = {}
-        for event, payload, clean in entries:
-            row = await manager._row(tx, event["job_id"])
-            source = payload["event"]
-            # A target can legitimately advance after the handler close and
-            # before maintenance. Its new generation owns its own projection.
-            if source.get("event_type", "result") != "operation" and source["event_id"] != result_id(row["job_id"], row["generation"]):
+            target = await manager._row(reader, payload["event"]["job_id"])
+            if target["generation"] != payload["target"]["generation"]:
                 continue
-            jobs[row["job_id"]] = row, clean
-            tx.sessions.add(event["caller_session_id"])
-        for job_id, (row, clean) in jobs.items():
-            tx.touch_job(job_id)
-            await _replace(manager, tx, row, clean=clean)
+            handler = event.get("_handler_snapshot") or await manager._row(reader, event["job_id"])
+            actor = JobActor(target["tenant_id"], target["principal_id"], event["caller_session_id"])
+            from .message_ref import integer_id
+            from .processing import _decision_target, require_event_handled
+            target, source = await _decision_target(manager, reader, actor, handler, payload["event"],
+                integer_id(payload["response_ref"]["seq"], "seq"))
+            if verify:
+                await _desired(manager, reader, target, verify=True)
+                if payload["target"] != {key: target[key] for key in ("job_id", "root_job_id", "generation")}:
+                    raise JobError("processing_target_changed")
+                await require_event_handled(manager, reader, source, session_id=actor.session_id,
+                    owner_job_id=handler["control_owner_job_id"], allow_suppressed=target["generation"] == 0)
+            roots.setdefault(target["root_job_id"], []).append((event, payload, target, source))
+        pending = []
+        for root_id in sorted(roots):
+            projections = await _prepare_closed_tree(manager, reader, roots[root_id])
+            try:
+                await _refresh_closed_tree(manager, root_id, projections)
+            except _ProjectionConflict:
+                # A real concurrent stop/resume changed a target after discovery.
+                # Roll back this tree and rediscover without retaining any lock.
+                pending.extend(entry[0] for entry in roots[root_id])
+
+
+async def _prepare_closed_tree(manager, reader, entries):
+    jobs = {}
+    for event, payload, row, source in entries:
+        jobs.setdefault(row["job_id"], (row, []))[1].append((event, payload, source))
+    projections = []
+    for row, sources in jobs.values():
+        inputs = {source["event_id"] for _, payload, source in sources
+            if payload["event"].get("event_type", "result") == "operation"}
+        observed_result = any(source["event_id"] == result_id(row["job_id"], row["generation"])
+            for _, _, source in sources)
+        negative = row["kind"] == "background_tool" and row["generation"] == 0
+        result_changed = observed_result and not negative and row["result_status"] != "handled"
+        events = [source for _, _, source in sources if source["delivery_status"] != "handled" and not negative]
+        changed = bool(events) or result_changed
+        now = manager.now()
+        expected_version = row["version"]
+        if changed:
+            row = {**row, "version": row["version"]+1, "updated_at": now,
+                **({"result_status": "handled"} if result_changed else {})}
+        projected = frozenset(source["event_id"] for source in events)
+        entries = await _desired(manager, reader, row, clean=True if observed_result else None,
+            processed_inputs=inputs, projected_events=projected)
+        projections.append(_Projection(row, expected_version, changed, result_changed,
+            tuple(sorted(projected)), frozenset(entries),
+            frozenset(event["caller_session_id"] for event, _, _ in sources)))
+    return projections
+
+
+async def _refresh_closed_tree(manager, root_id, projections):
+    async with manager._write() as tx:
+        for projection in projections:
+            row = projection.row
+            version = "version+1" if projection.changed else "version"
+            fields = ",result_status='handled'" if projection.result_changed else ""
+            fields += ",updated_at=?" if projection.changed else ""
+            params = ((row["updated_at"],) if projection.changed else ())+(row["job_id"], row["generation"], projection.expected_version)
+            count = await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET version={version}{fields} "
+                "WHERE job_id=? AND generation=? AND version=?", params)
+            if count != 1:
+                raise _ProjectionConflict()
+            for event_id in projection.events:
+                await tx.update_event(row["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?",
+                    (event_id,), obligations=False)
+            tx.sessions.update(projection.sessions)
+            await _write_entries(manager, tx, row, projection.entries)
 
 
 @verify_stored

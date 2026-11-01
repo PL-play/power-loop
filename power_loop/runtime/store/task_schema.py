@@ -2,7 +2,8 @@
 
 No live store is migrated by opening it. A maintenance caller must close writers
 and explicitly invoke migrate_task_schema; old binaries reject the current stamp or
-the unknown task protocol. Protocol21 permits independent initial accounting evidence without a model
+the unknown task protocol. Protocol25 owns processing decisions in the handler's
+tree; target handling flags remain derived. Protocol21 permits independent initial accounting evidence without a model
 exit record. Protocol 23 adds atomic session change counters. Older writers must
 not overwrite this evidence or release execution.
 """
@@ -25,7 +26,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 12
-TASK_PROTOCOL_VERSION = 24
+TASK_PROTOCOL_VERSION = 25
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
