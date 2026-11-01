@@ -60,8 +60,9 @@ async def cold_original_call_refuses_corruption(c, code):
     [plan] = [row for row in plans if json.loads(row["payload_json"])["call_ref"] == ref.to_dict()]
     async with cold._write() as tx:
         source = await cold._row(tx, plan["job_id"])
-        with pytest.raises(JobError, match=code):
+        with pytest.raises(JobError, match=code) as raised:
             await read(cold, tx, source, ref)
+        assert raised.value.code == code
 
 
 @pytest.mark.parametrize("fault", ["none", "admission_ack", "dispatch_ack", "replay"])
