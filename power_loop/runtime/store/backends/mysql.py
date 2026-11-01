@@ -7,7 +7,7 @@ takes a ``SELECT … FOR UPDATE`` row lock inside the transaction (the ``(sessio
 PK is the backstop). ``aiomysql`` is imported lazily in :meth:`connect`, so the core
 never depends on it.
 
-Two MySQL-specific choices made here:
+MySQL-specific choices made here:
 
 * **``CLIENT.FOUND_ROWS``** — without it MySQL's ``rowcount`` after an UPDATE counts
   *changed* rows, not *matched* rows, so a no-op UPDATE (e.g. a timer heartbeat that
@@ -17,6 +17,9 @@ Two MySQL-specific choices made here:
 * **``autocommit=True``** on the pool, so a bare ``execute``/``fetch`` outside an explicit
   transaction commits immediately (mirrors asyncpg/SQLite); ``transaction()`` wraps a
   ``begin()``/``commit()``/``rollback()`` block that suspends autocommit for its duration.
+* Writers use **READ COMMITTED**. A lookup before a root-row lock must not pin
+  an earlier owner generation after another process commits. Cold inspection
+  explicitly uses REPEATABLE READ in ``read_snapshot()``.
 """
 
 from __future__ import annotations
@@ -95,7 +98,7 @@ class MySQLDatabase:
             client_flag=CLIENT.FOUND_ROWS,  # rowcount = matched rows (CAS parity)
             # Suppress benign Note-level diagnostics (e.g. "table already exists" from
             # CREATE TABLE IF NOT EXISTS); real Warnings/Errors still surface.
-            init_command="SET sql_notes=0",
+            init_command="SET SESSION sql_notes=0, transaction_isolation='READ-COMMITTED'",
             minsize=minsize,
             maxsize=maxsize,
         )
