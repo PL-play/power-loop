@@ -25,7 +25,8 @@ CONSTRAINTS = (
 
 
 def notice_id(manager, source, *, native=False):
-    return ('pc_native_note_' if native else 'source_abort_notice_') + _hash([manager.store.store_id, source['job_id'], source['generation']])[:48]
+    prefix = 'pc_native_note_' if native else 'source_abort_notice_'
+    return prefix + _hash([manager.store.store_id, source['job_id'], source['generation']])[:min(48, 64 - len(prefix))]
 
 
 def render(public):

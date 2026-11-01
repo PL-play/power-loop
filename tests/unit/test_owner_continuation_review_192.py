@@ -295,6 +295,8 @@ async def test_later_original_generation_reviews_before_output_without_mutating_
         source = await c.manager.get_job(c.runtime.actor(c.state.root), c.state.source)
         owner = await c.manager.get_job(c.runtime.actor(c.state.root), c.state.owner_id)
         assert source.result_status == "handled" and source.supervision_status == "closed"
+        notices = await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='source_abort_delivery'", (source.job_id,))
+        assert notices and all(len(row['event_id']) <= 64 for row in notices)
         assert owner.generation == 2 and owner.outcome == "failed"
         assert owner.result["usage"]["total_tokens"] == 20
         assert (
