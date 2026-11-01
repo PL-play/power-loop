@@ -166,6 +166,8 @@ async def test_original_child_outlives_closed_model_without_a_provider_gate_and_
     assert c.model.calls["child"] == 3 and len(await c.store.list_children(c.state.parent)) == 1
     assert (await c.manager.get_job(c.runtime.actor(c.state.parent), registration.job.job_id)).outcome == "succeeded"
     assert len(await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='owner_wait_resumed'")) == 1
+    [resumed] = await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='owner_wait_resumed'")
+    assert len(resumed['event_id']) <= 64
     await c.loop.flush_follow_ups(c.state.parent)
     rows = await c.manager.db.fetchall(f"SELECT supervision_status FROM {c.manager.jobs}")
     assert all(r["supervision_status"] == "closed" for r in rows), rows

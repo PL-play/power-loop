@@ -22,6 +22,7 @@ async def test_original_prepare_failure_records_abort_and_retains_unprocessed_pe
                        expected_error='test_plan_' + stage)
     events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type IN ('tool_call_abort','tool_call_abort_anchor')")
     assert len(events) == 2
+    assert all(len(event['event_id']) <= 64 for event in events)
     assert c.model.calls == c.host.reserve_calls == 1
     assert c.state.prepared == c.state.dispatched == c.state.lookups == 0
     [source] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='send'")
@@ -55,7 +56,10 @@ async def test_abort_read_and_parent_close_refuse_missing_or_conflicting_origina
     [event] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='tool_call_abort'")
     value = json.loads(event['payload_json'])
     if part in ('abort_missing', 'anchor_missing'):
-        await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (event['event_id'] + ('_anchor' if part == 'anchor_missing' else ''),))
+        target = event
+        if part == 'anchor_missing':
+            [target] = await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='tool_call_abort_anchor'", (source['job_id'],))
+        assert await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (target['event_id'],)) == 1
     elif part in ('payload_hash', 'scope_boolean', 'version_boolean'):
         if part == 'scope_boolean':
             value['scope']['generation'] = True

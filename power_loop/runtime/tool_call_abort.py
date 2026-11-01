@@ -90,10 +90,10 @@ async def read(manager, tx, source, ref, *, required=False):
     value = await _read(manager, tx, key, source, 'tool_call_abort', optional=not required)
     if value is None:
         # A lost checkpoint cannot leave an orphan anchor looking like no abort.
-        if await _read(manager, tx, key + '_anchor', source, 'tool_call_abort_anchor', optional=True) is not None:
+        if await _read(manager, tx, key + '_a', source, 'tool_call_abort_anchor', optional=True) is not None:
             raise JobError('tool_call_abort_checkpoint_missing')
         return None
-    anchor = await _read(manager, tx, key + '_anchor', source, 'tool_call_abort_anchor')
+    anchor = await _read(manager, tx, key + '_a', source, 'tool_call_abort_anchor')
     fields = {'version', 'scope', 'assistant_ref', 'entries', 'plan', 'decision', 'execution_authority', 'acknowledgement_created', 'billing_settled'}
     if (type(value) is not dict or set(value) != fields or type(value['version']) is not int or value['version'] != 1
             or _hash(value['scope']) != _hash(proof(source)) or _hash(value['assistant_ref']) != _hash(ref.to_dict())
@@ -140,7 +140,7 @@ async def _record(attempt):
                 raise JobError('tool_call_abort_checkpoint_conflict')
             return old
         await _event(manager, tx, key, source, 'tool_call_abort', value)
-        await _event(manager, tx, key + '_anchor', source, 'tool_call_abort_anchor',
+        await _event(manager, tx, key + '_a', source, 'tool_call_abort_anchor',
                      {'version': 1, 'scope': proof(source), 'abort_id': key, 'abort_hash': _hash(value), 'assistant_ref': attempt.ref.to_dict()})
     return value
 

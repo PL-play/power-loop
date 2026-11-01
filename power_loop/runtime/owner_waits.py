@@ -49,7 +49,7 @@ async def _confirm(operation, *args):
 
 
 def _id(manager, prefix, data):
-    return prefix + _hash([manager.store.store_id, data])[:48]
+    return prefix + _hash([manager.store.store_id, data])[:min(48, 64 - len(prefix))]
 
 
 def _fact(event, owner, kind, identity, data):
