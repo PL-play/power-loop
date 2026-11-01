@@ -41,6 +41,10 @@
 - Mutable session hints now live in one lease-scoped `SessionHolding`. Lease
   exit discards the holding; stale inherited contexts and delayed commit results
   cannot change a later holding, including reuse of the same owner ID.
+- Workflow shutdown joins repairs already handling cancellation without cancelling
+  them again. Their original cancellation results can finish committing; unknown
+  resources, previous-generation results and downstream execution fences remain
+  intact. Controlled three-engine tests cover cancellation during the result write.
 - Remove the unused synchronous `runtime/session_store.py` and its compatibility
   imports/tests. Current asynchronous store coverage remains; server-backend
   conformance uses current asynchronous SQLite as its reference.

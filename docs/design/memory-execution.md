@@ -300,6 +300,16 @@ control SQL from 19 to 229 and control transactions from 2 to 62 on each engine.
 This is measured remaining cost, not an elapsed-independent SQL guarantee.
 The short-send SQL limits below have not been raised to absorb that cost.
 
+## Workflow cancellation joins
+
+Workflow shutdown cancels live repairs that have not already begun cancellation,
+then joins every original repair. A repair handling cancellation still owns its
+negative result write; another cancellation must not interrupt that publication
+at a database await. Unknown resources remain unknown, previous-generation
+results remain unchanged, and downstream models do not run. This adds no SQL.
+Three-engine tests hold the original failure read until workflow shutdown joins
+the repair, preserving the real cancellation result across that overlap.
+
 ## Remaining control costs
 
 Admission and close retain the global `task_store` lock. Executor drain and
