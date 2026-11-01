@@ -14,7 +14,7 @@ from power_loop.core.agent_context import get_session_id, reset_session_id, set_
 from power_loop.runtime import delegation
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
 
-from .test_job_registry_192 import call, registry_store, runtime
+from .test_job_registry_192 import registry_store, runtime
 from .test_task_runtime_192 import finish, jobs, managed, receipt
 from .test_workflow_task_runtime_192 import leaf, managed_workflow, settle
 
@@ -145,24 +145,31 @@ async def test_stale_or_foreign_proof_cannot_admit_nudge(nudge_case, which):
 @pytest.mark.parametrize("fault", ["rollback", "lost_ack"])
 async def test_admission_and_inbox_are_atomic_and_exact_replay_never_duplicates(nudge_case, monkeypatch, fault):
     c = nudge_case
-    original = c.manager._write
+    original = c.manager.db.transaction
+    failed = []
 
     @asynccontextmanager
     async def fail():
         async with original() as tx:
             yield tx
-            if fault == "rollback":
+            hit = not failed and await tx.fetchone(f"SELECT event_id FROM {c.manager.events} WHERE action='nudge'")
+            if hit:
+                failed.append(fault)
+            if hit and fault == "rollback":
                 raise RuntimeError("rollback operation and inbox")
-        if fault == "lost_ack":
+        if hit and fault == "lost_ack":
             raise RuntimeError("commit ack lost")
 
-    monkeypatch.setattr(c.manager, "_write", fail)
+    monkeypatch.setattr(c.manager.db, "transaction", fail)
     with pytest.raises(RuntimeError):
         await c.accept()
+    assert failed == [fault]
     assert (await c.store.inbox_counts(c.sid))["pending"] == (0 if fault == "rollback" else 1)
-    monkeypatch.setattr(c.manager, "_write", original)
+    assert len(await c.manager.db.fetchall(f"SELECT source_id FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")) == 1
+    monkeypatch.setattr(c.manager.db, "transaction", original)
     op, replayed = await c.accept()
-    assert replayed == (fault == "lost_ack")
+    assert replayed  # The exact source permission survived either target outcome.
+    assert not await c.manager.db.fetchall(f"SELECT source_id FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")
     same, repeated = await c.accept()
     assert repeated and same.operation_id == op.operation_id and (await c.store.inbox_counts(c.sid))["pending"] == 1
 
@@ -188,16 +195,28 @@ async def test_pending_or_history_only_input_blocks_success_until_original_recei
 
 @pytest.mark.parametrize("first", ["nudge", "close", "cancel"])
 async def test_admission_serializes_with_target_close_and_cancel(nudge_case, first):
+    from power_loop.runtime import nudges
+
     c = nudge_case
     original = c.manager._write
     entered, release = asyncio.Event(), asyncio.Event()
     initial = True
+    in_target = False
+    apply = nudges._apply_nudge_request
+
+    async def target_phase(*args, **kwargs):
+        nonlocal in_target
+        in_target = True
+        try:
+            return await apply(*args, **kwargs)
+        finally:
+            in_target = False
 
     @asynccontextmanager
     async def hold():
         nonlocal initial
         async with original() as tx:
-            if initial:
+            if initial and (first != "nudge" or in_target):
                 initial = False
                 entered.set()
                 await release.wait()
@@ -212,6 +231,7 @@ async def test_admission_serializes_with_target_close_and_cancel(nudge_case, fir
     # A completed model send is stopped, so only the nudge/close race remains.
     await c.manager.close_model_execution(c.child_actor, c.receiver)
     c.manager._write = hold
+    nudges._apply_nudge_request = target_phase
     try:
         one = asyncio.create_task(c.accept() if first == "nudge" else close() if first == "close" else cancel())
         await asyncio.wait_for(entered.wait(), 2)
@@ -222,6 +242,7 @@ async def test_admission_serializes_with_target_close_and_cancel(nudge_case, fir
     finally:
         release.set()
         c.manager._write = original
+        nudges._apply_nudge_request = apply
     assert not isinstance(results[0], BaseException)
     assert isinstance(results[1], JobError)
     assert (await c.store.inbox_counts(c.sid))["pending"] == (1 if first == "nudge" else 0)
@@ -303,7 +324,56 @@ async def test_new_nudge_after_completion_does_not_resurrect_child(managed, monk
     assert accepted["session_id"] in {j.session_id for j in await jobs(managed) if j.kind == "subagent"}
 
 
-@pytest.mark.parametrize("fault", ["lost_ack", "signal", "inbox_failure"])
+async def test_pending_permission_without_a_local_handle_recovers_input_without_resuming_the_child(managed, monkeypatch):
+    from power_loop.runtime import nudges, subagent_resume
+
+    store, manager, runtime, loop, model, parent, _ = managed
+    runtime.lease_ms = 30000
+    await loop.send("delegate", parent)
+    await asyncio.wait_for(model.entered.wait(), 2)
+    original = delegation.nudge
+    recovered = []
+
+    async def retry_after_permission(current, sid, message, **kwargs):
+        async def target_unavailable(*args, **options):
+            raise OSError("target storage unavailable after source permission")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(nudges, "_apply_nudge_request", target_unavailable)
+            with pytest.raises(OSError, match="target storage unavailable"):
+                await original(current, sid, message, **kwargs)
+        assert len(await manager.db.fetchall(f"SELECT source_id FROM {manager.prefix}session_obligations WHERE kind='control_request'")) == 1
+        assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")
+        key = (id(store), sid)
+        running = delegation._RUNNING.pop(key)
+
+        async def forbid_resume(*args, **options):
+            pytest.fail("a durable input permission must never allocate another execution")
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(subagent_resume, "resume_locked", forbid_resume)
+                recovered.append(await original(current, sid, message, **kwargs))
+                return recovered[-1]
+        finally:
+            delegation._RUNNING[key] = running
+
+    monkeypatch.setattr(delegation, "nudge", retry_after_permission)
+    accepted, result, _ = await issue_nudge(managed, monkeypatch)
+    assert result.status == "completed" and len(recovered) == 1
+    assert recovered[0]["mode"] == "steer" and recovered[0]["replayed"]
+    assert (recovered[0]["job_id"], recovered[0]["session_id"], recovered[0]["run_id"]) == (
+        accepted["job_id"], accepted["session_id"], accepted["run_id"])
+    assert model.child_calls == 1
+    assert not await manager.db.fetchall(f"SELECT source_id FROM {manager.prefix}session_obligations WHERE kind='control_request'")
+    await finish(managed)
+    saved = await manager.get_job(runtime.actor(parent), accepted["job_id"])
+    assert saved.generation == 1 and saved.outcome == "succeeded" and saved.result["final_text"] == "NUDGED-42"
+    operation = await manager.get_operation(runtime.actor(parent), recovered[0]["operation_id"])
+    assert operation.receipt_ref is not None
+
+
+@pytest.mark.parametrize("fault", ["lost_ack", "signal", "inbox_failure", "accepted_ack", "target_ack", "completed_ack"])
 async def test_actual_admission_failures_preserve_exact_result_and_never_repeat_admission(managed, monkeypatch, fault):
     store, manager, runtime, loop, model, parent, _ = managed
     runtime.lease_ms = 30000  # keep the injected admission failure as the only fault
@@ -320,6 +390,9 @@ async def test_actual_admission_failures_preserve_exact_result_and_never_repeat_
         return operation
 
     monkeypatch.setattr(manager, "accept_nudge", wrapped)
+    if fault.endswith("_ack") and fault != "lost_ack":
+        from .test_nudge_request_trees import lose_input_ack
+        lost = lose_input_ack(manager, monkeypatch, fault.removesuffix("_ack"))
     if fault == "signal":
         signal = loop.steer_event
 
@@ -356,6 +429,9 @@ async def test_actual_admission_failures_preserve_exact_result_and_never_repeat_
     saved = await manager.get_job(runtime.actor(parent), accepted["job_id"])
     assert saved.outcome == "succeeded"
     assert saved.result["final_text"] == ("CHILD-PROOF-42" if fault == "inbox_failure" else "NUDGED-42")
+    if fault.endswith("_ack") and fault != "lost_ack":
+        assert lost == [fault.removesuffix("_ack")]
+        assert not await manager.db.fetchall(f"SELECT source_id FROM {manager.prefix}session_obligations WHERE kind='control_request'")
 
 
 async def test_same_invocation_replay_after_target_finishes_is_read_only(managed, monkeypatch):
@@ -467,7 +543,9 @@ async def test_nudge_rejects_wrong_execution_roles_kinds_and_conflicting_action(
         with pytest.raises(JobError, match="nudge_caller_mismatch"):
             await c.accept(caller=c.target)
     elif case == "source_subagent":
-        origin = await call(c.store, c.child_actor, "forbidden-child")
+        seq = await c.store.append_message(c.child_actor.session_id, role="assistant", send_index=1, round_index=0,
+            tool_calls=[{"id": "forbidden-child", "type": "function", "function": {"name": "spawn_agent", "arguments": "{}"}}])
+        origin = await c.store.message_ref(c.child_actor.session_id, seq)
         with pytest.raises(JobError, match="role_forbids_delegation"):
             await c.manager.accept_nudge(c.child_actor, c.target, caller=c.receiver, call_ref=origin,
                 tool_call_id="forbidden-child", session_id=c.sid, message="no permission")

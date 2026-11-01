@@ -107,6 +107,51 @@ async def test_second_restoration_replays_unaffected_node_without_new_requests_o
     assert plan["replay"] == ["BUILD"]
 
 
+async def test_active_input_into_a_restored_workflow_stays_in_its_original_node_generation(native_restore):
+    c = native_restore
+    c.model.release["BUILD"].clear()
+    c.model.entered["BUILD"].clear()
+    handle = await c.restore(message="recompute the original BUILD")
+    await asyncio.wait_for(c.model.entered["BUILD"].wait(), 4)
+    c.run_id = handle.run_id
+    c.sid = c.original["results"]["BUILD"]["session_id"]
+    [node] = [row for row in c.node_jobs if row["job_id"] == runner._ENGINES[c.run_id]._task_nodes[c.sid].lease.job_id]
+    c.job_id = node["job_id"]
+    before = await c.manager.get_job(c.actor, c.job_id)
+    assert before.generation == 2 and before.resource_state == "running"
+    assert (await c.manager.get_job(c.actor, handle.job_id)).generation == 2
+    errors = []
+
+    async def input_into_restored_node():
+        try:
+            return await runner.steer_node(c.run_id, "BUILD", c.sid, "NUDGED-43")
+        except Exception:
+            import traceback
+            errors.append(traceback.format_exc())
+            raise
+
+    await c.issue(handler=input_into_restored_node)
+    if errors:
+        c.model.release["BUILD"].set()
+        await asyncio.wait_for(handle.task, 10)
+    assert not errors, "\n".join(errors)
+    receipt = c.replies[-1]
+    assert (receipt["mode"], receipt["status"], receipt["job_id"], receipt["session_id"], receipt["run_id"], receipt["generation"]) == (
+        "steer", "accepted", c.job_id, c.sid, c.run_id, 2)
+    assert c.model.counts["REVIEW"] == 1
+    c.model.release["BUILD"].set()
+    await asyncio.wait_for(handle.task, 10)
+    node = await c.manager.get_job(c.actor, c.job_id)
+    assert node.generation == 2 and node.outcome == "succeeded" and node.result["text"] == "NUDGED-43"
+    assert await c.manager.get_result_revision(c.actor, handle.job_id, 1) == c.before
+    assert len(await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='workflow_node'")) == 2
+    assert c.model.counts["REVIEW"] == 2
+    [event] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (receipt["operation_id"],))
+    assert event["delivery_status"] == "handled" and event["receipt_ref_json"]
+    assert not await c.manager.db.fetchall(f"SELECT source_id FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")
+    await c.loop.flush_follow_ups(c.parent)
+
+
 async def test_parallel_sibling_is_frozen_replay_not_a_new_execution(managed_workflow, monkeypatch):
     c = await client(managed_workflow, monkeypatch)
     c.state["spec"]["root"] = {"type": "sequence", "steps": [

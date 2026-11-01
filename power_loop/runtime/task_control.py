@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 
-from .jobs import JobActor, JobError, JobLease, _hash, _json, _operation, verify_stored
+from . import control_requests as requests
+from .jobs import JobError, JobLease, _hash, _json, _operation, verify_stored
 from .message_ref import MessageRef
+
+TARGET_BARRIERS = frozenset({"stop_generation_changed"})
 
 
 def _receipt(manager, event, request, request_ref):
@@ -94,126 +97,44 @@ def _intent(job_id, caller, call_ref, tool_call_id, reason, expected_generation)
 
 
 def _request_id(key):
-    return "stop_req_"+key[:48]
+    return requests.identity("stop", key)
 
 
 def _completion_id(request_id):
-    return "stop_done_"+_hash(request_id)[:48]
+    return requests.completion_id(request_id)
 
 
 def _reference(event):
-    from .model_exit import content_reference
-    return content_reference(event)
-
-
-@dataclass(frozen=True)
-class _AcceptedStop:
-    event: dict
-    data: dict
-    source: dict
-    completion: dict | None = None
+    return requests.reference(event)
 
 
 @verify_stored
 async def _stored_request(manager, reader, actor, event, request, completion=None):
-    """Cold retry validates the original permission, never recreates it."""
-    from .execution_membership import scope
-    from .managed_effects import _ref
-
-    try:
-        data = json.loads(event["payload_json"])
-        key = manager._origin_key(actor, "stop", _ref(request["call_ref"]), request["tool_call_id"], None)
-        if (event["event_id"] != _request_id(key) or event["event_type"] != "task_control_request"
-                or event["job_id"] != request["caller"]["job_id"] or event["delivery_status"] != "not_applicable"
-                or event["caller_session_id"] != actor.session_id or event["tool_call_id"] != request["tool_call_id"]
-                or json.loads(event["call_ref_json"]) != request["call_ref"]
-                or set(data) != {"version", "phase", "action", "actor", "source", "target", "request"}
-                or data["version"] != 1 or type(data["version"]) is not int or data["phase"] != "accepted"
-                or data["action"] != "stop" or data["actor"] != asdict(actor)
-                or event["request_hash"] != _hash(data)):
-            raise JobError("stop_request_corrupt")
-        if data["request"] != request:
-            raise JobError("operation_conflict")
-        source = await manager._authorize(reader, actor, event["job_id"])
-        frozen = await scope(manager, reader, event["job_id"], request["caller"]["generation"])
-        if (data["source"] != {**request["caller"], "root_job_id": source["root_job_id"]}
-                or frozen["lease"] != request["caller"] or frozen["kind"] != "send"
-                or (frozen["tenant_id"], frozen["principal_id"], frozen["session_id"]) !=
-                    (actor.tenant_id, actor.principal_id, actor.session_id)
-                or set(data["target"]) != {"job_id", "root_job_id", "generation"}
-                or data["target"]["job_id"] != request["job_id"]
-                or type(data["target"]["generation"]) is not int or data["target"]["generation"] < 0
-                or request["expected_generation"] is not None and data["target"]["generation"] != request["expected_generation"]):
-            raise JobError("stop_request_corrupt")
-        await manager._validate_call(reader, actor, _ref(request["call_ref"]), request["tool_call_id"])
-        return _AcceptedStop(dict(event), data, dict(source), completion)
-    except (KeyError, TypeError, ValueError) as exc:
-        if isinstance(exc, JobError):
-            raise
-        raise JobError("stop_request_corrupt") from exc
+    accepted = await requests.stored(manager, reader, actor, event, request, action="stop", completion=completion)
+    if request["expected_generation"] is not None and accepted.data["target"]["generation"] != request["expected_generation"]:
+        raise JobError("stop_request_corrupt")
+    return accepted
 
 
 def _completed(accepted, event, outcome):
-    expected = {"version": 1, "phase": "completed", "request": _reference(accepted.event), "outcome": _reference(outcome)}
-    try:
-        if (event["event_id"] != _completion_id(accepted.event["event_id"])
-                or event["event_type"] != "task_control_request" or event["job_id"] != accepted.event["job_id"]
-                or event["caller_session_id"] != accepted.data["actor"]["session_id"]
-                or event["delivery_status"] != "not_applicable" or event["job_version"] <= accepted.event["job_version"]
-                or event["request_hash"] != _hash(expected) or json.loads(event["payload_json"]) != expected):
-            raise JobError("stop_request_completion_corrupt")
-    except (ValueError, TypeError, KeyError) as exc:
-        raise JobError("stop_request_completion_corrupt") from exc
+    return requests.completed(accepted, event, outcome)
 
 
 async def _accept_stop_request(manager, actor, request, target):
     from .managed_effects import _ref
 
-    ref, caller = _ref(request["call_ref"]), JobLease(**request["caller"])
-    key = manager._origin_key(actor, "stop", ref, request["tool_call_id"], None)
-    event_id = _request_id(key)
-    old = None
-    async with manager._write() as tx:
-        old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
-        if old is None:
-            source = await _source(manager, tx, actor, caller, ref, request["tool_call_id"])
-            ancestor = source
-            for _ in range(64):
-                if ancestor["job_id"] == request["job_id"]:
-                    raise JobError("cannot_stop_current_execution")
-                if ancestor["parent_job_id"] is None:
-                    break
-                ancestor = await manager._row(tx, ancestor["parent_job_id"])
-            else:
-                raise JobError("job_depth_exceeded")
-            # A normal native dispatch start may still be buffered. It must
-            # commit with acceptance before another tree can apply the request.
-            from .task_runtime import _SEND
-            binding = _SEND.get()
-            if binding is not None and binding.runtime.manager is manager and binding.lease == caller:
-                from .control_runtime import flush_binding
-                await flush_binding(binding, transaction=tx)
-            version = source["version"]+1
-            changed = await tx.write_job(caller.job_id, f"UPDATE {manager.jobs} SET version=version+1,updated_at=? "
-                "WHERE job_id=? AND root_job_id=? AND generation=? AND executor_id=? AND boot_id=? AND version=? "
-                "AND intake='open' AND status IN ('running','waiting','settling')",
-                (manager.now(), caller.job_id, source["root_job_id"], caller.generation, caller.executor_id, caller.boot_id, source["version"]))
-            if changed != 1:
-                raise JobError("stop_caller_changed")
-            data = {"version": 1, "phase": "accepted", "action": "stop", "actor": asdict(actor),
-                "source": {**asdict(caller), "root_job_id": source["root_job_id"]}, "target": target, "request": request}
-            event = {"event_id": event_id, "job_id": caller.job_id, "event_type": "task_control_request", "job_version": version,
-                "caller_session_id": actor.session_id, "tool_call_id": request["tool_call_id"], "call_ref_json": _json(ref.to_dict()),
-                "request_hash": _hash(data), "payload_json": _json(data), "delivery_status": "not_applicable", "created_at": manager.now()}
-            await tx.append_event(tuple(event), tuple(event.values()))
-            _remember_request_event(manager, event)
-            tx.open_obligation(session_id=actor.session_id, kind="control_request", source_id=event_id,
-                job_id=caller.job_id, opened_version=version)
-    if old is not None:
-        async with manager._read() as reader:
-            completion = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (_completion_id(event_id),))
-            return await _stored_request(manager, reader, actor, old, request, completion), True
-    return _AcceptedStop(event, data, {**source, "version": version}), False
+    async def authorize(tx):
+        source = await _source(manager, tx, actor, JobLease(**request["caller"]), _ref(request["call_ref"]), request["tool_call_id"])
+        ancestor = source
+        for _ in range(64):
+            if ancestor["job_id"] == request["job_id"]:
+                raise JobError("cannot_stop_current_execution")
+            if ancestor["parent_job_id"] is None:
+                return source
+            ancestor = await manager._row(tx, ancestor["parent_job_id"])
+        raise JobError("job_depth_exceeded")
+
+    return await requests.accept(manager, actor, request, target, action="stop", authorize=authorize)
 
 
 async def _apply_stop_request(manager, actor, event, data):
@@ -223,15 +144,15 @@ async def _apply_stop_request(manager, actor, event, data):
     key = manager._origin_key(actor, "stop", _ref(request["call_ref"]), request["tool_call_id"], None)
     job_id = request["job_id"]
     async with manager._write() as tx:
-        old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE operation_key=?", (key,))
-        if old is not None:
+        found = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE operation_key=? OR event_id=?",
+            (key, requests.rejection_id(event["event_id"])))
+        if found:
+            old = found[0]
             await manager._authorize(tx, actor, old["job_id"])
-            if old["request_hash"] != _hash(request):
-                raise JobError("operation_conflict")
-            return _receipt(manager, old, request, request_ref), old
+            return requests.read_outcome(manager, requests.AcceptedRequest(event, data, {}), old), old
         row = await manager._authorize(tx, actor, job_id)
         if {key: row[key] for key in ("job_id", "root_job_id", "generation")} != target:
-            raise JobError("stop_generation_changed")
+            return None, await requests.reject(manager, tx, actor, event, data, row, "stop_generation_changed")
         if row["supervision_status"] != "closed" and row["cancel_requested_at"] is None:
             now = manager.now()
             status = "cancelled" if row["resource_state"] == "not_started" else "cancelling"
@@ -255,65 +176,12 @@ async def _apply_stop_request(manager, actor, event, data):
     return operation, outcome
 
 
-class _RequestProjectionConflict(Exception):
-    pass
-
-
 async def _complete_stop_request(manager, actor, accepted, outcome):
-    """A source-owned completion receipt and its pending-index removal are atomic."""
-    if accepted.completion is not None:
-        _completed(accepted, accepted.completion, outcome)
-        _remember_request_event(manager, accepted.completion)
-        return
-    source = accepted.source
-    event_id = _completion_id(accepted.event["event_id"])
-    value = {"version": 1, "phase": "completed", "request": _reference(accepted.event), "outcome": _reference(outcome)}
-    while True:
-        try:
-            async with manager._write() as tx:
-                changed = await tx.write_job(source["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? "
-                    "WHERE job_id=? AND root_job_id=? AND generation=? AND version=?",
-                    (manager.now(), source["job_id"], accepted.data["source"]["root_job_id"], source["generation"], source["version"]))
-                if changed != 1:
-                    raise _RequestProjectionConflict()
-                event = {"event_id": event_id, "job_id": source["job_id"], "event_type": "task_control_request",
-                    "job_version": source["version"]+1, "caller_session_id": actor.session_id,
-                    "request_hash": _hash(value), "payload_json": _json(value), "delivery_status": "not_applicable", "created_at": manager.now()}
-                await tx.append_event(tuple(event), tuple(event.values()))
-                _remember_request_event(manager, event)
-                tx.close_obligation(session_id=actor.session_id, kind="control_request",
-                    source_id=accepted.event["event_id"], job_id=source["job_id"])
-            return
-        except _RequestProjectionConflict:
-            async with manager._read() as reader:
-                completed = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
-                if completed is not None:
-                    _completed(accepted, completed, outcome)
-                    _remember_request_event(manager, completed)
-                    return
-                source = await manager._authorize(reader, actor, source["job_id"])
+    await requests.complete(manager, actor, accepted, outcome)
 
 
 async def _discover_stop_request(manager, reader, actor, request):
-    from .managed_effects import _ref
-    key = manager._origin_key(actor, "stop", _ref(request["call_ref"]), request["tool_call_id"], None)
-    identity = _request_id(key)
-    rows = await reader.fetchall(f"SELECT * FROM {manager.events} WHERE event_id IN (?,?) OR operation_key=?",
-        (identity, _completion_id(identity), key))
-    original = next((row for row in rows if row["event_id"] == identity), None)
-    completion = next((row for row in rows if row["event_id"] == _completion_id(identity)), None)
-    outcome = next((row for row in rows if row["operation_key"] == key), None)
-    if original is None:
-        if outcome is not None or completion is not None:
-            raise JobError("stop_request_original_missing")
-        return None, None
-    accepted = await _stored_request(manager, reader, actor, original, request, completion)
-    if outcome is not None:
-        await manager._authorize(reader, actor, request["job_id"])
-        _receipt(manager, outcome, request, _reference(original))
-    elif completion is not None:
-        raise JobError("stop_request_outcome_missing")
-    return accepted, outcome
+    return await requests.discover(manager, reader, actor, request, action="stop")
 
 
 async def recall_stop(manager, actor, job_id, *, caller, call_ref, tool_call_id, reason="Stopped by request", expected_generation=None):
@@ -325,7 +193,7 @@ async def recall_stop(manager, actor, job_id, *, caller, call_ref, tool_call_id,
             return None
         if accepted.completion is not None:
             _completed(accepted, accepted.completion, outcome)
-        return _receipt(manager, outcome, request, _reference(accepted.event))
+        return requests.read_outcome(manager, accepted, outcome)
 
 
 async def request_stop(manager, actor, job_id, *, caller, call_ref, tool_call_id, reason="Stopped by request", expected_generation=None):
@@ -350,13 +218,14 @@ async def request_stop(manager, actor, job_id, *, caller, call_ref, tool_call_id
 
 async def _finish_accepted_stop(manager, actor, accepted, outcome):
     """Resume only the exact committed request, without another source grant."""
-    _remember_request_event(manager, accepted.event)
-    request = accepted.data["request"]
+    requests.remember_event(manager, accepted.event)
     if outcome is None:
         operation, outcome = await _apply_stop_request(manager, actor, accepted.event, accepted.data)
     else:
-        operation = _receipt(manager, outcome, request, _reference(accepted.event))
+        operation = requests.read_outcome(manager, accepted, outcome)
     await _complete_stop_request(manager, actor, accepted, outcome)
+    if operation is None:
+        raise JobError(json.loads(outcome["payload_json"])["error"])
     return operation
 
 
@@ -381,77 +250,6 @@ async def reconcile_stop_request(manager, actor, request_id):
         request = json.loads(event["payload_json"])["request"]
         accepted, outcome = await _discover_stop_request(manager, reader, actor, request)
     return await _finish_accepted_stop(manager, actor, accepted, outcome)
-
-
-def _request_records(events):
-    accepted, completed = {}, {}
-    for event in events:
-        if event["event_type"] != "task_control_request":
-            continue
-        data = json.loads(event["payload_json"])
-        if data["phase"] == "accepted":
-            accepted[event["event_id"]] = (event, data)
-        elif data["phase"] == "completed":
-            completed[data["request"]["event_id"]] = event
-        else:
-            raise JobError("stop_request_corrupt")
-    return accepted, completed
-
-
-def note_fresh_source(manager, job_id):
-    from .execution_membership import _remember_after_commit
-    _remember_after_commit(manager, None, "_control_request_events", job_id, {})
-
-
-def _remember_request_event(manager, event):
-    from .execution_membership import _cache, remember_merge
-    name, job_id = "_control_request_events", event["job_id"]
-    cache, overlay = _cache(manager, name), manager._control_overlay.get()
-    if job_id in cache or overlay is not None and (name, job_id) in overlay:
-        remember_merge(manager, name, job_id, {event["event_id"]: event})
-        # An unknown commit must not leave a cached *absence* of a request.
-        manager.after_outcome(lambda: None, lambda: cache.pop(job_id, None))
-
-
-async def request_events(manager, reader, job_id):
-    from .execution_membership import _trusted
-    known = _trusted(manager, "_control_request_events", job_id)
-    if known is not None:
-        return list(known.values())
-    return await reader.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='task_control_request'", (job_id,))
-
-
-async def request_obligations(manager, reader, row, events, *, verify=False):
-    """Source-owned receipts determine pending state; cold checks follow proofs."""
-    accepted, completed = _request_records(events)
-    if verify and completed.keys()-accepted.keys():
-        raise JobError("stop_request_original_missing")
-    entries = set()
-    for identity, (event, data) in accepted.items():
-        if verify:
-            actor = JobActor(**data["actor"])
-            original = await _stored_request(manager, reader, actor, event, data["request"])
-            target = await manager._authorize(reader, actor, data["target"]["job_id"])
-            if target["root_job_id"] != data["target"]["root_job_id"]:
-                raise JobError("stop_request_target_changed")
-            if identity in completed:
-                value = json.loads(completed[identity]["payload_json"])
-                outcome = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (value["outcome"]["event_id"],))
-                if outcome is None:
-                    raise JobError("stop_request_outcome_missing")
-                _receipt(manager, outcome, data["request"], _reference(event))
-                _completed(original, completed[identity], outcome)
-        if identity not in completed:
-            entries.add((data["actor"]["session_id"], "control_request", identity, row["job_id"], event["job_version"]))
-    return entries
-
-
-def completed_request_events(events):
-    """An execution may exit before its accepted cross-tree stop is acknowledged."""
-    accepted, completed = _request_records(events)
-    if accepted.keys()-completed.keys():
-        raise JobError("task_control_request_unresolved")
-    return [event for identity, (event, _) in sorted(accepted.items()) for event in (event, completed[identity])]
 
 
 async def signal_local(runtime, actor, operation):

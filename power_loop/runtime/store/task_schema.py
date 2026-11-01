@@ -2,7 +2,9 @@
 
 No live store is migrated by opening it. A maintenance caller must close writers
 and explicitly invoke migrate_task_schema; old binaries reject the current stamp or
-the unknown task protocol. Protocol26 gives cross-tree stop requests source-owned
+the unknown task protocol. Protocol27 uses source-owned stop/input permissions,
+target-only outcomes (including explicit refusals), and source acknowledgements.
+Protocol26 gives cross-tree stop requests source-owned
 acceptance/completion originals and a separate target receipt. Protocol25 owns
 processing decisions in the handler's tree; target handling flags remain derived.
 Protocol21 permits independent initial accounting evidence without a model
@@ -28,7 +30,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 12
-TASK_PROTOCOL_VERSION = 26
+TASK_PROTOCOL_VERSION = 27
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),

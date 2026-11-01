@@ -95,6 +95,14 @@ class ControlTransaction(ControlReadView):
                f"INSERT INTO {self._events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})")
         return await self._execute(sql, values)
 
+    async def append_event_if_current(self, event, row):
+        """Append mechanical evidence without changing a superseding owner."""
+        self.note_event(event)
+        columns = tuple(event)
+        sql = f"INSERT INTO {self._events} ({','.join(columns)}) SELECT " + ','.join('?' for _ in columns)
+        sql += f" FROM {self._jobs} WHERE job_id=? AND root_job_id=? AND generation=? AND version=?"
+        return await self._execute(sql, (*event.values(), row["job_id"], row["root_job_id"], row["generation"], row["version"]))
+
     def note_event(self, event):
         self.touched_jobs.add(event["job_id"])
         from .session_obligations import note

@@ -178,7 +178,7 @@ async def steer(loop, engine, run_id, node_id, sid, message, *, expected_job=Non
 
     from . import delegation
     from .invocation import current_invocation
-    from .nudges import receipt
+    from .nudges import receipt, recover_call
     from .task_runtime import _SEND
 
     runtime = loop.task_runtime
@@ -204,6 +204,12 @@ async def steer(loop, engine, run_id, node_id, sid, message, *, expected_job=Non
                     data.get("workflow_run_id") != run_id or data.get("node_id") != node_id or operation.call_ref != ref.to_dict() or
                     expected_job is not None and (operation.job_id, request.get("previous_generation", data.get("generation", 1))) != expected_job):
                 raise JobError("operation_conflict")
+            if operation.result["mode"] == "steer":
+                recovered = await recover_call(manager, source.actor, ref, call_id, session_id=sid, message=message,
+                    node_key=(run_id, node_id), expected_job=expected_job)
+                if recovered is None:
+                    raise JobError("nudge_request_original_missing")
+                return recovered
         return operation
 
     async with delegation._gate(manager.store, sid):
@@ -212,6 +218,10 @@ async def steer(loop, engine, run_id, node_id, sid, message, *, expected_job=Non
             return receipt(old, True)
         binding = engine._task_nodes.get(sid) if engine is not None else None
         if (binding is None or binding.runtime is not runtime or engine._run_id != run_id or binding.stop_renewal.is_set()):
+            recovered = await recover_call(manager, source.actor, ref, call_id, session_id=sid, message=message,
+                node_key=(run_id, node_id), expected_job=expected_job)
+            if recovered is not None:
+                return receipt(recovered, True)
             if engine is None or engine._run_id != run_id:
                 raise JobError("task_adapter_unavailable:workflow_node_resume")
             import asyncio
@@ -220,18 +230,20 @@ async def steer(loop, engine, run_id, node_id, sid, message, *, expected_job=Non
             return await asyncio.shield(reserve(loop, engine, source, ref, call_id, node_id, sid, message, expected_job=expected_job))
         if expected_job is not None and (binding.lease.job_id, binding.lease.generation) != expected_job:
             raise JobError("workflow_node_generation_changed")
-        job = await manager.get_job(source.actor, binding.lease.job_id)
-        data = await descriptor(manager, manager.db, asdict(job), sid)
+        async with manager._read() as reader:
+            job = await manager._authorize(reader, source.actor, binding.lease.job_id)
+            data = await descriptor(manager, reader, job, sid)
         if data["node_id"] != node_id or data["workflow_run_id"] != run_id:
             raise JobError("node_input_binding_mismatch")
         try:
             operation, replayed = await manager.accept_nudge(source.actor, binding.lease, caller=source.lease,
                 call_ref=ref, tool_call_id=call_id, session_id=sid, message=message, node=data)
         except Exception:
-            old = await previous()
-            if old is None:
+            recovered = await recover_call(manager, source.actor, ref, call_id, session_id=sid, message=message,
+                node_key=(run_id, node_id), expected_job=expected_job)
+            if recovered is None:
                 raise
-            return receipt(old, True)
+            return receipt(recovered, True)
         try:
             loop.steer_event(sid).set()
         except Exception:

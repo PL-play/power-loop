@@ -159,10 +159,16 @@ async def test_target_claim_after_acceptance_is_never_cancelled_by_the_old_reque
     assert len(newer) == 1 and current.generation == newer[0].generation == 1
     assert current.cancel_requested_at is None and current.resource_state == "running"
     pending = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")
-    assert len(pending) == 1
+    assert pending == []
+    rows = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='task_control_request' ORDER BY event_id")
+    [accepted] = [event for event in rows if json.loads(event["payload_json"])["phase"] == "accepted"]
+    [refused] = [json.loads(event["payload_json"]) for event in rows if json.loads(event["payload_json"])["phase"] == "rejected"]
+    assert refused["target"]["generation"] == 0 and refused["observed"]["generation"] == 1
+    assert refused["error"] == "stop_generation_changed"
     with pytest.raises(JobError, match="stop_generation_changed"):
-        await task_control.reconcile_stop_request(c.manager, c.actor, pending[0]["source_id"])
+        await task_control.reconcile_stop_request(c.manager, c.actor, accepted["event_id"])
     assert await c.manager.get_job(c.actor, c.target.job.job_id) == current
+    assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='task_control_request' ORDER BY event_id") == rows
     await session_obligations.verify(c.manager, c.actor)
 
 
@@ -191,16 +197,17 @@ async def test_cold_rebuild_rejects_a_missing_target_receipt_before_repairing_an
     await session_obligations.verify(c.manager, c.actor)
 
 
-async def test_protocol25_cannot_open_with_split_stop_admission_semantics(registry_store):
+@pytest.mark.parametrize("old_protocol", [25, 26])
+async def test_prior_protocol_cannot_open_with_source_control_acknowledgements(registry_store, old_protocol):
     from power_loop.runtime.store.schema import StoreSchemaError
     from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION
 
     store, connect = registry_store
-    await store._db.execute(f"UPDATE {store.table_prefix}task_store SET protocol_version=25 WHERE id=1")
+    await store._db.execute(f"UPDATE {store.table_prefix}task_store SET protocol_version=? WHERE id=1", (old_protocol,))
     try:
         with pytest.raises(StoreSchemaError):
             await connect()
-        assert (await store._db.fetchone(f"SELECT protocol_version FROM {store.table_prefix}task_store"))["protocol_version"] == 25
+        assert (await store._db.fetchone(f"SELECT protocol_version FROM {store.table_prefix}task_store"))["protocol_version"] == old_protocol
     finally:
         await store._db.execute(f"UPDATE {store.table_prefix}task_store SET protocol_version=? WHERE id=1", (TASK_PROTOCOL_VERSION,))
 

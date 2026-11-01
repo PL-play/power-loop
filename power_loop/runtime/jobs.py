@@ -1079,7 +1079,7 @@ class JobManager:
             if generation == 1:
                 note_first_claim(self, job_id)
                 if row["kind"] == "send":
-                    from .task_control import note_fresh_source
+                    from .control_requests import note_fresh_source
                     note_fresh_source(self, job_id)
             await start(self, tx, await self._row(tx, job_id))
             if row["kind"] in ("subagent", "workflow_node"):

@@ -281,11 +281,24 @@ async def test_input_processing_decision_is_part_of_new_generation_proof(ready, 
     actor = c.runtime.actor(c.parent)
     job = await c.manager.get_job(actor, c.old.job_id)
     assert job.supervision_status == "closed" and job.generation == 2
-    events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE job_id=? AND event_type='processing_decision'", (job.job_id,))
-    [event] = [e for e in events if json.loads(e["payload_json"])["event"]["event_id"].startswith("op_")]
+    events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='processing_decision'")
+    [event] = [e for e in events if json.loads(e["payload_json"])["target"]["job_id"] == job.job_id
+        and json.loads(e["payload_json"])["event"]["event_id"].startswith("op_")]
+    handled = json.loads(event["payload_json"])
+    assert event["job_id"] == handled["handler_job_id"] and event["job_id"] != job.job_id
+    assert handled["target"]["generation"] == job.generation
+    handler = await c.manager.get_job(actor, handled["handler_job_id"])
+    assert handler.kind == "send" and handler.control_owner_job_id == job.job_id
     await c.manager.db.execute(f"UPDATE {c.manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (event["event_id"],))
-    with pytest.raises(JobError, match="finalization_evidence_changed"):
-        await close(c.manager, actor, job)
+    try:
+        with pytest.raises(JobError, match="finalization_evidence_changed"):
+            await close(c.manager, actor, job)
+        damaged = await c.manager.db.fetchone(f"SELECT delivery_status FROM {c.manager.events} WHERE event_id=?", (event["event_id"],))
+        assert damaged["delivery_status"] == "pending_delivery"
+        assert await c.manager.get_job(actor, job.job_id) == job
+    finally:
+        await c.manager.db.execute(f"UPDATE {c.manager.events} SET delivery_status=? WHERE event_id=?",
+            (event["delivery_status"], event["event_id"]))
 
 
 async def test_host_stop_of_closed_scope_keeps_proof_and_future_admission_barrier(ready, monkeypatch):

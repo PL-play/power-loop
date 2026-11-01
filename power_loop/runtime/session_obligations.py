@@ -81,7 +81,7 @@ async def _desired(manager, tx, row, *, verify=False, clean=None, processed_inpu
         for event in events]
     if not events:
         return set()
-    from .task_control import request_obligations
+    from .control_requests import request_obligations
     entries = await request_obligations(manager, tx, row, events, verify=verify)
     if row["supervision_status"] == "closed":
         if verify:

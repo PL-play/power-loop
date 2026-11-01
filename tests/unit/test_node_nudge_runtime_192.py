@@ -84,7 +84,7 @@ async def live_node(managed_workflow, monkeypatch):
     yield c
 
 
-@pytest.mark.parametrize("fault", ["none", "lost_ack", "signal", "duplicate"])
+@pytest.mark.parametrize("fault", ["none", "lost_ack", "signal", "duplicate", "accepted_ack", "target_ack", "completed_ack"])
 async def test_nudge_is_atomic_processed_in_original_node_and_precedes_review(live_node, managed_workflow, monkeypatch, fault):
     c = live_node
     original = c.manager.accept_nudge
@@ -96,6 +96,9 @@ async def test_nudge_is_atomic_processed_in_original_node_and_precedes_review(li
             raise RuntimeError("committed; lost ack")
         return result
     monkeypatch.setattr(c.manager, "accept_nudge", accept)
+    if fault.endswith("_ack") and fault != "lost_ack":
+        from .test_nudge_request_trees import lose_input_ack
+        lost = lose_input_ack(c.manager, monkeypatch, fault.removesuffix("_ack"))
     steer_event = c.loop.steer_event
     if fault == "signal":
         def failed_signal(sid):
@@ -125,10 +128,59 @@ async def test_nudge_is_atomic_processed_in_original_node_and_precedes_review(li
     assert event["delivery_status"] == "handled"
     op = await c.manager.get_operation(c.runtime.actor(c.parent), event["event_id"])
     assert op.call_ref["id"] != op.receipt_ref["id"] and op.receipt_ref["tool_call_id"].startswith("node-nudge-")
-    [decision] = await c.manager.db.fetchall(f"SELECT payload_json FROM {c.manager.events} WHERE job_id=? AND event_type='processing_decision'", (c.job_id,))
-    assert json.loads(decision["payload_json"])["response_ref"]["session_id"] == c.sid
+    decisions = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='processing_decision'")
+    [decision] = [event for event in decisions if json.loads(event["payload_json"])["event"]["event_id"] == receipt["operation_id"]]
+    handled = json.loads(decision["payload_json"])
+    assert handled["response_ref"]["session_id"] == c.sid
+    assert decision["job_id"] == handled["handler_job_id"]
+    assert handled["target"]["job_id"] == c.job_id
+    handler = await c.manager.get_job(c.runtime.actor(c.parent), decision["job_id"])
+    assert handler.kind == "send" and handler.control_owner_job_id == c.job_id and handler.session_id == c.sid
     assert not c.engine._task_nodes
     assert len(await target(c)) == 2  # BUILD and REVIEW, no replacement node/session
+    if fault.endswith("_ack") and fault != "lost_ack":
+        assert lost == [fault.removesuffix("_ack")]
+        assert not await c.manager.db.fetchall(f"SELECT source_id FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")
+
+
+async def test_pending_input_permission_without_a_local_node_binding_never_reserves_a_new_generation(live_node, managed_workflow, monkeypatch):
+    from power_loop.runtime import node_resume, nudges
+
+    c = live_node
+
+    async def handler():
+        async def target_unavailable(*args, **kwargs):
+            raise OSError("target storage unavailable after source permission")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(nudges, "_apply_nudge_request", target_unavailable)
+            with pytest.raises(OSError, match="target storage unavailable"):
+                await runner.steer_node(c.run_id, "BUILD", c.sid, "NUDGED-43")
+        assert len(await c.manager.db.fetchall(f"SELECT source_id FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")) == 1
+        assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE action='nudge'")
+        binding = c.engine._task_nodes.pop(c.sid)
+
+        async def forbid_reservation(*args, **kwargs):
+            pytest.fail("a durable input permission must never reserve another node generation")
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(node_resume, "reserve", forbid_reservation)
+                return await runner.steer_node(c.run_id, "BUILD", c.sid, "NUDGED-43")
+        finally:
+            c.engine._task_nodes[c.sid] = binding
+
+    await c.issue(handler=handler)
+    [receipt] = c.replies
+    assert receipt["mode"] == "steer" and receipt["replayed"] and receipt["job_id"] == c.job_id
+    assert receipt["session_id"] == c.sid and receipt["run_id"] == c.run_id
+    assert c.model.counts["BUILD"] == 1 and c.model.counts["REVIEW"] == 0
+    assert not await c.manager.db.fetchall(f"SELECT source_id FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")
+    await settle(managed_workflow)
+    job = await c.manager.get_job(c.runtime.actor(c.parent), c.job_id)
+    assert job.generation == 1 and job.outcome == "succeeded" and job.result["text"] == "NUDGED-43"
+    operation = await c.manager.get_operation(c.runtime.actor(c.parent), receipt["operation_id"])
+    assert operation.receipt_ref is not None
 
 
 @pytest.mark.parametrize("wrong", ["node_id", "run_id", "sid", "empty", "type", "nul"])
