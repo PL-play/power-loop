@@ -113,7 +113,7 @@ async def transfer_in_process(c, record_property):
         rows = await c.manager.db.fetchall('PRAGMA database_list')
         dsn = next(row['file'] for row in rows if row['name'] == 'main')
     else:
-        dsn = os.environ['POWER_LOOP_TASK_PG_DSN']
+        dsn = os.environ['POWER_LOOP_TASK_PG_DSN' if c.manager.db.dialect.name == 'postgres' else 'POWER_LOOP_TASK_MYSQL_DSN']
         from urllib.parse import urlparse
         assert urlparse(dsn).path.endswith('_test')
     code = '''import asyncio,json,sys

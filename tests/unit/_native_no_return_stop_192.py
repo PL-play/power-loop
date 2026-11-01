@@ -79,7 +79,7 @@ async def exercise(registry_store, model, record_property, *, target='child', re
         if manager.db.dialect.name == 'sqlite':
             dsn = next(row['file'] for row in await manager.db.fetchall('PRAGMA database_list') if row['name'] == 'main')
         else:
-            dsn = os.environ['POWER_LOOP_TASK_PG_DSN']
+            dsn = os.environ['POWER_LOOP_TASK_PG_DSN' if manager.db.dialect.name == 'postgres' else 'POWER_LOOP_TASK_MYSQL_DSN']
             assert urlparse(dsn).path.endswith('_test')
         code = '''import asyncio,json,sys
 from power_loop.runtime.store.factory import open_store
