@@ -27,11 +27,25 @@
 - Session inbox/background/runtime change counters commit with their payloads;
   rounds load details after a change and check once more before completion.
   Entry reads and committed assistant references are reused within one send.
-  Current task stores use schema 12 / protocol 23; upgrades require explicit
+  Current task stores use schema 12 / protocol 24; upgrades require explicit
   maintenance, with no runtime legacy-format path.
+- Pending-only `session_obligations` entries are produced and consumed with their
+  original control transactions. Clean handler close is required before dropping
+  review barriers; generation-zero negative notices remain discoverable.
+  Changed/cold discovery no longer scans handled history. Explicit maintenance
+  and cold repair validate originals, atomically rebuild this projection and
+  invalidate affected session caches without changing messages or fees.
+- Mutable session hints now live in one lease-scoped `SessionHolding`. Lease
+  exit discards the holding; stale inherited contexts and delayed commit results
+  cannot change a later holding, including reuse of the same owner ID.
+- Remove the unused synchronous `runtime/session_store.py` and its compatibility
+  imports/tests. Current asynchronous store coverage remains; server-backend
+  conformance uses current asynchronous SQLite as its reference.
 - Shared bounded budget grants stay reserved until close; cumulative settlement
   and original financial evidence remain idempotent after unknown commits.
   Eligible model close and supervision publication share one row update.
+  Ordered checkpoint batches in a joined transaction preserve a subsequent
+  close, allocation settlement and lifecycle publication after an open checkpoint.
 - Distributed-session writes are fenced by the current lease. Stale writers
   raise `SessionLeaseLost` (`session.lease_lost`); same-timestamp renewal uses
   matched-row counts without a confirmation read. Expired inherited turn
@@ -42,8 +56,12 @@
   accounting data stays out of hooks, history and provider requests.
 - Three-engine SQL limits are tightened to fixed control 19/29 statements for
   unbudgeted/budgeted sends, with ordinary storage slopes 5/7 on SQLite/PG versus
-  MySQL. Global control locking and changed/cold historical obligation discovery
-  remain in place; concurrent-session/tree tests cover the current lock.
+  MySQL. Task heartbeats use a conditional UPDATE returning cancellation and
+  retain one global-lock read, for two SQL per owned task renewal. Finite durable
+  leases still require ongoing writes: a controlled 3,000-second send measures
+  control 19 to 229 and transactions 2 to 62 with 30 task/executor renewals.
+  Short-send budgets are unchanged. Global control locking remains because a
+  common multi-root lock order and cancellation/new-root barrier are unproved.
 - `AgentLoopConfig.max_context_rows` now defaults to `None` (unlimited). Explicit
   `None` and `0` are unlimited; positive caller limits remain effective.
 - End-of-send projection writes maintain renderer-versioned fold statistics atomically.

@@ -91,6 +91,39 @@ the SQL prefix. Rollback discards both the route and the version advancement.
 A source-level test covers all seven current routing calls in six modules and
 rejects direct recipient UPDATEs outside this method.
 
+## Pending-only session discovery
+
+`session_obligations` contains only outstanding work. Its primary key is
+`(session_id, kind, source_id)`; each row also retains the original job and its
+opening version. Discovery joins this index to original events/jobs for abort
+reviews, pending-call dispositions, managed effects, stopped controllers,
+results, wait notifications and queued inputs. Completed history is removed
+from the index. There is no historical-scan fallback on the execution path.
+
+The existing control transaction observes affected original sources and routed
+recipients, then refreshes their pending entries before committing. Consumption
+uses that same transaction boundary. A processing decision alone cannot remove
+a managed-effect or abort review barrier: the original handler's clean model
+close must also commit. That transaction passes its own clean-close fact rather
+than rereading it. Physical closure of a generation-zero managed action retains
+its negative notice until the original main actually reviews it. Workflow
+control operations are distinct from queued `steer`, `continue` and
+`restore_input` inputs.
+
+The index is a projection, never execution, processing or billing authority.
+Cold `verify` compares it with validated originals; explicit `rebuild` verifies
+originals and replaces the projection atomically under the control write lock.
+Missing or corrupt originals reject rebuilding. Rebuilding advances affected
+session invalidation versions so live clean-session caches observe the repair.
+Original events, messages and fees are unchanged. Offline maintenance creates
+and rebuilds the table for protocol 23 and earlier supported stores; ordinary
+opening requires the current protocol.
+
+Tests kill actual producer/consumer processes before and after commit, inject
+rollback and lost acknowledgements, and corrupt originals before cold repair.
+Creating and processing 1,024 actual original results leaves cold discovery SQL
+and returned row counts equal to the zero-history case on all three engines.
+
 ## Incremental evidence and storage limits
 
 The hash-linked execution journal remains the control authority. Inspection
@@ -139,10 +172,33 @@ Natural completion and `pass_turn` perform a fresh final signal check. Input or
 background results committed during the last model round remain discoverable;
 explicit hard-stop semantics still apply to `pass_turn`.
 
-The current base store schema is 11; task schema is 12 with task protocol 23.
+The current base store schema is 11; task schema is 12 with task protocol 24.
 Explicit maintenance adds and backfills the counters, including partially
 completed DDL. Old task stores require maintenance before current writers open
 them. Runtime execution reads only the current format.
+
+## Lease-scoped session holding
+
+One `SessionHolding` owns the mutable hints for a session holding period:
+entry rows/runtime snapshots, next sequence, known pending calls, deferred round,
+activity timestamp, change-signal snapshot, appended tool-call hint and the
+committed assistant reference. An explicit session lease acquisition always
+creates a new holding, including reacquisition by the same owner ID. The
+existing entry read seeds its activity timestamp without another SQL statement.
+
+Lease/send exit retires the whole object and clears its mutable contents.
+The inactive object retains only the identity required to reject writes through
+an inherited old context. Writers capture the original holding before waiting
+for storage; commit, rollback and unknown-acknowledgement handling cannot publish
+into a later holding. Unscoped public storage operations use a bounded cache;
+public reads and cold verification still read durable state. Consolidating these
+hints does not change the SQL budget or introduce a second ownership mechanism.
+
+The unused synchronous `runtime/session_store.py` implementation and its
+compatibility imports are removed. Public `SessionStore` continues to use the
+current asynchronous store. Server-backend conformance compares against current
+asynchronous SQLite, retaining exact return-value and final-state assertions.
+Historical schema tests use fixed offline SQL fixtures, not an old runtime.
 
 ## Shared budget checkpoints and round accounting
 
@@ -152,6 +208,11 @@ ordinary open checkpoints do not rewrite shared counters. Close applies the
 cumulative difference under the original scope locks. Report versions make
 unknown-commit retries and repeated projection repair idempotent. Actual usage
 above the entire grant is booked immediately and closes new admission.
+
+Multiple checkpoints staged in one transaction retain an ordered immutable
+batch queue and contiguous hashes. A staged open checkpoint does not suppress a
+later close in that transaction. Commit/rollback callbacks publish or discard
+each batch together with its original allocation and lifecycle facts.
 
 Expired-owner retirement preserves its unknown suffix and reserved capacity.
 Actual supplier capture and financial submissions remain authoritative for paid
@@ -192,6 +253,32 @@ Renewal uses the database port's integer matched-row count;
 MySQL already enables `CLIENT.FOUND_ROWS`, including unchanged timestamps.
 There is no follow-up confirmation SELECT.
 
+## Conditional task renewal
+
+A live owned task heartbeat uses one conditional UPDATE. Its conditions include
+generation/executor/boot, tenant/principal/session access, task and control-owner
+leases, cancellation through original ancestry, original completion deadlines,
+and current admission of the original executor. The same statement returns
+cancellation: SQLite/PostgreSQL use `RETURNING`; MySQL returns
+`LAST_INSERT_ID(cancelled)` in the UPDATE's OK packet with matched-row semantics.
+There is no additional SELECT to obtain the flag. Cancellation raises and rolls
+back without extending the lease. Cold callers verify originals at entry; a
+conditional miss invokes fault-only fencing for the precise failure reason.
+
+The surrounding transaction retains the existing global control lock read.
+Thus a live owned task renewal is two SQL statements in one transaction, not one
+SQL statement overall. Tests cover actual generation takeover, ancestor stop,
+executor expiry while its job lease remains live, finite completion expiry,
+same-clock retries, rollback and lost acknowledgements on all three engines.
+
+Finite durable leases require continued writes during a long send. A controlled
+clock experiment uses the configured 300,000 ms task/executor leases, renews at
+100,000 ms intervals, and advances from zero to 3,000 seconds inside a real
+fake-model send. Thirty task renewals plus thirty executor heartbeats increase
+control SQL from 19 to 229 and control transactions from 2 to 62 on each engine.
+This is measured remaining cost, not an elapsed-independent SQL guarantee.
+The short-send SQL limits below have not been raised to absorb that cost.
+
 ## Remaining control costs
 
 Admission and close retain the global `task_store` lock. Executor drain and
@@ -200,11 +287,18 @@ proven common lock order across those transactions. Tests cover real-process
 session contention, independent concurrent models and same-tree stop/result
 races with the existing lock.
 
-`session_controls` skips unchanged clean-session discovery. A changed or cold
-session can still scan processed historical obligations; a durable pending-only
-index has not been implemented. Unified task renewal also retains ancestor,
-deadline and executor-admission checks. Finite durable leases require ongoing
-renewal writes; total control SQL is not independent of elapsed time.
+The complete multi-root lock order has not been proved. Executor drain locks an
+executor before iterating jobs in job-ID order, while context cancellation
+enumerates multiple roots and must also block concurrent new-root admission.
+Locking only the roots already present does not cover that admission race.
+Removing the global lock requires a common complete-root acquisition order and
+real-process tests for opposing multi-root operations; the existing 15
+concurrency cases do not establish those facts. The global lock remains.
+
+`session_controls` skips unchanged clean-session discovery; changed and cold
+discovery now uses the pending-only index. Original proof verification remains
+at recovery/inspection entry. Finite durable leases require ongoing renewal
+writes; total control SQL is not independent of elapsed time.
 
 `tests/unit/test_send_sql_profile.py` is the SQL regression authority. It covers
 three engines, budgeted/unbudgeted sends with 1–32 model responses, and 0 versus
