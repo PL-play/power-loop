@@ -177,6 +177,29 @@ class JobManager:
         self._deferred_model_updates = ContextVar("execution_deferred_model_updates", default=None)
 
     @asynccontextmanager
+    async def _control_transaction(self):
+        """Time entry wait and the actual lock lifetime, including commit."""
+        started = time.perf_counter()
+        acquired = None
+        outcome = "rolled_back"
+        try:
+            async with self.db.transaction() as tx:
+                suffix = "" if self.db.dialect.name == "sqlite" else " FOR UPDATE"
+                row = await tx.fetchone(f"SELECT store_id,protocol_version FROM {self.prefix}task_store WHERE id=1" + suffix)
+                acquired = time.perf_counter()
+                if row is None or row["store_id"] != self.store.store_id or row["protocol_version"] != TASK_PROTOCOL_VERSION:
+                    raise JobError("store_identity_changed")
+                yield tx
+            outcome = "committed"
+        finally:
+            finished = time.perf_counter()
+            logging.getLogger("power_loop.control.transactions").debug(
+                "control_transaction",
+                extra={"wait_ms": ((acquired if acquired is not None else finished) - started) * 1000,
+                       "hold_ms": 0.0 if acquired is None else (finished - acquired) * 1000,
+                       "outcome": outcome, "dialect": self.db.dialect.name})
+
+    @asynccontextmanager
     async def joined_write(self):
         """Run several control steps as one transaction (one lock, one commit).
 
@@ -213,11 +236,7 @@ class JobManager:
         overlay_token = self._control_overlay.set({} if outer_overlay is None else outer_overlay)
         try:
             try:
-                async with self.db.transaction() as tx:
-                    suffix = "" if self.db.dialect.name == "sqlite" else " FOR UPDATE"
-                    row = await tx.fetchone(f"SELECT store_id,protocol_version FROM {self.prefix}task_store WHERE id=1" + suffix)
-                    if row is None or row["store_id"] != self.store.store_id or row["protocol_version"] != TASK_PROTOCOL_VERSION:
-                        raise JobError("store_identity_changed")
+                async with self._control_transaction() as tx:
                     from .session_controls import RecordingTransaction, bump
                     recorder = RecordingTransaction(tx, self.events, (
                         (self.jobs, "job_id"), (self.prefix + "task_executors", "executor_key")))
