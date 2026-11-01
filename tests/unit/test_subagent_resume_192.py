@@ -11,7 +11,6 @@ import pytest
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import delegation, execution_membership
 from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.native_returns import NativeReturnPending
 from power_loop.runtime.result_revisions import result_id
 
 from .test_job_registry_192 import registry_store
@@ -47,6 +46,22 @@ async def latest(c):
 async def nudge_receipt(c):
     rows = await c.store.load_all_messages(c.parent)
     return json.loads(next(r.content for r in reversed(rows) if r.role == "tool"))
+
+
+async def cold_original_call_refuses_corruption(c, code):
+    from power_loop.runtime.tool_call_plans import read
+
+    rows = await c.store.load_all_messages(c.parent)
+    [assistant] = [row for row in rows if row.role == "assistant" and
+                   any(call["id"] == "actual-nudge" for call in (row.tool_calls or []))]
+    ref = await c.store.message_ref(c.parent, assistant.seq)
+    cold = JobManager(await c.connect())
+    plans = await cold.db.fetchall(f"SELECT job_id,payload_json FROM {cold.events} WHERE event_type='tool_call_plan'")
+    [plan] = [row for row in plans if json.loads(row["payload_json"])["call_ref"] == ref.to_dict()]
+    async with cold._write() as tx:
+        source = await cold._row(tx, plan["job_id"])
+        with pytest.raises(JobError, match=code):
+            await read(cold, tx, source, ref)
 
 
 @pytest.mark.parametrize("fault", ["none", "admission_ack", "dispatch_ack", "replay"])
@@ -218,15 +233,9 @@ async def test_admission_rechecks_current_session_contract_and_actual_caller(rea
     rows = await c.store.load_all_messages(c.parent)
     c.created_call = next(r for r in rows if r.role == "assistant" and r.tool_calls)
     monkeypatch.setattr(c.manager, "resume_subagent", change)
+    await issue_nudge(c.fixture, monkeypatch)
     if fault == "source_role":
-        # Corrupting the actual caller also invalidates the original return
-        # checkpoint. Keep its reply pending instead of accepting a new scope.
-        with pytest.raises(NativeReturnPending, match="native_return_checkpoint_pending") as pending:
-            await issue_nudge(c.fixture, monkeypatch)
-        assert isinstance(pending.value.__cause__, JobError)
-        assert pending.value.__cause__.code == "managed_completion_scope_changed"
-    else:
-        await issue_nudge(c.fixture, monkeypatch)
+        await cold_original_call_refuses_corruption(c, "managed_completion_scope_changed")
     code = {"pending_tools": "resume_tools_pending", "pending_input": "resume_input_pending", "session_role": "resume_session_unavailable",
         "contract_changed": "resume_contract_mismatch", "source_role": "resume_caller_mismatch", "old_call": "operation_conflict"}[fault]
     assert errors == [code] and (await latest(c)).generation == 1 and c.model.child_calls == 1
@@ -246,9 +255,10 @@ async def test_resume_failure_rolls_back_generation_operation_and_inbox(ready, m
                 execute = tx.execute
                 async def faulty(sql, params=()):
                     value = await execute(sql, params)
-                    match = (point == "operation" and sql.startswith("INSERT INTO "+c.manager.events) and "nudge" in params or
+                    event_insert = sql.lstrip().upper().startswith("INSERT") and c.manager.events in sql
+                    match = (point == "operation" and event_insert and "nudge" in params or
                         point == "inbox" and "INSERT" in sql and c.store.t.follow_up_queue in sql or
-                        point in ("execution", "execution_scope") and sql.startswith("INSERT INTO "+c.manager.events) and point in params)
+                        point in ("execution", "execution_scope") and event_insert and point in params)
                     if match:
                         hits.append(point)
                         raise RuntimeError("injected write failure: "+point)
@@ -437,14 +447,10 @@ async def test_dispatch_faults_never_start_an_unclaimed_execution_and_remain_can
             errors.append(exc.code)
             raise
     monkeypatch.setattr(c.manager, "claim_resume_dispatch", fail)
+    await issue_nudge(c.fixture, monkeypatch)
     if fault in ("source_send", "source_role"):
-        with pytest.raises(NativeReturnPending, match="native_return_checkpoint_pending") as pending:
-            await issue_nudge(c.fixture, monkeypatch)
-        assert isinstance(pending.value.__cause__, JobError)
         code = "managed_effect_call_evidence_mismatch" if fault == "source_send" else "managed_completion_scope_changed"
-        assert pending.value.__cause__.code == code
-    else:
-        await issue_nudge(c.fixture, monkeypatch)
+        await cold_original_call_refuses_corruption(c, code)
     expected = {"invalid_token": "invalid_dispatch_token", "invalid_caller": "execution_lease_required", "missing_operation": "resume_dispatch_mismatch",
         "wrong_caller": "resume_dispatch_mismatch", "wrong_mode": "resume_dispatch_mismatch",
         "source_role": "resume_caller_mismatch", "source_send": "resume_caller_mismatch", "cancel_target": "cancel_requested"}
