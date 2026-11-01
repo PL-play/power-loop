@@ -118,7 +118,7 @@ async def test_original_job_and_session_resume_once_with_distinct_results_and_us
     assert await reopened.get_result_revision(c.runtime.actor(c.parent), c.old.job_id, 1) == old
 
 
-@pytest.mark.parametrize("block", ["cancel", "unknown", "failed", "open", "unhandled", "generation", "role", "owner", "principal", "scope_missing", "seal_missing", "edge_missing"])
+@pytest.mark.parametrize("block", ["cancel", "unknown", "failed", "open", "generation", "role", "owner", "principal", "scope_missing", "seal_missing", "edge_missing"])
 async def test_resume_admission_rejects_invalid_original_state_without_new_model(ready, monkeypatch, block):
     c = ready
     original = c.manager.resume_subagent
@@ -139,7 +139,7 @@ async def test_resume_admission_rejects_invalid_original_state_without_new_model
                 await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE job_id=? AND event_type='execution_member'", (job_id,))
         else:
             field, value = {"unknown": ("resource_state", "unknown"), "failed": ("outcome", "failed"),
-                "open": ("intake", "open"), "unhandled": ("result_status", "pending_delivery"),
+                "open": ("intake", "open"),
                 "role": ("execution_role", "workflow_node"), "owner": ("control_owner_job_id", "other")}[block]
             await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET {field}=? WHERE job_id=?", (value, job_id))
         try:
@@ -150,12 +150,38 @@ async def test_resume_admission_rejects_invalid_original_state_without_new_model
     monkeypatch.setattr(c.manager, "resume_subagent", invalid)
     await issue_nudge(c.fixture, monkeypatch)
     expected = {"cancel": "cancel_requested", "unknown": "unresolved_prior_attempt", "failed": "resume_target_unsettled",
-        "open": "resume_target_unsettled", "unhandled": "resume_result_unhandled", "generation": "resume_generation_changed",
+        "open": "resume_target_unsettled", "generation": "resume_generation_changed",
         "role": "resume_target_mismatch", "owner": "resume_target_mismatch", "principal": "access_denied",
         "scope_missing": "execution_membership_missing", "seal_missing": "execution_membership_missing", "edge_missing": "execution_membership_corrupt"}
     assert errors == [expected[block]]
     assert c.model.child_calls == 1 and (await latest(c)).generation == 1
     assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type IN ('dispatch','execution')")
+
+
+async def test_resume_rejects_an_original_result_not_yet_seen_by_any_main_model(managed):
+    store, manager, runtime, loop, model, parent, _ = managed
+    await loop.send("delegate", parent)
+    created = await receipt(managed)
+    await finish(managed)
+    actor = runtime.actor(parent)
+    before = await manager.get_job(actor, created['job_id'])
+    assert before.outcome == 'succeeded' and before.result_status == 'pending_delivery'
+    source = await manager.register_job(actor, kind='send', session_id=parent,
+        system_key='unseen-result-caller', request={'send_index':2})
+    caller = await manager.claim_job(actor, source.job.job_id, executor_id=runtime.executor_id,
+        boot_id=runtime.boot_id, expected_version=source.job.version)
+    seq = await store.append_message(parent, role='assistant', send_index=2, round_index=0,
+        tool_calls=[{'id':'unseen-resume', 'type':'function', 'function':{'name':'spawn_agent',
+            'arguments':json.dumps({'action':'nudge', 'sub_session':created['session_id'], 'message':'continue'})}}])
+    with pytest.raises(JobError, match='^resume_result_unhandled$'):
+        await manager.resume_subagent(actor, before.job_id, caller=caller,
+            call_ref=await store.message_ref(parent, seq), tool_call_id='unseen-resume',
+            session_id=created['session_id'], message='continue', expected_generation=1,
+            executor_id=runtime.executor_id, boot_id=runtime.boot_id,
+            contract=await store.get_runtime_state(created['session_id'], 'workflow_execution_contract'))
+    assert await manager.get_job(actor, before.job_id) == before
+    assert model.child_calls == 1
+    assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge' OR event_type='dispatch'")
 
 
 async def test_three_generations_keep_history_and_only_latest_result_is_consumed(ready, monkeypatch):

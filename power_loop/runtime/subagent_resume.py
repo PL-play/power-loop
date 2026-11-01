@@ -117,32 +117,8 @@ async def claim_dispatch(manager, actor, operation_id, *, caller, token):
         raise JobError("invalid_dispatch_token")
     if not isinstance(caller, JobLease):
         raise JobError("execution_lease_required")
-    event_id = "dispatch_"+operation_id
-    async with manager._write() as tx:
-        op = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND action='nudge' AND event_type='operation'", (operation_id,))
-        if op is None or op["caller_session_id"] != actor.session_id:
-            raise JobError("resume_dispatch_mismatch")
-        job = await manager._authorize(tx, actor, op["job_id"])
-        payload = json.loads(op["payload_json"])
-        if payload.get("mode") != "continue" or payload["request"].get("caller") != asdict(caller):
-            raise JobError("resume_dispatch_mismatch")
-        old = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (event_id,))
-        if old:
-            return json.loads(old["payload_json"])["token"] == token
-        source = await manager._fence(tx, actor, caller)
-        if source["kind"] != "send" or source["session_id"] != actor.session_id or source["execution_role"] != "main":
-            raise JobError("resume_caller_mismatch")
-        await manager._fence(tx, actor, JobLease(**payload["request"]["target"]))
-        if job["kind"] == "workflow_node":
-            from .node_resume import validate_execution
-            await validate_execution(manager, tx, job, payload["request"]["session_id"])
-        # The claim belongs to the same originating model send, not another
-        # later send that happens to reuse the original principal/SID.
-        create = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND action='create'", (caller.job_id,))
-        if json.loads(create["payload_json"])["request"]["send_index"] != int(json.loads(op["call_ref_json"])["send_index"]):
-            raise JobError("resume_caller_mismatch")
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (event_id, job["job_id"], "dispatch", job["version"], _json({"token": token, "operation_id": operation_id}), "claimed", manager.now()))
-        return True
+    from .resume_dispatch import claim
+    return await claim(manager, actor, operation_id, caller=caller, token=token)
 
 
 async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_complete=None, finalize=None, admission=None):

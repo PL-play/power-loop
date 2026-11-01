@@ -39,6 +39,9 @@ def _domain(action):
     if action == "nudge":
         from . import nudges
         return nudges
+    if action == "dispatch":
+        from . import resume_dispatch
+        return resume_dispatch
     raise JobError("control_request_action_unknown")
 
 
