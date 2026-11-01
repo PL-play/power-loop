@@ -160,16 +160,20 @@ async def test_disposition_and_complete_supervision_transaction_roll_back_togeth
     async with c.manager._write() as tx:
         cls = type(tx)
     execute = cls._execute
+    fault_hits = []
     async def fail(tx, sql, params=()):
         result = await execute(tx, sql, params)
         if ((point == "disposition" and sql.startswith("INSERT INTO " + c.manager.events) and params[2] == "wait_disposition")
-                or (point == "handled" and sql.startswith("UPDATE " + c.manager.events + " SET delivery_status='handled' WHERE event_id=?") and params[0].startswith("wait_decision_"))
+                or (point == "handled" and sql.startswith("UPDATE " + c.manager.events + " SET delivery_status=? WHERE event_id=?")
+                    and params[0] == "handled" and params[1].startswith("wait_decision_"))
                 or (point == "supervision" and sql.startswith("INSERT INTO " + c.manager.events) and params[2] == "supervision_closed")):
+            fault_hits.append(point)
             raise OSError("negative disposition write failed")
         return result
     monkeypatch.setattr(cls, "_execute", fail)
     with pytest.raises(OSError, match="negative disposition"):
         await c.manager.finalize_supervision(c.main, timer_id, generation=0)
+    assert fault_hits == [point]
     assert await c.manager.get_job(c.main, timer_id) == before
     assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type IN ('wait_disposition','wait_terminated','result','supervision_closed')", (timer_id,))
     [decision] = await c.manager.db.fetchall(f"SELECT delivery_status FROM {c.manager.events} WHERE event_type='wait_decision'")

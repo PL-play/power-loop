@@ -62,10 +62,11 @@ async def _original(manager, tx, event):
     return row, request, outcome, exit_refs, raw
 
 
-async def _expected(manager, tx, event):
+async def _expected(manager, tx, event, *, queue=None):
     row, request, outcome, exit_refs, raw = await _original(manager, tx, event)
-    queue = await tx.fetchone(f"SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
-        (request["session_id"], "nudge:" + event["event_id"]))
+    if queue is None:
+        queue = await tx.fetchone(f"SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
+            (request["session_id"], "nudge:" + event["event_id"]))
     if queue is None or queue["status"] not in ("void", "delivered") or queue["claim_token"] is not None:
         raise JobError("input_disposition_queue_unsettled")
     delivered = None
@@ -93,6 +94,9 @@ async def _expected(manager, tx, event):
 
 
 async def read_tx(manager, tx, event, *, required=False):
+    prepared = manager._finalization_preparation.get()
+    if prepared is not None and event["event_id"] in prepared.inputs:
+        return prepared.inputs[event["event_id"]]
     key = identity(manager, event["event_id"])
     proof = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
     if proof is None:
@@ -118,6 +122,12 @@ async def read_tx(manager, tx, event, *, required=False):
 
 async def reconcile_tx(manager, tx, actor, event):
     """One original input, under the caller's existing control transaction."""
+    from .finalization_plan import execute
+
+    return await execute(manager, tx, lambda prepared: _prepare(manager, tx, actor, event, prepared))
+
+
+async def _prepare(manager, tx, actor, event, prepared):
     owner = await manager._authorize(tx, actor, event["job_id"])
     old = await read_tx(manager, tx, event)
     if old is not None:
@@ -135,23 +145,27 @@ async def reconcile_tx(manager, tx, actor, event):
     decision = "decision_" + _hash([event["event_id"], event["job_version"], _hash(waits._object(event["payload_json"]))])[:48]
     if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (decision,)):
         raise JobError("input_disposition_processing_conflict")
-    await manager.store.signal_changes(tx, request["session_id"], "inbox")
-    await tx.execute(f"UPDATE {manager.store.t.follow_up_queue} SET status='void',claim_token=NULL "
-        "WHERE session_id=? AND item_id=? AND status IN ('pending','claimed')",
+    queue = await tx.fetchone(f"SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
         (request["session_id"], "nudge:" + event["event_id"]))
-    _, payload = await _expected(manager, tx, event)
+    if queue is not None and queue["status"] in ("pending", "claimed"):
+        queue = prepared.withdraw(queue)
+    _, payload = await _expected(manager, tx, event, queue=queue)
     key = identity(manager, event["event_id"])
-    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, owner["job_id"], "input_disposition", owner["version"]+1, event["caller_session_id"], _hash(payload), _json(payload), "not_applicable", manager.now()))
-    await tx.update_event(owner["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (event["event_id"],))
-    await tx.write_job(owner["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
-    updated = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event["event_id"],))
-    return await read_tx(manager, tx, updated, required=True)
+    proof = prepared.append({"event_id": key, "job_id": owner["job_id"], "event_type": "input_disposition",
+        "job_version": owner["version"]+1, "caller_session_id": event["caller_session_id"], "request_hash": _hash(payload),
+        "payload_json": _json(payload), "delivery_status": "not_applicable", "created_at": manager.now()})
+    prepared.signals.add(request["session_id"])
+    prepared.handled(owner["job_id"], event["event_id"])
+    prepared.change_job(owner)
+    prepared.inputs[event["event_id"]] = proof
+    return proof
 
 
-async def reconcile_owner_tx(manager, tx, actor, owner, generation):
+async def _owner_events(manager, tx, owner, generation):
     if owner["kind"] not in ("subagent", "workflow_node"):
-        return
+        return []
     events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' AND action='nudge' ORDER BY event_id", (owner["job_id"],))
+    current = []
     for event in events:
         request = waits._object(event["payload_json"]).get("request")
         if not isinstance(request, dict):
@@ -162,7 +176,13 @@ async def reconcile_owner_tx(manager, tx, actor, owner, generation):
         if type(target.get("generation")) is not int:
             raise JobError("input_disposition_origin_corrupt")
         if target["generation"] == generation:
-            await reconcile_tx(manager, tx, actor, event)
+            current.append(event)
+    return current
+
+
+async def reconcile_owner_tx(manager, tx, actor, owner, generation):
+    for event in await _owner_events(manager, tx, owner, generation):
+        await reconcile_tx(manager, tx, actor, event)
 
 
 def event_ids(proof):

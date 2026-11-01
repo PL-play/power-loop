@@ -147,6 +147,9 @@ async def _cancel_effect(manager, tx, saved, *, handled=False, _state=None):
 
 
 async def _terminated(manager, tx, actor, job, creation, saved, *, _state=None):
+    prepared = manager._finalization_preparation.get()
+    if prepared is not None and job["job_id"] in prepared.terminals:
+        return prepared.terminals[job["job_id"]]
     identity = terminal_id(manager, job["job_id"], creation["event_id"])
     row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (identity,))
     if row is None:
@@ -180,11 +183,19 @@ async def terminate(manager, actor, job_id):
 
 async def terminate_tx(manager, tx, actor, job_id):
     """The same control transaction also supports atomic tree finalization."""
+    from .finalization_plan import execute
+
+    return await execute(manager, tx, lambda prepared: _prepare_termination(manager, tx, actor, job_id, prepared))
+
+
+async def _prepare_termination(manager, tx, actor, job_id, prepared):
     job, creation, saved = await admission(manager, tx, actor, job_id)
     identity = terminal_id(manager, job_id, creation["event_id"])
+    if job_id in prepared.terminals:
+        return {"status": "terminated", "job_id": job_id, "termination_event_id": identity, "execution_authority": False}
     old = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (identity,))
     if old:
-        await _terminated(manager, tx, actor, job, creation, saved)
+        prepared.terminals[job_id] = await _terminated(manager, tx, actor, job, creation, saved)
         from .wait_dispositions import reconcile_tx
         await reconcile_tx(manager, tx, actor, job, creation, saved)
         return {"status": "terminated", "job_id": job_id, "termination_event_id": identity, "execution_authority": False}
@@ -198,25 +209,27 @@ async def terminate_tx(manager, tx, actor, job_id):
         target = "timed_out" if outcome == "timed_out" else "cancelled"
         projection = {"status": target, "wait_terminated_event_id": identity, "owner_outcome": outcome}
         canonical = {"outcome": target, "result": projection, "resource_state": "stopped", "unstarted": True, "logical_wait": True}
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (result_id, job_id, "result", job["version"]+1, _hash(canonical), _json(canonical), "handled", manager.now()))
-        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET status='settling',outcome=?,resource_state='stopped',intake='closed',result_status='handled',"
-            "result_json=?,version=version+1,updated_at=? WHERE job_id=?", (target, _json(projection), manager.now(), job_id), obligations=True)
-        job = await manager._row(tx, job_id)
-        result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (result_id,))
+        result = prepared.append({"event_id": result_id, "job_id": job_id, "event_type": "result",
+            "job_version": job["version"]+1, "request_hash": _hash(canonical), "payload_json": _json(canonical),
+            "delivery_status": "handled", "created_at": manager.now()})
+        job = prepared.change_job(job, status="settling", outcome=target, resource_state="stopped",
+            intake="closed", result_status="handled", result_json=_json(projection))
         legacy = False
     else:
         legacy = _result_projection(job, waits._object(result["payload_json"]))
         if not legacy:
             raise JobError("wait_terminal_evidence_missing")
-        await tx.update_event(job_id, f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (result_id,))
-        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET result_status='handled',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job_id), obligations=True)
+        prepared.handled(job_id, result_id)
+        job = prepared.change_job(job, result_status="handled")
     data = {"version": 1, "creation_id": creation["event_id"], "creation_hash": creation["request_hash"],
         "owner": saved["binding"]["owner"], "owner_outcome": outcome, "owner_exit": refs,
         "result": content_reference(result), "legacy_result": legacy, "cancel_effect": cancelled}
-    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (identity, job_id, "wait_terminated", job["version"]+1, _hash(data), _json(data), "not_applicable", manager.now()))
+    prepared.terminals[job_id] = prepared.append({"event_id": identity, "job_id": job_id, "event_type": "wait_terminated",
+        "job_version": job["version"]+1, "request_hash": _hash(data), "payload_json": _json(data),
+        "delivery_status": "not_applicable", "created_at": manager.now()})
     if cancelled:
-        await tx.update_event(job_id, f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (cancelled["effect_id"], cancelled["decision_id"]))
-    await _terminated(manager, tx, actor, job, creation, saved)
+        prepared.handled(job_id, cancelled["effect_id"])
+        prepared.handled(job_id, cancelled["decision_id"])
     from .wait_dispositions import reconcile_tx
     await reconcile_tx(manager, tx, actor, job, creation, saved)
     return {"status": "terminated", "job_id": job_id, "termination_event_id": identity, "execution_authority": False}
@@ -227,6 +240,9 @@ async def references(manager, tx, job):
     from .finalization import _reference
 
     actor = JobActor(job["tenant_id"], job["principal_id"], job["created_by_session_id"])
+    if manager._finalization_preparation.get() is not None and job["outcome"] != "succeeded":
+        await terminate_tx(manager, tx, actor, job["job_id"])
+        job = await manager._row(tx, job["job_id"])
     job, creation, saved = await admission(manager, tx, actor, job["job_id"])
     if job["resource_state"] != "stopped" or job["intake"] != "closed" or job["result_status"] != "handled":
         raise JobError("wait_resolution_unsettled")

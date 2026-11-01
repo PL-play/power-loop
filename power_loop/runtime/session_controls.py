@@ -103,6 +103,22 @@ class ControlTransaction(ControlReadView):
         sql += f" FROM {self._jobs} WHERE job_id=? AND root_job_id=? AND generation=? AND version=?"
         return await self._execute(sql, (*event.values(), row["job_id"], row["root_job_id"], row["generation"], row["version"]))
 
+    async def append_event_if_tree_current(self, event, tree):
+        """Publish a prepared original only if no job in its tree changed.
+
+        Job versions only advance. Count plus their sum also catches a new or
+        resumed descendant which was absent from the prepared closure plans.
+        The tree writer remains held until all conditional projections commit.
+        """
+        self.note_event(event)
+        columns = tuple(event)
+        sql = f"INSERT INTO {self._events} ({','.join(columns)}) SELECT " + ','.join('?' for _ in columns)
+        sql += (f" WHERE EXISTS (SELECT 1 FROM {self._jobs} WHERE job_id=? AND generation=?)"
+            f" AND (SELECT COUNT(*) FROM {self._jobs} WHERE root_job_id=?)=?"
+            f" AND (SELECT COALESCE(SUM(version),0) FROM {self._jobs} WHERE root_job_id=?)=?")
+        return await self._execute(sql, (*event.values(), tree.root_id, tree.generation,
+            tree.root_id, tree.count, tree.root_id, tree.version_sum))
+
     def note_event(self, event):
         self.touched_jobs.add(event["job_id"])
         from .session_obligations import note

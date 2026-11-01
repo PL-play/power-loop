@@ -102,6 +102,9 @@ async def read_tx(manager, tx, actor, job, creation, saved, state, *, required=F
     from . import wait_notifications as notices
 
     key = identity(manager, notices.decision_id(manager, state["event_id"]))
+    prepared = manager._finalization_preparation.get()
+    if prepared is not None and key in prepared.dispositions:
+        return prepared.dispositions[key]
     dispositions = await tx.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='wait_disposition' LIMIT 2", (job["job_id"],))
     if any(item["event_id"] != key for item in dispositions) or len(dispositions) > 1:
         raise JobError("wait_disposition_branch_corrupt")
@@ -133,6 +136,12 @@ async def read_tx(manager, tx, actor, job, creation, saved, state, *, required=F
 
 async def reconcile_tx(manager, tx, actor, job, creation, saved):
     """Called after the original logical termination, in that same transaction."""
+    from .finalization_plan import execute
+
+    return await execute(manager, tx, lambda prepared: _prepare(manager, tx, actor, job, creation, saved, prepared))
+
+
+async def _prepare(manager, tx, actor, job, creation, saved, prepared):
     from .wait_reviews import history
 
     state = await history(manager, tx, actor, job, creation, saved)
@@ -144,6 +153,7 @@ async def reconcile_tx(manager, tx, actor, job, creation, saved):
         return None
     main, decision, data, _, effect = intent
     if effect is not None and data["request"]["decision"] == "cancel":
+        prepared.dispositions[identity(manager, decision["event_id"])] = None
         return None  # Applied cancel retains its original terminal protocol.
     if effect is not None and data["request"]["decision"] == "continue":
         from .input_dispositions import reconcile_tx as retire_input
@@ -156,13 +166,15 @@ async def reconcile_tx(manager, tx, actor, job, creation, saved):
         raise JobError("wait_disposition_after_close")
     payload = await _expected(manager, tx, actor, job, creation, saved, state, intent)
     key = identity(manager, decision["event_id"])
-    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job["job_id"], "wait_disposition", job["version"]+1, main.session_id, _hash(payload), _json(payload), "not_applicable", manager.now()))
-    await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (decision["event_id"],))
+    proof = prepared.append({"event_id": key, "job_id": job["job_id"], "event_type": "wait_disposition",
+        "job_version": job["version"]+1, "caller_session_id": main.session_id, "request_hash": _hash(payload),
+        "payload_json": _json(payload), "delivery_status": "not_applicable", "created_at": manager.now()})
+    prepared.handled(job["job_id"], decision["event_id"])
     if effect:
-        await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (effect["event_id"],))
-    await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
-    current = await manager._row(tx, job["job_id"])
-    return await read_tx(manager, tx, actor, current, creation, saved, state, required=True)
+        prepared.handled(job["job_id"], effect["event_id"])
+    prepared.change_job(job)
+    prepared.dispositions[key] = proof
+    return proof
 
 
 def reply(row):

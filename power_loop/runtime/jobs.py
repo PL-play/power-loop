@@ -176,6 +176,7 @@ class JobManager:
         self._joined_write = ContextVar("execution_joined_write", default=None)
         self._control_intents = ContextVar("execution_control_intents", default=None)
         self._deferred_model_updates = ContextVar("execution_deferred_model_updates", default=None)
+        self._finalization_preparation = ContextVar("execution_finalization_preparation", default=None)
 
     @asynccontextmanager
     async def _control_transaction(self):
@@ -509,10 +510,13 @@ class JobManager:
         try:
             async with self.joined_write() as tx:
                 record = await self.close_model_execution(actor, lease, evidence=evidence, resource_state=resource_state)
-                if record.parent_job_id or (evidence or {}).get("processing_decisions"):
-                    return record, False
-                finalize = self._finalize_guarded if guarded else self._finalize_unguarded
-                closure = await finalize(tx, actor, lease)
+                from .execution_membership import childless
+                defer_closure = bool(record.parent_job_id or (evidence or {}).get("processing_decisions")
+                    or not childless(self, lease.job_id))
+                closure = None
+                if not defer_closure:
+                    finalize = self._finalize_guarded if guarded else self._finalize_unguarded
+                    closure = await finalize(tx, actor, lease)
                 if closure is None and lease.job_id in deferred:
                     # A legitimate unfinished child keeps supervision open;
                     # the model exit still commits in this same transaction.
@@ -526,7 +530,7 @@ class JobManager:
             self._deferred_model_updates.reset(token)
         if closure is not None:
             self._publish_closure(actor, lease.job_id, lease.generation, closure)
-        return record, True
+        return record, not defer_closure
 
     async def _finalize_unguarded(self, tx, actor, lease):
         from .finalization import finalize

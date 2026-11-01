@@ -168,6 +168,7 @@ async def test_full_supervision_transaction_rolls_back_disposition_and_queue(han
     before_jobs = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} ORDER BY job_id")
     before_events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id")
     before_queue = await c.store.inbox_items(c.sid)
+    fault_hits = []
 
     async def fail(tx, sql, params=()):
         count = await original(tx, sql, params)
@@ -175,10 +176,12 @@ async def test_full_supervision_transaction_rolls_back_disposition_and_queue(han
         if (
             (point == "void" and "SET status='void'" in sql)
             or (point == "input_proof" and inserted == "input_disposition")
-            or (point == "handled" and "SET delivery_status='handled'" in sql)
+            or (point == "handled" and sql.startswith("UPDATE " + c.manager.events + " SET delivery_status=?")
+                and params[0] == "handled")
             or (point == "wait_proof" and inserted == "wait_disposition")
             or (point == "supervision" and inserted == "supervision_closed")
         ):
+            fault_hits.append(point)
             raise OSError("original transaction failed")
         return count
 
@@ -186,6 +189,7 @@ async def test_full_supervision_transaction_rolls_back_disposition_and_queue(han
         patch.setattr(tx_type, "_execute", fail)
         with pytest.raises(OSError, match="original transaction failed"):
             await c.manager.finalize_supervision(c.main, h.registration.job.job_id, generation=0)
+    assert fault_hits == [point]
     assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} ORDER BY job_id") == before_jobs
     assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id") == before_events
     assert await c.store.inbox_items(c.sid) == before_queue

@@ -7,9 +7,21 @@ No model call, host callback, or execution dispatch occurs in this module.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
+from .finalization_plan import PlanChanged as _PlanChanged
+from .finalization_plan import Preparation
 from .jobs import JobError, _hash, _json
 from .result_revisions import result_id
+
+
+@dataclass(frozen=True)
+class _TreeRevision:
+    root_id: str
+    generation: int
+    count: int
+    version_sum: int
+    preparation: Preparation
 
 
 def _identity(manager, kind, values):
@@ -34,6 +46,9 @@ def _object(raw):
 
 
 async def _reference(manager, tx, event_id):
+    prepared = manager._finalization_preparation.get()
+    if prepared is not None and event_id in prepared.events:
+        return _event_reference(prepared.project_event(prepared.events[event_id]))
     from .execution_membership import trusted_ref
     known = trusted_ref(manager, event_id)
     if known is not None:
@@ -41,7 +56,7 @@ async def _reference(manager, tx, event_id):
     event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
     if event is None:
         raise JobError("finalization_evidence_missing")
-    return _event_reference(event)
+    return _event_reference(event if prepared is None else prepared.project_event(event))
 
 
 def _event_reference(event):
@@ -57,6 +72,9 @@ async def _references(manager, tx, event_ids, known=None):
     """
     event_ids = list(event_ids)
     found = {key: known[key] for key in event_ids if known and key in known}
+    prepared = manager._finalization_preparation.get()
+    if prepared is not None:
+        found.update({key: prepared.events[key] for key in event_ids if key in prepared.events})
     missing = [key for key in event_ids if key not in found]
     for offset in range(0, len(missing), 100):
         part = missing[offset:offset + 100]
@@ -65,7 +83,7 @@ async def _references(manager, tx, event_ids, known=None):
         found.update({row["event_id"]: row for row in rows})
     if any(key not in found for key in event_ids):
         raise JobError("finalization_evidence_missing")
-    return [_event_reference(found[key]) for key in event_ids]
+    return [_event_reference(found[key] if prepared is None else prepared.project_event(found[key])) for key in event_ids]
 
 
 async def _closed_event(manager, tx, event, state=None, depth=0):
@@ -422,7 +440,22 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
     return ref
 
 
-async def _publish(manager, tx, plans):
+def _closure_event(manager, row, version, data, ref):
+    return {"event_id": ref["event_id"], "job_id": row["job_id"], "event_type": "supervision_closed",
+        "job_version": version, "request_hash": _hash(data), "payload_json": _json(data),
+        "delivery_status": "not_applicable", "created_at": manager.now()}
+
+
+async def _publish(manager, tx, plans, *, tree=None):
+    # A closed descendant may have resumed without being in `plans`. Guard
+    # the complete tree once, before changing any of its planned projections.
+    if tree is not None:
+        row, version, data, ref = plans[0]
+        if await tx.append_event_if_tree_current(_closure_event(manager, row, version, data, ref), tree) != 1:
+            raise _PlanChanged()
+    prepared = tree.preparation if tree is not None else manager._finalization_preparation.get()
+    if prepared is not None:
+        await prepared.apply(tx)
     for row, version, data, ref in plans:
         status = "model_closed" if row["kind"] == "send" else row["outcome"]
         deferred = manager._deferred_model_updates.get()
@@ -433,29 +466,77 @@ async def _publish(manager, tx, plans):
                 "lease_until_ms=NULL,supervision_status='closed',version=?,updated_at=? "
                 "WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'", (status, resource, version, manager.now(), row["job_id"], previous_version, generation))
         else:
-            changed = await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status=?,supervision_status='closed',version=?,updated_at=? WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'", (status, version, manager.now(), row["job_id"], row["version"], row["generation"]))
+            changed = await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status=?,supervision_status='closed',version=?,updated_at=? WHERE job_id=? AND root_job_id=? AND version=? AND generation=? AND supervision_status='open'", (status, version, manager.now(), row["job_id"], row["root_job_id"], row["version"], row["generation"]))
         if changed != 1:
             raise JobError("finalization_execution_changed")
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (ref["event_id"], row["job_id"], "supervision_closed", version, _hash(data), _json(data), "not_applicable", manager.now()))
+        if tree is None or ref["event_id"] != plans[0][3]["event_id"]:
+            event = _closure_event(manager, row, version, data, ref)
+            await tx.append_event(tuple(event), tuple(event.values()))
+
+
+async def _validate_request(manager, reader, actor, job_id, generation):
+    row = await manager._authorize(reader, actor, job_id)
+    if generation == 0 and row["kind"] not in ("timer", "background_tool"):
+        raise JobError("invalid_result_generation")
+    if generation == 0 and row["kind"] == "background_tool":
+        from .managed_effects import descriptor
+        if await descriptor(manager, reader, row) is None:
+            raise JobError("invalid_result_generation")
+    if row["generation"] != generation:
+        raise JobError("finalization_generation_changed")
+    return row
+
+
+async def _prepare_snapshot(manager, actor, job_id, generation):
+    async with manager._read() as reader:
+        prepared = Preparation(manager, reader)
+        token = manager._finalization_preparation.set(prepared)
+        try:
+            row = await _validate_request(manager, reader, actor, job_id, generation)
+            state = {"done": {}, "visiting": set(), "plans": []}
+            ref = await _prepare(manager, reader, actor, row, generation, state)
+            if not state["plans"]:
+                return ref, [], None
+            root = row["root_job_id"]
+            summary = await reader.fetchone(f"SELECT COUNT(*) AS job_count,COALESCE(SUM(version),0) AS version_sum,"
+                f"MAX(CASE WHEN job_id=? THEN generation END) AS root_generation FROM {manager.jobs} WHERE root_job_id=?",
+                (root, root))
+            tree = _TreeRevision(root, summary["root_generation"], summary["job_count"], summary["version_sum"], prepared)
+            return ref, state["plans"], tree
+        finally:
+            manager._finalization_preparation.reset(token)
+
+
+async def _publish_plan(manager, plans, tree):
+    async with manager._write() as tx:
+        await _publish(manager, tx, plans, tree=tree)
 
 
 async def finalize(manager, actor, job_id, *, generation):
     if type(generation) is not int or not 0 <= generation < 2**63:
         raise JobError("invalid_result_generation")
-    async with manager._write() as tx:
-        row = await manager._authorize(tx, actor, job_id)
-        if generation == 0 and row["kind"] not in ("timer", "background_tool"):
-            raise JobError("invalid_result_generation")
-        if generation == 0 and row["kind"] == "background_tool":
-            from .managed_effects import descriptor
-            if await descriptor(manager, tx, row) is None:
-                raise JobError("invalid_result_generation")
-        if row["generation"] != generation:
-            raise JobError("finalization_generation_changed")
-        state = {"done": {}, "visiting": set(), "plans": []}
-        ref = await _prepare(manager, tx, actor, row, generation, state)
-        await _publish(manager, tx, state["plans"])
-        return ref
+    joined = manager._joined_write.get()
+    if joined is not None:
+        # The live childless send closes using its own transaction-local facts.
+        # A tree with descendants is deferred until after its model exit commits.
+        prepared = Preparation(manager, joined)
+        token = manager._finalization_preparation.set(prepared)
+        try:
+            row = await _validate_request(manager, joined, actor, job_id, generation)
+            state = {"done": {}, "visiting": set(), "plans": []}
+            ref = await _prepare(manager, joined, actor, row, generation, state)
+            await _publish(manager, joined, state["plans"])
+            return ref
+        finally:
+            manager._finalization_preparation.reset(token)
+    while True:
+        try:
+            ref, plans, tree = await _prepare_snapshot(manager, actor, job_id, generation)
+            if plans:
+                await _publish_plan(manager, plans, tree)
+            return ref
+        except _PlanChanged:
+            continue
 
 
 async def consume_node(runtime, workflow, node, result):
