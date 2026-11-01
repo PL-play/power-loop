@@ -761,10 +761,11 @@ async def test_raw_index_and_observation_are_atomic_and_lost_ack_is_queryable(
 
 
 async def test_protocol_seven_original_pending_receipt_can_be_upgraded_and_reindexed_without_execution(registry_store):
-    from power_loop.runtime import jobs
     from power_loop.runtime.managed_effects import _id, read_raw_receipt, reconcile_raw_receipt
     from power_loop.runtime.store import task_schema
     from power_loop.runtime.store.schema import StoreSchemaError
+
+    from ._pre_memory_protocol_fixture import reopen_after_maintenance, retain_pre_memory_format
 
     c = await scenario(registry_store, budgeted=True, pending=True)
     [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
@@ -774,10 +775,11 @@ async def test_protocol_seven_original_pending_receipt_can_be_upgraded_and_reind
     await c.manager.db.execute(
         f"DELETE FROM {c.manager.events} WHERE event_id=?", (_id(c.manager, "raw_receipt", job["job_id"], 0),)
     )
-    await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_store SET protocol_version=7 WHERE id=1")
+    await retain_pre_memory_format(c, 7)
     with pytest.raises(StoreSchemaError):
         await task_schema.verify_task_schema(c.manager.db, c.manager.prefix)
     await task_schema.migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
+    await reopen_after_maintenance(c, registry_store[1])
     after = await reconcile_raw_receipt(c.manager, c.actor, job["job_id"])
     assert after["call_ref"] == before["call_ref"] and after["receipt_ref"] == before["receipt_ref"]
     assert not after["acknowledges_result"]
@@ -786,7 +788,7 @@ async def test_protocol_seven_original_pending_receipt_can_be_upgraded_and_reind
     await reconcile(c.runtime, c.actor, job["job_id"], c.adapter)
     await c.manager.finalize_supervision(c.actor, job["job_id"], generation=1)
     assert (await c.manager.get_job(c.actor, job["job_id"])).supervision_status == "closed"
-    assert jobs.TASK_PROTOCOL_VERSION == 22
+    assert (await c.manager.db.fetchone(f"SELECT protocol_version FROM {c.manager.prefix}task_store"))["protocol_version"] == task_schema.TASK_PROTOCOL_VERSION
 
 
 async def test_claim_membership_survives_lost_ack_and_cannot_be_relabelled_unclaimed(registry_store):

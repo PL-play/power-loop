@@ -211,6 +211,8 @@ async def test_retained_protocol_thirteen_per_item_notices_keep_their_original_r
     from power_loop.runtime.managed_effects import terminate_unstarted
     from power_loop.runtime.store.schema import StoreSchemaError
     from power_loop.runtime.store.task_schema import migrate_task_schema, verify_task_schema
+
+    from ._pre_memory_protocol_fixture import reopen_after_maintenance, retain_pre_memory_format
     c, source = await pending_batch(registry_store, stage='commit_ack')
     loop, model = await controller(c)
     try:
@@ -219,16 +221,23 @@ async def test_retained_protocol_thirteen_per_item_notices_keep_their_original_r
             await terminate_unstarted(c.manager, c.actor, child['job_id'])
             await enqueue(loop, c.actor, child['job_id'])
         old_disposition = await retire_pending(loop, c.actor, source['job_id'])
+        assert model.calls == 0
+        await loop.aclose(drain_timeout_s=.1)
+        await retain_pre_memory_format(c, 13)
         events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
         raw = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq')
-        await c.manager.db.execute(f'UPDATE {c.manager.prefix}task_store SET protocol_version=13 WHERE id=1')
         with pytest.raises(StoreSchemaError):
             await verify_task_schema(c.manager.db, c.manager.prefix)
         with pytest.raises(StoreSchemaError, match='maintenance_required'):
             await migrate_task_schema(c.manager.db, c.manager.prefix)
         await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == events
+        # The new journal adds import bookkeeping; every original event,
+        # including the two per-item notices, must remain byte-for-byte intact.
+        for event in events:
+            assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (event['event_id'],)) == event
         assert await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq') == raw
+        await reopen_after_maintenance(c, registry_store[1])
+        loop, model = await controller(c)
         assert JobManager(c.store).store.store_id == c.manager.store.store_id
         staged = await reconcile_pending(loop, c.actor, source['job_id'])
         assert len(staged['notices']) == 2 and staged.get('mode') != 'retired_for_abort_review'

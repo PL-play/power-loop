@@ -10,6 +10,8 @@ from power_loop.runtime.store.task_schema import migrate_task_schema, verify_tas
 from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_managed_effects_192 import scenario
 
+from ._pre_memory_protocol_fixture import reopen_after_maintenance, retain_pre_memory_format
+
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 __all__ = ['registry_store']
 
@@ -26,10 +28,11 @@ async def test_legacy_protocol_eight_exit_is_readable_but_cannot_invent_a_comple
     for kind in ['completion', 'result_recovery']:
         await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (_id(c.manager, kind, row['job_id'], 1),))
     original = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq')
-    await c.manager.db.execute(f'UPDATE {c.manager.prefix}task_store SET protocol_version=8 WHERE id=1')
+    await retain_pre_memory_format(c, 8)
     with pytest.raises(StoreSchemaError):
         await verify_task_schema(c.manager.db, c.manager.prefix)
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
+    await reopen_after_maintenance(c, registry_store[1])
     with pytest.raises(JobError, match='checkpoint_unavailable'):
         await restore_result(c.manager, c.actor, row['job_id'])
     c.state.resolved = True
