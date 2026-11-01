@@ -297,13 +297,19 @@ async def reserve(attempt, logical_request, *, service=None, pricing=None):
     plan = BudgetPlan(supplied.token_bound, supplied.request)
     if (tool and plan.token_bound != 0) or (not tool and (logical_request.max_tokens is None or plan.token_bound < logical_request.max_tokens)):
         raise JobError("budget_request_bound_missing")
-    allocation_id = await allocate(binding, plan.token_bound, attempt.attempt_id)
-    state = dict(version=0, attempt_id=attempt.attempt_id, job_id=binding.lease.job_id,
-        policy_key=policy["policy_key"], context=context, plan=asdict(plan), plan_hash=plan.request_hash,
-        phase="host_reserving", pending=True, started_at_ms=binding.runtime.manager.now(),
-        host_intent=True, grant=None, observation=None, submission=None, ack=None,
-        allocation_id=allocation_id, scopes=binding.resource_evidence["_control_budget_scopes"])
-    save(binding, state)
+    async with binding.resource_evidence.setdefault("_budget_prepare_lock", asyncio.Lock()):
+        # Metadata preparation yielded to other local tasks. A non-dispatch
+        # proof may have won while it was in flight. Allocation and publishing
+        # host intent must then form one local choice against that closer.
+        if control.get("budget", attempt.attempt_id) is not None:
+            raise JobError("budget_attempt_already_reserved")
+        allocation_id = await allocate(binding, plan.token_bound, attempt.attempt_id)
+        state = dict(version=0, attempt_id=attempt.attempt_id, job_id=binding.lease.job_id,
+            policy_key=policy["policy_key"], context=context, plan=asdict(plan), plan_hash=plan.request_hash,
+            phase="host_reserving", pending=True, started_at_ms=binding.runtime.manager.now(),
+            host_intent=True, grant=None, observation=None, submission=None, ack=None,
+            allocation_id=allocation_id, scopes=binding.resource_evidence["_control_budget_scopes"])
+        save(binding, state)
     try:
         try:
             grant = await budgets._port(attempt, "reserve", lambda: provider.reserve(plan))
@@ -406,24 +412,25 @@ async def close_unreserved(attempt):
     """The original stack can prove it never even requested a host grant."""
     from .model_budgets import _context
     binding, control = attempt.binding, current(attempt.binding)
-    policy = check(binding)
-    saved = control.get("attempt", attempt.attempt_id)
-    if saved is None or saved["prepared"] != attempt.prepared:
-        raise JobError("budget_release_requires_original_owner")
-    state = control.get("budget", attempt.attempt_id)
-    if state is not None:
-        return state["ack"] if state["phase"] == "released" else None
-    if saved["phase"] != "prepared":
-        raise JobError("budget_release_not_permitted")
-    ack = {"local_only": True, "dispatch_not_authorized": True, "no_reservation": True}
-    if policy is not None:
-        state = dict(version=0, attempt_id=attempt.attempt_id, job_id=binding.lease.job_id,
-            policy_key=policy["policy_key"], context=_context(attempt, source(binding)),
-            plan=None, plan_hash=None, phase="released", pending=False, started_at_ms=binding.runtime.manager.now(),
-            host_intent=False, grant=None, observation=None, submission=None, ack=ack, scopes=[])
-        save(binding, state)
-    control.abort_prepared(attempt.attempt_id)
-    return ack
+    async with binding.resource_evidence.setdefault("_budget_prepare_lock", asyncio.Lock()):
+        policy = check(binding)
+        saved = control.get("attempt", attempt.attempt_id)
+        if saved is None or saved["prepared"] != attempt.prepared:
+            raise JobError("budget_release_requires_original_owner")
+        state = control.get("budget", attempt.attempt_id)
+        if state is not None:
+            return state["ack"] if state["phase"] == "released" else None
+        if saved["phase"] != "prepared":
+            raise JobError("budget_release_not_permitted")
+        ack = {"local_only": True, "dispatch_not_authorized": True, "no_reservation": True}
+        if policy is not None:
+            state = dict(version=0, attempt_id=attempt.attempt_id, job_id=binding.lease.job_id,
+                policy_key=policy["policy_key"], context=_context(attempt, source(binding)),
+                plan=None, plan_hash=None, phase="released", pending=False, started_at_ms=binding.runtime.manager.now(),
+                host_intent=False, grant=None, observation=None, submission=None, ack=ack, scopes=[])
+            save(binding, state)
+        control.abort_prepared(attempt.attempt_id)
+        return ack
 
 
 async def release_unstarted(attempt):
