@@ -12,6 +12,7 @@ from collections import deque
 from .jobs import KINDS, JobError, _hash, _json
 from .message_ref import integer_id
 from .result_revisions import result_id
+from .session_controls import ControlReadView
 
 _SCAN_LIMIT = 5000
 _OUTCOMES = frozenset({"succeeded", "failed", "cancelled", "timed_out", "budget_exceeded", "interrupted"})
@@ -232,67 +233,67 @@ async def list_jobs(manager, actor, *, root_job_id=None, scope="descendants", st
     page = _decode(cursor) if cursor is not None else None
     if page and page["query"] != query:
         raise JobError("query_cursor_mismatch")
-    async with manager._write() as tx:
-        if scope == "self":
-            row = await manager._authorize(tx, actor, root_job_id)
-            rows, depths, tree_truncated = {root_job_id: row}, {root_job_id: 0}, False
-        else:
-            rows, depths, tree_truncated = await _forest(manager, tx, actor, root_job_id, max_depth,
-                tuple(page["upper"]) if page else None)
-        membership = _hash(sorted((r["job_id"], r["parent_job_id"]) for r in rows.values()))
-        if page and page["membership"] != membership:
-            # Random job IDs are not an insertion sequence. A same-millisecond
-            # insert below the saved upper key must not silently enter a page.
-            raise JobError("query_snapshot_changed")
-        upper = tuple(page["upper"]) if page else max((_key(r) for r in rows.values()), default=(0, "empty"))
-        snapshot = page["snapshot_at"] if page else manager.now()
-        matches, processing_views = [], {}
-        for row in rows.values():
-            if root_job_id is not None and (row["job_id"] == root_job_id) != (scope == "self"):
-                continue
-            if (kinds is not None and row["kind"] not in kinds) or (page and _key(row) <= tuple(page["after"])):
-                continue
-            if (created_after is not None and row["created_at"] < created_after) or (created_before is not None and row["created_at"] > created_before):
-                continue
-            processing_views[row['job_id']] = await _processing_view(manager, tx, row)
-            if ((status == "active" and not active_reasons(row, processing=processing_views[row['job_id']])) or (status == "terminal" and row["outcome"] is None) or
-                    (isinstance(status, list) and row["status"] not in status)):
-                continue
-            matches.append(row)
-        matches.sort(key=_key)
-        envelope = {"version": 1, "snapshot_at": snapshot, "observed_at": manager.now(),
-            "root": {"job_id": root_job_id, "session_id": actor.session_id}, "nodes": [], "matched_count": 0,
-            "tree_truncated": tree_truncated, "truncated": tree_truncated or bool(matches), "next_cursor": None}
-        selected = set()
-        for index, row in enumerate(matches[:limit]):
-            additions = {}
-            parent = row["parent_job_id"]
-            while parent in rows and parent not in selected:
-                additions[parent] = _summary(rows[parent], context=True)
-                parent = rows[parent]["parent_job_id"]
-            additions[row["job_id"]] = {**_summary(row, processing=processing_views[row['job_id']]), **await _index(manager, tx, row)}
-            combined = {n["job_id"]: n for n in envelope["nodes"]}
-            for jid, node in additions.items():
-                if jid not in combined or not node["context_only"]:
-                    combined[jid] = node
-            candidate = {**envelope, "nodes": sorted(combined.values(), key=lambda n: (depths[n["job_id"]], _key(rows[n["job_id"]]))),
-                "matched_count": index + 1, "truncated": tree_truncated or index + 1 < len(matches),
-                "next_cursor": _cursor(query, upper, _key(row), snapshot, membership) if index + 1 < len(matches) else None}
-            if len(_json(candidate)) > max_chars:
-                if not envelope["matched_count"]:
-                    raise JobError("query_result_too_small")
-                break
-            envelope = candidate
-            selected.add(row["job_id"])
-        return envelope
+    tx = ControlReadView(manager.db, manager)
+    if scope == "self":
+        row = await manager._authorize(tx, actor, root_job_id)
+        rows, depths, tree_truncated = {root_job_id: row}, {root_job_id: 0}, False
+    else:
+        rows, depths, tree_truncated = await _forest(manager, tx, actor, root_job_id, max_depth,
+            tuple(page["upper"]) if page else None)
+    membership = _hash(sorted((r["job_id"], r["parent_job_id"]) for r in rows.values()))
+    if page and page["membership"] != membership:
+        # Random job IDs are not an insertion sequence. A same-millisecond
+        # insert below the saved upper key must not silently enter a page.
+        raise JobError("query_snapshot_changed")
+    upper = tuple(page["upper"]) if page else max((_key(r) for r in rows.values()), default=(0, "empty"))
+    snapshot = page["snapshot_at"] if page else manager.now()
+    matches, processing_views = [], {}
+    for row in rows.values():
+        if root_job_id is not None and (row["job_id"] == root_job_id) != (scope == "self"):
+            continue
+        if (kinds is not None and row["kind"] not in kinds) or (page and _key(row) <= tuple(page["after"])):
+            continue
+        if (created_after is not None and row["created_at"] < created_after) or (created_before is not None and row["created_at"] > created_before):
+            continue
+        processing_views[row['job_id']] = await _processing_view(manager, tx, row)
+        if ((status == "active" and not active_reasons(row, processing=processing_views[row['job_id']])) or (status == "terminal" and row["outcome"] is None) or
+                (isinstance(status, list) and row["status"] not in status)):
+            continue
+        matches.append(row)
+    matches.sort(key=_key)
+    envelope = {"version": 1, "snapshot_at": snapshot, "observed_at": manager.now(),
+        "root": {"job_id": root_job_id, "session_id": actor.session_id}, "nodes": [], "matched_count": 0,
+        "tree_truncated": tree_truncated, "truncated": tree_truncated or bool(matches), "next_cursor": None}
+    selected = set()
+    for index, row in enumerate(matches[:limit]):
+        additions = {}
+        parent = row["parent_job_id"]
+        while parent in rows and parent not in selected:
+            additions[parent] = _summary(rows[parent], context=True)
+            parent = rows[parent]["parent_job_id"]
+        additions[row["job_id"]] = {**_summary(row, processing=processing_views[row['job_id']]), **await _index(manager, tx, row)}
+        combined = {n["job_id"]: n for n in envelope["nodes"]}
+        for jid, node in additions.items():
+            if jid not in combined or not node["context_only"]:
+                combined[jid] = node
+        candidate = {**envelope, "nodes": sorted(combined.values(), key=lambda n: (depths[n["job_id"]], _key(rows[n["job_id"]]))),
+            "matched_count": index + 1, "truncated": tree_truncated or index + 1 < len(matches),
+            "next_cursor": _cursor(query, upper, _key(row), snapshot, membership) if index + 1 < len(matches) else None}
+        if len(_json(candidate)) > max_chars:
+            if not envelope["matched_count"]:
+                raise JobError("query_result_too_small")
+            break
+        envelope = candidate
+        selected.add(row["job_id"])
+    return envelope
 
 
 async def get_job(manager, actor, job_id, *, max_chars=8000):
     """A current saved summary and references, never execution control secrets."""
     _int(max_chars, "max_chars", 1024, 32000)
-    async with manager._write() as tx:
-        row = await manager._authorize(tx, actor, job_id)
-        output = {"version": 1, "observed_at": manager.now(), "node": {**_summary(row, processing=await _processing_view(manager, tx, row)), **await _index(manager, tx, row)}}
-        if len(_json(output)) > max_chars:
-            raise JobError("query_result_too_small")
-        return output
+    tx = ControlReadView(manager.db, manager)
+    row = await manager._authorize(tx, actor, job_id)
+    output = {"version": 1, "observed_at": manager.now(), "node": {**_summary(row, processing=await _processing_view(manager, tx, row)), **await _index(manager, tx, row)}}
+    if len(_json(output)) > max_chars:
+        raise JobError("query_result_too_small")
+    return output
