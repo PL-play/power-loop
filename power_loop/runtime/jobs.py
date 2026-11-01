@@ -1138,6 +1138,13 @@ class JobManager:
         return await self._bind_receipt(actor, operation_id, receipt_ref)
 
     async def _bind_receipt(self, actor, operation_id, receipt_ref, *, caller=None):
+        if caller is not None:
+            # The live API checks its caller before attaching a historical raw
+            # fact. Binding that fact grants no execution or dispatch authority.
+            async with self._read() as reader:
+                caller_row = await self._fence(reader, actor, caller)
+                if (caller_row["session_id"] or caller_row["created_by_session_id"]) != actor.session_id:
+                    raise JobError("caller_is_not_executing_parent")
         async with self._write() as tx:
             op = await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=? AND event_type='operation'", (operation_id,))
             if op is None:
@@ -1145,10 +1152,6 @@ class JobManager:
             target = await self._authorize(tx, actor, op["job_id"])
             from . import managed_effects
             effect = target["kind"] == "background_tool" and await managed_effects.descriptor(self, tx, target) is not None
-            if caller is not None:
-                caller_row = await self._fence(tx, actor, caller)
-                if (caller_row["session_id"] or caller_row["created_by_session_id"]) != actor.session_id:
-                    raise JobError("caller_is_not_executing_parent")
             row = await self._validate_ref(tx, actor, receipt_ref, role="tool", metadata_only=effect)
             call = json.loads(op["call_ref_json"]) if op["call_ref_json"] else None
             if (not call or op["caller_session_id"] != actor.session_id or

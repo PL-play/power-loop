@@ -196,6 +196,8 @@ async def test_full_result_chunks_are_bounded_and_reconstruct_original_json(even
 @pytest.mark.parametrize("fault", ["existing", "outside", "small_receipt", "partial", "authority", "scope_change", "revision_changed"])
 async def test_export_revalidates_and_cleans_failures_without_overwriting(events_case, monkeypatch, fault):
     c = events_case
+    before_job = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.job,))
+    before_event = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (c.result,))
     target = c.workspace/"events.jsonl"
     options = {"view": "results", "output_file": "events.jsonl"}
     if fault == "existing":
@@ -224,6 +226,15 @@ async def test_export_revalidates_and_cleans_failures_without_overwriting(events
     assert "error" in result and "SECRET" not in str(result)
     assert not list(c.workspace.rglob(".recall-*"))
     assert target.read_text() == "KEEP" if fault == "existing" else not target.exists()
+    if fault in ("authority", "scope_change"):
+        field = "principal_id" if fault == "authority" else "created_by_session_id"
+        assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.job,)) == {
+            **before_job, field: "foreign"}
+        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET {field}=? WHERE job_id=?", (before_job[field], c.job))
+    elif fault == "revision_changed":
+        assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (c.result,)) == {
+            **before_event, "job_version": before_event["job_version"] + 1}
+        await c.manager.db.execute(f"UPDATE {c.manager.events} SET job_version=? WHERE event_id=?", (before_event["job_version"], c.result))
 
 
 @pytest.mark.parametrize("which", ["call", "receipt", "both"])
@@ -286,7 +297,10 @@ async def test_cancelled_unstarted_result_preserves_generation_zero(events_case)
 @pytest.mark.parametrize("fault", ["list", "generation", "missing_result", "malformed_id", "bad_call"])
 async def test_corrupt_event_fields_do_not_expose_control_payload(events_case, fault):
     c = events_case
+    identity = c.stop if fault == "bad_call" else c.result
+    before = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (identity,))
     if fault == "bad_call":
+        field, value = "tool_call_id", None
         await c.manager.db.execute(f"UPDATE {c.manager.events} SET tool_call_id=NULL WHERE event_id=?", (c.stop,))
         result = await tool(c, view="operations")
     else:
@@ -299,12 +313,18 @@ async def test_corrupt_event_fields_do_not_expose_control_payload(events_case, f
         elif fault == "missing_result":
             payload.pop("result")
         if fault == "malformed_id":
+            field, value = "event_id", "malformed-result"
             await c.manager.db.execute(f"UPDATE {c.manager.events} SET event_id='malformed-result' WHERE event_id=?", (c.result,))
             result = await tool(c, view="results")
         else:
+            field, value = "payload_json", json.dumps(payload)
             await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?", (json.dumps(payload), c.result))
             result = await tool(c, view="results", event_id=c.result)
     assert "error" in result and "SECRET" not in str(result)
+    mutated_id = value if field == "event_id" else identity
+    assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (mutated_id,)) == {
+        **before, field: value}
+    await c.manager.db.execute(f"UPDATE {c.manager.events} SET {field}=? WHERE event_id=?", (before[field], mutated_id))
 
 
 async def test_newer_operations_do_not_enter_an_existing_page(events_case):

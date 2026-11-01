@@ -136,7 +136,7 @@ async def test_untrusted_or_missing_delivery_evidence_cannot_be_queued_again(pen
     c, row, loop, model = pending_review
     key = identity(c.manager, row)
     if part in ('notice_hash', 'notice_lease'):
-        notice = await c.manager.db.fetchone(f'SELECT payload_json FROM {c.manager.events} WHERE event_id=?', (key,))
+        notice = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (key,))
         value = json.loads(notice['payload_json'])
         if part == 'notice_lease':
             value['lease']['generation'] = 2
@@ -144,8 +144,10 @@ async def test_untrusted_or_missing_delivery_evidence_cannot_be_queued_again(pen
             value['message_hash'] = 'f' * 64
         await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?', (_json(value), _hash(value), key))
     elif part == 'root_role':
+        session = await c.manager.db.fetchone(f'SELECT * FROM {c.store.t.sessions} WHERE session_id=?', (c.sid,))
         await c.manager.db.execute(f'UPDATE {c.store.t.sessions} SET metadata_json=? WHERE session_id=?', (_json({'execution_role': 'subagent'}), c.sid))
     elif part == 'root_session':
+        root = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (row['root_job_id'],))
         other = await c.store.create_session()
         await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET session_id=?,created_by_session_id=? WHERE job_id=?', (other, other, row['root_job_id']))
     elif part == 'inbox_missing':
@@ -155,7 +157,8 @@ async def test_untrusted_or_missing_delivery_evidence_cannot_be_queued_again(pen
         await c.manager.db.execute(f'UPDATE {c.store.t.follow_up_queue} SET {column}=? WHERE item_id=?', (value, key))
     else:
         from power_loop.runtime.result_revisions import result_id
-        saved = await c.manager.db.fetchone(f'SELECT payload_json FROM {c.manager.events} WHERE event_id=?', (result_id(row['job_id'], 1),))
+        saved = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (result_id(row['job_id'], 1),))
+        target = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (row['job_id'],))
         value = json.loads(saved['payload_json'])
         value['result']['display'] = 'invented canonical result'
         await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (_json(value), result_id(row['job_id'], 1)))
@@ -163,6 +166,27 @@ async def test_untrusted_or_missing_delivery_evidence_cannot_be_queued_again(pen
     with pytest.raises(JobError):
         await enqueue(loop, c.actor, row['job_id'])
     assert model.calls == 0 and c.state.dispatched == c.state.prepared == c.model.calls == 1
+    if part in ('notice_hash', 'notice_lease'):
+        assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (key,)) == {
+            **notice, 'payload_json': _json(value), 'request_hash': _hash(value)}
+        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?',
+            (notice['payload_json'], notice['request_hash'], key))
+    elif part == 'root_role':
+        assert await c.manager.db.fetchone(f'SELECT * FROM {c.store.t.sessions} WHERE session_id=?', (c.sid,)) == {
+            **session, 'metadata_json': _json({'execution_role': 'subagent'})}
+        await c.manager.db.execute(f'UPDATE {c.store.t.sessions} SET metadata_json=? WHERE session_id=?', (session['metadata_json'], c.sid))
+    elif part == 'root_session':
+        assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (row['root_job_id'],)) == {
+            **root, 'session_id': other, 'created_by_session_id': other}
+        await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET session_id=?,created_by_session_id=? WHERE job_id=?',
+            (root['session_id'], root['created_by_session_id'], row['root_job_id']))
+    elif part == 'canonical_result':
+        assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (saved['event_id'],)) == {
+            **saved, 'payload_json': _json(value)}
+        assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (row['job_id'],)) == {
+            **target, 'result_json': _json(value['result'])}
+        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (saved['payload_json'], saved['event_id']))
+        await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET result_json=? WHERE job_id=?', (target['result_json'], row['job_id']))
 
 
 @pytest.mark.parametrize('part', ['delivered_message', 'decision', 'snapshot', 'model_closed', 'response'])
@@ -174,21 +198,42 @@ async def test_closed_resolution_revalidates_actual_handling_evidence(pending_re
     c, row, loop, model = pending_review
     await loop.send('Read and handle the original result without repeating work.', c.sid)
     await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
-    [decision] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE job_id=? AND event_type='processing_decision'", (row['job_id'],))
+    from power_loop.runtime.result_revisions import result_id
+    candidates = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='processing_decision'")
+    [decision] = [event for event in candidates if json.loads(event['payload_json'])['event']['event_id'] == result_id(row['job_id'], 1)]
     value = json.loads(decision['payload_json'])
+    assert decision['job_id'] == value['handler_job_id'] and decision['job_id'] != row['job_id']
+    table, key_name = c.manager.events, 'event_id'
     if part == 'delivered_message':
+        table, key_name = c.store.t.messages, 'id'
+        original = await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE session_id=? AND seq=?', (c.sid, value['event']['delivered_seq']))
         await c.manager.db.execute(f'DELETE FROM {c.store.t.messages} WHERE session_id=? AND seq=?', (c.sid, value['event']['delivered_seq']))
     elif part == 'decision':
         value['event']['managed_delivery']['payload_hash'] = 'f' * 64
         await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (_json(value), decision['event_id']))
     elif part == 'snapshot':
+        original = await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE event_id=?', (value['snapshot_id'],))
         await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (value['snapshot_id'],))
     elif part == 'response':
+        table, key_name = c.store.t.messages, 'id'
+        original = await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE id=?', (int(value['response_ref']['id']),))
         await c.manager.db.execute(f'DELETE FROM {c.store.t.messages} WHERE id=?', (int(value['response_ref']['id']),))
     else:
+        original = await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE event_id=?', ('model_closed_' + value['handler_job_id'],))
         await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', ('model_closed_' + value['handler_job_id'],))
     with pytest.raises(JobError):
         await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
+    assert c.state.dispatched == c.model.calls == model.calls == 1
+    if part == 'decision':
+        assert await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE event_id=?', (decision['event_id'],)) == {
+            **decision, 'payload_json': _json(value)}
+        await c.manager.db.execute(f'UPDATE {table} SET payload_json=? WHERE event_id=?', (decision['payload_json'], decision['event_id']))
+    else:
+        assert original is not None
+        assert await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE {key_name}=?', (original[key_name],)) is None
+        columns = tuple(original)
+        await c.manager.db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", tuple(original.values()))
+    await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
     assert c.state.dispatched == c.model.calls == model.calls == 1
 
 
@@ -278,6 +323,10 @@ async def test_local_hint_failure_does_not_lose_or_repeat_a_durable_outcome(pend
 
 
 async def test_processing_commit_ack_loss_recalls_same_decision_and_does_not_repeat_effect(pending_review):
+    import json
+
+    from power_loop.runtime.result_revisions import result_id
+
     c, row, loop, model = pending_review
     commit = c.manager.commit_processing_decision
     fired = []
@@ -292,6 +341,11 @@ async def test_processing_commit_ack_loss_recalls_same_decision_and_does_not_rep
     c.manager.commit_processing_decision = lose_ack
     result = await loop.send('Handle the known result once.', c.sid)
     assert result.status == 'completed'
+    assert fired == [True]
     assert (await c.manager.get_job(c.actor, row['job_id'])).supervision_status == 'closed'
-    assert len(await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='processing_decision'", (row['job_id'],))) == 1
+    candidates = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='processing_decision'")
+    [decision] = [event for event in candidates if json.loads(event['payload_json'])['event']['event_id'] == result_id(row['job_id'], 1)]
+    value = json.loads(decision['payload_json'])
+    assert decision['job_id'] == value['handler_job_id'] and decision['job_id'] != row['job_id']
+    assert len(await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='processing_decision'", (value['handler_job_id'],))) == 1
     assert model.calls == c.state.dispatched == c.model.calls == 1 and c.host.reserve_calls == 2
