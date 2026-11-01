@@ -149,11 +149,46 @@ async def _inbox(manager, tx, receipt):
 
 
 async def enqueue_notification(loop, actor, event_id):
-    """Commit one root inbox row and receipt; a local hint never starts a model."""
+    """Prepare historical main sources before this timer's inbox publication."""
     runtime = getattr(loop, "task_runtime", None)
     if runtime is None or runtime.actor(actor.session_id) != actor:
         raise JobError("task_runtime_required")
     manager = runtime.manager
+    from .finalization_plan import PlanChanged
+    from .wait_decisions import prepared_sources
+
+    while True:
+        with prepared_sources() as proofs:
+            async with manager._read() as reader:
+                job,_,_,receipt = await notification(manager,reader,actor,event_id,required=False)
+                if receipt is not None:
+                    inbox = await _inbox(manager,reader,receipt)
+                    result = _reply(actor,event_id,job,receipt,inbox)
+            if receipt is not None:
+                _hint(loop,inbox,receipt)
+                return result
+            proofs.publishing = True
+            try:
+                return await _publish_notification(manager,loop,actor,event_id)
+            except PlanChanged:
+                continue
+
+
+def _reply(actor,event_id,job,receipt,inbox):
+    return {'notification_id':receipt['item_id'],'event_id':event_id,'wait_job_id':job['job_id'],
+        'main_session_id':actor.session_id,'status':'enqueued','inbox_status':inbox['status'],'execution_authority':False}
+
+
+def _hint(loop,inbox,receipt):
+    if inbox['status']=='pending':
+        try:
+            loop._note_committed_inbox(receipt['main_session_id'])
+        except Exception:
+            _LOG.exception('wait notification is durably queued;local hint failed:%s',receipt['item_id'])
+
+
+async def _publish_notification(manager,loop,actor,event_id):
+    """Fresh eligibility and its own inbox/original/index writes commit together."""
     async with manager._write() as tx:
         job, event, saved, receipt = await notification(manager, tx, actor, event_id, required=False)
         if receipt is None:
@@ -176,19 +211,20 @@ async def enqueue_notification(loop, actor, event_id):
             await manager.store.signal_changes(tx, actor.session_id, "inbox")
             await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
                 (actor.session_id, key, "wait_handoff", "queue", "pending", message, manager.now()))
-            await _inbox(manager, tx, receipt)
             version = job["version"] + 1
             await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job["job_id"], "wait_notification", version, actor.session_id, _hash(receipt), _json(receipt), "delivered", manager.now()))
-            await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=?,updated_at=? WHERE job_id=?", (version, manager.now(), job["job_id"]))
+            changed = await tx.write_job(job['job_id'],f"UPDATE {manager.jobs} SET version=?,updated_at=? "
+                'WHERE job_id=? AND root_job_id=? AND generation=? AND version=?',
+                (version,manager.now(),job['job_id'],job['root_job_id'],job['generation'],job['version']))
+            if changed!=1:
+                from .finalization_plan import PlanChanged
+                raise PlanChanged()
             await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='delivered' WHERE event_id=?", (event_id,))
-        inbox = await _inbox(manager, tx, receipt)
-        result = {"notification_id": receipt["item_id"], "event_id": event_id, "wait_job_id": job["job_id"],
-            "main_session_id": actor.session_id, "status": "enqueued", "inbox_status": inbox["status"], "execution_authority": False}
-    if inbox["status"] == "pending":
-        try:
-            loop._note_committed_inbox(actor.session_id)
-        except Exception:
-            _LOG.exception("wait notification is durably queued; local hint failed: %s", receipt["item_id"])
+            inbox = {'status':'pending'}
+        else:
+            inbox = await _inbox(manager,tx,receipt)
+        result = _reply(actor,event_id,job,receipt,inbox)
+    _hint(loop,inbox,receipt)
     return result
 
 
