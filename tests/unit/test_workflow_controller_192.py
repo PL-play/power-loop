@@ -168,7 +168,7 @@ async def test_partial_driver_binding_rolls_back_and_retry_is_exactly_once(unbou
     @asynccontextmanager
     async def broken():
         async with write() as tx:
-            execute = tx.execute
+            execute = tx._execute
             async def fail(sql, params=()):
                 value = await execute(sql, params)
                 if (point == "update" and sql.startswith("UPDATE "+c.manager.jobs) or
@@ -178,7 +178,7 @@ async def test_partial_driver_binding_rolls_back_and_retry_is_exactly_once(unbou
                     raise RuntimeError("controller transaction fault")
                 return value
             with monkeypatch.context() as patch:
-                patch.setattr(tx, "execute", fail)
+                patch.setattr(tx, "_execute", fail)
                 yield tx
     saved = await c.manager.get_job(c.actor, c.proof.job_id)
     before = await rows(c)
@@ -333,7 +333,7 @@ async def test_new_workflow_generation_cannot_borrow_old_controller_or_create_pe
     from power_loop.runtime.execution_membership import start
     # Storage-only fixture; no runtime resume, model, or new execution license.
     async with c.manager._write() as tx:
-        await tx.execute(f"UPDATE {c.manager.jobs} SET generation=2 WHERE job_id=?", (c.proof.job_id,))
+        await tx.write_job(c.proof.job_id, f"UPDATE {c.manager.jobs} SET generation=2 WHERE job_id=?", (c.proof.job_id,))
         row = await c.manager._row(tx, c.proof.job_id)
         await start(c.manager, tx, row)
     proof = replace(c.proof, generation=2)
@@ -350,7 +350,7 @@ async def test_new_workflow_generation_cannot_borrow_old_controller_or_create_pe
         with pytest.raises(JobError, match="workflow_restore_execution_mismatch"):
             await controller.expected(c.manager, tx, row, 2, c.sid)
         data = {**old, "workflow": asdict(proof)}
-        await tx.execute(f"INSERT INTO {c.manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        await tx.append_event(('event_id','job_id','event_type','job_version','request_hash','payload_json','delivery_status','created_at'),
             (controller.event_id(c.manager, c.proof.job_id, 2), c.proof.job_id, "workflow_controller", row["version"], _hash(data), json.dumps(data), "not_applicable", c.manager.now()))
     with pytest.raises(JobError, match="workflow_restore_execution_mismatch"):
         await c.manager.get_workflow_controller(c.actor, c.proof.job_id, 2)

@@ -160,13 +160,13 @@ async def test_atomic_close_failure_rolls_back_view_and_receipt(managed_workflow
     @asynccontextmanager
     async def broken():
         async with write() as tx:
-            execute = tx.execute
+            execute = tx._execute
             async def fail(sql, params=()):
                 if sql.startswith("INSERT") and "supervision_closed" in params:
                     raise RuntimeError("test: after view CAS before closure receipt")
                 return await execute(sql, params)
             with monkeypatch.context() as patch:
-                patch.setattr(tx, "execute", fail)
+                patch.setattr(tx, "_execute", fail)
                 yield tx
     with monkeypatch.context() as patch:
         patch.setattr(manager, "_write", broken)

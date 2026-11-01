@@ -192,12 +192,16 @@ async def test_read_cannot_accept_a_resume_identity_with_the_wrong_event_role(pa
     [event] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='owner_wait_resumed'")
     try:
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {c.manager.events} SET event_type='operation' WHERE event_id=?", (event["event_id"],))
+            await tx.update_event(event['job_id'], f"UPDATE {c.manager.events} SET event_type='operation' WHERE event_id=?",
+                                  (event["event_id"],), obligations=False)
         with pytest.raises(JobError):
             await owner_waits.read(c.manager, c.runtime.actor(c.state.parent), p.owner.job_id)
+        assert (await c.manager.db.fetchone(f"SELECT event_type FROM {c.manager.events} WHERE event_id=?",
+            (event['event_id'],)))['event_type'] == 'operation'
     finally:
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {c.manager.events} SET event_type=? WHERE event_id=?", (event["event_type"], event["event_id"]))
+            await tx.update_event(event['job_id'], f"UPDATE {c.manager.events} SET event_type=? WHERE event_id=?",
+                                  (event["event_type"], event["event_id"]), obligations=False)
 
 
 @pytest.mark.parametrize("generation", [True, 0, -1, "1", 1.5, 2])
@@ -285,7 +289,7 @@ async def test_resume_confirmation_keeps_original_execution_fences(paused, monke
             key, column, value = row["job_id"], "resource_state", "unknown"
         [before] = await c.manager.db.fetchall(f"SELECT {column} FROM {c.manager.jobs} WHERE job_id=?", (key,))
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {c.manager.jobs} SET {column}=? WHERE job_id=?", (value, key))
+            await tx.write_job(key, f"UPDATE {c.manager.jobs} SET {column}=? WHERE job_id=?", (value, key))
         restored = (column, before[column], key)
     try:
         with pytest.raises(JobError):
@@ -296,7 +300,7 @@ async def test_resume_confirmation_keeps_original_execution_fences(paused, monke
         if restored:
             column, value, key = restored
             async with c.manager._write() as tx:
-                await tx.execute(f"UPDATE {c.manager.jobs} SET {column}=? WHERE job_id=?", (value, key))
+                await tx.write_job(key, f"UPDATE {c.manager.jobs} SET {column}=? WHERE job_id=?", (value, key))
 
 
 async def test_read_rejects_rehashed_original_tracking_changes(paused):
@@ -306,13 +310,15 @@ async def test_read_rejects_rehashed_original_tracking_changes(paused):
     corrupt = {**json.loads(event["payload_json"]), "session_id": "invented-session"}
     try:
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?", (json.dumps(corrupt), _hash(corrupt), event["event_id"]))
+            await tx.update_event(event['job_id'], f"UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?",
+                                  (json.dumps(corrupt), _hash(corrupt), event["event_id"]), obligations=False)
         with pytest.raises(JobError):
             await owner_waits.read(c.manager, c.runtime.actor(c.state.parent), p.owner.job_id)
         assert c.model.calls["child"] == 2
     finally:
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?", (event["payload_json"], event["request_hash"], event["event_id"]))
+            await tx.update_event(event['job_id'], f"UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?",
+                                  (event["payload_json"], event["request_hash"], event["event_id"]), obligations=False)
 
 
 async def test_read_requires_the_original_ordinary_nudge_receipt(paused, monkeypatch):
@@ -323,12 +329,14 @@ async def test_read_requires_the_original_ordinary_nudge_receipt(paused, monkeyp
     [event] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE job_id=? AND event_type='operation' AND action='nudge' AND call_ref_json IS NOT NULL", (p.owner.job_id,))
     try:
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {c.manager.events} SET receipt_ref_json=NULL WHERE event_id=?", (event["event_id"],))
+            await tx.update_event(event['job_id'], f"UPDATE {c.manager.events} SET receipt_ref_json=NULL WHERE event_id=?",
+                                  (event["event_id"],), obligations=False)
         with pytest.raises(JobError, match="receipt_missing"):
             await owner_waits.read(c.manager, c.runtime.actor(c.state.parent), p.owner.job_id)
     finally:
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {c.manager.events} SET receipt_ref_json=? WHERE event_id=?", (event["receipt_ref_json"], event["event_id"]))
+            await tx.update_event(event['job_id'], f"UPDATE {c.manager.events} SET receipt_ref_json=? WHERE event_id=?",
+                                  (event["receipt_ref_json"], event["event_id"]), obligations=False)
 
 
 @pytest.mark.parametrize("fault,expected_calls", [("domain", 1), ("persistent_storage", 2)])
@@ -402,12 +410,14 @@ async def test_expired_history_remains_readable_but_a_wrong_expiry_role_is_rejec
     event_id = history["phases"][0]["expired"]["event_id"]
     try:
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {c.manager.events} SET event_type='operation' WHERE event_id=?", (event_id,))
+            await tx.update_event(p.owner.job_id, f"UPDATE {c.manager.events} SET event_type='operation' WHERE event_id=?",
+                                  (event_id,), obligations=False)
         with pytest.raises(JobError):
             await owner_waits.read(c.manager, c.runtime.actor(c.state.parent), p.owner.job_id)
     finally:
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {c.manager.events} SET event_type='owner_wait_expired' WHERE event_id=?", (event_id,))
+            await tx.update_event(p.owner.job_id, f"UPDATE {c.manager.events} SET event_type='owner_wait_expired' WHERE event_id=?",
+                                  (event_id,), obligations=False)
 
 
 async def test_malformed_input_and_transition_metadata_return_domain_errors(paused):

@@ -168,6 +168,10 @@ async def test_cancelled_owner_remains_cancelled_when_actual_exit_is_recovered(r
 async def test_unconfirmed_controller_cannot_publish_a_result_or_claim_resource_stop(registry_store, fault):
     c = await ready(registry_store, 'subagent')
     rt, owner = c.recovery_runtime, c.state.owner_binding
+    original_child = await rt.manager.db.fetchone(
+        f"SELECT supervision_status,result_status,resource_state FROM {rt.manager.jobs} WHERE job_id=?", (c.state.source,))
+    original_exit = await rt.manager.db.fetchone(
+        f"SELECT * FROM {rt.manager.events} WHERE job_id=? AND event_type='controller_task_exit'", (owner.lease.job_id,))
     try:
         actor = c.actor
         if fault == 'missing_task_exit':
@@ -181,7 +185,57 @@ async def test_unconfirmed_controller_cannot_publish_a_result_or_claim_resource_
             await reconcile(rt, actor, owner.lease.job_id)
         assert await rt.manager.get_job(c.actor, owner.lease.job_id) == before
         assert not await rt.manager.db.fetchall(f"SELECT event_id FROM {rt.manager.events} WHERE event_type IN ('controller_stopped','controller_result_delivery')")
+        if fault == 'unhandled_child':
+            assert await rt.manager.db.fetchone(
+                f"SELECT supervision_status,result_status,resource_state FROM {rt.manager.jobs} WHERE job_id=?",
+                (c.state.source,)) == {'supervision_status': 'open', 'result_status': 'pending_delivery', 'resource_state': 'unknown'}
     finally:
+        if fault == 'unhandled_child':
+            await rt.manager.db.execute(f"UPDATE {rt.manager.jobs} SET supervision_status=?,result_status=?,resource_state=? WHERE job_id=?",
+                (original_child['supervision_status'], original_child['result_status'], original_child['resource_state'], c.state.source))
+        elif fault == 'missing_task_exit':
+            columns = tuple(original_exit)
+            await rt.manager.db.execute(
+                f"INSERT INTO {rt.manager.events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                tuple(original_exit[key] for key in columns))
+        await cleanup(c)
+
+
+@pytest.mark.parametrize('missing_seal', [False, True])
+async def test_controller_evidence_discovery_never_writes_or_recreates_its_seal(registry_store, missing_seal):
+    from power_loop.runtime import controller_recovery
+    from power_loop.runtime.execution_membership import seal_id
+    from power_loop.runtime.session_controls import ControlReadView
+
+    c = await ready(registry_store, 'subagent')
+    rt, actor, owner = c.recovery_runtime, c.actor, c.state.owner_binding
+    original = None
+    try:
+        await reconcile(rt, actor, owner.lease.job_id)
+        job = await rt.manager._authorize(rt.manager.db, actor, owner.lease.job_id)
+        key = seal_id(rt.manager, owner.lease.job_id, owner.lease.generation)
+        if missing_seal:
+            original = await rt.manager.db.fetchone(f"SELECT * FROM {rt.manager.events} WHERE event_id=?", (key,))
+            assert original is not None
+            await rt.manager.db.execute(f"DELETE FROM {rt.manager.events} WHERE event_id=?", (key,))
+        events = await rt.manager.db.fetchall(f"SELECT * FROM {rt.manager.events} ORDER BY event_id")
+        jobs = await rt.manager.db.fetchall(f"SELECT * FROM {rt.manager.jobs} ORDER BY job_id")
+        reader = ControlReadView(rt.manager.db, rt.manager)
+        if missing_seal:
+            with pytest.raises(JobError, match='execution_membership_missing'):
+                await controller_recovery.read(rt.manager, reader, job, optional=False)
+        else:
+            saved = await controller_recovery.read(rt.manager, reader, job, optional=False)
+            assert saved is not None
+        assert await rt.manager.db.fetchall(f"SELECT * FROM {rt.manager.events} ORDER BY event_id") == events
+        assert await rt.manager.db.fetchall(f"SELECT * FROM {rt.manager.jobs} ORDER BY job_id") == jobs
+        assert c.state.counts['BUILD'] == 1 and not c.state.effects
+    finally:
+        if original is not None:
+            columns = tuple(original)
+            await rt.manager.db.execute(
+                f"INSERT INTO {rt.manager.events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                tuple(original[key] for key in columns))
         await cleanup(c)
 
 

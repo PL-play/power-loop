@@ -112,6 +112,7 @@ async def test_wait_closure_does_not_turn_a_callback_return_into_a_business_deli
 @pytest.mark.parametrize("fault", ["running", "unknown", "legacy_exit", "cache", "missing_result", "missing_seal"])
 async def test_owner_stop_must_be_proven_before_wait_can_be_terminated(handoff, fault):
     h, c = handoff, handoff.c
+    removed = None
     if fault == "running":
         await decide(h, "cancel")
         await effects.apply(c.manager, c.main, h.event_id)
@@ -120,12 +121,22 @@ async def test_owner_stop_must_be_proven_before_wait_can_be_terminated(handoff, 
         if fault == "cache":
             await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET resource_state='unknown' WHERE job_id=?", (c.owner.job_id,))
         elif fault == "missing_result":
+            removed = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE job_id=? AND event_type='result'", (c.owner.job_id,))
             await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE job_id=? AND event_type='result'", (c.owner.job_id,))
         elif fault == "missing_seal":
             await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE job_id=? AND event_type='execution_membership_seal'", (c.owner.job_id,))
-    with pytest.raises(JobError):
-        await terminal.terminate(c.manager, c.main, h.registration.job.job_id)
-    assert (await c.manager.get_job(c.main, h.registration.job.job_id)).outcome is None
+    try:
+        with pytest.raises(JobError):
+            await terminal.terminate(c.manager, c.main, h.registration.job.job_id)
+        assert (await c.manager.get_job(c.main, h.registration.job.job_id)).outcome is None
+        if fault == "missing_result":
+            assert await c.manager.db.fetchone(f"SELECT event_id FROM {c.manager.events} WHERE event_id=?", (removed['event_id'],)) is None
+    finally:
+        if removed is not None:
+            columns = tuple(removed)
+            await c.manager.db.execute(
+                f"INSERT INTO {c.manager.events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                tuple(removed[key] for key in columns))
 
 
 @pytest.mark.parametrize("point", ["result", "termination", "close_view", "closure"])
@@ -134,7 +145,7 @@ async def test_negative_wait_terminal_result_and_closure_roll_back_together(hand
     await stop_owner(h)
     async with c.manager._write() as tx:
         transaction_type = type(tx)
-    execute = transaction_type.execute
+    execute = transaction_type._execute
 
     async def fail(tx, sql, params=()):
         result = await execute(tx, sql, params)
@@ -145,7 +156,7 @@ async def test_negative_wait_terminal_result_and_closure_roll_back_together(hand
             raise RuntimeError("terminal transaction failed")
         return result
 
-    monkeypatch.setattr(transaction_type, "execute", fail)
+    monkeypatch.setattr(transaction_type, "_execute", fail)
     with pytest.raises(RuntimeError, match="terminal transaction failed"):
         await c.manager.finalize_supervision(c.main, h.registration.job.job_id, generation=0)
     timer = await c.manager.get_job(c.main, h.registration.job.job_id)

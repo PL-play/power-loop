@@ -2,19 +2,19 @@
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+from tests.control_faults import control_mutations
+
 
 def fail_completion_once(manager, stage):
     original = manager._write
     state = SimpleNamespace(fired=False)
 
-    class Transaction:
-        def __init__(self, target, flags):
-            self.target, self.flags = target, flags
+    @asynccontextmanager
+    async def intercepted():
+        flags = {'target': False}
+        joined = manager._joined_write.get() is not None
 
-        def __getattr__(self, key):
-            return getattr(self.target, key)
-
-        async def execute(self, statement, params=()):
+        async def intercept(execute, statement, params):
             event = None
             if (statement.startswith(f'INSERT INTO {manager.events} ')
                     and len(params) > 2 and str(params[1]).startswith('effect_')):
@@ -23,18 +23,16 @@ def fail_completion_once(manager, stage):
                         'result': 'result', 'publication': 'managed_effect_result_recovery',
                         'exit_ack': 'managed_effect_completion', 'result_ack': 'managed_effect_result_recovery'}[stage]
             if event == selected and not state.fired:
-                self.flags['target'] = True
+                flags['target'] = True
                 if stage not in ('exit_ack', 'result_ack'):
                     state.fired = True
                     raise OSError('test_completion_' + stage)
-            return await self.target.execute(statement, params)
+            return await execute(statement, params)
 
-    @asynccontextmanager
-    async def intercepted():
-        flags = {'target': False}
         async with original() as tx:
-            yield Transaction(tx, flags)
-        if flags['target'] and not state.fired:
+            async with control_mutations(tx, intercept):
+                yield tx
+        if not joined and flags['target'] and not state.fired:
             state.fired = True
             raise OSError('test_completion_' + stage)
 

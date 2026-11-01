@@ -159,7 +159,7 @@ async def test_disposition_and_complete_supervision_transaction_roll_back_togeth
     before = await c.manager.get_job(c.main, timer_id)
     async with c.manager._write() as tx:
         cls = type(tx)
-    execute = cls.execute
+    execute = cls._execute
     async def fail(tx, sql, params=()):
         result = await execute(tx, sql, params)
         if ((point == "disposition" and sql.startswith("INSERT INTO " + c.manager.events) and params[2] == "wait_disposition")
@@ -167,7 +167,7 @@ async def test_disposition_and_complete_supervision_transaction_roll_back_togeth
                 or (point == "supervision" and sql.startswith("INSERT INTO " + c.manager.events) and params[2] == "supervision_closed")):
             raise OSError("negative disposition write failed")
         return result
-    monkeypatch.setattr(cls, "execute", fail)
+    monkeypatch.setattr(cls, "_execute", fail)
     with pytest.raises(OSError, match="negative disposition"):
         await c.manager.finalize_supervision(c.main, timer_id, generation=0)
     assert await c.manager.get_job(c.main, timer_id) == before
@@ -229,13 +229,19 @@ async def test_history_does_not_control_or_modify_a_later_owner_generation(hando
     await decide(h, "defer")
     await exited(h)
     await terminal.terminate(c.manager, c.main, h.registration.job.job_id)
+    fields = ('generation', 'executor_id', 'boot_id', 'resource_state', 'cancel_requested_at')
+    original = await c.manager.db.fetchone(f"SELECT {','.join(fields)} FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,))
     await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET generation=2,executor_id='later-executor',boot_id='later-boot',resource_state='running',cancel_requested_at=NULL WHERE job_id=?", (c.owner.job_id,))
-    before = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,))
-    reply = await effects.apply(c.manager, c.main, h.event_id)
-    assert reply['original_owner']['generation'] == '1'
-    assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,)) == before
-    with pytest.raises(JobError):
-        await effects.apply(c.manager, replace(c.main, principal_id='foreign'), h.event_id)
+    try:
+        before = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,))
+        reply = await effects.apply(c.manager, c.main, h.event_id)
+        assert reply['original_owner']['generation'] == '1'
+        assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,)) == before
+        with pytest.raises(JobError):
+            await effects.apply(c.manager, replace(c.main, principal_id='foreign'), h.event_id)
+    finally:
+        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET " + ','.join(field+'=?' for field in fields) + ' WHERE job_id=?',
+            (*[original[field] for field in fields], c.owner.job_id))
 
 
 @pytest.mark.parametrize("state", ["dispatched", "unknown"])

@@ -132,7 +132,7 @@ async def test_receipt_is_preserved_when_callback_does_not_return(registry_store
             assert original == payload
             if stage == 'tamper':
                 payload['billing_receipt']['provider_amount']['amount'] = '999'
-                await tx.execute(f'UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?',
+                await tx.update_event(source['job_id'], f'UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?',
                                  (_json(payload), _hash(payload), rows[0]['event_id']))
                 with pytest.raises(JobError, match='anchor_changed'):
                     await read_receipt(c.manager, tx, source, ref, entry, plan)

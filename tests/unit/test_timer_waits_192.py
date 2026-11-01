@@ -152,7 +152,7 @@ async def test_failed_registration_rolls_back_required_child_and_evidence(waitin
     c = waiting
     async with c.manager._write() as tx:
         transaction_type = type(tx)
-    original = transaction_type.execute
+    original = transaction_type._execute
 
     async def fail(tx, query, params=()):
         result = await original(tx, query, params)
@@ -161,7 +161,7 @@ async def test_failed_registration_rolls_back_required_child_and_evidence(waitin
             raise RuntimeError("wait registration write failed")
         return result
 
-    monkeypatch.setattr(transaction_type, "execute", fail)
+    monkeypatch.setattr(transaction_type, "_execute", fail)
     with pytest.raises(RuntimeError, match="registration write failed"):
         await c.register()
     assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='timer'") == []
@@ -318,7 +318,7 @@ async def test_due_event_write_failure_rolls_back_version_and_delivery_responsib
     c.now[0] += 101
     async with c.manager._write() as tx:
         transaction_type = type(tx)
-    execute = transaction_type.execute
+    execute = transaction_type._execute
 
     async def fail(tx, sql, params=()):
         result = await execute(tx, sql, params)
@@ -327,7 +327,7 @@ async def test_due_event_write_failure_rolls_back_version_and_delivery_responsib
             raise RuntimeError("due event write failed")
         return result
 
-    monkeypatch.setattr(transaction_type, "execute", fail)
+    monkeypatch.setattr(transaction_type, "_execute", fail)
     with pytest.raises(RuntimeError, match="due event write failed"):
         await waits.prepare_due(c.manager, c.main, registered.job.job_id)
     assert (await c.manager.get_job(c.main, registered.job.job_id)).version == 1

@@ -51,10 +51,9 @@ async def evidence(c):
 async def install_generation(c, generation, *, bound=False):
     """Storage-only fixture for the future admission port, never a resume API."""
     async with c.manager._write() as tx:
-        await tx.execute(f"UPDATE {c.manager.jobs} SET generation=? WHERE job_id=?", (generation, c.node.job.job_id))
+        await tx.write_job(c.node.job.job_id, f"UPDATE {c.manager.jobs} SET generation=? WHERE job_id=?", (generation, c.node.job.job_id))
         if bound:
-            await tx.execute(f"INSERT INTO {c.manager.events} "
-                "(event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
+            await tx.append_event(('event_id','job_id','event_type','job_version','payload_json','delivery_status','created_at'),
                 (c.manager._node_session_event_id(c.node.job.job_id, c.sid, generation), c.node.job.job_id,
                  "node_session", c.row["version"], json.dumps({**c.data, "generation": generation}), "not_applicable", c.manager.now()))
     c.row["generation"] = generation
@@ -266,7 +265,7 @@ async def test_control_lock_serializes_generation_change_against_old_closure(phy
         async with c.manager._write() as tx:
             entered.set()
             await release.wait()
-            await tx.execute(f"UPDATE {c.manager.jobs} SET generation=2 WHERE job_id=?", (c.node.job.job_id,))
+            await tx.write_job(c.node.job.job_id, f"UPDATE {c.manager.jobs} SET generation=2 WHERE job_id=?", (c.node.job.job_id,))
     if order == "close_first":
         await node_inputs.close(c.runtime, c.binding, c.sid)
         release.set()

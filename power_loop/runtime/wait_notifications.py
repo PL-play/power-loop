@@ -196,19 +196,17 @@ def observation_id(manager, caller, round_index, notice_id):
     return "wait_seen_" + _hash([manager.store.store_id, caller.job_id, caller.generation, round_index, notice_id])[:48]
 
 
-async def observe_request(manager, tx, actor, caller, *, source, round_index, send_index, messages):
-    """Called inside the original actual-input preparation transaction.
-
-    Returns how many delivered notices remain to be observed.
-    """
+async def prepare_request_observations(manager, tx, actor, caller, *, source, round_index, send_index, messages):
+    """Discover delivered notices without holding the caller's writer lock."""
     if source["execution_role"] != "main":
-        return 0
+        return 0, []
     visible = {m["seq"]: m for m in messages}
     from .session_obligations import event_rows
     notices = [event for event in await event_rows(manager, tx, actor, "wait")
                if event["delivery_status"] == "delivered"]
     if len(notices) > _SCOPE_LIMIT:
         raise JobError("wait_notification_scope_too_large")
+    observations = []
     for notice in notices:
         data = waits._object(notice["payload_json"])
         _, due_event, _, receipt = await notification(manager, tx, actor, data["due_event_id"])
@@ -229,13 +227,19 @@ async def observe_request(manager, tx, actor, caller, *, source, round_index, se
             "notification_id": notice["event_id"], "caller": asdict(caller), "round_index": round_index,
             "send_index": send_index, "message_ref": ref.to_dict(), "message_hash": _hash(row["content"])}
         key = observation_id(manager, caller, round_index, notice["event_id"])
+        observations.append((key, observed))
+    return len(notices), observations
+
+
+async def record_request_observations(manager, tx, actor, caller, *, source, observations):
+    """Publish only this handler's observations after its fresh execution fence."""
+    for key, observed in observations:
         old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
         if old is not None:
             if old["request_hash"] != _hash(observed) or _hash(waits._object(old["payload_json"])) != _hash(observed):
                 raise JobError("wait_observation_conflict")
         else:
             await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, caller.job_id, "wait_observed", source["version"], actor.session_id, _hash(observed), _json(observed), "prepared", manager.now()))
-    return len(notices)
 
 
 def _message_ref(manager, row):

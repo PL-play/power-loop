@@ -164,6 +164,8 @@ async def test_checkpoint_storage_failure_preserves_original_failure_and_unknown
 async def test_actual_cancellation_before_checkpoint_keeps_unknown_pending_and_no_grant(registry_store, when):
     import asyncio
     from contextlib import asynccontextmanager
+
+    from tests.control_faults import control_mutations
     captured = {}
     async def configure(loop, state):
         manager = loop.task_runtime.manager
@@ -176,14 +178,15 @@ async def test_actual_cancellation_before_checkpoint_keeps_unknown_pending_and_n
                 self.target = target
             def __getattr__(self, name):
                 return getattr(self.target, name)
-            async def execute(self, statement, params=()):
+            async def intercept(self, execute, statement, params):
                 if statement.startswith(f'INSERT INTO {manager.events} ') and len(params) > 2 and params[2] == ('tool_call_plan' if when == 'plan' else 'tool_call_abort'):
                     raise asyncio.CancelledError()
-                return await self.target.execute(statement, params)
+                return await execute(statement, params)
         @asynccontextmanager
         async def cancel_write():
             async with original() as tx:
-                yield Transaction(tx)
+                async with control_mutations(tx, Transaction(tx).intercept):
+                    yield tx
         manager._write = cancel_write
     with pytest.raises(asyncio.CancelledError):
         await scenario(registry_store, configure=configure)

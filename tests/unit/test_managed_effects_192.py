@@ -719,6 +719,7 @@ async def test_raw_index_and_observation_are_atomic_and_lost_ack_is_queryable(
     registry_store, monkeypatch, after_commit
 ):
     from power_loop.runtime.managed_effects import reconcile_raw_receipt
+    from tests.control_faults import control_mutations
 
     c = await scenario(registry_store, claim_failure=True, receipt_bind_failure=True)
     [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
@@ -732,15 +733,19 @@ async def test_raw_index_and_observation_are_atomic_and_lost_ack_is_queryable(
         def __getattr__(self, name):
             return getattr(self.tx, name)
 
-        async def execute(self, sql, params=()):
+        async def intercept(self, execute, sql, params):
             if sql.startswith(f"UPDATE {manager.events} SET receipt_ref_json="):
                 raise OSError("test_index_write_failed")
-            return await self.tx.execute(sql, params)
+            return await execute(sql, params)
 
     @asynccontextmanager
     async def fail_write():
         async with write() as tx:
-            yield tx if after_commit else Proxy(tx)
+            if after_commit:
+                yield tx
+            else:
+                async with control_mutations(tx, Proxy(tx).intercept):
+                    yield tx
         if after_commit:
             raise OSError("test_receipt_ack_lost")
 

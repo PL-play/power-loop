@@ -76,22 +76,25 @@ async def test_projection_reopens_without_driver_and_deduplicates_after_main_con
 
 @pytest.mark.parametrize("fault", ["before_commit", "lost_ack", "journal", "inbox", "inbox_ack"])
 async def test_failed_projection_repairs_views_only_and_preserves_one_revision(delivery_case, monkeypatch, fault):
+    from tests.control_faults import control_mutations
+
     c = delivery_case
     original_write = c.manager._write
     @asynccontextmanager
     async def broken_write():
         async with original_write() as tx:
-            async def execute(sql, params=()):
+            async def execute(real_execute, sql, params):
                 if fault == "journal" and sql.startswith(f"UPDATE {c.store.t.session_runtime_state} SET value_json="):
                     raise RuntimeError("journal unavailable")
                 inbox = sql.startswith("INSERT") and c.store.t.follow_up_queue in sql
                 if fault == "inbox" and inbox:
                     raise RuntimeError("inbox unavailable")
-                value = await tx.execute(sql, params)
+                value = await real_execute(sql, params)
                 if fault == "inbox_ack" and inbox:
                     raise RuntimeError("inbox statement ACK lost before transaction commit")
                 return value
-            yield SimpleNamespace(execute=execute, fetchone=tx.fetchone, fetchall=tx.fetchall)
+            async with control_mutations(tx, execute):
+                yield tx
             if fault == "before_commit":
                 raise RuntimeError("rollback")
         if fault == "lost_ack":
@@ -126,6 +129,7 @@ async def test_competing_managers_freeze_one_identical_delivery(delivery_case):
                                   "unstarted_corrupt", "driver_missing", "journal_json"])
 async def test_missing_or_corrupt_evidence_never_projects_a_guess(delivery_case, fault):
     c = delivery_case
+    removed = None
     if fault.startswith("projection_"):
         await workflow_results.prepare(c.manager, c.actor, c.job_id, 1)
         field, value = {"projection_json": ("payload_json", "{}"), "projection_hash": ("request_hash", "wrong"),
@@ -136,6 +140,8 @@ async def test_missing_or_corrupt_evidence_never_projects_a_guess(delivery_case,
         key = {"result_missing": "result_"+c.job_id,
                "scope": execution_membership.scope_id(c.manager, c.job_id, 1),
                "unsealed": execution_membership.seal_id(c.manager, c.job_id, 1)}[fault]
+        if fault == "result_missing":
+            removed = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (key,))
         await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_id=?", (key,))
     elif fault == "result_json":
         await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json='[]' WHERE event_id=?", ("result_"+c.job_id,))
@@ -164,11 +170,20 @@ async def test_missing_or_corrupt_evidence_never_projects_a_guess(delivery_case,
         else:
             await journal.update(c.store, c.actor.session_id, c.run_id,
                 **({"task_generation": 2} if fault == "journal_generation" else {"status": "completed", "result": {}}))
-    counts = c.model.counts.copy()
-    with pytest.raises(JobError):
-        await workflow_results.project(c.loop, c.actor, c.job_id, 2 if fault == "generation" else 0 if fault == "unstarted_corrupt" else 1,
-            lease=replace(c.lease, executor_id="wrong") if fault == "lease" else None if fault == "unstarted_corrupt" else c.lease)
-    assert c.model.counts == counts and (await c.store.inbox_counts(c.actor.session_id))["pending"] == 0
+    try:
+        counts = c.model.counts.copy()
+        with pytest.raises(JobError):
+            await workflow_results.project(c.loop, c.actor, c.job_id, 2 if fault == "generation" else 0 if fault == "unstarted_corrupt" else 1,
+                lease=replace(c.lease, executor_id="wrong") if fault == "lease" else None if fault == "unstarted_corrupt" else c.lease)
+        assert c.model.counts == counts and (await c.store.inbox_counts(c.actor.session_id))["pending"] == 0
+        if fault == "result_missing":
+            assert await c.manager.db.fetchone(f"SELECT event_id FROM {c.manager.events} WHERE event_id=?", (removed['event_id'],)) is None
+    finally:
+        if removed is not None:
+            columns = tuple(removed)
+            await c.manager.db.execute(
+                f"INSERT INTO {c.manager.events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                tuple(removed[column] for column in columns))
 
 
 @pytest.mark.parametrize("generation", [True, False, -1, 1.0, "1", None, 2**63])
@@ -186,7 +201,7 @@ async def test_empty_new_execution_ledger_replaces_old_rollup_and_preserves_hist
     # History-only fixture, no controller/admission/dispatch permission. A
     # future empty generation must not charge the reused nodes' old rollup.
     async with c.manager._write() as tx:
-        await tx.execute(f"UPDATE {c.manager.jobs} SET generation=2,executor_id='future',status='running',resource_state='running',"
+        await tx.write_job(c.job_id, f"UPDATE {c.manager.jobs} SET generation=2,executor_id='future',status='running',resource_state='running',"
                          "result_status='none',result_json=NULL,outcome=NULL WHERE job_id=?", (c.job_id,))
         await execution_membership.start(c.manager, tx, await c.manager._row(tx, c.job_id))
     binding = Execution(c.runtime, c.actor, replace(c.lease, generation=2, executor_id="future"))
@@ -216,12 +231,19 @@ async def test_old_workflow_result_does_not_enter_new_generation_request(process
     job_id, row = await c.result(kind="workflow")
     if stage == "commit":
         snapshot = await c.prepare([row])
+    original = await c.manager.db.fetchone(f"SELECT generation,result_status FROM {c.manager.jobs} WHERE job_id=?", (job_id,))
     await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET generation=2,result_status='pending_delivery' WHERE job_id=?", (job_id,))
-    assert await c.prepare([row]) is None
-    if stage == "commit":
-        with pytest.raises(JobError, match="processing_revision_changed"):
-            await c.commit(snapshot, await c.response())
-    assert (await c.manager.get_job(c.actor, job_id)).result_status == "pending_delivery"
+    try:
+        saved = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (job_id,))
+        assert await c.prepare([row]) is None
+        if stage == "commit":
+            with pytest.raises(JobError, match="processing_revision_changed"):
+                await c.commit(snapshot, await c.response())
+        assert (await c.manager.get_job(c.actor, job_id)).result_status == "pending_delivery"
+        assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (job_id,)) == saved
+    finally:
+        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET generation=?,result_status=? WHERE job_id=?",
+                                  (original['generation'], original['result_status'], job_id))
 
 
 @pytest.mark.parametrize("field", ["tenant_id", "principal_id", "session_id", "driver"])
@@ -236,19 +258,24 @@ async def test_projection_is_restricted_to_original_main_subject(delivery_case, 
 
 @pytest.mark.parametrize("fault", ["content", "kind", "mode", "void", "missing", "journal_noop"])
 async def test_silent_view_conflict_cannot_be_reported_as_delivery(delivery_case, monkeypatch, fault):
+    from tests.control_faults import control_mutations
+
     c = delivery_case
     key = "result_"+c.job_id
+    ignored = []
     if fault in ("journal_noop", "missing"):
         original = c.manager._write
         @asynccontextmanager
         async def no_op():
             async with original() as tx:
-                async def execute(sql, params=()):
+                async def execute(real_execute, sql, params):
                     if ((fault == "missing" and sql.startswith("INSERT") and c.store.t.follow_up_queue in sql) or
                             (fault == "journal_noop" and sql.startswith(f"UPDATE {c.store.t.session_runtime_state} SET value_json="))):
+                        ignored.append(fault)
                         return 0
-                    return await tx.execute(sql, params)
-                yield SimpleNamespace(execute=execute, fetchone=tx.fetchone, fetchall=tx.fetchall)
+                    return await real_execute(sql, params)
+                async with control_mutations(tx, execute):
+                    yield tx
         monkeypatch.setattr(c.manager, "_write", no_op)
     else:
         data = await workflow_results.prepare(c.manager, c.actor, c.job_id, 1)
@@ -259,6 +286,8 @@ async def test_silent_view_conflict_cannot_be_reported_as_delivery(delivery_case
         await c.manager.db.execute(f"UPDATE {c.store.t.follow_up_queue} SET {field}=? WHERE item_id=?", (value, key))
     with pytest.raises(JobError, match="workflow_delivery_(journal|inbox)_mismatch"):
         await workflow_results.project(c.loop, c.actor, c.job_id, 1)
+    if fault in ("journal_noop", "missing"):
+        assert ignored == [fault]
     assert (await c.manager.get_job(c.actor, c.job_id)).result_status == "pending_delivery"
 
 

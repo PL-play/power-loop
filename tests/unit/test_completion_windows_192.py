@@ -137,7 +137,7 @@ async def test_window_and_original_owner_claim_are_one_atomic_transaction(runtim
     c = await registered(runtime)
     async with c.manager._write() as tx:
         transaction_type = type(tx)
-    execute = transaction_type.execute
+    execute = transaction_type._execute
     read_row = windows.read_row
 
     async def fail_write(tx, sql, params=()):
@@ -151,7 +151,7 @@ async def test_window_and_original_owner_claim_are_one_atomic_transaction(runtim
         raise RuntimeError("window commit failed")
 
     if point == "insert_window":
-        monkeypatch.setattr(transaction_type, "execute", fail_write)
+        monkeypatch.setattr(transaction_type, "_execute", fail_write)
     else:
         monkeypatch.setattr(windows, "read_row", fail_read)
     with pytest.raises(RuntimeError, match="window commit failed"):
@@ -288,14 +288,14 @@ async def test_expired_original_node_closes_input_only_with_exact_retained_autho
         if fault == "write_failure":
             async with manager._write() as tx:
                 transaction_type = type(tx)
-            execute = transaction_type.execute
+            execute = transaction_type._execute
             async def fail(tx, sql, params=()):
                 result = await execute(tx, sql, params)
                 if sql.startswith("INSERT INTO " + manager.events) and params[2] == "node_input_closed":
                     raise RuntimeError("original input close write failed")
                 return result
             with monkeypatch.context() as patch:
-                patch.setattr(transaction_type, "execute", fail)
+                patch.setattr(transaction_type, "_execute", fail)
                 with pytest.raises(RuntimeError, match="input close write failed"):
                     await node_inputs.close(task_runtime, binding, sid)
             assert not await node_inputs.is_closed(manager, manager.db, before, sid)

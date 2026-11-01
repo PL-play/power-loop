@@ -173,7 +173,7 @@ async def test_partial_admission_rolls_back_all_records(ready_node, monkeypatch,
     @asynccontextmanager
     async def broken():
         async with write() as tx:
-            execute = tx.execute
+            execute = tx._execute
             async def wrapped(sql, params=()):
                 if sql.startswith("INSERT") and ((fault == "binding_insert" and "node_session" in params) or
                         (fault == "execution_insert" and "execution" in params) or
@@ -183,7 +183,7 @@ async def test_partial_admission_rolls_back_all_records(ready_node, monkeypatch,
                     raise RuntimeError("injected write failure")
                 return await execute(sql, params)
             with monkeypatch.context() as patch:
-                patch.setattr(tx, "execute", wrapped)
+                patch.setattr(tx, "_execute", wrapped)
                 yield tx
     monkeypatch.setattr(c.manager, "_write", broken)
     await c.issue()

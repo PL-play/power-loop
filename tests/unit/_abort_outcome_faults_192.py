@@ -2,6 +2,8 @@
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+from tests.control_faults import control_mutations
+
 
 def fail_outcome_once(manager, source_id, stage):
     original = manager._write
@@ -11,7 +13,7 @@ def fail_outcome_once(manager, source_id, stage):
             self.target, self.flags = target, flags
         def __getattr__(self, name):
             return getattr(self.target, name)
-        async def execute(self, statement, params=()):
+        async def intercept(self, execute, statement, params):
             event = params[2] if statement.startswith(f'INSERT INTO {manager.events} ') and len(params) > 2 else None
             selected = (stage == 'child' and event == 'result' and params[1] != source_id
                 or stage == 'result' and event == 'result' and params[1] == source_id
@@ -24,16 +26,19 @@ def fail_outcome_once(manager, source_id, stage):
                 if stage not in ('commit', 'commit_ack'):
                     state.fired = True
                     raise OSError('test_outcome_'+stage)
-            return await self.target.execute(statement, params)
+            return await execute(statement, params)
     @asynccontextmanager
     async def intercepted():
         flags = {'target': False}
+        joined = manager._joined_write.get() is not None
         async with original() as tx:
-            yield Transaction(tx, flags)
-            if flags['target'] and not state.fired and stage == 'commit':
+            proxy = Transaction(tx, flags)
+            async with control_mutations(tx, proxy.intercept):
+                yield tx
+            if not joined and flags['target'] and not state.fired and stage == 'commit':
                 state.fired = True
                 raise OSError('test_outcome_'+stage)
-        if flags['target'] and not state.fired and stage == 'commit_ack':
+        if not joined and flags['target'] and not state.fired and stage == 'commit_ack':
             state.fired = True
             raise OSError('test_outcome_'+stage)
     manager._write = intercepted

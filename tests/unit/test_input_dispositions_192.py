@@ -164,7 +164,7 @@ async def test_full_supervision_transaction_rolls_back_disposition_and_queue(han
     await _applied(h)
     await exited(h)
     async with c.manager._write() as tx:
-        tx_type, original = type(tx), type(tx).execute
+        tx_type, original = type(tx), type(tx)._execute
     before_jobs = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} ORDER BY job_id")
     before_events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id")
     before_queue = await c.store.inbox_items(c.sid)
@@ -183,7 +183,7 @@ async def test_full_supervision_transaction_rolls_back_disposition_and_queue(han
         return count
 
     with monkeypatch.context() as patch:
-        patch.setattr(tx_type, "execute", fail)
+        patch.setattr(tx_type, "_execute", fail)
         with pytest.raises(OSError, match="original transaction failed"):
             await c.manager.finalize_supervision(c.main, h.registration.job.job_id, generation=0)
     assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} ORDER BY job_id") == before_jobs
@@ -233,6 +233,7 @@ async def test_closed_negative_proof_revalidates_original_history(handoff, fault
     await terminal.terminate(c.manager, c.main, h.registration.job.job_id)
     await c.manager.finalize_supervision(c.main, h.registration.job.job_id, generation=0)
     [proof] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='input_disposition'")
+    original_status = await c.manager.db.fetchone(f"SELECT delivery_status FROM {c.manager.events} WHERE event_id=?", (op['event_id'],))
     if fault.startswith("proof_"):
         data = json.loads(proof["payload_json"])
         data["owner_outcome"] = "failed"
@@ -273,8 +274,16 @@ async def test_closed_negative_proof_revalidates_original_history(handoff, fault
                 c.now[0],
             ),
         )
-    with pytest.raises(JobError):
-        await effects.apply(c.manager, c.main, h.event_id)
+    try:
+        with pytest.raises(JobError):
+            await effects.apply(c.manager, c.main, h.event_id)
+        if fault == "operation":
+            assert (await c.manager.db.fetchone(f"SELECT delivery_status FROM {c.manager.events} WHERE event_id=?",
+                (op['event_id'],)))['delivery_status'] == 'pending_delivery'
+    finally:
+        if fault == "operation":
+            await c.manager.db.execute(f"UPDATE {c.manager.events} SET delivery_status=? WHERE event_id=?",
+                                      (original_status['delivery_status'], op['event_id']))
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -285,18 +294,24 @@ async def test_later_generation_cannot_receive_historical_disposition_writes(han
     if existing:
         await terminal.terminate(c.manager, c.main, h.registration.job.job_id)
         op = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (op["event_id"],))
+    fields = ('generation', 'status', 'resource_state', 'intake', 'outcome', 'result_json')
+    original = await c.manager.db.fetchone(f"SELECT {','.join(fields)} FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,))
     await c.manager.db.execute(
         f"UPDATE {c.manager.jobs} SET generation=2,status='running',resource_state='running',intake='open',outcome=NULL,result_json=NULL WHERE job_id=?",
         (c.owner.job_id,),
     )
-    before = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,))
-    async with c.manager._write() as tx:
-        if existing:
-            assert await inputs.read_tx(c.manager, tx, op, required=True)
-        else:
-            with pytest.raises(JobError, match="historical_read_only"):
-                await inputs.reconcile_tx(c.manager, tx, c.main, op)
-    assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,)) == before
+    try:
+        before = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,))
+        async with c.manager._write() as tx:
+            if existing:
+                assert await inputs.read_tx(c.manager, tx, op, required=True)
+            else:
+                with pytest.raises(JobError, match="historical_read_only"):
+                    await inputs.reconcile_tx(c.manager, tx, c.main, op)
+        assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,)) == before
+    finally:
+        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET " + ','.join(field+'=?' for field in fields) + ' WHERE job_id=?',
+            (*[original[field] for field in fields], c.owner.job_id))
 
 
 @pytest.mark.parametrize("delivery", ["pending", "claimed", "delivered", "missing_receipt"])

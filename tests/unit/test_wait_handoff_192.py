@@ -179,7 +179,7 @@ async def test_original_version_one_constraints_remain_readable_without_rewritin
         message = notices.render_message(legacy_payload)
         assert "supplied wait_handoff actions" in message
         legacy_receipt = {**receipt, "public": legacy_payload, "message_hash": _hash(message)}
-        await tx.execute(f"UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?",
+        await tx.update_event(job["job_id"], f"UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?",
             (_json(legacy_receipt), _hash(legacy_receipt), notices.notification_id(c.manager, h.event_id)))
         await tx.execute(f"UPDATE {c.store.t.follow_up_queue} SET content=? WHERE session_id=? AND item_id=?",
             (message, c.main.session_id, receipt["item_id"]))
@@ -194,18 +194,21 @@ async def test_enqueue_write_failure_rolls_back_inbox_receipt_and_status(handoff
     h, c = handoff, handoff.c
     async with c.manager._write() as tx:
         transaction_type = type(tx)
-    execute = transaction_type.execute
+    execute = transaction_type._execute
+    fired = []
 
     async def fail(tx, sql, params=()):
         value = await execute(tx, sql, params)
         if ((point == "inbox" and c.store.t.follow_up_queue in sql and sql.startswith("INSERT"))
                 or (point == "receipt" and sql.startswith("INSERT INTO " + c.manager.events))):
+            fired.append(point)
             raise RuntimeError("notification write failed")
         return value
 
-    monkeypatch.setattr(transaction_type, "execute", fail)
+    monkeypatch.setattr(transaction_type, "_execute", fail)
     with pytest.raises(RuntimeError, match="notification write failed"):
         await notices.enqueue_notification(h.loop, c.main, h.event_id)
+    assert fired == [point]
     assert await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.follow_up_queue}") == []
     assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='wait_notification'") == []
     [due] = await c.manager.db.fetchall(f"SELECT delivery_status FROM {c.manager.events} WHERE event_id=?", (h.event_id,))
@@ -254,7 +257,8 @@ async def test_decision_storage_failure_never_partially_consumes_notification(ha
     await notices.enqueue_notification(h.loop, c.main, h.event_id)
     async with c.manager._write() as tx:
         transaction_type = type(tx)
-    execute = transaction_type.execute
+    execute = transaction_type._execute
+    fired = []
 
     async def fail(tx, sql, params=()):
         value = await execute(tx, sql, params)
@@ -262,11 +266,13 @@ async def test_decision_storage_failure_never_partially_consumes_notification(ha
              and params[2] == "operation" and params[6] == "wait_decision")
                 or (fault == "intent" and sql.startswith("INSERT INTO " + c.manager.events) and params[2] == "wait_decision")
                 or (fault == "status" and sql.startswith("UPDATE " + c.manager.events + " SET delivery_status='handled'"))):
+            fired.append(fault)
             raise RuntimeError("decision storage unavailable")
         return value
 
-    monkeypatch.setattr(transaction_type, "execute", fail)
+    monkeypatch.setattr(transaction_type, "_execute", fail)
     await h.loop.flush_follow_ups(c.main.session_id)
+    assert fired == [fault]
     assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='wait_decision' OR event_type='wait_decision'") == []
     [due] = await c.manager.db.fetchall(f"SELECT delivery_status FROM {c.manager.events} WHERE event_id=?", (h.event_id,))
     assert due["delivery_status"] == "delivered"
@@ -344,15 +350,36 @@ async def test_long_original_text_is_retrievable_in_full_with_fixed_constraints_
 async def test_broken_delivery_receipt_is_not_silently_repaired_or_reenqueued(handoff, fault):
     h, c = handoff, handoff.c
     await notices.enqueue_notification(h.loop, c.main, h.event_id)
+    [original] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='wait_notification'")
+    [inbox] = await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.follow_up_queue}")
     if fault == "message":
         await c.manager.db.execute(f"UPDATE {c.store.t.follow_up_queue} SET content='different message'")
     elif fault == "receipt":
         await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json='{{}}' WHERE event_type='wait_notification'")
     else:
         await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_type='wait_notification'")
-    with pytest.raises(JobError):
-        await notices.enqueue_notification(h.loop, c.main, h.event_id)
-    assert len(await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.follow_up_queue}")) == 1
+    try:
+        events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id")
+        messages = await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.follow_up_queue}")
+        with pytest.raises(JobError):
+            await notices.enqueue_notification(h.loop, c.main, h.event_id)
+        assert len(await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.follow_up_queue}")) == 1
+        assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id") == events
+        assert await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.follow_up_queue}") == messages
+    finally:
+        # Restore only the injected fault after proving the rejected call left
+        # the damaged originals unchanged. The common full index audit remains.
+        if fault == "message":
+            await c.manager.db.execute(f"UPDATE {c.store.t.follow_up_queue} SET content=? WHERE session_id=? AND item_id=?",
+                                      (inbox["content"], inbox["session_id"], inbox["item_id"]))
+        elif fault == "receipt":
+            await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?",
+                                      (original["payload_json"], original["event_id"]))
+        else:
+            columns = tuple(original)
+            await c.manager.db.execute(
+                f"INSERT INTO {c.manager.events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                tuple(original[key] for key in columns))
 
 
 @pytest.mark.parametrize("fault", ["version_bool", "round_bool", "send_bool", "message", "caller_session", "status"])

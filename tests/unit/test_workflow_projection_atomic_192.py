@@ -11,6 +11,7 @@ import pytest
 from power_loop.runtime import workflow_results as results
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
 from power_loop.workflow import journal
+from tests.control_faults import control_mutations
 
 from .test_job_registry_192 import registry_store
 from .test_workflow_result_delivery_192 import delivery_case
@@ -18,16 +19,6 @@ from .test_workflow_task_runtime_192 import managed_workflow
 
 __all__ = ["registry_store", "managed_workflow", "delivery_case"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
-
-
-class _TransactionProxy:
-    """Inject one statement fault while retaining the control transaction port."""
-
-    def __init__(self, target, execute):
-        self.target, self.execute = target, execute
-
-    def __getattr__(self, name):
-        return getattr(self.target, name)
 
 
 async def closed(c, *, consumed=False, manager=None):
@@ -67,26 +58,31 @@ async def test_all_projection_writes_rollback_together_or_all_commit(delivery_ca
     c = delivery_case
     original = c.manager._write
     canonical = await c.manager.get_result_revision(c.actor, c.job_id, 1)
+    fired = []
     @asynccontextmanager
     async def fail():
         async with original() as tx:
-            async def execute(sql, params=()):
-                value = await tx.execute(sql, params)
+            async def execute(mutate, sql, params):
+                value = await mutate(sql, params)
                 hit = ((fault == "journal" and sql.startswith(f"UPDATE {c.store.t.session_runtime_state} SET value_json=")) or
                     (fault == "inbox" and sql.startswith("INSERT") and c.store.t.follow_up_queue in sql) or
                     (fault in ("closed_receipt", "cancel") and "workflow_projected" in params))
                 if hit:
+                    fired.append(fault)
                     if fault == "cancel":
                         raise asyncio.CancelledError()
                     raise RuntimeError("transaction statement fault")
                 return value
-            yield _TransactionProxy(tx, execute)
+            async with control_mutations(tx, execute):
+                yield tx
         if fault == "commit_ack":
+            fired.append(fault)
             raise RuntimeError("lost commit ACK")
     with monkeypatch.context() as patch:
         patch.setattr(c.manager, "_write", fail)
         with pytest.raises(asyncio.CancelledError if fault == "cancel" else RuntimeError):
             await results.project(c.loop, c.actor, c.job_id, 1)
+    assert fired == [fault]
     committed = fault == "commit_ack"
     assert (await c.store.inbox_counts(c.actor.session_id))["pending"] == int(committed)
     j = await journal.read(c.store, c.actor.session_id, c.run_id)
@@ -109,6 +105,7 @@ async def test_projection_and_future_takeover_serialize_under_same_control_lock(
     c = delivery_case
     other = JobManager(await c.connect())
     entered, release = asyncio.Event(), asyncio.Event()
+    replaced = []
     original = results._views
     if order == "takeover_first":
         await results.project(c.loop, c.actor, c.job_id, 1)
@@ -126,10 +123,12 @@ async def test_projection_and_future_takeover_serialize_under_same_control_lock(
                 await release.wait()
             # Storage-only fixture for the future admission transaction. No
             # controller, execution authority, provider or resume is granted.
-            await tx.execute(f"UPDATE {other.jobs} SET generation=2 WHERE job_id=?", (c.job_id,))
+            original_generation = (await other._row(tx, c.job_id))["generation"]
+            await tx.write_job(c.job_id, f"UPDATE {other.jobs} SET generation=2 WHERE job_id=?", (c.job_id,))
             saved = await tx.fetchone(f"SELECT value_json FROM {c.store.t.session_runtime_state} WHERE session_id=? AND state_key=?",
                 (c.actor.session_id, journal.run_key(c.run_id)))
             j = json.loads(saved["value_json"])
+            replaced.append((original_generation, saved["value_json"]))
             j.update(task_generation=2, status="running", result=None)
             await tx.execute(f"UPDATE {c.store.t.session_runtime_state} SET value_json=? WHERE session_id=? AND state_key=?",
                 (json.dumps(j), c.actor.session_id, journal.run_key(c.run_id)))
@@ -160,6 +159,14 @@ async def test_projection_and_future_takeover_serialize_under_same_control_lock(
     finally:
         release.set()
         await asyncio.gather(first, *([second] if 'second' in locals() else []), return_exceptions=True)
+        # Only the synthetic future-admission fields are restored, after all
+        # generation fencing assertions. The final full index audit still runs.
+        if replaced:
+            original_generation, original_journal = replaced[0]
+            await c.manager.db.execute(f"UPDATE {other.jobs} SET generation=? WHERE job_id=?",
+                (original_generation, c.job_id))
+            await c.manager.db.execute(f"UPDATE {c.store.t.session_runtime_state} SET value_json=? WHERE session_id=? AND state_key=?",
+                (original_journal, c.actor.session_id, journal.run_key(c.run_id)))
 
 
 async def test_lost_post_commit_hint_cannot_undo_projection_or_start_model(delivery_case, monkeypatch):
@@ -187,24 +194,30 @@ async def test_callback_commit_faults_never_claim_false_completion_or_repeat_eff
     state["on_complete"] = callback
     await loop.send("run", sid)
     original = manager._write
+    fired = []
     @asynccontextmanager
     async def fail():
         phase_hit = False
         async with original() as tx:
-            async def execute(sql, params=()):
+            async def execute(mutate, sql, params):
                 nonlocal phase_hit
-                value = await tx.execute(sql, params)
-                phase_hit |= "workflow_callback_"+fault.split('_')[0] in params
+                value = await mutate(sql, params)
+                hit = "workflow_callback_"+fault.split('_')[0] in params
+                phase_hit |= hit
+                if hit:
+                    fired.append(fault)
                 if phase_hit and fault.endswith("rollback"):
                     raise RuntimeError("callback receipt rollback")
                 return value
-            yield _TransactionProxy(tx, execute)
+            async with control_mutations(tx, execute):
+                yield tx
         if phase_hit and fault.endswith("ack"):
             raise RuntimeError("callback receipt committed before lost ACK")
     with monkeypatch.context() as patch:
         patch.setattr(manager, "_write", fail)
         model.release["BUILD"].set()
         await asyncio.wait_for(state["handles"][0].task, 6)
+    assert fired == [fault]
     c = SimpleNamespace(manager=manager, actor=runtime.actor(sid), job_id=state["handles"][0].job_id)
     assert len(calls) == int(fault.startswith("exit"))
     if fault == "exit_ack":
@@ -242,17 +255,21 @@ async def test_corrupt_closed_evidence_cannot_authorize_takeover(delivery_case, 
 async def test_silent_closed_receipt_insert_is_not_success(delivery_case, monkeypatch):
     c = delivery_case
     original = c.manager._write
+    ignored = []
     @asynccontextmanager
     async def noop():
         async with original() as tx:
-            async def execute(sql, params=()):
+            async def execute(mutate, sql, params):
                 if "workflow_projected" in params:
+                    ignored.append(True)
                     return 0
-                return await tx.execute(sql, params)
-            yield _TransactionProxy(tx, execute)
+                return await mutate(sql, params)
+            async with control_mutations(tx, execute):
+                yield tx
     monkeypatch.setattr(c.manager, "_write", noop)
     with pytest.raises(JobError, match="projection_receipt_mismatch"):
         await results.project(c.loop, c.actor, c.job_id, 1)
+    assert ignored == [True]
     assert (await c.store.inbox_counts(c.actor.session_id))["pending"] == 0
     assert (await journal.read(c.store, c.actor.session_id, c.run_id))["status"] == "running"
 

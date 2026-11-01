@@ -35,17 +35,12 @@ def render(public):
     return CONSTRAINTS + 'Original controller result:\n' + _json(public)
 
 
-async def _facts(manager, tx, actor, row, *, _closures=None):
+async def _exit_facts(manager, tx, actor, row):
     from .controller_retirement import read_retirement
-    from .controller_task_exit import identity as exit_id
     from .controller_task_exit import read as task_exit
-    from .execution_membership import read as membership
-    from .execution_membership import seal, seal_id
-    from .finalization import closed
     from .managed_delivery import _main
     from .workflow_controller import proof
 
-    _closures = {'visiting': set(), 'done': {}} if _closures is None else _closures
     main = await _main(manager, tx, row)
     if actor.session_id != main['session_id'] or row['kind'] not in ('subagent', 'workflow_node', 'workflow'):
         raise JobError('controller_recovery_requires_original_main')
@@ -60,9 +55,18 @@ async def _facts(manager, tx, actor, row, *, _closures=None):
         'resource_stop_confirmed': False, 'result_handled': False}
     if _hash(data) != _hash(expected):
         raise JobError('controller_recovery_retirement_changed')
-    # Closing intake prevents admission; sealing freezes actual members, rather
-    # than guessing that an absent local handle means a resource has stopped.
-    await seal(manager, tx, row)
+    return main, lease, retirement
+
+
+async def _facts(manager, tx, actor, row, *, _closures=None, _source=None):
+    from .controller_task_exit import identity as exit_id
+    from .execution_membership import read as membership
+    from .execution_membership import seal_id
+    from .finalization import closed
+    from .workflow_controller import proof
+
+    _closures = {'visiting': set(), 'done': {}} if _closures is None else _closures
+    main, lease, retirement = _source if _source is not None else await _exit_facts(manager, tx, actor, row)
     frozen = await membership(manager, tx, row, row['generation'])
     if not frozen['sealed'] or _hash(frozen['scope']['lease']) != _hash(proof(row)):
         raise JobError('controller_recovery_members_unsealed')
@@ -187,7 +191,12 @@ async def reconcile(runtime, actor, job_id):
     async with manager._write() as tx:
         row = await manager._authorize(tx, actor, job_id)
         validated = {'visiting': set(), 'done': {}}
-        main, refs = await _facts(manager, tx, actor, row, _closures=validated)
+        source = await _exit_facts(manager, tx, actor, row)
+        # This explicit producer seals intake in its own tree transaction.
+        # Discovery and evidence readers only validate the committed seal.
+        from .execution_membership import seal
+        await seal(manager, tx, row)
+        main, refs = await _facts(manager, tx, actor, row, _closures=validated, _source=source)
         old = await read(manager, tx, row, _closures=validated)
         if old is None:
             result = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (result_id(job_id, row['generation']),))

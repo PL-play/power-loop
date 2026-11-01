@@ -253,7 +253,7 @@ async def test_resume_failure_rolls_back_generation_operation_and_inbox(ready, m
         @asynccontextmanager
         async def inject():
             async with write() as tx:
-                execute = tx.execute
+                execute = tx._execute
                 async def faulty(sql, params=()):
                     value = await execute(sql, params)
                     event_insert = sql.lstrip().upper().startswith("INSERT") and c.manager.events in sql
@@ -265,7 +265,7 @@ async def test_resume_failure_rolls_back_generation_operation_and_inbox(ready, m
                         raise RuntimeError("injected write failure: "+point)
                     return value
                 with monkeypatch.context() as patch:
-                    patch.setattr(tx, "execute", faulty)
+                    patch.setattr(tx, "_execute", faulty)
                     yield tx
         with monkeypatch.context() as patch:
             patch.setattr(c.manager, "_write", inject)

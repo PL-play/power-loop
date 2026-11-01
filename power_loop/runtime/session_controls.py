@@ -14,18 +14,49 @@ OBLIGATION_EVENTS = frozenset({
 GLOBAL = "*"
 
 
-class ControlTransaction:
+class ControlReadView:
+    """A bounded discovery's primary-key view, with no mutation port or lock.
+
+    Discovery is evidence for a later conditional publication, never authority
+    to write. Its caller must fence again when publishing its own observations.
+    """
+
+    def __init__(self, reader, manager):
+        self._tx = reader
+        self.dialect = manager.db.dialect
+        self._memo_sql = {f"SELECT * FROM {table} WHERE {key}=?": table for table, key in (
+            (manager.jobs, "job_id"), (manager.prefix + "task_executors", "executor_key"))}
+        self._memo: dict[tuple[str, tuple], dict | None] = {}
+
+    def forget_reads(self):
+        self._memo.clear()
+
+    def remember_row(self, table, key, value, row):
+        self._memo[f"SELECT * FROM {table} WHERE {key}=?", (value,)] = dict(row)
+
+    async def fetchone(self, sql, params=()):
+        if sql in self._memo_sql:
+            key = (sql, tuple(params))
+            if key not in self._memo:
+                row = await self._tx.fetchone(sql, params)
+                self._memo[key] = None if row is None else dict(row)
+            row = self._memo[key]
+            return None if row is None else dict(row)
+        return await self._tx.fetchone(sql, params)
+
+    async def fetchall(self, sql, params=()):
+        return await self._tx.fetchall(sql, params)
+
+
+class ControlTransaction(ControlReadView):
     """One transaction's declared writes, read view and derived-state work."""
 
     def __init__(self, tx, manager):
-        self._tx = tx
+        super().__init__(tx, manager)
         self._events = manager.events
         self._jobs = manager.jobs
         self._executors = manager.prefix + "task_executors"
         self._dialect = manager.db.dialect
-        self._memo_sql = {f"SELECT * FROM {table} WHERE {key}=?": table for table, key in (
-            (self._jobs, "job_id"), (self._executors, "executor_key"))}
-        self._memo: dict[tuple[str, tuple], dict | None] = {}
         self.jobs: set[str] = set()
         self.sessions: set[str] = set()
         self.touched_jobs: set[str] = set()
@@ -37,13 +68,6 @@ class ControlTransaction:
 
     def __getattr__(self, name):
         return getattr(self._tx, name)
-
-    def forget_reads(self):
-        self._memo.clear()
-
-    def remember_row(self, table, key, value, row):
-        """Publish a full row written by this transaction into its own read view."""
-        self._memo[f"SELECT * FROM {table} WHERE {key}=?", (value,)] = dict(row)
 
     def touch_job(self, job_id, *, obligations=False, notify=False):
         self.touched_jobs.add(job_id)
@@ -117,20 +141,6 @@ class ControlTransaction:
         self.writes += 1
         self.forget_reads()
         return await self._tx.execute_flag(sql, params)
-
-    async def fetchone(self, sql, params=()):
-        if sql in self._memo_sql:
-            key = (sql, tuple(params))
-            if key not in self._memo:
-                row = await self._tx.fetchone(sql, params)
-                self._memo[key] = None if row is None else dict(row)
-            row = self._memo[key]
-            return None if row is None else dict(row)
-        return await self._tx.fetchone(sql, params)
-
-    async def fetchall(self, sql, params=()):
-        return await self._tx.fetchall(sql, params)
-
 
 async def bump(manager, tx, recorder):
     sessions = set(recorder.sessions)

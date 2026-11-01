@@ -134,7 +134,7 @@ async def test_system_effect_storage_failure_rolls_back_input_operation_owner_an
     before = await c.manager.get_job(c.main, c.owner.job_id)
     async with c.manager._write() as tx:
         transaction_type = type(tx)
-    execute = transaction_type.execute
+    execute = transaction_type._execute
 
     async def fail(tx, sql, params=()):
         result = await execute(tx, sql, params)
@@ -146,7 +146,7 @@ async def test_system_effect_storage_failure_rolls_back_input_operation_owner_an
             raise RuntimeError("system effect storage failed")
         return result
 
-    monkeypatch.setattr(transaction_type, "execute", fail)
+    monkeypatch.setattr(transaction_type, "_execute", fail)
     with pytest.raises(RuntimeError, match="system effect storage failed"):
         await effects.apply(c.manager, c.main, h.event_id)
     assert (await c.manager.get_job(c.main, c.owner.job_id)).version == before.version
@@ -253,7 +253,7 @@ async def test_owner_success_and_required_wait_resolution_commit_or_roll_back_to
         answer = await loop.flush_follow_ups(c.sid)
         async with c.manager._write() as tx:
             transaction_type = type(tx)
-        execute = transaction_type.execute
+        execute = transaction_type._execute
 
         async def fail(tx, sql, params=()):
             result = await execute(tx, sql, params)
@@ -267,7 +267,7 @@ async def test_owner_success_and_required_wait_resolution_commit_or_roll_back_to
             return result
 
         with monkeypatch.context() as patch:
-            patch.setattr(transaction_type, "execute", fail)
+            patch.setattr(transaction_type, "_execute", fail)
             with pytest.raises(RuntimeError, match="result transaction failed"):
                 await c.manager.record_execution_result(c.actor, c.owner, outcome="succeeded",
                     result={"final_text": answer.final_text}, resource_state="stopped")
@@ -288,7 +288,7 @@ async def test_cancel_storage_failure_keeps_original_owner_and_wait_open(handoff
     await decide(h, "cancel")
     async with c.manager._write() as tx:
         transaction_type = type(tx)
-    execute = transaction_type.execute
+    execute = transaction_type._execute
 
     async def fail(tx, sql, params=()):
         result = await execute(tx, sql, params)
@@ -298,7 +298,7 @@ async def test_cancel_storage_failure_keeps_original_owner_and_wait_open(handoff
             raise RuntimeError("cancel transaction failed")
         return result
 
-    monkeypatch.setattr(transaction_type, "execute", fail)
+    monkeypatch.setattr(transaction_type, "_execute", fail)
     with pytest.raises(RuntimeError, match="cancel transaction failed"):
         await effects.apply(c.manager, c.main, h.event_id)
     owner = await c.manager.get_job(c.main, c.owner.job_id)

@@ -2,6 +2,8 @@
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+from tests.control_faults import control_mutations
+
 
 def fail_unstarted_once(manager, stage):
     original = manager._write
@@ -10,33 +12,29 @@ def fail_unstarted_once(manager, stage):
                 'closure': 'supervision_closed', 'commit': 'supervision_closed',
                 'commit_ack': 'supervision_closed'}[stage]
 
-    class Transaction:
-        def __init__(self, target, flags):
-            self.target, self.flags = target, flags
-
-        def __getattr__(self, key):
-            return getattr(self.target, key)
-
-        async def execute(self, statement, params=()):
-            if (not state.fired and statement.startswith(f'INSERT INTO {manager.events} ')
-                    and len(params) > 2 and params[2] == selected):
-                job = await self.target.fetchone(f'SELECT kind,generation FROM {manager.jobs} WHERE job_id=?', (params[1],))
-                if job is not None and job['kind'] == 'background_tool' and job['generation'] == 0:
-                    self.flags['target'] = True
-                    if stage not in ('commit', 'commit_ack'):
-                        state.fired = True
-                        raise OSError('test_unstarted_' + stage)
-            return await self.target.execute(statement, params)
-
     @asynccontextmanager
     async def intercepted():
         flags = {'target': False}
+        joined = manager._joined_write.get() is not None
+
+        async def intercept(execute, statement, params):
+            if (not state.fired and statement.startswith(f'INSERT INTO {manager.events} ')
+                    and len(params) > 2 and params[2] == selected):
+                job = await tx.fetchone(f'SELECT kind,generation FROM {manager.jobs} WHERE job_id=?', (params[1],))
+                if job is not None and job['kind'] == 'background_tool' and job['generation'] == 0:
+                    flags['target'] = True
+                    if stage not in ('commit', 'commit_ack'):
+                        state.fired = True
+                        raise OSError('test_unstarted_' + stage)
+            return await execute(statement, params)
+
         async with original() as tx:
-            yield Transaction(tx, flags)
-            if flags['target'] and not state.fired and stage == 'commit':
+            async with control_mutations(tx, intercept):
+                yield tx
+            if not joined and flags['target'] and not state.fired and stage == 'commit':
                 state.fired = True
                 raise OSError('test_unstarted_' + stage)
-        if flags['target'] and not state.fired and stage == 'commit_ack':
+        if not joined and flags['target'] and not state.fired and stage == 'commit_ack':
             state.fired = True
             raise OSError('test_unstarted_' + stage)
 

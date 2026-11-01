@@ -102,7 +102,7 @@ async def test_pending_state_and_disposition_are_atomic_and_lost_ack_is_recalled
     async def inject():
         nonlocal fired
         async with original() as tx:
-            execute = tx.execute
+            execute = tx._execute
             async def fault(sql, args=()):
                 nonlocal fired
                 target = (stage == 'record' and sql.startswith('INSERT INTO ' + c.manager.events)
@@ -111,7 +111,7 @@ async def test_pending_state_and_disposition_are_atomic_and_lost_ack_is_recalled
                     fired = True
                     raise OSError('test_pending_write_failed')
                 return await execute(sql, args)
-            tx.execute = fault
+            tx._execute = fault
             yield tx
             if stage == 'commit' and not fired:
                 fired = True

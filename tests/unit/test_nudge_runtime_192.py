@@ -385,14 +385,23 @@ async def test_receiver_cannot_ack_an_input_not_carried_by_its_request(nudge_cas
     rows = await c.store.inbox_claim(c.sid)
     seq = await c.store.append_message(c.sid, role="user", content="NUDGED-42", send_index=1,
         inbox={"claim_token": rows[0]["claim_token"], "ids": [r["id"] for r in rows]})
+    original = await c.manager.db.fetchone(f"SELECT event_id,payload_json FROM {c.manager.events} WHERE action='nudge'")
     if visibility == "wrong_session":
         await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE action='nudge'",
             (json.dumps({"request": {"session_id": "wrong"}}),))
-    messages = [] if visibility == "missing" else [{"seq": seq, "role": "user",
-        "content": "different" if visibility == "rewritten" else "NUDGED-42"}]
-    assert await c.manager.prepare_processing(c.child_actor, c.receiver, round_index=0, send_index=1, messages=messages) is None
-    with pytest.raises(JobError, match="required_input_unhandled"):
-        await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={}, resource_state="stopped", require_children_stopped=True)
+    try:
+        messages = [] if visibility == "missing" else [{"seq": seq, "role": "user",
+            "content": "different" if visibility == "rewritten" else "NUDGED-42"}]
+        assert await c.manager.prepare_processing(c.child_actor, c.receiver, round_index=0, send_index=1, messages=messages) is None
+        with pytest.raises(JobError, match="required_input_unhandled"):
+            await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={}, resource_state="stopped", require_children_stopped=True)
+        if visibility == "wrong_session":
+            assert (await c.manager.db.fetchone(f"SELECT payload_json FROM {c.manager.events} WHERE event_id=?",
+                (original['event_id'],)))['payload_json'] == json.dumps({"request": {"session_id": "wrong"}})
+    finally:
+        if visibility == "wrong_session":
+            await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?",
+                                      (original['payload_json'], original['event_id']))
 
 
 async def test_originating_parent_cannot_handle_the_receivers_input(nudge_case):

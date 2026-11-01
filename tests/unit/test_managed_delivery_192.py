@@ -8,6 +8,7 @@ from power_loop.runtime.managed_completion import flush_local
 from power_loop.runtime.managed_delivery import enqueue, identity
 from power_loop.runtime.managed_effects import reconcile
 from power_loop.tools.registry import ToolRegistry
+from tests.control_faults import control_mutations
 
 from .test_job_registry_192 import registry_store
 from .test_managed_completion_192 import failure_case
@@ -228,30 +229,25 @@ async def test_queue_and_receipt_publish_atomically_or_recall_the_original_commi
     loop, model = await controller(c)
     original_write, fired = c.manager._write, []
 
-    class Transaction:
-        def __init__(self, target, flags):
-            self.target, self.flags = target, flags
+    @asynccontextmanager
+    async def write():
+        flags = {'target': False}
 
-        def __getattr__(self, key):
-            return getattr(self.target, key)
-
-        async def execute(self, statement, params=()):
+        async def intercept(execute, statement, params):
             is_inbox = statement.startswith('INSERT') and c.store.t.follow_up_queue in statement
             is_notice = statement.startswith(f'INSERT INTO {c.manager.events} ') and len(params) > 2 and params[2] == 'managed_effect_delivery'
             is_projection = "SET result_status='pending_delivery'" in statement
             if not fired and ((stage == 'inbox' and is_inbox) or (stage in ('notice', 'commit_ack') and is_notice)
                               or (stage == 'projection' and is_projection)):
-                self.flags['target'] = True
+                flags['target'] = True
                 if stage != 'commit_ack':
                     fired.append(stage)
                     raise OSError('test_managed_delivery_' + stage)
-            return await self.target.execute(statement, params)
+            return await execute(statement, params)
 
-    @asynccontextmanager
-    async def write():
-        flags = {'target': False}
         async with original_write() as tx:
-            yield Transaction(tx, flags)
+            async with control_mutations(tx, intercept):
+                yield tx
         if flags['target'] and not fired:
             fired.append(stage)
             raise OSError('test_managed_delivery_' + stage)
@@ -260,6 +256,7 @@ async def test_queue_and_receipt_publish_atomically_or_recall_the_original_commi
     try:
         with pytest.raises(OSError, match='test_managed_delivery_'):
             await enqueue(loop, c.actor, row['job_id'])
+        assert fired == [stage]
         rows = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.follow_up_queue} WHERE item_id=?', (identity(c.manager, row),))
         notices = await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='managed_effect_delivery'", (row['job_id'],))
         assert len(rows) == len(notices) == (1 if stage == 'commit_ack' else 0)

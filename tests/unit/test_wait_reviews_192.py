@@ -212,14 +212,14 @@ async def test_review_and_responsibility_transfer_rollback_together(handoff, mon
     before = await c.manager.get_job(c.main, h.registration.job.job_id)
     async with c.manager._write() as tx:
         cls = type(tx)
-    original = cls.execute
+    original = cls._execute
     async def fail(tx, sql, params=()):
         value = await original(tx, sql, params)
         if ((point == "review" and sql.startswith("INSERT INTO " + c.manager.events) and params[2] == "wait_review")
                 or (point == "handled" and sql.startswith("UPDATE " + c.manager.events + " SET delivery_status='handled'"))):
             raise OSError("review transfer storage fault")
         return value
-    monkeypatch.setattr(cls, "execute", fail)
+    monkeypatch.setattr(cls, "_execute", fail)
     with pytest.raises(OSError, match="review transfer"):
         await effects.apply(c.manager, c.main, h.event_id)
     assert await c.manager.get_job(c.main, h.registration.job.job_id) == before

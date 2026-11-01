@@ -51,88 +51,14 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages, 
     # Freeze before the first await. The caller supplies only actual request
     # rows, not every row present somewhere in the durable transcript.
     request_rows = json.loads(_json(messages))
-    visible = {integer_id(m["seq"], "seq"): m for m in request_rows}
+    observed, wait_observations = await _discover_request(manager, actor, caller,
+        round_index=round_index, send_index=send_index, request_rows=request_rows, report=report)
     async with manager._write() as tx:
+        # Discovery is not permission to publish. Cancellation, expiry or
+        # takeover while it was reading must prevent even the snapshot write.
         send = await manager._fence(tx, actor, caller)
-        if send["kind"] != "send" or send["session_id"] != actor.session_id:
-            raise JobError("processing_caller_mismatch")
-        create = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND action='create'", (caller.job_id,))
-        if (create is None or isinstance(send_index, bool) or not isinstance(send_index, int) or
-                json.loads(create["payload_json"]).get("request", {}).get("send_index") != send_index):
-            raise JobError("processing_send_mismatch")
-        from .wait_notifications import observe_request
-        notices = await observe_request(manager, tx, actor, caller, source=send, round_index=round_index,
-                                        send_index=send_index, messages=request_rows)
-        from .session_obligations import event_rows
-        results = await event_rows(manager, tx, actor, "result", limit=None)
-        from .managed_delivery import candidates
-        results.extend(await candidates(manager, tx, actor))
-        from .abort_outcomes import candidates as aborted_candidates
-        results.extend(await aborted_candidates(manager, tx, actor))
-        from .controller_recovery import candidates as controller_candidates
-        results.extend(await controller_candidates(manager, tx, actor))
-        results = list({event['event_id']: event for event in results}.values())
-        inputs = []
-        if send['control_owner_job_id'] is not None:
-            inputs = await event_rows(manager, tx, actor, "input", job_id=send["control_owner_job_id"], limit=None)
-        if report is not None:
-            report["quiet"] = not results and not inputs and not notices
-        observed = []
-        for event in [*results, *inputs]:
-            if event["event_type"] == "operation":
-                from .wait_effects import validate_input
-                await validate_input(manager, tx, actor, event)
-            job = (await input_target(manager, tx, actor, send, event) if event["event_type"] == "operation"
-                   else await manager._authorize(tx, actor, event["job_id"]))
-            if event["event_type"] == "operation":
-                request = json.loads(event["payload_json"])["request"]
-                if (job["kind"] != "workflow_node" and job["session_id"] != actor.session_id) or request["session_id"] != actor.session_id:
-                    continue
-                item_id = "nudge:" + event["event_id"]
-            else:
-                if event["event_id"] != result_id(job["job_id"], job["generation"]):
-                    continue
-                item_id = await delivery_id(manager, tx, job) if job["kind"] == "subagent" else event["event_id"]
-            if event['event_type'] == 'result' and job['kind'] in ('subagent', 'workflow_node', 'workflow'):
-                from .controller_recovery import observation as controller_observation
-                from .controller_recovery import read as controller_stop
-                if await controller_stop(manager, tx, job) is not None:
-                    actual = await controller_observation(manager, tx, actor, job, visible)
-                    if actual is not None:
-                        observed.append({'event_id': event['event_id'], 'job_id': event['job_id'],
-                            'revision': int(event['job_version']), 'result_hash': _hash(json.loads(event['payload_json'])), **actual})
-                    continue
-            if event['event_type'] == 'result' and job['kind'] == 'send':
-                from .abort_outcomes import observation
-                actual = await observation(manager, tx, actor, job, event, visible)
-                if actual is not None:
-                    observed.append({'event_id': event['event_id'], 'job_id': event['job_id'],
-                        'revision': int(event['job_version']), 'result_hash': _hash(json.loads(event['payload_json'])), **actual})
-                continue
-            if event['event_type'] == 'result' and job['kind'] == 'background_tool':
-                from .managed_delivery import observation
-
-                actual = await observation(manager, tx, actor, job, event, visible)
-                if actual is not None:
-                    observed.append({"event_id": event["event_id"], "job_id": event["job_id"],
-                        "revision": int(event["job_version"]), "result_hash": _hash(json.loads(event["payload_json"])),
-                        **actual})
-                continue
-            inbox = await tx.fetchone(f"SELECT status,delivered_seq FROM {manager.store.t.follow_up_queue} "
-                                      "WHERE session_id=? AND item_id=?", (actor.session_id, item_id))
-            if inbox is None or inbox["status"] != "delivered" or inbox["delivered_seq"] not in visible:
-                continue
-            seq = int(inbox["delivered_seq"])
-            row = await tx.fetchone(f"SELECT * FROM {manager.store.t.messages} WHERE session_id=? AND seq=?",
-                                   (actor.session_id, seq))
-            # Hooks may remove, copy, or rewrite rows. Equality with the real
-            # inbox row is required; merely appearing later in history is not.
-            message = visible[seq]
-            if row is None or row["role"] != message.get("role") or row["content"] != message.get("content"):
-                continue
-            observed.append({"event_id": event["event_id"], "job_id": event["job_id"],
-                "revision": int(event["job_version"]), "result_hash": _hash(json.loads(event["payload_json"])),
-                "delivered_seq": seq, **({"event_type": "operation"} if event["event_type"] == "operation" else {})})
+        from .wait_notifications import record_request_observations
+        await record_request_observations(manager, tx, actor, caller, source=send, observations=wait_observations)
         if not observed:
             return None
         payload = {"handler_job_id": caller.job_id, "generation": caller.generation,
@@ -146,6 +72,104 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages, 
         await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'payload_json', 'delivery_status', 'created_at'), (event_id, caller.job_id, "processing_request", send["version"],
                 actor.session_id, _json(payload), "prepared", manager.now()))
         return event_id
+
+
+async def _discover_request(manager, actor, caller, *, round_index, send_index, request_rows, report):
+    """Inspect immutable sources across trees without holding a writer lock."""
+    from .jobs import JobError, _hash
+    from .session_controls import ControlReadView
+
+    tx = ControlReadView(manager.db, manager)
+    visible = {integer_id(m["seq"], "seq"): m for m in request_rows}
+    row = await tx.fetchone(f"SELECT j.*,e.payload_json AS processing_creation_json FROM {manager.jobs} j "
+        f"LEFT JOIN {manager.events} e ON e.job_id=j.job_id AND e.event_type='operation' AND e.action='create' "
+        "WHERE j.job_id=?", (caller.job_id,))
+    if row is None:
+        raise JobError("access_denied")
+    creation = row.pop("processing_creation_json")
+    tx.remember_row(manager.jobs, "job_id", caller.job_id, row)
+    send = await manager._authorize(tx, actor, caller.job_id)
+    manager._check_proof(send, caller)
+    if send["kind"] != "send" or send["session_id"] != actor.session_id:
+        raise JobError("processing_caller_mismatch")
+    create = {"payload_json": creation} if creation is not None else None
+    if (create is None or isinstance(send_index, bool) or not isinstance(send_index, int) or
+            json.loads(create["payload_json"]).get("request", {}).get("send_index") != send_index):
+        raise JobError("processing_send_mismatch")
+    from .wait_notifications import prepare_request_observations
+    notices, wait_observations = await prepare_request_observations(manager, tx, actor, caller, source=send, round_index=round_index,
+                                    send_index=send_index, messages=request_rows)
+    from .session_obligations import event_rows
+    results = await event_rows(manager, tx, actor, "result", limit=None)
+    from .managed_delivery import candidates
+    results.extend(await candidates(manager, tx, actor))
+    from .abort_outcomes import candidates as aborted_candidates
+    results.extend(await aborted_candidates(manager, tx, actor))
+    from .controller_recovery import candidates as controller_candidates
+    results.extend(await controller_candidates(manager, tx, actor))
+    results = list({event['event_id']: event for event in results}.values())
+    inputs = []
+    if send['control_owner_job_id'] is not None:
+        inputs = await event_rows(manager, tx, actor, "input", job_id=send["control_owner_job_id"], limit=None)
+    if report is not None:
+        report["quiet"] = not results and not inputs and not notices
+    observed = []
+    for event in [*results, *inputs]:
+        if event["event_type"] == "operation":
+            from .wait_effects import validate_input
+            await validate_input(manager, tx, actor, event)
+        job = (await input_target(manager, tx, actor, send, event) if event["event_type"] == "operation"
+               else await manager._authorize(tx, actor, event["job_id"]))
+        if event["event_type"] == "operation":
+            request = json.loads(event["payload_json"])["request"]
+            if (job["kind"] != "workflow_node" and job["session_id"] != actor.session_id) or request["session_id"] != actor.session_id:
+                continue
+            item_id = "nudge:" + event["event_id"]
+        else:
+            if event["event_id"] != result_id(job["job_id"], job["generation"]):
+                continue
+            item_id = await delivery_id(manager, tx, job) if job["kind"] == "subagent" else event["event_id"]
+        if event['event_type'] == 'result' and job['kind'] in ('subagent', 'workflow_node', 'workflow'):
+            from .controller_recovery import observation as controller_observation
+            from .controller_recovery import read as controller_stop
+            if await controller_stop(manager, tx, job) is not None:
+                actual = await controller_observation(manager, tx, actor, job, visible)
+                if actual is not None:
+                    observed.append({'event_id': event['event_id'], 'job_id': event['job_id'],
+                        'revision': int(event['job_version']), 'result_hash': _hash(json.loads(event['payload_json'])), **actual})
+                continue
+        if event['event_type'] == 'result' and job['kind'] == 'send':
+            from .abort_outcomes import observation
+            actual = await observation(manager, tx, actor, job, event, visible)
+            if actual is not None:
+                observed.append({'event_id': event['event_id'], 'job_id': event['job_id'],
+                    'revision': int(event['job_version']), 'result_hash': _hash(json.loads(event['payload_json'])), **actual})
+            continue
+        if event['event_type'] == 'result' and job['kind'] == 'background_tool':
+            from .managed_delivery import observation
+
+            actual = await observation(manager, tx, actor, job, event, visible)
+            if actual is not None:
+                observed.append({"event_id": event["event_id"], "job_id": event["job_id"],
+                    "revision": int(event["job_version"]), "result_hash": _hash(json.loads(event["payload_json"])),
+                    **actual})
+            continue
+        inbox = await tx.fetchone(f"SELECT status,delivered_seq FROM {manager.store.t.follow_up_queue} "
+                                  "WHERE session_id=? AND item_id=?", (actor.session_id, item_id))
+        if inbox is None or inbox["status"] != "delivered" or inbox["delivered_seq"] not in visible:
+            continue
+        seq = int(inbox["delivered_seq"])
+        row = await tx.fetchone(f"SELECT * FROM {manager.store.t.messages} WHERE session_id=? AND seq=?",
+                               (actor.session_id, seq))
+        # Hooks may remove, copy, or rewrite rows. Equality with the real
+        # inbox row is required; merely appearing later in history is not.
+        message = visible[seq]
+        if row is None or row["role"] != message.get("role") or row["content"] != message.get("content"):
+            continue
+        observed.append({"event_id": event["event_id"], "job_id": event["job_id"],
+            "revision": int(event["job_version"]), "result_hash": _hash(json.loads(event["payload_json"])),
+            "delivered_seq": seq, **({"event_type": "operation"} if event["event_type"] == "operation" else {})})
+    return observed, wait_observations
 
 
 async def commit(manager, actor, caller, *, snapshot_id, response_ref, decision="consumed", reason):

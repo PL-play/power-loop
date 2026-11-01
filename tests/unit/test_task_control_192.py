@@ -140,7 +140,7 @@ async def test_stop_transaction_rollback_and_lost_commit_ack(control, monkeypatc
     async def fault():
         nonlocal fired
         async with original() as tx:
-            execute = tx.execute
+            execute = tx._execute
             async def wrapped(sql, params=()):
                 nonlocal fired
                 hit = ("SET status=?,cancel_requested_at" in sql if port in ("update", "noop", "cancel") else "INSERT INTO" in sql and "job_events" in sql)
@@ -150,7 +150,7 @@ async def test_stop_transaction_rollback_and_lost_commit_ack(control, monkeypatc
                         return 1
                     raise asyncio.CancelledError() if port == "cancel" else RuntimeError("test statement fault")
                 return await execute(sql, params)
-            monkeypatch.setattr(tx, "execute", wrapped)
+            monkeypatch.setattr(tx, "_execute", wrapped)
             yield tx
         if port == "ack" and not fired:
             fired = True
