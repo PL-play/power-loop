@@ -130,9 +130,7 @@ async def _prepare(manager, tx, actor, job_id, generation, *, lease=None, _contr
     else:
         if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (_id("projected", job_id, generation),)):
             raise JobError("workflow_delivery_revision_mismatch")
-        await tx.execute(f"INSERT INTO {manager.events} "
-            "(event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (key, job_id, "workflow_delivery", canonical["job_version"], _hash(data), _json(data), "not_applicable", manager.now()))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job_id, "workflow_delivery", canonical["job_version"], _hash(data), _json(data), "not_applicable", manager.now()))
     return data
 
 
@@ -143,9 +141,7 @@ async def _event(manager, tx, key, kind, data, job_id, revision):
                 old["delivery_status"] != "not_applicable" or old["request_hash"] != _hash(data) or old["payload_json"] != _json(data)):
             raise JobError("workflow_projection_receipt_mismatch")
     else:
-        count = await tx.execute(f"INSERT INTO {manager.events} "
-            "(event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (key, job_id, kind, revision, _hash(data), _json(data), "not_applicable", manager.now()))
+        count = await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job_id, kind, revision, _hash(data), _json(data), "not_applicable", manager.now()))
         if count != 1:
             raise JobError("workflow_projection_receipt_mismatch")
 

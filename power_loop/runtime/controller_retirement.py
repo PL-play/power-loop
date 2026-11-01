@@ -120,6 +120,5 @@ async def _persist(runtime, binding):
         # Close admission atomically with the receipt. Existing SDK readers
         # already fence closed intake and unknown resources; no new permission
         # rule or inferred physical-exit proof is needed.
-        await tx.execute(f"UPDATE {manager.jobs} SET intake='closed',status='settling',"
-                         "resource_state='unknown',lease_until_ms=NULL,version=version+1,updated_at=? WHERE job_id=?",
-                         (manager.now(), row['job_id']))
+        await tx.write_job(row['job_id'], f"UPDATE {manager.jobs} SET intake='closed',status='settling',"
+                         "resource_state='unknown',lease_until_ms=NULL,version=version+1,updated_at=? WHERE job_id=?", (manager.now(), row['job_id']))

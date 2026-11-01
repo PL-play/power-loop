@@ -70,11 +70,11 @@ async def accept(manager, actor, target, *, caller, call_ref, tool_call_id, sess
                    "mode": "steer", "status": "accepted", "request": request}
         if job["generation"] > 1:
             payload.update(generation=job["generation"], result_event_id=result_id(target.job_id, job["generation"]))
-        await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), target.job_id))
+        await tx.write_job(target.job_id, f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), target.job_id))
         operation = await manager._insert_operation(tx, job_id=target.job_id, version=job["version"]+1,
             actor=actor, action="nudge", key=key, fingerprint=fingerprint,
             call_ref=call_ref, tool_call_id=tool_call_id, payload=payload)
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (operation.operation_id,))
+        await tx.update_event(operation.job_id, f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (operation.operation_id,), notify=True)
         cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
         await manager.store.signal_changes(tx, session_id, "inbox")
         inserted = await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),

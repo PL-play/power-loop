@@ -140,8 +140,7 @@ async def require_current(manager, tx, row):
 
 async def _insert(manager, tx, event_id, job_id, kind, version, payload):
     columns = ("event_id", "job_id", "event_type", "job_version", "payload_json", "delivery_status", "created_at")
-    inserted = await tx.execute(manager.db.dialect.insert_ignore(manager.events, columns),
-        (event_id, job_id, kind, version, _json(payload), "not_applicable", manager.now()))
+    inserted = await tx.append_event(columns, (event_id, job_id, kind, version, _json(payload), "not_applicable", manager.now()), ignore=True)
     if inserted:
         remember_ref(manager, event_id, job_id, kind, version, payload)
         return

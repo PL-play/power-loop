@@ -422,17 +422,14 @@ async def _publish(manager, tx, plans):
         close = deferred.get(row["job_id"]) if deferred is not None else None
         if close is not None:
             resource, _now, previous_version, generation = close
-            changed = await tx.execute(f"UPDATE {manager.jobs} SET status=?,intake='closed',resource_state=?,"
+            changed = await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status=?,intake='closed',resource_state=?,"
                 "lease_until_ms=NULL,supervision_status='closed',version=?,updated_at=? "
-                "WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'",
-                (status, resource, version, manager.now(), row["job_id"], previous_version, generation))
+                "WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'", (status, resource, version, manager.now(), row["job_id"], previous_version, generation))
         else:
-            changed = await tx.execute(f"UPDATE {manager.jobs} SET status=?,supervision_status='closed',version=?,updated_at=? WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'",
-                (status, version, manager.now(), row["job_id"], row["version"], row["generation"]))
+            changed = await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status=?,supervision_status='closed',version=?,updated_at=? WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'", (status, version, manager.now(), row["job_id"], row["version"], row["generation"]))
         if changed != 1:
             raise JobError("finalization_execution_changed")
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (ref["event_id"], row["job_id"], "supervision_closed", version, _hash(data), _json(data), "not_applicable", manager.now()))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (ref["event_id"], row["job_id"], "supervision_closed", version, _hash(data), _json(data), "not_applicable", manager.now()))
 
 
 async def finalize(manager, actor, job_id, *, generation):
@@ -473,9 +470,9 @@ async def consume_node(runtime, workflow, node, result):
         # an unknown child may retain supervision after its node was consumed.
         # Freeze the handled canonical marker, never a pending delivery marker.
         if row["result_status"] != "handled":
-            await tx.execute(f"UPDATE {manager.jobs} SET result_status='handled',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), row["job_id"]))
+            await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET result_status='handled',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), row["job_id"]), obligations=True)
             row = await manager._row(tx, row["job_id"])
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (result_id(row["job_id"], row["generation"]),))
+        await tx.update_event(row["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (result_id(row["job_id"], row["generation"]),))
         canonical = await _reference(manager, tx, result_id(row["job_id"], row["generation"]))
         data = {"version": 1, "workflow": _lease(parent), "node": _lease(row), "result": canonical}
         key = _identity(manager, "node", [row["job_id"], row["generation"]])
@@ -484,8 +481,7 @@ async def consume_node(runtime, workflow, node, result):
             if old["request_hash"] != _hash(data) or json.loads(old["payload_json"]) != data:
                 raise JobError("node_result_consumption_conflict")
         else:
-            await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (key, row["job_id"], "node_result_consumed", row["version"], _hash(data), _json(data), "not_applicable", manager.now()))
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, row["job_id"], "node_result_consumed", row["version"], _hash(data), _json(data), "not_applicable", manager.now()))
 
 
 async def reopen(manager, tx, previous, target, operation_id):
@@ -502,13 +498,12 @@ async def reopen(manager, tx, previous, target, operation_id):
                 "operation_id": operation_id, "target": target}
             row = await manager._row(tx, current["job_id"])
             if current["job_id"] != previous["job_id"]:
-                await tx.execute(f"UPDATE {manager.jobs} SET supervision_status='open',version=version+1,updated_at=? WHERE job_id=? AND supervision_status='closed'", (manager.now(), current["job_id"]))
+                await tx.write_job(current["job_id"], f"UPDATE {manager.jobs} SET supervision_status='open',version=version+1,updated_at=? WHERE job_id=? AND supervision_status='closed'", (manager.now(), current["job_id"]))
                 row = await manager._row(tx, current["job_id"])
             elif row["supervision_status"] != "open":
                 raise JobError("finalization_reopen_missing")
             key = _identity(manager, "reopened", [current["job_id"], operation_id])
-            await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (key, current["job_id"], "supervision_reopened", row["version"], _hash(data), _json(data), "not_applicable", manager.now()))
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, current["job_id"], "supervision_reopened", row["version"], _hash(data), _json(data), "not_applicable", manager.now()))
         current = await manager._row(tx, current["parent_job_id"]) if current["parent_job_id"] else None
 
 

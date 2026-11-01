@@ -211,8 +211,7 @@ async def reconcile(runtime, actor, job_id):
                 'execution_authority': False, 'billing_settled': False}
             await _event(manager, tx, identity(manager, row), row, 'controller_stopped', data)
             await tx.set_event_recipient(identity(manager, row), actor.session_id)
-            await tx.execute(f"UPDATE {manager.jobs} SET resource_state='stopped',version=version+1,updated_at=? WHERE job_id=?",
-                             (manager.now(), job_id))
+            await tx.write_job(job_id, f"UPDATE {manager.jobs} SET resource_state='stopped',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job_id))
             row = await manager._row(tx, job_id)
             old = await read(manager, tx, row, optional=False, _closures=validated)
         await enqueue(manager, tx, row, old, _closures=validated)

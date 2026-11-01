@@ -184,8 +184,7 @@ async def record(manager, tx, actor, binding, operation):
     # The operation DTO contains its public payload, not its source hash.
     create = await tx.fetchone(f"SELECT request_hash FROM {manager.events} WHERE event_id=?", (operation.operation_id,))
     payload["creation_request_hash"] = create["request_hash"]
-    await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,request_hash,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (_identity(manager, actor, step, source), operation.job_id, "host_send_step", 1,
+    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'request_hash', 'delivery_status', 'created_at'), (_identity(manager, actor, step, source), operation.job_id, "host_send_step", 1,
             _json(payload), _hash(payload), "not_applicable", manager.now()))
 
 

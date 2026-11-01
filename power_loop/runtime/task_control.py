@@ -137,9 +137,8 @@ async def request_stop(manager, actor, job_id, *, caller, call_ref, tool_call_id
         if row["supervision_status"] != "closed" and row["cancel_requested_at"] is None:
             now = manager.now()
             status = "cancelled" if row["resource_state"] == "not_started" else "cancelling"
-            if await tx.execute(f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,intake='closed',"
-                    "version=version+1,updated_at=? WHERE job_id=? AND version=? AND generation=?",
-                    (status, now, reason, now, job_id, row["version"], row["generation"])) != 1:
+            if await tx.write_job(job_id, f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,intake='closed',"
+                    "version=version+1,updated_at=? WHERE job_id=? AND version=? AND generation=?", (status, now, reason, now, job_id, row["version"], row["generation"])) != 1:
                 raise JobError("stop_write_mismatch")
             saved = await manager._row(tx, job_id)
             if (saved["version"] != row["version"] + 1 or saved["generation"] != row["generation"] or

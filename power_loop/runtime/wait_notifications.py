@@ -178,10 +178,9 @@ async def enqueue_notification(loop, actor, event_id):
                 (actor.session_id, key, "wait_handoff", "queue", "pending", message, manager.now()))
             await _inbox(manager, tx, receipt)
             version = job["version"] + 1
-            await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (key, job["job_id"], "wait_notification", version, actor.session_id, _hash(receipt), _json(receipt), "delivered", manager.now()))
-            await tx.execute(f"UPDATE {manager.jobs} SET version=?,updated_at=? WHERE job_id=?", (version, manager.now(), job["job_id"]))
-            await tx.execute(f"UPDATE {manager.events} SET delivery_status='delivered' WHERE event_id=?", (event_id,))
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job["job_id"], "wait_notification", version, actor.session_id, _hash(receipt), _json(receipt), "delivered", manager.now()))
+            await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=?,updated_at=? WHERE job_id=?", (version, manager.now(), job["job_id"]))
+            await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='delivered' WHERE event_id=?", (event_id,))
         inbox = await _inbox(manager, tx, receipt)
         result = {"notification_id": receipt["item_id"], "event_id": event_id, "wait_job_id": job["job_id"],
             "main_session_id": actor.session_id, "status": "enqueued", "inbox_status": inbox["status"], "execution_authority": False}
@@ -235,8 +234,7 @@ async def observe_request(manager, tx, actor, caller, *, source, round_index, se
             if old["request_hash"] != _hash(observed) or _hash(waits._object(old["payload_json"])) != _hash(observed):
                 raise JobError("wait_observation_conflict")
         else:
-            await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (key, caller.job_id, "wait_observed", source["version"], actor.session_id, _hash(observed), _json(observed), "prepared", manager.now()))
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, caller.job_id, "wait_observed", source["version"], actor.session_id, _hash(observed), _json(observed), "prepared", manager.now()))
     return len(notices)
 
 

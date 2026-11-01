@@ -80,6 +80,9 @@ async def test_native_ledger_has_one_wire_request_without_changing_legacy_retry_
         try:
             await service.close()
         finally:
+            if native:
+                from tests.obligation_invariants import assert_obligation_projection
+                await assert_obligation_projection(store, store.table_prefix)
             await store.close()
             server.close()
             await server.wait_closed()

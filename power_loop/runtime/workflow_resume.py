@@ -113,10 +113,9 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, gener
         from .executor_registry import ExecutorIdentity, require_accepting
         executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
             required=row["executor_key"] is not None or source["executor_key"] is not None)
-        updated = await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,session_id=NULL,"
+        updated = await tx.write_job(job_id, f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,session_id=NULL,"
             "status='running',supervision_status='open',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
-            "version=version+1,updated_at=? WHERE job_id=?",
-            (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id))
+            "version=version+1,updated_at=? WHERE job_id=?", (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id), obligations=True)
         from .workflow_controller import proof
         current = await manager._row(tx, job_id)
         if updated != 1 or _hash(proof(current)) != _hash(asdict(target)) or current["session_id"] is not None or current["result_json"] is not None:
@@ -126,12 +125,11 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, gener
         op = await manager._insert_operation(tx, job_id=job_id, version=row["version"]+1, actor=actor, action="nudge",
             key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id, payload=payload)
         payload["execution_id"] = op.operation_id[3:]
-        if await tx.execute(f"UPDATE {manager.events} SET payload_json=?,delivery_status='pending_delivery' WHERE event_id=?", (_json(payload), op.operation_id)) != 1:
+        if await tx.update_event(op.job_id, f"UPDATE {manager.events} SET payload_json=?,delivery_status='pending_delivery' WHERE event_id=?", (_json(payload), op.operation_id), notify=True) != 1:
             raise JobError("workflow_restore_admission_mismatch")
         evidence = {"version": 1, "operation_id": op.operation_id, "request_hash": _hash(request),
             "target": asdict(target), "run_id": plan["run_id"], "driver_sid": driver_sid}
-        if await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (execution_id(job_id, target.generation), job_id, "execution", row["version"]+1, _hash(evidence), _json(evidence), "not_applicable", now)) != 1:
+        if await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (execution_id(job_id, target.generation), job_id, "execution", row["version"]+1, _hash(evidence), _json(evidence), "not_applicable", now)) != 1:
             raise JobError("workflow_restore_admission_mismatch")
         from .execution_membership import scope, start
         await start(manager, tx, await manager._row(tx, job_id))
@@ -142,8 +140,7 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, gener
                 "previous": plan["nodes"][nid]["lease"], "generation": plan["nodes"][nid]["lease"]["generation"]+1,
                 "source_hash": _hash(plan["nodes"][nid])}
             rid = reservation_id(manager, job_id, target.generation, nid)
-            if await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                    (rid, job_id, "workflow_node_reservation", row["version"]+1, _hash(reserved), _json(reserved), "not_applicable", now)) != 1:
+            if await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (rid, job_id, "workflow_node_reservation", row["version"]+1, _hash(reserved), _json(reserved), "not_applicable", now)) != 1:
                 raise JobError("workflow_restore_admission_mismatch")
             stored = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (rid,))
             if stored is None or _hash(json.loads(stored["payload_json"])) != _hash(reserved):
@@ -256,8 +253,7 @@ async def claim_dispatch(manager, actor, operation_id, *, caller, token, resourc
         admission(resources, manager, actor, request["plan"]["profile"],
             prior_usage=request["prior_usage"], previous=request.get("resource_evidence"))
         evidence = {"version": 1, "operation_id": operation_id, "target": request["target"], "driver_sid": request["driver_sid"], "token": token}
-        if await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (key, row["job_id"], "workflow_dispatch", row["version"], _hash(evidence), _json(evidence), "claimed", manager.now())) != 1:
+        if await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, row["job_id"], "workflow_dispatch", row["version"], _hash(evidence), _json(evidence), "claimed", manager.now())) != 1:
             raise JobError("workflow_restore_dispatch_mismatch")
         saved = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (key,))
         if saved is None or _hash(json.loads(saved["payload_json"])) != _hash(evidence):

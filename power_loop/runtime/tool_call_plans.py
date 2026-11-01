@@ -74,8 +74,7 @@ async def _event(manager, tx, key, source, kind, value):
     document = _json(value)
     if len(document.encode('utf-8')) > 262144:
         raise JobError('tool_call_plan_too_large')
-    await tx.execute(f'INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)',
-        (key, source['job_id'], kind, source['version'], _hash(value), document, 'not_applicable', manager.now()))
+    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, source['job_id'], kind, source['version'], _hash(value), document, 'not_applicable', manager.now()))
 
 
 async def _read(manager, tx, key, source, kind, *, optional=False):

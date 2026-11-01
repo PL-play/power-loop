@@ -95,6 +95,8 @@ async def test_process_death_preserves_dispatched_attempt_and_blocks_unconfirmed
             after = await future.get_job(actor, job["job_id"])
             assert after.cancel_requested_at is not None and after.supervision_status == "open"
         finally:
+            from tests.obligation_invariants import assert_obligation_projection
+            await assert_obligation_projection(store, store.table_prefix)
             await store.close()
     finally:
         if process.returncode is None:

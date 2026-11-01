@@ -184,8 +184,8 @@ async def enqueue_runtime(runtime, actor, job):
             # Any former tool receipt describes the old pending/error boundary.
             # This new, resolved outcome now has its own processing obligation.
             if row['generation'] != 0:
-                await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (result['event_id'],))
-                await tx.execute(f"UPDATE {manager.jobs} SET result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job))
+                await tx.update_event(job, f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (result['event_id'],), notify=True)
+                await tx.write_job(job, f"UPDATE {manager.jobs} SET result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job), obligations=True)
             else:
                 from .pending_calls import SNAPSHOT, model
                 source = await manager._row(tx, row['parent_job_id'])

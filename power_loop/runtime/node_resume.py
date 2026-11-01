@@ -129,20 +129,18 @@ async def admit(manager, actor, job_id, *, caller, workflow, call_ref, tool_call
         from .executor_registry import ExecutorIdentity, require_accepting
         executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
             required=job["executor_key"] is not None or source["executor_key"] is not None or wf["executor_key"] is not None)
-        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,status='running',supervision_status='open',"
-            "intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,version=version+1,updated_at=? WHERE job_id=?",
-            (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id))
+        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,status='running',supervision_status='open',"
+            "intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,version=version+1,updated_at=? WHERE job_id=?", (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id), obligations=True)
         payload = {"job_id": job_id, "session_id": node["session_id"], "run_id": node["workflow_run_id"],
             "mode": "continue", "status": "accepted", "generation": target.generation,
             "result_event_id": result_id(job_id, target.generation), "request": request}
         op = await manager._insert_operation(tx, job_id=job_id, version=job["version"]+1, actor=actor, action="nudge",
             key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id, payload=payload)
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (op.operation_id,))
+        await tx.update_event(op.job_id, f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (op.operation_id,), notify=True)
         for event_id, kind, data in ((execution_id(job_id, target.generation), "execution", {"operation_id": op.operation_id,
                 "run_id": node["workflow_run_id"], "target": request["target"], "workflow": request["workflow"]}),
                 (manager._node_session_event_id(job_id, node["session_id"], target.generation), "node_session", request["node"])):
-            await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
-                (event_id, job_id, kind, job["version"]+1, _json(data), "not_applicable", now))
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (event_id, job_id, kind, job["version"]+1, _json(data), "not_applicable", now))
         cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
         await manager.store.signal_changes(tx, node["session_id"], "inbox")
         if not await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),

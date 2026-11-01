@@ -194,10 +194,9 @@ async def record_decision(manager, actor, *, event_id, caller, call_ref, tool_ca
         payload = {"version": 1, "event_id": event_id, "due_hash": due["request_hash"],
             "operation_id": operation.operation_id, "request": request, "observation": seen,
             "original_owner": saved["binding"]["owner"], "continuation_hash": _hash(saved["request"]["request"]["continuation"])}
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (canonical_id, job["job_id"], "wait_decision", job["version"]+1, actor.session_id, _hash(payload), _json(payload), "pending_delivery", manager.now()))
-        await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (event_id, receipt["item_id"]))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (canonical_id, job["job_id"], "wait_decision", job["version"]+1, actor.session_id, _hash(payload), _json(payload), "pending_delivery", manager.now()))
+        await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
+        await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (event_id, receipt["item_id"]))
         return operation, False
 
 

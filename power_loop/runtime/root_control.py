@@ -67,9 +67,8 @@ async def _cancel_job(manager, tx, actor, job_id, *, key, fingerprint, reason):
         # running cancellation would strand its original pending/result proof.
         status = row["status"] if row["supervision_status"] == "closed" or row["status"] == "model_closed" else (
             "cancelled" if row["resource_state"] == "not_started" else "cancelling")
-        await tx.execute(f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,"
-            "intake='closed',version=version+1,updated_at=? WHERE job_id=?",
-            (status, manager.now(), reason, manager.now(), job_id))
+        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,"
+            "intake='closed',version=version+1,updated_at=? WHERE job_id=?", (status, manager.now(), reason, manager.now(), job_id))
         row = await manager._row(tx, job_id)
     return await manager._insert_operation(tx, job_id=job_id, version=row["version"], actor=actor,
         action="stop", key=key, fingerprint=fingerprint, payload={"job_id": job_id,

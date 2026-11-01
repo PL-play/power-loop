@@ -81,10 +81,7 @@ async def _policy(runtime, tx, *, create=False, job=None):
         )
         if legacy:
             raise JobError("budget_legacy_execution_unsettled")
-        await tx.execute(
-            f"INSERT INTO {manager.events} "
-            "(event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (
                 marker_id,
                 job["job_id"],
                 "model_budget_policy",
@@ -93,8 +90,7 @@ async def _policy(runtime, tx, *, create=False, job=None):
                 _json(manifest),
                 "not_applicable",
                 manager.now(),
-            ),
-        )
+            ))
         marker = {"payload_json": _json(manifest), "request_hash": _hash(manifest)}
         await tx.execute(
             f"INSERT INTO {manager.prefix}task_budget_policies "

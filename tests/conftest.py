@@ -64,3 +64,26 @@ def pytest_collection_modifyitems(
     for item in items:
         if "real_llm" in item.keywords:
             item.add_marker(skip_marker)
+
+
+@pytest.fixture(autouse=True)
+def require_declared_control_writes(monkeypatch):
+    """Catch forgotten intent declarations, including SQL built dynamically.
+
+    SQL inspection is deliberately confined to tests. Production transactions
+    derive all invalidations and pending-index work from their explicit ports.
+    """
+    import re
+
+    from power_loop.runtime.session_controls import ControlTransaction
+
+    execute = ControlTransaction.execute
+
+    async def checked(self, sql, params=()):
+        if re.match(r"\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b", sql, re.I):
+            for table in (self._events, self._jobs, self._executors):
+                assert not re.search(r"\b" + re.escape(table) + r"\b", sql), (
+                    "Control writes must declare an explicit intent", sql)
+        return await execute(self, sql, params)
+
+    monkeypatch.setattr(ControlTransaction, "execute", checked)

@@ -129,4 +129,6 @@ async def test_host_creation_snapshot_is_durable_and_not_replaced_on_replay(tmp_
     payload = json.loads(event["payload_json"])
     assert payload["host_contexts"]["host.trace"] == captured
     assert "host_contexts" not in payload.get("request", {})
+    from tests.obligation_invariants import assert_obligation_projection
+    await assert_obligation_projection(reopened, reopened.table_prefix)
     await reopened.close()

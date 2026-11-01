@@ -89,25 +89,22 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, sessi
         from .executor_registry import ExecutorIdentity, require_accepting
         executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
             required=job["executor_key"] is not None or source["executor_key"] is not None)
-        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,"
+        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,"
             "status='running',supervision_status='open',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
-            "version=version+1,updated_at=? WHERE job_id=?",
-            (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id))
+            "version=version+1,updated_at=? WHERE job_id=?", (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id), obligations=True)
         payload = {"job_id": job_id, "session_id": session_id, "mode": "continue", "status": "accepted",
                    "generation": target.generation, "result_event_id": result_id(job_id, target.generation), "request": request}
         operation = await manager._insert_operation(tx, job_id=job_id, version=job["version"]+1,
             actor=actor, action="nudge", key=key, fingerprint=fingerprint, call_ref=call_ref,
             tool_call_id=tool_call_id, payload=payload)
         payload["run_id"] = operation.operation_id[3:]
-        await tx.execute(f"UPDATE {manager.events} SET payload_json=?,delivery_status='pending_delivery' WHERE event_id=?",
-            (_json(payload), operation.operation_id))
+        await tx.update_event(operation.job_id, f"UPDATE {manager.events} SET payload_json=?,delivery_status='pending_delivery' WHERE event_id=?", (_json(payload), operation.operation_id), notify=True)
         cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
         await manager.store.signal_changes(tx, session_id, "inbox")
         if not await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),
                 (session_id, "nudge:"+operation.operation_id, "relay", "steer", "pending", message, now)):
             raise JobError("nudge_inbox_conflict")
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
-            (execution_id(job_id, target.generation), job_id, "execution", job["version"]+1,
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (execution_id(job_id, target.generation), job_id, "execution", job["version"]+1,
              _json({"operation_id": operation.operation_id, "run_id": payload["run_id"], "target": request["target"]}), "not_applicable", now))
         await start(manager, tx, await manager._row(tx, job_id))
         from .finalization import reopen
@@ -144,8 +141,7 @@ async def claim_dispatch(manager, actor, operation_id, *, caller, token):
         create = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND action='create'", (caller.job_id,))
         if json.loads(create["payload_json"])["request"]["send_index"] != int(json.loads(op["call_ref_json"])["send_index"]):
             raise JobError("resume_caller_mismatch")
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
-            (event_id, job["job_id"], "dispatch", job["version"], _json({"token": token, "operation_id": operation_id}), "claimed", manager.now()))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (event_id, job["job_id"], "dispatch", job["version"], _json({"token": token, "operation_id": operation_id}), "claimed", manager.now()))
         return True
 
 

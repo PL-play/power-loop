@@ -156,12 +156,11 @@ async def reconcile_tx(manager, tx, actor, job, creation, saved):
         raise JobError("wait_disposition_after_close")
     payload = await _expected(manager, tx, actor, job, creation, saved, state, intent)
     key = identity(manager, decision["event_id"])
-    await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (key, job["job_id"], "wait_disposition", job["version"]+1, main.session_id, _hash(payload), _json(payload), "not_applicable", manager.now()))
-    await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (decision["event_id"],))
+    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job["job_id"], "wait_disposition", job["version"]+1, main.session_id, _hash(payload), _json(payload), "not_applicable", manager.now()))
+    await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (decision["event_id"],))
     if effect:
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (effect["event_id"],))
-    await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
+        await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (effect["event_id"],))
+    await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
     current = await manager._row(tx, job["job_id"])
     return await read_tx(manager, tx, actor, current, creation, saved, state, required=True)
 

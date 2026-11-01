@@ -329,9 +329,8 @@ async def _prepare_due(manager, tx, actor, job_id):
             raise JobError("wait_due_evidence_corrupt")
     else:
         version = job["version"] + 1
-        await tx.execute(f"UPDATE {manager.jobs} SET version=?,updated_at=? WHERE job_id=?", (version, manager.now(), job_id))
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                         (event_id, job_id, "wait_due", version, _hash(payload), _json(payload), "pending_delivery", manager.now()))
+        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET version=?,updated_at=? WHERE job_id=?", (version, manager.now(), job_id))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (event_id, job_id, "wait_due", version, _hash(payload), _json(payload), "pending_delivery", manager.now()))
     return {"status": "decision_pending", "event_id": event_id, "payload": payload, "execution_authority": False}
 
 

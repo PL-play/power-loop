@@ -148,9 +148,8 @@ async def close(runtime, binding, sid):
         marker_id = closed_id(manager, job["job_id"], sid, job["generation"])
         if await is_closed(manager, tx, job, sid):
             return
-        await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
-            (marker_id, job["job_id"], "node_input_closed", job["version"]+1, json.dumps(_closed_data(job, sid)), "not_applicable", manager.now()))
+        await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (marker_id, job["job_id"], "node_input_closed", job["version"]+1, json.dumps(_closed_data(job, sid)), "not_applicable", manager.now()))
 
 
 async def finish_attempt(runtime, engine, raw):

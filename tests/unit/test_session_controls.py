@@ -27,9 +27,8 @@ async def test_notice_recipient_version_changes_only_with_its_transaction(regist
 
     async def route_notice():
         async with manager._write() as tx:
-            await tx.execute(
-                f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) "
-                "VALUES (?,?,?,?,?,?,?)",
+            await tx.append_event(
+                ("event_id", "job_id", "event_type", "job_version", "payload_json", "delivery_status", "created_at"),
                 ("notice", registered.job.job_id, "controller_review_handoff", 1, "{}", "pending", manager.now()))
             await tx.set_event_recipient("notice", recipient)
             if rollback:
@@ -63,7 +62,7 @@ async def test_all_notice_route_writers_use_explicit_recipient_invalidation():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr == "set_event_recipient":
                 routed.add((filename, function))
-            elif node.func.attr in {"execute", "fetchone", "fetchall"} and node.args:
+            elif node.func.attr in {"execute", "_execute", "fetchone", "fetchall"} and node.args:
                 statement = node.args[0]
                 parts = statement.values if isinstance(statement, ast.JoinedStr) else [statement]
                 sql = " ".join(part.value for part in parts if isinstance(part, ast.Constant) and isinstance(part.value, str))
@@ -76,3 +75,47 @@ async def test_all_notice_route_writers_use_explicit_recipient_invalidation():
         inspect(ast.parse(path.read_text()), path.name)
     assert routed == expected
     assert direct_writes == [("session_controls.py", "set_event_recipient")]
+
+
+@pytest.mark.parametrize("target", ["jobs", "job_events", "task_executors"])
+async def test_undeclared_control_mutations_fail_before_writing(registry_store, target):
+    store, _ = registry_store
+    manager = JobManager(store)
+    table = manager.prefix + target
+    before = await manager.db.fetchall(f"SELECT * FROM {table}")
+    with pytest.raises(AssertionError, match="must declare an explicit intent"):
+        async with manager._write() as tx:
+            await tx.execute(f"DELETE FROM {table}")
+    assert await manager.db.fetchall(f"SELECT * FROM {table}") == before
+
+
+async def test_runtime_event_and_job_writers_declare_their_intents():
+    runtime = Path(session_controls.__file__).parent
+    direct = []
+    for path in runtime.glob("*.py"):
+        if path.name == "session_controls.py":
+            continue
+        source = path.read_text()
+        for node in ast.walk(ast.parse(source)):
+            if (not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute)
+                    or node.func.attr not in {"execute", "fetchone", "fetchall"} or not node.args):
+                continue
+            statement = node.args[0]
+            tables = {part.attr for part in ast.walk(statement) if isinstance(part, ast.Attribute)}
+            if not tables.intersection({"jobs", "events"}):
+                continue
+            parts = statement.values if isinstance(statement, ast.JoinedStr) else [statement]
+            words = " ".join(part.value for part in parts
+                             if isinstance(part, ast.Constant) and isinstance(part.value, str))
+            if re.match(r"\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b", words, re.I):
+                direct.append((path.name, node.lineno))
+            elif isinstance(statement, ast.Call) and isinstance(statement.func, ast.Attribute):
+                if statement.func.attr in {"insert_ignore", "upsert"}:
+                    direct.append((path.name, node.lineno))
+    assert direct == []
+    source = Path(session_controls.__file__).read_text()
+    assert "_observe" not in source and "_value_rows" not in source
+    assert not any(isinstance(node, (ast.Import, ast.ImportFrom)) and
+                   (getattr(node, "module", None) == "re" or
+                    any(name.name == "re" for name in node.names))
+                   for node in ast.walk(ast.parse(source)))

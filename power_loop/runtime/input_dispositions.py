@@ -141,10 +141,9 @@ async def reconcile_tx(manager, tx, actor, event):
         (request["session_id"], "nudge:" + event["event_id"]))
     _, payload = await _expected(manager, tx, event)
     key = identity(manager, event["event_id"])
-    await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (key, owner["job_id"], "input_disposition", owner["version"]+1, event["caller_session_id"], _hash(payload), _json(payload), "not_applicable", manager.now()))
-    await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (event["event_id"],))
-    await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
+    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, owner["job_id"], "input_disposition", owner["version"]+1, event["caller_session_id"], _hash(payload), _json(payload), "not_applicable", manager.now()))
+    await tx.update_event(owner["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (event["event_id"],))
+    await tx.write_job(owner["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
     updated = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event["event_id"],))
     return await read_tx(manager, tx, updated, required=True)
 

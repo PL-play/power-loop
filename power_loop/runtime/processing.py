@@ -143,9 +143,7 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages, 
             if old["payload_json"] != _json(payload):
                 raise JobError("processing_snapshot_conflict")
             return event_id
-        await tx.execute(f"INSERT INTO {manager.events} "
-            "(event_id,job_id,event_type,job_version,caller_session_id,payload_json,delivery_status,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)", (event_id, caller.job_id, "processing_request", send["version"],
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'payload_json', 'delivery_status', 'created_at'), (event_id, caller.job_id, "processing_request", send["version"],
                 actor.session_id, _json(payload), "prepared", manager.now()))
         return event_id
 
@@ -278,20 +276,16 @@ async def commit(manager, actor, caller, *, snapshot_id, response_ref, decision=
             payload = {"event": event, "snapshot_id": snapshot_id, "handler_job_id": caller.job_id,
                        "generation": caller.generation, "response_ref": response, "decision": decision, "reason": reason,
                        "operation_ids": sorted(operation_ids), "follow_up_job_ids": sorted(follow_up_jobs)}
-            await tx.execute(f"INSERT INTO {manager.events} "
-                "(event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)", (decision_id, target["job_id"], "processing_decision", target["version"]+1,
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (decision_id, target["job_id"], "processing_decision", target["version"]+1,
                     actor.session_id, fingerprint, _json(payload), "committed", manager.now()))
             negative_review = not is_input and target['kind'] == 'background_tool' and target['generation'] == 0
             if not negative_review:
-                await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (event["event_id"],))
+                await tx.update_event(target["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (event["event_id"],))
             if not is_input and not negative_review:
-                await tx.execute(f"UPDATE {manager.jobs} SET result_status='handled',version=version+1,updated_at=? WHERE job_id=?",
-                                 (manager.now(), target["job_id"]))
+                await tx.write_job(target["job_id"], f"UPDATE {manager.jobs} SET result_status='handled',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), target["job_id"]), obligations=True)
             else:
-                await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?",
-                                 (manager.now(), target["job_id"]))
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (snapshot_id,))
+                await tx.write_job(target["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), target["job_id"]))
+        await tx.update_event(caller.job_id, f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (snapshot_id,), obligations=False)
         return decision_ids
 
 

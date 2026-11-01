@@ -153,16 +153,16 @@ async def apply(manager, actor, event_id):
             if choice == "cancel" and owner["cancel_requested_at"] is None:
                 status = owner["status"] if owner["supervision_status"] == "closed" else (
                     "cancelled" if owner["resource_state"] == "not_started" else "cancelling")
-                await tx.execute(f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,intake='closed',"
+                await tx.write_job(owner["job_id"], f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,intake='closed',"
                     "version=version+1,updated_at=? WHERE job_id=?", (status, manager.now(), request["reason"], manager.now(), owner["job_id"]))
             else:
-                await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
+                await tx.write_job(owner["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
             owner = await manager._row(tx, owner["job_id"])
             op = await manager._insert_operation(tx, job_id=owner["job_id"], version=owner["version"], actor=actor,
                 action=action, key=manager._origin_key(actor, action, None, None, "wait-effect:" + decision["event_id"]),
                 fingerprint=_hash(request), payload={"version": 1, "request": request})
             if choice == "continue":
-                await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (op.operation_id,))
+                await tx.update_event(op.job_id, f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (op.operation_id,), notify=True)
                 columns = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
                 await manager.store.signal_changes(tx, request["session_id"], "inbox")
                 inserted = await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
@@ -171,10 +171,9 @@ async def apply(manager, actor, event_id):
                     raise JobError("wait_effect_input_conflict")
         payload = {"version": 1, "binding": binding, "wait_job_id": job["job_id"], "owner": saved["binding"]["owner"],
             "decision": choice, "operation_id": op.operation_id if op else None, "review_at_ms": data["request"]["next_review_at_ms"]}
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (binding["effect_id"], job["job_id"], "wait_effect", job["version"]+1, actor.session_id, _hash(payload), _json(payload), "delivered", manager.now()))
-        await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='delivered' WHERE event_id=?", (decision["event_id"],))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (binding["effect_id"], job["job_id"], "wait_effect", job["version"]+1, actor.session_id, _hash(payload), _json(payload), "delivered", manager.now()))
+        await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
+        await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='delivered' WHERE event_id=?", (decision["event_id"],))
         if choice == "defer":
             from .wait_reviews import schedule
             job = await manager._row(tx, job["job_id"])
@@ -253,16 +252,14 @@ async def settle_owner_tx(manager, tx, actor, owner):
         payload = {"version": 1, "effect_id": effect["event_id"], "effect_hash": effect["request_hash"], "input_id": op_id,
             "input_hash": _hash(waits._object(op["payload_json"])), "proofs": proofs}
         key = "wait_resolved_" + _hash([manager.store.store_id, effect["event_id"]])[:48]
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (key, job["job_id"], "wait_resolved", job["version"]+1, _hash(payload), _json(payload), "not_applicable", manager.now()))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job["job_id"], "wait_resolved", job["version"]+1, _hash(payload), _json(payload), "not_applicable", manager.now()))
         result = {"status": "succeeded", "wait_resolved_event_id": key}
         canonical = {"outcome": "succeeded", "result": result, "resource_state": "stopped", "unstarted": True,
             "logical_wait": True, "resolution_hash": _hash(payload)}
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            ("result_" + job["job_id"], job["job_id"], "result", job["version"]+1, _hash(canonical), _json(canonical), "handled", manager.now()))
-        await tx.execute(f"UPDATE {manager.jobs} SET status='settling',outcome='succeeded',resource_state='stopped',intake='closed',"
-            "result_status='handled',result_json=?,version=version+1,updated_at=? WHERE job_id=?", (_json(result), manager.now(), job["job_id"]))
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (effect["event_id"], decision["event_id"]))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), ("result_" + job["job_id"], job["job_id"], "result", job["version"]+1, _hash(canonical), _json(canonical), "handled", manager.now()))
+        await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET status='settling',outcome='succeeded',resource_state='stopped',intake='closed',"
+            "result_status='handled',result_json=?,version=version+1,updated_at=? WHERE job_id=?", (_json(result), manager.now(), job["job_id"]), obligations=True)
+        await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (effect["event_id"], decision["event_id"]))
 
 
 async def _resolved(manager, tx, job, effect):

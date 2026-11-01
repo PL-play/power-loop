@@ -174,6 +174,7 @@ class JobManager:
         # audit paths leave this unset and re-verify stored evidence.
         self._trust_own_writes = TRUST_OWN_WRITES
         self._joined_write = ContextVar("execution_joined_write", default=None)
+        self._control_intents = ContextVar("execution_control_intents", default=None)
         self._deferred_model_updates = ContextVar("execution_deferred_model_updates", default=None)
 
     @asynccontextmanager
@@ -237,10 +238,13 @@ class JobManager:
         try:
             try:
                 async with self._control_transaction() as tx:
-                    from .session_controls import RecordingTransaction, bump
-                    recorder = RecordingTransaction(tx, self.events, (
-                        (self.jobs, "job_id"), (self.prefix + "task_executors", "executor_key")))
-                    yield recorder
+                    from .session_controls import ControlTransaction, bump
+                    recorder = ControlTransaction(tx, self)
+                    intent_token = self._control_intents.set(recorder)
+                    try:
+                        yield recorder
+                    finally:
+                        self._control_intents.reset(intent_token)
                     from .session_obligations import refresh
                     await refresh(self, tx, recorder)
                     if recorder.jobs or recorder.sessions:
@@ -439,14 +443,11 @@ class JobManager:
                 # conditional publish writes both transitions in one UPDATE.
                 deferred[lease.job_id] = (resource_state, now, row["version"], lease.generation)
             else:
-                await tx.execute(f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
-                    "resource_state=?,lease_until_ms=NULL,version=version+1,updated_at=? WHERE job_id=?",
-                    (resource_state, now, lease.job_id))
+                await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
+                    "resource_state=?,lease_until_ms=NULL,version=version+1,updated_at=? WHERE job_id=?", (resource_state, now, lease.job_id))
             closed = json.loads(_json({"generation": lease.generation, "evidence": evidence_data,
                                        "resource_state": resource_state}))
-            await tx.execute(f"INSERT INTO {self.events} "
-                "(event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
-                ("model_closed_" + lease.job_id, lease.job_id, "model_closed", row["version"]+1,
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), ("model_closed_" + lease.job_id, lease.job_id, "model_closed", row["version"]+1,
                  _json(closed), "not_applicable", now))
             from .execution_membership import remember_ref, seal
             remember_ref(self, "model_closed_" + lease.job_id, lease.job_id, "model_closed", row["version"] + 1, closed)
@@ -494,10 +495,9 @@ class JobManager:
                     # A legitimate unfinished child keeps supervision open;
                     # the model exit still commits in this same transaction.
                     state, now, version, generation = deferred[lease.job_id]
-                    changed = await tx.execute(f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
+                    changed = await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
                         "resource_state=?,lease_until_ms=NULL,version=version+1,updated_at=? "
-                        "WHERE job_id=? AND version=? AND generation=?",
-                        (state, now, lease.job_id, version, generation))
+                        "WHERE job_id=? AND version=? AND generation=?", (state, now, lease.job_id, version, generation))
                     if changed != 1:
                         raise JobError("stale_execution")
         finally:
@@ -521,11 +521,11 @@ class JobManager:
         hooks, undo, overlay = (self._control_commit_hooks.get(), self._control_rollback_hooks.get(),
                                 self._control_overlay.get())
         marks, visible = (len(hooks), len(undo)), dict(overlay)
-        await tx.execute("SAVEPOINT power_loop_finalize")
+        await tx.control_statement("SAVEPOINT power_loop_finalize")
         try:
             closure = await finalize(self, actor, lease.job_id, generation=lease.generation)
         except Exception as exc:
-            await tx.execute("ROLLBACK TO SAVEPOINT power_loop_finalize")
+            await tx.control_statement("ROLLBACK TO SAVEPOINT power_loop_finalize")
             for hook in reversed(undo[marks[1]:]):
                 hook()
             del hooks[marks[0]:], undo[marks[1]:]
@@ -535,7 +535,7 @@ class JobManager:
             if not isinstance(exc, (JobError, TypeError, ValueError, KeyError, AttributeError)):
                 logging.getLogger(__name__).exception("supervision remains open after model exit: %s", lease.job_id)
             closure = None
-        await tx.execute("RELEASE SAVEPOINT power_loop_finalize")
+        await tx.control_statement("RELEASE SAVEPOINT power_loop_finalize")
         return closure
 
     async def check_execution(self, actor: JobActor, lease: JobLease) -> None:
@@ -579,8 +579,7 @@ class JobManager:
             if (session is None or session["parent_session_id"] != actor.session_id or
                     json.loads(session["metadata_json"] or "{}").get("execution_role") != "subagent"):
                 raise JobError("session_ownership_mismatch")
-            await tx.execute(f"UPDATE {self.jobs} SET session_id=?,version=version+1,updated_at=? WHERE job_id=?",
-                             (session_id, self.now(), job_id))
+            await tx.write_job(job_id, f"UPDATE {self.jobs} SET session_id=?,version=version+1,updated_at=? WHERE job_id=?", (session_id, self.now(), job_id))
             return _record(await self._row(tx, job_id))
 
     async def bind_workflow_driver(self, actor: JobActor, lease: JobLease, session_id: str) -> JobRecord:
@@ -647,10 +646,8 @@ class JobManager:
             if await tx.fetchone(f"SELECT event_id FROM {self.events} WHERE event_id=?", (event_id,)):
                 await descriptor(self, tx, row, session_id)
                 return
-            await tx.execute(f"UPDATE {self.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (self.now(), lease.job_id))
-            await tx.execute(f"INSERT INTO {self.events} "
-                "(event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
-                (event_id, lease.job_id, "node_session", row["version"]+1,
+            await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (self.now(), lease.job_id))
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (event_id, lease.job_id, "node_session", row["version"]+1,
                  _json(data), "not_applicable", self.now()))
 
     async def operation_for_call(self, actor: JobActor, call_ref: MessageRef, tool_call_id: str) -> JobOperation | None:
@@ -745,11 +742,9 @@ class JobManager:
         call_ref_json, payload_json = (_json(call_ref.to_dict()) if call_ref else None), _json(payload or {})
         columns = ("event_id", "job_id", "event_type", "job_version", "operation_key", "request_hash", "action",
                    "caller_session_id", "tool_call_id", "call_ref_json", "payload_json", "delivery_status", "created_at")
-        sql = (self.db.dialect.insert_ignore(self.events, columns) if ignore else
-               f"INSERT INTO {self.events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})")
-        inserted = await tx.execute(sql, (operation_id, job_id, "operation", version, key,
+        inserted = await tx.append_event(columns, (operation_id, job_id, "operation", version, key,
             fingerprint, action, actor.session_id, tool_call_id,
-            call_ref_json, payload_json, "not_applicable", self.now()))
+            call_ref_json, payload_json, "not_applicable", self.now()), ignore=ignore)
         if ignore and not inserted:
             return None
         return _operation({"event_id": operation_id, "job_id": job_id, "action": action,
@@ -966,7 +961,7 @@ class JobManager:
         if parent is not None:
             from .execution_membership import note_child
             note_child(self, parent.job_id)
-        await tx.execute(f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
+        await tx.write_job(job_id, f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
             "session_id,created_by_session_id,kind,title,completion_scope_job_id,blocks_completion,"
             "status,version,generation,intake,resource_state,supervision_status,result_status,created_at,updated_at,"
             "parent_generation,parent_executor_id,parent_boot_id,execution_role,control_owner_job_id,"
@@ -1055,9 +1050,8 @@ class JobManager:
                        "executor_id": executor_id, "boot_id": boot_id,
                        "executor_key": executor["executor_key"] if executor else None,
                        "lease_until_ms": now + lease_ms, "resource_state": "running", "updated_at": now}
-            await tx.execute(f"UPDATE {self.jobs} SET status='running',version=version+1,generation=?,"
-                "executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,resource_state='running',updated_at=? WHERE job_id=?",
-                (generation, executor_id, boot_id, claimed["executor_key"], claimed["lease_until_ms"], now, job_id))
+            await tx.write_job(job_id, f"UPDATE {self.jobs} SET status='running',version=version+1,generation=?,"
+                "executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,resource_state='running',updated_at=? WHERE job_id=?", (generation, executor_id, boot_id, claimed["executor_key"], claimed["lease_until_ms"], now, job_id))
             tx.remember_row(self.jobs, "job_id", job_id, {**row, **claimed})
             from .execution_membership import note_first_claim, start
             if generation == 1:
@@ -1096,7 +1090,7 @@ class JobManager:
                     row["kind"] == "subagent" and caller_row["execution_role"] not in ("main", "workflow_node")):
                 raise JobError("role_forbids_delegation")
             await self._validate_call(tx, actor, call_ref, tool_call_id)
-            await tx.execute(f"UPDATE {self.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (self.now(), lease.job_id))
+            await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (self.now(), lease.job_id))
             return await self._insert_operation(tx, job_id=lease.job_id, version=int(row["version"]) + 1,
                 actor=actor, action=action, key=key, fingerprint=fingerprint,
                 call_ref=call_ref, tool_call_id=tool_call_id, payload=result_data)
@@ -1134,7 +1128,7 @@ class JobManager:
                 raise JobError("receipt_already_bound")
             if effect:
                 await managed_effects.bind_receipt(self, tx, target, op, receipt_ref)
-            await tx.execute(f"UPDATE {self.events} SET receipt_ref_json=? WHERE event_id=?", (encoded, operation_id))
+            await tx.update_event(op["job_id"], f"UPDATE {self.events} SET receipt_ref_json=? WHERE event_id=?", (encoded, operation_id), obligations=False)
             return _operation(await tx.fetchone(f"SELECT * FROM {self.events} WHERE event_id=?", (operation_id,)))
 
     async def record_result(self, actor: JobActor, lease: JobLease, *, outcome: str, result: Mapping[str, Any],
@@ -1218,12 +1212,9 @@ class JobManager:
             saved = {**result_data, "status": effective}
             from .result_payloads import canonical
             payload = canonical(payload, effective, saved)
-            await tx.execute(f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,resource_state='stopped',"
-                "intake='closed',lease_until_ms=NULL,result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?",
-                (effective, _json(saved), self.now(), job_id))
-            await tx.execute(f"INSERT INTO {self.events} "
-                "(event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
-                (event_id, job_id, "result", row["version"]+1, _json(payload), "pending_delivery", self.now()))
+            await tx.write_job(job_id, f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,resource_state='stopped',"
+                "intake='closed',lease_until_ms=NULL,result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?", (effective, _json(saved), self.now(), job_id), obligations=True)
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (event_id, job_id, "result", row["version"]+1, _json(payload), "pending_delivery", self.now()))
             return saved
 
     async def _record_result(self, actor, lease, *, outcome, result, resource_state, evidence_only=False, require_children_stopped=False):
@@ -1295,12 +1286,10 @@ class JobManager:
                 await self._require_scope_ready(tx, row)
         from .result_payloads import canonical
         payload = canonical(payload, effective_outcome, effective_result)
-        await tx.execute(f"UPDATE {self.jobs} SET status=?,outcome=?,result_json=?,"
+        await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET status=?,outcome=?,result_json=?,"
             "result_status='pending_delivery',resource_state=?,intake='closed',lease_until_ms=NULL,"
-            "version=version+1,updated_at=? WHERE job_id=?",
-            ("model_closed" if exited_model else "settling", effective_outcome, _json(effective_result), resource_state, self.now(), lease.job_id))
-        await tx.execute(f"INSERT INTO {self.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) "
-            "VALUES (?,?,?,?,?,?,?)", (event_id, lease.job_id, "result", int(row["version"]) + 1, _json(payload), "pending_delivery", self.now()))
+            "version=version+1,updated_at=? WHERE job_id=?", ("model_closed" if exited_model else "settling", effective_outcome, _json(effective_result), resource_state, self.now(), lease.job_id), obligations=True)
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (event_id, lease.job_id, "result", int(row["version"]) + 1, _json(payload), "pending_delivery", self.now()))
         from .execution_membership import seal
         await seal(self, tx, row)
         return event_id

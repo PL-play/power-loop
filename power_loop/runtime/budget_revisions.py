@@ -134,9 +134,7 @@ async def stage(runtime, actor, job_id, attempt_id, *, expected_revision, eviden
         snapshot = {"request": request, "receipt": receipt,
                     "previous_submission": asdict(previous_submission) if previous_submission else None,
                     "previous_ack": asdict(previous_ack) if previous_ack else None}
-        await tx.execute(f"INSERT INTO {manager.events} "
-            "(event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)", (event_id, job_id, "budget_usage_revision", job["version"],
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (event_id, job_id, "budget_usage_revision", job["version"],
                 _hash(snapshot), _json(snapshot), "not_applicable", manager.now()))
         state.update(usage_revision={"event_id": event_id, "revision": revision, "evidence": asdict(evidence)},
                      phase="settling", submission=None, ack=None, pending=True)

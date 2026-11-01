@@ -290,8 +290,7 @@ async def retire_pending_runtime(runtime, actor, source_job_id):
             encoded = _json(expected)
             if len(encoded.encode('utf-8')) > 262144:
                 raise JobError('pending_call_evidence_too_large')
-            await tx.execute(f'INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)',
-                (key, source['job_id'], 'pending_call_disposition', source['version'], _hash(expected), encoded, 'not_applicable', manager.now()))
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, source['job_id'], 'pending_call_disposition', source['version'], _hash(expected), encoded, 'not_applicable', manager.now()))
             await tx.execute(f'UPDATE {manager.store.t.session_state} SET pending_json=NULL WHERE session_id=?', (source['session_id'],))
             manager.store.forget_pending(source['session_id'])
         reference = await require_disposition(manager, tx, source, closed)

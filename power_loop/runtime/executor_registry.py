@@ -181,10 +181,10 @@ async def _save(manager, tx, identity, request, operation_key, value, *, old=Non
     _validate_snapshot(manager, identity, value)
     key = _key(manager, identity)
     if old is None:
-        await tx.execute(f"INSERT INTO {executors} ({','.join(_FIELDS)}) VALUES ({','.join('?' for _ in _FIELDS)})",
+        await tx.write_executor(key, f"INSERT INTO {executors} ({','.join(_FIELDS)}) VALUES ({','.join('?' for _ in _FIELDS)})",
             tuple(value[k] for k in _FIELDS))
     else:
-        if await tx.execute(f"UPDATE {executors} SET state=?,version=?,lease_until_ms=?,updated_at=? WHERE executor_key=? AND version=?",
+        if await tx.write_executor(key, f"UPDATE {executors} SET state=?,version=?,lease_until_ms=?,updated_at=? WHERE executor_key=? AND version=?",
                 (value["state"], value["version"], value["lease_until_ms"], value["updated_at"], key, old["version"])) != 1:
             raise JobError("executor_write_conflict")
     data = {"version": 1, "identity": asdict(identity), "request": request, "response": value, "effects": effects or {}}
@@ -354,7 +354,7 @@ async def drain(manager, identity, *, system_key, reason):
         for job in jobs:
             snapshot.append({k: job[k] for k in ("job_id", "generation", "kind", "executor_id", "boot_id", "resource_state")})
             if job["cancel_requested_at"] is None:
-                await tx.execute(f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,intake='closed',"
+                await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET status=?,cancel_requested_at=?,cancel_reason=?,intake='closed',"
                     "version=version+1,updated_at=? WHERE job_id=?", ("cancelled" if job["resource_state"] == "not_started" else "cancelling",
                     manager.now(), reason, manager.now(), job["job_id"]))
             saved = await manager._row(tx, job["job_id"])

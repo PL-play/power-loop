@@ -220,20 +220,38 @@ async def test_cold_rebuild_refuses_damaged_originals_and_keeps_the_barrier(regi
 
     c, source = await pending_batch(registry_store)
     loop, model = await controller(c)
+    removed = []
+    source_status = None
     try:
         await reconcile_pending(loop, c.actor, source["job_id"])
         original = await rows(c.manager)
         if damage == "closure":
+            source_status = await c.manager.db.fetchone(
+                f"SELECT supervision_status FROM {c.manager.jobs} WHERE job_id=?", (source["job_id"],))
             await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET supervision_status='closed' WHERE job_id=?", (source["job_id"],))
         else:
+            removed = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE job_id=? AND event_type=?",
+                (source["job_id"], "source_abort_delivery" if damage == "notice" else "result"))
             await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE job_id=? AND event_type=?",
                 (source["job_id"], "source_abort_delivery" if damage == "notice" else "result"))
+        damaged_events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id")
         cold = JobManager(await registry_store[1]())
         with pytest.raises(JobError):
             await obligations.rebuild(cold)
         assert await rows(cold) == original
+        assert await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id") == damaged_events
         assert c.model.calls == 1 and model.calls == c.state.dispatched == 0
     finally:
+        # Restore only this fault injection after all rejection/immutability
+        # assertions, so the common final invariant compares valid originals.
+        for event in removed:
+            columns = tuple(event)
+            await c.manager.db.execute(
+                f"INSERT INTO {c.manager.events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                tuple(event[key] for key in columns))
+        if source_status is not None:
+            await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET supervision_status=? WHERE job_id=?",
+                (source_status["supervision_status"], source["job_id"]))
         await loop.aclose(drain_timeout_s=.1)
 
 

@@ -120,10 +120,7 @@ async def _ensure_instance(manager, tx, policy, limits, subject):
             "(scope_key,policy_key,limits_hash,limits_json,counters_hash,counters_json) VALUES (?,?,?,?,?,?)",
             (key, policy["policy_key"], _hash(limits), _json(limits), _hash(counters), _json(counters)),
         )
-        await tx.execute(
-            f"INSERT INTO {manager.events} "
-            "(event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (
                 event_id,
                 subject["job_id"],
                 "model_budget_scope",
@@ -132,8 +129,7 @@ async def _ensure_instance(manager, tx, policy, limits, subject):
                 _json(body),
                 "not_applicable",
                 manager.now(),
-            ),
-        )
+            ))
     await check_marker(manager, tx, policy["policy_key"], limits)
 
 

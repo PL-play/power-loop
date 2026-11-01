@@ -464,9 +464,8 @@ async def _enter(manager, actor, lease, raw):
         if old is None:
             if owner["status"] == "waiting":
                 raise JobError("owner_wait_phase_changed")
-            await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                (identity, owner["job_id"], "owner_waiting", owner["version"]+1, _hash(data), _json(data), "not_applicable", manager.now()))
-            await tx.execute(f"UPDATE {manager.jobs} SET status='waiting',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
+            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (identity, owner["job_id"], "owner_waiting", owner["version"]+1, _hash(data), _json(data), "not_applicable", manager.now()))
+            await tx.write_job(owner["job_id"], f"UPDATE {manager.jobs} SET status='waiting',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
         else:
             await _validate_entry(manager, tx, actor, owner, old, data)
             if owner["status"] != "waiting":
@@ -503,8 +502,7 @@ async def _step(manager, actor, lease, identity, saved):
             key = _id(manager, "owner_wait_end_", identity)
             old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
             if old is None:
-                await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                    (key, owner["job_id"], "owner_wait_expired", owner["version"], _hash(payload), _json(payload), "not_applicable", manager.now()))
+                await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, owner["job_id"], "owner_wait_expired", owner["version"], _hash(payload), _json(payload), "not_applicable", manager.now()))
             else:
                 _expired(manager, owner, identity, saved, old)
             return "expired"
@@ -530,9 +528,8 @@ async def _step(manager, actor, lease, identity, saved):
         key = _id(manager, "owner_wait_resume_", identity)
         if owner["status"] != "waiting":
             raise JobError("owner_wait_phase_changed")
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (key, owner["job_id"], "owner_wait_resumed", owner["version"]+1, _hash(payload), _json(payload), "not_applicable", manager.now()))
-        await tx.execute(f"UPDATE {manager.jobs} SET status='running',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, owner["job_id"], "owner_wait_resumed", owner["version"]+1, _hash(payload), _json(payload), "not_applicable", manager.now()))
+        await tx.write_job(owner["job_id"], f"UPDATE {manager.jobs} SET status='running',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
         return "history" if any(delivered for _, delivered in ready) else "input"
 
 

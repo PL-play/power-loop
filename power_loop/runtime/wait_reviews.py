@@ -147,11 +147,10 @@ async def schedule(manager, tx, actor, job, saved, decision, effect):
     if state["cycle"] >= MAX_REVIEWS:
         raise JobError("wait_review_limit_exceeded")
     payload = _payload(manager, saved, state["event"], decision, effect, state["cycle"] + 1)
-    await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,caller_session_id,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (review_id(manager, effect["event_id"]), job["job_id"], "wait_review", job["version"] + 1, actor.session_id,
+    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (review_id(manager, effect["event_id"]), job["job_id"], "wait_review", job["version"] + 1, actor.session_id,
             _hash(payload), _json(payload), "not_applicable", manager.now()))
-    await tx.execute(f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
-    await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (decision["event_id"], effect["event_id"]))
+    await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
+    await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (decision["event_id"], effect["event_id"]))
 
 
 async def drive(loop, actor, job_id):

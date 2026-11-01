@@ -14,8 +14,7 @@ def identity(manager, kind, job_id, generation):
 
 
 async def put(manager, tx, key, job_id, kind, version, data, *, versioned=True):
-    if await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (key, job_id, kind, version, _hash(data), _json(data), "not_applicable", manager.now())) != 1:
+    if await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job_id, kind, version, _hash(data), _json(data), "not_applicable", manager.now())) != 1:
         raise JobError("workflow_restore_write_mismatch")
     actual = await get(manager, tx, key, job_id, kind, versioned=versioned)
     if _hash(actual) != _hash(data):
@@ -185,10 +184,9 @@ async def claim_node(runtime, workflow_binding, node_id, driver_sid, token):
         from .executor_registry import ExecutorIdentity, require_accepting
         executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, lease.executor_id, lease.boot_id),
             required=row["executor_key"] is not None or wf["executor_key"] is not None)
-        await tx.execute(f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,status='running',supervision_status='open',intake='open',resource_state='running',"
-            "outcome=NULL,result_json=NULL,result_status='none',control_owner_generation=?,control_owner_executor_id=?,control_owner_boot_id=?,version=version+1,updated_at=? WHERE job_id=?",
-            (lease.generation, lease.executor_id, lease.boot_id, executor["executor_key"] if executor else None,
-                manager.now()+runtime.lease_ms, wf["generation"], wf["executor_id"], wf["boot_id"], manager.now(), row["job_id"]))
+        await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,status='running',supervision_status='open',intake='open',resource_state='running',"
+            "outcome=NULL,result_json=NULL,result_status='none',control_owner_generation=?,control_owner_executor_id=?,control_owner_boot_id=?,version=version+1,updated_at=? WHERE job_id=?", (lease.generation, lease.executor_id, lease.boot_id, executor["executor_key"] if executor else None,
+                manager.now()+runtime.lease_ms, wf["generation"], wf["executor_id"], wf["boot_id"], manager.now(), row["job_id"]), obligations=True)
         await put(manager, tx, manager._node_session_event_id(row["job_id"], sid, lease.generation), row["job_id"], "node_session", row["version"]+1,
             {**old, "generation": lease.generation}, versioned=False)
         data = {"version": 1, "operation_id": op["event_id"], "workflow": request["target"], "node": asdict(lease),
@@ -215,7 +213,7 @@ async def accept_input(runtime, binding, sid, message):
             raise JobError("workflow_node_input_already_dispatched")
         op = await manager._insert_operation(tx, job_id=row["job_id"], version=row["version"], actor=binding.actor, action="nudge",
             key=key, fingerprint=_hash(payload), payload={"job_id": row["job_id"], "mode": "restore_input", "request": payload})
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (op.operation_id,))
+        await tx.update_event(op.job_id, f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (op.operation_id,), notify=True)
         cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
         await manager.store.signal_changes(tx, sid, "inbox")
         if await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),
@@ -313,7 +311,7 @@ async def settle(runtime, binding, status):
             nodes[nid] = {"event_id": result_id(node["job_id"], node["generation"]), "hash": _hash(json.loads(result["payload_json"]))}
         data = {"version": 1, "operation_id": op["event_id"], "workflow": request["target"], "status": status, "nodes": nodes}
         await put(manager, tx, identity(manager, "settled", row["job_id"], row["generation"]), row["job_id"], "workflow_restore_settled", row["version"], data)
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (op["event_id"],))
+        await tx.update_event(op["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (op["event_id"],))
 
 
 async def require_settled(manager, tx, row, event, *, success=False):

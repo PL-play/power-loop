@@ -198,10 +198,9 @@ async def terminate_tx(manager, tx, actor, job_id):
         target = "timed_out" if outcome == "timed_out" else "cancelled"
         projection = {"status": target, "wait_terminated_event_id": identity, "owner_outcome": outcome}
         canonical = {"outcome": target, "result": projection, "resource_state": "stopped", "unstarted": True, "logical_wait": True}
-        await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-            (result_id, job_id, "result", job["version"]+1, _hash(canonical), _json(canonical), "handled", manager.now()))
-        await tx.execute(f"UPDATE {manager.jobs} SET status='settling',outcome=?,resource_state='stopped',intake='closed',result_status='handled',"
-            "result_json=?,version=version+1,updated_at=? WHERE job_id=?", (target, _json(projection), manager.now(), job_id))
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (result_id, job_id, "result", job["version"]+1, _hash(canonical), _json(canonical), "handled", manager.now()))
+        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET status='settling',outcome=?,resource_state='stopped',intake='closed',result_status='handled',"
+            "result_json=?,version=version+1,updated_at=? WHERE job_id=?", (target, _json(projection), manager.now(), job_id), obligations=True)
         job = await manager._row(tx, job_id)
         result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (result_id,))
         legacy = False
@@ -209,15 +208,14 @@ async def terminate_tx(manager, tx, actor, job_id):
         legacy = _result_projection(job, waits._object(result["payload_json"]))
         if not legacy:
             raise JobError("wait_terminal_evidence_missing")
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (result_id,))
-        await tx.execute(f"UPDATE {manager.jobs} SET result_status='handled',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job_id))
+        await tx.update_event(job_id, f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (result_id,))
+        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET result_status='handled',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job_id), obligations=True)
     data = {"version": 1, "creation_id": creation["event_id"], "creation_hash": creation["request_hash"],
         "owner": saved["binding"]["owner"], "owner_outcome": outcome, "owner_exit": refs,
         "result": content_reference(result), "legacy_result": legacy, "cancel_effect": cancelled}
-    await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (identity, job_id, "wait_terminated", job["version"]+1, _hash(data), _json(data), "not_applicable", manager.now()))
+    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (identity, job_id, "wait_terminated", job["version"]+1, _hash(data), _json(data), "not_applicable", manager.now()))
     if cancelled:
-        await tx.execute(f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (cancelled["effect_id"], cancelled["decision_id"]))
+        await tx.update_event(job_id, f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (cancelled["effect_id"], cancelled["decision_id"]))
     await _terminated(manager, tx, actor, job, creation, saved)
     from .wait_dispositions import reconcile_tx
     await reconcile_tx(manager, tx, actor, job, creation, saved)

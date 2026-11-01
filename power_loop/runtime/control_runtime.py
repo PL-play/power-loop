@@ -108,14 +108,14 @@ async def project_events(manager, tx, identity, records):
         return
     columns = ("event_id", "job_id", "event_type", "job_version", "request_hash", "payload_json",
                "delivery_status", "created_at")
-    await upsert(manager, tx, manager.events, columns, "event_id", rows)
+    await upsert(manager, tx, manager.events, columns, "event_id", rows, event_projection=True)
     attempts = {row[0]: dict(zip(columns, row, strict=True)) for row in rows if row[2].startswith("model_attempt_")}
     if attempts:
         from .execution_membership import remember_merge
         remember_merge(manager, "_projected_attempts", identity.job_id, attempts)
 
 
-async def upsert(manager, tx, table, columns, primary, rows):
+async def upsert(manager, tx, table, columns, primary, rows, *, event_projection=False):
     # Bound statement size independently of action count; actual rows and bytes
     # are still counted by benchmarks, not hidden behind a single driver call.
     for offset in range(0, len(rows), 100):
@@ -127,8 +127,15 @@ async def upsert(manager, tx, table, columns, primary, rows):
         else:
             conflict = f" ON CONFLICT({primary}) DO UPDATE SET " + ",".join(
                 f"{column}=excluded.{column}" for column in columns[1:])
-        await tx.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES {values}" + conflict,
-                         tuple(value for row in part for value in row))
+        sql = f"INSERT INTO {table} ({','.join(columns)}) VALUES {values}" + conflict
+        params = tuple(value for row in part for value in row)
+        intents = manager._control_intents.get() if event_projection else None
+        if intents is not None:
+            await intents.project_events(columns, part, sql, params)
+        else:
+            # Standalone owner checkpoints already fence their original journal
+            # append. Their immutable inspection events create no new work.
+            await tx.execute(sql, params)
 
 
 def queue_event(binding, key, kind, value):

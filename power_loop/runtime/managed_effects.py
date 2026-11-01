@@ -387,9 +387,7 @@ async def _event(manager, tx, row, kind, value):
             raise JobError("managed_effect_evidence_conflict")
         return event_id
     payload = _json(_document(value, _LIMIT))
-    await tx.execute(
-        f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (
+    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (
             event_id,
             row["job_id"],
             "managed_effect_" + kind,
@@ -398,8 +396,7 @@ async def _event(manager, tx, row, kind, value):
             payload,
             "not_applicable",
             manager.now(),
-        ),
-    )
+        ))
     return event_id
 
 
@@ -987,14 +984,8 @@ async def terminate_unstarted_tx(manager, tx, actor, job):
         creation, binding = found
         payload = _unstarted_payload(row)
         version = row["version"] + 1
-        await tx.execute(
-            f"UPDATE {manager.jobs} SET status='settling',outcome='cancelled',resource_state='stopped',intake='closed',result_status='suppressed',result_json=?,version=?,updated_at=? WHERE job_id=?",
-            (_json(payload["result"]), version, manager.now(), job),
-        )
-        await tx.execute(
-            f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
-            ("result_" + job, job, "result", version, _json(payload), "suppressed", manager.now()),
-        )
+        await tx.write_job(job, f"UPDATE {manager.jobs} SET status='settling',outcome='cancelled',resource_state='stopped',intake='closed',result_status='suppressed',result_json=?,version=?,updated_at=? WHERE job_id=?", (_json(payload["result"]), version, manager.now(), job), obligations=True)
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), ("result_" + job, job, "result", version, _json(payload), "suppressed", manager.now()))
         row = await manager._row(tx, job)
         await _event(
             manager,
@@ -1229,10 +1220,8 @@ async def bind_receipt(manager, tx, row, creation, receipt_ref):
             "display_hash": _hash(raw["content"]),
         },
     )
-    await tx.execute(
-        f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (result_event["event_id"],)
-    )
-    await tx.execute(f"UPDATE {manager.jobs} SET result_status='handled' WHERE job_id=?", (row["job_id"],))
+    await tx.update_event(row["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id=?", (result_event["event_id"],))
+    await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET result_status='handled' WHERE job_id=?", (row["job_id"],), obligations=True)
 
 
 async def resolved_execution(manager, tx, row, result_event):

@@ -184,9 +184,8 @@ async def bind(manager, tx, row, sid):
     key = event_id(manager, row["job_id"], row["generation"])
     if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (key,)):
         raise JobError("workflow_controller_mismatch")
-    await tx.execute(f"UPDATE {manager.jobs} SET session_id=?,version=version+1,updated_at=? WHERE job_id=?", (sid, manager.now(), row["job_id"]))
-    await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (key, row["job_id"], "workflow_controller", row["version"]+1, _hash(data), _json(data), "not_applicable", manager.now()))
+    await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET session_id=?,version=version+1,updated_at=? WHERE job_id=?", (sid, manager.now(), row["job_id"]))
+    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, row["job_id"], "workflow_controller", row["version"]+1, _hash(data), _json(data), "not_applicable", manager.now()))
 
 
 async def get(manager, actor, job_id, generation):

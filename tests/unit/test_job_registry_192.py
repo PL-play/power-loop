@@ -13,7 +13,7 @@ import pytest
 from power_loop.runtime.jobs import JobActor, JobError, JobLease, JobManager
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.store.schema import _STORE_TABLES
-from power_loop.runtime.store.task_schema import TASK_TABLES, migrate_task_schema
+from power_loop.runtime.store.task_schema import TASK_SCHEMA_VERSION, TASK_TABLES, migrate_task_schema
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -41,12 +41,23 @@ async def registry_store(request, tmp_path):
     try:
         yield store, connect
     finally:
-        if backend != "sqlite":
-            for active_prefix in prefixes:
-                for name in (*TASK_TABLES, *_STORE_TABLES, "schema_migrations"):
-                    await store._db.execute(f"DROP TABLE IF EXISTS {active_prefix}{name}")
-        for s in reversed(stores):
-            await s.close()
+        try:
+            from tests.obligation_invariants import assert_obligation_projection
+            for active_prefix in sorted(prefixes):
+                targets = [s for s in stores if s.table_prefix == active_prefix
+                           and s.schema_version == TASK_SCHEMA_VERSION]
+                # Migration fixtures also open ordinary message stores. A
+                # failed offline upgrade has no task originals or index to
+                # compare; its raw schema/rollback assertions stay in its test.
+                if targets:
+                    await assert_obligation_projection(targets[-1], active_prefix)
+        finally:
+            if backend != "sqlite":
+                for active_prefix in prefixes:
+                    for name in (*TASK_TABLES, *_STORE_TABLES, "schema_migrations"):
+                        await store._db.execute(f"DROP TABLE IF EXISTS {active_prefix}{name}")
+            for s in reversed(stores):
+                await s.close()
 
 
 @pytest.fixture

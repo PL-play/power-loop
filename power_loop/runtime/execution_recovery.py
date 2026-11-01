@@ -50,7 +50,7 @@ async def inspect(manager, actor, job_id, *, generation, repair=False, retire_ex
             if row["generation"] == generation:
                 # Owner retirement is not physical exit, tool success, or a
                 # financial refund. Preserve those unresolved responsibilities.
-                await tx.execute(f"UPDATE {manager.jobs} SET intake='closed',resource_state='unknown',version=version+1,updated_at=? "
+                await tx.write_job(job_id, f"UPDATE {manager.jobs} SET intake='closed',resource_state='unknown',version=version+1,updated_at=? "
                                  "WHERE job_id=? AND generation=?", (manager.now(), job_id, generation))
             manager._control_retirements.get().add((job_id, generation))
         retired = True

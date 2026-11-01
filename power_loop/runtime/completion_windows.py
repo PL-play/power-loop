@@ -84,8 +84,7 @@ async def admit(manager, tx, row):
     creation, _ = await _creation(manager, tx, row)
     data = {"version": 1, "origin": proof(row), "creation_id": creation["event_id"], "creation_hash": creation["request_hash"],
         "timeout_ms": DEFAULT_TIMEOUT_MS, "admitted_at_ms": now, "deadline_at_ms": now + DEFAULT_TIMEOUT_MS}
-    await tx.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (event_id(manager, row["job_id"]), row["job_id"], "completion_window", row["version"], _hash(data), _json(data), "not_applicable", now))
+    await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (event_id(manager, row["job_id"]), row["job_id"], "completion_window", row["version"], _hash(data), _json(data), "not_applicable", now))
     await read_row(manager, tx, row)
 
 
