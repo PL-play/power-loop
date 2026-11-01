@@ -41,6 +41,10 @@
 - Remove the unused synchronous `runtime/session_store.py` and its compatibility
   imports/tests. Current asynchronous store coverage remains; server-backend
   conformance uses current asynchronous SQLite as its reference.
+- Remove long controller-key generation options and runtime alias lookups. Use
+  current bounded keys on all three stores; retain original event/message
+  immutability and no-replay checks in current-format tests. Task subprocess
+  fixtures now select their actual engine's isolated test DSN throughout.
 - Shared bounded budget grants stay reserved until close; cumulative settlement
   and original financial evidence remain idempotent after unknown commits.
   Eligible model close and supervision publication share one row update.

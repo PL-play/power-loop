@@ -138,6 +138,12 @@ IDs also fit 64 characters. Writers and readers share each generator. No runtime
 identifier format. Changing retained development data is an explicit maintenance
 operation outside the live execution path.
 
+Controller retirement and review use only `ctl_retire_` and `ctl_review_` keys.
+The legacy long-key generation option and dual-key alias readers are removed.
+Current-format three-engine tests preserve exact original event/message
+immutability, actual review closure and no-replay assertions; unsupported alias
+ambiguity is not an execution contract.
+
 ## Validation requirements
 
 Fault tests must cross actual commit boundaries, including lost acknowledgements
