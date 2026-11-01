@@ -10,6 +10,7 @@ from __future__ import annotations
 from . import timer_waits as waits
 from . import wait_decisions as decisions
 from . import wait_notifications as notices
+from .finalization_plan import PlanChanged
 from .jobs import JobActor, JobError, JobLease, _hash, _json
 
 
@@ -32,12 +33,19 @@ async def _decision(manager, tx, actor, event_id, *, _notification=None):
     # into an input. The completed main model send is not its execution lease.
     if accepted.receipt_ref is None:
         raise JobError("wait_decision_receipt_required")
-    call, receipt = waits._ref(accepted.call_ref), waits._ref(accepted.receipt_ref)
-    await manager._validate_call(tx, actor, call, op["tool_call_id"])
-    await manager._validate_ref(tx, actor, receipt, role="tool")
-    if (receipt.seq <= call.seq or receipt.tool_call_id != op["tool_call_id"]
-            or receipt.send_index != call.send_index or receipt.round_index != call.round_index):
-        raise JobError("wait_decision_receipt_mismatch")
+    proofs = decisions._SOURCE_PROOFS.get()
+    key = manager.store.store_id, op['event_id'], _json(accepted.receipt_ref)
+    if proofs is None or key not in proofs.receipts:
+        if proofs is not None and proofs.publishing:
+            raise PlanChanged()
+        call, receipt = waits._ref(accepted.call_ref), waits._ref(accepted.receipt_ref)
+        await manager._validate_call(tx, actor, call, op["tool_call_id"])
+        await manager._validate_ref(tx, actor, receipt, role="tool")
+        if (receipt.seq <= call.seq or receipt.tool_call_id != op["tool_call_id"]
+                or receipt.send_index != call.send_index or receipt.round_index != call.round_index):
+            raise JobError("wait_decision_receipt_mismatch")
+        if proofs is not None:
+            proofs.receipts.add(key)
     return job, due, saved, row, data
 
 
@@ -116,6 +124,19 @@ def _reply(effect):
 
 async def apply(manager, actor, event_id):
     """Apply one original decision atomically, without model dispatch or new work."""
+    while True:
+        with decisions.prepared_sources() as proofs:
+            async with manager._read() as reader:
+                await _decision(manager,reader,actor,event_id)
+            proofs.publishing = True
+            try:
+                return await _apply(manager,actor,event_id)
+            except PlanChanged:
+                continue
+
+
+async def _apply(manager, actor, event_id):
+    """Keep mutable owner/deadline checks and all local effects atomic."""
     async with manager._write() as tx:
         job, _, saved, decision, data = await _decision(manager, tx, actor, event_id)
         from .wait_dispositions import for_event, reply
@@ -171,17 +192,17 @@ async def apply(manager, actor, event_id):
                     raise JobError("wait_effect_input_conflict")
         payload = {"version": 1, "binding": binding, "wait_job_id": job["job_id"], "owner": saved["binding"]["owner"],
             "decision": choice, "operation_id": op.operation_id if op else None, "review_at_ms": data["request"]["next_review_at_ms"]}
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (binding["effect_id"], job["job_id"], "wait_effect", job["version"]+1, actor.session_id, _hash(payload), _json(payload), "delivered", manager.now()))
-        await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
+        effect = dict(zip(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'),
+            (binding['effect_id'],job['job_id'],'wait_effect',job['version']+1,actor.session_id,_hash(payload),_json(payload),'delivered',manager.now()),strict=True))
+        await tx.append_event(tuple(effect),tuple(effect.values()))
+        await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (effect['created_at'], job["job_id"]))
         await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='delivered' WHERE event_id=?", (decision["event_id"],))
         if choice == "defer":
             from .wait_reviews import schedule
-            job = await manager._row(tx, job["job_id"])
-            fresh = await _effect(manager, tx, actor, job, saved, {**decision, "delivery_status": "delivered"}, data)
-            await schedule(manager, tx, actor, job, saved, {**decision, "delivery_status": "delivered"}, fresh)
-            decision = {**decision, "delivery_status": "handled"}
-        job = await manager._row(tx, job["job_id"])
-        effect = await _effect(manager, tx, actor, job, saved, {**decision, "delivery_status": "handled" if choice == "defer" else "delivered"}, data)
+            job = {**job,'version':job['version']+1,'updated_at':effect['created_at']}
+            tx.remember_row(manager.jobs,'job_id',job['job_id'],job)
+            await schedule(manager, tx, actor, job, saved, {**decision, "delivery_status": "delivered"}, effect)
+            effect = {**effect,'delivery_status':'handled'}
         return _reply(effect)
 
 

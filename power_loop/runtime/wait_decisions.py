@@ -2,14 +2,38 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass
 
 from . import timer_waits as waits
 from . import wait_notifications as notices
 from .control_requests import reference
 from .execution_membership import _lease
+from .finalization_plan import PlanChanged
 from .jobs import JobError, JobLease, _hash, _json, _operation
 from .message_ref import MessageRef
+
+
+@dataclass
+class PreparedSources:
+    """One operation's verified immutable sources, never execution authority."""
+    grants: dict
+    receipts: set
+    publishing: bool = False
+
+
+_SOURCE_PROOFS = ContextVar('prepared_wait_sources',default=None)
+
+
+@contextmanager
+def prepared_sources():
+    proofs = PreparedSources({},set())
+    token = _SOURCE_PROOFS.set(proofs)
+    try:
+        yield proofs
+    finally:
+        _SOURCE_PROOFS.reset(token)
 
 
 def _intent(event_id, caller, call_ref, tool_call_id, decision, reason, next_review_at_ms):
@@ -46,13 +70,25 @@ async def _accepted(manager, tx, actor, event_id, request, operation, *, _notifi
     request_ref = data.get('request_ref')
     if not isinstance(request_ref, dict):
         raise JobError('wait_decision_evidence_corrupt')
-    grant = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='task_control_request'", (request_ref.get('event_id'),))
-    if grant is None:
-        raise JobError('wait_decision_evidence_missing')
-    original = waits._object(grant['payload_json'])['request']
+    proofs = _SOURCE_PROOFS.get()
+    key = manager.store.store_id, request_ref.get('event_id')
+    known = proofs.grants.get(key) if proofs is not None else None
+    if known is None:
+        if proofs is not None and proofs.publishing:
+            # Another decision/review appeared since readonly preparation.
+            # Abort this tree write and prepare that new original outside it.
+            raise PlanChanged()
+        grant = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='task_control_request'", (request_ref.get('event_id'),))
+        if grant is None:
+            raise JobError('wait_decision_evidence_missing')
+        original = waits._object(grant['payload_json'])['request']
+        await admission._stored_request(manager, tx, actor, grant, original, _notification=(job, due, saved, receipt))
+        if proofs is not None:
+            proofs.grants[key] = grant,original
+    else:
+        grant,original = known
     if admission.client(original)!=request or request_ref!=reference(grant):
         raise JobError('wait_decision_evidence_corrupt')
-    await admission._stored_request(manager, tx, actor, grant, original, _notification=(job, due, saved, receipt))
     canonical_id = notices.decision_id(manager, event_id)
     expected_response = {"status": "accepted", "event_id": event_id, "decision_event_id": canonical_id,
         "decision": request["decision"], "effect_status": "pending", "execution_authority": False}
