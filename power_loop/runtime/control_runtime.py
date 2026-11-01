@@ -349,7 +349,8 @@ async def flush_binding(binding, *, close=False, force=True, transaction=None):
             # Retry only the retained checkpoint, never a model/tool action.
             await state.close()
     else:
-        await state.checkpoint(force=force)
+        await state.checkpoint(force=force, transaction=transaction,
+                               defer=binding.runtime.manager.after_outcome if transaction is not None else None)
 
 
 def forget_completed(binding):

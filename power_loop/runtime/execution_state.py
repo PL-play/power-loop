@@ -227,6 +227,12 @@ class ExecutionState:
         value = self._records.get((kind, key))
         return None if value is None else copy.deepcopy(value)
 
+    def returned_models(self, round_index):
+        return sorted(identity for (kind, identity), value in self._records.items()
+                      if kind == "attempt" and value["kind"] == "model"
+                      and value["phase"] == "finished" and value["observation"]["status"] == "returned"
+                      and value["prepared"]["round_index"] == round_index)
+
     def begin_attempt(self, attempt_id: str, kind: str, prepared: dict, *, control_only=False):
         if type(control_only) is not bool or control_only and kind != "tool":
             raise JobError("invalid_execution_attempt_kind")
