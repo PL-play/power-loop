@@ -111,7 +111,7 @@ async def test_abort_checkpoint_cannot_be_reused_from_host_or_dispatch_or_claim(
                 await manager.claim_job(actor, job['job_id'], executor_id='forbidden', boot_id='boot', expected_version=1)
         entry = value['entries'][0]
         with invocation_context(actor.session_id, attempt.ref.seq, entry['call_id']):
-            with pytest.raises(JobError, match='tool_call_batch_aborted'):
+            with pytest.raises(JobError, match='tool_call_plan_original_requires_reconciliation'):
                 await tool_call_plans.dispatch(attempt.pipeline, entry['tool_name'], {'text': 'hello'}, attempt.pipeline.tool_registry.get(entry['tool_name']))
         rejected.append(True)
         return value
@@ -127,12 +127,16 @@ async def test_abort_checkpoint_cannot_be_reused_from_host_or_dispatch_or_claim(
 
 async def test_exception_after_actual_admission_cannot_be_reclassified_as_not_admitted(registry_store, monkeypatch):
     from power_loop.runtime import tool_call_plans
-    actual = tool_call_plans._prepare
+    actual = tool_call_plans._prepare_children
+    admitted = []
     async def after_grant(pipeline, attempt):
         await actual(pipeline, attempt)
+        assert pipeline._native_tool_batch_bindings is not None
+        admitted.append(True)
         raise OSError('test_after_actual_admission')
-    monkeypatch.setattr(tool_call_plans, '_prepare', after_grant)
+    monkeypatch.setattr(tool_call_plans, '_prepare_children', after_grant)
     c = await scenario(registry_store, expected_error='test_after_actual_admission')
+    assert admitted == [True]
     assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='tool_call_abort'")
     assert c.state.dispatched == 0 and c.model.calls == 1
 
