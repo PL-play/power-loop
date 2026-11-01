@@ -9,9 +9,11 @@ import pytest
 from power_loop import LLMRequest
 from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
+from power_loop.runtime.control_runtime import flush_binding
 from power_loop.runtime.jobs import JobError
 
 from .test_budget_reconcile_192 import reopened
+from .test_budget_revisions_192 import seal_original
 from .test_job_registry_192 import registry_store
 from .test_model_budgets_192 import budget_case, counters, start
 from .test_unstarted_budget_attempts_192 import prepared
@@ -25,6 +27,21 @@ async def release(runtime, c, attempt):
         job_id=attempt.binding.lease.job_id, attempt_id=attempt.attempt_id)
 
 
+async def seal_dispatch_closure(c, attempt):
+    """The actual original stack proves non-dispatch before cold recovery."""
+    async def unavailable(*args, **kwargs):
+        raise OSError("test original release handoff")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(c.host, "lookup", unavailable)
+        patch.setattr(c.host, "prepare_release", unavailable)
+        with pytest.raises(OSError, match="test original release handoff"):
+            await budgets.close_unstarted(attempt)
+    await seal_original(c, attempt)
+    state = await budgets.get_budget(c.manager, attempt.binding.actor, attempt.attempt_id)
+    assert state["phase"] == "dispatch_closed" and state["pending"]
+    assert not c.host.released and not c.host.applied
+
+
 @pytest.mark.parametrize('stage', ['host_reserving', 'host_reserved'])
 async def test_new_control_closes_original_reservation_without_starting_boot_or_rewriting_job(budget_case, monkeypatch, stage):
     c = budget_case
@@ -33,15 +50,18 @@ async def test_new_control_closes_original_reservation_without_starting_boot_or_
     async def unavailable(*args):
         raise OSError('host acknowledgement unavailable')
     if stage == 'host_reserving':
+        c.host.reserve_lost_ack = True
         monkeypatch.setattr(c.host, 'lookup', unavailable)
         with pytest.raises(OSError):
             await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
         monkeypatch.setattr(c.host, 'lookup', lookup)
+        c.host.reserve_lost_ack = False
     else:
         await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
     before = await c.manager.get_job(c.actor, a.binding.lease.job_id)
     messages = await c.store.load_all_messages(c.sid)
     assert (await budgets.get_budget(c.manager, c.actor, a.attempt_id))['phase'] == stage
+    await seal_dispatch_closure(c, a)
     runtime = await reopened(c)
     try:
         result = await release(runtime, c, a)
@@ -52,7 +72,7 @@ async def test_new_control_closes_original_reservation_without_starting_boot_or_
         assert await c.store.load_all_messages(c.sid) == messages
         assert await counters(c) == dict(used_calls=0, held_calls=0, used_tokens=0, held_tokens=0, inflight=0)
         assert c.host.reserve_calls == len(c.host.released) == 1 and not c.host.applied
-        with pytest.raises(JobError, match='budget_dispatch_not_authorized'):
+        with pytest.raises(JobError, match='execution_control_closed'):
             await attempts.dispatch(a)
     finally:
         await runtime.shutdown(timeout_s=1)
@@ -68,8 +88,10 @@ async def test_failed_host_release_retains_local_risk_until_original_retry(budge
     async def lost_lookup(*args):
         raise OSError('original lookup unavailable')
     monkeypatch.setattr(c.host, 'lookup', lost_lookup)
+    c.host.reserve_lost_ack = True
     with pytest.raises(OSError):
         await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
+    c.host.reserve_lost_ack = False
     if fault != 'lookup':
         monkeypatch.setattr(c.host, 'lookup', lookup)
         async def lost_release(submission):
@@ -77,6 +99,7 @@ async def test_failed_host_release_retains_local_risk_until_original_retry(budge
                 await host_release(submission)
             raise OSError('original release unavailable')
         monkeypatch.setattr(c.host, 'release', lost_release)
+    await seal_dispatch_closure(c, a)
     runtime = await reopened(c)
     try:
         before = await counters(c)
@@ -85,7 +108,7 @@ async def test_failed_host_release_retains_local_risk_until_original_retry(budge
         state = await budgets.get_budget(c.manager, c.actor, a.attempt_id)
         assert state['phase'] == 'dispatch_closed' and state['pending']
         assert await counters(c) == before
-        with pytest.raises(JobError, match='budget_dispatch_not_authorized'):
+        with pytest.raises(JobError, match='execution_control_closed'):
             await attempts.dispatch(a)
         monkeypatch.setattr(c.host, 'lookup', lookup)
         monkeypatch.setattr(c.host, 'release', host_release)
@@ -100,6 +123,7 @@ async def test_failed_host_release_retains_local_risk_until_original_retry(budge
 async def test_dispatched_attempt_never_refunds_from_a_new_host(budget_case):
     c = budget_case
     a = await start(c)
+    await flush_binding(c.binding, close=True)
     runtime = await reopened(c)
     try:
         before = await counters(c)
@@ -116,6 +140,7 @@ async def test_original_authority_and_preparation_are_required_before_any_releas
     c = budget_case
     a = await prepared(c)
     await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
+    await seal_dispatch_closure(c, a)
     runtime = await reopened(c, config=replace(c.config, provider_key='different') if fault == 'provider_changed' else c.config)
     sid = await c.store.create_session() if fault == 'foreign_session' else c.sid
     if fault == 'missing_preparation':
@@ -160,12 +185,19 @@ async def test_scanner_cannot_close_live_attempt_but_explicit_cancel_allows_reco
     try:
         before = await budgets.get_budget(c.manager, c.actor, a.attempt_id)
         held = await counters(c)
-        with pytest.raises(JobError, match='budget_release_requires_cancellation'):
+        with pytest.raises(JobError, match='budget_unstarted_execution_unconfirmed'):
             await runtime.release_unstarted_budget(c.sid, job_id=a.binding.lease.job_id,
                 attempt_id=a.attempt_id, require_cancelled=True)
         assert await budgets.get_budget(c.manager, c.actor, a.attempt_id) == before
         assert await counters(c) == held and not c.host.released
         await c.manager.request_cancel(c.actor, a.binding.lease.job_id, system_key='stop', reason='test')
+        # Cancellation alone cannot prove that an unflushed model suffix did
+        # not dispatch. Only the original stack's positive closure permits it.
+        with pytest.raises(JobError, match='budget_unstarted_execution_unconfirmed'):
+            await runtime.release_unstarted_budget(c.sid, job_id=a.binding.lease.job_id,
+                attempt_id=a.attempt_id, require_cancelled=True)
+        assert await counters(c) == held and not c.host.released
+        await seal_dispatch_closure(c, a)
         stopped = await c.manager.get_job(c.actor, a.binding.lease.job_id)
         result = await runtime.release_unstarted_budget(c.sid, job_id=a.binding.lease.job_id,
             attempt_id=a.attempt_id, require_cancelled=True)
@@ -181,6 +213,7 @@ async def test_scanner_retries_original_dispatch_closure_without_inventing_cance
     c = budget_case
     a = await prepared(c)
     await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
+    await seal_dispatch_closure(c, a)
     runtime = await reopened(c)
     original = c.host.release
     async def lost(*args):
@@ -204,6 +237,7 @@ async def test_two_fresh_controllers_release_same_original_risk_once(budget_case
     c = budget_case
     a = await prepared(c)
     await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
+    await seal_dispatch_closure(c, a)
     first, second = await reopened(c), await reopened(c)
     try:
         results = await asyncio.gather(release(first, c, a), release(second, c, a), return_exceptions=True)
@@ -231,6 +265,7 @@ async def test_cancelled_ancestor_authorizes_child_release_without_mutating_chil
     a = await prepared(c)
     await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
     await c.manager.request_cancel(c.actor, root.lease.job_id, system_key='root-stop', reason='test')
+    await seal_dispatch_closure(c, a)
     before = await c.manager.get_job(c.actor, child.job.job_id)
     assert before.cancel_requested_at is None
     runtime = await reopened(c)
