@@ -160,22 +160,82 @@ async def _replace(manager, tx, row, *, verify=False, clean=None):
 async def refresh(manager, tx, recorder):
     jobs = set(recorder.obligation_jobs)
     routes = sorted(recorder.obligation_routes)
-    decisions = sorted(recorder.obligation_decisions)
     clean = {job_id: False for job_id in recorder.obligation_processed}
-    for keys in (routes, decisions):
-        for offset in range(0, len(keys), 100):
-            part = keys[offset:offset+100]
-            rows = await tx.fetchall(f"SELECT event_id,job_id,payload_json FROM {manager.events} WHERE event_id IN (" +
-                ",".join("?" for _ in part) + ")", tuple(part))
-            jobs.update(row["job_id"] for row in rows)
-            for row in rows:
-                if row["event_id"] in recorder.obligation_decisions:
-                    clean[row["job_id"]] = (recorder.obligation_decisions[row["event_id"]]
-                                            == json.loads(row["payload_json"])["response_ref"])
+    for offset in range(0, len(routes), 100):
+        part = routes[offset:offset+100]
+        rows = await tx.fetchall(f"SELECT job_id FROM {manager.events} WHERE event_id IN (" +
+            ",".join("?" for _ in part) + ")", tuple(part))
+        jobs.update(row["job_id"] for row in rows)
     for job_id in sorted(jobs):
         row = await tx.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (job_id,))
         if row is not None:
             await _replace(manager, tx, row, clean=clean.get(job_id))
+
+
+async def refresh_closed_decisions(manager, decisions, *, verify=False):
+    """After the original close commits, discover and refresh one tree at a time.
+
+    An interrupted refresh leaves a conservative pending entry. The immutable
+    decision and actual close are sufficient for cold retry; no execution is
+    admitted and no additional original record is necessary.
+    """
+    from .session_controls import ControlReadView
+
+    reader = ControlReadView(manager.db, manager)
+    roots = {}
+    keys = sorted(decisions)
+    for offset in range(0, len(keys), 100):
+        part = keys[offset:offset+100]
+        rows = await reader.fetchall(f"SELECT e.event_id,e.job_id,e.caller_session_id,e.payload_json,j.root_job_id "
+            f"FROM {manager.events} e JOIN {manager.jobs} j ON j.job_id=e.job_id "
+            "WHERE e.event_type='processing_decision' AND e.event_id IN (" +
+            ",".join("?" for _ in part) + ")", tuple(part))
+        for event in rows:
+            payload = json.loads(event["payload_json"])
+            if verify:
+                await _desired(manager, reader, await manager._row(reader, event["job_id"]), verify=True)
+            roots.setdefault(event["root_job_id"], []).append((event, payload,
+                decisions[event["event_id"]] == payload["response_ref"]))
+    for root_id in sorted(roots):
+        await _refresh_closed_tree(manager, root_id, roots[root_id])
+
+
+async def _refresh_closed_tree(manager, root_id, entries):
+    async with manager._write() as tx:
+        jobs = {}
+        for event, payload, clean in entries:
+            row = await manager._row(tx, event["job_id"])
+            source = payload["event"]
+            # A target can legitimately advance after the handler close and
+            # before maintenance. Its new generation owns its own projection.
+            if source.get("event_type", "result") != "operation" and source["event_id"] != result_id(row["job_id"], row["generation"]):
+                continue
+            jobs[row["job_id"]] = row, clean
+            tx.sessions.add(event["caller_session_id"])
+        for job_id, (row, clean) in jobs.items():
+            tx.touch_job(job_id)
+            await _replace(manager, tx, row, clean=clean)
+
+
+@verify_stored
+async def reconcile_closed(manager, actor, job_id):
+    """Cold, mechanical retry of projections from an actual stored model exit."""
+    from .session_controls import ControlReadView
+
+    reader = ControlReadView(manager.db, manager)
+    row = await manager._authorize(reader, actor, job_id)
+    event = await reader.fetchone(f"SELECT payload_json FROM {manager.events} "
+        "WHERE event_id=? AND job_id=? AND event_type='model_closed'", ("model_closed_"+job_id, job_id))
+    if event is None:
+        return False
+    data = json.loads(event["payload_json"])
+    if data["generation"] != row["generation"]:
+        raise JobError("stale_execution")
+    evidence = data["evidence"]
+    response = evidence.get("last_assistant_ref") if evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass") else None
+    await refresh_closed_decisions(manager,
+        dict.fromkeys(evidence.get("processing_decisions", ()), response), verify=True)
+    return True
 
 
 async def sources(manager, tx, actor, *kinds):

@@ -310,7 +310,7 @@ async def test_explicit_protocol_23_maintenance_rebuilds_the_index(registry_stor
 
 @pytest.mark.parametrize("mode", ["produce", "consume"])
 @pytest.mark.parametrize("point", ["before_commit", "after_commit"])
-async def test_process_death_keeps_the_original_and_pending_index_atomic(registry_store, tmp_path, mode, point):
+async def test_process_death_keeps_originals_and_a_rebuildable_pending_index(registry_store, tmp_path, mode, point):
     store, connect = registry_store
     backend = store._db.dialect.name
     dsn = str(tmp_path / "registry.db") if backend == "sqlite" else os.environ[
@@ -330,10 +330,23 @@ async def test_process_death_keeps_the_original_and_pending_index_atomic(registr
     cold = JobManager(await connect())
     actor = JobActor(**saved["actor"])
     pending = point == "after_commit" if mode == "produce" else point == "before_commit"
-    assert bool(await pending_reviews(cold, cold.db, actor)) == pending
+    # Production originals and their initial index still commit atomically.
+    # Consumption's clean handler exit precedes the target-tree projection;
+    # interrupted projection remains conservative and is rebuilt mechanically.
+    assert bool(await pending_reviews(cold, cold.db, actor)) == (pending if mode == "produce" else False)
     indexed = await rows(cold)
     assert bool(indexed) == pending
     assert {row["kind"] for row in indexed} == ({"abort", "disposition"} if pending else set())
+    if mode == "consume" and pending:
+        originals = await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id")
+        messages = await cold.db.fetchall(f"SELECT * FROM {cold.store.t.messages} ORDER BY id")
+        with pytest.raises(JobError, match="session_obligation_projection_mismatch"):
+            await obligations.verify(cold, actor)
+        await obligations.rebuild(cold)
+        await obligations.verify(cold, actor)
+        assert await rows(cold) == []
+        assert await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id") == originals
+        assert await cold.db.fetchall(f"SELECT * FROM {cold.store.t.messages} ORDER BY id") == messages
     assert saved["model_calls"] == 1 and saved["dispatched"] == 0
     assert saved["review_calls"] == int(mode == "consume")
     assert saved["reserve_calls"] == saved["apply_calls"] == 1 + int(mode == "consume")

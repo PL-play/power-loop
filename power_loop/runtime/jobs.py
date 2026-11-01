@@ -277,6 +277,9 @@ class JobManager:
             self._control_overlay.reset(overlay_token)
             self._control_notifications.reset(token)
             self._control_retirements.reset(retirement_token)
+        if recorder.obligation_decisions:
+            from .session_obligations import refresh_closed_decisions
+            await refresh_closed_decisions(self, recorder.obligation_decisions)
 
     def after_outcome(self, commit, rollback):
         """Defer in-memory effects of a control write until its transaction ends."""
@@ -406,6 +409,13 @@ class JobManager:
                 raise JobError("not_model_send")
             self._check_proof(row, lease)
             if row["status"] == "model_closed":
+                # A lost close ACK or failed later target refresh must retry
+                # from the actual committed exit, not the retry's arguments.
+                original = await tx.fetchone(f"SELECT payload_json FROM {self.events} WHERE event_id=?",
+                    ("model_closed_"+lease.job_id,))
+                from .session_obligations import note
+                note(tx, {"job_id": lease.job_id, "event_type": "model_closed",
+                    "payload_json": original["payload_json"]})
                 return _record(row)
             from .model_exit import SNAPSHOT, capture
             from .pending_calls import ERROR as PENDING_ERROR

@@ -30,6 +30,9 @@ async def inspect(manager, actor, job_id, *, generation, repair=False, retire_ex
         await project_events(manager, tx, identity, records)
     journal = ExecutionJournal(manager.store, projector=projector)
     recovered = await journal.recover(identity, repair=repair)
+    if repair:
+        from .session_obligations import reconcile_closed
+        await reconcile_closed(manager, actor, job_id)
     retired = False
     if retire_expired and not recovered["summary"]["closed"]:
         async with manager._write() as tx:
