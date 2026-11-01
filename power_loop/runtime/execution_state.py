@@ -174,6 +174,9 @@ class ExecutionState:
         self._dirty_bytes = 0
         self._completed_since_flush = 0
         self._pending = None
+        self._pending_batches = []
+        self._staged_digests = []
+        self._staged_transaction = None
         self._flush_lock = asyncio.Lock()
         self._last_flush = time.monotonic()
         self.before_checkpoint = None
@@ -349,48 +352,70 @@ class ExecutionState:
                 raise
             finally:
                 if acquired:
+                    self._staged_transaction = None
                     self._flush_lock.release()
-        async with self._flush_lock:
+        if self._staged_transaction is transaction:
             return await self._checkpoint_locked(force=force, transaction=transaction, defer=defer)
+        await self._flush_lock.acquire()
+        if defer is None:
+            try:
+                return await self._checkpoint_locked(force=force, transaction=transaction, defer=defer)
+            finally:
+                self._flush_lock.release()
+        self._staged_transaction = transaction
+        def release():
+            self._staged_transaction = None
+            self._flush_lock.release()
+        # Keep the memory lock through the enclosing transaction's outcome.
+        # This transaction may reenter; another transaction must wait.
+        defer(release, release)
+        return await self._checkpoint_locked(force=force, transaction=transaction, defer=defer)
 
     async def _checkpoint_locked(self, *, force, transaction, defer):
-        if self._staged:
-            return False
-        if self._pending is None:
+        index = len(self._staged_digests)
+        if index == len(self._pending_batches):
             if not self._dirty or not force and not self.due():
                 return False
             if self.before_checkpoint is not None:
                 await self.before_checkpoint(transaction)
             records = list(self._dirty.values())
             summary = self.summary()
-            self._pending = (self.cursor + 1, self.chain_hash, records, summary)
+            number = (self._pending_batches[-1][0] if self._pending_batches else self.cursor) + 1
+            previous = self._staged_digests[-1][1] if self._staged_digests else self.chain_hash
+            self._pending_batches.append((number, previous, records, summary))
+            self._pending = self._pending_batches[0]
             self._dirty = {}
             self._dirty_sizes = {}
             self._dirty_bytes = 0
             self._completed_since_flush = 0
-        number, previous, records, summary = self._pending
+        number, previous, records, summary = self._pending_batches[index]
         try:
             digest = await self.journal.append(self.identity, number, previous, records, summary, transaction=transaction)
         except BaseException:
             self.checkpoint_failed = True
             raise
+        self._staged_digests.append((number, digest))
+        self._staged = True
         if defer is None:
             self._applied(number, digest)
         else:
-            self._staged = True
-            defer(lambda: self._applied(number, digest), self._unstage)
+            defer(lambda: self._applied(number, digest), lambda: self._unstage(number))
         return True
 
     def _applied(self, number, digest):
         self.cursor, self.chain_hash = number, digest
-        self._pending = None
-        self._staged = False
-        self.checkpoint_failed = False
+        self._pending_batches.pop(0)
+        self._staged_digests.pop(0)
+        self._pending = self._pending_batches[0] if self._pending_batches else None
+        self._staged = bool(self._staged_digests)
+        self.checkpoint_failed = bool(self._pending_batches)
         self._last_flush = time.monotonic()
 
-    def _unstage(self):
-        # The enclosing transaction rolled back: retry the same retained batch.
-        self._staged = False
+    def _unstage(self, number):
+        # Rollback callbacks run in reverse, including a savepoint rollback.
+        # Retain every exact batch so a lost ACK can replay the same chain.
+        self._staged_digests.pop()
+        self._staged = bool(self._staged_digests)
         self.checkpoint_failed = True
 
     async def close(self, *, transaction=None, defer=None):
@@ -403,5 +428,7 @@ class ExecutionState:
                     "needs_reconciliation": self.needs_reconciliation})
         # A previous failed flush may be followed by late observations. Commit
         # both batches in order, rather than dropping the late result on close.
-        while not self._staged and (self._pending is not None or self._dirty):
+        while self._pending_batches or self._dirty:
+            if transaction is not None and len(self._staged_digests) == len(self._pending_batches) and not self._dirty:
+                break
             await self.checkpoint(force=True, transaction=transaction, defer=defer)

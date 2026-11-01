@@ -346,7 +346,7 @@ async def flush_binding(binding, *, close=False, force=True, transaction=None):
             if state._staged:
                 from .execution_membership import _remember_after_commit
                 _remember_after_commit(manager, None, "_closed_summaries",
-                                       (state.identity.job_id, state.identity.generation), state._pending[3])
+                                       (state.identity.job_id, state.identity.generation), state._pending_batches[-1][3])
             return
         try:
             await state.close()
