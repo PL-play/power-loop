@@ -41,10 +41,6 @@ class Preparation:
     def handled(self, job_id, event_id):
         self.statuses[event_id] = job_id, "handled"
 
-    def project_event(self, event):
-        change = self.statuses.get(event["event_id"])
-        return event if change is None else {**event, "delivery_status": change[1]}
-
     def withdraw(self, queue):
         self.queues[queue["id"]] = dict(queue)
         return {**queue, "status": "void", "claim_token": None}

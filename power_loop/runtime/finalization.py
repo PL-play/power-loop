@@ -48,7 +48,7 @@ def _object(raw):
 async def _reference(manager, tx, event_id):
     prepared = manager._finalization_preparation.get()
     if prepared is not None and event_id in prepared.events:
-        return _event_reference(prepared.project_event(prepared.events[event_id]))
+        return _event_reference(prepared.events[event_id])
     from .execution_membership import trusted_ref
     known = trusted_ref(manager, event_id)
     if known is not None:
@@ -56,16 +56,16 @@ async def _reference(manager, tx, event_id):
     event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
     if event is None:
         raise JobError("finalization_evidence_missing")
-    return _event_reference(event if prepared is None else prepared.project_event(event))
+    return _event_reference(event)
 
 
 def _event_reference(event):
     return {"event_id": event["event_id"], "job_id": event["job_id"], "event_type": event["event_type"],
         "revision": event["job_version"], "request_hash": event["request_hash"],
-        "delivery_status": event["delivery_status"], "payload_hash": _hash(_object(event["payload_json"]))}
+        "payload_hash": _hash(_object(event["payload_json"]))}
 
 
-async def _references(manager, tx, event_ids, known=None):
+async def _reference_rows(manager, tx, event_ids, known=None):
     """Read the exact referenced events in bounded batches, preserving order.
 
     ``known`` holds rows already read in this transaction.
@@ -83,7 +83,13 @@ async def _references(manager, tx, event_ids, known=None):
         found.update({row["event_id"]: row for row in rows})
     if any(key not in found for key in event_ids):
         raise JobError("finalization_evidence_missing")
-    return [_event_reference(found[key] if prepared is None else prepared.project_event(found[key])) for key in event_ids]
+    return found
+
+
+async def _references(manager, tx, event_ids, known=None):
+    event_ids = list(event_ids)
+    found = await _reference_rows(manager, tx, event_ids, known)
+    return [_event_reference(found[key]) for key in event_ids]
 
 
 async def _closed_event(manager, tx, event, state=None, depth=0):
@@ -134,9 +140,11 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
     refs = data["proof"]["references"]
     if not isinstance(refs, list) or not refs or len(refs) > 10000:
         raise JobError("finalization_evidence_corrupt")
-    actual_refs = await _references(manager, tx, (ref["event_id"] for ref in refs))
-    for ref, actual in zip(refs, actual_refs, strict=True):
-        if actual != ref:
+    originals = await _reference_rows(manager, tx, (ref["event_id"] for ref in refs))
+    for ref in refs:
+        original = originals[ref["event_id"]]
+        if (_event_reference(original) != ref or
+                ref["event_type"] == "processing_decision" and original["delivery_status"] != "committed"):
             raise JobError("finalization_evidence_changed")
         if ref["event_type"] == "supervision_closed":
             child = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (ref["event_id"],))
@@ -312,7 +320,7 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         version = row["version"] + 1
         event_id = _identity(manager, "closed", [row["job_id"], 0, version, data["proof_hash"]])
         ref = {"event_id": event_id, "job_id": row["job_id"], "event_type": "supervision_closed", "revision": version,
-            "request_hash": _hash(data), "delivery_status": "not_applicable", "payload_hash": _hash(data)}
+            "request_hash": _hash(data), "payload_hash": _hash(data)}
         state["plans"].append((row, version, data, ref))
         state["visiting"].remove(key)
         state["done"][key] = ref
@@ -433,7 +441,7 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
     version = row["version"] + 1
     event_id = _identity(manager, "closed", [row["job_id"], generation, version, data["proof_hash"]])
     ref = {"event_id": event_id, "job_id": row["job_id"], "event_type": "supervision_closed", "revision": version,
-        "request_hash": _hash(data), "delivery_status": "not_applicable", "payload_hash": _hash(data)}
+        "request_hash": _hash(data), "payload_hash": _hash(data)}
     state["plans"].append((row, version, data, ref))
     state["visiting"].remove(key)
     state["done"][key] = ref

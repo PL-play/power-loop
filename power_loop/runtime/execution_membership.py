@@ -201,7 +201,7 @@ def remember_ref(manager, event_id, job_id, kind, version, payload, request_hash
     """Remember the finalization reference of an immutable event this process inserted."""
     _remember_after_commit(manager, None, "_event_refs", event_id, _json({
         "event_id": event_id, "job_id": job_id, "event_type": kind, "revision": version,
-        "request_hash": request_hash, "delivery_status": "not_applicable",
+        "request_hash": request_hash,
         "payload_hash": _hash(json.loads(_json(payload)))}))
 
 

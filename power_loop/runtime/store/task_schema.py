@@ -30,7 +30,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 12
-TASK_PROTOCOL_VERSION = 29
+TASK_PROTOCOL_VERSION = 30
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
