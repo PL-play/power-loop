@@ -92,12 +92,19 @@ async def admitting(managed_workflow, monkeypatch):
                 if claim_fault:
                     @asynccontextmanager
                     async def broken_claim():
+                        target_written = False
                         async with original() as tx:
                             original_execute = tx._execute
                             async def execute(sql, params=()):
+                                nonlocal target_written
+                                if claim_fault == "source_statement" and params and isinstance(params[0], str) and params[0].startswith('dispatch_req_'):
+                                    c.fault_hits.append(claim_fault)
+                                    raise OSError("dispatch permission write failed")
                                 if claim_fault == "statement" and "workflow_dispatch" in params:
                                     c.fault_hits.append(claim_fault)
                                     raise OSError("dispatch write failed")
+                                if "workflow_dispatch" in params:
+                                    target_written = True
                                 return await original_execute(sql, params)
                             with monkeypatch.context() as statements:
                                 statements.setattr(tx, "_execute", execute)
@@ -108,8 +115,9 @@ async def admitting(managed_workflow, monkeypatch):
                             if claim_fault == "cancel":
                                 c.fault_hits.append(claim_fault)
                                 raise asyncio.CancelledError()
-                        c.fault_hits.append(claim_fault)
-                        raise RuntimeError("claim committed, ACK lost")
+                        if claim_fault == "commit_ack" and target_written:
+                            c.fault_hits.append(claim_fault)
+                            raise RuntimeError("claim committed, ACK lost")
                     with monkeypatch.context() as patch:
                         patch.setattr(manager, "_write", broken_claim)
                         try:
@@ -242,7 +250,7 @@ async def test_two_independent_managers_admit_same_call_only_once(admitting):
     assert len(await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='workflow_node_reservation'")) == 2
 
 
-@pytest.mark.parametrize("fault", ["rollback", "cancel", "commit_ack", "statement"])
+@pytest.mark.parametrize("fault", ["rollback", "cancel", "commit_ack", "statement", "source_statement"])
 async def test_dispatch_transaction_rollback_cancel_and_lost_ack_keep_single_responsibility(admitting, fault):
     c = admitting
     await c.admit(claim=True, claim_fault=fault)
@@ -250,9 +258,16 @@ async def test_dispatch_transaction_rollback_cancel_and_lost_ack_keep_single_res
     other = JobManager(await c.connect())
     rows = await other.db.fetchall(f"SELECT * FROM {other.events} WHERE event_type='workflow_dispatch'")
     assert len(rows) == int(fault == "commit_ack")
-    if fault == "commit_ack":
+    accepted = [row for row in await other.db.fetchall(f"SELECT * FROM {other.events} WHERE event_type='task_control_request'")
+        if (lambda data:data['phase']=='accepted' and data['action']=='dispatch')(json.loads(row['payload_json']))]
+    assert len(accepted)==int(fault in ('commit_ack', 'statement'))
+    if fault in ("commit_ack", "statement"):
+        [pending] = await other.db.fetchall(f"SELECT source_id FROM {other.prefix}session_obligations WHERE kind='control_request'")
+        assert pending['source_id']==accepted[0]['event_id']
         assert await resume.claim_dispatch(other, c.actor, c.result[0].operation_id, caller=c.args["caller"], token="owner-token")
         assert not await resume.claim_dispatch(other, c.actor, c.result[0].operation_id, caller=c.args["caller"], token="stranger")
+        assert len(await other.db.fetchall(f"SELECT event_id FROM {other.events} WHERE event_type='workflow_dispatch'"))==1
+        assert not await other.db.fetchall(f"SELECT source_id FROM {other.prefix}session_obligations WHERE kind='control_request'")
     else:
         with pytest.raises(JobError):
             await resume.claim_dispatch(other, c.actor, c.result[0].operation_id, caller=c.args["caller"], token="owner-token")

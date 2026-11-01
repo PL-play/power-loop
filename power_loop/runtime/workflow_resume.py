@@ -11,7 +11,6 @@ from dataclasses import asdict
 
 from .jobs import JobError, JobLease, _hash, _json, _operation
 from .jobs import verify_stored as _verify_stored
-from .message_ref import MessageRef, integer_id
 from .result_revisions import execution_id, result_id
 
 
@@ -21,15 +20,6 @@ def reservation_id(manager, job_id, generation, node_id):
 
 def dispatch_id(operation_id):
     return "wf_disp_" + _hash(operation_id)[:48]
-
-
-def _ref(data):
-    if type(data.get("version")) is not int or data["version"] != 1 or data.get("id_status") != "available":
-        raise JobError("invalid_message_ref")
-    return MessageRef(store_id=data["store_id"], session_id=data["session_id"], id=integer_id(data["id"]),
-        seq=integer_id(data["seq"]), role=data["role"], tool_call_id=data.get("tool_call_id"),
-        send_index=int(data["send_index"]) if data.get("send_index") is not None else None,
-        round_index=data.get("round_index"))
 
 
 async def _source(manager, tx, actor, caller, ref):
@@ -226,36 +216,5 @@ async def execution(manager, tx, row, generation=None, *, expected_operation=Non
 async def claim_dispatch(manager, actor, operation_id, *, caller, token, resources=None):
     if not isinstance(token, str) or not 0 < len(token) <= 64 or not isinstance(caller, JobLease):
         raise JobError("invalid_dispatch_token")
-    async with manager._write() as tx:
-        op = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (operation_id,))
-        if op is None or op["caller_session_id"] != actor.session_id:
-            raise JobError("resume_dispatch_mismatch")
-        row = await manager._authorize(tx, actor, op["job_id"])
-        saved, request = await execution(manager, tx, row, expected_operation=operation_id)
-        if request["caller"] != asdict(caller):
-            raise JobError("resume_dispatch_mismatch")
-        key = dispatch_id(operation_id)
-        old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
-        if old:
-            payload = json.loads(old["payload_json"])
-            expected = {"version": 1, "operation_id": operation_id, "target": request["target"],
-                "driver_sid": request["driver_sid"], "token": payload.get("token")}
-            if (old["event_type"] != "workflow_dispatch" or old["job_id"] != row["job_id"] or old["delivery_status"] != "claimed" or
-                    old["request_hash"] != _hash(payload) or _hash(expected) != _hash(payload) or
-                    not isinstance(payload.get("token"), str) or not 0 < len(payload["token"]) <= 64):
-                raise JobError("workflow_restore_dispatch_mismatch")
-            return payload.get("token") == token
-        ref = _ref(json.loads(saved["call_ref_json"]))
-        await manager._validate_call(tx, actor, ref, saved["tool_call_id"])
-        await _source(manager, tx, actor, caller, ref)
-        await manager._fence(tx, actor, JobLease(**request["target"]))
-        from .workflow_restore_resources import admission
-        admission(resources, manager, actor, request["plan"]["profile"],
-            prior_usage=request["prior_usage"], previous=request.get("resource_evidence"))
-        evidence = {"version": 1, "operation_id": operation_id, "target": request["target"], "driver_sid": request["driver_sid"], "token": token}
-        if await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, row["job_id"], "workflow_dispatch", row["version"], _hash(evidence), _json(evidence), "claimed", manager.now())) != 1:
-            raise JobError("workflow_restore_dispatch_mismatch")
-        saved = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (key,))
-        if saved is None or _hash(json.loads(saved["payload_json"])) != _hash(evidence):
-            raise JobError("workflow_restore_dispatch_mismatch")
-        return True
+    from .resume_dispatch import claim
+    return await claim(manager, actor, operation_id, caller=caller, token=token, resources=resources)

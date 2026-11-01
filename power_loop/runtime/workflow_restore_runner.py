@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import secrets
 
@@ -24,7 +23,7 @@ async def start(loop, parent_sid, run_id, *, continuation, executor=None, budget
     from .workflow_restore_execution import settle
     from .workflow_restore_resources import prepare as prepare_resources
     from .workflow_restore_resources import reauthorize
-    from .workflow_resume import admit, claim_dispatch, dispatch_id
+    from .workflow_resume import admit, claim_dispatch
     from .workflow_tasks import _WORKFLOW
     source = _SEND.get()
     runtime = loop.task_runtime
@@ -98,10 +97,12 @@ async def start(loop, parent_sid, run_id, *, continuation, executor=None, budget
                 claimed = await claim_dispatch(manager, source.actor, operation.operation_id,
                     caller=source.lease, token=dispatch_token, resources=resources)
             except Exception:
-                saved = await manager.db.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (dispatch_id(operation.operation_id),))
-                if saved is None or json.loads(saved["payload_json"]).get("token") != dispatch_token:
+                from .resume_dispatch import recover_claim
+                recovered = await recover_claim(manager, source.actor, operation.operation_id,
+                    caller=source.lease, token=dispatch_token)
+                if recovered is None:
                     raise
-                claimed = True
+                claimed = recovered
             if not claimed:
                 raise JobError("workflow_restore_dispatch_unowned")
             from power_loop.runtime.cancellation import CancellationToken

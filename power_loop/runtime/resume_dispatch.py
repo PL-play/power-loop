@@ -27,15 +27,32 @@ async def _operation(manager, reader, actor, operation_id, caller):
         raise JobError("resume_dispatch_mismatch")
     job = await manager._authorize(reader, actor, op["job_id"])
     payload = json.loads(op["payload_json"])
-    if payload.get("mode") != "continue" or payload["request"].get("caller") != asdict(caller):
+    if payload.get("mode") not in ("continue", "workflow_continue") or payload["request"].get("caller") != asdict(caller):
         raise JobError("resume_dispatch_mismatch")
+    if payload["mode"] == "workflow_continue":
+        from .workflow_resume import execution
+        await execution(manager, reader, job, payload["generation"], expected_operation=operation_id)
     return op, job, payload["request"]
 
 
 def _intent(op, caller, token, target):
-    return {"job_id": op["job_id"], "caller": asdict(caller), "call_ref": json.loads(op["call_ref_json"]),
+    payload = json.loads(op["payload_json"])
+    request = {"job_id": op["job_id"], "caller": asdict(caller), "call_ref": json.loads(op["call_ref_json"]),
         "tool_call_id": op["tool_call_id"], "operation_id": op["event_id"], "operation": requests.reference(op),
-        "target": target, "token": token}
+        "target": target, "token": token, "mode": payload["mode"]}
+    if payload["mode"] == "workflow_continue":
+        request["driver_sid"] = payload["request"]["driver_sid"]
+    return request
+
+
+def _evidence(request, request_ref):
+    if request["mode"] == "workflow_continue":
+        from .workflow_resume import dispatch_id
+        return dispatch_id(request["operation_id"]), "workflow_dispatch", {
+            "version": 1, "operation_id": request["operation_id"], "target": request["target"],
+            "driver_sid": request["driver_sid"], "token": request["token"], "request_ref": request_ref}
+    return "dispatch_"+request["operation_id"], "dispatch", {
+        "token": request["token"], "operation_id": request["operation_id"], "request_ref": request_ref}
 
 
 @verify_stored
@@ -51,13 +68,14 @@ async def _stored_request(manager, reader, actor, event, request, completion=Non
 
 
 def _receipt(manager, event, request, request_ref):
-    value = {"token": request["token"], "operation_id": request["operation_id"], "request_ref": request_ref}
-    if (event["event_id"] != "dispatch_"+request["operation_id"] or event["event_type"] != "dispatch"
+    event_id, kind, value = _evidence(request, request_ref)
+    if (event["event_id"] != event_id or event["event_type"] != kind
             or event["job_id"] != request["job_id"] or event["delivery_status"] != "claimed"
             or event["request_hash"] != _hash(value) or json.loads(event["payload_json"]) != value
             or event["caller_session_id"] != request["call_ref"]["session_id"]
             or event["tool_call_id"] != request["tool_call_id"] or json.loads(event["call_ref_json"]) != request["call_ref"]):
-        raise JobError("resume_dispatch_receipt_mismatch")
+        raise JobError("workflow_restore_dispatch_mismatch" if request["mode"] == "workflow_continue"
+            else "resume_dispatch_receipt_mismatch")
     return True
 
 
@@ -78,7 +96,7 @@ async def _publish(manager, actor, accepted, outcome):
     if outcome is not None:
         return requests.read_outcome(manager, accepted, outcome), outcome
     request = accepted.data["request"]
-    event_id = "dispatch_"+request["operation_id"]
+    event_id, kind, value = _evidence(request, requests.reference(accepted.event))
     key = manager._origin_key(actor, ACTION, _ref(request["call_ref"]), request["tool_call_id"], None)
     async with manager._write() as tx:
         old = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE event_id IN (?,?)",
@@ -92,8 +110,7 @@ async def _publish(manager, actor, accepted, outcome):
             if exc.code not in TARGET_BARRIERS:
                 raise
             return None, await requests.reject(manager, tx, actor, accepted.event, accepted.data, row, exc.code)
-        value = {"token": request["token"], "operation_id": request["operation_id"], "request_ref": requests.reference(accepted.event)}
-        event = {"event_id": event_id, "job_id": job["job_id"], "event_type": "dispatch", "job_version": job["version"],
+        event = {"event_id": event_id, "job_id": job["job_id"], "event_type": kind, "job_version": job["version"],
             "operation_key": key, "caller_session_id": actor.session_id, "tool_call_id": request["tool_call_id"],
             "call_ref_json": _json(request["call_ref"]), "request_hash": _hash(value), "payload_json": _json(value),
             "delivery_status": "claimed", "created_at": manager.now()}
@@ -111,7 +128,7 @@ async def _finish(manager, actor, accepted, outcome):
     return result
 
 
-async def claim(manager, actor, operation_id, *, caller, token):
+async def claim(manager, actor, operation_id, *, caller, token, resources=None):
     while True:
         async with manager._read() as reader:
             op, job, original = await _operation(manager, reader, actor, operation_id, caller)
@@ -129,6 +146,10 @@ async def claim(manager, actor, operation_id, *, caller, token):
                 if job["kind"] == "workflow_node":
                     from .node_resume import validate_execution
                     await validate_execution(manager, reader, job, original["session_id"])
+                if request["mode"] == "workflow_continue":
+                    from .workflow_restore_resources import admission
+                    admission(resources, manager, actor, original["plan"]["profile"],
+                        prior_usage=original["prior_usage"], previous=original.get("resource_evidence"))
                 frozen = {"job_id": job["job_id"], "root_job_id": job["root_job_id"],
                     "generation": original["target"]["generation"]}
         if accepted is not None:
@@ -144,6 +165,23 @@ async def claim(manager, actor, operation_id, *, caller, token):
             # Re-read that original; only its exact token can finish the claim.
             continue
         return await _finish(manager, actor, accepted, None)
+
+
+@verify_stored
+async def recover_claim(manager, actor, operation_id, *, caller, token):
+    """Finish this owner's retained permission after an uncertain commit ACK."""
+    async with manager._read() as reader:
+        op, _, original = await _operation(manager, reader, actor, operation_id, caller)
+        request = _intent(op, caller, token, original["target"])
+        key = manager._origin_key(actor, ACTION, _ref(request["call_ref"]), request["tool_call_id"], None)
+        permission = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (requests.identity(ACTION, key),))
+        if permission is None:
+            return None
+        stored = json.loads(permission["payload_json"])["request"]
+        accepted, outcome = await requests.discover(manager, reader, actor, stored, action=ACTION)
+        if stored["token"] != token:
+            return False
+    return await _finish(manager, actor, accepted, outcome)
 
 
 @verify_stored

@@ -49,7 +49,8 @@ async def dispatch(manager, tx, row, generation=None):
     record = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (dispatch_id(op["event_id"]),))
     try:
         data = json.loads(record["payload_json"]) if record else {}
-        expected = {"version": 1, "operation_id": op["event_id"], "target": request["target"], "driver_sid": request["driver_sid"], "token": data.get("token")}
+        expected = {"version": 1, "operation_id": op["event_id"], "target": request["target"], "driver_sid": request["driver_sid"],
+            "token": data.get("token"), "request_ref": data["request_ref"]}
         if (not record or record["event_type"] != "workflow_dispatch" or record["job_id"] != row["job_id"] or
                 record["delivery_status"] != "claimed" or record["request_hash"] != _hash(data) or _hash(expected) != _hash(data) or
                 not isinstance(data.get("token"), str) or not 0 < len(data["token"]) <= 64):
