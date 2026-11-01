@@ -186,8 +186,7 @@ async def _save_counters(manager, tx, row, counters):
 async def _read(manager, tx, attempt_id, *, required=True):
     row = await tx.fetchone(f"SELECT * FROM {manager.prefix}task_budget_attempts WHERE attempt_id=?", (attempt_id,))
     if row is None:
-        marker = "mb_" + _hash([attempt_id, 1])[:48]
-        if required or await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (marker,)):
+        if required:
             raise JobError("budget_attempt_missing")
         return None
     event_id = "mb_" + _hash([attempt_id, row["version"]])[:48]
@@ -483,7 +482,21 @@ async def close_unreserved(attempt):
 async def is_closed_unstarted(manager, tx, prepared):
     """Read original release evidence without granting another dispatch."""
     state = await _read(manager, tx, prepared["attempt_id"], required=False)
-    if state is None or state["phase"] != "released" or state["pending"] or state["ack"] is None:
+    if state is None:
+        # A checkpoint coalesces RAM revisions; version 1 need never have been
+        # projected. At this cold evidence reader, any original budget version
+        # for the attempt proves that a missing projection is not "no grant".
+        extract = {
+            "sqlite": "json_extract(payload_json,'$.attempt_id')",
+            "postgres": "CAST(payload_json AS jsonb)->>'attempt_id'",
+            "mysql": "JSON_UNQUOTE(JSON_EXTRACT(payload_json,'$.attempt_id'))",
+        }[manager.db.dialect.name]
+        if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE job_id=? "
+                f"AND event_type='model_budget_state' AND {extract}=? LIMIT 1",
+                (prepared["scope"]["job_id"], prepared["attempt_id"])):
+            raise JobError("budget_attempt_missing")
+        return False
+    if state["phase"] != "released" or state["pending"] or state["ack"] is None:
         return False
     if (
         state["context"]["prepared_hash"] != _hash(prepared)

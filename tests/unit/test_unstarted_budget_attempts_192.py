@@ -11,7 +11,8 @@ import pytest
 from power_loop import LLMRequest
 from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
-from power_loop.runtime.jobs import JobError
+from power_loop.runtime.control_runtime import current, flush_binding
+from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.model_attempt_query import list_attempts
 
 from .test_job_registry_192 import registry_store
@@ -61,6 +62,7 @@ async def test_prepare_failure_is_closed_locally_and_the_same_send_can_admit_its
     c.host.prepare = unavailable
     with pytest.raises(OSError, match="metadata preparation failed"):
         await start(c)
+    await flush_binding(c.binding)
     [event] = await c.manager.db.fetchall(
         f"SELECT payload_json FROM {c.manager.events} WHERE event_type='model_attempt_prepared'"
     )
@@ -101,13 +103,16 @@ async def test_deleted_reservation_row_is_not_proof_that_no_reservation_ever_exi
     c = budget_case
     attempt = await prepared(c)
     await budgets.reserve(attempt, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
+    assert await budgets.close_unreserved(attempt) is None
+    await flush_binding(c.binding, close=True)
     await c.manager.db.execute(
         f"DELETE FROM {c.manager.prefix}task_budget_attempts WHERE attempt_id=?", (attempt.attempt_id,)
     )
+    cold = JobManager(await c.connect())
     with pytest.raises(JobError, match="budget_attempt_missing"):
-        await budgets.close_unreserved(attempt)
+        await budgets.get_budget(cold, c.actor, attempt.attempt_id)
     with pytest.raises(JobError, match="budget_attempt_missing"):
-        await list_attempts(c.manager, c.actor, c.binding.lease.job_id)
+        await list_attempts(cold, c.actor, c.binding.lease.job_id)
     assert c.host.reserve_calls == 1 and not c.host.released
 
 
@@ -124,7 +129,8 @@ async def test_local_closure_requires_exact_original_preparation_and_execution_i
         values = {fault: attempt.binding.lease.generation + 1 if fault == "generation" else "other"}
         lease = replace(attempt.binding.lease, **values)
         wrong = replace(attempt, binding=replace(attempt.binding, lease=lease))
-    with pytest.raises(JobError, match="budget_release_requires_original_owner"):
+    code = "budget_release_requires_original_owner" if fault in ("prepared", "owner") else "execution_control_binding_changed"
+    with pytest.raises(JobError, match=code):
         await budgets.close_unreserved(wrong)
     assert not await c.manager.db.fetchall(f"SELECT attempt_id FROM {c.manager.prefix}task_budget_attempts")
 
@@ -146,6 +152,7 @@ async def test_repeated_closure_has_one_proof_and_the_original_attempt_can_never
     attempt = await prepared(c)
     results = await asyncio.gather(*(budgets.close_unreserved(attempt) for _ in range(6)))
     assert all(r == results[0] for r in results)
+    await flush_binding(c.binding)
     assert (
         len(
             await c.manager.db.fetchall(
@@ -154,7 +161,7 @@ async def test_repeated_closure_has_one_proof_and_the_original_attempt_can_never
         )
         == 1
     )
-    with pytest.raises(JobError, match="budget_dispatch_not_authorized"):
+    with pytest.raises(JobError, match="model_attempt_dispatch_already_admitted"):
         await attempts.dispatch(attempt)
     with pytest.raises(JobError, match="budget_attempt_already_reserved"):
         await budgets.reserve(attempt, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
@@ -177,27 +184,31 @@ async def test_closure_write_failure_rolls_back_and_preserves_original_error_and
     budget_case, monkeypatch
 ):
     c = budget_case
-    original_prepare, save = c.host.prepare, budgets._save
+    original_prepare = c.host.prepare
+    journal = current(c.binding).journal
+    append = journal.append
 
     async def unavailable(*args, **kwargs):
         raise OSError("original preparation unavailable")
 
     async def rollback(*args, **kwargs):
-        await save(*args, **kwargs)
+        await append(*args, **kwargs)
         raise RuntimeError("test proof transaction rollback")
 
     c.host.prepare = unavailable
-    monkeypatch.setattr(budgets, "_save", rollback)
     with pytest.raises(OSError, match="original preparation unavailable"):
         await start(c)
+    monkeypatch.setattr(journal, "append", rollback)
+    with pytest.raises(RuntimeError, match="proof transaction rollback"):
+        await flush_binding(c.binding)
     assert not await c.manager.db.fetchall(f"SELECT attempt_id FROM {c.manager.prefix}task_budget_attempts")
     assert not await c.manager.db.fetchall(
         f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_budget_state'"
     )
-    assert c.binding.resource_evidence["budget_pending"]
-    monkeypatch.setattr(budgets, "_save", save)
+    assert current(c.binding).checkpoint_failed
+    monkeypatch.setattr(journal, "append", append)
     c.host.prepare = original_prepare
-    with pytest.raises(JobError, match="unresolved_prior_attempt"):
+    with pytest.raises(JobError, match="execution_checkpoint_pending"):
         await start(c)
     assert c.host.reserve_calls == 0
 
@@ -246,6 +257,7 @@ async def test_original_dispatch_and_host_release_cannot_both_win(budget_case):
     closed, dispatched = await asyncio.gather(
         budgets.close_unstarted(attempt), attempts.dispatch(attempt), return_exceptions=True
     )
+    await flush_binding(c.binding)
     actual = await c.manager.db.fetchall(
         f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'"
     )
@@ -256,7 +268,8 @@ async def test_original_dispatch_and_host_release_cannot_both_win(budget_case):
         await observed(c, attempt)
     else:
         assert not isinstance(closed, BaseException) and isinstance(dispatched, JobError)
-        assert str(dispatched) == "budget_dispatch_not_authorized" and len(c.host.released) == 1
+        assert str(dispatched) == "model_attempt_dispatch_already_admitted" and len(c.host.released) == 1
+    await flush_binding(c.binding, close=True)
     [scope] = await c.manager.db.fetchall(f"SELECT counters_json FROM {c.manager.prefix}task_budget_scopes")
     counters = json.loads(scope["counters_json"])
     assert counters["held_calls"] == counters["held_tokens"] == counters["inflight"] == 0
