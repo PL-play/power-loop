@@ -198,10 +198,16 @@ async def test_old_snapshot_cannot_acknowledge_new_result_revision(processing_ca
     job_id, row = await c.result()
     snapshot = await c.prepare([row])
     field, value = ("job_version", 999) if mutation == "revision" else ("payload_json", '{"changed":true}')
-    await c.manager.db.execute(f"UPDATE {c.manager.events} SET {field}=? WHERE event_id=?", (value, "result_" + job_id))
-    with pytest.raises(JobError, match="processing_revision_changed"):
-        await c.commit(snapshot, await c.response())
-    assert (await c.manager.get_job(c.actor, job_id)).result_status == "pending_delivery"
+    event_id = "result_" + job_id
+    original = await c.manager.db.fetchone(f"SELECT {field} FROM {c.manager.events} WHERE event_id=?", (event_id,))
+    try:
+        await c.manager.db.execute(f"UPDATE {c.manager.events} SET {field}=? WHERE event_id=?", (value, event_id))
+        with pytest.raises(JobError, match="processing_revision_changed"):
+            await c.commit(snapshot, await c.response())
+        assert (await c.manager.get_job(c.actor, job_id)).result_status == "pending_delivery"
+        assert (await c.manager.db.fetchone(f"SELECT {field} FROM {c.manager.events} WHERE event_id=?", (event_id,)))[field] == value
+    finally:
+        await c.manager.db.execute(f"UPDATE {c.manager.events} SET {field}=? WHERE event_id=?", (original[field], event_id))
 
 
 @pytest.mark.parametrize("fault", ["before_commit", "lost_ack"])
