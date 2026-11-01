@@ -35,6 +35,9 @@
   Changed/cold discovery no longer scans handled history. Explicit maintenance
   and cold repair validate originals, atomically rebuild this projection and
   invalidate affected session caches without changing messages or fees.
+  Current wait-decision system inputs are indexed with their original enqueue;
+  later owner failure preserves actual consumption proof. Cold repair rejects
+  damaged wait origins instead of dropping the pending barrier.
 - Mutable session hints now live in one lease-scoped `SessionHolding`. Lease
   exit discards the holding; stale inherited contexts and delayed commit results
   cannot change a later holding, including reuse of the same owner ID.
@@ -45,6 +48,12 @@
   current bounded keys on all three stores; retain original event/message
   immutability and no-replay checks in current-format tests. Task subprocess
   fixtures now select their actual engine's isolated test DSN throughout.
+- Journal and owned-history keys share bounded run tokens so opaque host SDK IDs
+  fit MySQL state keys. A disjoint digest namespace keeps concurrent long IDs,
+  literal token IDs and case variants distinct under MySQL's default collation;
+  run IDs remain complete in journal/index data. Retained raw journal/history
+  keys for noncanonical host IDs require explicit offline rekeying; readers
+  compute one current key without a stored-format fallback.
 - Shared bounded budget grants stay reserved until close; cumulative settlement
   and original financial evidence remain idempotent after unknown commits.
   Eligible model close and supervision publication share one row update.

@@ -108,7 +108,13 @@ close must also commit. That transaction passes its own clean-close fact rather
 than rereading it. Physical closure of a generation-zero managed action retains
 its negative notice until the original main actually reviews it. Workflow
 control operations are distinct from queued `steer`, `continue` and
-`restore_input` inputs.
+`restore_input` inputs. Current wait-decision continuations are system inputs
+with original `request.handoff` provenance, rather than a user-nudge mode.
+Their source and pending row commit together. Cold reconstruction selects
+pending subagent/node inputs by their owning role and delivery status, then
+validates originals; a damaged handoff cannot silently remove a review barrier.
+An input actually consumed before a later owner failure retains its original
+processing proof instead of acquiring a fabricated negative disposition.
 
 The index is a projection, never execution, processing or billing authority.
 Cold `verify` compares it with validated originals; explicit `rebuild` verifies
@@ -143,6 +149,15 @@ The legacy long-key generation option and dual-key alias readers are removed.
 Current-format three-engine tests preserve exact original event/message
 immutability, actual review closure and no-replay assertions; unsupported alias
 ambiguity is not an execution contract.
+
+Workflow journals and owned history share one bounded storage-token function.
+Opaque host SDK run IDs remain complete in original journals and indexes.
+Canonical generated IDs retain their key; other host IDs use a disjoint digest
+namespace. Literal token IDs, including case variants under MySQL's default
+collation, cannot alias another run's key. Readers compute one key. Retained raw
+journal/history keys for noncanonical host IDs require explicit offline rekeying;
+execution does not probe an alternative stored format, and this work executes
+no business migration.
 
 ## Validation requirements
 
