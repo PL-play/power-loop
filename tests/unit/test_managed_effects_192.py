@@ -377,7 +377,7 @@ async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identit
     assert await store.message_ref(sid, seq) == ref
     assert (
         await manager.db.fetchone(f"SELECT store_id,protocol_version FROM {manager.prefix}task_store WHERE id=1")
-    ) == {"store_id": store.store_id, "protocol_version": 21}
+    ) == {"store_id": store.store_id, "protocol_version": task_schema.TASK_PROTOCOL_VERSION}
     with monkeypatch.context() as patch:
         patch.setattr(jobs, "TASK_PROTOCOL_VERSION", old_protocol)
         with pytest.raises(JobError, match="store_identity_changed"):
