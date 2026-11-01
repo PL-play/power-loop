@@ -1,0 +1,262 @@
+"""Prepare historical continuation proof before separately fenced tree writes."""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+
+from . import control_requests as requests
+from .finalization_plan import PlanChanged
+from .jobs import JobError, JobLease, _hash, _json, _operation, verify_stored
+from .managed_effects import _ref
+from .result_revisions import execution_id, result_id
+
+ACTION = "resume"
+TARGET_BARRIERS = frozenset({"cancel_requested", "unresolved_prior_attempt", "resume_generation_changed",
+    "resume_target_unsettled", "resume_tools_pending", "resume_input_pending",
+    "executor_not_accepting", "executor_registration_required"})
+
+
+@dataclass(frozen=True)
+class PriorTree:
+    root_id: str
+    generation: int
+    count: int
+    version_sum: int
+
+
+def _intent(command, ref, call_id, executor_required):
+    return {"job_id": command["target"]["job_id"], "caller": command["caller"],
+        "call_ref": ref.to_dict(), "tool_call_id": call_id, "input": command, "executor_required": executor_required}
+
+
+async def _source(manager, reader, actor, request):
+    source = await manager._fence(reader, actor, JobLease(**request["caller"]))
+    create = await reader.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND action='create'", (source["job_id"],))
+    index = json.loads(create["payload_json"]).get("request", {}).get("send_index") if create else None
+    if (source["kind"] != "send" or source["session_id"] != actor.session_id or source["execution_role"] != "main"
+            or type(index) is not int or index < 1 or index != _ref(request["call_ref"]).send_index):
+        raise JobError("resume_caller_mismatch")
+    return source
+
+
+async def _mutable(manager, reader, actor, request):
+    command = request["input"]
+    row = await manager._authorize(reader, actor, request["job_id"])
+    if (row["kind"] != "subagent" or row["execution_role"] != "subagent" or row["control_owner_job_id"] is not None
+            or row["created_by_session_id"] != actor.session_id or row["session_id"] != command["session_id"]):
+        raise JobError("resume_target_mismatch")
+    await manager._supervision_barriers(reader, row)
+    if row["generation"] != command["previous_generation"]:
+        raise JobError("resume_generation_changed")
+    if row["outcome"] != "succeeded" or row["resource_state"] != "stopped" or row["intake"] != "closed":
+        raise JobError("resume_target_unsettled")
+    sid = command["session_id"]
+    state = await reader.fetchone(f"SELECT pending_json FROM {manager.store.t.session_state} WHERE session_id=?", (sid,))
+    if state is not None and state["pending_json"]:
+        raise JobError("resume_tools_pending")
+    if await reader.fetchone(f"SELECT item_id FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND status IN ('pending','claimed')", (sid,)):
+        raise JobError("resume_input_pending")
+    from .executor_registry import ExecutorIdentity, require_accepting
+    target = command["target"]
+    executor = await require_accepting(manager, reader, ExecutorIdentity(actor.tenant_id, actor.principal_id,
+        target["executor_id"], target["boot_id"]), required=row["executor_key"] is not None or request["executor_required"])
+    return row, executor
+
+
+async def _immutable(manager, reader, actor, request):
+    """The original standalone route and frozen child contract never change."""
+    command = request["input"]
+    sid = command["session_id"]
+    session = await reader.fetchone(f"SELECT parent_session_id,metadata_json FROM {manager.store.t.sessions} WHERE session_id=?", (sid,))
+    meta = json.loads(session["metadata_json"] or "{}") if session else {}
+    if (session is None or session["parent_session_id"] != actor.session_id or meta.get("execution_role") != "subagent"
+            or not meta.get("standalone_subagent")):
+        raise JobError("resume_session_unavailable")
+    contract = await reader.fetchone(f"SELECT value_json FROM {manager.store.t.session_runtime_state} WHERE session_id=? AND state_key=?",
+        (sid, "workflow_execution_contract"))
+    saved = json.loads(contract["value_json"]) if contract else None
+    if not isinstance(saved, dict) or saved.get("version") != 1 or _hash(saved) != command["contract_hash"]:
+        raise JobError("resume_contract_mismatch")
+
+
+async def _prepare(manager, reader, actor, request):
+    row, _ = await _mutable(manager, reader, actor, request)
+    await _immutable(manager, reader, actor, request)
+    from .finalization import prepare_reopen, require_resumable
+    await require_resumable(manager, reader, row)
+    from .processing import require_handled
+    try:
+        await require_handled(manager, reader, row)
+    except JobError as exc:
+        raise JobError("resume_result_unhandled") from exc
+    await manager._require_scope_ready(reader, row)
+    from .execution_membership import require_current
+    await require_current(manager, reader, row)
+    reopening = await prepare_reopen(manager, reader, row)
+    root = row["root_job_id"]
+    summary = await reader.fetchone(f"SELECT COUNT(*) AS job_count,COALESCE(SUM(version),0) AS version_sum,"
+        f"MAX(CASE WHEN job_id=? THEN generation END) AS root_generation FROM {manager.jobs} WHERE root_job_id=?", (root, root))
+    return row, PriorTree(root, summary["root_generation"], summary["job_count"], summary["version_sum"]), reopening
+
+
+@verify_stored
+async def _stored_request(manager, reader, actor, event, request, completion=None):
+    command = request["input"]
+    if (_intent(command, _ref(request["call_ref"]), request["tool_call_id"], request["executor_required"]) != request
+            or command["caller"] != request["caller"] or command["target"]["generation"] != command["previous_generation"]+1):
+        raise JobError("resume_request_corrupt")
+    accepted = await requests.stored(manager, reader, actor, event, request, action=ACTION, completion=completion)
+    if (accepted.data["target"]["generation"] != command["previous_generation"]
+            or accepted.data["source"]["execution_role"] != "main"
+            or request["executor_required"] != (accepted.source["executor_key"] is not None)):
+        raise JobError("resume_request_corrupt")
+    return accepted
+
+
+def _receipt(manager, event, request, request_ref):
+    command = request["input"]
+    value = json.loads(event["payload_json"])
+    expected = {"job_id": request["job_id"], "session_id": command["session_id"], "mode": "continue", "status": "accepted",
+        "generation": command["target"]["generation"], "result_event_id": result_id(request["job_id"], command["target"]["generation"]),
+        "request": command, "run_id": event["event_id"][3:], "request_ref": request_ref}
+    if (event["event_type"] != "operation" or event["action"] != "nudge" or event["job_id"] != request["job_id"]
+            or event["request_hash"] != _hash([command, request["call_ref"]]) or value != expected
+            or event["caller_session_id"] != request["call_ref"]["session_id"] or event["tool_call_id"] != request["tool_call_id"]
+            or json.loads(event["call_ref_json"]) != request["call_ref"]):
+        raise JobError("resume_receipt_mismatch")
+    return _operation(event)
+
+
+async def _publish(manager, actor, accepted, prepared):
+    request, command = accepted.data["request"], accepted.data["request"]["input"]
+    ref = _ref(request["call_ref"])
+    key = manager._origin_key(actor, "nudge", ref, request["tool_call_id"], None)
+    async with manager._write() as tx:
+        # Acquire the existing inbox signal row before any consistent read.
+        # MySQL must establish its snapshot after earlier inbox writers commit.
+        await manager.store.signal_changes(tx, command["session_id"], "inbox")
+        old = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE operation_key=? OR event_id=?",
+            (key, requests.rejection_id(accepted.event["event_id"])))
+        if old:
+            return requests.read_outcome(manager, accepted, old[0]), old[0]
+        current = await manager._authorize(tx, actor, request["job_id"])
+        try:
+            row, executor = await _mutable(manager, tx, actor, request)
+        except JobError as exc:
+            if exc.code not in TARGET_BARRIERS:
+                raise
+            return None, await requests.reject(manager, tx, actor, accepted.event, accepted.data, current, exc.code)
+        if prepared is None:
+            raise PlanChanged()
+        _, tree, reopening = prepared
+        target = JobLease(**command["target"])
+        version, now = row["version"]+1, manager.now()
+        payload = {"job_id": row["job_id"], "session_id": command["session_id"], "mode": "continue", "status": "accepted",
+            "generation": target.generation, "result_event_id": result_id(row["job_id"], target.generation),
+            "request": command, "request_ref": requests.reference(accepted.event)}
+        operation = await manager._insert_operation(tx, job_id=row["job_id"], version=version, actor=actor, action="nudge",
+            key=key, fingerprint=_hash([command, request["call_ref"]]), call_ref=ref, tool_call_id=request["tool_call_id"], payload=payload, tree=tree)
+        if operation is None:
+            raise PlanChanged()
+        if await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,"
+                "status='running',supervision_status='open',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
+                "version=version+1,updated_at=? WHERE job_id=? AND root_job_id=? AND generation=? AND version=?",
+                (target.generation, target.executor_id, target.boot_id, executor["executor_key"] if executor else None,
+                 now+command["lease_ms"], now, row["job_id"], row["root_job_id"], row["generation"], row["version"]), obligations=True) != 1:
+            raise PlanChanged()
+        payload["run_id"] = operation.operation_id[3:]
+        await tx.update_event(row["job_id"], f"UPDATE {manager.events} SET payload_json=?,delivery_status='pending_delivery' WHERE event_id=?",
+            (_json(payload), operation.operation_id), notify=True)
+        columns = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
+        if not await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
+                (command["session_id"], "nudge:"+operation.operation_id, "relay", "steer", "pending", command["message"], now)):
+            raise JobError("nudge_inbox_conflict")
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'),
+            (execution_id(row["job_id"], target.generation), row["job_id"], "execution", version,
+             _json({"operation_id": operation.operation_id, "run_id": payload["run_id"], "target": command["target"]}), "not_applicable", now))
+        from .execution_membership import start
+        from .finalization import publish_reopen
+        await start(manager, tx, await manager._row(tx, row["job_id"]))
+        await publish_reopen(manager, tx, row, command["target"], operation.operation_id, reopening)
+        outcome = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (operation.operation_id,))
+    return _operation(outcome), outcome
+
+
+async def _finish(manager, actor, accepted, outcome, prepared=None):
+    requests.remember_event(manager, accepted.event)
+    while outcome is None:
+        if prepared is None:
+            async with manager._read() as reader:
+                try:
+                    prepared = await _prepare(manager, reader, actor, accepted.data["request"])
+                except JobError as exc:
+                    if exc.code not in TARGET_BARRIERS:
+                        raise
+        try:
+            operation, outcome = await _publish(manager, actor, accepted, prepared)
+        except PlanChanged:
+            prepared = None
+    operation = requests.read_outcome(manager, accepted, outcome)
+    await requests.complete(manager, actor, accepted, outcome)
+    if operation is None:
+        raise JobError(json.loads(outcome["payload_json"])["error"])
+    return operation
+
+
+async def admit(manager, actor, command, ref, call_id):
+    key = manager._origin_key(actor, "nudge", ref, call_id, None)
+    prepared = None
+    async with manager._read() as reader:
+        original = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (requests.identity(ACTION, key),))
+        if original is not None:
+            request = json.loads(original["payload_json"])["request"]
+            if request["input"] != command or request["call_ref"] != ref.to_dict() or request["tool_call_id"] != call_id:
+                raise JobError("operation_conflict")
+        else:
+            source = await manager._authorize(reader, actor, command["caller"]["job_id"])
+            manager._check_proof(source, JobLease(**command["caller"]))
+            request = _intent(command, ref, call_id, source["executor_key"] is not None)
+        accepted, outcome = await requests.discover(manager, reader, actor, request, action=ACTION)
+        if accepted is None:
+            await manager._validate_call(reader, actor, ref, call_id)
+            for action in ("create", "steer"):
+                if await reader.fetchone(f"SELECT event_id FROM {manager.events} WHERE operation_key=?",
+                        (manager._origin_key(actor, action, ref, call_id, None),)):
+                    raise JobError("operation_conflict")
+            prepared = await _prepare(manager, reader, actor, request)
+    repeated = accepted is not None
+    if accepted is None:
+        async def authorize(tx):
+            return await _source(manager, tx, actor, request)
+        row, _, _ = prepared
+        accepted, repeated = await requests.accept(manager, actor, request,
+            {"job_id": row["job_id"], "root_job_id": row["root_job_id"], "generation": row["generation"]},
+            action=ACTION, authorize=authorize)
+    return await _finish(manager, actor, accepted, outcome, prepared), repeated
+
+
+@verify_stored
+async def recover_call(manager, actor, ref, call_id, *, session_id, message):
+    key = manager._origin_key(actor, "nudge", ref, call_id, None)
+    async with manager._read() as reader:
+        original = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (requests.identity(ACTION, key),))
+        if original is None:
+            return None
+        request = json.loads(original["payload_json"])["request"]
+        if request["input"]["session_id"] != session_id or request["input"]["message"] != message:
+            raise JobError("operation_conflict")
+        accepted, outcome = await requests.discover(manager, reader, actor, request, action=ACTION)
+    return await _finish(manager, actor, accepted, outcome)
+
+
+@verify_stored
+async def reconcile_request(manager, actor, request_id):
+    from .managed_completion import _host_only
+    _host_only()
+    async with manager._read() as reader:
+        original = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='task_control_request'", (request_id,))
+        if original is None:
+            raise JobError("resume_request_original_missing")
+        request = json.loads(original["payload_json"])["request"]
+        accepted, outcome = await requests.discover(manager, reader, actor, request, action=ACTION)
+    return await _finish(manager, actor, accepted, outcome)

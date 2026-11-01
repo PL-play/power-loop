@@ -307,6 +307,13 @@ async def steer(loop, session_id, message, *, on_complete=None, finalize=None, a
             if recovered is None:
                 raise JobError("nudge_request_original_missing")
             operation = recovered
+        elif operation.result["mode"] == "continue":
+            from .subagent_admission import recover_call as recover_resume
+            recovered = await recover_resume(runtime.manager, execution.actor, call_ref, call_id,
+                session_id=session_id, message=message)
+            if recovered is None:
+                raise JobError("resume_request_original_missing")
+            operation = recovered
         await notify(operation)
         return receipt(operation, True)
 
@@ -327,6 +334,12 @@ async def steer(loop, session_id, message, *, on_complete=None, finalize=None, a
         if (running is None or running.task_binding is None or running.task_binding.runtime is not runtime or
                 running.task is None or running.task.done()):
             recovered = await recover_call(runtime.manager, execution.actor, call_ref, call_id,
+                session_id=session_id, message=message)
+            if recovered is not None:
+                await notify(recovered)
+                return receipt(recovered, True)
+            from .subagent_admission import recover_call as recover_resume
+            recovered = await recover_resume(runtime.manager, execution.actor, call_ref, call_id,
                 session_id=session_id, message=message)
             if recovered is not None:
                 await notify(recovered)

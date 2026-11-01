@@ -7,9 +7,8 @@ import json
 import secrets
 from dataclasses import asdict
 
-from .jobs import JobError, JobLease, _hash, _json, _operation
+from .jobs import JobError, JobLease, _hash, _json
 from .jobs import verify_stored as _verify_stored
-from .result_revisions import execution_id, result_id
 
 
 @_verify_stored
@@ -30,86 +29,8 @@ async def admit(manager, actor, job_id, *, caller, call_ref, tool_call_id, sessi
     target = JobLease(job_id, executor_id, boot_id, expected_generation+1)
     request = {"target": asdict(target), "session_id": session_id, "message": message,
                "previous_generation": expected_generation, "lease_ms": lease_ms, "contract_hash": contract_hash, "caller": asdict(caller)}
-    key = manager._origin_key(actor, "nudge", call_ref, tool_call_id, None)
-    fingerprint = _hash([request, call_ref.to_dict()])
-    async with manager._write() as tx:
-        old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE operation_key=?", (key,))
-        if old:
-            await manager._authorize(tx, actor, old["job_id"])
-            if old["request_hash"] != fingerprint:
-                raise JobError("operation_conflict")
-            return _operation(old), True
-        await manager._validate_call(tx, actor, call_ref, tool_call_id)
-        for action in ("create", "steer"):
-            if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE operation_key=?",
-                (manager._origin_key(actor, action, call_ref, tool_call_id, None),)):
-                raise JobError("operation_conflict")
-        source = await manager._fence(tx, actor, caller)
-        source_create = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND action='create'", (caller.job_id,))
-        send_index = json.loads(source_create["payload_json"]).get("request", {}).get("send_index") if source_create else None
-        if (source["kind"] != "send" or source["session_id"] != actor.session_id or source["execution_role"] != "main" or
-                isinstance(send_index, bool) or not isinstance(send_index, int) or send_index < 1 or send_index != call_ref.send_index):
-            raise JobError("resume_caller_mismatch")
-        job = await manager._authorize(tx, actor, job_id)
-        if (job["kind"] != "subagent" or job["execution_role"] != "subagent" or job["control_owner_job_id"] is not None or
-                job["created_by_session_id"] != actor.session_id or job["session_id"] != session_id):
-            raise JobError("resume_target_mismatch")
-        await manager._supervision_barriers(tx, job)
-        if job["generation"] != expected_generation:
-            raise JobError("resume_generation_changed")
-        from .finalization import require_resumable
-        await require_resumable(manager, tx, job)
-        if (job["outcome"] != "succeeded" or job["resource_state"] != "stopped" or job["intake"] != "closed"):
-            raise JobError("resume_target_unsettled")
-        from .processing import require_handled
-        try:
-            await require_handled(manager, tx, job)
-        except JobError as exc:
-            raise JobError("resume_result_unhandled") from exc
-        await manager._require_scope_ready(tx, job)
-        session = await tx.fetchone(f"SELECT parent_session_id,metadata_json FROM {manager.store.t.sessions} WHERE session_id=?", (session_id,))
-        meta = json.loads(session["metadata_json"] or "{}") if session else {}
-        if (session is None or session["parent_session_id"] != actor.session_id or
-                meta.get("execution_role") != "subagent" or not meta.get("standalone_subagent")):
-            raise JobError("resume_session_unavailable")
-        saved_contract = await tx.fetchone(f"SELECT value_json FROM {manager.store.t.session_runtime_state} WHERE session_id=? AND state_key=?",
-            (session_id, "workflow_execution_contract"))
-        if (saved_contract is None or not isinstance(contract, dict) or contract.get("version") != 1 or
-                _hash(json.loads(saved_contract["value_json"])) != contract_hash):
-            raise JobError("resume_contract_mismatch")
-        state = await tx.fetchone(f"SELECT pending_json FROM {manager.store.t.session_state} WHERE session_id=?", (session_id,))
-        if state is not None and state["pending_json"]:
-            raise JobError("resume_tools_pending")
-        pending = await tx.fetchone(f"SELECT item_id FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND status IN ('pending','claimed')", (session_id,))
-        if pending is not None:
-            raise JobError("resume_input_pending")
-        from .execution_membership import require_current, start
-        await require_current(manager, tx, job)
-        now = manager.now()
-        from .executor_registry import ExecutorIdentity, require_accepting
-        executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
-            required=job["executor_key"] is not None or source["executor_key"] is not None)
-        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,"
-            "status='running',supervision_status='open',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
-            "version=version+1,updated_at=? WHERE job_id=?", (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id), obligations=True)
-        payload = {"job_id": job_id, "session_id": session_id, "mode": "continue", "status": "accepted",
-                   "generation": target.generation, "result_event_id": result_id(job_id, target.generation), "request": request}
-        operation = await manager._insert_operation(tx, job_id=job_id, version=job["version"]+1,
-            actor=actor, action="nudge", key=key, fingerprint=fingerprint, call_ref=call_ref,
-            tool_call_id=tool_call_id, payload=payload)
-        payload["run_id"] = operation.operation_id[3:]
-        await tx.update_event(operation.job_id, f"UPDATE {manager.events} SET payload_json=?,delivery_status='pending_delivery' WHERE event_id=?", (_json(payload), operation.operation_id), notify=True)
-        cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
-        await manager.store.signal_changes(tx, session_id, "inbox")
-        if not await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),
-                (session_id, "nudge:"+operation.operation_id, "relay", "steer", "pending", message, now)):
-            raise JobError("nudge_inbox_conflict")
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (execution_id(job_id, target.generation), job_id, "execution", job["version"]+1,
-             _json({"operation_id": operation.operation_id, "run_id": payload["run_id"], "target": request["target"]}), "not_applicable", now))
-        await start(manager, tx, await manager._row(tx, job_id))
-        from .finalization import reopen
-        await reopen(manager, tx, job, asdict(target), operation.operation_id)
-        return _operation(await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (operation.operation_id,))), False
+    from .subagent_admission import admit as accept
+    return await accept(manager, actor, request, call_ref, tool_call_id)
 
 
 async def claim_dispatch(manager, actor, operation_id, *, caller, token):
@@ -147,7 +68,8 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
     try:
         operation, repeated = await manager.resume_subagent(source.actor, job.job_id, **args)
     except Exception:
-        operation = await manager.operation_for_call(source.actor, call_ref, call_id)
+        from .subagent_admission import recover_call
+        operation = await recover_call(manager, source.actor, call_ref, call_id, session_id=sid, message=message)
         if operation is None or operation.result.get("mode") != "continue" or operation.result["request"]["session_id"] != sid or operation.result["request"]["message"] != message:
             raise
         repeated = False  # no dispatch has been attempted by this invocation

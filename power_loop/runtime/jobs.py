@@ -759,7 +759,7 @@ class JobManager:
             raise JobError("tool_call_not_found")
 
     async def _insert_operation(self, tx, *, job_id, version, actor, action, key, fingerprint,
-                                call_ref=None, tool_call_id=None, payload=None, ignore=False, notify_stop=True):
+                                call_ref=None, tool_call_id=None, payload=None, ignore=False, notify_stop=True, tree=None):
         self._control_operation_revision = getattr(self, "_control_operation_revision", 0) + 1
         notices = self._control_notifications.get()
         if action == "stop" and notify_stop and notices is not None:
@@ -768,9 +768,15 @@ class JobManager:
         call_ref_json, payload_json = (_json(call_ref.to_dict()) if call_ref else None), _json(payload or {})
         columns = ("event_id", "job_id", "event_type", "job_version", "operation_key", "request_hash", "action",
                    "caller_session_id", "tool_call_id", "call_ref_json", "payload_json", "delivery_status", "created_at")
-        inserted = await tx.append_event(columns, (operation_id, job_id, "operation", version, key,
+        values = (operation_id, job_id, "operation", version, key,
             fingerprint, action, actor.session_id, tool_call_id,
-            call_ref_json, payload_json, "not_applicable", self.now()), ignore=ignore)
+            call_ref_json, payload_json, "not_applicable", self.now())
+        if tree is None:
+            inserted = await tx.append_event(columns, values, ignore=ignore)
+        else:
+            inserted = await tx.append_event_if_tree_current(dict(zip(columns, values, strict=True)), tree)
+            if not inserted:
+                return None
         if ignore and not inserted:
             return None
         return _operation({"event_id": operation_id, "job_id": job_id, "action": action,

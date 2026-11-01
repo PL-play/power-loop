@@ -32,6 +32,12 @@ def rejection_id(request_id):
     return "control_no_"+_hash(request_id)[:48]
 
 
+def _origin(manager, actor, request, action):
+    from .managed_effects import _ref
+    return manager._origin_key(actor, "nudge" if action == "resume" else action,
+        _ref(request["call_ref"]), request["tool_call_id"], None)
+
+
 def _domain(action):
     if action == "stop":
         from . import task_control
@@ -42,6 +48,9 @@ def _domain(action):
     if action == "dispatch":
         from . import resume_dispatch
         return resume_dispatch
+    if action == "resume":
+        from . import subagent_admission
+        return subagent_admission
     raise JobError("control_request_action_unknown")
 
 
@@ -54,7 +63,7 @@ async def stored(manager, reader, actor, event, request, *, action, completion=N
     error = action+"_request_corrupt"
     try:
         data = json.loads(event["payload_json"])
-        key = manager._origin_key(actor, action, _ref(request["call_ref"]), request["tool_call_id"], None)
+        key = _origin(manager, actor, request, action)
         if (event["event_id"] != identity(action, key) or event["event_type"] != "task_control_request"
                 or event["job_id"] != request["caller"]["job_id"] or event["delivery_status"] != "not_applicable"
                 or event["caller_session_id"] != actor.session_id or event["tool_call_id"] != request["tool_call_id"]
@@ -90,7 +99,7 @@ async def accept(manager, actor, request, target, *, action, authorize):
     from .managed_effects import _ref
 
     ref, caller = _ref(request["call_ref"]), JobLease(**request["caller"])
-    key = manager._origin_key(actor, action, ref, request["tool_call_id"], None)
+    key = _origin(manager, actor, request, action)
     event_id = identity(action, key)
     async with manager._write() as tx:
         old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
@@ -227,10 +236,8 @@ def read_outcome(manager, accepted, event):
     if event["event_type"] == "task_control_request":
         rejection(accepted, event)
         return None
-    from .managed_effects import _ref
     request = accepted.data["request"]
-    key = manager._origin_key(JobActor(**accepted.data["actor"]), accepted.data["action"],
-        _ref(request["call_ref"]), request["tool_call_id"], None)
+    key = _origin(manager, JobActor(**accepted.data["actor"]), request, accepted.data["action"])
     if event["operation_key"] != key:
         raise JobError("control_request_outcome_mismatch")
     if accepted.data["action"] == "stop" and json.loads(event["payload_json"])["target"] != {
@@ -240,8 +247,7 @@ def read_outcome(manager, accepted, event):
 
 
 async def discover(manager, reader, actor, request, *, action):
-    from .managed_effects import _ref
-    key = manager._origin_key(actor, action, _ref(request["call_ref"]), request["tool_call_id"], None)
+    key = _origin(manager, actor, request, action)
     request_id = identity(action, key)
     rows = await reader.fetchall(f"SELECT * FROM {manager.events} WHERE event_id IN (?,?,?) OR operation_key=?",
         (request_id, completion_id(request_id), rejection_id(request_id), key))

@@ -271,37 +271,30 @@ async def test_admission_rechecks_current_session_contract_and_actual_caller(rea
 @pytest.mark.parametrize("point", ["operation", "inbox", "execution", "execution_scope"])
 async def test_resume_failure_rolls_back_generation_operation_and_inbox(ready, monkeypatch, point):
     c = ready
-    original = c.manager.resume_subagent
-    write = c.manager._write
+    from power_loop.runtime.session_controls import ControlTransaction
+
+    execute = ControlTransaction._execute
     hits = []
-    from contextlib import asynccontextmanager
-    async def fail(*args, **kwargs):
-        @asynccontextmanager
-        async def inject():
-            async with write() as tx:
-                execute = tx._execute
-                async def faulty(sql, params=()):
-                    value = await execute(sql, params)
-                    event_insert = sql.lstrip().upper().startswith("INSERT") and c.manager.events in sql
-                    match = (point == "operation" and event_insert and "nudge" in params or
-                        point == "inbox" and "INSERT" in sql and c.store.t.follow_up_queue in sql or
-                        point in ("execution", "execution_scope") and event_insert and point in params)
-                    if match:
-                        hits.append(point)
-                        raise RuntimeError("injected write failure: "+point)
-                    return value
-                with monkeypatch.context() as patch:
-                    patch.setattr(tx, "_execute", faulty)
-                    yield tx
-        with monkeypatch.context() as patch:
-            patch.setattr(c.manager, "_write", inject)
-            return await original(*args, **kwargs)
-    monkeypatch.setattr(c.manager, "resume_subagent", fail)
+
+    async def faulty(tx, sql, params=()):
+        value = await execute(tx, sql, params)
+        event_insert = sql.lstrip().upper().startswith("INSERT") and c.manager.events in sql and c.old.job_id in params
+        match = (point == "operation" and event_insert and "nudge" in params or
+            point == "inbox" and "INSERT" in sql and c.store.t.follow_up_queue in sql and c.sid in params or
+            point in ("execution", "execution_scope") and event_insert and point in params)
+        if match:
+            hits.append(point)
+            raise RuntimeError("injected write failure: "+point)
+        return value
+
+    monkeypatch.setattr(ControlTransaction, "_execute", faulty)
     await issue_nudge(c.fixture, monkeypatch)
-    assert hits == [point]
+    assert hits == [point, point], "the original attempt and its mechanical recovery must both hit the same fault"
     assert (await latest(c)).generation == 1 and (await latest(c)).result == c.old.result
     assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE action='nudge' OR event_type='execution'")
     assert (await c.store.inbox_counts(c.sid))["pending"] == 0 and c.model.child_calls == 1
+    [pending] = await c.manager.db.fetchall(f"SELECT source_id FROM {c.manager.prefix}session_obligations WHERE kind='control_request'")
+    assert pending['source_id'].startswith('resume_req_')
 
 
 async def test_independent_duplicate_admission_and_dispatch_claims_never_duplicate_model_work(ready, monkeypatch):
@@ -682,18 +675,26 @@ async def test_existing_inbox_identity_rolls_back_the_entire_resume_admission(re
     c = ready
     import power_loop.runtime.jobs as module
     original = c.manager.resume_subagent
+    insert = c.manager._insert_operation
     errors = []
+
+    async def same_identity(*args, **kwargs):
+        if kwargs['action'] == 'nudge':
+            with monkeypatch.context() as patch:
+                patch.setattr(module.secrets, "token_hex", lambda n: "f"*(n*2))
+                return await insert(*args, **kwargs)
+        return await insert(*args, **kwargs)
+
+    monkeypatch.setattr(c.manager, '_insert_operation', same_identity)
     async def collide(*args, **kwargs):
         identity = "nudge:op_"+"f"*32
         await c.store.inbox_put(c.sid, [{"item_id": identity, "content": "earlier delivered orphan"}])
         await c.manager.db.execute(f"UPDATE {c.store.t.follow_up_queue} SET status='delivered' WHERE session_id=? AND item_id=?", (c.sid, identity))
-        with monkeypatch.context() as patch:
-            patch.setattr(module.secrets, "token_hex", lambda n: "f"*(n*2))
-            try:
-                return await original(*args, **kwargs)
-            except JobError as exc:
-                errors.append(exc.code)
-                raise
+        try:
+            return await original(*args, **kwargs)
+        except JobError as exc:
+            errors.append(exc.code)
+            raise
     monkeypatch.setattr(c.manager, "resume_subagent", collide)
     await issue_nudge(c.fixture, monkeypatch)
     assert errors == ["nudge_inbox_conflict"] and (await latest(c)).generation == 1

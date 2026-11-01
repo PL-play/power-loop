@@ -572,27 +572,43 @@ async def consume_node(runtime, workflow, node, result):
             await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, row["job_id"], "node_result_consumed", row["version"], _hash(data), _json(data), "not_applicable", manager.now()))
 
 
-async def reopen(manager, tx, previous, target, operation_id):
-    """Same admission transaction; preserve old closure and reopen provenance."""
+async def prepare_reopen(manager, tx, previous):
+    """Freeze retained ancestor closures before a later tree publication."""
     current = previous
     visited = set()
+    prepared = []
     while current is not None:
         if current["job_id"] in visited or len(visited) >= 64:
             raise JobError("invalid_job_lineage")
         visited.add(current["job_id"])
         if current["supervision_status"] == "closed":
             event, _ = await closed(manager, tx, current)
-            data = {"version": 1, "scope": _lease(current), "previous_closure": await _reference(manager, tx, event["event_id"]),
-                "operation_id": operation_id, "target": target}
-            row = await manager._row(tx, current["job_id"])
-            if current["job_id"] != previous["job_id"]:
-                await tx.write_job(current["job_id"], f"UPDATE {manager.jobs} SET supervision_status='open',version=version+1,updated_at=? WHERE job_id=? AND supervision_status='closed'", (manager.now(), current["job_id"]))
-                row = await manager._row(tx, current["job_id"])
-            elif row["supervision_status"] != "open":
-                raise JobError("finalization_reopen_missing")
-            key = _identity(manager, "reopened", [current["job_id"], operation_id])
-            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, current["job_id"], "supervision_reopened", row["version"], _hash(data), _json(data), "not_applicable", manager.now()))
+            prepared.append((current, await _reference(manager, tx, event["event_id"])))
         current = await manager._row(tx, current["parent_job_id"]) if current["parent_job_id"] else None
+    return prepared
+
+
+async def publish_reopen(manager, tx, previous, target, operation_id, prepared):
+    for current, reference in prepared:
+        data = {"version": 1, "scope": _lease(current), "previous_closure": reference,
+            "operation_id": operation_id, "target": target}
+        row = await manager._row(tx, current["job_id"])
+        if current["job_id"] != previous["job_id"]:
+            if await tx.write_job(current["job_id"], f"UPDATE {manager.jobs} SET supervision_status='open',version=version+1,updated_at=? "
+                    "WHERE job_id=? AND root_job_id=? AND generation=? AND version=? AND supervision_status='closed'",
+                    (manager.now(), current["job_id"], current["root_job_id"], current["generation"], current["version"])) != 1:
+                raise JobError("finalization_execution_changed")
+            row = await manager._row(tx, current["job_id"])
+        elif row["supervision_status"] != "open":
+            raise JobError("finalization_reopen_missing")
+        key = _identity(manager, "reopened", [current["job_id"], operation_id])
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'),
+            (key, current["job_id"], "supervision_reopened", row["version"], _hash(data), _json(data), "not_applicable", manager.now()))
+
+
+async def reopen(manager, tx, previous, target, operation_id):
+    """Same admission transaction; preserve old closure and reopen provenance."""
+    await publish_reopen(manager, tx, previous, target, operation_id, await prepare_reopen(manager, tx, previous))
 
 
 async def require_resumable(manager, tx, row):
