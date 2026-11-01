@@ -74,8 +74,16 @@ async def test_process_death_preserves_dispatched_attempt_and_blocks_unconfirmed
             actor = JobActor(old.tenant_id, old.principal_id, ready["sid"])
             [job] = await future.db.fetchall(f"SELECT * FROM {future.jobs}")
             page = await list_attempts(future, actor, job["job_id"])
-            assert page["items"][0]["status"] == "dispatched_unconfirmed"
-            assert not page["items"][0]["response_received"] and page["billing_status"] == "unavailable"
+            # The held provider was actually entered, but its RAM suffix need
+            # not have reached a checkpoint before either real process signal.
+            head = await future.db.fetchone(f"SELECT identity_json,admission_nonce,summary_json FROM {future.prefix}execution_checkpoints "
+                                           "WHERE job_id=? AND generation=?", (job["job_id"], job["generation"]))
+            assert head["admission_nonce"] and not json.loads(head["summary_json"])["closed"]
+            identity = json.loads(head["identity_json"])
+            assert identity["job_id"] == job["job_id"] and identity["boot_id"] == old.boot_id
+            assert all(item["status"] == "dispatched_unconfirmed" and not item["response_received"] for item in page["items"])
+            assert not await future.db.fetchall(f"SELECT event_id FROM {future.events} WHERE event_type='model_attempt_finished'")
+            assert page["billing_status"] == "unavailable"
             assert job["resource_state"] == "running" and job["outcome"] is None
             newer = registry.ExecutorIdentity("crash-test", "host", "executor", "new-boot")
             await registry.register(future, newer, contract_hash="a"*64)
