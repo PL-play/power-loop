@@ -70,10 +70,15 @@ def registration_value(registered):
         'runtime_contract': asdict(implementation.runtime_contract) if implementation is not None else None}))
 
 
-async def _event(manager, tx, key, source, kind, value):
+def _event_document(value):
     document = _json(value)
     if len(document.encode('utf-8')) > 262144:
         raise JobError('tool_call_plan_too_large')
+    return document
+
+
+async def _event(manager, tx, key, source, kind, value):
+    document = _event_document(value)
     await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, source['job_id'], kind, source['version'], _hash(value), document, 'not_applicable', manager.now()))
 
 

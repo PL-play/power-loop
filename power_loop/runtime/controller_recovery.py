@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 
+from .finalization_plan import PlanChanged
 from .jobs import JobError, JobLease, _hash
 from .jobs import verify_stored as _verify_stored
 from .model_exit import content_reference
@@ -113,8 +115,8 @@ async def read(manager, tx, row, *, optional=True, _closures=None):
 
 class _NegativeProof(ResultPublicationProof):
     def __init__(self, manager, transaction, row, expected):
-        # _facts already validated this exact scope under the same task-control
-        # transaction. This private witness cannot cross a transaction boundary.
+        # Readonly preparation validated the originals; the conditional tree
+        # write admitted that preparation. This witness belongs to its publisher.
         self.manager, self.transaction = manager, transaction
         self.row, self.expected = _hash(dict(row)), expected
 
@@ -175,62 +177,154 @@ async def _interrupted_result(manager, tx, row):
         'projection_status': projection_status}
 
 
-@_verify_stored
-async def reconcile(runtime, actor, job_id):
-    """Host-only original-result recovery. No model or business callback runs."""
-    from .managed_completion import _host_only
-    from .task_runtime import TaskRuntime
-    from .tool_call_plans import _event
-    from .workflow_controller import proof
+@dataclass(frozen=True)
+class _Seal:
+    job_id: str
 
-    _host_only()
-    if not isinstance(runtime, TaskRuntime) or runtime.actor(actor.session_id) != actor:
-        raise JobError('task_runtime_required')
-    runtime._managed_completions.check()
-    manager = runtime.manager
+
+@dataclass(frozen=True)
+class _Recovery:
+    root_id: str
+    generation: int
+    count: int
+    version_sum: int
+    row: dict
+    main: dict
+    refs: list
+    stopped: tuple | None
+    result: dict | None
+    value: dict | None
+    delivery: tuple | None
+    complete: bool
+
+
+async def _prepare_recovery(manager, actor, job_id):
+    from .execution_membership import seal_id
+
+    async with manager._read() as reader:
+        row = await manager._authorize(reader, actor, job_id)
+        source = await _exit_facts(manager, reader, actor, row)
+        if await reader.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?',
+                (seal_id(manager, job_id, row['generation']),)) is None:
+            return _Seal(job_id)
+        validated = {'visiting': set(), 'done': {}}
+        main, refs = await _facts(manager, reader, actor, row, _closures=validated, _source=source)
+        old = await read(manager, reader, row, _closures=validated)
+        result = await reader.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',
+            (result_id(job_id, row['generation']),))
+        value = await _interrupted_result(manager, reader, row) if result is None else None
+        if result is not None and json.loads(result['payload_json']).get('outcome') not in NEGATIVE:
+            raise JobError('controller_recovery_negative_exit_required')
+        route = old[1]['handling_route'] if old is not None else (
+            'original' if result is not None and result['delivery_status'] == 'handled' else 'recovery')
+        if route == 'original':
+            await _original_handling(manager, reader, row, result, _closures=validated)
+        delivery, complete = None, old is not None and route == 'original'
+        if old is not None and route == 'recovery':
+            exists = await reader.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?',
+                (notice_id(manager, row),))
+            if exists is not None:
+                delivery = await notice(manager, reader, row, _closures=validated)
+                complete = await reader.fetchone(
+                    f'SELECT id FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?',
+                    (main['session_id'], notice_id(manager, row))) is not None
+        root = row['root_job_id']
+        revision = await reader.fetchone(f'SELECT COUNT(*) AS job_count,COALESCE(SUM(version),0) AS version_sum,'
+            f'MAX(CASE WHEN job_id=? THEN generation END) AS root_generation FROM {manager.jobs} WHERE root_job_id=?',
+            (root, root))
+        return _Recovery(root, revision['root_generation'], revision['job_count'], revision['version_sum'],
+            row, main, refs, old, result, value, delivery, complete)
+
+
+async def _seal_recovery(manager, actor, job_id):
+    from .execution_membership import seal
+
     async with manager._write() as tx:
         row = await manager._authorize(tx, actor, job_id)
-        validated = {'visiting': set(), 'done': {}}
-        source = await _exit_facts(manager, tx, actor, row)
-        # This explicit producer seals intake in its own tree transaction.
-        # Discovery and evidence readers only validate the committed seal.
-        from .execution_membership import seal
+        await _exit_facts(manager, tx, actor, row)
         await seal(manager, tx, row)
-        main, refs = await _facts(manager, tx, actor, row, _closures=validated, _source=source)
-        old = await read(manager, tx, row, _closures=validated)
+
+
+async def _publish_recovery(manager, actor, prepared):
+    from .tool_call_plans import _event_document
+    from .workflow_controller import proof
+
+    async with manager._write() as tx:
+        base, now = prepared.row, manager.now()
+        job_id = base['job_id']
+        # Move the existing version advance to the first write. The original
+        # source and all its descendants must still be the prepared tree.
+        resource = base['resource_state'] if prepared.result is None else 'stopped'
+        changed = await tx.write_job(job_id, f'UPDATE {manager.jobs} SET resource_state=?,version=version+1,updated_at=? '
+            'WHERE job_id=? AND root_job_id=? AND generation=? AND version=? '
+            'AND EXISTS (SELECT 1 FROM (SELECT COUNT(*) AS job_count,COALESCE(SUM(version),0) AS version_sum,'
+            f'MAX(CASE WHEN job_id=? THEN generation END) AS root_generation FROM {manager.jobs} '
+            'WHERE root_job_id=?) revision WHERE revision.job_count=? AND revision.version_sum=? '
+            'AND revision.root_generation=?)',
+            (resource, now, job_id, prepared.root_id, base['generation'], base['version'],
+             prepared.root_id, prepared.root_id, prepared.count, prepared.version_sum, prepared.generation))
+        if changed != 1:
+            raise PlanChanged()
+        row = {**base, 'resource_state': resource, 'version': base['version']+1, 'updated_at': now}
+        old, result = prepared.stopped, prepared.result
         if old is None:
-            result = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (result_id(job_id, row['generation']),))
             if result is None:
-                value = await _interrupted_result(manager, tx, row)
+                value = prepared.value
                 payload = {'outcome': 'interrupted', 'result': value, 'resource_state': 'stopped'}
                 if row['generation'] > 1:
                     payload['generation'] = row['generation']
                 await manager._record_result_tx(tx, actor, JobLease(**proof(row)), outcome='interrupted', result=value,
                     resource_state='stopped', evidence_only=True, publication_proof=_NegativeProof(manager, tx, row, payload))
                 result = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (result_id(job_id, row['generation']),))
-            elif json.loads(result['payload_json']).get('outcome') not in NEGATIVE:
-                raise JobError('controller_recovery_negative_exit_required')
             route = 'original' if result['delivery_status'] == 'handled' else 'recovery'
-            if route == 'original':
-                await _original_handling(manager, tx, row, result, _closures=validated)
-            # Retain the canonical result, including its original unknown marker.
-            # This separate proof confirms resources without rewriting history.
-            data = {'version': 1, 'generation': row['generation'], 'main_session_id': main['session_id'],
-                'evidence': refs, 'result': content_reference(result), 'handling_route': route,
+            data = {'version': 1, 'generation': row['generation'], 'main_session_id': prepared.main['session_id'],
+                'evidence': prepared.refs, 'result': content_reference(result), 'handling_route': route,
                 'execution_authority': False, 'billing_settled': False}
-            await _event(manager, tx, identity(manager, row), row, 'controller_stopped', data)
-            await tx.set_event_recipient(identity(manager, row), actor.session_id)
-            await tx.write_job(job_id, f"UPDATE {manager.jobs} SET resource_state='stopped',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job_id))
-            row = await manager._row(tx, job_id)
-            old = await read(manager, tx, row, optional=False, _closures=validated)
-        await enqueue(manager, tx, row, old, _closures=validated)
-        receipt = {'job_id': job_id, 'notification_id': notice_id(manager, row) if old[1]['handling_route'] == 'recovery' else None,
-            'main_session_id': actor.session_id,
-            'execution_authority': False, 'acknowledgement_created': False, 'billing_settled': False}
+            event = {'event_id': identity(manager, row), 'job_id': job_id, 'event_type': 'controller_stopped',
+                'job_version': row['version'], 'request_hash': _hash(data), 'payload_json': _event_document(data),
+                'delivery_status': 'not_applicable', 'caller_session_id': actor.session_id, 'created_at': manager.now()}
+            await tx.append_event(tuple(event), tuple(event.values()))
+            old = event, data
+            payload = json.loads(result['payload_json'])
+            row = {**row, 'outcome': payload['outcome'], 'resource_state': 'stopped',
+                'version': row['version']+(prepared.result is None)}
+        if old[1]['handling_route'] == 'original':
+            tx.handled(job_id)
+        await enqueue(manager, tx, row, old, result=result, delivery=prepared.delivery)
+    return old
+
+
+@_verify_stored
+async def reconcile(runtime, actor, job_id):
+    """Host-only original-result recovery. No model or business callback runs."""
+    from .managed_completion import _host_only
+    from .task_runtime import TaskRuntime
+
+    _host_only()
+    if not isinstance(runtime, TaskRuntime) or runtime.actor(actor.session_id) != actor:
+        raise JobError('task_runtime_required')
+    runtime._managed_completions.check()
+    manager = runtime.manager
+    while True:
+        prepared = await _prepare_recovery(manager, actor, job_id)
+        if isinstance(prepared, _Seal):
+            await _seal_recovery(manager, actor, prepared.job_id)
+            continue
+        if prepared.complete:
+            old = prepared.stopped
+            break
+        try:
+            old = await _publish_recovery(manager, actor, prepared)
+            break
+        except PlanChanged:
+            continue
+    row = prepared.row
     if old[1]['handling_route'] == 'original':
         from .finalization import try_finalize
         await try_finalize(manager, actor, job_id, row['generation'])
-    return receipt
+    return {'job_id': job_id, 'notification_id': notice_id(manager, row) if old[1]['handling_route'] == 'recovery' else None,
+        'main_session_id': actor.session_id, 'execution_authority': False,
+        'acknowledgement_created': False, 'billing_settled': False}
 
 
 def notice_id(manager, row):
@@ -255,27 +349,22 @@ async def notice(manager, tx, row, *, _closures=None):
     return event, data
 
 
-async def enqueue(manager, tx, row, saved, *, _closures=None):
-    from .tool_call_plans import _event, _read
+async def enqueue(manager, tx, row, saved, *, result, delivery):
+    from .tool_call_plans import _event
     if saved[1]['handling_route'] == 'original':
         return
-    result = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (result_id(row['job_id'], row['generation']),))
     public = {'job_id': row['job_id'], 'generation': row['generation'], 'outcome': row['outcome'],
         'result': json.loads(result['payload_json'])['result'], 'result_event_id': result['event_id'],
         'execution_authority': False, 'billing_settled': False}
     data = {'version': 1, 'main_session_id': saved[1]['main_session_id'], 'stopped': content_reference(saved[0]),
         'result': content_reference(result), 'public': public, 'message_hash': _hash(render(public))}
-    old = await _read(manager, tx, notice_id(manager, row), row, 'controller_result_delivery', optional=True)
-    if old is None:
+    if delivery is None:
         await _event(manager, tx, notice_id(manager, row), row, 'controller_result_delivery', data)
-    elif _hash(old) != _hash(data):
-        raise JobError('controller_recovery_delivery_changed')
     await tx.set_event_recipient(notice_id(manager, row), data['main_session_id'])
     columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
     await manager.store.signal_changes(tx, data['main_session_id'], "inbox")
     await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
         (data['main_session_id'], notice_id(manager, row), 'controller_result', 'queue', 'pending', render(public), manager.now()))
-    await notice(manager, tx, row, _closures=_closures)
 
 
 async def candidates(manager, tx, actor):
@@ -374,7 +463,7 @@ async def recover_tree(runtime, actor, root_job_id, *, after_job_id='', limit=32
         raise JobError('invalid_controller_recovery_query')
     runtime._managed_completions.check()
     manager = runtime.manager
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         root = await manager._authorize(tx, actor, root_job_id)
         original = await _main(manager, tx, root)
         if original['job_id'] != root_job_id or original['session_id'] != actor.session_id:

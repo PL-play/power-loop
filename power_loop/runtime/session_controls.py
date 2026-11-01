@@ -66,6 +66,7 @@ class ControlTransaction(ControlReadView):
         self.obligation_routes: set[str] = set()
         self.obligation_decisions: dict[str, dict | None] = {}
         self.obligation_processed: set[str] = set()
+        self.obligation_handled: set[str] = set()
         self.obligation_open: set[tuple] = set()
         self.obligation_close: set[tuple] = set()
 
@@ -79,6 +80,11 @@ class ControlTransaction(ControlReadView):
             self.obligation_jobs.add(job_id)
         if notify:
             self.jobs.add(job_id)
+
+    def handled(self, job_id):
+        """Declare an original result's already-proved handling for this write."""
+        self.touch_job(job_id, obligations=True)
+        self.obligation_handled.add(job_id)
 
     async def write_job(self, job_id, sql, params=(), *, obligations=False):
         self.touch_job(job_id, obligations=obligations)

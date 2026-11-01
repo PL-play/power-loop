@@ -183,6 +183,7 @@ async def refresh(manager, tx, recorder):
     jobs = set(recorder.obligation_jobs)
     routes = sorted(recorder.obligation_routes)
     clean = {job_id: False for job_id in recorder.obligation_processed}
+    clean.update(dict.fromkeys(recorder.obligation_handled, True))
     for offset in range(0, len(routes), 100):
         part = routes[offset:offset+100]
         rows = await tx.fetchall(f"SELECT job_id FROM {manager.events} WHERE event_id IN (" +

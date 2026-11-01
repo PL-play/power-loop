@@ -51,14 +51,21 @@ async def test_all_notice_route_writers_use_explicit_recipient_invalidation():
         ("pending_native.py", "prepare"),
         ("pending_owner.py", "transfer"),
         ("controller_handoff.py", "transfer_review_runtime"),
-        ("controller_recovery.py", "reconcile"),
+        ("controller_recovery.py", "_publish_recovery"),
         ("controller_recovery.py", "enqueue"),
     }
-    routed, direct_writes = set(), []
+    routed, initialized, direct_writes = set(), set(), []
 
     def inspect(node, filename, function=None):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             function = node.name
+        if isinstance(node, ast.Dict):
+            fields = {key.value: value for key, value in zip(node.keys, node.values, strict=True)
+                      if isinstance(key, ast.Constant)}
+            kind = fields.get("event_type")
+            if (isinstance(kind, ast.Constant) and kind.value in session_controls.OBLIGATION_EVENTS
+                    and "caller_session_id" in fields):
+                initialized.add((filename, function))
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             if node.func.attr == "set_event_recipient":
                 routed.add((filename, function))
@@ -73,7 +80,9 @@ async def test_all_notice_route_writers_use_explicit_recipient_invalidation():
 
     for path in runtime.rglob("*.py"):
         inspect(ast.parse(path.read_text()), path.name)
-    assert routed == expected
+    assert routed | initialized == expected
+    assert initialized == {("controller_recovery.py", "_publish_recovery")}
+    assert not routed & initialized
     assert direct_writes == [("session_controls.py", "set_event_recipient")]
 
 
