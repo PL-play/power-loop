@@ -1534,9 +1534,7 @@ class StatefulAgentLoop:
         # process to take the session while this one is still writing.
         renew = asyncio.create_task(self._renew_lease_forever(sid, ttl_ms))
         try:
-            async with self.store.send_read_scope(sid) as reads:
-                self.store.forget_turn_hints(sid)
-                reads.lease_owner_id = self._owner_id
+            async with self.store.send_read_scope(sid, lease_owner_id=self._owner_id):
                 yield
         finally:
             renew.cancel()

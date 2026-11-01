@@ -205,44 +205,35 @@ class SessionStore:
         # change after insert and seqs are never reused, so a ref can be served
         # without rereading the row; deletes in this process drop the session.
         self._appended_refs: OrderedDict[tuple[str, int], tuple] = OrderedDict()
-        self._appended_calls: dict[str, tuple[int, str]] = {}
-        # Pending state this process last committed (the session lease makes it the only
-        # writer while sending), a round index not yet written, and the last activity touch.
-        self._pending_written: OrderedDict[str, str | None] = OrderedDict()
-        self._deferred_round: dict[str, int] = {}
-        self._next_seq: dict[str, int] = {}
-        self._touched: dict[str, int] = {}
-        self._change_snapshots = OrderedDict()
+        self._session_holdings: OrderedDict[str, send_reads.SessionHolding] = OrderedDict()
 
-    def _remember_pending(self, session_id, pending_json):
-        self._pending_written[session_id] = pending_json
-        self._pending_written.move_to_end(session_id)
-        while len(self._pending_written) > 4096:
-            self._pending_written.popitem(last=False)
+    def _holding(self, session_id):
+        scoped = send_reads.ACTIVE.get()
+        if scoped is not None and scoped.store is self and scoped.sid == session_id:
+            return scoped
+        holding = self._session_holdings.get(session_id)
+        if holding is None:
+            holding = send_reads.SessionHolding(self, session_id)
+            self._session_holdings[session_id] = holding
+        self._session_holdings.move_to_end(session_id)
+        while len(self._session_holdings) > 4096:
+            self._session_holdings.popitem(last=False)
+        return holding
 
     def known_pending(self, session_id):
-        """``(True, pending)`` when this process committed the current pending state."""
-        if session_id not in self._pending_written:
-            return False, None
-        return True, _loads(self._pending_written[session_id])
+        """``(True, pending)`` when this holding committed the pending state."""
+        holding = self._holding(session_id)
+        return holding.pending_known, _loads(holding.pending_json) if holding.pending_known else None
 
     def forget_pending(self, session_id):
-        self._pending_written.pop(session_id, None)
+        holding = self._holding(session_id)
+        holding.pending_known, holding.pending_json = False, None
         send_reads.forget(self, session_id, "state")
 
     def defer_round_index(self, session_id: str, round_index: int) -> None:
         """Written with the round's first append instead of its own transaction."""
         send_reads.lease_writer(self, session_id)
-        self._deferred_round[session_id] = int(round_index)
-
-    def forget_turn_hints(self, session_id: str) -> None:
-        """A new lease period cannot reuse another owner's mutable state."""
-        self.forget_pending(session_id)
-        self._next_seq.pop(session_id, None)
-        self._deferred_round.pop(session_id, None)
-        reads = send_reads.current(self, session_id)
-        if reads is not None:
-            reads.assistant_send_index, reads.assistant_ref = None, None
+        self._holding(session_id).deferred_round = int(round_index)
 
     def _remember_appended(self, session_id, seq, row_id, role, tool_call_id, send_index,
                            round_index, tool_calls_json):
@@ -256,21 +247,21 @@ class SessionStore:
         while len(self._appended_refs) > 4096:
             self._appended_refs.popitem(last=False)
         if tool_calls_json is not None:
-            self._appended_calls[session_id] = (seq, tool_calls_json)
+            self._holding(session_id).appended_call = (seq, tool_calls_json)
 
     def _forget_appended(self, session_id):
-        self._change_snapshots.pop(session_id, None)
+        self._holding(session_id).change_snapshot = None
         send_reads.forget(self, session_id, "session", "state")
         reads = send_reads.current(self, session_id)
         if reads is not None:
             reads.assistant_send_index, reads.assistant_ref = None, None
-        self._appended_calls.pop(session_id, None)
+        self._holding(session_id).appended_call = None
         for key in [k for k in self._appended_refs if k[0] == session_id]:
             del self._appended_refs[key]
 
     def appended_tool_calls(self, session_id: str, seq: int) -> str | None:
         """Stored tool_calls JSON of the latest assistant row this process appended."""
-        found = self._appended_calls.get(session_id)
+        found = self._holding(session_id).appended_call
         return found[1] if found is not None and found[0] == seq else None
 
     @property
@@ -347,6 +338,9 @@ class SessionStore:
             await self._db.backup(dest_path)
 
     async def close(self) -> None:
+        for holding in self._session_holdings.values():
+            holding.retire()
+        self._session_holdings.clear()
         await self._db.close()
 
     async def __aenter__(self) -> SessionStore:
@@ -399,23 +393,32 @@ class SessionStore:
         return sid
 
     async def get_session(self, session_id: str) -> SessionRow | None:
+        holding = self._holding(session_id)
         row = await self._db.fetchone(
             f"SELECT * FROM {self.t.sessions} WHERE session_id=?", (session_id,)
         )
+        if row:
+            holding.touched = row["updated_at"]
         return _row_to_session(row) if row else None
 
     @contextlib.asynccontextmanager
-    async def send_read_scope(self, session_id):
+    async def send_read_scope(self, session_id, *, lease_owner_id=None):
         existing = send_reads.current(self, session_id)
-        if existing is not None:
+        if existing is not None and lease_owner_id is None:
             yield existing
             return
-        snapshot = send_reads.SendReads(self, session_id)
+        snapshot = send_reads.SessionHolding(self, session_id, lease_owner_id=lease_owner_id)
+        if existing is not None and "session" in existing.rows:
+            snapshot.rows["session"] = existing.rows["session"]
+            snapshot.touched = existing.rows["session"].updated_at
+        self._session_holdings[session_id] = snapshot
         token = send_reads.ACTIVE.set(snapshot)
         try:
             yield snapshot
         finally:
-            snapshot.active = False
+            snapshot.retire()
+            if self._session_holdings.get(session_id) is snapshot:
+                del self._session_holdings[session_id]
             send_reads.ACTIVE.reset(token)
 
     async def session_snapshot(self, session_id):
@@ -432,7 +435,7 @@ class SessionStore:
         snapshot = send_reads.trusted(self, session_id)
         if snapshot is not None and "state" in snapshot.rows:
             row = snapshot.rows["state"]
-            return replace(row, round_index=self._deferred_round.get(session_id, row.round_index))
+            return replace(row, round_index=snapshot.deferred_round if snapshot.deferred_round is not None else row.round_index)
         value = await self.get_state(session_id)
         send_reads.remember_state(self, session_id, value)
         return value
@@ -449,17 +452,18 @@ class SessionStore:
         return default if value is None else value
 
     async def get_state(self, session_id: str) -> SessionStateRow | None:
+        holding = self._holding(session_id)
         row = await self._db.fetchone(
             f"SELECT * FROM {self.t.session_state} WHERE session_id=?", (session_id,)
         )
         if row is None:
             return None
-        self._remember_pending(session_id, row["pending_json"])
-        self._next_seq[session_id] = int(row["next_seq"])
+        holding.pending_known, holding.pending_json = True, row["pending_json"]
+        holding.next_seq = int(row["next_seq"])
         return SessionStateRow(
             session_id=row["session_id"],
             next_seq=row["next_seq"],
-            round_index=self._deferred_round.get(session_id, row["round_index"]),
+            round_index=holding.deferred_round if holding.deferred_round is not None else row["round_index"],
             last_compact_seq=row["last_compact_seq"],
             pending=_loads(row["pending_json"]),
         )
@@ -482,7 +486,7 @@ class SessionStore:
                 and bool(await self.poll_background_updates(session_id)))
 
     async def signal_changes(self, tx, session_id, kind):
-        self._change_snapshots.pop(session_id, None)
+        self._holding(session_id).change_snapshot = None
         if kind == "runtime":
             snapshot = send_reads.current(self, session_id)
             if snapshot is not None:
@@ -492,7 +496,7 @@ class SessionStore:
     async def set_round_index(self, session_id: str, round_index: int) -> None:
         send_reads.lease_writer(self, session_id)
         prior = send_reads.take_state(self, session_id)
-        self._deferred_round.pop(session_id, None)
+        self._holding(session_id).deferred_round = None
         async with self._db.transaction() as tx:
             guard, arguments = self._lease_write_guard(session_id)
             changed = await tx.execute(
@@ -505,7 +509,8 @@ class SessionStore:
             send_reads.remember_state(self, session_id, replace(prior, round_index=round_index))
 
     async def set_pending(self, session_id: str, pending: dict[str, Any] | None) -> None:
-        lease_scope = send_reads.lease_writer(self, session_id)
+        holding = self._holding(session_id)
+        send_reads.lease_writer(self, session_id)
         prior = send_reads.take_state(self, session_id)
         async with self._db.transaction() as tx:
             guard, arguments = self._lease_write_guard(session_id)
@@ -517,9 +522,9 @@ class SessionStore:
             )
             if guard and changed != 1:
                 raise SessionLeaseLost(session_id)
-        if lease_scope is not None and not lease_scope.active:
+        if not holding.active:
             return
-        self._remember_pending(session_id, _dumps(pending) if pending else None)
+        holding.pending_known, holding.pending_json = True, _dumps(pending) if pending else None
         if prior is not None:
             send_reads.remember_state(self, session_id, replace(prior, pending=_loads(_dumps(pending)) if pending else None))
 
@@ -610,7 +615,8 @@ class SessionStore:
 
         ``pending`` (a dict or ``None``) replaces the pending state in the same statement
         that allocates ``seq``; it cannot depend on that seq."""
-        lease_scope = send_reads.lease_writer(self, session_id)
+        holding = self._holding(session_id)
+        send_reads.lease_writer(self, session_id)
         if type(pending_tool_calls) is not bool or pending_tool_calls and (role != "assistant" or not tool_calls):
             raise ValueError("invalid_pending_tool_message")
         if pending is not _KEEP and pending_tool_calls:
@@ -621,7 +627,7 @@ class SessionStore:
             reads.assistant_send_index, reads.assistant_ref = None, None
         now = _now_ms()
         pending_json = _KEEP if pending is _KEEP else (_dumps(pending) if pending else None)
-        deferred_round = self._deferred_round.pop(session_id, None)
+        deferred_round, holding.deferred_round = holding.deferred_round, None
         sets, params = [], []
         if inbox is not None:
             sets.append("inbox_version=inbox_version+1")
@@ -632,7 +638,7 @@ class SessionStore:
             sets.append("round_index=?")
             params.append(deferred_round)
         mysql = self._db.dialect.name == "mysql"
-        expected = self._next_seq.get(session_id)
+        expected = holding.next_seq
 
         def atomic_pending(seq):
             return _dumps({"assistant_seq": seq, "round_index": round_index,
@@ -747,7 +753,7 @@ class SessionStore:
                     )
                     if lease_guard and changed != 1:
                         raise SessionLeaseLost(session_id)
-                if now - self._touched.get(session_id, 0) >= _TOUCH_INTERVAL_MS:
+                if now - holding.touched >= _TOUCH_INTERVAL_MS:
                     # Activity time, not ordering: at most one write per session per interval.
                     await tx.execute(
                         f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
@@ -788,29 +794,26 @@ class SessionStore:
             lease_lost = True
             raise
         finally:
-            if not committed and not lease_lost and (lease_scope is None or lease_scope.active):
-                self._next_seq.pop(session_id, None)
-                self._change_snapshots.pop(session_id, None)
+            if not committed and not lease_lost and holding.active:
+                holding.next_seq = None
+                holding.change_snapshot = None
                 if deferred_round is not None:
-                    self._deferred_round.setdefault(session_id, deferred_round)
-        if lease_scope is not None and not lease_scope.active:
+                    holding.deferred_round = holding.deferred_round if holding.deferred_round is not None else deferred_round
+        if not holding.active:
             # The SQL committed before release, but its ACK arrived in a later
             # period. Keep that period's mutable hints and pending marker.
             return seq
-        self._next_seq[session_id] = seq + 1
+        holding.next_seq = seq + 1
         if prior is not None:
             send_reads.remember_state(self, session_id, replace(prior, next_seq=seq + 1,
                 pending=prior.pending if pending_json is _KEEP else _loads(pending_json),
                 round_index=deferred_round if deferred_round is not None else prior.round_index))
         if signal_values is not None:
-            self._change_snapshots[session_id] = seq, signal_values
-            self._change_snapshots.move_to_end(session_id)
-            while len(self._change_snapshots) > 4096:
-                self._change_snapshots.popitem(last=False)
+            holding.change_snapshot = seq, signal_values
         if touched is not None:
-            self._touched[session_id] = touched
+            holding.touched = touched
         if pending_json is not _KEEP:
-            self._remember_pending(session_id, pending_json)
+            holding.pending_known, holding.pending_json = True, pending_json
         if row_id is not None:
             self._remember_appended(session_id, seq, int(row_id), role, stored_call_id, stored_send,
                                     round_index, calls_json)
@@ -978,7 +981,7 @@ class SessionStore:
         one transaction. ``fold_seqs`` marks the EXACT set (never a BETWEEN range, which
         could invert under a non-monotonic identity map); ``order_key`` is the note's
         logical position (``meta['ord']``). Returns ``(compact_seq, note_seq)``."""
-        self._next_seq.pop(session_id, None)
+        self._holding(session_id).next_seq = None
         send_reads.forget(self, session_id, "state")
         now = _now_ms()
         async with self._db.transaction() as tx:
@@ -1128,7 +1131,7 @@ class SessionStore:
         """Insert (or replace, by ``(session_id, send_index, kind)``) one projection row.
         Idempotent so a resume/re-finalize of the same send is a no-op-equivalent rewrite;
         ``created_at`` is preserved across re-finalize (insert-only)."""
-        self._next_seq.pop(session_id, None)
+        self._holding(session_id).next_seq = None
         send_reads.forget(self, session_id, "state")
         async with self._db.transaction() as tx:
             # Standalone CRUD participates in the same revision fence. Low-level
@@ -2103,6 +2106,7 @@ class SessionStore:
         return default if value is None else value
 
     async def set_runtime_state(self, session_id: str, key: str, value: Any) -> None:
+        holding = self._holding(session_id)
         now = _now_ms()
         async with self._db.transaction() as tx:
             exists = await tx.fetchone(
@@ -2121,7 +2125,7 @@ class SessionStore:
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?",
                 (now, session_id),
             )
-        self._touched[session_id] = now
+        holding.touched = now
 
     async def mutate_runtime_state(
         self,
@@ -2147,6 +2151,7 @@ class SessionStore:
         must be a plain (non-coroutine) callable. Returns the persisted new value, or the
         unchanged current value when ``fn`` skips. Raises ``ValueError`` for an unknown
         session."""
+        holding = self._holding(session_id)
         now = _now_ms()
         async with self._db.transaction() as tx:
             await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
@@ -2172,7 +2177,7 @@ class SessionStore:
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?",
                 (now, session_id),
             )
-        self._touched[session_id] = now
+        holding.touched = now
         return new_value
 
     async def delete_runtime_state(self, session_id: str, key: str) -> None:

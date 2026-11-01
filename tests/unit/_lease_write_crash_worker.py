@@ -30,7 +30,7 @@ async def main(dsn, prefix, sid, evidence, stage):
             assert await other.acquire_session_lease(sid, owner_id="replacement", ttl_ms=60000)
         Path(evidence).write_text(json.dumps({"now": 301001, "pending": (await other.get_state(sid)).pending}))
         # Exercise MySQL's locking-read path, whose INSERT precedes allocation.
-        store._next_seq.pop(sid, None)
+        store._holding(sid).next_seq = None
         transaction = store._db.transaction
 
         @asynccontextmanager

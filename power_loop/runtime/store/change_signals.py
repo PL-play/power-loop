@@ -40,7 +40,7 @@ class ChangeReader:
         self.snapshot_seq = None
 
     async def refresh(self, *, force=False):
-        snapshot = self.store._change_snapshots.get(self.session_id)
+        snapshot = self.store._holding(self.session_id).change_snapshot
         if not force and snapshot is not None and snapshot[0] != self.snapshot_seq:
             self.snapshot_seq, self.versions = snapshot
             return
