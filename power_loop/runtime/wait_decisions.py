@@ -6,6 +6,7 @@ from dataclasses import asdict
 
 from . import timer_waits as waits
 from . import wait_notifications as notices
+from .control_requests import reference
 from .execution_membership import _lease
 from .jobs import JobError, JobLease, _hash, _json, _operation
 from .message_ref import MessageRef
@@ -30,7 +31,7 @@ def _intent(event_id, caller, call_ref, tool_call_id, decision, reason, next_rev
 
 async def _accepted(manager, tx, actor, event_id, request, operation, *, _notification=None):
     """Read exact accepted evidence, even after the caller closes or expires."""
-    _, due, saved, receipt = _notification if _notification is not None else await notices.notification(manager, tx, actor, event_id)
+    job, due, saved, receipt = _notification if _notification is not None else await notices.notification(manager, tx, actor, event_id)
     try:
         reconstructed = _intent(event_id, JobLease(**request["caller"]), waits._ref(request["call_ref"]),
             request["tool_call_id"], request["decision"], request["reason"], request["next_review_at_ms"])
@@ -41,6 +42,17 @@ async def _accepted(manager, tx, actor, event_id, request, operation, *, _notifi
     from .task_query import _reference
     call = _reference(manager, {"created_by_session_id": actor.session_id}, operation["call_ref_json"], "assistant")
     data = waits._object(operation["payload_json"])
+    from . import wait_decision_admission as admission
+    request_ref = data.get('request_ref')
+    if not isinstance(request_ref, dict):
+        raise JobError('wait_decision_evidence_corrupt')
+    grant = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='task_control_request'", (request_ref.get('event_id'),))
+    if grant is None:
+        raise JobError('wait_decision_evidence_missing')
+    original = waits._object(grant['payload_json'])['request']
+    if admission.client(original)!=request or request_ref!=reference(grant):
+        raise JobError('wait_decision_evidence_corrupt')
+    await admission._stored_request(manager, tx, actor, grant, original, _notification=(job, due, saved, receipt))
     canonical_id = notices.decision_id(manager, event_id)
     expected_response = {"status": "accepted", "event_id": event_id, "decision_event_id": canonical_id,
         "decision": request["decision"], "effect_status": "pending", "execution_authority": False}
@@ -48,13 +60,13 @@ async def _accepted(manager, tx, actor, event_id, request, operation, *, _notifi
             or operation["job_id"] != due["job_id"] or operation["caller_session_id"] != actor.session_id
             or operation["tool_call_id"] != request["tool_call_id"] or operation["request_hash"] != _hash(request)
             or _hash(call) != _hash(request["call_ref"])
-            or _hash(data) != _hash({"version": 1, "request": request, "response": expected_response})):
+            or _hash(data) != _hash({"version": 1, "request": request, "response": expected_response, 'request_ref':request_ref})):
         raise JobError("wait_decision_evidence_corrupt")
     canonical = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (canonical_id,))
     if canonical is None:
         raise JobError("wait_decision_evidence_missing")
     payload = waits._object(canonical["payload_json"])
-    keys = {"version", "event_id", "due_hash", "operation_id", "request", "observation", "original_owner", "continuation_hash"}
+    keys = {"version", "event_id", "due_hash", "operation_id", "request", "observation", "original_owner", "continuation_hash", 'request_ref'}
     if (canonical["event_type"] != "wait_decision" or canonical["job_id"] != due["job_id"]
             or set(payload) != keys or type(payload["version"]) is not int or payload["version"] != 1
             or canonical["request_hash"] != _hash(payload) or payload.get("operation_id") != operation["event_id"]
@@ -62,33 +74,12 @@ async def _accepted(manager, tx, actor, event_id, request, operation, *, _notifi
             or _hash(payload.get("request")) != _hash(request)
             or _hash(payload["original_owner"]) != _hash(saved["binding"]["owner"])
             or payload["continuation_hash"] != _hash(saved["request"]["request"]["continuation"])
+            or payload['request_ref'] != request_ref or payload['observation'] != original['proof']['observation']
             or canonical["delivery_status"] not in ("pending_delivery", "delivered", "handled")
             or due["delivery_status"] != "handled"):
         raise JobError("wait_decision_evidence_corrupt")
-    observed = payload["observation"]
-    if (not isinstance(observed, dict) or set(observed) != {"observation_id", "observation_hash", "model_attempt_ids"}
-            or not isinstance(observed["model_attempt_ids"], list) or not observed["model_attempt_ids"]
-            or any(not isinstance(x, str) for x in observed["model_attempt_ids"])):
-        raise JobError("wait_decision_evidence_corrupt")
-    observation = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (observed["observation_id"],))
-    if (observation is None or observation["event_type"] != "wait_observed"
-            or observation["job_id"] != request["caller"]["job_id"]
-            or observation["request_hash"] != observed["observation_hash"]
-            or _hash(waits._object(observation["payload_json"])) != observed["observation_hash"]):
-        raise JobError("wait_decision_evidence_corrupt")
-    caller, call_ref = JobLease(**request["caller"]), waits._ref(request["call_ref"])
-    expected_observation = notices.observation_id(manager, caller, call_ref.round_index, receipt["item_id"])
-    if observed["observation_id"] != expected_observation:
-        raise JobError("wait_decision_evidence_corrupt")
-    await _validate_observation(manager, tx, actor, caller, call_ref, due, receipt, observation)
-    from .model_attempts import _all
-    phases = await _all(manager, tx, request["caller"]["job_id"])
-    ids = observed["model_attempt_ids"]
-    if len(set(ids)) != len(ids) or any(identity not in phases["prepared"] or identity not in phases["finished"]
-            or phases["finished"][identity][1]["status"] != "returned"
-            or phases["prepared"][identity][1]["round_index"] != request["call_ref"]["round_index"]
-            or _hash(phases["prepared"][identity][1]["scope"]) != _hash(request["caller"]) for identity in ids):
-        raise JobError("wait_decision_evidence_corrupt")
+    # The source permission above validates the actual observation and exact
+    # returned model attempts once; the target original must reference them.
     return _operation(operation)
 
 
@@ -149,55 +140,8 @@ async def _observation(manager, tx, actor, caller, call_ref, due, receipt, *, _r
 async def record_decision(manager, actor, *, event_id, caller, call_ref, tool_call_id,
                           decision, reason="Reviewed original deferred request.", next_review_at_ms=None):
     request = _intent(event_id, caller, call_ref, tool_call_id, decision, reason, next_review_at_ms)
-    key = manager._origin_key(actor, "wait_decision", call_ref, tool_call_id, None)
-    async with manager._write() as tx:
-        old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE operation_key=?", (key,))
-        if old is not None:
-            if old["request_hash"] != _hash(request):
-                raise JobError("operation_conflict")
-            return await _accepted(manager, tx, actor, event_id, request, old), True
-        job, due, saved, receipt = await notices.notification(manager, tx, actor, event_id)
-        canonical_id = notices.decision_id(manager, event_id)
-        if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (canonical_id,)):
-            raise JobError("wait_decision_already_recorded")
-        from .task_control import _source
-        source = await _source(manager, tx, actor, caller, call_ref, tool_call_id)
-        if source["execution_role"] != "main" or source["parent_job_id"] is not None:
-            raise JobError("role_forbids_wait_decision")
-        await manager._fence(tx, actor, caller)
-        current = await waits._prepare_due(manager, tx, actor, job["job_id"])
-        if current["status"] != "decision_pending" or current["event_id"] != event_id:
-            raise JobError("wait_due_state_changed")
-        _, policy = waits._request(saved["request"])
-        if decision == "defer":
-            from .wait_reviews import MAX_REVIEWS
-            if current["payload"].get("review", {}).get("cycle", 0) >= MAX_REVIEWS:
-                raise JobError("wait_review_limit_exceeded")
-            if not manager.now() < next_review_at_ms < policy.deadline_at_ms:
-                raise JobError("wait_review_out_of_bounds")
-        # A durable decision references the original returned model attempt.
-        # Publish that buffered evidence in this transaction, so a crash cannot
-        # leave accepted intent whose observation exists only in owner memory.
-        binding = manager._execution_controls.get((caller.job_id, caller.generation))
-        returned = None
-        if binding is not None:
-            from .control_runtime import current, flush_binding
-            if manager._trust_own_writes.get():
-                returned = current(binding).returned_models(call_ref.round_index)
-            await flush_binding(binding, transaction=tx)
-        seen = await _observation(manager, tx, actor, caller, call_ref, due, receipt, _returned=returned)
-        response = {"status": "accepted", "event_id": event_id, "decision_event_id": canonical_id,
-            "decision": decision, "effect_status": "pending", "execution_authority": False}
-        operation = await manager._insert_operation(tx, job_id=job["job_id"], version=job["version"]+1,
-            actor=actor, action="wait_decision", key=key, fingerprint=_hash(request), call_ref=call_ref,
-            tool_call_id=tool_call_id, payload={"version": 1, "request": request, "response": response})
-        payload = {"version": 1, "event_id": event_id, "due_hash": due["request_hash"],
-            "operation_id": operation.operation_id, "request": request, "observation": seen,
-            "original_owner": saved["binding"]["owner"], "continuation_hash": _hash(saved["request"]["request"]["continuation"])}
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'caller_session_id', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (canonical_id, job["job_id"], "wait_decision", job["version"]+1, actor.session_id, _hash(payload), _json(payload), "pending_delivery", manager.now()))
-        await tx.write_job(job["job_id"], f"UPDATE {manager.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (manager.now(), job["job_id"]))
-        await tx.update_event(job["job_id"], f"UPDATE {manager.events} SET delivery_status='handled' WHERE event_id IN (?,?)", (event_id, receipt["item_id"]))
-        return operation, False
+    from .wait_decision_admission import record
+    return await record(manager, actor, request)
 
 
 async def inspect(manager, actor, event_id, *, field="summary", char_offset=0, max_chars=8000):

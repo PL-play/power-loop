@@ -270,8 +270,8 @@ def due_event_id(manager, job_id, creation_id):
     return "wait_due_" + _hash([manager.store.store_id, job_id, creation_id])[:48]
 
 
-async def _prepare_due(manager, tx, actor, job_id):
-    """Persist one at-least-once main-decision event, without delivering it.
+async def _inspect_due(manager, tx, actor, job_id):
+    """Prepare one due event without writing or granting execution authority.
 
     The event is evidence only. A later notification claim and decision adapter
     must recheck the original owner, deadline, cancellation, pause and budget.
@@ -312,7 +312,7 @@ async def _prepare_due(manager, tx, actor, job_id):
     from .wait_reviews import history
     state = await history(manager, tx, actor, job, creation, saved)
     if manager.now() < state["due_at_ms"]:
-        return {"status": "armed", "job_id": job_id, "due_at_ms": state["due_at_ms"], "execution_authority": False}
+        return {"status": "armed", "job_id": job_id, "due_at_ms": state["due_at_ms"], "execution_authority": False}, job, None
     if saved["receipt_ref"] is None:
         raise JobError("wait_receipt_missing")
     source_actor = JobActor(actor.tenant_id, actor.principal_id, binding["session_id"])
@@ -327,11 +327,17 @@ async def _prepare_due(manager, tx, actor, job_id):
                 or old["request_hash"] != _hash(payload) or _hash(_object(old["payload_json"])) != _hash(payload)
                 or old["delivery_status"] not in ("pending_delivery", "delivered", "handled")):
             raise JobError("wait_due_evidence_corrupt")
-    else:
-        version = job["version"] + 1
+    return {"status": "decision_pending", "event_id": event_id, "payload": payload, "execution_authority": False}, job, old
+
+
+async def _prepare_due(manager, tx, actor, job_id):
+    """Publish the prepared due in its own tree's existing writer transaction."""
+    result, job, old = await _inspect_due(manager, tx, actor, job_id)
+    if result['status']=='decision_pending' and old is None:
+        version, payload = job['version']+1, result['payload']
         await tx.write_job(job_id, f"UPDATE {manager.jobs} SET version=?,updated_at=? WHERE job_id=?", (version, manager.now(), job_id))
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (event_id, job_id, "wait_due", version, _hash(payload), _json(payload), "pending_delivery", manager.now()))
-    return {"status": "decision_pending", "event_id": event_id, "payload": payload, "execution_authority": False}
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (result['event_id'], job_id, "wait_due", version, _hash(payload), _json(payload), "pending_delivery", manager.now()))
+    return result
 
 
 async def prepare_due(manager, actor, job_id):

@@ -10,7 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from power_loop import AgentLoopConfig, StatefulAgentLoop
-from power_loop.runtime import wait_decisions
+from power_loop.runtime import control_runtime, wait_decisions
 from power_loop.runtime.execution_state import CheckpointPolicy
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.store.factory import open_store
@@ -33,7 +33,7 @@ async def main(dsn, prefix, evidence, config, stage):
     register_wait_handoff_tool(registry)
     loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
                              config=AgentLoopConfig(delegation_policy="single_level", max_rounds=3, max_tokens=20))
-    record, observation = wait_decisions.record_decision, wait_decisions._observation
+    record, flush = wait_decisions.record_decision, control_runtime.flush_binding
 
     async def retain(*args, **kwargs):
         proof = {**kwargs, "caller": asdict(kwargs["caller"]), "call_ref": kwargs["call_ref"].to_dict(),
@@ -41,9 +41,9 @@ async def main(dsn, prefix, evidence, config, stage):
         Path(evidence).write_text(json.dumps(proof))
         return await record(*args, **kwargs)
 
-    async def after_checkpoint(*args, **kwargs):
-        result = await observation(*args, **kwargs)
-        if stage == "after_checkpoint":
+    async def after_checkpoint(binding, **kwargs):
+        result = await flush(binding, **kwargs)
+        if stage == "after_checkpoint" and kwargs.get('transaction') is not None:
             os._exit(91)
         return result
 
@@ -74,7 +74,7 @@ async def main(dsn, prefix, evidence, config, stage):
             os._exit(93)
 
     store._db.transaction = crash_after_commit
-    wait_decisions.record_decision, wait_decisions._observation = retain, after_checkpoint
+    wait_decisions.record_decision, control_runtime.flush_binding = retain, after_checkpoint
     await loop.flush_follow_ups(saved["sid"])
     raise AssertionError("wait decision crash boundary was not reached")
 

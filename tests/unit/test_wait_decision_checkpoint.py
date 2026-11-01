@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from power_loop.runtime import model_attempts, timer_waits, wait_decisions, wait_effects, wait_notifications
+from power_loop.runtime import (
+    model_attempts,
+    timer_waits,
+    wait_decision_admission,
+    wait_decisions,
+    wait_effects,
+    wait_notifications,
+)
 from power_loop.runtime.execution_state import CheckpointPolicy
 from power_loop.runtime.jobs import JobError, JobLease, JobManager
 
@@ -83,7 +90,13 @@ async def test_process_death_never_leaves_decision_without_original_model(handof
         "AND event_type IN ('model_attempt_prepared','model_attempt_dispatched','model_attempt_finished')",
         (saved["caller"]["job_id"],))
     committed = stage == "after_commit"
-    assert sorted(row["event_type"] for row in phases) == (["model_attempt_dispatched", "model_attempt_finished", "model_attempt_prepared"] if committed else [])
+    source_committed = stage != 'after_checkpoint'
+    assert sorted(row["event_type"] for row in phases) == (["model_attempt_dispatched", "model_attempt_finished", "model_attempt_prepared"] if source_committed else [])
+    requests = await reader.db.fetchall(f"SELECT payload_json FROM {reader.events} WHERE event_type='task_control_request'")
+    granted = [row for row in requests if (lambda data:data['phase']=='accepted' and data['action']==wait_decision_admission.ACTION)(json.loads(row['payload_json']))]
+    assert len(granted)==int(source_committed)
+    pending = await reader.db.fetchall(f"SELECT source_id FROM {reader.prefix}session_obligations WHERE kind='control_request'")
+    assert len(pending)==int(source_committed)
     assert len(await reader.db.fetchall(f"SELECT event_id FROM {reader.events} WHERE event_type='wait_decision'")) == int(committed)
     request = {key: value for key, value in saved.items() if key != "model_calls"}
     request.update(caller=JobLease(**request["caller"]), call_ref=timer_waits._ref(request["call_ref"]))

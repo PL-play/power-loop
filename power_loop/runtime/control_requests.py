@@ -34,7 +34,8 @@ def rejection_id(request_id):
 
 def _origin(manager, actor, request, action):
     from .managed_effects import _ref
-    return manager._origin_key(actor, "nudge" if action in ("resume", "resume_node", "restore") else action,
+    operation = 'nudge' if action in ('resume', 'resume_node', 'restore') else 'wait_decision' if action=='decide' else action
+    return manager._origin_key(actor, operation,
         _ref(request["call_ref"]), request["tool_call_id"], None)
 
 
@@ -57,6 +58,9 @@ def _domain(action):
     if action == "restore":
         from . import workflow_admission
         return workflow_admission
+    if action == 'decide':
+        from . import wait_decision_admission
+        return wait_decision_admission
     raise JobError("control_request_action_unknown")
 
 
