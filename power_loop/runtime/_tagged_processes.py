@@ -68,14 +68,22 @@ def signal_members(variable, tag, sig, not_before=0):
             except (ProcessLookupError, FileNotFoundError):
                 pass
             except PermissionError:
-                # A matching process we could open but cannot signal is unknown.
-                if matched:
-                    raise
-                try:
-                    same_user = os.stat('/proc/' + name).st_uid == os.geteuid()
-                except FileNotFoundError:
-                    same_user = False
-                if same_user:
+                if not matched:
+                    try:
+                        same_user = os.stat('/proc/' + name).st_uid == os.geteuid()
+                    except FileNotFoundError:
+                        continue
+                    if not same_user:
+                        continue
+                # /proc/PID/environ can become unreadable during exit, before
+                # either membership read. An immutable pidfd exit notification
+                # proves absence; a live unreadable process remains unknown.
+                if fd is None:
+                    try:
+                        fd = os.pidfd_open(int(name))
+                    except (ProcessLookupError, FileNotFoundError):
+                        continue
+                if not select.select([fd], [], [], 0.05)[0]:
                     raise
             finally:
                 if fd is not None:

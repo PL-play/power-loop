@@ -168,6 +168,39 @@ def test_permission_failure_for_matching_process_is_not_absence(monkeypatch):
     assert result == {'confirmed': False, 'error': 'process_control_failed'}
 
 
+@pytest.mark.parametrize('exited', [True, False])
+@pytest.mark.parametrize('first_read', [True, False])
+def test_membership_read_denied_requires_original_pidfd_exit(monkeypatch, exited, first_read):
+    from types import SimpleNamespace
+
+    reads, waited, closed = [], [], []
+    monkeypatch.setattr(os, 'listdir', lambda _path: ['42'])
+    monkeypatch.setattr(os, 'getpid', lambda: 100)
+    monkeypatch.setattr(os, 'pidfd_open', lambda pid: 77)
+    monkeypatch.setattr(os, 'stat', lambda path: SimpleNamespace(st_uid=os.geteuid()))
+    monkeypatch.setattr(os, 'close', closed.append)
+
+    def environment(*args, **kwargs):
+        reads.append(args[0])
+        if not first_read and len(reads) == 1:
+            return io.BytesIO(b'PL_BG_TAG=original\0')
+        raise PermissionError('original is exiting or no longer readable')
+
+    def wait_original(fds, writes, errors, timeout):
+        waited.append((fds, writes, errors, timeout))
+        return ([77] if exited else [], [], [])
+
+    monkeypatch.setattr(builtins, 'open', environment)
+    monkeypatch.setattr(tagged.select, 'select', wait_original)
+    if exited:
+        assert tagged.signal_members('PL_BG_TAG', 'original', signal.SIGKILL) == []
+    else:
+        with pytest.raises(PermissionError):
+            tagged.signal_members('PL_BG_TAG', 'original', signal.SIGKILL)
+    assert waited == [([77], [], [], 0.05)]
+    assert closed == [77]
+
+
 async def test_control_factory_requires_explicit_interface_before_launch(tmp_path):
     class Invalid(LocalShellBackend):
         def bind_process_control(self, *args, **kwargs):
@@ -359,6 +392,9 @@ def test_unreadable_new_same_user_process_keeps_stop_unknown(monkeypatch):
     monkeypatch.setattr(os, 'getpid', lambda: 1000)
     monkeypatch.setattr(tagged, 'process_info', lambda name: (101, 'S'))
     monkeypatch.setattr(os, 'stat', lambda path: SimpleNamespace(st_uid=os.geteuid()))
+    monkeypatch.setattr(os, 'pidfd_open', lambda pid: 77)
+    monkeypatch.setattr(os, 'close', lambda fd: None)
+    monkeypatch.setattr(tagged.select, 'select', lambda *args: ([], [], []))
 
     def denied(*args, **kwargs):
         raise PermissionError('new process unreadable')
