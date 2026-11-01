@@ -11,6 +11,7 @@ from tests.unit._owned_pending_case_192 import owned_pending_case
 from tests.unit.test_controller_handoff_192 import new_main
 from tests.unit.test_job_registry_192 import registry_store
 from tests.unit.test_owned_pending_review_192 import cleanup
+from tests.unit.test_task_query_indexes_192 import mysql_index_paths
 
 __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -28,10 +29,16 @@ async def test_native_return_recovery_queries_are_flat_and_indexed(registry_stor
         if backend == 'sqlite':
             from power_loop.runtime.store.backends.sqlite import SqliteDatabase, _SqliteTransaction
             classes = [SqliteDatabase, _SqliteTransaction]
-        else:
+        elif backend == 'mysql':
+            from power_loop.runtime.store.backends.mysql import MySQLDatabase, _MyTransaction
+            classes = [MySQLDatabase, _MyTransaction]
+        elif backend == 'postgres':
             from power_loop.runtime.store.backends.postgres import PostgresDatabase, _PgTransaction
             classes = [PostgresDatabase, _PgTransaction]
-        names = (c.manager.jobs, c.manager.events, c.manager.prefix+'task_budget_attempts')
+        else:
+            raise AssertionError('uncovered query-plan backend: '+backend)
+        names = (c.manager.jobs, c.manager.events, c.manager.prefix+'task_budget_attempts',
+                 c.manager.prefix+'session_obligations')
         async def inspect_sql(self, sql, params):
             if sql in plans or not re.match(r'\s*(SELECT|UPDATE|DELETE)\b', sql, re.I) or not any(name in sql for name in names):
                 return
@@ -42,9 +49,20 @@ async def test_native_return_recovery_queries_are_flat_and_indexed(registry_stor
                 detail = [row['detail'] for row in rows]
                 # Sorting temporary results is permitted; reading an unindexed
                 # task relation is not. Check every joined table, not one leaf.
-                assert not any(re.match(r'SCAN\s+(?:j|e|d|t|'+re.escape(c.manager.prefix)+r'\w+)\b', text)
+                assert not any(re.match(r'SCAN\s+(?:j|e|d|t|o|'+re.escape(c.manager.prefix)+r'\w+)\b', text)
                     and 'USING' not in text for text in detail), (sql, detail)
                 plans[sql] = detail
+            elif backend == 'mysql':
+                async def explain(conn):
+                    import aiomysql
+                    async with conn.cursor(aiomysql.DictCursor) as cursor:
+                        await cursor.execute('EXPLAIN '+db.dialect.translate(sql), tuple(params))
+                        return mysql_index_paths(await cursor.fetchall())
+                if hasattr(self, '_conn'):
+                    plans[sql] = await explain(self._conn)
+                else:
+                    async with db._pool.acquire() as conn:
+                        plans[sql] = await explain(conn)
             else:
                 async def explain(conn):
                     async with conn.transaction():
