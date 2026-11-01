@@ -5,7 +5,6 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 
@@ -49,33 +48,43 @@ async def admitting(managed_workflow, monkeypatch):
                 @asynccontextmanager
                 async def broken():
                     async with original() as tx:
+                        original_execute = tx._execute
                         async def execute(sql, params=()):
-                            silent = ((fault == "silent_jobs" and sql.startswith(f"UPDATE {manager.jobs} SET generation=")) or
-                                (fault == "silent_operation" and sql.startswith(f"UPDATE {manager.events} SET payload_json=")) or
-                                (fault == "silent_execution" and "execution" in params) or
-                                (fault == "silent_scope" and "execution_scope" in params) or
-                                (fault == "silent_reservation" and "workflow_node_reservation" in params) or
-                                (fault == "silent_journal" and sql.startswith(f"UPDATE {store.t.session_runtime_state} SET value_json=")))
-                            if silent:
+                            failed = ((fault == "write_jobs" and sql.startswith(f"UPDATE {manager.jobs} SET generation=")) or
+                                (fault == "write_operation" and sql.startswith(f"UPDATE {manager.events} SET payload_json=")) or
+                                (fault == "write_execution" and "execution" in params) or
+                                (fault == "write_scope" and "execution_scope" in params) or
+                                (fault == "write_reservation" and "workflow_node_reservation" in params) or
+                                (fault == "write_journal" and sql.startswith(f"UPDATE {store.t.session_runtime_state} SET value_json=")))
+                            if failed:
                                 c.fault_hits.append(fault)
-                                return 1  # A lying rowcount must not manufacture receipt evidence.
-                            value = await tx.execute(sql, params)
+                                # A real statement/transport failure must roll
+                                # back; a DB lying about a successful write is
+                                # outside the runtime's defensive contract.
+                                raise OSError("injected statement failure")
+                            value = await original_execute(sql, params)
                             if ((fault == "reservation" and "workflow_node_reservation" in params) or
                                     (fault == "journal" and sql.startswith(f"UPDATE {store.t.session_runtime_state} SET value_json="))):
+                                c.fault_hits.append(fault)
                                 raise RuntimeError("injected statement failure")
                             return value
-                        yield SimpleNamespace(execute=execute, fetchone=tx.fetchone, fetchall=tx.fetchall)
+                        with monkeypatch.context() as statements:
+                            statements.setattr(tx, "_execute", execute)
+                            yield tx
                         if fault == "rollback":
+                            c.fault_hits.append(fault)
                             raise RuntimeError("precommit failure")
                         if fault == "cancel":
+                            c.fault_hits.append(fault)
                             raise asyncio.CancelledError()
                     if fault == "commit_ack":
+                        c.fault_hits.append(fault)
                         raise RuntimeError("lost commit ACK")
                 with monkeypatch.context() as patch:
                     patch.setattr(manager, "_write", broken)
                     try:
                         await resume.admit(manager, actor, handle.job_id, **c.args)
-                    except (RuntimeError, asyncio.CancelledError):
+                    except (OSError, RuntimeError, asyncio.CancelledError):
                         return {"fault": fault}
                 raise AssertionError("injected failure not reached")
             c.result = await resume.admit(manager, actor, handle.job_id, **c.args)
@@ -84,22 +93,29 @@ async def admitting(managed_workflow, monkeypatch):
                     @asynccontextmanager
                     async def broken_claim():
                         async with original() as tx:
+                            original_execute = tx._execute
                             async def execute(sql, params=()):
-                                if claim_fault == "silent" and "workflow_dispatch" in params:
-                                    return 1
-                                return await tx.execute(sql, params)
-                            yield SimpleNamespace(execute=execute, fetchone=tx.fetchone, fetchall=tx.fetchall)
+                                if claim_fault == "statement" and "workflow_dispatch" in params:
+                                    c.fault_hits.append(claim_fault)
+                                    raise OSError("dispatch write failed")
+                                return await original_execute(sql, params)
+                            with monkeypatch.context() as statements:
+                                statements.setattr(tx, "_execute", execute)
+                                yield tx
                             if claim_fault == "rollback":
+                                c.fault_hits.append(claim_fault)
                                 raise RuntimeError("claim rollback")
                             if claim_fault == "cancel":
+                                c.fault_hits.append(claim_fault)
                                 raise asyncio.CancelledError()
+                        c.fault_hits.append(claim_fault)
                         raise RuntimeError("claim committed, ACK lost")
                     with monkeypatch.context() as patch:
                         patch.setattr(manager, "_write", broken_claim)
                         try:
                             await resume.claim_dispatch(manager, actor, c.result[0].operation_id,
                                 caller=source.lease, token="owner-token")
-                        except (RuntimeError, asyncio.CancelledError, JobError):
+                        except (OSError, RuntimeError, asyncio.CancelledError, JobError):
                             pass
                 else:
                     c.claimed = await resume.claim_dispatch(manager, actor, c.result[0].operation_id,
@@ -143,6 +159,7 @@ async def test_every_admission_write_rolls_back_or_lost_ack_recalls_exactly_one_
     before = await journal.read(c.store, c.parent, c.handle.run_id)
     old = await c.manager.get_result_revision(c.actor, c.handle.job_id, 1)
     await c.admit(fault=fault)
+    assert c.fault_hits == [fault]
     other = JobManager(await c.connect())
     committed = fault == "commit_ack"
     current = await other.get_job(c.actor, c.handle.job_id)
@@ -225,10 +242,11 @@ async def test_two_independent_managers_admit_same_call_only_once(admitting):
     assert len(await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='workflow_node_reservation'")) == 2
 
 
-@pytest.mark.parametrize("fault", ["rollback", "cancel", "commit_ack", "silent"])
+@pytest.mark.parametrize("fault", ["rollback", "cancel", "commit_ack", "statement"])
 async def test_dispatch_transaction_rollback_cancel_and_lost_ack_keep_single_responsibility(admitting, fault):
     c = admitting
     await c.admit(claim=True, claim_fault=fault)
+    assert c.fault_hits == [fault]
     other = JobManager(await c.connect())
     rows = await other.db.fetchall(f"SELECT * FROM {other.events} WHERE event_type='workflow_dispatch'")
     assert len(rows) == int(fault == "commit_ack")
@@ -262,12 +280,12 @@ async def test_corrupt_claim_receipt_does_not_grant_dispatch_again(admitting, fi
         await resume.claim_dispatch(c.manager, c.actor, c.result[0].operation_id, caller=c.args["caller"], token="owner-token")
 
 
-@pytest.mark.parametrize("fault", ["silent_jobs", "silent_operation", "silent_execution", "silent_scope", "silent_reservation", "silent_journal"])
-async def test_silent_writes_even_with_success_rowcount_cannot_commit_partial_admission(admitting, fault):
+@pytest.mark.parametrize("fault", ["write_jobs", "write_operation", "write_execution", "write_scope", "write_reservation", "write_journal"])
+async def test_each_admission_statement_failure_rolls_back_all_admission_writes(admitting, fault):
     c = admitting
     j = await journal.read(c.store, c.parent, c.handle.run_id)
     await c.admit(fault=fault)
-    assert c.fault_hits
+    assert c.fault_hits == [fault]
     assert (await c.manager.get_job(c.actor, c.handle.job_id)).generation == 1
     assert await journal.read(c.store, c.parent, c.handle.run_id) == j
     assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='workflow_node_reservation'")
