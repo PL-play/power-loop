@@ -335,12 +335,31 @@ async def _prepare_due(manager, tx, actor, job_id):
     result, job, old = await _inspect_due(manager, tx, actor, job_id)
     if result['status']=='decision_pending' and old is None:
         version, payload = job['version']+1, result['payload']
-        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET version=?,updated_at=? WHERE job_id=?", (version, manager.now(), job_id))
+        changed = await tx.write_job(job_id, f"UPDATE {manager.jobs} SET version=?,updated_at=? "
+            'WHERE job_id=? AND root_job_id=? AND generation=? AND version=?',
+            (version,manager.now(),job_id,job['root_job_id'],job['generation'],job['version']))
+        if changed!=1:
+            from .finalization_plan import PlanChanged
+            raise PlanChanged()
         await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (result['event_id'], job_id, "wait_due", version, _hash(payload), _json(payload), "pending_delivery", manager.now()))
     return result
 
 
 async def prepare_due(manager, actor, job_id):
-    """Persist due evidence using one original control transaction."""
-    async with manager._write() as tx:
-        return await _prepare_due(manager, tx, actor, job_id)
+    """Prepare historical sources before conditionally publishing its own due."""
+    from .finalization_plan import PlanChanged
+    from .wait_decisions import prepared_sources
+
+    while True:
+        with prepared_sources() as proofs:
+            async with manager._read() as reader:
+                result,_,old = await _inspect_due(manager,reader,actor,job_id)
+            # These answers grant no execution and need no writer transaction.
+            if result['status']=='armed' or old is not None:
+                return result
+            proofs.publishing = True
+            try:
+                async with manager._write() as tx:
+                    return await _prepare_due(manager,tx,actor,job_id)
+            except PlanChanged:
+                continue
