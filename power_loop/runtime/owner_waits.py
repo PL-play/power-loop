@@ -6,9 +6,10 @@ Only an accepted original input can move the controller back to running.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 from . import timer_waits as waits
+from .finalization_plan import PlanChanged
 from .jobs import JobActor, JobError, JobLease, _hash, _json
 from .model_exit import content_reference, historical_row, require_stopped
 
@@ -444,15 +445,72 @@ async def _resume(manager, tx, actor, owner, identity, saved, event):
     return accepted
 
 
+@dataclass(frozen=True)
+class _Transition:
+    root_id: str
+    generation: int
+    count: int
+    version_sum: int
+    owner: dict
+    event: dict
+    status: str | None
+
+
+async def _transition(manager, reader, owner, event, status=None):
+    root = owner['root_job_id']
+    summary = await reader.fetchone(f"SELECT COUNT(*) AS job_count,COALESCE(SUM(version),0) AS version_sum,"
+        f"MAX(CASE WHEN job_id=? THEN generation END) AS root_generation FROM {manager.jobs} WHERE root_job_id=?",(root,root))
+    return _Transition(root,summary['root_generation'],summary['job_count'],summary['version_sum'],owner,event,status)
+
+
+async def _publish_transition(manager, actor, lease, transition, *, deadline=None):
+    async with manager._write() as tx:
+        event = transition.event
+        expiring = event['event_type']=='owner_wait_expired'
+        if deadline is not None and (manager.now()>=deadline)!=expiring:
+            raise PlanChanged()
+        if expiring:
+            owner = await manager._authorize(tx,actor,lease.job_id)
+            manager._check_proof(owner,lease)
+            await manager._supervision_barriers(tx,owner)
+            manager._execution_open(owner)
+            from .executor_registry import check_execution
+            await check_execution(manager,tx,owner)
+            await manager._control_owners(tx,owner)
+        else:
+            await manager._fence(tx,actor,lease)
+        if await tx.append_event_if_tree_current({**event,'created_at':manager.now()},transition)!=1:
+            raise PlanChanged()
+        if transition.status is not None:
+            base = transition.owner
+            changed = await tx.write_job(lease.job_id,f"UPDATE {manager.jobs} SET status=?,version=version+1,updated_at=? "
+                "WHERE job_id=? AND root_job_id=? AND generation=? AND version=?",
+                (transition.status,manager.now(),lease.job_id,transition.root_id,lease.generation,base['version']))
+            if changed!=1:
+                raise PlanChanged()
+
+
 async def _enter(manager, actor, lease, raw):
     from .execution_membership import _lease
     _lease(asdict(lease))
-    async with manager._write() as tx:
+    while True:
+        result,transition = await _prepare_enter(manager,actor,lease,raw)
+        if transition is None:
+            return result
+        try:
+            await _publish_transition(manager,actor,lease,transition)
+            return result
+        except PlanChanged:
+            continue
+
+
+async def _prepare_enter(manager, actor, lease, raw):
+    async with manager._read() as tx:
         owner = await manager._fence(tx, actor, lease)
         sid = raw.get("session_id")
         pending = await _pending(manager, tx, actor, owner, sid)
         if not pending:
-            return None
+            return None,None
         if not isinstance(sid, str) or not sid:
             raise JobError("owner_wait_session_required")
         refs = await _quiescent(manager, tx, owner)
@@ -464,13 +522,15 @@ async def _enter(manager, actor, lease, raw):
         if old is None:
             if owner["status"] == "waiting":
                 raise JobError("owner_wait_phase_changed")
-            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (identity, owner["job_id"], "owner_waiting", owner["version"]+1, _hash(data), _json(data), "not_applicable", manager.now()))
-            await tx.write_job(owner["job_id"], f"UPDATE {manager.jobs} SET status='waiting',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
+            event = {'event_id':identity,'job_id':owner['job_id'],'event_type':'owner_waiting',
+                'job_version':owner['version']+1,'request_hash':_hash(data),'payload_json':_json(data),
+                'delivery_status':'not_applicable','created_at':manager.now()}
+            return (identity,data),await _transition(manager,tx,owner,event,'waiting')
         else:
             await _validate_entry(manager, tx, actor, owner, old, data)
             if owner["status"] != "waiting":
                 raise JobError("owner_wait_already_resumed")
-        return identity, data
+        return (identity,data),None
 
 
 async def _step(manager, actor, lease, identity, saved):
@@ -479,7 +539,19 @@ async def _step(manager, actor, lease, identity, saved):
     if not isinstance(lease, JobLease):
         raise JobError("execution_lease_required")
     _lease(asdict(lease))
-    async with manager._write() as tx:
+    while True:
+        result,transition = await _prepare_step(manager,actor,lease,identity,saved)
+        if transition is None:
+            return result
+        try:
+            await _publish_transition(manager,actor,lease,transition,deadline=saved['deadline_at_ms'])
+            return result
+        except PlanChanged:
+            continue
+
+
+async def _prepare_step(manager, actor, lease, identity, saved):
+    async with manager._read() as tx:
         owner = await manager._authorize(tx, actor, lease.job_id)
         manager._check_proof(owner, lease)
         event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (identity,))
@@ -502,10 +574,13 @@ async def _step(manager, actor, lease, identity, saved):
             key = _id(manager, "owner_wait_end_", identity)
             old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
             if old is None:
-                await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, owner["job_id"], "owner_wait_expired", owner["version"], _hash(payload), _json(payload), "not_applicable", manager.now()))
+                event = {'event_id':key,'job_id':owner['job_id'],'event_type':'owner_wait_expired',
+                    'job_version':owner['version'],'request_hash':_hash(payload),'payload_json':_json(payload),
+                    'delivery_status':'not_applicable','created_at':manager.now()}
+                return 'expired',await _transition(manager,tx,owner,event)
             else:
                 _expired(manager, owner, identity, saved, old)
-            return "expired"
+            return "expired",None
         owner = await manager._fence(tx, actor, lease)
         if resumed is not None:
             await _validate_entry(manager, tx, actor, owner, event, saved)
@@ -514,10 +589,10 @@ async def _step(manager, actor, lease, identity, saved):
             ready = await _resume(manager, tx, actor, owner, identity, saved, resumed)
             if owner["status"] != "running":
                 raise JobError("owner_wait_phase_changed")
-            return "history" if any(delivered for _, delivered in ready) else "input"
+            return ("history" if any(delivered for _, delivered in ready) else "input"),None
         ready = await _inputs(manager, tx, actor, owner, saved["session_id"])
         if not ready:
-            return None
+            return None,None
         # Full immutable and physical proofs are checked at a transition, not
         # repeatedly while polling an unchanged waiting controller.
         await _validate_entry(manager, tx, actor, owner, event, saved)
@@ -528,9 +603,10 @@ async def _step(manager, actor, lease, identity, saved):
         key = _id(manager, "owner_wait_resume_", identity)
         if owner["status"] != "waiting":
             raise JobError("owner_wait_phase_changed")
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, owner["job_id"], "owner_wait_resumed", owner["version"]+1, _hash(payload), _json(payload), "not_applicable", manager.now()))
-        await tx.write_job(owner["job_id"], f"UPDATE {manager.jobs} SET status='running',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), owner["job_id"]))
-        return "history" if any(delivered for _, delivered in ready) else "input"
+        event = {'event_id':key,'job_id':owner['job_id'],'event_type':'owner_wait_resumed',
+            'job_version':owner['version']+1,'request_hash':_hash(payload),'payload_json':_json(payload),
+            'delivery_status':'not_applicable','created_at':manager.now()}
+        return ('history' if any(delivered for _, delivered in ready) else 'input'),await _transition(manager,tx,owner,event,'running')
 
 
 async def wait_ready(loop, raw, stop_event, *, deadline):

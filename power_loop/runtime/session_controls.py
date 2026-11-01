@@ -109,15 +109,18 @@ class ControlTransaction(ControlReadView):
         Job versions only advance. Count plus their sum also catches a new or
         resumed descendant which was absent from the prepared closure plans.
         The tree writer remains held until all conditional projections commit.
+        Original-only publications can leave job versions unchanged; their
+        original key must also remain absent when this statement executes.
         """
         self.note_event(event)
         columns = tuple(event)
         sql = f"INSERT INTO {self._events} ({','.join(columns)}) SELECT " + ','.join('?' for _ in columns)
         sql += (f" WHERE EXISTS (SELECT 1 FROM {self._jobs} WHERE job_id=? AND generation=?)"
             f" AND (SELECT COUNT(*) FROM {self._jobs} WHERE root_job_id=?)=?"
-            f" AND (SELECT COALESCE(SUM(version),0) FROM {self._jobs} WHERE root_job_id=?)=?")
+            f" AND (SELECT COALESCE(SUM(version),0) FROM {self._jobs} WHERE root_job_id=?)=?"
+            f" AND NOT EXISTS (SELECT 1 FROM {self._events} WHERE event_id=?)")
         return await self._execute(sql, (*event.values(), tree.root_id, tree.generation,
-            tree.root_id, tree.count, tree.root_id, tree.version_sum))
+            tree.root_id, tree.count, tree.root_id, tree.version_sum,event['event_id']))
 
     def note_event(self, event):
         self.touched_jobs.add(event["job_id"])
