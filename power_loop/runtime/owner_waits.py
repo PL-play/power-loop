@@ -266,19 +266,44 @@ async def require_time(manager, tx, owner):
 
 async def require_dispatch(manager, tx, row):
     """Check original wait policies again at actual paid request admission."""
+    return (await dispatch_policy(manager, tx, row))[0]
+
+
+async def dispatch_policy(manager, tx, row):
     seen = set()
     deadline = None
+    owners = []
     for _ in range(64):
         if row is None or row["job_id"] in seen:
             raise JobError("invalid_control_owner")
         seen.add(row["job_id"])
+        if row["kind"] in ("subagent", "workflow_node"):
+            owners.append((row["job_id"], row["generation"]))
         bound = await require_time(manager, tx, row)
         if bound is not None:
             deadline = bound if deadline is None else min(deadline, bound)
         if row["control_owner_job_id"] is None:
-            return deadline
+            return deadline, tuple(owners)
         row = await manager._row(tx, row["control_owner_job_id"])
     raise JobError("job_depth_exceeded")
+
+
+def note_registered_policy(manager, owner, deadline):
+    """Publish committed owner bounds; unknown writes invalidate admission hints."""
+    scope = (owner["job_id"], owner["generation"])
+
+    def publish(committed):
+        for binding in manager._execution_controls.values():
+            evidence = binding.resource_evidence
+            if scope not in evidence["_control_wait_owners"]:
+                continue
+            if not committed:
+                evidence.pop("_control_wait_deadline", None)
+            elif "_control_wait_deadline" in evidence:
+                previous = evidence["_control_wait_deadline"]
+                evidence["_control_wait_deadline"] = deadline if previous is None else min(previous, deadline)
+
+    manager.after_outcome(lambda: publish(True), lambda: publish(False))
 
 
 async def check_deadline(binding):

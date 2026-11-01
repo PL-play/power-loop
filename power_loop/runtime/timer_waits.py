@@ -131,6 +131,8 @@ async def prepare_binding(manager, tx, actor, source, request, *, caller, sessio
         "completion_scope_job_id": owner["job_id"], "route": route,
         "call_ref": call_ref.to_dict(), "tool_call_id": tool_call_id, "request_hash": _hash(request)}
     binding["evidence_hash"] = _hash(binding)
+    from .owner_waits import note_registered_policy
+    note_registered_policy(manager, owner, policy.deadline_at_ms)
     return binding
 
 

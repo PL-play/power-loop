@@ -213,7 +213,7 @@ async def open_control(binding):
         raise JobError("execution_already_owned")
     from .model_attempts import _no_unknown_sends
     from .model_budgets import ensure_policy, flush_observed_controls
-    from .owner_waits import require_dispatch
+    from .owner_waits import dispatch_policy
 
     await flush_observed_controls(binding)
     async with manager._write() as tx:
@@ -224,7 +224,7 @@ async def open_control(binding):
             raise JobError("model_attempt_owner_mismatch")
         await ensure_policy(binding, transaction=tx, job=source)
         await _no_unknown_sends(manager, tx, source)
-        wait_deadline = await require_dispatch(manager, tx, source)
+        wait_deadline, wait_owners = await dispatch_policy(manager, tx, source)
         import json
 
         from .abort_outcomes import pending_reviews
@@ -282,6 +282,7 @@ async def open_control(binding):
     binding.resource_evidence["_control_tool_plan_required"] = plan_required
     binding.resource_evidence["_control_review_pending"] = review_pending
     binding.resource_evidence["_control_wait_deadline"] = wait_deadline
+    binding.resource_evidence["_control_wait_owners"] = wait_owners
     binding.resource_evidence["_control_state"] = state
     from .root_context import _authority
     binding.resource_evidence["_control_authority"] = _authority(runtime)

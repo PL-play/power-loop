@@ -377,6 +377,16 @@ async def dispatch(attempt):
         raise JobError("model_attempt_owner_mismatch")
     if saved["phase"] != "prepared":
         raise JobError("model_attempt_dispatch_already_admitted")
+    if "_control_wait_deadline" not in binding.resource_evidence:
+        # A failed/unknown wait-registration transaction invalidates this hint.
+        # Resolve its durable policy before any provider dispatch; successful
+        # registrations publish their bound without another database round trip.
+        from .owner_waits import require_dispatch
+        manager = binding.runtime.manager
+        async with manager._write() as tx:
+            row = await manager._fence(tx, binding.actor, binding.lease)
+            deadline = await require_dispatch(manager, tx, row)
+        binding.resource_evidence["_control_wait_deadline"] = deadline
     if binding.runtime._original_budget_config is not None:
         from .execution_budget import authorize
         authorize(attempt)
@@ -601,7 +611,7 @@ async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, re
         control = current(attempt.binding)
         saved = control.get("attempt", attempt.attempt_id)
         await observe_budget(attempt, saved["observation"])
-        await control.checkpoint()
+        await control.checkpoint(force=control.closed)
     except Exception:
         # The actual model response must survive budget-delivery failure. The
         # durable pending record blocks further paid work, not jobs/read/stop.
