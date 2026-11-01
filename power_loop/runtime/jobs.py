@@ -1257,6 +1257,21 @@ class JobManager:
 
     async def _record_result(self, actor, lease, *, outcome, result, resource_state, evidence_only=False, require_children_stopped=False):
         result = _result_value(outcome, result, resource_state)
+        if outcome == "succeeded":
+            from . import wait_decisions, wait_effects
+            from .finalization_plan import PlanChanged
+
+            while True:
+                with wait_decisions.prepared_sources() as proofs:
+                    await wait_effects._prepare_owner_sources(self, actor, lease, check_result=True)
+                    proofs.publishing = True
+                    try:
+                        async with self._write() as tx:
+                            return await self._record_result_tx(tx, actor, lease, outcome=outcome, result=result,
+                                resource_state=resource_state, evidence_only=evidence_only,
+                                require_children_stopped=require_children_stopped)
+                    except PlanChanged:
+                        continue
         async with self._write() as tx:
             return await self._record_result_tx(tx, actor, lease, outcome=outcome, result=result,
                 resource_state=resource_state, evidence_only=evidence_only,

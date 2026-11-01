@@ -231,14 +231,47 @@ async def validate_input(manager, tx, actor, event, *, _retired_input=False):
 
 async def settle_owner(manager, actor, owner_lease):
     """Resolve only waits whose original continuation was actually consumed."""
-    async with manager._write() as tx:
-        owner = await manager._authorize(tx, actor, owner_lease.job_id)
+    while True:
+        with decisions.prepared_sources() as proofs:
+            pending = await _prepare_owner_sources(manager, actor, owner_lease)
+            if not pending:
+                return
+            proofs.publishing = True
+            try:
+                async with manager._write() as tx:
+                    owner = await manager._authorize(tx, actor, owner_lease.job_id)
+                    manager._check_proof(owner, owner_lease)
+                    await settle_owner_tx(manager, tx, actor, owner)
+                return
+            except PlanChanged:
+                continue
+
+
+async def _prepare_owner_sources(manager, actor, owner_lease, *, check_result=False):
+    """Retained main decisions are evidence, never a current owner lease."""
+    async with manager._read() as reader:
+        owner = await manager._authorize(reader, actor, owner_lease.job_id)
         manager._check_proof(owner, owner_lease)
-        await settle_owner_tx(manager, tx, actor, owner)
+        if check_result:
+            ancestor = owner
+            while ancestor is not None:
+                if ancestor["cancel_requested_at"] is not None:
+                    # The writer will retain the actual exit as cancelled;
+                    # an unresolved continuation cannot suppress that evidence.
+                    return False
+                ancestor = await manager._row(reader, ancestor["parent_job_id"]) if ancestor["parent_job_id"] else None
+            from .owner_waits import references
+            await references(manager, reader, actor, owner, success=True)
+        pending = False
+        async for job, _saved, _decision_row, effect in _owner_effects(manager, reader, actor, owner):
+            if effect["delivery_status"] == "handled":
+                await _resolved(manager, reader, job, effect)
+            else:
+                pending = True
+        return pending
 
 
-async def settle_owner_tx(manager, tx, actor, owner):
-    """Same original-owner result transaction; never dispatches or signals work."""
+async def _owner_effects(manager, tx, actor, owner):
     rows = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE control_owner_job_id=? AND control_owner_generation=? AND kind='timer'",
         (owner["job_id"], owner["generation"]))
     for row in rows:
@@ -257,6 +290,12 @@ async def settle_owner_tx(manager, tx, actor, owner):
         effect = await _effect(manager, tx, main, job, saved, decision, data)
         if effect is None or data["request"]["decision"] != "continue":
             continue
+        yield job, saved, decision, effect
+
+
+async def settle_owner_tx(manager, tx, actor, owner):
+    """Same original-owner result transaction; never dispatches or signals work."""
+    async for job, saved, decision, effect in _owner_effects(manager, tx, actor, owner):
         if effect["delivery_status"] == "handled":
             await _resolved(manager, tx, job, effect)
             continue
