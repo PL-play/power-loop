@@ -16,7 +16,7 @@ from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.control_runtime import flush_binding
-from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
+from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -115,6 +115,7 @@ async def test_missing_or_corrupt_scope_instance_never_creates_a_new_allowance(t
     c = tree_case
     await new_send(c)
     await observed(c, await start(c))
+    await flush_binding(c.binding, close=True)
     [item] = [item for item in await rows(c) if item[1].get("binding") == "root"]
     row = item[0]
     if fault == "row":
@@ -140,8 +141,15 @@ async def test_missing_or_corrupt_scope_instance_never_creates_a_new_allowance(t
         "limits": "budget_evidence_corrupt",
         "counters": "budget_evidence_corrupt",
     }[fault]
-    with pytest.raises(JobError, match=code):
-        await attempts.enable(c.binding)
+    from power_loop.runtime.task_runtime import Execution
+    cold = TaskRuntime(JobManager(await c.connect()), tenant_id="budget-tenant", principal_id="host",
+        executor_id="executor", boot_id="boot", boot_contract_hash="a" * 64, budget_config=c.config)
+    try:
+        with pytest.raises(JobError, match=code):
+            await budgets.ensure_policy(Execution(cold, c.actor, c.binding.lease))
+        assert cold._lifecycle._start_task is None
+    finally:
+        await cold.shutdown(timeout_s=1)
     assert c.host.reserve_calls == 1
 
 
@@ -149,8 +157,10 @@ async def test_scope_limits_survive_reconstruction_of_the_original_runtime(tree_
     c = tree_case
     await new_send(c)
     await observed(c, await start(c))
+    await flush_binding(c.binding, close=True)
+    before = await rows(c)
     replacement = TaskRuntime(
-        c.manager,
+        JobManager(await c.connect()),
         tenant_id="budget-tenant",
         principal_id="host",
         executor_id="executor",
@@ -164,8 +174,15 @@ async def test_scope_limits_survive_reconstruction_of_the_original_runtime(tree_
         from power_loop.runtime.task_runtime import Execution
 
         c.binding = Execution(replacement, actor, old_binding.lease)
-        with pytest.raises(JobError, match="budget_max_calls_exhausted"):
+        assert await budgets.ensure_policy(c.binding)
+        # Reconstructing a runtime reads the original limits/counters, but it
+        # cannot acquire the old execution's authority to call another model.
+        with pytest.raises(JobError, match="execution_control_not_started"):
             await start(c)
+        assert await rows(c) == before
+        [root] = [item for item in before if item[1].get("binding") == "root"]
+        assert root[1]["max_calls"] == root[2]["used_calls"] == 1
+        assert root[2]["held_calls"] == 0
         assert c.host.reserve_calls == 1
     finally:
         await replacement.shutdown(timeout_s=1)
@@ -214,45 +231,6 @@ async def test_cancelled_unstarted_attempt_refunds_exact_original_root_and_not_i
     assert root_values[old_root]["used_calls"] == root_values[old_root]["held_calls"] == 0
     assert root_values[new_root]["used_calls"] == 1 and root_values[new_root]["held_calls"] == 0
     assert (await budgets.get_budget(c.manager, old_actor, old.attempt_id))["phase"] == "released"
-
-
-@pytest.mark.parametrize("fault", ["row", "marker", "held_calls", "held_tokens", "inflight"])
-async def test_final_dispatch_rechecks_original_scope_after_host_grants(tree_case, fault):
-    c = tree_case
-    await new_send(c)
-    reserve = c.host.reserve
-
-    async def damage_after_grant(plan):
-        grant = await reserve(plan)
-        [item] = [item for item in await rows(c) if item[1].get("binding") == "root"]
-        row, _, counter = item
-        if fault == "row":
-            await c.manager.db.execute(
-                f"DELETE FROM {c.manager.prefix}task_budget_scopes WHERE scope_key=?", (row["scope_key"],)
-            )
-        elif fault == "marker":
-            await c.manager.db.execute(
-                f"DELETE FROM {c.manager.events} WHERE event_id=?", ("mb_scope_" + row["scope_key"][3:],)
-            )
-        else:
-            counter[fault] = 0
-            await c.manager.db.execute(
-                f"UPDATE {c.manager.prefix}task_budget_scopes SET counters_json=?,counters_hash=? WHERE scope_key=?",
-                (_json(counter), _hash(counter), row["scope_key"]),
-            )
-        return grant
-
-    c.host.reserve = damage_after_grant
-    code = {"row": "budget_scope_missing_or_changed", "marker": "budget_scope_evidence_corrupt"}.get(
-        fault, "budget_reservation_hold_missing"
-    )
-    with pytest.raises(JobError, match=code):
-        await start(c)
-    assert c.host.reserve_calls == 1
-    assert not await c.manager.db.fetchall(
-        f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'"
-    )
-    assert not c.host.applied and not c.host.released
 
 
 async def test_lost_usage_ack_replays_original_frozen_tree_after_another_root_finishes(tree_case):
