@@ -205,9 +205,8 @@ async def enqueue_runtime(runtime, actor, job):
 
 async def candidates(manager, tx, actor):
     """Only explicitly queued original-main deliveries join ordinary processing."""
-    rows = await tx.fetchall(f"SELECT e.event_id,e.job_id FROM {manager.events} e JOIN {manager.jobs} j ON j.job_id=e.job_id "
-        "WHERE e.event_type='managed_effect_delivery' AND e.caller_session_id=? AND j.tenant_id=? AND j.principal_id=? AND j.result_status<>'handled' ORDER BY e.event_id LIMIT 1001",
-        (actor.session_id, actor.tenant_id, actor.principal_id))
+    from .session_obligations import event_rows
+    rows = await event_rows(manager, tx, actor, "managed")
     if len(rows) > 1000:
         raise JobError('managed_delivery_scope_too_large')
     events = []
@@ -277,28 +276,14 @@ async def pending_reviews(manager, tx, actor):
     """Known original notices remain control-only until actual clean handling."""
     from .model_exit import content_reference
     from .pending_calls import require_disposition
-    own = await tx.fetchall(f"SELECT DISTINCT j.* FROM {manager.jobs} j "
-        f"JOIN {manager.events} e ON e.job_id=j.job_id WHERE j.session_id=? "
-        "AND j.kind='send' AND j.supervision_status='open' AND e.event_type='pending_call_disposition' "
-        "AND j.tenant_id=? AND j.principal_id=? ORDER BY j.job_id LIMIT 1001",
-        (actor.session_id, actor.tenant_id, actor.principal_id))
-    transferred = await tx.fetchall(f"SELECT DISTINCT j.* FROM {manager.events} t "
-        f"JOIN {manager.jobs} j ON j.job_id=t.job_id JOIN {manager.events} d ON d.job_id=j.job_id "
-        "WHERE t.caller_session_id=? AND t.event_type='pending_owner_transfer' "
-        "AND d.event_type='pending_call_disposition' AND j.kind='send' AND j.supervision_status='open' "
-        "AND j.tenant_id=? AND j.principal_id=? ORDER BY j.job_id LIMIT 1001",
-        (actor.session_id, actor.tenant_id, actor.principal_id))
-    by_id = {row['job_id']: row for row in (*own, *transferred)}
-    sources = [by_id[key] for key in sorted(by_id)]
+    from .session_obligations import sources as pending_sources
+    sources = await pending_sources(manager, tx, actor, "disposition")
     if len(sources) > 1000:
         raise JobError('managed_delivery_scope_too_large')
     for source in sources:
         await manager._authorize(tx, actor, source['job_id'])
         await require_disposition(manager, tx, source)
-    rows = await tx.fetchall(f'SELECT DISTINCT j.* FROM {manager.events} e '
-        f'JOIN {manager.jobs} j ON j.job_id=e.job_id WHERE e.caller_session_id=? '
-        "AND e.event_type='managed_effect_delivery' AND j.tenant_id=? AND j.principal_id=? "
-        'ORDER BY j.job_id LIMIT 1001', (actor.session_id, actor.tenant_id, actor.principal_id))
+    rows = await pending_sources(manager, tx, actor, "managed")
     if len(rows) > 1000:
         raise JobError('managed_delivery_scope_too_large')
     from .execution_membership import mark_resolved, resolved

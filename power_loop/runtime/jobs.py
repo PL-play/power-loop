@@ -222,6 +222,8 @@ class JobManager:
                     recorder = RecordingTransaction(tx, self.events, (
                         (self.jobs, "job_id"), (self.prefix + "task_executors", "executor_key")))
                     yield recorder
+                    from .session_obligations import refresh
+                    await refresh(self, tx, recorder)
                     if recorder.jobs or recorder.sessions:
                         await bump(self, tx, recorder)
             except BaseException:

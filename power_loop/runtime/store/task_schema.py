@@ -25,7 +25,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 12
-TASK_PROTOCOL_VERSION = 23
+TASK_PROTOCOL_VERSION = 24
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -36,12 +36,14 @@ _QUERY_INDEXES = {
     'idx_events_call': ('job_events', ('caller_session_id', 'tool_call_id', 'event_type')),
     'idx_budget_job': ('task_budget_attempts', ('job_id', 'attempt_id')),
     'idx_context_capacity': ('context_cache', ('size_bytes',)),
+    'idx_obligations_job': ('session_obligations', ('job_id',)),
 }
 _PROTOCOL_2_TABLES = ("task_store", "jobs", "job_events")
 _PROTOCOL_3_TABLES = (*_PROTOCOL_2_TABLES, "task_executors", "task_executor_events")
 _PROTOCOL_21_TABLES = (*_PROTOCOL_3_TABLES, "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
-TASK_TABLES = (*_PROTOCOL_21_TABLES, "execution_checkpoints", "execution_batches", "execution_allocations",
-               "session_controls")
+_PROTOCOL_23_TABLES = (*_PROTOCOL_21_TABLES, "execution_checkpoints", "execution_batches", "execution_allocations",
+                      "session_controls")
+TASK_TABLES = (*_PROTOCOL_23_TABLES, "session_obligations")
 
 
 def message_identity_ddl(statement: str, name: str) -> str:
@@ -115,6 +117,10 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
         *control_tables_ddl(name, prefix),
         f"""CREATE TABLE IF NOT EXISTS {prefix}session_controls (
             session_id {sid} PRIMARY KEY, version {integer} NOT NULL){opts}""",
+        f"""CREATE TABLE IF NOT EXISTS {prefix}session_obligations (
+            session_id {sid} NOT NULL, kind {small} NOT NULL, source_id {small} NOT NULL,
+            job_id {small} NOT NULL, opened_version {integer} NOT NULL,
+            PRIMARY KEY (session_id,kind,source_id)){opts}""",
         # All names stay below MySQL's 64-character identifier limit at prefix=24.
         # Discovery and recovery are explicit indexed steps, never correlated
         # table scans. Keep all index names under 64 chars at prefix=24.
@@ -170,9 +176,11 @@ async def verify_task_schema(db: Database, prefix: str) -> None:
         await _verify_task_schema_tx(tx, db, prefix)
 
 
-async def _verify_query_indexes(tx, db, prefix):
-    expected = {prefix+suffix: columns for suffix, (_table, columns) in _QUERY_INDEXES.items()}
-    owners = {prefix+suffix: prefix+table for suffix, (table, _columns) in _QUERY_INDEXES.items()}
+async def _verify_query_indexes(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSION):
+    indexes = {name: spec for name, spec in _QUERY_INDEXES.items()
+               if protocol >= 24 or spec[0] != "session_obligations"}
+    expected = {prefix+suffix: columns for suffix, (_table, columns) in indexes.items()}
+    owners = {prefix+suffix: prefix+table for suffix, (table, _columns) in indexes.items()}
     actual = {}
     if db.dialect.name == 'sqlite':
         for name in expected:
@@ -207,7 +215,7 @@ async def _verify_query_indexes(tx, db, prefix):
 
 async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSION):
     tables = (_PROTOCOL_2_TABLES if protocol == 2 else _PROTOCOL_3_TABLES if protocol == 3
-              else _PROTOCOL_21_TABLES if protocol < 22 else TASK_TABLES)
+              else _PROTOCOL_21_TABLES if protocol < 22 else _PROTOCOL_23_TABLES if protocol < 24 else TASK_TABLES)
     missing = [t for t in (*_STORE_TABLES, *tables) if not await _table_exists_tx(tx, db.dialect.name, prefix + t)]
     if missing:
         raise StoreSchemaError(f"task schema incomplete: {missing}")
@@ -303,7 +311,7 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
         if any(not columns.issubset(actual.get(prefix + table, set())) for table, columns in required.items()):
             raise StoreSchemaError("task budget schema incomplete")
     if protocol >= 18:
-        await _verify_query_indexes(tx, db, prefix)
+        await _verify_query_indexes(tx, db, prefix, protocol=protocol)
     if protocol >= 22:
         for table, columns in (
             ("execution_checkpoints", ("job_id", "generation", "identity_json", "identity_hash",
@@ -321,6 +329,11 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
         for column in COLUMNS:
             if not await _column_exists(tx, db.dialect.name, prefix + "session_state", column):
                 raise StoreSchemaError("session change counters incomplete")
+    if protocol >= 24:
+        from ..session_obligations import COLUMNS
+        for column in COLUMNS:
+            if not await _column_exists(tx, db.dialect.name, prefix + "session_obligations", column):
+                raise StoreSchemaError("session obligation schema incomplete")
 
 
 async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
@@ -379,8 +392,8 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
             for statement in await migration_steps(tx, db, prefix):
                 await tx.execute(statement)
             if int(row["version"]) in (10, TASK_SCHEMA_VERSION):
-                identity = await tx.fetchone(f"SELECT protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22):
+                identity = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1")
+                if identity and identity["protocol_version"] in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23):
                     old_protocol = identity["protocol_version"]
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
                     if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
@@ -390,6 +403,7 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                     from .execution_migration import import_accounting
                     if old_protocol < 22:
                         await import_accounting(tx, db, prefix)
+                    await _rebuild_obligations(tx, db, prefix, identity["store_id"])
                     if (
                         await tx.execute(
                             f"UPDATE {prefix}task_store SET protocol_version=? WHERE id=1 AND protocol_version=?",
@@ -402,6 +416,7 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                     # Explicit maintenance can add missing candidate indexes;
                     # ordinary open must never silently mutate a live schema.
                     await _run_task_ddl(tx, db, prefix)
+                    await _rebuild_obligations(tx, db, prefix, identity["store_id"])
                 await _verify_task_schema_tx(tx, db, prefix)
                 await tx.execute(f"UPDATE {prefix}schema_migrations SET version=? WHERE id=1", (TASK_SCHEMA_VERSION,))
                 return
@@ -471,6 +486,16 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
         finally:
             await _release_provision_lock(tx, db, prefix)
     await verify_task_schema(db, prefix)
+
+
+async def _rebuild_obligations(tx, db, prefix, store_id):
+    from ..jobs import JobManager
+    from ..session_obligations import rebuild_tx
+    from .store import SessionStore
+
+    store = SessionStore(db, table_prefix=prefix)
+    store._schema_version, store.store_id = TASK_SCHEMA_VERSION, store_id
+    await rebuild_tx(JobManager(store), tx)
 
 
 async def task_schema_preflight(db: Database, prefix: str) -> dict:

@@ -40,6 +40,10 @@ class RecordingTransaction:
         self.jobs: set[str] = set()
         self.sessions: set[str] = set()
         self.writes = 0
+        self.obligation_jobs: set[str] = set()
+        self.obligation_routes: set[str] = set()
+        self.obligation_decisions: dict[str, dict | None] = {}
+        self.obligation_processed: set[str] = set()
 
     def __getattr__(self, name):
         return getattr(self._tx, name)
@@ -57,6 +61,7 @@ class RecordingTransaction:
             f"UPDATE {self._events} SET caller_session_id=? WHERE event_id=?", (session_id, event_id))
         if changed:
             self.sessions.add(session_id)
+            self.obligation_routes.add(event_id)
         return changed
 
     def _written(self, sql):
@@ -103,6 +108,8 @@ class RecordingTransaction:
                 self.sessions.add(GLOBAL)
                 continue
             row = dict(zip(columns, values, strict=True))
+            from .session_obligations import note
+            note(self, row)
             if row.get("event_type") not in OBLIGATION_EVENTS:
                 continue
             if isinstance(row.get("job_id"), str):

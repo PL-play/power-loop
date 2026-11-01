@@ -271,11 +271,8 @@ async def enqueue(manager, tx, row, saved, *, _closures=None):
 
 
 async def candidates(manager, tx, actor):
-    rows = await tx.fetchall(f'SELECT DISTINCT j.* FROM {manager.events} e '
-        f'JOIN {manager.jobs} j ON j.job_id=e.job_id WHERE e.caller_session_id=? '
-        "AND e.event_type='controller_stopped' AND j.tenant_id=? AND j.principal_id=? "
-        "AND j.result_status<>'handled' ORDER BY j.job_id LIMIT 1001",
-        (actor.session_id, actor.tenant_id, actor.principal_id))
+    from .session_obligations import sources
+    rows = await sources(manager, tx, actor, "controller")
     if len(rows) > 1000:
         raise JobError('controller_recovery_scope_too_large')
     result = []

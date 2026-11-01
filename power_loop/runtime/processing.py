@@ -63,10 +63,8 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages, 
         from .wait_notifications import observe_request
         notices = await observe_request(manager, tx, actor, caller, source=send, round_index=round_index,
                                         send_index=send_index, messages=request_rows)
-        results = await tx.fetchall(f"SELECT e.* FROM {manager.events} e JOIN {manager.jobs} j ON j.job_id=e.job_id "
-            "WHERE e.event_type='result' AND j.created_by_session_id=? AND j.tenant_id=? AND j.principal_id=? "
-            "AND j.kind IN ('subagent','workflow') AND j.result_status<>'handled' AND e.delivery_status<>'handled' ORDER BY e.event_id",
-            (actor.session_id, actor.tenant_id, actor.principal_id))
+        from .session_obligations import event_rows
+        results = await event_rows(manager, tx, actor, "result", limit=None)
         from .managed_delivery import candidates
         results.extend(await candidates(manager, tx, actor))
         from .abort_outcomes import candidates as aborted_candidates
@@ -76,8 +74,7 @@ async def prepare(manager, actor, caller, *, round_index, send_index, messages, 
         results = list({event['event_id']: event for event in results}.values())
         inputs = []
         if send['control_owner_job_id'] is not None:
-            inputs = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' "
-                "AND action='nudge' AND delivery_status<>'handled' ORDER BY event_id", (send["control_owner_job_id"],))
+            inputs = await event_rows(manager, tx, actor, "input", job_id=send["control_owner_job_id"], limit=None)
         if report is not None:
             report["quiet"] = not results and not inputs and not notices
         observed = []

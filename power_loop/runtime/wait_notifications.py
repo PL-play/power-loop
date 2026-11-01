@@ -205,8 +205,9 @@ async def observe_request(manager, tx, actor, caller, *, source, round_index, se
     if source["execution_role"] != "main":
         return 0
     visible = {m["seq"]: m for m in messages}
-    notices = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE event_type='wait_notification' AND caller_session_id=? AND delivery_status='delivered' LIMIT ?",
-                               (actor.session_id, _SCOPE_LIMIT + 1))
+    from .session_obligations import event_rows
+    notices = [event for event in await event_rows(manager, tx, actor, "wait")
+               if event["delivery_status"] == "delivered"]
     if len(notices) > _SCOPE_LIMIT:
         raise JobError("wait_notification_scope_too_large")
     for notice in notices:
