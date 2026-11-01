@@ -210,6 +210,13 @@ async def steer(loop, engine, run_id, node_id, sid, message, *, expected_job=Non
                 if recovered is None:
                     raise JobError("nudge_request_original_missing")
                 return recovered
+            if operation.result["mode"] == "continue":
+                from .node_admission import recover_call as recover_resume
+                recovered = await recover_resume(manager, source.actor, ref, call_id, session_id=sid, message=message,
+                    node_key=(run_id, node_id), expected_job=expected_job)
+                if recovered is None:
+                    raise JobError("resume_node_request_original_missing")
+                return recovered
         return operation
 
     async with delegation._gate(manager.store, sid):
@@ -219,6 +226,11 @@ async def steer(loop, engine, run_id, node_id, sid, message, *, expected_job=Non
         binding = engine._task_nodes.get(sid) if engine is not None else None
         if (binding is None or binding.runtime is not runtime or engine._run_id != run_id or binding.stop_renewal.is_set()):
             recovered = await recover_call(manager, source.actor, ref, call_id, session_id=sid, message=message,
+                node_key=(run_id, node_id), expected_job=expected_job)
+            if recovered is not None:
+                return receipt(recovered, True)
+            from .node_admission import recover_call as recover_resume
+            recovered = await recover_resume(manager, source.actor, ref, call_id, session_id=sid, message=message,
                 node_key=(run_id, node_id), expected_job=expected_job)
             if recovered is not None:
                 return receipt(recovered, True)

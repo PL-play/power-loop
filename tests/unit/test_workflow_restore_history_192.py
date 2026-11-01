@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 import pytest
 
@@ -18,7 +19,25 @@ __all__ = ["registry_store", "managed_workflow"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("fault", ["none", "unhandled_child", "child_unknown", "child_membership_missing"])
+@asynccontextmanager
+async def event_status(manager, event_id, value):
+    original = await manager.db.fetchone(f"SELECT delivery_status FROM {manager.events} WHERE event_id=?", (event_id,))
+    assert original is not None
+    await manager.db.execute(f"UPDATE {manager.events} SET delivery_status=? WHERE event_id=?", (value, event_id))
+    try:
+        yield
+    finally:
+        await manager.db.execute(f"UPDATE {manager.events} SET delivery_status=? WHERE event_id=?", (original['delivery_status'], event_id))
+
+
+async def consuming_decision(manager, event_id):
+    decisions = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE event_type='processing_decision'")
+    [original] = [row for row in decisions if json.loads(row['payload_json'])['event']['event_id']==event_id]
+    assert original['delivery_status']=='committed'
+    return original['event_id']
+
+
+@pytest.mark.parametrize("fault", ["none", "uncommitted_child_decision", "derived_child_status", "child_unknown", "child_membership_missing"])
 async def test_plan_checks_original_nested_child_after_all_model_and_driver_sessions_end(managed_workflow, fault):
     _, manager, runtime, _, model, sid, state, _ = managed_workflow
     model.spawn_from_build = True
@@ -27,9 +46,23 @@ async def test_plan_checks_original_nested_child_after_all_model_and_driver_sess
     [child] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='subagent'")
     assert child["result_status"] == "handled" and child["resource_state"] == "stopped"
     before = model.counts.copy()
-    if fault == "unhandled_child":
-        await manager.db.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", ("result_"+child["job_id"],))
-    elif fault == "child_unknown":
+    if fault == "uncommitted_child_decision":
+        decision = await consuming_decision(manager, 'result_'+child['job_id'])
+        async with event_status(manager, decision, 'prepared'):
+            with pytest.raises(JobError):
+                await preview(managed_workflow)
+        assert model.counts==before
+        return
+    if fault == "derived_child_status":
+        result_id = 'result_'+child['job_id']
+        async with event_status(manager, result_id, 'pending_delivery'):
+            plan = await preview(managed_workflow)
+            build = await manager.get_job(runtime.actor(sid), plan['nodes']['BUILD']['lease']['job_id'])
+            assert build.job_id==child['control_owner_job_id'] and model.counts['AUDIT']==1
+            assert (await manager.db.fetchone(f"SELECT delivery_status FROM {manager.events} WHERE event_id=?", (result_id,)))['delivery_status']=='pending_delivery'
+        assert model.counts==before
+        return
+    if fault == "child_unknown":
         await manager.db.execute(f"UPDATE {manager.jobs} SET resource_state='unknown' WHERE job_id=?", (child["job_id"],))
     elif fault == "child_membership_missing":
         await manager.db.execute(f"DELETE FROM {manager.events} WHERE job_id=? AND event_type='execution_membership_seal'", (child["job_id"],))
@@ -44,7 +77,7 @@ async def test_plan_checks_original_nested_child_after_all_model_and_driver_sess
     assert model.counts == before
 
 
-@pytest.mark.parametrize("fault", ["none", "unhandled_nudge", "nudge_target_changed", "nudge_descriptor_changed"])
+@pytest.mark.parametrize("fault", ["none", "uncommitted_nudge_decision", "derived_nudge_status", "nudge_target_changed", "nudge_descriptor_changed"])
 async def test_plan_verifies_real_handled_nudge_with_original_detached_descriptor(managed_workflow, monkeypatch, fault):
     store, manager, _, loop, model, parent, state, _ = managed_workflow
     state["on_complete"] = None
@@ -61,16 +94,28 @@ async def test_plan_verifies_real_handled_nudge_with_original_detached_descripto
     assert (await store.get_session(c.sid)).parent_session_id is None
     [event] = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE action='nudge'")
     assert event["delivery_status"] == "handled"
-    if fault == "unhandled_nudge":
-        await manager.db.execute(f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (event["event_id"],))
-    elif fault in ("nudge_target_changed", "nudge_descriptor_changed"):
+    before = model.counts.copy()
+    if fault == "uncommitted_nudge_decision":
+        decision = await consuming_decision(manager, event['event_id'])
+        async with event_status(manager, decision, 'prepared'):
+            with pytest.raises(JobError):
+                await preview(managed_workflow)
+        assert model.counts==before
+        return
+    if fault == "derived_nudge_status":
+        async with event_status(manager, event['event_id'], 'pending_delivery'):
+            plan = await preview(managed_workflow)
+            assert plan['nodes']['BUILD']['binding']['session_id']==c.sid and c.run_id not in runner._ENGINES
+            assert (await manager.db.fetchone(f"SELECT delivery_status FROM {manager.events} WHERE event_id=?", (event['event_id'],)))['delivery_status']=='pending_delivery'
+        assert model.counts==before
+        return
+    if fault in ("nudge_target_changed", "nudge_descriptor_changed"):
         body = json.loads(event["payload_json"])
         if fault == "nudge_target_changed":
             body["request"]["target"]["generation"] = True
         else:
             body["request"]["node"]["route"] = ["forged"]
         await manager.db.execute(f"UPDATE {manager.events} SET payload_json=? WHERE event_id=?", (json.dumps(body), event["event_id"]))
-    before = model.counts.copy()
     if fault == "none":
         plan = await preview(managed_workflow)
         assert plan["nodes"]["BUILD"]["binding"]["session_id"] == c.sid

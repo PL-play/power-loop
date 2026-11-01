@@ -8,9 +8,9 @@ from contextvars import ContextVar
 from dataclasses import asdict
 from types import SimpleNamespace
 
-from .jobs import JobError, JobLease, _hash, _json, _operation
+from .jobs import JobError, JobLease, _hash, _json
 from .jobs import verify_stored as _verify_stored
-from .result_revisions import execution_id, result_id
+from .result_revisions import execution_id
 
 _PREPARED = ContextVar("power_loop_prepared_node_resume", default=None)
 
@@ -50,106 +50,8 @@ async def admit(manager, actor, job_id, *, caller, workflow, call_ref, tool_call
         "session_id": node["session_id"], "message": message, "previous_generation": generation,
         "node": {**node, "generation": target.generation}, "contract_hash": _hash(contract),
         "previous_result_hash": _hash(previous_result), "plan": plan, "lease_ms": lease_ms}
-    key = manager._origin_key(actor, "nudge", call_ref, tool_call_id, None)
-    fingerprint = _hash([request, call_ref.to_dict()])
-    async with manager._write() as tx:
-        old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE operation_key=?", (key,))
-        if old:
-            await manager._authorize(tx, actor, old["job_id"])
-            if old["request_hash"] != fingerprint:
-                raise JobError("operation_conflict")
-            return _operation(old), True
-        await manager._validate_call(tx, actor, call_ref, tool_call_id)
-        for action in ("create", "steer"):
-            if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE operation_key=?",
-                (manager._origin_key(actor, action, call_ref, tool_call_id, None),)):
-                raise JobError("operation_conflict")
-        source = await manager._fence(tx, actor, caller)
-        origin = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND action='create'", (caller.job_id,))
-        send_index = json.loads(origin["payload_json"]).get("request", {}).get("send_index") if origin else None
-        if (source["kind"] != "send" or source["session_id"] != actor.session_id or source["execution_role"] != "main" or
-                isinstance(send_index, bool) or not isinstance(send_index, int) or send_index != call_ref.send_index):
-            raise JobError("resume_caller_mismatch")
-        wf = await manager._fence(tx, actor, workflow)
-        job = await manager._authorize(tx, actor, job_id)
-        if (wf["kind"] != "workflow" or wf["created_by_session_id"] != actor.session_id or
-                job["kind"] != "workflow_node" or job["execution_role"] != "workflow_node" or
-                job["parent_job_id"] != wf["job_id"] or job["control_owner_job_id"] != wf["job_id"] or
-                job["created_by_session_id"] != wf["session_id"]):
-            raise JobError("resume_target_mismatch")
-        from .workflow_controller import for_node
-        await for_node(manager, tx, job)
-        await manager._supervision_barriers(tx, job)
-        await manager._control_owners(tx, job)
-        if job["generation"] != generation:
-            raise JobError("resume_generation_changed")
-        from .finalization import require_resumable
-        await require_resumable(manager, tx, job)
-        if (job["outcome"] != "succeeded" or job["resource_state"] != "stopped" or job["intake"] != "closed"):
-            raise JobError("resume_target_unsettled")
-        from .node_inputs import descriptor, is_closed
-        if _hash(await descriptor(manager, tx, job, node["session_id"])) != _hash(node) or not await is_closed(manager, tx, job, node["session_id"]):
-            raise JobError("node_input_binding_mismatch")
-        canonical = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=? AND job_id=? AND event_type='result'",
-            (result_id(job_id, generation), job_id))
-        if (canonical is None or _hash(json.loads(canonical["payload_json"])["result"]) != _hash(previous_result) or
-                _hash(json.loads(job["result_json"])) != _hash(previous_result)):
-            raise JobError("node_resume_result_mismatch")
-        wf_op = await tx.fetchone(f"SELECT event_id,payload_json FROM {manager.events} WHERE job_id=? AND action='create'", (wf["job_id"],))
-        from power_loop.workflow import journal
-        from power_loop.workflow.spec import WorkflowSpec
-        if wf_op is None or wf_op["event_id"][3:] != node["workflow_run_id"]:
-            raise JobError("workflow_run_mismatch")
-        frozen = json.loads(wf_op["payload_json"])["request"]["spec"]
-        _, _, expected_plan = selection(WorkflowSpec.from_json(frozen), node["node_id"])
-        if _hash(expected_plan.to_dict()) != _hash(plan):
-            raise JobError("node_resume_plan_mismatch")
-        journal_row = await tx.fetchone(f"SELECT value_json FROM {manager.store.t.session_runtime_state} WHERE session_id=? AND state_key=?",
-            (actor.session_id, journal.run_key(node["workflow_run_id"])))
-        j = json.loads(journal_row["value_json"]) if journal_row else {}
-        steps = [s for s in j.get("steps", []) if s.get("node_id") == node["node_id"]]
-        fields = ("node_id", "status", "session_id", "text", "payload", "usage", "error")
-        if (j.get("status") != "running" or len(steps) != 1 or
-                _hash({k: steps[0].get(k) for k in fields}) != _hash({k: previous_result.get(k) for k in fields})):
-            raise JobError("node_resume_journal_mismatch")
-        await manager._require_scope_ready(tx, job)
-        saved = await tx.fetchone(f"SELECT value_json FROM {manager.store.t.session_runtime_state} WHERE session_id=? AND state_key='workflow_execution_contract'", (node["session_id"],))
-        if not isinstance(contract, dict) or contract.get("version") != 1 or saved is None or _hash(json.loads(saved["value_json"])) != _hash(contract):
-            raise JobError("resume_contract_mismatch")
-        state = await tx.fetchone(f"SELECT pending_json FROM {manager.store.t.session_state} WHERE session_id=?", (node["session_id"],))
-        if state is not None and state["pending_json"]:
-            raise JobError("resume_tools_pending")
-        if await tx.fetchone(f"SELECT item_id FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND status IN ('pending','claimed')", (node["session_id"],)):
-            raise JobError("resume_input_pending")
-        from .execution_membership import require_current, start
-        await require_current(manager, tx, job)
-        from .finalization import require_node_consumed
-        await require_node_consumed(manager, tx, job)
-        now = manager.now()
-        from .executor_registry import ExecutorIdentity, require_accepting
-        executor = await require_accepting(manager, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
-            required=job["executor_key"] is not None or source["executor_key"] is not None or wf["executor_key"] is not None)
-        await tx.write_job(job_id, f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,status='running',supervision_status='open',"
-            "intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,version=version+1,updated_at=? WHERE job_id=?", (target.generation, executor_id, boot_id, executor["executor_key"] if executor else None, now+lease_ms, now, job_id), obligations=True)
-        payload = {"job_id": job_id, "session_id": node["session_id"], "run_id": node["workflow_run_id"],
-            "mode": "continue", "status": "accepted", "generation": target.generation,
-            "result_event_id": result_id(job_id, target.generation), "request": request}
-        op = await manager._insert_operation(tx, job_id=job_id, version=job["version"]+1, actor=actor, action="nudge",
-            key=key, fingerprint=fingerprint, call_ref=call_ref, tool_call_id=tool_call_id, payload=payload)
-        await tx.update_event(op.job_id, f"UPDATE {manager.events} SET delivery_status='pending_delivery' WHERE event_id=?", (op.operation_id,), notify=True)
-        for event_id, kind, data in ((execution_id(job_id, target.generation), "execution", {"operation_id": op.operation_id,
-                "run_id": node["workflow_run_id"], "target": request["target"], "workflow": request["workflow"]}),
-                (manager._node_session_event_id(job_id, node["session_id"], target.generation), "node_session", request["node"])):
-            await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (event_id, job_id, kind, job["version"]+1, _json(data), "not_applicable", now))
-        cols = ("session_id", "item_id", "kind", "mode", "status", "content", "created_at")
-        await manager.store.signal_changes(tx, node["session_id"], "inbox")
-        if not await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, cols),
-                (node["session_id"], "nudge:"+op.operation_id, "relay", "steer", "pending", message, now)):
-            raise JobError("nudge_inbox_conflict")
-        await start(manager, tx, await manager._row(tx, job_id))
-        from .finalization import reopen
-        await reopen(manager, tx, job, asdict(target), op.operation_id)
-        return op, False
+    from .node_admission import admit as admit_node
+    return await admit_node(manager, actor, request, call_ref, tool_call_id)
 
 
 async def validate_execution(manager, tx, job, sid, *, dispatch=False):
@@ -221,42 +123,42 @@ def reserve(loop, engine, source, ref, call_id, node_id, sid, message, *, expect
     async def repair():
         operation, binding, owned = None, None, False
         try:
-            rows = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE parent_job_id=? AND kind='workflow_node' AND tenant_id=? AND principal_id=?",
-                (workflow.lease.job_id, source.actor.tenant_id, source.actor.principal_id))
             # Resolve by full physical descriptor, never by node ID/latest journal.
             matches = []
             from .node_inputs import descriptor
-            for job_id in {row["job_id"] for row in rows}:
-                job = await manager.get_job(source.actor, job_id)
-                if job.parent_job_id != workflow.lease.job_id:
-                    continue
-                try:
-                    data = await descriptor(manager, manager.db, asdict(job), sid)
-                except JobError:
-                    continue
-                if data["node_id"] == node_id and data["workflow_run_id"] == engine._run_id:
-                    matches.append((job, data))
+            async with manager._read() as reader:
+                rows = await reader.fetchall(f"SELECT * FROM {manager.jobs} WHERE parent_job_id=? AND kind='workflow_node' AND tenant_id=? AND principal_id=?",
+                    (workflow.lease.job_id, source.actor.tenant_id, source.actor.principal_id))
+                for job in rows:
+                    try:
+                        data = await descriptor(manager, reader, job, sid)
+                    except JobError:
+                        continue
+                    if data["node_id"] == node_id and data["workflow_run_id"] == engine._run_id:
+                        matches.append((job, data))
             if len(matches) != 1:
                 raise JobError("node_input_binding_mismatch")
             job, data = matches[0]
-            if expected_job is not None and (job.job_id, job.generation) != expected_job:
+            if expected_job is not None and (job["job_id"], job["generation"]) != expected_job:
                 raise JobError("workflow_node_generation_changed")
             contract = await manager.store.get_runtime_state(sid, "workflow_execution_contract")
             child = await workflow_continuation_loop(loop, sid, expected_contract=contract)
             if child._lock_for(sid).locked():
                 raise JobError("resume_session_busy")
             try:
-                operation, replayed = await manager.resume_workflow_node(source.actor, job.job_id, caller=source.lease,
+                operation, replayed = await manager.resume_workflow_node(source.actor, job["job_id"], caller=source.lease,
                     workflow=workflow.lease, call_ref=ref, tool_call_id=call_id, node=data, message=message,
                     previous_result=previous_result, contract=contract, plan=frozen_plan,
                     executor_id=runtime.executor_id, boot_id=runtime.boot_id, lease_ms=runtime.lease_ms)
             except Exception:
-                saved = await manager.operation_for_call(source.actor, ref, call_id)
+                from .node_admission import recover_call
+                saved = await recover_call(manager, source.actor, ref, call_id, session_id=sid, message=message,
+                    node_key=(engine._run_id, node_id), expected_job=(job["job_id"], job["generation"]))
                 request = saved.result.get("request", {}) if saved else {}
-                if (saved is None or saved.action != "nudge" or saved.result.get("mode") != "continue" or saved.job_id != job.job_id or
+                if (saved is None or saved.action != "nudge" or saved.result.get("mode") != "continue" or saved.job_id != job["job_id"] or
                         request.get("session_id") != sid or request.get("message") != message or
-                        request.get("previous_generation") != job.generation or request.get("workflow") != asdict(workflow.lease) or
-                        request.get("caller") != asdict(source.lease) or _hash(request.get("node")) != _hash({**data, "generation": job.generation+1}) or
+                        request.get("previous_generation") != job["generation"] or request.get("workflow") != asdict(workflow.lease) or
+                        request.get("caller") != asdict(source.lease) or _hash(request.get("node")) != _hash({**data, "generation": job["generation"]+1}) or
                         _hash(request.get("plan")) != _hash(frozen_plan) or request.get("contract_hash") != _hash(contract) or
                         request.get("previous_result_hash") != _hash(previous_result)):
                     raise

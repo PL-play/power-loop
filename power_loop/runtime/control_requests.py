@@ -34,7 +34,7 @@ def rejection_id(request_id):
 
 def _origin(manager, actor, request, action):
     from .managed_effects import _ref
-    return manager._origin_key(actor, "nudge" if action == "resume" else action,
+    return manager._origin_key(actor, "nudge" if action in ("resume", "resume_node") else action,
         _ref(request["call_ref"]), request["tool_call_id"], None)
 
 
@@ -51,6 +51,9 @@ def _domain(action):
     if action == "resume":
         from . import subagent_admission
         return subagent_admission
+    if action == "resume_node":
+        from . import node_admission
+        return node_admission
     raise JobError("control_request_action_unknown")
 
 
