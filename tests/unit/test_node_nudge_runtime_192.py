@@ -178,8 +178,8 @@ async def test_nudge_rechecks_fenced_execution_inside_admission(live_node, monke
             raise
     monkeypatch.setattr(c.manager, "accept_nudge", break_admission)
     if fault == "source_cancel":
-        with pytest.raises(JobError, match="cancel_requested"):
-            await c.issue()
+        result = await c.issue()
+        assert result.status == "degraded" and "cancel_requested" in result.final_text
     else:
         await c.issue()
     expected = {"target_cancel": "cancel_requested", "source_cancel": "cancel_requested", "old_generation": "stale_execution",
