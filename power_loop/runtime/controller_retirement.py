@@ -7,23 +7,21 @@ from dataclasses import asdict, dataclass
 from .jobs import JobError, _hash
 
 
-def identity(manager, lease, *, legacy=False):
+def identity(manager, lease):
     value = asdict(lease) if not isinstance(lease, dict) else lease
-    return ('controller_retired_' if legacy else 'ctl_retire_') + _hash([manager.store.store_id, value])[:48]
+    return 'ctl_retire_' + _hash([manager.store.store_id, value])[:48]
 
 
 async def read_retirement(manager, tx, owner, lease, *, optional=False):
     from .tool_call_plans import _read
-    keys = [identity(manager, lease), identity(manager, lease, legacy=True)]
-    rows = await tx.fetchall(f'SELECT * FROM {manager.events} WHERE event_id IN (?,?)', tuple(keys))
-    if not rows:
+    key = identity(manager, lease)
+    event = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (key,))
+    if event is None:
         if optional:
             return None
         raise JobError('controller_retirement_required')
-    if len(rows) != 1:
-        raise JobError('controller_retirement_ambiguous')
-    value = await _read(manager, tx, rows[0]['event_id'], owner, 'controller_retired')
-    return rows[0], value
+    value = await _read(manager, tx, key, owner, 'controller_retired')
+    return event, value
 
 
 @dataclass(eq=False)

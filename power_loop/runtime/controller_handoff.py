@@ -7,8 +7,8 @@ from .jobs import JobError, _hash
 from .model_exit import content_reference
 
 
-def identity(manager, source, *, legacy=False):
-    return ('controller_review_' if legacy else 'ctl_review_') + _hash([manager.store.store_id, source['job_id'], source['generation']])[:48]
+def identity(manager, source):
+    return 'ctl_review_' + _hash([manager.store.store_id, source['job_id'], source['generation']])[:48]
 
 
 def _public(original, key, owner):
@@ -25,15 +25,12 @@ async def read(manager, tx, source, result, *, optional=True):
     from .original_owner_review import read as original_owner
     from .tool_call_plans import _read
 
-    candidates = await tx.fetchall(f'SELECT event_id FROM {manager.events} WHERE event_id IN (?,?)',
-        (identity(manager, source), identity(manager, source, legacy=True)))
-    if not candidates:
+    key = identity(manager, source)
+    candidate = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', (key,))
+    if candidate is None:
         if optional:
             return None
         raise JobError('controller_handoff_required')
-    if len(candidates) != 1:
-        raise JobError('controller_handoff_ambiguous')
-    key = candidates[0]['event_id']
     data = await _read(manager, tx, key, source, 'controller_review_handoff')
     binding = await original_owner(manager, tx, source)
     if binding is None:

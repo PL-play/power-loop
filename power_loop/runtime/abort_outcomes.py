@@ -181,8 +181,8 @@ async def _inbox(manager, tx, source, delivery):
         raise JobError('abort_outcome_inbox_mismatch')
     if row['status'] == 'transferred':
         from .controller_handoff import identity
-        found = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id IN (?,?) AND event_type='controller_review_handoff'",
-                                  (identity(manager, source), identity(manager, source, legacy=True)))
+        found = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=? AND event_type='controller_review_handoff'",
+                                  (identity(manager, source),))
         if found is None or row['item_id'] != notice_id(manager, source):
             raise JobError('abort_outcome_inbox_mismatch')
     return row

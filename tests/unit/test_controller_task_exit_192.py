@@ -221,5 +221,3 @@ async def test_new_controller_event_identifiers_fit_every_declared_task_store_di
     for identity in (handoff_id(manager, source), retirement_id(manager, lease), exit_id(manager, lease),
                      stop_id(manager, source), notice_id(manager, source)):
         assert len(identity) <= 64
-    assert len(handoff_id(manager, source, legacy=True)) > 64
-    assert len(retirement_id(manager, lease, legacy=True)) > 64
