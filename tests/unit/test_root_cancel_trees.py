@@ -107,7 +107,7 @@ async def test_begin_rollback_does_not_publish_barrier_or_lose_request_retry(roo
         with pytest.raises(OSError, match="admission barrier rolled back"):
             await stop(c)
     assert await stops(c.manager) == []
-    assert not await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.session_runtime_state} WHERE state_key LIKE ?",
+    assert not await c.manager.db.fetchall(f"SELECT * FROM {c.manager.prefix}task_context_events WHERE state_key LIKE ?",
                                          ("power-loop.root-stop%",))
     await send(c)
     receipt = await stop(c)
@@ -188,7 +188,7 @@ async def test_lost_metadata_ack_reuses_every_committed_original_and_never_repla
         async with transaction() as tx:
             yield tx
             if not lost:
-                ready = await tx.fetchone(f"SELECT state_key FROM {c.store.t.session_runtime_state} WHERE state_key LIKE ?",
+                ready = await tx.fetchone(f"SELECT state_key FROM {c.manager.prefix}task_context_events WHERE state_key LIKE ?",
                                           (f"power-loop.root-stop-{phase}.v1:%",)) is not None
         if ready:
             lost.append(True)
@@ -200,14 +200,14 @@ async def test_lost_metadata_ack_reuses_every_committed_original_and_never_repla
             await stop(c)
     assert lost == [True]
     originals = await c.manager.db.fetchall(
-        f"SELECT * FROM {c.store.t.session_runtime_state} WHERE state_key LIKE ? ORDER BY state_key",
+        f"SELECT * FROM {c.manager.prefix}task_context_events WHERE state_key LIKE ? ORDER BY state_key",
         ("power-loop.root-stop%",))
     original_stops = await stops(c.manager)
     assert len(original_stops) == (2 if phase == "request" else 0)
     cold = JobManager(await c.connect())
     receipt = await stop(c, manager=cold)
     after = await cold.db.fetchall(
-        f"SELECT * FROM {c.store.t.session_runtime_state} WHERE state_key LIKE ? ORDER BY state_key",
+        f"SELECT * FROM {c.manager.prefix}task_context_events WHERE state_key LIKE ? ORDER BY state_key",
         ("power-loop.root-stop%",))
     final_stops = await stops(cold)
     assert all(original in after for original in originals)
@@ -234,8 +234,9 @@ async def test_cold_scope_retry_refuses_invalid_original_target_without_repair_o
         with pytest.raises(OSError, match="scope committed"):
             await stop(c)
     original = await c.manager.db.fetchone(
-        f"SELECT * FROM {c.store.t.session_runtime_state} WHERE state_key LIKE ?", ("power-loop.root-stop-scope.v1:%",))
-    value = json.loads(original["value_json"])
+        f"SELECT * FROM {c.manager.prefix}task_context_events WHERE state_key LIKE ?", ("power-loop.root-stop-scope.v1:%",))
+    assert original is not None
+    value = json.loads(original["payload_json"])
     source = value["response"]["sources"][0]
     if damage == "generation":
         source["root_generation"] = 999
@@ -246,7 +247,7 @@ async def test_cold_scope_retry_refuses_invalid_original_target_without_repair_o
     # Exercise the cold source comparison, beyond the envelope checksum alone.
     value["evidence_hash"] = _hash({key: item for key, item in value.items() if key != "evidence_hash"})
     encoded = json.dumps(value)
-    await c.manager.db.execute(f"UPDATE {c.store.t.session_runtime_state} SET value_json=? WHERE state_key=?",
+    await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_context_events SET payload_json=? WHERE state_key=?",
                               (encoded, original["state_key"]))
     try:
         jobs = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} ORDER BY job_id")
@@ -257,12 +258,12 @@ async def test_cold_scope_retry_refuses_invalid_original_target_without_repair_o
         assert await cold.db.fetchall(f"SELECT * FROM {cold.jobs} ORDER BY job_id") == jobs
         assert await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id") == events
         assert (await cold.db.fetchone(
-            f"SELECT value_json FROM {c.store.t.session_runtime_state} WHERE state_key=?",
-            (original["state_key"],)))["value_json"] == encoded
+            f"SELECT payload_json FROM {c.manager.prefix}task_context_events WHERE state_key=?",
+            (original["state_key"],)))["payload_json"] == encoded
         assert len(c.model.calls) == 1 and await stops(cold) == []
     finally:
-        await c.manager.db.execute(f"UPDATE {c.store.t.session_runtime_state} SET value_json=? WHERE state_key=?",
-                                  (original["value_json"], original["state_key"]))
+        await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_context_events SET payload_json=? WHERE state_key=?",
+                                  (original["payload_json"], original["state_key"]))
 
 
 async def spawn_worker(c, tmp_path, mode):

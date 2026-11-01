@@ -81,7 +81,7 @@ def require_declared_control_writes(monkeypatch):
 
     async def checked(self, sql, params=()):
         if re.match(r"\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b", sql, re.I):
-            for table in (self._events, self._jobs, self._executors):
+            for table in (self._events, self._jobs, self._executors, self._context_events):
                 assert not re.search(r"\b" + re.escape(table) + r"\b", sql), (
                     "Control writes must declare an explicit intent", sql)
         return await execute(self, sql, params)

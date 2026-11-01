@@ -17,12 +17,12 @@ def _barrier_key(actor, document):
 
 
 async def _state(manager, tx, actor, key):
-    row = await tx.fetchone(f"SELECT value_json FROM {manager.store.t.session_runtime_state} "
+    row = await tx.fetchone(f"SELECT payload_json FROM {manager.prefix}task_context_events "
         "WHERE session_id=? AND state_key=?", (actor.session_id, key))
     if row is None:
         return None
     try:
-        value = json.loads(row["value_json"])
+        value = json.loads(row["payload_json"])
         shapes = ({"version", "actor", "document", "first_request_hash", "evidence_hash"},
             {"version", "actor", "request", "response", "evidence_hash"})
         if (type(value) is not dict or set(value) not in shapes
@@ -37,10 +37,9 @@ async def _state(manager, tx, actor, key):
 async def _save(manager, tx, actor, key, value):
     value = {"version": 1, "actor": asdict(actor), **value}
     value["evidence_hash"] = _hash(value)
-    sql = manager.db.dialect.upsert(manager.store.t.session_runtime_state,
-        ("session_id", "state_key"), ("value_json", "updated_at"))
-    await manager.store.signal_changes(tx, actor.session_id, "runtime")
-    await tx.execute(sql, (actor.session_id, key, _json(value), manager.now()))
+    columns = ('event_id', 'session_id', 'state_key', 'payload_json', 'created_at')
+    identity = 'rootctl_' + _hash([asdict(actor), key])[:48]
+    await tx.append_context_event(columns, (identity, actor.session_id, key, _json(value), manager.now()))
     return value
 
 

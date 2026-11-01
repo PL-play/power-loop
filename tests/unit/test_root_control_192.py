@@ -157,7 +157,7 @@ async def test_final_receipt_failure_preserves_committed_stop_and_barrier_for_ex
     assert saved.cancel_requested_at is not None
     assert saved.status == original.status and saved.result == original.result
     [operation] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='stop'")
-    assert not await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.session_runtime_state} WHERE state_key LIKE ?",
+    assert not await c.manager.db.fetchall(f"SELECT * FROM {c.manager.prefix}task_context_events WHERE state_key LIKE ?",
                                          ("power-loop.root-stop-request.v1:%",))
     with pytest.raises(JobError, match="root_context_cancelled"):
         await send(c)
@@ -177,8 +177,9 @@ async def test_corrupt_original_evidence_fails_closed_without_reconstruction(roo
     if fault in ("missing-barrier", "stop-receipt"):
         receipt = await stop(c)
         if fault == "missing-barrier":
-            await c.manager.db.execute(f"DELETE FROM {c.store.t.session_runtime_state} WHERE state_key LIKE ?",
+            deleted = await c.manager.db.execute(f"DELETE FROM {c.manager.prefix}task_context_events WHERE state_key LIKE ?",
                 ("power-loop.root-stop.v1:%",))
+            assert deleted == 1
         else:
             await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_id=?",
                 (receipt["roots"][0]["operation"]["operation_id"],))

@@ -1,4 +1,4 @@
-"""Explicit v12 task schema; ordinary storage uses v11.
+"""Explicit v13 task schema; ordinary storage uses v11.
 
 No live store is migrated by opening it. A maintenance caller must close writers
 and explicitly invoke migrate_task_schema; old binaries reject the current stamp or
@@ -10,6 +10,7 @@ processing decisions in the handler's tree; target handling flags remain derived
 Protocol21 permits independent initial accounting evidence without a model
 exit record. Protocol 23 adds atomic session change counters. Older writers must
 not overwrite this evidence or release execution.
+Protocol35 retains host context-control originals in task_context_events.
 """
 
 from __future__ import annotations
@@ -29,8 +30,8 @@ from .schema import (
     validate_table_prefix,
 )
 
-TASK_SCHEMA_VERSION = 12
-TASK_PROTOCOL_VERSION = 34
+TASK_SCHEMA_VERSION = 13
+TASK_PROTOCOL_VERSION = 35
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -48,7 +49,8 @@ _PROTOCOL_3_TABLES = (*_PROTOCOL_2_TABLES, "task_executors", "task_executor_even
 _PROTOCOL_21_TABLES = (*_PROTOCOL_3_TABLES, "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
 _PROTOCOL_23_TABLES = (*_PROTOCOL_21_TABLES, "execution_checkpoints", "execution_batches", "execution_allocations",
                       "session_controls")
-TASK_TABLES = (*_PROTOCOL_23_TABLES, "session_obligations")
+_PROTOCOL_34_TABLES = (*_PROTOCOL_23_TABLES, "session_obligations")
+TASK_TABLES = (*_PROTOCOL_34_TABLES, "task_context_events")
 
 
 def message_identity_ddl(statement: str, name: str) -> str:
@@ -98,6 +100,10 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             caller_session_id {sid}, tool_call_id {sid}, call_ref_json {body},
             receipt_ref_json {body}, payload_json {body} NOT NULL,
             delivery_status {small} NOT NULL, created_at {integer} NOT NULL){opts}""",
+        f"""CREATE TABLE IF NOT EXISTS {prefix}task_context_events (
+            event_id {small} PRIMARY KEY, session_id {sid} NOT NULL, state_key {sid} NOT NULL,
+            payload_json {body} NOT NULL, created_at {integer} NOT NULL,
+            UNIQUE (session_id,state_key)){opts}""",
         f"""CREATE TABLE IF NOT EXISTS {prefix}task_executors (
             executor_key {small} PRIMARY KEY, tenant_id {sid} NOT NULL, principal_id {sid} NOT NULL,
             executor_id {small} NOT NULL, boot_id {small} NOT NULL, contract_hash {small} NOT NULL,
@@ -220,7 +226,8 @@ async def _verify_query_indexes(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSIO
 
 async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSION):
     tables = (_PROTOCOL_2_TABLES if protocol == 2 else _PROTOCOL_3_TABLES if protocol == 3
-              else _PROTOCOL_21_TABLES if protocol < 22 else _PROTOCOL_23_TABLES if protocol < 24 else TASK_TABLES)
+              else _PROTOCOL_21_TABLES if protocol < 22 else _PROTOCOL_23_TABLES if protocol < 24
+              else _PROTOCOL_34_TABLES if protocol < 35 else TASK_TABLES)
     missing = [t for t in (*_STORE_TABLES, *tables) if not await _table_exists_tx(tx, db.dialect.name, prefix + t)]
     if missing:
         raise StoreSchemaError(f"task schema incomplete: {missing}")
@@ -391,14 +398,14 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
         await _acquire_provision_lock(tx, db, prefix)
         try:
             row = await tx.fetchone(f"SELECT version FROM {prefix}schema_migrations WHERE id=1")
-            if row is None or int(row["version"]) not in (9, 10, 11, TASK_SCHEMA_VERSION):
+            if row is None or int(row["version"]) not in (9, 10, 11, 12, TASK_SCHEMA_VERSION):
                 raise StoreSchemaError("task migration supports base or task schemas only")
             from .change_signals import migration_steps
             for statement in await migration_steps(tx, db, prefix):
                 await tx.execute(statement)
-            if int(row["version"]) in (10, TASK_SCHEMA_VERSION):
+            if int(row["version"]) in (10, 12, TASK_SCHEMA_VERSION):
                 identity = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23):
+                if identity and identity["protocol_version"] in (*range(2, 24), 34):
                     old_protocol = identity["protocol_version"]
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
                     if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
@@ -408,6 +415,8 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                     from .execution_migration import import_accounting
                     if old_protocol < 22:
                         await import_accounting(tx, db, prefix)
+                    from .context_migration import import_context_events
+                    await import_context_events(tx, db, prefix)
                     await _rebuild_obligations(tx, db, prefix, identity["store_id"])
                     if (
                         await tx.execute(
@@ -420,6 +429,8 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                 elif identity and identity['protocol_version'] == TASK_PROTOCOL_VERSION:
                     # Explicit maintenance can add missing candidate indexes;
                     # ordinary open must never silently mutate a live schema.
+                    if not await _table_exists_tx(tx, db.dialect.name, prefix+'task_context_events'):
+                        raise StoreSchemaError('task context original table missing; restore originals before maintenance')
                     await _run_task_ddl(tx, db, prefix)
                     await _rebuild_obligations(tx, db, prefix, identity["store_id"])
                 await _verify_task_schema_tx(tx, db, prefix)

@@ -56,6 +56,7 @@ class ControlTransaction(ControlReadView):
         self._events = manager.events
         self._jobs = manager.jobs
         self._executors = manager.prefix + "task_executors"
+        self._context_events = manager.prefix + "task_context_events"
         self._obligations = manager.prefix + "session_obligations"
         self._dialect = manager.db.dialect
         self.jobs: set[str] = set()
@@ -100,6 +101,13 @@ class ControlTransaction(ControlReadView):
         sql = (self._dialect.insert_ignore(self._events, columns) if ignore else
                f"INSERT INTO {self._events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})")
         return await self._execute(sql, values)
+
+    async def append_context_event(self, columns, values):
+        """Append a host task-context original, before any root need exist."""
+        event = dict(zip(columns, values, strict=True))
+        self.sessions.add(event['session_id'])
+        return await self._execute(f"INSERT INTO {self._context_events} ({','.join(columns)}) VALUES ("
+            + ','.join('?' for _ in columns) + ')', values)
 
     async def append_event_if_current(self, event, row):
         """Append mechanical evidence without changing a superseding owner."""
