@@ -133,12 +133,18 @@ async def _event(manager, tx, identity, version):
     return row, _decode(manager, identity, row)
 
 
-async def _row(manager, tx, identity, *, required=True):
+async def _row(manager, tx, identity, *, required=True, admission=False, exclusive=False):
     executors, _ = _tables(manager)
-    row = await tx.fetchone(f"SELECT * FROM {executors} WHERE executor_key=?", (_key(manager, identity),))
+    writer = manager._control_intents.get()
+    row = (await writer.executor_admission(_key(manager, identity), exclusive=exclusive) if admission and writer is not None else
+           await tx.fetchone(f"SELECT * FROM {executors} WHERE executor_key=?", (_key(manager, identity),)))
     if row is None:
         _, events = _tables(manager)
-        retained = await tx.fetchone(f"SELECT event_id FROM {events} WHERE executor_key=? LIMIT 1", (_key(manager, identity),))
+        # Once this logical executor is registered, another boot cannot fall
+        # back to unregistered dispatch while activation proves old roots.
+        retained = await tx.fetchone(f"SELECT event_id FROM {events} WHERE executor_key=? UNION ALL "
+            f"SELECT executor_key AS event_id FROM {executors} WHERE tenant_id=? AND principal_id=? AND executor_id=? LIMIT 1",
+            (_key(manager, identity), identity.tenant_id, identity.principal_id, identity.executor_id))
         bound = await tx.fetchone(f"SELECT job_id FROM {manager.jobs} WHERE executor_key=? LIMIT 1", (_key(manager, identity),))
         if retained or bound:
             raise JobError("executor_registration_required")
@@ -220,25 +226,68 @@ async def register(manager, identity, *, contract_hash, startup_lease_ms=30000):
         return await _save(manager, tx, identity, request, operation, value)
 
 
-async def activate(manager, identity, *, expected_version, system_key, lease_ms=30000):
-    operation = _operation_key(manager, identity, "activate", system_key)
-    if not _positive(expected_version) or not _positive(lease_ms, 300000):
-        raise JobError("invalid_executor_activation")
-    request = {"action": "activate", "expected_version": expected_version, "lease_ms": lease_ms}
+class _ActivationChanged(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class _ActivationProof:
+    boots: tuple[tuple[str, int], ...]
+
+
+async def _activation_boots(manager, tx, identity):
+    """Only boot metadata locks; never acquire an old root while holding them."""
+    executors, _ = _tables(manager)
+    suffix = '' if manager.db.dialect.name == 'sqlite' else ' FOR UPDATE'
+    rows = await tx.fetchall(f"SELECT * FROM {executors} WHERE tenant_id=? AND principal_id=? AND executor_id=? "
+        'ORDER BY executor_key'+suffix, (identity.tenant_id, identity.principal_id, identity.executor_id))
+    for row in rows:
+        tx.remember_row(executors, 'executor_key', row['executor_key'], row)
+    return rows
+
+
+async def _activation_current(manager, tx, identity, request, boots):
+    row = await _row(manager, tx, identity)
+    if row['state'] != 'starting' or row['version'] != request['expected_version']:
+        raise JobError('executor_activation_conflict')
+    if row['lease_until_ms'] <= manager.now():
+        raise JobError('executor_lease_expired')
+    for other in boots:
+        if (other['boot_id'] != identity.boot_id and other['state'] in ('starting', 'accepting')
+                and other['lease_until_ms'] > manager.now()):
+            raise JobError('executor_prior_boot_open')
+    return row
+
+
+async def _begin_activation(manager, identity, operation, request):
+    """Fence expired prior boots before inspecting their original task trees."""
     async with manager._write() as tx:
         replay = await _recall(manager, tx, identity, operation, request)
         if replay is not None:
-            return replay
-        row = await _row(manager, tx, identity)
-        if row["state"] != "starting" or row["version"] != expected_version:
-            raise JobError("executor_activation_conflict")
-        now = manager.now()
-        if row["lease_until_ms"] <= now:
-            raise JobError("executor_lease_expired")
-        executors, _ = _tables(manager)
-        if await tx.fetchone(f"SELECT executor_key FROM {executors} WHERE tenant_id=? AND principal_id=? AND executor_id=? "
-                "AND boot_id<>? AND state IN ('starting','accepting') AND lease_until_ms>? LIMIT 1", (*asdict(identity).values(), now)):
-            raise JobError("executor_prior_boot_open")
+            return replay, ()
+        boots = await _activation_boots(manager, tx, identity)
+        await _activation_current(manager, tx, identity, request, boots)
+        reason = 'activation:'+_hash([operation, request])
+        drain_request = {'action': 'drain', 'reason': reason}
+        for offset, old in enumerate(boots):
+            if old['boot_id'] == identity.boot_id:
+                continue
+            prior = identity_for(old)
+            barrier = _operation_key(manager, prior, 'drain', 'activation:'+operation)
+            await _recall(manager, tx, prior, barrier, drain_request)
+            if old['state'] in ('starting', 'accepting'):
+                old = await _row(manager, tx, prior)
+                value = {**_snapshot(old), 'state': 'draining', 'version': old['version']+1,
+                         'updated_at': manager.now()}
+                await _save(manager, tx, prior, drain_request, barrier, value, old=old,
+                    effects={'executions': [], 'stop_operations': [], 'scope_incomplete': True})
+                boots[offset] = value
+        return None, tuple((row['executor_key'], row['version']) for row in boots)
+
+
+async def _inspect_prior_executions(manager, identity):
+    """Cold transitive model/membership proof uses one coherent read snapshot."""
+    async with manager._read() as tx:
         if await tx.fetchone(f"SELECT job_id FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? AND executor_id=? "
                 "AND boot_id<>? AND resource_state IN ('running','unknown') LIMIT 1", tuple(asdict(identity).values())):
             raise JobError("executor_prior_execution_unsettled")
@@ -259,8 +308,40 @@ async def activate(manager, identity, *, expected_version, system_key, lease_ms=
                 await require_quiescent(manager, tx, send)
             except JobError as exc:
                 raise JobError("executor_prior_execution_unsettled") from exc
-        value = {**_snapshot(row), "state": "accepting", "version": row["version"]+1, "lease_until_ms": now+lease_ms, "updated_at": now}
+
+
+async def _publish_activation(manager, identity, operation, request, prepared):
+    async with manager._write() as tx:
+        replay = await _recall(manager, tx, identity, operation, request)
+        if replay is not None:
+            return replay
+        boots = await _activation_boots(manager, tx, identity)
+        row = await _activation_current(manager, tx, identity, request, boots)
+        if tuple((boot['executor_key'], boot['version']) for boot in boots) != prepared.boots:
+            raise _ActivationChanged()
+        now = manager.now()
+        value = {**_snapshot(row), "state": "accepting", "version": row["version"]+1,
+                 "lease_until_ms": now+request['lease_ms'], "updated_at": now}
         return await _save(manager, tx, identity, request, operation, value, old=row)
+
+
+async def activate(manager, identity, *, expected_version, system_key, lease_ms=30000):
+    operation = _operation_key(manager, identity, "activate", system_key)
+    if not _positive(expected_version) or not _positive(lease_ms, 300000):
+        raise JobError("invalid_executor_activation")
+    request = {"action": "activate", "expected_version": expected_version, "lease_ms": lease_ms}
+    replay = await _recall(manager, manager.db, identity, operation, request)
+    if replay is not None:
+        return replay
+    while True:
+        replay, boots = await _begin_activation(manager, identity, operation, request)
+        if replay is not None:
+            return replay
+        await _inspect_prior_executions(manager, identity)
+        try:
+            return await _publish_activation(manager, identity, operation, request, _ActivationProof(boots))
+        except _ActivationChanged:
+            continue
 
 
 async def heartbeat(manager, identity, *, expected_version, system_key, lease_ms=30000):
@@ -272,7 +353,7 @@ async def heartbeat(manager, identity, *, expected_version, system_key, lease_ms
         replay = await _recall(manager, tx, identity, operation, request)
         if replay is not None:
             return replay
-        row = await require_accepting(manager, tx, identity, required=True)
+        row = await require_accepting(manager, tx, identity, required=True, exclusive=True)
         if row["version"] != expected_version:
             raise JobError("executor_heartbeat_conflict")
         value = {**_snapshot(row), "version": row["version"]+1,
@@ -280,8 +361,8 @@ async def heartbeat(manager, identity, *, expected_version, system_key, lease_ms
         return await _save(manager, tx, identity, request, operation, value, old=row)
 
 
-async def require_accepting(manager, tx, identity, *, required=False):
-    row = await _row(manager, tx, identity, required=required)
+async def require_accepting(manager, tx, identity, *, required=False, exclusive=False):
+    row = await _row(manager, tx, identity, required=required, admission=True, exclusive=exclusive)
     if row is not None:
         if row["state"] != "accepting":
             raise JobError("executor_not_accepting")
@@ -342,7 +423,7 @@ async def _drain_barrier(manager, identity, operation, request):
         old = await _recall(manager, tx, identity, key, request)
         if old is not None:
             return old, False
-        row = await _row(manager, tx, identity)
+        row = await _row(manager, tx, identity, admission=True, exclusive=True)
         value = {**_snapshot(row), "state": "draining", "version": row["version"]+1,
                  "updated_at": manager.now()}
         return await _save(manager, tx, identity, request, key, value, old=row,
@@ -367,7 +448,7 @@ async def _drain_scope(manager, identity, operation, request):
         original = await _recall(manager, tx, identity, key, request)
         if original is not None:
             return original
-        row = await _row(manager, tx, identity)
+        row = await _row(manager, tx, identity, admission=True, exclusive=True)
         value = {**_snapshot(row), "state": "draining", "version": row["version"]+1,
                  "updated_at": manager.now()}
         return await _save(manager, tx, identity, request, key, value, old=row,
@@ -468,7 +549,7 @@ async def drain(manager, identity, *, system_key, reason):
         original = await _recall(manager, tx, identity, operation, request)
         if original is not None:
             return original
-        row = await _row(manager, tx, identity)
+        row = await _row(manager, tx, identity, admission=True, exclusive=True)
         value = {**_snapshot(row), "state": "draining", "version": row["version"]+1,
                  "updated_at": manager.now()}
         return await _save(manager, tx, identity, request, operation, value, old=row,

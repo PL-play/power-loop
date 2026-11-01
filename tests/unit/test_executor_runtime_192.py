@@ -35,24 +35,26 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 @pytest.fixture(autouse=True)
 async def registered_host(monkeypatch):
     # Test-host startup through the real persistent ports. It runs before the
-    # original scenario fixtures' first claim; no model response is altered.
-    claim = TaskRuntime.claim
+    # original scenario fixtures' first control writer; no model response is
+    # altered. Boot proof must finish before the joined send admission opens.
+    ensure_started = TaskRuntime.ensure_started
     seen = set()
 
-    async def registered(runtime, *args, **kwargs):
+    async def registered(runtime):
+        await ensure_started(runtime)
         identity = registry.ExecutorIdentity(
             runtime.tenant_id, runtime.principal_id, runtime.executor_id, runtime.boot_id
         )
         key = (runtime.manager.store.store_id, identity)
         if key not in seen:
+            assert runtime.manager._joined_write.get() is None
             await registry.register(runtime.manager, identity, contract_hash="a" * 64, startup_lease_ms=300000)
             await registry.activate(
                 runtime.manager, identity, expected_version=1, system_key="startup", lease_ms=300000
             )
             seen.add(key)
-        return await claim(runtime, *args, **kwargs)
 
-    monkeypatch.setattr(TaskRuntime, "claim", registered)
+    monkeypatch.setattr(TaskRuntime, "ensure_started", registered)
 
 
 async def assert_registered_scopes(manager, actor):

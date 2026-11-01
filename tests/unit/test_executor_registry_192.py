@@ -114,10 +114,10 @@ async def test_lost_ack_replays_exact_original_decision_without_new_effects(boot
     async def lose_ack():
         async with write() as tx:
             yield tx
-        committed = action != "drain" or await c.manager.db.fetchone(
+        committed = action not in ("activate", "drain") or await c.manager.db.fetchone(
             f"SELECT event_id FROM {c.manager.prefix}task_executor_events WHERE operation_key=?",
-            (registry._operation_key(c.manager, c.identity, "drain", "stop"),)) is not None
-        # Drain now has durable admission/scope steps. This original case
+            (registry._operation_key(c.manager, c.identity, action, "stop" if action == "drain" else "startup"),)) is not None
+        # Activation/drain have separate admission/proof steps. This case
         # still loses the ACK of its final receipt, preserving exact replay.
         if committed and not lost:
             lost.append(True)

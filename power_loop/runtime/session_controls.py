@@ -70,6 +70,7 @@ class ControlTransaction(ControlReadView):
         self.obligation_handled: set[str] = set()
         self.obligation_open: set[tuple] = set()
         self.obligation_close: set[tuple] = set()
+        self._executor_admissions: dict[str, bool] = {}
 
     def __getattr__(self, name):
         return getattr(self._tx, name)
@@ -94,6 +95,20 @@ class ControlTransaction(ControlReadView):
     async def write_executor(self, executor_key, sql, params=()):
         self._memo.pop((f"SELECT * FROM {self._executors} WHERE executor_key=?", (executor_key,)), None)
         return await self._execute(sql, params)
+
+    async def executor_admission(self, executor_key, *, exclusive=False):
+        """Hold this boot's admission until the tree publication commits.
+
+        Drain and activation close the boot with an exclusive metadata write
+        before discovering roots. Concurrent trees share this read lock.
+        """
+        sql = f"SELECT * FROM {self._executors} WHERE executor_key=?"
+        if executor_key not in self._executor_admissions or exclusive and not self._executor_admissions[executor_key]:
+            suffix = '' if self.dialect.name == 'sqlite' else ' FOR UPDATE' if exclusive else ' FOR SHARE'
+            row = await self._tx.fetchone(sql+suffix, (executor_key,))
+            self._memo[sql, (executor_key,)] = None if row is None else dict(row)
+            self._executor_admissions[executor_key] = exclusive
+        return await self.fetchone(sql, (executor_key,))
 
     async def append_event(self, columns, values, *, ignore=False):
         """Append a declared original; its meaning is supplied as fields."""

@@ -112,7 +112,11 @@ class MySQLDatabase:
             try:
                 yield tx
             except BaseException:
-                await conn.rollback()
+                # aiomysql closes its connection when an in-flight query is
+                # cancelled. A second command would hide that cancellation
+                # behind InterfaceError instead of preserving its real cause.
+                if not conn.closed:
+                    await conn.rollback()
                 raise
             else:
                 await conn.commit()
@@ -126,7 +130,8 @@ class MySQLDatabase:
                     await cur.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
                 yield ReadSnapshot(_MyTransaction(self, conn))
             finally:
-                await conn.rollback()
+                if not conn.closed:
+                    await conn.rollback()
 
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:
         import aiomysql
