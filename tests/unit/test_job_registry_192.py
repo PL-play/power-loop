@@ -50,7 +50,10 @@ async def registry_store(request, tmp_path):
                 # failed offline upgrade has no task originals or index to
                 # compare; its raw schema/rollback assertions stay in its test.
                 if targets:
-                    await assert_obligation_projection(targets[-1], active_prefix)
+                    # The first connection for this prefix belongs to the
+                    # fixture until cleanup. A reopened handle may already
+                    # have been explicitly closed by the case.
+                    await assert_obligation_projection(targets[0], active_prefix)
         finally:
             if backend != "sqlite":
                 for active_prefix in prefixes:
