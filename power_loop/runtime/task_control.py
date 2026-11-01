@@ -96,7 +96,7 @@ async def recall_stop(manager, actor, job_id, *, caller, call_ref, tool_call_id,
     """Read back one accepted intent after ACK loss, without creating an action."""
     request = _intent(job_id, caller, call_ref, tool_call_id, reason, expected_generation)
     key = manager._origin_key(actor, "stop", call_ref, tool_call_id, None)
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE operation_key=?", (key,))
         if row is None:
             return None
@@ -164,7 +164,7 @@ async def signal_local(runtime, actor, operation):
     snapshots = list(runtime._local_executions.values())
     tasks = set()
     selected = []
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         target = await manager._authorize(tx, actor, operation.job_id)
         event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (operation.operation_id,))
         op = _receipt(manager, event, operation.result["request"]) if event else None
