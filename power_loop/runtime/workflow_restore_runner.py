@@ -52,12 +52,17 @@ async def start(loop, parent_sid, run_id, *, continuation, executor=None, budget
             job = await manager.get_job(source.actor, creation.job_id)
             if creation.action != "create" or job.kind != "workflow" or job.created_by_session_id != parent_sid:
                 raise JobError("workflow_restore_target_mismatch")
+            from .workflow_admission import recover_call
+            recovered = await recover_call(manager, source.actor, ref, call_id, job_id=job.job_id,
+                node_id=node_id, message=message, rounds=rounds)
             old = await manager.operation_for_call(source.actor, ref, call_id)
             if old is not None:
                 request = old.result.get("request", {})
                 if (old.result.get("mode") != "workflow_continue" or old.job_id != job.job_id or
                         request.get("node_id") != node_id or request.get("message") != message or request.get("requested_rounds") != rounds):
                     raise JobError("operation_conflict")
+                if recovered is None:
+                    raise JobError("restore_request_original_missing")
                 prior = runtime._workflow_handles.get(old.operation_id) or runner.get_run_handle(run_id)
                 if prior is None or prior.operation_id != old.operation_id:
                     raise JobError("workflow_admission_requires_reconciliation")
@@ -77,7 +82,8 @@ async def start(loop, parent_sid, run_id, *, continuation, executor=None, budget
             try:
                 operation, repeated = await admit(manager, source.actor, job.job_id, resources=resources, **args)
             except Exception:
-                operation = await manager.operation_for_call(source.actor, ref, call_id)
+                operation = await recover_call(manager, source.actor, ref, call_id, job_id=job.job_id,
+                    node_id=node_id, message=message, rounds=rounds)
                 if operation is None or operation.result.get("mode") != "workflow_continue" or operation.result["request"]["plan_hash"] != _hash(plan):
                     raise
                 repeated = False

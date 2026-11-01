@@ -47,9 +47,11 @@ async def admitting(managed_workflow, monkeypatch):
             if fault:
                 @asynccontextmanager
                 async def broken():
+                    target_written = False
                     async with original() as tx:
                         original_execute = tx._execute
                         async def execute(sql, params=()):
+                            nonlocal target_written
                             failed = ((fault == "write_jobs" and sql.startswith(f"UPDATE {manager.jobs} SET generation=")) or
                                 (fault == "write_operation" and sql.startswith(f"UPDATE {manager.events} SET payload_json=")) or
                                 (fault == "write_execution" and "execution" in params) or
@@ -63,6 +65,8 @@ async def admitting(managed_workflow, monkeypatch):
                                 # outside the runtime's defensive contract.
                                 raise OSError("injected statement failure")
                             value = await original_execute(sql, params)
+                            if sql.startswith(f"UPDATE {manager.jobs} SET generation="):
+                                target_written = True
                             if ((fault == "reservation" and "workflow_node_reservation" in params) or
                                     (fault == "journal" and sql.startswith(f"UPDATE {store.t.session_runtime_state} SET value_json="))):
                                 c.fault_hits.append(fault)
@@ -77,7 +81,7 @@ async def admitting(managed_workflow, monkeypatch):
                         if fault == "cancel":
                             c.fault_hits.append(fault)
                             raise asyncio.CancelledError()
-                    if fault == "commit_ack":
+                    if fault == "commit_ack" and target_written:
                         c.fault_hits.append(fault)
                         raise RuntimeError("lost commit ACK")
                 with monkeypatch.context() as patch:
