@@ -19,8 +19,9 @@ from .test_aborted_call_outcomes_192 import pending_batch
 from .test_job_registry_192 import registry_store, runtime
 from .test_send_sql_profile import Profiled
 from .test_tool_call_plans_192 import controller
+from .test_wait_handoff_192 import handoff, waiting
 
-__all__ = ["registry_store", "runtime"]
+__all__ = ["registry_store", "runtime", "handoff", "waiting"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -72,6 +73,108 @@ async def test_original_notice_and_pending_index_share_the_transaction(registry_
         assert model.calls == c.model.calls == 1 and c.state.dispatched == 0
     finally:
         await loop.aclose(drain_timeout_s=.1)
+
+
+@pytest.mark.parametrize("outcome", ["rollback", "lost_ack", "commit"])
+async def test_current_wait_input_and_pending_index_commit_together(handoff, monkeypatch, outcome):
+    from power_loop.runtime.wait_effects import apply
+
+    from .test_wait_effects_192 import decide
+
+    h, c = handoff, handoff.c
+    await decide(h)
+    before = await rows(c.manager)
+    messages = await c.store.load_all_messages(c.sid)
+    model_calls = h.model.calls
+    original = c.manager.db.transaction
+    fired = []
+
+    @asynccontextmanager
+    async def transaction():
+        async with original() as tx:
+            yield tx
+            if not fired and await tx.fetchone(f"SELECT event_id FROM {c.manager.events} "
+                    "WHERE job_id=? AND action='nudge' AND delivery_status='pending_delivery'", (c.owner.job_id,)):
+                fired.append(True)
+                if outcome == "rollback":
+                    raise OSError("original input transaction rolled back")
+        if fired and outcome == "lost_ack":
+            raise OSError("original input acknowledgement lost")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(c.manager.db, "transaction", transaction)
+            if outcome == "commit":
+                await apply(c.manager, c.main, h.event_id)
+            else:
+                with pytest.raises(OSError, match="original input"):
+                    await apply(c.manager, c.main, h.event_id)
+        assert fired
+        cold = JobManager(await c.connect(), now_ms=c.manager.now)
+        if outcome == "rollback":
+            assert await rows(cold) == before
+            assert not await cold.db.fetchall(f"SELECT event_id FROM {cold.events} WHERE action='nudge'")
+        else:
+            indexed = [row for row in await rows(cold) if row["kind"] == "input"]
+            [event] = await cold.db.fetchall(f"SELECT * FROM {cold.events} WHERE action='nudge'")
+            assert indexed == [{"session_id": c.sid, "kind": "input", "source_id": event["event_id"],
+                "job_id": c.owner.job_id, "opened_version": event["job_version"]}]
+        reply = await apply(c.manager, c.main, h.event_id)
+        assert await apply(cold, c.main, h.event_id) == reply
+        [indexed] = [row for row in await rows(cold) if row["kind"] == "input"]
+        [event] = await obligations.event_rows(cold, cold.db, c.actor, "input", job_id=c.owner.job_id)
+        assert indexed["source_id"] == event["event_id"] == reply["operation_id"]
+        [item] = await c.store.inbox_items(c.sid)
+        assert item["item_id"] == "nudge:" + event["event_id"] and item["status"] == "pending"
+        await obligations.verify(cold, c.actor)
+        assert await c.store.load_all_messages(c.sid) == messages and h.model.calls == model_calls
+    finally:
+        await h.loop.aclose(drain_timeout_s=.1)
+
+
+@pytest.mark.parametrize("damage", [None, "handoff", "effect", "receipt"])
+async def test_cold_wait_input_rebuild_uses_original_decision_proof(handoff, damage):
+    from power_loop.runtime.wait_effects import apply
+
+    from .test_wait_effects_192 import decide
+
+    h, c = handoff, handoff.c
+    try:
+        await decide(h)
+        reply = await apply(c.manager, c.main, h.event_id)
+        expected = await rows(c.manager)
+        calls = h.model.calls
+        messages = await c.manager.db.fetchall(f"SELECT * FROM {c.store.t.messages} ORDER BY id")
+        if damage is None:
+            await c.manager.db.execute(f"DELETE FROM {c.manager.prefix}session_obligations "
+                "WHERE job_id=? AND kind='input'", (c.owner.job_id,))
+        elif damage == "handoff":
+            op = await c.manager.db.fetchone(f"SELECT payload_json FROM {c.manager.events} WHERE event_id=?",
+                                            (reply["operation_id"],))
+            data = json.loads(op["payload_json"])
+            del data["request"]["handoff"]
+            await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?",
+                (json.dumps(data), reply["operation_id"]))
+        elif damage == "effect":
+            await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_type='wait_effect'")
+        else:
+            await c.manager.db.execute(f"UPDATE {c.manager.events} SET receipt_ref_json=NULL WHERE action='wait_decision'")
+        originals = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id")
+        cold = JobManager(await c.connect(), now_ms=c.manager.now)
+        if damage is None:
+            with pytest.raises(JobError, match="session_obligation_projection_mismatch"):
+                await obligations.verify(cold, c.actor)
+            await obligations.rebuild(cold)
+            await obligations.verify(cold, c.actor)
+        else:
+            with pytest.raises(JobError):
+                await obligations.rebuild(cold)
+        assert await rows(cold) == expected
+        assert await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id") == originals
+        assert await cold.db.fetchall(f"SELECT * FROM {c.store.t.messages} ORDER BY id") == messages
+        assert h.model.calls == calls
+    finally:
+        await h.loop.aclose(drain_timeout_s=.1)
 
 
 async def test_cold_rebuild_recovers_missing_index_without_replaying_or_changing_originals(registry_store):

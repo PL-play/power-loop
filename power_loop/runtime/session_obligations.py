@@ -17,10 +17,17 @@ COLUMNS = ("session_id", "kind", "source_id", "job_id", "opened_version")
 _INPUT_MODES = frozenset({"steer", "continue", "restore_input"})
 
 
+def _queued_input(event, data):
+    # Current wait continuations carry the original decision/effect handoff,
+    # rather than the user-nudge mode. Generic caller operations are not input.
+    return data.get("mode") in _INPUT_MODES or (
+        event.get("call_ref_json") is None and "handoff" in data.get("request", {}))
+
+
 def note(recorder, event):
     kind = event.get("event_type")
     input_write = (kind == "operation" and event.get("action") == "nudge"
-                   and json.loads(event["payload_json"]).get("mode") in _INPUT_MODES)
+                   and _queued_input(event, json.loads(event["payload_json"])))
     if kind in EVENTS or input_write:
         recorder.obligation_jobs.add(event["job_id"])
         if kind == "processing_decision":
@@ -130,10 +137,9 @@ async def _desired(manager, tx, row, *, verify=False, clean=None):
                 actor = JobActor(row["tenant_id"], row["principal_id"], recipient)
                 await notification(manager, tx, actor, json.loads(event["payload_json"])["due_event_id"])
             add(recipient, "wait", event)
-        elif kind == "operation" and event["delivery_status"] != "handled":
+        elif (kind == "operation" and event["delivery_status"] == "pending_delivery"
+              and row["kind"] in ("subagent", "workflow_node")):
             data = json.loads(event["payload_json"])
-            if data.get("mode") not in _INPUT_MODES:
-                continue
             if verify:
                 from .wait_effects import validate_input
                 actor = JobActor(row["tenant_id"], row["principal_id"], data["request"]["session_id"])
