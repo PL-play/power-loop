@@ -42,6 +42,10 @@ class _PgTransaction:
         rows = await self._conn.fetch(self._db.dialect.translate(sql), *params)
         return [dict(r) for r in rows]
 
+    async def execute_flag(self, sql: str, params: Params = ()) -> bool | None:
+        row = await self.fetchone(sql, params)
+        return bool(row["cancelled"]) if row is not None else None
+
 
 class PostgresDatabase:
     def __init__(self, pool: Any) -> None:

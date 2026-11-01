@@ -36,6 +36,10 @@ class Transaction(Protocol):
 
     async def fetchall(self, sql: str, params: Params = ()) -> list[Row]: ...
 
+    async def execute_flag(self, sql: str, params: Params = ()) -> bool | None:
+        """Conditional UPDATE's flag, or None on no match, in one statement."""
+        ...
+
 
 @runtime_checkable
 class Database(Protocol):

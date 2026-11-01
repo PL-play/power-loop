@@ -50,6 +50,13 @@ class _MyTransaction:
             await cur.execute(self._db.dialect.translate(sql), _args(params))
             return cur.rowcount
 
+    async def execute_flag(self, sql: str, params: Params = ()) -> bool | None:
+        # LAST_INSERT_ID(expr) returns the flag in the same UPDATE's OK packet.
+        # Do not follow it with a SELECT or reuse a previous connection value.
+        async with self._conn.cursor() as cur:
+            await cur.execute(self._db.dialect.translate(sql), _args(params))
+            return bool(cur.lastrowid) if cur.rowcount else None
+
     async def fetchone(self, sql: str, params: Params = ()) -> Row | None:
         import aiomysql  # optional extra: power-loop[mysql]
 

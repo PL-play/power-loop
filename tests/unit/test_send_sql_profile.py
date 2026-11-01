@@ -124,6 +124,10 @@ class _Tx:
         self.owner.note(sql)
         return await self.tx.execute(sql, params)
 
+    async def execute_flag(self, sql, params=()):
+        self.owner.note(sql)
+        return await self.tx.execute_flag(sql, params)
+
     async def fetchone(self, sql, params=()):
         result = await self.tx.fetchone(sql, params)
         self.owner.note(sql, 0 if result is None else 1)

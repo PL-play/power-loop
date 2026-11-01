@@ -79,6 +79,11 @@ class RecordingTransaction:
         self._written(sql)
         return await self._tx.execute(sql, params)
 
+    async def execute_flag(self, sql, params=()):
+        self.writes += 1
+        self.forget_reads()
+        return await self._tx.execute_flag(sql, params)
+
     async def fetchone(self, sql, params=()):
         if sql in self._memo_sql:
             key = (sql, tuple(params))

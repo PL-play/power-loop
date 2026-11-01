@@ -529,9 +529,18 @@ class JobManager:
         if isinstance(lease_ms, bool) or not isinstance(lease_ms, int) or not 1 <= lease_ms <= 300000:
             raise JobError("invalid_lease_duration")
         async with self._write() as tx:
-            await self._fence(tx, actor, lease)
-            await tx.execute(f"UPDATE {self.jobs} SET lease_until_ms=?,updated_at=? WHERE job_id=?",
-                             (self.now() + lease_ms, self.now(), lease.job_id))
+            from .task_runtime import _OWNER, _SEND
+            owned = any(binding is not None and binding.runtime.manager is self and binding.lease == lease
+                        and not binding.stop_renewal.is_set() for binding in (_SEND.get(), _OWNER.get()))
+            if not owned:
+                await self._fence(tx, actor, lease)  # Cold control verifies originals at entry.
+            from .execution_renewal import renew
+            cancelled = await renew(self, tx, actor, lease, lease_ms)
+            if cancelled:
+                raise JobError("cancel_requested")
+            if cancelled is None:
+                await self._fence(tx, actor, lease)  # Fault-only precise classification.
+                raise JobError("execution_renewal_conflict")
 
     async def bind_session(self, actor: JobActor, job_id: str, session_id: str) -> JobRecord:
         """Bind an admitted subagent to its actual child before any model call."""
