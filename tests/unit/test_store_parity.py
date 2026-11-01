@@ -1,26 +1,18 @@
-"""Conformance: the new async SessionStore must behave IDENTICALLY to the legacy sync
-store across every method group. Each scenario runs the same operations on both (the
-legacy store wrapped in a thin async adapter) and asserts structural equality of every
-return value AND a final-state snapshot — the legacy store is the oracle.
+"""Backend conformance against the current async SQLite implementation.
 
-The scenarios are backend-agnostic (method calls only), so the SAME set validates the
-SQLite backend here and the PostgreSQL/MySQL backends in test_store_parity_pg.py etc.
-
-Wall-clock ``*_at`` fields are zeroed for comparison (they differ run-to-run); everything
-structural — seqs, ids, statuses, counts, ordering, folded sets, cascade counts,
-export shape — is compared exactly.
+The same scenarios run on PostgreSQL/MySQL and a fresh current SQLite store,
+comparing every return value and final-state snapshot. This retains dialect,
+transaction and data-size coverage without a synchronous runtime or adapter.
 """
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
 
-from power_loop.runtime.session_store import SessionStore as LegacyStore
 from power_loop.runtime.store.store import SessionStore as AsyncStore
 from power_loop.runtime.store.types import SubagentLifecycle as Lc
 
@@ -41,31 +33,6 @@ def _norm(v: Any) -> Any:
     return v
 
 
-class _LegacyAsync:
-    """Expose the sync legacy store with the same async surface (each call → to_thread)."""
-
-    def __init__(self, store: LegacyStore) -> None:
-        self._s = store
-
-    def __getattr__(self, name: str) -> Any:
-        attr = getattr(self._s, name)
-        if callable(attr):
-            async def _w(*a: Any, **k: Any) -> Any:
-                return await asyncio.to_thread(attr, *a, **k)
-            return _w
-        return attr
-
-
-def _sync_snapshot(store: LegacyStore, sid: str) -> Any:
-    return (
-        store.load_active_messages(sid), store.load_all_messages(sid),
-        store.get_state(sid), store.list_compactions(sid),
-        store.list_timers(sid, statuses=("armed", "firing", "fired", "cancelled")),
-        store.list_notes(sid), store.get_session_stats(sid),
-        store.list_background_tasks(sid),
-    )
-
-
 async def _async_snapshot(store: AsyncStore, sid: str) -> Any:
     return (
         await store.load_active_messages(sid), await store.load_all_messages(sid),
@@ -80,26 +47,19 @@ async def run_parity(
     scenario: Callable[[Any], Awaitable[list[Any]]],
     snapshot_sid: str | None = None,
     *,
-    new_store: AsyncStore | None = None,
+    new_store: AsyncStore,
 ) -> None:
-    """Run ``scenario`` on the legacy store and on ``new_store`` (a fresh SQLite
-    ``:memory:`` store if None — the caller owns a passed-in store, e.g. a PG one) and
-    assert return-value + snapshot parity. The legacy store is the oracle."""
-    legacy = LegacyStore.open(":memory:")
-    owns_new = new_store is None
-    new = new_store if new_store is not None else await AsyncStore.open(":memory:")
+    """Compare a server backend to the current SQLite contract."""
+    reference = await AsyncStore.open(":memory:")
     try:
-        legacy_out = await scenario(_LegacyAsync(legacy))
-        new_out = await scenario(new)
-        assert _norm(new_out) == _norm(legacy_out), "return-value parity"
+        reference_out = await scenario(reference)
+        new_out = await scenario(new_store)
+        assert _norm(new_out) == _norm(reference_out), "return-value parity"
         if snapshot_sid is not None:
-            legacy_snap = await asyncio.to_thread(_sync_snapshot, legacy, snapshot_sid)
-            assert _norm(await _async_snapshot(new, snapshot_sid)) == _norm(legacy_snap), \
-                "final-state parity"
+            assert _norm(await _async_snapshot(new_store, snapshot_sid)) == _norm(
+                await _async_snapshot(reference, snapshot_sid)), "final-state parity"
     finally:
-        legacy.close()
-        if owns_new:
-            await new.close()
+        await reference.close()
 
 
 # ── scenarios (backend-agnostic; reused by the PG/MySQL conformance suites) ──
@@ -252,11 +212,6 @@ SCENARIOS: list[tuple[str, Callable[[Any], Awaitable[list[Any]]], str | None]] =
     ("export_import", scn_export_import, None),
     ("prune", scn_prune, "s"),
 ]
-
-
-@pytest.mark.parametrize("name,scn,snap", SCENARIOS, ids=[s[0] for s in SCENARIOS])
-async def test_sqlite_parity(name: str, scn: Any, snap: str | None) -> None:
-    await run_parity(scn, snap)
 
 
 # ── H2 (BUG_REVIEW_3.4): large (>64 KiB) free-text/JSON payloads must round-trip on every

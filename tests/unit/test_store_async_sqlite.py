@@ -2,15 +2,13 @@
 
 Proves the new abstraction end-to-end for the hardest paths — transactional per-session
 seq allocation, compaction (explicit fold-set + logical ord ordering), atomic rollback,
-the ``pl_`` table prefix, and the schema-init contract — and asserts behavior PARITY with
-the legacy synchronous store for those operations.
+the ``pl_`` table prefix, and the schema-init contract.
 """
 
 from __future__ import annotations
 
 import pytest
 
-from power_loop.runtime.session_store import SessionStore as LegacyStore
 from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION, StoreSchemaError
 from power_loop.runtime.store.store import SessionStore
 
@@ -83,32 +81,3 @@ async def test_create_schema_false_on_fresh_db_raises(tmp_path) -> None:
     s2 = await SessionStore.open(db_path, create_schema=False)
     assert s2.schema_version == CURRENT_SCHEMA_VERSION
     await s2.close()
-
-
-async def test_parity_with_legacy_store_for_compaction() -> None:
-    """Same ops on the legacy sync store and the new async store yield identical
-    active-message logical ordering + folded set."""
-    def drive_legacy() -> list[tuple[str, int]]:
-        st = LegacyStore.open(":memory:")
-        try:
-            sid = st.create_session()
-            for i in range(4):
-                st.append_message(sid, role="user", content=f"m{i}")
-            st.record_compaction(sid, from_seq=1, to_seq=2, note_content="s",
-                                 before_tokens=9, after_tokens=1, round_index=1,
-                                 fold_seqs=[1, 2], order_key=1)
-            return [(m.name or m.role, m.seq) for m in st.load_active_messages(sid)]
-        finally:
-            st.close()
-
-    legacy = drive_legacy()
-    async with await SessionStore.open(":memory:") as store:
-        sid = await store.create_session()
-        for i in range(4):
-            await store.append_message(sid, role="user", content=f"m{i}")
-        await store.record_compaction(sid, from_seq=1, to_seq=2, note_content="s",
-                                      before_tokens=9, after_tokens=1, round_index=1,
-                                      fold_seqs=[1, 2], order_key=1)
-        new = [(m.name or m.role, m.seq) for m in await store.load_active_messages(sid)]
-
-    assert new == legacy

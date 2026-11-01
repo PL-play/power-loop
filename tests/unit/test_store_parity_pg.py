@@ -1,5 +1,5 @@
 """PostgreSQL conformance: run the SAME parity scenarios (test_store_parity.SCENARIOS)
-against a real Postgres-backed async store, with the legacy SQLite store as the oracle.
+against a real Postgres-backed async store, with the current async SQLite store as the reference.
 
 Gated on a reachable server (skips otherwise) so CI without Postgres stays green. Points
 at ``POWER_LOOP_TEST_PG_DSN`` (default: the local docker server's isolated

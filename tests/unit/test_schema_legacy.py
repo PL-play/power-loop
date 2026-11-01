@@ -11,10 +11,11 @@ must NOT false-warn.
 from __future__ import annotations
 
 import logging
+import sqlite3
+from pathlib import Path
 
 import pytest
 
-from power_loop.runtime.session_store import SessionStore as LegacyStore
 from power_loop.runtime.store.schema import SchemaPolicy, StoreSchemaError
 from power_loop.runtime.store.store import SessionStore
 
@@ -23,11 +24,13 @@ pytestmark = pytest.mark.unit
 
 def _make_legacy_db(path: str) -> str:
     """Create a pre-2.0 DB (unprefixed tables) with one session; return its id."""
-    legacy = LegacyStore.open(path)
-    try:
-        return legacy.create_session(system_prompt="old")
-    finally:
-        legacy.close()
+    sid = "original-pre2-session"
+    with sqlite3.connect(path) as connection:
+        connection.executescript((Path(__file__).parents[1] / "fixtures" / "pre2_store_schema.sql").read_text())
+        connection.execute("INSERT INTO sessions (session_id,created_at,updated_at,system_prompt) VALUES (?,?,?,?)",
+                           (sid, 1, 1, "old"))
+        connection.execute("INSERT INTO session_state (session_id) VALUES (?)", (sid,))
+    return sid
 
 
 async def test_auto_create_warns_on_legacy_unprefixed_db(tmp_path, caplog) -> None:

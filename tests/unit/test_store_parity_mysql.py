@@ -1,5 +1,5 @@
 """MySQL conformance: run the SAME parity scenarios (test_store_parity.SCENARIOS)
-against a real MySQL-backed async store, with the legacy SQLite store as the oracle.
+against a real MySQL-backed async store, with the current async SQLite store as the reference.
 
 Gated on a reachable server (skips otherwise) so CI without MySQL stays green. Points at
 ``POWER_LOOP_TEST_MYSQL_DSN`` (default: the local docker server's isolated
