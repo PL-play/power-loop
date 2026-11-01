@@ -711,23 +711,30 @@ class TaskRuntime:
         await self.ensure_started()
         self.check_local_admission()
         await flush_observed_controls(SimpleNamespace(runtime=self))
+        from .control_runtime import ReviewSourcesChanged, needs_review_sources, prepare_review_sources
+        review_sources = await prepare_review_sources(self.manager,actor) if needs_review_sources(self.manager,actor) else None
         # Registration, claim and control admission commit together or not at all.
-        async with self.manager.joined_write():
-            registration = await self.manager.register_job(
-                registering_actor,
-                kind="send",
-                session_id=sid,
-                parent=owner.lease if owner else None,
-                system_key=f"send:{sid}:{send_index}" if registering_actor != actor else f"send:{send_index}",
-                request=request,
-                fresh=True,
-            )
-            if registration.replayed:
-                # No automatic replay of a possibly side-effecting pending attempt.
-                raise JobError("task_send_requires_reconciliation")
-            binding = await self.claim(actor, registration)
-            binding.resource_evidence["_control_registered_payload"] = registration.operation.result
-            await enable(binding)
+        while True:
+            try:
+                async with self.manager.joined_write():
+                    registration = await self.manager.register_job(
+                        registering_actor,
+                        kind="send",
+                        session_id=sid,
+                        parent=owner.lease if owner else None,
+                        system_key=f"send:{sid}:{send_index}" if registering_actor != actor else f"send:{send_index}",
+                        request=request,
+                        fresh=True,
+                    )
+                    if registration.replayed:
+                        # No automatic replay of a possibly side-effecting pending attempt.
+                        raise JobError("task_send_requires_reconciliation")
+                    binding = await self.claim(actor, registration)
+                    binding.resource_evidence["_control_registered_payload"] = registration.operation.result
+                    await enable(binding,review_sources=review_sources)
+                break
+            except ReviewSourcesChanged:
+                review_sources = await prepare_review_sources(self.manager,actor)
         evidence = {"exit": "interrupted", "session_id": sid, "send_index": send_index}
         failure = None
         try:

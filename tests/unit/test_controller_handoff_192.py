@@ -56,7 +56,7 @@ async def test_new_host_transfers_only_negative_review_and_actual_main_must_cons
         assert after.result == before.result and after.result_status == 'handled'
         assert after.supervision_status == 'closed'
         from power_loop.runtime.abort_outcomes import handled_references
-        async with runtime.manager._write() as tx:
+        async with runtime.manager._read() as tx:
             source = await runtime.manager._authorize(tx, actor, c.state.source)
             assert await handled_references(runtime.manager, tx, source)
         assert await runtime.manager.execution_usage(owner.actor, owner.lease.job_id, generation=1) == usage
@@ -263,13 +263,18 @@ async def test_corrupt_handoff_cannot_be_used_as_model_processing_authority(regi
         else:
             from power_loop.runtime.execution_membership import seal_id
             key = seal_id(c.manager, c.state.owner_binding.lease.job_id, 1)
+        original = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (key,))
+        assert original is not None
         await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json='{{}}' WHERE event_id=?", (key,))
-        async with c.manager._write() as tx:
+        async with c.manager._read() as tx:
             with pytest.raises(JobError):
                 result = await result_event(c.manager, tx, source)
                 await notice(c.manager, tx, source, result)
         assert (await c.manager.get_job(actor, c.state.source)).result_status == 'pending_delivery'
         assert not c.state.effects
+        assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (key,)) == {
+            **original, 'payload_json': '{}'}
+        await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?", (original['payload_json'], key))
     finally:
         c.state.release.set()
         await c.runtime.shutdown(timeout_s=3)

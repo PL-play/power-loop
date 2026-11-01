@@ -273,9 +273,22 @@ async def _all(manager, tx, job_id):
     return phases
 
 
-async def enable(binding):
-    from .control_runtime import open_control
-    await open_control(binding)
+async def enable(binding, *, review_sources=None):
+    from .control_runtime import ReviewSourcesChanged, needs_review_sources, open_control, prepare_review_sources
+
+    manager = binding.runtime.manager
+    joined = manager._joined_write.get() is not None
+    if (binding.resource_evidence.get('_control_state') is None and not joined and review_sources is None
+            and needs_review_sources(manager,binding.actor)):
+        review_sources = await prepare_review_sources(manager,binding.actor)
+    while True:
+        try:
+            await open_control(binding,review_sources=review_sources)
+            break
+        except ReviewSourcesChanged:
+            if joined:
+                raise
+            review_sources = await prepare_review_sources(manager,binding.actor)
     binding.resource_evidence["model_attempt_protocol"] = 1
 
 

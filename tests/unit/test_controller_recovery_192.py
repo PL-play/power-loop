@@ -138,7 +138,7 @@ async def test_original_negative_controller_result_requires_real_main_handling_a
             assert final.result['messages'] and final.result['session_id'] == owner.actor.session_id
         assert c.state.counts['AFTER'] == 0
         assert await rt.manager.execution_usage(actor, pending.job_id, generation=1) == before
-        async with rt.manager._write() as tx:
+        async with rt.manager._read() as tx:
             row = await rt.manager._authorize(tx, actor, pending.job_id)
             assert await handled_references(rt.manager, tx, row)
             assert await closed(rt.manager, tx, row)
@@ -361,11 +361,11 @@ async def test_saved_closure_rechecks_exit_proof_in_a_new_transaction(registry_s
     try:
         await reconcile(rt, actor, owner.lease.job_id)
         await c.recovery_loop.send('Handle the original interrupted controller result.', c.state.root, tools=[])
-        async with rt.manager._write() as tx:
+        async with rt.manager._read() as tx:
             row = await rt.manager._authorize(tx, actor, owner.lease.job_id)
             assert await closed(rt.manager, tx, row)
         await rt.manager.db.execute(f"DELETE FROM {rt.manager.events} WHERE job_id=? AND event_type='controller_task_exit'", (owner.lease.job_id,))
-        async with rt.manager._write() as tx:
+        async with rt.manager._read() as tx:
             row = await rt.manager._authorize(tx, actor, owner.lease.job_id)
             with pytest.raises(JobError):
                 await closed(rt.manager, tx, row)

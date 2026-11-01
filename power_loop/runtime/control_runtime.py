@@ -1,7 +1,7 @@
 """Bind the memory reducer to the task owner and indexed inspection views."""
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 
 from .execution_journal import ExecutionJournal
 from .execution_state import ExecutionIdentity, ExecutionState
@@ -214,7 +214,32 @@ async def require_closed(manager, tx, job_id, generation):
         raise JobError("execution_reconciliation_requires_quiescence")
 
 
-async def open_control(binding):
+class ReviewSourcesChanged(JobError):
+    def __init__(self):
+        super().__init__('pending_review_sources_changed')
+
+
+@dataclass(frozen=True)
+class ReviewSources:
+    version: tuple
+    pending: bool
+
+
+def needs_review_sources(manager, actor):
+    return not (manager._trust_own_writes.get() and actor.session_id in manager.__dict__.get('_clean_sessions',{}))
+
+
+async def prepare_review_sources(manager, actor):
+    from . import session_controls
+    from .abort_outcomes import pending_reviews
+
+    async with manager._read() as reader:
+        seen = await session_controls.version(manager,reader,actor.session_id)
+        pending = bool(await pending_reviews(manager,reader,actor))
+        return ReviewSources(seen,pending)
+
+
+async def open_control(binding, *, review_sources=None):
     runtime, manager = binding.runtime, binding.runtime.manager
     if binding.resource_evidence.get("_control_state") is not None:
         return current(binding)
@@ -231,12 +256,19 @@ async def open_control(binding):
         await validate_dispatch(manager, tx, source)
         if source["kind"] != "send" or source["session_id"] != binding.actor.session_id:
             raise JobError("model_attempt_owner_mismatch")
+        from . import session_controls
+        seen = await session_controls.version(manager,tx,binding.actor.session_id)
+        if session_controls.is_clean(manager,binding.actor.session_id,seen):
+            review_pending = False
+        elif review_sources is None or review_sources.version!=seen:
+            raise ReviewSourcesChanged()
+        else:
+            review_pending = review_sources.pending
         await ensure_policy(binding, transaction=tx, job=source)
         await _no_unknown_sends(manager, tx, source)
         wait_deadline, wait_owners = await dispatch_policy(manager, tx, source)
         import json
 
-        from .abort_outcomes import pending_reviews
         length = "length(CAST(payload_json AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(payload_json)"
         registered = binding.resource_evidence.pop("_control_registered_payload", None)
         fresh = registered is not None and registered.get("job_id") == source["job_id"]
@@ -252,10 +284,6 @@ async def open_control(binding):
         if flag is not None and (type(flag) is not int or flag != 1):
             raise JobError("tool_call_plan_protocol_invalid")
         plan_required = flag == 1
-        from . import session_controls
-        seen = await session_controls.version(manager, tx, binding.actor.session_id)
-        review_pending = (False if session_controls.is_clean(manager, binding.actor.session_id, seen)
-                          else bool(await pending_reviews(manager, tx, binding.actor)))
         # A job registered in this same transaction cannot have children yet.
         managed_check = not fresh and await tx.fetchone(
             f"SELECT job_id FROM {manager.jobs} WHERE parent_job_id=? AND kind='background_tool' LIMIT 1",
