@@ -190,6 +190,6 @@ async def bind(manager, tx, row, sid):
 
 async def get(manager, actor, job_id, generation):
     event_id(manager, job_id, generation)
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         row = await manager._authorize(tx, actor, job_id)
         return await read(manager, tx, row, generation)

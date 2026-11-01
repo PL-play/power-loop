@@ -160,5 +160,5 @@ async def read(manager, reader, row):
 
 
 async def get(manager, actor, job_id):
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         return await read(manager, tx, await manager._authorize(tx, actor, job_id))

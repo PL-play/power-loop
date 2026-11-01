@@ -117,7 +117,7 @@ async def list_sessions(manager, actor, job_id):
     """
     if not isinstance(job_id, str) or not 0 < len(job_id) <= 64:
         raise JobError("invalid_task_session_job")
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         job = await manager._authorize(tx, actor, job_id)
         bindings = await _bindings(manager, tx, job)
         return {"version": 1, "store_id": manager.store.store_id, "job_id": job_id,

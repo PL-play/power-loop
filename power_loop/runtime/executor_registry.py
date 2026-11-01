@@ -326,7 +326,7 @@ async def validate_binding(manager, tx, data):
 
 
 async def get(manager, identity):
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         row = await _row(manager, tx, identity)
         return {**_snapshot(row), "admission_open": row["state"] == "accepting" and row["lease_until_ms"] > manager.now(),
             "physical_stop_confirmed": False}

@@ -305,7 +305,7 @@ async def read(manager, reader, row, generation):
 
 async def get(manager, actor, job_id, generation):
     _generation(generation)
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         row = await manager._authorize(tx, actor, job_id)
         return await read(manager, tx, row, generation)
 

@@ -201,6 +201,18 @@ class JobManager:
                        "outcome": outcome, "dialect": self.db.dialect.name})
 
     @asynccontextmanager
+    async def _read(self):
+        """Inspect one coherent view without acquiring a control writer."""
+        from .session_controls import ControlReadView
+
+        joined = self._joined_write.get()
+        if joined is not None:
+            yield ControlReadView(joined, self)
+        else:
+            async with self.db.read_snapshot() as snapshot:
+                yield ControlReadView(snapshot, self)
+
+    @asynccontextmanager
     async def joined_write(self):
         """Run several control steps as one transaction (one lock, one commit).
 
@@ -661,7 +673,7 @@ class JobManager:
                  _json(data), "not_applicable", self.now()))
 
     async def operation_for_call(self, actor: JobActor, call_ref: MessageRef, tool_call_id: str) -> JobOperation | None:
-        async with self._write() as tx:
+        async with self._read() as tx:
             await self._validate_call(tx, actor, call_ref, tool_call_id)
             rows = []
             for action in ("create", "nudge", "steer", "stop", "wait_decision"):
@@ -807,14 +819,14 @@ class JobManager:
         This is execution evidence, not billing or a transactional completion gate.
         Unknown/in-flight provider charges remain a separate recovery obligation.
         """
-        await self._authorize(self.db, actor, job_id)
-        if generation is not None and (isinstance(generation, bool) or not isinstance(generation, int) or generation < 1):
-            raise JobError("invalid_result_generation")
         if generation is not None:
             from .execution_membership import usage
-            async with self._write() as tx:
+            async with self._read() as tx:
                 row = await self._authorize(tx, actor, job_id)
+                if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+                    raise JobError("invalid_result_generation")
                 return await usage(self, tx, row, generation)
+        await self._authorize(self.db, actor, job_id)
         frontier, seen, totals = [job_id], set(), {}
         for _ in range(64):
             if not frontier:

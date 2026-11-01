@@ -40,12 +40,29 @@ async def prepare(manager, actor, job_id, generation, *, lease=None):
 
 
 async def _prepare(manager, tx, actor, job_id, generation, *, lease=None, _controller_closures=None):
-    """Caller holds task control; take the normal session-state lock second."""
-    key = delivery_event_id(job_id, generation)
+    """Explicit publisher: task control precedes the session-state write lock."""
+    row = await _workflow(manager, tx, actor, job_id)
+    await manager.db.dialect.lock_state(tx, manager.store.t.session_state, actor.session_id)
+    data, original = await _delivery(manager, tx, actor, row, generation, lease=lease,
+        _controller_closures=_controller_closures)
+    if original is None:
+        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'),
+            (delivery_event_id(job_id, generation), job_id, "workflow_delivery", data["envelope"]["result_revision"],
+             _hash(data), _json(data), "not_applicable", manager.now()))
+    return data
+
+
+async def _workflow(manager, tx, actor, job_id):
     row = await manager._authorize(tx, actor, job_id)
     if row["kind"] != "workflow" or row["execution_role"] != "workflow" or row["created_by_session_id"] != actor.session_id:
         raise JobError("workflow_delivery_target_mismatch")
-    await manager.db.dialect.lock_state(tx, manager.store.t.session_state, actor.session_id)
+    return row
+
+
+async def _delivery(manager, tx, actor, row, generation, *, lease=None, _controller_closures=None):
+    """Pure original/projection verification, also usable in read snapshots."""
+    job_id = row["job_id"]
+    key = delivery_event_id(job_id, generation)
     if row["generation"] != generation:
         raise JobError("workflow_delivery_generation_changed")
     if lease is not None:
@@ -130,8 +147,7 @@ async def _prepare(manager, tx, actor, job_id, generation, *, lease=None, _contr
     else:
         if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (_id("projected", job_id, generation),)):
             raise JobError("workflow_delivery_revision_mismatch")
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job_id, "workflow_delivery", canonical["job_version"], _hash(data), _json(data), "not_applicable", manager.now()))
-    return data
+    return data, old
 
 
 async def _event(manager, tx, key, kind, data, job_id, revision):
@@ -218,7 +234,10 @@ async def project(loop, actor, job_id, generation, *, lease=None):
 
 async def require_closed(manager, tx, actor, job_id, generation, *, consumed=False, _controller_closures=None):
     """Transaction-local takeover prerequisite, not workflow resume permission."""
-    data = await _prepare(manager, tx, actor, job_id, generation, _controller_closures=_controller_closures)
+    row = await _workflow(manager, tx, actor, job_id)
+    data, original = await _delivery(manager, tx, actor, row, generation, _controller_closures=_controller_closures)
+    if original is None:
+        raise JobError("workflow_projection_unsettled")
     expected = await _closure(manager, tx, data)
     key = _id("projected", job_id, generation)
     event = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (key,))

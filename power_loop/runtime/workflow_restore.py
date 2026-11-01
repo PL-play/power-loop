@@ -93,7 +93,7 @@ async def _stopped_tree(manager, tx, row, seen=None, depth=0):
 
 
 async def _prepare(manager, tx, actor, row, *, generation, node_id, message):
-    """Caller holds control lock; admission must recompute and compare this plan."""
+    """Read a consistent plan; admission must recompute and compare it."""
     from power_loop.runtime.spec import AgentSpec
     from power_loop.workflow.spec import WorkflowSpec, _node_to_dict
 
@@ -228,7 +228,7 @@ async def _prepare(manager, tx, actor, row, *, generation, node_id, message):
 
 
 async def preview(manager, actor, job_id, **kwargs):
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         return await prepare(manager, tx, actor, await manager._authorize(tx, actor, job_id), **kwargs)
 
 

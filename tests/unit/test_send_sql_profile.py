@@ -98,6 +98,13 @@ class Profiled:
         async with self.db.transaction() as tx:
             yield _Tx(self, tx)
 
+    @asynccontextmanager
+    async def read_snapshot(self):
+        self.transactions += 1
+        self.tx_sites.append(_sites())
+        async with self.db.read_snapshot() as reader:
+            yield _Tx(self, reader)
+
     async def fetchone(self, sql, params=()):
         result = await self.db.fetchone(sql, params)
         self.note(sql, 0 if result is None else 1)

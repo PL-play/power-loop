@@ -115,7 +115,7 @@ def for_send(runtime, session_id):
 
 async def read(manager, actor, source_job_id, *, namespace=None, required=True):
     """Read saved provenance even after exit; never renew a lease or grant work."""
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         return await _read(manager, tx, actor, source_job_id, namespace=namespace, required=required)
 
 
