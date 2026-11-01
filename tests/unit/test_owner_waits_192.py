@@ -457,19 +457,33 @@ async def test_resume_revalidates_original_wait_and_physical_exit_evidence(origi
     elif damage == "model_unknown":
         [model] = await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='send' AND control_owner_job_id=?", (owner.job_id,))
         table, column, key_column, key, value = c.manager.jobs, "resource_state", "job_id", model["job_id"], "unknown"
-    [original_row] = await c.manager.db.fetchall(f"SELECT {column} FROM {table} WHERE {key_column}=?", (key,))
-    try:
+    [original_row] = await c.manager.db.fetchall(f"SELECT * FROM {table} WHERE {key_column}=?", (key,))
+
+    async def mutate_original(field_value):
         async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {table} SET {column}=? WHERE {key_column}=?", (value, key))
+            sql = f"UPDATE {table} SET {column}=? WHERE {key_column}=?"
+            if table == c.manager.jobs:
+                await tx.write_job(key, sql, (field_value, key))
+            else:
+                # This fixture damages then restores one original. Do not
+                # rebuild derived indexes from its deliberately corrupt value.
+                await tx.update_event(original_row["job_id"], sql, (field_value, key), obligations=False)
+
+    try:
+        await mutate_original(value)
+        assert (await c.manager.db.fetchone(f"SELECT {column} FROM {table} WHERE {key_column}=?", (key,)))[column] == value
         before = c.model.calls.copy()
         with pytest.raises(JobError):
             await step(c.manager, c.runtime.actor(c.state.parent), JobLease(**saved["owner"]), event["event_id"], saved)
         assert c.model.calls == before
         assert (await c.manager.get_job(c.runtime.actor(c.state.parent), owner.job_id)).status == "waiting"
         assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='owner_wait_resumed' AND event_id<>?", (event["event_id"],))
+        assert (await c.manager.db.fetchone(f"SELECT {column} FROM {table} WHERE {key_column}=?", (key,)))[column] == value
     finally:
-        async with c.manager._write() as tx:
-            await tx.execute(f"UPDATE {table} SET {column}=? WHERE {key_column}=?", (original_row[column], key))
-        release.set()
+        try:
+            await mutate_original(original_row[column])
+            assert await c.manager.db.fetchone(f"SELECT * FROM {table} WHERE {key_column}=?", (key,)) == original_row
+        finally:
+            release.set()
     await asyncio.wait_for(asyncio.gather(*set(delegation._TASKS), return_exceptions=True), 5)
     assert (await c.manager.get_job(c.runtime.actor(c.state.parent), owner.job_id)).outcome == "succeeded"

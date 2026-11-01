@@ -68,29 +68,62 @@ async def test_pending_retires_only_for_actual_review_and_raw_messages_remain_or
 async def test_incomplete_or_rewritten_original_evidence_cannot_dispose_pending(original_pending, part):
     c, row, source, pending, loop, reviewer = original_pending
     key = 'model_closed_' + source.job_id
-    if part == 'model_missing':
-        await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (key,))
-    elif part == 'resource_unknown':
-        await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET resource_state='unknown' WHERE job_id=?", (source.job_id,))
-    elif part == 'source_generation':
-        await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET generation=2 WHERE job_id=?', (source.job_id,))
-    elif part == 'snapshot_call':
-        event = await c.manager.db.fetchone(f'SELECT payload_json FROM {c.manager.events} WHERE event_id=?', (key,))
-        value = json.loads(event['payload_json'])
-        value['evidence'][SNAPSHOT]['pending']['tool_calls'][0]['function']['arguments'] = '{"text":"rewritten"}'
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (_json(value), key))
-    elif part == 'model_attempt':
-        await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE job_id=? AND event_type='model_attempt_finished'", (source.job_id,))
-    elif part == 'notice_missing':
-        await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE job_id=? AND event_type='managed_effect_delivery'", (row['job_id'],))
-    else:
-        await c.store.set_pending(c.sid, {**pending, 'round_index': 20} if part == 'pending_changed' else None)
-    before = (await c.store.get_state(c.sid)).pending
-    with pytest.raises(JobError):
-        await retire_pending(loop, c.actor, source.job_id)
-    assert (await c.store.get_state(c.sid)).pending == before
-    assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='pending_call_disposition'")
-    assert reviewer.calls == 0 and c.state.dispatched == c.model.calls == 1
+    original_job = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (source.job_id,))
+    original_events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} WHERE job_id IN (?,?) ORDER BY event_id',
+        (source.job_id, row['job_id']))
+    try:
+        if part == 'model_missing':
+            await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (key,))
+        elif part == 'resource_unknown':
+            await c.manager.db.execute(f"UPDATE {c.manager.jobs} SET resource_state='unknown' WHERE job_id=?", (source.job_id,))
+        elif part == 'source_generation':
+            await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET generation=2 WHERE job_id=?', (source.job_id,))
+        elif part == 'snapshot_call':
+            event = next(event for event in original_events if event['event_id'] == key)
+            value = json.loads(event['payload_json'])
+            value['evidence'][SNAPSHOT]['pending']['tool_calls'][0]['function']['arguments'] = '{"text":"rewritten"}'
+            await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (_json(value), key))
+        elif part == 'model_attempt':
+            await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE job_id=? AND event_type='model_attempt_finished'", (source.job_id,))
+        elif part == 'notice_missing':
+            await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE job_id=? AND event_type='managed_effect_delivery'", (row['job_id'],))
+        else:
+            await c.store.set_pending(c.sid, {**pending, 'round_index': 20} if part == 'pending_changed' else None)
+        before = (await c.store.get_state(c.sid)).pending
+        damaged_job = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (source.job_id,))
+        damaged_events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} WHERE job_id IN (?,?) ORDER BY event_id',
+            (source.job_id, row['job_id']))
+        with pytest.raises(JobError):
+            await retire_pending(loop, c.actor, source.job_id)
+        assert (await c.store.get_state(c.sid)).pending == before
+        assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='pending_call_disposition'")
+        assert reviewer.calls == 0 and c.state.dispatched == c.model.calls == 1
+        assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (source.job_id,)) == damaged_job
+        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} WHERE job_id IN (?,?) ORDER BY event_id',
+            (source.job_id, row['job_id'])) == damaged_events
+    finally:
+        # Restore only this case's deliberate damage after proving that cold
+        # rejection did not repair it. The per-case original/index oracle then
+        # inspects the unchanged real source, not an invented second generation.
+        if part in ('resource_unknown', 'source_generation'):
+            await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET resource_state=?,generation=? WHERE job_id=?',
+                (original_job['resource_state'], original_job['generation'], source.job_id))
+        elif part == 'snapshot_call':
+            event = next(event for event in original_events if event['event_id'] == key)
+            await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (event['payload_json'], key))
+        elif part in ('model_missing', 'model_attempt', 'notice_missing'):
+            removed = [event for event in original_events if
+                (part == 'model_missing' and event['event_id'] == key) or
+                (part == 'model_attempt' and event['job_id'] == source.job_id and event['event_type'] == 'model_attempt_finished') or
+                (part == 'notice_missing' and event['job_id'] == row['job_id'] and event['event_type'] == 'managed_effect_delivery')]
+            for event in removed:
+                await c.manager.db.execute(f"INSERT INTO {c.manager.events} ({','.join(event)}) VALUES ({','.join('?' for _ in event)})",
+                    tuple(event.values()))
+        else:
+            await c.store.set_pending(c.sid, pending)
+    assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (source.job_id,)) == original_job
+    assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} WHERE job_id IN (?,?) ORDER BY event_id',
+        (source.job_id, row['job_id'])) == original_events
 
 
 @pytest.mark.parametrize('stage', ['record', 'state', 'commit', 'commit_ack'])

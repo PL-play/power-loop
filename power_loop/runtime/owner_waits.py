@@ -162,7 +162,7 @@ async def read(manager, actor, job_id, *, generation=None):
     """Authorized original facts, including after expiry; no execution grant."""
     from .execution_membership import _generation, scope
 
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         current = await manager._authorize(tx, actor, job_id)
         if current["kind"] not in ("subagent", "workflow_node"):
             raise JobError("owner_wait_owner_required")
@@ -308,7 +308,7 @@ def note_registered_policy(manager, owner, deadline):
 
 async def check_deadline(binding):
     manager = binding.runtime.manager
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         row = await manager._fence(tx, binding.actor, binding.lease)
         await require_time(manager, tx, row)
 

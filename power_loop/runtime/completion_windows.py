@@ -89,7 +89,7 @@ async def admit(manager, tx, row):
 
 
 async def read(manager, actor, job_id):
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         return await read_row(manager, tx, await manager._authorize(tx, actor, job_id))
 
 
@@ -109,7 +109,7 @@ async def bind_window(loop, window, sid):
     if runtime is None or owner is None or owner.runtime is not runtime:
         window.bind(sid)
         return
-    async with runtime.manager._write() as tx:
+    async with runtime.manager._read() as tx:
         row = await runtime.manager._authorize(tx, owner.actor, owner.lease.job_id)
         runtime.manager._check_proof(row, owner.lease)
         saved = await read_row(runtime.manager, tx, row)

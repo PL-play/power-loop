@@ -96,7 +96,7 @@ async def recall_decision(manager, actor, *, event_id, caller, call_ref, tool_ca
                           decision, reason="Reviewed original deferred request.", next_review_at_ms=None):
     request = _intent(event_id, caller, call_ref, tool_call_id, decision, reason, next_review_at_ms)
     key = manager._origin_key(actor, "wait_decision", call_ref, tool_call_id, None)
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE operation_key=?", (key,))
         if old is None:
             return None
@@ -204,7 +204,7 @@ async def inspect(manager, actor, event_id, *, field="summary", char_offset=0, m
     if (field not in ("summary", "note", "continuation") or type(char_offset) is not int or char_offset < 0
             or type(max_chars) is not int or not 256 <= max_chars <= 16000):
         raise JobError("invalid_wait_inspection")
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         job, due, saved, receipt = await notices.notification(manager, tx, actor, event_id)
         if field == "summary":
             if char_offset:

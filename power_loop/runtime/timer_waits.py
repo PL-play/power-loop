@@ -238,7 +238,7 @@ async def _read(manager, tx, actor, job_id):
 
 async def read_wait(manager, actor, job_id):
     """Read frozen evidence; history is never permission to resume an execution."""
-    async with manager._write() as tx:
+    async with manager._read() as tx:
         return (await _read(manager, tx, actor, job_id))[2]
 
 
