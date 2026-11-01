@@ -61,7 +61,8 @@ async def test_actual_recovery_queries_are_flat_and_every_task_relation_has_an_i
             classes = [PostgresDatabase, _PgTransaction]
         else:
             raise AssertionError('uncovered query-plan backend: '+backend)
-        names = (c.manager.jobs, c.manager.events, c.manager.prefix+'task_budget_attempts')
+        names = (c.manager.jobs, c.manager.events, c.manager.prefix+'task_budget_attempts',
+                 c.manager.prefix+'session_obligations')
         async def inspect_sql(self, sql, params):
             if sql in plans or not re.match(r'\s*(SELECT|UPDATE|DELETE)\b', sql, re.I) or not any(name in sql for name in names):
                 return
@@ -72,7 +73,7 @@ async def test_actual_recovery_queries_are_flat_and_every_task_relation_has_an_i
                 detail = [row['detail'] for row in rows]
                 # Sorting temporary results is permitted; reading an unindexed
                 # task relation is not. Check every joined table, not one leaf.
-                assert not any(re.match(r'SCAN\s+(?:j|e|d|t|'+re.escape(c.manager.prefix)+r'\w+)\b', text)
+                assert not any(re.match(r'SCAN\s+(?:j|e|d|t|o|'+re.escape(c.manager.prefix)+r'\w+)\b', text)
                     and 'USING' not in text for text in detail), (sql, detail)
                 plans[sql] = detail
             elif backend == 'mysql':
@@ -152,7 +153,8 @@ async def test_task_index_ddl_names_fit_all_supported_prefixes(registry_store):
     indexes = [sql for sql in rows if sql.startswith('CREATE INDEX ')]
     assert all(len(sql.split()[2]) <= 64 for sql in indexes)
     for suffix in ['idx_jobs_root_page','idx_jobs_session_kind','idx_jobs_control_owner','idx_jobs_main_page',
-                   'idx_events_job_type','idx_events_caller_type','idx_events_call','idx_budget_job','idx_context_capacity']:
+                   'idx_events_job_type','idx_events_caller_type','idx_events_call','idx_budget_job','idx_context_capacity',
+                   'idx_obligations_job']:
         assert any(sql.startswith('CREATE INDEX '+'x'*24+suffix+' ') for sql in indexes)
 
 

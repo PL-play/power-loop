@@ -14,11 +14,14 @@ EVENTS = frozenset({
     "managed_effect_tool_receipt",
 })
 COLUMNS = ("session_id", "kind", "source_id", "job_id", "opened_version")
+_INPUT_MODES = frozenset({"steer", "continue", "restore_input"})
 
 
 def note(recorder, event):
     kind = event.get("event_type")
-    if kind in EVENTS or kind == "operation" and event.get("action") == "nudge":
+    input_write = (kind == "operation" and event.get("action") == "nudge"
+                   and json.loads(event["payload_json"]).get("mode") in _INPUT_MODES)
+    if kind in EVENTS or input_write:
         recorder.obligation_jobs.add(event["job_id"])
         if kind == "processing_decision":
             recorder.obligation_processed.add(event["job_id"])
@@ -128,11 +131,14 @@ async def _desired(manager, tx, row, *, verify=False, clean=None):
                 await notification(manager, tx, actor, json.loads(event["payload_json"])["due_event_id"])
             add(recipient, "wait", event)
         elif kind == "operation" and event["delivery_status"] != "handled":
+            data = json.loads(event["payload_json"])
+            if data.get("mode") not in _INPUT_MODES:
+                continue
             if verify:
                 from .wait_effects import validate_input
-                actor = JobActor(row["tenant_id"], row["principal_id"], json.loads(event["payload_json"])["request"]["session_id"])
+                actor = JobActor(row["tenant_id"], row["principal_id"], data["request"]["session_id"])
                 await validate_input(manager, tx, actor, event)
-            add(json.loads(event["payload_json"])["request"]["session_id"], "input", event)
+            add(data["request"]["session_id"], "input", event)
     return entries
 
 
