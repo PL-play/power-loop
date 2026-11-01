@@ -9,7 +9,7 @@ one place.
 
 Layout (per parent session):
 
-* ``workflow:run:<run_id>``  → one journal blob per run (status, steps, result).
+* ``workflow:run:<run_token>`` → one journal blob per run (status, steps, result).
 * ``workflow:index``         → ``list[run_id]`` so runs can be enumerated
   (``SessionStore`` has no list-by-prefix / query-by-metadata).
 
@@ -28,6 +28,7 @@ Caveats baked in here:
 
 from __future__ import annotations
 
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -72,7 +73,7 @@ def _now_ms() -> int:
 
 def _run_token(run_id: str) -> str:
     """One bounded storage identity for journal and owned history keys."""
-    if len(run_id) <= 128 and not run_id.startswith("sdk_"):
+    if re.fullmatch(r"[0-9a-f]{8,64}", run_id):
         return run_id
     from power_loop.runtime.jobs import _hash
     return "sdk_" + _hash(run_id)

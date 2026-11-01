@@ -489,14 +489,18 @@ async def test_concurrent_long_run_ids_keep_distinct_original_journals(legacy_ca
     c = legacy_case
     left, right = "sdk-" + "x" * 300 + "left", "sdk-" + "x" * 300 + "right"
     alias = legacy_history.history_key(left).removeprefix("workflow:history:")
+    uppercase = alias.upper()
     await asyncio.gather(journal.seed(c.store, c.owner, left, "left-original"),
                          journal.seed(c.store, c.owner, right, "right-original"),
-                         journal.seed(c.store, c.owner, alias, "token-as-literal-original"))
+                         journal.seed(c.store, c.owner, alias, "token-as-literal-original"),
+                         journal.seed(c.store, c.owner, uppercase, "uppercase-token-original"))
     first, second = await journal.read(c.store, c.owner, left), await journal.read(c.store, c.owner, right)
     literal = await journal.read(c.store, c.owner, alias)
+    capitalized = await journal.read(c.store, c.owner, uppercase)
     assert first["run_id"] == left and first["workflow"] == "left-original"
     assert second["run_id"] == right and second["workflow"] == "right-original"
     assert literal["run_id"] == alias and literal["workflow"] == "token-as-literal-original"
+    assert capitalized["run_id"] == uppercase and capitalized["workflow"] == "uppercase-token-original"
     index = await c.store.get_runtime_state(c.owner, journal.INDEX_KEY)
-    assert set(index) == {left, right, alias}
+    assert set(index) == {left, right, alias, uppercase}
     assert not any(c.model.counts.values())
