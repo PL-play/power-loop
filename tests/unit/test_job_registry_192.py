@@ -57,6 +57,10 @@ async def registry_store(request, tmp_path):
         finally:
             if backend != "sqlite":
                 for active_prefix in prefixes:
+                    namespace = "current_schema()" if backend == 'postgres' else "DATABASE()"
+                    view = await store._db.fetchone('SELECT 1 AS present FROM information_schema.views '
+                        f'WHERE table_schema={namespace} AND table_name=?', (active_prefix+'usage_rounds',))
+                    await store._db.execute(f'DROP {"VIEW" if view else "TABLE"} IF EXISTS {active_prefix}usage_rounds')
                     for name in (*TASK_TABLES, *_STORE_TABLES, "schema_migrations"):
                         await store._db.execute(f"DROP TABLE IF EXISTS {active_prefix}{name}")
             for s in reversed(stores):

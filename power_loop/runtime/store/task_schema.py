@@ -1,4 +1,4 @@
-"""Explicit v13 task schema; ordinary storage uses v11.
+"""Explicit v14 task schema; ordinary storage uses v12.
 
 No live store is migrated by opening it. A maintenance caller must close writers
 and explicitly invoke migrate_task_schema; old binaries reject the current stamp or
@@ -15,6 +15,7 @@ Protocol36 records metadata operations through source-owned control permissions.
 Protocol37 fences first executor registration against unregistered claims.
 Protocol38 fences first budget-policy activation against unbudgeted sends.
 Protocol39 serializes control writers by their root job instead of task_store.
+Protocol40 stores response usage in the response original instead of a separate write.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import secrets
 from .db import Database
 from .schema import (
     _STORE_TABLES,
+    _STORE_VIEWS,
     StoreSchemaError,
     _acquire_provision_lock,
     _column_exists,
@@ -34,8 +36,8 @@ from .schema import (
     validate_table_prefix,
 )
 
-TASK_SCHEMA_VERSION = 13
-TASK_PROTOCOL_VERSION = 39
+TASK_SCHEMA_VERSION = 14
+TASK_PROTOCOL_VERSION = 40
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -239,7 +241,9 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
               else _PROTOCOL_21_TABLES if protocol < 22 else _PROTOCOL_23_TABLES if protocol < 24
               else _PROTOCOL_34_TABLES if protocol < 35 else _PROTOCOL_35_TABLES if protocol < 37
               else _PROTOCOL_37_TABLES if protocol < 38 else TASK_TABLES)
-    missing = [t for t in (*_STORE_TABLES, *tables) if not await _table_exists_tx(tx, db.dialect.name, prefix + t)]
+    base = (*_STORE_TABLES, *_STORE_VIEWS) if protocol >= 40 else tuple(
+        'usage_rounds' if name == 'usage_observations' else name for name in _STORE_TABLES)
+    missing = [t for t in (*base, *tables) if not await _table_exists_tx(tx, db.dialect.name, prefix + t)]
     if missing:
         raise StoreSchemaError(f"task schema incomplete: {missing}")
     if not await _column_exists(tx, db.dialect.name, prefix + "messages", "id"):
@@ -417,16 +421,23 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
         await _acquire_provision_lock(tx, db, prefix)
         try:
             row = await tx.fetchone(f"SELECT version FROM {prefix}schema_migrations WHERE id=1")
-            if row is None or int(row["version"]) not in (9, 10, 11, 12, TASK_SCHEMA_VERSION):
+            if row is None or int(row["version"]) not in (9, 10, 11, 12, 13, TASK_SCHEMA_VERSION):
                 raise StoreSchemaError("task migration supports base or task schemas only")
             from .change_signals import migration_steps
             for statement in await migration_steps(tx, db, prefix):
                 await tx.execute(statement)
-            if int(row["version"]) in (10, 12, TASK_SCHEMA_VERSION):
+            if int(row["version"]) in (10, 12, 13, TASK_SCHEMA_VERSION) and await _table_exists_tx(tx, db.dialect.name, prefix+'task_store'):
                 identity = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35, 36, 37, 38):
+                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35, 36, 37, 38, 39):
                     old_protocol = identity["protocol_version"]
+                    from .message_usage import migrate as migrate_usage
+                    # MySQL can commit the rename before an offline importer
+                    # dies. Recreate its derived view before verifying the old
+                    # read shape;the original observation table stays intact.
+                    if await _table_exists_tx(tx, db.dialect.name, prefix+'usage_observations'):
+                        await migrate_usage(tx, db, prefix)
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
+                    await migrate_usage(tx, db, prefix)
                     from .operation_migration import verify_operation_records
                     await verify_operation_records(tx, prefix)
                     if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
@@ -460,6 +471,8 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                     from .operation_migration import verify_operation_records
                     await verify_operation_records(tx, prefix)
                     await _run_task_ddl(tx, db, prefix)
+                    from .message_usage import migrate as migrate_usage
+                    await migrate_usage(tx, db, prefix)
                     from ..executor_admissions import rebuild
                     await rebuild(tx, prefix, identity['store_id'])
                     from ..budget_admissions import rebuild as rebuild_principals
@@ -529,6 +542,8 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                     )
             elif db.dialect.name != "mysql":
                 raise StoreSchemaError("unexpected existing raw IDs in v9 require inspection")
+            from .message_usage import migrate as migrate_usage
+            await migrate_usage(tx, db, prefix)
             await _run_task_ddl(tx, db, prefix)
             await tx.execute(f"UPDATE {prefix}schema_migrations SET version=? WHERE id=1", (TASK_SCHEMA_VERSION,))
         finally:

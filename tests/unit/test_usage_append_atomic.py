@@ -28,7 +28,7 @@ async def usage_rows(store, sid):
     return await store._db.fetchall(f"SELECT * FROM {store.t.usage_rounds} WHERE session_id=?", (sid,))
 
 
-@pytest.mark.parametrize("stage", ["after_message", "after_usage", "before_round_end"])
+@pytest.mark.parametrize("stage", ["after_reservation", "after_message", "before_round_end"])
 async def test_process_crash_keeps_message_usage_atomic_and_supplier_charge_original(registry_store, tmp_path, stage):
     store, connect = registry_store
     sid = await store.create_session()
@@ -45,7 +45,7 @@ async def test_process_crash_keeps_message_usage_atomic_and_supplier_charge_orig
         if process.returncode is None:
             process.kill()
             await process.wait()
-    assert process.returncode == {"after_message": 93, "after_usage": 94, "before_round_end": 95}[stage], output.decode()
+    assert process.returncode == {"after_reservation": 94, "after_message": 93, "before_round_end": 95}[stage], output.decode()
     saved = json.loads(evidence.read_text())
     reader = await connect(schema="compatible")
     rows = await reader.load_all_messages(sid)

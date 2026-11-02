@@ -28,7 +28,7 @@ from typing import Any
 
 from power_loop.contracts.errors import InboxClaimChanged, SessionLeaseLost
 from power_loop.runtime.message_ref import integer_id
-from power_loop.runtime.store import change_signals, send_reads
+from power_loop.runtime.store import change_signals, message_usage, send_reads
 from power_loop.runtime.store.capabilities import Maintenance
 from power_loop.runtime.store.db import Database, Row, Transaction
 from power_loop.runtime.store.schema import (
@@ -133,6 +133,7 @@ class _Tables:
         self.messages = f"{prefix}messages"
         self.compactions = f"{prefix}compactions"
         self.usage_rounds = f"{prefix}usage_rounds"
+        self.usage_observations = f"{prefix}usage_observations"
         self.session_state = f"{prefix}session_state"
         self.session_runtime_state = f"{prefix}session_runtime_state"
         self.shared_state = f"{prefix}shared_state"
@@ -168,8 +169,8 @@ _EXPORT_TABLES: tuple[tuple[str, Any, tuple[str, ...]], ...] = (
     ("compactions", lambda t: t.compactions, (
         "session_id", "compact_seq", "note_seq", "from_seq", "to_seq", "before_tokens",
         "after_tokens", "round_index", "created_at")),
-    ("usage_rounds", lambda t: t.usage_rounds, (
-        "session_id", "round_index", "prompt_tokens", "completion_tokens", "total_tokens",
+    ("usage_rounds", lambda t: t.usage_observations, (
+        "session_id", "send_index", "round_index", "prompt_tokens", "completion_tokens", "total_tokens",
         "cached_tokens", "model", "created_at")),
     ("session_runtime_state", lambda t: t.session_runtime_state, (
         "session_id", "state_key", "value_json", "updated_at")),
@@ -630,6 +631,10 @@ class SessionStore:
             # An unknown append outcome requires a stored read on close.
             reads.assistant_send_index, reads.assistant_ref = None, None
         now = _now_ms()
+        if round_usage is not None:
+            # One response original contains its usage;no separate per-round
+            # write or failure window between the response and its accounting.
+            meta = {**(meta or {}), message_usage.META_KEY: dict(round_usage)}
         pending_json = _KEEP if pending is _KEEP else (_dumps(pending) if pending else None)
         deferred_round, holding.deferred_round = holding.deferred_round, None
         sets, params = [], []
@@ -770,9 +775,6 @@ class SessionStore:
                     if state_written is not True:
                         await tx.execute(f"UPDATE {self.t.session_state} SET pending_json=? WHERE session_id=?",
                                          (pending_json, session_id))
-                if round_usage is not None:
-                    await self.record_usage(session_id, round_index=round_index, send_index=send_index,
-                                            transaction=tx, **round_usage)
                 if hook_injected:
                     # Per-session monotonic event_id; MAX+1 is race-free here because we hold the
                     # session_state lock for the whole append (serializes same-session writers).
@@ -1621,7 +1623,7 @@ class SessionStore:
         await tx.execute(f"DELETE FROM {self.t.messages} WHERE session_id=?", (session_id,))
         self._forget_appended(session_id)
         await tx.execute(f"DELETE FROM {self.t.compactions} WHERE session_id=?", (session_id,))
-        await tx.execute(f"DELETE FROM {self.t.usage_rounds} WHERE session_id=?", (session_id,))
+        await tx.execute(f"DELETE FROM {self.t.usage_observations} WHERE session_id=?", (session_id,))
         await tx.execute(f"DELETE FROM {self.t.session_stats} WHERE session_id=?", (session_id,))
         await tx.execute(f"DELETE FROM {self.t.timers} WHERE session_id=?", (session_id,))
         await tx.execute(
@@ -1931,6 +1933,17 @@ class SessionStore:
         return int(row["n"])
 
     # ── usage ─────────────────────────────────────────────────────────────
+    async def list_usage_rounds(self, session_id: str, *, transaction: Transaction | None = None) -> list[Row]:
+        """Read per-round originals once,including rounds without a message.
+
+        A committed response and a round-end observation following a lost ACK
+        describe one round. Response usage takes precedence instead of summing
+        these observations. Cumulative session statistics are independent.
+        """
+        reader = self._db if transaction is None else transaction
+        return await reader.fetchall(f'SELECT * FROM {self.t.usage_rounds} '
+            'WHERE session_id=? ORDER BY send_index,round_index', (session_id,))
+
     async def record_usage(
         self,
         session_id: str,
@@ -1944,14 +1957,18 @@ class SessionStore:
         send_index: int | None = None,
         transaction: Transaction | None = None,
     ) -> None:
-        """Record per-round token usage, keyed ``(session_id, send_index, round_index)``.
+        """Record usage for a round without a committed response acknowledgement.
+
+        Normal response usage is part of the message original. Empty responses
+        and uncertain append outcomes use this keyed observation;reporting
+        deduplicates it against any committed response for the same round.
 
         ``round_index`` RESETS per send — the pre-v6 2-column key made every new send
         overwrite the previous send's rows, so a session's accounting kept only the last
         send's detail. ``send_index=None`` (a caller that doesn't track sends) stores 0,
         which preserves the legacy overwrite-within-send-0 behavior instead of erroring."""
         sql = self._db.dialect.upsert(
-            self.t.usage_rounds,
+            self.t.usage_observations,
             ("session_id", "send_index", "round_index"),
             ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "model",
              "created_at"),
@@ -2064,27 +2081,25 @@ class SessionStore:
         keep_last: int | None = None,
         older_than_ms: int | None = None,
     ) -> int:
-        """Delete per-round usage accounting rows. ``keep_last`` retains the N most
-        recent (by ``round_index``); ``older_than_ms`` prunes rows older than that age
-        (by ``created_at``). Cumulative ``session_stats`` is untouched. Returns deletions
-        (the DELETE's affected-row count)."""
-        sql = f"DELETE FROM {self.t.usage_rounds} WHERE session_id=?"
-        params: list[Any] = [session_id]
-        if older_than_ms is not None:
-            sql += " AND created_at < ?"
-            params.append(_now_ms() - int(older_than_ms))
+        """Prune per-round details from both kinds of original observation.
+
+        Keep the newest rounds across sends. Message bodies and cumulative
+        session statistics stay intact. Returns distinct round details removed.
+        """
+        cutoff = None if older_than_ms is None else _now_ms()-int(older_than_ms)
         async with self._db.transaction() as tx:
+            rows = await self.list_usage_rounds(session_id, transaction=tx)
             if keep_last and keep_last > 0:
-                # Select one indexed boundary, then delete the older range in
-                # the same transaction; do not materialize N retained keys.
-                cutoff = await tx.fetchone(f"SELECT send_index,round_index FROM {self.t.usage_rounds} "
-                    "WHERE session_id=? ORDER BY send_index DESC,round_index DESC LIMIT 1 OFFSET ?",
-                    (session_id, int(keep_last)-1))
-                if cutoff is None:
-                    return 0
-                sql += " AND (send_index < ? OR (send_index = ? AND round_index < ?))"
-                params += [cutoff['send_index'], cutoff['send_index'], cutoff['round_index']]
-            return int(await tx.execute(sql, params))
+                rows = rows[:-int(keep_last)]
+            selected = [row for row in rows if cutoff is None or row['created_at'] < cutoff]
+            for row in selected:
+                key = (session_id, row['send_index'], row['round_index'])
+                await tx.execute(f'DELETE FROM {self.t.usage_observations} '
+                    'WHERE session_id=? AND send_index=? AND round_index=?', key)
+                await tx.execute(f'UPDATE {self.t.messages} '
+                    f'SET meta_json={message_usage.remove_sql(self._db.dialect.name)} '
+                    'WHERE session_id=? AND COALESCE(send_index,0)=? AND round_index=?', key)
+            return len(selected)
 
     # ── runtime state ─────────────────────────────────────────────────────
     async def get_runtime_state(self, session_id: str, key: str, default: Any = None) -> Any:
@@ -2474,11 +2489,13 @@ def _row_to_session(row: Row) -> SessionRow:
 
 
 def _row_to_message(row: Row) -> MessageRow:
+    meta = _loads(row['meta_json']) or {}
+    meta.pop(message_usage.META_KEY, None)
     return MessageRow(
         session_id=row["session_id"], seq=row["seq"], role=row["role"], name=row["name"],
         content=row["content"], tool_calls=_loads(row["tool_calls_json"]),
         tool_call_id=row["tool_call_id"], round_index=row["round_index"],
-        state=MessageState(row["state"]), meta=_loads(row["meta_json"]) or {},
+        state=MessageState(row["state"]), meta=meta,
         created_at=row["created_at"], send_index=row["send_index"],
         id=int(row["id"]) if "id" in row.keys() and row["id"] is not None else None,
     )

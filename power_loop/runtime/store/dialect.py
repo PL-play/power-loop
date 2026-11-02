@@ -12,6 +12,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from . import message_usage
+
 if TYPE_CHECKING:
     from power_loop.runtime.store.db import Row, Transaction
 
@@ -151,7 +153,7 @@ class SqliteDialect:
                 from_seq INTEGER NOT NULL, to_seq INTEGER NOT NULL, before_tokens INTEGER,
                 after_tokens INTEGER, round_index INTEGER, created_at INTEGER NOT NULL,
                 PRIMARY KEY (session_id, compact_seq))""",
-            f"""CREATE TABLE IF NOT EXISTS {p}usage_rounds (
+            f"""CREATE TABLE IF NOT EXISTS {p}usage_observations (
                 session_id TEXT NOT NULL, send_index INTEGER NOT NULL DEFAULT 0,
                 round_index INTEGER NOT NULL, prompt_tokens INTEGER,
                 completion_tokens INTEGER, total_tokens INTEGER, cached_tokens INTEGER, model TEXT,
@@ -197,6 +199,7 @@ class SqliteDialect:
             *self.hook_events_ddl(p),
             *self.leases_ddl(p),
             *self.inbox_ddl(p, f"{p}follow_up_queue"),
+            *message_usage.view_ddl(self.name, p),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -364,7 +367,7 @@ class PostgresDialect:
                 from_seq BIGINT NOT NULL, to_seq BIGINT NOT NULL, before_tokens BIGINT,
                 after_tokens BIGINT, round_index BIGINT, created_at BIGINT NOT NULL,
                 PRIMARY KEY (session_id, compact_seq))""",
-            f"""CREATE TABLE IF NOT EXISTS {p}usage_rounds (
+            f"""CREATE TABLE IF NOT EXISTS {p}usage_observations (
                 session_id TEXT NOT NULL, send_index BIGINT NOT NULL DEFAULT 0,
                 round_index BIGINT NOT NULL, prompt_tokens BIGINT,
                 completion_tokens BIGINT, total_tokens BIGINT, cached_tokens BIGINT, model TEXT,
@@ -410,6 +413,7 @@ class PostgresDialect:
             *self.hook_events_ddl(p),
             *self.leases_ddl(p),
             *self.inbox_ddl(p, f"{p}follow_up_queue"),
+            *message_usage.view_ddl(self.name, p),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:
@@ -543,7 +547,7 @@ class MySQLDialect:
                 from_seq BIGINT NOT NULL, to_seq BIGINT NOT NULL, before_tokens BIGINT,
                 after_tokens BIGINT, round_index BIGINT, created_at BIGINT NOT NULL,
                 PRIMARY KEY (session_id, compact_seq)) {opts}""",
-            f"""CREATE TABLE IF NOT EXISTS {p}usage_rounds (
+            f"""CREATE TABLE IF NOT EXISTS {p}usage_observations (
                 session_id VARCHAR(255) NOT NULL, send_index BIGINT NOT NULL DEFAULT 0,
                 round_index BIGINT NOT NULL, prompt_tokens BIGINT,
                 completion_tokens BIGINT, total_tokens BIGINT, cached_tokens BIGINT, model VARCHAR(255),
@@ -590,6 +594,7 @@ class MySQLDialect:
             *self.hook_events_ddl(p),
             *self.leases_ddl(p),
             *self.inbox_ddl(p, f"{p}follow_up_queue"),
+            *message_usage.view_ddl(self.name, p),
         ]
 
     def project_messages_ddl(self, prefix: str) -> list[str]:

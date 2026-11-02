@@ -58,16 +58,13 @@ async def main(dsn, prefix, sid, evidence, stage):
     async def interrupted():
         async with transaction() as tx:
             execute, fetchone = tx.execute, tx.fetchone
-            assistant = False
-
             def stop(sql, params):
-                nonlocal assistant
+                if (stage == 'after_reservation' and _SEND.get() is not None
+                        and sql.startswith(f'UPDATE {store.t.session_state} SET next_seq=')):
+                    os._exit(94)
                 if sql.startswith(f"INSERT INTO {store.t.messages} ") and params[2] == "assistant":
-                    assistant = True
                     if stage == "after_message":
                         os._exit(93)
-                if assistant and store.t.usage_rounds in sql and stage == "after_usage":
-                    os._exit(94)
 
             async def write(sql, params=()):
                 result = await execute(sql, params)

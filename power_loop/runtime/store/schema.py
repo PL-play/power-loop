@@ -84,17 +84,19 @@ def validate_table_prefix(prefix: str) -> str:
 #:   that writes it into the transcript — so a cancelled run neither loses nor double-delivers
 #:   queued steering. Rebuilt as ``…_v8`` + copy + rename (v7 rows become pending user items).
 # v10 was reserved for task/message identities; v11 adds committed change counters.
-CURRENT_SCHEMA_VERSION = 11
+# v12 stores response usage in messages;usage_rounds is a derived read view.
+CURRENT_SCHEMA_VERSION = 12
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
 #: ``store._Tables`` / ``Dialect.ddl``.
 _STORE_TABLES: tuple[str, ...] = (
-    "sessions", "messages", "compactions", "usage_rounds", "session_state",
+    "sessions", "messages", "compactions", "usage_observations", "session_state",
     "session_runtime_state", "shared_state", "background_tasks", "session_stats",
     "timers", "notes", "project_messages", "hook_events",
     "session_leases", "follow_up_queue", "context_cache", "context_attempts",
 )
+_STORE_VIEWS = ('usage_rounds',)
 
 
 def _send_index_column_type(dialect_name: str) -> str:
@@ -191,7 +193,7 @@ async def _table_exists_tx(tx: Transaction, dialect_name: str, table: str) -> bo
     deadlock on SQLite's single connection)."""
     if dialect_name == "sqlite":
         row = await tx.fetchone(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name=?", (table,)
         )
         return row is not None
     if dialect_name == "postgres":
@@ -385,7 +387,7 @@ async def _table_exists(db: Database, table: str) -> bool:
     name = db.dialect.name
     if name == "sqlite":
         row = await db.fetchone(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name=?", (table,)
         )
         return row is not None
     if name == "postgres":
@@ -528,7 +530,8 @@ async def ensure_schema(
         # restore, a manual/DBA drop, a half-applied provisioning script). Probe each so
         # VERIFY is a real pre-flight instead of passing then crashing on the first write.
         missing = [
-            f"{prefix}{name}" for name in _STORE_TABLES if not await _table_exists(db, f"{prefix}{name}")
+            f"{prefix}{name}" for name in (*_STORE_TABLES, *_STORE_VIEWS)
+            if not await _table_exists(db, f"{prefix}{name}")
         ]
         if missing:
             raise StoreSchemaError(
@@ -582,33 +585,8 @@ async def ensure_schema(
                     f"supports (max {CURRENT_SCHEMA_VERSION})"
                 )
             if version < CURRENT_SCHEMA_VERSION:
-                # Run the idempotent migration ladder under the provision lock, then bump the
-                # stamp. Wrap so a permission failure surfaces the full provisioning script.
-                try:
-                    for stmt in await _migration_steps(tx, db, prefix, from_version=version):
-                        await tx.execute(stmt)
-                except Exception as exc:
-                    # On MySQL DDL auto-commits, so the failed migration is half-applied and the
-                    # version stays at the old value; the steps are idempotent, so reopening with
-                    # AUTO_CREATE once the cause is fixed finishes it. Surface the MIGRATION steps
-                    # (incl. the ALTER) — NOT provisioning_ddl, which would skip the ADD COLUMN on
-                    # the existing messages table and so never actually complete the migration.
-                    mysql_note = (
-                        " (on MySQL the migration is non-atomic — DDL auto-commits — so this may "
-                        "be half-applied; the steps are idempotent, so once the cause is fixed "
-                        "simply reopen with AUTO_CREATE to finish.)"
-                        if db.dialect.name == "mysql" else ""
-                    )
-                    raise StoreSchemaError(
-                        f"failed to migrate the store schema from v{version} to "
-                        f"v{CURRENT_SCHEMA_VERSION}.{mysql_note} If this is a permission error, run "
-                        "the migration step(s) below as a user with the needed rights, then reopen "
-                        "with schema=SchemaPolicy.AUTO_CREATE (it re-runs the idempotent steps and "
-                        f"stamps the version). Underlying error: {exc!r}",
-                        ddl=migration_ddl_for_display(db, prefix, from_version=version),
-                    ) from exc
-                await tx.execute(f"UPDATE {vtable} SET version=? WHERE id=1", (CURRENT_SCHEMA_VERSION,))
-                return CURRENT_SCHEMA_VERSION
+                raise StoreSchemaError('store requires an explicit maintenance migration; '
+                    'ordinary opening never converts stored message or usage formats')
             return version
         finally:
             await _release_provision_lock(tx, db, prefix)
