@@ -9,7 +9,9 @@ from urllib.parse import urlparse
 
 import pytest
 
-from power_loop.runtime.jobs import JobActor, JobManager
+from power_loop.runtime.completion_windows import event_id as window_id
+from power_loop.runtime.jobs import JobActor, JobManager, _hash, _json
+from power_loop.runtime.model_exit import content_reference
 from power_loop.runtime.store.schema import StoreSchemaError
 from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, TASK_SCHEMA_VERSION
 from power_loop.workflow.journal import new_journal, run_key
@@ -47,7 +49,15 @@ async def test_deployed_ddl_upgrade_keeps_original_ids_rekeys_and_rebuilds_once(
         'id':'call', 'type':'function', 'function':{'name':'delegate', 'arguments':'{}'}}])
     ref = await store.message_ref(sid, seq)
     child = await manager.register_job(actor, kind='subagent', parent=lease, independent=True,
-        call_ref=ref, tool_call_id='call')
+        call_ref=ref, tool_call_id='call', request={'completion_window_protocol':1})
+    window = None
+    if backend != 'mysql':
+        # The deployed ID is 66 characters and cannot be represented by the
+        # actual MySQL VARCHAR(64) schema. SQLite/PG retain such old originals.
+        await manager.claim_job(actor, child.job.job_id, executor_id='child', boot_id='child', expected_version=1)
+        window = await store._db.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',
+            (window_id(manager, child.job.job_id),))
+        assert window is not None
     operation = await store._db.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',
         (child.operation.operation_id,))
     run_id = 'operator supplied workflow id'
@@ -56,6 +66,16 @@ async def test_deployed_ddl_upgrade_keeps_original_ids_rekeys_and_rebuilds_once(
     await store.record_usage(sid, send_index=1, round_index=0, prompt_tokens=7, completion_tokens=5, total_tokens=12)
     originals = await store._db.fetchall(f'SELECT * FROM {store.t.messages} ORDER BY id')
     await retain_protocol21_format(store)
+    if window is not None:
+        legacy = {**window, 'event_id':'completion_window_'+window['event_id'][len('cwin_'):]}
+        await store._db.execute(f'UPDATE {manager.events} SET event_id=? WHERE event_id=?',
+            (legacy['event_id'], window['event_id']))
+        for number in (1, 2):
+            value = {'event': content_reference(legacy)}
+            legacy = {**legacy, 'event_id':f'upgrade_reference_{number}', 'event_type':'upgrade_reference',
+                'payload_json':_json(value), 'request_hash':_hash(value)}
+            await store._db.execute(f'INSERT INTO {manager.events} ('+','.join(legacy)+') VALUES ('+
+                ','.join('?' for _ in legacy)+')', tuple(legacy.values()))
     # The deployed lookup columns permit this former spelling. Only lookup
     # keys change; event IDs, raw messages, references and payloads stay intact.
     await store._db.execute(f'UPDATE {manager.events} SET operation_key=? WHERE event_id=?',
@@ -76,6 +96,15 @@ async def test_deployed_ddl_upgrade_keeps_original_ids_rekeys_and_rebuilds_once(
     assert await cold.get_runtime_state(sid, 'workflow:run:'+run_id) is None
     restored = await cold._db.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (operation['event_id'],))
     assert restored == operation
+    if window is not None:
+        current = await cold._db.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (window['event_id'],))
+        assert current == window
+        for number in (1, 2):
+            event = await cold._db.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',
+                (f'upgrade_reference_{number}',))
+            value = json.loads(event['payload_json'])
+            assert value == {'event':content_reference(current)} and event['request_hash'] == _hash(value)
+            current = event
     rows = await cold._db.fetchall(f'SELECT * FROM {store.table_prefix}session_obligations ORDER BY source_id')
     again = await cli(dsn, store.table_prefix, '--apply', '--writers-stopped')
     assert again['source'] == [TASK_SCHEMA_VERSION, TASK_PROTOCOL_VERSION]
