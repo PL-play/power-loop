@@ -21,7 +21,7 @@ __all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("stage", ["before_bind", "after_bind", "clear_failed"])
+@pytest.mark.parametrize("stage", ["before_bind", "after_bind", "clear_failed", "during_tool_insert"])
 async def test_process_death_keeps_original_pending_and_does_not_repeat_effect(registry_store, tmp_path, stage):
     store, connect = registry_store
     backend = store._db.dialect.name
@@ -39,7 +39,8 @@ async def test_process_death_keeps_original_pending_and_does_not_repeat_effect(r
             process.kill()
             await process.wait()
         raise
-    assert process.returncode == {"before_bind": 73, "after_bind": 74, "clear_failed": 75}[stage], output.decode()
+    assert process.returncode == {"before_bind": 73, "after_bind": 74, "clear_failed": 75,
+                                 "during_tool_insert": 76}[stage], output.decode()
     assert json.loads(evidence.read_text()) == ["model", "effect"]
 
     # A fresh store/manager has none of the crashed process's memory hints.
@@ -47,14 +48,18 @@ async def test_process_death_keeps_original_pending_and_does_not_repeat_effect(r
     state = await reader.get_state(sid)
     assert state.pending is not None and state.pending["tool_call_ids"] == ["external-call"]
     rows = await reader.load_all_messages(sid)
-    [tool] = [row for row in rows if row.role == "tool"]
+    tools = [row for row in rows if row.role == "tool"]
+    interrupted = stage == "during_tool_insert"
+    assert len(tools) == int(not interrupted)
     [assistant] = [row for row in rows if row.role == "assistant"]
     assert state.pending["assistant_seq"] == assistant.seq
-    operation_id = json.loads(tool.content)["operation_id"]
+    operation_id = Path(str(evidence) + ".operation").read_text()
+    if not interrupted:
+        assert json.loads(tools[0].content)["operation_id"] == operation_id
     manager = JobManager(reader)
     actor = JobActor("crash-test", "host", sid)
     operation = await manager.get_operation(actor, operation_id)
-    assert (operation.receipt_ref is None) == (stage == "before_bind")
+    assert (operation.receipt_ref is None) == (stage in ("before_bind", "during_tool_insert"))
     provider_calls, effects = [], []
 
     class Model(LLMService):
@@ -83,11 +88,14 @@ async def test_process_death_keeps_original_pending_and_does_not_repeat_effect(r
         with pytest.raises(JobError, match="adapter_unavailable:resume"):
             await loop.resume(sid)
         assert not provider_calls and not effects
-        # Cold reconciliation only attaches the already durable result, idempotently.
-        ref = await reader.message_ref(sid, tool.seq)
-        for _ in range(2):
-            await manager.reconcile_receipt(actor, operation_id, ref)
-        assert (await manager.get_operation(actor, operation_id)).receipt_ref == ref.to_dict()
+        if not interrupted:
+            # Cold reconciliation only attaches the already durable result, idempotently.
+            ref = await reader.message_ref(sid, tools[0].seq)
+            for _ in range(2):
+                await manager.reconcile_receipt(actor, operation_id, ref)
+            assert (await manager.get_operation(actor, operation_id)).receipt_ref == ref.to_dict()
+        else:
+            assert (await manager.get_operation(actor, operation_id)).receipt_ref is None
         assert (await reader.get_state(sid)).pending == state.pending
         assert len(await reader.load_all_messages(sid)) == len(rows)
         assert json.loads(evidence.read_text()) == ["model", "effect"]

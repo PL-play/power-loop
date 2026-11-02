@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from power_loop import AgentLoopConfig, LLMResponse, LLMService, StatefulAgentLoop, ToolDefinition
@@ -48,6 +49,7 @@ async def main(dsn, prefix, sid, evidence_path, stage):
             call_ref=ref, tool_call_id=call_id)
         calls.append("effect")
         evidence.write_text(json.dumps(calls))
+        Path(str(evidence) + ".operation").write_text(registered.operation.operation_id)
         return json.dumps({"operation_id": registered.operation.operation_id, "accepted": True})
 
     registry = ToolRegistry()
@@ -69,6 +71,32 @@ async def main(dsn, prefix, sid, evidence_path, stage):
         os._exit(74)
 
     task_runtime.bind_tool_receipt = stop
+    if stage == "during_tool_insert":
+        transaction = store._db.transaction
+
+        @asynccontextmanager
+        async def interrupted():
+            async with transaction() as tx:
+                execute, fetchone = tx.execute, tx.fetchone
+
+                def stop(sql, params):
+                    if sql.startswith(f"INSERT INTO {store.t.messages} ") and params[2] == "tool":
+                        os._exit(76)
+
+                async def write(sql, params=()):
+                    result = await execute(sql, params)
+                    stop(sql, params)
+                    return result
+
+                async def read(sql, params=()):
+                    result = await fetchone(sql, params)
+                    stop(sql, params)
+                    return result
+
+                tx.execute, tx.fetchone = write, read
+                yield tx
+
+        store._db.transaction = interrupted
     loop = StatefulAgentLoop(llm=Model(), store=store, task_runtime=runtime, tool_registry=registry,
                              config=AgentLoopConfig(max_rounds=2, compactor=None, delegation_policy="single_level"))
     try:
