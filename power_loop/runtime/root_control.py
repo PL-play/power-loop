@@ -1,8 +1,8 @@
 """Host-only original-context cancellation, without creating an execution.
 
 Admission closes before discovery, followed by one repeatable stop per tree.
-The admission step still shares the control lock with root registration until
-the remaining multi-root writers have been split.
+The session's derived control-version row serializes admission and context
+original publication without acquiring any task tree. Originals remain authority.
 An accepted stop never asserts physical exit or releases financial holds.
 """
 import json
@@ -21,8 +21,12 @@ async def _state(manager, tx, actor, key):
         "WHERE session_id=? AND state_key=?", (actor.session_id, key))
     if row is None:
         return None
+    return _decode(actor, row['payload_json'])
+
+
+def _decode(actor, payload):
     try:
-        value = json.loads(row["payload_json"])
+        value = json.loads(payload)
         shapes = ({"version", "actor", "document", "first_request_hash", "evidence_hash"},
             {"version", "actor", "request", "response", "evidence_hash"})
         if (type(value) is not dict or set(value) not in shapes
@@ -32,6 +36,36 @@ async def _state(manager, tx, actor, key):
         return value
     except (ValueError, TypeError):
         raise JobError("root_control_evidence_corrupt") from None
+
+
+async def _lock_session(manager, tx, actor):
+    table = manager.prefix+'session_controls'
+    suffix = '' if manager.db.dialect.name == 'sqlite' else ' FOR UPDATE'
+    sql = f'SELECT version FROM {table} WHERE session_id=?'+suffix
+    if await tx.fetchone(sql, (actor.session_id,)) is None:
+        # A cold session or rebuilt derived table has no admission row yet.
+        await tx.execute(manager.db.dialect.insert_ignore(table, ('session_id', 'version')), (actor.session_id, 0))
+        await tx.fetchone(sql, (actor.session_id,))
+
+
+async def _admission_state(manager, tx, actor, key):
+    controls, events = manager.prefix+'session_controls', manager.prefix+'task_context_events'
+    suffix = '' if manager.db.dialect.name == 'sqlite' else ' FOR UPDATE'
+    sql = (f'SELECT c.version AS current_version,'
+        f'(SELECT version FROM {controls} WHERE session_id=?) AS observed_version,'
+        f'(SELECT payload_json FROM {events} WHERE session_id=? AND state_key=?) AS payload_json '
+        f'FROM {controls} c WHERE c.session_id=?'+suffix)
+    params = (actor.session_id, actor.session_id, key, actor.session_id)
+    row = await tx.fetchone(sql, params)
+    if row is None:
+        await tx.execute(manager.db.dialect.insert_ignore(controls, ('session_id', 'version')), (actor.session_id, 0))
+        row = await tx.fetchone(sql, params)
+    # PostgreSQL can return a newly committed locked row while its original
+    # subquery still uses the snapshot from before the wait. Cancellation bumps
+    # this same version atomically,so only that race needs a fresh original read.
+    if row['current_version'] != row['observed_version']:
+        return await _state(manager, tx, actor, key)
+    return None if row['payload_json'] is None else _decode(actor, row['payload_json'])
 
 
 async def _save(manager, tx, actor, key, value):
@@ -48,7 +82,7 @@ async def _admit(manager, tx, actor, document):
             or type(document.get("version")) is not int or document["version"] != 1
             or _document(document.get("namespace"), document.get("payload")) != document):
         raise JobError("root_context_evidence_corrupt")
-    value = await _state(manager, tx, actor, _barrier_key(actor, document))
+    value = await _admission_state(manager, tx, actor, _barrier_key(actor, document))
     if value is not None:
         if value.get("document") != document:
             raise JobError("root_control_evidence_corrupt")
@@ -96,6 +130,7 @@ async def _begin(manager, actor, request_key, request):
     begin_key = "power-loop.root-stop-begin.v1:" + _hash(request_key)
     response = {"state": "admission_closed", "request_hash": _hash(request)}
     async with manager._write() as tx:
+        await _lock_session(manager, tx, actor)
         original = await _request(manager, tx, actor, request_key, request)
         barrier_key = _barrier_key(actor, document)
         barrier = await _state(manager, tx, actor, barrier_key)
@@ -167,6 +202,7 @@ async def _freeze_scope(manager, actor, request_key, request):
     if len(_json(value).encode()) > 1_000_000:
         raise JobError("root_control_history_requires_compaction")
     async with manager._write() as tx:
+        await _lock_session(manager, tx, actor)
         original = await _request(manager, tx, actor, key, request)
         if original is not None:
             return _scope(original, request)
@@ -250,6 +286,7 @@ async def cancel(manager, actor, *, namespace, payload, system_key, reason):
     if len(_json(response).encode()) > 1_000_000:
         raise JobError("root_control_history_requires_compaction")
     async with manager._write() as tx:
+        await _lock_session(manager, tx, actor)
         original = await _request(manager, tx, actor, request_key, request)
         if original is None:
             await _save(manager, tx, actor, request_key, {"request": request, "response": response})

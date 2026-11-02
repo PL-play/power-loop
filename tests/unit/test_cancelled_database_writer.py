@@ -19,7 +19,7 @@ async def test_cancelled_lock_wait_does_not_replace_cancellation_with_rollback_d
     store, _ = registry_store
     db, table = store._db, store.table_prefix+'session_controls'
     sid = await store.create_session()
-    await db.execute(f'INSERT INTO {table} (session_id,version) VALUES (?,?)', (sid, 1))
+    assert await db.execute(f'UPDATE {table} SET version=? WHERE session_id=?', (1, sid)) == 1
     if db.dialect.name == 'sqlite':
         dsn = next(row['file'] for row in await db.fetchall('PRAGMA database_list') if row['name'] == 'main')
     else:

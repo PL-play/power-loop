@@ -390,6 +390,10 @@ class SessionStore:
             await tx.execute(
                 f"INSERT INTO {self.t.session_state} (session_id) VALUES (?)", (sid,)
             )
+            if self.store_id is not None:
+                # The first context-bearing send uses this existing row as its
+                # short admission gate;its version remains derived from writes.
+                await tx.execute(f'INSERT INTO {self.table_prefix}session_controls (session_id,version) VALUES (?,?)', (sid, 0))
         return sid
 
     async def get_session(self, session_id: str) -> SessionRow | None:
