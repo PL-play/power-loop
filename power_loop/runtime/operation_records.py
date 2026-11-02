@@ -119,7 +119,7 @@ async def _apply(manager, actor, accepted):
     request = accepted.data['request']
     ref, target = _call_ref(request['call_ref']), JobLease(**request['target'])
     key = requests._origin(manager, actor, request, 'record')
-    async with manager._write() as tx:
+    async with manager.tree_write(target.job_id) as tx:
         old = await tx.fetchall(f'SELECT * FROM {manager.events} WHERE operation_key=? OR event_id=?',
             (key, requests.rejection_id(accepted.event['event_id'])))
         if old:

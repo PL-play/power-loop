@@ -226,9 +226,8 @@ async def test_protocol_four_requires_maintenance_preserves_ids_and_fences_old_w
             f"SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1"))["protocol_version"] == 4
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
     assert c.sid == sid and c.store.store_id == store_id and await c.store.message_ref(c.sid, 1) == ref
-    import power_loop.runtime.jobs as jobs
-    with monkeypatch.context() as patch:
-        patch.setattr(jobs, "TASK_PROTOCOL_VERSION", 4)
-        with pytest.raises(JobError, match="store_identity_changed"):
-            await stop(c)
+    from power_loop.runtime.store import task_schema
+    async with c.manager.db.read_snapshot() as reader:
+        with pytest.raises(StoreSchemaError, match="protocol"):
+            await task_schema._verify_task_schema_tx(reader, c.manager.db, c.manager.prefix, protocol=4)
     assert len((await stop(c))["roots"]) == 1

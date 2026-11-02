@@ -54,7 +54,7 @@ def statement(manager):
 
 async def renew(manager, tx, actor, lease, lease_ms):
     now = manager.now()
-    return await tx.execute_flag(statement(manager), (
+    return await tx.renew_job(lease.job_id, statement(manager), (
         lease.job_id, lease.job_id, now+lease_ms, now,
         lease.job_id, actor.tenant_id, actor.principal_id, lease.executor_id, lease.boot_id, lease.generation,
         actor.session_id, actor.session_id, now, now, now, now))

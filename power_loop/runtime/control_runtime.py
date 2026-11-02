@@ -1,6 +1,7 @@
 """Bind the memory reducer to the task owner and indexed inspection views."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 
 from .execution_journal import ExecutionJournal
@@ -291,9 +292,10 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
         managed_check = not fresh and await tx.fetchone(
             f"SELECT job_id FROM {manager.jobs} WHERE parent_job_id=? AND kind='background_tool' LIMIT 1",
             (source["job_id"],)) is not None
-        ancestors, ancestor = [], source
+        ancestors, ancestor_proofs, ancestor = [], {}, source
         while ancestor is not None:
             ancestors.append(ancestor["job_id"])
+            ancestor_proofs[ancestor['job_id']] = tuple(ancestor[k] for k in ('generation', 'executor_id', 'boot_id'))
             if len(ancestors) > 64:
                 raise JobError("invalid_job_lineage")
             ancestor = await manager._row(tx, ancestor["parent_job_id"]) if ancestor["parent_job_id"] else None
@@ -304,9 +306,15 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
         async def projector(tx, identity, records):
             await project_events(manager, tx, identity, records)
 
+        @asynccontextmanager
+        async def owned_writer():
+            async with manager._write() as writer:
+                await writer.require_job(identity.job_id)
+                yield writer
+
         journal = binding.resource_evidence.get("_control_journal_opening")
         if journal is None:
-            journal = ExecutionJournal(manager.store, projector=projector)
+            journal = ExecutionJournal(manager.store, projector=projector, writer=owned_writer)
             binding.resource_evidence["_control_journal_opening"] = journal
         state = ExecutionState(identity, journal, lease_until_ms=source["lease_until_ms"],
                                policy=runtime.checkpoint_policy, now_ms=lambda: manager.now())
@@ -330,16 +338,19 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
         if state.closed:
             return  # Only original observations/fees may arrive after closure.
         reader = manager.db if transaction is None else transaction
-        rows = await reader.fetchall(
-            f"SELECT job_id,generation,executor_id,boot_id,cancel_requested_at,intake,resource_state,lease_until_ms "
-            f"FROM {manager.jobs} WHERE job_id IN (" + ",".join("?" for _ in ancestors) + ")", tuple(ancestors))
+        if len(ancestors) == 1:
+            rows = [await manager._row(reader, identity.job_id)]
+        else:
+            rows = await reader.fetchall(
+                f"SELECT job_id,generation,executor_id,boot_id,cancel_requested_at,intake,resource_state,lease_until_ms "
+                f"FROM {manager.jobs} WHERE job_id IN (" + ",".join("?" for _ in ancestors) + ")", tuple(ancestors))
         found = {row["job_id"]: row for row in rows}
         if len(found) != len(ancestors):
             state.needs_reconciliation = True
             raise JobError("invalid_job_lineage")
         actual = found[identity.job_id]
-        if (actual["generation"], actual["executor_id"], actual["boot_id"]) != (
-                identity.generation, identity.executor_id, identity.boot_id):
+        if any(tuple(row[k] for k in ('generation', 'executor_id', 'boot_id')) != ancestor_proofs[row['job_id']]
+                for row in rows):
             state.needs_reconciliation = True
             state.cancel_requested = True
         if any(row["cancel_requested_at"] is not None for row in rows) or actual["intake"] != "open":
@@ -373,6 +384,8 @@ async def flush_binding(binding, *, close=False, force=True, transaction=None):
     state = current(binding)
     if state.closed and not retained_owner(binding):
         return  # A cold writer already advanced this sealed owner's journal.
+    if transaction is not None:
+        await transaction.require_job(binding.lease.job_id)
     if close:
         from .execution_budget import allocation_record
         state.closed = True

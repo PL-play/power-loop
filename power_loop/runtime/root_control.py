@@ -90,14 +90,13 @@ async def _admit(manager, tx, actor, document):
 
 
 async def _cancel_job(manager, tx, actor, job_id, *, key, fingerprint, reason):
+    row = await manager._authorize(tx, actor, job_id)
     old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE operation_key=?", (key,))
     if old:
-        await manager._authorize(tx, actor, old["job_id"])
         if old["request_hash"] != fingerprint or old["job_id"] != job_id or old["action"] != "stop":
             raise JobError("operation_conflict")
         manager._control_notifications.get().add(job_id)
         return _operation(old)
-    row = await manager._authorize(tx, actor, job_id)
     if row["cancel_requested_at"] is None:
         # Cancellation retains an already closed model phase. Rewriting it as
         # running cancellation would strand its original pending/result proof.

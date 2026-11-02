@@ -358,8 +358,6 @@ async def test_base_requires_lifecycle_methods_and_supported_resource_contract()
 async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identity(
     registry_store, monkeypatch, old_protocol
 ):
-    import power_loop.runtime.jobs as jobs
-    from power_loop.runtime.jobs import JobError
     from power_loop.runtime.store import task_schema
     from power_loop.runtime.store.schema import StoreSchemaError
 
@@ -378,11 +376,9 @@ async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identit
     assert (
         await manager.db.fetchone(f"SELECT store_id,protocol_version FROM {manager.prefix}task_store WHERE id=1")
     ) == {"store_id": store.store_id, "protocol_version": task_schema.TASK_PROTOCOL_VERSION}
-    with monkeypatch.context() as patch:
-        patch.setattr(jobs, "TASK_PROTOCOL_VERSION", old_protocol)
-        with pytest.raises(JobError, match="store_identity_changed"):
-            async with manager._write():
-                pass
+    async with manager.db.read_snapshot() as reader:
+        with pytest.raises(StoreSchemaError, match="protocol"):
+            await task_schema._verify_task_schema_tx(reader, manager.db, manager.prefix, protocol=old_protocol)
 
 
 async def pending_case(registry_store):

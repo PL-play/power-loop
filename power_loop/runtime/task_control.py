@@ -143,7 +143,7 @@ async def _apply_stop_request(manager, actor, event, data):
     from .managed_effects import _ref
     key = manager._origin_key(actor, "stop", _ref(request["call_ref"]), request["tool_call_id"], None)
     job_id = request["job_id"]
-    async with manager._write() as tx:
+    async with manager.tree_write(job_id) as tx:
         found = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE operation_key=? OR event_id=?",
             (key, requests.rejection_id(event["event_id"])))
         if found:

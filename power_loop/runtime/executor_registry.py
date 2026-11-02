@@ -279,10 +279,10 @@ async def _activation_current(manager, tx, identity, request, boots):
 async def _begin_activation(manager, identity, operation, request):
     """Fence expired prior boots before inspecting their original task trees."""
     async with manager._write() as tx:
+        boots = await _activation_boots(manager, tx, identity)
         replay = await _recall(manager, tx, identity, operation, request)
         if replay is not None:
             return replay, ()
-        boots = await _activation_boots(manager, tx, identity)
         await _activation_current(manager, tx, identity, request, boots)
         reason = 'activation:'+_hash([operation, request])
         drain_request = {'action': 'drain', 'reason': reason}
@@ -329,10 +329,10 @@ async def _inspect_prior_executions(manager, identity):
 
 async def _publish_activation(manager, identity, operation, request, prepared):
     async with manager._write() as tx:
+        boots = await _activation_boots(manager, tx, identity)
         replay = await _recall(manager, tx, identity, operation, request)
         if replay is not None:
             return replay
-        boots = await _activation_boots(manager, tx, identity)
         row = await _activation_current(manager, tx, identity, request, boots)
         if tuple((boot['executor_key'], boot['version']) for boot in boots) != prepared.boots:
             raise _ActivationChanged()
@@ -367,6 +367,7 @@ async def heartbeat(manager, identity, *, expected_version, system_key, lease_ms
         raise JobError("invalid_executor_heartbeat")
     request = {"action": "heartbeat", "expected_version": expected_version, "lease_ms": lease_ms}
     async with manager._write() as tx:
+        await _row(manager, tx, identity, admission=True, exclusive=True)
         replay = await _recall(manager, tx, identity, operation, request)
         if replay is not None:
             return replay
@@ -451,13 +452,13 @@ async def _drain_barrier(manager, identity, operation, request):
     """Commit admission closure without acquiring or changing any task tree."""
     key = "edb_" + _hash([operation])[:48]
     async with manager._write() as tx:
+        row = await _row(manager, tx, identity, admission=True, exclusive=True)
         final = await _recall(manager, tx, identity, operation, request)
         if final is not None:
             return final, True
         old = await _recall(manager, tx, identity, key, request)
         if old is not None:
             return old, False
-        row = await _row(manager, tx, identity, admission=True, exclusive=True)
         value = {**_snapshot(row), "state": "draining", "version": row["version"]+1,
                  "updated_at": manager.now()}
         return await _save(manager, tx, identity, request, key, value, old=row,
@@ -479,10 +480,10 @@ async def _drain_scope(manager, identity, operation, request):
     snapshot = [{k: job[k] for k in ("job_id", "generation", "kind", "executor_id", "boot_id", "resource_state")}
                 for job in jobs]
     async with manager._write() as tx:
+        row = await _row(manager, tx, identity, admission=True, exclusive=True)
         original = await _recall(manager, tx, identity, key, request)
         if original is not None:
             return original
-        row = await _row(manager, tx, identity, admission=True, exclusive=True)
         value = {**_snapshot(row), "state": "draining", "version": row["version"]+1,
                  "updated_at": manager.now()}
         return await _save(manager, tx, identity, request, key, value, old=row,
@@ -499,6 +500,7 @@ async def _drain_tree(manager, identity, operation, reason, targets, creators):
             key = manager._origin_key(actor, "stop", None, None,
                 operation+":"+job_id+":"+str(target["generation"]))
             fingerprint = _hash([target, reason])
+            job = await manager._row(tx, job_id)
             old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE operation_key=?", (key,))
             if old is not None:
                 if old["request_hash"] != fingerprint:
@@ -519,7 +521,6 @@ async def _drain_tree(manager, identity, operation, reason, targets, creators):
                     # notification. Replay the signal, never the database stop.
                     manager._control_notifications.get().add(job_id)
                 continue
-            job = await manager._row(tx, job_id)
             changed = any(job[k] != target[k] for k in ("generation", "executor_id", "boot_id"))
             closed = not changed and job["resource_state"] == "stopped" and job["intake"] == "closed"
             if not changed and not closed and job["cancel_requested_at"] is None:
@@ -580,10 +581,10 @@ async def drain(manager, identity, *, system_key, reason):
         stops.update(zip((target["job_id"] for target in group), done, strict=True))
         incomplete |= partial
     async with manager._write() as tx:
+        row = await _row(manager, tx, identity, admission=True, exclusive=True)
         original = await _recall(manager, tx, identity, operation, request)
         if original is not None:
             return original
-        row = await _row(manager, tx, identity, admission=True, exclusive=True)
         value = {**_snapshot(row), "state": "draining", "version": row["version"]+1,
                  "updated_at": manager.now()}
         return await _save(manager, tx, identity, request, operation, value, old=row,

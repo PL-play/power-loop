@@ -14,6 +14,7 @@ Protocol35 retains host context-control originals in task_context_events.
 Protocol36 records metadata operations through source-owned control permissions.
 Protocol37 fences first executor registration against unregistered claims.
 Protocol38 fences first budget-policy activation against unbudgeted sends.
+Protocol39 serializes control writers by their root job instead of task_store.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 13
-TASK_PROTOCOL_VERSION = 38
+TASK_PROTOCOL_VERSION = 39
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -423,7 +424,7 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                 await tx.execute(statement)
             if int(row["version"]) in (10, 12, TASK_SCHEMA_VERSION):
                 identity = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35, 36, 37):
+                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35, 36, 37, 38):
                     old_protocol = identity["protocol_version"]
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
                     from .operation_migration import verify_operation_records

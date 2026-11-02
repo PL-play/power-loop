@@ -53,6 +53,9 @@ class ControlTransaction(ControlReadView):
 
     def __init__(self, tx, manager):
         super().__init__(tx, manager)
+        self._manager = manager
+        self.root_job_id = None
+        self._root_members: set[str] = set()
         self._events = manager.events
         self._jobs = manager.jobs
         self._executors = manager.prefix + "task_executors"
@@ -93,9 +96,78 @@ class ControlTransaction(ControlReadView):
         self.touch_job(job_id, obligations=True)
         self.obligation_handled.add(job_id)
 
+    async def job_row(self, job_id):
+        """Acquire this writer's one root before reading mutable job state."""
+        import time
+
+        sql = f'SELECT * FROM {self._jobs} WHERE job_id=?'
+        if self.root_job_id is None:
+            suffix = '' if self.dialect.name == 'sqlite' else ' FOR UPDATE'
+            root = await self._tx.fetchone(f'SELECT root.* FROM {self._jobs} root '
+                f'WHERE root.job_id=(SELECT root_job_id FROM {self._jobs} WHERE job_id=?)'+suffix, (job_id,))
+            if root is None:
+                return None
+            self.root_job_id = root['job_id']
+            self._root_members.add(root['job_id'])
+            self.remember_row(self._jobs, 'job_id', root['job_id'], root)
+            if (timing := self._manager._control_lock_timing.get()) is not None:
+                timing['acquired'] = time.perf_counter()
+        memo = sql, (job_id,)
+        if memo not in self._memo:
+            # A writer never acquires another root. The scope predicate also
+            # fences a prepared deterministic ID which was recreated elsewhere.
+            row = await self._tx.fetchone(sql+' AND root_job_id=?', (job_id, self.root_job_id))
+            self._memo[memo] = row
+        row = self._memo[memo]
+        if row is not None:
+            self._root_members.add(job_id)
+        return None if row is None else dict(row)
+
+    async def insert_job(self, job_id, root_job_id, sql, params=()):
+        """A fresh root's INSERT owns its row;children use the parent's writer."""
+        import time
+
+        from .jobs import JobError
+
+        if self.root_job_id is not None and self.root_job_id != root_job_id:
+            raise JobError('task_tree_scope_mismatch')
+        if job_id != root_job_id:
+            await self.job_row(root_job_id)
+        else:
+            # A no-op upsert takes the actual root row lock on both initial
+            # creation and a simultaneous retry,without a shared-lock upgrade.
+            sql += (' ON DUPLICATE KEY UPDATE job_id=VALUES(job_id)' if self.dialect.name == 'mysql' else
+                ' ON CONFLICT(job_id) DO UPDATE SET job_id=excluded.job_id')
+        self.touch_job(job_id)
+        changed = await self._execute(sql, params)
+        self._root_members.add(job_id)
+        if job_id == root_job_id:
+            self.root_job_id = root_job_id
+            if (timing := self._manager._control_lock_timing.get()) is not None:
+                timing['acquired'] = time.perf_counter()
+        return changed
+
     async def write_job(self, job_id, sql, params=(), *, obligations=False):
+        await self.require_job(job_id)
         self.touch_job(job_id, obligations=obligations)
         return await self._execute(sql, params)
+
+    async def require_job(self, job_id):
+        from .jobs import JobError
+
+        # Root membership is immutable. A job-state update invalidates its
+        # row cache,not the membership this transaction already locked/proved.
+        if job_id in self._root_members:
+            return
+        if await self.job_row(job_id) is None:
+            raise JobError('task_tree_scope_mismatch')
+
+    async def renew_job(self, job_id, sql, params):
+        """A lease update has the same root scope as other job writes."""
+        await self.require_job(job_id)
+        self.touch_job(job_id)
+        self.writes += 1
+        return await self._tx.execute_flag(sql, params)
 
     async def write_executor(self, executor_key, sql, params=()):
         self._memo.pop((f"SELECT * FROM {self._executors} WHERE executor_key=?", (executor_key,)), None)
@@ -137,7 +209,9 @@ class ControlTransaction(ControlReadView):
 
     async def append_event(self, columns, values, *, ignore=False):
         """Append a declared original; its meaning is supplied as fields."""
-        self.note_event(dict(zip(columns, values, strict=True)))
+        event = dict(zip(columns, values, strict=True))
+        await self.require_job(event['job_id'])
+        self.note_event(event)
         sql = (self._dialect.insert_ignore(self._events, columns) if ignore else
                f"INSERT INTO {self._events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})")
         return await self._execute(sql, values)
@@ -151,6 +225,7 @@ class ControlTransaction(ControlReadView):
 
     async def append_event_if_current(self, event, row):
         """Append mechanical evidence without changing a superseding owner."""
+        await self.require_job(event['job_id'])
         self.note_event(event)
         columns = tuple(event)
         sql = f"INSERT INTO {self._events} ({','.join(columns)}) SELECT " + ','.join('?' for _ in columns)
@@ -166,6 +241,7 @@ class ControlTransaction(ControlReadView):
         Original-only publications can leave job versions unchanged; their
         original key must also remain absent when this statement executes.
         """
+        await self.require_job(event['job_id'])
         self.note_event(event)
         columns = tuple(event)
         sql = f"INSERT INTO {self._events} ({','.join(columns)}) SELECT " + ','.join('?' for _ in columns)
@@ -189,11 +265,14 @@ class ControlTransaction(ControlReadView):
     async def project_events(self, columns, rows, sql, params):
         """Declare the fields of a journal projection's batched event write."""
         for row in rows:
-            self.note_event(dict(zip(columns, row, strict=True)))
+            event = dict(zip(columns, row, strict=True))
+            await self.require_job(event['job_id'])
+            self.note_event(event)
         return await self._execute(sql, params)
 
     async def update_event(self, job_id, sql, params=(), *, obligations=True, notify=False):
         """Declare an original event's state change without re-reading it."""
+        await self.require_job(job_id)
         self.touched_jobs.add(job_id)
         if obligations:
             self.obligation_jobs.add(job_id)
@@ -202,6 +281,8 @@ class ControlTransaction(ControlReadView):
         return await self._execute(sql, params)
 
     async def set_event_recipient(self, event_id: str, session_id: str):
+        row = await self.fetchone(f'SELECT job_id FROM {self._events} WHERE event_id=?', (event_id,))
+        await self.require_job(row['job_id'])
         changed = await self._execute(
             f"UPDATE {self._events} SET caller_session_id=? WHERE event_id=?", (session_id, event_id))
         if changed:

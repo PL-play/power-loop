@@ -23,7 +23,6 @@ from power_loop.contracts.events import AgentEvent, AgentEventType
 from power_loop.core.events import AgentEventBus
 
 from .message_ref import MessageRef
-from .store.task_schema import TASK_PROTOCOL_VERSION
 
 KINDS = frozenset({"send", "workflow", "workflow_node", "subagent", "background_tool", "background_command", "timer"})
 
@@ -177,6 +176,7 @@ class JobManager:
         self._control_intents = ContextVar("execution_control_intents", default=None)
         self._deferred_model_updates = ContextVar("execution_deferred_model_updates", default=None)
         self._finalization_preparation = ContextVar("execution_finalization_preparation", default=None)
+        self._control_lock_timing = ContextVar("execution_control_lock_timing", default=None)
 
     @asynccontextmanager
     async def _control_transaction(self):
@@ -184,17 +184,17 @@ class JobManager:
         started = time.perf_counter()
         acquired = None
         outcome = "rolled_back"
+        timing = {}
+        token = self._control_lock_timing.set(timing)
         try:
             async with self.db.transaction() as tx:
-                suffix = "" if self.db.dialect.name == "sqlite" else " FOR UPDATE"
-                row = await tx.fetchone(f"SELECT store_id,protocol_version FROM {self.prefix}task_store WHERE id=1" + suffix)
                 acquired = time.perf_counter()
-                if row is None or row["store_id"] != self.store.store_id or row["protocol_version"] != TASK_PROTOCOL_VERSION:
-                    raise JobError("store_identity_changed")
                 yield tx
             outcome = "committed"
         finally:
             finished = time.perf_counter()
+            acquired = timing.get('acquired', acquired)
+            self._control_lock_timing.reset(token)
             logging.getLogger("power_loop.control.transactions").debug(
                 "control_transaction",
                 extra={"wait_ms": ((acquired if acquired is not None else finished) - started) * 1000,
@@ -228,10 +228,16 @@ class JobManager:
                 self._joined_write.reset(token)
 
     @asynccontextmanager
+    async def tree_write(self, job_id):
+        """Declare a tree before reading its replay keys or mutable state."""
+        async with self._write() as tx:
+            await tx.job_row(job_id)
+            yield tx
+
+    @asynccontextmanager
     async def _write(self):
-        # One short store control lock avoids parent/child lock inversion. No
-        # transaction spans a model/provider request. B1 favours correctness over
-        # multi-tenant throughput; replace only with equivalent race tests.
+        # Each writer acquires its root before mutable job state. Metadata-only
+        # admission writers share no task root. No provider await belongs here.
         joined = self._joined_write.get()
         if joined is not None:
             yield joined
@@ -304,6 +310,9 @@ class JobManager:
         undo.append(rollback)
 
     async def _row(self, reader, job_id):
+        writer = self._control_intents.get()
+        if reader is writer:
+            return await writer.job_row(job_id)
         return await reader.fetchone(f"SELECT * FROM {self.jobs} WHERE job_id=?", (job_id,))
 
     async def _authorize(self, reader, actor: JobActor, job_id: str):
@@ -901,6 +910,8 @@ class JobManager:
     async def _register_job_tx(self, tx, actor, *, kind, title, session_id, parent, call_ref, tool_call_id, system_key, independent, request, request_data, effect, host_step, key, fingerprint, fresh=False):
         from . import host_send_steps, managed_effects
 
+        if parent is not None:
+            await self._row(tx, parent.job_id)
         old = None if fresh else await tx.fetchone(f"SELECT * FROM {self.events} WHERE operation_key=?", (key,))
         if old:
             if old["request_hash"] != fingerprint:
@@ -912,7 +923,8 @@ class JobManager:
                 await managed_effects.descriptor(self, tx, job)
             await host_send_steps.require_replay(self, tx, actor, host_step, old["job_id"])
             return JobRegistration(_record(job), _operation(old), True)
-        await host_send_steps.require_available(self, tx, actor, host_step)
+        if parent is not None:
+            await host_send_steps.require_available(self, tx, actor, host_step)
         if effect is not None and await self._row(tx, managed_effects.job_id(self, actor, call_ref, tool_call_id)) is not None:
             raise JobError("managed_effect_evidence_missing")
         if kind == "send" and parent is None and request_data.get("host_context") is not None:
@@ -970,7 +982,9 @@ class JobManager:
             raise JobError("root_session_required")
         if parent_row is not None and parent_row["kind"] in ("subagent", "workflow_node") and parent_row["status"] == "waiting":
             raise JobError("owner_waiting_requires_input")
-        job_id = (managed_effects.job_id(self, actor, call_ref, tool_call_id) if effect is not None else None) or host_send_steps.job_id(self, actor, host_step) or "job_" + secrets.token_hex(16)
+        job_id = ((managed_effects.job_id(self, actor, call_ref, tool_call_id) if effect is not None else None)
+            or host_send_steps.job_id(self, actor, host_step)
+            or ('job_'+_hash([self.store.store_id, key])[:32] if parent is None else 'job_'+secrets.token_hex(16)))
         root = parent_row["root_job_id"] if parent_row else job_id
         scope = job_id
         if not independent and parent_row:
@@ -993,7 +1007,7 @@ class JobManager:
         if parent is not None:
             from .execution_membership import note_child
             note_child(self, parent.job_id)
-        await tx.write_job(job_id, f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
+        await tx.insert_job(job_id, root, f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
             "session_id,created_by_session_id,kind,title,completion_scope_job_id,blocks_completion,"
             "status,version,generation,intake,resource_state,supervision_status,result_status,created_at,updated_at,"
             "parent_generation,parent_executor_id,parent_boot_id,execution_role,control_owner_job_id,"
@@ -1004,6 +1018,19 @@ class JobManager:
             parent.generation if parent else None, parent.executor_id if parent else None, parent.boot_id if parent else None,
             role, owner["job_id"] if owner else None, owner["generation"] if owner else None,
             owner["executor_id"] if owner else None, owner["boot_id"] if owner else None))
+        if parent is None:
+            # The root upsert serializes concurrent first registrations of the
+            # same origin. Read the immutable creation only after that lock.
+            old = await tx.fetchone(f'SELECT * FROM {self.events} WHERE operation_key=?', (key,))
+            if old is not None:
+                if fresh:
+                    raise JobError('task_send_requires_reconciliation')
+                if old['request_hash'] != fingerprint:
+                    raise JobError('operation_conflict')
+                current = await self._authorize(tx, actor, old['job_id'])
+                await host_send_steps.require_replay(self, tx, actor, host_step, old['job_id'])
+                return JobRegistration(_record(current), _operation(old), True)
+            await host_send_steps.require_available(self, tx, actor, host_step)
         tx.remember_row(self.jobs, "job_id", job_id, {
             "job_id": job_id, "parent_job_id": parent.job_id if parent else None, "root_job_id": root,
             "parent_generation": parent.generation if parent else None,

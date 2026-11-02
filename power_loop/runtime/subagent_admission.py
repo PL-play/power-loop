@@ -131,7 +131,7 @@ async def _publish(manager, actor, accepted, prepared):
     request, command = accepted.data["request"], accepted.data["request"]["input"]
     ref = _ref(request["call_ref"])
     key = manager._origin_key(actor, "nudge", ref, request["tool_call_id"], None)
-    async with manager._write() as tx:
+    async with manager.tree_write(accepted.data['target']['job_id']) as tx:
         # Acquire the existing inbox signal row before any consistent read.
         # MySQL must establish its snapshot after earlier inbox writers commit.
         await manager.store.signal_changes(tx, command["session_id"], "inbox")

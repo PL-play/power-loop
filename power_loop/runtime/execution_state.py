@@ -337,7 +337,7 @@ class ExecutionState:
             acquired = False
             hooks, undo = [], []
             try:
-                async with self.journal.db.transaction() as tx:
+                async with self.journal.transaction() as tx:
                     await self._flush_lock.acquire()
                     acquired = True
                     result = await self._checkpoint_locked(force=force, transaction=tx,

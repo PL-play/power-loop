@@ -259,7 +259,6 @@ async def test_actual_pipeline_does_not_invoke_a_replacement_after_admission(tmp
 
 
 async def test_original_protocol_five_requires_explicit_upgrade_without_new_identity(registry_store, monkeypatch):
-    import power_loop.runtime.jobs as jobs
     from power_loop.runtime.jobs import JobManager
     from power_loop.runtime.store import task_schema
     from power_loop.runtime.store.schema import StoreSchemaError
@@ -279,8 +278,6 @@ async def test_original_protocol_five_requires_explicit_upgrade_without_new_iden
     assert (
         await manager.db.fetchone(f"SELECT store_id,protocol_version FROM {manager.prefix}task_store WHERE id=1")
     ) == {"store_id": store.store_id, "protocol_version": task_schema.TASK_PROTOCOL_VERSION}
-    with monkeypatch.context() as patch:
-        patch.setattr(jobs, "TASK_PROTOCOL_VERSION", 5)
-        with pytest.raises(JobError, match="store_identity_changed"):
-            async with manager._write():
-                pass
+    async with manager.db.read_snapshot() as reader:
+        with pytest.raises(StoreSchemaError, match="protocol"):
+            await task_schema._verify_task_schema_tx(reader, manager.db, manager.prefix, protocol=5)

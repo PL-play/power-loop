@@ -78,13 +78,23 @@ def require_declared_control_writes(monkeypatch):
     from power_loop.runtime.session_controls import ControlTransaction
 
     execute = ControlTransaction.execute
+    execute_flag = ControlTransaction.execute_flag
+
+    def declared(self, sql):
+        for table in (self._events, self._jobs, self._executors, self._context_events, self._executor_groups,
+                      self._principal_admissions):
+            # Search the mutation target so WITH ... UPDATE is covered while
+            # a SELECT ... FOR UPDATE remains an ordinary locking read.
+            assert not re.search(r"\b(?:INSERT(?:\s+OR\s+IGNORE|\s+IGNORE)?\s+INTO|UPDATE|DELETE\s+FROM|REPLACE\s+INTO)\s+"
+                + re.escape(table) + r"\b", sql, re.I), ("Control writes must declare an explicit intent", sql)
 
     async def checked(self, sql, params=()):
-        if re.match(r"\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b", sql, re.I):
-            for table in (self._events, self._jobs, self._executors, self._context_events, self._executor_groups,
-                          self._principal_admissions):
-                assert not re.search(r"\b" + re.escape(table) + r"\b", sql), (
-                    "Control writes must declare an explicit intent", sql)
+        declared(self, sql)
         return await execute(self, sql, params)
 
+    async def checked_flag(self, sql, params=()):
+        declared(self, sql)
+        return await execute_flag(self, sql, params)
+
     monkeypatch.setattr(ControlTransaction, "execute", checked)
+    monkeypatch.setattr(ControlTransaction, "execute_flag", checked_flag)

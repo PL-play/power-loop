@@ -127,7 +127,7 @@ async def _publish(manager, actor, accepted, prepared):
     ref = waits._ref(request['call_ref'])
     key = manager._origin_key(actor, 'wait_decision', ref, request['tool_call_id'], None)
     canonical_id = notices.decision_id(manager, request['event_id'])
-    async with manager._write() as tx:
+    async with manager.tree_write(accepted.data['target']['job_id']) as tx:
         old = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE operation_key=? OR event_id=?",
             (key, requests.rejection_id(accepted.event['event_id'])))
         if old:

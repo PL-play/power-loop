@@ -173,7 +173,7 @@ async def _publish(manager, actor, accepted, prepared):
     ref = _ref(request["call_ref"])
     key = manager._origin_key(actor, "nudge", ref, request["tool_call_id"], None)
     # The plan digest is permission, not another copy of the workflow ledger.
-    async with manager._write() as tx:
+    async with manager.tree_write(accepted.data['target']['job_id']) as tx:
         await manager.store.signal_changes(tx, actor.session_id, "runtime")
         for sid in command["input_sessions"]:
             await manager.store.signal_changes(tx, sid, "inbox")

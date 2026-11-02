@@ -40,12 +40,13 @@ def control_tables_ddl(name, prefix):
 
 
 class ExecutionJournal:
-    def __init__(self, store, *, projector=None):
+    def __init__(self, store, *, projector=None, writer=None):
         self.store = store
         self.db = store._db
         self.heads = store.table_prefix + "execution_checkpoints"
         self.batches = store.table_prefix + "execution_batches"
         self.projector = projector
+        self.transaction = writer or self.db.transaction
         self.admission_nonce = secrets.token_hex(16)
 
     def _identity(self, identity):
@@ -73,7 +74,7 @@ class ExecutionJournal:
         self._identity(identity)
         if transaction is not None:
             return await self._create(transaction, identity, summary)
-        async with self.db.transaction() as tx:
+        async with self.transaction() as tx:
             await self._create(tx, identity, summary)
 
     async def _create(self, tx, identity, summary):
@@ -112,7 +113,7 @@ class ExecutionJournal:
         encoded, digest = _json(value), _hash(value)
         if transaction is not None:
             return await self._append_payload(transaction, identity, number, previous, records, summary, encoded, digest)
-        async with self.db.transaction() as tx:
+        async with self.transaction() as tx:
             return await self._append_payload(tx, identity, number, previous, records, summary, encoded, digest)
 
     async def _append_payload(self, tx, identity, number, previous, records, summary, encoded, digest):
@@ -178,7 +179,7 @@ class ExecutionJournal:
         """
         self._identity(identity)
         key = (identity.job_id, identity.generation)
-        async with self.db.transaction() as tx:
+        async with self.transaction() as tx:
             suffix = "" if self.db.dialect.name == "sqlite" else " FOR UPDATE"
             head = await tx.fetchone(
                 f"SELECT * FROM {self.heads} WHERE job_id=? AND generation=?" + suffix, key)

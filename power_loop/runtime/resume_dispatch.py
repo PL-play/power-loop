@@ -98,7 +98,7 @@ async def _publish(manager, actor, accepted, outcome):
     request = accepted.data["request"]
     event_id, kind, value = _evidence(request, requests.reference(accepted.event))
     key = manager._origin_key(actor, ACTION, _ref(request["call_ref"]), request["tool_call_id"], None)
-    async with manager._write() as tx:
+    async with manager.tree_write(accepted.data['target']['job_id']) as tx:
         old = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE event_id IN (?,?)",
             (event_id, requests.rejection_id(accepted.event["event_id"])))
         if old:

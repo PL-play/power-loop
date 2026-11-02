@@ -168,7 +168,7 @@ async def _publish(manager, actor, accepted, prepared):
     request, command = accepted.data["request"], accepted.data["request"]["input"]
     ref = _ref(request["call_ref"])
     key = manager._origin_key(actor, "nudge", ref, request["tool_call_id"], None)
-    async with manager._write() as tx:
+    async with manager.tree_write(accepted.data['target']['job_id']) as tx:
         await manager.store.signal_changes(tx, command["session_id"], "inbox")
         old = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE operation_key=? OR event_id=?",
             (key, requests.rejection_id(accepted.event["event_id"])))

@@ -89,7 +89,8 @@ async def allocate(binding, token_bound, attempt_id):
             try:
                 # Scope rows, in deterministic order, serialize competing
                 # owners. Unrelated scopes never share the task-store lock.
-                async with manager.db.transaction() as tx:
+                async with manager._write() as tx:
+                    await tx.require_job(binding.lease.job_id)
                     suffix = "" if manager.db.dialect.name == "sqlite" else " FOR UPDATE"
                     p = await tx.fetchone(f"SELECT enabled,request_hash FROM {manager.prefix}task_budget_policies "
                                           "WHERE policy_key=?" + suffix, (policy["policy_key"],))
@@ -177,12 +178,24 @@ async def allocate(binding, token_bound, attempt_id):
         return allocation.allocation_id
 
 
+async def _locked_allocation(manager, tx, identity, allocation_id):
+    from .budget_admissions import key
+
+    suffix = '' if manager.db.dialect.name == 'sqlite' else ' FOR UPDATE'
+    # Lock policy before any shared scope. Allocation rows belong to this
+    # already locked root,so another root cannot hold the same allocation.
+    return await tx.fetchone(f'SELECT allocation.* FROM {manager.prefix}execution_allocations allocation '
+        f'JOIN {manager.prefix}task_budget_policies policy ON policy.policy_key=? '
+        'WHERE allocation.allocation_id=?'+suffix,
+        (key(manager, identity.tenant_id, identity.principal_id), allocation_id))
+
+
 async def project_allocation(manager, tx, identity, key, value):
     """Apply a cumulative checkpoint once, under the original scope locks."""
     from . import model_budgets as budgets
     suffix = "" if manager.db.dialect.name == "sqlite" else " FOR UPDATE"
     table = manager.prefix + "execution_allocations"
-    row = await tx.fetchone(f"SELECT * FROM {table} WHERE allocation_id=?" + suffix, (key,))
+    row = await _locked_allocation(manager, tx, identity, key)
     if row is None:
         raise JobError("execution_allocation_missing")
     state = budgets._object(row["state_json"], row["state_hash"])
@@ -251,7 +264,7 @@ async def project_adjustment(manager, tx, identity, value):
     if allocation["identity"] != asdict(identity):
         raise JobError("execution_allocation_changed")
     suffix = "" if manager.db.dialect.name == "sqlite" else " FOR UPDATE"
-    row = await tx.fetchone(f"SELECT * FROM {table} WHERE allocation_id=?" + suffix, (key,))
+    row = await _locked_allocation(manager, tx, identity, key)
     if row is None:
         raise JobError("execution_allocation_missing")
     previous = budgets._object(row["state_json"], row["state_hash"])

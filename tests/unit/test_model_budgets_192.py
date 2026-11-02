@@ -393,9 +393,8 @@ async def test_explicit_protocol_three_migration_retains_original_ids_and_reject
     await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_store SET protocol_version=3 WHERE id=1")
     with pytest.raises(StoreSchemaError, match="incomplete|unsupported"):
         await verify_task_schema(c.manager.db, c.manager.prefix)
-    with pytest.raises(JobError, match="store_identity_changed"):
-        async with c.manager._write():
-            pass
+    with pytest.raises(StoreSchemaError, match="incomplete|protocol"):
+        await c.connect()
     with pytest.raises(StoreSchemaError, match="maintenance_required"):
         await migrate_task_schema(c.manager.db, c.manager.prefix)
     if failure:
@@ -419,14 +418,11 @@ async def test_explicit_protocol_three_migration_retains_original_ids_and_reject
     stored = await c.manager.db.fetchone(f"SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1")
     assert stored["protocol_version"] == TASK_PROTOCOL_VERSION
     assert await c.store.message_ref(c.sid, seq) == ref
-    # A bridge compiled against protocol3 cannot write the migrated control row.
-    import power_loop.runtime.jobs as jobs
-
-    with monkeypatch.context() as patch:
-        patch.setattr(jobs, "TASK_PROTOCOL_VERSION", 3)
-        with pytest.raises(JobError, match="store_identity_changed"):
-            async with c.manager._write():
-                pass
+    # Protocol is checked at startup;no singleton is read by control writers.
+    from power_loop.runtime.store import task_schema
+    async with c.manager.db.read_snapshot() as reader:
+        with pytest.raises(StoreSchemaError, match="protocol"):
+            await task_schema._verify_task_schema_tx(reader, c.manager.db, c.manager.prefix, protocol=3)
 
 
 @pytest.mark.parametrize("budget_case", [{"max_pending": 10}], indirect=True)

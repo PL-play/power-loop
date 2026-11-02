@@ -121,7 +121,7 @@ async def accept(manager, actor, request, target, *, action, authorize):
     ref, caller = _call_ref(action, request), JobLease(**request["caller"])
     key = _origin(manager, actor, request, action)
     event_id = identity(action, key)
-    async with manager._write() as tx:
+    async with manager.tree_write(caller.job_id) as tx:
         old = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (event_id,))
         if old is None:
             source = await authorize(tx)
