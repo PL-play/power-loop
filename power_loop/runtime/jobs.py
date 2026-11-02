@@ -1105,30 +1105,9 @@ class JobManager:
     async def register_operation(self, actor: JobActor, lease: JobLease, *, action: str,
             caller: JobLease, call_ref: MessageRef, tool_call_id: str,
             request: Mapping[str, Any], result: Mapping[str, Any]) -> JobOperation:
-        if action not in ("nudge", "steer"):
-            raise JobError("unsupported_operation")
-        request_data, result_data = json.loads(_json(dict(request))), json.loads(_json(dict(result)))
-        key = self._origin_key(actor, action, call_ref, tool_call_id, None)
-        fingerprint = _hash([lease.job_id, request_data, call_ref.to_dict()])
-        async with self._write() as tx:
-            old = await tx.fetchone(f"SELECT * FROM {self.events} WHERE operation_key=?", (key,))
-            if old:
-                await self._authorize(tx, actor, old["job_id"])
-                if old["request_hash"] != fingerprint:
-                    raise JobError("operation_conflict")
-                return _operation(old)
-            row = await self._fence(tx, actor, lease)
-            caller_row = await self._fence(tx, actor, caller)
-            if (caller_row["session_id"] or caller_row["created_by_session_id"]) != actor.session_id:
-                raise JobError("caller_is_not_executing_parent")
-            if (row["kind"] == "workflow" and caller_row["execution_role"] != "main") or (
-                    row["kind"] == "subagent" and caller_row["execution_role"] not in ("main", "workflow_node")):
-                raise JobError("role_forbids_delegation")
-            await self._validate_call(tx, actor, call_ref, tool_call_id)
-            await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET version=version+1,updated_at=? WHERE job_id=?", (self.now(), lease.job_id))
-            return await self._insert_operation(tx, job_id=lease.job_id, version=int(row["version"]) + 1,
-                actor=actor, action=action, key=key, fingerprint=fingerprint,
-                call_ref=call_ref, tool_call_id=tool_call_id, payload=result_data)
+        from .operation_records import record
+        return await record(self, actor, lease, caller=caller, action=action,
+            call_ref=call_ref, tool_call_id=tool_call_id, request=request, result=result)
 
     async def bind_receipt(self, actor: JobActor, operation_id: str, receipt_ref: MessageRef, *, caller: JobLease) -> JobOperation:
         return await self._bind_receipt(actor, operation_id, receipt_ref, caller=caller)

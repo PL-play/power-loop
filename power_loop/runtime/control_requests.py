@@ -32,11 +32,19 @@ def rejection_id(request_id):
     return "control_no_"+_hash(request_id)[:48]
 
 
-def _origin(manager, actor, request, action):
+def _call_ref(action, request):
+    if action == 'record':
+        from .operation_records import _call_ref as record_ref
+        return record_ref(request['call_ref'])
     from .managed_effects import _ref
-    operation = 'nudge' if action in ('resume', 'resume_node', 'restore') else 'wait_decision' if action=='decide' else action
+    return _ref(request['call_ref'])
+
+
+def _origin(manager, actor, request, action):
+    operation = (request['operation_action'] if action == 'record' else
+        'nudge' if action in ('resume', 'resume_node', 'restore') else 'wait_decision' if action=='decide' else action)
     return manager._origin_key(actor, operation,
-        _ref(request["call_ref"]), request["tool_call_id"], None)
+        _call_ref(action, request), request["tool_call_id"], None)
 
 
 def _domain(action):
@@ -61,14 +69,17 @@ def _domain(action):
     if action == 'decide':
         from . import wait_decision_admission
         return wait_decision_admission
+    if action == 'record':
+        from . import operation_records
+        return operation_records
     raise JobError("control_request_action_unknown")
 
 
 @verify_stored
-async def stored(manager, reader, actor, event, request, *, action, completion=None):
+async def stored(manager, reader, actor, event, request, *, action, completion=None,
+                 source_kinds=('send',), source_created_by=False):
     """Verify an original source permission; a raw plan alone never supplies it."""
     from .execution_membership import scope
-    from .managed_effects import _ref
 
     error = action+"_request_corrupt"
     try:
@@ -89,14 +100,15 @@ async def stored(manager, reader, actor, event, request, *, action, completion=N
         frozen = await scope(manager, reader, event["job_id"], request["caller"]["generation"])
         if (data["source"] != {**request["caller"], "root_job_id": source["root_job_id"],
                     "execution_role": frozen["execution_role"]}
-                or frozen["lease"] != request["caller"] or frozen["kind"] != "send"
-                or (frozen["tenant_id"], frozen["principal_id"], frozen["session_id"]) !=
+                or frozen["lease"] != request["caller"] or frozen["kind"] not in source_kinds
+                or (frozen["tenant_id"], frozen["principal_id"], frozen["session_id"] or
+                    (frozen['created_by_session_id'] if source_created_by else None)) !=
                     (actor.tenant_id, actor.principal_id, actor.session_id)
                 or set(data["target"]) != {"job_id", "root_job_id", "generation"}
                 or data["target"]["job_id"] != request["job_id"]
                 or type(data["target"]["generation"]) is not int or data["target"]["generation"] < 0):
             raise JobError(error)
-        await manager._validate_call(reader, actor, _ref(request["call_ref"]), request["tool_call_id"])
+        await manager._validate_call(reader, actor, _call_ref(action, request), request["tool_call_id"])
         return AcceptedRequest(dict(event), data, dict(source), completion)
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, JobError):
@@ -106,9 +118,7 @@ async def stored(manager, reader, actor, event, request, *, action, completion=N
 
 async def accept(manager, actor, request, target, *, action, authorize):
     """Commit a source-only permission plus its pending index, never a target."""
-    from .managed_effects import _ref
-
-    ref, caller = _ref(request["call_ref"]), JobLease(**request["caller"])
+    ref, caller = _call_ref(action, request), JobLease(**request["caller"])
     key = _origin(manager, actor, request, action)
     event_id = identity(action, key)
     async with manager._write() as tx:

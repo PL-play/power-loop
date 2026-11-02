@@ -11,6 +11,7 @@ Protocol21 permits independent initial accounting evidence without a model
 exit record. Protocol 23 adds atomic session change counters. Older writers must
 not overwrite this evidence or release execution.
 Protocol35 retains host context-control originals in task_context_events.
+Protocol36 records metadata operations through source-owned control permissions.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 13
-TASK_PROTOCOL_VERSION = 35
+TASK_PROTOCOL_VERSION = 36
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -405,9 +406,11 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                 await tx.execute(statement)
             if int(row["version"]) in (10, 12, TASK_SCHEMA_VERSION):
                 identity = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (*range(2, 24), 34):
+                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35):
                     old_protocol = identity["protocol_version"]
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
+                    from .operation_migration import verify_operation_records
+                    await verify_operation_records(tx, prefix)
                     if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
                         kind = "VARCHAR(64)" if db.dialect.name == "mysql" else "TEXT"
                         await tx.execute(f"ALTER TABLE {prefix}jobs ADD COLUMN executor_key {kind}")
@@ -415,8 +418,9 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                     from .execution_migration import import_accounting
                     if old_protocol < 22:
                         await import_accounting(tx, db, prefix)
-                    from .context_migration import import_context_events
-                    await import_context_events(tx, db, prefix)
+                    if old_protocol < 35:
+                        from .context_migration import import_context_events
+                        await import_context_events(tx, db, prefix)
                     await _rebuild_obligations(tx, db, prefix, identity["store_id"])
                     if (
                         await tx.execute(
@@ -431,6 +435,8 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                     # ordinary open must never silently mutate a live schema.
                     if not await _table_exists_tx(tx, db.dialect.name, prefix+'task_context_events'):
                         raise StoreSchemaError('task context original table missing; restore originals before maintenance')
+                    from .operation_migration import verify_operation_records
+                    await verify_operation_records(tx, prefix)
                     await _run_task_ddl(tx, db, prefix)
                     await _rebuild_obligations(tx, db, prefix, identity["store_id"])
                 await _verify_task_schema_tx(tx, db, prefix)

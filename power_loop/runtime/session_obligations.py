@@ -72,11 +72,16 @@ async def _processing_handled(manager, tx, row, event, session_id, owner_job_id,
 
 
 async def _desired(manager, tx, row, *, verify=False, clean=None, processed_inputs=frozenset(), projected_events=frozenset()):
+    operation_filter = "action IN ('steer','nudge')" if verify else "action='nudge'"
     events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND "
         "(event_type IN ('tool_call_abort','source_abort_delivery','pending_call_disposition',"
         "'controller_review_handoff','pending_owner_transfer','managed_effect_delivery',"
-        "'controller_stopped','wait_notification','result','task_control_request') OR (event_type='operation' AND action='nudge'))",
+        f"'controller_stopped','wait_notification','result','task_control_request') OR (event_type='operation' AND {operation_filter}))",
         (row["job_id"],))
+    if verify:
+        from .store.operation_migration import verify_operation_records
+        await verify_operation_records(tx, manager.prefix,
+            records=[event for event in events if event['event_type'] == 'operation'])
     events = [{**event, "delivery_status": "handled"} if event["event_id"] in projected_events else event
         for event in events]
     if not events:
