@@ -56,6 +56,7 @@ class ControlTransaction(ControlReadView):
         self._events = manager.events
         self._jobs = manager.jobs
         self._executors = manager.prefix + "task_executors"
+        self._executor_groups = manager.prefix + "task_executor_admissions"
         self._context_events = manager.prefix + "task_context_events"
         self._obligations = manager.prefix + "session_obligations"
         self._dialect = manager.db.dialect
@@ -71,6 +72,7 @@ class ControlTransaction(ControlReadView):
         self.obligation_open: set[tuple] = set()
         self.obligation_close: set[tuple] = set()
         self._executor_admissions: dict[str, bool] = {}
+        self._executor_group_locks: dict[str, tuple[bool, bool]] = {}
 
     def __getattr__(self, name):
         return getattr(self._tx, name)
@@ -96,14 +98,18 @@ class ControlTransaction(ControlReadView):
         self._memo.pop((f"SELECT * FROM {self._executors} WHERE executor_key=?", (executor_key,)), None)
         return await self._execute(sql, params)
 
-    async def executor_admission(self, executor_key, *, exclusive=False):
+    async def write_executor_group(self, group_key, sql, params=()):
+        self._executor_group_locks.pop(group_key, None)
+        return await self._execute(sql, params)
+
+    async def executor_admission(self, executor_key, *, exclusive=False, refresh=False):
         """Hold this boot's admission until the tree publication commits.
 
         Drain and activation close the boot with an exclusive metadata write
         before discovering roots. Concurrent trees share this read lock.
         """
         sql = f"SELECT * FROM {self._executors} WHERE executor_key=?"
-        if executor_key not in self._executor_admissions or exclusive and not self._executor_admissions[executor_key]:
+        if refresh or executor_key not in self._executor_admissions or exclusive and not self._executor_admissions[executor_key]:
             suffix = '' if self.dialect.name == 'sqlite' else ' FOR UPDATE' if exclusive else ' FOR SHARE'
             row = await self._tx.fetchone(sql+suffix, (executor_key,))
             self._memo[sql, (executor_key,)] = None if row is None else dict(row)

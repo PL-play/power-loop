@@ -138,6 +138,19 @@ async def _row(manager, tx, identity, *, required=True, admission=False, exclusi
     writer = manager._control_intents.get()
     row = (await writer.executor_admission(_key(manager, identity), exclusive=exclusive) if admission and writer is not None else
            await tx.fetchone(f"SELECT * FROM {executors} WHERE executor_key=?", (_key(manager, identity),)))
+    if row is None and admission and writer is not None:
+        from .executor_admissions import lock
+        registered = await lock(manager, writer, identity)
+        if registered:
+            # A first registration may have committed after the missing-boot
+            # statement's snapshot. The held group gate now fences that race.
+            row = await writer.executor_admission(_key(manager, identity), exclusive=exclusive, refresh=True)
+            if row is None:
+                raise JobError('executor_registration_required')
+        elif required:
+            raise JobError('executor_registration_required')
+        else:
+            return None
     if row is None:
         _, events = _tables(manager)
         # Once this logical executor is registered, another boot cannot fall
@@ -210,6 +223,8 @@ async def register(manager, identity, *, contract_hash, startup_lease_ms=30000):
     request = {"action": "register", "contract_hash": contract_hash, "startup_lease_ms": startup_lease_ms}
     operation = _operation_key(manager, identity, "register", "registration")
     async with manager._write() as tx:
+        from .executor_admissions import lock
+        await lock(manager, tx, identity, registration=True)
         replay = await _recall(manager, tx, identity, operation, request)
         if replay is not None:
             return replay

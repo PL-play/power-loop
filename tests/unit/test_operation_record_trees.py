@@ -18,7 +18,7 @@ from power_loop.runtime.jobs import JobError, JobManager, _hash
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.store.schema import StoreSchemaError
-from power_loop.runtime.store.task_schema import migrate_task_schema
+from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, migrate_task_schema
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
@@ -236,7 +236,7 @@ async def test_cold_entry_refuses_a_target_record_without_its_original_source_pe
         assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == before
         assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id') == jobs
         assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}session_obligations ORDER BY source_id') == pending
-        assert (await c.manager.db.fetchone(f'SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1'))['protocol_version'] == 36
+        assert (await c.manager.db.fetchone(f'SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1'))['protocol_version'] == TASK_PROTOCOL_VERSION
     finally:
         for event in grants:
             columns = tuple(event)
@@ -298,7 +298,7 @@ async def test_source35_opaque_record_requires_offline_attribution_before_protoc
             (original_caller['version'], c.caller.job_id))
         await c.manager.db.execute(f'UPDATE {c.manager.events} SET request_hash=? WHERE event_id=?',
             (original_target['request_hash'], result.operation_id))
-        await c.manager.db.execute(f'UPDATE {c.manager.prefix}task_store SET protocol_version=36 WHERE id=1')
+        await c.manager.db.execute(f'UPDATE {c.manager.prefix}task_store SET protocol_version=? WHERE id=1', (TASK_PROTOCOL_VERSION,))
     assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == original_events
 
 
