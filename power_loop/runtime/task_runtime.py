@@ -720,6 +720,8 @@ class TaskRuntime:
         while True:
             try:
                 async with prepare_policy(self, source=policy_source), self.manager.joined_write():
+                    from .budget_admissions import enter
+                    await enter(self, self.manager._joined_write.get())
                     registration = await self.manager.register_job(
                         registering_actor,
                         kind="send",

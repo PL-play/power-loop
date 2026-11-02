@@ -47,7 +47,8 @@ async def prepared(runtime, *, source=None):
         from .execution_membership import _trusted
         from .model_budgets import policy_key
         known = _trusted(manager, '_budget_markers', policy_key(runtime))
-        marker = {'payload_json': None, 'request_hash': known} if known else await _read(runtime)
+        marker = ({'payload_json': None, 'request_hash': known} if known else
+            None if runtime.budget_config is None else await _read(runtime))
         source = PolicySource(marker)
     token = _SOURCES.set({**existing, identity: source})
     try:

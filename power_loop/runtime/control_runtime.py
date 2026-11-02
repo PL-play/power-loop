@@ -252,6 +252,8 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
 
     await flush_observed_controls(binding)
     async with prepare_policy(runtime, source=policy_source), manager._write() as tx:
+        from .budget_admissions import enter
+        await enter(runtime, tx)
         source = dict(await manager._fence(tx, binding.actor, binding.lease))
         from .workflow_controller import validate_dispatch
         await validate_dispatch(manager, tx, source)

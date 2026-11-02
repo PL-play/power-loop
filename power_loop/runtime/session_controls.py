@@ -57,6 +57,7 @@ class ControlTransaction(ControlReadView):
         self._jobs = manager.jobs
         self._executors = manager.prefix + "task_executors"
         self._executor_groups = manager.prefix + "task_executor_admissions"
+        self._principal_admissions = manager.prefix + "task_principal_admissions"
         self._context_events = manager.prefix + "task_context_events"
         self._obligations = manager.prefix + "session_obligations"
         self._dialect = manager.db.dialect
@@ -73,6 +74,7 @@ class ControlTransaction(ControlReadView):
         self.obligation_close: set[tuple] = set()
         self._executor_admissions: dict[str, bool] = {}
         self._executor_group_locks: dict[str, tuple[bool, bool]] = {}
+        self._budget_policy_admissions: dict[str, dict | None] = {}
 
     def __getattr__(self, name):
         return getattr(self._tx, name)
@@ -100,6 +102,9 @@ class ControlTransaction(ControlReadView):
 
     async def write_executor_group(self, group_key, sql, params=()):
         self._executor_group_locks.pop(group_key, None)
+        return await self._execute(sql, params)
+
+    async def write_principal_admission(self, policy_key, sql, params=()):
         return await self._execute(sql, params)
 
     async def executor_admission(self, executor_key, *, exclusive=False, refresh=False):

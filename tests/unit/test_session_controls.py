@@ -86,7 +86,8 @@ async def test_all_notice_route_writers_use_explicit_recipient_invalidation():
     assert direct_writes == [("session_controls.py", "set_event_recipient")]
 
 
-@pytest.mark.parametrize("target", ["jobs", "job_events", "task_executors", "task_context_events", "task_executor_admissions"])
+@pytest.mark.parametrize("target", ["jobs", "job_events", "task_executors", "task_context_events", "task_executor_admissions",
+                                    "task_principal_admissions"])
 async def test_undeclared_control_mutations_fail_before_writing(registry_store, target):
     store, _ = registry_store
     manager = JobManager(store)

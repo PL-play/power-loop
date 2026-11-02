@@ -223,6 +223,8 @@ async def register(manager, identity, *, contract_hash, startup_lease_ms=30000):
     request = {"action": "register", "contract_hash": contract_hash, "startup_lease_ms": startup_lease_ms}
     operation = _operation_key(manager, identity, "register", "registration")
     async with manager._write() as tx:
+        from .budget_admissions import initialize
+        await initialize(manager, tx, identity)
         from .executor_admissions import lock
         await lock(manager, tx, identity, registration=True)
         replay = await _recall(manager, tx, identity, operation, request)

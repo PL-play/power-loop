@@ -30,7 +30,8 @@ def accounting_context(state):
 
 
 def policy_key(runtime):
-    return "bp_" + _hash([runtime.manager.store.store_id, runtime.tenant_id, runtime.principal_id])[:48]
+    from .budget_admissions import key
+    return key(runtime.manager, runtime.tenant_id, runtime.principal_id)
 
 
 def scope_key(key, name):
@@ -59,7 +60,9 @@ async def _policy(runtime, tx, *, create=False, job=None):
             for k in ("tenant_id", "principal_id", "executor_id", "boot_id")
         ):
             raise JobError("budget_runtime_binding_changed")
-    row = await tx.fetchone(f"SELECT * FROM {manager.prefix}task_budget_policies WHERE policy_key=?", (key,))
+    admissions = getattr(tx, '_budget_policy_admissions', {})
+    row = admissions[key] if key in admissions else await tx.fetchone(
+        f"SELECT * FROM {manager.prefix}task_budget_policies WHERE policy_key=?", (key,))
     marker_id = "mb_policy_" + key[3:]
     from .execution_membership import _remember_after_commit, _trusted
     known = row is not None and _trusted(manager, "_budget_markers", key)
@@ -108,6 +111,8 @@ async def _policy(runtime, tx, *, create=False, job=None):
             "(policy_key,tenant_id,principal_id,request_hash,manifest_json,enabled,created_at) VALUES (?,?,?,?,?,?,?)",
             (key, runtime.tenant_id, runtime.principal_id, _hash(manifest), _json(manifest), 1, manager.now()),
         )
+        from .budget_admissions import activated
+        await activated(runtime, tx, _hash(manifest))
         for limits in manifest["scopes"]:
             if limits.get("binding", "authority") != "authority":
                 continue
@@ -118,6 +123,7 @@ async def _policy(runtime, tx, *, create=False, job=None):
                 (scope_key(key, limits["key"]), key, _hash(limits), _json(limits), _hash(counters), _json(counters)),
             )
         row = await tx.fetchone(f"SELECT * FROM {manager.prefix}task_budget_policies WHERE policy_key=?", (key,))
+        admissions[key] = row
     manifest = _object(row["manifest_json"], row["request_hash"])
     if marker is None or _object(marker["payload_json"], marker["request_hash"]) != manifest:
         raise JobError("budget_policy_evidence_corrupt")
@@ -154,6 +160,8 @@ async def ensure_policy(binding, *, transaction=None, job=None):
     while True:
         try:
             async with prepare_policy(runtime, source=source), runtime.manager._write() as tx:
+                from .budget_admissions import enter
+                await enter(runtime, tx)
                 job = await runtime.manager._fence(tx, binding.actor, binding.lease)
                 return await _ensure_policy(binding, tx, job)
         except PolicySourceChanged as changed:

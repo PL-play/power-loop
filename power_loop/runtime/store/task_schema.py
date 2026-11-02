@@ -13,6 +13,7 @@ not overwrite this evidence or release execution.
 Protocol35 retains host context-control originals in task_context_events.
 Protocol36 records metadata operations through source-owned control permissions.
 Protocol37 fences first executor registration against unregistered claims.
+Protocol38 fences first budget-policy activation against unbudgeted sends.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 13
-TASK_PROTOCOL_VERSION = 37
+TASK_PROTOCOL_VERSION = 38
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -53,7 +54,8 @@ _PROTOCOL_23_TABLES = (*_PROTOCOL_21_TABLES, "execution_checkpoints", "execution
                       "session_controls")
 _PROTOCOL_34_TABLES = (*_PROTOCOL_23_TABLES, "session_obligations")
 _PROTOCOL_35_TABLES = (*_PROTOCOL_34_TABLES, "task_context_events")
-TASK_TABLES = (*_PROTOCOL_35_TABLES, "task_executor_admissions")
+_PROTOCOL_37_TABLES = (*_PROTOCOL_35_TABLES, "task_executor_admissions")
+TASK_TABLES = (*_PROTOCOL_37_TABLES, "task_principal_admissions")
 
 
 def message_identity_ddl(statement: str, name: str) -> str:
@@ -118,6 +120,8 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             payload_json {body} NOT NULL, created_at {integer} NOT NULL){opts}""",
         f"""CREATE TABLE IF NOT EXISTS {prefix}task_executor_admissions (
             group_key {small} PRIMARY KEY, registered INTEGER NOT NULL){opts}""",
+        f"""CREATE TABLE IF NOT EXISTS {prefix}task_principal_admissions (
+            policy_key {small} PRIMARY KEY, policy_hash {small}){opts}""",
         f"""CREATE TABLE IF NOT EXISTS {prefix}task_budget_policies (
             policy_key {small} PRIMARY KEY, tenant_id {sid} NOT NULL, principal_id {sid} NOT NULL,
             request_hash {small} NOT NULL, manifest_json {body} NOT NULL, enabled INTEGER NOT NULL,
@@ -232,7 +236,8 @@ async def _verify_query_indexes(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSIO
 async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSION):
     tables = (_PROTOCOL_2_TABLES if protocol == 2 else _PROTOCOL_3_TABLES if protocol == 3
               else _PROTOCOL_21_TABLES if protocol < 22 else _PROTOCOL_23_TABLES if protocol < 24
-              else _PROTOCOL_34_TABLES if protocol < 35 else _PROTOCOL_35_TABLES if protocol < 37 else TASK_TABLES)
+              else _PROTOCOL_34_TABLES if protocol < 35 else _PROTOCOL_35_TABLES if protocol < 37
+              else _PROTOCOL_37_TABLES if protocol < 38 else TASK_TABLES)
     missing = [t for t in (*_STORE_TABLES, *tables) if not await _table_exists_tx(tx, db.dialect.name, prefix + t)]
     if missing:
         raise StoreSchemaError(f"task schema incomplete: {missing}")
@@ -355,6 +360,10 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
         for column in ('group_key', 'registered'):
             if not await _column_exists(tx, db.dialect.name, prefix+'task_executor_admissions', column):
                 raise StoreSchemaError('executor admission schema incomplete')
+    if protocol >= 38:
+        for column in ('policy_key', 'policy_hash'):
+            if not await _column_exists(tx, db.dialect.name, prefix+'task_principal_admissions', column):
+                raise StoreSchemaError('principal admission schema incomplete')
 
 
 async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
@@ -414,7 +423,7 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                 await tx.execute(statement)
             if int(row["version"]) in (10, 12, TASK_SCHEMA_VERSION):
                 identity = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35, 36):
+                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35, 36, 37):
                     old_protocol = identity["protocol_version"]
                     await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
                     from .operation_migration import verify_operation_records
@@ -431,6 +440,8 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                         await import_context_events(tx, db, prefix)
                     from ..executor_admissions import rebuild
                     await rebuild(tx, prefix, identity['store_id'])
+                    from ..budget_admissions import rebuild as rebuild_principals
+                    await rebuild_principals(tx, prefix, identity['store_id'])
                     await _rebuild_obligations(tx, db, prefix, identity["store_id"])
                     if (
                         await tx.execute(
@@ -450,6 +461,8 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                     await _run_task_ddl(tx, db, prefix)
                     from ..executor_admissions import rebuild
                     await rebuild(tx, prefix, identity['store_id'])
+                    from ..budget_admissions import rebuild as rebuild_principals
+                    await rebuild_principals(tx, prefix, identity['store_id'])
                     await _rebuild_obligations(tx, db, prefix, identity["store_id"])
                 await _verify_task_schema_tx(tx, db, prefix)
                 await tx.execute(f"UPDATE {prefix}schema_migrations SET version=? WHERE id=1", (TASK_SCHEMA_VERSION,))
