@@ -294,15 +294,15 @@ async def _host_call(runtime, job_id, attempt_id, operation, call):
 
 
 async def _check_pending(manager, tx, policy):
-    # Include invalid nonzero projections so they cannot disappear from the
-    # pending cap through truthiness normalization (e.g. SQL 2 vs JSON true).
-    rows = await tx.fetchall(
-        f"SELECT attempt_id FROM {manager.prefix}task_budget_attempts WHERE policy_key=? AND pending<>0 LIMIT ?",
+    # Admission only needs the pending count. Reconciliation verifies each
+    # attempt's original chain in its own tree;do not borrow those trees here.
+    # Every nonzero flag still occupies capacity.
+    row = await tx.fetchone(
+        f"SELECT COUNT(*) AS n FROM (SELECT 1 FROM {manager.prefix}task_budget_attempts "
+        "WHERE policy_key=? AND pending<>0 LIMIT ?) AS pending_attempts",
         (policy["policy_key"], policy["manifest"]["max_pending"]),
     )
-    for row in rows:
-        await _read(manager, tx, row["attempt_id"])
-    if len(rows) >= policy["manifest"]["max_pending"]:
+    if row['n'] >= policy["manifest"]["max_pending"]:
         raise JobError("budget_reconciliation_required")
 
 

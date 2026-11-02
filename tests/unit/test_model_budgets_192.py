@@ -365,7 +365,9 @@ async def test_invalid_pending_projection_is_rejected_by_read_and_admission_with
     )
     with pytest.raises(JobError, match="budget_evidence_corrupt"):
         await budgets.get_budget(c.manager, c.actor, a.attempt_id)
-    with pytest.raises(JobError, match="budget_evidence_corrupt"):
+    # Cold inspection diagnoses corruption. Admission still counts every
+    # nonzero pending flag and rejects capacity without reopening that tree.
+    with pytest.raises(JobError, match="budget_reconciliation_required"):
         await new_send(c)
     assert c.host.reserve_calls == 1 and await counters(c) == before
 
