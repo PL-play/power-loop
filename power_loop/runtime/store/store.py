@@ -1263,7 +1263,7 @@ class SessionStore:
     async def prepare_send_projection_fold(
         self, session_id: str, *, send_index: int, rows: list[tuple[str, Any, str | None]],
         source_seq_lo: int | None, source_seq_hi: int | None, projector_version: int,
-        projector: Any, keep_last_sends: int, threshold: int,
+        projector: Any, keep_last_sends: int, threshold: int, row_threshold: float | None = None,
     ):
         """Persist projections and statistics; return a fenced fold candidate only when needed.
 
@@ -1275,7 +1275,7 @@ class SessionStore:
         return await prepare(
             self, session_id, send_index=send_index, rows=rows, source_seq_lo=source_seq_lo,
             source_seq_hi=source_seq_hi, projector_version=projector_version, projector=projector,
-            keep_last_sends=keep_last_sends, threshold=threshold,
+            keep_last_sends=keep_last_sends, threshold=threshold, row_threshold=row_threshold,
         )
 
     async def commit_projection_fold(

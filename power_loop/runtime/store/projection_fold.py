@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 
 from power_loop.runtime.budget import estimate_tokens
+from power_loop.runtime.fold import fold_due
 from power_loop.runtime.store.types import ProjectMessageRow
 
 logger = logging.getLogger(__name__)
@@ -98,12 +99,13 @@ def _cost(projector, row, maximum, owners, policy):
 
 
 def _base_state(store, sid, policy, cutoff):
-    return {"v": 1, "store_id": store.store_id, "session_id": sid, "policy": policy.fingerprint,
-            "cutoff": cutoff, "generation": secrets.token_hex(16), "tokens": 0, "sends": 0, "maximum": 0}
+    return {"v": 2, "store_id": store.store_id, "session_id": sid, "policy": policy.fingerprint,
+            "cutoff": cutoff, "generation": secrets.token_hex(16), "tokens": 0, "rows": 0,
+            "sends": 0, "maximum": 0}
 
 
 def _matches(store, sid, state, policy, cutoff):
-    return (isinstance(state, dict) and state.get("v") == 1
+    return (isinstance(state, dict) and state.get("v") == 2
             and state.get("store_id") == store.store_id and state.get("session_id") == sid
             and state.get("policy") == policy.fingerprint and state.get("cutoff") == cutoff
             and isinstance(state.get("generation"), str)
@@ -148,6 +150,7 @@ async def _advance(store, tx, sid, state, projector, policy, new_rows, send_inde
     owners.update(dict.fromkeys(new_keys, send_index))
     after = sum(_cost(projector, row, send_index, owners, policy) for row in [*changed, *new_rows])
     updated = {**state, "tokens": state["tokens"] + after - before,
+               "rows": state["rows"] + len(new_rows),
                "sends": state["sends"] + int(any(r.kind in ("user", "project") for r in new_rows)),
                "maximum": send_index}
     if updated["tokens"] < 0:
@@ -283,6 +286,7 @@ async def _rebuild(store, sid, projector, policy, snapshot, obsolete):
             owners[key] = max(row.send_index, owners.get(key, row.send_index))
     state.update(tokens=sum(_cost(projector, row, maximum, owners, policy) for row in rows)
                  + (estimate_tokens(projector.render([prior])) if prior is not None else 0),
+                 rows=sum(r.kind in ("user", "project") for r in rows),
                  sends=len(sends), maximum=maximum, revision=snapshot.revision)
     installed = False
     replaced = obsolete
@@ -309,7 +313,7 @@ async def _rebuild(store, sid, projector, policy, snapshot, obsolete):
     return None
 
 
-async def prepare(store, sid, *, projector, keep_last_sends, threshold, **projection):
+async def prepare(store, sid, *, projector, keep_last_sends, threshold, row_threshold=None, **projection):
     """Persist this send; read historical bodies only after a positive gate or during repair."""
     provider = getattr(projector, "fold_statistics_policy", None)
     policy = provider() if provider is not None else None
@@ -325,14 +329,14 @@ async def prepare(store, sid, *, projector, keep_last_sends, threshold, **projec
         return None
     cutoff = state.get("cutoff")
     if policy is not None and _matches(store, sid, state, policy, cutoff):
-        if state["sends"] <= keep_last_sends or state["tokens"] < threshold:
+        if state["sends"] <= keep_last_sends or not fold_due(state["tokens"], threshold, state["rows"], row_threshold):
             return None
     snapshot = await read_snapshot(store, sid, revision=state["revision"])
     if snapshot is None:
         return None  # a concurrent writer won; its send will re-evaluate the new revision
     if policy is not None and not _matches(store, sid, state, policy, cutoff):
         state = await _rebuild(store, sid, projector, policy, snapshot, state.get("obsolete"))
-        if state is None or state["sends"] <= keep_last_sends or state["tokens"] < threshold:
+        if state is None or state["sends"] <= keep_last_sends or not fold_due(state["tokens"], threshold, state["rows"], row_threshold):
             return None
     if policy is None:
         sends = {r.send_index for r in snapshot.rows if r.kind in ("user", "project")}
@@ -340,6 +344,7 @@ async def prepare(store, sid, *, projector, keep_last_sends, threshold, **projec
             return None
         if hasattr(projector, "stamp_render_context"):
             projector.stamp_render_context(snapshot.rows, max(sends) + 1)
-        if estimate_tokens(projector.render(([snapshot.prior] if snapshot.prior else []) + snapshot.rows)) < threshold:
+        if not fold_due(estimate_tokens(projector.render(([snapshot.prior] if snapshot.prior else []) + snapshot.rows)),
+                        threshold, len(snapshot.rows), row_threshold):
             return None
     return snapshot

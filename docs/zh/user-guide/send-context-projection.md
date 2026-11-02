@@ -41,11 +41,13 @@ flowchart TD
     P --> L[loop 运行: assistant/tool 行逐字写 pl_messages]
     L --> F[send N 结束]
     F --> W["writer: 投影 send N -> pl_project_messages (user + project 行)"]
-    W --> C{"投影前缀 token ≥ max_tokens × trigger_ratio?"}
+    W --> C{"token 或历史条数达到阈值?"}
     C -->|是| K[fold_strategy 把最老的若干 send 折成一条 append-only compact 行]
     C -->|否| Z[完成]
     K --> Z
 ```
+
+跨 send 压缩在 token 或压缩点后的历史行数任一达到阈值时触发；行数阈值为 `max_context_rows × trigger_ratio`（None/0 表示关闭条数触发）。两个统计都随现有投影事务增量推进，普通发送不增加 SQL；旧 compact 不计入行数，压缩仍保留完整的最近几轮。
 
 在 **send N+1 开始时**，reader 这样拼 LLM 历史：
 

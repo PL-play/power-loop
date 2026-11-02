@@ -2528,12 +2528,15 @@ class StatefulAgentLoop:
         keep = int(getattr(strategy, "keep_last_sends", 0) or 0)
         ratio = float(getattr(strategy, "trigger_ratio", 0.75) or 0.75)
         threshold = int((self.config.effective_context_budget() or 8000) * ratio)
+        cap = self.config.max_context_rows
+        row_threshold = cap * ratio if cap and cap > 0 else None
         policy_provider = getattr(projector, "fold_statistics_policy", None)
         policy = policy_provider() if policy_provider else None
         candidate = await store.prepare_send_projection_fold(
             sid, send_index=send_index, rows=proj_rows_to_write,
             source_seq_lo=projected.source_seq_lo, source_seq_hi=projected.source_seq_hi,
             projector_version=version, projector=projector, keep_last_sends=keep, threshold=threshold,
+            row_threshold=row_threshold,
         )
         if candidate is None:
             return
@@ -2583,7 +2586,10 @@ class StatefulAgentLoop:
             if hasattr(projector, "stamp_render_context"):
                 projector.stamp_render_context(snapshot, (max(live_sends) + 1) if live_sends else None)
             rendered_prefix = projector.render(([prior] if prior is not None else []) + snapshot)
-            if estimate_tokens(rendered_prefix) < threshold:
+            from power_loop.runtime.fold import fold_due
+            cap = self.config.max_context_rows
+            row_threshold = cap * trigger_ratio if cap and cap > 0 else None
+            if not fold_due(estimate_tokens(rendered_prefix), threshold, len(snapshot), row_threshold):
                 return None, ()  # below threshold — small per-send projections just accumulate
             fold_sends = set(live_sends[: len(live_sends) - keep])
             fold_rows = [

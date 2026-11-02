@@ -44,11 +44,13 @@ flowchart TD
     P --> L[loop runs: assistant/tool rows -> pl_messages verbatim]
     L --> F[send N ends]
     F --> W["writer: project send N -> pl_project_messages (user + project rows)"]
-    W --> C{"projected prefix tokens ≥ max_tokens × trigger_ratio?"}
+    W --> C{"token or history-row threshold reached?"}
     C -->|Yes| K[fold_strategy folds oldest sends into one append-only compact row]
     C -->|No| Z[done]
     K --> Z
 ```
+
+Cross-send folding starts when either the token threshold or the post-compact history-row threshold is reached. The row threshold is `max_context_rows × trigger_ratio` (disabled for None/0). Both counters advance with the existing projection transaction; normal sends add no SQL. The previous compact is excluded from the row count, and folding still keeps whole recent sends.
 
 At the **start of send N+1**, the reader assembles the LLM history as:
 

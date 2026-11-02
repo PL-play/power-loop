@@ -108,6 +108,7 @@ async def assert_exact(store, sid, projector):
     expected = estimate_tokens(projector.render(([prior] if prior else []) + live))
     assert state["tokens"] == expected
     assert state["sends"] == len(sends)
+    assert state["rows"] == sum(r.kind in ("user", "project") for r in live)
     assert state["maximum"] == max(sends, default=0)
     return state
 

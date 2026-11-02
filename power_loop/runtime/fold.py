@@ -91,7 +91,8 @@ class FoldStrategy(Protocol):
     user/project sends) into ONE compact record. May have side effects per concrete strategy.
 
     ``keep_last_sends`` (>= 1): most-recent finished sends kept individually before older fold.
-    ``trigger_ratio`` (0,1]: fold when rendered prefix tokens >= ``max_tokens × trigger_ratio``.
+    ``trigger_ratio`` (0,1]: fold when tokens or post-compact history rows reach
+    the corresponding context limit multiplied by this ratio.
     ``fold_id``: stable id stamped on compact rows (``fold_version`` column) so a strategy switch
     is detectable per-row and re-foldable."""
 
@@ -110,6 +111,11 @@ class FoldStrategy(Protocol):
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
+
+
+def fold_due(tokens, threshold, rows, row_threshold=None):
+    """Either context limit can require folding before the next send is capped."""
+    return tokens >= threshold or (row_threshold is not None and rows >= row_threshold)
 
 
 def _folded_sends(rows: list[ProjectMessageRow]) -> list[int]:
