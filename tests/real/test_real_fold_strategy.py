@@ -134,21 +134,3 @@ async def test_real_projection_agentic_fold() -> None:
 
 
 # ── mode switch: verbatim → projection migrates prior history (one-time, never throws) ──
-
-
-async def test_real_mode_switch_verbatim_to_projection_migrates() -> None:
-    store = await SessionStore.open(":memory:")
-    try:
-        v = _loop(store, VerbatimRepresentation(), LLMSummaryFold(keep_last_sends=4), budget=8000)
-        sid = await v.new_session()
-        await _drive(v, sid, 2)
-        assert await store.load_project_messages(sid) == []  # verbatim wrote no projection rows
-
-        # Re-open the SAME session in projection mode → migration folds prior history once.
-        p = _loop(store, ProjectedRepresentation(), LLMSummaryFold(keep_last_sends=2), budget=40)
-        r = await p.send("Now reply OK once more.", session_id=sid)
-        assert r.status == "completed"
-        assert await store.load_project_messages(sid), "prior history migrated into projection table"
-        assert (await store.get_session(sid)).metadata.get("projection_migrated") is not None
-    finally:
-        await store.close()

@@ -1327,51 +1327,6 @@ class SessionStore:
         return True
 
 
-    async def write_projection_migration(
-        self,
-        session_id: str,
-        *,
-        project_rows: list[tuple[int, str, Any, str | None]],
-        compact: tuple[Any, str | None, int, int] | None,
-        projector_version: int,
-        metadata_patch: dict[str, Any] | None = None,
-    ) -> None:
-        """Atomically seed the projection table for a one-time mode-switch migration: write the
-        per-send ``project_rows`` (``(send_index, kind, content, rendered_text)``), an optional
-        ``compact`` (``(content, rendered_text, from_send, to_send)``), AND an optional
-        ``metadata_patch`` merged into the session metadata — all in ONE transaction under the
-        session lock, so a crash can't leave a half-migrated projection OR a written migration with
-        an unset marker (the marker and the rows commit together)."""
-        send_reads.forget(self, session_id, "session", "state")
-        now = _now_ms()
-        async with self._db.transaction() as tx:
-            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
-            from .projection_fold import invalidate
-            await invalidate(self, tx, session_id)
-            for send_index, kind, content, rendered_text in project_rows:
-                await self._upsert_project_message_tx(
-                    tx, session_id, send_index=send_index, kind=kind, content=content,
-                    rendered_text=rendered_text, projector_version=projector_version, now=now,
-                )
-            if compact is not None:
-                c_content, c_rendered, from_send, to_send = compact
-                await self._upsert_project_message_tx(
-                    tx, session_id, send_index=to_send, kind="compact", content=c_content,
-                    rendered_text=c_rendered, compact_from_send=from_send, compact_to_send=to_send,
-                    projector_version=projector_version, now=now,
-                )
-            if metadata_patch:
-                row = await tx.fetchone(
-                    f"SELECT metadata_json FROM {self.t.sessions} WHERE session_id=?", (session_id,)
-                )
-                if row is not None:
-                    current = _loads(row["metadata_json"]) or {}
-                    current.update(metadata_patch)
-                    await tx.execute(
-                        f"UPDATE {self.t.sessions} SET metadata_json=?, updated_at=? "
-                        "WHERE session_id=?",
-                        (_dumps(current), now, session_id),
-                    )
 
     # ── session lifecycle ─────────────────────────────────────────────────────
     async def list_children(self, parent_session_id: str) -> list[SessionRow]:

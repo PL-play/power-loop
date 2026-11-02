@@ -262,7 +262,7 @@ async def try_handle(loop,sid,error,stop_event,*,window=None,caller_consumes=Fal
         # missing tool reply or an extra history-migration model request.
         from .representation import ProjectedRepresentation
         original_config = loop.config
-        loop.config = replace(original_config,representation=ProjectedRepresentation(),migrate_history_on_switch=False)
+        loop.config = replace(original_config,representation=ProjectedRepresentation())
         try:
             result = await loop.flush_follow_ups(sid,stop_event=stop_event,tools=[],max_rounds=allowance)
         finally:

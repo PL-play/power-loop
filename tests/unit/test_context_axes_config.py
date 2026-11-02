@@ -2,7 +2,7 @@
 
 Covers AgentLoopConfig's resolution of the two axes onto the loop's mechanisms (projection
 derived-fold vs verbatim in-place compactor), the deprecated 2.x kwarg mapping (history_projector
-/ compactor / migrate_history_on_projection_switch), and the custom-fold-in-verbatim adapter.
+/ compactor), and the custom-fold-in-verbatim adapter.
 """
 
 from __future__ import annotations
@@ -157,11 +157,6 @@ def test_legacy_projector_becomes_projection_representation():
     assert c.resolve_compactor() is None  # projection → no in-place fold
 
 
-def test_legacy_migrate_flag_alias():
-    with _no_warn():
-        c = AgentLoopConfig(history_projector=DefaultDeterministicProjector(),
-                            compactor=None, migrate_history_on_projection_switch=False)
-    assert c.migrate_history_on_switch is False
 
 
 def test_new_axes_win_over_legacy_when_both_present():

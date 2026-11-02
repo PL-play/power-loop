@@ -3,14 +3,11 @@
 Each test FAILS against the pre-fix code and passes after:
   B2  — workflow wake-guard must claim atomically (no journal clobber / no double-wake).
   B3+B5 — resume() must self-heal a crash-left ids-only pending instead of stranding the session.
-  B4  — projection migration must not write a compact that COVERS sends it didn't fold (data loss).
-  B13 — projection migration must keep the would-be-folded sends (as project rows) on fold soft-fail.
 """
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 
 import pytest
 
@@ -81,17 +78,6 @@ def test_b9_projected_render_tags_sends_with_index() -> None:
     assert "recall_send" in out[2]["content"] and "#1" in out[2]["content"]  # compact shows its range
 
 
-@dataclass
-class _DeclineFold:
-    """A fold strategy that always soft-fails (returns None) — to exercise the migration's
-    soft-fail branch deterministically without an LLM."""
-
-    keep_last_sends: int = 1
-    trigger_ratio: float = 0.75
-    fold_id: str = "decline"
-
-    async def fold(self, rows, *, context):
-        return None
 
 
 # ── B2: wake-guard atomic claim ───────────────────────────────────────────────
@@ -150,26 +136,8 @@ async def test_resume_self_heals_ids_only_pending() -> None:
         assert any(r.role == "tool" and r.tool_call_id == "b" for r in rows)  # protocol resolved
 
 
-# ── B13: migration soft-fail keeps the would-be-folded sends ──────────────────
 
 
-async def test_migration_softfail_keeps_fold_sends_as_project_rows() -> None:
-    async with await SessionStore.open(":memory:") as store:
-        base = StatefulAgentLoop(
-            llm=_Scripted([LLMResponse(raw_text="a1"), LLMResponse(raw_text="a2")]), store=store,
-            tool_registry=_echo_registry(),
-            config=AgentLoopConfig(system_prompt="S", max_rounds=2),
-        )
-        sid = await base.new_session()
-        await base.send("m1", session_id=sid)  # send 1
-        await base.send("m2", session_id=sid)  # send 2
-        proj = _projector_loop(
-            store, _Scripted([LLMResponse(raw_text="a3")]), DefaultDeterministicProjector(),
-            fold_strategy=_DeclineFold(keep_last_sends=1),
-        )
-        await proj.send("m3", session_id=sid)  # migrating send; keep=1 → fold span = [1], soft-fails
-        proj_sends = {r.send_index for r in await store.load_project_messages(sid) if r.kind == "project"}
-        assert {1, 2}.issubset(proj_sends)  # send 1 (the fold span) preserved, not dropped
 
 
 # ── Test-gap (test-audit): the fold GATE — a foldable span UNDER budget must NOT fold ──
@@ -190,35 +158,3 @@ async def test_fold_gate_does_not_fold_below_token_budget() -> None:
             assert (await proj.send(f"m{i}", session_id=sid)).status == "completed"
         compacts = [r for r in await store.load_project_messages(sid) if r.kind == "compact"]
         assert compacts == [], "fold fired below the token budget (the trigger gate is broken)"
-
-
-# ── B4: migration soft-fail with a pre-existing compact_note must not over-claim ──
-
-
-async def test_migration_softfail_with_note_does_not_overclaim_range() -> None:
-    async with await SessionStore.open(":memory:") as store:
-        base = StatefulAgentLoop(
-            llm=_Scripted([LLMResponse(raw_text=f"a{i}") for i in range(1, 4)]), store=store,
-            tool_registry=_echo_registry(),
-            config=AgentLoopConfig(system_prompt="S", max_rounds=2),
-        )
-        sid = await base.new_session()
-        for m in ("m1", "m2", "m3"):
-            await base.send(m, session_id=sid)  # sends 1,2,3
-        # Simulate the in-place compactor folding send 1 into a compact_note.
-        s1 = [r.seq for r in await store.load_active_messages(sid) if r.send_index == 1]
-        await store.record_compaction(
-            sid, from_seq=min(s1), to_seq=max(s1), note_content="OLD-SUMMARY",
-            before_tokens=None, after_tokens=None, round_index=0, fold_seqs=s1, order_key=0,
-        )
-        proj = _projector_loop(
-            store, _Scripted([LLMResponse(raw_text="a4")]), DefaultDeterministicProjector(),
-            fold_strategy=_DeclineFold(keep_last_sends=1),
-        )
-        await proj.send("m4", session_id=sid)  # migrating send 4; fold span = [2], soft-fails
-        compact = await store.latest_project_compact(sid)
-        assert compact is not None
-        # the note-only compact must claim NO real send range (else the reader excludes send 2 forever)
-        assert compact.compact_to_send == 0
-        proj_sends = {r.send_index for r in await store.load_project_messages(sid) if r.kind == "project"}
-        assert 2 in proj_sends  # the un-merged fold send is preserved as a project row

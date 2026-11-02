@@ -42,7 +42,11 @@ async def test_bounded_read_gives_the_same_prompt_as_a_full_read(monkeypatch, ca
     try:
         bounded_llm, sid = await _run(bounded_store, 12, cap=cap)
         with monkeypatch.context() as m:
-            m.delattr(SessionStore, "load_unsent_messages")   # no bounded reader → full read
+            load = SessionStore.load_project_messages
+            async def full_projection_read(self, *args, **kwargs):
+                kwargs.pop("last_rows", None)
+                return await load(self, *args, **kwargs)
+            m.setattr(SessionStore, "load_project_messages", full_projection_read)
             full_llm, _ = await _run(full_store, 12, cap=cap)
         assert bounded_llm.calls == full_llm.calls
         main = [c for c in bounded_llm.calls if "question 11" in str(c) and "summarizer" not in str(c)][-1]

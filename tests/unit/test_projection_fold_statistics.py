@@ -317,7 +317,7 @@ class CaptureFold:
 
 
 async def test_fold_reads_all_candidates_despite_history_cap_and_pages(fold_store, monkeypatch):
-    sid = await fold_store.create_session(metadata={"projection_migrated": 0})
+    sid = await fold_store.create_session(metadata={})
     for n in range(1, 322):
         await append(fold_store, sid, n)
         await fold_store.append_message(sid, role="user", content=f"original {n}", send_index=n)
@@ -393,7 +393,7 @@ async def test_fold_cannot_advance_over_unprocessed_sends(fold_store):
         async def fold(self, rows, *, context):
             return FoldResult({"summary": "invalid cursor"}, max(r.send_index for r in rows) + 1)
 
-    sid = await fold_store.create_session(metadata={"projection_migrated": 0})
+    sid = await fold_store.create_session(metadata={})
     for n in range(1, 4):
         await append(fold_store, sid, n)
     await fold_store.set_runtime_state(sid, "send_index", 3)

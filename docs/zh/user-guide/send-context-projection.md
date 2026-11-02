@@ -197,21 +197,19 @@ from power_loop import Representation, ProjectedSend, ProjectedRow  # 写自己�
 - **原子且并发安全** —— 每个已结束 send 的投影行在一把短锁内提交；（LLM）折叠在锁外运行，并以乐观的先验游标检查提交，所以两个共享 store 的 loop 不会重复写一次折叠。
 - **token**：真正的削减来自 `ProjectedRepresentation` 的按字段截断 + `compact` 折叠；存的是结构化 JSON，装配时渲染成紧凑文本。**前缀缓存**：投影前缀是 append-only 增长（每 send 一组行），比逐字的就地压缩（每次折叠重写一段）对厂商的隐式前缀缓存更友好。
 
-## 在已有会话上切换模式
+## 已有会话的一次性转换
 
-模式（投影 `representation` vs 逐字默认）是**按 loop** 选的。会话**首次运行**时把**原始模式 + 配置**记到**会话元数据**（`SessionRow.metadata`，供检视与切换检测）——但用**不同模式**重开一个已有会话**绝不抛异常**：它降级为尽力的逐字渲染并打日志警告。`send_index` 无论哪种模式每次 send 都分配。
+运行时不转换旧会话，也不按旧模式降级。某个 send 的投影缺失或版本不符时，读取该 send 的原始消息；现有的逐 send 投影修复可以重建这份派生记录。会话最初使用的表示仍保留在元数据中供查看。
 
-| 从 → 到 | 行为 |
-|---|---|
-| **逐字 → 投影**，*尚未触发任何折叠* | **迁移（默认）。** 首次投影 send 时，把旧历史**一次性**折进投影表——一条 `compact` 覆盖旧 send，加上最近 `keep_last_sends` 作为 project 行。设 `migrate_history_on_switch=False` 时，旧 send 改为用 `pl_messages` **逐字渲染**（不折叠）。 |
-| **逐字 → 投影**，*已触发过就地折叠* | **迁移（默认）。** 就地 `compact_note` **种子**化投影 compact，活动尾段被投影。迁移关闭时则**降级**为逐字渲染——压缩但连贯——并跳过本次投影。绝不抛。若迁移折叠软失败，本应被折叠的 send 会保留为单独的 project 行（不丢数据）。 |
-| **resume()/submit_input() 在任何 send() 之前** | **降级，不抛。** 没有可切分的 `send_index`，逐字渲染、尽力运行，打警告。 |
-| **投影 → 逐字** | **安全。** 投影从不把 `pl_messages` 行标 inactive，所以逐字模式看到完整历史；过时的投影行被忽略。 |
-| **改 representation 的 `version` / 实现** | 不同 `version` 写的行逐 send 回退逐字（见行为说明）。换实现/内容结构时请**升 `version`**，让旧行干净回退。 |
+保留的逐字历史要转成投影时，先把数据库升级到当前任务结构，停止写者并备份，再从 SDK 目录查看单个会话的转换计划：
 
-**迁移**（`migrate_history_on_switch`，默认 `True`）每会话只跑**一次**——尽力（失败则回退逐字、下次 send 再试）、幂等（以 `projection_migrated` 记在会话元数据）、且仅当投影表为空。它通过配置的 `fold_strategy` 折叠。
+```bash
+.venv/bin/python -m scripts.migrate_projection_history --dsn "$POWER_LOOP_MAINTENANCE_DSN" --session-id SESSION_ID
+```
 
-**建议**：在创建会话时定好模式。切换总是可生还的（尽力 + 警告，绝不抛异常）；但要最干净、可完全折叠的投影，请用**全新 session**。
+追加 `--apply --writers-stopped` 才实际执行；多个会话逐个处理。CLI 使用内置 `ProjectedRepresentation`；应用有自定义表示时，把配置好的对象传给脚本的 `convert(..., projector=...)` 函数。
+脚本补齐缺失或过时的逐 send 投影，把已有的就地压缩摘要保留为 compact 种子，移除退役的迁移标记；不调用模型、不执行工具、不改原始消息或费用。投影与元数据在同一事务提交，已转换会话重跑不重复写入。
+
 
 ## 鲁棒性：自愈错乱的历史
 

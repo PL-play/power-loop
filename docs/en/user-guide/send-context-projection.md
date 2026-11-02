@@ -200,21 +200,28 @@ A custom representation satisfies the `Representation` Protocol by declaring `ki
 - **Atomic & concurrency-safe** — each finished send's projection rows commit under a short lock; the (LLM) fold runs outside the lock and commits with an optimistic prior-cursor check, so two loops sharing a store can't double-write a fold.
 - **Tokens**: real reduction comes from `ProjectedRepresentation`'s per-field truncation and the `compact` fold; stored content is structured JSON, rendered to compact text at assembly time. **Prompt caching**: the projected prefix grows append-only (one row group per send), friendlier to a provider's implicit prefix cache than verbatim in-place compaction (which rewrites a span on each fold).
 
-## Switching modes on an existing session
+## Existing sessions and offline conversion
 
-The mode (a projection `representation` vs the verbatim default) is chosen **per loop**. The **original** mode + config is recorded in the **session metadata** (`SessionRow.metadata`) the first time it runs, for inspection and switch-detection — but reopening a session in a *different* mode **never throws**: it degrades to a best-effort verbatim render and logs a warning. `send_index` is allocated on every send regardless of mode.
+Runtime sends do not convert old sessions or downgrade their history mode. A missing
+or version-mismatched projection reads that send's original messages; the existing
+per-send projection repair can rebuild that derived row. The session's original
+representation remains inspectable in metadata.
 
-| From → To | What happens |
-|---|---|
-| **verbatim → projection**, *no fold had fired yet* | **Migrated (default).** On the first projection send, prior history is folded into the projection table **once** — a `compact` covering the old sends plus the most-recent `keep_last_sends` as project rows. With `migrate_history_on_switch=False`, the prior sends instead render **verbatim from `pl_messages`** (never folded). |
-| **verbatim → projection**, *an in-place fold had fired* | **Migrated (default).** The in-place `compact_note` **seeds** the projection compact and the active tail is projected. With migration off it **degrades** to verbatim rendering — compressed but coherent — and skips projecting this send. Never throws. If the migration fold soft-fails, the would-be-folded sends are preserved as individual project rows (no data loss). |
-| **resume()/submit_input() before any send()** | **Degrades, never throws.** No `send_index` is allocated to partition by, so it renders verbatim and runs best-effort, with a warning. |
-| **projection → verbatim** | **Safe.** Projection never marks `pl_messages` rows inactive, so verbatim mode sees the full history; the now-stale projection rows are ignored. |
-| **change representation `version` / implementation** | Rows written by a *different* `version` fall back to verbatim per send (see Behavior notes). **Bump `version`** whenever you change the implementation/content shape so old rows fall back cleanly. |
+To convert retained verbatim history, first upgrade the database to the current task
+schema, stop writers and take a backup. From the SDK checkout, inspect one session:
 
-**Migration** (`migrate_history_on_switch`, default `True`) runs **once** per session — best-effort (on failure it falls back to verbatim and retries next send), idempotent (recorded as `projection_migrated` in the session metadata), and only when the projection table is empty. It folds via the configured `fold_strategy`.
+```bash
+.venv/bin/python -m scripts.migrate_projection_history --dsn "$POWER_LOOP_MAINTENANCE_DSN" --session-id SESSION_ID
+```
 
-**Recommendation:** pick the mode at session creation. A switch is always survivable (best-effort + warning, never an exception), but for clean, fully-foldable projection start a **fresh session**.
+Add `--apply --writers-stopped` for the explicit conversion. Each session is handled
+independently. The CLI uses `ProjectedRepresentation`; for a custom representation,
+pass its configured object to the script's `convert(..., projector=...)` function.
+The script projects missing/stale sends, preserves an existing in-place summary as a
+compact seed, and removes the retired migration marker. It does not call a model,
+execute tools, modify original messages, or change fees. Projection writes and
+metadata commit together; rerunning an already-converted session is a no-op.
+
 
 ## Robustness: self-healing a malformed history
 

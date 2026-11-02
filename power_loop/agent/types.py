@@ -145,15 +145,11 @@ class AgentLoopConfig:
     #: store lock, but a hung provider would still stall the end-of-send path; on timeout the fold
     #: soft-fails (rows committed, no compact this send — retried next send). None disables.
     fold_timeout_s: float | None = 120.0
-    #: On a representation/fold change for an existing session, fold the prior history into the new
-    #: form ONCE (best-effort, never throws). Default True.
-    migrate_history_on_switch: bool = True
     # ── deprecated 2.x kwargs (accepted + mapped onto the two axes in __post_init__) ──
     # The public API is representation × fold_strategy; these keep existing call sites + DeepTalk
     # working until migrated. A future major drops them.
     compactor: Any = _UNSET
     history_projector: Any = _UNSET
-    migrate_history_on_projection_switch: Any = _UNSET
     #: Internal, not API: what a deprecated ``compactor=`` resolved to, and the fold this config
     #: seeded itself. They are FIELDS (not plain attributes) so ``dataclasses.replace`` — which the
     #: loop runs for every per-send override — carries them. As attributes they were dropped:
@@ -312,7 +308,7 @@ class AgentLoopConfig:
 
     def _map_legacy_axes(self) -> None:
         """Resolve representation/fold_strategy, mapping the deprecated 2.x ``history_projector`` /
-        ``compactor`` / ``migrate_history_on_projection_switch`` kwargs onto them (NEW fields win
+        ``compactor`` kwargs onto them (NEW fields win
         when explicitly set). A legacy ``compactor`` (incl. ``None`` = no compaction) under verbatim
         is preserved EXACTLY via ``_legacy_verbatim_compactor`` so old behavior is unchanged; a
         legacy projector becomes the projection representation (its fold is now the fold_strategy)."""
@@ -322,13 +318,10 @@ class AgentLoopConfig:
         # On dataclasses.replace the fold is no longer _UNSET — it is the one WE seeded. It only
         # counts as the caller's choice when replace() swapped in a different object.
         fold_still_seeded = self._seeded_fold is not None and self.fold_strategy is self._seeded_fold
-        if legacy_proj is not _UNSET or legacy_comp is not _UNSET or (
-            self.migrate_history_on_projection_switch is not _UNSET
-        ):
+        if legacy_proj is not _UNSET or legacy_comp is not _UNSET:
             warnings.warn(
-                "AgentLoopConfig: history_projector / compactor / "
-                "migrate_history_on_projection_switch are deprecated; use representation / "
-                "fold_strategy / migrate_history_on_switch.",
+                "AgentLoopConfig: history_projector / compactor are deprecated; use "
+                "representation / fold_strategy.",
                 DeprecationWarning,
                 stacklevel=3,
             )
@@ -368,15 +361,7 @@ class AgentLoopConfig:
             pass  # dataclasses.replace of a config that already resolved one — keep it
         else:
             object.__setattr__(self, "_legacy_verbatim_compactor", _UNSET)
-        if self.migrate_history_on_projection_switch is not _UNSET:
-            object.__setattr__(
-                self, "migrate_history_on_switch",
-                bool(self.migrate_history_on_projection_switch),
-            )
-        # Clear the deprecated fields so they never leak into fingerprints / re-validation.
-        object.__setattr__(self, "compactor", _UNSET)
         object.__setattr__(self, "history_projector", _UNSET)
-        object.__setattr__(self, "migrate_history_on_projection_switch", _UNSET)
 
     def _validate_context_config(self) -> None:
         if self.representation is None or self.fold_strategy is None:

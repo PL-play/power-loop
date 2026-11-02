@@ -1875,9 +1875,8 @@ class StatefulAgentLoop:
         cache_eligible = sink is None and self._session_cache_size > 0 and projector is None
         sink = sink if sink is not None else SQLiteSink(store, sid)
         # Record the session's ORIGINAL history mode + projector config ONCE, in the session
-        # METADATA (inspectable, and the baseline for switch-detection). A later mode switch never
-        # fails the run — it logs a warning and renders best-effort (the config-level
-        # projector/compactor exclusion can't catch a cross-RUN switch). Loaded here once and
+        # METADATA for inspection. Per-send originals supply a missing/stale
+        # projection; no mode switch performs a runtime migration. Loaded once and
         # reused below for the system-prompt precedence.
         session_row = await store.session_snapshot(sid)
         current_mode = "projection" if projector is not None else "default"
@@ -1897,7 +1896,7 @@ class StatefulAgentLoop:
             elif recorded != current_mode:
                 logger.warning(
                     "session %s: running in %r history mode but it was originally %r — rendering "
-                    "best-effort (prior-mode history shown verbatim or compacted).",
+                    "per-send originals supply missing or version-mismatched projections.",
                     sid, current_mode, recorded,
                 )
         except Exception:
@@ -1916,102 +1915,19 @@ class StatefulAgentLoop:
         else:
             projection_active = projector is not None
             active_rows: list[Any] | None = None
-            # Bounded read: once a session is projection-native (the one-time migration check left its
-            # marker) history needs only the rows with no send index, the in-flight send, the latest
-            # compact and the newest projection rows — never a scan of every past send. Sessions
-            # without the marker take the full read once (the migration check needs it).
-            bounded = (
-                projection_active and current_send_index is not None and session_row is not None
-                and session_row.metadata.get("projection_migrated") is not None
-                and hasattr(store, "load_unsent_messages")
-            )
             if projection_active:
-                if bounded:
-                    active_rows = [
-                        *await store.load_unsent_messages(sid),
-                        *await store.load_active_messages(sid, send_index=current_send_index),
-                    ]
-                else:
-                    active_rows = await store.load_active_messages(sid)
-                migrated = (
-                    session_row is not None and session_row.metadata.get("projection_migrated") is not None
-                )
-                if current_send_index is None:
-                    # resume()/submit_input() before any send() — no in-flight send to partition by.
-                    logger.warning(
-                        "session %s: projection mode degrading to verbatim rendering (no allocated "
-                        "send_index — resume before any send); best-effort.", sid,
-                    )
-                    projection_active = False
-                elif not migrated and self.config.migrate_history_on_switch:
-                    # One-time migration: a session with prior NON-projection history opened in
-                    # projection mode. Fold that prior history into the projection table so it becomes
-                    # projection-native (a compact + the recent keep_last_sends as project rows) rather
-                    # than rendering it verbatim forever. Only when the projection table is EMPTY (a
-                    # genuine switch / in-place-compacted / never-projected session) — an incidental
-                    # missing/stale row on an already-projected session is left to the verbatim
-                    # fallback below.
-                    has_note = any(r.name == "compact_note" for r in active_rows)
-                    has_prior = any(
-                        r.send_index is not None and r.send_index < current_send_index
-                        and r.name != "compact_note"
-                        for r in active_rows
-                    )
-                    if has_note or has_prior:
-                        if await store.load_project_messages(sid):
-                            # Already projection-native (normal session, or a version bump handled by
-                            # the verbatim fallback) — mark resolved so we don't re-check every send.
-                            try:
-                                await store.merge_session_metadata(sid, {"projection_migrated": 0})
-                            except Exception:
-                                logger.exception("session %s: migration bookkeeping failed", sid)
-                            migrated = True
-                        else:
-                            try:
-                                # Writes the rows AND the projection_migrated marker in one tx (atomic).
-                                await self._migrate_prior_history_to_projection(
-                                    store, sid, projector,
-                                    current_send_index=current_send_index, active_rows=active_rows,
-                                    stop_event=stop_event,
-                                )
-                                migrated = True
-                                logger.info(
-                                    "session %s: migrated prior history into the projection table "
-                                    "(mode switch).", sid,
-                                )
-                            except CancellationRequested:
-                                raise
-                            except Exception:
-                                # Best-effort: fall back to verbatim this send (and retry next send).
-                                logger.exception(
-                                    "session %s: projection migration failed (continuing best-effort)",
-                                    sid,
-                                )
-                # A compact_note that migration did NOT fold in (migration off/failed) can't be
-                # send_index-partitioned → degrade to verbatim. Once migrated, the note is represented
-                # by the projection compact and is excluded from the partition below.
-                if (
-                    projection_active
-                    and not migrated
-                    and any(r.name == "compact_note" for r in active_rows)
-                ):
-                    logger.warning(
-                        "session %s: projection mode degrading to verbatim rendering (in-place "
-                        "compaction history present, not migrated); best-effort.", sid,
-                    )
-                    projection_active = False
+                assert current_send_index is not None
+                active_rows = [
+                    *await store.load_unsent_messages(sid),
+                    *await store.load_active_messages(sid, send_index=current_send_index),
+                ]
 
-            if projection_active:
                 # ── Projection mode (v2): history = rendered projections of FINISHED sends + the
                 # in-flight send's structured rows. pl_messages is NEVER compacted here (compactor is
                 # None, enforced by AgentLoopConfig), so it stays in seq order; we partition by the
                 # send_index stamped on every row. (active_rows loaded above; current_send_index set.)
-                assert current_send_index is not None and active_rows is not None
-                # Rows predating the projection era (pre-v2 / export→import) carry send_index=NULL —
-                # render them VERBATIM as a temporally-first prefix (never dropped, never lumped into
-                # the current send). compact_note rows are in-place-compactor artifacts: in projection
-                # mode they are represented by the projection compact (after migration) and must never
-                # be rendered verbatim, so they are excluded from both the prefix and the partition.
+                # Out-of-send messages stay a separate prefix. In-place compact
+                # notes are converted only by explicit offline maintenance.
                 legacy_rows = [
                     r for r in active_rows if r.send_index is None and r.name != "compact_note"
                 ]
@@ -2019,8 +1935,7 @@ class StatefulAgentLoop:
                     r for r in active_rows
                     if r.send_index == current_send_index and r.name != "compact_note"
                 ]
-                # pl_messages is the immutable audit log and is NEVER compacted in projection mode, so
-                # every past send's rows are still present here — the FALLBACK source whenever a send's
+                # pl_messages is the immutable audit log. Read a past send only when its
                 # projection row is missing (a best-effort end-of-send projection write failed/crashed)
                 # or was written by a DIFFERENT projector version (the user changed the projector).
                 # Without this fallback such a send would be silently dropped from context forever.
@@ -2036,7 +1951,7 @@ class StatefulAgentLoop:
                 compact = await store.latest_project_compact(sid)
                 cutoff = compact.compact_to_send if compact is not None else None
                 cap = getattr(self.config, "max_context_rows", None)
-                limit = int(cap) + 2 if bounded and cap and int(cap) > 0 else None
+                limit = int(cap) + 2 if cap and int(cap) > 0 else None
 
                 async def _load_proj_rows() -> list[Any]:
                     raw = await store.load_project_messages(
@@ -2051,20 +1966,19 @@ class StatefulAgentLoop:
                     return rows
 
                 proj_rows = await _load_proj_rows()
-                if bounded:
-                    # Past sends inside the window whose current-version projection is missing need
-                    # their raw rows (heal or verbatim fallback); nothing older is read.
-                    window_lo = (min(r.send_index for r in proj_rows)
-                                 if limit is not None and proj_rows else (cutoff or 0) + 1)
-                    if limit is not None:  # every send renders at least one row
-                        window_lo = max(window_lo, current_send_index - limit)
-                    have = {r.send_index for r in proj_rows if int(r.projector_version or 0) == version}
-                    for si in range(window_lo, current_send_index):
-                        if si not in have:
-                            rows = [r for r in await store.load_active_messages(sid, send_index=si)
-                                    if r.name != "compact_note"]
-                            if rows:
-                                active_by_send[si] = rows
+                # Past sends inside the window whose current-version projection is missing need
+                # their raw rows (heal or verbatim fallback); nothing older is read.
+                window_lo = (min(r.send_index for r in proj_rows)
+                             if limit is not None and proj_rows else (cutoff or 0) + 1)
+                if limit is not None:  # every send renders at least one row
+                    window_lo = max(window_lo, current_send_index - limit)
+                have = {r.send_index for r in proj_rows if int(r.projector_version or 0) == version}
+                for si in range(window_lo, current_send_index):
+                    if si not in have:
+                        rows = [r for r in await store.load_active_messages(sid, send_index=si)
+                                if r.name != "compact_note"]
+                        if rows:
+                            active_by_send[si] = rows
                 # Only rows written by the CURRENT projector version are faithfully renderable by it;
                 # rows from another version fall back to verbatim (below), keyed per send.
                 cur_proj_by_send: dict[int, list[Any]] = {}
@@ -2342,108 +2256,6 @@ class StatefulAgentLoop:
             texts=result.texts,
         )
 
-    async def _migrate_prior_history_to_projection(
-        self,
-        store: SessionStore,
-        sid: str,
-        projector: Representation,
-        *,
-        current_send_index: int,
-        active_rows: list[Any],
-        stop_event: CancellationLike = None,
-    ) -> None:
-        """One-time best-effort migration: fold a session's prior NON-projection history into the
-        projection table so it becomes projection-native (starts with a ``compact`` covering the
-        old sends, plus the most-recent ``keep_last_sends`` as individual project rows). Handles
-        both a clean default→projection switch (no projection rows yet) and a session the in-place
-        compactor had folded (its ``compact_note`` summary seeds the projection compact). Folds via
-        the configured ``fold_strategy`` (bounded by ``fold_timeout_s``, OUTSIDE the migration write
-        lock). Never raises (the caller swallows + sets the migrated marker only on success)."""
-        from power_loop.runtime.store.types import ProjectMessageRow
-
-        keep = max(int(getattr(self.config.fold_strategy, "keep_last_sends", 0) or 0), 0)
-        version = int(getattr(projector, "version", 0) or 0)
-        note = next((r for r in active_rows if r.name == "compact_note"), None)
-        by_send: dict[int, list[Any]] = {}
-        for r in active_rows:
-            if r.send_index is not None and r.send_index < current_send_index and r.name != "compact_note":
-                by_send.setdefault(r.send_index, []).append(r)
-        prior = sorted(by_send)
-        if not prior and note is None:
-            return  # nothing to migrate
-
-        projected = {si: projector.project_send(by_send[si], send_index=si, tool_registry=None) for si in prior}
-        # Fold all but the most-recent `keep` prior sends; keep the rest as individual project rows.
-        if keep > 0 and len(prior) > keep:
-            fold, recent = prior[:-keep], prior[-keep:]
-        elif keep == 0:
-            fold, recent = prior, []
-        else:
-            fold, recent = [], prior
-
-        def _pm(si: int, kind: str, content: Any) -> ProjectMessageRow:
-            return ProjectMessageRow(
-                session_id=sid, send_index=si, kind=kind, content=content, rendered_text=None,
-                source_seq_lo=None, source_seq_hi=None, compact_from_send=None,
-                compact_to_send=None, projector_version=version, token_estimate=None, created_at=0,
-            )
-
-        # Build the seed compact: the in-place compactor's note (if any) rolled forward + the
-        # folded sends, via the configured fold_strategy (run below with the fold timeout).
-        to_compact: list[ProjectMessageRow] = []
-        if note is not None:
-            to_compact.append(_pm(0, "compact", {"summary": note.content or ""}))
-        for si in fold:
-            for pr in projected[si].rows:
-                to_compact.append(_pm(si, pr.kind, pr.content))
-        compact_tuple: tuple[Any, str | None, int, int] | None = None
-        migration_note_ops: list[Any] = []
-        folded = None
-        if any(r.kind in ("user", "project") for r in to_compact):
-            # Same fold-timeout guard as the end-of-send path (this runs OUTSIDE the migration's
-            # write lock — write_projection_migration is called afterwards with the result).
-            calls = self._fold_calls(sid, stop_event)
-            folded = await self._run_fold_with_timeout(
-                self.config.fold_strategy, to_compact, self._fold_context(sid, projector, calls),
-            )
-            if calls is not None:
-                calls.raise_if_cancelled()
-        fold_as_project: list[int] = []
-        if folded is not None:
-            from_send = 0 if note is not None else (min(fold) if fold else 0)
-            compact_tuple = (folded.content, folded.rendered_text, from_send, folded.folded_to_send)
-            migration_note_ops = list(folded.note_ops)
-        else:
-            # The fold soft-failed (LLM error/timeout/empty) OR nothing was foldable. Do NOT write a
-            # compact that claims to COVER sends it never merged — the reader uses compact_to_send as
-            # the exclusion cutoff, so an over-claiming range silently drops real history (B4), and a
-            # marker-set no-op drops compression forever (B13). Instead preserve everything: keep the
-            # note as a standalone compact that covers NO real send (to_send=0), and write the
-            # would-be-folded sends as individual project rows. A later end-of-send fold compresses
-            # them (rolling this note compact forward) once over budget.
-            if note is not None:
-                compact_tuple = ({"summary": note.content or ""}, None, 0, 0)
-            fold_as_project = fold
-
-        project_rows = [
-            (si, pr.kind, pr.content, pr.rendered_text)
-            for si in (fold_as_project + recent)
-            for pr in projected[si].rows
-        ]
-        # Mark migrated in the SAME transaction as the rows (atomic): a crash can't leave the
-        # migration written with an unset marker.
-        await store.write_projection_migration(
-            sid, project_rows=project_rows, compact=compact_tuple, projector_version=version,
-            metadata_patch={"projection_migrated": current_send_index},
-        )
-        for op in migration_note_ops:  # agentic-fold facts from the migrated history (best-effort)
-            try:
-                if getattr(op, "op", None) == "add":
-                    await store.add_note(sid, op.content or "", pinned=bool(op.pinned))
-                elif getattr(op, "op", None) == "update":
-                    await store.update_note(sid, op.note_id, content=op.content, pinned=op.pinned)
-            except Exception:
-                logger.exception("session %s: migration note op failed (continuing)", sid)
 
     async def _heal_send_projection(
         self,

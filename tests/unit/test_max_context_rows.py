@@ -27,14 +27,21 @@ async def store() -> AsyncIterator[SessionStore]:
     await s.close()
 
 
+class _UnavailableSummary(_Scripted):
+    async def complete(self, request, **kwargs):
+        return LLMResponse(raw_text="")
+
+
 def _loop(store, llm, *, cap, fold=None):
     return StatefulAgentLoop(
         llm=llm, store=store, tool_registry=_echo_registry(),
         config=AgentLoopConfig(
             system_prompt="S", max_rounds=2, representation=ProjectedRepresentation(),
             max_context_rows=cap,
-            # a lazy fold that never triggers on these tiny sends unless stated otherwise
-            fold_strategy=fold or LLMSummaryFold(keep_last_sends=2, trigger_ratio=0.99),
+            # Isolate the history cap when summary generation declines. Successful
+            # row-triggered folding is covered by test_context_fold_rows.
+            fold_strategy=fold or LLMSummaryFold(keep_last_sends=2, trigger_ratio=0.99,
+                                               summary_llm=_UnavailableSummary()),
             max_tokens=100_000,
         ),
     )
@@ -77,9 +84,9 @@ async def test_history_limit_is_explicit_beyond_previous_defaults(store: Session
     llm = _Scripted(responses=[LLMResponse(raw_text="done")])
     loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(
         system_prompt="S", representation=ProjectedRepresentation(), max_tokens=1_000_000,
-        fold_strategy=LLMSummaryFold(keep_last_sends=2), **options,
+        fold_strategy=LLMSummaryFold(keep_last_sends=2, summary_llm=_UnavailableSummary()), **options,
     ))
-    sid = await loop.new_session(metadata={"projection_migrated": 0})
+    sid = await loop.new_session(metadata={})
     for send in range(1, 212):
         for kind, content in (("user", {"input": [f"history-user-{send:04d}"]}),
                               ("project", {"final_text": f"history-answer-{send:04d}"})):
