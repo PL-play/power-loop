@@ -28,7 +28,7 @@ from typing import Any
 
 from power_loop.contracts.errors import InboxClaimChanged, SessionLeaseLost
 from power_loop.runtime.message_ref import integer_id
-from power_loop.runtime.store import change_signals, message_usage, send_reads
+from power_loop.runtime.store import change_signals, message_usage, owner_writes, send_reads
 from power_loop.runtime.store.capabilities import Maintenance
 from power_loop.runtime.store.db import Database, Row, Transaction
 from power_loop.runtime.store.schema import (
@@ -503,12 +503,9 @@ class SessionStore:
         prior = send_reads.take_state(self, session_id)
         self._holding(session_id).deferred_round = None
         async with self._db.transaction() as tx:
-            guard, arguments = self._lease_write_guard(session_id)
-            changed = await tx.execute(
-                f"UPDATE {self.t.session_state} SET round_index=? WHERE session_id=?{guard}",
-                (round_index, session_id, *arguments),
-            )
-            if guard and changed != 1:
+            sql, arguments, guarded, _ = self._state_update(session_id, ['round_index=?'], (round_index,))
+            changed = await tx.execute(sql, arguments)
+            if guarded and changed != 1:
                 raise SessionLeaseLost(session_id)
         if prior is not None:
             send_reads.remember_state(self, session_id, replace(prior, round_index=round_index))
@@ -518,14 +515,12 @@ class SessionStore:
         send_reads.lease_writer(self, session_id)
         prior = send_reads.take_state(self, session_id)
         async with self._db.transaction() as tx:
-            guard, arguments = self._lease_write_guard(session_id)
-            changed = await tx.execute(
-                f"UPDATE {self.t.session_state} SET pending_json=? WHERE session_id=?{guard}",
+            sql, arguments, guarded, _ = self._state_update(session_id, ['pending_json=?'],
                 # Normalize a falsy-but-non-None pending ({}) to SQL NULL, matching the
                 # legacy oracle so get_state(...).pending round-trips to None, not {}.
-                (_dumps(pending) if pending else None, session_id, *arguments),
-            )
-            if guard and changed != 1:
+                (_dumps(pending) if pending else None,))
+            changed = await tx.execute(sql, arguments)
+            if guarded and changed != 1:
                 raise SessionLeaseLost(session_id)
         if not holding.active:
             return
@@ -542,6 +537,27 @@ class SessionStore:
         lock = "" if self._db.dialect.name == "sqlite" else " FOR UPDATE"
         return (f" AND EXISTS (SELECT 1 FROM {self.t.session_leases} WHERE session_id=? "
                 f"AND owner_id=? AND expires_at>?{lock})", (session_id, reads.lease_owner_id, _now_ms()))
+
+    def _state_update(self, session_id, sets, values, *, condition='', condition_values=()):
+        """Declare an ordinary mutation with its owner condition in the DML."""
+        guard, lease_arguments = self._lease_write_guard(session_id)
+        permission = owner_writes.permission(self, session_id)
+        guarded = bool(guard or permission)
+        if permission is not None and self._db.dialect.name == 'mysql':
+            query, proofs = permission
+            # LIMIT in the permission query prevents derived-table merging.
+            # STRAIGHT_JOIN acquires that root before the mutable state row.
+            statement = (f'UPDATE ({query}) message_permission STRAIGHT_JOIN {self.t.session_state} '
+                f'ON {self.t.session_state}.session_id=? SET '+', '.join(sets)+' WHERE 1=1'+condition+guard)
+            arguments = (*proofs, session_id, *values, *condition_values, *lease_arguments)
+        else:
+            statement = f'UPDATE {self.t.session_state} SET '+', '.join(sets)+' WHERE session_id=?'+condition+guard
+            arguments = (*values, session_id, *condition_values, *lease_arguments)
+            if permission is not None:
+                query, proofs = permission
+                statement += ' AND EXISTS ('+query+')'
+                arguments += proofs
+        return statement, arguments, guarded, permission
 
     async def last_assistant_ref(self, session_id: str, send_index: int):
         """Reuse this send's committed append; recovery reads its stored tail."""
@@ -660,7 +676,6 @@ class SessionStore:
         signal_values = None
         try:
             async with self._db.transaction() as tx:
-                lease_guard, lease_arguments = self._lease_write_guard(session_id)
                 seq, state_written = None, False
                 if expected is not None:
                     # The lease holder knows its next seq: one conditional UPDATE allocates it and
@@ -670,9 +685,9 @@ class SessionStore:
                         fast_sets.append("pending_json=?")
                         fast_params.append(atomic_pending(expected))
                     guard = " AND pending_json IS NULL" if pending_tool_calls else ""
-                    statement = (f"UPDATE {self.t.session_state} SET {', '.join(['next_seq=?', *fast_sets])} "
-                                 f"WHERE session_id=? AND next_seq=?{guard}{lease_guard}")
-                    arguments = (expected + 1, *fast_params, session_id, expected, *lease_arguments)
+                    statement, arguments, guarded, owned = self._state_update(session_id,
+                        ['next_seq=?', *fast_sets], (expected+1, *fast_params),
+                        condition=' AND next_seq=?'+guard, condition_values=(expected,))
                     if mysql:
                         matched = await tx.execute(statement, arguments) == 1
                     else:
@@ -682,25 +697,38 @@ class SessionStore:
                             signal_values = tuple(snapshot[column] for column in change_signals.COLUMNS)
                     if matched:
                         seq, state_written = expected, True
+                    elif owned is not None:
+                        # An owned send cannot allocate past another writer or
+                        # a superseding ancestor. It must reconcile its turn.
+                        raise SessionLeaseLost(session_id)
                 if seq is not None:
                     pass
                 elif mysql:
-                    st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+                    owned = owner_writes.permission(self, session_id)
+                    if owned is None:
+                        st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+                    else:
+                        query, proofs = owned
+                        lease_guard, lease_arguments = self._lease_write_guard(session_id)
+                        st = await tx.fetchone(f'SELECT {self.t.session_state}.* FROM ({query}) message_permission '
+                            f'STRAIGHT_JOIN {self.t.session_state} ON {self.t.session_state}.session_id=? '
+                            'WHERE 1=1'+lease_guard+' FOR UPDATE', (*proofs, session_id, *lease_arguments))
+                        if st is None:
+                            raise SessionLeaseLost(session_id)
                     seq = int(st["next_seq"])
                     if pending_tool_calls and st["pending_json"] is not None:
                         raise ValueError("pending_tool_calls_exist")
                 else:
                     # One statement locks the state row, allocates the seq and applies state changes.
                     guard = " AND pending_json IS NULL" if pending_tool_calls else ""
-                    st = await tx.fetchone(
-                        f"UPDATE {self.t.session_state} SET {', '.join(['next_seq=next_seq+1', *sets])} "
-                        f"WHERE session_id=?{guard}{lease_guard} RETURNING next_seq,{signal_columns}",
-                        (*params, session_id, *lease_arguments))
+                    statement, arguments, guarded, _ = self._state_update(session_id,
+                        ['next_seq=next_seq+1', *sets], params, condition=guard)
+                    st = await tx.fetchone(statement+f' RETURNING next_seq,{signal_columns}', arguments)
                     if st is None:
                         if pending_tool_calls and await tx.fetchone(
                                 f"SELECT 1 AS present FROM {self.t.session_state} WHERE session_id=?", (session_id,)):
                             raise ValueError("pending_tool_calls_exist")
-                        if lease_guard:
+                        if guarded:
                             raise SessionLeaseLost(session_id)
                         raise ValueError(f"unknown session: {session_id}")
                     seq = int(st["next_seq"]) - 1
@@ -756,11 +784,10 @@ class SessionStore:
                 else:
                     row_id = (await tx.fetchone(insert + " RETURNING id", values))["id"]
                 if state_written is False:
-                    changed = await tx.execute(
-                        f"UPDATE {self.t.session_state} SET {', '.join(['next_seq=?', *sets])} WHERE session_id=?{lease_guard}",
-                        (seq + 1, *params, session_id, *lease_arguments),
-                    )
-                    if lease_guard and changed != 1:
+                    statement, arguments, guarded, _ = self._state_update(session_id,
+                        ['next_seq=?', *sets], (seq+1, *params))
+                    changed = await tx.execute(statement, arguments)
+                    if guarded and changed != 1:
                         raise SessionLeaseLost(session_id)
                 if now - holding.touched >= _TOUCH_INTERVAL_MS:
                     # Activity time, not ordering: at most one write per session per interval.

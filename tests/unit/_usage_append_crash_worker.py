@@ -53,6 +53,15 @@ async def main(dsn, prefix, sid, evidence, stage):
     loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
         config=AgentLoopConfig(max_rounds=2, max_tokens=20, compactor=None, delegation_policy="single_level"))
     transaction = store._db.transaction
+    state_update, allocations = store._state_update, set()
+
+    def declared_allocation(session_id, sets, values, **kwargs):
+        result = state_update(session_id, sets, values, **kwargs)
+        if session_id == sid and sets[0] in ('next_seq=?', 'next_seq=next_seq+1'):
+            allocations.add(result[0])
+        return result
+
+    store._state_update = declared_allocation
 
     @asynccontextmanager
     async def interrupted():
@@ -60,7 +69,8 @@ async def main(dsn, prefix, sid, evidence, stage):
             execute, fetchone = tx.execute, tx.fetchone
             def stop(sql, params):
                 if (stage == 'after_reservation' and _SEND.get() is not None
-                        and sql.startswith(f'UPDATE {store.t.session_state} SET next_seq=')):
+                        and any(sql == statement or sql.startswith(statement+' RETURNING ')
+                                for statement in allocations)):
                     os._exit(94)
                 if sql.startswith(f"INSERT INTO {store.t.messages} ") and params[2] == "assistant":
                     if stage == "after_message":

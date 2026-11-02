@@ -16,6 +16,7 @@ Protocol37 fences first executor registration against unregistered claims.
 Protocol38 fences first budget-policy activation against unbudgeted sends.
 Protocol39 serializes control writers by their root job instead of task_store.
 Protocol40 stores response usage in the response original instead of a separate write.
+Protocol41 fences ordinary message/state writes with every retained ancestor generation.
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ from .schema import (
 )
 
 TASK_SCHEMA_VERSION = 14
-TASK_PROTOCOL_VERSION = 40
+TASK_PROTOCOL_VERSION = 41
 _QUERY_INDEXES = {
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
@@ -428,7 +429,7 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
                 await tx.execute(statement)
             if int(row["version"]) in (10, 12, 13, TASK_SCHEMA_VERSION) and await _table_exists_tx(tx, db.dialect.name, prefix+'task_store'):
                 identity = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35, 36, 37, 38, 39):
+                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35, 36, 37, 38, 39, 40):
                     old_protocol = identity["protocol_version"]
                     from .message_usage import migrate as migrate_usage
                     # MySQL can commit the rename before an offline importer

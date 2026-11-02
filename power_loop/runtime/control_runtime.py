@@ -326,6 +326,7 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
     binding.resource_evidence.pop("_control_journal_opening", None)
     binding.resource_evidence["_control_source"] = source
     binding.resource_evidence["_control_ancestors"] = tuple(ancestors)
+    binding.resource_evidence['_message_write_proofs'] = tuple((job_id, *ancestor_proofs[job_id]) for job_id in ancestors)
     binding.resource_evidence["_control_create_request"] = creation_request
     binding.resource_evidence["_control_tool_plan_required"] = plan_required
     binding.resource_evidence["_control_review_pending"] = review_pending

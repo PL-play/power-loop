@@ -513,7 +513,7 @@ class TaskRuntime:
             from .model_attempts import enable
             await enable(binding)  # One admission transaction owns all checks.
         else:
-            await self.manager.check_execution(binding.actor, binding.lease)
+            await self.manager.check_execution(binding.actor, binding.lease, capture=binding.resource_evidence)
         variable = context if context is not None else _OWNER if owner else _SEND
         token = variable.set(binding)
         owner_token = _enter_task_owner(self)
