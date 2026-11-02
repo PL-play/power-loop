@@ -1,10 +1,4 @@
-"""Real-Postgres regression for deep-review B1: the v1→v2 ``send_index`` ALTER must be scoped to
-the CURRENT schema. Pre-fix, ``_column_exists`` probed ``information_schema.columns`` across ALL
-schemas, so a same-named ``pl_messages`` with ``send_index`` in another schema made the ALTER get
-skipped (then v2 stamped) → every ``append_message`` in the un-migrated schema crashed.
-
-Cannot manifest on SQLite (no schemas). Gated on the PG test server; skips cleanly otherwise.
-"""
+"""The explicit protocol-21 upgrade probes only the current PostgreSQL schema."""
 
 from __future__ import annotations
 
@@ -41,7 +35,7 @@ def _dsn(schema: str) -> str:
 
 
 @_pg
-async def test_v1_to_v2_send_index_alter_is_schema_scoped() -> None:
+async def test_protocol21_upgrade_columns_are_schema_scoped() -> None:
     asyncpg = pytest.importorskip("asyncpg")
     a_schema, b_schema = "pltest_b1_a", "pltest_b1_b"
     raw = await asyncpg.connect(PG_DSN)
@@ -52,35 +46,43 @@ async def test_v1_to_v2_send_index_alter_is_schema_scoped() -> None:
     finally:
         await raw.close()
     try:
-        # Two schemas each get a full v2 store (both pl_messages have send_index).
-        for s in (a_schema, b_schema):
-            st = await open_store(_dsn(s))
+        from power_loop.runtime.store.change_signals import COLUMNS
+        from power_loop.runtime.store.schema import StoreSchemaError
+        from power_loop.runtime.store.task_schema import migrate_task_schema
+
+        from ._protocol21_fixture import retain_protocol21_format
+        for schema_name in (a_schema, b_schema):
+            st = await open_store(_dsn(schema_name), schema="tasks")
             await st.close()
-        # Downgrade schema B to a v1-shaped DB: drop send_index + reset its recorded version to 1.
-        rb = await asyncpg.connect(_dsn(b_schema))
+        original = await open_store(_dsn(b_schema), schema="tasks")
         try:
-            await rb.execute("ALTER TABLE pl_messages DROP COLUMN send_index")
-            await rb.execute("UPDATE pl_schema_migrations SET version=1")
+            sid = await original.create_session(system_prompt="B")
+            seq = await original.append_message(sid, role="user", content="original", send_index=1)
+            ref = await original.message_ref(sid, seq)
+            await retain_protocol21_format(original)
         finally:
-            await rb.close()
-        # Reopen B → the v1→v2 ladder must re-add send_index to B (NOT be fooled by A's column).
-        b2 = await open_store(_dsn(b_schema))
+            await original.close()
+        with pytest.raises(StoreSchemaError):
+            await open_store(_dsn(b_schema), schema="tasks")
+        from power_loop.runtime.store.factory import _make_database
+        db = await _make_database(_dsn(b_schema))
         try:
-            rb = await asyncpg.connect(_dsn(b_schema))
-            try:
-                has = await rb.fetchval(
-                    "SELECT 1 FROM information_schema.columns WHERE table_schema=$1 "
-                    "AND table_name='pl_messages' AND column_name='send_index'",
-                    b_schema,
-                )
-            finally:
-                await rb.close()
-            assert has is not None, "v1→v2 migration skipped the send_index ALTER for schema B"
-            # And an append that writes send_index must succeed (it crashed pre-fix).
-            sid = await b2.create_session(system_prompt="B")
-            await b2.append_message(sid, role="user", content="x", round_index=0, send_index=1)
+            before = await db.fetchall("SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='pl_session_state'")
+            assert not set(COLUMNS) & {row['column_name'] for row in before}
+            await migrate_task_schema(db, 'pl_', maintenance=True)
+            after = await db.fetchall("SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema=current_schema() AND table_name='pl_session_state'")
+            assert set(COLUMNS) <= {row['column_name'] for row in after}
         finally:
-            await b2.close()
+            await db.close()
+        upgraded = await open_store(_dsn(b_schema), schema="tasks")
+        try:
+            assert await upgraded.message_ref(sid, seq) == ref
+            assert (await upgraded.load_active_messages(sid))[0].content == "original"
+            await upgraded.append_message(sid, role="user", content="after", send_index=2)
+        finally:
+            await upgraded.close()
     finally:
         raw = await asyncpg.connect(PG_DSN)
         try:

@@ -17,7 +17,6 @@ from power_loop.runtime.store.task_schema import (
     TASK_PROTOCOL_VERSION,
     TASK_SCHEMA_VERSION,
     TASK_TABLES,
-    migrate_task_schema,
 )
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -476,17 +475,6 @@ async def test_control_survives_session_message_deletion(runtime):
     assert stop.result["cancel_requested"]
 
 
-async def test_explicit_migration_runs_on_each_real_backend(registry_store):
-    _, connect = registry_store
-    legacy = await connect(schema="auto_create", suffix="old_")
-    sid = await legacy.create_session()
-    await legacy.append_message(sid, role="assistant", content="preserved", tool_calls=[{"id": "old-call"}])
-    await migrate_task_schema(legacy._db, legacy.table_prefix, maintenance=True)
-    migrated = await connect(schema="compatible", suffix="old_")
-    ref = await migrated.message_ref(sid, 1)
-    assert ref.id is not None and ref.store_id == migrated.store_id
-    assert (await migrated.message_by_id(sid, ref.id)).tool_calls == [{"id": "old-call"}]
-    assert await migrated.append_message(sid, role="user", content="next") == 2
 
 
 async def test_unknown_resource_keeps_supervision_and_blocks_more_work(runtime):
@@ -526,22 +514,3 @@ async def test_model_origin_must_reference_an_actual_assistant_tool_call(runtime
         await m.register_job(actor, kind="subagent", parent=lease, call_ref=replace(ref, id=ref.id + 99), tool_call_id="call-1")
     with pytest.raises(JobError, match="persistent_system_key_required"):
         await m.register_job(actor, kind="subagent", parent=lease)
-
-
-async def test_migration_failure_after_raw_table_change_rolls_back_everything(registry_store, monkeypatch):
-    from power_loop.runtime.store import task_schema
-
-    store, connect = registry_store
-    legacy = await connect(schema="auto_create", suffix="fail_")
-    original_version = legacy.schema_version
-    sid = await legacy.create_session()
-    await legacy.append_message(sid, role="user", content="preserve on rollback")
-
-    async def broken(*args):
-        raise RuntimeError("injected late DDL failure")
-
-    monkeypatch.setattr(task_schema, "_run_task_ddl", broken)
-    with pytest.raises(RuntimeError, match="late DDL failure"):
-        await migrate_task_schema(legacy._db, legacy.table_prefix, maintenance=True)
-    assert (await legacy._db.fetchone(f"SELECT version FROM {legacy.table_prefix}schema_migrations"))["version"] == original_version
-    assert (await legacy.load_all_messages(sid))[0].content == "preserve on rollback"

@@ -41,6 +41,7 @@ async def test_postgres_projection_identity_and_snapshot_jsonl(tmp_path):
             assert saved["status"] == "exported" and saved["records"] == 1
             assert json.loads((tmp_path / "data.jsonl").read_text())["content"] == "record"
     finally:
+        await store._db.execute(f"DROP VIEW IF EXISTS {prefix}usage_rounds")
         for table in (*_STORE_TABLES, "schema_migrations"):
             await store._db.execute(f"DROP TABLE IF EXISTS {prefix}{table}")
         await store.close()

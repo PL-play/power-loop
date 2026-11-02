@@ -94,6 +94,9 @@ async def test_storage_only_owner_generations_partition_the_same_logical_node(ru
         n2 = {**await m._row(tx, np.job_id), "generation": 2, "control_owner_generation": 2,
             "control_owner_executor_id": "future-owner"}
         s2 = {**await m._row(tx, sp.job_id), "job_id": "history-only-send-2", "control_owner_generation": 2}
+        s2['parent_generation'] = 2
+        await tx.insert_job(s2['job_id'], s2['root_job_id'], f"INSERT INTO {m.jobs} ("+','.join(s2)+") VALUES ("+
+            ','.join('?' for _ in s2)+")", tuple(s2.values()))
         for row in (w2, n2, s2):
             await membership.start(m, tx, row)
         await membership._insert(m, tx, "model_closed_"+s2["job_id"], s2["job_id"], "model_closed", 3,
@@ -280,17 +283,22 @@ async def test_corrupt_membership_graph_has_bounded_traversal(runtime, fault):
     _, m, actor, root, rp, _, _ = runtime
     data = (await m.get_execution_membership(actor, root.job.job_id, 1))["scope"]
     # Persist a deliberately impossible graph; do not grant leases or run tasks.
-    async with m._write() as tx:
+    async def unsafe_insert(tx, event_id, job_id, kind, version, payload):
+        await tx.execute(m.db.dialect.insert_ignore(m.events,
+            ('event_id','job_id','event_type','job_version','payload_json','delivery_status','created_at')),
+            (event_id, job_id, kind, version, json.dumps(payload), 'not_applicable', m.now()))
+
+    async with m.db.transaction() as tx:
         previous = asdict(rp)
         for index in range(65 if fault == "depth" else 1):
             proof = {**asdict(rp), "job_id": "corrupt-"+str(index)}
-            await membership._insert(m, tx, membership.scope_id(m, proof["job_id"], 1), proof["job_id"], "execution_scope", 1,
+            await unsafe_insert(tx, membership.scope_id(m, proof["job_id"], 1), proof["job_id"], "execution_scope", 1,
                 {**data, "lease": proof, "owner": previous})
-            await membership._insert(m, tx, membership.member_id(m, proof["job_id"], 1), previous["job_id"], "execution_member", 1,
+            await unsafe_insert(tx, membership.member_id(m, proof["job_id"], 1), previous["job_id"], "execution_member", 1,
                 {"version": 1, "owner": previous, "member": proof})
             previous = proof
         if fault == "cycle":
-            await membership._insert(m, tx, membership.member_id(m, rp.job_id, 1), previous["job_id"], "execution_member", 1,
+            await unsafe_insert(tx, membership.member_id(m, rp.job_id, 1), previous["job_id"], "execution_member", 1,
                 {"version": 1, "owner": previous, "member": asdict(rp)})
     with pytest.raises(JobError, match="job_depth_exceeded" if fault == "depth" else "invalid_execution_membership"):
         await m.execution_usage(actor, root.job.job_id, generation=1)

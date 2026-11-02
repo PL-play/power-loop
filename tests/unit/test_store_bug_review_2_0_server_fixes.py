@@ -99,7 +99,9 @@ async def test_pg_concurrent_first_boot_provisioning_converges():
     # Drop the whole pl_ schema so every concurrent open hits the first-boot path.
     admin = await open_store(PG_DSN)
     prefix = admin.table_prefix
-    drop = [f"{prefix}schema_migrations"] + [getattr(admin.t, n) for n in _ALL_TABLES if n != "schema_migrations"]
+    from power_loop.runtime.store.schema import _STORE_TABLES
+    await admin._db.execute(f"DROP VIEW IF EXISTS {prefix}usage_rounds")
+    drop = [f"{prefix}schema_migrations", *(prefix+name for name in _STORE_TABLES)]
     for table in drop:
         await admin._db.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
     await admin.close()

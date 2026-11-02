@@ -27,7 +27,7 @@ async def test_current_controller_events_and_source_messages_are_immutable_after
         await c.loop.send('Read and handle the original result without repeating work.', c.state.root, tools=[])
         row = await c.manager.get_job(actor, c.state.source)
         assert row.supervision_status == 'closed' and row.result_status == 'handled'
-        async with c.manager._write() as tx:
+        async with c.manager._read() as tx:
             source = await c.manager._authorize(tx, actor, c.state.source)
             assert await handled_references(c.manager, tx, source)
         assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type IN ('controller_retired','controller_review_handoff') ORDER BY event_id") == saved

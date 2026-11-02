@@ -173,7 +173,7 @@ async def test_native_result_notice_and_disposition_roll_back_as_one_transaction
         assert (await recover_runtime(runtime, actor, c.state.source))['state'] == 'queued_for_review'
         assert (await recover_runtime(runtime, actor, c.state.source))['state'] == 'disposed'
         async def view():
-            async with runtime.manager._write() as tx:
+            async with runtime.manager._read() as tx:
                 row = await runtime.manager._row(tx, c.state.source)
                 return await review_view(runtime.manager, tx, row)
         before = await view()
@@ -199,7 +199,7 @@ async def test_unstarted_managed_sibling_keeps_its_separate_review_view(registry
         assert result['state'] == 'queued_for_review' and len(result['notices']) == 2
         [negative] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool' AND generation=0")
         async def view():
-            async with runtime.manager._write() as tx:
+            async with runtime.manager._read() as tx:
                 row = await runtime.manager._row(tx, negative['job_id'])
                 return await negative_review_view(runtime.manager, tx, row)
         before = await view()

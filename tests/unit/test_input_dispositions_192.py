@@ -134,7 +134,7 @@ async def test_consumed_input_keeps_its_actual_processing_proof_after_later_owne
     [queue] = await c.store.inbox_items(c.sid)
     assert queue["status"] == "delivered" and model.calls == 1
     current = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (op["event_id"],))
-    async with c.manager._write() as tx:
+    async with c.manager._read() as tx:
         assert await inputs.reconcile_tx(c.manager, tx, c.main, current) is None
     await consume_owner(h)
 
@@ -306,7 +306,7 @@ async def test_later_generation_cannot_receive_historical_disposition_writes(han
     )
     try:
         before = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.owner.job_id,))
-        async with c.manager._write() as tx:
+        async with c.manager._read() as tx:
             if existing:
                 assert await inputs.read_tx(c.manager, tx, op, required=True)
             else:
@@ -701,12 +701,12 @@ async def test_input_proof_revision_cannot_precede_its_original_operation(handof
     h, c = handoff, handoff.c
     op = await _applied(h)
     await exited(h)
-    async with c.manager._write() as tx:
-        proof = await inputs.reconcile_tx(c.manager, tx, c.main, op)
+    await terminal.terminate(c.manager, c.main, h.registration.job.job_id)
+    proof = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (inputs.identity(c.manager, op["event_id"]),))
     current = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (op["event_id"],))
     await c.manager.db.execute(
         f"UPDATE {c.manager.events} SET job_version=? WHERE event_id=?", (op["job_version"], proof["event_id"])
     )
     with pytest.raises(JobError, match="input_disposition_evidence_corrupt"):
-        async with c.manager._write() as tx:
+        async with c.manager._read() as tx:
             await inputs.read_tx(c.manager, tx, current, required=True)

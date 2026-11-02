@@ -4,7 +4,7 @@ pl_messages stays the immutable audit log; this derived table holds one row per
 projected send (kind=user/project) plus append-only compact rows. The core CRUD is
 exercised via :func:`exercise_project_messages_crud` so the SAME assertions run against
 SQLite (here) and against real Postgres/MySQL (test_store_parity_pg/_mysql). SQLite-only
-here: cascade-delete and the v1→v2 migration.
+here: cascade-delete and refusal of old formats during ordinary opening.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION
 from power_loop.runtime.store.store import SessionStore
 
 
@@ -145,70 +144,50 @@ async def test_migration_ddl_for_display_includes_alter(store: SessionStore) -> 
 
 
 @pytest.mark.asyncio
-async def test_v1_to_current_migration_adds_all_tables_and_columns(tmp_path) -> None:
+async def test_v1_store_is_refused_without_rewriting_originals(tmp_path) -> None:
+    import sqlite3
+
+    from power_loop.runtime.store.schema import StoreSchemaError
     path = str(tmp_path / "m.db")
-    s = await SessionStore.open(path)  # fresh → current
-    assert s.schema_version == CURRENT_SCHEMA_VERSION
-    # Simulate a true pre-existing v1 store: drop every post-v1 artifact (the v2 project_messages
-    # table + send_index column, the v3 hook_events table), then roll the version stamp back to 1.
+    s = await SessionStore.open(path)
+    sid = await s.create_session()
+    await s.append_message(sid, role="user", content="original")
     async with s._db.transaction() as tx:
+        await tx.execute("DROP VIEW pl_usage_rounds")
         await tx.execute("DROP TABLE pl_project_messages")
         await tx.execute("DROP TABLE pl_hook_events")
         await tx.execute("ALTER TABLE pl_messages DROP COLUMN send_index")
         await tx.execute("UPDATE pl_schema_migrations SET version=1 WHERE id=1")
     await s.close()
-
-    s2 = await SessionStore.open(path)  # AUTO_CREATE runs the full v1→current migration ladder
-    assert s2.schema_version == CURRENT_SCHEMA_VERSION
-    # (a) the project_messages table is back
-    await s2.upsert_project_message("sess_m", send_index=1, kind="project", content={"ok": True})
-    assert (await s2.load_project_messages("sess_m"))[0].content == {"ok": True}
-    # (b) the send_index column was re-added by the ALTER (write + read it back)
-    sid = await s2.create_session()
-    await s2.append_message(sid, role="user", content="hi", send_index=7)
-    assert (await s2.load_active_messages(sid))[0].send_index == 7
-    # (c) the hook_events table is back and writable
-    seq = await s2.append_message(
-        sid, role="assistant", content="a", round_index=0, send_index=7,
-        hook_injected={"hook_point": "LLM_BEFORE", "hook": "x", "position": "tail",
-                       "kind": "inject", "payload": {"v": 1, "items": []}},
-    )
-    evs = await s2.list_hook_events(sid)
-    assert len(evs) == 1 and evs[0].message_seq == seq
-    await s2.close()
-
-    # idempotent: reopening (already current) is a no-op and everything survives
-    s3 = await SessionStore.open(path)
-    assert s3.schema_version == CURRENT_SCHEMA_VERSION
-    assert (await s3.load_active_messages(sid))[0].send_index == 7
-    assert len(await s3.list_hook_events(sid)) == 1
-    await s3.close()
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
+        before = list(original.iterdump())
+    with pytest.raises(StoreSchemaError, match="explicit maintenance"):
+        await SessionStore.open(path)
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
+        assert list(original.iterdump()) == before
+        assert original.execute("SELECT version FROM pl_schema_migrations").fetchone() == (1,)
 
 
 @pytest.mark.asyncio
-async def test_v2_to_v3_migration_adds_hook_events(tmp_path) -> None:
+async def test_v2_store_is_refused_without_rewriting_originals(tmp_path) -> None:
+    import sqlite3
+
+    from power_loop.runtime.store.schema import StoreSchemaError
     path = str(tmp_path / "h.db")
-    s = await SessionStore.open(path)  # fresh → current (v3)
-    # Simulate a pre-existing v2 store: drop the v3 hook_events table, roll the stamp back to 2.
+    s = await SessionStore.open(path)
+    sid = await s.create_session()
+    await s.append_message(sid, role="user", content="original", send_index=7)
     async with s._db.transaction() as tx:
         await tx.execute("DROP TABLE pl_hook_events")
         await tx.execute("UPDATE pl_schema_migrations SET version=2 WHERE id=1")
     await s.close()
-
-    s2 = await SessionStore.open(path)  # AUTO_CREATE runs just the v2→v3 step
-    assert s2.schema_version == CURRENT_SCHEMA_VERSION
-    sid = await s2.create_session()
-    seq = await s2.append_message(
-        sid, role="assistant", content="a", round_index=0,
-        hook_injected={"hook_point": "LLM_BEFORE", "hook": "builtin.memory_recall",
-                       "position": "tail", "kind": "inject",
-                       "payload": {"v": 1, "items": [{"name": "memory_0", "chars": 3}]}},
-    )
-    evs = await s2.list_hook_events(sid)
-    assert len(evs) == 1
-    assert evs[0].message_seq == seq and evs[0].hook == "builtin.memory_recall"
-    assert evs[0].payload["items"][0]["name"] == "memory_0"
-    await s2.close()
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
+        before = list(original.iterdump())
+    with pytest.raises(StoreSchemaError, match="explicit maintenance"):
+        await SessionStore.open(path)
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
+        assert list(original.iterdump()) == before
+        assert original.execute("SELECT version FROM pl_schema_migrations").fetchone() == (2,)
 
 @pytest.mark.asyncio
 async def test_load_active_messages_can_filter_to_one_send(store: SessionStore) -> None:

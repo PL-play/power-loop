@@ -5,7 +5,7 @@ Covers the loop-level contract on top of the store tests in test_session_leases*
 - what a person said never shares a message with a system wake-up (Z2);
 - the idle path, the in-flight path and the terminal-window flush all go through the inbox;
 - nothing private (the ``_inbox`` marker) ever reaches the provider;
-- a v7 store migrates to v8 with its queued rows kept.
+- ordinary opening refuses old formats without changing queued originals.
 """
 
 from __future__ import annotations
@@ -300,11 +300,11 @@ async def test_terminal_window_item_is_flushed_once(store: SessionStore) -> None
     assert texts.count("late card submission") == 1
 
 
-# ── schema v7 → v8 ────────────────────────────────────────────────────────────────────────
+# Old formats require explicit offline maintenance.
 
 
 @pytest.mark.asyncio
-async def test_v7_store_migrates_with_queued_rows_kept(tmp_path: Any) -> None:
+async def test_v7_store_is_refused_with_queued_originals_kept(tmp_path: Any) -> None:
     path = str(tmp_path / "v7.db")
     s = await SessionStore.open(path)
     sid = await s.create_session(system_prompt="S")
@@ -323,16 +323,12 @@ async def test_v7_store_migrates_with_queued_rows_kept(tmp_path: Any) -> None:
     await db.execute(f"UPDATE {ver_table} SET version=7")
     await s.close()
 
-    s2 = await SessionStore.open(path)
-    try:
-        from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION
-        assert s2.schema_version == CURRENT_SCHEMA_VERSION
-        rows = await s2.inbox_items(sid)
-        assert [(r["item_id"], r["kind"], r["mode"], r["status"], r["content"]) for r in rows] == [
-            ("v7:1", "user", "queue", "pending", "parked one"),
-            ("v7:2", "user", "queue", "pending", "parked two"),
-        ]
-        # and the migrated table behaves like a fresh one
-        assert await s2.inbox_put(sid, [{"item_id": "v7:1", "content": "dup"}]) == []
-    finally:
-        await s2.close()
+    import sqlite3
+
+    from power_loop.runtime.store.schema import StoreSchemaError
+    with pytest.raises(StoreSchemaError, match="explicit maintenance"):
+        await SessionStore.open(path)
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
+        assert original.execute(f"SELECT version FROM {ver_table}").fetchone() == (7,)
+        assert original.execute(f"SELECT id,session_id,content,created_at FROM {s.t.follow_up_queue} ORDER BY id").fetchall() == [
+            (1, sid, "parked one", 1000), (2, sid, "parked two", 1001)]

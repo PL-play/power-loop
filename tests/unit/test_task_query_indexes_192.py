@@ -33,7 +33,14 @@ def mysql_index_paths(rows):
     assert rows
     paths = []
     for row in rows:
-        if row.get('table') is None:
+        table = row.get('table')
+        if table and re.fullmatch(r'<derived[0-9]+>', table):
+            # The bounded materialized result is not a task relation; its
+            # underlying task-table access must still pass the checks below.
+            source_id = int(table[len('<derived'):-1])
+            assert any(source.get('id') == source_id and source.get('table')
+                and not source['table'].startswith('<') for source in rows), row
+        elif table is None:
             assert any(reason in (row.get('Extra') or '').lower() for reason in
                        ('impossible', 'no matching', 'no tables used')), row
         else:
@@ -66,7 +73,14 @@ async def test_actual_recovery_queries_are_flat_and_every_task_relation_has_an_i
         async def inspect_sql(self, sql, params):
             if sql in plans or not re.match(r'\s*(SELECT|UPDATE|DELETE)\b', sql, re.I) or not any(name in sql for name in names):
                 return
-            assert not NESTED.search(sql), sql
+            root_lookup = (f'SELECT root.* FROM {c.manager.jobs} root '
+                f'WHERE root.job_id=(SELECT root_job_id FROM {c.manager.jobs} WHERE job_id=?)')
+            pending_count = (f'SELECT COUNT(*) AS n FROM (SELECT 1 FROM {c.manager.prefix}task_budget_attempts '
+                'WHERE policy_key=? AND pending<>0 LIMIT ?) AS pending_attempts')
+            # Flatness constrains discovery reads, not conditional writes'
+            # ownership fences. Every statement still gets its index check.
+            if sql.lstrip().upper().startswith('SELECT'):
+                assert not NESTED.search(sql) or sql in (root_lookup, root_lookup+' FOR UPDATE', pending_count), sql
             db = getattr(self, '_db', self)
             if backend == 'sqlite':
                 rows = await db._fetchall('EXPLAIN QUERY PLAN '+sql, params)

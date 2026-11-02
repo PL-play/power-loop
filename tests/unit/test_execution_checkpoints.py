@@ -93,6 +93,7 @@ async def case(registry_store, *, actions=8):
     identity = ExecutionIdentity(store.store_id, "control-job", 1, "executor", "boot", "tenant", "host", "session")
     journal = ExecutionJournal(store)
     journal.db = counted = CountedDatabase(store._db)
+    journal.transaction = counted.transaction
     now = [1000]
     state = ExecutionState(identity, journal, lease_until_ms=31000, now_ms=lambda: now[0],
                            policy=CheckpointPolicy(actions=actions))
@@ -143,7 +144,7 @@ async def test_closing_transaction_and_concurrent_checkpoint_do_not_invert_locks
     store, _, state, journal, _, _ = await case(registry_store)
     complete(state, 1)
     entering, release = asyncio.Event(), asyncio.Event()
-    transaction = journal.db.transaction
+    transaction = journal.transaction
 
     @asynccontextmanager
     async def delayed_transaction():
@@ -152,7 +153,7 @@ async def test_closing_transaction_and_concurrent_checkpoint_do_not_invert_locks
         async with transaction() as tx:
             yield tx
 
-    monkeypatch.setattr(journal.db, "transaction", delayed_transaction)
+    monkeypatch.setattr(journal, "transaction", delayed_transaction)
     flushing = None
     hooks = []
     try:
@@ -189,7 +190,7 @@ async def test_database_growth_tracks_checkpoints_not_internal_calls(registry_st
 async def test_checkpoint_lost_ack_retries_exact_batch(registry_store):
     _, _, state, journal, _, _ = await case(registry_store)
     complete(state, 1)
-    original = journal.db.transaction
+    original = journal.transaction
     failed = False
 
     @asynccontextmanager
@@ -201,7 +202,7 @@ async def test_checkpoint_lost_ack_retries_exact_batch(registry_store):
             failed = True
             raise OSError("commit acknowledged after connection loss")
 
-    journal.db.transaction = lose_ack
+    journal.transaction = lose_ack
     with pytest.raises(OSError):
         await state.checkpoint(force=True)
     assert len(await journal.db.fetchall(f"SELECT batch_no FROM {journal.batches}")) == 1
@@ -325,7 +326,8 @@ async def test_allocation_never_refunds_unknown_or_invents_capacity():
 
 async def test_protocol21_requires_explicit_migration(registry_store):
     store, connect = registry_store
-    await store._db.execute(f"UPDATE {store.table_prefix}task_store SET protocol_version=21 WHERE id=1")
+    from ._protocol21_fixture import retain_protocol21_format
+    await retain_protocol21_format(store)
     from power_loop.runtime.store.schema import StoreSchemaError
     with pytest.raises(StoreSchemaError):
         await connect()

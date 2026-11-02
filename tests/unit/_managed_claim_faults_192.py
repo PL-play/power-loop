@@ -13,6 +13,7 @@ def fail_claim_transaction(manager, stage, *, read_failure=None):
     class Transaction:
         def __init__(self, target, flags):
             self.read, self.flags = target.fetchone, flags
+            self.read_job = target.job_row
 
         async def intercept(self, execute, sql, params):
             if (sql.startswith(f"UPDATE {manager.jobs} SET status='running',version=version+1,generation=")
@@ -22,13 +23,16 @@ def fail_claim_transaction(manager, stage, *, read_failure=None):
             return await execute(sql, params)
 
         async def fetchone(self, sql, params=()):
+            return await self.read(sql, params)
+
+        async def job_row(self, job_id):
             if (read_failure and state.fired and not state.resolve_failed
-                    and sql == f'SELECT * FROM {manager.jobs} WHERE job_id=?' and params == (state.job_id,)):
+                    and job_id == state.job_id):
                 state.resolve_failed = True
                 if read_failure == 'cancel':
                     raise asyncio.CancelledError('cancelled while reading original claim commit')
                 raise OSError('cannot read original claim commit')
-            return await self.read(sql, params)
+            return await self.read_job(job_id)
 
     @asynccontextmanager
     async def intercepted():
@@ -36,13 +40,15 @@ def fail_claim_transaction(manager, stage, *, read_failure=None):
         joined = manager._joined_write.get() is not None
         async with original() as tx:
             proxy = Transaction(tx, flags)
-            read = tx.fetchone
+            read, read_job = tx.fetchone, tx.job_row
             tx.fetchone = proxy.fetchone
+            tx.job_row = proxy.job_row
             try:
                 async with control_mutations(tx, proxy.intercept):
                     yield tx
             finally:
                 tx.fetchone = read
+                tx.job_row = read_job
             if not joined and flags['claimed'] and stage == 'rollback':
                 state.fired = True
                 raise OSError('original claim transaction rolled back')

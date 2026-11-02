@@ -454,27 +454,27 @@ async def duplicate_node_records(c, count, *, node_id=None, same_sid=False):
     event = dict(await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE job_id=? AND action='create'", (c.job_id,)))
     ids = ["job_boundary_"+str(i) for i in range(count)]
     try:
-        async with c.manager._write() as tx:
+        async with c.manager.db.transaction() as tx:
             for target_id in ids:
                 saved = {**job, "job_id": target_id}
                 keys = list(saved)
-                await tx.write_job(target_id, f"INSERT INTO {c.manager.jobs} ({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})", tuple(saved.values()))
+                await tx.execute(f"INSERT INTO {c.manager.jobs} ({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})", tuple(saved.values()))
                 payload = json.loads(event["payload_json"])
                 if node_id is not None:
                     payload["request"]["node"]["id"] = node_id
                 saved = {**event, "event_id": "op_"+target_id, "job_id": target_id,
                     "operation_key": "boundary:"+target_id, "payload_json": json.dumps(payload)}
                 keys = list(saved)
-                await tx.append_event(keys, tuple(saved.values()))
+                await tx.execute(f"INSERT INTO {c.manager.events} ({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})", tuple(saved.values()))
                 if same_sid:
-                    await tx.append_event(('event_id','job_id','event_type','job_version','payload_json','delivery_status','created_at'),
+                    await tx.execute(f"INSERT INTO {c.manager.events} (event_id,job_id,event_type,job_version,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?)",
                         (c.manager._node_session_event_id(target_id, c.sid, 1), target_id, "node_session", 1, json.dumps(c.data), "not_applicable", c.manager.now()))
         yield ids
     finally:
-        async with c.manager._write() as tx:
+        async with c.manager.db.transaction() as tx:
             for target_id in ids:
-                await tx.update_event(target_id, f"DELETE FROM {c.manager.events} WHERE job_id=?", (target_id,), obligations=False)
-                await tx.write_job(target_id, f"DELETE FROM {c.manager.jobs} WHERE job_id=?", (target_id,))
+                await tx.execute(f"DELETE FROM {c.manager.events} WHERE job_id=?", (target_id,))
+                await tx.execute(f"DELETE FROM {c.manager.jobs} WHERE job_id=?", (target_id,))
 
 
 @pytest.mark.parametrize("total,code", [(100, "workflow_node_ambiguous_choose_job"), (101, "workflow_node_scope_too_large")])

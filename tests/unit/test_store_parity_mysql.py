@@ -18,7 +18,6 @@ import pytest
 pytest.importorskip("aiomysql")
 
 from power_loop.runtime.store.factory import open_store  # noqa: E402
-from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION  # noqa: E402
 from tests.unit.test_store_parity import SCENARIOS, run_parity  # noqa: E402
 
 MYSQL_DSN = os.environ.get(
@@ -106,40 +105,25 @@ async def _content_data_type(db, table: str) -> str:
     return str(row["dt"]).lower()
 
 
-async def test_mysql_v3_to_v4_widens_text_columns() -> None:
-    # Provision the full v4 schema, downgrade one column back to TEXT + stamp v3 (simulating a
-    # pre-fix store), then REOPEN so ensure_schema runs the real v3→v4 migration. Assert the
-    # column becomes LONGTEXT and a >64 KiB write that fails on TEXT now succeeds end-to-end.
-    from power_loop.runtime.store.factory import open_store
+async def test_mysql_old_format_is_refused_without_implicit_widening() -> None:
+    import secrets
 
-    prefix, big = _MIG_PREFIX, "A" * 100_000
-    msgs = f"{prefix}messages"
+    from power_loop.runtime.store.schema import _STORE_TABLES, StoreSchemaError
+    prefix = _MIG_PREFIX + secrets.token_hex(4) + "_"
     store = await open_store(MYSQL_DSN, table_prefix=prefix)
     try:
-        # Simulate a v3 store: revert content TEXT and roll the version back to 3.
-        await store._db.execute(f"ALTER TABLE {msgs} MODIFY content TEXT")
+        sid = await store.create_session()
+        await store.append_message(sid, role="assistant", content="original", send_index=1)
+        before = await store._db.fetchall(f"SELECT * FROM {prefix}messages")
+        await store._db.execute(f"ALTER TABLE {prefix}messages MODIFY content TEXT")
         await store._db.execute(f"UPDATE {prefix}schema_migrations SET version=3 WHERE id=1")
-        assert await _content_data_type(store._db, msgs) == "text"  # precondition
+        with pytest.raises(StoreSchemaError, match="explicit maintenance"):
+            await open_store(MYSQL_DSN, table_prefix=prefix)
+        assert await _content_data_type(store._db, prefix+'messages') == 'text'
+        assert await store._db.fetchall(f"SELECT * FROM {prefix}messages") == before
+        assert await store._db.fetchone(f"SELECT version FROM {prefix}schema_migrations") == {'version':3}
     finally:
+        await store._db.execute(f"DROP VIEW IF EXISTS {prefix}usage_rounds")
+        for name in (*_STORE_TABLES, 'schema_migrations'):
+            await store._db.execute(f"DROP TABLE IF EXISTS {prefix}{name}")
         await store.close()
-
-    store2 = await open_store(MYSQL_DSN, table_prefix=prefix)  # → runs the v3→v4 migration
-    try:
-        assert store2.schema_version == CURRENT_SCHEMA_VERSION
-        assert await _content_data_type(store2._db, msgs) == "longtext"  # widened by migration
-        await store2.create_session(session_id="m")
-        await store2.append_message("m", role="assistant", content=big, round_index=0)
-        rows = await store2.load_active_messages("m")
-        assert rows[0].content == big and len(rows[0].content) == 100_000
-        # Idempotent: re-running the migration steps on an already-LONGTEXT column is a no-op.
-        await store2._db.execute(f"UPDATE {prefix}schema_migrations SET version=3 WHERE id=1")
-    finally:
-        await store2.close()
-
-    store3 = await open_store(MYSQL_DSN, table_prefix=prefix)  # migration re-runs cleanly
-    try:
-        assert store3.schema_version == CURRENT_SCHEMA_VERSION
-        for n in _DATA_TABLES + ("schema_migrations",):
-            await store3._db.execute(f"DROP TABLE IF EXISTS {prefix}{n}")
-    finally:
-        await store3.close()

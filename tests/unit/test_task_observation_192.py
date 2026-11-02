@@ -91,15 +91,15 @@ async def test_authorization_generation_and_transaction_failure_never_emit(manag
         await observer.finalize_supervision(replace(actor, session_id="other"), job.job_id, generation=job.generation)
     with pytest.raises(JobError, match="generation_changed"):
         await observer.finalize_supervision(actor, job.job_id, generation=job.generation + 1)
-    original = observer._write
+    original = observer._read
 
     @asynccontextmanager
     async def rollback():
         async with original() as tx:
             yield tx
-            raise OSError("commit not acknowledged")
+            raise OSError("original evidence read transaction failed")
 
-    monkeypatch.setattr(observer, "_write", rollback)
+    monkeypatch.setattr(observer, "_read", rollback)
     with pytest.raises(OSError):
         await observer.finalize_supervision(actor, job.job_id, generation=job.generation)
     assert not events

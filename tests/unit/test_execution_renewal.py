@@ -31,7 +31,7 @@ def owner(case):
     return task_runtime, Execution(task_runtime, actor, lease)
 
 
-async def test_owned_renewal_has_one_update_and_one_registry_lock_even_at_the_same_time(runtime):
+async def test_owned_renewal_has_one_update_and_one_root_lock_even_at_the_same_time(runtime):
     task_runtime, binding = owner(runtime)
     manager = task_runtime.manager
     async with task_runtime.execution(binding, initialize_model=False):
@@ -42,7 +42,7 @@ async def test_owned_renewal_has_one_update_and_one_registry_lock_even_at_the_sa
                 measured.records.clear()
                 await manager.renew_execution(binding.actor, binding.lease)
                 assert len(measured.records) == 2
-                assert measured.records[0]["sql"].startswith("SELECT store_id,protocol_version")
+                assert measured.records[0]["sql"].startswith("SELECT root.*")
                 assert measured.records[1]["sql"].startswith("WITH RECURSIVE lineage")
         finally:
             manager.db = original

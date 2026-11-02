@@ -23,7 +23,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 async def closed(c, *, consumed=False, manager=None):
     m = manager or c.manager
-    async with m._write() as tx:
+    async with m._read() as tx:
         return await results.require_closed(m, tx, c.actor, c.job_id, 1, consumed=consumed)
 
 
@@ -363,6 +363,13 @@ async def test_legacy_callback_contract_is_never_guessed(managed_workflow, monke
     model.release["BUILD"].set()
     await state["handles"][0].task
     c = SimpleNamespace(manager=manager, actor=runtime.actor(sid), job_id=state["handles"][0].job_id)
-    with pytest.raises(JobError, match="callback_contract_"+("unknown" if legacy == "absent" else "mismatch")):
+    if legacy == "invalid":
+        # The publisher now rolls preparation back with the invalid closure.
+        # Keep the precise contract rejection and the no-projection assertion.
+        with pytest.raises(JobError, match="callback_contract_mismatch"):
+            await results.project(loop, c.actor, c.job_id, 1)
+        assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? "
+            "AND event_type IN ('workflow_delivery','workflow_projected')", (c.job_id,))
+    with pytest.raises(JobError, match="callback_contract_unknown" if legacy == "absent" else "projection_unsettled"):
         await closed(c)
     assert (await store.inbox_counts(sid))["pending"] == (1 if legacy == "absent" else 0)

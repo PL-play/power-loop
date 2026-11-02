@@ -1013,6 +1013,10 @@ class JobManager:
         if parent is not None:
             from .execution_membership import note_child
             note_child(self, parent.job_id)
+        if parent is None:
+            # Context admission already holds the session's exclusive gate.
+            # Check the deterministic host-stage anchor before inserting it.
+            await host_send_steps.require_available(self, tx, actor, host_step)
         await tx.insert_job(job_id, root, f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
             "session_id,created_by_session_id,kind,title,completion_scope_job_id,blocks_completion,"
             "status,version,generation,intake,resource_state,supervision_status,result_status,created_at,updated_at,"
@@ -1036,7 +1040,6 @@ class JobManager:
                 current = await self._authorize(tx, actor, old['job_id'])
                 await host_send_steps.require_replay(self, tx, actor, host_step, old['job_id'])
                 return JobRegistration(_record(current), _operation(old), True)
-            await host_send_steps.require_available(self, tx, actor, host_step)
         tx.remember_row(self.jobs, "job_id", job_id, {
             "job_id": job_id, "parent_job_id": parent.job_id if parent else None, "root_job_id": root,
             "parent_generation": parent.generation if parent else None,

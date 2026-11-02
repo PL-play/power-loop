@@ -29,6 +29,7 @@ async def test_recovered_negative_review_is_visible_until_real_main_processing_a
     jobs = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool' ORDER BY generation DESC")
     negative, source_id = jobs[1], jobs[0]['parent_job_id']
     loop, reviewer = await controller(c)
+    deleted = []
     try:
         await reconcile_pending(loop, c.actor, source_id)
         await retire_pending(loop, c.actor, source_id)
@@ -47,10 +48,13 @@ async def test_recovered_negative_review_is_visible_until_real_main_processing_a
         assert details['node']['result_status'] == 'suppressed'
         if corrupt is not None:
             event_type = 'managed_effect_delivery' if corrupt == 'notice_missing' else 'managed_effect_unstarted'
+            deleted = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} WHERE job_id=? AND event_type=?', (negative['job_id'], event_type))
             await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE job_id=? AND event_type=?', (negative['job_id'], event_type))
             details = await task_query.get_job(c.manager, c.actor, negative['job_id'])
             assert details['node']['processing_obligation']['state'] == 'unknown'
             assert details['node']['active_reason'] == ['managed_review_unknown']
         assert reviewer.calls == 1 and c.state.dispatched == 1
     finally:
+        for row in deleted:
+            await c.manager.db.execute(f"INSERT INTO {c.manager.events} ("+','.join(row)+") VALUES ("+','.join('?' for _ in row)+")", tuple(row.values()))
         await loop.aclose(drain_timeout_s=.1)

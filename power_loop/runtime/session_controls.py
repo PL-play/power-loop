@@ -96,22 +96,27 @@ class ControlTransaction(ControlReadView):
         self.touch_job(job_id, obligations=True)
         self.obligation_handled.add(job_id)
 
-    async def job_row(self, job_id):
-        """Acquire this writer's one root before reading mutable job state."""
+    async def _lock_root(self, job_id):
+        """The lookup proves the target's root without fetching its full row."""
         import time
 
+        suffix = '' if self.dialect.name == 'sqlite' else ' FOR UPDATE'
+        root = await self._tx.fetchone(f'SELECT root.* FROM {self._jobs} root '
+            f'WHERE root.job_id=(SELECT root_job_id FROM {self._jobs} WHERE job_id=?)'+suffix, (job_id,))
+        if root is None:
+            return False
+        self.root_job_id = root['job_id']
+        self._root_members.update((root['job_id'], job_id))
+        self.remember_row(self._jobs, 'job_id', root['job_id'], root)
+        if (timing := self._manager._control_lock_timing.get()) is not None:
+            timing['acquired'] = time.perf_counter()
+        return True
+
+    async def job_row(self, job_id):
+        """Acquire this writer's one root before reading mutable job state."""
         sql = f'SELECT * FROM {self._jobs} WHERE job_id=?'
-        if self.root_job_id is None:
-            suffix = '' if self.dialect.name == 'sqlite' else ' FOR UPDATE'
-            root = await self._tx.fetchone(f'SELECT root.* FROM {self._jobs} root '
-                f'WHERE root.job_id=(SELECT root_job_id FROM {self._jobs} WHERE job_id=?)'+suffix, (job_id,))
-            if root is None:
-                return None
-            self.root_job_id = root['job_id']
-            self._root_members.add(root['job_id'])
-            self.remember_row(self._jobs, 'job_id', root['job_id'], root)
-            if (timing := self._manager._control_lock_timing.get()) is not None:
-                timing['acquired'] = time.perf_counter()
+        if self.root_job_id is None and not await self._lock_root(job_id):
+            return None
         memo = sql, (job_id,)
         if memo not in self._memo:
             # A writer never acquires another root. The scope predicate also
@@ -159,8 +164,12 @@ class ControlTransaction(ControlReadView):
         # row cache,not the membership this transaction already locked/proved.
         if job_id in self._root_members:
             return
-        if await self.job_row(job_id) is None:
-            raise JobError('task_tree_scope_mismatch')
+        if self.root_job_id is None:
+            if await self._lock_root(job_id):
+                return
+        elif await self.job_row(job_id) is not None:
+            return
+        raise JobError('task_tree_scope_mismatch')
 
     async def renew_job(self, job_id, sql, params):
         """A lease update has the same root scope as other job writes."""

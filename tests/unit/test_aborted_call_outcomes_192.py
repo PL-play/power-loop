@@ -166,6 +166,7 @@ async def test_corrupt_or_newer_original_responsibility_cannot_be_cleared_or_ack
     from power_loop.runtime.jobs import _json
     c, source = await pending_batch(registry_store)
     loop, model = await controller(c)
+    deleted = []
     try:
         if part in ('newer_pending', 'roletool'):
             if part == 'newer_pending':
@@ -186,6 +187,7 @@ async def test_corrupt_or_newer_original_responsibility_cannot_be_cleared_or_ack
             await c.manager.db.execute(f'DELETE FROM {c.store.t.follow_up_queue}')
         else:
             for kind in eventtypes[part]:
+                deleted.extend(await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE job_id=? AND event_type=?", (source["job_id"], kind)))
                 await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE job_id=? AND event_type=?', (source['job_id'],kind))
         with pytest.raises(JobError):
             await reconcile_pending(loop, c.actor, source['job_id'])
@@ -202,6 +204,8 @@ async def test_corrupt_or_newer_original_responsibility_cannot_be_cleared_or_ack
                 assert reviews
         assert model.calls == 0 and c.state.dispatched == 0
     finally:
+        for row in deleted:
+            await c.manager.db.execute(f"INSERT INTO {c.manager.events} ("+','.join(row)+") VALUES ("+','.join('?' for _ in row)+")", tuple(row.values()))
         await loop.aclose(drain_timeout_s=.1)
 
 

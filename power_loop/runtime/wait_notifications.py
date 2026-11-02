@@ -113,11 +113,15 @@ def render_message(payload):
 async def notification(manager, tx, actor, event_id, *, required=True, _due=None):
     job, event, saved = _due if _due is not None else await due(manager, tx, actor, event_id)
     key = notification_id(manager, event_id)
-    row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
+    row = await tx.fetchone(f"SELECT n.*,d.delivery_status AS due_delivery_status FROM {manager.events} n "
+        f"JOIN {manager.events} d ON d.event_id=? WHERE n.event_id=?", (event_id, key))
     if row is None:
         if required or event["delivery_status"] != "pending_delivery":
             raise JobError("wait_notification_receipt_missing")
         return job, event, saved, None
+    # Preparation retains immutable due evidence. Read both mutable delivery
+    # flags in one statement so a concurrent publisher cannot split the view.
+    event = {**event, "delivery_status": row["due_delivery_status"]}
     data = waits._object(row["payload_json"])
     try:
         public = data["public"]
