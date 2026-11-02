@@ -249,7 +249,7 @@ async def observe_managed_free(attempt, tx, job):
 async def reconcile(runtime, actor, job_id, attempt_id):
     from . import model_budgets as budgets
     manager = runtime.manager
-    async with manager._write() as tx:
+    async with budgets.prepare_policy(runtime), manager._write() as tx:
         job = await manager._authorize(tx, actor, job_id)
         state = await budgets._read(manager, tx, attempt_id)
         policy = await budgets._policy(runtime, tx)
@@ -291,7 +291,7 @@ async def release_unstarted(runtime, actor, job_id, attempt_id, *, require_cance
     from . import model_budgets as budgets
     from .budget_contracts import BudgetAck, BudgetGrant, BudgetPlan, BudgetSubmission
     manager = runtime.manager
-    async with manager._write() as tx:
+    async with budgets.prepare_policy(runtime), manager._write() as tx:
         job = await manager._authorize(tx, actor, job_id)
         policy = await budgets._policy(runtime, tx)
         state = await budgets._read(manager, tx, attempt_id)
@@ -349,7 +349,7 @@ async def release_unstarted(runtime, actor, job_id, attempt_id, *, require_cance
     if type(ack) is not BudgetAck or (ack.attempt_id, ack.revision, ack.request_hash) != (
             attempt_id, submission.revision, submission.request_hash):
         raise JobError('budget_ack_mismatch')
-    async with manager._write() as tx:
+    async with budgets.prepare_policy(runtime), manager._write() as tx:
         job = await manager._authorize(tx, actor, job_id)
         state = await budgets._read(manager, tx, attempt_id)
         policy = await budgets._policy(runtime, tx)

@@ -13,6 +13,9 @@ from dataclasses import asdict
 
 from . import budget_scopes
 from .budget_contracts import BudgetAck, BudgetConfig, BudgetGrant, BudgetPlan, BudgetSubmission
+from .budget_policy_sources import PolicySourceChanged
+from .budget_policy_sources import current as prepared_source
+from .budget_policy_sources import prepared as prepare_policy
 from .jobs import JobError, _hash, _json
 from .jobs import verify_stored as _verify_stored
 
@@ -63,7 +66,15 @@ async def _policy(runtime, tx, *, create=False, job=None):
     if known and known == row["request_hash"]:
         marker = {"payload_json": row["manifest_json"], "request_hash": row["request_hash"]}  # Immutable, verified.
     else:
-        marker = await tx.fetchone(f"SELECT payload_json,request_hash FROM {manager.events} WHERE event_id=?", (marker_id,))
+        source = prepared_source(runtime)
+        if source is None:
+            if manager._control_intents.get() is not None:
+                raise JobError('budget_policy_source_required_before_writer')
+            marker = await tx.fetchone(f"SELECT payload_json,request_hash FROM {manager.events} WHERE event_id=?", (marker_id,))
+        else:
+            marker = source.marker
+            if row is not None and marker is None:
+                raise PolicySourceChanged(row['request_hash'])
     if row is None:
         if marker is not None:
             raise JobError("budget_policy_missing")
@@ -139,9 +150,14 @@ async def ensure_policy(binding, *, transaction=None, job=None):
     if transaction is not None:
         return await _ensure_policy(binding, transaction, job)
     await flush_observed_controls(binding)
-    async with runtime.manager._write() as tx:
-        job = await runtime.manager._fence(tx, binding.actor, binding.lease)
-        return await _ensure_policy(binding, tx, job)
+    source = None
+    while True:
+        try:
+            async with prepare_policy(runtime, source=source), runtime.manager._write() as tx:
+                job = await runtime.manager._fence(tx, binding.actor, binding.lease)
+                return await _ensure_policy(binding, tx, job)
+        except PolicySourceChanged as changed:
+            source = changed.source
 
 
 async def _ensure_policy(binding, tx, job):
@@ -306,7 +322,7 @@ async def observe(attempt, observation):
 
 async def _observe(runtime, actor, job_id, attempt_id, observation):
     manager = runtime.manager
-    async with manager._write() as tx:
+    async with prepare_policy(runtime), manager._write() as tx:
         policy = await _policy(runtime, tx)
         if policy is None:
             return
@@ -382,7 +398,7 @@ async def deliver(attempt):
 
 async def _deliver(runtime, actor, job_id, attempt_id):
     manager = runtime.manager
-    async with manager._write() as tx:
+    async with prepare_policy(runtime), manager._write() as tx:
         await _policy(runtime, tx)
         job = await manager._authorize(tx, actor, job_id)
         state = await _read(manager, tx, attempt_id)
@@ -577,7 +593,7 @@ async def _require_cancelled_lineage(manager, tx, job):
 
 async def _release_unstarted(runtime, actor, job_id, attempt_id, *, require_cancelled=False):
     manager = runtime.manager
-    async with manager._write() as tx:
+    async with prepare_policy(runtime), manager._write() as tx:
         policy = await _policy(runtime, tx)
         job = await manager._authorize(tx, actor, job_id)
         state = await _release_source(runtime, tx, job, attempt_id, policy)
@@ -661,7 +677,7 @@ async def _release_unstarted(runtime, actor, job_id, attempt_id, *, require_canc
         submission.request_hash,
     ):
         raise JobError("budget_ack_mismatch")
-    async with manager._write() as tx:
+    async with prepare_policy(runtime), manager._write() as tx:
         policy = await _policy(runtime, tx)
         job = await manager._authorize(tx, actor, job_id)
         latest = await _read(manager, tx, attempt_id)
@@ -740,7 +756,7 @@ async def _reconciliation_state(runtime, actor, job_id, attempt_id, *, allow_mis
         raise JobError("invalid_budget_reconciliation_identity")
     manager = runtime.manager
     from .model_attempts import _read as read_model
-    async with manager._write() as tx:
+    async with prepare_policy(runtime), manager._write() as tx:
         job = await manager._authorize(tx, actor, job_id)
         policy = await _policy(runtime, tx)
         if policy is None:

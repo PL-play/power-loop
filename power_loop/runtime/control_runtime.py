@@ -239,18 +239,19 @@ async def prepare_review_sources(manager, actor):
         return ReviewSources(seen,pending)
 
 
-async def open_control(binding, *, review_sources=None):
+async def open_control(binding, *, review_sources=None, policy_source=None):
     runtime, manager = binding.runtime, binding.runtime.manager
     if binding.resource_evidence.get("_control_state") is not None:
         return current(binding)
     if (binding.lease.job_id, binding.lease.generation) in manager._execution_controls:
         raise JobError("execution_already_owned")
+    from .budget_policy_sources import prepared as prepare_policy
     from .model_attempts import _no_unknown_sends
     from .model_budgets import ensure_policy, flush_observed_controls
     from .owner_waits import dispatch_policy
 
     await flush_observed_controls(binding)
-    async with manager._write() as tx:
+    async with prepare_policy(runtime, source=policy_source), manager._write() as tx:
         source = dict(await manager._fence(tx, binding.actor, binding.lease))
         from .workflow_controller import validate_dispatch
         await validate_dispatch(manager, tx, source)

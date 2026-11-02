@@ -76,7 +76,7 @@ async def stage(runtime, actor, job_id, attempt_id, *, expected_revision, eviden
     event_id = "br_" + _hash([manager.store.store_id, attempt_id, evidence.evidence_id])[:48]
     request = {"attempt_id": attempt_id, "job_id": job_id,
                "expected_revision": expected_revision, "evidence": asdict(evidence)}
-    async with manager._write() as tx:
+    async with budgets.prepare_policy(runtime), manager._write() as tx:
         runtime._lifecycle.check_admission()  # Closed local hosts cannot acquire new control work.
         policy = await budgets._policy(runtime, tx)
         job = await manager._authorize(tx, actor, job_id)

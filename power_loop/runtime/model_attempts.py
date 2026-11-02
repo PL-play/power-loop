@@ -274,6 +274,7 @@ async def _all(manager, tx, job_id):
 
 
 async def enable(binding, *, review_sources=None):
+    from .budget_policy_sources import PolicySourceChanged
     from .control_runtime import ReviewSourcesChanged, needs_review_sources, open_control, prepare_review_sources
 
     manager = binding.runtime.manager
@@ -281,14 +282,19 @@ async def enable(binding, *, review_sources=None):
     if (binding.resource_evidence.get('_control_state') is None and not joined and review_sources is None
             and needs_review_sources(manager,binding.actor)):
         review_sources = await prepare_review_sources(manager,binding.actor)
+    policy_source = None
     while True:
         try:
-            await open_control(binding,review_sources=review_sources)
+            await open_control(binding,review_sources=review_sources,policy_source=policy_source)
             break
         except ReviewSourcesChanged:
             if joined:
                 raise
             review_sources = await prepare_review_sources(manager,binding.actor)
+        except PolicySourceChanged as changed:
+            if joined:
+                raise
+            policy_source = changed.source
     binding.resource_evidence["model_attempt_protocol"] = 1
 
 

@@ -711,12 +711,15 @@ class TaskRuntime:
         await self.ensure_started()
         self.check_local_admission()
         await flush_observed_controls(SimpleNamespace(runtime=self))
+        from .budget_policy_sources import PolicySourceChanged
+        from .budget_policy_sources import prepared as prepare_policy
         from .control_runtime import ReviewSourcesChanged, needs_review_sources, prepare_review_sources
         review_sources = await prepare_review_sources(self.manager,actor) if needs_review_sources(self.manager,actor) else None
         # Registration, claim and control admission commit together or not at all.
+        policy_source = None
         while True:
             try:
-                async with self.manager.joined_write():
+                async with prepare_policy(self, source=policy_source), self.manager.joined_write():
                     registration = await self.manager.register_job(
                         registering_actor,
                         kind="send",
@@ -735,6 +738,8 @@ class TaskRuntime:
                 break
             except ReviewSourcesChanged:
                 review_sources = await prepare_review_sources(self.manager,actor)
+            except PolicySourceChanged as changed:
+                policy_source = changed.source
         evidence = {"exit": "interrupted", "session_id": sid, "send_index": send_index}
         failure = None
         try:
