@@ -13,9 +13,14 @@ def key(manager, tenant_id, principal_id):
 
 
 async def initialize(manager, tx, identity):
+    from .execution_membership import _remember_after_commit, _trusted
+
     policy_key = key(manager, identity.tenant_id, identity.principal_id)
+    if _trusted(manager, '_principal_gate_presence', policy_key):
+        return
     table = manager.prefix+'task_principal_admissions'
     if await tx.fetchone(f'SELECT policy_key FROM {table} WHERE policy_key=?', (policy_key,)):
+        _remember_after_commit(manager, tx, '_principal_gate_presence', policy_key, True)
         return
     marker = await tx.fetchone(f'SELECT payload_json,request_hash FROM {manager.events} WHERE event_id=?',
         ('mb_policy_'+policy_key[3:],))
@@ -25,6 +30,7 @@ async def initialize(manager, tx, identity):
     await tx.write_principal_admission(policy_key,
         manager.db.dialect.insert_ignore(table, ('policy_key', 'policy_hash')),
         (policy_key, marker['request_hash'] if marker is not None else None))
+    _remember_after_commit(manager, tx, '_principal_gate_presence', policy_key, True)
 
 
 async def enter(runtime, tx):
@@ -35,8 +41,19 @@ async def enter(runtime, tx):
     policy_key = key(manager, runtime.tenant_id, runtime.principal_id)
     if policy_key in tx._budget_policy_admissions:
         return
+    if runtime.budget_config is None:
+        suffix = '' if manager.db.dialect.name == 'sqlite' else ' FOR SHARE'
+        sql = f'SELECT policy_hash FROM {manager.prefix}task_principal_admissions WHERE policy_key=?'+suffix
+        row = await tx.fetchone(sql, (policy_key,))
+        if row is None:
+            await initialize(manager, tx, runtime)
+            row = await tx.fetchone(sql, (policy_key,))
+        if row['policy_hash'] is not None:
+            raise JobError('budget_provider_required')
+        tx._budget_policy_admissions[policy_key] = None
+        return
     source = current(runtime)
-    exclusive = runtime.budget_config is not None and source.marker is None
+    exclusive = source.marker is None
     # Only the non-null admission side is locked. PostgreSQL does not permit
     # locking the nullable side of an outer join. Both server backends support
     # OF on the named admission alias; SQLite serializes its writers itself.

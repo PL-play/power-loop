@@ -720,8 +720,15 @@ class TaskRuntime:
         while True:
             try:
                 async with prepare_policy(self, source=policy_source), self.manager.joined_write():
-                    from .budget_admissions import enter
-                    await enter(self, self.manager._joined_write.get())
+                    tx = self.manager._joined_write.get()
+                    if self.budget_config is None:
+                        from .executor_registry import ExecutorIdentity, admit_unbudgeted
+                        await admit_unbudgeted(self.manager, tx,
+                            ExecutorIdentity(self.tenant_id, self.principal_id, self.executor_id, self.boot_id),
+                            required=self._lifecycle is not None)
+                    else:
+                        from .budget_admissions import enter
+                        await enter(self, tx)
                     registration = await self.manager.register_job(
                         registering_actor,
                         kind="send",

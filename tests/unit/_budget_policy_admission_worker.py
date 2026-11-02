@@ -64,13 +64,14 @@ def make_loop(store, *, executor, budgeted, model_release=None, model_ready=None
 async def main():
     dsn, prefix, sid, paid, directory, *extra = sys.argv[1:]
     mode = extra[0] if extra else 'send'
+    registered = mode != 'send-unregistered'
     if '://' in dsn:
         address = urlparse(dsn)
         assert address.hostname == '127.0.0.1' and address.path.endswith('_test')
     directory = Path(directory)
     store = await open_store(dsn, table_prefix=prefix, schema='compatible')
     loop, runtime, model, host = make_loop(store, executor='worker', budgeted=paid == '1',
-        model_release=directory/'model.release', model_ready=directory/'model.ready')
+        model_release=directory/'model.release', model_ready=directory/'model.ready', registered=registered)
     await runtime.ensure_started()
     opening_entry = False
 
@@ -101,7 +102,8 @@ async def main():
         (directory/'worker.done').write_text(json.dumps({'status': result.status, 'text': result.final_text,
             'calls': model.calls, 'reserve': host.reserve_calls, 'apply': host.apply_calls}))
     finally:
-        await runtime.shutdown(timeout_s=1)
+        if registered:
+            await runtime.shutdown(timeout_s=1)
         await loop.aclose(drain_timeout_s=.1)
         await store.close()
 

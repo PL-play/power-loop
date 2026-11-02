@@ -17,21 +17,30 @@ def key(manager, identity):
         identity.tenant_id, identity.principal_id, identity.executor_id])[:48]
 
 
-async def lock(manager, tx, identity, *, registration=False):
+async def lock(manager, tx, identity, *, registration=False, principal_key=None):
     group, table = key(manager, identity), manager.prefix+'task_executor_admissions'
     known = tx._executor_group_locks.get(group)
-    if known is not None and (not registration or known[0]):
+    if (known is not None and (not registration or known[0])
+            and (principal_key is None or principal_key in tx._principal_admission_hashes)):
         return known[1]
     suffix = '' if manager.db.dialect.name == 'sqlite' else ' FOR UPDATE' if registration else ' FOR SHARE'
     sql = f'SELECT registered FROM {table} WHERE group_key=?'+suffix
-    row = await tx.fetchone(sql, (group,))
+    params = (group,)
+    if principal_key is not None:
+        sql = (f'SELECT logical.registered,principal.policy_hash AS admission_hash FROM {table} logical '
+            f'JOIN {manager.prefix}task_principal_admissions principal ON principal.policy_key=? '
+            'WHERE logical.group_key=?'+suffix)
+        params = principal_key, group
+    row = await tx.fetchone(sql, params)
     if row is None:
         # The first absence claim creates a lockable derived row in this same
         # writer. A racing registration must wait for the actual claim commit.
         await tx.write_executor_group(group,
             manager.db.dialect.insert_ignore(table, ('group_key', 'registered')),
             (group, int(registration)))
-        row = await tx.fetchone(sql, (group,))
+        row = await tx.fetchone(sql, params)
+    if principal_key is not None:
+        tx._principal_admission_hashes[principal_key] = row['admission_hash']
     registered = bool(row['registered'])
     if registration and not registered:
         await tx.write_executor_group(group,

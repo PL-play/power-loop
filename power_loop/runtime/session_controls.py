@@ -75,6 +75,7 @@ class ControlTransaction(ControlReadView):
         self._executor_admissions: dict[str, bool] = {}
         self._executor_group_locks: dict[str, tuple[bool, bool]] = {}
         self._budget_policy_admissions: dict[str, dict | None] = {}
+        self._principal_admission_hashes: dict[str, str | None] = {}
 
     def __getattr__(self, name):
         return getattr(self._tx, name)
@@ -120,6 +121,19 @@ class ControlTransaction(ControlReadView):
             self._memo[sql, (executor_key,)] = None if row is None else dict(row)
             self._executor_admissions[executor_key] = exclusive
         return await self.fetchone(sql, (executor_key,))
+
+    async def unbudgeted_executor_admission(self, executor_key, policy_key):
+        """Share both existing metadata gates in the boot admission query."""
+        suffix = '' if self.dialect.name == 'sqlite' else ' FOR SHARE'
+        row = await self._tx.fetchone(
+            f'SELECT boot.*,principal.policy_hash AS admission_hash FROM {self._executors} boot '
+            f'JOIN {self._principal_admissions} principal ON principal.policy_key=? '
+            'WHERE boot.executor_key=?'+suffix, (policy_key, executor_key))
+        if row is not None:
+            self._principal_admission_hashes[policy_key] = row.pop('admission_hash')
+        self._memo[f'SELECT * FROM {self._executors} WHERE executor_key=?', (executor_key,)] = row
+        self._executor_admissions[executor_key] = False
+        return row
 
     async def append_event(self, columns, values, *, ignore=False):
         """Append a declared original; its meaning is supplied as fields."""

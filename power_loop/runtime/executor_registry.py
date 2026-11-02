@@ -388,6 +388,23 @@ async def require_accepting(manager, tx, identity, *, required=False, exclusive=
     return row
 
 
+async def admit_unbudgeted(manager, tx, identity, *, required):
+    """Before tree publication,join mandatory-policy and boot admission."""
+    from . import budget_admissions, executor_admissions
+
+    policy_key = budget_admissions.key(manager, identity.tenant_id, identity.principal_id)
+    row = await tx.unbudgeted_executor_admission(_key(manager, identity), policy_key)
+    if row is None:
+        # Optional unregistered runtimes instead share the logical-executor
+        # absence gate. Row-presence caching never caches the policy value.
+        await budget_admissions.initialize(manager, tx, identity)
+        await executor_admissions.lock(manager, tx, identity, principal_key=policy_key)
+    await require_accepting(manager, tx, identity, required=required)
+    if tx._principal_admission_hashes[policy_key] is not None:
+        raise JobError('budget_provider_required')
+    tx._budget_policy_admissions[policy_key] = None
+
+
 async def check_execution(manager, tx, row):
     identity = identity_for(row)
     registered = await require_accepting(manager, tx, identity, required=row["executor_key"] is not None)

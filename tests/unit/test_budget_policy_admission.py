@@ -47,10 +47,12 @@ async def wait_for_admission_lock(manager, observer, action):
 
 
 @pytest.mark.parametrize('worker_paid', [False, True])
+@pytest.mark.parametrize('unbudget_registered', [False, True])
 async def test_first_policy_cannot_cross_an_uncommitted_unbudgeted_send(
-        registry_store, monkeypatch, tmp_path, worker_paid):
+        registry_store, monkeypatch, tmp_path, worker_paid, unbudget_registered):
     store, _ = registry_store
-    loop, runtime, model, host = make_loop(store, executor='parent', budgeted=not worker_paid)
+    loop, runtime, model, host = make_loop(store, executor='parent', budgeted=not worker_paid,
+        registered=not worker_paid or unbudget_registered)
     sid, worker_sid = await loop.new_session(), await loop.new_session()
     await runtime.ensure_started()
     engine = runtime.manager.db.dialect.name
@@ -60,7 +62,8 @@ async def test_first_policy_cannot_cross_an_uncommitted_unbudgeted_send(
     observer = await _make_database(dsn)
     process = await asyncio.create_subprocess_exec(sys.executable, '-m',
         'tests.unit._budget_policy_admission_worker', dsn, store.table_prefix, worker_sid,
-        str(int(worker_paid)), str(tmp_path), cwd=Path(__file__).resolve().parents[2],
+        str(int(worker_paid)), str(tmp_path), 'send' if worker_paid or unbudget_registered else 'send-unregistered',
+        cwd=Path(__file__).resolve().parents[2],
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     action = None
 
@@ -106,7 +109,8 @@ async def test_first_policy_cannot_cross_an_uncommitted_unbudgeted_send(
             action.cancel()
             await asyncio.gather(action, return_exceptions=True)
         await stop_worker(process)
-        await runtime.shutdown(timeout_s=1)
+        if not worker_paid or unbudget_registered:
+            await runtime.shutdown(timeout_s=1)
         await loop.aclose(drain_timeout_s=.1)
         await observer.close()
 
