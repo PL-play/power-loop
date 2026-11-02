@@ -281,7 +281,7 @@ async def test_physically_closed_unstarted_actions_keep_their_unreviewed_notices
         await loop.aclose(drain_timeout_s=.1)
 
 
-async def test_explicit_protocol_23_maintenance_rebuilds_the_index(registry_store):
+async def test_explicit_final_format_maintenance_rebuilds_the_index(registry_store):
     from power_loop.runtime.store.schema import StoreSchemaError
     from power_loop.runtime.store.task_schema import verify_task_schema
     from power_loop.runtime.tool_call_plans import reconcile_pending
@@ -294,7 +294,6 @@ async def test_explicit_protocol_23_maintenance_rebuilds_the_index(registry_stor
         await loop.aclose(drain_timeout_s=.1)
         await c.runtime.shutdown(timeout_s=1)
         await c.manager.db.execute(f"DROP TABLE {c.manager.prefix}session_obligations")
-        await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_store SET protocol_version=23 WHERE id=1")
         with pytest.raises(StoreSchemaError):
             await verify_task_schema(c.manager.db, c.manager.prefix)
         with pytest.raises(StoreSchemaError, match="maintenance_required"):

@@ -82,14 +82,14 @@ async def previous_schema(c, started):
     events = await db.fetchall(f'SELECT * FROM {prefix}task_context_events ORDER BY event_id')
     assert len(events) == 4
     # Reconstruct the actual immediately previous storage: four former
-    # originals in runtime_state,no context event table,schema12/protocol34.
+    # originals in runtime_state,no context event table,schema10/protocol21.
     for event in events:
         await db.execute(f'INSERT INTO {c.store.t.session_runtime_state} '
             '(session_id,state_key,value_json,updated_at) VALUES (?,?,?,?)',
             (event['session_id'], event['state_key'], event['payload_json'], event['created_at']))
     await db.execute(f'DROP TABLE {prefix}task_context_events')
-    await db.execute(f'UPDATE {prefix}schema_migrations SET version=12 WHERE id=1')
-    await db.execute(f'UPDATE {prefix}task_store SET protocol_version=34 WHERE id=1')
+    await db.execute(f'UPDATE {prefix}schema_migrations SET version=10 WHERE id=1')
+    await db.execute(f'UPDATE {prefix}task_store SET protocol_version=21 WHERE id=1')
     return receipt, prefix, db, events, messages
 
 
@@ -99,7 +99,7 @@ async def test_explicit_previous_schema_import_preserves_context_originals_after
     receipt, prefix, db, events, messages = await previous_schema(c, started)
     with pytest.raises(StoreSchemaError):
         await c.connect()
-    assert (await db.fetchone(f'SELECT protocol_version FROM {prefix}task_store WHERE id=1'))['protocol_version'] == 34
+    assert (await db.fetchone(f'SELECT protocol_version FROM {prefix}task_store WHERE id=1'))['protocol_version'] == 21
     async with db.read_snapshot() as reader:
         assert not await _table_exists_tx(reader, db.dialect.name, prefix+'task_context_events')
     with pytest.raises(StoreSchemaError, match='maintenance_required'):
@@ -156,8 +156,8 @@ async def test_context_import_rejects_changed_originals_before_copying_any_other
     before = await db.fetchall(f'SELECT * FROM {c.store.t.session_runtime_state} ORDER BY session_id,state_key')
     with pytest.raises(StoreSchemaError, match='context migration original'):
         await migrate_task_schema(db, prefix, maintenance=True)
-    assert (await db.fetchone(f'SELECT protocol_version FROM {prefix}task_store WHERE id=1'))['protocol_version'] == 34
-    assert (await db.fetchone(f'SELECT version FROM {prefix}schema_migrations WHERE id=1'))['version'] == 12
+    assert (await db.fetchone(f'SELECT protocol_version FROM {prefix}task_store WHERE id=1'))['protocol_version'] == 21
+    assert (await db.fetchone(f'SELECT version FROM {prefix}schema_migrations WHERE id=1'))['version'] == 10
     assert await db.fetchall(f'SELECT * FROM {c.store.t.session_runtime_state} ORDER BY session_id,state_key') == before
     assert await db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY id') == messages
     async with db.read_snapshot() as reader:

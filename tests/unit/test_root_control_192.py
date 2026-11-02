@@ -8,8 +8,6 @@ import pytest
 
 from power_loop.runtime import root_context, root_control
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
-from power_loop.runtime.store.schema import StoreSchemaError
-from power_loop.runtime.store.task_schema import migrate_task_schema, verify_task_schema
 
 from .test_job_registry_192 import registry_store
 from .test_root_context_192 import NAMESPACE, root_case
@@ -195,39 +193,3 @@ async def test_corrupt_original_evidence_fails_closed_without_reconstruction(roo
     with pytest.raises(JobError, match="evidence_corrupt"):
         await stop(c)
     assert len(c.model.calls) == 1
-
-
-@pytest.mark.parametrize("failure", [False, True])
-async def test_protocol_four_requires_maintenance_preserves_ids_and_fences_old_writers(
-    root_case, monkeypatch, failure
-):
-    c = root_case
-    await send(c)
-    ref = await c.store.message_ref(c.sid, 1)
-    sid, store_id = c.sid, c.store.store_id
-    await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_store SET protocol_version=4 WHERE id=1")
-    with pytest.raises(StoreSchemaError, match="protocol"):
-        await verify_task_schema(c.manager.db, c.manager.prefix)
-    with pytest.raises(StoreSchemaError, match="protocol"):
-        await c.connect()
-    with pytest.raises(StoreSchemaError, match="maintenance_required"):
-        await migrate_task_schema(c.manager.db, c.manager.prefix)
-    if failure:
-        from power_loop.runtime.store import task_schema
-        ddl = task_schema._run_task_ddl
-        async def broken(*args):
-            await ddl(*args)
-            raise RuntimeError("protocol upgrade failure")
-        with monkeypatch.context() as patch:
-            patch.setattr(task_schema, "_run_task_ddl", broken)
-            with pytest.raises(RuntimeError, match="upgrade failure"):
-                await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        assert (await c.manager.db.fetchone(
-            f"SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1"))["protocol_version"] == 4
-    await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    assert c.sid == sid and c.store.store_id == store_id and await c.store.message_ref(c.sid, 1) == ref
-    from power_loop.runtime.store import task_schema
-    async with c.manager.db.read_snapshot() as reader:
-        with pytest.raises(StoreSchemaError, match="protocol"):
-            await task_schema._verify_task_schema_tx(reader, c.manager.db, c.manager.prefix, protocol=4)
-    assert len((await stop(c))["roots"]) == 1

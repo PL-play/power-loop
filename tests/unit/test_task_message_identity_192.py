@@ -1,4 +1,4 @@
-"""B1 message identity, explicit schema entry and v9 bridge compatibility."""
+"""Message identity, explicit schema entry and refusal of unsupported migration sources."""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +9,7 @@ import pytest
 from power_loop import SessionStore
 from power_loop.runtime.message_ref import integer_id
 from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION, SchemaPolicy, StoreSchemaError
-from power_loop.runtime.store.task_schema import migrate_task_schema, task_schema_preflight
+from power_loop.runtime.store.task_schema import migrate_task_schema
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -106,30 +106,6 @@ async def test_legacy_mode_degrades_and_never_automatically_migrates(tmp_path):
     await s.close()
 
 
-async def test_explicit_migration_preserves_every_message_and_next_seq(tmp_path):
-    path = str(tmp_path / "migrate.db")
-    s = await SessionStore.open(path)
-    sid = await s.create_session()
-    for role in ("user", "assistant", "tool"):
-        await s.append_message(sid, role=role, content=role, meta={"kind": role})
-    before = await s.export_session(sid)
-    assert await task_schema_preflight(s._db, s.table_prefix) == {
-        "version": CURRENT_SCHEMA_VERSION, "message_count": 3, "sessions_with_messages": 1, "maintenance_required": True}
-    with pytest.raises(StoreSchemaError, match="maintenance_required"):
-        await migrate_task_schema(s._db, s.table_prefix)
-    await migrate_task_schema(s._db, s.table_prefix, maintenance=True)
-    await migrate_task_schema(s._db, s.table_prefix, maintenance=True)  # idempotent
-    await s.close()
-    s = await SessionStore.open(path, schema="compatible")
-    try:
-        after = await s.export_session(sid)
-        assert after["tables"] == before["tables"]
-        assert await s.append_message(sid, role="user", content="next") == 4
-        assert (await s.message_ref(sid, 4)).id > 3
-        rows = await s.load_all_messages(sid)
-        assert len({r.id for r in rows}) == 4
-    finally:
-        await s.close()
 
 
 async def test_two_connections_allocate_unique_ids_and_keep_same_identity(tmp_path):
@@ -181,7 +157,7 @@ async def test_incomplete_schema_and_custom_migration_fail_without_destroying_hi
     sid = await s.create_session()
     await s.append_message(sid, role="user", content="preserve")
     await s._db.execute("CREATE INDEX custom_message_index ON pl_messages(role)")
-    with pytest.raises(StoreSchemaError, match="custom"):
+    with pytest.raises(StoreSchemaError, match="unsupported_migration_source"):
         await migrate_task_schema(s._db, s.table_prefix, maintenance=True)
     assert (await s.load_all_messages(sid))[0].content == "preserve"
     assert (await s._db.fetchone("SELECT version FROM pl_schema_migrations"))["version"] == CURRENT_SCHEMA_VERSION
@@ -207,7 +183,7 @@ async def test_migration_refuses_unreviewed_dependencies_or_partial_schema(tmp_p
     else:
         await s._db.execute("ALTER TABLE pl_messages ADD COLUMN id INTEGER")
     try:
-        with pytest.raises(StoreSchemaError, match="inspection|reviewed"):
+        with pytest.raises(StoreSchemaError, match="unsupported_migration_source"):
             await migrate_task_schema(s._db, s.table_prefix, maintenance=True)
         assert (await s.load_all_messages(sid))[0].content == "must survive"
         assert (await s._db.fetchone("SELECT version FROM pl_schema_migrations"))["version"] == CURRENT_SCHEMA_VERSION

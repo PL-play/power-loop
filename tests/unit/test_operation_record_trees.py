@@ -245,16 +245,13 @@ async def test_cold_entry_refuses_a_target_record_without_its_original_source_pe
     assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == originals
 
 
-async def test_explicit_source35_upgrade_keeps_current_record_originals_and_ignores_dead_context_cache(operation_case):
+async def test_final_maintenance_keeps_record_originals_and_ignores_dead_context_cache(operation_case):
     c = operation_case
     original = await record(c)
     events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
     jobs = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id')
     messages = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY id')
     await c.store.set_runtime_state(c.actor.session_id, 'power-loop.root-stop.v1:dead-cache', {'not': 'an original'})
-    await c.manager.db.execute(f'UPDATE {c.manager.prefix}task_store SET protocol_version=35 WHERE id=1')
-    with pytest.raises(StoreSchemaError):
-        await c.connect()
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
     cold = JobManager(await c.connect(), now_ms=c.manager.now)
     assert await record(c, manager=cold) == original
@@ -265,7 +262,7 @@ async def test_explicit_source35_upgrade_keeps_current_record_originals_and_igno
 
 
 @pytest.mark.parametrize('action', ['steer', 'nudge'])
-async def test_source35_opaque_record_requires_offline_attribution_before_protocol_changes(operation_case, action):
+async def test_opaque_record_requires_original_attribution_during_maintenance(operation_case, action):
     c = operation_case
     result = await record(c, action)
     original_events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
@@ -280,12 +277,11 @@ async def test_source35_opaque_record_requires_offline_attribution_before_protoc
         old_fingerprint = _hash([c.target.job_id, {'message': 'record metadata'}, c.ref.to_dict()])
         assert await c.manager.db.execute(f'UPDATE {c.manager.events} SET request_hash=? WHERE event_id=?',
             (old_fingerprint, result.operation_id)) == 1
-        await c.manager.db.execute(f'UPDATE {c.manager.prefix}task_store SET protocol_version=35 WHERE id=1')
         before = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
         jobs = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id')
         with pytest.raises(StoreSchemaError, match='original caller permission'):
             await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        assert (await c.manager.db.fetchone(f'SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1'))['protocol_version'] == 35
+        assert (await c.manager.db.fetchone(f'SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1'))['protocol_version'] == TASK_PROTOCOL_VERSION
         assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == before
         assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id') == jobs
     finally:

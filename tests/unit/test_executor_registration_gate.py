@@ -175,7 +175,7 @@ async def test_real_registration_process_death_keeps_gate_and_original_atomic(bo
         await stop_worker(process)
 
 
-@pytest.mark.parametrize('damage', ['missing-row', 'false-flag', 'missing-table', 'source36'])
+@pytest.mark.parametrize('damage', ['missing-row', 'false-flag', 'missing-table'])
 async def test_offline_maintenance_rebuilds_registration_gates_from_originals(boot, damage):
     c = boot
     await start(c)
@@ -191,9 +191,7 @@ async def test_offline_maintenance_rebuilds_registration_gates_from_originals(bo
         await c.manager.db.execute(f'DELETE FROM {table}')
     else:
         await c.manager.db.execute(f'DROP TABLE {table}')
-    if damage == 'source36':
-        await c.manager.db.execute(f'UPDATE {c.manager.prefix}task_store SET protocol_version=36 WHERE id=1')
-    if damage in ('missing-table', 'source36'):
+    if damage == 'missing-table':
         with pytest.raises(StoreSchemaError):
             await c.connect()
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)

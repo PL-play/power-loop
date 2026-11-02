@@ -256,28 +256,3 @@ async def test_actual_pipeline_does_not_invoke_a_replacement_after_admission(tmp
     finally:
         await loop.aclose(drain_timeout_s=0.1)
         await store.close()
-
-
-async def test_original_protocol_five_requires_explicit_upgrade_without_new_identity(registry_store, monkeypatch):
-    from power_loop.runtime.jobs import JobManager
-    from power_loop.runtime.store import task_schema
-    from power_loop.runtime.store.schema import StoreSchemaError
-
-    store, _ = registry_store
-    manager = JobManager(store)
-    sid = await store.create_session()
-    seq = await store.append_message(sid, role="user", content="Keep the original identity")
-    original = await store.message_ref(sid, seq)
-    await manager.db.execute(f"UPDATE {manager.prefix}task_store SET protocol_version=5 WHERE id=1")
-    with pytest.raises(StoreSchemaError):
-        await task_schema.verify_task_schema(manager.db, manager.prefix)
-    with pytest.raises(StoreSchemaError, match="maintenance_required"):
-        await task_schema.migrate_task_schema(manager.db, manager.prefix)
-    await task_schema.migrate_task_schema(manager.db, manager.prefix, maintenance=True)
-    assert await store.message_ref(sid, seq) == original
-    assert (
-        await manager.db.fetchone(f"SELECT store_id,protocol_version FROM {manager.prefix}task_store WHERE id=1")
-    ) == {"store_id": store.store_id, "protocol_version": task_schema.TASK_PROTOCOL_VERSION}
-    async with manager.db.read_snapshot() as reader:
-        with pytest.raises(StoreSchemaError, match="protocol"):
-            await task_schema._verify_task_schema_tx(reader, manager.db, manager.prefix, protocol=5)

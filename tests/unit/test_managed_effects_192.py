@@ -354,31 +354,6 @@ async def test_base_requires_lifecycle_methods_and_supported_resource_contract()
             ManagedToolContract("generic.tool", "a" * 64, **kwargs)
 
 
-@pytest.mark.parametrize("old_protocol", [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20])
-async def test_old_protocol_requires_explicit_upgrade_and_keeps_original_identity(
-    registry_store, monkeypatch, old_protocol
-):
-    from power_loop.runtime.store import task_schema
-    from power_loop.runtime.store.schema import StoreSchemaError
-
-    store, _ = registry_store
-    manager = JobManager(store)
-    sid = await store.create_session()
-    seq = await store.append_message(sid, role="user", content="Retain original identity")
-    ref = await store.message_ref(sid, seq)
-    await manager.db.execute(f"UPDATE {manager.prefix}task_store SET protocol_version=? WHERE id=1", (old_protocol,))
-    with pytest.raises(StoreSchemaError):
-        await task_schema.verify_task_schema(manager.db, manager.prefix)
-    with pytest.raises(StoreSchemaError, match="maintenance_required"):
-        await task_schema.migrate_task_schema(manager.db, manager.prefix)
-    await task_schema.migrate_task_schema(manager.db, manager.prefix, maintenance=True)
-    assert await store.message_ref(sid, seq) == ref
-    assert (
-        await manager.db.fetchone(f"SELECT store_id,protocol_version FROM {manager.prefix}task_store WHERE id=1")
-    ) == {"store_id": store.store_id, "protocol_version": task_schema.TASK_PROTOCOL_VERSION}
-    async with manager.db.read_snapshot() as reader:
-        with pytest.raises(StoreSchemaError, match="protocol"):
-            await task_schema._verify_task_schema_tx(reader, manager.db, manager.prefix, protocol=old_protocol)
 
 
 async def pending_case(registry_store):
@@ -761,35 +736,6 @@ async def test_raw_index_and_observation_are_atomic_and_lost_ack_is_queryable(
     assert c.model.calls == 1 and c.state.dispatched == c.state.lookups == 0
 
 
-async def test_protocol_seven_original_pending_receipt_can_be_upgraded_and_reindexed_without_execution(registry_store):
-    from power_loop.runtime.managed_effects import _id, read_raw_receipt, reconcile_raw_receipt
-    from power_loop.runtime.store import task_schema
-    from power_loop.runtime.store.schema import StoreSchemaError
-
-    from ._pre_memory_protocol_fixture import reopen_after_maintenance, retain_pre_memory_format
-
-    c = await scenario(registry_store, budgeted=True, pending=True)
-    [job] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-    before = await read_raw_receipt(c.manager, c.actor, job["job_id"])
-    # Protocol7 retained the canonical row/index but had no independent raw
-    # observation. This pending original has no child/parent closure to rewrite.
-    await c.manager.db.execute(
-        f"DELETE FROM {c.manager.events} WHERE event_id=?", (_id(c.manager, "raw_receipt", job["job_id"], 0),)
-    )
-    await retain_pre_memory_format(c, 7)
-    with pytest.raises(StoreSchemaError):
-        await task_schema.verify_task_schema(c.manager.db, c.manager.prefix)
-    await task_schema.migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    await reopen_after_maintenance(c, registry_store[1])
-    after = await reconcile_raw_receipt(c.manager, c.actor, job["job_id"])
-    assert after["call_ref"] == before["call_ref"] and after["receipt_ref"] == before["receipt_ref"]
-    assert not after["acknowledges_result"]
-    assert c.state.dispatched == c.model.calls == c.host.reserve_calls == 1 and c.state.lookups == 0
-    c.state.resolved = True
-    await reconcile(c.runtime, c.actor, job["job_id"], c.adapter)
-    await c.manager.finalize_supervision(c.actor, job["job_id"], generation=1)
-    assert (await c.manager.get_job(c.actor, job["job_id"])).supervision_status == "closed"
-    assert (await c.manager.db.fetchone(f"SELECT protocol_version FROM {c.manager.prefix}task_store"))["protocol_version"] == task_schema.TASK_PROTOCOL_VERSION
 
 
 async def test_claim_membership_survives_lost_ack_and_cannot_be_relabelled_unclaimed(registry_store):

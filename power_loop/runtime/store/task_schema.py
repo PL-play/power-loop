@@ -1,22 +1,7 @@
-"""Explicit v14 task schema; ordinary storage uses v12.
+"""Final task storage and the single offline upgrade from deployed protocol 21.
 
-No live store is migrated by opening it. A maintenance caller must close writers
-and explicitly invoke migrate_task_schema; old binaries reject the current stamp or
-the unknown task protocol. Protocol27 uses source-owned stop/input permissions,
-target-only outcomes (including explicit refusals), and source acknowledgements.
-Protocol26 gives cross-tree stop requests source-owned
-acceptance/completion originals and a separate target receipt. Protocol25 owns
-processing decisions in the handler's tree; target handling flags remain derived.
-Protocol21 permits independent initial accounting evidence without a model
-exit record. Protocol 23 adds atomic session change counters. Older writers must
-not overwrite this evidence or release execution.
-Protocol35 retains host context-control originals in task_context_events.
-Protocol36 records metadata operations through source-owned control permissions.
-Protocol37 fences first executor registration against unregistered claims.
-Protocol38 fences first budget-policy activation against unbudgeted sends.
-Protocol39 serializes control writers by their root job instead of task_store.
-Protocol40 stores response usage in the response original instead of a separate write.
-Protocol41 fences ordinary message/state writes with every retained ancestor generation.
+Ordinary opening never upgrades a store. Intermediate development protocols were
+never released and have no migration path. Stop all writers before maintenance.
 """
 
 from __future__ import annotations
@@ -51,16 +36,13 @@ _QUERY_INDEXES = {
     'idx_context_capacity': ('context_cache', ('size_bytes',)),
     'idx_obligations_job': ('session_obligations', ('job_id',)),
 }
-_PROTOCOL_2_TABLES = ("task_store", "jobs", "job_events")
-_PROTOCOL_3_TABLES = (*_PROTOCOL_2_TABLES, "task_executors", "task_executor_events")
-_PROTOCOL_21_TABLES = (*_PROTOCOL_3_TABLES, "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
-_PROTOCOL_23_TABLES = (*_PROTOCOL_21_TABLES, "execution_checkpoints", "execution_batches", "execution_allocations",
-                      "session_controls")
-_PROTOCOL_34_TABLES = (*_PROTOCOL_23_TABLES, "session_obligations")
-_PROTOCOL_35_TABLES = (*_PROTOCOL_34_TABLES, "task_context_events")
-_PROTOCOL_37_TABLES = (*_PROTOCOL_35_TABLES, "task_executor_admissions")
-TASK_TABLES = (*_PROTOCOL_37_TABLES, "task_principal_admissions")
-
+DEPLOYED_TASK_SCHEMA_VERSION = 10
+DEPLOYED_TASK_PROTOCOL_VERSION = 21
+_DEPLOYED_TASK_TABLES = ("task_store", "jobs", "job_events", "task_executors", "task_executor_events",
+                         "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
+TASK_TABLES = (*_DEPLOYED_TASK_TABLES, "execution_checkpoints", "execution_batches", "execution_allocations",
+               "session_controls", "session_obligations", "task_context_events", "task_executor_admissions",
+               "task_principal_admissions")
 
 def message_identity_ddl(statement: str, name: str) -> str:
     identities = {
@@ -202,7 +184,7 @@ async def verify_task_schema(db: Database, prefix: str) -> None:
 
 async def _verify_query_indexes(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSION):
     indexes = {name: spec for name, spec in _QUERY_INDEXES.items()
-               if protocol >= 24 or spec[0] != "session_obligations"}
+               if protocol == TASK_PROTOCOL_VERSION or spec[0] != "session_obligations"}
     expected = {prefix+suffix: columns for suffix, (_table, columns) in indexes.items()}
     owners = {prefix+suffix: prefix+table for suffix, (table, _columns) in indexes.items()}
     actual = {}
@@ -238,11 +220,11 @@ async def _verify_query_indexes(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSIO
 
 
 async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSION):
-    tables = (_PROTOCOL_2_TABLES if protocol == 2 else _PROTOCOL_3_TABLES if protocol == 3
-              else _PROTOCOL_21_TABLES if protocol < 22 else _PROTOCOL_23_TABLES if protocol < 24
-              else _PROTOCOL_34_TABLES if protocol < 35 else _PROTOCOL_35_TABLES if protocol < 37
-              else _PROTOCOL_37_TABLES if protocol < 38 else TASK_TABLES)
-    base = (*_STORE_TABLES, *_STORE_VIEWS) if protocol >= 40 else tuple(
+    if protocol not in (DEPLOYED_TASK_PROTOCOL_VERSION, TASK_PROTOCOL_VERSION):
+        raise StoreSchemaError("unsupported task protocol; only deployed 21 or the final protocol is supported")
+    final = protocol == TASK_PROTOCOL_VERSION
+    tables = TASK_TABLES if final else _DEPLOYED_TASK_TABLES
+    base = (*_STORE_TABLES, *_STORE_VIEWS) if final else tuple(
         'usage_rounds' if name == 'usage_observations' else name for name in _STORE_TABLES)
     missing = [t for t in (*base, *tables) if not await _table_exists_tx(tx, db.dialect.name, prefix + t)]
     if missing:
@@ -261,86 +243,83 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
     ):
         if not await _column_exists(tx, db.dialect.name, prefix + "jobs", column):
             raise StoreSchemaError("task control owner schema incomplete")
-    if protocol >= 3:
-        if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
-            raise StoreSchemaError("task executor binding schema incomplete")
-        for table, columns in (
+    if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
+        raise StoreSchemaError("task executor binding schema incomplete")
+    for table, columns in (
+        (
+            "task_executors",
             (
-                "task_executors",
-                (
-                    "executor_key",
-                    "tenant_id",
-                    "principal_id",
-                    "executor_id",
-                    "boot_id",
-                    "contract_hash",
-                    "state",
-                    "version",
-                    "lease_until_ms",
-                    "created_at",
-                    "updated_at",
-                ),
-            ),
-            (
-                "task_executor_events",
-                ("event_id", "executor_key", "action", "operation_key", "request_hash", "payload_json", "created_at"),
-            ),
-        ):
-            for column in columns:
-                if not await _column_exists(tx, db.dialect.name, prefix + table, column):
-                    raise StoreSchemaError("task executor schema incomplete")
-
-    if protocol >= 4:
-        required = {
-            "task_budget_policies": {
-                "policy_key",
+                "executor_key",
                 "tenant_id",
                 "principal_id",
-                "request_hash",
-                "manifest_json",
-                "enabled",
-                "created_at",
-            },
-            "task_budget_scopes": {
-                "scope_key",
-                "policy_key",
-                "limits_hash",
-                "limits_json",
-                "counters_hash",
-                "counters_json",
-            },
-            "task_budget_attempts": {
-                "attempt_id",
-                "job_id",
-                "policy_key",
+                "executor_id",
+                "boot_id",
+                "contract_hash",
+                "state",
                 "version",
-                "phase",
-                "pending",
-                "state_hash",
-                "state_json",
+                "lease_until_ms",
                 "created_at",
                 "updated_at",
-            },
-        }
-        actual = {}
-        if db.dialect.name == "sqlite":
-            for table in required:
-                rows = await tx.fetchall(f"PRAGMA table_info({prefix}{table})")
-                actual[prefix + table] = {row["name"] for row in rows}
-        else:
-            current = "current_schema()" if db.dialect.name == "postgres" else "DATABASE()"
-            rows = await tx.fetchall(
-                "SELECT table_name AS budget_table,column_name AS budget_column FROM information_schema.columns "
-                f"WHERE table_schema={current} AND table_name IN (?,?,?)",
-                tuple(prefix + table for table in required),
-            )
-            for row in rows:
-                actual.setdefault(row["budget_table"], set()).add(row["budget_column"])
-        if any(not columns.issubset(actual.get(prefix + table, set())) for table, columns in required.items()):
-            raise StoreSchemaError("task budget schema incomplete")
-    if protocol >= 18:
-        await _verify_query_indexes(tx, db, prefix, protocol=protocol)
-    if protocol >= 22:
+            ),
+        ),
+        (
+            "task_executor_events",
+            ("event_id", "executor_key", "action", "operation_key", "request_hash", "payload_json", "created_at"),
+        ),
+    ):
+        for column in columns:
+            if not await _column_exists(tx, db.dialect.name, prefix + table, column):
+                raise StoreSchemaError("task executor schema incomplete")
+
+    required = {
+        "task_budget_policies": {
+            "policy_key",
+            "tenant_id",
+            "principal_id",
+            "request_hash",
+            "manifest_json",
+            "enabled",
+            "created_at",
+        },
+        "task_budget_scopes": {
+            "scope_key",
+            "policy_key",
+            "limits_hash",
+            "limits_json",
+            "counters_hash",
+            "counters_json",
+        },
+        "task_budget_attempts": {
+            "attempt_id",
+            "job_id",
+            "policy_key",
+            "version",
+            "phase",
+            "pending",
+            "state_hash",
+            "state_json",
+            "created_at",
+            "updated_at",
+        },
+    }
+    actual = {}
+    if db.dialect.name == "sqlite":
+        for table in required:
+            rows = await tx.fetchall(f"PRAGMA table_info({prefix}{table})")
+            actual[prefix + table] = {row["name"] for row in rows}
+    else:
+        current = "current_schema()" if db.dialect.name == "postgres" else "DATABASE()"
+        rows = await tx.fetchall(
+            "SELECT table_name AS budget_table,column_name AS budget_column FROM information_schema.columns "
+            f"WHERE table_schema={current} AND table_name IN (?,?,?)",
+            tuple(prefix + table for table in required),
+        )
+        for row in rows:
+            actual.setdefault(row["budget_table"], set()).add(row["budget_column"])
+    if any(not columns.issubset(actual.get(prefix + table, set())) for table, columns in required.items()):
+        raise StoreSchemaError("task budget schema incomplete")
+    await _verify_query_indexes(tx, db, prefix, protocol=protocol)
+    if final:
         for table, columns in (
             ("execution_checkpoints", ("job_id", "generation", "identity_json", "identity_hash",
                                        "batch_no", "chain_hash", "summary_json", "summary_hash", "admission_nonce")),
@@ -352,21 +331,21 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
             for column in columns:
                 if not await _column_exists(tx, db.dialect.name, prefix + table, column):
                     raise StoreSchemaError("execution checkpoint schema incomplete")
-    if protocol >= 23:
+    if final:
         from .change_signals import COLUMNS
         for column in COLUMNS:
             if not await _column_exists(tx, db.dialect.name, prefix + "session_state", column):
                 raise StoreSchemaError("session change counters incomplete")
-    if protocol >= 24:
+    if final:
         from ..session_obligations import COLUMNS
         for column in COLUMNS:
             if not await _column_exists(tx, db.dialect.name, prefix + "session_obligations", column):
                 raise StoreSchemaError("session obligation schema incomplete")
-    if protocol >= 37:
+    if final:
         for column in ('group_key', 'registered'):
             if not await _column_exists(tx, db.dialect.name, prefix+'task_executor_admissions', column):
                 raise StoreSchemaError('executor admission schema incomplete')
-    if protocol >= 38:
+    if final:
         for column in ('policy_key', 'policy_hash'):
             if not await _column_exists(tx, db.dialect.name, prefix+'task_principal_admissions', column):
                 raise StoreSchemaError('principal admission schema incomplete')
@@ -408,12 +387,11 @@ async def ensure_task_schema(db: Database, prefix: str, *, create: bool) -> int:
 
 
 async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = False) -> None:
-    """Explicit v9→v10 or older supported task protocols→current maintenance migration.
+    """Upgrade deployed task schema 10/protocol 21 directly to the final format.
 
-    SQLite/PG are transactional. MySQL uses an atomic ALTER for the raw table;
-    the following idempotent steps allow an interrupted DDL run to be resumed.
-    No messages are deleted, and the stamp changes last. This is not permission
-    to migrate a production database without the bridge/release acceptance gate.
+    Re-running final-format maintenance only rebuilds derived data. MySQL DDL
+    may commit independently; repeatable DDL precedes all accounting imports,
+    and both version stamps change last in the same data transaction.
     """
     validate_table_prefix(prefix)
     if not maintenance:
@@ -421,135 +399,52 @@ async def migrate_task_schema(db: Database, prefix: str, *, maintenance: bool = 
     async with db.transaction() as tx:
         await _acquire_provision_lock(tx, db, prefix)
         try:
-            row = await tx.fetchone(f"SELECT version FROM {prefix}schema_migrations WHERE id=1")
-            if row is None or int(row["version"]) not in (9, 10, 11, 12, 13, TASK_SCHEMA_VERSION):
-                raise StoreSchemaError("task migration supports base or task schemas only")
+            stamp = await tx.fetchone(f"SELECT version FROM {prefix}schema_migrations WHERE id=1")
+            owned = await _table_exists_tx(tx, db.dialect.name, prefix+'task_store')
+            identity = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1") if owned else None
+            source = (int(stamp['version']), int(identity['protocol_version'])) if stamp and identity else None
+            deployed = (DEPLOYED_TASK_SCHEMA_VERSION, DEPLOYED_TASK_PROTOCOL_VERSION)
+            current = (TASK_SCHEMA_VERSION, TASK_PROTOCOL_VERSION)
+            if source not in (deployed, current):
+                raise StoreSchemaError("unsupported_migration_source: expected schema 10/protocol 21 or final format")
+            from .message_usage import migrate as migrate_usage
+            if source == deployed:
+                # A MySQL retry can find the already committed rename. Restore
+                # the reporting view before checking the deployed read shape.
+                if await _table_exists_tx(tx, db.dialect.name, prefix+'usage_observations'):
+                    await migrate_usage(tx, db, prefix)
+                await _verify_task_schema_tx(tx, db, prefix, protocol=DEPLOYED_TASK_PROTOCOL_VERSION)
+            elif not await _table_exists_tx(tx, db.dialect.name, prefix+'task_context_events'):
+                raise StoreSchemaError('task context original table missing; restore originals before maintenance')
             from .change_signals import migration_steps
             for statement in await migration_steps(tx, db, prefix):
                 await tx.execute(statement)
-            if int(row["version"]) in (10, 12, 13, TASK_SCHEMA_VERSION) and await _table_exists_tx(tx, db.dialect.name, prefix+'task_store'):
-                identity = await tx.fetchone(f"SELECT store_id,protocol_version FROM {prefix}task_store WHERE id=1")
-                if identity and identity["protocol_version"] in (*range(2, 24), 34, 35, 36, 37, 38, 39, 40):
-                    old_protocol = identity["protocol_version"]
-                    from .message_usage import migrate as migrate_usage
-                    # MySQL can commit the rename before an offline importer
-                    # dies. Recreate its derived view before verifying the old
-                    # read shape;the original observation table stays intact.
-                    if await _table_exists_tx(tx, db.dialect.name, prefix+'usage_observations'):
-                        await migrate_usage(tx, db, prefix)
-                    await _verify_task_schema_tx(tx, db, prefix, protocol=old_protocol)
-                    await migrate_usage(tx, db, prefix)
-                    from .operation_migration import verify_operation_records
-                    await verify_operation_records(tx, prefix)
-                    if not await _column_exists(tx, db.dialect.name, prefix + "jobs", "executor_key"):
-                        kind = "VARCHAR(64)" if db.dialect.name == "mysql" else "TEXT"
-                        await tx.execute(f"ALTER TABLE {prefix}jobs ADD COLUMN executor_key {kind}")
-                    await _run_task_ddl(tx, db, prefix)
-                    from .execution_migration import import_accounting
-                    if old_protocol < 22:
-                        await import_accounting(tx, db, prefix)
-                    if old_protocol < 35:
-                        from .context_migration import import_context_events
-                        await import_context_events(tx, db, prefix)
-                    from ..executor_admissions import rebuild
-                    await rebuild(tx, prefix, identity['store_id'])
-                    from ..budget_admissions import rebuild as rebuild_principals
-                    await rebuild_principals(tx, prefix, identity['store_id'])
-                    await _rebuild_obligations(tx, db, prefix, identity["store_id"])
-                    if (
-                        await tx.execute(
-                            f"UPDATE {prefix}task_store SET protocol_version=? WHERE id=1 AND protocol_version=?",
-                            (TASK_PROTOCOL_VERSION, old_protocol),
-                        )
-                        != 1
-                    ):
-                        raise StoreSchemaError("task executor migration conflict")
-                elif identity and identity['protocol_version'] == TASK_PROTOCOL_VERSION:
-                    # Explicit maintenance can add missing candidate indexes;
-                    # ordinary open must never silently mutate a live schema.
-                    if not await _table_exists_tx(tx, db.dialect.name, prefix+'task_context_events'):
-                        raise StoreSchemaError('task context original table missing; restore originals before maintenance')
-                    from .operation_migration import verify_operation_records
-                    await verify_operation_records(tx, prefix)
-                    await _run_task_ddl(tx, db, prefix)
-                    from .message_usage import migrate as migrate_usage
-                    await migrate_usage(tx, db, prefix)
-                    from ..executor_admissions import rebuild
-                    await rebuild(tx, prefix, identity['store_id'])
-                    from ..budget_admissions import rebuild as rebuild_principals
-                    await rebuild_principals(tx, prefix, identity['store_id'])
-                    await _rebuild_obligations(tx, db, prefix, identity["store_id"])
-                await _verify_task_schema_tx(tx, db, prefix)
-                await tx.execute(f"UPDATE {prefix}schema_migrations SET version=? WHERE id=1", (TASK_SCHEMA_VERSION,))
-                return
-            table = prefix + "messages"
-            if not await _column_exists(tx, db.dialect.name, table, "id"):
-                if db.dialect.name == "sqlite":
-                    if await _table_exists_tx(tx, "sqlite", table + "_v10"):
-                        raise StoreSchemaError("unexpected migration table requires inspection")
-                    tables = await tx.fetchall("SELECT name FROM sqlite_master WHERE type='table'")
-                    for item in tables:
-                        quoted = '"' + str(item["name"]).replace('"', '""') + '"'
-                        references = await tx.fetchall(f"PRAGMA foreign_key_list({quoted})")
-                        if any(ref["table"] == table for ref in references):
-                            raise StoreSchemaError("custom foreign key requires a reviewed migration")
-                    custom = await tx.fetchall(
-                        "SELECT name FROM sqlite_master "
-                        "WHERE tbl_name=? AND sql IS NOT NULL AND type IN ('index','trigger') AND name<>?",
-                        (table, prefix + "idx_messages_session_state"),
-                    )
-                    columns_before = await tx.fetchall(f"PRAGMA table_info({table})")
-                    expected = {
-                        "session_id",
-                        "seq",
-                        "role",
-                        "name",
-                        "content",
-                        "tool_calls_json",
-                        "tool_call_id",
-                        "round_index",
-                        "state",
-                        "meta_json",
-                        "send_index",
-                        "created_at",
-                    }
-                    if custom or {row["name"] for row in columns_before} != expected:
-                        raise StoreSchemaError("custom message schema/index/trigger requires a reviewed migration")
-                    statement = next(
-                        s for s in db.dialect.ddl(prefix) if s.startswith(f"CREATE TABLE IF NOT EXISTS {table} (")
-                    )
-                    await tx.execute(message_identity_ddl(statement, "sqlite").replace(table, table + "_v10", 1))
-                    columns = (
-                        "session_id,seq,role,name,content,tool_calls_json,tool_call_id,"
-                        "round_index,state,meta_json,send_index,created_at"
-                    )
-                    await tx.execute(
-                        f"INSERT INTO {table}_v10 ({columns}) SELECT {columns} FROM {table} ORDER BY session_id,seq"
-                    )
-                    await tx.execute(f"DROP TABLE {table}")
-                    await tx.execute(f"ALTER TABLE {table}_v10 RENAME TO {table}")
-                    await tx.execute(
-                        f"CREATE INDEX {prefix}idx_messages_session_state ON {table}(session_id,state,seq)"
-                    )
-                elif db.dialect.name == "postgres":
-                    await tx.execute(f"ALTER TABLE {table} ADD COLUMN id BIGINT GENERATED BY DEFAULT AS IDENTITY")
-                    await tx.execute(f"ALTER TABLE {table} DROP CONSTRAINT {table}_pkey")
-                    await tx.execute(f"ALTER TABLE {table} ADD PRIMARY KEY (id)")
-                    await tx.execute(f"ALTER TABLE {table} ADD UNIQUE (session_id,seq)")
-                else:
-                    await tx.execute(
-                        f"ALTER TABLE {table} ADD COLUMN id BIGINT NOT NULL AUTO_INCREMENT, "
-                        "DROP PRIMARY KEY, ADD PRIMARY KEY (id), ADD UNIQUE (session_id,seq)"
-                    )
-            elif db.dialect.name != "mysql":
-                raise StoreSchemaError("unexpected existing raw IDs in v9 require inspection")
-            from .message_usage import migrate as migrate_usage
-            await migrate_usage(tx, db, prefix)
             await _run_task_ddl(tx, db, prefix)
-            await tx.execute(f"UPDATE {prefix}schema_migrations SET version=? WHERE id=1", (TASK_SCHEMA_VERSION,))
+            await migrate_usage(tx, db, prefix)
+            if source == deployed:
+                from .protocol21 import rekey
+                await rekey(tx, prefix)
+            from .operation_migration import verify_operation_records
+            await verify_operation_records(tx, prefix)
+            if source == deployed:
+                from .context_migration import import_context_events
+                from .execution_migration import import_accounting
+                await import_accounting(tx, db, prefix)
+                await import_context_events(tx, db, prefix)
+            from ..budget_admissions import rebuild as rebuild_principals
+            from ..executor_admissions import rebuild
+            await rebuild(tx, prefix, identity['store_id'])
+            await rebuild_principals(tx, prefix, identity['store_id'])
+            await _rebuild_obligations(tx, db, prefix, identity['store_id'])
+            if source == deployed:
+                changed = await tx.execute(f"UPDATE {prefix}task_store SET protocol_version=? "
+                    "WHERE id=1 AND protocol_version=?", (TASK_PROTOCOL_VERSION, DEPLOYED_TASK_PROTOCOL_VERSION))
+                if changed != 1:
+                    raise StoreSchemaError("task migration conflict")
+                await tx.execute(f"UPDATE {prefix}schema_migrations SET version=? WHERE id=1", (TASK_SCHEMA_VERSION,))
+            await _verify_task_schema_tx(tx, db, prefix)
         finally:
             await _release_provision_lock(tx, db, prefix)
-    await verify_task_schema(db, prefix)
 
 
 async def _rebuild_obligations(tx, db, prefix, store_id):

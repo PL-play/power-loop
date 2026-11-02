@@ -205,52 +205,6 @@ async def test_corrupt_or_newer_original_responsibility_cannot_be_cleared_or_ack
         await loop.aclose(drain_timeout_s=.1)
 
 
-async def test_retained_protocol_thirteen_per_item_notices_keep_their_original_route(registry_store):
-    from power_loop.runtime.jobs import JobManager
-    from power_loop.runtime.managed_delivery import enqueue
-    from power_loop.runtime.managed_effects import terminate_unstarted
-    from power_loop.runtime.store.schema import StoreSchemaError
-    from power_loop.runtime.store.task_schema import migrate_task_schema, verify_task_schema
-
-    from ._pre_memory_protocol_fixture import reopen_after_maintenance, retain_pre_memory_format
-    c, source = await pending_batch(registry_store, stage='commit_ack')
-    loop, model = await controller(c)
-    try:
-        children = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
-        for child in children:
-            await terminate_unstarted(c.manager, c.actor, child['job_id'])
-            await enqueue(loop, c.actor, child['job_id'])
-        old_disposition = await retire_pending(loop, c.actor, source['job_id'])
-        assert model.calls == 0
-        await loop.aclose(drain_timeout_s=.1)
-        await retain_pre_memory_format(c, 13)
-        events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
-        raw = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq')
-        with pytest.raises(StoreSchemaError):
-            await verify_task_schema(c.manager.db, c.manager.prefix)
-        with pytest.raises(StoreSchemaError, match='maintenance_required'):
-            await migrate_task_schema(c.manager.db, c.manager.prefix)
-        await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        # The new journal adds import bookkeeping; every original event,
-        # including the two per-item notices, must remain byte-for-byte intact.
-        for event in events:
-            assert await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (event['event_id'],)) == event
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY seq') == raw
-        await reopen_after_maintenance(c, registry_store[1])
-        loop, model = await controller(c)
-        assert JobManager(c.store).store.store_id == c.manager.store.store_id
-        staged = await reconcile_pending(loop, c.actor, source['job_id'])
-        assert len(staged['notices']) == 2 and staged.get('mode') != 'retired_for_abort_review'
-        assert await retire_pending(loop, c.actor, source['job_id']) == old_disposition
-        assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE event_type='source_abort_delivery'")
-        result = await loop.send('Read both original negative outcomes.', c.sid)
-        assert result.status == 'completed' and model.calls == 1
-        assert (await c.manager.get_job(c.actor, source['job_id'])).supervision_status == 'closed'
-        for child in children:
-            saved = await c.manager.get_job(c.actor, child['job_id'])
-            assert saved.result_status == 'suppressed' and saved.supervision_status == 'closed'
-    finally:
-        await loop.aclose(drain_timeout_s=.1)
 
 
 async def test_reused_provider_call_id_does_not_attach_an_earlier_negative_to_a_later_batch(registry_store):

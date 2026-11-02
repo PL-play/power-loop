@@ -267,7 +267,7 @@ async def test_explicit_counter_migration_resumes_partial_ddl_and_preserves_work
         else:
             await store._db.execute(f"UPDATE {store.t.session_state} SET {column}=0")
     await store._db.execute(f"UPDATE {store.table_prefix}schema_migrations SET version=10 WHERE id=1")
-    await store._db.execute(f"UPDATE {store.table_prefix}task_store SET protocol_version=22 WHERE id=1")
+    await store._db.execute(f"UPDATE {store.table_prefix}task_store SET protocol_version=21 WHERE id=1")
     with pytest.raises(StoreSchemaError, match="maintenance migration"):
         await connect(schema="compatible")
     await migrate_task_schema(store._db, store.table_prefix, maintenance=True)

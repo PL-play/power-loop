@@ -23,7 +23,7 @@ from power_loop.runtime.budget_contracts import (
 from power_loop.runtime.jobs import JobError, JobManager, _hash
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.store.schema import StoreSchemaError
-from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, migrate_task_schema, verify_task_schema
+from power_loop.runtime.store.task_schema import verify_task_schema
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 
 from .test_job_registry_192 import registry_store
@@ -381,48 +381,6 @@ async def test_invalid_policy_enabled_projection_cannot_enable_paid_work(budget_
     assert c.host.reserve_calls == 0 and all(v == 0 for v in (await counters(c)).values())
 
 
-@pytest.mark.parametrize("failure", [False, True])
-async def test_explicit_protocol_three_migration_retains_original_ids_and_rejects_old_writers(
-    budget_case, monkeypatch, failure
-):
-    c = budget_case
-    seq = await c.store.append_message(c.sid, role="user", content="retained")
-    ref = await c.store.message_ref(c.sid, seq)
-    for name in ("task_budget_policies", "task_budget_scopes", "task_budget_attempts"):
-        await c.manager.db.execute(f"DROP TABLE {c.manager.prefix}{name}")
-    await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_store SET protocol_version=3 WHERE id=1")
-    with pytest.raises(StoreSchemaError, match="incomplete|unsupported"):
-        await verify_task_schema(c.manager.db, c.manager.prefix)
-    with pytest.raises(StoreSchemaError, match="incomplete|protocol"):
-        await c.connect()
-    with pytest.raises(StoreSchemaError, match="maintenance_required"):
-        await migrate_task_schema(c.manager.db, c.manager.prefix)
-    if failure:
-        from power_loop.runtime.store import task_schema
-
-        original = task_schema._run_task_ddl
-
-        async def broken(*args):
-            await original(*args)
-            raise RuntimeError("budget migration failure")
-
-        with monkeypatch.context() as patch:
-            patch.setattr(task_schema, "_run_task_ddl", broken)
-            with pytest.raises(RuntimeError, match="budget migration failure"):
-                await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        assert (await c.manager.db.fetchone(f"SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1"))[
-            "protocol_version"
-        ] == 3
-    await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    stored = await c.manager.db.fetchone(f"SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1")
-    assert stored["protocol_version"] == TASK_PROTOCOL_VERSION
-    assert await c.store.message_ref(c.sid, seq) == ref
-    # Protocol is checked at startup;no singleton is read by control writers.
-    from power_loop.runtime.store import task_schema
-    async with c.manager.db.read_snapshot() as reader:
-        with pytest.raises(StoreSchemaError, match="protocol"):
-            await task_schema._verify_task_schema_tx(reader, c.manager.db, c.manager.prefix, protocol=3)
 
 
 @pytest.mark.parametrize("budget_case", [{"max_pending": 10}], indirect=True)

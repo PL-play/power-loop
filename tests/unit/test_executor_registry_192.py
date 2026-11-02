@@ -11,8 +11,6 @@ import pytest
 
 from power_loop.runtime import executor_registry as registry
 from power_loop.runtime.jobs import JobActor, JobError, JobManager, _hash
-from power_loop.runtime.store.schema import StoreSchemaError
-from power_loop.runtime.store.task_schema import migrate_task_schema, verify_task_schema
 
 from .test_job_registry_192 import registry_store
 
@@ -249,40 +247,6 @@ async def test_oversized_drain_still_persists_admission_barrier_and_reports_pend
     assert not (await registry.get(c.manager, c.identity))["admission_open"]
 
 
-@pytest.mark.parametrize("failure", [False, True])
-async def test_explicit_protocol_two_migration_preserves_identity_messages_and_jobs(boot, monkeypatch, failure):
-    c = boot
-    reg, _ = await root(c)
-    seq = await c.store.append_message(c.actor.session_id, role="user", content="retained raw")
-    ref = await c.store.message_ref(c.actor.session_id, seq)
-    store_id = c.store.store_id
-    for table in ("task_executors", "task_executor_events"):
-        await c.manager.db.execute(f"DROP TABLE {c.manager.prefix}{table}")
-    suffix = f" ON {c.manager.jobs}" if c.manager.db.dialect.name == "mysql" else ""
-    await c.manager.db.execute(f"DROP INDEX {c.manager.prefix}idx_jobs_executor{suffix}")
-    await c.manager.db.execute(f"ALTER TABLE {c.manager.jobs} DROP COLUMN executor_key")
-    await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_store SET protocol_version=2 WHERE id=1")
-    with pytest.raises(StoreSchemaError, match="incomplete|unsupported"):
-        await verify_task_schema(c.manager.db, c.manager.prefix)
-    with pytest.raises(StoreSchemaError, match="maintenance_required"):
-        await migrate_task_schema(c.manager.db, c.manager.prefix)
-    if failure:
-        from power_loop.runtime.store import task_schema
-        original = task_schema._run_task_ddl
-        async def broken(*args):
-            await original(*args)
-            raise RuntimeError("test: migration DDL failure")
-        with monkeypatch.context() as patch:
-            patch.setattr(task_schema, "_run_task_ddl", broken)
-            with pytest.raises(RuntimeError, match="DDL failure"):
-                await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        row = await c.manager.db.fetchone(f"SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1")
-        assert row["protocol_version"] == 2
-    await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    await verify_task_schema(c.manager.db, c.manager.prefix)
-    assert c.store.store_id == store_id and await c.store.message_ref(c.actor.session_id, seq) == ref
-    assert (await c.manager.get_job(c.actor, reg.job.job_id)).generation == 1
 
 
 @pytest.mark.parametrize("field,value", [("executor_id", ""), ("boot_id", "bad\nboot"), ("executor_id", "x"*65),

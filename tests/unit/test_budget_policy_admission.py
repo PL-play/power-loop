@@ -263,7 +263,7 @@ async def test_first_policy_write_failure_does_not_separate_the_admission_from_i
             await active_loop.aclose(drain_timeout_s=.1)
 
 
-@pytest.mark.parametrize('damage', ['missing-row', 'null-hash', 'wrong-hash', 'missing-table', 'source37'])
+@pytest.mark.parametrize('damage', ['missing-row', 'null-hash', 'wrong-hash', 'missing-table'])
 async def test_explicit_maintenance_rebuilds_principal_admission_from_policy_originals(budget_case, damage):
     c = budget_case
     await c.runtime.shutdown(timeout_s=1)
@@ -277,8 +277,6 @@ async def test_explicit_maintenance_rebuilds_principal_admission_from_policy_ori
         await c.manager.db.execute(f'UPDATE {table} SET policy_hash=?', (None if damage == 'null-hash' else '0'*64,))
     else:
         await c.manager.db.execute(f'DROP TABLE {table}')
-        if damage == 'source37':
-            await c.manager.db.execute(f'UPDATE {c.manager.prefix}task_store SET protocol_version=37 WHERE id=1')
     await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
     assert await c.manager.db.fetchall(f'SELECT * FROM {table}') == before
     assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == originals

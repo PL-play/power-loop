@@ -1,19 +1,11 @@
-"""Release rehearsal: offline native backups, old migration and original recovery."""
+"""Native backup safety checks; protocol-21 upgrade rehearsals live in tests/unit."""
 import pytest
 
 from scripts.acceptance._backup_restore import database_name, restore_copy
-from scripts.acceptance.test_schema_bridge import (
-    test_actual_legacy_protocol_upgrade_original_control_and_accounting as exercise,
-)
 
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.mark.parametrize('backend', ['sqlite', 'postgres'])
-@pytest.mark.parametrize('real', [False, pytest.param(True, marks=pytest.mark.real_llm)])
-async def test_offline_backup_restore_retains_original_ids_usage_and_control(
-        tmp_path, monkeypatch, record_property, backend, real):
-    await exercise(tmp_path, monkeypatch, record_property, backend, real, backup_restore=True)
 
 
 @pytest.mark.parametrize('dsn', ['postgresql://localhost/production', 'sqlite:///db_test',

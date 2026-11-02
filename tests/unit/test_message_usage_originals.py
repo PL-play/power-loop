@@ -112,11 +112,11 @@ async def test_offline_upgrade_renames_usage_originals_and_keeps_existing_reader
     seq = await store.append_message(sid, role='assistant', content='original', send_index=1, round_index=0)
     ref = await store.message_ref(sid, seq)
     await store.record_usage(sid, send_index=1, round_index=0, **USAGE)
-    # Exact previous physical usage shape and stamps;no old runtime or worktree.
+    # Deployed physical usage shape and stamps;no old runtime or worktree.
     await store._db.execute(f'DROP VIEW {store.t.usage_rounds}')
     await store._db.execute(f'ALTER TABLE {store.t.usage_observations} RENAME TO {store.t.usage_rounds}')
-    await store._db.execute(f'UPDATE {store.table_prefix}schema_migrations SET version=13 WHERE id=1')
-    await store._db.execute(f'UPDATE {store.table_prefix}task_store SET protocol_version=39 WHERE id=1')
+    await store._db.execute(f'UPDATE {store.table_prefix}schema_migrations SET version=10 WHERE id=1')
+    await store._db.execute(f'UPDATE {store.table_prefix}task_store SET protocol_version=21 WHERE id=1')
     with pytest.raises(StoreSchemaError, match='explicit maintenance'):
         await connect()
     with pytest.raises(StoreSchemaError, match='maintenance_required'):

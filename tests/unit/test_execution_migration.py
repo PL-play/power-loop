@@ -9,6 +9,7 @@ from power_loop.runtime.jobs import _hash, _json
 from power_loop.runtime.store.schema import StoreSchemaError
 from power_loop.runtime.store.task_schema import migrate_task_schema
 
+from ._protocol21_fixture import retain_protocol21_format
 from .test_budget_reconcile_192 import reopened
 from .test_job_registry_192 import registry_store
 from .test_model_budgets_192 import budget_case, counters, observed, start
@@ -29,7 +30,7 @@ async def protocol21(c, attempt):
                      (_json(value), _hash(value), "mb_" + _hash([attempt.attempt_id, value["version"]])[:48]))
     for table in ("execution_batches", "execution_checkpoints", "execution_allocations"):
         await db.execute(f"DELETE FROM {p}{table}")
-    await db.execute(f"UPDATE {p}task_store SET protocol_version=21 WHERE id=1")
+    await retain_protocol21_format(c.store)
     return value
 
 
@@ -71,4 +72,7 @@ async def test_import_rejects_inconsistent_original_balance(budget_case):
         await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
     [stamp] = await c.manager.db.fetchall(f"SELECT protocol_version FROM {c.manager.prefix}task_store")
     assert stamp["protocol_version"] == 21
-    assert not await c.manager.db.fetchall(f"SELECT * FROM {c.manager.prefix}execution_checkpoints")
+    from power_loop.runtime.store.schema import _table_exists_tx
+    async with c.manager.db.read_snapshot() as reader:
+        if await _table_exists_tx(reader, c.manager.db.dialect.name, c.manager.prefix+'execution_checkpoints'):
+            assert not await reader.fetchall(f"SELECT * FROM {c.manager.prefix}execution_checkpoints")

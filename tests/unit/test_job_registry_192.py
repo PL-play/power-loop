@@ -13,7 +13,12 @@ import pytest
 from power_loop.runtime.jobs import JobActor, JobError, JobLease, JobManager
 from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.store.schema import _STORE_TABLES
-from power_loop.runtime.store.task_schema import TASK_SCHEMA_VERSION, TASK_TABLES, migrate_task_schema
+from power_loop.runtime.store.task_schema import (
+    TASK_PROTOCOL_VERSION,
+    TASK_SCHEMA_VERSION,
+    TASK_TABLES,
+    migrate_task_schema,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -53,7 +58,11 @@ async def registry_store(request, tmp_path):
                     # The first connection for this prefix belongs to the
                     # fixture until cleanup. A reopened handle may already
                     # have been explicitly closed by the case.
-                    await assert_obligation_projection(targets[0], active_prefix)
+                    identity = await targets[0]._db.fetchone(f'SELECT protocol_version FROM {active_prefix}task_store WHERE id=1')
+                    # An intentionally retained protocol-21 fixture has no
+                    # final-format pending index to compare after rollback.
+                    if identity and identity['protocol_version'] == TASK_PROTOCOL_VERSION:
+                        await assert_obligation_projection(targets[0], active_prefix)
         finally:
             if backend != "sqlite":
                 for active_prefix in prefixes:
