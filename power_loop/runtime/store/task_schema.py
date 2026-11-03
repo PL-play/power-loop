@@ -120,6 +120,10 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             version {integer} NOT NULL, phase {small} NOT NULL, pending INTEGER NOT NULL,
             state_hash {small} NOT NULL, state_json {body} NOT NULL,
             created_at {integer} NOT NULL, updated_at {integer} NOT NULL){opts}""",
+        f"""CREATE TABLE IF NOT EXISTS {prefix}task_costs (
+            cost_id {small} PRIMARY KEY, run_id {sid} NOT NULL,
+            kind {small} NOT NULL, amount {small} NOT NULL, currency {small} NOT NULL,
+            meta_json {body}, created_at {integer} NOT NULL){opts}""",
         *control_tables_ddl(name, prefix),
         f"""CREATE TABLE IF NOT EXISTS {prefix}session_controls (
             session_id {sid} PRIMARY KEY, version {integer} NOT NULL){opts}""",
@@ -143,6 +147,7 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
         f"CREATE INDEX {prefix}idx_executor_scope ON {prefix}task_executors(tenant_id,principal_id,executor_id)",
         f"CREATE INDEX {prefix}idx_executor_events ON {prefix}task_executor_events(executor_key,created_at,event_id)",
         f"CREATE INDEX {prefix}idx_budget_pending ON {prefix}task_budget_attempts(policy_key,pending,updated_at,attempt_id)",
+        f"CREATE INDEX {prefix}idx_costs_run ON {prefix}task_costs(run_id,created_at,cost_id)",
     ]
 
 

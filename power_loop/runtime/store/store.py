@@ -2456,6 +2456,46 @@ class SessionStore:
                              "background_version=background_version+1,runtime_version=runtime_version+1 WHERE session_id=?", (new_id,))
         return new_id
 
+    async def write_costs(self, items: list) -> None:
+        """Batch write cost items to task_costs table.
+
+        This is called by BatchedCostSink to persist buffered cost records.
+        Items are written in a single transaction for efficiency.
+
+        Args:
+            items: List of CostItem objects to persist
+        """
+        if not items:
+            return
+
+        import json
+        import secrets
+
+        # Prepare batch insert values
+        values = []
+        for item in items:
+            cost_id = secrets.token_urlsafe(16)
+            meta_json = json.dumps(item.meta) if item.meta else None
+            values.append((
+                cost_id,
+                item.run_id,
+                item.kind,
+                str(item.amount),  # Store Decimal as string
+                item.currency,
+                meta_json,
+                item.created_at,
+            ))
+
+        # Batch insert
+        async with self._db.transaction() as tx:
+            for val in values:
+                await tx.execute(
+                    f"INSERT INTO {self.table_prefix}task_costs "
+                    "(cost_id, run_id, kind, amount, currency, meta_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    val
+                )
+
 # ── row converters (dict rows; backend-agnostic) ────────────────────────────────
 
 
