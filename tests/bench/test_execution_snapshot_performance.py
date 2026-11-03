@@ -25,15 +25,30 @@ pytestmark = [pytest.mark.bench, pytest.mark.asyncio]
 
 async def create_test_state(store, manager, job_id="perf_test_job", with_snapshot=True):
     """Create ExecutionState for performance testing."""
+    from power_loop.runtime.jobs import JobActor
+
+    # Create session and actor
+    session_id = await store.create_session()
+    actor = JobActor("perf_tenant", "perf_principal", session_id)
+
+    # Register job (required for inspect_from_snapshot and inspect_from_journal)
+    registration = await manager.register_job(
+        actor,
+        kind="send",
+        title="Performance Test",
+        session_id=session_id,
+        system_key=f"perf-test-{job_id}"
+    )
+
     identity = ExecutionIdentity(
         store.store_id,
-        job_id,
+        registration.job.job_id,  # Use system-generated job_id
         1,
         "perf_executor",
         "perf_boot",
         "perf_tenant",
         "perf_principal",
-        "perf_session"
+        session_id
     )
 
     journal = ExecutionJournal(store)
@@ -45,7 +60,7 @@ async def create_test_state(store, manager, job_id="perf_test_job", with_snapsho
     )
 
     await journal.create(identity, state.summary())
-    return state, identity
+    return state, identity, actor
 
 
 @pytest.mark.asyncio
@@ -53,10 +68,9 @@ async def test_benchmark_snapshot_vs_journal_inspection(registry_store):
     """Benchmark: snapshot inspection vs journal recovery speed."""
     store, connect = registry_store
     manager = JobManager(store)
-    actor = JobActor("tenant", "host", await store.create_session())
 
     # Create state and simulate workload
-    state, identity = await create_test_state(store, manager)
+    state, identity, actor = await create_test_state(store, manager)
 
     # Simulate workload: 50 operations, 10 checkpoints
     for batch in range(10):
@@ -100,7 +114,7 @@ async def test_snapshot_size_growth(registry_store):
     store, connect = registry_store
     manager = JobManager(store)
 
-    state, identity = await create_test_state(store, manager)
+    state, identity, _ = await create_test_state(store, manager)
 
     sizes = []
 
@@ -142,7 +156,7 @@ async def test_checkpoint_overhead_comparison(registry_store):
     print(f"\n=== Checkpoint Overhead Comparison ===")
 
     # Test 1: Without snapshot
-    state_no_snap, identity_no_snap = await create_test_state(
+    state_no_snap, identity_no_snap, _ = await create_test_state(
         store, manager, job_id="perf_no_snap", with_snapshot=False
     )
 
@@ -153,7 +167,7 @@ async def test_checkpoint_overhead_comparison(registry_store):
     time_no_snap = time.time() - start
 
     # Test 2: With snapshot
-    state_with_snap, identity_with_snap = await create_test_state(
+    state_with_snap, identity_with_snap, _ = await create_test_state(
         store, manager, job_id="perf_with_snap", with_snapshot=True
     )
 
@@ -180,7 +194,7 @@ async def test_snapshot_consistency_over_time(registry_store):
     store, connect = registry_store
     manager = JobManager(store)
 
-    state, identity = await create_test_state(store, manager)
+    state, identity, _ = await create_test_state(store, manager)
 
     print(f"\n=== Snapshot Consistency Test ===")
 
@@ -215,9 +229,8 @@ async def test_large_workload_performance(registry_store):
     """Benchmark with large workload (100 checkpoints)."""
     store, connect = registry_store
     manager = JobManager(store)
-    actor = JobActor("tenant", "host", await store.create_session())
 
-    state, identity = await create_test_state(store, manager, job_id="large_workload")
+    state, identity, actor = await create_test_state(store, manager, job_id="large_workload")
 
     print(f"\n=== Large Workload Performance ===")
 

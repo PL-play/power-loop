@@ -58,7 +58,7 @@ class ExecutionSnapshot:
             raise JobError("unsupported_snapshot_version")
         if self.snapshot_type not in ("intermediate", "final"):
             raise JobError("invalid_snapshot_type")
-        if self.checkpoint_reason not in ("periodic", "forced", "error", "pause", "complete"):
+        if self.checkpoint_reason not in ("periodic", "forced", "error", "pause", "complete", "reconstructed"):
             raise JobError("invalid_checkpoint_reason")
 
     def to_dict(self) -> dict[str, Any]:
