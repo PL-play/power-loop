@@ -95,7 +95,7 @@ async def import_accounting(tx, db, prefix):
             async def projector(tx, identity, records):
                 await project_events(manager, tx, identity, records)
             journal = ExecutionJournal(store, projector=projector)
-            state = ExecutionState(identity, journal, lease_until_ms=0)
+            state = ExecutionState(identity, journal, lease_until_ms=0, manager=manager)
             state.closed = True
             records = []
             for original, scopes, booked in attempts:
