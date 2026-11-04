@@ -1,0 +1,140 @@
+"""Provider rejections get one repaired request; repeated failure stays explicit."""
+import json
+from dataclasses import replace
+
+import pytest
+
+from power_loop import AgentLoopConfig, LLMResponse, LLMRetryPolicy, LLMTokenUsage, StatefulAgentLoop
+from power_loop.contracts.errors import CompactionFailed
+from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
+from power_loop.runtime.history_sanitize import sanitize_request_messages
+from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.response_capture import ResponseCaptureReceipt
+from power_loop.runtime.retry import request_repair_kind
+from power_loop.runtime.task_runtime import TaskRuntime
+from tests.unit.test_fold_calls_192 import FoldHost
+from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
+from tests.unit.test_request_sanitize import StrictModel, assert_valid_request, assistant, call
+from tests.unit.test_stateful_loop import _echo_registry
+
+
+class Rejection(Exception):
+    status_code = 400
+
+
+class RepairModel(StrictModel):
+    def __init__(self, kind, *, fails_twice=False, summary_fails=False):
+        super().__init__()
+        self.kind, self.fails_twice, self.summary_fails = kind, fails_twice, summary_fails
+        self.main_requests, self.summaries = [], 0
+
+    async def complete(self, request, **kwargs):
+        assert_valid_request(request.to_messages())
+        usage = LLMTokenUsage(prompt_tokens=3, completion_tokens=2, total_tokens=5)
+        if str(request.messages[0].get("content", "")).startswith("You are a conversation summarizer"):
+            self.summaries += 1
+            if self.summary_fails:
+                raise Rejection("maximum context length exceeded")
+            return LLMResponse(raw_text="<summary>Old tool returned known.</summary>", token_usage=usage)
+        self.main_requests.append(request)
+        if len(self.main_requests) == 1 or self.fails_twice:
+            raise Rejection("invalid messages: tool_call format" if self.kind == "format"
+                            else "maximum context length exceeded")
+        return LLMResponse(raw_text="recovered", token_usage=usage)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["format", "context"])
+@pytest.mark.parametrize("fails_twice", [False, True])
+@pytest.mark.parametrize("mode", ["plain", "managed", "budgeted"])
+async def test_rejected_history_recovers_once(registry_store, kind, fails_twice, mode):  # noqa: F811
+    store, _ = registry_store
+    model = RepairModel(kind, fails_twice=fails_twice)
+    host = FoldHost()
+    host.service = model
+    original_prepare = host.prepare
+
+    async def prepare(context, request, *, service, purpose=None):
+        plan = await original_prepare(context, request, service=service, purpose=purpose)
+        return replace(plan, token_bound=max(plan.token_bound, request.max_tokens))
+    host.prepare = prepare
+
+    async def capture(packet):
+        return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, "captured")
+    host.capture_response = capture
+    budget = BudgetConfig("repair", (LocalBudgetScope("shared", max_calls=20, max_tokens=100000),), host)
+    runtime = (None if mode == "plain" else TaskRuntime(JobManager(store), tenant_id="eval",
+        principal_id="host", executor_id="repair", boot_id="boot", boot_contract_hash="a" * 64,
+        budget_config=budget if mode == "budgeted" else None))
+    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=_echo_registry(),
+        config=AgentLoopConfig(compactor=None, delegation_policy="single_level", max_tokens=20,
+            retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0, give_up_on=None)))
+    try:
+        sid = await loop.new_session()
+        for msg in [{"role": "user", "content": "old details " * 200}, assistant(call("old")),
+                    {"role": "tool", "tool_call_id": "old", "content": "known"}]:
+            await store.append_message(sid, **msg)
+        before = await store.load_active_messages(sid)
+        if fails_twice:
+            with pytest.raises(Rejection):
+                await loop.send("continue", sid)
+        else:
+            assert (await loop.send("continue", sid)).final_text == "recovered"
+        assert len(model.main_requests) == 2
+        assert model.summaries == (1 if kind == "context" else 0)
+        first, second = [r.messages for r in model.main_requests]
+        assert any(m.get("tool_calls") for m in first)
+        assert not any(m.get("tool_calls") for m in second)
+        assert "known" in str(second)
+        if kind == "context":
+            assert len(json.dumps(second)) < len(json.dumps(first))
+        assert (await store.load_active_messages(sid))[:len(before)] == before
+        if mode == "budgeted":
+            assert host.reserve_calls == host.apply_calls == (3 if kind == "context" else 2)
+            rows = await store._db.fetchall(f"SELECT state_json FROM {store.table_prefix}task_budget_attempts")
+            observations = [json.loads(r['state_json'])['observation'] for r in rows]
+            zero = [o for o in observations if o['usage']['total_tokens'] == 0]
+            assert len(zero) == (2 if fails_twice else 1)
+            assert all(not o['estimated'] and o['status'] == 'returned' for o in zero)
+    finally:
+        await loop.aclose()
+
+
+def test_strict_repair_preserves_current_tool_round():
+    source = [assistant(call("old")), {"role": "tool", "tool_call_id": "old", "content": "old result"},
+              {"role": "user", "content": "next"}, assistant(call("current")),
+              {"role": "tool", "tool_call_id": "current", "content": "current result"}]
+    out = sanitize_request_messages(source, strict=True)
+    assert_valid_request(out)
+    assert "old result" in out[0]["content"] and "tool_calls" not in out[0]
+    assert out[-2]["tool_calls"][0]["id"] == "current"
+    assert out[-1]["content"] == "current result"
+
+
+@pytest.mark.parametrize("status,detail,expected", [
+    (400, "context_length_exceeded", "context"), (413, "prompt is too long", "context"),
+    (422, "messages invalid", "format"), (400, "reasoning_content is missing", "format"),
+    (401, "messages invalid", None), (400, "invalid model", None), (500, "messages invalid", None),
+])
+def test_request_rejection_classifier(status, detail, expected):
+    error = Rejection(detail)
+    error.status_code = status
+    assert request_repair_kind(error) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_history", [False, True])
+async def test_uncompressible_request_fails_without_identical_retry(tmp_path, old_history):
+    model = RepairModel("context", summary_fails=True)
+    loop = StatefulAgentLoop(llm=model, db_path=str(tmp_path / "s.db"), config=AgentLoopConfig(compactor=None))
+    try:
+        sid = await loop.new_session()
+        if old_history:
+            await loop.store.append_message(sid, role="user", content="old " * 200)
+            await loop.store.append_message(sid, role="assistant", content="done")
+        with pytest.raises(CompactionFailed, match="Context too long"):
+            await loop.send("new", sid)
+        assert len(model.main_requests) == 1
+        assert model.summaries == int(old_history)
+    finally:
+        await loop.aclose()

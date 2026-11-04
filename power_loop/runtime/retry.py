@@ -93,6 +93,27 @@ def is_permanent_llm_error(exc: BaseException) -> bool:
     return status is not None and 400 <= status < 500 and status not in _RETRYABLE_STATUSES
 
 
+def request_repair_kind(exc: BaseException) -> str | None:
+    """Classify provider request rejections at the single shared error boundary."""
+    if isinstance(exc, LLMRetryExhausted):
+        exc = exc.last_error
+    status = _status_of(exc)
+    detail = f"{exc} {getattr(exc, 'code', '')} {getattr(exc, 'body', '')}".lower()
+    if status not in (400, 413, 422):
+        return None
+    if any(word in detail for word in (
+        "context_length", "context window", "context length", "too many tokens",
+        "maximum context", "prompt is too long", "上下文超长", "上下文长度",
+    )):
+        return "context"
+    if status in (400, 422) and any(word in detail for word in (
+        "messages", "tool_call", "tool result", "tool_result", "reasoning_content",
+        "message role", "roles must", "invalid json",
+    )):
+        return "format"
+    return None
+
+
 @dataclass
 class LLMRetryPolicy:
     """Retry policy for ``LLMService.complete`` calls.

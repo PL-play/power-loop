@@ -363,13 +363,13 @@ async def provider_deadline(attempt):
 
 
 async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, response_id=None,
-                  cost_currency=None, response_metrics=None):
+                  cost_currency=None, response_metrics=None, rejected=False):
     if attempt is None:
         return
-    if error is not None:
+    if error is not None and not rejected:
         attempt.binding.resource_evidence["resource_state"] = "unknown"
     args = dict(
-        status="unknown" if error is not None else "returned",
+        status="unknown" if error is not None and not rejected else "returned",
         usage=usage,
         estimated=estimated,
         error_type=type(error).__name__ if error is not None else None,
@@ -405,5 +405,5 @@ async def observe(attempt, *, usage, estimated, error=None, cost_amount=None, re
         # durable pending record blocks further paid work, not jobs/read/stop.
         attempt.binding.resource_evidence["budget_pending"] = True
         log.exception("budget handoff remains pending: %s", attempt.attempt_id)
-    if error is None:
+    if error is None or rejected:
         attempt.binding.resource_evidence.get("model_attempts_inflight", set()).discard(attempt.attempt_id)

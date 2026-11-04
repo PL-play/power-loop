@@ -120,7 +120,7 @@ def _join_content(left: Any, right: Any) -> Any:
     return [*blocks(left), *blocks(right)]
 
 
-def sanitize_request_messages(messages: list[LoopMessage]) -> list[LoopMessage]:
+def sanitize_request_messages(messages: list[LoopMessage], *, strict: bool = False) -> list[LoopMessage]:
     """Repair a model request in memory, without changing history or pending work.
 
     Call only after pending tools have stopped/executed. Tool results remain
@@ -171,6 +171,19 @@ def sanitize_request_messages(messages: list[LoopMessage]) -> list[LoopMessage]:
         normalized.append(msg)
 
     aligned, _, _, _, _ = align_tool_calls(normalized, [], [], close_trailing=True)
+    if strict:
+        # Keep the latest tool round after the latest user input. Older tool
+        # exchanges become ordinary descriptions, retaining their actual results.
+        boundary = max((i for i, msg in enumerate(aligned)
+                        if msg["role"] == "user" or msg.get("tool_calls")), default=0)
+        for msg in aligned[:boundary]:
+            if msg.get("tool_calls"):
+                descriptions = [f"[tool call {tc['id']}] {tc['function']['name']}({tc['function']['arguments']})"
+                                for tc in msg.pop("tool_calls")]
+                msg["content"] = _join_content(msg.get("content"), "\n".join(descriptions))
+            elif msg["role"] == "tool":
+                msg["role"] = "assistant"
+                msg["content"] = _join_content(f"[tool result {msg.pop('tool_call_id')}]", msg.get("content"))
     out: list[LoopMessage] = []
     for msg in aligned:
         if out and msg["role"] == out[-1]["role"] and msg["role"] != "tool":

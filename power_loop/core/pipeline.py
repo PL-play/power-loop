@@ -19,6 +19,7 @@ import logging
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -1354,6 +1355,7 @@ class AgentPipeline:
         from power_loop.runtime.review_tools import restrict_request
         system_prompt, tools = await restrict_request(self, system_prompt, tools)
         from power_loop.runtime.history_sanitize import sanitize_request_messages
+        from power_loop.runtime.retry import request_repair_kind
         messages = sanitize_request_messages(messages)
         if messages and messages[0]["role"] == "system":
             system_prompt = "\n\n".join(filter(None, (system_prompt, messages[0].get("content"))))
@@ -1453,15 +1455,18 @@ class AgentPipeline:
                     # output (402, 401, 400…) was never processed → prompt 0.
                     outcome = _failure_outcome(exc)
                     produced = "".join(streamed["text"]), "".join(streamed["think"])
-                    # Managed attempts lack a provider rejection receipt: an
-                    # HTTP status alone cannot release their unknown risk.
-                    rejected = model_attempt is None and _status_of(exc) is not None and not any(produced)
+                    # A format/context rejection before any output did not run
+                    # the model. Settle it at zero so a corrected request can run.
+                    repair_kind = request_repair_kind(exc)
+                    repairable = repair_kind is not None and not any(produced)
+                    rejected = not any(produced) and (repairable or (
+                        model_attempt is None and _status_of(exc) is not None))
                     p_est = 0 if rejected or not provider_started else estimate_prompt_tokens(
                         messages=messages, system_prompt=system_prompt, tools=tools)
                     c_est = estimate_completion_tokens(text=produced[0], think=produced[1])
                     self.ctx.add_unreported_usage(p_est, c_est)
                     await observe(model_attempt, usage={"prompt_tokens": p_est, "completion_tokens": c_est,
-                        "total_tokens": p_est + c_est}, estimated=True, error=exc)
+                        "total_tokens": p_est + c_est}, estimated=not repairable, error=exc, rejected=repairable)
                     self._emit(
                         AgentEventType.LLM_CALL_COMPLETED,
                         LlmCallCompletedPayload(
@@ -1469,13 +1474,13 @@ class AgentPipeline:
                             model=model_name, duration_ms=(time.perf_counter() - t0) * 1000.0,
                             success=False, error_type=type(exc).__name__,
                             prompt_tokens=p_est, completion_tokens=c_est,
-                            total_tokens=p_est + c_est, estimated=True, outcome=outcome,
+                            total_tokens=p_est + c_est, estimated=not repairable, outcome=outcome,
                             endpoint=_llm_endpoint(self.llm),
                             **durable_identity,
                         ),
                         round_index=round_index, stream_id="main",
                     )
-                    if model_attempt is not None and isinstance(exc, Exception):
+                    if (model_attempt is not None or repair_kind is not None) and isinstance(exc, Exception):
                         raise LLMNonRetryable(attempts=attempt, last_error=exc) from exc
                     raise
                 usage = getattr(resp, "token_usage", None)
@@ -1551,10 +1556,10 @@ class AgentPipeline:
                 except (Exception, asyncio.CancelledError) as exc:
                     logger.warning("Stream completion observer failed: %s", type(exc).__name__)
 
-        policy = self.config.retry_policy
-        if policy is None:
-            response = await _do_call()
-        else:
+        async def _initial_call():
+            policy = self.config.retry_policy
+            if policy is None:
+                return await _do_call()
             def _on_retry(attempt: int, exc: BaseException, sleep_s: float) -> None:
                 self._emit(
                     AgentEventType.LLM_RETRY_ATTEMPTED,
@@ -1569,11 +1574,58 @@ class AgentPipeline:
                     stream_id="main",
                 )
 
-            response = await with_retry(
+            return await with_retry(
                 _do_call, policy=policy, token=self.cancel_token, on_retry=_on_retry,
             )
 
-        return response
+        try:
+            return await _initial_call()
+        except Exception as exc:
+            kind = request_repair_kind(exc)
+            if kind is None or any(streamed["text"]) or any(streamed["think"]):
+                raise
+            if kind == "format":
+                messages = sanitize_request_messages(messages, strict=True)
+            else:
+                messages = await self._compact_rejected_request(messages)
+            request = replace(request, messages=messages)
+            self.cancel_token.raise_if_cancelled()
+            # Exactly one repaired retry, independent of the transient retry policy.
+            try:
+                return await _do_call()
+            except LLMRetryExhausted as failed:
+                raise failed.last_error from failed
+
+    async def _compact_rejected_request(self, messages: list[LoopMessage]) -> list[LoopMessage]:
+        """Force one request-only summary, preserving the latest user exchange."""
+        from power_loop.contracts.errors import CompactionFailed
+        from power_loop.runtime.compact import DefaultCompactor
+        from power_loop.runtime.history_sanitize import sanitize_request_messages
+        from power_loop.runtime.model_attempts import is_managed
+
+        compactor = DefaultCompactor(keep_last_n=1)
+        span = compactor._compactable_span(messages)
+        if span is None:
+            raise CompactionFailed("Context too long; no older exchange can be compressed")
+        start, end = span
+        summary_llm = self.llm
+        fold_calls = None
+        if is_managed(self.session_id):
+            from power_loop.runtime.fold_calls import FoldCalls
+            fold_calls = FoldCalls(session_id=self.session_id, bus=self.bus, cancel_token=self.cancel_token)
+            summary_llm = fold_calls.wrap(summary_llm)
+        summary = await compactor._summarize_async(messages[start:end + 1], llm=summary_llm)
+        if fold_calls is not None:
+            fold_calls.raise_if_cancelled()
+        if not summary:
+            raise CompactionFailed("Context too long; history summary failed") from (
+                fold_calls.failure if fold_calls is not None else None)
+        compacted = sanitize_request_messages([
+            *messages[:start], {"role": "user", "content": "[历史摘要]\n" + summary}, *messages[end + 1:],
+        ])
+        if estimate_tokens(compacted) >= estimate_tokens(messages):
+            raise CompactionFailed("Context too long; history summary did not reduce the request")
+        return compacted
 
     def _is_async_capable(self, tool_name: str, tool_args: Mapping[str, Any] | None = None) -> bool:
         # 6.15.0：async_capable 可以是一组 action 名，所以判定要带上这次调用的参数——
