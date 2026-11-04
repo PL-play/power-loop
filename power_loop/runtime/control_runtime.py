@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 from .execution_journal import ExecutionJournal
 from .execution_state import ExecutionIdentity, ExecutionState
@@ -35,8 +35,6 @@ async def project_events(manager, tx, identity, records):
     The journal remains authoritative. Inspection keeps stable event identities,
     so existing task-result references do not acquire another authority ledger.
     """
-    from .model_attempts import event_id
-
     rows, budget_rows = [], []
     def event(key, kind, payload, metadata):
         row = (key, identity.job_id, kind, metadata["job_version"], _hash(payload),
@@ -47,7 +45,6 @@ async def project_events(manager, tx, identity, records):
 
     for record in records:
         value = record["value"]
-        phases = {}
         if record["kind"] == "allocation_adjustment_immutable":
             from .execution_budget import project_adjustment
             await project_adjustment(manager, tx, identity, value)
@@ -68,39 +65,12 @@ async def project_events(manager, tx, identity, records):
             event(record["key"], value["event_type"], value["payload"], value["event_metadata"])
             continue
         if record["kind"] == "budget":
-            metadata = {"job_version": 1, "created_at": value["started_at_ms"]}
-            event("mb_" + _hash([record["key"], value["version"]])[:48], "model_budget_state", value, metadata)
+            from .model_budgets import stored_state
+            stored = stored_state(value)
             budget_rows.append((value["attempt_id"], identity.job_id, value["policy_key"], value["version"],
-                                value["phase"], int(value["pending"]), _hash(value), _json(value),
+                                value["phase"], int(value["pending"]), _hash(stored), _json(stored),
                                 value["started_at_ms"], value.get("finished_at_ms", value["started_at_ms"])))
             continue
-        if record["kind"] == "model_tracking_immutable":
-            phases["tracking"] = value["data"]
-            original = value["data"]["scope"]
-        elif record["kind"] == "attempt":
-            prepared = value["prepared"]
-            original = record["key"]
-            phases["prepared"] = prepared
-            if value["phase"] in ("dispatched", "finished"):
-                phases["dispatched"] = {"version": 1, "scope": prepared["scope"],
-                                        "attempt_id": original, "prepared_hash": _hash(prepared)}
-            if value["phase"] == "finished":
-                phases["finished"] = value["observation"]
-        else:
-            continue
-        metadata = value.get("event_metadata")
-        if (type(metadata) is not dict or set(metadata) != {"job_version", "created_at"}
-                or type(metadata["job_version"]) is not int or type(metadata["created_at"]) is not int):
-            raise JobError("execution_event_metadata_missing")
-        for phase, payload in phases.items():
-            if record["kind"] == "attempt" and value["kind"] == "tool":
-                from .model_exit import content_reference
-                from .tool_attempts import event_id as tool_event_id
-                key = tool_event_id(manager, phase, original)
-                original_event = event(key, "tool_attempt_" + phase, payload, metadata)
-                event(key + "_a", "tool_attempt_anchor", {"version": 1, "source": content_reference(original_event)}, metadata)
-            else:
-                event(event_id(manager, phase, original), "model_attempt_" + phase, payload, metadata)
     if budget_rows:
         await upsert(manager, tx, manager.prefix + "task_budget_attempts",
                      ("attempt_id", "job_id", "policy_key", "version", "phase", "pending", "state_hash",
@@ -110,10 +80,6 @@ async def project_events(manager, tx, identity, records):
     columns = ("event_id", "job_id", "event_type", "job_version", "request_hash", "payload_json",
                "delivery_status", "created_at")
     await upsert(manager, tx, manager.events, columns, "event_id", rows, event_projection=True)
-    attempts = {row[0]: dict(zip(columns, row, strict=True)) for row in rows if row[2].startswith("model_attempt_")}
-    if attempts:
-        from .execution_membership import remember_merge
-        remember_merge(manager, "_projected_attempts", identity.job_id, attempts)
 
 
 async def upsert(manager, tx, table, columns, primary, rows, *, event_projection=False):
@@ -190,14 +156,12 @@ async def append_correction(manager, tx, job, generation, records, *, summary_de
         summary[key] += delta
     for record in records:
         if record["kind"] == "budget":
-            previous = await tx.fetchone(f"SELECT state_json,state_hash FROM {manager.prefix}task_budget_attempts WHERE attempt_id=?",
+            previous = await tx.fetchone(f"SELECT pending,phase FROM {manager.prefix}task_budget_attempts WHERE attempt_id=?",
                                          (record["key"],))
-            from .model_budgets import _object
             def unsettled(value):
-                return value is not None and (value["pending"] or value["phase"] not in ("released", "settling") or value["ack"] is None)
-            old = _object(previous["state_json"], previous["state_hash"]) if previous else None
-            summary["budget_attempts"] = summary.get("budget_attempts", 0) + int(old is None)
-            summary["budget_unsettled"] = summary.get("budget_unsettled", 0) + int(unsettled(record["value"])) - int(unsettled(old))
+                return value is not None and (value["pending"] or value["phase"] not in ("released", "settling"))
+            summary["budget_attempts"] = summary.get("budget_attempts", 0) + int(previous is None)
+            summary["budget_unsettled"] = summary.get("budget_unsettled", 0) + int(unsettled(record["value"])) - int(unsettled(previous))
     digest = await journal.append(identity, head["batch_no"] + 1, head["chain_hash"], records, summary, transaction=tx)
     return head["batch_no"] + 1, digest
 
@@ -366,11 +330,6 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
             allocation_record(binding)
     state.before_checkpoint = refresh
     manager._execution_controls[(source["job_id"], source["generation"])] = binding
-    scope = asdict(binding.lease)
-    state.record("model_tracking_immutable", "tracking", {
-        "data": {"version": 1, "scope": scope, "session_id": binding.actor.session_id},
-        "event_metadata": {"job_version": source["version"], "created_at": manager.now()},
-    })
     return state
 
 

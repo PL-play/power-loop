@@ -193,7 +193,6 @@ async def prepare_attempt(binding, ref, call_id, registered, arguments):
     value = control.begin_attempt(key, "tool", prepared, control_only=control_only)
     config = binding.runtime._original_budget_config
     value["budget_required"] = not control_only and config is not None and callable(getattr(config.provider, "prepare_tool", None))
-    value["event_metadata"] = {"job_version": job["version"], "created_at": binding.runtime.manager.now()}
     control.record("attempt", key, value)
     return ToolAttempt(binding, key, prepared, PricedCall(registered.definition.name, arguments, job["execution_role"]), pricing, asyncio.current_task())
 

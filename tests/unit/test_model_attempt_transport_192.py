@@ -12,7 +12,6 @@ from power_loop._vendor.llm_client.attempt_scope import single_attempt
 from power_loop._vendor.llm_client.interface import OpenAICompatibleChatConfig
 from power_loop._vendor.llm_client.llm_factory import OpenAICompatibleChatLLMService
 from power_loop.runtime.jobs import JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.retry import LLMRetryPolicy
 from power_loop.runtime.task_runtime import TaskRuntime
 
@@ -71,11 +70,9 @@ async def test_native_ledger_has_one_wire_request_without_changing_legacy_retry_
         if native:
             [job] = await runtime.manager.db.fetchall(f"SELECT * FROM {runtime.manager.jobs}")
             assert job["resource_state"] == "unknown" and job["supervision_status"] == "open"
-            page = await list_attempts(runtime.manager, runtime.actor(sid), job["job_id"])
-            assert len(page["items"]) == 1 and page["items"][0]["status"] == "unknown"
-            assert page["items"][0]["observed_usage"]["prompt_tokens"] > 0
+            assert result.usage["prompt_tokens"] > 0
             if fault == "stream_interrupted":
-                assert page["items"][0]["observed_usage"]["completion_tokens"] > 0
+                assert result.usage["completion_tokens"] > 0
     finally:
         try:
             await service.close()

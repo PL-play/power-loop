@@ -11,7 +11,6 @@ import pytest
 from power_loop import SessionStore
 from power_loop.runtime import executor_registry as registry
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -73,7 +72,6 @@ async def test_process_death_preserves_dispatched_attempt_and_blocks_unconfirmed
             future = JobManager(store, now_ms=lambda: record["lease_until_ms"]+1)
             actor = JobActor(old.tenant_id, old.principal_id, ready["sid"])
             [job] = await future.db.fetchall(f"SELECT * FROM {future.jobs}")
-            page = await list_attempts(future, actor, job["job_id"])
             # The held provider was actually entered, but its RAM suffix need
             # not have reached a checkpoint before either real process signal.
             head = await future.db.fetchone(f"SELECT identity_json,admission_nonce,summary_json FROM {future.prefix}execution_checkpoints "
@@ -81,9 +79,7 @@ async def test_process_death_preserves_dispatched_attempt_and_blocks_unconfirmed
             assert head["admission_nonce"] and not json.loads(head["summary_json"])["closed"]
             identity = json.loads(head["identity_json"])
             assert identity["job_id"] == job["job_id"] and identity["boot_id"] == old.boot_id
-            assert all(item["status"] == "dispatched_unconfirmed" and not item["response_received"] for item in page["items"])
             assert not await future.db.fetchall(f"SELECT event_id FROM {future.events} WHERE event_type='model_attempt_finished'")
-            assert page["billing_status"] == "unavailable"
             assert job["resource_state"] == "running" and job["outcome"] is None
             newer = registry.ExecutorIdentity("crash-test", "host", "executor", "new-boot")
             await registry.register(future, newer, contract_hash="a"*64)

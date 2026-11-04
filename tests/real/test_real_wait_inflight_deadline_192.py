@@ -11,7 +11,6 @@ from power_loop.runtime import delegation
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
@@ -91,13 +90,7 @@ async def test_real_provider_short_policy_stops_original_request_and_keeps_unkno
             assert owner.outcome == "timed_out" and owner.resource_state == "unknown", owner
             assert owner.supervision_status == "open" and owner.cancel_requested_at is None
             assert len(child_requests) == 1
-            [source] = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send' AND control_owner_job_id=?", (owner.job_id,))
-            items = (await list_attempts(manager, runtime.actor(parent), source["job_id"]))["items"]
-            assert sorted(item["status"] for item in items) == ["returned", "unknown"]
-            unknown = next(item for item in items if item["status"] == "unknown")
-            assert unknown["estimated"] and unknown["observed_usage"]["prompt_tokens"] > 0
             record_property("original_owner_result", owner.result)
-            record_property("original_attempts", items)
     finally:
         provider.report(record_property)
         for registration in registrations:

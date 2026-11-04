@@ -10,7 +10,6 @@ import pytest
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
 from power_loop.runtime import root_control
 from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_real_async_boundaries_192 import BoundedProvider
@@ -74,15 +73,12 @@ async def test_real_context_stop_never_renews_execution_and_retains_original_usa
                 await send()
             [row] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
             assert row["cancel_requested_at"] is not None
-            [attempt] = (await list_attempts(manager, runtime.actor(sid), row["job_id"]))["items"]
             if inflight:
                 assert row["resource_state"] == "unknown" and row["supervision_status"] == "open"
-                assert attempt["status"] == "unknown" and attempt["estimated"] and not attempt["response_received"]
             else:
-                assert attempt["response_received"] and attempt["observed_usage"]["total_tokens"] > 0
+                assert provider.responses[0].token_usage.total_tokens > 0
             assert provider.calls == 1
             record_property("original_context_stop", json.dumps(receipt))
-            record_property("original_model_attempt", json.dumps(attempt))
             record_property("provider_server_receipt_confirmed", not inflight)
     finally:
         if sending is not None and not sending.done():

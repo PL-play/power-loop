@@ -12,8 +12,7 @@ from power_loop import LLMRequest
 from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
 from power_loop.runtime.control_runtime import current, flush_binding
-from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
+from power_loop.runtime.jobs import JobError
 
 from .test_job_registry_192 import registry_store
 from .test_model_budgets_192 import budget_case, new_send, observed, start
@@ -63,16 +62,14 @@ async def test_prepare_failure_is_closed_locally_and_the_same_send_can_admit_its
     with pytest.raises(OSError, match="metadata preparation failed"):
         await start(c)
     await flush_binding(c.binding)
-    [event] = await c.manager.db.fetchall(
-        f"SELECT payload_json FROM {c.manager.events} WHERE event_type='model_attempt_prepared'"
-    )
-    original = json.loads(event["payload_json"])
+    [original] = [value["prepared"] for (kind, _), value in current(c.binding)._records.items()
+                  if kind == "attempt" and value["kind"] == "model"]
     state = await budgets.get_budget(c.manager, c.actor, original["attempt_id"])
     assert state["phase"] == "released" and not state["pending"]
     assert state["ack"] == {"local_only": True, "dispatch_not_authorized": True, "no_reservation": True}
     assert state["plan"] is None and state["plan_hash"] is None and not c.host.released
-    [item] = (await list_attempts(c.manager, c.actor, c.binding.lease.job_id))["items"]
-    assert item["status"] == "not_dispatched" and item["observed_usage"] is None and not item["response_received"]
+    saved = current(c.binding).get("attempt", original["attempt_id"])
+    assert saved["phase"] == "aborted" and saved.get("observation") is None
     assert c.host.reserve_calls == 0
     c.host.prepare = prepare_host
     await observed(c, await start(c))
@@ -97,23 +94,6 @@ async def test_exhausted_original_allowance_stays_exhausted_after_repeated_local
     assert not await c.manager.db.fetchall(
         f"SELECT attempt_id FROM {c.manager.prefix}task_budget_attempts WHERE pending<>0"
     )
-
-
-async def test_deleted_reservation_row_is_not_proof_that_no_reservation_ever_existed(budget_case):
-    c = budget_case
-    attempt = await prepared(c)
-    await budgets.reserve(attempt, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
-    assert await budgets.close_unreserved(attempt) is None
-    await flush_binding(c.binding, close=True)
-    await c.manager.db.execute(
-        f"DELETE FROM {c.manager.prefix}task_budget_attempts WHERE attempt_id=?", (attempt.attempt_id,)
-    )
-    cold = JobManager(await c.connect())
-    with pytest.raises(JobError, match="budget_attempt_missing"):
-        await budgets.get_budget(cold, c.actor, attempt.attempt_id)
-    with pytest.raises(JobError, match="budget_attempt_missing"):
-        await list_attempts(cold, c.actor, c.binding.lease.job_id)
-    assert c.host.reserve_calls == 1 and not c.host.released
 
 
 @pytest.mark.parametrize("fault", ["prepared", "owner", "generation", "executor_id", "boot_id"])
@@ -156,7 +136,7 @@ async def test_repeated_closure_has_one_proof_and_the_original_attempt_can_never
     assert (
         len(
             await c.manager.db.fetchall(
-                f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_budget_state'"
+                f"SELECT attempt_id FROM {c.manager.prefix}task_budget_attempts"
             )
         )
         == 1
@@ -203,7 +183,7 @@ async def test_closure_write_failure_rolls_back_and_preserves_original_error_and
         await flush_binding(c.binding)
     assert not await c.manager.db.fetchall(f"SELECT attempt_id FROM {c.manager.prefix}task_budget_attempts")
     assert not await c.manager.db.fetchall(
-        f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_budget_state'"
+        f"SELECT attempt_id FROM {c.manager.prefix}task_budget_attempts"
     )
     assert current(c.binding).checkpoint_failed
     monkeypatch.setattr(journal, "append", append)

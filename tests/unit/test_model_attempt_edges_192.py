@@ -6,9 +6,7 @@ from dataclasses import replace
 import pytest
 
 from power_loop.runtime import model_attempts as attempts
-from power_loop.runtime.control_runtime import flush_binding
-from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
+from power_loop.runtime.jobs import JobError
 
 from .test_job_registry_192 import registry_store
 from .test_model_attempts_192 import attempt_case, completed, prepare
@@ -16,60 +14,13 @@ from .test_model_attempts_192 import attempt_case, completed, prepare
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 __all__ = ["attempt_case", "registry_store"]
 
-@pytest.mark.parametrize("raw", ["[]", "{", '{"version":true}', '{"version":2}', '{"version":1,"bad":NaN}'])
-async def test_corrupt_serialized_phase_cannot_be_used_as_control_evidence(attempt_case, raw):
+
+async def test_active_model_call_limit(attempt_case, monkeypatch):
     c = attempt_case
-    attempt = await completed(c)
-    await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?", (raw, attempts.event_id(c.manager,"prepared",attempt.attempt_id)))
-    with pytest.raises(JobError, match="model_attempt_evidence_corrupt"):
-        await list_attempts(c.manager,c.actor,c.binding.lease.job_id)
-    assert (await c.manager.get_job(c.actor,c.binding.lease.job_id)).supervision_status == "open"
-
-async def test_corrupt_tracking_delivery_marker_refuses_dispatch(attempt_case):
-    c=attempt_case
-    await prepare(c)
-    await c.manager.db.execute(f"UPDATE {c.manager.events} SET delivery_status='handled' WHERE event_type='model_attempt_tracking'")
-    with pytest.raises(JobError,match="model_attempt_evidence_corrupt"):
-        await list_attempts(JobManager(await c.connect()),c.actor,c.binding.lease.job_id)
-    assert not await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'")
-
-async def test_new_protocol_no_calls_does_not_treat_lost_tracking_as_legacy(attempt_case):
-    c=attempt_case
-    await flush_binding(c.binding)
-    assert await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_type='model_attempt_tracking'") == 1
-    cold = JobManager(await c.connect())
-    result = await cold.close_model_execution(c.actor,c.binding.lease,evidence={"exit":"completed"})
-    assert result.resource_state == "unknown"
-    import json
-    event = await cold.db.fetchone(f"SELECT payload_json FROM {cold.events} WHERE event_type='model_closed'")
-    evidence = json.loads(event["payload_json"])["evidence"]
-    assert evidence["model_attempt_snapshot_error"] == "model_attempt_evidence_missing"
-    assert "model_attempt_snapshot" not in evidence
-    with pytest.raises(JobError,match="model_attempt_evidence_missing"):
-        await cold.finalize_supervision(c.actor,c.binding.lease.job_id,generation=1)
-
-@pytest.mark.parametrize("case", ["new_admission","phase_bound","prepared_bound","query_bound"])
-async def test_phase_and_query_limits_are_enforced_against_real_saved_rows(attempt_case,monkeypatch,case):
-    c=attempt_case
     await completed(c)
-    if case=="new_admission":
-        monkeypatch.setattr(attempts,"_LIMIT",1)
-        with pytest.raises(JobError,match="model_attempt_limit"):
-            await prepare(c,nonce="next")
-        assert len(await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='model_attempt_prepared'"))==1
-        return
-    await completed(c,await prepare(c,nonce="second"))
-    if case=="query_bound":
-        from power_loop.runtime import model_attempt_query
-        monkeypatch.setattr(model_attempt_query,"_MAX_EVENTS",1)
-        error="task_event_scope_too_large"
-    else:
-        monkeypatch.setattr(attempts,"_LIMIT",1)
-        error="model_attempt_limit"
-        if case=="prepared_bound":
-            await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_type IN ('model_attempt_dispatched','model_attempt_finished')")
-    with pytest.raises(JobError,match=error):
-        await list_attempts(c.manager,c.actor,c.binding.lease.job_id)
+    monkeypatch.setattr(attempts, "_LIMIT", 1)
+    with pytest.raises(JobError, match="model_attempt_limit"):
+        await prepare(c, nonce="next")
 
 @pytest.mark.parametrize("field,value",[("error_type",False),("error_type",""),("response_id","bad\nidentifier"),("response_id","x"*256),("estimated",1),("status","done"),("usage",{"unknown_dimension":1})])
 async def test_invalid_observation_never_creates_a_finished_event(attempt_case,field,value):
@@ -89,7 +40,8 @@ async def test_known_finished_attempt_refuses_another_dispatch_and_lost_ack_reca
         await attempts.dispatch(attempt)
     with pytest.raises(JobError,match="model_attempt_dispatch_conflict"):
         await attempts._recall_dispatch(attempt)
-    assert len(await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'"))==1
+    from power_loop.runtime.control_runtime import current
+    assert current(c.binding).get("attempt", attempt.attempt_id)["phase"] == "finished"
 
 async def test_prepared_without_dispatch_has_no_ack_to_recall(attempt_case):
     c=attempt_case
@@ -106,16 +58,6 @@ async def test_changed_original_preparation_cannot_authorize_dispatch_or_late_ob
     with pytest.raises(JobError,match="model_attempt_owner_mismatch"):
         await attempts.finish(wrong,status="returned",usage={},estimated=False)
 
-async def test_attempt_query_requires_send_kind_and_a_whole_item_budget(attempt_case):
-    c=attempt_case
-    child=await c.manager.register_job(c.actor,kind="subagent",parent=c.binding.lease,system_key="query-kind")
-    with pytest.raises(JobError,match="model_attempts_require_send_job"):
-        await list_attempts(c.manager,c.actor,child.job.job_id)
-    attempt=await prepare(c,model="model-"+"x"*240)
-    await attempts.dispatch(attempt)
-    await attempts.finish(attempt,status="returned",usage={"total_tokens":10},estimated=False,response_id="r"*255)
-    with pytest.raises(JobError,match="query_result_too_small"):
-        await list_attempts(c.manager,c.actor,c.binding.lease.job_id,max_chars=1024)
 
 async def test_new_physical_send_cannot_evade_same_owner_unknown_request(attempt_case):
     c=attempt_case

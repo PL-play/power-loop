@@ -1,20 +1,14 @@
-"""Durable observations of physical model calls, not budget reservations.
-
-No request/response body, credential or provider control capability is stored.
-An exception is uncertain remote execution; only a complete response proves
-this model call returned. Late observations never grant dispatch authority.
-"""
+"""Track physical model calls in the active execution and report their usage."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import secrets
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 
-from .jobs import JobError, JobLease, _hash, _json
+from .jobs import JobError, _hash
 
 _LIMIT = 10000
 _PHASES = ("tracking", "prepared", "dispatched", "finished")
@@ -83,21 +77,6 @@ def _scope(lease):
     return _lease(asdict(lease))
 
 
-def _object(raw):
-    try:
-        data = json.loads(raw)
-        if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] != 1:
-            raise ValueError()
-        _json(data)
-        return data
-    except (ValueError, TypeError) as exc:
-        raise JobError("model_attempt_evidence_corrupt") from exc
-
-
-def _hash_value(value):
-    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
-
-
 def _cost(value):
     if value is None:
         return True
@@ -122,155 +101,6 @@ def response_observation(usage, response):
         "response_metrics": getattr(response, 'debug', {}).get('response_extraction', {}),
         "response_id": response_id,
     }
-
-
-def _validate_data(manager, phase, identity, data):
-    from .execution_membership import _lease
-
-    try:
-        scope = _lease(data.get("scope"))
-        keys = {"version", "scope"}
-        if phase == "tracking":
-            keys |= {"session_id"}
-            valid = scope == identity
-        elif phase == "prepared":
-            keys |= {
-                "attempt_id",
-                "session_id",
-                "nonce",
-                "round_index",
-                "retry_index",
-                "request_hash",
-                "model",
-                "max_tokens",
-            }
-            if "purpose" in data:
-                keys |= {"purpose"}
-            valid = (
-                data.get("purpose", "fold") == "fold"
-                and isinstance(data.get("nonce"), str)
-                and 1 <= len(data["nonce"]) <= 64
-                and data.get("attempt_id")
-                == identity
-                == "attempt_" + _hash([manager.store.store_id, scope, data["nonce"]])[:48]
-                and type(data.get("round_index")) is int
-                and 0 <= data["round_index"] < 2**63
-                and type(data.get("retry_index")) is int
-                and 1 <= data["retry_index"] < 2**63
-                and _hash_value(data.get("request_hash"))
-                and isinstance(data.get("model"), str)
-                and len(data["model"]) <= 255
-                and (
-                    data.get("max_tokens") is None
-                    or type(data["max_tokens"]) is int
-                    and 1 <= data["max_tokens"] < 2**63
-                )
-            )
-        else:
-            keys |= {"attempt_id", "prepared_hash"}
-            valid = data.get("attempt_id") == identity and _hash_value(data.get("prepared_hash"))
-            if phase == "finished":
-                keys |= {
-                    "dispatch_hash",
-                    "status",
-                    "usage",
-                    "estimated",
-                    "error_type",
-                    "provider_cost",
-                    "provider_cost_currency",
-                    "provider_response_id",
-                }
-                usage = data.get("usage")
-                valid = (
-                    valid
-                    and _hash_value(data.get("dispatch_hash"))
-                    and data.get("status") in ("returned", "unknown")
-                    and type(data.get("estimated")) is bool
-                    and isinstance(usage, dict)
-                    and not set(usage) - set(_TOKENS)
-                    and all(type(v) is int and 0 <= v < 2**63 for v in usage.values())
-                    and _cost(data.get("provider_cost"))
-                    and (data.get("provider_cost_currency") is None or
-                         isinstance(data['provider_cost_currency'], str) and len(data['provider_cost_currency']) == 3
-                         and data['provider_cost_currency'].isalpha() and data['provider_cost_currency'].isupper())
-                    and _response_id(data.get("provider_response_id"))
-                    and (
-                        data.get("error_type") is None
-                        or isinstance(data["error_type"], str)
-                        and 0 < len(data["error_type"]) <= 255
-                    )
-                )
-        if (
-            set(data) != keys
-            or not valid
-            or phase in ("tracking", "prepared")
-            and (not isinstance(data.get("session_id"), str) or not 0 < len(data["session_id"]) <= 255)
-        ):
-            raise JobError("model_attempt_evidence_corrupt")
-    except (KeyError, TypeError, ValueError, AttributeError) as exc:
-        raise JobError("model_attempt_evidence_corrupt") from exc
-
-
-async def _read(manager, tx, phase, identity, *, required=True):
-    key = event_id(manager, phase, identity)
-    row = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (key,))
-    if row is None:
-        if required:
-            raise JobError("model_attempt_evidence_missing")
-        return None
-    data = _object(row["payload_json"])
-    _validate_data(manager, phase, identity, data)
-    if (
-        row["event_type"] != "model_attempt_" + phase
-        or row["delivery_status"] != "not_applicable"
-        or row["request_hash"] != _hash(data)
-        or data.get("scope", {}).get("job_id") != row["job_id"]
-    ):
-        raise JobError("model_attempt_evidence_corrupt")
-    return row, data
-
-
-async def _all(manager, tx, job_id):
-    rows = await tx.fetchall(
-        f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type IN "
-        "('model_attempt_prepared','model_attempt_dispatched','model_attempt_finished') ORDER BY event_id LIMIT ?",
-        (job_id, 3 * _LIMIT + 1),
-    )
-    if len(rows) > 3 * _LIMIT:
-        raise JobError("model_attempt_limit")
-    phases = {phase: {} for phase in _PHASES if phase != "tracking"}
-    for row in rows:
-        phase = row["event_type"].removeprefix("model_attempt_")
-        data = _object(row["payload_json"])
-        identity = data.get("attempt_id")
-        _validate_data(manager, phase, identity, data)
-        if (
-            row["job_id"] != job_id
-            or data["scope"]["job_id"] != job_id
-            or row["event_id"] != event_id(manager, phase, identity)
-            or row["delivery_status"] != "not_applicable"
-            or row["request_hash"] != _hash(data)
-            or identity in phases[phase]
-        ):
-            raise JobError("model_attempt_evidence_corrupt")
-        phases[phase][identity] = (row, data)
-    prepared, dispatched, finished = (phases[p] for p in ("prepared", "dispatched", "finished"))
-    if len(prepared) > _LIMIT:
-        raise JobError("model_attempt_limit")
-    if set(dispatched) - set(prepared) or set(finished) - set(dispatched):
-        raise JobError("model_attempt_evidence_corrupt")
-    for identity, (_, data) in dispatched.items():
-        source = prepared[identity][1]
-        if data != {"version": 1, "scope": source["scope"], "attempt_id": identity, "prepared_hash": _hash(source)}:
-            raise JobError("model_attempt_evidence_corrupt")
-    for identity, (_, data) in finished.items():
-        if (
-            data["scope"] != prepared[identity][1]["scope"]
-            or data["prepared_hash"] != _hash(prepared[identity][1])
-            or data["dispatch_hash"] != _hash(dispatched[identity][1])
-        ):
-            raise JobError("model_attempt_evidence_corrupt")
-    return phases
 
 
 async def enable(binding, *, review_sources=None):
@@ -321,21 +151,6 @@ async def _no_unknown_sends(manager, tx, row):
         raise JobError("unresolved_prior_attempt")
 
 
-async def _no_inflight(manager, tx, row, *, except_attempt=None):
-    phases = await _all(manager, tx, row["job_id"])
-    for identity in phases["prepared"]:
-        if identity == except_attempt:
-            continue
-        exited = phases["finished"].get(identity)
-        if exited is None or exited[1].get("status") != "returned":
-            if identity not in phases["dispatched"]:
-                from .model_budgets import is_closed_unstarted
-
-                if await is_closed_unstarted(manager, tx, phases["prepared"][identity][1]):
-                    continue
-            raise JobError("unresolved_prior_attempt")
-
-
 async def prepare(binding, *, nonce, round_index, retry_index, request_hash, model, max_tokens, purpose=None):
     if (
         purpose not in (None, "fold")
@@ -371,7 +186,7 @@ async def prepare(binding, *, nonce, round_index, retry_index, request_hash, mod
     }
     if purpose is not None:
         data["purpose"] = purpose
-    from .control_runtime import current, source
+    from .control_runtime import current
     control = current(binding)
     old = control.get("attempt", identity)
     if old is not None:
@@ -380,9 +195,7 @@ async def prepare(binding, *, nonce, round_index, retry_index, request_hash, mod
         return Attempt(binding, identity, data)
     if control.models >= _LIMIT:
         raise JobError("model_attempt_limit")
-    value = control.begin_attempt(identity, "model", data)
-    value["event_metadata"] = {"job_version": source(binding)["version"], "created_at": manager.now()}
-    control.record("attempt", identity, value)
+    control.begin_attempt(identity, "model", data)
     return Attempt(binding, identity, data)
 
 
@@ -448,119 +261,39 @@ async def finish(attempt, *, status, usage, estimated, error_type=None, cost_amo
     if not _cost(cost_amount) or not _response_id(response_id):
         raise JobError("invalid_model_attempt_observation")
     binding = attempt.binding
-    from .control_runtime import current, retained_owner
+    from .control_runtime import current
     control = current(binding)
     saved = control.get("attempt", attempt.attempt_id)
     if (saved is None or saved["prepared"] != attempt.prepared
             or saved["prepared"]["scope"] != _scope(binding.lease)
             or saved["prepared"]["session_id"] != binding.actor.session_id):
         raise JobError("model_attempt_owner_mismatch")
-    prepared = saved["prepared"]
-    dispatched = {"version": 1, "scope": prepared["scope"], "attempt_id": attempt.attempt_id,
-                  "prepared_hash": _hash(prepared)}
     data = {
-        "version": 1, "scope": prepared["scope"], "attempt_id": attempt.attempt_id,
-        "prepared_hash": _hash(prepared), "dispatch_hash": _hash(dispatched),
         "status": status, "usage": dict(usage), "estimated": estimated, "error_type": error_type,
         "provider_cost": cost_amount, "provider_cost_currency": cost_currency,
         "provider_response_id": response_id,
     }
     if saved["phase"] == "finished" and saved["observation"] != data:
         raise JobError("model_attempt_conflict")
-    if control.closed:
-        if retained_owner(binding):
-            # Finish any original failed/unknown close commit first. A clean
-            # sealed owner has no new RAM batch to publish after another
-            # process advances its journal for financial reconciliation.
-            while control._pending is not None or control._dirty:
-                await control.checkpoint(force=True)
-        await _finish_closed(attempt, {**saved, "phase": "finished", "observation": data})
-        return data
     control.observe(attempt.attempt_id, data)
+    if control.closed:
+        await control.checkpoint(force=True)
     return data
 
 
-async def _finish_closed(attempt, value):
-    """Append an original late return using the current sealed journal head."""
-    from .control_runtime import append_correction
-    binding = attempt.binding
-    manager = binding.runtime.manager
-    async with manager._write() as tx:
-        job = await manager._authorize(tx, binding.actor, binding.lease.job_id)
-        manager._control_retirements.get().add((binding.lease.job_id, binding.lease.generation))
-        phases = await _all(manager, tx, job["job_id"])
-        prepared = phases["prepared"].get(attempt.attempt_id)
-        dispatched = phases["dispatched"].get(attempt.attempt_id)
-        if prepared is None or dispatched is None:
-            raise JobError("model_attempt_evidence_missing")
-        if prepared[1] != attempt.prepared:
-            raise JobError("model_attempt_owner_mismatch")
-        finished = phases["finished"].get(attempt.attempt_id)
-        if finished is not None:
-            if finished[1] != value["observation"]:
-                raise JobError("model_attempt_conflict")
-            return
-        await append_correction(manager, tx, job, binding.lease.generation,
-            [{"kind": "attempt", "key": attempt.attempt_id, "value": value}],
-            summary_delta={"completed": 1, "inflight": -1,
-                           "unknown": int(value["observation"]["status"] == "unknown")})
-
-
-async def require_quiescent(manager, tx, row, *, include_budget=True, loaded=None):
-    """Return immutable event IDs; absent tracking is legacy, not zero calls.
-
-    ``loaded`` is ``(tracking, phases)`` already read in this transaction.
-    """
-    if type(include_budget) is not bool:
-        raise JobError("invalid_model_quiescence_options")
-    scope = _scope(JobLease(row["job_id"], row["executor_id"], row["boot_id"], row["generation"]))
-    tracking = loaded[0] if loaded else await _read(manager, tx, "tracking", scope, required=False)
-    if tracking is None:
-        creation = await tx.fetchone(
-            f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND action='create' AND event_type='operation'",
-            (row["job_id"],),
-        )
-        if (
-            creation
-            and json.loads(creation["payload_json"]).get("request", {}).get("model_attempt_protocol") is not None
-        ):
-            raise JobError("model_attempt_evidence_missing")
-        if await tx.fetchone(
-            f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type IN "
-            "('model_attempt_prepared','model_attempt_dispatched','model_attempt_finished') LIMIT 1",
-            (row["job_id"],),
-        ):
-            raise JobError("model_attempt_evidence_missing")
-        return []
-    if tracking[1] != {"version": 1, "scope": scope, "session_id": row["session_id"]}:
-        raise JobError("model_attempt_evidence_corrupt")
-    refs = [tracking[0]["event_id"]]
-    phases = loaded[1] if loaded else await _all(manager, tx, row["job_id"])
-    for identity, prepared in phases["prepared"].items():
-        raw, data = prepared
-        if prepared[1]["scope"] != scope or prepared[1]["session_id"] != row["session_id"]:
-            raise JobError("model_attempt_evidence_corrupt")
-        refs.append(raw["event_id"])
-        dispatched = phases["dispatched"].get(identity)
-        finished = phases["finished"].get(identity)
-        if dispatched is None:
-            if finished is not None or row["intake"] != "closed":
-                raise JobError("model_attempt_unsettled")
-            continue
-        if (
-            dispatched[1]
-            != {"version": 1, "scope": scope, "attempt_id": data["attempt_id"], "prepared_hash": _hash(data)}
-            or finished is None
-            or finished[1].get("prepared_hash") != _hash(data)
-            or finished[1].get("dispatch_hash") != _hash(dispatched[1])
-            or finished[1].get("status") != "returned"
-        ):
+async def require_quiescent(manager, tx, row, *, include_budget=True):
+    """Check the live execution and outstanding accounting before closing."""
+    binding = manager._execution_controls.get((row["job_id"], row["generation"]))
+    if binding is not None:
+        from .control_runtime import current
+        state = current(binding)
+        if any(attempt["kind"] == "model" and attempt["phase"] == "dispatched"
+               for attempt in state.active.values()):
             raise JobError("model_attempt_unsettled")
-        refs.extend([dispatched[0]["event_id"], finished[0]["event_id"]])
     if include_budget:
         from .model_budgets import require_quiescent as budget_quiescent
-        refs.extend(await budget_quiescent(manager, tx, row))
-    return refs
+        return await budget_quiescent(manager, tx, row)
+    return []
 
 
 async def start_call(pipeline, request, *, round_index, retry_index, model, purpose=None):

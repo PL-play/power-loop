@@ -305,6 +305,11 @@ async def reserve(attempt, logical_request, *, service=None, pricing=None):
         (lambda: provider.prepare_tool(copy.deepcopy(context), logical_request, pricing=pricing)) if tool else
         lambda: provider.prepare(copy.deepcopy(context), copy.deepcopy(logical_request), service=service,
                                  **({"purpose": attempt.prepared["purpose"]} if "purpose" in attempt.prepared else {})))
+    if tool and supplied is None:
+        saved = control.get('attempt', attempt.attempt_id)
+        saved['budget_required'] = False
+        control.record('attempt', attempt.attempt_id, saved)
+        return False
     if type(supplied) is not BudgetPlan:
         raise JobError("invalid_budget_plan")
     plan = BudgetPlan(supplied.token_bound, supplied.request)

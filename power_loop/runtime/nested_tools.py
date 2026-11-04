@@ -1,14 +1,10 @@
-"""Internal priced calls reuse the original task's budget and durable delivery.
-
-Each supplier invocation has its own prepared/dispatched/receipt/finished events.
-Recovery only finishes bookkeeping; it never invokes the supplier again.
-"""
+"""Internal priced calls share the active task and accounting delivery."""
 from __future__ import annotations
 
 import asyncio
 import copy
 
-from .jobs import JobError, _hash
+from .jobs import JobError
 from .pricing import PricingError
 
 
@@ -42,30 +38,10 @@ async def join_children(slot, *, cancel=False):
 
 
 async def persist_receipt(slot):
-    from .control_runtime import current, queue_event
-    from .execution_tools import event_reference
-    from .tool_attempts import event_id
-    cache, attempt = slot.binding.runtime._native_returns, slot.budget_attempt
-    try:
-        async with cache.lock:
-            cache.require(slot)
-            if slot.billing_saved:
-                return
-            if slot.billing_receipt is None:
-                raise JobError("tool_billing_receipt_missing")
-            control = current(slot.binding)
-            saved = control.get("attempt", attempt.attempt_id)
-            if saved is None or saved["phase"] not in ("dispatched", "finished") or saved["prepared"] != attempt.prepared:
-                raise JobError("tool_attempt_original_mismatch")
-            key = event_id(slot.binding.runtime.manager, "receipt", attempt.attempt_id)
-            queue_event(slot.binding, key, "tool_attempt_receipt", dict(version=1, scope=attempt.prepared["scope"],
-                prepared_hash=_hash(attempt.prepared), billing_receipt=slot.billing_receipt.to_dict()))
-            queue_event(slot.binding, key + "_a", "tool_attempt_anchor", {"version": 1, "source": event_reference(slot.binding, key)})
-            await control.checkpoint(force=True)
-            slot.billing_saved = True
-    except BaseException:
-        slot.failed = True
-        raise
+    slot.binding.runtime._native_returns.require(slot)
+    if slot.billing_receipt is None:
+        raise JobError("tool_billing_receipt_missing")
+    slot.billing_saved = True
 
 
 async def flush_slot(slot):
@@ -135,8 +111,7 @@ async def invoke_priced_tool(definition, arguments, handler):
         raise JobError('native_return_requires_reconciliation')
     cache.slots[cache.key(slot)] = slot
     try:
-        if not await tools.reserve(attempt):
-            raise JobError('budget_tool_adapter_unavailable')
+        await tools.reserve(attempt)
         from .control_runtime import source
         require_parent(parent)
         await tools.authorize_dispatch(attempt, None, source(slot.binding))

@@ -439,13 +439,12 @@ class JobManager:
                 note(tx, {"job_id": lease.job_id, "event_type": "model_closed",
                     "payload_json": original["payload_json"]})
                 return _record(row)
-            from .model_exit import SNAPSHOT, capture
             from .pending_calls import ERROR as PENDING_ERROR
             from .pending_calls import SNAPSHOT as PENDING_SNAPSHOT
             from .pending_calls import capture as capture_pending
             from .pending_native import FIELD as NATIVE_PENDING
             from .pending_native import capture as capture_native
-            if any(key in evidence_data for key in (SNAPSHOT, "model_attempt_snapshot_error", PENDING_SNAPSHOT, PENDING_ERROR, NATIVE_PENDING)):
+            if any(key in evidence_data for key in (PENDING_SNAPSHOT, PENDING_ERROR, NATIVE_PENDING)):
                 raise JobError("reserved_model_exit_evidence")
             try:
                 pending = await capture_pending(self, tx, row)
@@ -456,13 +455,6 @@ class JobManager:
                         evidence_data[NATIVE_PENDING] = native
             except JobError as exc:
                 evidence_data[PENDING_ERROR] = exc.code
-                resource_state = "unknown"
-            try:
-                snapshot = await capture(self, tx, row)
-                if snapshot is not None:
-                    evidence_data[SNAPSHOT] = snapshot
-            except JobError as exc:
-                evidence_data["model_attempt_snapshot_error"] = exc.code
                 resource_state = "unknown"
             # Closing an already executed attempt is evidence, not permission to
             # dispatch more work. Cancellation/lease expiry must not prevent it.

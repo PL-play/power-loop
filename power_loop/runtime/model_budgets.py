@@ -12,7 +12,7 @@ import json
 from dataclasses import asdict
 
 from . import budget_scopes
-from .budget_contracts import BudgetAck, BudgetConfig, BudgetGrant, BudgetPlan, BudgetSubmission
+from .budget_contracts import BudgetAck, BudgetConfig, BudgetGrant, BudgetSubmission
 from .budget_policy_sources import PolicySourceChanged
 from .budget_policy_sources import current as prepared_source
 from .budget_policy_sources import prepared as prepare_policy
@@ -23,10 +23,30 @@ _COUNTERS = budget_scopes.COUNTERS
 
 
 def accounting_context(state):
-    """Carry the original reserved request across hosts, recovery and revisions."""
+    """Keep pricing inputs with the live owner until its submission is frozen."""
     from .budget_contracts import payload
-    return {**payload(state['context']),
-        'reservation_request': payload(state['plan']['request'])}
+    context = payload(state['context'])
+    if state['plan'] is not None and 'request' in state['plan']:
+        context['reservation_request'] = payload(state['plan']['request'])
+    return context
+
+
+def stored_state(state):
+    """Persist accounting and the frozen outbox, without pricing or phase proofs."""
+    value = {key: state[key] for key in (
+        'allocation_id', 'plan_hash', 'host_intent', 'observation',
+        'usage_revision', 'initial_usage_evidence') if key in state}
+    value['generation'] = state['context']['generation']
+    value['kind'] = state['context'].get('kind', 'model')
+    value['token_bound'] = state['plan']['token_bound'] if state['plan'] is not None else None
+    grant = state['grant']
+    value['grant'] = {key: grant[key] for key in ('version', 'state')} if grant else None
+    submission = state['submission']
+    value['submission'] = {key: submission[key] for key in ('revision', 'request')} if submission else None
+    ack = state['ack']
+    value['ack'] = ({key: ack[key] for key in ('revision', 'request_hash')}
+                    if ack and 'request_hash' in ack else ack)
+    return value
 
 
 def policy_key(runtime):
@@ -204,37 +224,34 @@ async def _save_counters(manager, tx, row, counters):
 
 
 async def _read(manager, tx, attempt_id, *, required=True):
-    row = await tx.fetchone(f"SELECT * FROM {manager.prefix}task_budget_attempts WHERE attempt_id=?", (attempt_id,))
+    row = await tx.fetchone(
+        f"SELECT b.*,j.tenant_id,j.principal_id,j.session_id,j.root_job_id "
+        f"FROM {manager.prefix}task_budget_attempts b JOIN {manager.jobs} j ON j.job_id=b.job_id "
+        "WHERE b.attempt_id=?", (attempt_id,))
     if row is None:
         if required:
             raise JobError("budget_attempt_missing")
         return None
-    event_id = "mb_" + _hash([attempt_id, row["version"]])[:48]
-    event = await tx.fetchone(
-        f"SELECT payload_json,request_hash,job_id,event_type,delivery_status FROM {manager.events} WHERE event_id=?", (event_id,))
-    return _validate_row(row, event)
+    return _budget_row(manager, row)
 
 
-def _validate_row(row, event):
+def _budget_row(manager, row):
     value = _object(row["state_json"], row["state_hash"])
-    if type(row["pending"]) is not int or row["pending"] not in (0, 1) or type(value.get("pending")) is not bool:
-        raise JobError("budget_evidence_corrupt")
-    if (
-        value.get("attempt_id"),
-        value.get("job_id"),
-        value.get("policy_key"),
-        value.get("version"),
-        value.get("phase"),
-        value.get("pending"),
-    ) != (row["attempt_id"], row["job_id"], row["policy_key"], row["version"], row["phase"], bool(row["pending"])):
-        raise JobError("budget_evidence_corrupt")
-    if (
-        event is None
-        or (event["job_id"], event["event_type"], event["delivery_status"])
-        != (row["job_id"], "model_budget_state", "not_applicable")
-        or _object(event["payload_json"], event["request_hash"]) != value
-    ):
-        raise JobError("budget_evidence_corrupt")
+    value.update({key: row[key] for key in ('attempt_id', 'job_id', 'policy_key', 'version', 'phase')})
+    value['pending'] = bool(row['pending'])
+    value['started_at_ms'], value['finished_at_ms'] = row['created_at'], row['updated_at']
+    value['context'] = {key: row[key] for key in ('tenant_id', 'principal_id', 'session_id', 'root_job_id', 'job_id', 'attempt_id')}
+    value['context'].update(store_id=manager.store.store_id, generation=value.pop('generation'))
+    if value.pop('kind') == 'tool':
+        value['context']['kind'] = 'tool'
+    bound = value.pop('token_bound')
+    value['plan'] = {'token_bound': bound} if bound is not None else None
+    if value['grant'] is not None:
+        value['grant'].update(attempt_id=value['attempt_id'], request_hash=value['plan_hash'], receipt={})
+    if value['submission'] is not None:
+        value['submission']['attempt_id'] = value['attempt_id']
+    if value['ack'] is not None and 'request_hash' in value['ack']:
+        value['ack'].update(attempt_id=value['attempt_id'], receipt={})
     return value
 
 
@@ -335,11 +352,6 @@ async def _observe(runtime, actor, job_id, attempt_id, observation):
         if policy is None:
             return
         job = await manager._authorize(tx, actor, job_id)
-        from .model_attempts import _read as read_model
-
-        source = await read_model(manager, tx, "finished", attempt_id)
-        if source[1] != observation:
-            raise JobError("budget_observation_source_mismatch")
         state = await _read(manager, tx, attempt_id)
         if state.get("initial_usage_evidence") is not None:
             from .budget_revisions import read_initial
@@ -354,15 +366,15 @@ async def _observe(runtime, actor, job_id, attempt_id, observation):
             if observation["status"] == "returned":
                 from .execution_budget import adjust_allocation
                 await adjust_allocation(manager, tx, state, {"inflight": -1})
-            state.update(observation=observation, finished_at_ms=source[0]["created_at"])
+            state.update(observation=observation, finished_at_ms=manager.now())
             await _save(manager, tx, state, job)
         else:
-            if not await _project_observation(manager, tx, policy, state, job, observation, source):
+            if not await _project_observation(manager, tx, policy, state, job, observation, manager.now()):
                 return
     await _deliver(runtime, actor, job_id, attempt_id)
 
 
-async def _project_observation(manager, tx, policy, state, job, observation, source):
+async def _project_observation(manager, tx, policy, state, job, observation, finished_at_ms):
     """First ordinary observation, when no independent financial evidence exists."""
     if state["phase"] != "dispatch_authorized":
         if state["observation"] == observation:
@@ -387,10 +399,8 @@ async def _project_observation(manager, tx, policy, state, job, observation, sou
         await tx.execute(
             f"UPDATE {manager.prefix}task_budget_policies SET enabled=0 WHERE policy_key=?", (state["policy_key"],)
         )
-    # Recovery may happen hours later; never retime the original usage to
-    # the reconciler's wall clock (which could change its pricing period).
     state.update(phase="settling", pending=True, observation=observation,
-                 finished_at_ms=source[0]["created_at"])
+                 finished_at_ms=finished_at_ms)
     await _save(manager, tx, state, job)
     return True
 
@@ -410,9 +420,6 @@ async def _deliver(runtime, actor, job_id, attempt_id):
         await _policy(runtime, tx)
         job = await manager._authorize(tx, actor, job_id)
         state = await _read(manager, tx, attempt_id)
-        if state['context'].get('kind') == 'tool':
-            from .tool_attempts import verify_state
-            await verify_state(manager, tx, job, state, finished=True)
         if state["phase"] != "settling":
             raise JobError("budget_usage_not_ready")
         if state.get("initial_usage_evidence") is not None:
@@ -483,7 +490,7 @@ async def _deliver(runtime, actor, job_id, attempt_id):
         if latest["ack"] is None:
             latest.update(ack=asdict(ack), pending=False)
             await _save(manager, tx, latest, job)
-        elif latest["ack"] != asdict(ack):
+        elif any(latest['ack'][key] != getattr(ack, key) for key in ('attempt_id', 'revision', 'request_hash')):
             raise JobError("budget_ack_conflict")
     return asdict(ack)
 
@@ -499,66 +506,18 @@ async def close_unreserved(attempt):
     return await close_owned(attempt)
 
 
-async def is_closed_unstarted(manager, tx, prepared):
-    """Read original release evidence without granting another dispatch."""
-    state = await _read(manager, tx, prepared["attempt_id"], required=False)
-    if state is None:
-        # A checkpoint coalesces RAM revisions; version 1 need never have been
-        # projected. At this cold evidence reader, any original budget version
-        # for the attempt proves that a missing projection is not "no grant".
-        extract = {
-            "sqlite": "json_extract(payload_json,'$.attempt_id')",
-            "postgres": "CAST(payload_json AS jsonb)->>'attempt_id'",
-            "mysql": "JSON_UNQUOTE(JSON_EXTRACT(payload_json,'$.attempt_id'))",
-        }[manager.db.dialect.name]
-        if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE job_id=? "
-                f"AND event_type='model_budget_state' AND {extract}=? LIMIT 1",
-                (prepared["scope"]["job_id"], prepared["attempt_id"])):
-            raise JobError("budget_attempt_missing")
-        return False
-    if state["phase"] != "released" or state["pending"] or state["ack"] is None:
-        return False
-    if (
-        state["context"]["prepared_hash"] != _hash(prepared)
-        or state["context"]["session_id"] != prepared["session_id"]
-        or state["job_id"] != prepared["scope"]["job_id"]
-        or state["context"]["generation"] != prepared["scope"]["generation"]
-    ):
-        raise JobError("budget_evidence_corrupt")
-    return True
-
-
 async def close_unstarted(attempt):
     from .execution_budget import release_unstarted as release_owned
     return await release_owned(attempt)
 
 
 async def _release_source(runtime, tx, job, attempt_id, policy):
-    """Validate persisted authority without impersonating its old executor."""
-    from .model_attempts import _read as read_model
-
     manager = runtime.manager
     if policy is None:
         raise JobError("budget_provider_required")
     state = await _read(manager, tx, attempt_id)
-    _, prepared = await read_model(manager, tx, "prepared", attempt_id)
-    _, tracking = await read_model(manager, tx, "tracking", prepared["scope"])
-    context = {
-        "version": 1, "store_id": manager.store.store_id,
-        "tenant_id": job["tenant_id"], "principal_id": job["principal_id"],
-        "root_job_id": job["root_job_id"], "job_id": job["job_id"],
-        "generation": prepared["scope"]["generation"], "session_id": job["session_id"],
-        "attempt_id": attempt_id, "prepared_event_id":
-            "ma_prepared_" + _hash([manager.store.store_id, attempt_id])[:48],
-        "prepared_hash": _hash(prepared), "request_hash": prepared["request_hash"],
-        "model": prepared["model"], "max_tokens": prepared["max_tokens"],
-    }
-    if (job["kind"] != "send" or state["job_id"] != job["job_id"]
-            or state["policy_key"] != policy["policy_key"]
-            or prepared["scope"]["job_id"] != job["job_id"]
-            or prepared["session_id"] != job["session_id"] or state["context"] != context
-            or tracking != {"version": 1, "scope": prepared["scope"], "session_id": job["session_id"]}):
-        raise JobError("budget_reconciliation_evidence_mismatch")
+    if state["job_id"] != job["job_id"] or state["policy_key"] != policy["policy_key"]:
+        raise JobError("budget_reconciliation_scope_mismatch")
     return state
 
 
@@ -605,10 +564,6 @@ async def _release_unstarted(runtime, actor, job_id, attempt_id, *, require_canc
         policy = await _policy(runtime, tx)
         job = await manager._authorize(tx, actor, job_id)
         state = await _release_source(runtime, tx, job, attempt_id, policy)
-        from .model_attempts import _read as read_model
-
-        if await read_model(manager, tx, "dispatched", attempt_id, required=False):
-            raise JobError("budget_release_not_permitted")
         if state["phase"] == "released":
             return state["ack"]
         if state["phase"] != "dispatch_closed":
@@ -623,32 +578,8 @@ async def _release_unstarted(runtime, actor, job_id, attempt_id, *, require_canc
             await _save(manager, tx, state, job)
             return state["ack"]
     provider = runtime.budget_config.provider
-    if state["grant"] is None:
-        plan = BudgetPlan(**state["plan"])
-        grant = await _host_call(runtime, job_id, attempt_id, "lookup", lambda: provider.lookup(plan))
-        if grant is not None and (
-            type(grant) is not BudgetGrant
-            or (grant.attempt_id, grant.request_hash) != (attempt_id, state["plan_hash"])
-        ):
-            raise JobError("budget_host_reservation_unconfirmed")
-        if grant is not None and grant.state not in ("reserved", "released"):
-            raise JobError("budget_release_not_permitted")
-        if grant is not None:
-            async with manager._write() as tx:
-                job = await manager._authorize(tx, actor, job_id)
-                state = await _read(manager, tx, attempt_id)
-                if state["phase"] == "released":
-                    return state["ack"]
-                if state["phase"] != "dispatch_closed":
-                    raise JobError("budget_release_not_permitted")
-                if state["grant"] is None:
-                    state["grant"] = asdict(grant)
-                    await _save(manager, tx, state, job)
-                if grant.state == "released":
-                    await _refund_local(manager, tx, policy, state)
-                    state.update(phase="released", pending=False, ack={"release_observation": asdict(grant)})
-                    await _save(manager, tx, state, job)
-                    return state["ack"]
+    if state["grant"] is None and state["submission"] is None:
+        raise JobError("budget_reconciliation_submission_required")
     if state["submission"] is None:
         proof = {
             "proof": "dispatch_not_authorized",
@@ -696,7 +627,7 @@ async def _release_unstarted(runtime, actor, job_id, attempt_id, *, require_canc
         await _refund_local(manager, tx, policy, latest)
         latest.update(phase="released", pending=False, ack=asdict(ack))
         await _save(manager, tx, latest, job)
-    return asdict(ack)
+    return {**asdict(ack), "receipt": {}}
 
 
 async def get_budget(manager, actor, attempt_id):
@@ -714,6 +645,10 @@ async def get_budget(manager, actor, attempt_id):
             control.needs_reconciliation = True
         else:
             await flush_binding(binding)
+            from .budget_contracts import payload
+            live = control.get('budget', attempt_id)
+            if live is not None:
+                return payload(live)
     async with manager._write() as tx:
         state = await _read(manager, tx, attempt_id)
         await manager._authorize(tx, actor, state["job_id"])
@@ -756,56 +691,24 @@ async def recovery_config(manager, actor, job_id, attempt_id, *, provider_key, p
 
 
 async def _reconciliation_state(runtime, actor, job_id, attempt_id, *, allow_missing_observation=False):
-    """Read and verify original model, policy and accounting provenance."""
-    if (type(job_id) is not str or not 0 < len(job_id) <= 64
-            or type(attempt_id) is not str or len(attempt_id) != 56
-            or not attempt_id.startswith("attempt_")
-            or any(c not in "0123456789abcdef" for c in attempt_id[8:])):
-        raise JobError("invalid_budget_reconciliation_identity")
+    """Use the stored accounting state for settlement and resubmission."""
     manager = runtime.manager
-    from .model_attempts import _read as read_model
     async with prepare_policy(runtime), manager._write() as tx:
-        job = await manager._authorize(tx, actor, job_id)
+        await manager._authorize(tx, actor, job_id)
         policy = await _policy(runtime, tx)
         if policy is None:
             raise JobError("budget_provider_required")
         state = await _read(manager, tx, attempt_id)
         if state["job_id"] != job_id or state["policy_key"] != policy["policy_key"]:
             raise JobError("budget_reconciliation_scope_mismatch")
-        _, prepared = await read_model(manager, tx, "prepared", attempt_id)
-        _, dispatched = await read_model(manager, tx, "dispatched", attempt_id)
-        finished = await read_model(manager, tx, "finished", attempt_id,
-            required=not allow_missing_observation and state.get("initial_usage_evidence") is None)
-        observation = finished[1] if finished is not None else None
+        if state["phase"] not in ("dispatch_authorized", "settling"):
+            raise JobError("budget_usage_not_ready")
+        observation = state["observation"]
+        if observation is None and not allow_missing_observation and state.get("initial_usage_evidence") is None:
+            raise JobError("budget_usage_not_ready")
         if state.get("initial_usage_evidence") is not None:
             from .budget_revisions import read_initial
             await read_initial(manager, tx, state)
-        _, tracking = await read_model(manager, tx, "tracking", prepared["scope"])
-        expected = {
-            "version": 1, "store_id": manager.store.store_id,
-            "tenant_id": job["tenant_id"], "principal_id": job["principal_id"],
-            "root_job_id": job["root_job_id"], "job_id": job_id,
-            "generation": prepared["scope"]["generation"], "session_id": job["session_id"],
-            "attempt_id": attempt_id, "prepared_event_id":
-                "ma_prepared_" + _hash([manager.store.store_id, attempt_id])[:48],
-            "prepared_hash": _hash(prepared), "request_hash": prepared["request_hash"],
-            "model": prepared["model"], "max_tokens": prepared["max_tokens"],
-        }
-        if (job["kind"] != "send" or prepared["scope"]["job_id"] != job_id
-                or prepared["session_id"] != job["session_id"] or state["context"] != expected
-                or tracking != {"version": 1, "scope": prepared["scope"], "session_id": job["session_id"]}
-                or dispatched != {"version": 1, "scope": prepared["scope"],
-                    "attempt_id": attempt_id, "prepared_hash": _hash(prepared)}
-                or observation is not None and (observation["scope"] != prepared["scope"]
-                    or observation["prepared_hash"] != _hash(prepared)
-                    or observation["dispatch_hash"] != _hash(dispatched))):
-            raise JobError("budget_reconciliation_evidence_mismatch")
-        if state["phase"] not in ("dispatch_authorized", "settling"):
-            raise JobError("budget_usage_not_ready")
-        if (state["phase"] == "settling" and state["observation"] != observation
-                and not (state.get("initial_usage_evidence") is not None
-                         and state["observation"] is None and observation is not None)):
-            raise JobError("budget_observation_source_mismatch")
         from .control_runtime import require_closed
         await require_closed(manager, tx, job_id, state["context"]["generation"])
     return state, observation
@@ -834,7 +737,7 @@ async def require_quiescent(manager, tx, job):
             and summary.get("budget_attempts") == 0 and not summary.get("budget_unsettled")):
         return []  # This process wrote every budget attempt of this execution: none.
     rows = await tx.fetchall(
-        f"SELECT * FROM {manager.prefix}task_budget_attempts WHERE job_id=? LIMIT 10001", (job["job_id"],))
+        f"SELECT pending,phase FROM {manager.prefix}task_budget_attempts WHERE job_id=? LIMIT 10001", (job["job_id"],))
     if len(rows) > 10000:
         raise JobError("budget_attempt_limit")
     head = await tx.fetchone(f"SELECT summary_json,summary_hash FROM {manager.prefix}execution_checkpoints WHERE job_id=? AND generation=?",
@@ -845,14 +748,7 @@ async def require_quiescent(manager, tx, job):
             raise JobError("budget_attempt_missing")
         if summary["budget_unsettled"]:
             raise JobError("budget_reconciliation_required")
-    refs = ["mb_" + _hash([row["attempt_id"], row["version"]])[:48] for row in rows]
-    events = {}
-    for offset in range(0, len(refs), 100):
-        part = refs[offset:offset + 100]
-        found = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE event_id IN (" + ",".join("?" for _ in part) + ")", tuple(part))
-        events.update({event["event_id"]: event for event in found})
-    for row, ref in zip(rows, refs, strict=True):
-        state = _validate_row(row, events.get(ref))
-        if state["pending"] or state["phase"] not in ("released", "settling") or state["ack"] is None:
+    for row in rows:
+        if row["pending"] or row["phase"] not in ("released", "settling"):
             raise JobError("budget_reconciliation_required")
-    return refs
+    return []

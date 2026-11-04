@@ -26,7 +26,6 @@ from power_loop.runtime.budget_contracts import (
     LocalBudgetScope,
 )
 from power_loop.runtime.jobs import JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow.facade import WorkflowToolPorts, register_workflow_tool
@@ -298,10 +297,12 @@ async def test_real_same_original_send_can_continue_after_proven_local_preparati
                     if getattr(response.token_usage, k) is not None
                 }
                 await model_attempts.observe(attempt, usage=usage, estimated=False)
-                page = await list_attempts(runtime.manager, actor, binding.lease.job_id)
-                assert {item["status"] for item in page["items"]} == {"not_dispatched", "returned"}
-                assert len(page["items"]) == 2 and provider.calls == host.reserve_calls == len(host.applied) == 1
-                assert all(item["generation"] == str(binding.lease.generation) for item in page["items"])
+                from power_loop.runtime.control_runtime import current
+                models = [value for (kind, _), value in current(binding)._records.items()
+                          if kind == "attempt" and value["kind"] == "model"]
+                assert {item["phase"] for item in models} == {"aborted", "finished"}
+                assert len(models) == 2 and provider.calls == host.reserve_calls == len(host.applied) == 1
+                assert all(item["prepared"]["scope"]["generation"] == binding.lease.generation for item in models)
                 rows = await runtime.manager.db.fetchall(
                     f"SELECT counters_json FROM {runtime.manager.prefix}task_budget_scopes"
                 )

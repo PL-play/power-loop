@@ -12,6 +12,7 @@ import pytest
 from power_loop import LLMRequest
 from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
+from power_loop.runtime.control_runtime import current
 from power_loop.runtime.budget_contracts import (
     BudgetAck,
     BudgetConfig,
@@ -164,17 +165,13 @@ async def test_admission_and_model_dispatch_commit_one_original_grant(budget_cas
     assert state["context"]["prepared_hash"] == _hash(a.prepared)
     assert c.host.reserve_calls == 1
     assert await counters(c) == {"used_calls": 0, "held_calls": 1, "used_tokens": 0, "held_tokens": 100, "inflight": 1}
-    [row] = await c.manager.db.fetchall(
-        f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'"
-    )
-    assert row["event_id"]
+    assert current(c.binding).get("attempt", a.attempt_id)["phase"] == "dispatched"
     with pytest.raises(JobError, match="dispatch_already_admitted"):
         await attempts.dispatch(a)
     state = await observed(c, a)
     assert state["phase"] == "settling" and not state["pending"] and state["ack"]
     # Open owners retain their full grant; checkpoint summaries hold actuals.
     assert await counters(c) == {"used_calls": 0, "held_calls": 1, "used_tokens": 0, "held_tokens": 100, "inflight": 1}
-    from power_loop.runtime.control_runtime import current
     [actual] = (await current(c.binding).journal.inspect(current(c.binding).identity))["summary"]["allocations"]
     assert actual["used_calls"] == 1 and actual["used_tokens"] == 10
     from power_loop.runtime.control_runtime import flush_binding
@@ -275,14 +272,10 @@ async def test_cancel_after_host_grant_never_authorizes_provider_and_can_release
     c.host.reserve = cancel_after_grant
     with pytest.raises(JobError, match="cancel_requested"):
         await start(c)
-    [row] = await c.manager.db.fetchall(
-        f"SELECT payload_json FROM {c.manager.events} WHERE event_type='model_attempt_prepared'"
-    )
-    prepared = json.loads(row["payload_json"])
+    [prepared] = [value["prepared"] for (kind, _), value in current(c.binding)._records.items()
+                  if kind == "attempt" and value["kind"] == "model"]
     a = attempts.Attempt(c.binding, prepared["attempt_id"], prepared)
-    assert not await c.manager.db.fetchall(
-        f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'"
-    )
+    assert all(value["phase"] != "dispatched" for value in current(c.binding).active.values())
     proof = await budgets.close_unstarted(a)
     assert proof and (await budgets.get_budget(c.manager, c.actor, a.attempt_id))["phase"] == "released"
     assert all(value == 0 for value in (await counters(c)).values())
@@ -353,23 +346,6 @@ async def test_actual_component_over_bound_closes_policy_and_preserves_the_whole
     assert c.host.reserve_calls == 1
 
 
-@pytest.mark.parametrize("invalid", [2, -1])
-async def test_invalid_pending_projection_is_rejected_by_read_and_admission_without_host_work(budget_case, invalid):
-    c = budget_case
-    c.host.apply_unavailable = True
-    a = await start(c)
-    assert (await observed(c, a))["pending"]
-    before = await counters(c)
-    await c.manager.db.execute(
-        f"UPDATE {c.manager.prefix}task_budget_attempts SET pending=? WHERE attempt_id=?", (invalid, a.attempt_id)
-    )
-    with pytest.raises(JobError, match="budget_evidence_corrupt"):
-        await budgets.get_budget(c.manager, c.actor, a.attempt_id)
-    # Cold inspection diagnoses corruption. Admission still counts every
-    # nonzero pending flag and rejects capacity without reopening that tree.
-    with pytest.raises(JobError, match="budget_reconciliation_required"):
-        await new_send(c)
-    assert c.host.reserve_calls == 1 and await counters(c) == before
 
 
 @pytest.mark.parametrize("invalid", [2, -1])
@@ -426,19 +402,15 @@ async def test_unconfirmed_reservation_closes_dispatch_then_uses_host_tombstone_
     c.host.reserve = unavailable
     with pytest.raises(JobError, match="budget_host_reservation_unconfirmed"):
         await start(c)
-    [raw] = await c.manager.db.fetchall(
-        f"SELECT payload_json FROM {c.manager.events} WHERE event_type='model_attempt_prepared'"
-    )
-    prepared = json.loads(raw["payload_json"])
+    [prepared] = [value["prepared"] for (kind, _), value in current(c.binding)._records.items()
+                  if kind == "attempt" and value["kind"] == "model"]
     original = attempts.Attempt(c.binding, prepared["attempt_id"], prepared)
     proof = await budgets.close_unstarted(original)
     from power_loop.runtime.control_runtime import flush_binding
     await flush_binding(c.binding, close=True)
     assert proof and (await counters(c))["held_tokens"] == 0
     assert (await budgets.get_budget(c.manager, c.actor, original.attempt_id))["phase"] == "released"
-    assert not await c.manager.db.fetchall(
-        f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'"
-    )
+    assert all(value["phase"] != "dispatched" for value in current(c.binding).active.values())
 
 
 @pytest.mark.parametrize("budget_case", [{"timeout_s": 0.1}], indirect=True)
@@ -458,19 +430,15 @@ async def test_timed_out_api_task_is_retained_and_late_grant_only_allows_mechani
     assert not task.done() and not task.cancelling()
     release.set()
     await task
-    [raw] = await c.manager.db.fetchall(
-        f"SELECT payload_json FROM {c.manager.events} WHERE event_type='model_attempt_prepared'"
-    )
-    prepared = json.loads(raw["payload_json"])
+    [prepared] = [value["prepared"] for (kind, _), value in current(c.binding)._records.items()
+                  if kind == "attempt" and value["kind"] == "model"]
     original = attempts.Attempt(c.binding, prepared["attempt_id"], prepared)
     await budgets.close_unstarted(original)
     from power_loop.runtime.control_runtime import flush_binding
     await flush_binding(c.binding, close=True)
     assert (await budgets.get_budget(c.manager, c.actor, original.attempt_id))["phase"] == "released"
     assert all(value == 0 for value in (await counters(c)).values())
-    assert not await c.manager.db.fetchall(
-        f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'"
-    )
+    assert all(value["phase"] != "dispatched" for value in current(c.binding).active.values())
 
 
 @pytest.mark.parametrize("field,value", [("attempt_id", "foreign"), ("request_hash", "c" * 64), ("state", "released")])
@@ -484,9 +452,7 @@ async def test_wrong_api_grant_is_not_authority_for_a_model_call(budget_case, fi
     c.host.reserve = wrong
     with pytest.raises(JobError, match="budget_host_reservation_unconfirmed"):
         await start(c)
-    assert not await c.manager.db.fetchall(
-        f"SELECT event_id FROM {c.manager.events} WHERE event_type='model_attempt_dispatched'"
-    )
+    assert all(value["phase"] != "dispatched" for value in current(c.binding).active.values())
 
 
 async def test_wrong_usage_ack_cannot_clear_a_frozen_outbox_or_apply_local_tokens_twice(budget_case):

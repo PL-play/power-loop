@@ -289,18 +289,6 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         from .wait_terminal import terminate_tx
         await terminate_tx(manager, tx, actor, row["job_id"])
         row = await manager._row(tx, row["job_id"])
-    if row["kind"] == "send":
-        from .execution_membership import _trusted
-        cached = _trusted(manager, "_membership_reads", key)
-        if cached is not None:
-            exit_evidence = (json.loads(cached)["model"] or {}).get("payload", {}).get("evidence", {})
-        else:
-            exit = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", ("model_closed_" + row["job_id"],))
-            exit_evidence = _object(exit["payload_json"]).get("evidence", {}) if exit else {}
-        if exit_evidence.get("model_attempt_snapshot_error"):
-            from .model_exit import capture
-            await capture(manager, tx, row)  # Keep the original precise corruption error.
-            raise JobError("model_exit_snapshot_incomplete")
     if row["resource_state"] != "stopped" or row["intake"] != "closed":
         raise JobError("finalization_execution_unsettled")
     state["visiting"].add(key)
@@ -345,20 +333,13 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         model = membership["model"]
         if (row["status"] != "model_closed" or model is None or model["payload"].get("resource_state") != "stopped"):
             raise JobError("finalization_model_exit_unconfirmed")
-        from .model_exit import SNAPSHOT, require_stopped
+        from .model_exit import require_stopped
         evidence = model["payload"].get("evidence", {})
         if evidence.get("exit") != "completed" and evidence.get("exit") not in ("failed", "cancelled", "interrupted", "hit_round_limit", "timed_out", "budget_exceeded", "degraded"):
             raise JobError("finalization_model_exit_unconfirmed")
-        if evidence.get("exit") != "completed" and SNAPSHOT not in evidence:
-            raise JobError("finalization_model_exit_unconfirmed")
-        known = {}
-        if SNAPSHOT in evidence:
-            attempt_refs = await require_stopped(manager, tx, row, model["payload"], known=known)
-            from .model_budgets import require_quiescent as require_budget_quiescent
-            attempt_refs.extend(await require_budget_quiescent(manager, tx, row))
-        else:
-            from .model_attempts import require_quiescent
-            attempt_refs = await require_quiescent(manager, tx, row)
+        await require_stopped(manager, tx, row, model["payload"])
+        from .model_budgets import require_quiescent as require_budget_quiescent
+        attempt_refs = await require_budget_quiescent(manager, tx, row)
         refs.append(await _reference(manager, tx, model["event_id"]))
         from .pending_calls import require_disposition
         pending_ref = await require_disposition(manager, tx, row, model["payload"])
@@ -366,7 +347,7 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
             refs.append(pending_ref)
             from .pending_calls import negative_review_references
             refs.extend(await negative_review_references(manager, tx, row))
-        refs.extend(await _references(manager, tx, attempt_refs, known))
+        refs.extend(await _references(manager, tx, attempt_refs))
         from .control_requests import completed_request_events, request_events
         refs.extend(_event_reference(event) for event in completed_request_events(await request_events(manager, tx, row["job_id"])))
     else:

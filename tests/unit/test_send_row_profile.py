@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 
 import pytest
 
@@ -13,77 +14,78 @@ from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
+from tests.unit.test_send_sql_profile import Profiled, _counts
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 OUT = os.environ.get("ROWS_OUT")
 
-# Baseline 3b69678, design 201 A0. Byte budgets allow the specified 2% margin.
-_BASELINE = {(1, 0, False): {'execution_batches': (1, 2207),
+# Design 201 A0 baseline, lowered by A1. Byte budgets allow a 2% margin.
+_BASELINE = {(1, 0, False): {'jobs': (1, 311),
+                 'job_events': (5, 4200),
                  'execution_checkpoints': (1, 729),
-                 'job_events': (9, 9405),
-                 'jobs': (1, 311),
+                 'execution_batches': (1, 1474),
                  'messages': (2, 221),
                  'session_stats': (0, 1)},
- (1, 0, True): {'execution_allocations': (1, 763),
-                'execution_batches': (2, 8023),
+ (1, 0, True): {'jobs': (1, 311),
+                'job_events': (5, 4200),
+                'task_budget_scopes': (0, 1),
+                'task_budget_attempts': (1, 1384),
                 'execution_checkpoints': (1, 910),
-                'job_events': (10, 13901),
-                'jobs': (1, 311),
+                'execution_batches': (2, 6498),
+                'execution_allocations': (1, 763),
                 'messages': (2, 221),
-                'session_stats': (0, 1),
-                'task_budget_attempts': (1, 4216),
-                'task_budget_scopes': (0, 1)},
- (4, 1, False): {'execution_batches': (1, 21947),
+                'session_stats': (0, 1)},
+ (4, 1, False): {'jobs': (1, 311),
+                 'job_events': (20, 15924),
                  'execution_checkpoints': (1, 729),
-                 'job_events': (51, 44487),
-                 'jobs': (1, 311),
+                 'execution_batches': (1, 19747),
                  'messages': (8, 1186),
                  'session_state': (0, 1),
                  'session_stats': (0, 1)},
- (4, 1, True): {'execution_allocations': (1, 766),
-                'execution_batches': (2, 53857),
+ (4, 1, True): {'jobs': (1, 311),
+                'job_events': (20, 15924),
+                'task_budget_scopes': (0, 1),
+                'task_budget_attempts': (4, 5536),
                 'execution_checkpoints': (1, 911),
-                'job_events': (58, 77651),
-                'jobs': (1, 311),
+                'execution_batches': (2, 34778),
+                'execution_allocations': (1, 765),
                 'messages': (8, 1186),
                 'session_state': (0, 1),
-                'session_stats': (0, 1),
-                'task_budget_attempts': (7, 30712),
-                'task_budget_scopes': (0, 1)},
- (32, 1, False): {'execution_batches': (1, 206676),
+                'session_stats': (0, 1)},
+ (32, 1, False): {'jobs': (1, 312),
+                  'job_events': (160, 125574),
                   'execution_checkpoints': (1, 733),
-                  'job_events': (443, 372429),
-                  'jobs': (1, 312),
+                  'execution_batches': (1, 190751),
                   'messages': (64, 10321),
                   'session_state': (0, 1),
                   'session_stats': (0, 2)},
- (32, 1, True): {'execution_allocations': (1, 772),
-                 'execution_batches': (3, 483367),
+ (32, 1, True): {'jobs': (1, 312),
+                 'job_events': (160, 125574),
+                 'task_budget_scopes': (0, 1),
+                 'task_budget_attempts': (32, 44288),
                  'execution_checkpoints': (1, 918),
-                 'job_events': (506, 673287),
-                 'jobs': (1, 312),
+                 'execution_batches': (3, 300303),
+                 'execution_allocations': (1, 771),
                  'messages': (64, 10321),
                  'session_state': (0, 1),
-                 'session_stats': (0, 2),
-                 'task_budget_attempts': (63, 278134),
-                 'task_budget_scopes': (0, 1)},
- (32, 4, False): {'execution_batches': (3, 610193),
+                 'session_stats': (0, 2)},
+ (32, 4, False): {'jobs': (1, 312),
+                  'job_events': (439, 391911),
                   'execution_checkpoints': (1, 735),
-                  'job_events': (1280, 994747),
-                  'jobs': (1, 312),
+                  'execution_batches': (3, 588440),
                   'messages': (157, 25745),
                   'session_stats': (0, 2)},
- (32, 4, True): {'execution_allocations': (1, 775),
-                 'execution_batches': (6, 1321005),
-                 'execution_checkpoints': (1, 923),
-                 'job_events': (1436, 1766371),
-                 'jobs': (1, 312),
+ (32, 4, True): {'jobs': (1, 312),
+                 'job_events': (439, 391911),
+                 'task_budget_attempts': (32, 44288),
+                 'execution_checkpoints': (1, 920),
+                 'execution_batches': (4, 697917),
+                 'execution_allocations': (1, 771),
                  'messages': (157, 25745),
-                 'session_stats': (0, 2),
-                 'task_budget_attempts': (156, 707608)}}
+                 'session_stats': (0, 2)}}
 
 
-async def _snapshot(db, prefix):
+async def _snapshot(db, prefix, *, largest=None):
     d = db.dialect.name
     if d == "sqlite":
         tables = [r["name"] for r in await db.fetchall("SELECT name FROM sqlite_master WHERE type='table'")]
@@ -107,8 +109,10 @@ async def _snapshot(db, prefix):
             cols = [r["column_name"] for r in await db.fetchall(
                 f"SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='{t}'")]
             size = "+".join(f"COALESCE(OCTET_LENGTH(CAST(\"{c}\" AS TEXT)),0)" for c in cols) or "0"
-        row = await db.fetchone(f"SELECT COUNT(*) AS n, COALESCE(SUM({size}),0) AS b FROM {t}")
+        row = await db.fetchone(f"SELECT COUNT(*) AS n, COALESCE(SUM({size}),0) AS b, COALESCE(MAX({size}),0) AS m FROM {t}")
         out[t[len(prefix):]] = (int(row["n"]), int(row["b"]))
+        if largest is not None:
+            largest[t[len(prefix):]] = int(row['m'])
     return out
 
 
@@ -123,7 +127,7 @@ async def _events(db, table):
 @pytest.mark.parametrize("r,k", [(1, 0), (4, 1), (32, 1), (32, 4)])
 async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
     store, _ = registry_store
-    from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
+    from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
     from power_loop.runtime.response_capture import ResponseCaptureReceipt
     from tests.unit.test_model_budgets_192 import Host
     host = Host()
@@ -132,12 +136,15 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
         return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, "fixture-original")
 
     async def tool_plan(context, call, *, pricing):
-        return BudgetPlan(0, {"attempt_id": context["attempt_id"], "origin": context})
+        return None
     host.capture_response, host.prepare_tool = capture, tool_plan
     config = BudgetConfig("send-budget", (LocalBudgetScope("shared", max_calls=100000, max_tokens=10000000,
                                                            max_inflight=64),), host)
+    original_db = store._db
+    store._db = profiled = Profiled(original_db)
     runtime = TaskRuntime(JobManager(store), tenant_id="eval", principal_id="host", executor_id=f"rows-{r}-{k}",
-                          boot_id="boot", boot_contract_hash="a" * 64, budget_config=config if budgeted else None)
+                          boot_id="boot", lease_ms=300000, boot_contract_hash="a" * 64,
+                          budget_config=config if budgeted else None)
     registry = ToolRegistry()
 
     async def echo(text):
@@ -175,9 +182,16 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
         events_table = p + "job_events"
         before, ev_before = await _snapshot(store._db, p), await _events(store._db, events_table)
         model.calls = 0
+        profiled.records.clear()
+        profiled.tx_sites.clear()
+        started = time.monotonic()
         result = await loop.send("run", sid)
+        elapsed_s = time.monotonic() - started
+        sql = _counts(profiled.records, profiled.tx_sites)
+        sql["total"] = len(profiled.records)
         assert result.status == "completed" and model.calls == r
-        after, ev_after = await _snapshot(store._db, p), await _events(store._db, events_table)
+        largest = {}
+        after, ev_after = await _snapshot(store._db, p, largest=largest), await _events(store._db, events_table)
         delta = {t: (after[t][0] - before.get(t, (0, 0))[0], after[t][1] - before.get(t, (0, 0))[1])
                  for t in after if after[t] != before.get(t)}
         ev = {k2: (v[0] - ev_before.get(k2, (0, 0))[0], v[1] - ev_before.get(k2, (0, 0))[1])
@@ -192,8 +206,12 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
         if OUT:
             with open(OUT, "a") as f:
                 f.write(json.dumps({"db": store._db.dialect.name, "R": r, "K": k, "T": (r - 1) * k,
-                                    "budgeted": budgeted, "tables": delta, "job_events": ev}) + "\n")
+                                    "budgeted": budgeted, "tables": delta, "job_events": ev,
+                                    "sql": sql, "elapsed_s": elapsed_s, "largest": largest}) + "\n")
         assert not over, json.dumps({"over": over, "actual": delta}, sort_keys=True)
+        assert delta.get('task_budget_attempts', (0, 0))[0] <= (r if budgeted else 0)
+        assert largest.get('task_budget_attempts', 0) <= 1536
     finally:
         await runtime.shutdown(timeout_s=1)
         await loop.aclose(drain_timeout_s=0.1)
+        store._db = original_db

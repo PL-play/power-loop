@@ -204,12 +204,7 @@ async def record(manager, actor, original):
             if await reader.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?",
                     (notices.decision_id(manager, original['event_id']),)):
                 raise JobError('wait_decision_already_recorded')
-            binding = manager._execution_controls.get((caller.job_id, caller.generation))
-            returned = None
-            if binding is not None and manager._trust_own_writes.get():
-                from .control_runtime import current
-                returned = current(binding).returned_models(ref.round_index)
-            seen = await _observation(manager, reader, actor, caller, ref, due, receipt, _returned=returned)
+            seen = await _observation(manager, reader, actor, caller, ref, due, receipt)
             request = {**original, 'job_id':job['job_id'], 'proof':_proof(due,saved,seen)}
         accepted, outcome = await requests.discover(manager, reader, actor, request, action=ACTION)
         if accepted is None:

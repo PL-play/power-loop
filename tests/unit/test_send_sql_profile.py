@@ -55,8 +55,8 @@ def _limits(dialect, tools, budgeted, elapsed_s):
     mysql = dialect == "mysql"
     return {
         "ordinary": (17 if mysql else 15) + (6 if mysql else 4) * tools + int(elapsed_s),
-        "billing": 13 if budgeted else 0,
-        "control": 28 + tools // 6 + 4 * (tools // 16) if budgeted else 18 + tools // 6,
+        "billing": 12 if budgeted else 0,
+        "control": 25 + int(tools > 0) + 6 * (tools // 31) if budgeted else 17 + int(tools > 0) + tools // 31,
         "control_tx": 3 + tools // 16 if budgeted else 2,
     }
 
@@ -179,7 +179,7 @@ async def _measure(store, models, budgeted, history=0):
     original = store._db
     store._db = profiled = Profiled(original)
     manager = JobManager(store)
-    from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
+    from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
     from power_loop.runtime.response_capture import ResponseCaptureReceipt
 
     from .test_model_budgets_192 import Host
@@ -189,7 +189,7 @@ async def _measure(store, models, budgeted, history=0):
         return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, "fixture-original")
 
     async def tool_plan(context, call, *, pricing):
-        return BudgetPlan(0, {"attempt_id": context["attempt_id"], "origin": context})
+        return None
     host.capture_response, host.prepare_tool = capture, tool_plan
     config = BudgetConfig("send-budget", (LocalBudgetScope("shared", max_calls=10000, max_tokens=1000000,
                                                            max_inflight=64),), host)

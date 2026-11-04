@@ -43,10 +43,10 @@ def receipt_context(slot):
 
 
 async def record_billing_receipt(receipt: BillingReceipt) -> None:
-    """Save provider facts before subsequent decoding/business logic can fail.
+    """Retain provider facts for settlement before subsequent decoding can fail.
 
-    Await from the original async tool callback. A successful return means the
-    receipt is durable; it does not mean that the charge has been settled.
+    Await from the original async tool callback. Settlement reports the charge
+    after the callback completes or raises.
     """
     from .task_runtime import _SEND
     slot = _CURRENT.get()

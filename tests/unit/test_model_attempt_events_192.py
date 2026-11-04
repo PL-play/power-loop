@@ -21,7 +21,6 @@ from power_loop import (
 from power_loop.runtime import delegation
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.jobs import JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
@@ -155,8 +154,8 @@ async def test_same_short_call_id_in_two_sends_does_not_reuse_the_durable_attemp
         assert payload.model_attempt_store_id == c.store.store_id
         assert payload.budget_managed == (c.mode == "budget")
         assert payload.model_attempt_generation == 1
-        [saved] = (await list_attempts(c.manager, c.runtime.actor(sid), payload.model_attempt_job_id))["items"]
-        assert saved["attempt_id"] == payload.model_attempt_id and saved["status"] == "returned"
+        job = await c.manager.get_job(c.runtime.actor(sid), payload.model_attempt_job_id)
+        assert job.session_id == sid and event.data.model_attempt_id in ids
     assert {e.data.model_attempt_id for e in completed} == set(ids)
 
 

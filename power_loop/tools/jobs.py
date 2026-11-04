@@ -15,7 +15,6 @@ JOBS_DEFINITION = ToolDefinition(pricing=Free("local"),
         "list defaults to active obligations, which can include a finished outcome with unresolved resources or supervision. "
         "get reads one job_id; view=operations lists its saved operation call/receipt references, "
         "view=results lists canonical result versions. view=returns reads original native callback returns; these do not complete asynchronous work. "
-        "view=attempts reads bounded physical model-call observations for one send job, without billing settlement. "
         "Select event_id for operations/results/returns to read one saved event in character chunks, "
         "or output_file to export saved events as new workspace JSONL. Reads never acknowledge or execute them. "
         "stop requests durable cancellation for one job_id and its supervised subtree; acceptance is not physical stop. "
@@ -120,15 +119,10 @@ async def _native(loop, sid, action, options):
         if set(options) - {"job_id", "max_chars", "view", "event_id", "char_offset", "limit", "cursor", "output_file"}:
             raise JobError("invalid_jobs_parameters")
         view = options.get("view", "summary")
-        if view not in ("summary", "operations", "results", "returns", "attempts"):
+        if view not in ("summary", "operations", "results", "returns"):
             raise JobError("invalid_jobs_parameters")
         target = await _resolve(manager, actor, options.get("job_id"), metadata_only=view != "summary")
         budget = _budget(options)
-        if view == "attempts":
-            if set(options) - {"job_id", "view", "limit", "cursor", "max_chars"}:
-                raise JobError("invalid_jobs_parameters")
-            from power_loop.runtime.model_attempt_query import list_attempts
-            return await list_attempts(manager, actor, target, **{k: v for k, v in options.items() if k not in ("job_id", "view")})
         if view in ("operations", "results", "returns"):
             from power_loop.runtime.task_events import read_events
             return await read_events(manager, actor, target, **{k: v for k, v in options.items() if k != "job_id"})

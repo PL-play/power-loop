@@ -8,7 +8,6 @@ import pytest
 from power_loop import AgentLoopConfig, SessionStore, StatefulAgentLoop
 from power_loop.runtime import executor_registry as registry
 from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_real_async_boundaries_192 import BoundedProvider
@@ -32,8 +31,7 @@ async def test_real_automatic_start_and_shutdown_retain_known_usage_and_block_ne
             result = await loop.send("Reply exactly 42 in plain assistant text, without tools or pass_turn.", sid)
             assert result.final_text.strip() == "42" and provider.calls == 1
             [job] = await runtime.manager.db.fetchall(f"SELECT * FROM {runtime.manager.jobs}")
-            [attempt] = (await list_attempts(runtime.manager, runtime.actor(sid), job["job_id"]))["items"]
-            assert attempt["status"] == "returned" and not attempt["estimated"]
+            assert result.usage["total_tokens"] > 0
             stopped = await runtime.shutdown(timeout_s=5)
             assert stopped["durable_drain_confirmed"] and not stopped["pending_handles"]
             assert not stopped["physical_stop_confirmed"] and not stopped["billing_settled"]
@@ -78,8 +76,6 @@ async def test_real_automatic_shutdown_signals_inflight_default_send_without_ext
             assert stopped["durable_drain_confirmed"] and not stopped["pending_handles"]
             [job] = await runtime.manager.db.fetchall(f"SELECT * FROM {runtime.manager.jobs}")
             assert job["resource_state"] == "unknown" and job["supervision_status"] == "open"
-            [attempt] = (await list_attempts(runtime.manager, runtime.actor(sid), job["job_id"]))["items"]
-            assert attempt["status"] == "unknown" and attempt["estimated"] and not attempt["response_received"]
             with pytest.raises(JobError, match="executor_not_accepting"):
                 await loop.send("Do not replace the original request.", sid)
             assert provider.calls == 1

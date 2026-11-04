@@ -6,7 +6,6 @@ from dataclasses import replace
 
 import pytest
 
-from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import model_budgets as budgets
 from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
@@ -77,27 +76,7 @@ async def test_new_boot_can_replay_after_cancel_without_reopening_or_double_coun
     assert saved["observation"]["status"] == ("unknown" if unknown else "returned")
 
 
-async def test_original_model_observation_projects_after_budget_projection_failed(budget_case, monkeypatch):
-    c = budget_case
-    a = await start(c)
-    original_observe = budgets.observe
-    async def unavailable(*args):
-        raise OSError("projection unavailable after actual response persisted")
-    monkeypatch.setattr(budgets, "observe", unavailable)
-    await observed(c, a, tokens=12)
-    before = await counters(c)
-    assert before["used_calls"] == 0 and before["held_calls"] == 1
-    monkeypatch.setattr(budgets, "observe", original_observe)
-    r1, r2 = await reopened(c), await reopened(c)
-    original_time = (await attempts._read(c.manager, c.manager.db, "finished", a.attempt_id))[0]["created_at"]
-    r1.manager.now = r2.manager.now = lambda: original_time + 60000
-    await asyncio.gather(reconcile(r1, c, a), reconcile(r2, c, a))
-    assert (await counters(c))["used_calls"] == 1 and (await counters(c))["used_tokens"] == 12
-    assert (await budgets.get_budget(c.manager, c.actor, a.attempt_id))["finished_at_ms"] == original_time
-    assert len(c.host.applied) == c.host.reserve_calls == 1
-
-
-@pytest.mark.parametrize("fault", ["session", "job", "config", "prepared", "dispatched", "finished", "tracking"])
+@pytest.mark.parametrize("fault", ["session", "job", "config"])
 async def test_foreign_or_missing_evidence_never_calls_provider(budget_case, fault):
     c = budget_case
     c.host.apply_lost_ack = True
@@ -106,10 +85,6 @@ async def test_foreign_or_missing_evidence_never_calls_provider(budget_case, fau
     before = (c.host.apply_calls, c.host.reserve_calls)
     config = replace(c.config, provider_key="foreign") if fault == "config" else c.config
     runtime = await reopened(c, config=config)
-    if fault in ("prepared", "dispatched", "finished", "tracking"):
-        identity = a.prepared["scope"] if fault == "tracking" else a.attempt_id
-        await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_id=?",
-            (attempts.event_id(c.manager, fault, identity),))
     with pytest.raises(JobError):
         await runtime.reconcile_budget_usage("foreign" if fault == "session" else c.sid,
             job_id="missing" if fault == "job" else c.binding.lease.job_id, attempt_id=a.attempt_id)
@@ -123,7 +98,7 @@ async def test_dispatched_without_observation_cannot_be_forged_or_released(budge
     await flush_binding(a.binding, close=True)
     runtime = await reopened(c)
     before = await counters(c)
-    with pytest.raises(JobError, match="model_attempt_evidence_missing"):
+    with pytest.raises(JobError, match="budget_usage_not_ready"):
         await reconcile(runtime, c, a)
     assert not c.host.applied and not c.host.released and await counters(c) == before
 

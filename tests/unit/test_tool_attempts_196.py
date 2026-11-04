@@ -295,27 +295,6 @@ async def test_failed_dispatch_checkpoint_does_not_undo_original_memory_dispatch
     state = await budgets.get_budget(c.manager, c.actor, attempt.attempt_id)
     assert state['phase'] == 'dispatch_authorized'
     await flush_binding(attempt.binding, close=True)
-    with pytest.raises(JobError, match='release_not_permitted'):
+    with pytest.raises(JobError, match='budget_unstarted_execution_unconfirmed'):
         await budgets.release_unstarted(c.runtime, c.actor, attempt.binding.lease.job_id, attempt.attempt_id)
     assert (await counters(c))['used_calls'] == 0
-
-
-async def test_rehashed_settlement_tampering_is_rejected_before_host_delivery(budget_case):
-    from power_loop.runtime.jobs import _hash, _json
-    c = budget_case
-    attempt, _ = await prepared(c)
-    await start(c, attempt)
-    c.host.apply_unavailable = True
-    with pytest.raises(OSError):
-        await settle(c, attempt)
-    c.host.apply_unavailable = False
-    key = tools.event_id(c.manager, 'finished', attempt.attempt_id)
-    row = await c.manager.db.fetchone(f'SELECT payload_json FROM {c.manager.events} WHERE event_id=?', (key,))
-    payload = json.loads(row['payload_json'])
-    payload['charge']['amount'] = '999'
-    await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?',
-                              (_json(payload), _hash(payload), key))
-    before = c.host.apply_calls
-    with pytest.raises(JobError, match='evidence_changed'):
-        await budgets.reconcile_usage(c.runtime, c.actor, attempt.binding.lease.job_id, attempt.attempt_id)
-    assert c.host.apply_calls == before

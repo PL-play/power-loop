@@ -8,7 +8,6 @@ import pytest
 from power_loop import AgentLoopConfig, CancellationToken, SessionStore, StatefulAgentLoop
 from power_loop.runtime import executor_registry as registry
 from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_real_async_boundaries_192 import BoundedProvider
@@ -88,9 +87,7 @@ async def test_real_inflight_request_keeps_unknown_after_durable_drain_and_local
             assert result.status == "cancelled" and provider.calls == 1
             [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
             assert job["resource_state"] == "unknown" and job["supervision_status"] == "open"
-            [attempt] = (await list_attempts(manager, runtime.actor(sid), job["job_id"]))["items"]
-            assert attempt["status"] == "unknown" and attempt["estimated"] and not attempt["response_received"]
-            assert attempt["observed_usage"]["prompt_tokens"] > 0
+            assert result.usage["prompt_tokens"] > 0
             with pytest.raises(JobError, match="executor_not_accepting"):
                 await loop.send("Do not dispatch another request.", sid)
             assert provider.calls == 1

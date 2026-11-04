@@ -6,7 +6,6 @@ import asyncio
 import pytest
 
 from power_loop import AgentLoopConfig, CancellationToken, StatefulAgentLoop
-from power_loop.runtime.model_attempt_query import list_attempts
 
 from .test_executor_lifecycle_192 import host
 from .test_job_registry_192 import registry_store
@@ -51,8 +50,6 @@ async def test_ordinary_shutdown_keeps_one_request_cancellation_and_usage_cleanu
         assert stopped["durable_drain_confirmed"] and not stopped["pending_handles"]
         assert not runtime._adapter_tasks
         [job] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
-        [attempt] = (await list_attempts(manager, runtime.actor(sid), job["job_id"]))["items"]
-        assert attempt["status"] == "unknown" and attempt["estimated"]
         assert job["resource_state"] == "unknown" and job["supervision_status"] == "open"
     finally:
         release.set()
@@ -107,9 +104,6 @@ async def test_original_request_stays_reachable_after_controller_exits(host, mon
         await asyncio.wait_for(asyncio.gather(sending, *handles, return_exceptions=True), 3)
 
     assert not runtime._adapter_tasks and all(t.done() for t in handles)
-    [attempt] = (await list_attempts(manager, runtime.actor(sid), job["job_id"]))["items"]
-    assert attempt["status"] == "returned" and not attempt["estimated"]
-    assert attempt["observed_usage"]["total_tokens"] == 10
     [after] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs}")
     assert after["result_json"] == original_result
     assert model.child_calls == 1

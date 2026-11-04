@@ -11,7 +11,6 @@ from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import delegation, model_attempts
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime.invocation import current_invocation
-from power_loop.runtime.model_attempt_query import list_attempts
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import _SEND
 
@@ -67,14 +66,6 @@ async def test_short_policy_interrupts_original_inflight_request_before_lease_re
         assert owner.result["status"] == "timed_out"
         assert owner.resource_state == ("stopped" if late_response else "unknown")
         assert owner.supervision_status == "open"
-        [send] = await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='send' AND control_owner_job_id=?", (owner.job_id,))
-        items = (await list_attempts(c.manager, c.runtime.actor(c.state.parent), send["job_id"]))["items"]
-        assert sorted(item["status"] for item in items) == (["returned", "returned"] if late_response else ["returned", "unknown"])
-        if late_response:
-            assert all(item["observed_usage"]["total_tokens"] == 10 for item in items)
-        else:
-            [unknown] = [item for item in items if item["status"] == "unknown"]
-            assert unknown["estimated"] is True and unknown["observed_usage"]["prompt_tokens"] > 0
     finally:
         release.set()
         tasks = set(delegation._TASKS) - before
@@ -125,11 +116,6 @@ async def test_uncooperative_provider_does_not_hold_original_controller_past_dea
     assert c.model.calls["child"] == 2
     assert not c.runtime._adapter_tasks
     assert (await c.manager.get_job(c.runtime.actor(c.state.parent), owner.job_id)).result == owner.result
-    [send] = await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='send' AND control_owner_job_id=?", (owner.job_id,))
-    items = (await list_attempts(c.manager, c.runtime.actor(c.state.parent), send["job_id"]))["items"]
-    assert [item["status"] for item in items] == ["returned", "returned"]
-    assert sum(item["observed_usage"]["total_tokens"] for item in items) == 20
-    # execution_usage is the immutable model-exit snapshot, not the late billing ledger.
 
 
 @pytest.mark.parametrize("original", ["boot"], indirect=True)
@@ -270,8 +256,3 @@ async def test_dispatch_commit_delay_cannot_start_transport_after_original_deadl
     [registration] = c.state.registrations
     owner = await c.manager.get_job(c.runtime.actor(c.state.parent), registration.job.control_owner_job_id)
     assert owner.outcome == "timed_out" and owner.supervision_status == "open"
-    [send] = await c.manager.db.fetchall(f"SELECT job_id FROM {c.manager.jobs} WHERE kind='send' AND control_owner_job_id=?", (owner.job_id,))
-    items = (await list_attempts(c.manager, c.runtime.actor(c.state.parent), send["job_id"]))["items"]
-    [unconfirmed] = [item for item in items if item["status"] == "unknown"]
-    assert unconfirmed["observed_usage"]["total_tokens"] == 0 and unconfirmed["estimated"] is True
-    assert unconfirmed["provider_reported_cost"] is None  # no fabricated final zero fee/refund

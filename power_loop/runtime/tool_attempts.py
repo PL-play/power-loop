@@ -12,7 +12,6 @@ from dataclasses import asdict, dataclass, field
 
 from .jobs import JobError, _hash
 from .jobs import verify_stored as _verify_stored
-from .model_exit import content_reference
 from .pricing import BillingReceipt, Charge, PricedCall, canonical
 
 
@@ -40,49 +39,6 @@ def context(manager, job, prepared):
         attempt_id=prepared['attempt_id'], prepared_event_id=event_id(manager, 'prepared', prepared['attempt_id']),
         prepared_hash=_hash(prepared), request_hash=prepared['request_hash'], kind='tool',
         tool_name=prepared['tool_name'], pricing_rule=prepared['pricing_rule'])
-
-
-async def _read(manager, tx, job, phase, attempt_id, *, optional=False):
-    from .tool_call_plans import _read as read_event
-    key = event_id(manager, phase, attempt_id)
-    value = await read_event(manager, tx, key, job, 'tool_attempt_' + phase, optional=optional)
-    anchor = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (key + '_a',))
-    if value is None:
-        if anchor is not None:
-            raise JobError('tool_attempt_evidence_missing')
-        return None
-    event = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (key,))
-    proof = await read_event(manager, tx, key + '_a', job, 'tool_attempt_anchor')
-    if proof != {'version': 1, 'source': content_reference(event)}:
-        raise JobError('tool_attempt_evidence_changed')
-    return event, value
-
-
-async def _original(manager, tx, job, prepared, *, depth=0):
-    from .jobs import JobActor
-    from .managed_effects import _ref, _verify_call
-    ref = _ref(prepared['call_ref'])
-    scope = prepared['scope']
-    if depth > 16:
-        raise JobError('tool_attempt_nesting_limit')
-    if prepared.get('version') == 2:
-        _, parent = await _read(manager, tx, job, 'prepared', prepared['parent_attempt_id'])
-        expected = 'toolattempt_' + _hash(['nested', manager.store.store_id, scope,
-            prepared['parent_attempt_id'], prepared['invocation_id']])[:48]
-        if (prepared['attempt_id'] != expected or parent['attempt_id'] == expected
-                or prepared['parent_prepared_hash'] != _hash(parent)
-                or any(prepared[k] != parent[k] for k in ('scope', 'session_id', 'call_ref', 'call_id'))):
-            raise JobError('tool_attempt_original_mismatch')
-        await _original(manager, tx, job, parent, depth=depth + 1)
-        await _read(manager, tx, job, 'dispatched', parent['attempt_id'])
-        return
-    expected = 'toolattempt_' + _hash([manager.store.store_id, scope, ref.to_dict(), prepared['call_id']])[:48]
-    if (prepared['attempt_id'] != expected or scope['job_id'] != job['job_id']
-            or prepared['session_id'] != job['session_id'] or ref.session_id != job['session_id']):
-        raise JobError('tool_attempt_original_mismatch')
-    actor = JobActor(job['tenant_id'], job['principal_id'], job['session_id'])
-    await _verify_call(manager, tx, actor, job, ref, prepared['call_id'],
-                       prepared['tool_name'], prepared['request_hash'])
 
 
 async def prepare(binding, ref, call_id, registered, arguments):
@@ -113,7 +69,7 @@ async def prepare_nested(parent, registered, arguments):
         request_hash=_hash(arguments), tool_name=registered.definition.name,
         pricing_rule={"rule_id": pricing.rule_id, "rule_version": registered.pricing_version})
     value = control.begin_attempt(key, "tool", prepared)
-    value.update(budget_required=True, event_metadata={"job_version": source(binding)["version"], "created_at": binding.runtime.manager.now()})
+    value["budget_required"] = True
     control.record("attempt", key, value)
     return ToolAttempt(binding, key, prepared, PricedCall(registered.definition.name, arguments, source(binding)["execution_role"]),
                        pricing, asyncio.current_task())
@@ -185,29 +141,6 @@ def capture(attempt, receipt: BillingReceipt | None, error: BaseException | None
             rule_id=charge.rule_id, rule_version=charge.rule_version))
 
 
-async def verify_state(manager, tx, job, state, *, finished=False):
-    _, prepared = await _read(manager, tx, job, 'prepared', state['attempt_id'])
-    await _original(manager, tx, job, prepared)
-    if state['context'] != context(manager, job, prepared):
-        raise JobError('tool_attempt_context_mismatch')
-    dispatched = await _read(manager, tx, job, 'dispatched', state['attempt_id'], optional=not finished)
-    if dispatched is not None and dispatched[1] != dict(version=1, scope=prepared['scope'],
-            attempt_id=state['attempt_id'], prepared_hash=_hash(prepared)):
-        raise JobError('tool_attempt_dispatch_changed')
-    if not finished:
-        return prepared
-    original = await _read(manager, tx, job, 'finished', state['attempt_id'])
-    observation = original[1]
-    rule = prepared['pricing_rule']
-    if (observation['prepared_hash'] != _hash(prepared) or observation['scope'] != prepared['scope']
-            or observation['attempt_id'] != state['attempt_id']
-            or observation['charge']['rule_id'] != rule['rule_id']
-            or observation['charge']['rule_version'] != rule['rule_version']
-            or state['observation'] is not None and state['observation'] != observation):
-        raise JobError('tool_attempt_observation_changed')
-    return original
-
-
 async def finish(attempt):
     from .control_runtime import current
     from .execution_budget import observe
@@ -250,15 +183,15 @@ async def reconcile(runtime, actor, job_id, attempt_id):
     from . import model_budgets as budgets
     manager = runtime.manager
     async with budgets.prepare_policy(runtime), manager._write() as tx:
-        job = await manager._authorize(tx, actor, job_id)
+        await manager._authorize(tx, actor, job_id)
         state = await budgets._read(manager, tx, attempt_id)
         policy = await budgets._policy(runtime, tx)
         if policy is None or state['job_id'] != job_id or state['policy_key'] != policy['policy_key']:
             raise JobError('budget_reconciliation_scope_mismatch')
-        source = await verify_state(manager, tx, job, state, finished=True)
+        if state['observation'] is None:
+            raise JobError('budget_usage_not_ready')
         from .control_runtime import require_closed
         await require_closed(manager, tx, job_id, state['context']['generation'])
-        await budgets._project_observation(manager, tx, policy, state, job, source[1], source)
     ack = await budgets._deliver(runtime, actor, job_id, attempt_id)
     return dict(attempt_id=attempt_id, job_id=job_id, revision=ack['revision'],
                 request_hash=ack['request_hash'], usage_acknowledged=True, execution_authority=False)
@@ -289,7 +222,7 @@ async def begin_pipeline(pipeline, registered, arguments):
 async def release_unstarted(runtime, actor, job_id, attempt_id, *, require_cancelled=False):
     """Seal original dispatch before refunding a reservation; never replay tools."""
     from . import model_budgets as budgets
-    from .budget_contracts import BudgetAck, BudgetGrant, BudgetPlan, BudgetSubmission
+    from .budget_contracts import BudgetAck, BudgetGrant, BudgetSubmission
     manager = runtime.manager
     async with budgets.prepare_policy(runtime), manager._write() as tx:
         job = await manager._authorize(tx, actor, job_id)
@@ -297,9 +230,6 @@ async def release_unstarted(runtime, actor, job_id, attempt_id, *, require_cance
         state = await budgets._read(manager, tx, attempt_id)
         if policy is None or state['job_id'] != job_id or state['policy_key'] != policy['policy_key']:
             raise JobError('budget_reconciliation_scope_mismatch')
-        await verify_state(manager, tx, job, state)
-        if await _read(manager, tx, job, 'dispatched', attempt_id, optional=True) is not None:
-            raise JobError('budget_release_not_permitted')
         if state['phase'] == 'released':
             return state['ack']
         if state['phase'] != 'dispatch_closed':
@@ -320,11 +250,7 @@ async def release_unstarted(runtime, actor, job_id, attempt_id, *, require_cance
     if state['submission'] is not None:
         grant = None  # Replay the frozen release, including after a lost ACK.
     elif state['grant'] is None:
-        plan = BudgetPlan(**state['plan'])
-        grant = await budgets._host_call(runtime, job_id, attempt_id, 'lookup', lambda: provider.lookup(plan))
-        if grant is not None and (type(grant) is not BudgetGrant
-                or (grant.attempt_id, grant.request_hash, grant.state) != (attempt_id, state['plan_hash'], 'reserved')):
-            raise JobError('budget_host_reservation_unconfirmed')
+        raise JobError('budget_reconciliation_submission_required')
     else:
         grant = BudgetGrant(**state['grant'])
     proof = dict(proof='dispatch_not_authorized', reservation_request_hash=state['plan_hash'],

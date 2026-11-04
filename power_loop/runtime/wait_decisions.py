@@ -152,7 +152,7 @@ async def _validate_observation(manager, tx, actor, caller, call_ref, due, recei
         raise JobError("wait_observation_mismatch")
 
 
-async def _observation(manager, tx, actor, caller, call_ref, due, receipt, *, _returned=None):
+async def _observation(manager, tx, actor, caller, call_ref, due, receipt):
     if type(call_ref.round_index) is not int or call_ref.round_index < 0:
         raise JobError("wait_observation_required")
     key = notices.observation_id(manager, caller, call_ref.round_index, receipt["item_id"])
@@ -160,17 +160,7 @@ async def _observation(manager, tx, actor, caller, call_ref, due, receipt, *, _r
     if event is None:
         raise JobError("wait_observation_required")
     await _validate_observation(manager, tx, actor, caller, call_ref, due, receipt, event)
-    # A prepared visibility snapshot alone is not a successful model request.
-    matched = _returned
-    if matched is None:
-        from .model_attempts import _all
-        phases = await _all(manager, tx, caller.job_id)
-        matched = [identity for identity, (_, prepared) in phases["prepared"].items()
-            if prepared["round_index"] == call_ref.round_index and _hash(prepared["scope"]) == _hash(asdict(caller))
-            and identity in phases["finished"] and phases["finished"][identity][1]["status"] == "returned"]
-    if not matched:
-        raise JobError("wait_model_response_required")
-    return {"observation_id": key, "observation_hash": event["request_hash"], "model_attempt_ids": sorted(matched)}
+    return {"observation_id": key, "observation_hash": event["request_hash"]}
 
 
 async def record_decision(manager, actor, *, event_id, caller, call_ref, tool_call_id,

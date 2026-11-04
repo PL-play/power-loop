@@ -95,11 +95,8 @@ async def stage(runtime, actor, job_id, attempt_id, *, expected_revision, eviden
                 raise JobError("budget_revision_evidence_conflict")
             return saved["receipt"]
         if expected_revision == 0:
-            from .model_attempts import _read as read_model
-            finished = await read_model(manager, tx, "finished", attempt_id, required=False)
             if (state["phase"] != "dispatch_authorized" or state["pending"]
-                    or any(state[k] is not None for k in ("observation", "submission", "ack"))
-                    or finished is not None):
+                    or any(state[k] is not None for k in ("observation", "submission", "ack"))):
                 raise JobError("budget_initial_evidence_not_ready")
             if evidence.correction_of is not None:
                 raise JobError("budget_correction_source_mismatch")

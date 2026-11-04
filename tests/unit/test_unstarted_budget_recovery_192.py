@@ -64,6 +64,11 @@ async def test_new_control_closes_original_reservation_without_starting_boot_or_
     await seal_dispatch_closure(c, a)
     runtime = await reopened(c)
     try:
+        if stage == 'host_reserving':
+            with pytest.raises(JobError, match='budget_reconciliation_submission_required'):
+                await release(runtime, c, a)
+            assert not c.host.released and (await budgets.get_budget(runtime.manager, c.actor, a.attempt_id))['pending']
+            return
         result = await release(runtime, c, a)
         assert result['released'] and not result['execution_authority']
         assert result == await release(runtime, c, a)
@@ -79,26 +84,17 @@ async def test_new_control_closes_original_reservation_without_starting_boot_or_
         await runtime.manager.store.close()
 
 
-@pytest.mark.parametrize('fault', ['lookup', 'release', 'release_ack'])
+@pytest.mark.parametrize('fault', ['release', 'release_ack'])
 async def test_failed_host_release_retains_local_risk_until_original_retry(budget_case, monkeypatch, fault):
     c = budget_case
     a = await prepared(c)
-    # Leave a durable intent with no confirmed grant: reserve committed but lookup failed.
-    lookup, host_release = c.host.lookup, c.host.release
-    async def lost_lookup(*args):
-        raise OSError('original lookup unavailable')
-    monkeypatch.setattr(c.host, 'lookup', lost_lookup)
-    c.host.reserve_lost_ack = True
-    with pytest.raises(OSError):
-        await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
-    c.host.reserve_lost_ack = False
-    if fault != 'lookup':
-        monkeypatch.setattr(c.host, 'lookup', lookup)
-        async def lost_release(submission):
-            if fault == 'release_ack':
-                await host_release(submission)
-            raise OSError('original release unavailable')
-        monkeypatch.setattr(c.host, 'release', lost_release)
+    await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
+    host_release = c.host.release
+    async def lost_release(submission):
+        if fault == 'release_ack':
+            await host_release(submission)
+        raise OSError('original release unavailable')
+    monkeypatch.setattr(c.host, 'release', lost_release)
     await seal_dispatch_closure(c, a)
     runtime = await reopened(c)
     try:
@@ -110,7 +106,6 @@ async def test_failed_host_release_retains_local_risk_until_original_retry(budge
         assert await counters(c) == before
         with pytest.raises(JobError, match='execution_control_closed'):
             await attempts.dispatch(a)
-        monkeypatch.setattr(c.host, 'lookup', lookup)
         monkeypatch.setattr(c.host, 'release', host_release)
         await release(runtime, c, a)
         assert await counters(c) == dict(used_calls=0, held_calls=0, used_tokens=0, held_tokens=0, inflight=0)
@@ -127,7 +122,7 @@ async def test_dispatched_attempt_never_refunds_from_a_new_host(budget_case):
     runtime = await reopened(c)
     try:
         before = await counters(c)
-        with pytest.raises(JobError, match='budget_release_not_permitted'):
+        with pytest.raises(JobError, match='budget_unstarted_execution_unconfirmed'):
             await release(runtime, c, a)
         assert await counters(c) == before and not c.host.released
     finally:
@@ -135,17 +130,14 @@ async def test_dispatched_attempt_never_refunds_from_a_new_host(budget_case):
         await runtime.manager.store.close()
 
 
-@pytest.mark.parametrize('fault', ['foreign_session', 'provider_changed', 'missing_preparation'])
-async def test_original_authority_and_preparation_are_required_before_any_release(budget_case, fault):
+@pytest.mark.parametrize('fault', ['foreign_session', 'provider_changed'])
+async def test_original_authority_is_required_before_any_release(budget_case, fault):
     c = budget_case
     a = await prepared(c)
     await budgets.reserve(a, LLMRequest(messages=[], max_tokens=20), service=c.host.service)
     await seal_dispatch_closure(c, a)
     runtime = await reopened(c, config=replace(c.config, provider_key='different') if fault == 'provider_changed' else c.config)
     sid = await c.store.create_session() if fault == 'foreign_session' else c.sid
-    if fault == 'missing_preparation':
-        await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?',
-            (attempts.event_id(c.manager, 'prepared', a.attempt_id),))
     try:
         before = await counters(c)
         with pytest.raises(JobError):
