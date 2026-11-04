@@ -1353,6 +1353,11 @@ class AgentPipeline:
 
         from power_loop.runtime.review_tools import restrict_request
         system_prompt, tools = await restrict_request(self, system_prompt, tools)
+        from power_loop.runtime.history_sanitize import sanitize_request_messages
+        messages = sanitize_request_messages(messages)
+        if messages and messages[0]["role"] == "system":
+            system_prompt = "\n\n".join(filter(None, (system_prompt, messages[0].get("content"))))
+            messages = messages[1:]
         request = LLMRequest(
             messages=messages,
             system_prompt=system_prompt,

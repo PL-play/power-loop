@@ -26,11 +26,12 @@ by another message are repaired.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 LoopMessage = dict[str, Any]
 
-_PLACEHOLDER_RESULT = "[tool result missing — repaired]"
+_PLACEHOLDER_RESULT = "[执行中断，结果未知 / tool result missing — repaired]"
 
 
 def _tool_call_ids(message: LoopMessage) -> list[str]:
@@ -46,6 +47,8 @@ def align_tool_calls(
     messages: list[LoopMessage],
     seqs: list[int | None],
     ords: list[int | None],
+    *,
+    close_trailing: bool = False,
 ) -> tuple[list[LoopMessage], list[int | None], list[int | None], list[int], int]:
     """Repair tool-call/result pairing in an assembled history. Returns
     ``(messages, seqs, ords, dropped_seqs, synthesized)`` where ``dropped_seqs`` are the real
@@ -98,7 +101,86 @@ def align_tool_calls(
         out_o.append(o)
         if role == "assistant":
             open_ids = _tool_call_ids(m)
-    # NOTE: intentionally do NOT flush trailing open_ids — a trailing unanswered assistant call
-    # is the in-flight send's pending tools, which the loop executes on resume; fabricating
-    # results for them would corrupt that resume.
+    # Loading history may precede pending execution. At the model boundary there
+    # are no in-flight tools, so unanswered trailing calls must be closed too.
+    if close_trailing:
+        _flush_placeholders()
     return out_m, out_s, out_o, dropped_seqs, synthesized
+
+
+def _join_content(left: Any, right: Any) -> Any:
+    if not left:
+        return right
+    if not right:
+        return left
+    if isinstance(left, str) and isinstance(right, str):
+        return left + "\n\n" + right
+    def blocks(value: Any) -> list:
+        return value if isinstance(value, list) else [{"type": "text", "text": value}]
+    return [*blocks(left), *blocks(right)]
+
+
+def sanitize_request_messages(messages: list[LoopMessage]) -> list[LoopMessage]:
+    """Repair a model request in memory, without changing history or pending work.
+
+    Call only after pending tools have stopped/executed. Tool results remain
+    separate messages even when adjacent: each answers its own call id.
+    """
+    used_ids = {str(tc["id"]) for m in messages for tc in m.get("tool_calls") or []
+                if isinstance(tc, dict) and tc.get("id")}
+    normalized = []
+    for index, original in enumerate(messages):
+        msg = dict(original)
+        if msg.get("role") == "system" and normalized and normalized[-1]["role"] != "system":
+            msg["role"] = "user"
+            msg["content"] = _join_content("[历史系统说明]", msg.get("content"))
+        if msg.get("role") == "assistant":
+            calls, seen = [], set()
+            for pos, raw in enumerate(msg.get("tool_calls") or []):
+                # These are damaged stored/provider messages, not trusted internal state.
+                if not isinstance(raw, dict) or not isinstance(raw.get("function"), dict):
+                    continue
+                function = dict(raw["function"])
+                if not function.get("name"):
+                    continue
+                cid = str(raw.get("id") or "")
+                if not cid:
+                    cid = f"repaired_{index}_{pos}"
+                    while cid in used_ids:
+                        cid += "_"
+                    used_ids.add(cid)
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                args = function.get("arguments", "{}")
+                if isinstance(args, str):
+                    try:
+                        json.loads(args)
+                    except ValueError:
+                        args = json.dumps({"_invalid_arguments": args}, ensure_ascii=False)
+                else:
+                    args = json.dumps(args, ensure_ascii=False)
+                function["arguments"] = args
+                calls.append({**raw, "id": cid, "type": "function", "function": function})
+            if calls:
+                msg["tool_calls"] = calls
+            else:
+                msg.pop("tool_calls", None)
+                if not msg.get("content") or (isinstance(msg["content"], str) and not msg["content"].strip()):
+                    continue
+        normalized.append(msg)
+
+    aligned, _, _, _, _ = align_tool_calls(normalized, [], [], close_trailing=True)
+    out: list[LoopMessage] = []
+    for msg in aligned:
+        if out and msg["role"] == out[-1]["role"] and msg["role"] != "tool":
+            previous = out[-1]
+            previous["content"] = _join_content(previous.get("content"), msg.get("content"))
+            if msg.get("tool_calls"):
+                previous["tool_calls"] = msg["tool_calls"]
+            if msg.get("reasoning_content"):
+                previous["reasoning_content"] = _join_content(
+                    previous.get("reasoning_content"), msg["reasoning_content"])
+        else:
+            out.append(msg)
+    return out
