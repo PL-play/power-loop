@@ -317,7 +317,7 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
             journal = ExecutionJournal(manager.store, projector=projector, writer=owned_writer)
             binding.resource_evidence["_control_journal_opening"] = journal
         state = ExecutionState(identity, journal, lease_until_ms=source["lease_until_ms"],
-                               policy=runtime.checkpoint_policy, now_ms=lambda: manager.now(), manager=manager)
+                               policy=runtime.checkpoint_policy, now_ms=lambda: manager.now())
         policy = binding.resource_evidence.get("_control_budget_policy")
         if policy is not None:
             state.max_pending_obligations = policy["manifest"]["max_pending"]

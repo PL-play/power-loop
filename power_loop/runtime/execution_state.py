@@ -142,10 +142,9 @@ class ExecutionState:
     """
 
     def __init__(self, identity: ExecutionIdentity, journal, *, lease_until_ms: int,
-                 policy: CheckpointPolicy | None = None, now_ms=None, manager=None):
+                 policy: CheckpointPolicy | None = None, now_ms=None):
         self.identity = identity
         self.journal = journal
-        self.manager = manager
         self.policy = policy or CheckpointPolicy()
         self.now_ms = now_ms or (lambda: time.time_ns() // 1_000_000)
         self.lease_until_ms = lease_until_ms
@@ -389,17 +388,6 @@ class ExecutionState:
             self._dirty_sizes = {}
             self._dirty_bytes = 0
             self._completed_since_flush = 0
-
-            # NEW: Also save snapshot to jobs.result_json (dual write for safety)
-            if self.manager is not None:
-                try:
-                    snapshot = self.to_snapshot()
-                    from .execution_snapshot import update_snapshot
-                    await update_snapshot(self.manager, transaction, self.identity.job_id, self.identity.generation, snapshot)
-                except Exception:
-                    # Snapshot save failure should not break checkpoint
-                    # Journal is still the authoritative source
-                    pass
         number, previous, records, summary = self._pending_batches[index]
         try:
             digest = await self.journal.append(self.identity, number, previous, records, summary, transaction=transaction)
@@ -444,76 +432,3 @@ class ExecutionState:
             if transaction is not None and len(self._staged_digests) == len(self._pending_batches) and not self._dirty:
                 break
             await self.checkpoint(force=True, transaction=transaction, defer=defer)
-
-    def to_snapshot(self):
-        """Convert current state to lightweight snapshot for fast recovery.
-        
-        This provides an alternative to full journal recovery. The snapshot captures
-        essential state for continuation but allows intermediate details to be lost.
-        """
-        from .execution_snapshot import ExecutionSnapshot
-        
-        # Extract pending tool calls from active attempts
-        pending_tools = []
-        for (kind, key), value in self._records.items():
-            if kind == "attempt" and value.get("kind") == "tool" and value.get("phase") in ("prepared", "dispatched"):
-                pending_tools.append({
-                    "tool_call_id": key,
-                    "tool_name": value.get("prepared", {}).get("tool_name"),
-                    "status": value.get("phase"),
-                    "dispatched_at": value.get("prepared", {}).get("started_at")
-                })
-        
-        # Get round tracking from records
-        round_index = 0
-        send_index = 0
-        total_rounds = 0
-        total_tokens = 0
-        
-        for (kind, key), value in self._records.items():
-            if kind == "model_tracking_immutable":
-                tracking = value.get("data", {})
-                round_index = max(round_index, tracking.get("round_index", 0))
-                total_rounds = self.models
-                total_tokens = tracking.get("usage", {}).get("total_tokens", 0)
-            elif kind == "attempt" and value.get("kind") == "model":
-                prepared = value.get("prepared", {})
-                round_index = max(round_index, prepared.get("round_index", 0))
-                send_index = max(send_index, prepared.get("send_index", 0))
-        
-        return ExecutionSnapshot(
-            captured_at_ms=self.now_ms(),
-            round_index=round_index,
-            send_index=send_index,
-            total_rounds=total_rounds,
-            total_tokens=total_tokens,
-            pending_tool_calls=pending_tools[:100],  # Limit to 100 to control size
-            cancel_requested=self.cancel_requested,
-            needs_reconciliation=self.needs_reconciliation,
-            resource_state="stopped" if self.closed else "running",
-            generation=self.identity.generation,
-            checkpoint_reason="periodic"
-        )
-    
-    @classmethod
-    def from_snapshot(cls, identity, journal, snapshot, *, lease_until_ms, policy=None, now_ms=None, manager=None):
-        """Restore state from lightweight snapshot.
-
-        This is faster than journal recovery but may lose intermediate details.
-        Suitable for normal recovery where full history is not required.
-        """
-        state = cls(identity, journal, lease_until_ms=lease_until_ms, policy=policy, now_ms=now_ms, manager=manager)
-        
-        # Restore flags
-        state.cancel_requested = snapshot.cancel_requested
-        state.needs_reconciliation = snapshot.needs_reconciliation
-        state.closed = snapshot.resource_state != "running"
-        
-        # Restore counters
-        state.models = snapshot.total_rounds
-        state.completed = snapshot.total_rounds
-        
-        # Note: Detailed records are not restored from snapshot
-        # If precise state is needed, fallback to journal recovery
-        
-        return state
