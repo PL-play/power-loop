@@ -37,7 +37,6 @@ def identity(manager, source, ref):
 async def _facts(manager, tx, source, ref, entries):
     from .managed_completion import _scope
     from .managed_effects import _never_claimed, _verify_call, descriptor
-    from .tool_call_plans import _read, start_id
     from .tool_call_plans import identity as plan_identity
     from .tool_call_plans import read as read_plan
     from .tool_call_plans import required as plan_required
@@ -59,16 +58,10 @@ async def _facts(manager, tx, source, ref, entries):
         raise JobError('tool_call_abort_call_set_changed')
     key = plan_identity(manager, source, ref)
     plan = await read_plan(manager, tx, source, ref, optional=True)
-    if plan is None:
-        if await _read(manager, tx, key + '_seal', source, 'tool_call_plan_seal', optional=True) is not None:
-            raise JobError('tool_call_abort_plan_changed')
-    elif _hash(normalize(plan['entries'])) != _hash(entries):
+    if plan is not None and _hash(normalize(plan['entries'])) != _hash(entries):
         raise JobError('tool_call_abort_plan_changed')
     for entry in entries:
         await _verify_call(manager, tx, actor, source, ref, entry['call_id'], entry['tool_name'], entry['arguments_hash'])
-        started = start_id(key, entry['call_id'])
-        if await _read(manager, tx, started, source, 'tool_call_dispatch_started', optional=True) is not None:
-            raise JobError('tool_call_abort_already_admitted')
         operation_key = manager._origin_key(actor, 'create', ref, entry['call_id'], None)
         operation = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE operation_key=?', (operation_key,))
         if operation is not None:

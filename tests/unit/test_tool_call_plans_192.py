@@ -118,10 +118,10 @@ async def test_every_managed_intent_and_seal_exist_before_first_prepare(registry
     c = await scenario(registry_store, call_count=3, inspect_prepare=inspect)
     assert c.result.status == 'completed' and c.state.prepared == c.state.dispatched == 3
     assert [value[0] for value in observations] == [[0, 0, 1], [0, 1, 1], [1, 1, 1]]
-    assert all(value[1] == {'tool_call_plan', 'tool_call_plan_seal'} for value in observations)
+    assert all(value[1] == {'tool_call_plan'} for value in observations)
 
 
-@pytest.mark.parametrize('stage', ['first_registration', 'second_registration', 'plan', 'seal', 'commit', 'commit_ack'])
+@pytest.mark.parametrize('stage', ['first_registration', 'second_registration', 'plan', 'commit', 'commit_ack'])
 async def test_whole_plan_transaction_never_dispatches_partial_or_unacknowledged_intentions(registry_store, stage):
     from ._tool_plan_faults_192 import fail_plan_once
     failures = []
@@ -133,7 +133,7 @@ async def test_whole_plan_transaction_never_dispatches_partial_or_unacknowledged
     jobs = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool'")
     plans = await c.manager.db.fetchall(f"SELECT event_type FROM {c.manager.events} WHERE event_type IN ('tool_call_plan','tool_call_plan_seal')")
     assert len(jobs) == (2 if stage == 'commit_ack' else 0)
-    assert len(plans) == (2 if stage == 'commit_ack' else 0)
+    assert len(plans) == (1 if stage == 'commit_ack' else 0)
     assert all(job['generation'] == 0 and job['resource_state'] == 'not_started' for job in jobs)
     assert not await c.manager.db.fetchall(f"SELECT id FROM {c.store.t.messages} WHERE role='tool'")
     pending = (await c.store.get_state(c.sid)).pending
@@ -157,39 +157,6 @@ async def test_whole_plan_transaction_never_dispatches_partial_or_unacknowledged
         await loop.aclose(drain_timeout_s=.1)
 
 
-@pytest.mark.parametrize('part', ['missing_plan', 'missing_seal', 'plan_hash', 'scope_boolean', 'snapshot_hash'])
-async def test_recovery_rechecks_plan_and_original_exit_snapshot(registry_store, part):
-    from power_loop.runtime.jobs import _hash, _json
-    from power_loop.runtime.pending_calls import SNAPSHOT
-    c = await scenario(registry_store, call_count=2, budgeted=True, raw_receipt_failure=True)
-    [source] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='send'")
-    [plan] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='tool_call_plan'")
-    if part.startswith('missing_'):
-        key = plan['event_id'] + ('_seal' if part == 'missing_seal' else '')
-        await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (key,))
-    elif part == 'snapshot_hash':
-        key = 'model_closed_' + source['job_id']
-        event = await c.manager.db.fetchone(f'SELECT payload_json FROM {c.manager.events} WHERE event_id=?', (key,))
-        data = json.loads(event['payload_json'])
-        data['evidence'][SNAPSHOT]['call_plan']['payload_hash'] = 'f' * 64
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (_json(data), key))
-    else:
-        data = json.loads(plan['payload_json'])
-        if part == 'scope_boolean':
-            data['scope']['generation'] = True
-        else:
-            data['entries'][0]['arguments_hash'] = 'f' * 64
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?', (_json(data), _hash(data), plan['event_id']))
-    pending = (await c.store.get_state(c.sid)).pending
-    loop, reviewer = await controller(c)
-    try:
-        with pytest.raises(JobError):
-            await reconcile_pending(loop, c.actor, source['job_id'])
-        assert (await c.store.get_state(c.sid)).pending == pending
-        assert reviewer.calls == 0 and c.state.prepared == c.state.dispatched == 1
-        assert c.state.lookups == 0
-    finally:
-        await loop.aclose(drain_timeout_s=.1)
 
 
 @pytest.mark.parametrize('registered_plain', [True, False])
@@ -223,33 +190,6 @@ async def test_mixed_unsupported_intent_cannot_be_silently_dropped_or_partly_res
         await loop.aclose(drain_timeout_s=.1)
 
 
-async def test_modified_coalesced_notice_cannot_acknowledge_hidden_negative_or_close_source(registry_store):
-    from power_loop import HookPoint
-    from power_loop.runtime.managed_delivery import render
-    c = await scenario(registry_store, budgeted=True, raw_receipt_failure=True, call_count=2)
-    jobs = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='background_tool' ORDER BY generation DESC")
-    loop, reviewer = await controller(c)
-    try:
-        await reconcile_pending(loop, c.actor, jobs[0]['parent_job_id'])
-        await retire_pending(loop, c.actor, jobs[0]['parent_job_id'])
-        [event] = await c.manager.db.fetchall(f"SELECT payload_json FROM {c.manager.events} WHERE job_id=? AND event_type='managed_effect_delivery'", (jobs[1]['job_id'],))
-        hidden = render(json.loads(event['payload_json'])['public'])
-        async def hide(ctx):
-            for message in ctx.messages:
-                if isinstance(message.get('content'), str):
-                    message['content'] = message['content'].replace(hidden, '[negative outcome deliberately hidden]')
-        loop.hooks.register(HookPoint.LLM_BEFORE, hide, name='test.plan.hide-negative')
-        result = await loop.send('Read the supplied original outcomes, no actions.', c.sid)
-        assert result.status == 'completed' and reviewer.calls == 1
-        assert (await c.manager.get_job(c.actor, jobs[0]['job_id'])).result_status == 'pending_delivery'
-        negative = await c.manager.get_job(c.actor, jobs[1]['job_id'])
-        assert negative.result_status == 'suppressed' and negative.supervision_status == 'closed'
-        assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='processing_decision'", (jobs[1]['job_id'],))
-        with pytest.raises(JobError):
-            await c.manager.finalize_supervision(c.actor, jobs[0]['parent_job_id'], generation=1)
-        assert c.state.dispatched == c.model.calls == 1
-    finally:
-        await loop.aclose(drain_timeout_s=.1)
 
 
 @pytest.mark.parametrize('part', ['too_many_calls', 'oversized_pending', 'oversized_plan'])

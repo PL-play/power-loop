@@ -226,7 +226,7 @@ async def project_allocation(manager, tx, identity, key, value):
 
 
 async def adjust_allocation(manager, tx, state, changes):
-    """A cold, proven correction changes the original capacity accounting."""
+    """Apply a staged accounting revision to its original allocation."""
     from . import model_budgets as budgets
     from .control_runtime import append_correction, require_closed
     await require_closed(manager, tx, state["job_id"], state["context"]["generation"])
@@ -261,8 +261,6 @@ async def project_adjustment(manager, tx, identity, value):
     from . import model_budgets as budgets
     table = manager.prefix + "execution_allocations"
     key, allocation = value["allocation_id"], value["state"]
-    if allocation["identity"] != asdict(identity):
-        raise JobError("execution_allocation_changed")
     suffix = "" if manager.db.dialect.name == "sqlite" else " FOR UPDATE"
     row = await _locked_allocation(manager, tx, identity, key)
     if row is None:
@@ -325,7 +323,7 @@ async def reserve(attempt, logical_request, *, service=None, pricing=None):
         state = dict(version=0, attempt_id=attempt.attempt_id, job_id=binding.lease.job_id,
             policy_key=policy["policy_key"], context=context, plan=asdict(plan), plan_hash=plan.request_hash,
             phase="host_reserving", pending=True, started_at_ms=binding.runtime.manager.now(),
-            host_intent=True, grant=None, observation=None, submission=None, ack=None,
+            host_intent=True, grant=None, observation=None, observation_hash=None, submission=None, ack=None,
             allocation_id=allocation_id, scopes=binding.resource_evidence["_control_budget_scopes"])
         save(binding, state)
     try:
@@ -383,7 +381,7 @@ async def observe(attempt, observation):
             binding.resource_evidence["_control_budget_policy"]["enabled"] = 0
             control.record("budget_policy_closed", state["policy_key"], {"enabled": False})
         allocation_record(binding)
-        state.update(phase="settling", pending=True, observation=observation,
+        state.update(phase="settling", pending=True, observation=observation, observation_hash=_hash(observation),
                      finished_at_ms=binding.runtime.manager.now())
         save(binding, state)
     if state["ack"] is not None:
@@ -445,7 +443,7 @@ async def close_unreserved(attempt):
             state = dict(version=0, attempt_id=attempt.attempt_id, job_id=binding.lease.job_id,
                 policy_key=policy["policy_key"], context=_context(attempt, source(binding)),
                 plan=None, plan_hash=None, phase="released", pending=False, started_at_ms=binding.runtime.manager.now(),
-                host_intent=False, grant=None, observation=None, submission=None, ack=ack, scopes=[])
+                host_intent=False, grant=None, observation=None, observation_hash=None, submission=None, ack=ack, scopes=[])
             save(binding, state)
         control.abort_prepared(attempt.attempt_id)
         return ack

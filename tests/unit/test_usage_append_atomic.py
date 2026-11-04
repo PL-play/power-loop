@@ -12,7 +12,7 @@ import pytest
 
 from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop
 from power_loop.agent.sink import SQLiteSink
-from power_loop.runtime.jobs import JobManager, _hash
+from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from ._budget_checkpoint_crash_worker import config
@@ -62,22 +62,14 @@ async def test_process_crash_keeps_message_usage_atomic_and_supplier_charge_orig
     capture = json.loads(Path(str(charges) + ".capture").read_text())
     assert capture["usage"]["total_tokens"] == 12
     assert capture["context"]["attempt_id"] == submission["attempt_id"]
-    prepared = await reader._db.fetchone(f"SELECT payload_json FROM {reader.table_prefix}job_events WHERE event_id=?",
-        (capture["context"]["prepared_event_id"],))
-    assert _hash(json.loads(prepared["payload_json"])) == capture["context"]["prepared_hash"]
     host = UsageHost(charges)
     runtime = TaskRuntime(JobManager(reader), tenant_id="budget-tenant", principal_id="host",
         executor_id="reconciler", boot_id="new-boot", boot_contract_hash="a" * 64, budget_config=config(host))
     try:
-        for _ in range(2):
-            result = await runtime.repair_execution_checkpoint(sid, saved["job_id"], generation=saved["generation"])
-            assert result["needs_reconciliation"] and not result["replay_allowed"]
-            # The last control checkpoint can precede the supplier's return.
-            # Preserve its entire grant; the supplier capture/charge above is
-            # the original usage authority, never a guessed control summary.
-            [allocation] = await reader._db.fetchall(f"SELECT state_json FROM {reader.table_prefix}execution_allocations")
-            booked = json.loads(allocation["state_json"])["booked"]
-            assert booked == dict(used_calls=0, used_tokens=0, held_calls=1, held_tokens=100, inflight=1)
+        assert (await runtime.manager.get_job(runtime.actor(sid), saved['job_id'])).job_id == saved['job_id']
+        [allocation] = await reader._db.fetchall(f"SELECT state_json FROM {reader.table_prefix}execution_allocations")
+        booked = json.loads(allocation['state_json'])['booked']
+        assert booked == dict(used_calls=0, used_tokens=0, held_calls=1, held_tokens=100, inflight=1)
         assert len(json.loads(charges.read_text())) == 1 and host.reserve_calls == 0
         assert saved["calls"] == 1
     finally:

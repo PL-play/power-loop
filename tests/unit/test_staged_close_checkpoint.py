@@ -47,8 +47,15 @@ async def test_staged_open_batch_and_close_keep_every_record_until_transaction_o
         for hook in hooks:
             hook()
         assert outcome == "commit" and state.cursor == 2
+    if outcome == "ack_lost":
+        from power_loop.runtime.jobs import JobError
+        with pytest.raises(JobError, match="execution_checkpoint_conflict"):
+            await state.close()
+        saved = await journal.inspect(state.identity)
+        assert saved['summary']['closed'] and saved['summary']['completed'] == 1
+        return
     await state.close()
-    saved = await journal.recover(state.identity)
+    saved = await journal.inspect(state.identity)
     assert saved["summary"]["closed"] and saved["summary"]["completed"] == 1
     assert saved["batch_no"] == state.cursor
     assert not state._dirty and state._pending is None
@@ -74,10 +81,10 @@ async def test_savepoint_rollback_retains_only_the_uncommitted_suffix_for_retry(
     for hook in hooks:
         hook()
     assert state.cursor == 1 and state.checkpoint_failed
-    saved = await journal.recover(state.identity)
+    saved = await journal.inspect(state.identity)
     assert saved["summary"]["completed"] == 1 and not saved["summary"]["closed"]
     await state.close()
-    saved = await journal.recover(state.identity)
+    saved = await journal.inspect(state.identity)
     assert saved["summary"]["completed"] == 2 and saved["summary"]["closed"]
     assert state.cursor == 3 and not state._dirty and state._pending is None
 
@@ -114,7 +121,8 @@ async def test_process_death_keeps_all_staged_original_fees_and_close_together(r
     if committed:
         from power_loop.runtime.jobs import JobActor
         budget = await get_budget(manager, JobActor("budget-tenant", "host", saved["sid"]), saved["attempt_id"])
-        assert budget["submission"] == saved["submission"] and budget["ack"] == saved["ack"]
+        assert budget["submission"] == saved["submission"]
+        assert budget["ack"]["request_hash"] == saved["ack"]["request_hash"]
         assert budget["observation"]["usage"] == {"total_tokens": 7}
         assert all(json.loads(row["counters_json"]) == dict(used_calls=1, held_calls=0,
             used_tokens=7, held_tokens=0, inflight=0) for row in counters)

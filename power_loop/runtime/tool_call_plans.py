@@ -106,12 +106,10 @@ async def read(manager, tx, source, ref, *, optional=False):
     value = await _read(manager, tx, key, source, 'tool_call_plan', optional=optional)
     if value is None:
         return None
-    anchor = await _read(manager, tx, key + '_seal', source, 'tool_call_plan_seal')
     await _scope(manager, tx, source)
     if (set(value) != {'version', 'scope', 'call_ref', 'entries'} or type(value['version']) is not int
             or value['version'] != 1 or _hash(value['scope']) != _hash(proof(source)) or _hash(value['call_ref']) != _hash(ref.to_dict())
-            or type(value['entries']) is not list or not 0 < len(value['entries']) <= 64
-            or _hash(anchor) != _hash({'version': 1, 'scope': proof(source), 'plan_id': key, 'plan_hash': _hash(value)})):
+            or type(value['entries']) is not list or not 0 < len(value['entries']) <= 64):
         raise JobError('tool_call_plan_corrupt')
     actor = JobActor(source['tenant_id'], source['principal_id'], source['session_id'])
     # Bound the original raw row before decoding it, including when a plan is
@@ -245,8 +243,6 @@ async def _prepare_children(pipeline, attempt):
         key = identity(manager, source, ref)
         value = {'version': 1, 'scope': proof(source), 'call_ref': ref.to_dict(), 'entries': entries}
         await _event(manager, tx, key, source, 'tool_call_plan', value)
-        await _event(manager, tx, key + '_seal', source, 'tool_call_plan_seal',
-                     {'version': 1, 'scope': proof(source), 'plan_id': key, 'plan_hash': _hash(value)})
     # Publish the process-local binding only after the whole transaction's ACK.
     # If commit loses its ACK, no callback receives execution authority.
     pipeline._native_tool_batch_bindings = _BatchBindings(
@@ -307,10 +303,6 @@ async def adopt(manager, tx, source, ref, call_id, request):
     if len(matches) != 1 or matches[0]['recovery'] != {'kind': 'managed_effect', 'request': request}:
         raise JobError('tool_call_plan_binding_changed')
     entry = matches[0]
-    key = start_id(identity(manager, source, ref), call_id)
-    started = await _read(manager, tx, key, source, 'tool_call_dispatch_started')
-    if started != {'version': 1, 'scope': plan['scope'], 'plan_id': identity(manager, source, ref), 'plan_hash': _hash(plan), 'entry_hash': _hash(entry)}:
-        raise JobError('tool_call_plan_corrupt')
     row = await manager._row(tx, entry['job_id'])
     if row['generation'] != 0 or row['status'] != 'queued' or row['resource_state'] != 'not_started':
         raise JobError('managed_effect_original_requires_reconciliation')

@@ -26,7 +26,7 @@ async def test_ordinary_callbacks_and_models_complete_once(registry_store, model
     original_db = store._db
     store._db = counted = CountedDatabase(original_db)
     manager = JobManager(store)
-    from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
+    from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
     from power_loop.runtime.response_capture import ResponseCaptureReceipt
 
     from .test_model_budgets_192 import Host
@@ -36,7 +36,7 @@ async def test_ordinary_callbacks_and_models_complete_once(registry_store, model
         assert captures.setdefault(packet.capture_id, packet) == packet
         return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, "fixture-original")
     async def tool_plan(context, call, *, pricing):
-        return BudgetPlan(0, {"attempt_id": context["attempt_id"], "origin": context})
+        return None
     host.capture_response, host.prepare_tool = capture, tool_plan
     config = BudgetConfig("send-budget", (LocalBudgetScope("shared", max_calls=10000, max_tokens=1000000, max_inflight=64),), host)
     runtime = TaskRuntime(manager, tenant_id="memory-send", principal_id="host", executor_id="executor", boot_id="boot", boot_contract_hash="a" * 64,
@@ -86,15 +86,14 @@ async def test_ordinary_callbacks_and_models_complete_once(registry_store, model
         messages = await store.load_all_messages(sid)
         assert seen == ["ok"] * ((models - 1) * tools_per_round), [(m.role, m.content) for m in messages]
         assert result.status == "completed" and model.calls == models
-        rows = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE event_type='model_attempt_finished'")
-        assert len(rows) == models
-        rows = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE event_type='tool_attempt_finished'")
-        assert len(rows) == (models - 1) * tools_per_round
+        [row] = await manager.db.fetchall(f"SELECT summary_json FROM {manager.prefix}execution_checkpoints WHERE job_id=(SELECT job_id FROM {manager.jobs} ORDER BY created_at DESC,job_id DESC LIMIT 1)")
+        summary = json.loads(row['summary_json'])
+        assert summary['models'] == models and summary['tools'] == len(seen)
         if budgeted:
             assert len(captures) == models
-            assert len(host.applied) == host.reserve_calls == models + len(seen)
+            assert len(host.applied) == host.reserve_calls == models
             [scope] = await manager.db.fetchall(f"SELECT counters_json FROM {manager.prefix}task_budget_scopes")
-            assert json.loads(scope["counters_json"]) == dict(used_calls=models + len(seen), used_tokens=5 * models,
+            assert json.loads(scope["counters_json"]) == dict(used_calls=models, used_tokens=5 * models,
                                                              held_calls=0, held_tokens=0, inflight=0)
         assert not manager._execution_controls and not manager._live_budget_bindings
     finally:

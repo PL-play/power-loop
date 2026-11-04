@@ -15,7 +15,7 @@ from power_loop.runtime.budget_contracts import (
     BudgetUsageEvidence,
     LocalBudgetScope,
 )
-from power_loop.runtime.jobs import JobError, JobManager, _hash
+from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_budget_reconcile_192 import reconcile, reopened
@@ -130,7 +130,7 @@ async def test_unknown_original_after_cancel_and_disabled_policy_corrects_tokens
     assert await c.manager.get_job(c.actor, c.binding.lease.job_id) == before_job
     assert runtime._lifecycle._start_task is None and c.host.reserve_calls == 1 and not c.host.released
     saved = await budgets.get_budget(c.manager, c.actor, a.attempt_id)
-    assert saved["observation"] == original["observation"] and not saved["pending"]
+    assert saved["observation_hash"] == original["observation_hash"] and not saved["pending"]
 
 
 @pytest.mark.parametrize("tokens", [5, 15, 105])
@@ -142,7 +142,7 @@ async def test_actual_correction_changes_all_original_scope_counters_once(late_c
     with pytest.raises(JobError, match="budget_actual_correction_required"):
         await stage(c, a, evidence(tokens))
     assert await counters(c) == before
-    value = evidence(tokens, correction_of=_hash(original["observation"]))
+    value = evidence(tokens, correction_of=original["observation_hash"])
     one, two = await reopened(c), await reopened(c)
     results = await asyncio.gather(stage(c, a, value, runtime=one), stage(c, a, value, runtime=two))
     assert results[0] == results[1]
@@ -157,7 +157,7 @@ async def test_pending_conflicting_and_stale_revisions_are_not_accepted_or_charg
     c = late_case
     a = await start(c)
     original = await observed(c, a)
-    await stage(c, a, evidence(correction_of=_hash(original["observation"])))
+    await stage(c, a, evidence(correction_of=original["observation_hash"]))
     before = await rows(c)
     with pytest.raises(JobError, match="budget_revision_pending"):
         await stage(c, a, evidence(14, key="other"))
@@ -331,7 +331,7 @@ async def test_successive_corrections_update_each_original_scope_without_countin
     c = late_case
     a = await start(c)
     original = await observed(c, a)
-    first = evidence(12, correction_of=_hash(original["observation"]))
+    first = evidence(12, correction_of=original["observation_hash"])
     receipt = await stage(c, a, first)
     await reconcile(c.runtime, c, a)
     second = evidence(5, key="correction-2", correction_of=first.fingerprint)

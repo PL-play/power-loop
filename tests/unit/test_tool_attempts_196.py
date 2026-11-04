@@ -199,14 +199,17 @@ async def test_real_agent_loop_bills_original_tool_and_does_not_reexecute_on_del
     sid = await loop.new_session()
     try:
         result = await loop.send('echo hello', sid)
-        states = await manager.db.fetchall(f'SELECT state_json FROM {manager.prefix}task_budget_attempts')
-        tool_states = [json.loads(row['state_json']) for row in states
-                       if json.loads(row['state_json'])['context'].get('kind') == 'tool']
+        states = await manager.db.fetchall(f'SELECT * FROM {manager.prefix}task_budget_attempts')
+        for row in states:
+            assert sum(len(str(value).encode()) for value in row.values() if value is not None) <= 1536
+        reader = JobManager(store)
+        tool_states = [await budgets.get_budget(reader, runtime.actor(sid), row['attempt_id']) for row in states
+                       if json.loads(row['state_json'])['kind'] == 'tool']
         assert len(tool_states) == 1 and calls == ['hello']
         state = tool_states[0]
-        assert state['observation']['charge']['quality'] == 'provider_reported'
-        assert state['observation']['charge']['amount'] == '0.25'
-        assert state['observation']['outcome'] == ('failed' if charged_error else 'returned')
+        assert state['submission']['request']['evidence']['charge']['quality'] == 'provider_reported'
+        assert state['submission']['request']['evidence']['charge']['amount'] == '0.25'
+        assert state['submission']['request']['evidence']['outcome'] == ('failed' if charged_error else 'returned')
         assert state['phase'] == 'settling'
         host.apply_unavailable = False
         if failed:

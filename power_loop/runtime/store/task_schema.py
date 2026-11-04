@@ -40,7 +40,7 @@ DEPLOYED_TASK_SCHEMA_VERSION = 10
 DEPLOYED_TASK_PROTOCOL_VERSION = 21
 _DEPLOYED_TASK_TABLES = ("task_store", "jobs", "job_events", "task_executors", "task_executor_events",
                          "task_budget_policies", "task_budget_scopes", "task_budget_attempts")
-TASK_TABLES = (*_DEPLOYED_TASK_TABLES, "execution_checkpoints", "execution_batches", "execution_allocations",
+TASK_TABLES = (*_DEPLOYED_TASK_TABLES, "execution_checkpoints", "execution_allocations",
                "session_controls", "session_obligations", "task_context_events", "task_executor_admissions",
                "task_principal_admissions")
 
@@ -321,10 +321,7 @@ async def _verify_task_schema_tx(tx, db, prefix, *, protocol=TASK_PROTOCOL_VERSI
     await _verify_query_indexes(tx, db, prefix, protocol=protocol)
     if final:
         for table, columns in (
-            ("execution_checkpoints", ("job_id", "generation", "identity_json", "identity_hash",
-                                       "batch_no", "chain_hash", "summary_json", "summary_hash", "admission_nonce")),
-            ("execution_batches", ("job_id", "generation", "batch_no", "previous_hash",
-                                   "payload_json", "payload_hash")),
+            ("execution_checkpoints", ("job_id", "generation", "batch_no", "summary_json")),
             ("execution_allocations", ("allocation_id", "job_id", "generation", "state_json", "state_hash")),
             ("session_controls", ("session_id", "version")),
         ):

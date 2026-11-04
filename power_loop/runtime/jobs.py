@@ -442,17 +442,12 @@ class JobManager:
             from .pending_calls import ERROR as PENDING_ERROR
             from .pending_calls import SNAPSHOT as PENDING_SNAPSHOT
             from .pending_calls import capture as capture_pending
-            from .pending_native import FIELD as NATIVE_PENDING
-            from .pending_native import capture as capture_native
-            if any(key in evidence_data for key in (PENDING_SNAPSHOT, PENDING_ERROR, NATIVE_PENDING)):
+            if any(key in evidence_data for key in (PENDING_SNAPSHOT, PENDING_ERROR)):
                 raise JobError("reserved_model_exit_evidence")
             try:
                 pending = await capture_pending(self, tx, row)
                 if pending is not None:
                     evidence_data[PENDING_SNAPSHOT] = pending
-                    native = await capture_native(self, tx, row, pending)
-                    if native is not None:
-                        evidence_data[NATIVE_PENDING] = native
             except JobError as exc:
                 evidence_data[PENDING_ERROR] = exc.code
                 resource_state = "unknown"

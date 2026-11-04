@@ -117,8 +117,6 @@ async def test_actual_native_tools_list_get_stop_bind_receipt_and_cancel_origina
 
         monkeypatch.setattr(task_control, "signal_local", unavailable)
     elif fault.endswith("_ack"):
-        from power_loop.runtime.managed_effects import _ref
-        from power_loop.runtime.tool_call_plans import identity, start_id
 
         transaction = manager.db.transaction
         lost = []
@@ -136,14 +134,6 @@ async def test_actual_native_tools_list_get_stop_bind_receipt_and_cancel_origina
                     # Reserve this exact injection before DB commit releases
                     # its connection to concurrent child-exit bookkeeping.
                     lost.append(phase)
-                    acceptance = next(event for event in requests if json.loads(event["payload_json"])["phase"] == "accepted")
-                    request = json.loads(acceptance["payload_json"])["request"]
-                    source = await manager._row(tx, acceptance["job_id"])
-                    dispatched = start_id(identity(manager, source, _ref(request["call_ref"])), request["tool_call_id"])
-                    # Permission to apply in another tree must include the
-                    # actual callback dispatch, never just its persisted plan.
-                    assert await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=? "
-                        "AND event_type='tool_call_dispatch_started'", (dispatched,))
             if hit:
                 raise OSError("stop "+phase+" committed; ACK lost")
 

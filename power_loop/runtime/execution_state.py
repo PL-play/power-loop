@@ -1,8 +1,6 @@
-"""Single-owner control state; reducers never perform database I/O.
+"""Single-owner control state with coalesced checkpoint writes.
 
-The journal owns recoverable facts. This object owns only the current execution
-and a bounded, coalesced set of changes awaiting a checkpoint. A recovered open
-execution is *not* permission to repeat its uncertain external actions.
+Reducers run in memory. Checkpoints commit projections and a compact summary.
 """
 from __future__ import annotations
 
@@ -159,7 +157,6 @@ class ExecutionState:
         self.pending_obligations: set[str] = set()
         self.max_pending_obligations = 1
         self.cursor = 0
-        self.chain_hash = identity.digest
         self.models = 0
         self.tools = 0
         self.completed = 0
@@ -175,7 +172,7 @@ class ExecutionState:
         self._completed_since_flush = 0
         self._pending = None
         self._pending_batches = []
-        self._staged_digests = []
+        self._staged_numbers = []
         self._staged_transaction = None
         self._flush_lock = asyncio.Lock()
         self._last_flush = time.monotonic()
@@ -366,7 +363,7 @@ class ExecutionState:
         return await self._checkpoint_locked(force=force, transaction=transaction, defer=defer)
 
     async def _checkpoint_locked(self, *, force, transaction, defer):
-        index = len(self._staged_digests)
+        index = len(self._staged_numbers)
         if index == len(self._pending_batches):
             if not self._dirty or not force and not self.due():
                 return False
@@ -375,41 +372,40 @@ class ExecutionState:
             records = list(self._dirty.values())
             summary = self.summary()
             number = (self._pending_batches[-1][0] if self._pending_batches else self.cursor) + 1
-            previous = self._staged_digests[-1][1] if self._staged_digests else self.chain_hash
-            self._pending_batches.append((number, previous, records, summary))
+            self._pending_batches.append((number, records, summary))
             self._pending = self._pending_batches[0]
             self._dirty = {}
             self._dirty_sizes = {}
             self._dirty_bytes = 0
             self._completed_since_flush = 0
-        number, previous, records, summary = self._pending_batches[index]
+        number, records, summary = self._pending_batches[index]
         try:
-            digest = await self.journal.append(self.identity, number, previous, records, summary, transaction=transaction)
+            await self.journal.append(self.identity, number, records, summary, transaction=transaction)
         except BaseException:
             self.checkpoint_failed = True
             raise
-        self._staged_digests.append((number, digest))
+        self._staged_numbers.append(number)
         self._staged = True
         if defer is None:
-            self._applied(number, digest)
+            self._applied(number)
         else:
-            defer(lambda: self._applied(number, digest), lambda: self._unstage(number))
+            defer(lambda: self._applied(number), lambda: self._unstage(number))
         return True
 
-    def _applied(self, number, digest):
-        self.cursor, self.chain_hash = number, digest
+    def _applied(self, number):
+        self.cursor = number
         self._pending_batches.pop(0)
-        self._staged_digests.pop(0)
+        self._staged_numbers.pop(0)
         self._pending = self._pending_batches[0] if self._pending_batches else None
-        self._staged = bool(self._staged_digests)
+        self._staged = bool(self._staged_numbers)
         self.checkpoint_failed = bool(self._pending_batches)
         self._last_flush = time.monotonic()
 
     def _unstage(self, number):
         # Rollback callbacks run in reverse, including a savepoint rollback.
-        # Retain every exact batch so a lost ACK can replay the same chain.
-        self._staged_digests.pop()
-        self._staged = bool(self._staged_digests)
+        # Keep an uncommitted suffix available for an ordinary rollback retry.
+        self._staged_numbers.pop()
+        self._staged = bool(self._staged_numbers)
         self.checkpoint_failed = True
 
     async def close(self, *, transaction=None, defer=None):
@@ -423,6 +419,6 @@ class ExecutionState:
         # A previous failed flush may be followed by late observations. Commit
         # both batches in order, rather than dropping the late result on close.
         while self._pending_batches or self._dirty:
-            if transaction is not None and len(self._staged_digests) == len(self._pending_batches) and not self._dirty:
+            if transaction is not None and len(self._staged_numbers) == len(self._pending_batches) and not self._dirty:
                 break
             await self.checkpoint(force=True, transaction=transaction, defer=defer)

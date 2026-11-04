@@ -37,7 +37,7 @@ def previous_fact(state):
         return value.token_quality, value.usage, value.fingerprint
     observation = state["observation"]
     quality = "unknown" if not observation["usage"] else "estimated" if observation["estimated"] else "actual"
-    return quality, observation["usage"], _hash(observation)
+    return quality, observation["usage"], state["observation_hash"]
 
 
 def validate_transition(state, evidence):

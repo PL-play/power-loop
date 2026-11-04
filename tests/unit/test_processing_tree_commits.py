@@ -12,7 +12,6 @@ import pytest
 from power_loop.runtime import session_obligations as obligations
 from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.processing import require_handled
-from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_closed_obligation_trees import _another_tree_result
 from .test_job_registry_192 import registry_store, runtime
@@ -197,12 +196,8 @@ async def test_process_death_after_logical_commit_cannot_fabricate_a_clean_exit(
     saved = json.loads(evidence.read_text())
     cold = JobManager(await connect())
     actor = JobActor(**saved["actor"])
-    repair = TaskRuntime(cold, tenant_id=actor.tenant_id, principal_id=actor.principal_id,
-        executor_id="cold-decision-reader", boot_id="inspection")
     assert len(await pending_reviews(cold, cold.db, actor)) == 1
-    for _ in range(2):
-        result = await repair.repair_execution_checkpoint(actor.session_id, saved["handler_job_id"], generation=1)
-        assert result["needs_reconciliation"] and not result["execution_authority"] and not result["replay_allowed"]
+    assert (await cold.get_job(actor, saved['handler_job_id'])).job_id == saved['handler_job_id']
     assert not await cold.db.fetchone(f"SELECT event_id FROM {cold.events} WHERE event_id=?",
         ("model_closed_"+saved["handler_job_id"],))
     assert (await cold.get_job(actor, saved["source_job_id"])).result_status == "pending_delivery"

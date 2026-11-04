@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from power_loop.runtime.control_runtime import current, flush_binding
+from power_loop.runtime.control_runtime import flush_binding
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 
@@ -45,18 +45,18 @@ async def test_process_crash_preserves_grant_and_usage_until_atomic_close(regist
     runtime = TaskRuntime(JobManager(reader), tenant_id="budget-tenant", principal_id="host",
         executor_id="reconciler", boot_id="new-boot", boot_contract_hash="a" * 64, budget_config=config(host))
     try:
-        # Repeated cold replay neither frees an open grant nor charges again.
-        for _ in range(2):
-            result = await runtime.repair_execution_checkpoint(saved["sid"], saved["job_id"],
-                generation=saved["generation"])
-            [row] = await reader._db.fetchall(f"SELECT counters_json FROM {reader.table_prefix}task_budget_scopes")
-            actual = json.loads(row["counters_json"])
-            expected = dict(used_calls=1, held_calls=0, used_tokens=12, held_tokens=0, inflight=0) if stage == "closed" else dict(
-                used_calls=0, held_calls=1, used_tokens=0, held_tokens=100, inflight=1)
-            assert actual == expected
-            [allocation] = result["summary"]["allocations"]
-            assert allocation["used_calls"] == 1 and allocation["used_tokens"] == 12
-            assert result["summary"]["closed"] == (stage == "closed")
+        row = await reader._db.fetchone(f"SELECT summary_json FROM {reader.table_prefix}execution_checkpoints WHERE job_id=? AND generation=?",
+                                       (saved['job_id'], saved['generation']))
+        summary = json.loads(row['summary_json'])
+        [row] = await reader._db.fetchall(f"SELECT counters_json FROM {reader.table_prefix}task_budget_scopes")
+        actual = json.loads(row['counters_json'])
+        expected = dict(used_calls=1, held_calls=0, used_tokens=12, held_tokens=0, inflight=0) if stage == "closed" else dict(
+            used_calls=0, held_calls=1, used_tokens=0, held_tokens=100, inflight=1)
+        assert actual == expected
+        [allocation] = summary['allocations']
+        assert allocation['used_calls'] == 1 and allocation['used_tokens'] == 12
+        assert summary['closed'] == (stage == 'closed')
+        assert (await runtime.manager.get_job(runtime.actor(saved['sid']), saved['job_id'])).job_id == saved['job_id']
         if stage == "closed":
             for _ in range(2):
                 replay = await runtime.reconcile_budget_usage(saved["sid"], job_id=saved["job_id"],
@@ -66,6 +66,7 @@ async def test_process_crash_preserves_grant_and_usage_until_atomic_close(regist
         assert host.reserve_calls == 0 and not host.released
     finally:
         await runtime.shutdown(timeout_s=1)
+        await reader.close()
 
 
 @pytest.mark.parametrize("fault", ["rollback", "ack_loss"])
@@ -91,9 +92,11 @@ async def test_close_commit_failure_retries_same_usage_delta_once(budget_case, m
 
     with monkeypatch.context() as patch:
         patch.setattr(c.manager.db, "transaction", fail_once)
-        await flush_binding(c.binding, close=True)
+        if fault == 'ack_loss':
+            from power_loop.runtime.jobs import JobError
+            with pytest.raises(JobError, match='execution_checkpoint_conflict'):
+                await flush_binding(c.binding, close=True)
+        else:
+            await flush_binding(c.binding, close=True)
     expected = dict(used_calls=1, held_calls=0, used_tokens=12, held_tokens=0, inflight=0)
     assert await counters(c) == expected and len(c.host.applied) == 1
-    for _ in range(2):
-        await current(c.binding).journal.recover(current(c.binding).identity, repair=True)
-        assert await counters(c) == expected

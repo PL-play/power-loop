@@ -344,12 +344,6 @@ class TaskRuntime:
                 "controller_retirement_pending": len(self._controller_retirements.pending),
                 "controller_task_exit_pending": len(self._controller_task_exits.slots)}
 
-    async def repair_execution_checkpoint(self, session_id, job_id, *, generation, retire_expired=False):
-        """Restore derived inspection state; never re-execute an unknown action."""
-        from .execution_recovery import inspect
-        return await inspect(self.manager, self.actor(session_id), job_id, generation=generation,
-                             repair=True, retire_expired=retire_expired)
-
     def _owned_checkpoint_pending(self):
         from .control_runtime import current
         return sum(bool(current(binding)._pending or current(binding)._dirty)

@@ -12,7 +12,6 @@ import pytest
 
 from power_loop.runtime import session_obligations as obligations
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
-from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_job_registry_192 import registry_store, runtime
 from .test_processing_decisions_192 import processing_case
@@ -188,14 +187,10 @@ async def test_process_death_between_exit_and_target_refresh_preserves_a_rebuild
     assert {row["kind"] for row in indexed} == {"abort", "disposition"}
     with pytest.raises(JobError, match="session_obligation_projection_mismatch"):
         await obligations.verify(cold, actor)
-    repair = TaskRuntime(cold, tenant_id=actor.tenant_id, principal_id=actor.principal_id,
-        executor_id="cold-repair", boot_id="inspection")
     expected_events = [{**event, "delivery_status": "handled"}
         if event["event_id"] == "result_"+saved["source_job_id"] else event for event in events]
     for _ in range(2):
-        result = await repair.repair_execution_checkpoint(actor.session_id, saved["handler_job_id"],
-            generation=json.loads(closed["payload_json"])["generation"])
-        assert result["repaired"] and not result["execution_authority"] and not result["replay_allowed"]
+        await obligations.reconcile_closed(cold, actor, saved['handler_job_id'])
         await obligations.verify(cold, actor)
     assert await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id") == expected_events
     assert await cold.db.fetchall(f"SELECT * FROM {cold.store.t.messages} ORDER BY id") == messages

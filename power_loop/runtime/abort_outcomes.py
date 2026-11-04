@@ -74,12 +74,6 @@ async def _original(manager, tx, source):
 
 
 async def requested(manager, tx, source):
-    from .pending_calls import SNAPSHOT
-    from .pending_calls import model as original_model
-    closed = await original_model(manager, tx, source)
-    if closed['evidence'].get(SNAPSHOT, {}).get('version') == 2:
-        from .pending_native import requested as native_requested
-        return await native_requested(manager, tx, source)
     from .tool_call_abort import identity
     from .workflow_controller import proof
 

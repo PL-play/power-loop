@@ -34,8 +34,10 @@ def accounting_context(state):
 def stored_state(state):
     """Persist accounting and the frozen outbox, without pricing or phase proofs."""
     value = {key: state[key] for key in (
-        'allocation_id', 'plan_hash', 'host_intent', 'observation',
+        'allocation_id', 'plan_hash', 'host_intent', 'observation', 'observation_hash',
         'usage_revision', 'initial_usage_evidence') if key in state}
+    if state['submission'] is not None and state['observation'] is not None:
+        value['observation'] = {key: state['observation'][key] for key in ('status', 'usage', 'estimated')}
     value['generation'] = state['context']['generation']
     value['kind'] = state['context'].get('kind', 'model')
     value['token_bound'] = state['plan']['token_bound'] if state['plan'] is not None else None
@@ -357,7 +359,7 @@ async def _observe(runtime, actor, job_id, attempt_id, observation):
             from .budget_revisions import read_initial
             await read_initial(manager, tx, state)
             if state["observation"] is not None:
-                if state["observation"] == observation:
+                if state["observation_hash"] == _hash(observation):
                     return
                 raise JobError("budget_observation_conflict")
             # Financial evidence already consumed the call/token reservation.
@@ -366,7 +368,7 @@ async def _observe(runtime, actor, job_id, attempt_id, observation):
             if observation["status"] == "returned":
                 from .execution_budget import adjust_allocation
                 await adjust_allocation(manager, tx, state, {"inflight": -1})
-            state.update(observation=observation, finished_at_ms=manager.now())
+            state.update(observation=observation, observation_hash=_hash(observation), finished_at_ms=manager.now())
             await _save(manager, tx, state, job)
         else:
             if not await _project_observation(manager, tx, policy, state, job, observation, manager.now()):
@@ -377,7 +379,7 @@ async def _observe(runtime, actor, job_id, attempt_id, observation):
 async def _project_observation(manager, tx, policy, state, job, observation, finished_at_ms):
     """First ordinary observation, when no independent financial evidence exists."""
     if state["phase"] != "dispatch_authorized":
-        if state["observation"] == observation:
+        if state["observation_hash"] == _hash(observation):
             return False
         raise JobError("budget_observation_conflict")
     returned = observation["status"] == "returned"
@@ -399,7 +401,7 @@ async def _project_observation(manager, tx, policy, state, job, observation, fin
         await tx.execute(
             f"UPDATE {manager.prefix}task_budget_policies SET enabled=0 WHERE policy_key=?", (state["policy_key"],)
         )
-    state.update(phase="settling", pending=True, observation=observation,
+    state.update(phase="settling", pending=True, observation=observation, observation_hash=_hash(observation),
                  finished_at_ms=finished_at_ms)
     await _save(manager, tx, state, job)
     return True
@@ -740,10 +742,10 @@ async def require_quiescent(manager, tx, job):
         f"SELECT pending,phase FROM {manager.prefix}task_budget_attempts WHERE job_id=? LIMIT 10001", (job["job_id"],))
     if len(rows) > 10000:
         raise JobError("budget_attempt_limit")
-    head = await tx.fetchone(f"SELECT summary_json,summary_hash FROM {manager.prefix}execution_checkpoints WHERE job_id=? AND generation=?",
+    head = await tx.fetchone(f"SELECT summary_json FROM {manager.prefix}execution_checkpoints WHERE job_id=? AND generation=?",
                              (job["job_id"], job["generation"]))
     if head is not None:
-        summary = _object(head["summary_json"], head["summary_hash"])
+        summary = json.loads(head["summary_json"])
         if summary["budget_attempts"] != len(rows):
             raise JobError("budget_attempt_missing")
         if summary["budget_unsettled"]:

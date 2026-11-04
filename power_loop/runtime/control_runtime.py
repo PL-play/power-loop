@@ -30,11 +30,7 @@ def current(binding):
 
 
 async def project_events(manager, tx, identity, records):
-    """Rebuildable observation views, atomically advanced with the journal.
-
-    The journal remains authoritative. Inspection keeps stable event identities,
-    so existing task-result references do not acquire another authority ledger.
-    """
+    """Persist control projections in the checkpoint transaction."""
     rows, budget_rows = [], []
     def event(key, kind, payload, metadata):
         row = (key, identity.job_id, kind, metadata["job_version"], _hash(payload),
@@ -120,11 +116,7 @@ def queue_event(binding, key, kind, value):
 
 
 async def append_correction(manager, tx, job, generation, records, *, summary_delta=None):
-    """Cold reconciliation appends to the same original journal authority.
-
-    It grants no lease. A running owner must use its own memory reducer; a
-    reconciler cannot race that owner's next checkpoint or silently overwrite it.
-    """
+    """Advance a closed execution's projections for accounting reconciliation."""
     import json
     binding = manager._execution_controls.get((job["job_id"], generation))
     if binding is not None and not current(binding).closed:
@@ -142,10 +134,8 @@ async def append_correction(manager, tx, job, generation, records, *, summary_de
                              (job["job_id"], generation))
     if head is None:
         raise JobError("execution_checkpoint_missing")
-    identity = ExecutionIdentity(**json.loads(head["identity_json"]))
-    if (identity.job_id, identity.generation, identity.tenant_id, identity.principal_id) != (
-            job["job_id"], generation, job["tenant_id"], job["principal_id"]):
-        raise JobError("execution_checkpoint_corrupt")
+    identity = ExecutionIdentity(manager.store.store_id, job['job_id'], generation,
+        job['executor_id'], job['boot_id'], job['tenant_id'], job['principal_id'], job['session_id'])
     async def projector(tx, identity, records):
         await project_events(manager, tx, identity, records)
     journal = ExecutionJournal(manager.store, projector=projector)
@@ -162,20 +152,20 @@ async def append_correction(manager, tx, job, generation, records, *, summary_de
                 return value is not None and (value["pending"] or value["phase"] not in ("released", "settling"))
             summary["budget_attempts"] = summary.get("budget_attempts", 0) + int(previous is None)
             summary["budget_unsettled"] = summary.get("budget_unsettled", 0) + int(unsettled(record["value"])) - int(unsettled(previous))
-    digest = await journal.append(identity, head["batch_no"] + 1, head["chain_hash"], records, summary, transaction=tx)
-    return head["batch_no"] + 1, digest
+    await journal.append(identity, head["batch_no"] + 1, records, summary, transaction=tx)
+    return head["batch_no"] + 1
 
 
 async def require_closed(manager, tx, job_id, generation):
     """A cold writer cannot supersede an owner with an unflushed suffix."""
-    from .model_budgets import _object
+    import json
     suffix = "" if manager.db.dialect.name == "sqlite" else " FOR UPDATE"
     head = await tx.fetchone(
-        f"SELECT summary_json,summary_hash FROM {manager.prefix}execution_checkpoints WHERE job_id=? AND generation=?" + suffix,
+        f"SELECT summary_json FROM {manager.prefix}execution_checkpoints WHERE job_id=? AND generation=?" + suffix,
         (job_id, generation))
     if head is None:
         raise JobError("execution_checkpoint_missing")
-    if not _object(head["summary_json"], head["summary_hash"]).get("closed"):
+    if not json.loads(head["summary_json"]).get("closed"):
         raise JobError("execution_reconciliation_requires_quiescence")
 
 
@@ -357,7 +347,7 @@ async def flush_binding(binding, *, close=False, force=True, transaction=None):
             if state._staged:
                 from .execution_membership import _remember_after_commit
                 _remember_after_commit(manager, None, "_closed_summaries",
-                                       (state.identity.job_id, state.identity.generation), state._pending_batches[-1][3])
+                                       (state.identity.job_id, state.identity.generation), state._pending_batches[-1][2])
             return
         try:
             await state.close()

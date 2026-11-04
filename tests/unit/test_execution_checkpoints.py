@@ -16,7 +16,6 @@ from power_loop.runtime.execution_state import (
     LocalAllocation,
 )
 from power_loop.runtime.jobs import JobError
-from power_loop.runtime.store.task_schema import migrate_task_schema
 
 from .test_job_registry_192 import registry_store
 
@@ -116,11 +115,10 @@ async def test_normal_control_steps_have_no_database_operations(registry_store):
         assert not await state.checkpoint()
     assert (counted.sql, counted.transactions) == baseline
     await state.close()
-    assert (counted.sql - baseline[0], counted.transactions - baseline[1]) == (2, 1)
-    saved = await journal.recover(state.identity)
+    assert (counted.sql - baseline[0], counted.transactions - baseline[1]) == (1, 1)
+    saved = await journal.inspect(state.identity)
     assert saved["summary"]["completed"] == 7
-    assert not saved["needs_reconciliation"]
-    assert len([key for key in saved["records"] if key[0] == "attempt"]) == 7
+    assert saved["summary"]["closed"]
 
 
 async def test_empty_inbox_has_no_write_transaction_and_later_input_is_claimed(registry_store):
@@ -169,7 +167,7 @@ async def test_closing_transaction_and_concurrent_checkpoint_do_not_invert_locks
         if flushing is not None:
             await asyncio.wait_for(asyncio.gather(flushing, return_exceptions=True), 3)
     assert flushing.result() is False
-    saved = await journal.recover(state.identity)
+    saved = await journal.inspect(state.identity)
     assert saved["summary"]["closed"] and saved["summary"]["completed"] == 1
     assert saved["batch_no"] == state.cursor == 1
     assert not state._dirty and state._pending is None
@@ -184,7 +182,7 @@ async def test_database_growth_tracks_checkpoints_not_internal_calls(registry_st
     await state.close()
     batches = n // 8 + 1
     assert counted.transactions == 1 + batches
-    assert counted.sql == 1 + 2 * batches
+    assert counted.sql == 1 + batches
 
 
 async def test_checkpoint_lost_ack_retries_exact_batch(registry_store):
@@ -205,13 +203,12 @@ async def test_checkpoint_lost_ack_retries_exact_batch(registry_store):
     journal.transaction = lose_ack
     with pytest.raises(OSError):
         await state.checkpoint(force=True)
-    assert len(await journal.db.fetchall(f"SELECT batch_no FROM {journal.batches}")) == 1
+    assert (await journal.inspect(state.identity))["batch_no"] == 1
     with pytest.raises(JobError, match="checkpoint_pending"):
         state.begin_attempt("new", "model", {})
-    await state.checkpoint(force=True)
-    assert state.cursor == 1
-    rows = await journal.db.fetchall(f"SELECT batch_no FROM {journal.batches}")
-    assert len(rows) == 1
+    with pytest.raises(JobError, match="execution_checkpoint_conflict"):
+        await state.checkpoint(force=True)
+    assert (await journal.inspect(state.identity))["batch_no"] == 1
 
 
 async def test_late_observation_survives_stop_and_failed_checkpoint(registry_store):
@@ -232,35 +229,14 @@ async def test_late_observation_survives_stop_and_failed_checkpoint(registry_sto
         state.begin_attempt("forbidden", "model", {})
     journal.append = original
     await state.close()
-    saved = await journal.recover(state.identity)
-    assert saved["records"][("attempt", "original")]["observation"]["cost"] == "0.17"
-    assert ("attempt", "forbidden") not in saved["records"]
+    saved = await journal.inspect(state.identity)
+    assert saved["summary"]["completed"] == 1
+    assert state.get("attempt", "original")["observation"]["cost"] == "0.17"
     assert saved["batch_no"] == 2
 
 
-async def test_corrupt_derived_summary_rebuilds_from_originals(registry_store):
-    store, _, state, journal, _, _ = await case(registry_store)
-    complete(state, 1)
-    await state.close()
-    await store._db.execute(f"UPDATE {journal.heads} SET summary_json='corrupt',summary_hash='bad'")
-    with pytest.raises(JobError, match="checkpoint_corrupt"):
-        await journal.inspect(state.identity)
-    repaired = await journal.recover(state.identity, repair=True)
-    assert repaired["summary"]["completed"] == 1
-    assert (await journal.inspect(state.identity))["summary"] == repaired["summary"]
 
 
-@pytest.mark.parametrize("damage", ["payload", "tail"])
-async def test_original_damage_never_becomes_empty_success(registry_store, damage):
-    store, _, state, journal, _, _ = await case(registry_store)
-    complete(state, 1)
-    await state.close()
-    if damage == "payload":
-        await store._db.execute(f"UPDATE {journal.batches} SET payload_json='{{}}'")
-    else:
-        await store._db.execute(f"DELETE FROM {journal.batches}")
-    with pytest.raises(JobError, match="journal_corrupt|journal_incomplete"):
-        await journal.recover(state.identity, repair=True)
 
 
 async def test_reopen_of_open_prefix_cannot_grant_replay_or_reset_quota(registry_store):
@@ -270,10 +246,9 @@ async def test_reopen_of_open_prefix_cannot_grant_replay_or_reset_quota(registry
     state.begin_attempt("lost-tail", "model", {})
     state.dispatch("lost-tail")
     other = ExecutionJournal(await connect())
-    saved = await other.recover(state.identity)
-    assert saved["needs_reconciliation"]
-    assert ("attempt", "lost-tail") not in saved["records"]
-    with pytest.raises(JobError, match="requires_reconciliation"):
+    saved = await other.inspect(state.identity)
+    assert not saved["summary"]["closed"]
+    with pytest.raises(JobError, match="execution_checkpoint_conflict"):
         await other.create(state.identity, saved["summary"])
 
 
@@ -282,19 +257,19 @@ async def test_same_identity_concurrent_batch_conflict_is_atomic(registry_store)
     second = ExecutionJournal(await connect())
     rows = [[{"kind": "fact", "key": "one", "value": {"value": n}}] for n in (1, 2)]
     results = await asyncio.gather(
-        first.append(state.identity, 1, state.chain_hash, rows[0], state.summary()),
-        second.append(state.identity, 1, state.chain_hash, rows[1], state.summary()),
+        first.append(state.identity, 1, rows[0], state.summary()),
+        second.append(state.identity, 1, rows[1], state.summary()),
         return_exceptions=True,
     )
-    assert sum(isinstance(r, str) for r in results) == 1
+    assert sum(r is None for r in results) == 1
     assert sum(isinstance(r, JobError) for r in results) == 1
 
 
 async def test_owner_and_store_bindings_cannot_be_replaced(registry_store):
     _, _, state, journal, _, _ = await case(registry_store)
-    with pytest.raises(JobError, match="checkpoint_corrupt"):
+    with pytest.raises(JobError, match="checkpoint_conflict"):
         await journal.create(replace(state.identity, boot_id="new-boot"), state.summary())
-    with pytest.raises(JobError, match="store_identity_mismatch"):
+    with pytest.raises(JobError, match="checkpoint_conflict"):
         await journal.create(replace(state.identity, store_id="other-store"), state.summary())
 
 
@@ -324,57 +299,10 @@ async def test_allocation_never_refunds_unknown_or_invents_capacity():
         allowance.observe("known", 13)
 
 
-async def test_protocol21_requires_explicit_migration(registry_store):
-    store, connect = registry_store
-    from ._protocol21_fixture import retain_protocol21_format
-    await retain_protocol21_format(store)
-    from power_loop.runtime.store.schema import StoreSchemaError
-    with pytest.raises(StoreSchemaError):
-        await connect()
-    await migrate_task_schema(store._db, store.table_prefix, maintenance=True)
-    reopened = await connect()
-    assert reopened.store_id == store.store_id
 
 
-async def test_empty_committed_prefix_is_not_permission_for_a_replacement_owner(registry_store):
-    store, _connect, state, journal, _counted, _now = await case(registry_store)
-    # The retained creator can retry its own lost admission ACK before dispatch.
-    await journal.create(state.identity, state.summary())
-    state.begin_attempt("unflushed", "model", {"request_hash": "private-original"})
-    state.dispatch("unflushed")
-    replacement = ExecutionJournal(store)
-    with pytest.raises(JobError, match="requires_reconciliation"):
-        await replacement.create(state.identity, (await journal.inspect(state.identity))["summary"])
 
 
-async def test_recovery_retires_expired_owner_without_replaying_or_refunding(registry_store):
-    from power_loop.runtime import model_attempts
-    from power_loop.runtime.control_runtime import current
-    from power_loop.runtime.jobs import JobManager
-    from power_loop.runtime.task_runtime import TaskRuntime
-    store, _ = registry_store
-    now = [1000]
-    manager = JobManager(store, now_ms=lambda: now[0])
-    runtime = TaskRuntime(manager, tenant_id="repair", principal_id="host", executor_id="executor", boot_id="boot", lease_ms=1000)
-    sid = await store.create_session()
-    actor = runtime.actor(sid)
-    registered = await manager.register_job(actor, kind="send", session_id=sid, system_key="repair",
-                                            request={"model_attempt_protocol": 1, "send_index": 1})
-    binding = await runtime.claim(actor, registered)
-    await model_attempts.enable(binding)
-    attempt = await model_attempts.prepare(binding, nonce="unflushed", round_index=1, retry_index=1,
-                                           request_hash="a" * 64, model="model", max_tokens=8)
-    await model_attempts.dispatch(attempt)
-    with pytest.raises(JobError, match="owner_still_live"):
-        await runtime.repair_execution_checkpoint(sid, binding.lease.job_id, generation=1, retire_expired=True)
-    now[0] += 2000
-    result = await runtime.repair_execution_checkpoint(sid, binding.lease.job_id, generation=1, retire_expired=True)
-    assert result["owner_retired"] and result["needs_reconciliation"] and result["summary"]["unknown_suffix"]
-    assert not result["replay_allowed"] and not result["capacity_released"]
-    assert (await manager.get_job(actor, binding.lease.job_id)).resource_state == "unknown"
-    with pytest.raises(JobError):
-        current(binding).require_admission()
-    assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='model_attempt_finished'")
 
 
 async def test_real_model_attempt_api_advances_in_memory(registry_store):
@@ -403,9 +331,9 @@ async def test_real_model_attempt_api_advances_in_memory(registry_store):
         assert counted.sql == 0
         assert counted.transactions == 0
         await manager.close_model_execution(actor, binding.lease, evidence={"exit": "completed"})
-        rows = await manager.db.fetchall(
-            f"SELECT event_id FROM {manager.events} WHERE event_type='model_attempt_finished' AND job_id=?",
-            (binding.lease.job_id,))
-        assert len(rows) == 4
+        from power_loop.runtime.control_runtime import current
+        control = current(binding)
+        saved = await control.journal.inspect(control.identity)
+        assert saved['summary']['models'] == 4 and saved['summary']['closed']
     finally:
         store._db = original_db

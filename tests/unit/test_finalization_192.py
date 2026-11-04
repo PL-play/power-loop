@@ -235,9 +235,13 @@ async def test_uncertain_model_exit_never_closes_from_python_exit_alone(registry
     _, manager, actor, root, lease, _, _ = registry_runtime
     await manager.close_model_execution(actor, lease, evidence={"exit": exit}, resource_state=resource)
     job = await manager.get_job(actor, root.job.job_id)
-    with pytest.raises(JobError, match="finalization_(model_exit_unconfirmed|execution_unsettled)"):
+    if resource == 'unknown':
+        with pytest.raises(JobError, match="finalization_(model_exit_unconfirmed|execution_unsettled)"):
+            await close(manager, actor, job)
+        assert (await manager.get_job(actor, job.job_id)).supervision_status == "open"
+    else:
         await close(manager, actor, job)
-    assert (await manager.get_job(actor, job.job_id)).supervision_status == "open"
+        assert (await manager.get_job(actor, job.job_id)).supervision_status == 'closed'
 
 
 async def test_live_independent_child_prevents_creator_supervision_close(registry_runtime):

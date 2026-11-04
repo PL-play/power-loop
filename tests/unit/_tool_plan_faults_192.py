@@ -7,8 +7,8 @@ def fail_plan_once(manager, stage):
     original = manager.db.transaction
     state = SimpleNamespace(fired=False, registrations=0)
     selected = {'first_registration': 'managed_effect_registered', 'second_registration': 'managed_effect_registered',
-                'plan': 'tool_call_plan', 'seal': 'tool_call_plan_seal',
-                'commit': 'tool_call_plan_seal', 'commit_ack': 'tool_call_plan_seal'}[stage]
+                'plan': 'tool_call_plan', 'seal': 'tool_call_plan',
+                'commit': 'tool_call_plan', 'commit_ack': 'tool_call_plan'}[stage]
 
     class Transaction:
         def __init__(self, target, flags):

@@ -5,7 +5,7 @@ import asyncio
 import json
 from dataclasses import asdict
 
-from .control_runtime import current, queue_event, source
+from .control_runtime import current, source
 from .jobs import JobError, _hash, _json
 
 
@@ -109,9 +109,6 @@ async def prepare(pipeline, attempt):
     else:
         key = plans.identity(manager, job, ref)
         value = {"version": 1, "scope": proof(job), "call_ref": ref.to_dict(), "entries": entries}
-        queue_event(binding, key, "tool_call_plan", value)
-        queue_event(binding, key + "_seal", "tool_call_plan_seal",
-                    {"version": 1, "scope": proof(job), "plan_id": key, "plan_hash": _hash(value)})
         pipeline._native_tool_batch_bindings = plans._BatchBindings(
             key, _hash(value), _json(proof(job)), _json(ref.to_dict()), tuple(originals.items()))
     for e in entries:
@@ -146,13 +143,13 @@ async def dispatch(pipeline, name, arguments, registered, *, budget_attempt=None
         raise JobError("tool_call_plan_binding_changed")
     plan, ref = owned["plan"], owned["ref"]
     key = start_id(identity(manager, job, ref), call_id)
-    if control.get("event_immutable", key) is not None:
+    dispatched = binding.resource_evidence.setdefault("_control_dispatched_tools", set())
+    if key in dispatched:
         raise JobError("tool_call_already_dispatched")
     if budget_attempt is not None:
         from .tool_attempts import authorize_dispatch
         await authorize_dispatch(budget_attempt, None, job)
-    queue_event(binding, key, "tool_call_dispatch_started", {"version": 1, "scope": plan["scope"],
-        "plan_id": identity(manager, job, ref), "plan_hash": owned["hash"], "entry_hash": _hash(selected)})
+    dispatched.add(key)
     if selected["recovery"] is not None:
         # A managed child must see the start before it can claim its own lease.
         if budget_attempt is not None:
@@ -197,29 +194,8 @@ async def prepare_attempt(binding, ref, call_id, registered, arguments):
     return ToolAttempt(binding, key, prepared, PricedCall(registered.definition.name, arguments, job["execution_role"]), pricing, asyncio.current_task())
 
 
-def event_reference(binding, key):
-    from .model_exit import content_reference
-    saved = current(binding).get("event_immutable", key)
-    if saved is None:
-        raise JobError("execution_original_event_missing")
-    return content_reference(dict(event_id=key, job_id=binding.lease.job_id,
-        event_type=saved["event_type"], job_version=saved["event_metadata"]["job_version"],
-        request_hash=_hash(saved["payload"]), payload_json=_json(saved["payload"])))
-
-
-def return_basis(slot):
-    from .tool_call_plans import identity, start_id
-    owned, selected = entry(slot.binding, slot.ref.seq, slot.call_id)
-    if slot.plan_hash != owned["hash"] or slot.entry_hash != _hash(selected) or slot.ref != owned["ref"]:
-        raise JobError("native_return_original_changed")
-    key = start_id(identity(slot.binding.runtime.manager, source(slot.binding), slot.ref), slot.call_id)
-    start = event_reference(slot.binding, key)
-    return owned, selected, start
-
-
 async def persist_return(runtime, slot):
     from .model_exit import content_reference
-    from .native_returns import _LIMIT, anchor_id
     cache, manager = runtime._native_returns, runtime.manager
     try:
         async with cache.lock:
@@ -229,7 +205,7 @@ async def persist_return(runtime, slot):
             cache.require(slot)
             if slot.text is None:
                 raise JobError("native_return_unconfirmed")
-            owned, selected, start = return_basis(slot)
+            _, selected = entry(slot.binding, slot.ref.seq, slot.call_id)
             operations = []
             if (getattr(slot, "operation_revision", None) != getattr(manager, "_control_operation_revision", 0)
                     or (selected["registration"] or {}).get("runtime_contract") is not None):
@@ -241,21 +217,8 @@ async def persist_return(runtime, slot):
                     if json.loads(row["call_ref_json"] or "null") == slot.ref.to_dict():
                         await manager._authorize(manager.db, slot.binding.actor, row["job_id"])
                         operations.append(content_reference(row))
-            value = dict(version=1, scope=owned["plan"]["scope"], call_ref=slot.ref.to_dict(), call_id=slot.call_id,
-                         plan_hash=slot.plan_hash, entry_hash=slot.entry_hash, started=start,
-                         operations=operations, return_text=slot.text)
-            if slot.billing_receipt is not None:
-                value.update(version=2, billing_receipt=slot.billing_receipt.to_dict())
-            if len(_json(value).encode()) > _LIMIT:
-                raise JobError("native_return_too_large")
             key = cache.key(slot)
-            queue_event(slot.binding, key, "native_callback_returned", value)
-            queue_event(slot.binding, anchor_id(key), "native_callback_return_anchor",
-                        {"version": 1, "return": event_reference(slot.binding, key)})
             slot.binding.resource_evidence.setdefault("_control_tool_operations", {})[(slot.ref.seq, slot.call_id)] = operations
-            # Accepted by the live owner's journal buffer. A failed checkpoint
-            # retains these immutable facts and prevents further admission.
-            await current(slot.binding).checkpoint()
             del cache.slots[key]
             slot.saved = True
     except BaseException:
@@ -264,31 +227,8 @@ async def persist_return(runtime, slot):
 
 
 async def persist_billing_receipt(runtime, slot):
-    from .native_returns import _LIMIT
-    from .tool_billing import identity
     cache = runtime._native_returns
-    try:
-        async with cache.lock:
-            cache.check()
-            if slot.billing_saved and slot.binding.runtime is runtime:
-                return
-            cache.require(slot)
-            if slot.billing_receipt is None:
-                raise JobError("tool_billing_receipt_missing")
-            owned, _selected, start = return_basis(slot)
-            value = dict(version=1, scope=owned["plan"]["scope"], call_ref=slot.ref.to_dict(), call_id=slot.call_id,
-                         plan_hash=slot.plan_hash, entry_hash=slot.entry_hash, started=start,
-                         billing_receipt=slot.billing_receipt.to_dict())
-            if len(_json(value).encode()) > _LIMIT:
-                raise JobError("tool_billing_receipt_too_large")
-            key = identity(cache.key(slot))
-            queue_event(slot.binding, key, "tool_billing_receipt", value)
-            queue_event(slot.binding, key + "_a", "tool_billing_receipt_anchor",
-                        {"version": 1, "receipt": event_reference(slot.binding, key)})
-            # This public method promises durable fees before fallible decoding.
-            # Keep that promise even when ordinary control is batched.
-            await current(slot.binding).checkpoint(force=True)
-            slot.billing_saved = True
-    except BaseException:
-        slot.failed = True
-        raise
+    cache.require(slot)
+    if slot.billing_receipt is None:
+        raise JobError("tool_billing_receipt_missing")
+    slot.billing_saved = True

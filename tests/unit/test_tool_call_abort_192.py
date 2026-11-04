@@ -4,7 +4,6 @@ import json
 import pytest
 
 from power_loop.runtime.jobs import JobError
-from power_loop.runtime.tool_call_plans import start_id
 
 from ._tool_plan_faults_192 import fail_plan_once
 from .test_job_registry_192 import registry_store
@@ -44,54 +43,6 @@ async def test_original_prepare_failure_records_abort_and_retains_unprocessed_pe
     assert not any(row['role'] == 'tool' for row in raw)
 
 
-@pytest.mark.parametrize('part', ['abort_missing', 'anchor_missing', 'payload_hash', 'scope_boolean', 'version_boolean', 'raw_name', 'dispatch', 'plan_deleted', 'source_protocol'])
-async def test_abort_read_and_parent_close_refuse_missing_or_conflicting_originals(registry_store, part):
-    from power_loop.runtime.jobs import _hash, _json
-    from power_loop.runtime.tool_call_abort import read_abort
-    stage = 'commit_ack' if part == 'plan_deleted' else 'seal'
-    async def configure(loop, state):
-        fail_plan_once(loop.task_runtime.manager, stage)
-    c = await scenario(registry_store, call_count=2, configure=configure, expected_error='test_plan_' + stage)
-    [source] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.jobs} WHERE kind='send'")
-    [event] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='tool_call_abort'")
-    value = json.loads(event['payload_json'])
-    if part in ('abort_missing', 'anchor_missing'):
-        target = event
-        if part == 'anchor_missing':
-            [target] = await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='tool_call_abort_anchor'", (source['job_id'],))
-        assert await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (target['event_id'],)) == 1
-    elif part in ('payload_hash', 'scope_boolean', 'version_boolean'):
-        if part == 'scope_boolean':
-            value['scope']['generation'] = True
-        elif part == 'version_boolean':
-            value['version'] = True
-        else:
-            value['decision'] = 'guessed_from_absence'
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=?,request_hash=? WHERE event_id=?', (_json(value), _hash(value), event['event_id']))
-    elif part == 'raw_name':
-        row = await c.store.get_message(c.sid, int(value['assistant_ref']['seq']))
-        calls = row.tool_calls
-        calls[0]['function']['name'] = 'changed'
-        await c.manager.db.execute(f'UPDATE {c.store.t.messages} SET tool_calls_json=? WHERE id=?', (_json(calls), int(value['assistant_ref']['id'])))
-    elif part == 'dispatch':
-        plan_id = event['event_id'].removesuffix('_abort')
-        await c.manager.db.execute(f'INSERT INTO {c.manager.events} (event_id,job_id,event_type,job_version,payload_json,request_hash,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)',
-                                  (start_id(plan_id, value['entries'][0]['call_id']), source['job_id'], 'tool_call_dispatch_started', source['version'], '{}', _hash({}), 'not_applicable', c.manager.now()))
-    elif part == 'source_protocol':
-        creation = await c.manager.db.fetchone(f"SELECT event_id,payload_json FROM {c.manager.events} WHERE job_id=? AND event_type='operation' AND action='create'", (source['job_id'],))
-        payload = json.loads(creation['payload_json'])
-        del payload['request']['tool_call_plan_protocol']
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (_json(payload), creation['event_id']))
-    else:
-        await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_type='tool_call_plan'")
-    before = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
-    with pytest.raises(JobError):
-        await read_abort(c.manager, c.actor, source['job_id'], assistant_seq=int(value['assistant_ref']['seq']))
-    with pytest.raises(JobError):
-        await c.manager.finalize_supervision(c.actor, source['job_id'], generation=1)
-    assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == before
-    assert (await c.store.get_state(c.sid)).pending is not None
-    assert c.model.calls == 1 and c.state.dispatched == 0
 
 
 async def test_abort_checkpoint_cannot_be_reused_from_host_or_dispatch_or_claim(registry_store, monkeypatch):

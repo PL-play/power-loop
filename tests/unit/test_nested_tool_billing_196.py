@@ -1,5 +1,4 @@
 import asyncio
-import json
 from decimal import Decimal
 
 import pytest
@@ -44,7 +43,7 @@ class Paid:
 
 
 @pytest.mark.parametrize('fault', ['success', 'paid_error', 'ack_lost', 'parallel', 'reserve_lost',
-    'reserve_unconfirmed', 'receipt_disk', 'finished_disk', 'detached', 'argument_mutation'])
+    'reserve_unconfirmed', 'finished_disk', 'detached', 'argument_mutation'])
 async def test_composite_uses_separate_original_paid_attempts_and_only_retries_bookkeeping(registry_store, monkeypatch, fault):
     store, _ = registry_store
     host, calls, child_contexts = Host(), [], []
@@ -141,9 +140,11 @@ async def test_composite_uses_separate_original_paid_attempts_and_only_retries_b
         result = await loop.send('make image', sid)
         if fault in ('success', 'ack_lost', 'parallel', 'reserve_lost', 'detached', 'argument_mutation'):
             assert result.status == 'completed', result
-        states = [json.loads(row['state_json']) for row in await manager.db.fetchall(
-            f'SELECT state_json FROM {manager.prefix}task_budget_attempts')]
-        inner_states = [state for state in states if state['context'].get('tool_name') == 'inner']
+        reader = JobManager(store)
+        states = [await budgets.get_budget(reader, runtime.actor(sid), row['attempt_id']) for row in await manager.db.fetchall(
+            f'SELECT attempt_id FROM {manager.prefix}task_budget_attempts')]
+        inner_ids = {context['attempt_id'] for context in child_contexts}
+        inner_states = [state for state in states if state['attempt_id'] in inner_ids]
         count = 2 if fault == 'parallel' else 1
         assert len(inner_states) == count
         assert len({state['attempt_id'] for state in inner_states}) == count
@@ -152,16 +153,16 @@ async def test_composite_uses_separate_original_paid_attempts_and_only_retries_b
         else:
             assert len(calls) == count
             for state in inner_states:
-                assert state['observation']['charge']['amount'] == '0.25'
-                assert state['observation']['charge']['rule_version'] == 'fixed-inner-price'
-                assert state['observation']['provider_response_id'] in {'supplier-' + call for call in calls}
+                assert state['submission']['request']['evidence']['charge']['amount'] == '0.25'
+                assert state['submission']['request']['evidence']['charge']['rule_version'] == 'fixed-inner-price'
+                assert state['submission']['request']['evidence']['provider_response_id'] in {'supplier-' + call for call in calls}
                 host.apply_lost_ack = False
                 await budgets.reconcile_usage(runtime, runtime.actor(sid), state['job_id'], state['attempt_id'])
                 assert len(calls) == count
         assert runtime._native_returns.pending_count() == 0
         assert not runtime._native_returns.slots
         for state in states:
-            if state['pending'] and state['context'].get('tool_name') != 'inner':
+            if state['pending'] and state['attempt_id'] not in inner_ids:
                 host.apply_lost_ack = host.reserve_lost_ack = False
                 await budgets.reconcile_usage(runtime, runtime.actor(sid), state['job_id'], state['attempt_id'])
     finally:

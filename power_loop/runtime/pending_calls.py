@@ -175,15 +175,7 @@ async def _expected(manager, tx, source, closed):
         raise JobError('pending_call_interaction_unresolved')
     actor = JobActor(source['tenant_id'], source['principal_id'], source['session_id'])
     refs = []
-    native_ids, native = set(), None
-    from .pending_native import FIELD as NATIVE_SNAPSHOT
-    if NATIVE_SNAPSHOT in closed.get('evidence', {}):
-        from .pending_native import resolved
-        native = await resolved(manager, tx, source)
-        native_ids = {entry['call_id'] for entry in native[3]}
     for call in calls:
-        if call['id'] in native_ids:
-            continue
         row = await manager._authorize(tx, actor, job_id(manager, actor, ref, call['id']))
         found = await descriptor(manager, tx, row)
         if found is None:
@@ -203,17 +195,6 @@ async def _expected(manager, tx, source, closed):
         'model_exit': await _reference(manager, tx, 'model_closed_' + source['job_id']),
         'calls': refs, 'disposition': 'retired_for_result_review', 'execution_authority': False,
         'acknowledgement_created': False, 'billing_settled': False}
-    if native is not None:
-        from .abort_outcomes import _inbox as native_inbox
-        from .abort_outcomes import notice as native_notice
-        from .abort_outcomes import result_event as native_result
-        from .model_exit import content_reference
-        result = await native_result(manager, tx, source)
-        delivery = await native_notice(manager, tx, source, result, original=True)
-        await native_inbox(manager, tx, source, delivery)
-        expected.update(version=3, native_calls={'calls': sorted(native_ids),
-            'checkpoint': content_reference(native[4][0]), 'source_result': content_reference(result),
-            'notice_id': delivery[0]['event_id'], 'notice_hash': _hash(delivery[1])})
     if source['execution_role'] != 'main':
         from .model_exit import content_reference
         from .pending_owner import read
@@ -277,10 +258,6 @@ async def retire_pending_runtime(runtime, actor, source_job_id):
             await transfer(manager, tx, actor, source)
         elif source['root_job_id'] != source_job_id or source['session_id'] != actor.session_id:
             raise JobError('pending_call_requires_original_main')
-        from .pending_native import FIELD as NATIVE_SNAPSHOT
-        if NATIVE_SNAPSHOT in closed.get('evidence', {}):
-            from .pending_native import prepare
-            source = await prepare(manager, tx, actor, source)
         expected = await _expected(manager, tx, source, closed)
         key = identity(manager, source)
         old = await _object(manager, tx, manager.events, 'payload_json', 'event_id=?', (key,), 262144)
@@ -312,9 +289,7 @@ async def negative_review_references(manager, tx, source):
         return await handled_references(manager, tx, source)
     from .managed_delivery import handled_references, read, result_event
     refs = []
-    if record.get('native_calls'):
-        from .abort_outcomes import handled_references as native_handled
-        refs.extend(await native_handled(manager, tx, source))
+
     for call in record['calls']:
         if call['generation'] == 0:
             row = await manager._row(tx, call['job_id'])
@@ -358,9 +333,6 @@ async def recover_runtime(runtime, actor, source_job_id):
                 raise JobError('pending_owner_controller_not_retired')
             await task_exit(manager, tx, owner, JobLease(**binding['owner']))
         pending, calls, ref = await _verify(manager, tx, source, snapshot)
-        from .tool_call_plans import read as read_plan
-        plan = await read_plan(manager, tx, source, ref)
-        native_ids = {entry['call_id'] for entry in plan['entries'] if entry['recovery'] is None}
         if await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', (identity(manager, source),)):
             reference = await require_disposition(manager, tx, source, closed)
             return {'job_id': source_job_id, 'state': 'disposed', 'disposition': reference, 'execution_authority': False}
@@ -369,10 +341,6 @@ async def recover_runtime(runtime, actor, source_job_id):
         original_actor = JobActor(source['tenant_id'], source['principal_id'], source['session_id'])
         for call in calls:
             try:
-                if call['id'] in native_ids:
-                    from .pending_native import resolved
-                    await resolved(manager, tx, source)
-                    continue
                 row = await manager._authorize(tx, actor, job_id(manager, original_actor, ref, call['id']))
                 found = await descriptor(manager, tx, row)
                 if found is None:

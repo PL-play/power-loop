@@ -119,8 +119,7 @@ def capture(attempt, receipt: BillingReceipt | None, error: BaseException | None
         # supplier receipt remains in the native-return journal; this path
         # neither fabricates a zero charge nor claims financial ownership.
         cancelled = isinstance(error, asyncio.CancelledError)
-        attempt.observation = dict(version=1, scope=attempt.prepared["scope"], attempt_id=attempt.attempt_id,
-            prepared_hash=_hash(attempt.prepared), status="unknown" if cancelled else "returned",
+        attempt.observation = dict(status="unknown" if cancelled else "returned",
             usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, estimated=False,
             outcome="cancelled" if cancelled else "failed" if error else "returned",
             error_type=type(error).__name__ if error is not None else None, financial_authority=False)
@@ -130,8 +129,7 @@ def capture(attempt, receipt: BillingReceipt | None, error: BaseException | None
             or charge.rule_version != attempt.prepared['pricing_rule']['rule_version']):
         raise JobError('tool_settlement_rule_mismatch')
     cancelled = isinstance(error, asyncio.CancelledError)
-    attempt.observation = dict(version=1, scope=attempt.prepared['scope'], attempt_id=attempt.attempt_id,
-        prepared_hash=_hash(attempt.prepared), status='unknown' if cancelled else 'returned',
+    attempt.observation = dict(status='unknown' if cancelled else 'returned',
         usage={'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}, estimated=False,
         outcome='cancelled' if cancelled else 'failed' if error is not None else 'returned',
         error_type=type(error).__name__ if error is not None else None,
@@ -168,8 +166,7 @@ async def observe_managed_free(attempt, tx, job):
         raise JobError('tool_settlement_rule_mismatch')
     # Pricing itself has returned an exact zero, so it owns no vendor inflight
     # slot. The independent managed child still retains the business outcome.
-    value = dict(version=1, scope=attempt.prepared['scope'], attempt_id=attempt.attempt_id,
-        prepared_hash=_hash(attempt.prepared), status='returned',
+    value = dict(status='returned',
         usage={'prompt_tokens':0, 'completion_tokens':0, 'total_tokens':0}, estimated=False,
         outcome='unknown', error_type=None, provider_response_id=None,
         charge=dict(amount=format(charge.amount.amount,'f'), currency=charge.amount.currency,

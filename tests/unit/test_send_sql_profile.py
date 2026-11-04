@@ -56,8 +56,8 @@ def _limits(dialect, tools, budgeted, elapsed_s):
     return {
         "ordinary": (17 if mysql else 15) + (6 if mysql else 4) * tools + int(elapsed_s),
         "billing": 12 if budgeted else 0,
-        "control": 25 + int(tools > 0) + 6 * (tools // 31) if budgeted else 17 + int(tools > 0) + tools // 31,
-        "control_tx": 3 + tools // 16 if budgeted else 2,
+        "control": 23 if budgeted else 16,
+        "control_tx": 3 if budgeted else 2,
     }
 
 

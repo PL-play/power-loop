@@ -5,6 +5,7 @@ import json
 
 from .jobs import JobError, _hash
 
+
 def content_reference(event):
     """Business ACK may change later; the original event content cannot."""
     return {k: event[k] for k in ("event_id", "job_id", "event_type", "job_version", "request_hash")} | {
@@ -15,8 +16,6 @@ async def require_stopped(manager, tx, row, model):
     if (model.get("resource_state") != "stopped" or model.get("generation") != row["generation"]
             or row["kind"] != "send"):
         raise JobError("model_exit_unconfirmed")
-    from .pending_native import validate
-    await validate(manager, tx, row, model)
     from .model_attempts import require_quiescent
     return await require_quiescent(manager, tx, row, include_budget=False)
 
