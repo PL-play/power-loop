@@ -105,7 +105,7 @@ v0.2.0 与 0.1.x **不兼容**。无状态的 `AgentLoop` 已移除；一切围�
 | `AgentLoop(llm, config).run(messages=[...])` | `sid = await loop.new_session(); await loop.send(user_input, session_id=sid)` |
 | 调用方管理 `messages` 列表 | 库从 `SessionStore` 按 `session_id` 加载 |
 | 无持久化 | `db_path`（默认 `./power_loop_sessions.db`） |
-| 无悬挂检测 | 工具中崩溃 → 下次 `send` 抛 `SessionPendingError` |
+| 无悬挂检测 | 工具中崩溃 → 下次 `send` 补未知结果并继续 |
 | 老 `spawn_agent` | `register_spawn_agent(registry)` + 共享 `SessionStore` |
 | 无声明式子代理 | `AgentSpec` + `run_agent_spec()` |
 | 老 LLM 配置 | `LLMProviderConfig` + `create_llm_service_from_env()` |
@@ -123,7 +123,7 @@ v0.2.0 与 0.1.x **不兼容**。无状态的 `AgentLoop` 已移除；一切围�
 
 ### 3. 处理悬挂态
 
-**前**：工具执行中崩溃 = 静默数据丢失。**后**：下次 `send()` 抛 `SessionPendingError`。调用 `resume()` 或 `abort_pending()`。
+下次 `send()` 自动为遗留调用写入“执行中断，结果未知”并继续。回答待输入问题时使用 `submit_input()`。
 
 ### 4. 使用 LLMProviderConfig
 

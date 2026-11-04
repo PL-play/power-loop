@@ -93,7 +93,7 @@ async def test_tool_after_break_resolves_remaining_tool_calls() -> None:
     result = await loop.send("go", session_id=sid)
     assert result.status == "completed"
     _assert_no_dangling(await loop.get_messages(sid))  # c2 must have a (skipped) response
-    # the session must NOT be left pending → a second send works (no SessionPendingError)
+    # the session must NOT be left pending → a second send works (no unresolved calls)
     r2 = await loop.send("again", session_id=sid)
     assert r2.status in ("completed", "hit_round_limit")
 

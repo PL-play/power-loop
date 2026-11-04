@@ -2,10 +2,8 @@
 
 We simulate the crash by directly inserting an ``assistant(tool_calls)``
 message + ``set_pending`` on the store, then verify:
-  1. The next ``send`` raises :class:`SessionPendingError`.
-  2. ``abort_pending`` synthesizes ``<aborted>`` tool messages.
-  3. After abort, a subsequent send completes against the real LLM and the
-     answer is judged coherent.
+  The next send closes stale calls with interrupted/unknown results and answers
+  the new input against the real provider.
 """
 
 from __future__ import annotations
@@ -14,7 +12,6 @@ import pytest
 
 from power_loop import (
     AgentLoopConfig,
-    SessionPendingError,
     SessionStore,
     StatefulAgentLoop,
 )
@@ -41,7 +38,7 @@ def _noop_registry() -> ToolRegistry:
 
 
 @pytest.mark.asyncio
-async def test_pending_blocks_then_abort_clears_then_send_works() -> None:
+async def test_pending_is_interrupted_then_send_works() -> None:
     store = await SessionStore.open(":memory:")
     try:
         loop = StatefulAgentLoop(
@@ -79,16 +76,12 @@ async def test_pending_blocks_then_abort_clears_then_send_works() -> None:
             }],
         })
 
-        with pytest.raises(SessionPendingError):
-            await loop.send("anything", session_id=sid)
-
-        aborted = await loop.abort_pending(sid, reason="crash-simulated")
-        assert aborted == 1
-        assert await loop.get_pending(sid) is None
-
         q = "In one short sentence, what does HTML stand for?"
         r = await loop.send(q, session_id=sid)
         assert r.status == "completed"
+        assert await loop.get_pending(sid) is None
+        rows = await store.load_active_messages(sid)
+        assert any(row.role == "tool" and "结果未知" in row.content for row in rows)
         await assert_passes(
             question=q,
             answer=r.final_text,

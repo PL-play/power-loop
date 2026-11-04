@@ -47,7 +47,6 @@ try:
     await loop.send("hi", session_id=sid)
 except PowerLoopError as exc:
     if exc.code == "llm.timeout": ...
-    elif exc.code == "session.pending": ...   # resume / abort_pending / heal_pending
 ```
 
 Common codes: `llm.timeout`, `llm.retry_exhausted`, `session.pending`, `session.not_found`,
@@ -69,7 +68,7 @@ This physically deletes the session and all its messages, compactions, and sub-a
 
 ### What happens if the process crashes during tool execution?
 
-The session enters a "pending" state. The next `send()` raises `SessionPendingError`. Call `resume()` (finish the tools) or `abort_pending()` (cancel them). See [Sessions](user-guide/sessions.md).
+The next `send()` automatically records interrupted/unknown results for stale tool calls and continues. Use `submit_input()` to answer a pending user interaction.
 
 ## Tools
 

@@ -94,7 +94,6 @@ Every exception inherits from `PowerLoopError` and exposes a stable, machine-rea
 |---|---|
 | `PowerLoopError` (base) | `power_loop.error` |
 | `SessionNotFoundError` | `session.not_found` |
-| `SessionPendingError` | `session.pending` |
 | `LLMTimeout` | `llm.timeout` |
 | `LLMRetryExhausted` | `llm.retry_exhausted` |
 | `CancellationRequested` | `cancelled` |

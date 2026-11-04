@@ -9,10 +9,9 @@ persistence, pending-state machine — is wired up internally.
 Failure model
 -------------
 * If a session has unresolved tool_calls from a previous run, :meth:`send`
-  raises :class:`SessionPendingError`. Caller decides:
-    - :meth:`resume` to finish executing those tool_calls and continue, or
-    - :meth:`abort_pending` to synthesize ``<aborted>`` tool messages and
-      proceed with the new input.
+  records interrupted/unknown results and continues with the new input.
+  :meth:`resume` explicitly continues pending work; :meth:`abort_pending`
+  explicitly discards it.
 * :meth:`close_session` physically deletes the session and its data.
 """
 
@@ -55,7 +54,6 @@ from power_loop.contracts.errors import (
     InboxClaimChanged,
     SessionBusy,
     SessionNotFoundError,
-    SessionPendingError,
 )
 from power_loop.contracts.protocols import ChildRunGuard
 from power_loop.core.agent_context import (
@@ -511,7 +509,7 @@ class StatefulAgentLoop:
         CONTIGUITY GUARD: ``row.seq`` is the store's pre-append ``next_seq``, which equals the
         cached token ONLY if the cache saw every write since it was built. A mismatch means some
         out-of-band writer advanced the durable ``next_seq`` past our window —
-        ``resume()`` / ``submit_input()`` / ``abort_pending()`` / ``heal_pending`` (which append
+        ``resume()`` / ``submit_input()`` / ``abort_pending()`` (which append
         via their own sink), or another loop/process sharing the store. Re-syncing the token
         then would paper over the gap and let the next ``_cache_get`` HIT a row-missing window
         (the bug the code review caught); instead we drop the entry so the next send MISSes and
@@ -746,7 +744,6 @@ class StatefulAgentLoop:
         stop_event: CancellationLike = None,
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
-        heal_pending: bool = False,
         max_rounds: int | None = None,
         response_format: dict[str, Any] | None = None,
         history: bool = True,
@@ -776,27 +773,15 @@ class StatefulAgentLoop:
         - ``metadata``: JSON-serialisable tag stored with this send's user row
           (``meta["send"]``), e.g. which host-side agent or call the send belongs to.
 
-        Raises :class:`SessionPendingError` if the session has unresolved
-        tool_calls (a previous run died mid tool-call); the caller must call
-        :meth:`resume` or :meth:`abort_pending` first — or pass
-        ``heal_pending=True`` to have ``send`` abort the stale tool_calls
-        itself and proceed (the right default for orchestrators whose runs
-        can be killed, e.g. by a human interrupt).
+        Unresolved calls from an interrupted run are automatically closed with
+        an unknown-result marker before accepting the new user input.
         """
         sid = session_id
         self._raise_if_closing()
         store = await self._ensure_store()
         async with self._lock_for(sid), store.send_read_scope(sid):
             await self._ensure_session_or_raise(sid)
-            if heal_pending:
-                healed = await self._heal_pending(sid)
-                if healed:
-                    logger.warning(
-                        "send(heal_pending=True): aborted %d stale tool_call(s) "
-                        "in session %s before proceeding", healed, sid,
-                    )
-            else:
-                await self._raise_if_pending(sid)
+            await self._interrupt_pending(sid)
             # Cross-process turn: the in-process lock above only covers THIS interpreter.
             async with self._session_lease(sid):
                 send_index = await self._persist_user_input(sid, user_input, send_meta=metadata)
@@ -986,15 +971,15 @@ class StatefulAgentLoop:
     ) -> StatefulResult | None:
         """A send whose input is the waiting inbox items; ``None`` if nothing is waiting.
 
-        The claim happens only after the pending check passed, so a refused send leaves the
-        items pending. The first message (the first run of same-kind items) becomes the send's
+        Stale tool calls are interrupted before claiming inbox items.
+        The first message (the first run of same-kind items) becomes the send's
         input and is marked delivered in the same transaction as its transcript row; the rest
         go straight back to pending and are claimed by the pipeline's round-0 drain moments
         later — still before the first model call."""
         store = await self._ensure_store()
         async with self._lock_for(sid), store.send_read_scope(sid):
             await self._ensure_session_or_raise(sid)
-            await self._raise_if_pending(sid)
+            await self._interrupt_pending(sid)
             async with self._session_lease(sid):
                 for _ in range(3):
                     claimed = await self._claim_inbox(sid)
@@ -1085,7 +1070,6 @@ class StatefulAgentLoop:
         stop_event: CancellationLike = None,
         tools: Sequence[str] | ToolRegistry | None = None,
         system_prompt: str | None = None,
-        heal_pending: bool = False,
     ) -> StatefulResult:
         return self._run_sync(
             self.send(
@@ -1094,7 +1078,6 @@ class StatefulAgentLoop:
                 stop_event=stop_event,
                 tools=tools,
                 system_prompt=system_prompt,
-                heal_pending=heal_pending,
             )
         )
 
@@ -1182,14 +1165,13 @@ class StatefulAgentLoop:
 
             return await self._run_loop(session_id, stop_event=stop_event, sink=sink)
 
-    async def _heal_pending(self, sid: str) -> int:
-        """abort_pending without the session-existence re-check (callers in
-        send already hold the lock and have validated the session)."""
+    async def _interrupt_pending(self, sid: str) -> int:
+        """Reuse the send-entry snapshot; only stale pending causes writes."""
         store = await self._ensure_store()
-        state = await store.get_state(sid)
+        state = await store.state_snapshot(sid)
         if state is None or not state.pending:
             return 0
-        return await self.abort_pending(sid, reason="auto-healed by send(heal_pending=True)")
+        return await self.abort_pending(sid, reason="执行中断，结果未知")
 
     async def abort_pending(self, session_id: str, *, reason: str = "aborted") -> int:
         """Synthesize ``<aborted: reason>`` tool messages for every unresolved
@@ -1598,17 +1580,6 @@ class StatefulAgentLoop:
         store = await self._ensure_store()
         if await store.session_snapshot(sid) is None:
             raise SessionNotFoundError(sid)
-
-    async def _raise_if_pending(self, sid: str) -> None:
-        store = await self._ensure_store()
-        state = await store.state_snapshot(sid)
-        if state is not None and state.pending:
-            pending = state.pending
-            raise SessionPendingError(
-                sid,
-                assistant_seq=int(pending.get("assistant_seq") or 0),
-                pending_tool_calls=pending.get("tool_calls", []),
-            )
 
     @staticmethod
     def _coerce_send_index(raw: Any) -> int | None:

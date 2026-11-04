@@ -372,7 +372,7 @@ async def test_resume_after_warm_send_warm_equals_cold():
 async def _pending_then_abort_then_send(loop, sid, tools):
     await loop.send("u1", session_id=sid)                       # tool_call, no registry → pending (warms)
     await loop.abort_pending(sid)                               # <aborted> tool row, out-of-band
-    await loop.send("u2", session_id=sid, heal_pending=True)    # must reload
+    await loop.send("u2", session_id=sid)    # must reload
 
 
 async def test_abort_after_warm_send_warm_equals_cold():

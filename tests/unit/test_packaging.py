@@ -37,7 +37,7 @@ def test_stable_api_symbols_are_exported_and_real() -> None:
 _FROZEN_STABLE_V0 = frozenset({
     "StatefulAgentLoop", "StatefulResult", "FollowUpQueued",
     "AgentLoopConfig", "AgentLoopResult", "SessionStore", "SubagentLifecycle",
-    "PowerLoopError", "SessionPendingError", "SessionNotFoundError",
+    "PowerLoopError", "SessionNotFoundError",
     "LLMTimeout", "LLMRetryExhausted", "CancellationRequested",
     "LLMRetryPolicy", "CancellationToken",
     "AgentHooks", "AgentEventBus", "HookPoint", "HookDirective",
@@ -64,7 +64,6 @@ def test_stable_api_semver_guard() -> None:
 # changed code string is a breaking change requiring a MAJOR bump — so pin them here.
 _FROZEN_ERROR_CODES = {
     "PowerLoopError": "power_loop.error",
-    "SessionPendingError": "session.pending",
     "SessionNotFoundError": "session.not_found",
     "LLMTimeout": "llm.timeout",
     "LLMRetryExhausted": "llm.retry_exhausted",

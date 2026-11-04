@@ -293,23 +293,14 @@ async def _simulate_crash_pending(store, sid):
     )
     await store.set_pending(sid, {"assistant_seq": asst_seq, ...})
 
-# 直接 send 会抛——协议禁止把悬挂态丢给 LLM
-try:
-    await loop.send("anything", session_id=sid)
-except SessionPendingError as exc:
-    print(f"[blocked] pending: {[tc['id'] for tc in exc.pending_tool_calls]}")
-
-# 选择 abort_pending（也可以 await loop.resume(sid)）
-n = await loop.abort_pending(sid, reason="user_cancelled")
-
-# 现在 send 可以正常往下走
+# send 自动修复遗留 pending 后再请求模型
 r = await loop.send("What does HTML stand for?", session_id=sid)
 ```
 
 ### 要点
 
 - 协议：`assistant(tool_calls=[A,B])` 之后必须有对应的 `tool` 消息
-- 进程在 assistant 落库后、tool 没全部落库时挂掉 → 下次 send 抛 `SessionPendingError`
+- 下次 `send()` 自动为遗留调用写入“执行中断，结果未知”并继续。回答待输入问题时使用 `submit_input()`。
 - **两条恢复路径**：
   - `resume(sid)` — 跑完剩余 tool_calls，继续循环
   - `abort_pending(sid, reason=...)` — 写 `<aborted>` 消息，恢复协议合法性
@@ -317,8 +308,6 @@ r = await loop.send("What does HTML stand for?", session_id=sid)
 ### 输出
 
 ```
-[blocked] pending tool_calls: ['tc-stuck']
-[abort_pending] aborted 1 tool_call(s); pending now None
 [send]  status=completed, reply=HTML stands for HyperText Markup Language.
 ```
 

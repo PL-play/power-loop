@@ -1,4 +1,4 @@
-"""StatefulResult.usage accumulation + send(heal_pending=True) recovery.
+"""StatefulResult.usage accumulation + default send recovery recovery.
 
 Both features exist because orchestrators (one loop, many sessions, runs that
 can be killed mid tool-call) need per-run token accounting and crash recovery
@@ -12,9 +12,11 @@ from typing import Any
 
 import pytest
 
-from power_loop import SessionPendingError, StatefulAgentLoop
+from power_loop import StatefulAgentLoop
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk, LLMTokenUsage
 from power_loop.core.state import ContextManager
+from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
+from tests.unit.test_request_sanitize import StrictModel
 
 
 @dataclass
@@ -169,7 +171,7 @@ async def test_each_send_gets_its_own_usage(tmp_path):
     loop.close()
 
 
-# ── send(heal_pending=True) ─────────────────────────────────────────────
+# ── default send recovery ─────────────────────────────────────────────
 
 
 async def _wedge_session(loop: StatefulAgentLoop, sid: str) -> None:
@@ -188,39 +190,49 @@ async def _wedge_session(loop: StatefulAgentLoop, sid: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_raises_pending_by_default_with_guidance(tmp_path):
+async def test_send_interrupts_pending_and_proceeds(tmp_path):
     from power_loop import AgentLoopConfig
 
     loop = StatefulAgentLoop(
-        llm=_Scripted(responses=[_resp("ok", prompt=1, completion=1)]),
+        llm=StrictModel(responses=[_resp("recovered", prompt=1, completion=1)]),
         db_path=str(tmp_path / "s.db"), config=AgentLoopConfig(system_prompt="t"),
     )
     sid = await loop.new_session()
     await _wedge_session(loop, sid)
-    with pytest.raises(SessionPendingError) as ei:
-        await loop.send("hello", session_id=sid)
-    assert "heal_pending=True" in str(ei.value)
-    loop.close()
-
-
-@pytest.mark.asyncio
-async def test_send_heal_pending_aborts_and_proceeds(tmp_path):
-    from power_loop import AgentLoopConfig
-
-    loop = StatefulAgentLoop(
-        llm=_Scripted(responses=[_resp("recovered", prompt=1, completion=1)]),
-        db_path=str(tmp_path / "s.db"), config=AgentLoopConfig(system_prompt="t"),
-    )
-    sid = await loop.new_session()
-    await _wedge_session(loop, sid)
-    res = await loop.send("hello again", session_id=sid, heal_pending=True)
+    res = await loop.send("hello again", session_id=sid)
     assert res.status == "completed"
     assert res.final_text == "recovered"
     # The dead tool_call got a synthetic <aborted> tool message.
     msgs = await loop.get_messages(sid)
-    aborted = [m for m in msgs if m.get("role") == "tool" and "aborted" in str(m.get("content"))]
+    aborted = [m for m in msgs if m.get("role") == "tool" and "执行中断，结果未知" in str(m.get("content"))]
     assert len(aborted) == 1
-    # Healthy session: heal_pending is a no-op.
-    res2 = await loop.send("again", session_id=sid, heal_pending=True)
+    # A healthy send needs no repair.
+    res2 = await loop.send("again", session_id=sid)
     assert res2.status == "completed"
     loop.close()
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_send_interrupts_stale_pending(registry_store):  # noqa: F811
+    from power_loop import AgentLoopConfig
+    from power_loop.runtime.jobs import JobManager
+    from power_loop.runtime.task_runtime import TaskRuntime
+
+    store, _ = registry_store
+    runtime = TaskRuntime(JobManager(store), tenant_id="eval", principal_id="host",
+                          executor_id="heal", boot_id="boot")
+    model = StrictModel()
+    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
+                             config=AgentLoopConfig(compactor=None, delegation_policy="single_level"))
+    try:
+        sid = await loop.new_session()
+        await _wedge_session(loop, sid)
+        assert (await loop.send("continue", sid)).status == "completed"
+        assert await loop.get_pending(sid) is None
+        tools = [m for m in model.requests[0] if m["role"] == "tool"]
+        assert len(tools) == 1 and "执行中断，结果未知" in tools[0]["content"]
+        assert (await loop.send("continue again", sid)).status == "completed"
+        rows = await store.load_active_messages(sid)
+        assert len([r for r in rows if r.role == "tool"]) == 1
+    finally:
+        await loop.aclose()

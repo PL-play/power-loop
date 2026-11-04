@@ -48,7 +48,6 @@ try:
     await loop.send("hi", session_id=sid)
 except PowerLoopError as exc:
     if exc.code == "llm.timeout": ...
-    elif exc.code == "session.pending": ...   # resume / abort_pending / heal_pending
 ```
 
 常见 code：`llm.timeout`、`llm.retry_exhausted`、`session.pending`、`session.not_found`、
@@ -69,7 +68,7 @@ loop.close_session(sid, cascade=True)
 
 ### 进程在工具执行中崩溃怎么办？
 
-会话进入"悬挂"状态。下次 `send()` 抛 `SessionPendingError`。调用 `resume()` 或 `abort_pending()`。
+下次 `send()` 自动为遗留调用写入“执行中断，结果未知”并继续。回答待输入问题时使用 `submit_input()`。
 
 ## Hooks vs Events
 

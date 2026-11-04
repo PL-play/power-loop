@@ -216,9 +216,7 @@ class CustomNotesMemory:                                   # config.memory = Cus
 
 ## 崩溃恢复（附带）
 
-以上都不改变恢复故事：工具调用中途崩溃会留下 `pending`；下次 `send()` 抛 `SessionPendingError`；用
-`resume` / `abort_pending` / `heal_pending` 恢复。见 [`examples/05_pending_recovery.py`](https://github.com/)
-和[异步编排](async-orchestration.md)的恢复一节。
+下次 `send()` 自动为遗留调用写入“执行中断，结果未知”并继续。回答待输入问题时使用 `submit_input()`。
 
 ## 另见
 

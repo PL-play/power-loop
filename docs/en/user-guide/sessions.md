@@ -121,18 +121,10 @@ The same applies with a server backend — point both processes at `postgresql:/
 
 ## Pending Recovery
 
-If the process crashes while executing tool calls, the session enters a "pending" state. The next `send()` raises `SessionPendingError`:
+The next `send()` automatically records interrupted/unknown results for stale tool calls and continues. Use `submit_input()` to answer a pending user interaction.
 
 ```python
-try:
-    result = await loop.send("do something", session_id=sid)
-except SessionPendingError as exc:
-    print(f"Unresolved tool calls: {exc.pending_tool_calls}")
-    # Option A: finish executing the pending tools
-    result = await loop.resume(sid)
-    # Option B: abort and move on
-    await loop.abort_pending(sid, reason="user_cancelled")
-    result = await loop.send("new input", session_id=sid)
+result = await loop.send("new input", session_id=sid)
 ```
 
 ## Resumable User Input

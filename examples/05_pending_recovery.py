@@ -5,10 +5,8 @@ What you learn / 你将学到
 - 一轮工具调用的协议要求：assistant(tool_calls=[A,B]) 之后必须有 tool 消息对应每个 id
   / protocol requires: assistant(tool_calls=[A,B]) must be followed by a tool
   message for each id
-- 如果进程在 assistant 已落库、tool 还没全部落库时挂掉 → 下次 send 会抛
-  :class:`SessionPendingError`
-  / if process crashes after assistant is persisted but before all tool messages →
-  next send raises :class:`SessionPendingError`
+- 下次 send 自动为遗留调用补“执行中断，结果未知”并继续。
+  / The next send records interrupted/unknown results and continues.
 - 两条恢复路径 / Two recovery paths:
   - ``await loop.resume(sid)`` —— 把剩余的 tool_calls 跑完，继续循环
     / finish executing remaining tool_calls, then continue the loop
@@ -33,7 +31,6 @@ from _helpers import make_llm
 
 from power_loop import (
     AgentLoopConfig,
-    SessionPendingError,
     SessionStore,
     StatefulAgentLoop,
     ToolDefinition,
@@ -101,20 +98,7 @@ async def main() -> str:
         await store.append_message(sid, role="user", content="initial prompt")
         await _simulate_crash_pending(store, sid)
 
-        # 2. 直接 send 会抛 — 协议禁止把悬挂态丢给 LLM
-        #    Direct send raises — protocol forbids passing pending state to LLM
-        try:
-            await loop.send("anything", session_id=sid)
-        except SessionPendingError as exc:
-            print(f"[blocked] pending tool_calls: "
-                  f"{[tc['id'] for tc in exc.pending_tool_calls]}")
-
-        # 3. 选择 abort_pending（也可以 await loop.resume(sid)）
-        #    Choose abort_pending (or alternatively: await loop.resume(sid))
-        n = await loop.abort_pending(sid, reason="user_cancelled")
-        print(f"[abort_pending] aborted {n} tool_call(s); pending now {await loop.get_pending(sid)}")
-
-        # 4. 现在 send 可以正常往下走 / Now send proceeds normally
+        # 2. send 自动修复并继续 / send repairs pending calls and continues
         r = await loop.send("In one sentence: what does HTML stand for?", session_id=sid)
         print(f"[send]  status={r.status}, reply={r.final_text}")
         return r.final_text

@@ -142,7 +142,7 @@ stateDiagram-v2
     Aborted --> Clean: aborted tool messages stored
 ```
 
-如果进程在 assistant tool calls 已落库、tool 消息未全部落库时退出，下次 `send()` 会抛 `SessionPendingError`。调用方可以 `resume()` 跑完剩余工具，或 `abort_pending()` 合成中止 tool 消息。
+如果进程在 assistant tool calls 已落库、tool 消息未全部落库时退出，下次 `send()` 自动为遗留调用补“执行中断，结果未知”并继续。调用方仍可显式使用 `resume()` 或 `abort_pending()`。
 
 ## 6. 压缩流程
 

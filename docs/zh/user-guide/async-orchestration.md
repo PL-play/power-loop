@@ -59,10 +59,7 @@ power-loop 有几种方式做"一轮 LLM 里做不完"的工作——[后台任�
 因为 store 是唯一事实源，一个 session **可凭 `(dsn, session_id)` 跨进程恢复**——没有内存里的
 session 状态会丢。你要处理的是：
 
-- **工具调用中途崩溃会留下 `pending`。** 该 session 下一次 `loop.send()` 会抛
-  **`SessionPendingError`** 而不是悄悄丢掉这半截。用 `loop.resume(sid)`（重放 pending 工具并续跑）、
-  `loop.abort_pending(sid)`（丢弃）、或 `loop.send(..., heal_pending=True)`（先丢再发）恢复。
-  请有意识地选——这是特性不是 bug：它阻止一对悬空的 tool 调用污染下一轮。
+- 下次 `send()` 自动为遗留调用写入“执行中断，结果未知”并继续。回答待输入问题时使用 `submit_input()`。
 - **`resume()` 会重新执行工具处理器**，所以有副作用的处理器必须**幂等**（或自己防重）——resume 的
   工具调用会再跑一次。
 - **每 session 的锁和 follow-up 队列都在内存里**（`_locks[sid]`、`_follow_up_queues[sid]`）。它们
@@ -140,9 +137,7 @@ EXPORT_TOOL = ToolDefinition(
 的 event loop。如果该 loop 在写落地前**关停时被关闭**，写就丢了。关闭循环前先 drain/await 飞行中的工作
 （`await loop.aclose(...)`），并把长期 `running` 的任务在下次启动时当作可能孤儿处理。
 
-**"`send()` 抛 `SessionPendingError`。"** 上一次运行在 assistant 发了 tool_calls 但结果没写全时崩了。
-调 `resume(sid)`（写完）、`abort_pending(sid)`（丢弃）、或 `send(..., heal_pending=True)`。别忽略它
-——它在保护下一轮不被一对悬空 tool 调用搞坏。
+下次 `send()` 自动为遗留调用写入“执行中断，结果未知”并继续。回答待输入问题时使用 `submit_input()`。
 
 **"我的异步工具跑了但结果没出现 / 跑在了错误的线程上。"** 把处理器注册成 **`async def`**（或 `__call__`
 是 async 的可调用对象）。一个*返回协程的同步 lambda* 会被当作同步、用 `asyncio.to_thread` 跑，它的协程

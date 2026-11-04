@@ -97,7 +97,7 @@ power-loop v0.2.0 is a **hard break** from 0.1.x. The stateless `AgentLoop` is g
 | `AgentLoop(llm, config).run(messages=[...])` | `sid = await loop.new_session(); await loop.send(user_input, session_id=sid)` |
 | Caller manages `messages` list | Library loads from `SessionStore` by `session_id` |
 | No persistence | `db_path` (default `./power_loop_sessions.db`); `":memory:"` for tests |
-| No pending detection | Crash mid-tool → next `send` raises `SessionPendingError` |
+| No pending detection | Crash mid-tool → next `send` records unknown results and continues |
 | `spawn_agent` with private `AgentLoop` | `register_spawn_agent(registry)`; shared `SessionStore` with parent linking |
 | No declarative subagent | `AgentSpec` + `run_agent_spec(spec, input, parent_loop=...)` |
 | Compaction via `ContextManager` | `AgentLoopConfig.compactor = DefaultCompactor()` (default-on) |
@@ -140,13 +140,9 @@ r2 = await loop.send("What is my name?", session_id=sid)
 
 **Before**: crashes during tool execution were silent data loss.
 
-**After**: the next `send()` raises `SessionPendingError`:
+The next `send()` automatically records interrupted/unknown results for stale tool calls and continues. Use `submit_input()` to answer a pending user interaction.
 ```python
-try:
-    result = await loop.send("do something", session_id=sid)
-except SessionPendingError:
-    await loop.abort_pending(sid, reason="user_cancelled")
-    result = await loop.send("new input", session_id=sid)
+result = await loop.send("new input", session_id=sid)
 ```
 
 ### 4. Use LLMProviderConfig

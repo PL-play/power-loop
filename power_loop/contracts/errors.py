@@ -6,8 +6,6 @@ callers can ``except PowerLoopError`` as a single catch-all.
 
 from __future__ import annotations
 
-from typing import Any
-
 
 class PowerLoopError(Exception):
     """Base for all power-loop raised exceptions.
@@ -60,50 +58,6 @@ class SessionLeaseLost(PowerLoopError):
     def __init__(self, session_id: str) -> None:
         self.session_id = session_id
         super().__init__(f"session lease lost: {session_id}")
-
-
-class SessionPendingError(PowerLoopError):
-    """Raised when a session has unresolved tool_calls from a previous run.
-
-    The previous loop crashed (or was killed) after the assistant emitted
-    ``tool_calls`` but before all matching ``tool`` messages were appended.
-    The OpenAI/Anthropic message protocol forbids us from sending the next
-    LLM request in this state. The caller must explicitly choose:
-
-      * ``StatefulAgentLoop.resume(sid)`` — finish executing the pending
-        tool_calls and continue the loop, or
-      * ``StatefulAgentLoop.abort_pending(sid)`` — append synthetic
-        ``<aborted>`` tool messages, restoring protocol validity, then
-        proceed with the new user input.
-    """
-
-    code = "session.pending"
-
-    def __init__(
-        self,
-        session_id: str,
-        *,
-        assistant_seq: int,
-        pending_tool_calls: list[dict[str, Any]],
-    ) -> None:
-        self.session_id = session_id
-        self.assistant_seq = assistant_seq
-        self.pending_tool_calls = pending_tool_calls
-        def _tc_name(tc: dict[str, Any]) -> str:
-            # ``function`` is normally a dict, but a malformed/imported tool_call can carry a
-            # non-dict (e.g. a bare string) — guard so name extraction never raises here.
-            fn = tc.get("function")
-            name = fn.get("name") if isinstance(fn, dict) else None
-            return str(name or tc.get("name") or "?")
-
-        names = ",".join(_tc_name(tc) for tc in pending_tool_calls)
-        super().__init__(
-            f"session {session_id} has {len(pending_tool_calls)} unresolved tool_calls"
-            f" from round (assistant_seq={assistant_seq}): {names}."
-            " Recover with resume(sid) to finish them, abort_pending(sid) to"
-            " discard them, or call send(..., heal_pending=True) to auto-abort"
-            " and proceed"
-        )
 
 
 class LLMTimeout(PowerLoopError):

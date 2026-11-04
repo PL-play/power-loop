@@ -68,11 +68,7 @@ snapshot of in-flight tool_calls). Background tasks live in `pl_background_tasks
 Because the store is the source of truth, a session **resumes cross-process from `(dsn, session_id)`**
 — there is no in-memory session state to lose. What you must handle:
 
-- **A crash mid-tool-call leaves `pending` set.** The next `loop.send()` on that session raises
-  **`SessionPendingError`** rather than silently dropping the half-finished turn. Recover with
-  `loop.resume(sid)` (re-execute the pending tools and continue), `loop.abort_pending(sid)` (discard
-  them), or `loop.send(..., heal_pending=True)` (abort-then-send). Pick one deliberately — this is a
-  feature, not a bug: it stops a dangling tool pair from corrupting the next turn.
+- The next `send()` automatically records interrupted/unknown results for stale tool calls and continues. Use `submit_input()` to answer a pending user interaction.
 - **`resume()` re-executes tool handlers**, so a handler that has side effects must be **idempotent**
   (or guard against double-execution) — a resumed tool call runs again.
 - **The per-session lock and the follow-up queue are in-memory** (`_locks[sid]`,
@@ -160,10 +156,7 @@ loop is **closed during shutdown** before the write lands, the write is dropped.
 in-flight work before closing the loop (`await loop.aclose(...)`), and treat a long-`running` task as
 possibly-orphaned on the next start.
 
-**“`SessionPendingError` on `send()`.”** A prior run crashed after the assistant emitted tool_calls
-but before all results were written. Call `resume(sid)` (finish them), `abort_pending(sid)`
-(discard), or `send(..., heal_pending=True)`. Don't ignore it — it's protecting the next turn from a
-dangling tool pair.
+The next `send()` automatically records interrupted/unknown results for stale tool calls and continues. Use `submit_input()` to answer a pending user interaction.
 
 **“My async tool runs but its result never appears / it ran on the wrong thread.”** Register the
 handler as **`async def`** (or a callable whose `__call__` is async). A *sync lambda that returns a

@@ -19,7 +19,6 @@ import pytest
 from power_loop import AgentLoopConfig, FollowUpQueued, SessionStore, StatefulAgentLoop
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService
 from power_loop.agent.follow_up import FOLLOW_UP_MESSAGE_NAME, InboxItem
-from power_loop.contracts.errors import SessionPendingError
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.runtime.cancellation import CancellationToken
 from power_loop.runtime.pricing import Free
@@ -148,7 +147,7 @@ async def test_duplicate_only_delivery_starts_no_run(store: SessionStore) -> Non
     assert len(llm.calls) == n, "a duplicate must not wake the model"
 
 
-# ── Z2: kinds never merge ─────────────────────────────────────────────────────────────────
+# ── Z2: stored kinds remain separate ─────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -167,10 +166,10 @@ async def test_inflight_kinds_become_separate_messages(store: SessionStore) -> N
 
     second = llm.calls[1]
     follow = [m for m in second if m.get("name") == FOLLOW_UP_MESSAGE_NAME]
-    assert len(follow) == 2, "user items and the task wake-up must be two messages"
+    assert len(follow) == 1, "adjacent user roles merge only in the model request"
     assert "换个方向" in follow[0]["content"] and "再加一点" in follow[0]["content"]
-    assert "后台任务" not in follow[0]["content"]
-    assert "后台任务" in follow[1]["content"]
+    assert "后台任务" in follow[0]["content"]
+    assert follow[0]["content"].count("<follow_up>") == 2
 
     rows = [r for r in await store.load_active_messages(sid) if r.name == FOLLOW_UP_MESSAGE_NAME]
     assert [r.meta.get("inbox", {}).get("kinds") for r in rows] == [["user"], ["task_done"]]
@@ -191,9 +190,10 @@ async def test_idle_multi_kind_first_group_is_the_input_rest_before_first_call(
 
     first_call = llm.calls[0]
     user_msgs = [m for m in first_call if m.get("role") == "user"]
-    assert user_msgs[0]["content"] == "任务完成"          # send input: oldest group, no envelope
-    assert "用户的新问题" in user_msgs[1]["content"]       # claimed by the round-0 drain
-    assert user_msgs[1].get("name") == FOLLOW_UP_MESSAGE_NAME
+    assert len(user_msgs) == 1
+    assert user_msgs[0]["content"].startswith("任务完成")
+    assert "用户的新问题" in user_msgs[0]["content"]
+    assert "<follow_up>" in user_msgs[0]["content"]
     assert len(llm.calls) == 1, "both reached the model in the SAME first call"
 
 
@@ -260,9 +260,8 @@ async def test_steer_event_set_on_accept_and_cleared_on_claim(store: SessionStor
 
 
 @pytest.mark.asyncio
-async def test_refused_idle_send_leaves_items_pending(store: SessionStore) -> None:
-    """A session with stale tool_calls refuses a send; what was delivered must not be lost with
-    it — it waits until the host heals the session."""
+async def test_idle_send_heals_pending_and_delivers_items(store: SessionStore) -> None:
+    """An idle delivery heals stale tool calls and consumes its input once."""
     llm = _Gate([_tool_call("c1")])
     loop = _loop(store, llm, max_rounds=1)
     sid = await loop.new_session()
@@ -271,13 +270,11 @@ async def test_refused_idle_send_leaves_items_pending(store: SessionStore) -> No
     await s.set_pending(sid, {"assistant_seq": 1, "round_index": 0, "tool_call_ids": ["zz"],
                               "tool_calls": [{"id": "zz", "type": "function",
                                               "function": {"name": "echo", "arguments": "{}"}}]})
-    with pytest.raises(SessionPendingError):
-        await loop.deliver(InboxItem("don't lose me", item_id="k"), sid)
-    assert (await loop.inbox_pending(sid))["pending"] == 1
-    await loop.abort_pending(sid, reason="heal")
     llm.responses.append(LLMResponse(raw_text="ok"))
-    res = await loop.flush_follow_ups(sid)
-    assert res is not None and res.status == "completed"
+    res = await loop.deliver(InboxItem("don't lose me", item_id="k"), sid)
+    assert res.status == "completed"
+    assert (await loop.inbox_pending(sid))["pending"] == 0
+    assert await loop.get_pending(sid) is None
     assert "don't lose me" in "\n".join(_user_texts(await store.load_active_messages(sid)))
 
 

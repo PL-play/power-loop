@@ -91,7 +91,7 @@ pip install 'power-loop[openai]'      # 或 [anthropic] · 要那两个后端就
 | **可插拔记忆** | 通过 `MemoryProvider` Protocol 做跨会话召回；默认开启的内置 hook 在请求尾部临时注入(可做前缀缓存) | [记忆](docs/zh/user-guide/memory.md) |
 | **重试/取消/预算** | Provider 感知的重试、统一取消令牌、硬性每运行 token 上限 | [重试与取消](docs/zh/user-guide/retry-cancel.md) |
 | **稳定错误码** | 每个 `PowerLoopError` 带冻结的机器可读 `code`——按 `exc.code` 分支 | [API:错误码](docs/zh/api/index.md#错误码) |
-| **崩溃恢复** | `heal_pending` / `resume` / `abort_pending` 处理工具调用中途被杀的运行 | [Pending 恢复](docs/zh/user-guide/sessions.md) |
+| **崩溃恢复** | `send` (automatic recovery) / `resume` / `abort_pending` 处理工具调用中途被杀的运行 | [Pending 恢复](docs/zh/user-guide/sessions.md) |
 
 ---
 

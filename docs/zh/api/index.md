@@ -91,7 +91,6 @@ transport 包。**1.0 起 STABLE** —— `LLMService`、`LLMRequest`、`LLMResp
 |---|---|
 | `PowerLoopError`（基类） | `power_loop.error` |
 | `SessionNotFoundError` | `session.not_found` |
-| `SessionPendingError` | `session.pending` |
 | `LLMTimeout` | `llm.timeout` |
 | `LLMRetryExhausted` | `llm.retry_exhausted` |
 | `CancellationRequested` | `cancelled` |

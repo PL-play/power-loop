@@ -310,23 +310,14 @@ async def _simulate_crash_pending(store, sid):
         "tool_calls": [{"id": "tc-stuck", "function": {"name": "echo", "arguments": '{"text":"x"}'}}],
     })
 
-# Direct send raises — protocol forbids passing pending state to LLM
-try:
-    await loop.send("anything", session_id=sid)
-except SessionPendingError as exc:
-    print(f"[blocked] pending tool_calls: {[tc['id'] for tc in exc.pending_tool_calls]}")
-
-# Choose abort_pending (or alternatively: await loop.resume(sid))
-n = await loop.abort_pending(sid, reason="user_cancelled")
-
-# Now send proceeds normally
+# send repairs stale pending before calling the model
 r = await loop.send("In one sentence: what does HTML stand for?", session_id=sid)
 ```
 
 ### Key Points
 
 - Protocol: `assistant(tool_calls=[A,B])` must be followed by a `tool` message for each id
-- If process crashes after assistant but before all tool messages → next send raises `SessionPendingError`
+- The next `send()` automatically records interrupted/unknown results for stale tool calls and continues. Use `submit_input()` to answer a pending user interaction.
 - **Two recovery paths**:
   - `resume(sid)` — finish executing remaining tool_calls, continue the loop
   - `abort_pending(sid, reason=...)` — write `<aborted>` messages, restoring protocol validity
@@ -334,8 +325,6 @@ r = await loop.send("In one sentence: what does HTML stand for?", session_id=sid
 ### Output
 
 ```
-[blocked] pending tool_calls: ['tc-stuck']
-[abort_pending] aborted 1 tool_call(s); pending now None
 [send]  status=completed, reply=HTML stands for HyperText Markup Language.
 ```
 

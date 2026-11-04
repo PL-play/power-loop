@@ -13,7 +13,6 @@ from power_loop import (
     FollowUpQueued,
     MessageState,
     RuntimeProjector,
-    SessionPendingError,
     SessionStore,
     StatefulAgentLoop,
     create_default_tool_registry,
@@ -561,7 +560,7 @@ async def test_tool_round_persists_assistant_and_tool_messages(store: SessionSto
 
 
 @pytest.mark.asyncio
-async def test_pending_state_blocks_followup_send(store: SessionStore) -> None:
+async def test_pending_state_is_interrupted_before_followup_send(store: SessionStore) -> None:
     """Simulate a crash mid-tool by deferring tool execution.
 
     We emulate the crash by directly inserting an assistant(tool_calls)
@@ -581,11 +580,11 @@ async def test_pending_state_blocks_followup_send(store: SessionStore) -> None:
         "tool_calls": [{"id": "tc-stuck", "function": {"name": "echo", "arguments": "{}"}}],
     })
 
-    with pytest.raises(SessionPendingError) as exc:
-        await loop.send("anything", session_id=sid)
-    assert exc.value.session_id == sid
-    assert exc.value.assistant_seq == seq
-    assert len(exc.value.pending_tool_calls) == 1
+    result = await loop.send("anything", session_id=sid)
+    assert result.status == "completed"
+    assert await loop.get_pending(sid) is None
+    messages = await loop.get_messages(sid)
+    assert any(m["role"] == "tool" and "结果未知" in m["content"] for m in messages)
 
 
 @pytest.mark.asyncio

@@ -230,10 +230,7 @@ attribute (`note.note_id`, `note.content`, `note.pinned`).
 
 ## Crash recovery (bonus)
 
-None of these change the recovery story: a crash mid-tool-call leaves `pending` set; the next
-`send()` raises `SessionPendingError`; recover with `resume` / `abort_pending` / `heal_pending`. See
-[`examples/05_pending_recovery.py`](https://github.com/) and the recovery section of
-[Async orchestration](async-orchestration.md).
+The next `send()` automatically records interrupted/unknown results for stale tool calls and continues. Use `submit_input()` to answer a pending user interaction.
 
 ## See also
 

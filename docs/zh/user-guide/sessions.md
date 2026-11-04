@@ -121,18 +121,10 @@ print(r2.final_text)  # → "你喜欢蓝色。"
 
 ## 悬挂恢复
 
-如果进程在执行工具调用时崩溃，会话进入"悬挂"状态。下次 `send()` 抛出 `SessionPendingError`：
+下次 `send()` 自动为遗留调用写入“执行中断，结果未知”并继续。回答待输入问题时使用 `submit_input()`。
 
 ```python
-try:
-    result = await loop.send("do something", session_id=sid)
-except SessionPendingError as exc:
-    print(f"未解决的 tool calls: {exc.pending_tool_calls}")
-    # 选项 A：完成执行悬挂的工具
-    result = await loop.resume(sid)
-    # 选项 B：放弃并继续
-    await loop.abort_pending(sid, reason="user_cancelled")
-    result = await loop.send("new input", session_id=sid)
+result = await loop.send("new input", session_id=sid)
 ```
 
 ## 可恢复用户输入

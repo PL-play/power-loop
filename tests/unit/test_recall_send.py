@@ -145,16 +145,6 @@ async def test_recall_send_truncation_multiple_tool_calls(store: SessionStore) -
     assert "[tool_calls: bash, python, node]" in out and "…[truncated:" in out
 
 
-def test_session_pending_error_tolerates_malformed_function() -> None:
-    # SessionPendingError name extraction must guard a non-dict "function" (always builds a msg).
-    from power_loop.contracts.errors import SessionPendingError
-    exc = SessionPendingError(
-        "sid", assistant_seq=1,
-        pending_tool_calls=[{"id": "c1", "function": "not-a-dict", "name": "weird"}],
-    )
-    assert "weird" in str(exc)
-
-
 def test_recall_send_registered_in_default_tools() -> None:
     reg = create_default_tool_registry(include=["recall_send"], bind=False)
     assert reg.get("recall_send") is not None
