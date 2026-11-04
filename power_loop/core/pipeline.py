@@ -1598,23 +1598,44 @@ class AgentPipeline:
                 _do_call, policy=policy, token=self.cancel_token, on_retry=_on_retry,
             )
 
+        started = time.monotonic()
+        total_timeout = self.config.retry_policy.total_timeout if self.config.retry_policy is not None else None
+
+        def _check_recovery_budget() -> None:
+            self.cancel_token.raise_if_cancelled()
+            elapsed = time.monotonic() - started
+            if total_timeout is not None and elapsed >= total_timeout:
+                raise LLMTimeout(elapsed=elapsed, attempts=attempt_box[0], total_timeout=total_timeout)
+
         try:
             return await _initial_call()
         except Exception as exc:
             kind = request_repair_kind(exc)
             if kind is None or any(streamed["text"]) or any(streamed["think"]):
                 raise
-            if kind == "format":
-                messages = sanitize_request_messages(messages, strict=True)
-            else:
-                messages = await self._compact_rejected_request(messages)
-            request = replace(request, messages=messages)
-            self.cancel_token.raise_if_cancelled()
-            # Exactly one repaired retry, independent of the transient retry policy.
+            _check_recovery_budget()
+            # Initial attempts already used part of the budget. Summary and the
+            # single repaired retry share only what remains, without resetting it.
+            remaining = None if total_timeout is None else total_timeout - (time.monotonic() - started)
+            recovery_clock = asyncio.timeout(remaining)
             try:
-                return await _do_call()
-            except LLMRetryExhausted as failed:
-                raise failed.last_error from failed
+                async with recovery_clock:
+                    if kind == "format":
+                        messages = sanitize_request_messages(messages, strict=True)
+                    else:
+                        messages = await self._compact_rejected_request(messages)
+                    request = replace(request, messages=messages)
+                    _check_recovery_budget()
+                    # Exactly one repaired retry, independent of the transient retry policy.
+                    try:
+                        return await _do_call()
+                    except LLMRetryExhausted as failed:
+                        raise failed.last_error from failed
+            except TimeoutError as failed:
+                if not recovery_clock.expired():
+                    raise
+                raise LLMTimeout(elapsed=time.monotonic() - started, attempts=attempt_box[0],
+                                 total_timeout=total_timeout) from failed
 
     async def _compact_rejected_request(self, messages: list[LoopMessage]) -> list[LoopMessage]:
         """Force one request-only summary, preserving the latest user exchange."""

@@ -1,16 +1,26 @@
 """Provider rejections get one repaired request; repeated failure stays explicit."""
+import asyncio
 import json
+import time
 from dataclasses import replace
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMRetryPolicy, LLMTokenUsage, StatefulAgentLoop
+from power_loop import (
+    AgentLoopConfig,
+    CancellationToken,
+    LLMResponse,
+    LLMRetryPolicy,
+    LLMTokenUsage,
+    StatefulAgentLoop,
+)
 from power_loop.contracts.errors import CompactionFailed
 from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
 from power_loop.runtime.history_sanitize import sanitize_request_messages
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.response_capture import ResponseCaptureReceipt
 from power_loop.runtime.retry import request_repair_kind
+from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.task_runtime import TaskRuntime
 from tests.unit.test_fold_calls_192 import FoldHost
 from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
@@ -41,6 +51,69 @@ class RepairModel(StrictModel):
             raise Rejection("invalid messages: tool_call format" if self.kind == "format"
                             else "maximum context length exceeded")
         return LLMResponse(raw_text="recovered", token_usage=usage)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("managed", [False, True])
+@pytest.mark.parametrize("ending", ["timeout", "cancel"])
+@pytest.mark.parametrize("kind,delays,expected", [
+    ("format", {"retry": 1}, ["initial", "retry"]),
+    ("context", {"summary": 1}, ["initial", "summary"]),
+    ("context", {"retry": 1}, ["initial", "summary", "retry"]),
+    ("context", {"initial": .06, "summary": .06, "retry": .06},
+     ["initial", "summary", "retry"]),
+], ids=["format-retry", "context-summary", "context-retry", "shared-budget"])
+async def test_recovery_stops_within_original_budget(managed, ending, kind, delays, expected,
+                                                     record_property):
+    phases, stopped = [], []
+    reached = asyncio.Event()
+    started = None
+
+    class SlowRepair(RepairModel):
+        async def complete(self, request, **kwargs):
+            nonlocal started
+            if started is None:
+                started = time.monotonic()
+            summary = str(request.messages[0].get("content", "")).startswith(
+                "You are a conversation summarizer")
+            phase = "summary" if summary else ("retry" if self.main_requests else "initial")
+            phases.append(phase)
+            if phase == expected[-1]:
+                reached.set()
+            try:
+                await asyncio.sleep(1 if ending == "cancel" and phase == expected[-1]
+                                    else delays.get(phase, 0))
+                return await super().complete(request, **kwargs)
+            finally:
+                stopped.append(phase)
+
+    store = await open_store(":memory:", schema="tasks")
+    runtime = (TaskRuntime(JobManager(store), tenant_id="eval", principal_id="host",
+        executor_id="repair", boot_id="boot", boot_contract_hash="a" * 64) if managed else None)
+    timeout = (1 if ending == "cancel" else .15 if len(delays) == 3 else .05)
+    loop = StatefulAgentLoop(llm=SlowRepair(kind), store=store, task_runtime=runtime,
+        config=AgentLoopConfig(compactor=None, delegation_policy="single_level",
+            retry_policy=LLMRetryPolicy(max_attempts=5, backoff_initial=0, total_timeout=timeout)))
+    token = CancellationToken()
+    try:
+        sid = await loop.new_session()
+        await store.append_message(sid, role="user", content="old details " * 200)
+        await store.append_message(sid, role="assistant", content="done")
+        task = asyncio.create_task(loop.send("continue", sid, stop_event=token))
+        if ending == "cancel":
+            await asyncio.wait_for(reached.wait(), .5)
+            token.cancel("stop during repair")
+        result = await asyncio.wait_for(task, .5)
+        elapsed = time.monotonic() - started
+        record_property("elapsed_seconds", round(elapsed, 4))
+        assert result.status == ("degraded" if ending == "timeout" else "cancelled")
+        if ending == "timeout":
+            assert "LLM timeout" in result.final_text
+            assert elapsed < timeout + .1
+        await asyncio.sleep(.02)
+        assert phases == stopped == expected
+    finally:
+        await loop.aclose()
 
 
 @pytest.mark.asyncio
