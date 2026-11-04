@@ -149,6 +149,9 @@ async def _read(manager, tx, actor, source_job_id, *, namespace=None, required=T
         creation = json.loads(event["payload_json"])
         request = creation["request"]
         index = request["send_index"]
+        system_key = f"send:{index}"
+        if request.get("continuation_key") is not None:
+            system_key += f":continue:{request['continuation_key']}"
         protocol = request["model_attempt_protocol"]
         if (type(index) is not int or index < 1 or type(protocol) is not int or protocol != 1
                 or creation["job_id"] != root["job_id"] or creation["status"] != "queued"
@@ -156,7 +159,7 @@ async def _read(manager, tx, actor, source_job_id, *, namespace=None, required=T
                 or event["caller_session_id"] != root["session_id"]
                 or event["call_ref_json"] is not None or event["tool_call_id"] is not None
                 or event["request_hash"] != _hash(["send", root["title"], root["session_id"], None, False, request, None])
-                or event["operation_key"] != manager._origin_key(actor, "create", None, None, f"send:{index}")):
+                or event["operation_key"] != manager._origin_key(actor, "create", None, None, system_key)):
             raise ValueError()
         saved = request.get("host_context")
         if saved is None:

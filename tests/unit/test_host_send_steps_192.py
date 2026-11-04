@@ -73,6 +73,18 @@ async def test_different_stage_has_its_own_original_send_and_root_provenance(roo
     assert (await root_context.read(c.manager, c.actor, second["job_id"]))["payload"] == SOURCE["payload"]
 
 
+async def test_continuation_has_its_own_host_step_with_original_message_index(root_case):
+    c = root_case
+    await send(c)
+    first = await lookup(c)
+    continuation = {**STEP, "step_id": "continue:0"}
+    with c.runtime.root_context(c.sid, **SOURCE), c.runtime.host_send_step(c.sid, **continuation):
+        assert (await c.loop.resume(c.sid)).status == "completed"
+    second = await lookup(c, step_id="continue:0")
+    assert first["job_id"] != second["job_id"] and len(c.model.calls) == 2
+    assert {r.send_index for r in await c.store.load_all_messages(c.sid)} == {1}
+
+
 async def test_failed_atomic_binding_rolls_back_the_job_and_operation_before_model(root_case, monkeypatch):
     c = root_case
     original = steps.record

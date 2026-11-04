@@ -93,10 +93,13 @@ def request_step(request, *, actor, kind, parent, session_id, system_key):
         source = request["host_context"]
         original = root_context._document(source["namespace"], source["payload"])
         index = request["send_index"]
+        expected_key = f"send:{index}"
+        if request.get("continuation_key") is not None:
+            expected_key += f":continue:{request['continuation_key']}"
         if (kind != "send" or parent is not None or session_id != actor.session_id
                 or type(index) is not int or not 1 <= index < 2**63
                 or type(request["model_attempt_protocol"]) is not int or request["model_attempt_protocol"] != 1
-                or source != original or system_key != f"send:{index}"):
+                or source != original or system_key != expected_key):
             raise ValueError()
     except (TypeError, ValueError, KeyError):
         raise JobError("host_send_step_main_root_required") from None

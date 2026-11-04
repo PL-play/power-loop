@@ -1087,19 +1087,23 @@ class StatefulAgentLoop:
         *,
         stop_event: CancellationLike = None,
     ) -> StatefulResult:
-        """Finish executing pending tool_calls, then continue the loop.
+        """Continue the loop, resolving leftover calls before requesting the model.
+
+        Task-managed continuations mark stale calls interrupted/unknown instead
+        of replaying external work. Pending user questions still wait for answers.
 
         No-op (but still valid) if the session has no pending state — equivalent
         to "run one more round with no new user input".
         """
-        from power_loop.runtime.task_runtime import reject_unregistered_adapter
-        reject_unregistered_adapter("resume", self)
+        await self._require_host_continuation(session_id)
         store = await self._ensure_store()
         async with self._lock_for(session_id):
             await self._ensure_session_or_raise(session_id)
             waiting = await self._waiting_result_if_needed(session_id)
             if waiting is not None:
                 return waiting
+            if self.task_runtime is not None:
+                await self._interrupt_pending(session_id)
             sink = SQLiteSink(store, session_id)
             await self._prime_sink_from_pending(session_id, sink)
             async with self._runner.session_async(session_id=session_id):
@@ -1108,7 +1112,7 @@ class StatefulAgentLoop:
                     await self._execute_pending(session_id, sink)
                 finally:
                     reset_current_loop(loop_token)
-            return await self._run_loop(session_id, stop_event=stop_event, sink=sink)
+            return await self._run_loop(session_id, stop_event=stop_event, sink=sink, _task_continuation=True)
 
     async def submit_input(
         self,
@@ -1125,8 +1129,7 @@ class StatefulAgentLoop:
         user, wait minutes or days, restart processes, then call this method
         with the collected answer.
         """
-        from power_loop.runtime.task_runtime import reject_unregistered_adapter
-        reject_unregistered_adapter("submit_input", self)
+        await self._require_host_continuation(session_id)
         store = await self._ensure_store()
         async with self._lock_for(session_id):
             await self._ensure_session_or_raise(session_id)
@@ -1163,7 +1166,20 @@ class StatefulAgentLoop:
             if waiting is not None:
                 return waiting
 
-            return await self._run_loop(session_id, stop_event=stop_event, sink=sink)
+            return await self._run_loop(session_id, stop_event=stop_event, sink=sink, _task_continuation=True)
+
+    async def _require_host_continuation(self, sid: str) -> None:
+        if self.task_runtime is None:
+            return
+        from power_loop.runtime.execution_roles import session_role
+        from power_loop.runtime.jobs import JobError
+        from power_loop.runtime.task_runtime import _OWNER, _SEND
+        # Check before taking the session lock or writing an answer: a tool must
+        # not recursively resume its own running send or drive another owner.
+        if _SEND.get() is not None or _OWNER.get() is not None:
+            raise JobError("task_owner_required")
+        if await session_role(await self._ensure_store(), sid) != "main":
+            raise JobError("task_owner_required")
 
     async def _interrupt_pending(self, sid: str) -> int:
         """Reuse the send-entry snapshot; only stale pending causes writes."""
@@ -1753,7 +1769,8 @@ class StatefulAgentLoop:
                 reads.assistant_ref = None
             return await self._run_loop_owned(sid, _entry_send_index=_entry_send_index, **kwargs)
 
-    async def _run_loop_owned(self, sid: str, *, _entry_send_index, **kwargs: Any) -> StatefulResult:
+    async def _run_loop_owned(self, sid: str, *, _entry_send_index,
+                              _task_continuation=False, **kwargs: Any) -> StatefulResult:
         if self.task_runtime is not None:
             store = await self._ensure_store()
             # This send can run on a task also hosting its logical node and
@@ -1763,7 +1780,11 @@ class StatefulAgentLoop:
             kwargs["stop_event"] = stop
             send_index = (_entry_send_index if _entry_send_index is not _ENTRY_INDEX_UNSET
                           else await self._current_send_index(store, sid))
+            if _task_continuation and send_index is None:
+                # A host may resume a newly created session before its first send.
+                send_index = await store.mutate_runtime_state(sid, "send_index", lambda v: int(v or 0) + 1, default=0)
             async with self.task_runtime.model_send(self, sid, send_index, cancel_token=stop,
+                                                    _continuation_key=uuid.uuid4().hex if _task_continuation else None,
                                                     round_limit=kwargs.get('max_rounds')) as evidence:
                 result = await self._run_with_tool_context(sid, **kwargs)
                 evidence.update(exit=result.status, usage=dict(result.usage or {}), rounds=result.rounds,

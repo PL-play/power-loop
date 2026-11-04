@@ -2699,6 +2699,12 @@ _h_schedule_wakeup = FunctionRuntimeTool(
 )
 
 
+class _UserInputTool(FunctionRuntimeTool):
+    # Asking for input is a synchronous control signal; keep registry.invoke usable.
+    def __call__(self, **arguments):
+        return self.handler(**arguments)
+
+
 DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "bash": ShellTool(lambda **kw: run_bash(kw.get("command"), kw.get("restart", False), kw.get("timeout", 120), kw.get("description"), kw.get("context_policy", "retire"))),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("offset"), kw.get("limit")),
@@ -2730,10 +2736,12 @@ DEFAULT_TOOL_HANDLERS: dict[str, Any] = {
     "view_image": lambda **kw: run_view_image(kw["path"], kw.get("question") or ""),
     "background_run": _h_background_run,
     "jobs": JOBS_HANDLER,
-    "request_user_input": lambda **kw: request_user_input(
-        kind=kw.get("kind", "text"),
-        prompt=kw["prompt"],
-        options=kw.get("options") or [],
-        metadata=kw.get("metadata") or {},
+    "request_user_input": _UserInputTool(
+        lambda **kw: request_user_input(
+            kind=kw.get("kind", "text"), prompt=kw["prompt"],
+            options=kw.get("options") or [], metadata=kw.get("metadata") or {},
+        ),
+        ToolRuntimeContract("sdk.user_input"),
+        policy=lambda arguments: ToolDispatchPolicy(native_admitted=True),
     ),
 }

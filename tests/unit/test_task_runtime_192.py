@@ -192,8 +192,8 @@ async def test_receipt_storage_failure_preserves_pending_and_canonical_child_wit
     accepted = json.loads(tool.content)
     assert (await manager.get_operation(runtime.actor(sid), accepted["operation_id"])).receipt_ref is None
     # Recovery must not blindly dispatch a non-idempotent pending call.
-    with pytest.raises(JobError, match="adapter_unavailable:resume"):
-        await loop.resume(sid)
+    assert (await loop.resume(sid)).status == "completed"
+    assert (await store.get_state(sid)).pending is None
     monkeypatch.setattr(manager, "reconcile_receipt", original)
     await manager.reconcile_receipt(runtime.actor(sid), accepted["operation_id"], await store.message_ref(sid, tool.seq))
     await finish(managed)
@@ -436,7 +436,7 @@ async def test_rejected_adoption_of_cancel_resistant_work_is_bounded_and_retains
             parent=JobLease(root.job_id, "executor", "boot", 1))
 
 
-@pytest.mark.parametrize("entry", ["workflow", "background_command", "background_tool", "background_adopt", "timer", "timer_tool", "nudge", "direct_subagent", "ephemeral", "submit_input"])
+@pytest.mark.parametrize("entry", ["workflow", "background_command", "background_tool", "background_adopt", "timer", "timer_tool", "nudge", "direct_subagent", "ephemeral", "submit_input", "resume"])
 async def test_unadapted_entry_is_rejected_before_external_work(managed, entry):
     store, _, _, loop, model, sid, _ = managed
     model.tool_name = "probe"
@@ -468,6 +468,8 @@ async def test_unadapted_entry_is_rejected_before_external_work(managed, entry):
                 await delegation.nudge(current, sid, "no")
             elif entry == "submit_input":
                 await current.submit_input(sid, "not-admitted", "no")
+            elif entry == "resume":
+                await current.resume(sid)
             elif entry == "ephemeral":
                 await delegation.start(current, AgentSpec(name="no", system_prompt="no"), "no")
             else:

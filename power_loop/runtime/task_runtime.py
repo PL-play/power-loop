@@ -1,6 +1,6 @@
 """Opt-in execution adapters for the experimental task store.
 
-Main sends and standalone, linked subagent creates only. This is deliberately
+Main sends, host continuations and standalone, linked subagent creates. This is deliberately
 not enabled by opening a v10 database or by a model argument. Other async
 adapters fail closed until they participate in the same durable protocol.
 """
@@ -615,7 +615,8 @@ class TaskRuntime:
                     _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
-    async def model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None):
+    async def model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None,
+                         _continuation_key=None):
         owner_token = _enter_task_owner(self)
         trust_token = self.manager._trust_own_writes.set(True)
         local = None
@@ -623,7 +624,8 @@ class TaskRuntime:
             await self.ensure_started()
             local = {"task": asyncio.current_task(), "cancel_token": cancel_token, "signalled": False}
             self._model_executions[id(local)] = local
-            async with self._model_send(loop, sid, send_index, cancel_token=cancel_token, round_limit=round_limit) as evidence:
+            async with self._model_send(loop, sid, send_index, cancel_token=cancel_token, round_limit=round_limit,
+                                        _continuation_key=_continuation_key) as evidence:
                 yield evidence
         finally:
             if local is not None:
@@ -632,7 +634,8 @@ class TaskRuntime:
             _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
-    async def _model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None):
+    async def _model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None,
+                          _continuation_key=None):
         from .execution_roles import session_role
 
         if (type(self.require_host_send_steps) is not bool
@@ -676,6 +679,12 @@ class TaskRuntime:
         if owner is None and await session_role(self.manager.store, sid) != "main":
             raise JobError("task_owner_required")
         request = {"send_index": send_index, "model_attempt_protocol": 1, "tool_call_plan_protocol": 1}
+        system_key = f"send:{sid}:{send_index}" if registering_actor != actor else f"send:{send_index}"
+        if _continuation_key is not None:
+            # One logical send may pause for input repeatedly. Each continuation
+            # gets a fresh execution while messages retain the original send_index.
+            system_key += f":continue:{_continuation_key}"
+            request["continuation_key"] = _continuation_key
         original_round_limit = None
         if owner is not None:
             from .original_owner_review import enabled
@@ -729,7 +738,7 @@ class TaskRuntime:
                         kind="send",
                         session_id=sid,
                         parent=owner.lease if owner else None,
-                        system_key=f"send:{sid}:{send_index}" if registering_actor != actor else f"send:{send_index}",
+                        system_key=system_key,
                         request=request,
                         fresh=True,
                     )

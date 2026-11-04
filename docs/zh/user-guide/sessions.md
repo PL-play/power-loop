@@ -141,6 +141,12 @@ result = await loop.submit_input(sid, interaction["interaction_id"], {"choice": 
 
 待输入项会存进 SQLite，因此另一个进程之后重新打开同一个数据库，也可以调用 `submit_input()` 继续。
 
+启用 `task_runtime` 时，宿主也可以调用主会话的 `resume()` 和 `submit_input()`。
+等待输入时 `resume()` 返回原问题；提交答案后继续执行，答案仍绑定原 `interaction_id` 和 `send_index`。
+每次续跑创建新的执行任务；若配置宿主阶段绑定，续跑须使用新的 `host_send_step`。
+没有待回答问题时，托管 `resume()` 将遗留调用记为“执行中断，结果未知”后继续，不重放外部动作。
+工具执行过程中不能嵌套调用这两个入口。
+
 ## 每次调用覆盖
 
 `send()` 和 `send_sync()` 接受 `tools=` 与 `system_prompt=`，且不会修改 loop 或已存储的

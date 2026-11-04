@@ -141,6 +141,13 @@ result = await loop.submit_input(sid, interaction["interaction_id"], {"choice": 
 
 The pending interaction is persisted in the store, so another process can reconstruct the loop from the same `dsn` and call `submit_input()` later.
 
+With `task_runtime`, the host can call `resume()` and `submit_input()` on a main session.
+While waiting for input, `resume()` returns the existing question. Answers retain the original
+`interaction_id` and `send_index`, while each continuation creates a fresh execution job.
+Hosts using stage bindings must provide a new `host_send_step` for the continuation.
+Without a pending question, managed `resume()` records stale calls as interrupted/unknown
+before continuing, without replaying external actions. Tools cannot invoke either entry recursively.
+
 ## Per-Call Overrides
 
 `send()` and `send_sync()` accept `tools=` and `system_prompt=` without
