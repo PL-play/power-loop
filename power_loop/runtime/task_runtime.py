@@ -407,10 +407,11 @@ class TaskRuntime:
         return self._completion_status(await self._lifecycle.status())
 
     async def reconcile_budget_usage(self, session_id, *, job_id, attempt_id):
-        """Re-deliver this authority's saved usage, including after restart.
+        """Replay frozen usage, or release an expired send's unfrozen fees.
 
         This control operation does not start a boot, admit a model request,
-        reconstruct an Execution, or settle a job's supervision.
+        reconstruct an Execution, or settle a job's supervision. Unknown usage
+        is discarded after closing the expired execution, per design 200.
         """
         from .model_budgets import reconcile_usage
         return await reconcile_usage(self, self.actor(session_id), job_id, attempt_id)

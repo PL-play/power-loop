@@ -11,12 +11,21 @@ import os
 import sys
 import time
 from contextlib import asynccontextmanager
+from decimal import Decimal
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop, ToolDefinition
+from power_loop import (
+    AgentLoopConfig,
+    LLMResponse,
+    LLMService,
+    LLMTokenUsage,
+    StatefulAgentLoop,
+    ToolDefinition,
+    record_billing_receipt,
+)
 from power_loop.runtime.jobs import JobManager
-from power_loop.runtime.pricing import Free
+from power_loop.runtime.pricing import BillingReceipt, Free, Money
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
@@ -148,20 +157,26 @@ class _Tx:
 
 @pytest.mark.parametrize("models", [1, 2, 4, 8, 16, 32])
 @pytest.mark.parametrize("budgeted", [False, True])
-async def test_send_sql_profile(registry_store, models, budgeted):
+async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=False):
     store, _ = registry_store
-    records, transactions, tx_sites, elapsed_s = await _measure(store, models, budgeted)
+    records, transactions, tx_sites, elapsed_s = await _measure(store, models, budgeted, paid_tools=paid_tools)
     dialect = store._db.dialect.name
     target = os.environ.get("POWER_LOOP_SQL_PROFILE")
     if target:
         os.makedirs(target, exist_ok=True)
-        with open(os.path.join(target, f"send-{dialect}-m{models}-b{int(budgeted)}.json"), "w") as f:
-            json.dump({"models": models, "tools": models - 1, "budgeted": budgeted,
-                       "transactions": transactions, "tx_sites": tx_sites,
+        suffix = '-paid' if paid_tools else ''
+        with open(os.path.join(target, f"send-{dialect}-m{models}-b{int(budgeted)}{suffix}.json"), "w") as f:
+            json.dump({"models": models, "tools": models - 1, "budgeted": budgeted, "paid_tools": paid_tools,
+                       "transactions": transactions, "tx_sites": tx_sites, "elapsed_s": elapsed_s,
                        "records": records}, f)
     counts, limits = _counts(records, tx_sites), _limits(dialect, models - 1, budgeted, elapsed_s)
     over = {name: (counts[name], limit) for name, limit in limits.items() if counts[name] > limit}
     assert not over, f"SQL budget exceeded (actual, limit): {over}"
+
+
+@pytest.mark.parametrize('models', [2, 32])
+async def test_paid_tool_send_sql_profile(registry_store, models):
+    await test_send_sql_profile(registry_store, models, True, paid_tools=True)
 
 
 @pytest.mark.parametrize("budgeted", [False, True])
@@ -175,11 +190,11 @@ async def test_send_sql_independent_of_history(registry_store, budgeted):
     assert long["ordinary"] <= short["ordinary"] + 1, (short, long)
 
 
-async def _measure(store, models, budgeted, history=0):
+async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
     original = store._db
     store._db = profiled = Profiled(original)
     manager = JobManager(store)
-    from power_loop.runtime.budget_contracts import BudgetConfig, LocalBudgetScope
+    from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
     from power_loop.runtime.response_capture import ResponseCaptureReceipt
 
     from .test_model_budgets_192 import Host
@@ -189,6 +204,8 @@ async def _measure(store, models, budgeted, history=0):
         return ResponseCaptureReceipt(packet.capture_id, packet.fingerprint, "fixture-original")
 
     async def tool_plan(context, call, *, pricing):
+        if paid_tools:
+            return BudgetPlan(0, {'attempt_id': context['attempt_id'], 'origin': context})
         return None
     host.capture_response, host.prepare_tool = capture, tool_plan
     config = BudgetConfig("send-budget", (LocalBudgetScope("shared", max_calls=10000, max_tokens=1000000,
@@ -198,9 +215,12 @@ async def _measure(store, models, budgeted, history=0):
     registry = ToolRegistry()
 
     async def echo(text):
+        if paid_tools:
+            await record_billing_receipt(BillingReceipt(provider_amount=Money(Decimal('1'), 'CNY')))
         return text
+    from .test_nested_tool_billing_196 import Paid
     registry.register(ToolDefinition("echo", "Return input", input_schema={
-        "type": "object", "properties": {"text": {"type": "string"}}}, pricing=Free("fixture")), echo)
+        "type": "object", "properties": {"text": {"type": "string"}}}, pricing=Paid() if paid_tools else Free("fixture")), echo)
 
     class Model(LLMService):
         calls = 0
@@ -240,6 +260,8 @@ async def _measure(store, models, budgeted, history=0):
         elapsed_s = time.monotonic() - started
         records, transactions, tx_sites = list(profiled.records), profiled.transactions, list(profiled.tx_sites)
         assert result.status == "completed" and model.calls == models
+        if paid_tools:
+            assert sum(key.startswith('toolattempt_') for key in host.applied) == models - 1
         return records, transactions, tx_sites, elapsed_s
     finally:
         store._db = original

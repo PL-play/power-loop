@@ -91,16 +91,16 @@ async def test_foreign_or_missing_evidence_never_calls_provider(budget_case, fau
     assert (c.host.apply_calls, c.host.reserve_calls) == before
 
 
-async def test_dispatched_without_observation_cannot_be_forged_or_released(budget_case):
+async def test_closed_dispatch_without_observation_releases_unknown_usage(budget_case):
     c = budget_case
     a = await start(c)
     from power_loop.runtime.control_runtime import flush_binding
     await flush_binding(a.binding, close=True)
     runtime = await reopened(c)
-    before = await counters(c)
-    with pytest.raises(JobError, match="budget_usage_not_ready"):
-        await reconcile(runtime, c, a)
-    assert not c.host.applied and not c.host.released and await counters(c) == before
+    result = await reconcile(runtime, c, a)
+    assert result['released'] and not result['execution_authority']
+    assert not c.host.applied and len(c.host.released) == 1
+    assert all(v == 0 for v in (await counters(c)).values())
 
 
 async def test_ack_commit_failure_replays_same_request_without_reapplying_local_usage(budget_case, monkeypatch):

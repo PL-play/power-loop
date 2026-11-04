@@ -499,8 +499,19 @@ async def _deliver(runtime, actor, job_id, attempt_id):
 
 async def _refund_local(manager, tx, policy, state):
     from .execution_budget import adjust_allocation
-    await adjust_allocation(manager, tx, state,
-                            {"held_calls": -1, "held_tokens": -state["plan"]["token_bound"], "inflight": -1})
+    changes = {"held_calls": -1, "held_tokens": -state["plan"]["token_bound"], "inflight": -1}
+    observation = state['observation']
+    if observation is not None:
+        changes.update(held_calls=0, used_calls=-1)
+        usage = observation['usage']
+        tokens = None if observation['estimated'] else usage.get('total_tokens')
+        if tokens is None and not observation['estimated'] and all(k in usage for k in ('prompt_tokens', 'completion_tokens')):
+            tokens = usage['prompt_tokens'] + usage['completion_tokens']
+        if tokens is not None:
+            changes.update(held_tokens=0, used_tokens=-tokens)
+        if observation['status'] == 'returned':
+            changes['inflight'] = 0
+    await adjust_allocation(manager, tx, state, changes)
 
 
 async def close_unreserved(attempt):
@@ -580,8 +591,6 @@ async def _release_unstarted(runtime, actor, job_id, attempt_id, *, require_canc
             await _save(manager, tx, state, job)
             return state["ack"]
     provider = runtime.budget_config.provider
-    if state["grant"] is None and state["submission"] is None:
-        raise JobError("budget_reconciliation_submission_required")
     if state["submission"] is None:
         proof = {
             "proof": "dispatch_not_authorized",
@@ -716,8 +725,64 @@ async def _reconciliation_state(runtime, actor, job_id, attempt_id, *, allow_mis
     return state, observation
 
 
+async def _prepare_unfrozen_release(runtime, actor, job_id, attempt_id):
+    """An expired send loses its unknown usage; retained reservations can close."""
+    from .execution_budget import project_allocation
+    from .execution_journal import ExecutionJournal
+    from .execution_state import ExecutionIdentity
+    from .jobs import JobLease
+
+    manager = runtime.manager
+    async with prepare_policy(runtime), manager.joined_write() as tx:
+        policy = await _policy(runtime, tx)
+        job = await manager._authorize(tx, actor, job_id)
+        state = await _release_source(runtime, tx, job, attempt_id, policy)
+        if state['submission'] is not None or state['phase'] == 'released':
+            return False
+        generation = state['context']['generation']
+        if job['generation'] != generation:
+            raise JobError('stale_execution')
+        head = await tx.fetchone(f'SELECT * FROM {manager.prefix}execution_checkpoints WHERE job_id=? AND generation=?',
+                                (job_id, generation))
+        summary = json.loads(head['summary_json'])
+        if not summary['closed']:
+            # A live lease is never interpreted as a crashed owner. Fence the
+            # old job and checkpoint in this transaction before any API release.
+            changed = await tx.write_job(job_id, f"UPDATE {manager.jobs} SET intake='closed',version=version+1 "
+                "WHERE job_id=? AND generation=? AND version=? AND lease_until_ms<=?",
+                (job_id, generation, job['version'], manager.now()))
+            if changed != 1:
+                raise JobError('execution_reconciliation_requires_quiescence')
+            identity = ExecutionIdentity(manager.store.store_id, job_id, generation,
+                job['executor_id'], job['boot_id'], job['tenant_id'], job['principal_id'], job['session_id'])
+            summary.update(closed=True, unknown=summary['unknown'] + summary['inflight'], inflight=0)
+            rows = await tx.fetchall(f'SELECT state_json,state_hash FROM {manager.prefix}task_budget_attempts WHERE job_id=?',
+                                     (job_id,))
+            attempts = [_object(row['state_json'], row['state_hash']) for row in rows]
+            for allocation in summary['allocations']:
+                row = await tx.fetchone(f'SELECT state_json,state_hash FROM {manager.prefix}execution_allocations WHERE allocation_id=?',
+                                        (allocation['allocation_id'],))
+                saved = _object(row['state_json'], row['state_hash'])
+                await project_allocation(manager, tx, identity, allocation['allocation_id'],
+                    {**allocation, 'closed': True, 'observed_calls': sum(
+                        a.get('allocation_id') == allocation['allocation_id'] and a['observation'] is not None
+                        for a in attempts),
+                     'report_version': saved['report_version'] + 1})
+            await ExecutionJournal(manager.store).append(
+                identity, head['batch_no'] + 1, [], summary, transaction=tx)
+            await manager.close_model_execution(actor, JobLease(job_id, job['executor_id'], job['boot_id'], generation),
+                evidence={'exit': 'interrupted'})
+        state.update(phase='dispatch_closed', pending=True)
+        await _save(manager, tx, state, job)
+    return True
+
+
 @_verify_stored
 async def reconcile_usage(runtime, actor, job_id, attempt_id):
+    if await _prepare_unfrozen_release(runtime, actor, job_id, attempt_id):
+        ack = await _release_unstarted(runtime, actor, job_id, attempt_id)
+        return {'attempt_id': attempt_id, 'job_id': job_id, 'released': True,
+                'execution_authority': False, 'ack': ack}
     if isinstance(attempt_id, str) and attempt_id.startswith('toolattempt_'):
         from .tool_attempts import reconcile
         return await reconcile(runtime, actor, job_id, attempt_id)

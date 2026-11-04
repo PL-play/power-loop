@@ -399,14 +399,15 @@ async def observe(attempt, observation):
             if type(submission) is not BudgetSubmission or (submission.attempt_id, submission.revision) != (attempt.attempt_id, 1):
                 raise JobError("invalid_budget_submission")
             state["submission"] = asdict(submission)
+            # The frozen submission now owns pricing; retain only the local
+            # bound instead of buffering the original reservation a second time.
+            state['plan'] = {'token_bound': state['plan']['token_bound']}
             save(binding, state)
         submission = BudgetSubmission(**state["submission"])
-        # A durable response capture can own this obligation independently.
-        # Otherwise seal the frozen fee outbox before any remote apply. This is
-        # required financial I/O, not repeated execution authorization.
-        charge = observation.get("charge", {})
-        known_free = state["context"].get("kind") == "tool" and charge.get("amount") == "0" and charge.get("quality") == "free"
-        if not known_free and not binding.resource_evidence.get("_captured_" + attempt.attempt_id):
+        # Tool submissions share the regular checkpoint. A failed delivery
+        # below flushes its frozen request for retry; a process crash may lose
+        # an uncheckpointed fee under design 200.
+        if state['context'].get('kind') != 'tool' and not binding.resource_evidence.get("_captured_" + attempt.attempt_id):
             await control.checkpoint(force=True)
         ack = await budgets._port(attempt, "apply_usage:1", lambda: binding.runtime.budget_config.provider.apply_usage(submission))
         if type(ack) is not BudgetAck or (ack.attempt_id, ack.revision, ack.request_hash) != (

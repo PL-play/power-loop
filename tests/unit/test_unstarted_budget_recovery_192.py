@@ -64,11 +64,6 @@ async def test_new_control_closes_original_reservation_without_starting_boot_or_
     await seal_dispatch_closure(c, a)
     runtime = await reopened(c)
     try:
-        if stage == 'host_reserving':
-            with pytest.raises(JobError, match='budget_reconciliation_submission_required'):
-                await release(runtime, c, a)
-            assert not c.host.released and (await budgets.get_budget(runtime.manager, c.actor, a.attempt_id))['pending']
-            return
         result = await release(runtime, c, a)
         assert result['released'] and not result['execution_authority']
         assert result == await release(runtime, c, a)
