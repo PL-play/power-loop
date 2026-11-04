@@ -137,6 +137,9 @@ def _row_to_loop_dict(row: MessageRow) -> LoopMessage:
     """Verbatim MessageRow → LoopMessage (mirrors stateful_loop._row_to_loop_message; kept
     local to avoid an agent→runtime import cycle)."""
     msg: LoopMessage = {"role": row.role}
+    if row.role == "assistant" and (row.meta or {}).get("reasoning_content"):
+        msg["reasoning_content"] = row.meta["reasoning_content"]
+        msg["_reasoning_model"] = row.meta["reasoning_model"]
     if row.content is not None:
         msg["content"] = row.content
     if row.tool_calls:

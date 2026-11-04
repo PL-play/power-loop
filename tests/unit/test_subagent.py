@@ -568,13 +568,16 @@ async def test_reasoning_content_is_echoed_back(store: SessionStore) -> None:
             seen.append([dict(m) for m in (getattr(request, "messages", None) or [])])
             return await super().complete(request)
 
-    # 第一轮只有思考（没正文、没工具调用）→ 触发「只有思考」那条路：补一条提示后再来一轮。
-    # 于是第二次请求里必然带着第一轮那条 assistant 消息，正好用来验思考有没有回传。
+    # 用真实工具轮触发下一次请求；无正文、无工具的空 assistant 已由请求整理删除。
+    from tests.unit.test_stateful_loop import _echo_registry
     llm = _Recording(responses=[
-        LLMResponse(raw_text="", think="推演过程"),
+        LLMResponse(raw_text="", think="推演过程", tool_calls=[{
+            "id": "echo-think", "type": "function", "function": {
+                "name": "echo", "arguments": '{"text":"ok"}'}}]),
         LLMResponse(raw_text="答案"),
     ])
-    loop = StatefulAgentLoop(llm=llm, store=store, config=AgentLoopConfig(max_rounds=3))
+    loop = StatefulAgentLoop(llm=llm, store=store, tool_registry=_echo_registry(),
+        config=AgentLoopConfig(max_rounds=3))
     await loop.send("问题", session_id=await loop.new_session())
     assert len(seen) >= 2, "应当有第二次请求"
     echoed = [m for m in seen[-1]

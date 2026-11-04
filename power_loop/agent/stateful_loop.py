@@ -2502,6 +2502,9 @@ class StatefulAgentLoop:
 
 def _row_to_loop_message(row: MessageRow) -> LoopMessage:
     msg: LoopMessage = {"role": row.role}
+    if row.role == "assistant" and (row.meta or {}).get("reasoning_content"):
+        msg["reasoning_content"] = row.meta["reasoning_content"]
+        msg["_reasoning_model"] = row.meta["reasoning_model"]
     if row.content is not None:
         content: Any = row.content
         # Reconstruct structured (multimodal) content that was JSON-encoded on persist, so the

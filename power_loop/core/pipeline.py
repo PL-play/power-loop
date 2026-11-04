@@ -522,6 +522,13 @@ class AgentPipeline:
 
     # ── Helper: append message (with MESSAGE_APPEND hook) ──
 
+    @staticmethod
+    def _assistant_message(response: LLMResponse, text: str) -> LoopMessage:
+        message: LoopMessage = {"role": "assistant", "content": text}
+        if response.think:
+            message["reasoning_content"] = response.think
+        return message
+
     async def _append_message(
         self,
         msg: LoopMessage,
@@ -548,6 +555,9 @@ class AgentPipeline:
         )
         await self.hooks.run_typed_async(HookPoint.MESSAGE_APPEND, ctx)
         sink_msg = ctx.message
+        if sink_msg.get("reasoning_content"):
+            sink_msg = {**sink_msg, "_reasoning_model": self.config.model
+                or getattr(getattr(self.llm, "capabilities", None), "model", None) or ""}
         if self.send_index is not None:
             sink_msg = {**sink_msg, "send_index": self.send_index}
         if hook_injected is not None:
@@ -1356,6 +1366,18 @@ class AgentPipeline:
         system_prompt, tools = await restrict_request(self, system_prompt, tools)
         from power_loop.runtime.history_sanitize import sanitize_request_messages
         from power_loop.runtime.retry import request_repair_kind
+        model_name = (self.config.model
+                      or getattr(getattr(self.llm, "capabilities", None), "model", None) or "")
+        prepared = []
+        for original in messages:
+            message = dict(original)
+            origin = message.pop("_reasoning_model", None)
+            # Echo persisted reasoning only to the model that produced it. This uses
+            # observed output, without guessing capabilities from a vendor/model name.
+            if origin is not None and (not origin or origin != model_name):
+                message.pop("reasoning_content", None)
+            prepared.append(message)
+        messages = prepared
         messages = sanitize_request_messages(messages)
         if messages and messages[0]["role"] == "system":
             system_prompt = "\n\n".join(filter(None, (system_prompt, messages[0].get("content"))))
@@ -1373,8 +1395,6 @@ class AgentPipeline:
 
         # The model that actually served the call: the per-loop override if set, else the
         # service's own configured model (design/124 U6 — "" left 61% of usage rows unattributed).
-        model_name = (self.config.model
-                      or getattr(getattr(self.llm, "capabilities", None), "model", None) or "")
         attempt_box = [0]
 
         async def _do_call() -> LLMResponse:
@@ -2138,7 +2158,7 @@ class AgentPipeline:
                 if llm_after.directive == HookDirective.BREAK:
                     text = (getattr(response, "raw_text", "") or "").strip()
                     await self._append_message(
-                        {"role": "assistant", "content": text},
+                        self._assistant_message(response, text),
                         round_index=round_idx, hook_injected=hook_audit,
                     )
                     await self._finalize("hook_break", final_text=text, rounds=round_idx + 1)
@@ -2176,18 +2196,10 @@ class AgentPipeline:
                 self._truncated_streak = 0
 
             # Append assistant message
-            assistant_msg: dict[str, Any] = {"role": "assistant", "content": assistant_text}
-            # 🔴 思考内容要原样带回去。DeepSeek 的思考模式（deepseek-flash 等）明确要求：
-            # 带过 reasoning_content 的 assistant 消息，下一次请求必须把它一起回传，否则 400
-            # "The `reasoning_content` in the thinking mode must be passed back to the API."
-            # ——那是个硬错，重试同样的历史只会再错一遍，最后 retry_exhausted 整个 run 降级
-            # （真实事故：会话刚发完第一张卡片就死在这里）。
-            #
-            # 只在**这次回复真的带了**思考内容时才回传：产生它的供应商必然收得回去；
-            # 没产生的（OpenAI 正统、Anthropic 走自己的 thinking 块）什么都不加，行为不变。
-            _think = (getattr(response, "think", "") or "").strip()
-            if _think:
-                assistant_msg["reasoning_content"] = _think
+            assistant_msg = self._assistant_message(response, assistant_text)
+            # DeepSeek tool mode requires all previous assistant reasoning, verbatim.
+            # See https://api-docs.deepseek.com/guides/thinking_mode/#tool-calls
+            _think = response.think
             # 第二道：正文、工具调用、思考**三样都没有**的那一轮，历史里不要留这条空 assistant 行。
             # 它一个字的信息都不带，却会让下一次请求以一条空 assistant 消息结尾——在 DeepSeek 的
             # 思考模式下那是非法的（见上），别的供应商也只是白占一行。下面的空回复分支会重试这一轮。
@@ -2715,7 +2727,7 @@ class AgentPipeline:
         # the success branch returned it to the caller but never recorded it, so the next send's
         # history had a dangling "summarize…" user prompt with no answer. Mirrors the degraded branch.
         if final_text:
-            await self._append_message({"role": "assistant", "content": final_text}, round_index=max_rounds)
+            await self._append_message(self._assistant_message(final_resp, final_text), round_index=max_rounds)
         await self._finalize("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",
                              rounds=int(self.config.max_rounds))
         return self._make_result("hit_round_limit", final_text=f"[hit_round_limit]\n{final_text}",

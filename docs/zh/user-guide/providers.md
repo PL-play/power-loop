@@ -4,6 +4,11 @@
 
 power-loop 通过 `LLMProviderConfig` 和 `LLMService` 与 LLM 对话。OpenAI 兼容 `chat/completions` 端点可以直接使用；Anthropic 兼容 Messages API 端点会走原生 Anthropic transport。
 
+模型返回的思考内容随 assistant 消息保存在现有元数据中。重载历史及原样投影会保留它，
+请求出口只向来源模型回传；切换模型后不携带。模型身份来自 loop 配置或服务声明。
+这修复了 [DeepSeek 思考模式](https://api-docs.deepseek.com/guides/thinking_mode/#tool-calls)
+携带 tools 时要求回传所有先前 assistant 思考（包括非工具轮）的情况；不调用真实模型探测。
+
 ## 快速开始
 
 ```python

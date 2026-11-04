@@ -4,6 +4,13 @@
 
 power-loop speaks to LLMs through `LLMProviderConfig` and `LLMService`. OpenAI-compatible `chat/completions` endpoints work, and Anthropic-compatible Messages API endpoints are supported through the native Anthropic transport.
 
+Returned reasoning is saved in the assistant message's existing metadata and preserved by
+history reload and verbatim projection. Requests echo it only to its originating model,
+identified by loop configuration or the service declaration; model switches omit it.
+This supports [DeepSeek thinking mode](https://api-docs.deepseek.com/guides/thinking_mode/#tool-calls),
+which requires all prior assistant reasoning when tools are supplied, including non-tool turns.
+No live model probe is performed.
+
 ## Quick Start
 
 ```python
