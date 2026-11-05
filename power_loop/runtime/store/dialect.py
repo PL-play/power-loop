@@ -181,6 +181,13 @@ class SqliteDialect:
             *self.hook_events_ddl(p),
             *self.leases_ddl(p),
             *self.inbox_ddl(p, f"{p}follow_up_queue"),
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_messages ON {p}messages(created_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_usage ON {p}usage_observations(created_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_runtime ON {p}session_runtime_state(updated_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_timers ON {p}timers(status,updated_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_hooks ON {p}hook_events(created_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_item ON {p}follow_up_queue(item_id)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_inbox ON {p}follow_up_queue(status,created_at)",
             *message_usage.view_ddl(self.name, p),
         ]
 
@@ -370,6 +377,13 @@ class PostgresDialect:
             *self.hook_events_ddl(p),
             *self.leases_ddl(p),
             *self.inbox_ddl(p, f"{p}follow_up_queue"),
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_messages ON {p}messages(created_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_usage ON {p}usage_observations(created_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_runtime ON {p}session_runtime_state(updated_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_timers ON {p}timers(status,updated_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_hooks ON {p}hook_events(created_at)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_item ON {p}follow_up_queue(item_id)",
+            f"CREATE INDEX IF NOT EXISTS {p}idx_retention_inbox ON {p}follow_up_queue(status,created_at)",
             *message_usage.view_ddl(self.name, p),
         ]
 
@@ -493,7 +507,8 @@ class MySQLDialect:
                 name VARCHAR(255), content LONGTEXT, tool_calls_json LONGTEXT, tool_call_id VARCHAR(255),
                 round_index BIGINT, state VARCHAR(32) NOT NULL DEFAULT 'active', meta_json LONGTEXT,
                 send_index BIGINT, created_at BIGINT NOT NULL, PRIMARY KEY (session_id, seq),
-                KEY {p}idx_messages_session_state (session_id, state, seq)) {opts}""",
+                KEY {p}idx_messages_session_state (session_id, state, seq),
+                KEY {p}idx_retention_messages (created_at)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}compactions (
                 session_id VARCHAR(255) NOT NULL, compact_seq BIGINT NOT NULL, note_seq BIGINT NOT NULL,
                 from_seq BIGINT NOT NULL, to_seq BIGINT NOT NULL, before_tokens BIGINT,
@@ -504,7 +519,8 @@ class MySQLDialect:
                 round_index BIGINT NOT NULL, prompt_tokens BIGINT,
                 completion_tokens BIGINT, total_tokens BIGINT, cached_tokens BIGINT, model VARCHAR(255),
                 created_at BIGINT NOT NULL,
-                PRIMARY KEY (session_id, send_index, round_index)) {opts}""",
+                PRIMARY KEY (session_id, send_index, round_index),
+                KEY {p}idx_retention_usage (created_at)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_state (
                 session_id VARCHAR(255) NOT NULL, next_seq BIGINT NOT NULL DEFAULT 1,
                 round_index BIGINT NOT NULL DEFAULT 0, last_compact_seq BIGINT NOT NULL DEFAULT 0,
@@ -513,7 +529,8 @@ class MySQLDialect:
                 PRIMARY KEY (session_id)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
                 session_id VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json LONGTEXT,
-                updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, state_key)) {opts}""",
+                updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, state_key),
+                KEY {p}idx_retention_runtime (updated_at)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}shared_state (
                 owner VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json LONGTEXT,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (owner, state_key)) {opts}""",
@@ -537,7 +554,8 @@ class MySQLDialect:
                 fire_count BIGINT NOT NULL DEFAULT 0, last_fired_at BIGINT,
                 created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
                 PRIMARY KEY (session_id, timer_id),
-                KEY {p}idx_timers_due (status, due_at)) {opts}""",
+                KEY {p}idx_timers_due (status, due_at),
+                KEY {p}idx_retention_timers (status, updated_at)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}notes (
                 session_id VARCHAR(255) NOT NULL, note_id BIGINT NOT NULL, content LONGTEXT NOT NULL,
                 pinned TINYINT NOT NULL DEFAULT 0, created_at BIGINT NOT NULL,
@@ -573,7 +591,8 @@ class MySQLDialect:
                 round_index BIGINT, send_index BIGINT, hook_point VARCHAR(32) NOT NULL, hook VARCHAR(255),
                 position VARCHAR(32), kind VARCHAR(32) NOT NULL, payload_json LONGTEXT, created_at BIGINT NOT NULL,
                 PRIMARY KEY (session_id, event_id),
-                KEY {p}idx_hook_events_session_msg (session_id, message_seq)) {opts}""",
+                KEY {p}idx_hook_events_session_msg (session_id, message_seq),
+                KEY {p}idx_retention_hooks (created_at)) {opts}""",
         ]
 
     def leases_ddl(self, prefix: str) -> list[str]:
@@ -599,7 +618,9 @@ class MySQLDialect:
                 created_at BIGINT NOT NULL, delivered_at BIGINT, delivered_seq BIGINT,
                 delivered_send_index BIGINT,
                 UNIQUE KEY {p}uq_inbox_item (session_id, item_id),
-                KEY {p}idx_inbox_session_status (session_id, status, id)) {opts}""",
+                KEY {p}idx_inbox_session_status (session_id, status, id),
+                KEY {p}idx_retention_inbox (status, created_at),
+                KEY {p}idx_retention_item (item_id)) {opts}""",
         ]
 
     def inbox_v8_copy_sql(self, prefix: str, src: str, dst: str) -> str:

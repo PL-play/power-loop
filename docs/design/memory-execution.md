@@ -252,6 +252,60 @@ and restore the native backup or finish that same migration. Changing only the
 version stamp does not restore the old format. No historical fees are repriced
 and no provider, executor or external action runs during migration.
 
+## Host-invoked retention
+
+`await store.purge_expired(now_ms, limit=1000, retention_days={...})` performs one
+maintenance pass. `now_ms` is UTC epoch milliseconds. Each delete statement
+selects at most `limit` indexed keys, and `limit` must be between 1 and 1,000.
+The return value contains actual deletion counts by table, plus `task_trees`
+and distinct `usage_rounds`. Large trees are removed in bounded pages within
+their existing root-row transaction. Concurrent callers can repeat the pass.
+
+Default retention, in days:
+
+| Parameter | Days | Eligibility |
+| --- | --- | --- |
+| `task_trees` | 30 | Every task closed/stopped; no obligations, pending alerts or unconfirmed fees |
+| `executors` | 1 | Draining or expired, with no current job reference |
+| `follow_ups` | 7 | Ordinary delivered, void or transferred inputs; claimed/pending items remain |
+| `timers` | 7 | Fired or cancelled |
+| `hooks` | 30 | Record age |
+| `usage` | 90 | Observation age, including details embedded in response metadata |
+| `runtime` | 30 | Owning root closed; both root and runtime record past the window |
+
+Applications can override individual parameters. Voided/transferred inbox rows
+use their creation date; delivered rows must also have an old delivery date.
+Task-associated notifications remain until their task tree is removed, because
+normal completion and workflow continuation still read them after delivery.
+The existing event ID, `nudge:<operation_id>` and `subagent:<run_id>` inbox keys
+identify the association. No new table or event is used. This retention change
+was explicitly approved on 2026-11-05.
+There are no retained plan/callback events after A2, so no separate seven-day
+cleanup is needed for those event types. The SDK adds no background task.
+
+The existing timer/usage prune methods accept `now` and `limit`; a `None`
+session selects across sessions. Message bodies and cumulative session usage
+remain. Runtime cleanup removes task-owned subagent/workflow keys and removes
+the run from the shared workflow index. A recent runtime key retains its task
+tree until both retention windows end. Keys without a task owner are removed
+with their session.
+
+`close_session_tree` also removes roots owned by each deleted session and their
+task descendants. Deleting an ephemeral child session keeps the jobs belonging
+to its still-existing parent root, so parent completion can read them.
+
+Budget manifests and scope balances live solely in `task_budget_policies` and
+`task_budget_scopes`. Policy preparation, admission reconstruction and fee
+reconciliation read those rows. The SDK no longer writes policy/scope events
+under the first task; tree retention and session deletion preserve these rows.
+The first-policy admission lock still prevents an unbudgeted send from crossing
+mandatory policy activation. New indexes apply to fresh schemas; the D3 offline
+upgrade and version change remain a separate task.
+That upgrade must also adjust executor-admission reconstruction: the current
+offline rebuilder requires historical registration events, which this retention
+pass can remove. Normal runtime registration keeps the existing admission gate;
+do not use the old offline reconstruction on a purged store before D3.
+
 ## SQL and validation contract
 
 `tests/unit/test_send_sql_profile.py` is the hard SQL authority. It covers three

@@ -13,7 +13,6 @@ import pytest
 from power_loop.runtime import budget_admissions
 from power_loop.runtime.jobs import JobError
 from power_loop.runtime.store.factory import _make_database
-from power_loop.runtime.store.schema import StoreSchemaError
 from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, migrate_task_schema
 
 from ._budget_policy_admission_worker import make_loop, wait_file
@@ -166,7 +165,7 @@ async def test_policy_original_and_admission_survive_actual_entry_process_death(
         assert host.reserve_calls == host.apply_calls == 0
         assert not (tmp_path/'model.ready').exists() and not (tmp_path/'worker.done').exists()
         policies = await manager.db.fetchall(f'SELECT * FROM {manager.prefix}task_budget_policies')
-        originals = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE event_type='model_budget_policy'")
+        originals = await manager.db.fetchall(f'SELECT * FROM {manager.prefix}task_budget_policies')
         assert len(policies) == len(originals) == int(committed)
         admission = await manager.db.fetchone(f'SELECT policy_hash FROM {manager.prefix}task_principal_admissions')
         assert admission['policy_hash'] == (originals[0]['request_hash'] if committed else None)
@@ -244,7 +243,7 @@ async def test_first_policy_write_failure_does_not_separate_the_admission_from_i
         assert changed == [True]
         assert model.calls == host.reserve_calls == host.apply_calls == 0
         committed = outcome == 'lost-ack'
-        originals = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE event_type='model_budget_policy'")
+        originals = await manager.db.fetchall(f'SELECT * FROM {manager.prefix}task_budget_policies')
         assert len(originals) == int(committed)
         assert (await manager.db.fetchone(f'SELECT COUNT(*) AS n FROM {manager.prefix}task_budget_policies'))['n'] == int(committed)
         assert (await manager.db.fetchone(f'SELECT policy_hash FROM {manager.prefix}task_principal_admissions'))[
@@ -282,23 +281,3 @@ async def test_explicit_maintenance_rebuilds_principal_admission_from_policy_ori
     assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == originals
     assert (await c.manager.db.fetchone(f'SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1'))[
         'protocol_version'] == TASK_PROTOCOL_VERSION
-
-
-@pytest.mark.parametrize('remove_gate', [False, True])
-async def test_maintenance_never_uses_an_admission_hash_to_replace_a_missing_policy_original(budget_case, remove_gate):
-    c = budget_case
-    await c.runtime.shutdown(timeout_s=1)
-    marker = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_type='model_budget_policy'")
-    before = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}task_principal_admissions')
-    if remove_gate:
-        await c.manager.db.execute(f'DELETE FROM {c.manager.prefix}task_principal_admissions')
-        before = []
-    await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (marker['event_id'],))
-    try:
-        with pytest.raises(StoreSchemaError, match='^principal admission policy original missing$'):
-            await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}task_principal_admissions') == before
-        assert not await c.manager.db.fetchone(f'SELECT * FROM {c.manager.events} WHERE event_id=?', (marker['event_id'],))
-    finally:
-        await c.manager.db.execute(f'INSERT INTO {c.manager.events} ('+','.join(marker)+') VALUES ('+
-            ','.join('?' for _ in marker)+')', tuple(marker.values()))

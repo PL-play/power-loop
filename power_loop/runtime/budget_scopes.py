@@ -1,7 +1,7 @@
 """Trusted budget templates resolved against original job and control-owner IDs.
 
 The same task-store control transaction owns scope creation and reservations.
-A scope instance's creation marker prevents lazy recreation of a deleted balance.
+Scope rows retain both their limits and balances independently of task retention.
 Settlement uses the original attempt's frozen set, never its current driver/SID.
 """
 
@@ -83,54 +83,16 @@ def _owners(job, lineage):
     raise JobError("budget_scope_depth_exceeded")
 
 
-def _marker(policy_key, limits):
-    key = scope_key(policy_key, limits)
-    return "mb_scope_" + key[3:], {"version": 1, "policy_key": policy_key, "scope_key": key, "limits": limits}
-
-
-async def check_marker(manager, tx, policy_key, limits):
-    if "binding" not in limits:
-        return
-    event_id, body = _marker(policy_key, limits)
-    event = await tx.fetchone(
-        f"SELECT job_id,event_type,request_hash,payload_json,delivery_status FROM {manager.events} WHERE event_id=?",
-        (event_id,),
-    )
-    if event is None or (
-        event["job_id"],
-        event["event_type"],
-        event["request_hash"],
-        event["payload_json"],
-        event["delivery_status"],
-    ) != (limits["subject_job_id"], "model_budget_scope", _hash(body), _json(body), "not_applicable"):
-        raise JobError("budget_scope_evidence_corrupt")
-
-
 async def _ensure_instance(manager, tx, policy, limits, subject):
     key = scope_key(policy["policy_key"], limits)
     row = await tx.fetchone(f"SELECT scope_key FROM {manager.prefix}task_budget_scopes WHERE scope_key=?", (key,))
-    event_id, body = _marker(policy["policy_key"], limits)
-    marker = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (event_id,))
     if row is None:
-        if marker is not None:
-            raise JobError("budget_scope_missing_or_changed")
         counters = dict.fromkeys(COUNTERS, 0)
         await tx.execute(
             f"INSERT INTO {manager.prefix}task_budget_scopes "
             "(scope_key,policy_key,limits_hash,limits_json,counters_hash,counters_json) VALUES (?,?,?,?,?,?)",
             (key, policy["policy_key"], _hash(limits), _json(limits), _hash(counters), _json(counters)),
         )
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (
-                event_id,
-                subject["job_id"],
-                "model_budget_scope",
-                subject["version"],
-                _hash(body),
-                _json(body),
-                "not_applicable",
-                manager.now(),
-            ))
-    await check_marker(manager, tx, policy["policy_key"], limits)
 
 
 async def resolve(runtime, tx, policy, job, *, create=False):

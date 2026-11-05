@@ -14,7 +14,6 @@ from dataclasses import asdict
 from . import budget_scopes
 from .budget_contracts import BudgetAck, BudgetConfig, BudgetGrant, BudgetSubmission
 from .budget_policy_sources import PolicySourceChanged
-from .budget_policy_sources import current as prepared_source
 from .budget_policy_sources import prepared as prepare_policy
 from .jobs import JobError, _hash, _json
 from .jobs import verify_stored as _verify_stored
@@ -85,24 +84,8 @@ async def _policy(runtime, tx, *, create=False, job=None):
     admissions = getattr(tx, '_budget_policy_admissions', {})
     row = admissions[key] if key in admissions else await tx.fetchone(
         f"SELECT * FROM {manager.prefix}task_budget_policies WHERE policy_key=?", (key,))
-    marker_id = "mb_policy_" + key[3:]
-    from .execution_membership import _remember_after_commit, _trusted
-    known = row is not None and _trusted(manager, "_budget_markers", key)
-    if known and known == row["request_hash"]:
-        marker = {"payload_json": row["manifest_json"], "request_hash": row["request_hash"]}  # Immutable, verified.
-    else:
-        source = prepared_source(runtime)
-        if source is None:
-            if manager._control_intents.get() is not None:
-                raise JobError('budget_policy_source_required_before_writer')
-            marker = await tx.fetchone(f"SELECT payload_json,request_hash FROM {manager.events} WHERE event_id=?", (marker_id,))
-        else:
-            marker = source.marker
-            if row is not None and marker is None:
-                raise PolicySourceChanged(row['request_hash'])
+    from .execution_membership import _remember_after_commit
     if row is None:
-        if marker is not None:
-            raise JobError("budget_policy_missing")
         if config is None:
             return None
         if not create:
@@ -117,17 +100,6 @@ async def _policy(runtime, tx, *, create=False, job=None):
         )
         if legacy:
             raise JobError("budget_legacy_execution_unsettled")
-        await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (
-                marker_id,
-                job["job_id"],
-                "model_budget_policy",
-                job["version"],
-                _hash(manifest),
-                _json(manifest),
-                "not_applicable",
-                manager.now(),
-            ))
-        marker = {"payload_json": _json(manifest), "request_hash": _hash(manifest)}
         await tx.execute(
             f"INSERT INTO {manager.prefix}task_budget_policies "
             "(policy_key,tenant_id,principal_id,request_hash,manifest_json,enabled,created_at) VALUES (?,?,?,?,?,?,?)",
@@ -147,8 +119,6 @@ async def _policy(runtime, tx, *, create=False, job=None):
         row = await tx.fetchone(f"SELECT * FROM {manager.prefix}task_budget_policies WHERE policy_key=?", (key,))
         admissions[key] = row
     manifest = _object(row["manifest_json"], row["request_hash"])
-    if marker is None or _object(marker["payload_json"], marker["request_hash"]) != manifest:
-        raise JobError("budget_policy_evidence_corrupt")
     if (row["tenant_id"], row["principal_id"]) != (runtime.tenant_id, runtime.principal_id):
         raise JobError("budget_policy_identity_mismatch")
     if type(row["enabled"]) is not int or row["enabled"] not in (0, 1):
@@ -209,7 +179,6 @@ async def _scope(manager, tx, key, limits):
     )
     if row is None or row["policy_key"] != key or _object(row["limits_json"], row["limits_hash"]) != limits:
         raise JobError("budget_scope_missing_or_changed")
-    await budget_scopes.check_marker(manager, tx, key, limits)
     counters = _object(row["counters_json"], row["counters_hash"])
     if set(counters) != set(_COUNTERS) or any(type(v) is not int or v < 0 for v in counters.values()):
         raise JobError("budget_counters_corrupt")
@@ -703,13 +672,10 @@ async def recovery_config(manager, actor, job_id, attempt_id, *, provider_key, p
         if state["job_id"] != job_id or state["policy_key"] != key:
             raise JobError("budget_reconciliation_scope_mismatch")
         row = await tx.fetchone(f"SELECT * FROM {manager.prefix}task_budget_policies WHERE policy_key=?", (key,))
-        marker = await tx.fetchone(f"SELECT payload_json,request_hash FROM {manager.events} WHERE event_id=?",
-                                  ("mb_policy_" + key[3:],))
-        if row is None or marker is None:
+        if row is None:
             raise JobError("budget_policy_missing")
         manifest = _object(row["manifest_json"], row["request_hash"])
-        if (_object(marker["payload_json"], marker["request_hash"]) != manifest
-                or (row["tenant_id"], row["principal_id"]) != (actor.tenant_id, actor.principal_id)
+        if ((row["tenant_id"], row["principal_id"]) != (actor.tenant_id, actor.principal_id)
                 or manifest.get("provider_key") != provider_key):
             raise JobError("budget_policy_conflict")
     try:

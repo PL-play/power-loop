@@ -22,8 +22,8 @@ async def initialize(manager, tx, identity):
     if await tx.fetchone(f'SELECT policy_key FROM {table} WHERE policy_key=?', (policy_key,)):
         _remember_after_commit(manager, tx, '_principal_gate_presence', policy_key, True)
         return
-    marker = await tx.fetchone(f'SELECT payload_json,request_hash FROM {manager.events} WHERE event_id=?',
-        ('mb_policy_'+policy_key[3:],))
+    marker = await tx.fetchone(f'SELECT manifest_json AS payload_json,request_hash FROM {manager.prefix}task_budget_policies WHERE policy_key=?',
+        (policy_key,))
     if marker is not None:
         from .model_budgets import _object
         _object(marker['payload_json'], marker['request_hash'])
@@ -93,12 +93,11 @@ async def rebuild(tx, prefix, store_id):
 
     manager = SimpleNamespace(store=SimpleNamespace(store_id=store_id))
     expected = {}
-    originals = await tx.fetchall(f'SELECT event.event_id,event.payload_json,event.request_hash,job.tenant_id,job.principal_id '
-        f'FROM {prefix}job_events event LEFT JOIN {prefix}jobs job ON job.job_id=event.job_id '
-        "WHERE event.event_type='model_budget_policy'")
+    originals = await tx.fetchall(f'SELECT policy_key,manifest_json AS payload_json,request_hash,tenant_id,principal_id '
+        f'FROM {prefix}task_budget_policies')
     for original in originals:
         policy_key = key(manager, original['tenant_id'], original['principal_id'])
-        if original['event_id'] != 'mb_policy_'+policy_key[3:] or policy_key in expected:
+        if original['policy_key'] != policy_key or policy_key in expected:
             raise StoreSchemaError('principal admission policy original invalid')
         try:
             _object(original['payload_json'], original['request_hash'])
@@ -107,9 +106,7 @@ async def rebuild(tx, prefix, store_id):
         expected[policy_key] = original['request_hash']
     table = prefix+'task_principal_admissions'
     actual = {row['policy_key']: row['policy_hash'] for row in await tx.fetchall(f'SELECT * FROM {table}')}
-    retained = await tx.fetchall(f'SELECT policy_key FROM {prefix}task_budget_policies')
-    if (any(digest is not None and policy_key not in expected for policy_key, digest in actual.items())
-            or any(row['policy_key'] not in expected for row in retained)):
+    if any(digest is not None and policy_key not in expected for policy_key, digest in actual.items()):
         raise StoreSchemaError('principal admission policy original missing')
     for policy_key, digest in sorted(expected.items()):
         if policy_key not in actual:

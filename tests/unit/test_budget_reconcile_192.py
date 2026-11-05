@@ -137,22 +137,19 @@ async def test_disabled_policy_still_accepts_original_usage_without_reenabling(b
     assert row["enabled"] == 0 and (await counters(c))["used_tokens"] == 101
 
 
-@pytest.mark.parametrize('fault', [None, 'provider', 'scope', 'marker', 'disabled'])
+@pytest.mark.parametrize('fault', [None, 'provider', 'scope', 'disabled'])
 async def test_recovery_configuration_uses_original_manifest_without_writing(budget_case, fault):
     c = budget_case
     a = await start(c)
     from power_loop.runtime.control_runtime import flush_binding
     await flush_binding(a.binding)
-    if fault == 'marker':
-        await c.manager.db.execute(f"DELETE FROM {c.manager.events} WHERE event_id=?",
-                                  ('mb_policy_' + budgets.policy_key(c.runtime)[3:],))
     if fault == 'disabled':
         await c.manager.db.execute(f"UPDATE {c.manager.prefix}task_budget_policies SET enabled=0")
     before = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} ORDER BY event_id")
     kwargs = dict(provider_key='different' if fault == 'provider' else c.config.provider_key,
                   provider=c.host)
     actor = replace(c.actor, session_id='other') if fault == 'scope' else c.actor
-    if fault in ('provider', 'scope', 'marker'):
+    if fault in ('provider', 'scope'):
         with pytest.raises(JobError):
             await budgets.recovery_config(c.manager, actor, c.binding.lease.job_id, a.attempt_id, **kwargs)
     else:

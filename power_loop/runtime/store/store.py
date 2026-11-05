@@ -326,6 +326,17 @@ class SessionStore:
         return self.schema_version == TASK_SCHEMA_VERSION and self.store_id is not None
 
     # ── maintenance (optional capability; no-op on backends that lack it) ──────
+    async def purge_expired(self, now: int, *, limit: int = 1000,
+                            retention_days: dict[str, float] | None = None) -> dict[str, int]:
+        """Trusted-host retention; UTC milliseconds, at most 1000 rows per delete.
+
+        Defaults in days: task_trees/runtime/hooks 30, executors 1,
+        follow_ups/timers 7, usage 90. Override individual categories by name.
+        Messages and cumulative usage totals are retained.
+        """
+        from .retention import purge_expired
+        return await purge_expired(self, now, limit=limit, retention_days=retention_days)
+
     async def checkpoint(self, *, mode: str = "TRUNCATE") -> None:
         if isinstance(self._db, Maintenance):
             await self._db.checkpoint(mode=mode)
@@ -1507,6 +1518,8 @@ class SessionStore:
                 f"UPDATE {self.t.sessions} SET parent_session_id=NULL WHERE parent_session_id=?",
                 (session_id,),
             )
+        from .retention import delete_session_tasks
+        await delete_session_tasks(self, tx, session_id)
         await tx.execute(f"DELETE FROM {self.t.messages} WHERE session_id=?", (session_id,))
         self._forget_appended(session_id)
         await tx.execute(f"DELETE FROM {self.t.compactions} WHERE session_id=?", (session_id,))
@@ -1703,24 +1716,18 @@ class SessionStore:
 
     async def prune_timers(
         self,
-        session_id: str,
+        session_id: str | None,
         *,
         statuses: tuple[str, ...] = ("fired", "cancelled"),
         older_than_ms: int | None = None,
+        now: int | None = None,
+        limit: int = 1000,
     ) -> int:
-        """Delete timers in terminal ``statuses`` (default fired/cancelled), optionally
-        only those whose ``updated_at`` is older than ``older_than_ms``. Armed/recurring
-        timers in other statuses are never touched. Returns deletions."""
-        if not statuses:
-            return 0
-        placeholders = ",".join("?" * len(statuses))
-        sql = f"DELETE FROM {self.t.timers} WHERE session_id=? AND status IN ({placeholders})"
-        params: list[Any] = [session_id, *statuses]
-        if older_than_ms is not None:
-            sql += " AND updated_at < ?"
-            params.append(_now_ms() - int(older_than_ms))
-        async with self._db.transaction() as tx:
-            return await tx.execute(sql, params)
+        """Delete one bounded batch of terminal timers; None selects all sessions."""
+        from .retention import prune_timers
+        current = _now_ms() if now is None else now
+        cutoff = None if older_than_ms is None else current-int(older_than_ms)
+        return await prune_timers(self, session_id, statuses=statuses, cutoff=cutoff, limit=limit)
 
     # ── notes (agent-authored persistent memory) ──────────────────────────
     async def add_note(self, session_id: str, content: str, *, pinned: bool = False) -> NoteRow:
@@ -1962,22 +1969,31 @@ class SessionStore:
     # ── retention: usage rounds ───────────────────────────────────────────
     async def prune_usage_rounds(
         self,
-        session_id: str,
+        session_id: str | None,
         *,
         keep_last: int | None = None,
         older_than_ms: int | None = None,
+        now: int | None = None,
+        limit: int = 1000,
     ) -> int:
         """Prune per-round details from both kinds of original observation.
 
         Keep the newest rounds across sends. Message bodies and cumulative
         session statistics stay intact. Returns distinct round details removed.
         """
-        cutoff = None if older_than_ms is None else _now_ms()-int(older_than_ms)
+        from .retention import batch_limit, prune_usage
+        limit = batch_limit(limit)
+        current = _now_ms() if now is None else now
+        cutoff = None if older_than_ms is None else current-int(older_than_ms)
+        if not keep_last:
+            return await prune_usage(self, session_id, cutoff=current+1 if cutoff is None else cutoff, limit=limit)
+        if session_id is None:
+            raise ValueError('keep_last requires a session')
         async with self._db.transaction() as tx:
             rows = await self.list_usage_rounds(session_id, transaction=tx)
             if keep_last and keep_last > 0:
                 rows = rows[:-int(keep_last)]
-            selected = [row for row in rows if cutoff is None or row['created_at'] < cutoff]
+            selected = [row for row in rows if cutoff is None or row['created_at'] < cutoff][:limit]
             for row in selected:
                 key = (session_id, row['send_index'], row['round_index'])
                 await tx.execute(f'DELETE FROM {self.t.usage_observations} '

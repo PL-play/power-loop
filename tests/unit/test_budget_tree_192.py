@@ -110,7 +110,7 @@ async def test_independent_root_cannot_escape_authority_limit_by_getting_a_new_i
     assert all(counter["held_calls"] == 0 for _, _, counter in await rows(c))
 
 
-@pytest.mark.parametrize("fault", ["row", "marker", "limits", "counters"])
+@pytest.mark.parametrize("fault", ["limits", "counters"])
 async def test_missing_or_corrupt_scope_instance_never_creates_a_new_allowance(tree_case, fault):
     c = tree_case
     await new_send(c)
@@ -118,15 +118,7 @@ async def test_missing_or_corrupt_scope_instance_never_creates_a_new_allowance(t
     await flush_binding(c.binding, close=True)
     [item] = [item for item in await rows(c) if item[1].get("binding") == "root"]
     row = item[0]
-    if fault == "row":
-        await c.manager.db.execute(
-            f"DELETE FROM {c.manager.prefix}task_budget_scopes WHERE scope_key=?", (row["scope_key"],)
-        )
-    elif fault == "marker":
-        await c.manager.db.execute(
-            f"DELETE FROM {c.manager.events} WHERE event_id=?", ("mb_scope_" + row["scope_key"][3:],)
-        )
-    elif fault == "limits":
+    if fault == "limits":
         await c.manager.db.execute(
             f"UPDATE {c.manager.prefix}task_budget_scopes SET limits_json='{{}}' WHERE scope_key=?", (row["scope_key"],)
         )
@@ -136,8 +128,6 @@ async def test_missing_or_corrupt_scope_instance_never_creates_a_new_allowance(t
             (row["scope_key"],),
         )
     code = {
-        "row": "budget_scope_missing_or_changed",
-        "marker": "budget_scope_evidence_corrupt",
         "limits": "budget_evidence_corrupt",
         "counters": "budget_evidence_corrupt",
     }[fault]

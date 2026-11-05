@@ -466,13 +466,13 @@ async def test_registration_and_operation_rollback_together(runtime, monkeypatch
     assert (await store._db.fetchone(f"SELECT COUNT(*) AS n FROM {m.jobs}"))["n"] == 1
 
 
-async def test_control_survives_session_message_deletion(runtime):
+async def test_session_deletion_removes_its_root_task_tree(runtime):
     store, m, actor, root, _, _, _ = runtime
     await child(runtime)
     await store.close_session(actor.session_id)
-    assert (await m.get_job(actor, root.job.job_id)).session_id == actor.session_id
-    stop = await m.request_cancel(actor, root.job.job_id, system_key="after-delete", reason="retained control")
-    assert stop.result["cancel_requested"]
+    assert not await store._db.fetchall(f'SELECT job_id FROM {m.jobs}')
+    assert not await store._db.fetchall(f'SELECT event_id FROM {m.events}')
+
 
 
 

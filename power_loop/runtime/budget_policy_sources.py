@@ -28,9 +28,8 @@ def current(runtime):
 
 async def _read(runtime):
     from .model_budgets import policy_key
-    marker_id = 'mb_policy_'+policy_key(runtime)[3:]
     return await runtime.manager.db.fetchone(
-        f'SELECT payload_json,request_hash FROM {runtime.manager.events} WHERE event_id=?', (marker_id,))
+        f'SELECT manifest_json AS payload_json,request_hash FROM {runtime.manager.prefix}task_budget_policies WHERE policy_key=?', (policy_key(runtime),))
 
 
 @asynccontextmanager
