@@ -117,3 +117,13 @@ problem.
 - **Multi-writer scale-out is a backend choice, not magic.** PostgreSQL/MySQL let many processes write one logical store, but a single session is still one writer at a time — either your dispatcher enforces that, or the application provides a shared session coordinator. The numbers below were recorded against SQLite.
 - **Compaction is the main scaling lever** for long sessions; without it, per-send cost grows with history.
 - **Whether the ceiling is "enough" is your call** against your expected concurrent-session load — and which backend you point the DSN at.
+
+## Host inspection and reconciliation
+
+Use `power_loop.runtime.task_inspection.list_open_roots(manager, after_job_id="", limit=100)`
+to discover unfinished root tasks, and `power_loop.runtime.model_budgets.list_unsettled(manager,
+after_attempt_id="", limit=100)` to discover unacknowledged fees and outstanding dispatches.
+Responses contain `roots` or `attempts` and `next_cursor` (`None` at the end).
+These trusted host queries cover the store; use the original task actor when calling
+inspection or reconciliation. Each page is limited to 1,000 rows and skips finished history.
+Executor heartbeats extend the current row's lease and do not accumulate event rows.

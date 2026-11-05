@@ -193,7 +193,7 @@ async def test_finite_durable_leases_require_writes_as_send_time_advances(regist
                     clock[0] += 100000  # The configured five-minute leases renew at TTL/3.
                     lifecycle = task_runtime._lifecycle
                     receipt = await executor_registry.heartbeat(manager, lifecycle.identity,
-                        expected_version=lifecycle._version, system_key=f"controlled-heartbeat:{lifecycle._version}", lease_ms=300000)
+                        expected_version=lifecycle._version, lease_ms=300000)
                     lifecycle._version = receipt["executor"]["version"]
                     start = len(measured.records)
                     await manager.renew_execution(binding.actor, binding.lease, lease_ms=300000)

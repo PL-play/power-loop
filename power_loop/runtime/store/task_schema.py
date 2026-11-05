@@ -25,6 +25,11 @@ from .schema import (
 TASK_SCHEMA_VERSION = 14
 TASK_PROTOCOL_VERSION = 41
 _QUERY_INDEXES = {
+    'idx_jobs_open_roots': ('jobs', ('supervision_status', 'parent_job_id', 'job_id')),
+    'idx_jobs_executor_work': ('jobs', ('executor_id', 'resource_state', 'job_id')),
+    'idx_jobs_executor_open': ('jobs', ('executor_id', 'supervision_status', 'kind', 'resource_state', 'job_id')),
+    'idx_budget_unsettled': ('task_budget_attempts', ('pending', 'attempt_id')),
+    'idx_budget_dispatch': ('task_budget_attempts', ('pending', 'phase', 'attempt_id')),
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
     'idx_jobs_control_owner': ('jobs', ('control_owner_job_id', 'control_owner_generation', 'job_id')),
@@ -140,7 +145,7 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
         f"CREATE INDEX {prefix}idx_jobs_executor ON {prefix}jobs(executor_key)",
         f"CREATE INDEX {prefix}idx_job_events_job ON {prefix}job_events(job_id, created_at, event_id)",
         f"CREATE INDEX {prefix}idx_job_events_delivery ON {prefix}job_events(delivery_status, created_at)",
-        f"CREATE INDEX {prefix}idx_executor_scope ON {prefix}task_executors(tenant_id,principal_id,executor_id)",
+        f"CREATE INDEX {prefix}idx_executor_scope ON {prefix}task_executors(tenant_id,principal_id,executor_id,state,executor_key)",
         f"CREATE INDEX {prefix}idx_executor_events ON {prefix}task_executor_events(executor_key,created_at,event_id)",
         f"CREATE INDEX {prefix}idx_budget_pending ON {prefix}task_budget_attempts(policy_key,pending,updated_at,attempt_id)",
     ]

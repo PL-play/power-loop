@@ -68,6 +68,22 @@ def render(value):
     return CONSTRAINTS + '\n\nTask alert data:\n' + _json(public)
 
 
+async def list_open_roots(manager, *, after_job_id='', limit=100):
+    """Trusted host discovery across this store; does not grant task authority.
+
+    Only unfinished roots are paged. Call inspect_tasks with the original actor
+    to authorize and inspect a returned root.
+    """
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise JobError('invalid_inspection_limit')
+    if type(after_job_id) is not str or len(after_job_id) > 64:
+        raise JobError('invalid_inspection_cursor')
+    rows = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} "
+        "WHERE supervision_status='open' AND parent_job_id IS NULL AND job_id>? ORDER BY job_id LIMIT ?",
+        (after_job_id, limit + 1))
+    return {'roots': rows[:limit], 'next_cursor': rows[limit-1]['job_id'] if len(rows) > limit else None}
+
+
 async def inspect_tasks(manager, actor, root_job_id, *, policy=None, limit=100, after_job_id=''):
     """One authorized root/page per tick. Persist at most two alerts per episode.
 

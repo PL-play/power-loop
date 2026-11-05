@@ -115,3 +115,12 @@ workspace 写东西，两台机器上的两个进程看到的根本不是同一�
 - **多写者横向扩展是后端选择，不是魔法。** PostgreSQL/MySQL 让多个进程写同一个逻辑 store，但单个 session 仍同一时刻只能有一个写者——要么由你的 dispatcher 保证，要么由应用提供共享会话协调器。上面的数字是针对 SQLite 记录的。
 - **压缩是长期会话的主要扩展杠杆**；不开则每次 send 成本随历史增长。
 - **上限是否"够用"由你判断**，对照你预期的并发会话负载——以及你把 DSN 指向哪个后端。
+
+## 宿主巡检与费用对账
+
+调用 `power_loop.runtime.task_inspection.list_open_roots(manager, after_job_id="", limit=100)`
+发现未关闭的根任务；调用 `power_loop.runtime.model_budgets.list_unsettled(manager,
+after_attempt_id="", limit=100)` 发现未确认费用及仍在派发的调用。
+返回值包含 `roots` 或 `attempts`，以及分页用的 `next_cursor`（末页为 `None`）。
+这两个接口供可信宿主查询整个 store；后续巡检、对账仍使用原任务身份进行授权。
+每页最多 1,000 行，跳过已结束历史。执行实例心跳只更新当前行的租约，不积累事件行。

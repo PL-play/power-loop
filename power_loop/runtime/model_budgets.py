@@ -641,6 +641,29 @@ async def _release_unstarted(runtime, actor, job_id, attempt_id, *, require_canc
     return {**asdict(ack), "receipt": {}}
 
 
+async def list_unsettled(manager, *, after_attempt_id='', limit=100):
+    """Trusted host discovery of unacknowledged or still-dispatched fees.
+
+    Returns identities only; get_budget/recovery_config still authorize each
+    original task before inspection or reconciliation. Settled history is never
+    loaded. The two indexed branches are disjoint, including pending dispatch.
+    """
+    if type(limit) is not int or not 1 <= limit <= 1000:
+        raise JobError('invalid_budget_query_limit')
+    if type(after_attempt_id) is not str or len(after_attempt_id) > 64:
+        raise JobError('invalid_budget_query_cursor')
+    attempts = manager.prefix + 'task_budget_attempts'
+    rows = await manager.db.fetchall(
+        f"SELECT b.attempt_id,b.job_id,b.phase,b.pending,j.tenant_id,j.principal_id,j.session_id,j.root_job_id "
+        f"FROM (SELECT attempt_id,job_id,phase,pending FROM {attempts} WHERE pending=1 AND attempt_id>? "
+        f"UNION ALL SELECT attempt_id,job_id,phase,pending FROM {attempts} WHERE pending=0 "
+        "AND phase IN ('local_reserved','host_reserving','host_reserved','dispatch_authorized','dispatch_closed') "
+        "AND attempt_id>? ORDER BY attempt_id LIMIT ?) b "
+        f"JOIN {manager.jobs} j ON j.job_id=b.job_id ORDER BY b.attempt_id",
+        (after_attempt_id, after_attempt_id, limit + 1))
+    return {'attempts': rows[:limit], 'next_cursor': rows[limit-1]['attempt_id'] if len(rows) > limit else None}
+
+
 async def get_budget(manager, actor, attempt_id):
     """Authorized mechanical inspection, independent of model/provider availability."""
     binding = manager._live_budget_bindings.get(attempt_id)

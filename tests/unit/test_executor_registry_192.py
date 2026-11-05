@@ -97,12 +97,12 @@ async def test_drain_does_not_stop_other_boot_independent_roots_or_destroy_termi
     assert first.executor_id != lease2.executor_id
 
 
-@pytest.mark.parametrize("action", ["register", "activate", "heartbeat", "drain"])
+@pytest.mark.parametrize("action", ["register", "activate", "drain"])
 async def test_lost_ack_replays_exact_original_decision_without_new_effects(boot, monkeypatch, action):
     c = boot
     if action != "register":
         await registry.register(c.manager, c.identity, contract_hash="a"*64, startup_lease_ms=1000)
-    if action in ("heartbeat", "drain"):
+    if action == "drain":
         await registry.activate(c.manager, c.identity, expected_version=1, system_key="startup", lease_ms=1000)
     if action == "drain":
         await root(c)
@@ -123,7 +123,6 @@ async def test_lost_ack_replays_exact_original_decision_without_new_effects(boot
     fn = getattr(registry, action)
     args = {"register": {"contract_hash": "a"*64, "startup_lease_ms": 1000},
         "activate": {"expected_version": 1, "system_key": "startup", "lease_ms": 1000},
-        "heartbeat": {"expected_version": 2, "system_key": "beat", "lease_ms": 1000},
         "drain": {"system_key": "stop", "reason": "shutdown"}}[action]
     with monkeypatch.context() as patch:
         patch.setattr(c.manager, "_write", lose_ack)
@@ -141,13 +140,14 @@ async def test_lost_ack_replays_exact_original_decision_without_new_effects(boot
 async def test_replayed_old_activation_or_heartbeat_cannot_revive_drain(boot):
     c = boot
     accepted = await start(c)
-    beat = await registry.heartbeat(c.manager, c.identity, expected_version=2, system_key="beat", lease_ms=1000)
+    await registry.heartbeat(c.manager, c.identity, expected_version=2, lease_ms=1000)
     await registry.drain(c.manager, c.identity, system_key="shutdown", reason="shutdown")
     assert (await registry.activate(c.manager, c.identity, expected_version=1, system_key="startup", lease_ms=1000))["executor"] == accepted["executor"]
-    assert (await registry.heartbeat(c.manager, c.identity, expected_version=2, system_key="beat", lease_ms=1000))["executor"] == beat["executor"]
+    with pytest.raises(JobError, match="executor_not_accepting"):
+        await registry.heartbeat(c.manager, c.identity, expected_version=2, lease_ms=1000)
     assert (await registry.get(c.manager, c.identity))["state"] == "draining"
     with pytest.raises(JobError, match="executor_not_accepting"):
-        await registry.heartbeat(c.manager, c.identity, expected_version=4, system_key="new-beat")
+        await registry.heartbeat(c.manager, c.identity, expected_version=2)
 
 
 async def test_expired_boot_cannot_renew_or_dispatch_while_job_lease_is_still_live(boot):
@@ -156,7 +156,7 @@ async def test_expired_boot_cannot_renew_or_dispatch_while_job_lease_is_still_li
     _, lease = await root(c)
     c.now[0] += 1001
     with pytest.raises(JobError, match="executor_lease_expired"):
-        await registry.heartbeat(c.manager, c.identity, expected_version=2, system_key="late")
+        await registry.heartbeat(c.manager, c.identity, expected_version=2)
     with pytest.raises(JobError, match="executor_lease_expired"):
         await c.manager.check_execution(c.actor, lease)
     assert not (await registry.get(c.manager, c.identity))["admission_open"]
@@ -272,9 +272,6 @@ async def test_immutable_registration_and_operation_requests_cannot_be_reinterpr
     await start(c)
     with pytest.raises(JobError, match="executor_operation_conflict"):
         await registry.register(c.manager, c.identity, contract_hash="b"*64, startup_lease_ms=1000)
-    await registry.heartbeat(c.manager, c.identity, expected_version=2, system_key="beat", lease_ms=1000)
-    with pytest.raises(JobError, match="executor_operation_conflict"):
-        await registry.heartbeat(c.manager, c.identity, expected_version=2, system_key="beat", lease_ms=2000)
     with pytest.raises(JobError, match="executor_registration_required"):
         await registry.get(c.manager, replace(c.identity, tenant_id="another-tenant"))
 
@@ -286,11 +283,12 @@ async def test_registration_and_heartbeat_are_serialized_across_two_store_connec
     assert sorted(r["replayed"] for r in replies) == [False, True]
     assert replies[0]["event_id"] == replies[1]["event_id"]
     await registry.activate(c.manager, c.identity, expected_version=1, system_key="start", lease_ms=1000)
-    replies = await asyncio.gather(*(registry.heartbeat(m, c.identity, expected_version=2, system_key=key, lease_ms=1000)
-        for m, key in ((c.manager, "a"), (other, "b"))), return_exceptions=True)
-    assert sum(isinstance(r, dict) for r in replies) == 1
-    assert sum(isinstance(r, JobError) and r.code == "executor_heartbeat_conflict" for r in replies) == 1
-    assert (await registry.get(c.manager, c.identity))["version"] == 3
+    replies = await asyncio.gather(*(registry.heartbeat(m, c.identity, expected_version=2, lease_ms=1000)
+        for m in (c.manager, other)), return_exceptions=True)
+    assert all(isinstance(r, dict) for r in replies)
+    assert (await registry.get(c.manager, c.identity))["version"] == 2
+    assert not await c.manager.db.fetchall(
+        f"SELECT event_id FROM {c.manager.prefix}task_executor_events WHERE action='heartbeat'")
 
 
 async def test_drain_storage_failure_rolls_back_stop_intents_and_boot_view_together(boot, monkeypatch):
@@ -388,7 +386,7 @@ async def test_invalid_control_arguments_cannot_change_boot_admission(boot, acti
     await start(c)
     before = await registry.get(c.manager, c.identity)
     defaults = {"activate": {"expected_version": 1, "lease_ms": 1000, "system_key": "bad"},
-        "heartbeat": {"expected_version": 2, "lease_ms": 1000, "system_key": "bad"},
+        "heartbeat": {"expected_version": 2, "lease_ms": 1000},
         "drain": {"system_key": "bad", "reason": "shutdown"}}[action]
     with pytest.raises(JobError, match="invalid_executor_"):
         await getattr(registry, action)(c.manager, c.identity, **(defaults | args))

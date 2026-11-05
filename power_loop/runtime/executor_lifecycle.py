@@ -152,10 +152,9 @@ class ExecutorLifecycle:
                 if self.closed:
                     return
                 self.check_admission()
-                receipt = await self._idempotent(
-                    registry.heartbeat,
+                receipt = await registry.heartbeat(
+                    self.manager, self.identity,
                     expected_version=self._version,
-                    system_key="runtime-heartbeat:" + str(self._version),
                     lease_ms=self.runtime.lease_ms,
                 )
                 self._version = receipt["executor"]["version"]

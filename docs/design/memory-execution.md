@@ -166,6 +166,26 @@ Finite leases require continuing renewals and executor heartbeats during long
 sends. SQL is not independent of elapsed time. Control lock timing adds no SQL
 and records acquisition wait and holding duration, including outcome.
 
+## Host discovery and executor heartbeat
+
+`task_inspection.list_open_roots(manager, after_job_id='', limit=100)` pages only
+roots with open supervision. `model_budgets.list_unsettled(manager,
+after_attempt_id='', limit=100)` pages pending fees and reservations/dispatches
+that have not reached an acknowledged terminal phase. Both are trusted host
+queries across the store, return `next_cursor`, and accept at most 1,000 rows.
+They do not grant task or billing authority; the existing actor checks still
+apply when inspecting or reconciling each returned task. The fee query returns
+identities and routing metadata, without loading settled accounting payloads.
+
+Executor activation reads only `starting`/`accepting` boots. `draining` boots
+already have admission closed; prior running/unknown jobs are checked separately
+with pending-work indexes. Heartbeat updates only `task_executors.lease_until_ms`
+and `updated_at`, using the current admission version and a live-lease condition.
+It adds no event and does not advance that version. `heartbeat` no longer takes
+`system_key`; a failed heartbeat stops local supervision instead of recalling a
+historical heartbeat receipt. State changes retain their existing events.
+The one-minute live-heartbeat and 10,000-row history tests run on all three stores.
+
 ## Offline protocol 21 to 41 upgrade
 
 `scripts/upgrade_protocol21.py` is the single maintenance entry. It accepts

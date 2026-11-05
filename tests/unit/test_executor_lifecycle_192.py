@@ -84,7 +84,7 @@ async def test_concurrent_start_is_one_registration_and_cancelled_waiter_does_no
     assert sorted(e["action"] for e in events) == ["activate", "register"]
 
 
-@pytest.mark.parametrize("phase", ["register", "activate", "heartbeat", "drain"])
+@pytest.mark.parametrize("phase", ["register", "activate", "drain"])
 async def test_lost_ack_recalls_same_boot_operation_without_duplicate_actions(host, monkeypatch, phase):
     _, manager, runtime = host
     original = getattr(registry, phase)
@@ -101,10 +101,6 @@ async def test_lost_ack_recalls_same_boot_operation_without_duplicate_actions(ho
 
     monkeypatch.setattr(registry, phase, uncertain)
     await runtime.start()
-    if phase == "heartbeat":
-        await asyncio.wait_for(accepted.wait(), 5)
-        while runtime._lifecycle._version == 2:
-            await asyncio.sleep(0.01)
     result = await runtime.shutdown(timeout_s=1)
     assert lost and result["durable_drain_confirmed"] and not result["pending_handles"]
     assert not result["physical_stop_confirmed"] and not result["billing_settled"]
@@ -122,12 +118,13 @@ async def test_idle_runtime_renews_boot_without_any_model_send(host):
     async def renewed():
         while True:
             current = await registry.get(manager, runtime._lifecycle.identity)
-            if current["version"] > first["version"]:
+            if current["lease_until_ms"] > first["lease_until_ms"]:
                 return current
             await asyncio.sleep(0.02)
 
     current = await asyncio.wait_for(renewed(), 5)
     assert current["lease_until_ms"] > first["lease_until_ms"] and current["admission_open"]
+    assert current["version"] == first["version"]
     assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs}")
 
 

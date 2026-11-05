@@ -67,7 +67,7 @@ async def test_executor_heartbeat_outlives_the_send_that_started_it(host):
         async with asyncio.timeout(5):
             while True:
                 current = await executor_registry.get(manager, runtime._lifecycle.identity)
-                if current['version'] > first['version']:
+                if current['lease_until_ms'] > first['lease_until_ms']:
                     break
                 await asyncio.sleep(.02)
         assert current['admission_open'] and current['lease_until_ms'] > first['lease_until_ms']

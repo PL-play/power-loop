@@ -88,7 +88,7 @@ def _decode(manager, identity, event):
             valid = (set(request) == {"action", "contract_hash", "startup_lease_ms"} and
                 request["contract_hash"] == response["contract_hash"] and _positive(request["startup_lease_ms"], 300000) and
                 response["version"] == 1 and response["state"] == "starting" and not data["effects"])
-        elif action in ("activate", "heartbeat"):
+        elif action == "activate":
             valid = (set(request) == {"action", "expected_version", "lease_ms"} and _positive(request["expected_version"]) and
                 _positive(request["lease_ms"], 300000) and response["version"] == request["expected_version"]+1 and
                 response["state"] == "accepting" and not data["effects"])
@@ -168,7 +168,8 @@ async def _row(manager, tx, identity, *, required=True, admission=False, exclusi
     if not manager._trust_own_writes.get():
         _, current = await _event(manager, tx, identity, row["version"])
         _, original = await _event(manager, tx, identity, 1)
-        if (current["response"] != _snapshot(row) or original["request"].get("action") != "register" or
+        if (any(current["response"][key] != row[key] for key in _FIELDS
+                if key not in ("lease_until_ms", "updated_at")) or original["request"].get("action") != "register" or
                 original["response"]["state"] != "starting" or original["response"]["contract_hash"] != row["contract_hash"] or
                 original["response"]["created_at"] != row["created_at"]):
             raise JobError("executor_evidence_corrupt")
@@ -257,7 +258,7 @@ async def _activation_boots(manager, tx, identity):
     executors, _ = _tables(manager)
     suffix = '' if manager.db.dialect.name == 'sqlite' else ' FOR UPDATE'
     rows = await tx.fetchall(f"SELECT * FROM {executors} WHERE tenant_id=? AND principal_id=? AND executor_id=? "
-        'ORDER BY executor_key'+suffix, (identity.tenant_id, identity.principal_id, identity.executor_id))
+        "AND state IN ('starting','accepting') ORDER BY executor_key"+suffix, (identity.tenant_id, identity.principal_id, identity.executor_id))
     for row in rows:
         tx.remember_row(executors, 'executor_key', row['executor_key'], row)
     return rows
@@ -299,7 +300,8 @@ async def _begin_activation(manager, identity, operation, request):
                 await _save(manager, tx, prior, drain_request, barrier, value, old=old,
                     effects={'executions': [], 'stop_operations': [], 'scope_incomplete': True})
                 boots[offset] = value
-        return None, tuple((row['executor_key'], row['version']) for row in boots)
+        return None, tuple((row['executor_key'], row['version']) for row in boots
+                           if row['state'] in ('starting', 'accepting'))
 
 
 async def _inspect_prior_executions(manager, identity):
@@ -311,7 +313,7 @@ async def _inspect_prior_executions(manager, identity):
         # Open responsibilities cannot use a stopped cache to hide an original
         # model dispatch that never acquired returned-response evidence.
         prior_sends = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? AND executor_id=? "
-            "AND boot_id<>? AND executor_key IS NOT NULL AND kind='send' AND supervision_status<>'closed' "
+            "AND boot_id<>? AND executor_key IS NOT NULL AND kind='send' AND supervision_status='open' "
             "AND resource_state='stopped' ORDER BY job_id LIMIT ?", (*asdict(identity).values(), _LIMIT+1))
         if len(prior_sends) > _LIMIT:
             raise JobError("executor_prior_execution_unsettled")
@@ -361,22 +363,24 @@ async def activate(manager, identity, *, expected_version, system_key, lease_ms=
             continue
 
 
-async def heartbeat(manager, identity, *, expected_version, system_key, lease_ms=30000):
-    operation = _operation_key(manager, identity, "heartbeat", system_key)
+async def heartbeat(manager, identity, *, expected_version, lease_ms=30000):
+    """Extend the current admission lease without adding a control event."""
     if not _positive(expected_version) or not _positive(lease_ms, 300000):
         raise JobError("invalid_executor_heartbeat")
-    request = {"action": "heartbeat", "expected_version": expected_version, "lease_ms": lease_ms}
     async with manager._write() as tx:
-        await _row(manager, tx, identity, admission=True, exclusive=True)
-        replay = await _recall(manager, tx, identity, operation, request)
-        if replay is not None:
-            return replay
         row = await require_accepting(manager, tx, identity, required=True, exclusive=True)
         if row["version"] != expected_version:
             raise JobError("executor_heartbeat_conflict")
-        value = {**_snapshot(row), "version": row["version"]+1,
-            "lease_until_ms": max(row["lease_until_ms"], manager.now()+lease_ms), "updated_at": manager.now()}
-        return await _save(manager, tx, identity, request, operation, value, old=row)
+        now = manager.now()
+        value = {**_snapshot(row), "lease_until_ms": max(row["lease_until_ms"], now+lease_ms), "updated_at": now}
+        executors, _ = _tables(manager)
+        changed = await tx.write_executor(row["executor_key"],
+            f"UPDATE {executors} SET lease_until_ms=?,updated_at=? "
+            "WHERE executor_key=? AND version=? AND state='accepting' AND lease_until_ms>?",
+            (value["lease_until_ms"], now, row["executor_key"], expected_version, now))
+        if changed != 1:
+            raise JobError("executor_heartbeat_conflict")
+        return {"executor": value, "physical_stop_confirmed": False, "execution_authority": False}
 
 
 async def require_accepting(manager, tx, identity, *, required=False, exclusive=False):
