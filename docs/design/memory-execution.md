@@ -166,6 +166,26 @@ Finite leases require continuing renewals and executor heartbeats during long
 sends. SQL is not independent of elapsed time. Control lock timing adds no SQL
 and records acquisition wait and holding duration, including outcome.
 
+## Finalization retention
+
+Finalization deletes the job's execution checkpoints, execution allocations,
+budget attempts, and `execution_scope`/`execution_membership_seal` events in the
+same transaction that closes supervision. The allocation table is indexed by
+`job_id`. Cleanup uses four fixed DELETE statements for the planned closures;
+control SQL limits are 18 unbudgeted / 25 budgeted (approved for D1), with the
+same 2/3 control transactions and 0/12 billing statements.
+
+Closing still requires stopped work, acknowledged accounting and completed
+children. A failed commit rolls back cleanup with the closure; unsettled fees
+cannot pass the gate. Durable policy/scope balances and model usage remain.
+
+The existing `supervision_closed` record retains the execution identity and
+owner/session information needed by historical usage, parent completion and
+workflow restore. Closed generations read that record; live generations use
+their active scope. Retained results no longer reference deleted scope/seal
+proofs. Controller exits, review handoffs and wait completion use the retained
+identity/results, without preserving a duplicate chain of scope/seal events.
+
 ## Host discovery and executor heartbeat
 
 `task_inspection.list_open_roots(manager, after_job_id='', limit=100)` pages only
@@ -243,8 +263,8 @@ Let T be tool rounds (model responses minus one), and L be elapsed whole seconds
 | Ordinary SQLite/PostgreSQL | 15 + 4T + L |
 | Ordinary MySQL | 17 + 6T + L |
 | Billing, unpaid / paid | 0 / 12 |
-| Control, unpaid | 14 |
-| Control, paid | 21 |
+| Control, unpaid | 18 |
+| Control, paid | 25 |
 | Control transactions, unpaid / paid | 2 / 3 |
 
 Activity touching contributes at most L ordinary statements. Long-lived renewal

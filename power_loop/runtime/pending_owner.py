@@ -18,7 +18,6 @@ async def _expected(manager, tx, source):
     from .controller_task_exit import identity as exit_id
     from .controller_task_exit import read as task_exit
     from .execution_membership import read as membership
-    from .execution_membership import seal_id
     from .managed_delivery import _main
     from .model_exit import historical_row
     from .original_owner_review import read as original_owner
@@ -46,7 +45,7 @@ async def _expected(manager, tx, source):
     if _hash(data) != _hash(expected):
         raise JobError('pending_owner_retirement_changed')
     events = [retirement]
-    for key in (exit_id(manager, lease), seal_id(manager, owner['job_id'], lease.generation)):
+    for key in (exit_id(manager, lease),):
         events.append(await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (key,)))
     from .workflow_controller import proof
     return {'version': 1, 'source': proof(source), 'review_owner': binding,

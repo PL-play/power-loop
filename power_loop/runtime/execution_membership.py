@@ -89,15 +89,26 @@ def _remember(manager, name, key, value):
         cache.popitem(last=False)
 
 
+async def _completed_scope(manager, reader, job_id, generation):
+    rows = await reader.fetchall(f"SELECT payload_json FROM {manager.events} "
+        "WHERE job_id=? AND event_type='supervision_closed' ORDER BY job_version DESC", (job_id,))
+    for row in rows:
+        data = _object(row['payload_json'])
+        if data['scope']['generation'] == generation:
+            return data['execution_scope']
+    return None
+
+
 async def scope(manager, reader, job_id, generation):
     # Scope events are immutable; one written or validated here is not reread.
     known = _trusted(manager, "_membership_scopes", (job_id, generation))
     if known is not None:
         return json.loads(known)
     row = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (scope_id(manager, job_id, generation),))
-    if row is None:
+    data = (await _completed_scope(manager, reader, job_id, generation) if row is None
+            else _event(row, job_id, "execution_scope"))
+    if data is None:
         raise JobError("execution_membership_missing")
-    data = _event(row, job_id, "execution_scope")
     proof = _lease(data.get("lease"))
     keys = {"version", "lease", "owner", "tenant_id", "principal_id", "kind", "execution_role", "parent_job_id", "created_by_session_id", "session_id"}
     if data.get("version") == 2:
@@ -111,7 +122,7 @@ async def scope(manager, reader, job_id, generation):
         raise JobError("execution_membership_corrupt")
     if data["owner"] is not None:
         _lease(data["owner"])
-    if data["version"] == 2:
+    if data["version"] == 2 and row is not None:
         from .executor_registry import validate_binding
         await validate_binding(manager, reader, data)
     if manager._control_commit_hooks.get() is None:
@@ -261,6 +272,8 @@ async def seal(manager, tx, row, *, model=None):
 
     ``model`` is the model_closed fact written by the caller in this transaction.
     """
+    if row["supervision_status"] == "closed":
+        return
     key = (row["job_id"], row["generation"])
     if _trusted(manager, "_membership_scopes", key) is None:
         anchor = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (scope_id(manager, *key),))
@@ -294,6 +307,8 @@ async def read(manager, reader, row, generation):
             "model": {k: model[k] for k in ("event_id", "hash")} if model else None}
         if _hash(_event(sealed, row["job_id"], "execution_membership_seal")) != _hash(expected):
             raise JobError("execution_membership_corrupt")
+    elif await _completed_scope(manager, reader, row["job_id"], generation) is not None:
+        return {"scope": data, "members": edges, "sealed": True, "model": model}
     elif model is not None:
         raise JobError("execution_membership_missing")
     else:

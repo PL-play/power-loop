@@ -21,66 +21,66 @@ OUT = os.environ.get("ROWS_OUT")
 
 # Design 201 A0 baseline, lowered through A4. Byte budgets allow a 2% margin.
 _BASELINE = {(1, 0, False): {'jobs': (1, 311),
-                 'job_events': (5, 4200),
-                 'execution_checkpoints': (1, 261),
+                 'job_events': (3, 3030),
+                 'execution_checkpoints': (0, 0),
                  'execution_batches': (0, 0),
                  'messages': (2, 221),
                  'session_stats': (0, 1)},
  (1, 0, True): {'jobs': (1, 311),
-                'job_events': (5, 4200),
+                'job_events': (3, 3030),
                 'task_budget_scopes': (0, 1),
-                'task_budget_attempts': (1, 1373),
-                'execution_checkpoints': (1, 442),
+                'task_budget_attempts': (0, 0),
+                'execution_checkpoints': (0, 0),
                 'execution_batches': (0, 0),
-                'execution_allocations': (1, 763),
+                'execution_allocations': (0, 0),
                 'messages': (2, 221),
                 'session_stats': (0, 1)},
  (4, 1, False): {'jobs': (1, 311),
-                 'job_events': (5, 4206),
-                 'execution_checkpoints': (1, 261),
+                 'job_events': (3, 3036),
+                 'execution_checkpoints': (0, 0),
                  'execution_batches': (0, 0),
                  'messages': (8, 1186),
                  'session_state': (0, 1),
                  'session_stats': (0, 1)},
  (4, 1, True): {'jobs': (1, 311),
-                'job_events': (5, 4206),
+                'job_events': (3, 3036),
                 'task_budget_scopes': (0, 1),
-                'task_budget_attempts': (4, 5492),
-                'execution_checkpoints': (1, 443),
+                'task_budget_attempts': (0, 0),
+                'execution_checkpoints': (0, 0),
                 'execution_batches': (0, 0),
-                'execution_allocations': (1, 765),
+                'execution_allocations': (0, 0),
                 'messages': (8, 1186),
                 'session_state': (0, 1),
                 'session_stats': (0, 1)},
  (32, 1, False): {'jobs': (1, 312),
-                  'job_events': (5, 4222),
-                  'execution_checkpoints': (1, 264),
+                  'job_events': (3, 3051),
+                  'execution_checkpoints': (0, 0),
                   'execution_batches': (0, 0),
                   'messages': (64, 10321),
                   'session_state': (0, 1),
                   'session_stats': (0, 2)},
  (32, 1, True): {'jobs': (1, 312),
-                 'job_events': (5, 4222),
+                 'job_events': (3, 3051),
                  'task_budget_scopes': (0, 1),
-                 'task_budget_attempts': (32, 43936),
-                 'execution_checkpoints': (1, 449),
+                 'task_budget_attempts': (0, 0),
+                 'execution_checkpoints': (0, 0),
                  'execution_batches': (0, 0),
-                 'execution_allocations': (1, 771),
+                 'execution_allocations': (0, 0),
                  'messages': (64, 10321),
                  'session_state': (0, 1),
                  'session_stats': (0, 2)},
  (32, 4, False): {'jobs': (1, 312),
-                  'job_events': (5, 4223),
-                  'execution_checkpoints': (1, 266),
+                  'job_events': (3, 3052),
+                  'execution_checkpoints': (0, 0),
                   'execution_batches': (0, 0),
                   'messages': (157, 25745),
                   'session_stats': (0, 2)},
  (32, 4, True): {'jobs': (1, 312),
-                 'job_events': (5, 4223),
-                 'task_budget_attempts': (32, 43936),
-                 'execution_checkpoints': (1, 451),
+                 'job_events': (3, 3052),
+                 'task_budget_attempts': (0, 0),
+                 'execution_checkpoints': (0, 0),
                  'execution_batches': (0, 0),
-                 'execution_allocations': (1, 771),
+                 'execution_allocations': (0, 0),
                  'messages': (157, 25745),
                  'session_stats': (0, 2)}}
 
@@ -209,13 +209,14 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
                                     "budgeted": budgeted, "tables": delta, "job_events": ev,
                                     "sql": sql, "elapsed_s": elapsed_s, "largest": largest}) + "\n")
         assert not over, json.dumps({"over": over, "actual": delta}, sort_keys=True)
-        assert delta.get('task_budget_attempts', (0, 0))[0] <= (r if budgeted else 0)
-        assert largest.get('task_budget_attempts', 0) <= 1536
-        assert delta.get('job_events', (0, 0))[0] <= 8
-        assert delta.get('job_events', (0, 0))[1] <= 10 * 1024
+        assert delta.get('task_budget_attempts', (0, 0))[0] == 0
+        assert largest.get('task_budget_attempts', 0) == 0
+        assert delta.get('job_events', (0, 0))[0] <= 3
+        assert delta.get('job_events', (0, 0))[1] <= 4 * 1024
         assert after.get('execution_batches', (0, 0))[0] == 0
-        assert delta['execution_checkpoints'][0] == 1 and largest['execution_checkpoints'] <= 1024
-        assert sum(max(0, value[1]) for value in delta.values()) <= (90 if budgeted else 40) * 1024
+        assert after['execution_checkpoints'][0] == 0
+        assert after['execution_allocations'][0] == 0 and after['task_budget_attempts'][0] == 0
+        assert sum(max(0, value[1]) for value in delta.values()) <= 30 * 1024
     finally:
         await runtime.shutdown(timeout_s=1)
         await loop.aclose(drain_timeout_s=0.1)

@@ -215,8 +215,14 @@ async def test_real_process_death_preserves_an_atomic_tree_closure_without_repla
         receipt = await cold.finalize_supervision(c.actor, c.root, generation=1)
         after = await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id")
         originals = {row["event_id"]: row for row in after}
-        assert all(originals[row["event_id"]] == row for row in before_events)
-        assert len(after) == len(before_events)+2
+        closed_jobs = {row['job_id'] for row in before_jobs if row['root_job_id'] == c.root}
+        def removed(row):
+            return row['job_id'] in closed_jobs and row['event_type'] in {
+                'execution_scope', 'execution_membership_seal'}
+        retained = [row for row in before_events if not removed(row)]
+        assert all(originals[row["event_id"]] == row for row in retained)
+        assert not any(removed(row) for row in after)
+        assert len(after) == len(retained)+2
         assert await c.manager.finalize_supervision(c.actor, c.root, generation=1) == receipt
         assert await cold.db.fetchall(f"SELECT * FROM {cold.events} ORDER BY event_id") == after
         assert await c.store.load_all_messages(c.actor.session_id) == messages

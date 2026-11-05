@@ -34,41 +34,38 @@ async def admit(manager,tx,owner):
         if old is not None:
             raise JobError('original_owner_review_contract_invalid')
         return
-    from .execution_membership import scope_id
     from .tool_call_plans import _event
     from .workflow_controller import proof
-    event = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',(scope_id(manager,owner['job_id'],1),))
-    data = {'version':1,'origin':proof(owner),'creation':content_reference(creation),'scope':content_reference(event)}
+    data = {'version':1,'origin':proof(owner),'creation':content_reference(creation)}
     await _event(manager,tx,admission_id(manager,owner),owner,'owner_review_admission',data)
     await enabled(manager,tx,owner)
 
 
 async def enabled(manager,tx,owner):
-    from .execution_membership import _lease, scope_id
+    from .execution_membership import _lease, scope
     from .pending_calls import _object
     creation,value = await _declaration(manager,tx,owner)
     key = admission_id(manager,owner)
     data = await _object(manager,tx,manager.events,'payload_json','event_id=?',(key,),32768)
     if value is None and data is None:
         return None
-    if value != 1 or data is None or set(data) != {'version','origin','creation','scope'} or type(data['version']) is not int or data['version'] != 1:
+    if value != 1 or data is None or set(data) != {'version','origin','creation'} or type(data['version']) is not int or data['version'] != 1:
         raise JobError('original_owner_review_admission_required')
     origin = _lease(data['origin'])
     if origin['job_id'] != owner['job_id'] or origin['generation'] != 1:
         raise JobError('original_owner_review_admission_invalid')
     event = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',(key,))
-    frozen = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',(scope_id(manager,owner['job_id'],1),))
+    frozen = await scope(manager, tx, owner['job_id'], 1)
     if (event['event_type'] != 'owner_review_admission' or event['job_id'] != owner['job_id'] or event['delivery_status'] != 'not_applicable'
-            or event['request_hash'] != _hash(data) or frozen is None
-            or _hash(json.loads(frozen['payload_json'])['lease']) != _hash(origin)
-            or _hash(data['scope']) != _hash(content_reference(frozen))
+            or event['request_hash'] != _hash(data)
+            or _hash(frozen['lease']) != _hash(origin)
             or _hash(data['creation']) != _hash(content_reference(creation))):
         raise JobError('original_owner_review_admission_invalid')
     return creation
 
 
 async def read(manager, tx, source):
-    from .execution_membership import member_id, members, scope, scope_id
+    from .execution_membership import member_id, members, scope
     from .managed_completion import _scope
     from .model_exit import historical_row
     from .pending_calls import _object
@@ -114,8 +111,7 @@ async def read(manager, tx, source):
         refs.append(manager._node_session_event_id(owner['job_id'],source['session_id'],lease['generation']))
     elif frozen['session_id'] != source['session_id'] or not meta.get('standalone_subagent'):
         raise JobError('original_owner_review_session_invalid')
-    refs.extend([scope_id(manager,source['job_id'],source['generation']),scope_id(manager,owner['job_id'],lease['generation']),
-                 member_id(manager,source['job_id'],source['generation']),creation['event_id'],admission_id(manager,owner)])
+    refs.extend([member_id(manager,source['job_id'],source['generation']),creation['event_id'],admission_id(manager,owner)])
     evidence = []
     for key in refs:
         event = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',(key,))

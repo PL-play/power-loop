@@ -151,8 +151,7 @@ class TaskExitCache:
 
 
 async def persist(runtime, slot):
-    from .execution_membership import scope, scope_id
-    from .model_exit import content_reference
+    from .execution_membership import scope
     from .tool_call_plans import _event, _read
 
     cache = runtime._controller_task_exits
@@ -168,9 +167,7 @@ async def persist(runtime, slot):
             raise JobError('controller_exit_scope_changed')
         if original['kind'] not in ('subagent', 'workflow_node', 'workflow'):
             return
-        frozen = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',
-                                   (scope_id(manager, row['job_id'], slot.lease.generation),))
-        value = {'version': 1, 'lease': asdict(slot.lease), 'scope': content_reference(frozen),
+        value = {'version': 1, 'lease': asdict(slot.lease),
             'task_exit': dict(slot.exit), 'execution_authority': False,
             'descendant_stop_confirmed': False, 'billing_settled': False}
         key = identity(manager, slot.lease)
@@ -182,19 +179,16 @@ async def persist(runtime, slot):
 
 
 async def read(manager, tx, row, lease):
-    from .execution_membership import scope, scope_id
-    from .model_exit import content_reference
+    from .execution_membership import scope
     from .tool_call_plans import _read
 
     frozen = await scope(manager, tx, row['job_id'], lease.generation)
     if _hash(frozen['lease']) != _hash(asdict(lease)) or frozen['kind'] not in ('subagent', 'workflow_node', 'workflow'):
         raise JobError('controller_exit_scope_changed')
     data = await _read(manager, tx, identity(manager, lease), row, 'controller_task_exit')
-    event = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',
-                              (scope_id(manager, row['job_id'], lease.generation),))
-    keys = {'version', 'lease', 'scope', 'task_exit', 'execution_authority', 'descendant_stop_confirmed', 'billing_settled'}
+    keys = {'version', 'lease', 'task_exit', 'execution_authority', 'descendant_stop_confirmed', 'billing_settled'}
     if (set(data) != keys or type(data['version']) is not int or data['version'] != 1
-            or _hash(data['lease']) != _hash(asdict(lease)) or _hash(data['scope']) != _hash(content_reference(event))
+            or _hash(data['lease']) != _hash(asdict(lease))
             or any(data[k] is not False for k in ('execution_authority', 'descendant_stop_confirmed', 'billing_settled'))
             or type(data['task_exit']) is not dict or set(data['task_exit']) != {'state', 'error_type', 'observed_at_ms'}
             or data['task_exit']['state'] not in ('returned', 'raised', 'cancelled')

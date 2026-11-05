@@ -41,12 +41,10 @@ async def read(manager, tx, source, result, *, optional=True):
                 'evidence', 'public', 'message_hash', 'execution_authority', 'resource_stop_confirmed', 'billing_settled'}
     from .abort_outcomes import render
     from .controller_retirement import read_retirement
-    from .execution_membership import seal_id
     from .pending_calls import identity as disposition_id
     owner = await manager._row(tx, binding['owner']['job_id'])
     retirement = (await read_retirement(manager, tx, owner, binding['owner']))[0]['event_id']
-    required_ids = {retirement, disposition_id(manager, source), seal_id(manager, binding['owner']['job_id'],
-                    binding['owner']['generation']), 'model_closed_' + source['job_id']}
+    required_ids = {retirement, disposition_id(manager, source), 'model_closed_' + source['job_id']}
     if (set(data) != required or type(data['version']) is not int or data['version'] != 1
             or data['source_job_id'] != source['job_id'] or data['main_session_id'] != main['session_id']
             or data['review_owner'] != binding or data['result'] != content_reference(result)
@@ -75,7 +73,7 @@ async def read(manager, tx, source, result, *, optional=True):
 async def _quiescent(manager, tx, actor, owner, source, binding):
     """Retirement fences new work; every existing descendant needs exit evidence."""
     from .execution_membership import read as membership
-    from .execution_membership import seal, seal_id
+    from .execution_membership import seal
     from .model_exit import require_stopped
     from .pending_calls import _closed
     from .workflow_controller import proof
@@ -129,8 +127,6 @@ async def _quiescent(manager, tx, actor, owner, source, binding):
     frozen = await membership(manager, tx, owner, owner['generation'])
     if not frozen['sealed']:
         raise JobError('controller_handoff_members_unsealed')
-    evidence.append(await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?',
-                                    (seal_id(manager, owner['job_id'], owner['generation']),)))
     return evidence
 
 

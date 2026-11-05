@@ -102,7 +102,7 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
     state["visiting"].add(event_id)
     data = _object(event["payload_json"])
     if (event["event_type"] != "supervision_closed" or event["delivery_status"] != "not_applicable" or
-            set(data) != {"version", "scope", "proof", "proof_hash"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3) or
+            set(data) != {"version", "scope", "execution_scope", "proof", "proof_hash"} or type(data["version"]) is not int or data["version"] not in (1, 2, 3) or
             not isinstance(data["scope"], dict) or not isinstance(data["proof"], dict) or
             data["scope"]["job_id"] != event["job_id"] or data["proof_hash"] != _hash(data["proof"]) or
             event["request_hash"] != _hash(data) or event["event_id"] != _identity(manager, "closed",
@@ -271,7 +271,7 @@ async def require_node_consumed(manager, tx, row):
 
 
 async def _prepare(manager, tx, actor, row, generation, state, depth=0):
-    from .execution_membership import read, scope_id, seal_id
+    from .execution_membership import read
     key = (row["job_id"], generation)
     validated = state.setdefault('validated_closures', {'visiting': set(), 'done': {}})
     if key in state["done"]:
@@ -304,7 +304,8 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         else:
             raise JobError("finalization_adapter_required")
         proof = {"kind": row["kind"], "outcome": row["outcome"], "references": refs}
-        data = {"version": version_code, "scope": _lease(row), "proof": proof, "proof_hash": _hash(proof)}
+        data = {"version": version_code, "scope": _lease(row), "execution_scope": None,
+                "proof": proof, "proof_hash": _hash(proof)}
         version = row["version"] + 1
         event_id = _identity(manager, "closed", [row["job_id"], 0, version, data["proof_hash"]])
         ref = {"event_id": event_id, "job_id": row["job_id"], "event_type": "supervision_closed", "revision": version,
@@ -316,8 +317,7 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
     membership = await read(manager, tx, row, generation)
     if not membership["sealed"] or _hash(membership["scope"]["lease"]) != _hash(_lease(row)):
         raise JobError("finalization_execution_unsettled")
-    refs = [await _reference(manager, tx, scope_id(manager, row["job_id"], generation)),
-        await _reference(manager, tx, seal_id(manager, row["job_id"], generation))]
+    refs = []
     if row["kind"] in ("subagent", "workflow_node"):
         if row["outcome"] in ("failed", "cancelled", "timed_out", "budget_exceeded", "interrupted"):
             from .input_dispositions import reconcile_owner_tx
@@ -418,7 +418,8 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         refs.append(await _prepare(manager, tx, actor, child, child_generation, state, depth+1))
     refs = list({ref["event_id"]: ref for ref in refs}.values())
     proof = {"kind": row["kind"], "outcome": row["outcome"], "references": refs}
-    data = {"version": 1, "scope": _lease(row), "proof": proof, "proof_hash": _hash(proof)}
+    data = {"version": 1, "scope": _lease(row), "execution_scope": membership["scope"],
+            "proof": proof, "proof_hash": _hash(proof)}
     version = row["version"] + 1
     event_id = _identity(manager, "closed", [row["job_id"], generation, version, data["proof_hash"]])
     ref = {"event_id": event_id, "job_id": row["job_id"], "event_type": "supervision_closed", "revision": version,
@@ -461,6 +462,14 @@ async def _publish(manager, tx, plans, *, tree=None):
         if tree is None or ref["event_id"] != plans[0][3]["event_id"]:
             event = _closure_event(manager, row, version, data, ref)
             await tx.append_event(tuple(event), tuple(event.values()))
+
+    if plans:
+        ids = tuple(row['job_id'] for row, *_ in plans)
+        placeholders = ','.join('?' for _ in ids)
+        for table in ('execution_checkpoints', 'execution_allocations', 'task_budget_attempts'):
+            await tx.execute(f"DELETE FROM {manager.prefix}{table} WHERE job_id IN ({placeholders})", ids)
+        await tx.update_event(ids[0], f"DELETE FROM {manager.events} WHERE job_id IN ({placeholders}) "
+                              "AND event_type IN ('execution_scope','execution_membership_seal')", ids, obligations=False)
 
 
 async def _validate_request(manager, reader, actor, job_id, generation):

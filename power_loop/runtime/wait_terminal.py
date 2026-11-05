@@ -38,7 +38,7 @@ async def _owner_exit(manager, tx, actor, saved):
 
 async def negative_owner_exit(manager, tx, actor, original, kind):
     """Original sealed execution tree; history never grants execution authority."""
-    from .execution_membership import read, scope_id, seal_id
+    from .execution_membership import read
     from .result_revisions import result_id
 
     queue, seen, refs, outcome = [(original, None)], set(), {}, None
@@ -62,7 +62,7 @@ async def negative_owner_exit(manager, tx, actor, original, kind):
             row = historical_row(current, scope)
             if current["generation"] == lease["generation"] and (current["resource_state"] != "stopped" or current["intake"] != "closed"):
                 raise JobError("wait_owner_exit_unconfirmed")
-            ids = [scope_id(manager, lease["job_id"], lease["generation"]), seal_id(manager, lease["job_id"], lease["generation"])]
+            ids = []
             if scope["kind"] == "send":
                 model = member["model"]
                 if model is None:
@@ -278,7 +278,6 @@ async def _prepare_termination(manager, tx, actor, job_id, prepared):
 
 async def references(manager, tx, job):
     """Strict generation-zero adapter for the common supervision tree."""
-    from .execution_membership import scope_id
     from .finalization import _reference
 
     actor = JobActor(job["tenant_id"], job["principal_id"], job["created_by_session_id"])
@@ -288,8 +287,7 @@ async def references(manager, tx, job):
     job, creation, saved = await admission(manager, tx, actor, job["job_id"])
     if job["resource_state"] != "stopped" or job["intake"] != "closed" or job["result_status"] != "handled":
         raise JobError("wait_resolution_unsettled")
-    ids = [creation["event_id"], "result_" + job["job_id"], scope_id(manager, saved["binding"]["source"]["job_id"], saved["binding"]["source"]["generation"]),
-        scope_id(manager, saved["binding"]["owner"]["job_id"], saved["binding"]["owner"]["generation"])]
+    ids = [creation["event_id"], "result_" + job["job_id"]]
     if job["outcome"] == "succeeded":
         projection = waits._object(job["result_json"])
         resolved = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=?", (projection.get("wait_resolved_event_id"),))

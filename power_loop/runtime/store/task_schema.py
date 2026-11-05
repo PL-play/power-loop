@@ -37,6 +37,7 @@ _QUERY_INDEXES = {
     'idx_events_job_type': ('job_events', ('job_id', 'event_type', 'event_id')),
     'idx_events_caller_type': ('job_events', ('caller_session_id', 'event_type', 'job_id', 'event_id')),
     'idx_events_call': ('job_events', ('caller_session_id', 'tool_call_id', 'event_type')),
+    'idx_allocations_job': ('execution_allocations', ('job_id',)),
     'idx_budget_job': ('task_budget_attempts', ('job_id', 'attempt_id')),
     'idx_context_capacity': ('context_cache', ('size_bytes',)),
     'idx_obligations_job': ('session_obligations', ('job_id',)),

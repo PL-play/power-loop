@@ -72,14 +72,14 @@ async def test_callback_return_is_not_business_receipt(managed_workflow):
         await close(manager, runtime.actor(sid), wf)
 
 
-@pytest.mark.parametrize("fault", ["scope", "seal", "model", "node_ack", "decision", "delivery", "closure"])
+@pytest.mark.parametrize("fault", ["model", "node_ack", "decision", "delivery", "closure"])
 async def test_closed_tree_revalidates_immutable_evidence(managed_workflow, fault):
     _, manager, runtime, _, _, sid, _, _ = managed_workflow
     handle = await finished(managed_workflow)
     actor = runtime.actor(sid)
     wf = await manager.get_job(actor, handle.job_id)
     assert wf.supervision_status == "closed"
-    kind = {"scope": "execution_scope", "seal": "execution_membership_seal", "model": "model_closed",
+    kind = {"model": "model_closed",
         "node_ack": "node_result_consumed", "decision": "processing_decision", "delivery": "workflow_delivery",
         "closure": "supervision_closed"}[fault]
     closure = await close(manager, actor, wf)

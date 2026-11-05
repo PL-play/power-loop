@@ -495,13 +495,6 @@ async def _original(manager, tx, row, creation, binding):
         or row["job_id"] != job_id(manager, actor, ref, creation["tool_call_id"])
     ):
         raise JobError("managed_effect_evidence_corrupt")
-    event_id = execution_membership.scope_id(manager, source["job_id"], proof.generation)
-    length = (
-        "length(CAST(payload_json AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(payload_json)"
-    )
-    size = await tx.fetchone(f"SELECT {length} AS n FROM {manager.events} WHERE event_id=?", (event_id,))
-    if size is None or size["n"] is None or size["n"] > 32768:
-        raise JobError("managed_effect_source_evidence_unavailable")
     scope = await execution_membership.scope(manager, tx, source["job_id"], proof.generation)
     if (
         scope["lease"] != asdict(proof)

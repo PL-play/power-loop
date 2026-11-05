@@ -315,7 +315,7 @@ async def check_deadline(binding):
 
 
 async def _quiescent(manager, tx, owner):
-    from .execution_membership import read, scope_id, seal_id
+    from .execution_membership import read
     from .result_revisions import result_id
 
     queue, seen, refs = [(owner, None)], set(), {}
@@ -332,11 +332,10 @@ async def _quiescent(manager, tx, owner):
             scope = member["scope"]
             if (scope["tenant_id"], scope["principal_id"]) != (owner["tenant_id"], owner["principal_id"]):
                 raise JobError("owner_wait_membership_corrupt")
-            ids = [scope_id(manager, *key)]
+            ids = []
             if parent is not None:
                 if _hash(scope["owner"]) != _hash(parent) or not member["sealed"]:
                     raise JobError("owner_wait_resources_unsettled")
-                ids.append(seal_id(manager, *key))
                 if scope["kind"] == "send":
                     if member["model"] is None:
                         raise JobError("owner_wait_resources_unsettled")

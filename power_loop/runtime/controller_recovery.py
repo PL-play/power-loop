@@ -63,7 +63,6 @@ async def _exit_facts(manager, tx, actor, row):
 async def _facts(manager, tx, actor, row, *, _closures=None, _source=None):
     from .controller_task_exit import identity as exit_id
     from .execution_membership import read as membership
-    from .execution_membership import seal_id
     from .finalization import closed
     from .workflow_controller import proof
 
@@ -80,7 +79,7 @@ async def _facts(manager, tx, actor, row, *, _closures=None, _source=None):
     if len(children) > 1000:
         raise JobError('controller_recovery_scope_too_large')
     refs = [content_reference(retirement)]
-    for key in (exit_id(manager, lease), seal_id(manager, row['job_id'], row['generation'])):
+    for key in (exit_id(manager, lease),):
         refs.append(content_reference(await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (key,))))
     for job_id, generation in sorted(children):
         child = await manager._authorize(tx, actor, job_id)
@@ -199,13 +198,12 @@ class _Recovery:
 
 
 async def _prepare_recovery(manager, actor, job_id):
-    from .execution_membership import seal_id
+    from .execution_membership import read as membership
 
     async with manager._read() as reader:
         row = await manager._authorize(reader, actor, job_id)
         source = await _exit_facts(manager, reader, actor, row)
-        if await reader.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?',
-                (seal_id(manager, job_id, row['generation']),)) is None:
+        if not (await membership(manager, reader, row, row['generation']))['sealed']:
             return _Seal(job_id)
         validated = {'visiting': set(), 'done': {}}
         main, refs = await _facts(manager, reader, actor, row, _closures=validated, _source=source)
