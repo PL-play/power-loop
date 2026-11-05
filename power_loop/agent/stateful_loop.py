@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import threading
-import time
 import uuid
 import weakref
 from collections import OrderedDict
@@ -33,11 +32,7 @@ from typing import TYPE_CHECKING, Any
 
 from power_loop._vendor.llm_client.interface import LLMService
 from power_loop.agent.follow_up import (
-    INBOX_KIND_USER,
     FollowUpQueued,
-    InboxItem,
-    inbox_row,
-    render_inbox_rows,
 )
 from power_loop.agent.sink import (
     CONTENT_ENCODING_JSON,
@@ -52,7 +47,6 @@ from power_loop.agent.system_prompt import (
 from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
     CancellationRequested,
-    InboxClaimChanged,
     SessionNotFoundError,
 )
 from power_loop.contracts.protocols import ChildRunGuard
@@ -270,7 +264,7 @@ def _discard_session_sync(sid: str) -> None:
         _SESSION_SYNC.pop(sid, None)
 
 
-class StatefulAgentLoop:
+class _ExecutionLoop:
     """The only public entry point for running an agent loop.
 
     A single instance can drive any number of sessions concurrently on one event
@@ -297,7 +291,7 @@ class StatefulAgentLoop:
         event_bus: AgentEventBus | None = None,
         max_spawn_depth: int | None = None,
         session_cache_size: int = 256,
-        task_runtime: Any = None,
+        task_runtime: Any,
         timer_backend: Any = None,
         session_coordinator: Any = None,
     ) -> None:
@@ -321,7 +315,7 @@ class StatefulAgentLoop:
         # store is opened LAZILY on first async use via :meth:`_ensure_store`. A passed store is
         # already open.
         self.store: SessionStore | None = store
-        if task_runtime is not None and (store is None or task_runtime.manager.store is not store):
+        if store is None or task_runtime.manager.store is not store:
             raise ValueError("task_runtime requires its pre-opened authoritative store")
         from power_loop.runtime.timer_backend import TimerBackend
         if timer_backend is not None and not isinstance(timer_backend, TimerBackend):
@@ -347,7 +341,7 @@ class StatefulAgentLoop:
         # from inside a running loop (keeps the task from being GC'd before it runs).
         self._orphaned_close_task: asyncio.Future[None] | None = None
         self.config = config if config is not None else AgentLoopConfig()
-        if task_runtime is not None and self.config.delegation_policy != "single_level":
+        if self.config.delegation_policy != "single_level":
             raise ValueError("task_runtime requires single_level delegation")
         self.tool_registry = tool_registry
         # Own a FRESH AgentHooks when the caller supplies none — NOT the shared
@@ -737,149 +731,8 @@ class StatefulAgentLoop:
                 self._cache_put(session_id, state.next_seq, rows, state.last_compact_seq)
         return True
 
-    async def send(
-        self,
-        user_input: str | LoopMessage,
-        session_id: str,
-        *,
-        stop_event: CancellationLike = None,
-        tools: Sequence[str] | ToolRegistry | None = None,
-        system_prompt: str | None = None,
-        max_rounds: int | None = None,
-        response_format: dict[str, Any] | None = None,
-        history: bool = True,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> StatefulResult:
-        """Append one user input to the session and run the loop.
 
-        ``session_id`` must refer to an existing session created by
-        :meth:`new_session` (or by lower-level ``SessionStore`` APIs).
 
-        Per-call overrides (do not mutate loop/session state):
-
-        - ``tools``: restrict this run to a subset of the loop's tools. Pass a
-          sequence of tool names (allowlisted from the loop registry) or a
-          ``ToolRegistry`` to use directly. The model only *sees* these tools.
-        - ``system_prompt``: override the system prompt for this run only
-          (precedence: this arg > session system_prompt > config).
-        - ``response_format``: OpenAI-compatible structured-output spec for this
-          run only (e.g. ``{"type": "json_object"}`` or a ``json_schema`` dict
-          from :meth:`StructuredOutputSpec.to_openai_response_format`). Needed
-          because a loop is often **shared across callers** — a host that wants
-          JSON from one send must not flip the whole loop into JSON mode for
-          every other session using it. ``None`` = whatever the config says.
-        - ``history=False``: this run sees only its own input — earlier sends, compact rows and
-          projections are neither read nor written for this send (its raw rows are still stored).
-          For hosts that reuse one session for many independent one-shot runs.
-        - ``metadata``: JSON-serialisable tag stored with this send's user row
-          (``meta["send"]``), e.g. which host-side agent or call the send belongs to.
-
-        Unresolved calls from an interrupted run are automatically closed with
-        an unknown-result marker before accepting the new user input.
-        """
-        sid = session_id
-        self._raise_if_closing()
-        await self._ensure_store()
-        async with self._session_guard(sid), self._session_lease(sid):
-            await self._ensure_session_or_raise(sid)
-            await self._interrupt_pending(sid)
-            send_index = await self._persist_user_input(sid, user_input, send_meta=metadata)
-            return await self._run_loop(
-                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                max_rounds=max_rounds, response_format=response_format,
-                with_history=history, _entry_send_index=send_index,
-            )
-
-    async def deliver(
-        self,
-        items: InboxItem | Sequence[InboxItem],
-        session_id: str,
-        *,
-        stop_event: CancellationLike = None,
-        tools: Sequence[str] | ToolRegistry | None = None,
-        system_prompt: str | None = None,
-        max_rounds: int | None = None,
-        enqueue_only: bool = False,
-    ) -> StatefulResult | FollowUpQueued:
-        """Put ``items`` in front of the session's model — now, or as soon as it can take them.
-
-        Every item first lands in the session's durable inbox (design/124 §6); an ``item_id``
-        seen before is dropped (at most once per session, ever). Then:
-
-        * a run is in flight on this session (this process holds its lock) → the items wait in
-          the inbox; that run claims them at its next round boundary. Returns
-          :class:`FollowUpQueued`.
-        * another owner holds the session → raises :class:`SessionBusy` before accepting input.
-        * idle → a fresh send runs with the waiting items as its input (everything pending —
-          including items a cancelled run left behind — oldest first). Returns its result.
-        * ``enqueue_only=True`` → persist and return without starting an idle send;
-          the orchestration owner must drain it, including the terminal window.
-        * nothing new (all duplicates) → :class:`FollowUpQueued` with ``accepted=0``.
-
-        ``stop_event`` / ``tools`` / ``system_prompt`` / ``max_rounds`` apply only to a run this
-        call starts (the idle case); a run in flight keeps its own.
-        """
-        sid = session_id
-        batch = [items] if isinstance(items, InboxItem) else list(items)
-        self._raise_if_closing()
-        store = await self._ensure_store()
-        async with self._session_lease(sid):
-            await self._ensure_session_or_raise(sid)
-            rows = [inbox_row(it) for it in batch]
-            accepted = await store.inbox_put(sid, rows)
-            entry = _session_sync(sid, owner=self)
-            self._sync_sids.add(sid)
-            entry.pending_hint += len(accepted)
-            accepted_set = set(accepted)
-            if any(r["mode"] == "steer" and r["item_id"] in accepted_set for r in rows):
-                entry.steer.set()
-
-            async def _queued() -> FollowUpQueued:
-                counts = await store.inbox_counts(sid)
-                self._release_idle_sync(sid)
-                return FollowUpQueued(
-                    session_id=sid, queue_depth=counts["pending"], accepted=len(accepted),
-                    duplicates=len(rows) - len(accepted), accepted_ids=tuple(accepted),
-                )
-
-            if enqueue_only or not accepted or self._session_busy(sid):
-                return await _queued()
-            result = await self._send_from_inbox(
-                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                max_rounds=max_rounds,
-            )
-            return result if result is not None else await _queued()
-
-    async def follow_up(
-        self,
-        user_input: str | LoopMessage,
-        session_id: str,
-        *,
-        stop_event: CancellationLike = None,
-        tools: Sequence[str] | ToolRegistry | None = None,
-        system_prompt: str | None = None,
-        max_rounds: int | None = None,
-        enqueue_only: bool = False,
-        kind: str = INBOX_KIND_USER,
-        mode: str = "queue",
-        item_id: str | None = None,
-    ) -> StatefulResult | FollowUpQueued:
-        """Steer an in-flight loop, or run it now if the session is idle.
-
-        One-item :meth:`deliver`: while a run holds the session the input waits in the inbox and
-        is claimed at that run's next **round** boundary (as a ``<follow_up>`` user message);
-        on an idle session it runs as a send. ``kind`` / ``mode`` / ``item_id`` — see
-        :class:`InboxItem`.
-
-        ``max_rounds`` (per-call, idle path only): run this continuation with a different round
-        budget than ``config.max_rounds`` — e.g. a short bounded "finalize" turn. Ignored on the
-        STEERED path (an in-flight loop's own budget governs the drained follow-up).
-        """
-        return await self.deliver(
-            InboxItem(content=user_input, kind=kind, mode=mode, item_id=item_id),
-            session_id, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-            max_rounds=max_rounds, enqueue_only=enqueue_only,
-        )
 
     def _note_committed_inbox(self, session_id: str) -> None:
         """Idempotent wake hint after an external atomic inbox commit; no dispatch."""
@@ -917,88 +770,7 @@ class StatefulAgentLoop:
         process accepted is undelivered). Interrupt points and waiting tools await it."""
         return _session_sync(session_id).steer
 
-    async def flush_follow_ups(
-        self,
-        session_id: str,
-        *,
-        stop_event: CancellationLike = None,
-        tools: Sequence[str] | ToolRegistry | None = None,
-        system_prompt: str | None = None,
-        max_rounds: int | None = None,
-    ) -> StatefulResult | None:
-        """Run inbox items left waiting on an IDLE session.
 
-        Returns ``None`` when there is nothing to do: the inbox is empty, or the session lock is
-        held (the running owner claims the inbox itself at its round boundaries). Otherwise runs
-        a send whose input is everything waiting and returns that run's result. Call in a loop
-        until it returns ``None`` to also cover items that arrived during the flush run's own
-        terminal window.
-        """
-        sid = session_id
-        self._raise_if_closing()
-        store = await self._ensure_store()
-        async with self._session_lease(sid):
-            await self._ensure_session_or_raise(sid)
-            # A host can commit input and its cursor proof atomically instead of
-            # calling deliver(). Read the durable pending state before returning
-            # to a busy owner, so committed steering still interrupts that owner.
-            pending = await store.inbox_counts(sid)
-            entry = _session_sync(sid, owner=self)
-            self._sync_sids.add(sid)
-            entry.pending_hint = max(entry.pending_hint, pending['pending'])
-            if pending['steer']:
-                entry.steer.set()
-            if self._session_busy(sid):
-                return None
-            return await self._send_from_inbox(
-                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                max_rounds=max_rounds,
-            )
-
-    async def _send_from_inbox(
-        self,
-        sid: str,
-        *,
-        stop_event: CancellationLike,
-        tools: Sequence[str] | ToolRegistry | None,
-        system_prompt: str | None,
-        max_rounds: int | None,
-    ) -> StatefulResult | None:
-        """A send whose input is the waiting inbox items; ``None`` if nothing is waiting.
-
-        Stale tool calls are interrupted before claiming inbox items.
-        The first message (the first run of same-kind items) becomes the send's
-        input and is marked delivered in the same transaction as its transcript row; the rest
-        go straight back to pending and are claimed by the pipeline's round-0 drain moments
-        later — still before the first model call."""
-        store = await self._ensure_store()
-        async with self._session_guard(sid), self._session_lease(sid):
-            await self._ensure_session_or_raise(sid)
-            await self._interrupt_pending(sid)
-            for _ in range(3):
-                claimed = await self._claim_inbox(sid)
-                if not claimed:
-                    return None
-                token = claimed[0]["claim_token"]
-                first = render_inbox_rows(claimed, wrap=False)[0]
-                stale = False
-                try:
-                    send_index = await self._persist_user_input(sid, first)
-                except InboxClaimChanged:
-                    stale = True
-                    continue
-                finally:
-                    released = await store.inbox_release(sid, token)
-                    _session_sync(sid).pending_hint += released
-                    if stale:
-                        # Another consumer may already have released/reclaimed the
-                        # batch, so our own release count alone can lose the wake hint.
-                        _session_sync(sid).pending_hint = (await store.inbox_counts(sid))["pending"]
-                return await self._run_loop(
-                    sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                    max_rounds=max_rounds, _entry_send_index=send_index,
-                )
-            return None
 
     def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
         """Drive ``coro`` to completion on the loop's dedicated sync event loop.
@@ -1023,148 +795,12 @@ class StatefulAgentLoop:
                 self._sync_runner = _SyncLoopRunner()
         return self._sync_runner.run(coro)
 
-    def follow_up_sync(
-        self,
-        user_input: str | LoopMessage,
-        session_id: str,
-        *,
-        stop_event: CancellationLike = None,
-        tools: Sequence[str] | ToolRegistry | None = None,
-        system_prompt: str | None = None,
-    ) -> StatefulResult | FollowUpQueued:
-        return self._run_sync(
-            self.follow_up(
-                user_input,
-                session_id,
-                stop_event=stop_event,
-                tools=tools,
-                system_prompt=system_prompt,
-            )
-        )
 
-    def new_session_sync(
-        self,
-        *,
-        metadata: dict[str, Any] | None = None,
-        system_prompt: str | None = None,
-    ) -> str:
-        """Synchronous :meth:`new_session`. Use this (not ``asyncio.run(loop.new_session())``)
-        to bootstrap a session for the sync API: it runs on the loop's dedicated sync event
-        loop, so an owned PG/MySQL pool opens on the SAME loop that ``send_sync`` later uses
-        (a throwaway ``asyncio.run`` would bind the pool to a loop that is then closed)."""
-        return self._run_sync(
-            self.new_session(metadata=metadata, system_prompt=system_prompt)
-        )
 
-    def send_sync(
-        self,
-        user_input: str | LoopMessage,
-        session_id: str,
-        *,
-        stop_event: CancellationLike = None,
-        tools: Sequence[str] | ToolRegistry | None = None,
-        system_prompt: str | None = None,
-    ) -> StatefulResult:
-        return self._run_sync(
-            self.send(
-                user_input,
-                session_id,
-                stop_event=stop_event,
-                tools=tools,
-                system_prompt=system_prompt,
-            )
-        )
 
-    async def resume(
-        self,
-        session_id: str,
-        *,
-        stop_event: CancellationLike = None,
-    ) -> StatefulResult:
-        """Continue the loop, resolving leftover calls before requesting the model.
 
-        Task-managed continuations mark stale calls interrupted/unknown instead
-        of replaying external work. Pending user questions still wait for answers.
-
-        No-op (but still valid) if the session has no pending state — equivalent
-        to "run one more round with no new user input".
-        """
-        await self._require_host_continuation(session_id)
-        store = await self._ensure_store()
-        async with self._session_guard(session_id), self._session_lease(session_id):
-            await self._ensure_session_or_raise(session_id)
-            waiting = await self._waiting_result_if_needed(session_id)
-            if waiting is not None:
-                return waiting
-            if self.task_runtime is not None:
-                await self._interrupt_pending(session_id)
-            sink = SQLiteSink(store, session_id)
-            await self._prime_sink_from_pending(session_id, sink)
-            async with self._runner.session_async(session_id=session_id):
-                loop_token = set_current_loop(self)
-                try:
-                    await self._execute_pending(session_id, sink)
-                finally:
-                    reset_current_loop(loop_token)
-            return await self._run_loop(session_id, stop_event=stop_event, sink=sink, _task_continuation=True)
-
-    async def submit_input(
-        self,
-        session_id: str,
-        interaction_id: str,
-        value: Any,
-        *,
-        stop_event: CancellationLike = None,
-    ) -> StatefulResult:
-        """Resolve a paused ``request_user_input`` interaction and continue.
-
-        ``request_user_input`` is persisted as pending session state instead of
-        awaiting in-process. The product layer can show the prompt/options to a
-        user, wait minutes or days, restart processes, then call this method
-        with the collected answer.
-        """
-        await self._require_host_continuation(session_id)
-        store = await self._ensure_store()
-        async with self._session_guard(session_id), self._session_lease(session_id):
-            await self._ensure_session_or_raise(session_id)
-            state = await store.get_state(session_id)
-            pending = state.pending if state is not None else None
-            interactions = list((pending or {}).get("pending_interactions") or [])
-            interaction = next(
-                (item for item in interactions if str(item.get("interaction_id")) == str(interaction_id)),
-                None,
-            )
-            if interaction is None:
-                raise ValueError(f"pending interaction not found: {interaction_id}")
-
-            sink = SQLiteSink(store, session_id)
-            await self._prime_sink_from_pending(session_id, sink)
-            round_index = int((pending or {}).get("round_index") or 0)
-            # Stamp the in-flight send's index so projection mode keeps this answer in the
-            # active send's current_rows (else it lands in the NULL-send_index legacy prefix,
-            # renders before its own tool_call, and is dropped as an orphan). See H1.
-            send_index = await self._current_send_index(store, session_id)
-            await sink.on_message_appended(
-                {
-                    "role": "tool",
-                    "tool_call_id": str(interaction["tool_call_id"]),
-                    "name": str(interaction.get("tool_name") or "request_user_input"),
-                    "content": _as_tool_result_text(value),
-                    "send_index": send_index,
-                },
-                round_index=round_index,
-            )
-            await self._remove_pending_interaction(session_id, str(interaction_id))
-
-            waiting = await self._waiting_result_if_needed(session_id)
-            if waiting is not None:
-                return waiting
-
-            return await self._run_loop(session_id, stop_event=stop_event, sink=sink, _task_continuation=True)
 
     async def _require_host_continuation(self, sid: str) -> None:
-        if self.task_runtime is None:
-            return
         from power_loop.runtime.execution_roles import session_role
         from power_loop.runtime.jobs import JobError
         from power_loop.runtime.task_runtime import _OWNER, _SEND
@@ -1561,12 +1197,7 @@ class StatefulAgentLoop:
     async def _drain_follow_up_messages(self, sid: str) -> list[LoopMessage]:
         """Round-boundary drain: claim the inbox and render it as ``<follow_up>`` messages (one
         per run of same-kind items), each marked for same-transaction delivery."""
-        try:
-            rows = await self._claim_inbox(sid)
-        except Exception:  # never let a store blip abort a live round — the items stay pending
-            logger.warning("inbox claim failed for %s; will retry next round", sid, exc_info=True)
-            return []
-        return render_inbox_rows(rows, wrap=True) if rows else []
+        return await self._runtime_worker.drain_append(self._runtime_worker_context)
 
     async def _ensure_session_or_raise(self, sid: str) -> None:
         store = await self._ensure_store()
@@ -1746,35 +1377,31 @@ class StatefulAgentLoop:
             return await self._run_loop_owned(sid, _entry_send_index=_entry_send_index, **kwargs)
 
     async def _run_loop_owned(self, sid: str, *, _entry_send_index,
-                              _task_continuation=False, **kwargs: Any) -> StatefulResult:
-        if self.task_runtime is not None:
-            store = await self._ensure_store()
-            # This send can run on a task also hosting its logical node and
-            # workflow. Its lease heartbeat must stop the send's operation,
-            # not cancel the shared task and bypass its parent's bookkeeping.
-            stop = CancellationToken.from_any(kwargs.get("stop_event")).child()
-            kwargs["stop_event"] = stop
-            send_index = (_entry_send_index if _entry_send_index is not _ENTRY_INDEX_UNSET
-                          else await self._current_send_index(store, sid))
-            if _task_continuation and send_index is None:
-                # A host may resume a newly created session before its first send.
-                send_index = await store.mutate_runtime_state(sid, "send_index", lambda v: int(v or 0) + 1, default=0)
-            async with self.task_runtime.model_send(self, sid, send_index, cancel_token=stop,
-                                                    _continuation_key=uuid.uuid4().hex if _task_continuation else None,
-                                                    round_limit=kwargs.get('max_rounds')) as evidence:
-                result = await self._run_with_tool_context(sid, **kwargs)
-                evidence.update(exit=result.status, usage=dict(result.usage or {}), rounds=result.rounds,
-                                new_input_after_pass=bool(result.new_input_after_pass))
-                from power_loop.runtime.jobs import JobError
-                from power_loop.runtime.send_receipt import KEY, capture
-                try:
-                    evidence[KEY] = capture(result)
-                except JobError as exc:
-                    # Evidence limits cannot turn an already completed model
-                    # call into a retry. Such exits remain explicitly unreadable.
-                    evidence["stateful_result_error"] = exc.code
-                return result
-        return await self._run_with_tool_context(sid, **kwargs)
+                              _runtime_start, **kwargs: Any) -> StatefulResult:
+        store = await self._ensure_store()
+        # This send can run on a task also hosting its logical node and
+        # workflow. Its lease heartbeat must stop the send's operation,
+        # not cancel the shared task and bypass its parent's bookkeeping.
+        stop = CancellationToken.from_any(kwargs.get("stop_event")).child()
+        kwargs["stop_event"] = stop
+        send_index = (_entry_send_index if _entry_send_index is not _ENTRY_INDEX_UNSET
+                      else await self._current_send_index(store, sid))
+        async with self.task_runtime.model_send(self, sid, send_index, cancel_token=stop,
+                                                round_limit=kwargs.get('max_rounds'), input_start=_runtime_start) as evidence:
+            result = await self._run_with_tool_context(sid, **kwargs)
+            _runtime_start.completed(result)
+            evidence.update(exit=result.status, usage=dict(result.usage or {}), rounds=result.rounds,
+                            new_input_after_pass=bool(result.new_input_after_pass))
+            from power_loop.runtime.jobs import JobError
+            from power_loop.runtime.send_receipt import KEY, capture
+            try:
+                evidence[KEY] = capture(result)
+            except JobError as exc:
+                # Evidence limits cannot turn an already completed model
+                # call into a retry. Such exits remain explicitly unreadable.
+                evidence["stateful_result_error"] = exc.code
+            return result
+
 
     async def _run_with_tool_context(self, sid: str, **kwargs: Any) -> StatefulResult:
         from power_loop.runtime.tool_context import ToolContextEngine, active_engine
@@ -2140,8 +1767,6 @@ class StatefulAgentLoop:
             try:
                 async def _drain_follow_ups(*, force=False) -> list[LoopMessage]:
                     await changes.refresh(force=force)
-                    if not changes.inbox_due(time.time_ns() // 1_000_000):
-                        return []
                     return await self._drain_follow_up_messages(sid)
 
                 pipeline = AgentPipeline(
@@ -2402,17 +2027,12 @@ class StatefulAgentLoop:
             return None, ()
 
     def _fold_calls(self, sid: str, stop_event: CancellationLike) -> Any:
-        """A task-managed send books its fold calls itself; a plain loop calls the model directly."""
-        if self.task_runtime is None:
-            return None
+        """Fold model calls use the same task accounting as ordinary rounds."""
         from power_loop.runtime.fold_calls import FoldCalls
         return FoldCalls(session_id=sid, bus=self._runner.event_bus, cancel_token=stop_event)
 
     def _fold_context(self, sid: str, projector: Representation, calls: Any) -> Any:
         from power_loop.runtime.fold import FoldContext
-        if calls is None:
-            return FoldContext(session_id=sid, round_index=0, representation=projector,
-                               llm=self.llm, max_tokens=self.config.max_tokens)
         summary = getattr(self.config.fold_strategy, "summary_llm", None) or self.llm
         return FoldContext(session_id=sid, round_index=0, representation=projector,
                            llm=calls.wrap(self.llm), summary_llm=calls.wrap(summary),
@@ -2526,6 +2146,48 @@ def _as_tool_result_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False)
+
+
+class StatefulAgentLoop:
+    """A client facade. Execution and resource lifetime belong to RuntimeWorker.
+
+    Construct a Runtime with a registered factory, start its worker, and pass
+    that runtime here. Every operation keeps the caller's stable request ID and
+    authenticated identity. Closing this facade only closes its own client.
+    """
+
+    def __init__(self, *, runtime):
+        from .runtime_client import RuntimeClient
+        self.runtime = runtime
+        self.store = runtime.store
+        self.client = RuntimeClient(store=runtime.store, transport=runtime.transport, namespace=runtime.namespace)
+
+    async def new_session(self, descriptor, *, actor):
+        return await self.runtime.open_session(descriptor, actor=actor)
+
+    async def send(self, target, body, *, message_id, actor, deadline_ms, options=None, descriptor=None):
+        receipt = await self.client.send(target, body, message_id=message_id, actor=actor,
+                                         options=options, descriptor=descriptor, deadline_ms=deadline_ms)
+        return await self.client.wait(receipt.input_ref, actor=actor, deadline_ms=deadline_ms)
+
+    async def follow_up(self, target, body, *, message_id, actor, deadline_ms=None):
+        return await self.client.append(target, body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
+
+    async def submit_input(self, ref, *, interaction_id, wait_round, value, message_id, actor):
+        return await self.client.answer(ref, interaction_id=interaction_id, wait_round=wait_round,
+                                        value=value, message_id=message_id, actor=actor)
+
+    async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None):
+        return await self.client.resume(ref, message_id=message_id, actor=actor, body=body, deadline_ms=deadline_ms)
+
+    async def aclose(self):
+        await self.client.aclose()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.aclose()
 
 
 __all__ = ["StatefulAgentLoop", "StatefulResult", "MessageState", "FollowUpQueued"]

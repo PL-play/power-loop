@@ -1,4 +1,4 @@
-"""SchemaPolicy provisioning, StoreSchemaError(.ddl), the create_schema deprecated alias,
+"""SchemaPolicy provisioning, StoreSchemaError(.ddl), current schemas,
 the next_seq monotonicity invariant the window cache relies on, and the delta load."""
 
 from __future__ import annotations
@@ -55,17 +55,6 @@ async def test_auto_create_is_idempotent(tmp_path):
         await s.close()
 
 
-async def test_create_schema_bool_alias_maps_to_policy(tmp_path):
-    db = str(tmp_path / "alias.db")
-    s = await SessionStore.open(db, create_schema=True)  # → AUTO_CREATE
-    await s.close()
-    s2 = await SessionStore.open(db, create_schema=False)  # → VERIFY (schema exists)
-    assert s2.schema_version == CURRENT_SCHEMA_VERSION
-    await s2.close()
-    # explicit policy wins over the bool alias
-    db2 = str(tmp_path / "wins.db")
-    with pytest.raises(StoreSchemaError):
-        await SessionStore.open(db2, schema=SchemaPolicy.VERIFY, create_schema=True)
 
 
 async def test_auto_create_ddl_failure_raises_storeschemaerror_with_ddl(monkeypatch):

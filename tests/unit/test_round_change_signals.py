@@ -16,8 +16,6 @@ from power_loop.runtime.pricing import Free
 from power_loop.runtime.runtime_state import BackgroundRuntimeProjector
 from power_loop.runtime.store import store as store_module
 from power_loop.runtime.store.change_signals import COLUMNS
-from power_loop.runtime.store.schema import StoreSchemaError
-from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, TASK_SCHEMA_VERSION, migrate_task_schema
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
@@ -253,28 +251,3 @@ async def test_concurrent_writers_advance_counter_without_losing_input(registry_
         for number in range(8))), 10)
     assert await versions(store, sid) == (8, 0, 0)
     assert {row["item_id"] for row in await store.inbox_items(sid)} == {str(number) for number in range(8)}
-
-
-@pytest.mark.parametrize("partial", [False, True])
-async def test_explicit_counter_migration_resumes_partial_ddl_and_preserves_work(registry_store, partial):
-    store, connect = registry_store
-    sid = await store.create_session()
-    for kind in ("inbox", "background", "runtime"):
-        await write(store, sid, kind)
-    for column in COLUMNS:
-        if not partial or column == "runtime_version":
-            await store._db.execute(f"ALTER TABLE {store.t.session_state} DROP COLUMN {column}")
-        else:
-            await store._db.execute(f"UPDATE {store.t.session_state} SET {column}=0")
-    await store._db.execute(f"UPDATE {store.table_prefix}schema_migrations SET version=10 WHERE id=1")
-    await store._db.execute(f"UPDATE {store.table_prefix}task_store SET protocol_version=21 WHERE id=1")
-    with pytest.raises(StoreSchemaError, match="maintenance migration"):
-        await connect(schema="compatible")
-    await migrate_task_schema(store._db, store.table_prefix, maintenance=True)
-    cold = await connect(schema="compatible")
-    assert cold.schema_version == TASK_SCHEMA_VERSION
-    assert await versions(cold, sid) == (1, 1, 1)
-    for kind in ("inbox", "background", "runtime"):
-        assert await payload(cold, sid, kind)
-    [identity] = await cold._db.fetchall(f"SELECT protocol_version FROM {cold.table_prefix}task_store WHERE id=1")
-    assert identity["protocol_version"] == TASK_PROTOCOL_VERSION

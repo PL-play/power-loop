@@ -7,8 +7,6 @@ from contextlib import asynccontextmanager
 import pytest
 
 from power_loop.agent.sink import SQLiteSink
-from power_loop.runtime.store.schema import StoreSchemaError
-from power_loop.runtime.store.task_schema import migrate_task_schema
 
 from .test_job_registry_192 import registry_store
 from .test_send_sql_profile import Profiled
@@ -104,47 +102,3 @@ async def test_export_import_keeps_response_and_empty_round_usage(registry_store
     assert [(row['send_index'], row['round_index'], row['total_tokens']) for row in details] == [(7, 0, 12), (7, 1, 12)]
     [message] = await store.load_all_messages(restored)
     assert message.content == 'original' and '_round_usage' not in message.meta
-
-
-async def test_offline_upgrade_renames_usage_originals_and_keeps_existing_readers(registry_store, monkeypatch):
-    store, connect = registry_store
-    sid = await store.create_session()
-    seq = await store.append_message(sid, role='assistant', content='original', send_index=1, round_index=0)
-    ref = await store.message_ref(sid, seq)
-    await store.record_usage(sid, send_index=1, round_index=0, **USAGE)
-    # Deployed physical usage shape and stamps;no old runtime or worktree.
-    await store._db.execute(f'DROP VIEW {store.t.usage_rounds}')
-    await store._db.execute(f'ALTER TABLE {store.t.usage_observations} RENAME TO {store.t.usage_rounds}')
-    await store._db.execute(f'UPDATE {store.table_prefix}schema_migrations SET version=10 WHERE id=1')
-    await store._db.execute(f'UPDATE {store.table_prefix}task_store SET protocol_version=21 WHERE id=1')
-    with pytest.raises(StoreSchemaError, match='explicit maintenance'):
-        await connect()
-    with pytest.raises(StoreSchemaError, match='maintenance_required'):
-        await migrate_task_schema(store._db, store.table_prefix)
-    transaction, hits = store._db.transaction, []
-
-    @asynccontextmanager
-    async def interrupted():
-        async with transaction() as tx:
-            execute = tx.execute
-            async def after_rename(sql, params=()):
-                result = await execute(sql, params)
-                if sql == f'ALTER TABLE {store.t.usage_rounds} RENAME TO {store.t.usage_observations}':
-                    hits.append('rename')
-                    raise OSError('offline importer failed after rename')
-                return result
-            tx.execute = after_rename
-            yield tx
-
-    with monkeypatch.context() as patch:
-        patch.setattr(store._db, 'transaction', interrupted)
-        with pytest.raises(OSError, match='failed after rename'):
-            await migrate_task_schema(store._db, store.table_prefix, maintenance=True)
-    assert hits == ['rename']
-    for _ in range(2):
-        await migrate_task_schema(store._db, store.table_prefix, maintenance=True)
-        cold = await connect()
-        assert cold.store_id == store.store_id and await cold.message_ref(sid, seq) == ref
-        [detail] = await cold._db.fetchall(f'SELECT * FROM {cold.t.usage_rounds} WHERE session_id=?', (sid,))
-        assert {key:detail[key] for key in USAGE} == USAGE
-        assert (detail['send_index'], detail['round_index']) == (1, 0)

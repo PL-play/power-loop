@@ -2073,6 +2073,9 @@ async def run_background(
     task_ids: list[str] | None = None, timeout_s: float | None = None,
 ) -> str:
     """Execute one action of the merged ``background_run`` tool."""
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "background tasks is not enabled")
     operation = str(action or "").strip().lower()
     if operation == "run":
         from power_loop.runtime.tool_context import active_engine

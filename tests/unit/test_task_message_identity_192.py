@@ -9,7 +9,6 @@ import pytest
 from power_loop import SessionStore
 from power_loop.runtime.message_ref import integer_id
 from power_loop.runtime.store.schema import CURRENT_SCHEMA_VERSION, SchemaPolicy, StoreSchemaError
-from power_loop.runtime.store.task_schema import migrate_task_schema
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -149,43 +148,3 @@ async def test_legacy_zero_send_provenance_is_preserved_without_inventing_a_new_
     await task_store.append_message(sid, role="user", content="legacy import", send_index=0, round_index=0)
     ref = await task_store.message_ref(sid, 1)
     assert ref.to_dict()["send_index"] == "0" and ref.round_index == 0
-
-
-async def test_incomplete_schema_and_custom_migration_fail_without_destroying_history(tmp_path):
-    path = str(tmp_path / "custom.db")
-    s = await SessionStore.open(path)
-    sid = await s.create_session()
-    await s.append_message(sid, role="user", content="preserve")
-    await s._db.execute("CREATE INDEX custom_message_index ON pl_messages(role)")
-    with pytest.raises(StoreSchemaError, match="unsupported_migration_source"):
-        await migrate_task_schema(s._db, s.table_prefix, maintenance=True)
-    assert (await s.load_all_messages(sid))[0].content == "preserve"
-    assert (await s._db.fetchone("SELECT version FROM pl_schema_migrations"))["version"] == CURRENT_SCHEMA_VERSION
-    await s.close()
-    s = await SessionStore.open(str(tmp_path / "incomplete.db"), schema="tasks")
-    await s._db.execute("DROP TABLE pl_jobs")
-    await s.close()
-    with pytest.raises(StoreSchemaError, match="incomplete"):
-        await SessionStore.open(str(tmp_path / "incomplete.db"), schema="compatible")
-
-
-@pytest.mark.parametrize("case", ["foreign-key", "stale-table", "unexpected-id"])
-async def test_migration_refuses_unreviewed_dependencies_or_partial_schema(tmp_path, case):
-    s = await SessionStore.open(str(tmp_path / "unsafe.db"))
-    sid = await s.create_session()
-    await s.append_message(sid, role="user", content="must survive")
-    if case == "foreign-key":
-        await s._db.execute("CREATE TABLE dependent (sid TEXT, seq INTEGER, "
-                            "FOREIGN KEY(sid,seq) REFERENCES pl_messages(session_id,seq))")
-        await s._db.execute("INSERT INTO dependent VALUES (?,1)", (sid,))
-    elif case == "stale-table":
-        await s._db.execute("CREATE TABLE pl_messages_v10 (unexpected TEXT)")
-    else:
-        await s._db.execute("ALTER TABLE pl_messages ADD COLUMN id INTEGER")
-    try:
-        with pytest.raises(StoreSchemaError, match="unsupported_migration_source"):
-            await migrate_task_schema(s._db, s.table_prefix, maintenance=True)
-        assert (await s.load_all_messages(sid))[0].content == "must survive"
-        assert (await s._db.fetchone("SELECT version FROM pl_schema_migrations"))["version"] == CURRENT_SCHEMA_VERSION
-    finally:
-        await s.close()

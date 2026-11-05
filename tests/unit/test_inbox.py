@@ -16,13 +16,15 @@ from typing import Any
 
 import pytest
 
-from power_loop import AgentLoopConfig, FollowUpQueued, SessionStore, StatefulAgentLoop
+from power_loop import SessionStore
 from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService
-from power_loop.agent.follow_up import FOLLOW_UP_MESSAGE_NAME, InboxItem
+from power_loop.agent.follow_up import FOLLOW_UP_MESSAGE_NAME
+from power_loop.agent.runtime_store import now_ms
+from power_loop.agent.runtime_types import RuntimeRequestError
 from power_loop.contracts.tools import ToolDefinition
-from power_loop.runtime.cancellation import CancellationToken
 from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
 
 class _Gate(LLMService):
@@ -66,14 +68,6 @@ def _registry() -> ToolRegistry:
     return reg
 
 
-def _loop(store: SessionStore, llm: LLMService, **cfg: Any) -> StatefulAgentLoop:
-    return StatefulAgentLoop(
-        llm=llm, store=store, tool_registry=_registry(),
-        config=AgentLoopConfig(system_prompt="S", max_rounds=cfg.pop("max_rounds", 4),
-                               compactor=None, **cfg),
-    )
-
-
 async def _wait_calls(llm: _Gate, n: int) -> None:
     for _ in range(400):
         if len(llm.calls) >= n:
@@ -93,239 +87,84 @@ async def store() -> AsyncIterator[SessionStore]:
     await s.close()
 
 
-# ── Z4: cancel neither loses nor duplicates ──────────────────────────────────────────────
+pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.asyncio
-async def test_cancel_then_redeliver_puts_each_message_in_history_once(store: SessionStore) -> None:
-    """The incident reproduced in design/124 phase 0: a follow-up waiting when the run was
-    cancelled, plus the host re-sending the same batch, used to put the same user message in the
-    transcript twice (and the stale copy last, as if just said). With item ids the re-send is a
-    no-op and the waiting item is delivered once, by the next send."""
-    llm = _Gate([_tool_call("c1"), LLMResponse(raw_text="ok")])
-    gate = llm.gate(0)
-    loop = _loop(store, llm)
-    sid = await loop.new_session()
-    tok = CancellationToken()
+@pytest.fixture
+async def make_agent(store):
+    agents = []
+    async def make(model):
+        agent = await RunningAgent(store, model, _registry()).start()
+        agents.append(agent)
+        return agent
+    yield make
+    for agent in agents:
+        await agent.aclose()
 
-    run = asyncio.create_task(loop.deliver(
-        InboxItem("帮我做调研", item_id="m1"), sid, stop_event=tok))
-    await _wait_calls(llm, 1)
-    queued = await loop.deliver(InboxItem("顺便查一下天气", item_id="m2"), sid)
-    assert isinstance(queued, FollowUpQueued) and queued.accepted == 1
-    tok.cancel("user stop")
+
+async def test_duplicate_delivery_returns_original_result_without_new_model_call(store, make_agent):
+    model = _Gate([LLMResponse(raw_text='first')])
+    agent = await make_agent(model)
+    original = await agent.send('hello', message_id='one')
+    duplicate = await agent.runtime.client.send(agent.target, 'hello', message_id='one', actor=agent.actor,
+        deadline_ms=(await agent.runtime.worker.inputs.input(store._db,
+            original.input_ref)).row['expires_at'])
+    assert not duplicate.newly_accepted and duplicate.state == 'delivered'
+    result = await agent.runtime.client.wait(duplicate.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
+    assert result == original and len(model.calls) == 1
+    with pytest.raises(RuntimeRequestError, match='duplicate_input_conflict'):
+        await agent.runtime.client.send(agent.target, 'changed', message_id='one', actor=agent.actor)
+
+
+async def test_inflight_append_preserves_image_and_hides_delivery_markers(store, make_agent):
+    model = _Gate([_tool_call('c1'), LLMResponse(raw_text='done')])
+    gate = model.gate(0)
+    agent = await make_agent(model)
+    run = asyncio.create_task(agent.send('start'))
+    await _wait_calls(model, 1)
+    image = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AAAA'}}
+    receipt = await agent.loop.follow_up(agent.target,
+        {'role': 'user', 'content': [{'type': 'text', 'text': 'look'}, image]},
+        message_id='append', actor=agent.actor)
+    # Notification handler runs separately from the gated model.
+    for _ in range(100):
+        if agent.runtime.worker._active[agent.target.session_id].append_refs:
+            break
+        await asyncio.sleep(.001)
     gate.set()
-    res = await run
-    assert res.status == "cancelled"
-    await loop.abort_pending(sid, reason="cancelled by user")
-
-    # waiting item survived the cancel
-    assert (await loop.inbox_pending(sid))["pending"] == 1
-
-    # host re-sends the whole batch + one new message
-    res2 = await loop.deliver([InboxItem("帮我做调研", item_id="m1"),
-                               InboxItem("顺便查一下天气", item_id="m2"),
-                               InboxItem("新的一句", item_id="m3")], sid)
-    assert res2.status == "completed"
-    texts = "\n".join(_user_texts(await store.load_active_messages(sid)))
-    assert texts.count("帮我做调研") == 1
-    assert texts.count("顺便查一下天气") == 1
-    assert texts.count("新的一句") == 1
-    assert (await loop.inbox_pending(sid))["pending"] == 0
+    result = await run
+    joined = await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
+    assert joined.job_ref == result.job_ref
+    assert any(image in m.get('content', []) for m in model.calls[1] if isinstance(m.get('content'), list))
+    assert not any('_inbox' in m or 'inbox' in m for call in model.calls for m in call)
+    rows = await store.load_active_messages(agent.target.session_id)
+    assert sum(r.name == FOLLOW_UP_MESSAGE_NAME for r in rows) == 1
+    assert not any(r['status'] == 'claimed' for r in await store.inbox_items(agent.target.session_id))
 
 
-@pytest.mark.asyncio
-async def test_duplicate_only_delivery_starts_no_run(store: SessionStore) -> None:
-    llm = _Gate([LLMResponse(raw_text="first")])
-    loop = _loop(store, llm)
-    sid = await loop.new_session()
-    await loop.deliver(InboxItem("hello", item_id="m1"), sid)
-    n = len(llm.calls)
-    again = await loop.deliver(InboxItem("hello", item_id="m1"), sid)
-    assert isinstance(again, FollowUpQueued)
-    assert again.accepted == 0 and again.duplicates == 1
-    assert len(llm.calls) == n, "a duplicate must not wake the model"
+async def test_idle_append_starts_one_turn_and_retry_does_not_repeat(store, make_agent):
+    model = _Gate([LLMResponse(raw_text='done')])
+    agent = await make_agent(model)
+    first = await agent.loop.follow_up(agent.target, 'idle append', message_id='a', actor=agent.actor)
+    result = await agent.runtime.client.wait(first.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
+    await agent.drain()
+    second = await agent.loop.follow_up(agent.target, 'idle append', message_id='a', actor=agent.actor)
+    assert not second.newly_accepted and second.job_ref == result.job_ref
+    assert len(model.calls) == 1
 
 
-# ── Z2: stored kinds remain separate ─────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_inflight_kinds_become_separate_messages(store: SessionStore) -> None:
-    llm = _Gate([_tool_call("c1"), LLMResponse(raw_text="ok")])
-    gate = llm.gate(0)
-    loop = _loop(store, llm)
-    sid = await loop.new_session()
-    run = asyncio.create_task(loop.send("start", sid))
-    await _wait_calls(llm, 1)
-    await loop.deliver([InboxItem("用户：换个方向", item_id="u1"),
-                        InboxItem("用户：再加一点", item_id="u2"),
-                        InboxItem("[后台任务 t1 已完成]", kind="task_done", item_id="t1")], sid)
+async def test_steer_text_is_persisted_once_and_bound_to_original_job(store, make_agent):
+    model = _Gate([_tool_call('c1'), LLMResponse(raw_text='done')])
+    gate = model.gate(0)
+    agent = await make_agent(model)
+    run = asyncio.create_task(agent.send('start'))
+    await _wait_calls(model, 1)
+    ctx = agent.runtime.worker._active[agent.target.session_id]
+    receipt = await agent.runtime.client.steer(ctx.job_ref, 'new direction', message_id='steer', actor=agent.actor)
+    await asyncio.wait_for(ctx.loop.steer_event(ctx.session_id).wait(), 2)
     gate.set()
-    await run
-
-    second = llm.calls[1]
-    follow = [m for m in second if m.get("name") == FOLLOW_UP_MESSAGE_NAME]
-    assert len(follow) == 1, "adjacent user roles merge only in the model request"
-    assert "换个方向" in follow[0]["content"] and "再加一点" in follow[0]["content"]
-    assert "后台任务" in follow[0]["content"]
-    assert follow[0]["content"].count("<follow_up>") == 2
-
-    rows = [r for r in await store.load_active_messages(sid) if r.name == FOLLOW_UP_MESSAGE_NAME]
-    assert [r.meta.get("inbox", {}).get("kinds") for r in rows] == [["user"], ["task_done"]]
-    assert rows[0].meta["inbox"]["item_ids"] == ["u1", "u2"]
-
-
-@pytest.mark.asyncio
-async def test_idle_multi_kind_first_group_is_the_input_rest_before_first_call(
-    store: SessionStore,
-) -> None:
-    llm = _Gate([LLMResponse(raw_text="ok")])
-    loop = _loop(store, llm)
-    sid = await loop.new_session()
-    s = await loop.ensure_store()
-    # left waiting by earlier runs (e.g. a wake-up that arrived while the session was busy)
-    await s.inbox_put(sid, [{"item_id": "t1", "kind": "task_done", "content": "任务完成"}])
-    await loop.deliver(InboxItem("用户的新问题", item_id="u1"), sid)
-
-    first_call = llm.calls[0]
-    user_msgs = [m for m in first_call if m.get("role") == "user"]
-    assert len(user_msgs) == 1
-    assert user_msgs[0]["content"].startswith("任务完成")
-    assert "用户的新问题" in user_msgs[0]["content"]
-    assert "<follow_up>" in user_msgs[0]["content"]
-    assert len(llm.calls) == 1, "both reached the model in the SAME first call"
-
-
-# ── nothing private leaks, structured content survives ───────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_inbox_marker_never_reaches_the_provider(store: SessionStore) -> None:
-    llm = _Gate([_tool_call("c1"), LLMResponse(raw_text="ok")])
-    gate = llm.gate(0)
-    loop = _loop(store, llm)
-    sid = await loop.new_session()
-    run = asyncio.create_task(loop.deliver(InboxItem("go", item_id="a"), sid))
-    await _wait_calls(llm, 1)
-    await loop.deliver(InboxItem("steer", item_id="b"), sid)
-    gate.set()
-    await run
-    for call in llm.calls:
-        for m in call:
-            assert "_inbox" not in m and "inbox" not in m
-
-
-@pytest.mark.asyncio
-async def test_image_blocks_survive_the_inbox(store: SessionStore) -> None:
-    llm = _Gate([_tool_call("c1"), LLMResponse(raw_text="ok")])
-    gate = llm.gate(0)
-    loop = _loop(store, llm)
-    sid = await loop.new_session()
-    run = asyncio.create_task(loop.send("start", sid))
-    await _wait_calls(llm, 1)
-    img = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
-    await loop.deliver(InboxItem({"role": "user", "content": [{"type": "text", "text": "看这张"},
-                                                             img]}, item_id="img1"), sid)
-    gate.set()
-    await run
-    follow = [m for m in llm.calls[1] if m.get("name") == FOLLOW_UP_MESSAGE_NAME][0]
-    assert isinstance(follow["content"], list)
-    assert img in follow["content"]
-    assert "看这张" in follow["content"][0]["text"]
-
-
-# ── steer event, pending safety, terminal flush ──────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_steer_event_set_on_accept_and_cleared_on_claim(store: SessionStore) -> None:
-    llm = _Gate([_tool_call("c1"), LLMResponse(raw_text="ok")])
-    gate = llm.gate(0)
-    loop = _loop(store, llm)
-    sid = await loop.new_session()
-    run = asyncio.create_task(loop.send("start", sid))
-    await _wait_calls(llm, 1)
-    ev = loop.steer_event(sid)
-    assert not ev.is_set()
-    await loop.deliver(InboxItem("queued only", item_id="q"), sid)
-    assert not ev.is_set(), "queue-mode items don't raise the steer flag"
-    await loop.deliver(InboxItem("stop please", mode="steer", item_id="s"), sid)
-    assert ev.is_set()
-    assert (await loop.inbox_pending(sid)) == {"pending": 2, "steer": 1}
-    gate.set()
-    await run
-    assert not ev.is_set()
-    assert (await loop.inbox_pending(sid)) == {"pending": 0, "steer": 0}
-
-
-@pytest.mark.asyncio
-async def test_idle_send_heals_pending_and_delivers_items(store: SessionStore) -> None:
-    """An idle delivery heals stale tool calls and consumes its input once."""
-    llm = _Gate([_tool_call("c1")])
-    loop = _loop(store, llm, max_rounds=1)
-    sid = await loop.new_session()
-    s = await loop.ensure_store()
-    await loop.send("start", sid)  # round limit hit mid tool-call? force a pending state:
-    await s.set_pending(sid, {"assistant_seq": 1, "round_index": 0, "tool_call_ids": ["zz"],
-                              "tool_calls": [{"id": "zz", "type": "function",
-                                              "function": {"name": "echo", "arguments": "{}"}}]})
-    llm.responses.append(LLMResponse(raw_text="ok"))
-    res = await loop.deliver(InboxItem("don't lose me", item_id="k"), sid)
-    assert res.status == "completed"
-    assert (await loop.inbox_pending(sid))["pending"] == 0
-    assert await loop.get_pending(sid) is None
-    assert "don't lose me" in "\n".join(_user_texts(await store.load_active_messages(sid)))
-
-
-@pytest.mark.asyncio
-async def test_terminal_window_item_is_flushed_once(store: SessionStore) -> None:
-    llm = _Gate([LLMResponse(raw_text="a"), LLMResponse(raw_text="b")])
-    loop = _loop(store, llm)
-    sid = await loop.new_session()
-    await loop.send("first", sid)
-    # accepted as if the lock was still held at the very end of that run
-    async with loop._session_guard(sid):
-        q = await loop.follow_up("late card submission", sid, item_id="card")
-    assert isinstance(q, FollowUpQueued)
-    assert loop.pending_follow_up_count(sid) == 1
-    res = await loop.flush_follow_ups(sid)
-    assert res is not None and res.status == "completed"
-    assert loop.pending_follow_up_count(sid) == 0
-    assert await loop.flush_follow_ups(sid) is None
-    texts = "\n".join(_user_texts(await store.load_active_messages(sid)))
-    assert texts.count("late card submission") == 1
-
-
-# Old formats require explicit offline maintenance.
-
-
-@pytest.mark.asyncio
-async def test_v7_store_is_refused_with_queued_originals_kept(tmp_path: Any) -> None:
-    path = str(tmp_path / "v7.db")
-    s = await SessionStore.open(path)
-    sid = await s.create_session(system_prompt="S")
-    db = s._db
-    # rewind to the v7 shape: old queue table with two parked rows, version 7
-    await db.execute(f"DROP TABLE {s.t.follow_up_queue}")
-    await db.execute(
-        f"CREATE TABLE {s.t.follow_up_queue} (id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "session_id TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL)")
-    for i, text in enumerate(("parked one", "parked two")):
-        await db.execute(
-            f"INSERT INTO {s.t.follow_up_queue} (session_id, content, created_at) VALUES (?,?,?)",
-            (sid, text, 1000 + i))
-    prefix = s.t.sessions[: -len("sessions")]
-    ver_table = f"{prefix}schema_migrations"
-    await db.execute(f"UPDATE {ver_table} SET version=7")
-    await s.close()
-
-    import sqlite3
-
-    from power_loop.runtime.store.schema import StoreSchemaError
-    with pytest.raises(StoreSchemaError, match="explicit maintenance"):
-        await SessionStore.open(path)
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
-        assert original.execute(f"SELECT version FROM {ver_table}").fetchone() == (7,)
-        assert original.execute(f"SELECT id,session_id,content,created_at FROM {s.t.follow_up_queue} ORDER BY id").fetchall() == [
-            (1, sid, "parked one", 1000), (2, sid, "parked two", 1001)]
+    result = await run
+    assert (await agent.runtime.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)).job_ref == result.job_ref
+    rows = await store.load_active_messages(agent.target.session_id)
+    assert sum('new direction' in (r.content or '') for r in rows) == 1
+    assert (await store.inbox_counts(agent.target.session_id))['pending'] == 0

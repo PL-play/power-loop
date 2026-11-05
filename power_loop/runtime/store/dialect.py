@@ -64,10 +64,6 @@ class Dialect(Protocol):
         landed in the transcript)."""
         ...
 
-    def inbox_v8_copy_sql(self, prefix: str, src: str, dst: str) -> str:
-        """``INSERT … SELECT`` carrying v7 queue rows (session_id/content/created_at only) into
-        the v8 table as pending ``user``/``queue`` items with a synthetic ``v7:<id>`` item_id."""
-        ...
 
     def insert_ignore(self, table: str, cols: Sequence[str]) -> str:
         """Render an INSERT that silently does nothing when it would violate a unique key
@@ -145,7 +141,13 @@ class SqliteDialect:
                 session_id TEXT PRIMARY KEY, next_seq INTEGER NOT NULL DEFAULT 1,
                 round_index INTEGER NOT NULL DEFAULT 0, last_compact_seq INTEGER NOT NULL DEFAULT 0,
                 pending_json TEXT, inbox_version INTEGER NOT NULL DEFAULT 0,
-                background_version INTEGER NOT NULL DEFAULT 0, runtime_version INTEGER NOT NULL DEFAULT 0)""",
+                background_version INTEGER NOT NULL DEFAULT 0, runtime_version INTEGER NOT NULL DEFAULT 0,
+                owner_epoch INTEGER NOT NULL DEFAULT 0 CHECK(owner_epoch>=0),
+                owner_token TEXT, owner_node_id TEXT, owner_boot_id TEXT,
+                owner_lease_until_ms INTEGER, lifecycle TEXT NOT NULL DEFAULT 'open',
+                CHECK(lifecycle IN ('open','closing','closed')),
+                CHECK((owner_token IS NULL AND owner_node_id IS NULL AND owner_boot_id IS NULL)
+                   OR (owner_token IS NOT NULL AND owner_node_id IS NOT NULL AND owner_boot_id IS NOT NULL)))""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
                 session_id TEXT NOT NULL, state_key TEXT NOT NULL, value_json TEXT,
                 updated_at INTEGER NOT NULL, PRIMARY KEY (session_id, state_key))""",
@@ -228,25 +230,8 @@ class SqliteDialect:
         ]
 
     def inbox_ddl(self, prefix: str, table: str) -> list[str]:
-        p = prefix
-        return [
-            f"""CREATE TABLE IF NOT EXISTS {table} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
-                item_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'user',
-                mode TEXT NOT NULL DEFAULT 'queue', status TEXT NOT NULL DEFAULT 'pending',
-                content TEXT NOT NULL, meta_json TEXT, claim_token TEXT, claimed_at INTEGER,
-                created_at INTEGER NOT NULL, delivered_at INTEGER, delivered_seq INTEGER,
-                delivered_send_index INTEGER)""",
-            f"CREATE UNIQUE INDEX IF NOT EXISTS {p}uq_inbox_item ON {table}(session_id, item_id)",
-            f"CREATE INDEX IF NOT EXISTS {p}idx_inbox_session_status "
-            f"ON {table}(session_id, status, id)",
-        ]
+        return runtime_inbox_ddl(self.name, prefix, table)
 
-    def inbox_v8_copy_sql(self, prefix: str, src: str, dst: str) -> str:
-        return (
-            f"INSERT OR IGNORE INTO {dst} (session_id, item_id, content, created_at) "
-            f"SELECT session_id, 'v7:' || id, content, created_at FROM {src}"
-        )
 
     def insert_ignore(self, table, cols):
         return (
@@ -341,7 +326,13 @@ class PostgresDialect:
                 session_id TEXT PRIMARY KEY, next_seq BIGINT NOT NULL DEFAULT 1,
                 round_index BIGINT NOT NULL DEFAULT 0, last_compact_seq BIGINT NOT NULL DEFAULT 0,
                 pending_json TEXT, inbox_version BIGINT NOT NULL DEFAULT 0,
-                background_version BIGINT NOT NULL DEFAULT 0, runtime_version BIGINT NOT NULL DEFAULT 0)""",
+                background_version BIGINT NOT NULL DEFAULT 0, runtime_version BIGINT NOT NULL DEFAULT 0,
+                owner_epoch BIGINT NOT NULL DEFAULT 0 CHECK(owner_epoch>=0),
+                owner_token TEXT, owner_node_id TEXT, owner_boot_id TEXT,
+                owner_lease_until_ms BIGINT, lifecycle TEXT NOT NULL DEFAULT 'open',
+                CHECK(lifecycle IN ('open','closing','closed')),
+                CHECK((owner_token IS NULL AND owner_node_id IS NULL AND owner_boot_id IS NULL)
+                   OR (owner_token IS NOT NULL AND owner_node_id IS NOT NULL AND owner_boot_id IS NOT NULL)))""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
                 session_id TEXT NOT NULL, state_key TEXT NOT NULL, value_json TEXT,
                 updated_at BIGINT NOT NULL, PRIMARY KEY (session_id, state_key))""",
@@ -424,26 +415,8 @@ class PostgresDialect:
         ]
 
     def inbox_ddl(self, prefix: str, table: str) -> list[str]:
-        p = prefix
-        return [
-            f"""CREATE TABLE IF NOT EXISTS {table} (
-                id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL,
-                item_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'user',
-                mode TEXT NOT NULL DEFAULT 'queue', status TEXT NOT NULL DEFAULT 'pending',
-                content TEXT NOT NULL, meta_json TEXT, claim_token TEXT, claimed_at BIGINT,
-                created_at BIGINT NOT NULL, delivered_at BIGINT, delivered_seq BIGINT,
-                delivered_send_index BIGINT)""",
-            f"CREATE UNIQUE INDEX IF NOT EXISTS {p}uq_inbox_item ON {table}(session_id, item_id)",
-            f"CREATE INDEX IF NOT EXISTS {p}idx_inbox_session_status "
-            f"ON {table}(session_id, status, id)",
-        ]
+        return runtime_inbox_ddl(self.name, prefix, table)
 
-    def inbox_v8_copy_sql(self, prefix: str, src: str, dst: str) -> str:
-        return (
-            f"INSERT INTO {dst} (session_id, item_id, content, created_at) "
-            f"SELECT session_id, 'v7:' || id, content, created_at FROM {src} "
-            "ON CONFLICT DO NOTHING"
-        )
 
     def insert_ignore(self, table, cols):
         return (
@@ -526,6 +499,12 @@ class MySQLDialect:
                 round_index BIGINT NOT NULL DEFAULT 0, last_compact_seq BIGINT NOT NULL DEFAULT 0,
                 pending_json LONGTEXT, inbox_version BIGINT NOT NULL DEFAULT 0,
                 background_version BIGINT NOT NULL DEFAULT 0, runtime_version BIGINT NOT NULL DEFAULT 0,
+                owner_epoch BIGINT NOT NULL DEFAULT 0 CHECK(owner_epoch>=0),
+                owner_token VARCHAR(64), owner_node_id VARCHAR(64), owner_boot_id VARCHAR(64),
+                owner_lease_until_ms BIGINT, lifecycle VARCHAR(64) NOT NULL DEFAULT 'open',
+                CHECK(lifecycle IN ('open','closing','closed')),
+                CHECK((owner_token IS NULL AND owner_node_id IS NULL AND owner_boot_id IS NULL)
+                   OR (owner_token IS NOT NULL AND owner_node_id IS NOT NULL AND owner_boot_id IS NOT NULL)),
                 PRIMARY KEY (session_id)) {opts}""",
             f"""CREATE TABLE IF NOT EXISTS {p}session_runtime_state (
                 session_id VARCHAR(255) NOT NULL, state_key VARCHAR(255) NOT NULL, value_json LONGTEXT,
@@ -606,28 +585,8 @@ class MySQLDialect:
         ]
 
     def inbox_ddl(self, prefix: str, table: str) -> list[str]:
-        p = prefix
-        opts = "ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-        return [
-            f"""CREATE TABLE IF NOT EXISTS {table} (
-                id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                session_id VARCHAR(255) NOT NULL, item_id VARCHAR(255) NOT NULL,
-                kind VARCHAR(32) NOT NULL DEFAULT 'user', mode VARCHAR(16) NOT NULL DEFAULT 'queue',
-                status VARCHAR(16) NOT NULL DEFAULT 'pending', content LONGTEXT NOT NULL,
-                meta_json LONGTEXT, claim_token VARCHAR(64), claimed_at BIGINT,
-                created_at BIGINT NOT NULL, delivered_at BIGINT, delivered_seq BIGINT,
-                delivered_send_index BIGINT,
-                UNIQUE KEY {p}uq_inbox_item (session_id, item_id),
-                KEY {p}idx_inbox_session_status (session_id, status, id),
-                KEY {p}idx_retention_inbox (status, created_at),
-                KEY {p}idx_retention_item (item_id)) {opts}""",
-        ]
+        return runtime_inbox_ddl(self.name, prefix, table)
 
-    def inbox_v8_copy_sql(self, prefix: str, src: str, dst: str) -> str:
-        return (
-            f"INSERT IGNORE INTO {dst} (session_id, item_id, content, created_at) "
-            f"SELECT session_id, CONCAT('v7:', id), content, created_at FROM {src}"
-        )
 
     def insert_ignore(self, table, cols):
         return (
@@ -689,3 +648,44 @@ class MySQLDialect:
 
 
 __all__ = ["Dialect", "SqliteDialect", "PostgresDialect", "MySQLDialect"]
+
+
+def runtime_inbox_ddl(name: str, p: str, table: str) -> list[str]:
+    """Current inbox only; claims and execution bindings share the original row."""
+    integer = 'INTEGER' if name == 'sqlite' else 'BIGINT'
+    key = 'VARCHAR(64)' if name == 'mysql' else 'TEXT'
+    sid = 'VARCHAR(255)' if name == 'mysql' else 'TEXT'
+    body = 'LONGTEXT' if name == 'mysql' else 'TEXT'
+    identity = {'sqlite': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'postgres': 'BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY',
+                'mysql': 'BIGINT AUTO_INCREMENT PRIMARY KEY'}[name]
+    opts = ' ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin' if name == 'mysql' else ''
+    statement = f"""CREATE TABLE IF NOT EXISTS {table} (
+        id {identity}, session_id {sid} NOT NULL, item_id {key} NOT NULL,
+        kind {key} NOT NULL DEFAULT 'user', mode {key} NOT NULL DEFAULT 'queue',
+        status {key} NOT NULL DEFAULT 'pending', content {body} NOT NULL, meta_json {body} NOT NULL,
+        claim_token {key}, claimed_at {integer}, claim_owner_epoch {integer},
+        created_at {integer} NOT NULL, delivered_at {integer}, delivered_seq {integer},
+        delivered_send_index {integer}, target_job_id {key}, expected_job_generation {integer},
+        expires_at {integer}, delivered_job_id {key}, delivered_job_generation {integer},
+        CHECK(status IN ('pending','claimed','delivered','void')),
+        CHECK(mode IN ('queue','steer')),
+        CHECK(expected_job_generation IS NULL OR expected_job_generation>=0),
+        CHECK(delivered_job_generation IS NULL OR delivered_job_generation>=0),
+        CHECK((delivered_job_id IS NULL AND delivered_job_generation IS NULL)
+           OR (delivered_job_id IS NOT NULL AND delivered_job_generation IS NOT NULL)),
+        CHECK((status='claimed' AND claim_token IS NOT NULL AND claimed_at IS NOT NULL AND claim_owner_epoch IS NOT NULL)
+           OR (status<>'claimed' AND claim_token IS NULL AND claimed_at IS NULL AND claim_owner_epoch IS NULL))
+        {{indexes}}){opts}"""
+    indexes = [('uq_inbox_item', 'session_id,item_id', True),
+               ('idx_inbox_session_status', 'session_id,status,id', False),
+               ('idx_inbox_pending', 'status,id', False)]
+    if name == 'mysql':
+        indexes += [('idx_retention_inbox', 'status,created_at', False),
+                    ('idx_retention_item', 'item_id', False)]
+        return [statement.format(indexes=''.join(
+            f", {'UNIQUE ' if unique else ''}KEY {p}{index} ({columns})"
+            for index, columns, unique in indexes))]
+    return [statement.format(indexes=''), *[
+        f"CREATE {'UNIQUE ' if unique else ''}INDEX IF NOT EXISTS {p}{index} ON {table}({columns})"
+        for index, columns, unique in indexes]]

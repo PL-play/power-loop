@@ -13,7 +13,6 @@ import pytest
 from power_loop.runtime import budget_admissions
 from power_loop.runtime.jobs import JobError
 from power_loop.runtime.store.factory import _make_database
-from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, migrate_task_schema
 
 from ._budget_policy_admission_worker import make_loop, wait_file
 from .test_executor_drain_trees import stop_worker, wait_ready
@@ -260,24 +259,3 @@ async def test_first_policy_write_failure_does_not_separate_the_admission_from_i
         for active_runtime, active_loop in ((runtime, loop), (cold_runtime, cold_loop)):
             await active_runtime.shutdown(timeout_s=1)
             await active_loop.aclose(drain_timeout_s=.1)
-
-
-@pytest.mark.parametrize('damage', ['missing-row', 'null-hash', 'wrong-hash', 'missing-table'])
-async def test_explicit_maintenance_rebuilds_principal_admission_from_policy_originals(budget_case, damage):
-    c = budget_case
-    await c.runtime.shutdown(timeout_s=1)
-    table = c.manager.prefix+'task_principal_admissions'
-    before = await c.manager.db.fetchall(f'SELECT * FROM {table}')
-    originals = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
-    assert len(before) == 1 and before[0]['policy_hash'] is not None
-    if damage == 'missing-row':
-        await c.manager.db.execute(f'DELETE FROM {table}')
-    elif damage in ('null-hash', 'wrong-hash'):
-        await c.manager.db.execute(f'UPDATE {table} SET policy_hash=?', (None if damage == 'null-hash' else '0'*64,))
-    else:
-        await c.manager.db.execute(f'DROP TABLE {table}')
-    await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    assert await c.manager.db.fetchall(f'SELECT * FROM {table}') == before
-    assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == originals
-    assert (await c.manager.db.fetchone(f'SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1'))[
-        'protocol_version'] == TASK_PROTOCOL_VERSION

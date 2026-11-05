@@ -37,6 +37,43 @@ from power_loop._vendor.llm_client.interface import (
 )
 from power_loop._vendor.llm_client.multimodal import create_attachment_ref
 from power_loop.agent.follow_up import FollowUpQueued, InboxItem
+
+# Design 203: ID-addressed message runtime (the SDK major is finalized at P7).
+from power_loop.agent.runtime import (
+    ExecutionEnvironment,
+    RegistryRuntimeFactory,
+    Runtime,
+    RuntimeFactory,
+)
+from power_loop.agent.runtime_client import OutputSubscription, RuntimeClient
+from power_loop.agent.runtime_transport import (
+    DatabasePollingTransport,
+    MemoryMessageTransport,
+    MessageTransport,
+    PublishReceipt,
+    SubscriptionSpec,
+    TransportCapabilities,
+    TransportPacket,
+)
+from power_loop.agent.runtime_types import (
+    CapacityError,
+    Command,
+    InputRef,
+    JobPage,
+    JobRef,
+    Receipt,
+    RequestOptions,
+    Result,
+    RuntimeDescriptor,
+    RuntimeRequestError,
+    ShutdownResult,
+    Status,
+    StoreError,
+    TargetRef,
+    TrustedActor,
+    WaitTimeout,
+)
+from power_loop.agent.runtime_worker import ExecutionContext, RuntimeWorker
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
 from power_loop.agent.system_prompt import (
@@ -583,4 +620,13 @@ __all__ = [
 	"AgentSpec",
 	"AgentSpecError",
 	"run_agent_spec",
+]
+
+__all__ += [
+    "Runtime", "RuntimeFactory", "RegistryRuntimeFactory", "ExecutionEnvironment",
+    "RuntimeClient", "RuntimeWorker", "ExecutionContext", "OutputSubscription",
+    "TargetRef", "InputRef", "JobRef", "Command", "RequestOptions", "RuntimeDescriptor", "TrustedActor",
+    "Receipt", "Status", "Result", "ShutdownResult", "JobPage", "RuntimeRequestError", "CapacityError", "WaitTimeout", "StoreError",
+    "MessageTransport", "MemoryMessageTransport", "DatabasePollingTransport",
+    "TransportPacket", "TransportCapabilities", "SubscriptionSpec", "PublishReceipt",
 ]

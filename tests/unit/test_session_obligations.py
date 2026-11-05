@@ -13,7 +13,6 @@ import pytest
 from power_loop.runtime import session_obligations as obligations
 from power_loop.runtime.abort_outcomes import pending_reviews
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
-from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, migrate_task_schema
 
 from .test_aborted_call_outcomes_192 import pending_batch
 from .test_job_registry_192 import registry_store, runtime
@@ -281,30 +280,6 @@ async def test_physically_closed_unstarted_actions_keep_their_unreviewed_notices
         await loop.aclose(drain_timeout_s=.1)
 
 
-async def test_explicit_final_format_maintenance_rebuilds_the_index(registry_store):
-    from power_loop.runtime.store.schema import StoreSchemaError
-    from power_loop.runtime.store.task_schema import verify_task_schema
-    from power_loop.runtime.tool_call_plans import reconcile_pending
-
-    c, source = await pending_batch(registry_store)
-    loop, _ = await controller(c)
-    try:
-        await reconcile_pending(loop, c.actor, source["job_id"])
-        expected = await rows(c.manager)
-        await loop.aclose(drain_timeout_s=.1)
-        await c.runtime.shutdown(timeout_s=1)
-        await c.manager.db.execute(f"DROP TABLE {c.manager.prefix}session_obligations")
-        with pytest.raises(StoreSchemaError):
-            await verify_task_schema(c.manager.db, c.manager.prefix)
-        with pytest.raises(StoreSchemaError, match="maintenance_required"):
-            await migrate_task_schema(c.manager.db, c.manager.prefix)
-        await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        cold = JobManager(await registry_store[1]())
-        assert await rows(cold) == expected
-        assert (await cold.db.fetchone(f"SELECT protocol_version FROM {cold.prefix}task_store"))["protocol_version"] == TASK_PROTOCOL_VERSION
-        assert c.model.calls == 1 and c.state.dispatched == 0
-    finally:
-        await loop.aclose(drain_timeout_s=.1)
 
 
 @pytest.mark.parametrize("mode", ["produce", "consume"])

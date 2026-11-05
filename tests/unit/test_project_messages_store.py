@@ -133,14 +133,6 @@ async def test_export_import_preserves_send_index(store: SessionStore) -> None:
     await exercise_export_import_send_index(store)
 
 
-@pytest.mark.asyncio
-async def test_migration_ddl_for_display_includes_alter(store: SessionStore) -> None:
-    # The migration-FAILURE error must surface the ACTUAL steps incl. the ADD COLUMN that
-    # provisioning_ddl omits (regression for #4).
-    from power_loop.runtime.store.schema import migration_ddl_for_display
-    joined = " ".join(migration_ddl_for_display(store._db, "pl_", from_version=1))
-    assert "ADD COLUMN send_index" in joined and "project_messages" in joined
-    assert "hook_events" in joined  # v2→v3 step is in the full ladder from v1
 
 
 @pytest.mark.asyncio
@@ -161,7 +153,7 @@ async def test_v1_store_is_refused_without_rewriting_originals(tmp_path) -> None
     await s.close()
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
         before = list(original.iterdump())
-    with pytest.raises(StoreSchemaError, match="explicit maintenance"):
+    with pytest.raises(StoreSchemaError, match="fresh store"):
         await SessionStore.open(path)
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
         assert list(original.iterdump()) == before
@@ -183,7 +175,7 @@ async def test_v2_store_is_refused_without_rewriting_originals(tmp_path) -> None
     await s.close()
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
         before = list(original.iterdump())
-    with pytest.raises(StoreSchemaError, match="explicit maintenance"):
+    with pytest.raises(StoreSchemaError, match="fresh store"):
         await SessionStore.open(path)
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as original:
         assert list(original.iterdump()) == before

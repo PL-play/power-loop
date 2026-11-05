@@ -20,11 +20,9 @@ from power_loop.runtime import executor_admissions
 from power_loop.runtime import executor_registry as registry
 from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.store.factory import _make_database
-from power_loop.runtime.store.schema import StoreSchemaError
-from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, migrate_task_schema
 
 from .test_executor_drain_trees import stop_worker, wait_ready
-from .test_executor_registry_192 import boot, root, start
+from .test_executor_registry_192 import boot, start
 from .test_job_registry_192 import registry_store
 from .test_send_sql_profile import Profiled, _counts
 
@@ -175,54 +173,8 @@ async def test_real_registration_process_death_keeps_gate_and_original_atomic(bo
         await stop_worker(process)
 
 
-@pytest.mark.parametrize('damage', ['missing-row', 'false-flag', 'missing-table'])
-async def test_offline_maintenance_rebuilds_registration_gates_from_originals(boot, damage):
-    c = boot
-    await start(c)
-    _, lease = await root(c)
-    await c.manager.close_model_execution(c.actor, lease, evidence={'exit':'completed'}, resource_state='stopped')
-    events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}task_executor_events ORDER BY event_id')
-    jobs = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id')
-    originals = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
-    table = c.manager.prefix+'task_executor_admissions'
-    if damage == 'false-flag':
-        await c.manager.db.execute(f'UPDATE {table} SET registered=0')
-    elif damage == 'missing-row':
-        await c.manager.db.execute(f'DELETE FROM {table}')
-    else:
-        await c.manager.db.execute(f'DROP TABLE {table}')
-    if damage == 'missing-table':
-        with pytest.raises(StoreSchemaError):
-            await c.connect()
-    await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    cold = JobManager(await c.connect(), now_ms=c.manager.now)
-    assert await cold.db.fetchall(f'SELECT * FROM {table}') == [
-        {'group_key':executor_admissions.key(cold, c.identity), 'registered':1}]
-    assert (await cold.db.fetchone(f'SELECT protocol_version FROM {cold.prefix}task_store WHERE id=1'))['protocol_version'] == TASK_PROTOCOL_VERSION
-    assert await cold.db.fetchall(f'SELECT * FROM {cold.prefix}task_executor_events ORDER BY event_id') == events
-    assert await cold.db.fetchall(f'SELECT * FROM {cold.jobs} ORDER BY job_id') == jobs
-    assert await cold.db.fetchall(f'SELECT * FROM {cold.events} ORDER BY event_id') == originals
-    assert (await registry.get(cold, c.identity))['state'] == 'accepting'
 
 
-async def test_offline_maintenance_cannot_replace_a_missing_registration_original_with_its_gate(boot):
-    c = boot
-    await start(c)
-    events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}task_executor_events ORDER BY event_id')
-    original = next(row for row in events if row['action'] == 'register')
-    try:
-        await c.manager.db.execute(f'DELETE FROM {c.manager.prefix}task_executor_events WHERE event_id=?', (original['event_id'],))
-        before = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}task_executor_events ORDER BY event_id')
-        gates = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}task_executor_admissions')
-        with pytest.raises(StoreSchemaError, match='registration original missing'):
-            await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}task_executor_events ORDER BY event_id') == before
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}task_executor_admissions') == gates
-    finally:
-        columns = tuple(original)
-        await c.manager.db.execute(f"INSERT INTO {c.manager.prefix}task_executor_events ({','.join(columns)}) VALUES ("
-            + ','.join('?' for _ in columns) + ')', tuple(original.values()))
-    assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}task_executor_events ORDER BY event_id') == events
 
 
 async def test_a_later_registered_boot_revokes_unregistered_admission_without_a_cached_absence(boot):

@@ -71,13 +71,13 @@ async def test_pl_prefix_isolates_tables() -> None:
         assert "sessions" not in names  # unprefixed names are NOT created
 
 
-async def test_create_schema_false_on_fresh_db_raises(tmp_path) -> None:
+async def test_verify_on_fresh_db_raises(tmp_path) -> None:
     db_path = str(tmp_path / "fresh.db")
     with pytest.raises(StoreSchemaError, match="not initialized"):
-        await SessionStore.open(db_path, create_schema=False)
+        await SessionStore.open(db_path, schema="verify")
     # provisioning then reopening read-only works
-    s = await SessionStore.open(db_path, create_schema=True)
+    s = await SessionStore.open(db_path, schema="auto_create")
     await s.close()
-    s2 = await SessionStore.open(db_path, create_schema=False)
+    s2 = await SessionStore.open(db_path, schema="verify")
     assert s2.schema_version == CURRENT_SCHEMA_VERSION
     await s2.close()

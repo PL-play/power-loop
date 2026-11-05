@@ -14,11 +14,11 @@ import pytest
 
 from power_loop import AgentLoopConfig, LLMResponse, LLMService, StatefulAgentLoop, ToolDefinition
 from power_loop.runtime import control_requests, operation_records, session_obligations
-from power_loop.runtime.jobs import JobError, JobManager, _hash
+from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.runtime_state import get_tool_runtime_context
 from power_loop.runtime.store.schema import StoreSchemaError
-from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, migrate_task_schema
+from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION
 from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 
@@ -212,90 +212,10 @@ async def test_each_record_transaction_rollback_or_unknown_ack_recovers_its_orig
     assert (await cold.get_job(c.actor, c.target.job_id)).generation == 1
 
 
-@pytest.mark.parametrize('action', ['steer', 'nudge'])
-@pytest.mark.parametrize('entry', ['verify', 'rebuild', 'maintenance'])
-async def test_cold_entry_refuses_a_target_record_without_its_original_source_permission(operation_case, action, entry):
-    c = operation_case
-    await record(c, action)
-    originals = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
-    grants = [event for event in originals if event['event_type'] == 'task_control_request']
-    assert len(grants) == 2
-    try:
-        for event in grants:
-            assert await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (event['event_id'],)) == 1
-        before = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
-        jobs = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id')
-        pending = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}session_obligations ORDER BY source_id')
-        with pytest.raises(StoreSchemaError, match='original caller permission'):
-            if entry == 'verify':
-                await session_obligations.verify(c.manager, c.actor)
-            elif entry == 'rebuild':
-                await session_obligations.rebuild(c.manager)
-            else:
-                await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == before
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id') == jobs
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}session_obligations ORDER BY source_id') == pending
-        assert (await c.manager.db.fetchone(f'SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1'))['protocol_version'] == TASK_PROTOCOL_VERSION
-    finally:
-        for event in grants:
-            columns = tuple(event)
-            await c.manager.db.execute(f"INSERT INTO {c.manager.events} ({','.join(columns)}) VALUES ("
-                + ','.join('?' for _ in columns) + ')', tuple(event.values()))
-    assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == originals
 
 
-async def test_final_maintenance_keeps_record_originals_and_ignores_dead_context_cache(operation_case):
-    c = operation_case
-    original = await record(c)
-    events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
-    jobs = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id')
-    messages = await c.manager.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY id')
-    await c.store.set_runtime_state(c.actor.session_id, 'power-loop.root-stop.v1:dead-cache', {'not': 'an original'})
-    await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-    cold = JobManager(await c.connect(), now_ms=c.manager.now)
-    assert await record(c, manager=cold) == original
-    assert await cold.db.fetchall(f'SELECT * FROM {cold.events} ORDER BY event_id') == events
-    assert await cold.db.fetchall(f'SELECT * FROM {cold.jobs} ORDER BY job_id') == jobs
-    assert await cold.db.fetchall(f'SELECT * FROM {c.store.t.messages} ORDER BY id') == messages
-    assert await c.store.get_runtime_state(c.actor.session_id, 'power-loop.root-stop.v1:dead-cache') == {'not': 'an original'}
 
 
-@pytest.mark.parametrize('action', ['steer', 'nudge'])
-async def test_opaque_record_requires_original_attribution_during_maintenance(operation_case, action):
-    c = operation_case
-    result = await record(c, action)
-    original_events = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
-    original_caller = await c.manager.db.fetchone(f'SELECT * FROM {c.manager.jobs} WHERE job_id=?', (c.caller.job_id,))
-    original_target = next(row for row in original_events if row['event_id'] == result.operation_id)
-    source_events = [row for row in original_events if row['event_type'] == 'task_control_request']
-    assert len(source_events) == 2
-    try:
-        for event in source_events:
-            assert await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (event['event_id'],)) == 1
-        assert await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET version=version-2 WHERE job_id=?', (c.caller.job_id,)) == 1
-        old_fingerprint = _hash([c.target.job_id, {'message': 'record metadata'}, c.ref.to_dict()])
-        assert await c.manager.db.execute(f'UPDATE {c.manager.events} SET request_hash=? WHERE event_id=?',
-            (old_fingerprint, result.operation_id)) == 1
-        before = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
-        jobs = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id')
-        with pytest.raises(StoreSchemaError, match='original caller permission'):
-            await migrate_task_schema(c.manager.db, c.manager.prefix, maintenance=True)
-        assert (await c.manager.db.fetchone(f'SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1'))['protocol_version'] == TASK_PROTOCOL_VERSION
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == before
-        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id') == jobs
-    finally:
-        # Only the test restores the exact saved originals after fault injection.
-        for event in source_events:
-            columns = tuple(event)
-            await c.manager.db.execute(f"INSERT INTO {c.manager.events} ({','.join(columns)}) VALUES ("
-                + ','.join('?' for _ in columns) + ')', tuple(event.values()))
-        await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET version=? WHERE job_id=?',
-            (original_caller['version'], c.caller.job_id))
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET request_hash=? WHERE event_id=?',
-            (original_target['request_hash'], result.operation_id))
-        await c.manager.db.execute(f'UPDATE {c.manager.prefix}task_store SET protocol_version=? WHERE id=1', (TASK_PROTOCOL_VERSION,))
-    assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == original_events
 
 
 @pytest.mark.parametrize('action', ['steer', 'nudge'])
@@ -353,3 +273,34 @@ async def test_actual_model_tool_records_an_old_tree_and_binds_its_real_receipt_
         assert not await manager.db.fetchall(f"SELECT * FROM {manager.prefix}session_obligations WHERE kind='control_request'")
     finally:
         await loop.aclose(drain_timeout_s=.1)
+
+
+@pytest.mark.parametrize('action', ['steer', 'nudge'])
+@pytest.mark.parametrize('entry', ['verify', 'rebuild'])
+async def test_cold_entry_refuses_a_target_record_without_its_original_source_permission(operation_case, action, entry):
+    c = operation_case
+    await record(c, action)
+    originals = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
+    grants = [event for event in originals if event['event_type'] == 'task_control_request']
+    assert len(grants) == 2
+    try:
+        for event in grants:
+            assert await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (event['event_id'],)) == 1
+        before = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id')
+        jobs = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id')
+        pending = await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}session_obligations ORDER BY source_id')
+        with pytest.raises(StoreSchemaError, match='original caller permission'):
+            if entry == 'verify':
+                await session_obligations.verify(c.manager, c.actor)
+            elif entry == 'rebuild':
+                await session_obligations.rebuild(c.manager)
+        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == before
+        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.jobs} ORDER BY job_id') == jobs
+        assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.prefix}session_obligations ORDER BY source_id') == pending
+        assert (await c.manager.db.fetchone(f'SELECT protocol_version FROM {c.manager.prefix}task_store WHERE id=1'))['protocol_version'] == TASK_PROTOCOL_VERSION
+    finally:
+        for event in grants:
+            columns = tuple(event)
+            await c.manager.db.execute(f"INSERT INTO {c.manager.events} ({','.join(columns)}) VALUES ("
+                + ','.join('?' for _ in columns) + ')', tuple(event.values()))
+    assert await c.manager.db.fetchall(f'SELECT * FROM {c.manager.events} ORDER BY event_id') == originals

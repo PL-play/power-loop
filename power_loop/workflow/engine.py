@@ -416,6 +416,9 @@ class WorkflowEngine:
         self._task_nodes: dict[str, Any] = {}
 
     async def run(self, spec: WorkflowSpec) -> WorkflowResult:
+        # Disabled until its unified task path is implemented; retained internals are not a fallback.
+        from power_loop.agent.runtime_types import RuntimeRequestError
+        raise RuntimeRequestError("feature_unavailable", "workflow is not enabled")
         runtime = getattr(self._loop, "task_runtime", None)
         if runtime is not None:
             from power_loop.runtime.jobs import JobError

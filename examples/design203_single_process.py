@@ -1,7 +1,6 @@
-"""Design 203 P0 contract example. Syntax-checked in P0; runnable after P1.
+"""Design 203 P1 single-process runtime example.
 
-These future Runtime exports are intentionally NOT implemented by P0.
-Run from a fresh directory after P1: python design203_single_process.py
+Run from a fresh directory: python design203_single_process.py
 """
 import asyncio
 import time

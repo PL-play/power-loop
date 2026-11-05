@@ -172,30 +172,6 @@ async def test_task_index_ddl_names_fit_all_supported_prefixes(registry_store):
         assert any(sql.startswith('CREATE INDEX '+'x'*24+suffix+' ') for sql in indexes)
 
 
-@pytest.mark.parametrize('fault', ['missing', 'wrong_columns'])
-async def test_missing_or_wrong_indexes_require_explicit_maintenance(registry_store, fault):
-    from power_loop.runtime.store.schema import StoreSchemaError
-    from power_loop.runtime.store.task_schema import migrate_task_schema
-
-    store, connect = registry_store
-    sid = await store.create_session()
-    await store.append_message(sid, role='user', content='Immutable original index maintenance witness')
-    original = await store._db.fetchall(f'SELECT * FROM {store.t.messages} WHERE session_id=?', (sid,))
-    identity = await store._db.fetchone(f'SELECT * FROM {store.table_prefix}task_store WHERE id=1')
-    key = store.table_prefix+'idx_events_caller_type'
-    await store._db.execute(drop_index_sql(store._db.dialect.name, key, store.table_prefix+'job_events'))
-    if fault == 'wrong_columns':
-        await store._db.execute(f'CREATE INDEX {key} ON {store.table_prefix}job_events(event_type,caller_session_id)')
-    with pytest.raises(StoreSchemaError, match='discovery indexes'):
-        await connect()
-    if fault == 'wrong_columns':
-        with pytest.raises(StoreSchemaError, match='discovery indexes'):
-            await migrate_task_schema(store._db, store.table_prefix, maintenance=True)
-        await store._db.execute(drop_index_sql(store._db.dialect.name, key, store.table_prefix+'job_events'))
-    await migrate_task_schema(store._db, store.table_prefix, maintenance=True)
-    reopened = await connect()
-    assert await reopened._db.fetchone(f'SELECT * FROM {store.table_prefix}task_store WHERE id=1') == identity
-    assert await reopened._db.fetchall(f'SELECT * FROM {store.t.messages} WHERE session_id=?', (sid,)) == original
 
 
 @pytest.mark.parametrize('backend', ['sqlite', 'postgres', 'mysql'])
@@ -246,3 +222,22 @@ async def test_same_named_index_on_wrong_table_never_satisfies_recovery_schema(r
         await db.execute(f'DROP TABLE IF EXISTS {unrelated}')
         await db.execute(f'CREATE INDEX {key} ON {target}({columns})')
     await verify_task_schema(db, prefix)
+
+
+@pytest.mark.parametrize('fault', ['missing', 'wrong_columns'])
+async def test_missing_or_wrong_indexes_are_rejected_without_mutation(registry_store, fault):
+    from power_loop.runtime.store.schema import StoreSchemaError
+
+    store, connect = registry_store
+    sid = await store.create_session()
+    await store.append_message(sid, role='user', content='Immutable original index maintenance witness')
+    original = await store._db.fetchall(f'SELECT * FROM {store.t.messages} WHERE session_id=?', (sid,))
+    identity = await store._db.fetchone(f'SELECT * FROM {store.table_prefix}task_store WHERE id=1')
+    key = store.table_prefix+'idx_events_caller_type'
+    await store._db.execute(drop_index_sql(store._db.dialect.name, key, store.table_prefix+'job_events'))
+    if fault == 'wrong_columns':
+        await store._db.execute(f'CREATE INDEX {key} ON {store.table_prefix}job_events(event_type,caller_session_id)')
+    with pytest.raises(StoreSchemaError, match='discovery indexes'):
+        await connect()
+    assert await store._db.fetchone(f'SELECT * FROM {store.table_prefix}task_store WHERE id=1') == identity
+    assert await store._db.fetchall(f'SELECT * FROM {store.t.messages} WHERE session_id=?', (sid,)) == original

@@ -1,148 +1,100 @@
-"""OPS-5: graceful async shutdown — aclose()/quiesce + async context manager.
-
-The sync ``close()`` can race a send's background (``asyncio.to_thread``) store write and
-close the connection out from under it. ``aclose()`` quiesces first: it blocks new sends,
-waits for in-flight sends to release their per-session locks (by which point their
-background writes have committed), drains pending async event-bus tasks, checkpoints the
-WAL, and only then closes an owned store.
-"""
-
-from __future__ import annotations
-
+"""Facade shutdown releases its references; worker shutdown owns execution."""
 import asyncio
-import sqlite3
-from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from typing import Any
 
 import pytest
 
-from power_loop import (
-    AgentEvent,
-    AgentEventBus,
-    AgentEventType,
-    AgentLoopConfig,
-    SessionStore,
-    StatefulAgentLoop,
-)
-from power_loop._vendor.llm_client.interface import (
-    LLMRequest,
-    LLMResponse,
-    LLMService,
-    LLMStreamChunk,
-)
+from power_loop import AgentEvent, AgentEventBus, AgentEventType, StatefulAgentLoop
+from power_loop.agent.runtime_store import now_ms
+from power_loop.agent.runtime_types import RuntimeRequestError
+from tests.runtime_fixture import RunningAgent
 
-pytestmark = pytest.mark.unit
+from .test_inbox import _Gate, _wait_calls, store
+
+__all__ = ['store']
+pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@dataclass
-class _SlowLLM(LLMService):
-    """Signals when a call begins, then sleeps — so a send can be held in-flight."""
-
-    delay: float = 0.2
-    started: asyncio.Event = field(default_factory=asyncio.Event)
-
-    async def complete(self, request: LLMRequest, **_: Any) -> LLMResponse:
-        self.started.set()
-        await asyncio.sleep(self.delay)
-        return LLMResponse(raw_text="done")
-
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-        async def _empty() -> AsyncIterator[LLMStreamChunk]:
-            if False:
-                yield LLMStreamChunk()
-
-        return _empty()
-
-    async def close(self) -> None:
-        return None
-
-
-def _cfg() -> AgentLoopConfig:
-    return AgentLoopConfig(max_rounds=1, compactor=None)
-
-
-async def test_async_context_manager_closes_owned_store() -> None:
-    loop = StatefulAgentLoop(llm=_SlowLLM(delay=0.0), db_path=":memory:", config=_cfg())
-    async with loop:
-        sid = await loop.new_session()
-        r = await loop.send("hi", sid)
-        assert r.status == "completed"
-    assert loop._closing is True
-    # owned store was closed → using its connection now raises
-    with pytest.raises(sqlite3.ProgrammingError):
-        loop.store._db._conn.execute("SELECT 1")
+async def test_closing_one_facade_does_not_cancel_execution_or_other_client(store):
+    model = _Gate([])
+    release = model.gate(0)
+    agent = await RunningAgent(store, model).start()
+    other = StatefulAgentLoop(runtime=agent.runtime)
+    try:
+        run = asyncio.create_task(agent.loop.send(agent.target, 'hello', message_id='one',
+            actor=agent.actor, deadline_ms=now_ms()+10000))
+        await _wait_calls(model, 1)
+        ctx = agent.runtime.worker._active[agent.target.session_id]
+        await agent.loop.aclose()
+        assert (await asyncio.gather(run, return_exceptions=True))[0].__class__ is asyncio.CancelledError
+        assert not ctx.stop.is_cancelled()
+        release.set()
+        result = await other.client.wait(ctx.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
+        assert result.status == 'completed'
+        assert await store.get_session(agent.target.session_id)
+        await agent.loop.aclose()
+        with pytest.raises(RuntimeRequestError, match='session_closed'):
+            await agent.loop.follow_up(agent.target, 'no', message_id='closed', actor=agent.actor)
+    finally:
+        release.set()
+        await other.aclose()
+        await agent.aclose()
 
 
-async def test_aclose_waits_for_inflight_send_and_rejects_new() -> None:
-    """The race fix: aclose blocks new sends immediately but lets the in-flight one
-    finish cleanly (no ProgrammingError), then returns."""
-    store = await SessionStore.open(":memory:")
-    llm = _SlowLLM(delay=0.2)
-    loop = StatefulAgentLoop(llm=llm, store=store, config=_cfg())
-    sid = await loop.new_session()
-
-    send_task = asyncio.create_task(loop.send("hi", sid))
-    await asyncio.wait_for(llm.started.wait(), timeout=1)  # send now holds the lock
-
-    close_task = asyncio.create_task(loop.aclose())
-    await asyncio.sleep(0.01)  # let aclose flip _closing and start waiting on the lock
-
-    # a new send during closing is rejected at once (before the in-flight one ends)
-    with pytest.raises(RuntimeError, match="closing"):
-        await loop.send("again", sid)
-
-    r = await asyncio.wait_for(send_task, timeout=2)  # in-flight send completes cleanly
-    assert r.status == "completed"
-    await asyncio.wait_for(close_task, timeout=2)      # aclose returns after it drained
-
-    # store was NOT owned by the loop → aclose left it open and consistent
-    assert await store.get_session(sid) is not None
-    await store.close()
+async def test_worker_shutdown_drains_then_closes_subscriptions(store):
+    model = _Gate([])
+    release = model.gate(0)
+    agent = await RunningAgent(store, model).start()
+    receipt = await agent.runtime.client.send(agent.target, 'running', message_id='one', actor=agent.actor)
+    await _wait_calls(model, 1)
+    shutdown = asyncio.create_task(agent.runtime.worker.shutdown(timeout_s=5))
+    await asyncio.sleep(.01)
+    assert not shutdown.done() and len(agent.runtime.transport._subscriptions) == 3
+    release.set()
+    result = await shutdown
+    assert result.drained
+    assert not agent.runtime.transport._subscriptions and not agent.runtime.worker._active
+    # A separate authorized client can still read after the worker has stopped.
+    assert (await agent.loop.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)).status == 'completed'
+    await agent.aclose()
 
 
-async def test_aclose_leaves_unowned_store_open() -> None:
-    store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(llm=_SlowLLM(delay=0.0), store=store, config=_cfg())
-    sid = await loop.new_session()
-    await loop.send("hi", sid)
-    await loop.aclose()
-    # not owned → still usable
-    assert await store.get_session(sid) is not None
-    await store.close()
+async def test_shutdown_cancellation_is_persisted_before_releasing_worker(store):
+    model = _Gate([])
+    model.gate(0)
+    agent = await RunningAgent(store, model).start()
+    receipt = await agent.runtime.client.send(agent.target, 'running', message_id='one', actor=agent.actor)
+    await _wait_calls(model, 1)
+    result = await agent.runtime.worker.shutdown(timeout_s=3, cancel_running=True)
+    assert result.drained
+    result = await agent.loop.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
+    assert result.status == 'cancelled'
+    job = await store._db.fetchone(f'SELECT cancel_requested_at FROM {store.table_prefix}jobs WHERE job_id=?',
+                                   (result.job_ref.job_id,))
+    assert job['cancel_requested_at'] is not None
+    await agent.aclose()
 
 
-async def test_aclose_is_idempotent() -> None:
-    loop = StatefulAgentLoop(llm=_SlowLLM(delay=0.0), db_path=":memory:", config=_cfg())
-    await loop.aclose()
-    await loop.aclose()  # second call must not raise
-    assert loop._closing is True
-
-
-async def test_send_and_follow_up_after_aclose_raise() -> None:
-    loop = StatefulAgentLoop(llm=_SlowLLM(delay=0.0), db_path=":memory:", config=_cfg())
-    sid = await loop.new_session()
-    await loop.aclose()
-    with pytest.raises(RuntimeError, match="closing"):
-        await loop.send("x", sid)
-    with pytest.raises(RuntimeError, match="closing"):
-        await loop.follow_up("x", sid)
-
-
-async def test_event_bus_drain_awaits_pending_async_subscribers() -> None:
-    """drain() returns only after in-flight async subscribers (scheduled from sync
-    publish) have completed — the primitive aclose relies on."""
+async def test_event_bus_drain_awaits_pending_async_subscribers():
     bus = AgentEventBus(suppress_subscriber_errors=True)
-    done: list[AgentEvent] = []
-
-    async def slow(ev: AgentEvent) -> None:
-        await asyncio.sleep(0.05)
-        done.append(ev)
-
-    bus.subscribe(AgentEventType.SESSION_STARTED, slow)
+    done = []
+    async def subscriber(event):
+        await asyncio.sleep(.01)
+        done.append(event)
+    bus.subscribe(AgentEventType.SESSION_STARTED, subscriber)
     bus.publish(AgentEvent(type=AgentEventType.SESSION_STARTED))
-    assert done == []  # not yet — the task is still pending right after publish
+    await bus.drain(timeout=1)
+    assert len(done) == 1 and not bus._async_tasks
 
-    await bus.drain(timeout=1.0)
-    assert len(done) == 1
-    assert bus._async_tasks == set()
+
+async def test_worker_shutdown_timeout_reports_interrupted_and_releases_slots(store):
+    model = _Gate([])
+    model.gate(0)
+    agent = await RunningAgent(store, model).start()
+    receipt = await agent.runtime.client.send(agent.target, 'running', message_id='one', actor=agent.actor)
+    await _wait_calls(model, 1)
+    result = await asyncio.wait_for(agent.runtime.worker.shutdown(timeout_s=.01), 5)
+    assert not result.drained and len(result.interrupted_jobs) == 1
+    result = await agent.loop.client.wait(receipt.input_ref, actor=agent.actor, deadline_ms=now_ms()+5000)
+    assert result.status == 'interrupted'
+    assert not agent.runtime.worker._active and not agent.runtime.worker._tasks
+    await agent.aclose()

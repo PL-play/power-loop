@@ -141,6 +141,9 @@ async def run_spec_isolated(
     allows reads even while another connection writes). Returns a dict shaped
     like ``run_agent_spec`` plus ``db_path``.
     """
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "workflow worker is not enabled")
     from power_loop.agent.stateful_loop import StatefulAgentLoop
     from power_loop.agent.types import AgentLoopConfig
     from power_loop.runtime.spec import AgentSpec, output_response_format

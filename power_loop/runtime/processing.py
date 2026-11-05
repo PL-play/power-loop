@@ -93,8 +93,14 @@ async def _discover_request(manager, actor, caller, *, round_index, send_index, 
     if send["kind"] != "send" or send["session_id"] != actor.session_id:
         raise JobError("processing_caller_mismatch")
     create = {"payload_json": creation} if creation is not None else None
-    if (create is None or isinstance(send_index, bool) or not isinstance(send_index, int) or
-            json.loads(create["payload_json"]).get("request", {}).get("send_index") != send_index):
+    if create is None:
+        raise JobError("processing_send_mismatch")
+    request = json.loads(create["payload_json"])["request"]
+    input_ref = request["input_ref"]
+    queued = await tx.fetchone(f"SELECT delivered_send_index FROM {manager.store.t.follow_up_queue} "
+        "WHERE session_id=? AND item_id=?", (input_ref["session_id"], input_ref["message_id"]))
+    original_index = queued["delivered_send_index"] if queued else None
+    if type(send_index) is not int or original_index != send_index:
         raise JobError("processing_send_mismatch")
     from .wait_notifications import prepare_request_observations
     notices, wait_observations = await prepare_request_observations(manager, tx, actor, caller, source=send, round_index=round_index,

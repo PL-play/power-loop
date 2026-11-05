@@ -626,8 +626,7 @@ class TaskRuntime:
                     _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
-    async def model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None,
-                         _continuation_key=None):
+    async def model_send(self, loop, sid: str, send_index: int, *, input_start, cancel_token=None, round_limit=None):
         owner_token = _enter_task_owner(self)
         trust_token = self.manager._trust_own_writes.set(True)
         local = None
@@ -636,7 +635,7 @@ class TaskRuntime:
             local = {"task": asyncio.current_task(), "cancel_token": cancel_token, "signalled": False}
             self._model_executions[id(local)] = local
             async with self._model_send(loop, sid, send_index, cancel_token=cancel_token, round_limit=round_limit,
-                                        _continuation_key=_continuation_key) as evidence:
+                                        input_start=input_start) as evidence:
                 yield evidence
         finally:
             if local is not None:
@@ -645,8 +644,7 @@ class TaskRuntime:
             _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
-    async def _model_send(self, loop, sid: str, send_index: int, *, cancel_token=None, round_limit=None,
-                          _continuation_key=None):
+    async def _model_send(self, loop, sid: str, send_index: int, *, input_start, cancel_token=None, round_limit=None):
         from .execution_roles import session_role
 
         if (type(self.require_host_send_steps) is not bool
@@ -689,13 +687,9 @@ class TaskRuntime:
                 owner = None
         if owner is None and await session_role(self.manager.store, sid) != "main":
             raise JobError("task_owner_required")
-        request = {"send_index": send_index, "model_attempt_protocol": 1, "tool_call_plan_protocol": 1}
-        system_key = f"send:{sid}:{send_index}" if registering_actor != actor else f"send:{send_index}"
-        if _continuation_key is not None:
-            # One logical send may pause for input repeatedly. Each continuation
-            # gets a fresh execution while messages retain the original send_index.
-            system_key += f":continue:{_continuation_key}"
-            request["continuation_key"] = _continuation_key
+        from power_loop.agent.runtime_types import plain
+        request = {"input_ref": plain(input_start.context.input_ref)}
+        system_key = "input:" + input_start.context.input_ref.message_id
         original_round_limit = None
         if owner is not None:
             from .original_owner_review import enabled
@@ -736,6 +730,7 @@ class TaskRuntime:
             try:
                 async with prepare_policy(self, source=policy_source), self.manager.joined_write():
                     tx = self.manager._joined_write.get()
+                    await input_start.prepare(tx)
                     if self.budget_config is None:
                         from .executor_registry import ExecutorIdentity, admit_unbudgeted
                         await admit_unbudgeted(self.manager, tx,
@@ -757,6 +752,7 @@ class TaskRuntime:
                         # No automatic replay of a possibly side-effecting pending attempt.
                         raise JobError("task_send_requires_reconciliation")
                     binding = await self.claim(actor, registration)
+                    await input_start.bind(tx, binding)
                     binding.resource_evidence["_control_registered_payload"] = registration.operation.result
                     await enable(binding,review_sources=review_sources)
                 break
@@ -764,6 +760,7 @@ class TaskRuntime:
                 review_sources = await prepare_review_sources(self.manager,actor)
             except PolicySourceChanged as changed:
                 policy_source = changed.source
+        input_start.committed()
         evidence = {"exit": "interrupted", "session_id": sid, "send_index": send_index}
         failure = None
         try:
@@ -790,6 +787,10 @@ class TaskRuntime:
         except BaseException as exc:
             failure = exc
             evidence["exit"] = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+            if isinstance(exc, JobError) and exc.code == "cancel_requested":
+                evidence["exit"] = "cancelled"
+            if input_start.context.shutdown_interrupted:
+                evidence["exit"] = "interrupted"
             evidence["error_type"] = type(exc).__name__
             evidence.setdefault("usage", dict(binding.resource_evidence.get("model_usage_totals", {})))
             raise
@@ -801,12 +802,13 @@ class TaskRuntime:
             last = await self.manager.store.last_assistant_ref(sid, send_index)
             if last is not None:
                 evidence["last_assistant_ref"] = last.to_dict()
-            _, finalized = await self.manager.close_and_finalize(
-                actor,
-                binding.lease,
-                evidence=evidence,
-                resource_state=binding.resource_evidence.get("resource_state", "stopped"),
-            )
+            async with self.manager.joined_write() as tx:
+                await input_start.prepare_finish(tx)
+                _, finalized = await self.manager.close_and_finalize(
+                    actor, binding.lease, evidence=evidence,
+                    resource_state=binding.resource_evidence.get("resource_state", "stopped"),
+                )
+                await input_start.finish(tx, binding, evidence)
             from .finalization import after_send
 
             try:
@@ -824,6 +826,9 @@ class TaskRuntime:
                 remember(binding,owner,failure,original_round_limit)
 
     async def admit_subagent(self, sid: str, spec, task: str) -> JobRegistration:
+        # Disabled until its unified task path is implemented; retained internals are not a fallback.
+        from power_loop.agent.runtime_types import RuntimeRequestError
+        raise RuntimeRequestError("feature_unavailable", "subagent is not enabled")
         execution = _SEND.get()
         if execution is None or execution.runtime is not self or execution.actor.session_id != sid:
             raise JobError("task_send_required")

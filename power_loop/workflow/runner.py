@@ -431,6 +431,9 @@ async def run_detached(
     (in-process, timer-free). It receives a :class:`WorkflowCompletion`; the
     durable timer and ``eager_wake`` are both skipped. See the module docstring.
     """
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "workflow is not enabled")
     parent_sid = workflow._parent_sid
     if not parent_sid:
         raise WorkflowRunError("detached run requires a parent_session_id on the workflow")
@@ -620,6 +623,9 @@ def spawn_background(
     durable timer and ``eager_wake`` are both skipped and a
     :class:`WorkflowCompletion` is handed to it instead (in-process, timer-free).
     """
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "workflow is not enabled")
 
     runtime = getattr(loop, "task_runtime", None)
     if runtime is not None and task_registration is None:

@@ -233,6 +233,9 @@ async def resume_run(
     ``executor`` / ``budget`` if the original run used one. A ``budget`` is
     pre-charged with the tokens already spent by replayed steps.
     """
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "workflow resume is not enabled")
     from power_loop.runtime.task_runtime import reject_unregistered_adapter
     reject_unregistered_adapter("workflow_resume", loop)
     store = await loop._ensure_store()
@@ -300,6 +303,9 @@ async def resume_detached(
     ``on_complete`` to take over the wake in-process (timer-free); it supersedes
     ``eager_wake`` and skips the durable timer (see :func:`run_detached`).
     """
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "workflow resume is not enabled")
     from power_loop.runtime.execution_roles import require_orchestration
     from power_loop.runtime.task_runtime import reject_unregistered_adapter
     if getattr(loop, "task_runtime", None) is not None:

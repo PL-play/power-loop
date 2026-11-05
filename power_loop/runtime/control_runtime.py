@@ -238,10 +238,7 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
             if len(creations) != 1 or creations[0]["payload_json"] is None:
                 raise JobError("execution_creation_missing")
             creation_request = json.loads(creations[0]["payload_json"])["request"]
-        flag = creation_request.get("tool_call_plan_protocol")
-        if flag is not None and (type(flag) is not int or flag != 1):
-            raise JobError("tool_call_plan_protocol_invalid")
-        plan_required = flag == 1
+        plan_required = "input_ref" in creation_request
         # A job registered in this same transaction cannot have children yet.
         managed_check = not fresh and await tx.fetchone(
             f"SELECT job_id FROM {manager.jobs} WHERE parent_job_id=? AND kind='background_tool' LIMIT 1",

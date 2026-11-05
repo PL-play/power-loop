@@ -287,18 +287,16 @@ class SessionStore:
         max_spawn_depth: int = DEFAULT_MAX_SPAWN_DEPTH,
         table_prefix: str = DEFAULT_TABLE_PREFIX,
         schema: SchemaPolicy | str | None = None,
-        create_schema: bool | None = None,
-    ) -> SessionStore:
+        ) -> SessionStore:
         """Open a SQLite-backed store (the default backend). For Postgres/MySQL use
         :func:`power_loop.runtime.store.factory.open_store` with a DSN.
 
-        ``schema`` is a :class:`SchemaPolicy` (default AUTO_CREATE). ``create_schema`` (bool)
-        is a deprecated alias kept for the 1.x line (True→AUTO_CREATE, False→VERIFY)."""
+        ``schema`` is a :class:`SchemaPolicy` (default AUTO_CREATE); VERIFY never writes DDL."""
         from power_loop.runtime.store.backends.sqlite import SqliteDatabase
 
         db = await SqliteDatabase.connect(path)
         try:
-            version = await ensure_schema(db, table_prefix, policy=schema, create_schema=create_schema)
+            version = await ensure_schema(db, table_prefix, policy=schema)
             store = cls(db, max_spawn_depth=max_spawn_depth, table_prefix=table_prefix)
             await store._initialize_identity(version)
             return store
@@ -733,12 +731,15 @@ class SessionStore:
                     # Conditional UPDATE serializes against void/release/reclaim on the actual
                     # queue rows. A partial match rolls back this whole transaction, including
                     # delivery markers; no stale batch may acquire a transcript row.
+                    binding = inbox.get("job_ref")
+                    binding_sql = "delivered_job_id=?,delivered_job_generation=?," if binding else ""
+                    binding_args = (binding["job_id"], binding["generation"]) if binding else ()
                     changed = await tx.execute(
-                        f"UPDATE {self.t.follow_up_queue} SET status='delivered', delivered_at=?, "
-                        "delivered_seq=?, delivered_send_index=?, claim_token=NULL "
+                        f"UPDATE {self.t.follow_up_queue} SET {binding_sql}status='delivered', delivered_at=?, "
+                        "delivered_seq=?, delivered_send_index=?, claim_token=NULL, claimed_at=NULL, claim_owner_epoch=NULL "
                         f"WHERE session_id=? AND claim_token=? AND status='claimed' "
                         f"AND id IN ({','.join('?' for _ in ids)})",
-                        (now, seq, (int(send_index) if send_index is not None else None),
+                        (*binding_args, now, seq, (int(send_index) if send_index is not None else None),
                          session_id, token, *ids),
                     )
                     if changed != len(ids):
@@ -1361,65 +1362,32 @@ class SessionStore:
                 n = await tx.execute(sql, (
                     session_id, item_id, str(it.get("kind") or "user"),
                     str(it.get("mode") or "queue"), "pending", _nul_safe(str(it.get("content") or "")),
-                    _dumps(meta) if meta else None, now,
+                    _dumps(meta or {}), now,
                 ))
                 if n:
                     accepted.append(item_id)
         return accepted
 
-    async def inbox_claim(
-        self, session_id: str, *, stale_after_ms: int = 60_000
-    ) -> list[dict[str, Any]]:
-        """Claim every pending item of ``session_id`` (oldest first) for delivery.
-
-        The claim is one ``UPDATE … WHERE status='pending'`` stamped with a fresh token, then a
-        read by that token — atomic on every backend (a concurrent claimer's UPDATE blocks on the
-        row locks and then re-checks ``status``), with no ``RETURNING`` needed. Claims older than
-        ``stale_after_ms`` are first returned to pending: their claimer died before the
-        transcript write (which would have flipped them to ``delivered`` in the same tx)."""
-        token = uuid.uuid4().hex
-        now = _now_ms()
-        q = self.t.follow_up_queue
-        ready = await self._db.fetchone(
-            f"SELECT id,status,claimed_at FROM {q} WHERE session_id=? AND status IN ('pending','claimed') "
-            "ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END,claimed_at LIMIT 1", (session_id,))
-        changes = change_signals.reader(self, session_id)
-        if ready is None:
-            if changes is not None:
-                changes.inbox_seen, changes.inbox_retry_at = changes.versions[0], None
-            return []
-        if ready["status"] == "claimed" and ready["claimed_at"] >= now - int(stale_after_ms):
-            if changes is not None:
-                changes.inbox_seen = changes.versions[0]
-                changes.inbox_retry_at = ready["claimed_at"] + int(stale_after_ms) + 1
-            return []
+    async def inbox_claim(self, session_id: str, *, limit: int = 100, owner_epoch: int = 0) -> list[dict[str, Any]]:
+        """Select a bounded page before claiming. Age alone never revokes a claim."""
+        if not 1 <= limit <= 100:
+            raise ValueError("inbox claim limit must be in 1..100")
+        token, now, q = uuid.uuid4().hex, _now_ms(), self.t.follow_up_queue
         async with self._db.transaction() as tx:
+            await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            rows = await tx.fetchall(
+                f"SELECT * FROM {q} WHERE session_id=? AND status='pending' ORDER BY id LIMIT ?",
+                (session_id, limit))
+            if not rows:
+                return []
+            ids = [r['id'] for r in rows]
             await self.signal_changes(tx, session_id, "inbox")
             await tx.execute(
-                f"UPDATE {q} SET status='pending', claim_token=NULL, claimed_at=NULL "
-                "WHERE session_id=? AND status='claimed' AND claimed_at < ?",
-                (session_id, now - int(stale_after_ms)),
-            )
-            await tx.execute(
-                f"UPDATE {q} SET status='claimed', claim_token=?, claimed_at=? "
-                "WHERE session_id=? AND status='pending'",
-                (token, now, session_id),
-            )
-            rows = await tx.fetchall(
-                f"SELECT id, item_id, kind, mode, content, meta_json, created_at FROM {q} "
-                "WHERE session_id=? AND claim_token=? ORDER BY id",
-                (session_id, token),
-            )
-        out: list[dict[str, Any]] = []
-        for r in rows:
-            meta = r["meta_json"]
-            out.append({
-                "id": int(r["id"]), "item_id": r["item_id"], "kind": r["kind"],
-                "mode": r["mode"], "content": r["content"],
-                "meta": json.loads(meta) if meta else {}, "created_at": r["created_at"],
-                "claim_token": token,
-            })
-        return out
+                f"UPDATE {q} SET status='claimed', claim_token=?, claimed_at=?, claim_owner_epoch=? "
+                f"WHERE status='pending' AND id IN ({','.join('?' for _ in ids)})",
+                (token, now, owner_epoch, *ids))
+        return [{**dict(r), 'meta': json.loads(r['meta_json']), 'claim_token': token,
+                 'claim_owner_epoch': owner_epoch} for r in rows]
 
     async def inbox_release(self, session_id: str, claim_token: str) -> int:
         """Return still-claimed rows of ``claim_token`` to pending (the delivery they were claimed
@@ -1428,7 +1396,7 @@ class SessionStore:
             await self.signal_changes(tx, session_id, "inbox")
             return await tx.execute(
                 f"UPDATE {self.t.follow_up_queue} SET status='pending', claim_token=NULL, "
-                "claimed_at=NULL WHERE session_id=? AND claim_token=? AND status='claimed'", (session_id, claim_token))
+                "claimed_at=NULL, claim_owner_epoch=NULL WHERE session_id=? AND claim_token=? AND status='claimed'", (session_id, claim_token))
 
     async def inbox_void(self, session_id: str, item_ids: Sequence[str]) -> int:
         """Withdraw not-yet-delivered items (pending or claimed) so they never reach the model.
@@ -1439,7 +1407,7 @@ class SessionStore:
         async with self._db.transaction() as tx:
             await self.signal_changes(tx, session_id, "inbox")
             return await tx.execute(
-                f"UPDATE {self.t.follow_up_queue} SET status='void', claim_token=NULL "
+                f"UPDATE {self.t.follow_up_queue} SET status='void', claim_token=NULL, claimed_at=NULL, claim_owner_epoch=NULL "
                 f"WHERE session_id=? AND status IN ('pending','claimed') AND item_id IN ({marks})",
                 (session_id, *[str(i) for i in item_ids]))
 
@@ -1560,6 +1528,8 @@ class SessionStore:
         the session-state row lock so concurrent merges don't clobber each other). No-op if the
         session is gone. Used to record the projection/history mode + projector config for
         inspection and switch-detection."""
+        if {"tenant_id", "principal_id"}.intersection(patch):
+            raise ValueError("session identity is immutable")
         if not patch:
             return
         send_reads.forget(self, session_id, "session")

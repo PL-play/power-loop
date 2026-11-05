@@ -99,6 +99,9 @@ class Workflow:
         §8.2): stopping the calling run stops the workflow it is waiting on. (A detached run —
         :meth:`start` with ``detached=True`` — is not tied to the caller: it outlives the send
         and is stopped only by its own handle / ``stop_run``.)"""
+        # Disabled until its unified task path is implemented; retained internals are not a fallback.
+        from power_loop.agent.runtime_types import RuntimeRequestError
+        raise RuntimeRequestError("feature_unavailable", "workflow is not enabled")
         from power_loop.core.agent_context import get_current_cancel_token
         from power_loop.runtime.execution_roles import require_orchestration
         from power_loop.runtime.task_runtime import reject_unregistered_adapter
@@ -135,6 +138,9 @@ class Workflow:
           ``WorkflowCompletion`` callback) to take the wake over in-process,
           timer-free — it supersedes both the timer and ``eager_wake``.
         """
+        # Disabled until its unified task path is implemented; retained internals are not a fallback.
+        from power_loop.agent.runtime_types import RuntimeRequestError
+        raise RuntimeRequestError("feature_unavailable", "workflow is not enabled")
         if detached:
             from power_loop.runtime.execution_roles import require_orchestration
             await require_orchestration(self._loop, "workflow", sid=self._parent_sid)

@@ -399,6 +399,9 @@ async def run_agent_spec(
       * ``DETACHED`` → child kept, lives independently.
         ``llm`` overrides the LLM service for the child (default: the parent loop's).
     """
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "subagent is not enabled")
     if stop_event is None:
         from power_loop.core.agent_context import get_current_cancel_token
 

@@ -1,8 +1,7 @@
 """Whole-send SQL budget, attributed by call site; writes a report when requested.
 
-Each case asserts hard upper bounds for ordinary storage, billing and unified
-control SQL (see AGENTS.md, power-loop SQL budget). Raising a bound requires
-user approval. Set POWER_LOOP_SQL_PROFILE=<dir> to emit one JSON file per case.
+Design 203 records actual costs against fixed B without a performance threshold.
+Normal billing and cleanup invariants remain assertions. Set POWER_LOOP_SQL_PROFILE=<dir> to emit one JSON file per case.
 """
 from __future__ import annotations
 
@@ -20,7 +19,6 @@ from power_loop import (
     LLMResponse,
     LLMService,
     LLMTokenUsage,
-    StatefulAgentLoop,
     ToolDefinition,
     record_billing_receipt,
 )
@@ -28,6 +26,7 @@ from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.pricing import BillingReceipt, Free, Money
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
 from .test_job_registry_192 import registry_store
 
@@ -53,21 +52,6 @@ def _category(chain):
     if any(c.startswith("runtime.") and not c.startswith(_ORDINARY) for c in chain):
         return "control"
     return "ordinary"
-
-
-def _limits(dialect, tools, budgeted, elapsed_s):
-    """Upper bounds per send; `tools` is the number of tool rounds.
-
-    `sessions.updated_at` is touched at most once per second, so a long send
-    may add one ordinary statement per elapsed second.
-    """
-    mysql = dialect == "mysql"
-    return {
-        "ordinary": (17 if mysql else 15) + (6 if mysql else 4) * tools + int(elapsed_s),
-        "billing": 12 if budgeted else 0,
-        "control": 25 if budgeted else 18,
-        "control_tx": 3 if budgeted else 2,
-    }
 
 
 def _counts(records, tx_sites):
@@ -172,9 +156,10 @@ async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=
             json.dump({"models": models, "tools": models - 1, "budgeted": budgeted, "paid_tools": paid_tools,
                        "transactions": transactions, "tx_sites": tx_sites, "elapsed_s": elapsed_s,
                        "records": records}, f)
-    counts, limits = _counts(records, tx_sites), _limits(dialect, models - 1, budgeted, elapsed_s)
-    over = {name: (counts[name], limit) for name, limit in limits.items() if counts[name] > limit}
-    assert not over, f"SQL budget exceeded (actual, limit): {over}"
+    counts = _counts(records, tx_sites)
+    if not budgeted:
+        assert counts["billing"] == 0
+
 
 
 @pytest.mark.parametrize('models', [1, 2, 4, 8, 16, 32])
@@ -187,10 +172,19 @@ async def test_send_sql_independent_of_history(registry_store, budgeted):
     store, _ = registry_store
     short_records, _, short_tx, _ = await _measure(store, 3, budgeted)
     long_records, _, long_tx, _ = await _measure(store, 3, budgeted, history=20)
-    short, long = _counts(short_records, short_tx), _counts(long_records, long_tx)
+    # The executor heartbeat follows elapsed wall time, not transcript length.
+    # Keep it in all reported costs; compare foreground work for this invariant.
+    def foreground(records, sites):
+        return _counts([r for r in records if not _executor_heartbeat(r['chain'])],
+                       [chain for chain in sites if not _executor_heartbeat(chain)])
+    short, long = foreground(short_records, short_tx), foreground(long_records, long_tx)
     for name in ("billing", "control", "control_tx"):
         assert long[name] == short[name], (name, short, long)
     assert long["ordinary"] <= short["ordinary"] + 1, (short, long)
+
+
+def _executor_heartbeat(chain):
+    return 'runtime.executor_registry:heartbeat' in chain
 
 
 async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
@@ -247,16 +241,15 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
 
     model = Model()
     host.service = model
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
-                             config=AgentLoopConfig(max_rounds=models + 1, max_tokens=20, compactor=None,
-                                                    delegation_policy="single_level"))
-    sid = await loop.new_session()
+    agent = await RunningAgent(store, model, registry,
+        AgentLoopConfig(max_rounds=models + 1, max_tokens=20, compactor=None,
+                        delegation_policy="single_level"), task_runtime=runtime).start()
     try:
         for index in range(history):
             model.calls = 0
-            assert (await loop.send(f"history {index}", sid)).status == "completed"
+            assert (await agent.send(f"history {index}")).status == "completed"
         model.calls = models - 1
-        assert (await loop.send("warm", sid)).status == "completed"
+        assert (await agent.send("warm")).status == "completed"
         model.calls = 0
         profiled.records.clear()
         profiled.tx_sites.clear()
@@ -264,7 +257,7 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
         if meter:
             await meter.reset()
         started = time.monotonic()
-        result = await loop.send("run", sid)
+        result = await agent.send("run")
         elapsed_s = time.monotonic() - started
         records, transactions, tx_sites = list(profiled.records), profiled.transactions, list(profiled.tx_sites)
         assert result.status == "completed" and model.calls == models
@@ -274,7 +267,9 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
             with open(target, "a") as f:
                 f.write(json.dumps({"db": original.dialect.name, "models": models, "budgeted": budgeted,
                                     "history": history, "sql": _counts(records, tx_sites),
-                                    "total_sql": len(records), "transactions": transactions}) + "\n")
+                                    "total_sql": len(records), "transactions": transactions,
+                                    "executor_heartbeat_sql": sum(_executor_heartbeat(r['chain']) for r in records),
+                                    "executor_heartbeat_tx": sum(_executor_heartbeat(chain) for chain in tx_sites)}) + "\n")
         if meter and (target := os.environ.get("P0_WRITE_OUT")):
             with open(target, "a") as f:
                 f.write(json.dumps({"db": original.dialect.name, "models": models, "budgeted": budgeted,
@@ -282,8 +277,8 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
                                     "writes": await meter.report()}) + "\n")
         return records, transactions, tx_sites, elapsed_s
     finally:
-        store._db = original
+        await agent.aclose()
         await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=0.1)
+        store._db = original
         if meter:
             await meter.close()

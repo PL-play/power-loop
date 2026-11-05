@@ -1,4 +1,4 @@
-"""Portable schema bootstrap + version ladder (replaces SQLite's PRAGMA user_version).
+"""Portable current-schema bootstrap (replaces SQLite's PRAGMA user_version).
 
 Every backend stores its version in a single-row ``{prefix}schema_migrations`` table, so
 fresh-stamp / verify / refuse-newer works identically on SQLite/PostgreSQL/MySQL. DDL is
@@ -64,28 +64,8 @@ def validate_table_prefix(prefix: str) -> str:
         )
     return prefix
 
-#: Bump + append a migration step for ANY schema change.
-#: v2 (2026-06): adds the ``{prefix}project_messages`` table (send-context projection).
-#: v3 (2026-06): adds the ``{prefix}hook_events`` table (ephemeral hook-augmentation audit log).
-#: v4 (2026-06): widen MySQL free-text/JSON columns TEXT→LONGTEXT.
-#: v5 (2026-06): adds ``cached_tokens`` (prompt cache-read tokens) to usage_rounds + session_stats.
-#: v6 (2026-07): usage_rounds PK (session_id, round_index) → (session_id, send_index, round_index).
-#:   round_index RESETS per send, so the old key silently overwrote earlier sends' per-round rows —
-#:   a session's accounting kept only the LAST send's detail. Existing rows backfill send_index=0
-#:   (their true send is unrecoverable); new rows carry the real send index.
-#: v7 (2026-07): adds ``{prefix}session_leases`` + ``{prefix}follow_up_queue`` — cross-PROCESS
-#:   session mutual exclusion. The in-process lock only serializes one interpreter; with several
-#:   agent processes on one database, two of them could drive a session concurrently. The lease row
-#:   is the shared arbiter, and the queue lets a process that loses the race hand its steering to
-#:   the holder instead of starting a competing run.
-#: v8 (2026-09): ``{prefix}follow_up_queue`` becomes the durable INBOX (design/124 §6): every
-#:   item is stored (not only cross-process ones), carries a dedupe ``item_id`` (unique per
-#:   session), ``kind``/``mode``/``status``, and is marked ``delivered`` in the SAME transaction
-#:   that writes it into the transcript — so a cancelled run neither loses nor double-delivers
-#:   queued steering. Rebuilt as ``…_v8`` + copy + rename (v7 rows become pending user items).
-# v10 was reserved for task/message identities; v11 adds committed change counters.
-# v12 stores response usage in messages;usage_rounds is a derived read view.
-CURRENT_SCHEMA_VERSION = 12
+# Only the current task structure can be opened. No runtime migration.
+CURRENT_SCHEMA_VERSION = 15
 
 #: The store's data tables (besides ``{prefix}schema_migrations``) — used by VERIFY to
 #: confirm the FULL schema is present, not just the version row. Keep in sync with
@@ -99,93 +79,10 @@ _STORE_TABLES: tuple[str, ...] = (
 _STORE_VIEWS = ('usage_rounds',)
 
 
-def _send_index_column_type(dialect_name: str) -> str:
-    return "INTEGER" if dialect_name == "sqlite" else "BIGINT"
 
 
-async def _migration_steps(
-    tx: Transaction, db: Database, prefix: str, *, from_version: int
-) -> list[str]:
-    """DDL to migrate an existing store from ``from_version`` to :data:`CURRENT_SCHEMA_VERSION`.
-    CREATE statements are ``IF NOT EXISTS`` (idempotent); the ``ALTER … ADD COLUMN`` (no portable
-    ``IF NOT EXISTS`` across SQLite/MySQL) is guarded by a catalog probe (on the open ``tx``) so a
-    half-applied or re-run migration is safe.
-
-    On SQLite/PostgreSQL this whole ladder runs inside one transaction (atomic — a failure rolls
-    back). On MySQL each DDL auto-commits, so a mid-ladder failure leaves a half-applied schema
-    with the version NOT bumped; because every step is idempotent, simply reopening with
-    AUTO_CREATE once the cause (permissions/disk) is fixed completes it (see the migration-failure
-    error in :func:`ensure_schema`, which surfaces these exact steps)."""
-    steps: list[str] = []
-    if from_version < 2:
-        # v1 → v2: add the project_messages (send-context projection) table + index, and the
-        # authoritative send_index column on messages (NULL on pre-existing rows).
-        steps += db.dialect.project_messages_ddl(prefix)
-        if not await _column_exists(tx, db.dialect.name, f"{prefix}messages", "send_index"):
-            steps.append(
-                f"ALTER TABLE {prefix}messages ADD COLUMN send_index "
-                f"{_send_index_column_type(db.dialect.name)}"
-            )
-    if from_version < 3:
-        # v2 → v3: add the hook_events (ephemeral hook-augmentation audit) table + index. A new
-        # CREATE TABLE IF NOT EXISTS — no ALTER on the hot messages table, so no _column_exists
-        # probe needed (the CREATE is itself idempotent).
-        steps += db.dialect.hook_events_ddl(prefix)
-    if from_version < 4:
-        # v3 → v4: widen the MySQL free-text/JSON columns TEXT(64 KiB)→LONGTEXT so large LLM
-        # content/tool output/system prompts no longer fail the write (H2). MySQL-only — SQLite/
-        # Postgres TEXT is already unbounded, so this is a pure version bump there. MODIFY is
-        # idempotent. (Fresh stores already provision LONGTEXT via Dialect.ddl.)
-        if db.dialect.name == "mysql":
-            steps += db.dialect.widen_text_columns_ddl(prefix)
-    if from_version < 5:
-        # v4 → v5: add cached_tokens (prompt cache-read tokens) to usage_rounds + session_stats.
-        # ALTER … ADD COLUMN has no portable IF NOT EXISTS, so probe the catalog on the open tx.
-        int_t = "INTEGER" if db.dialect.name == "sqlite" else "BIGINT"
-        if not await _column_exists(tx, db.dialect.name, f"{prefix}usage_rounds", "cached_tokens"):
-            steps.append(f"ALTER TABLE {prefix}usage_rounds ADD COLUMN cached_tokens {int_t}")
-        if not await _column_exists(tx, db.dialect.name, f"{prefix}session_stats", "cached_tokens"):
-            steps.append(
-                f"ALTER TABLE {prefix}session_stats ADD COLUMN cached_tokens {int_t} NOT NULL DEFAULT 0"
-            )
-    if from_version < 6:
-        # v5 → v6: usage_rounds PK gains send_index (round_index resets per send; the old
-        # 2-column key overwrote prior sends' rows). SQLite can't alter a PK → rebuild the
-        # table; PG/MySQL alter in place. The _column_exists probe makes a re-run safe on
-        # MySQL's auto-committing DDL (a half-applied ladder resumes past the done steps).
-        if not await _column_exists(tx, db.dialect.name, f"{prefix}usage_rounds", "send_index"):
-            steps += _usage_rounds_v6_ddl(db.dialect.name, prefix)
-    if from_version < 7:
-        # v6 → v7: add the session_leases table (cross-process session mutual exclusion). New
-        # CREATE TABLE IF NOT EXISTS — idempotent, no probe. The v7 follow_up_queue table is NOT
-        # created here any more: the v8 step below builds the inbox shape directly.
-        steps += db.dialect.leases_ddl(prefix)
-    if from_version < 8:
-        steps += await _inbox_v8_steps(tx, db, prefix)
-    if from_version < 9:
-        from .context_cache import context_cache_ddl
-        steps += context_cache_ddl(db.dialect.name, prefix)
-    if from_version < 11:
-        from .change_signals import migration_steps
-        steps += await migration_steps(tx, db, prefix)
-    return steps
 
 
-async def _inbox_v8_steps(tx: Transaction, db: Database, prefix: str) -> list[str]:
-    """v7 → v8: rebuild ``follow_up_queue`` into the inbox shape. Probes make it resumable from
-    ANY point of a half-applied MySQL ladder (its DDL auto-commits): already migrated → nothing;
-    the ``_v8`` table may already exist (CREATE IF NOT EXISTS) and hold a partial copy (the copy
-    ignores duplicates); the old table may already be gone (skip copy + drop, just rename)."""
-    name = db.dialect.name
-    old, tmp = f"{prefix}follow_up_queue", f"{prefix}follow_up_queue_v8"
-    old_exists = await _table_exists_tx(tx, name, old)
-    if old_exists and await _column_exists(tx, name, old, "status"):
-        return []
-    steps = list(db.dialect.inbox_ddl(prefix, tmp))
-    if old_exists:
-        steps += [db.dialect.inbox_v8_copy_sql(prefix, old, tmp), f"DROP TABLE {old}"]
-    steps.append(f"ALTER TABLE {tmp} RENAME TO {old}")
-    return steps
 
 
 async def _table_exists_tx(tx: Transaction, dialect_name: str, table: str) -> bool:
@@ -207,75 +104,8 @@ async def _table_exists_tx(tx: Transaction, dialect_name: str, table: str) -> bo
     return row is not None
 
 
-def _usage_rounds_v6_ddl(dialect_name: str, prefix: str) -> list[str]:
-    p = prefix
-    if dialect_name == "sqlite":
-        return [
-            f"""CREATE TABLE {p}usage_rounds_v6 (
-                session_id TEXT NOT NULL, send_index INTEGER NOT NULL DEFAULT 0,
-                round_index INTEGER NOT NULL, prompt_tokens INTEGER,
-                completion_tokens INTEGER, total_tokens INTEGER, cached_tokens INTEGER, model TEXT,
-                created_at INTEGER NOT NULL,
-                PRIMARY KEY (session_id, send_index, round_index))""",
-            f"INSERT INTO {p}usage_rounds_v6 (session_id, send_index, round_index, prompt_tokens,"
-            f" completion_tokens, total_tokens, cached_tokens, model, created_at)"
-            f" SELECT session_id, 0, round_index, prompt_tokens, completion_tokens, total_tokens,"
-            f" cached_tokens, model, created_at FROM {p}usage_rounds",
-            f"DROP TABLE {p}usage_rounds",
-            f"ALTER TABLE {p}usage_rounds_v6 RENAME TO {p}usage_rounds",
-        ]
-    if dialect_name == "postgres":
-        return [
-            f"ALTER TABLE {p}usage_rounds ADD COLUMN send_index BIGINT NOT NULL DEFAULT 0",
-            f"ALTER TABLE {p}usage_rounds DROP CONSTRAINT {p}usage_rounds_pkey",
-            f"ALTER TABLE {p}usage_rounds ADD PRIMARY KEY (session_id, send_index, round_index)",
-        ]
-    # mysql: one statement so the auto-committing DDL can't leave the PK half-swapped.
-    return [
-        f"ALTER TABLE {p}usage_rounds ADD COLUMN send_index BIGINT NOT NULL DEFAULT 0, "
-        f"DROP PRIMARY KEY, ADD PRIMARY KEY (session_id, send_index, round_index)"
-    ]
 
 
-def migration_ddl_for_display(db: Database, prefix: str, *, from_version: int) -> list[str]:
-    """The migration DDL as a human-runnable script for an error message — NO catalog probe (the
-    ``ALTER`` is shown unconditionally so an operator running it by hand sees every step). Unlike
-    :func:`provisioning_ddl` (which only CREATEs fresh tables and would silently SKIP the
-    ``ALTER … ADD COLUMN`` on an existing table), this is what actually completes the migration."""
-    steps: list[str] = []
-    if from_version < 2:
-        steps += db.dialect.project_messages_ddl(prefix)
-        steps.append(
-            f"ALTER TABLE {prefix}messages ADD COLUMN send_index "
-            f"{_send_index_column_type(db.dialect.name)}"
-        )
-    if from_version < 3:
-        steps += db.dialect.hook_events_ddl(prefix)
-    if from_version < 4 and db.dialect.name == "mysql":
-        steps += db.dialect.widen_text_columns_ddl(prefix)
-    if from_version < 5:
-        int_t = "INTEGER" if db.dialect.name == "sqlite" else "BIGINT"
-        steps.append(f"ALTER TABLE {prefix}usage_rounds ADD COLUMN cached_tokens {int_t}")
-        steps.append(
-            f"ALTER TABLE {prefix}session_stats ADD COLUMN cached_tokens {int_t} NOT NULL DEFAULT 0"
-        )
-    if from_version < 6:
-        steps += _usage_rounds_v6_ddl(db.dialect.name, prefix)
-    if from_version < 7:
-        steps += db.dialect.leases_ddl(prefix)
-    if from_version < 7:
-        steps += db.dialect.inbox_ddl(prefix, f"{prefix}follow_up_queue")
-    elif from_version < 8:
-        old, tmp = f"{prefix}follow_up_queue", f"{prefix}follow_up_queue_v8"
-        steps += db.dialect.inbox_ddl(prefix, tmp)
-        steps += [db.dialect.inbox_v8_copy_sql(prefix, old, tmp), f"DROP TABLE {old}",
-                  f"ALTER TABLE {tmp} RENAME TO {old}"]
-    if from_version < 11:
-        from .change_signals import COLUMNS
-        integer = "INTEGER" if db.dialect.name == "sqlite" else "BIGINT"
-        steps += [f"ALTER TABLE {prefix}session_state ADD COLUMN {column} {integer} NOT NULL DEFAULT 0"
-                  for column in COLUMNS]
-    return steps
 
 
 class SchemaPolicy(str, Enum):
@@ -284,42 +114,38 @@ class SchemaPolicy(str, Enum):
     AUTO_CREATE = "auto_create"  # create tables/indexes if missing, then stamp
     VERIFY = "verify"            # verify only; raise (with DDL) if missing/stale
     TASKS = "tasks"              # current task schema, fresh or already current only
-    COMPATIBLE = "compatible"    # verify current base/task schemas, never migrate/create
-
-
-def _coerce_policy(policy: SchemaPolicy | str | None, create_schema: bool | None) -> SchemaPolicy:
-    """Resolve the effective policy. ``create_schema`` (bool) is the deprecated alias:
-    True → AUTO_CREATE, False → VERIFY. An explicit ``policy`` wins over it."""
-    if policy is not None:
-        return SchemaPolicy(policy)
-    if create_schema is not None:
-        return SchemaPolicy.AUTO_CREATE if create_schema else SchemaPolicy.VERIFY
-    return SchemaPolicy.AUTO_CREATE
 
 
 def provisioning_ddl(db: Database, prefix: str) -> list[str]:
-    """The COMPLETE provisioning script: the version table, every store table/index, and the
-    version-row stamp — i.e. exactly what a privileged user must run so that a later
-    ``VERIFY`` open succeeds. (``Dialect.ddl`` alone omits the migrations table + stamp.)
+    """Complete current-schema script for an empty database, including identity."""
+    import secrets
 
-    The whole script is idempotent (``CREATE TABLE IF NOT EXISTS`` + an ``ON CONFLICT/IGNORE``
-    version stamp) so infra automation (Terraform/Ansible/k8s init) can re-apply it safely."""
-    vtable = f"{prefix}schema_migrations"
-    if db.dialect.name == "mysql":
-        stamp = f"INSERT IGNORE INTO {vtable} (id, version) VALUES (1, {CURRENT_SCHEMA_VERSION})"
-    else:
-        stamp = (
-            f"INSERT INTO {vtable} (id, version) VALUES (1, {CURRENT_SCHEMA_VERSION}) "
-            "ON CONFLICT(id) DO NOTHING"
-        )
     from .context_cache import context_cache_ddl
-    return [
-        f"CREATE TABLE IF NOT EXISTS {vtable} "
-        f"(id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL)",
-        *db.dialect.ddl(prefix),
-        *context_cache_ddl(db.dialect.name, prefix),
-        stamp,
-    ]
+    from .task_schema import TASK_PROTOCOL_VERSION, message_identity_ddl, task_tables_ddl
+    vtable = prefix + "schema_migrations"
+    statements = [f"CREATE TABLE IF NOT EXISTS {vtable} "
+                  "(id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL)",
+                  *db.dialect.ddl(prefix), *context_cache_ddl(db.dialect.name, prefix),
+                  *task_tables_ddl(db.dialect.name, prefix)]
+    output, indexes = [], set()
+    for statement in statements:
+        if statement.startswith(f"CREATE TABLE IF NOT EXISTS {prefix}messages ("):
+            statement = message_identity_ddl(statement, db.dialect.name)
+        match = re.match(r"CREATE (?:UNIQUE )?INDEX (?:IF NOT EXISTS )?(\w+)", statement)
+        if match:
+            if match[1] in indexes:
+                continue
+            indexes.add(match[1])
+        if statement.startswith("CREATE TABLE"):
+            indexes.update(re.findall(r"\b(?:INDEX|KEY)\s+(\w+)\s*\(", statement))
+        output.append(statement)
+    store_id = "store_" + secrets.token_hex(16)
+    insert = "INSERT IGNORE" if db.dialect.name == "mysql" else "INSERT"
+    conflict = "" if db.dialect.name == "mysql" else " ON CONFLICT(id) DO NOTHING"
+    output.append(f"{insert} INTO {prefix}task_store (id,store_id,protocol_version) "
+                  f"VALUES (1,'{store_id}',{TASK_PROTOCOL_VERSION}){conflict}")
+    output.append(f"{insert} INTO {vtable} (id,version) VALUES (1,{CURRENT_SCHEMA_VERSION}){conflict}")
+    return output
 
 
 class StoreSchemaError(RuntimeError):
@@ -346,31 +172,8 @@ class StoreSchemaError(RuntimeError):
 _FetchOne = Callable[..., Awaitable["Row | None"]]
 
 
-async def _legacy_unprefixed_present(fetch: _FetchOne, dialect_name: str, prefix: str) -> bool:
-    """True iff this looks like a PRE-2.0 power-loop SQLite database: legacy UNPREFIXED tables
-    exist but the prefixed 2.0 schema does not. 1.x was SQLite-only and used no table prefix,
-    so on upgrade the 2.0 ``pl_`` schema would open as an empty store while the old sessions
-    sit (intact) under the unprefixed names. Only meaningful for SQLite with a non-empty prefix."""
-    if not prefix or dialect_name != "sqlite":
-        return False
-    try:
-        legacy = await fetch("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
-        prefixed = await fetch(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (f"{prefix}sessions",)
-        )
-    except Exception:  # pragma: no cover - detection is best-effort, never fatal
-        return False
-    return legacy is not None and prefixed is None
 
 
-def _legacy_message(prefix: str) -> str:
-    return (
-        f"found a pre-2.0 power-loop database (legacy UNPREFIXED tables) but no '{prefix}' "
-        f"schema at this path. power-loop 2.0 uses the '{prefix}' table prefix, so prior "
-        "sessions are NOT visible under it — they are intact, just under the old unprefixed "
-        "tables. To read the legacy data open the store with table_prefix='' (the 1.x layout); "
-        f"otherwise a fresh '{prefix}' schema is used and the old sessions are ignored."
-    )
 
 
 def _version_stamp_sql(db: Database, vtable: str) -> str:
@@ -472,124 +275,11 @@ async def ensure_schema(
     prefix: str,
     *,
     policy: SchemaPolicy | str | None = None,
-    create_schema: bool | None = None,
 ) -> int:
-    """Bring the store to :data:`CURRENT_SCHEMA_VERSION` per ``policy``; return the live version.
-
-    ``policy`` is a :class:`SchemaPolicy`. ``create_schema`` (bool) is a deprecated alias
-    (True→AUTO_CREATE, False→VERIFY); an explicit ``policy`` takes precedence.
-    """
-    eff = _coerce_policy(policy, create_schema)
-    validate_table_prefix(prefix)
-    vtable = f"{prefix}schema_migrations"
-
-    if eff is SchemaPolicy.TASKS:
-        from .task_schema import ensure_task_schema
-        return await ensure_task_schema(db, prefix, create=True)
-    if eff is SchemaPolicy.COMPATIBLE:
-        from .task_schema import TASK_SCHEMA_VERSION, ensure_task_schema
-        if not await _table_exists(db, vtable):
-            raise StoreSchemaError("compatible mode requires an existing current store")
-        row = await db.fetchone(f"SELECT version FROM {vtable} WHERE id=1")
-        version = int(row["version"]) if row else 0
-        if version == TASK_SCHEMA_VERSION:
-            return await ensure_task_schema(db, prefix, create=False)
-        if version != CURRENT_SCHEMA_VERSION:
-            raise StoreSchemaError("store requires an explicit maintenance migration")
-        eff = SchemaPolicy.VERIFY
-
-    if eff is SchemaPolicy.VERIFY:
-        # Probe the version table via the CATALOG (never via SELECT … FROM, which would
-        # raise on a missing table and force us to swallow ALL exceptions — masking a
-        # transient connection/permission failure as 'schema not initialized').
-        if not await _table_exists(db, vtable):
-            if await _legacy_unprefixed_present(db.fetchone, db.dialect.name, prefix):
-                raise StoreSchemaError(_legacy_message(prefix), ddl=provisioning_ddl(db, prefix))
-            raise StoreSchemaError(
-                f"store schema not initialized ({vtable} missing). Open with "
-                "schema=SchemaPolicy.AUTO_CREATE or provision the schema first.",
-                ddl=provisioning_ddl(db, prefix),
-            )
-        # The version table exists: a failure reading it now is a REAL fault (connection /
-        # permission), so let it propagate as itself rather than reporting 'not initialized'.
-        row = await db.fetchone(f"SELECT version FROM {vtable} WHERE id=1")
-        if row is None:
-            raise StoreSchemaError(
-                f"store schema not initialized ({vtable} has no version row). Open with "
-                "schema=SchemaPolicy.AUTO_CREATE or provision the schema first.",
-                ddl=provisioning_ddl(db, prefix),
-            )
-        version = int(row["version"])
-        if version != CURRENT_SCHEMA_VERSION:
-            raise StoreSchemaError(
-                f"store schema version {version} != code {CURRENT_SCHEMA_VERSION}; "
-                "run an upgrade (auto-create is disabled).",
-                ddl=provisioning_ddl(db, prefix),
-            )
-        # The version row can be present + current while a DATA table was dropped (partial
-        # restore, a manual/DBA drop, a half-applied provisioning script). Probe each so
-        # VERIFY is a real pre-flight instead of passing then crashing on the first write.
-        missing = [
-            f"{prefix}{name}" for name in (*_STORE_TABLES, *_STORE_VIEWS)
-            if not await _table_exists(db, f"{prefix}{name}")
-        ]
-        if missing:
-            raise StoreSchemaError(
-                f"store schema incomplete: version stamped v{version} but data table(s) "
-                f"missing: {', '.join(missing)}.",
-                ddl=provisioning_ddl(db, prefix),
-            )
-        return version
-
-    # AUTO_CREATE
-    async with db.transaction() as tx:
-        # Serialize concurrent first-boot across processes so a race on CREATE TABLE doesn't
-        # surface as a raw duplicate-object error / misleading 'permission' hint (PG xact
-        # advisory lock auto-releases; MySQL named lock released in finally; SQLite no-op).
-        await _acquire_provision_lock(tx, db, prefix)
-        try:
-            await tx.execute(
-                f"CREATE TABLE IF NOT EXISTS {vtable} "
-                f"(id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL)"
-            )
-            row = await tx.fetchone(f"SELECT version FROM {vtable} WHERE id=1")
-            if row is None:
-                # Pre-2.0 DB at this path? Warn loudly (the prefix change is accepted-breaking,
-                # but silently fronting an empty store would strand the user's old sessions).
-                # Then proceed to create the fresh prefixed schema.
-                if await _legacy_unprefixed_present(tx.fetchone, db.dialect.name, prefix):
-                    logger.warning("power-loop store: %s", _legacy_message(prefix))
-                # Fresh store: create every table (only on first init — a no-op CREATE IF NOT
-                # EXISTS otherwise, but it warns per-table on MySQL), then stamp. Wrap the DDL
-                # so a permission failure surfaces the full provisioning script instead of a
-                # raw driver error.
-                try:
-                    from .context_cache import context_cache_ddl
-                    for stmt in db.dialect.ddl(prefix) + context_cache_ddl(db.dialect.name, prefix):
-                        await tx.execute(stmt)
-                except Exception as exc:
-                    raise StoreSchemaError(
-                        "failed to auto-create the store schema. If this is a permission "
-                        "error, run the DDL below as a user with CREATE rights and reopen "
-                        f"with schema=SchemaPolicy.VERIFY. Underlying error: {exc!r}",
-                        ddl=provisioning_ddl(db, prefix),
-                    ) from exc
-                await tx.execute(_version_stamp_sql(db, vtable), (CURRENT_SCHEMA_VERSION,))
-                return CURRENT_SCHEMA_VERSION
-            version = int(row["version"])
-            if version == 10:
-                raise StoreSchemaError("task schema requires an explicit maintenance migration")
-            if version > CURRENT_SCHEMA_VERSION:
-                raise StoreSchemaError(
-                    f"store schema version {version} is newer than this power_loop build "
-                    f"supports (max {CURRENT_SCHEMA_VERSION})"
-                )
-            if version < CURRENT_SCHEMA_VERSION:
-                raise StoreSchemaError('store requires an explicit maintenance migration; '
-                    'ordinary opening never converts stored message or usage formats')
-            return version
-        finally:
-            await _release_provision_lock(tx, db, prefix)
+    """Create the current task structure or verify it; never open an older mode."""
+    from .task_schema import ensure_task_schema
+    eff = SchemaPolicy(policy) if policy is not None else SchemaPolicy.AUTO_CREATE
+    return await ensure_task_schema(db, prefix, create=eff in {SchemaPolicy.AUTO_CREATE, SchemaPolicy.TASKS})
 
 
 __all__ = [

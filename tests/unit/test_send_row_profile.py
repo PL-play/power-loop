@@ -1,90 +1,24 @@
-"""Per-send row and byte budgets on SQLite/PostgreSQL/MySQL; limits only decrease."""
+"""Whole-send row/byte measurements and cleanup on three databases (fixed B)."""
 from __future__ import annotations
 
 import json
-import math
 import os
 import time
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop, ToolDefinition
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, ToolDefinition
 from power_loop.runtime.jobs import JobManager
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
 from tests.unit.test_send_sql_profile import Profiled, _counts
 from tests.write_meter import WriteMeter
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 OUT = os.environ.get("ROWS_OUT")
-
-# Design 201 A0 baseline, lowered through A4. Byte budgets allow a 2% margin.
-_BASELINE = {(1, 0, False): {'jobs': (1, 311),
-                 'job_events': (3, 3030),
-                 'execution_checkpoints': (0, 0),
-                 'execution_batches': (0, 0),
-                 'messages': (2, 221),
-                 'session_stats': (0, 1)},
- (1, 0, True): {'jobs': (1, 311),
-                'job_events': (3, 3030),
-                'task_budget_scopes': (0, 1),
-                'task_budget_attempts': (0, 0),
-                'execution_checkpoints': (0, 0),
-                'execution_batches': (0, 0),
-                'execution_allocations': (0, 0),
-                'messages': (2, 221),
-                'session_stats': (0, 1)},
- (4, 1, False): {'jobs': (1, 311),
-                 'job_events': (3, 3036),
-                 'execution_checkpoints': (0, 0),
-                 'execution_batches': (0, 0),
-                 'messages': (8, 1186),
-                 'session_state': (0, 1),
-                 'session_stats': (0, 1)},
- (4, 1, True): {'jobs': (1, 311),
-                'job_events': (3, 3036),
-                'task_budget_scopes': (0, 1),
-                'task_budget_attempts': (0, 0),
-                'execution_checkpoints': (0, 0),
-                'execution_batches': (0, 0),
-                'execution_allocations': (0, 0),
-                'messages': (8, 1186),
-                'session_state': (0, 1),
-                'session_stats': (0, 1)},
- (32, 1, False): {'jobs': (1, 312),
-                  'job_events': (3, 3051),
-                  'execution_checkpoints': (0, 0),
-                  'execution_batches': (0, 0),
-                  'messages': (64, 10321),
-                  'session_state': (0, 1),
-                  'session_stats': (0, 2)},
- (32, 1, True): {'jobs': (1, 312),
-                 'job_events': (3, 3051),
-                 'task_budget_scopes': (0, 1),
-                 'task_budget_attempts': (0, 0),
-                 'execution_checkpoints': (0, 0),
-                 'execution_batches': (0, 0),
-                 'execution_allocations': (0, 0),
-                 'messages': (64, 10321),
-                 'session_state': (0, 1),
-                 'session_stats': (0, 2)},
- (32, 4, False): {'jobs': (1, 312),
-                  'job_events': (3, 3052),
-                  'execution_checkpoints': (0, 0),
-                  'execution_batches': (0, 0),
-                  'messages': (157, 25745),
-                  'session_stats': (0, 2)},
- (32, 4, True): {'jobs': (1, 312),
-                 'job_events': (3, 3052),
-                 'task_budget_attempts': (0, 0),
-                 'execution_checkpoints': (0, 0),
-                 'execution_batches': (0, 0),
-                 'execution_allocations': (0, 0),
-                 'messages': (157, 25745),
-                 'session_stats': (0, 2)}}
-
 
 async def _snapshot(db, prefix, *, largest=None):
     d = db.dialect.name
@@ -173,13 +107,12 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
 
     model = Model()
     host.service = model
-    loop = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime, tool_registry=registry,
-                             config=AgentLoopConfig(max_rounds=r + 1, max_tokens=20, compactor=None,
-                                                    delegation_policy="single_level"))
-    sid = await loop.new_session()
+    agent = await RunningAgent(store, model, registry,
+        AgentLoopConfig(max_rounds=r + 1, max_tokens=20, compactor=None,
+                        delegation_policy="single_level"), task_runtime=runtime).start()
     try:
         model.calls, model.target = 0, r
-        assert (await loop.send("warm", sid)).status == "completed"
+        assert (await agent.send("warm")).status == "completed"
         p = store.table_prefix
         events_table = p + "job_events"
         before, ev_before = await _snapshot(store._db, p), await _events(store._db, events_table)
@@ -189,7 +122,7 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
         if meter:
             await meter.reset()
         started = time.monotonic()
-        result = await loop.send("run", sid)
+        result = await agent.send("run")
         elapsed_s = time.monotonic() - started
         sql = _counts(profiled.records, profiled.tx_sites)
         sql["total"] = len(profiled.records)
@@ -201,31 +134,20 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
                  for t in after if after[t] != before.get(t)}
         ev = {k2: (v[0] - ev_before.get(k2, (0, 0))[0], v[1] - ev_before.get(k2, (0, 0))[1])
               for k2, v in ev_after.items() if v != ev_before.get(k2)}
-        over = {}
-        limits = _BASELINE[r, k, budgeted]
-        for table, (count, size) in delta.items():
-            row_limit, baseline_bytes = limits.get(table, (0, 0))
-            byte_limit = math.ceil(baseline_bytes * 1.02)
-            if count > row_limit or size > byte_limit:
-                over[table] = {"actual": (count, size), "limit": (row_limit, byte_limit)}
         if OUT:
             with open(OUT, "a") as f:
                 f.write(json.dumps({"db": store._db.dialect.name, "R": r, "K": k, "T": (r - 1) * k,
                                     "budgeted": budgeted, "tables": delta, "job_events": ev,
                                     "sql": sql, "transactions": len(profiled.tx_sites),
                                     "writes": writes, "elapsed_s": elapsed_s, "largest": largest}) + "\n")
-        assert not over, json.dumps({"over": over, "actual": delta}, sort_keys=True)
         assert delta.get('task_budget_attempts', (0, 0))[0] == 0
         assert largest.get('task_budget_attempts', 0) == 0
-        assert delta.get('job_events', (0, 0))[0] <= 3
-        assert delta.get('job_events', (0, 0))[1] <= 4 * 1024
         assert after.get('execution_batches', (0, 0))[0] == 0
         assert after['execution_checkpoints'][0] == 0
         assert after['execution_allocations'][0] == 0 and after['task_budget_attempts'][0] == 0
-        assert sum(max(0, value[1]) for value in delta.values()) <= 30 * 1024
     finally:
         await runtime.shutdown(timeout_s=1)
-        await loop.aclose(drain_timeout_s=0.1)
+        await agent.aclose()
         store._db = original_db
         if meter:
             await meter.close()

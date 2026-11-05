@@ -67,7 +67,7 @@ async def prepare(pipeline, attempt):
                              raw["tool_call_id"], raw["send_index"], raw["round_index"])
     if raw is None or raw["role"] != "assistant" or raw["calls"] is None:
         raise JobError("tool_call_plan_raw_unavailable")
-    if binding.resource_evidence["_control_create_request"].get("send_index") != ref.send_index:
+    if binding.resource_evidence["_runtime_send_index"] != ref.send_index:
         raise JobError("tool_call_plan_original_send_mismatch")
     try:
         calls = json.loads(raw["calls"])

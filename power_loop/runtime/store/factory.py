@@ -35,14 +35,12 @@ async def open_store(
     max_spawn_depth: int = DEFAULT_MAX_SPAWN_DEPTH,
     table_prefix: str = DEFAULT_TABLE_PREFIX,
     schema: SchemaPolicy | str | None = None,
-    create_schema: bool | None = None,
 ) -> SessionStore:
     """Open an async store for ``dsn`` (scheme → backend), provisioned per ``schema``
-    (:class:`SchemaPolicy`, default AUTO_CREATE). ``create_schema`` (bool) is a deprecated
-    alias (True→AUTO_CREATE, False→VERIFY)."""
+    (:class:`SchemaPolicy`, default AUTO_CREATE). Only the current schema is supported."""
     db = await _make_database(dsn)
     try:
-        version = await ensure_schema(db, table_prefix, policy=schema, create_schema=create_schema)
+        version = await ensure_schema(db, table_prefix, policy=schema)
         store = SessionStore(db, max_spawn_depth=max_spawn_depth, table_prefix=table_prefix)
         await store._initialize_identity(version)
         return store

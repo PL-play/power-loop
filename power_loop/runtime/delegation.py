@@ -312,6 +312,9 @@ async def _complete(loop, parent, sid, run, raw, after_seq, lifecycle, finalize,
 async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=None,
                 admission: asyncio.Semaphore | None = None, llm=None,
                 inherit_send_filter=True, prepare_result=None) -> dict[str, Any]:
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "subagent is not enabled")
     from .execution_roles import require_orchestration
     await require_orchestration(loop, "subagent")
     parent = get_session_id()
@@ -418,6 +421,9 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
 
 async def run_inline(spec, task, *, parent_loop, llm=None, inherit_send_filter=True, finalize=None):
     """Await the standard owned child; never start an unmanaged inline session."""
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "subagent is not enabled")
     runtime = parent_loop.task_runtime
     if runtime is None:
         from .jobs import JobError
@@ -438,6 +444,9 @@ async def run_inline(spec, task, *, parent_loop, llm=None, inherit_send_filter=T
 
 async def nudge(loop, sid: str, message: str, *, on_complete=None, finalize=None,
                 admission: asyncio.Semaphore | None = None) -> dict[str, Any]:
+    # Disabled until its unified task path is implemented; retained internals are not a fallback.
+    from power_loop.agent.runtime_types import RuntimeRequestError
+    raise RuntimeRequestError("feature_unavailable", "subagent is not enabled")
     from .execution_roles import require_orchestration
     await require_orchestration(loop, "subagent")
     if getattr(loop, "task_runtime", None) is not None:
