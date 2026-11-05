@@ -301,6 +301,8 @@ class TaskRuntime:
         self._lifecycle = ExecutorLifecycle(self, boot_contract_hash) if boot_contract_hash is not None else None
 
     def check_local_admission(self):
+        from .session_ownership import require_current_ownership
+        require_current_ownership(self.manager.store)
         if self._lifecycle is not None:
             self._lifecycle.check_admission()
         self._controller_retirements.check()
@@ -448,8 +450,10 @@ class TaskRuntime:
         return tuple(task for task in self._budget_handles.values() if not task.done())
 
     def track_task(self, task, *, cancel_token=None, job_id=None):
+        from .session_ownership import track_owned_task
         if not isinstance(task, asyncio.Task):
             raise JobError("executor_task_handle_required")
+        track_owned_task(task)
         # Keep original mechanical writes reachable even for a legacy runtime
         # without the optional automatic boot lifecycle.
         self._adapter_tasks.add(task)
@@ -587,7 +591,9 @@ class TaskRuntime:
                 raise JobError("task_supervision_lost") from lost[0]
         finally:
             try:
-                if (owner or context is not None) and self._local_executions.get(local_key) is local:
+                from .session_ownership import current_ownership, ownership_lost
+                if ((owner or context is not None) and self._local_executions.get(local_key) is local
+                        and not ownership_lost(current_ownership())):
                     binding.stop_renewal.set()
                     # Capture before the first await: cancellation or SQL rollback
                     # cannot erase the fact that this local controller exited.
@@ -597,6 +603,11 @@ class TaskRuntime:
                         async with asyncio.timeout(2):
                             await retire(self, binding, local)
                     except BaseException as exc:
+                        from power_loop.contracts.errors import SessionLeaseLost
+                        if isinstance(exc, SessionLeaseLost):
+                            self._controller_retirements.discard(slot)
+                            self._controller_task_exits.exclude(binding.lease)
+                            raise
                         slot.failed = True
                         if not isinstance(exc, Exception):
                             raise
@@ -783,6 +794,8 @@ class TaskRuntime:
             evidence.setdefault("usage", dict(binding.resource_evidence.get("model_usage_totals", {})))
             raise
         finally:
+            from .session_ownership import require_current_ownership
+            require_current_ownership(self.manager.store)
             if binding.resource_evidence.get("model_attempts_inflight"):
                 binding.resource_evidence["resource_state"] = "unknown"
             last = await self.manager.store.last_assistant_ref(sid, send_index)

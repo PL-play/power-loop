@@ -208,6 +208,11 @@ from power_loop.runtime.runtime_state import (
     default_runtime_projectors,
     get_tool_runtime_context,
 )
+from power_loop.runtime.session_ownership import (
+    MemorySessionOwnershipCoordinator,
+    SessionOwnership,
+    SessionOwnershipCoordinator,
+)
 from power_loop.runtime.skills import (
     LOAD_SKILL_DEFINITION,
     SkillLoader,
@@ -330,6 +335,9 @@ STABLE_API = (
 )
 
 __all__ = [
+    "SessionOwnership",
+    "SessionOwnershipCoordinator",
+    "MemorySessionOwnershipCoordinator",
     "ResponseMetrics",
     "ProviderCost",
     "TokenUsageExtractor",

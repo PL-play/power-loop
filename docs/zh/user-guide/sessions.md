@@ -117,7 +117,7 @@ print(r2.final_text)  # → "你喜欢蓝色。"
 
 换成服务器后端也一样——把两个进程都指向 `postgresql://…` / `mysql://…`（见 [存储后端](storage-backends.md)）。
 
-> **注意**：同一个 session 同一时刻必须只由一个写者驱动。按 session 的 `asyncio.Lock` 覆盖**整个进程**（自 3.19.0 起它按 `session_id` 放在进程级注册表里，因此同一 store 上的多个 `StatefulAgentLoop` 对象也能正确串行），但它看不见别的进程。多个进程共享一个 store 时，要么在你的 dispatcher/queue 层把同一 session 的 send 串行化，要么设 `distributed_sessions=True` 让 power-loop 用数据库租约来协调。用 SQLite 时，每个文件跑一个写者进程（把 session 按文件分片）；见 [扩展性](scaling.md)。
+> 同一会话只由一个所有者驱动。默认协调器只协调本进程；多进程部署向 `StatefulAgentLoop(session_coordinator=...)` 传入应用提供的共享协调器。详见[伸缩](scaling.md)。
 
 ## 悬挂恢复
 

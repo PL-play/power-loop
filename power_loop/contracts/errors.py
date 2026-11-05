@@ -29,12 +29,10 @@ class SessionNotFoundError(PowerLoopError):
 
 
 class SessionBusy(PowerLoopError):
-    """Raised when another PROCESS holds the session's lease (distributed_sessions only).
+    """Another owner holds this session; retry on the holder or after release.
 
-    Not an error condition so much as a routing signal: the session is legitimately being driven
-    elsewhere. ``follow_up`` catches it and parks the input in the shared queue for the holder to
-    drain; a host calling ``send`` directly should either do the same or retry later, never spin
-    (the holder may work for minutes).
+    Foreign input is not accepted or parked by the SDK. The application keeps
+    the wake-up pending and routes or retries it.
     """
 
     code = "session.busy"

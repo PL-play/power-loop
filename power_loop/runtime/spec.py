@@ -341,6 +341,7 @@ async def workflow_continuation_loop(parent_loop: Any, session_id: str, *, expec
         tool_registry=filtered_registry(parent_loop.tool_registry, tools),
         hooks=parent_loop._runner.hooks, event_bus=parent_loop._runner.event_bus,
         task_runtime=getattr(parent_loop, "task_runtime", None),
+        session_coordinator=parent_loop.session_coordinator,
     )
     loop._child_run_guards = getattr(parent_loop, "_child_run_guards", ())
     return loop
@@ -532,6 +533,7 @@ async def run_agent_spec(
         hooks=parent_loop._runner.hooks,
         event_bus=parent_loop._runner.event_bus,
         task_runtime=getattr(parent_loop, "task_runtime", None),
+        session_coordinator=parent_loop.session_coordinator,
     )
     # Child-run guards propagate: a grandchild spawned DURING this child's run
     # ticks the same task-local host state, so it must enter the same guards.

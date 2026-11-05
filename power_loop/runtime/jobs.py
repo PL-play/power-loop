@@ -236,6 +236,8 @@ class JobManager:
 
     @asynccontextmanager
     async def _write(self):
+        from .session_ownership import require_current_ownership
+        require_current_ownership(self.store)
         # Each writer acquires its root before mutable job state. Metadata-only
         # admission writers share no task root. No provider await belongs here.
         joined = self._joined_write.get()

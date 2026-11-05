@@ -174,6 +174,8 @@ class ControlTransaction(ControlReadView):
     async def renew_job(self, job_id, sql, params):
         """A lease update has the same root scope as other job writes."""
         await self.require_job(job_id)
+        from .session_ownership import require_current_ownership
+        require_current_ownership(self._manager.store)
         self.touch_job(job_id)
         self.writes += 1
         return await self._tx.execute_flag(sql, params)
@@ -321,6 +323,8 @@ class ControlTransaction(ControlReadView):
         return await self._execute(sql, params)
 
     async def _execute(self, sql, params=()):
+        from .session_ownership import require_current_ownership
+        require_current_ownership(self._manager.store)
         self.writes += 1
         return await self._tx.execute(sql, params)
 
@@ -329,6 +333,8 @@ class ControlTransaction(ControlReadView):
         return await self._tx.execute(sql)
 
     async def execute_flag(self, sql, params=()):
+        from .session_ownership import require_current_ownership
+        require_current_ownership(self._manager.store)
         self.writes += 1
         self.forget_reads()
         return await self._tx.execute_flag(sql, params)

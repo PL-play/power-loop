@@ -74,57 +74,37 @@ Route a given session to a fixed process (e.g. hash the session id). Do **not** 
 
 ## Running several processes over one store
 
-With a server backend, two processes can be handed the same session — a retry, a rebalance, a
-blue/green overlap. The in-process lock cannot see across processes, so either your dispatcher
-guarantees affinity, or you opt in:
+The default `MemorySessionOwnershipCoordinator` coordinates loops within one process. Multi-process hosts implement a shared coordinator and pass it to every loop:
 
 ```python
 loop = StatefulAgentLoop(
-    llm=llm, store=store,                      # PostgreSQL / MySQL — SQLite is single-host
-    config=AgentLoopConfig(
-        system_prompt="…",
-        distributed_sessions=True,
-        session_lease_ttl_s=90.0,
-    ),
+    llm=llm, store=store,
+    session_coordinator=shared_coordinator,
+    config=AgentLoopConfig(session_lease_ttl_s=90.0),
 )
 ```
 
-Each `send()` then takes a **lease row** for the session, renews it from a background task while
-it works, and releases it at the end. A process that cannot take the lease raises `SessionBusy`:
+`SessionOwnershipCoordinator` defines `acquire`, `renew`, and `release`; notify ownership loss through the returned `SessionOwnership.lose()`.
+Application implementations must pass `power_loop.testing.SessionOwnershipContractTests`.
+The SDK has no Redis dependency and the default coordinator requires no database lease table.
 
-```python
-from power_loop import SessionBusy
-
-try:
-    result = await loop.send(text, session_id=sid)
-except SessionBusy:
-    ...  # reschedule; never spin — the holder may work for minutes
-```
-
-`follow_up()` handles this for you: when another process holds the session it writes the input to
-a shared queue and returns `FollowUpQueued`. The holder drains that queue at its next round
-boundary, so steering still folds into the live run — across processes.
-
-Requires schema v7; `open_store` migrates automatically (it only adds tables).
+Send, follow-up, and resume acquire ownership before accepting work. A competing owner receives `SessionBusy`; the host keeps the wake-up pending and routes or retries it.
+`follow_up()` does not deliver to another process. Ownership lasts through the send and its child Agent/workflow tasks, releasing when the last task exits.
+Renewal failure stops local session work. Takeover validates caches, repairs pending messages, and marks unfinished execution interrupted.
 
 ### Sizing the TTL
 
 The TTL is a **failure-detection window**, not a per-round budget. Renewal runs on a background
 task every TTL/3, independent of round boundaries — a round that takes ten minutes does not
 threaten the lease. What does threaten it is the event loop being *starved* (a synchronous tool
-blocking the loop, a long CPU-bound stretch) or several renewals failing in a row, so size the TTL
+blocking the loop, a long CPU-bound stretch) or a failed renewal, so size the TTL
 above the longest stall you expect. The same number sets how long a genuinely crashed holder's
 session stays locked before another process can take it: raise it and a live-but-slow holder is
 less likely to be presumed dead; lower it and recovery after a real crash is faster.
 
 ### What the lease does not give you
 
-A lease is not a hard mutual-exclusion guarantee. A holder that stalls past its TTL is presumed
-dead and another process takes over while the first may still be running — the classic distributed
--lock hazard. The `fence` column exists for the fix (a monotonic token that lets writes from a
-dispossessed holder be rejected) but is not yet enforced, so treat the lease as a strong reduction
-in the odds, not an impossibility proof. `renew_session_lease()` returning `False` is the signal a
-holder has been dispossessed.
+Local deadline checks and loss notification cancel session tasks. Message-state writes retain a `next_seq` condition that rejects a writer behind the new owner. Failures may lose results or leave them unknown; takeover repairs message format and continues without replaying old external actions.
 
 Note also that the lease protects the **session**, not whatever else your run touches: if your
 tools write to a local filesystem workspace, two processes on different hosts have different
@@ -134,6 +114,6 @@ problem.
 ## Honest caveats
 
 - **The measured ceiling above is single-SQLite-writer and environment-sensitive.** Disk fsync latency and CPU dominate; record authoritative numbers on your reference hardware.
-- **Multi-writer scale-out is a backend choice, not magic.** PostgreSQL/MySQL let many processes write one logical store, but a single session is still one writer at a time — either your dispatcher enforces that, or you opt into `distributed_sessions`. The numbers below were recorded against SQLite.
+- **Multi-writer scale-out is a backend choice, not magic.** PostgreSQL/MySQL let many processes write one logical store, but a single session is still one writer at a time — either your dispatcher enforces that, or the application provides a shared session coordinator. The numbers below were recorded against SQLite.
 - **Compaction is the main scaling lever** for long sessions; without it, per-send cost grows with history.
 - **Whether the ceiling is "enough" is your call** against your expected concurrent-session load — and which backend you point the DSN at.

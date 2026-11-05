@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import logging
 from dataclasses import asdict, dataclass
 
@@ -20,6 +19,8 @@ class _Slot:
     task: object
     exit: dict | None = None
     failed: bool = False
+    ownership: object = None
+    context: object = None
 
 
 class TaskExitCache:
@@ -48,7 +49,8 @@ class TaskExitCache:
             return
         if len(self.slots) >= 1000:
             raise JobError('controller_task_exit_capacity_reached')
-        slot = _Slot(binding.actor, binding.lease, task)
+        from .session_ownership import current_ownership, detached_context
+        slot = _Slot(binding.actor, binding.lease, task, ownership=current_ownership(), context=detached_context())
         self.slots[key] = slot
         task.add_done_callback(lambda done: self._finished(key, slot, done))
 
@@ -56,10 +58,18 @@ class TaskExitCache:
         self.slots.pop(_hash(asdict(lease)), None)
 
     def failed_count(self):
+        from .session_ownership import ownership_lost
+        for key, slot in list(self.slots.items()):
+            if ownership_lost(slot.ownership):
+                del self.slots[key]
         return sum(slot.failed for slot in self.slots.values())
 
     def _finished(self, key, slot, done):
         if self.slots.get(key) is not slot:
+            return
+        from .session_ownership import ownership_lost
+        if ownership_lost(slot.ownership):
+            self.slots.pop(key, None)
             return
         if done is not slot.task or not done.done():
             slot.failed = True
@@ -70,14 +80,16 @@ class TaskExitCache:
                          'error_type': type(error).__name__ if error is not None else None,
                          'observed_at_ms': self.runtime.manager.now()}
         if self._writer is not None and not self._writer.done():
+            from .session_ownership import track_owned_task
+            slot.context.run(track_owned_task, self._writer)
             return
         coroutine = self._write_ready()
         writer = None
         try:
-            writer = asyncio.create_task(coroutine, context=contextvars.Context(), name='controller-exit-checkpoints')
+            writer = asyncio.create_task(coroutine, context=slot.context.copy(), name='controller-exit-checkpoints')
             self._writer = writer
             writer.add_done_callback(self._writer_finished)
-            self.runtime.track_task(writer)
+            slot.context.run(self.runtime.track_task, writer)
         except BaseException:
             if writer is None:
                 coroutine.close()
@@ -88,10 +100,14 @@ class TaskExitCache:
 
     def _writer_finished(self, done):
         if done.cancelled() or done.exception() is not None:
-            for slot in self.slots.values():
-                if slot.exit is not None:
-                    slot.failed = True
-            return
+            from .session_ownership import ownership_lost
+            lost = any(ownership_lost(slot.ownership) for slot in self.slots.values())
+            self.failed_count()  # Discard only the ownership periods that ended.
+            if not done.cancelled() or not lost:
+                for slot in self.slots.values():
+                    if slot.exit is not None:
+                        slot.failed = True
+                return
         # A second controller may finish after the active writer took its
         # snapshot. Drain that new witness too, without retrying failed writes.
         if not self.failed_count():
@@ -101,10 +117,13 @@ class TaskExitCache:
                     break
 
     async def _write_ready(self):
+        from power_loop.contracts.errors import SessionLeaseLost
         try:
             async with asyncio.timeout(2):
                 await self.runtime._controller_retirements.flush()
                 await self.flush()
+        except SessionLeaseLost:
+            self.failed_count()
         except Exception as error:
             for slot in self.slots.values():
                 if slot.exit is not None:
@@ -116,6 +135,10 @@ class TaskExitCache:
         async with self._lock:
             self.check()
             for key, slot in list(self.slots.items()):
+                from .session_ownership import ownership_lost
+                if ownership_lost(slot.ownership):
+                    del self.slots[key]
+                    continue
                 if slot.exit is None:
                     continue
                 try:

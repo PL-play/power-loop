@@ -89,16 +89,14 @@ returns those counters; a live round reads detailed state only after a change.
 Final completion performs a fresh signal check. Public getters and stored
 verification read durable state rather than reuse a live turn's snapshot.
 
-Cross-process sharing of a session requires `distributed_sessions=True`. Its
-existing session lease serializes sends even when they create different root
-trees. A second process receives `SessionBusy` before claiming that input; after
-release it creates a distinct root/send. Conditional writes fence expired or
-superseded holders, including a later acquisition by the same owner ID.
-The three-engine real-process test is `test_shared_session_roots.py`.
-
-The default remains `False`. Root locks alone do not serialize unrelated roots
-sharing a session across processes. Hosts must enable the existing session lease
-for that usage; this change adds no second input-ownership structure.
+Session ownership is provided by `SessionOwnershipCoordinator`; the default
+implementation is in-memory. Shared implementations belong to the application
+and must pass the importable `power_loop.testing.SessionOwnershipContractTests`.
+All entry points acquire ownership before accepting input. Loss cancels local
+send/child/workflow tasks. A fresh owner validates the message cache against
+`next_seq`, repairs pending tools, and abandons interrupted task execution.
+The write condition uses the send's observed `next_seq`. The former database
+lease table is retained only until the separate D3 migration.
 
 ## Message usage and crash boundaries
 

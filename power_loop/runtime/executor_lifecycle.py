@@ -7,6 +7,7 @@ to signal its own work; their disappearance never proves remote/provider stop.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
 
 from . import executor_registry as registry
@@ -31,7 +32,9 @@ def _observe(task):
 
 def _create_task(coroutine, *, name):
     try:
-        task = asyncio.create_task(coroutine, name=name)
+        # Boot admission/heartbeat/drain belong to the executor, not the send
+        # that happened to start it. Their writes use the boot's own version.
+        task = asyncio.create_task(coroutine, name=name, context=contextvars.Context())
     except BaseException:
         coroutine.close()
         raise

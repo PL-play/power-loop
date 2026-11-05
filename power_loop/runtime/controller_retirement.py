@@ -29,6 +29,7 @@ class _Exit:
     actor: object
     lease: object
     failed: bool = False
+    ownership: object = None
 
 
 class RetirementCache:
@@ -51,7 +52,8 @@ class RetirementCache:
         key = _hash(asdict(binding.lease))
         if key not in self.pending and len(self.pending) >= 1000:
             raise JobError('controller_retirement_capacity_reached')
-        slot = self.pending.setdefault(key, _Exit(binding.actor, binding.lease))
+        from .session_ownership import current_ownership
+        slot = self.pending.setdefault(key, _Exit(binding.actor, binding.lease, ownership=current_ownership()))
         local['retirement'] = slot
         self.runtime._controller_task_exits.capture(binding, local)
         return slot
@@ -66,6 +68,11 @@ class RetirementCache:
             del self.pending[key]
 
     def failed_count(self):
+        from .session_ownership import ownership_lost
+        for key, slot in list(self.pending.items()):
+            if ownership_lost(slot.ownership):
+                del self.pending[key]
+                self.runtime._controller_task_exits.exclude(slot.lease)
         return sum(slot.failed for slot in self.pending.values())
 
     async def flush(self):

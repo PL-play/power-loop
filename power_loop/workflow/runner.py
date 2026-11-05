@@ -682,6 +682,8 @@ def spawn_background(
                 await _eager_wake(loop, store, parent_sid, run_id, note, task_set)
 
     task = asyncio.create_task(_bg(), name=f"workflow-{run_id}")
+    from power_loop.runtime.session_ownership import track_owned_task
+    track_owned_task(task)
     task_set.add(task)
     task.add_done_callback(task_set.discard)
     # In-process liveness (workflow-durability-3): mark live now, discard when the task settles —

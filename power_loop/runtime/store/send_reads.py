@@ -11,13 +11,13 @@ ACTIVE = ContextVar("power_loop_send_reads", default=None)
 class SessionHolding:
     """One holding period's mutable state and immutable lease identity."""
 
-    def __init__(self, store, sid, *, lease_owner_id=None):
+    def __init__(self, store, sid, *, ownership=None):
         self.store, self.sid = store, sid
         self.active = True
         self.rows, self.runtime = {}, {}
         self.assistant_send_index = None
         self.assistant_ref = None
-        self.lease_owner_id = lease_owner_id
+        self.ownership = ownership
         self.next_seq = None
         self.pending_known, self.pending_json = False, None
         self.deferred_round = None
@@ -47,11 +47,14 @@ def trusted(store, sid):
 
 def lease_writer(store, sid):
     """An inherited old turn never borrows a new period with the same owner ID."""
+    from ..session_ownership import require_current_ownership
+    require_current_ownership(store)
     value = ACTIVE.get()
-    if value is None or value.store is not store or value.sid != sid or value.lease_owner_id is None:
+    if value is None or value.store is not store or value.sid != sid or value.ownership is None:
         return None
     if not value.active:
         raise SessionLeaseLost(sid)
+    value.ownership.require_owned()
     return value
 
 

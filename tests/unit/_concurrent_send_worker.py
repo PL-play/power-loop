@@ -41,8 +41,10 @@ async def main(dsn, prefix, sid, evidence, release, role):
 
     runtime = TaskRuntime(JobManager(store), tenant_id="lock-test", principal_id="host",
         executor_id="executor", boot_id=role, lease_ms=300000, boot_contract_hash="a" * 64)
+    from ._shared_session_coordinator import SharedSessionCoordinator
     loop = StatefulAgentLoop(llm=Model(), store=store, task_runtime=runtime,
-        config=AgentLoopConfig(max_rounds=1, compactor=None, distributed_sessions=True,
+        session_coordinator=SharedSessionCoordinator(str(gate.parent/"ownership.json")),
+        config=AgentLoopConfig(max_rounds=1, compactor=None,
                               session_lease_ttl_s=300, delegation_policy="single_level"))
     try:
         try:

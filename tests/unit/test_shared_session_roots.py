@@ -19,11 +19,13 @@ __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-def loop_for(store, model, executor):
+def loop_for(store, model, executor, directory):
+    from ._shared_session_coordinator import SharedSessionCoordinator
     runtime = TaskRuntime(JobManager(store), tenant_id='shared-session', principal_id='host',
                           executor_id=executor, boot_id=executor)
     return StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
-        config=AgentLoopConfig(distributed_sessions=True, compactor=None, delegation_policy='single_level'))
+        session_coordinator=SharedSessionCoordinator(str(Path(directory)/"ownership.json")),
+        config=AgentLoopConfig(compactor=None, delegation_policy='single_level'))
 
 
 class Model(LLMService):
@@ -50,7 +52,7 @@ async def worker(dsn, prefix, sid, directory):
             return response
 
     store = await open_store(dsn, table_prefix=prefix, schema='tasks')
-    loop = loop_for(store, Paused(), 'first')
+    loop = loop_for(store, Paused(), 'first', directory)
     try:
         assert (await loop.send('first input', sid)).status == 'completed'
     finally:
@@ -66,7 +68,7 @@ async def test_distinct_roots_cannot_claim_one_sessions_input_concurrently(regis
     process = await asyncio.create_subprocess_exec(sys.executable, '-m', 'tests.unit.test_shared_session_roots', dsn, store.table_prefix,
         sid, str(tmp_path), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
     model = Model()
-    loop = loop_for(store, model, 'second')
+    loop = loop_for(store, model, 'second', tmp_path)
     try:
         async with asyncio.timeout(15):
             while not (tmp_path/'entered').exists():

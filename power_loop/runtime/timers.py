@@ -147,11 +147,14 @@ class TimerRunner:
         """Fire everything currently due. Returns the number fired (any
         outcome). Exposed for tests and external schedulers."""
         fired = 0
+        from power_loop.contracts.errors import SessionBusy
         store = await self._loop._ensure_store()
         for timer in await store.due_timers():
             try:
                 await self._fire(timer)
                 fired += 1
+            except SessionBusy:
+                continue  # Leave the wake-up for the owning container.
             except Exception:
                 logger.exception(
                     "timers: firing %s/%d failed; postponing 30s",
@@ -186,6 +189,10 @@ class TimerRunner:
                 logger.exception("timers: scan failed (continuing)")
 
     async def _fire(self, timer: TimerRow) -> None:
+        async with self._loop._session_lease(timer.session_id):
+            await self._fire_owned(timer)
+
+    async def _fire_owned(self, timer: TimerRow) -> None:
         store = await self._loop._ensure_store()
         # Claim (CAS): lost claims mean another runner took it.
         if not await store.transition_timer(

@@ -76,24 +76,6 @@ class Dialect(Protocol):
         "accepted vs. already had it" signal."""
         ...
 
-    async def try_acquire_lease(
-        self,
-        tx: Transaction,
-        table: str,
-        *,
-        session_id: str,
-        owner_id: str,
-        now_ms: int,
-        expires_at: int,
-    ) -> bool:
-        """Take the lease on ``session_id`` for ``owner_id``, stealing it only if the incumbent
-        has EXPIRED. Returns whether we now hold it.
-
-        Like :meth:`lock_state`, this is a dialect seam because its correctness depends on the
-        engine's concurrency model: the take-or-steal decision MUST be one atomic statement. A
-        ``SELECT`` then ``INSERT`` would let two processes both observe "expired" and both claim
-        it — precisely the race the lease exists to prevent."""
-        ...
 
 
     def upsert(
@@ -265,11 +247,6 @@ class SqliteDialect:
             "ON CONFLICT DO NOTHING"
         )
 
-    async def try_acquire_lease(self, tx, table, *, session_id, owner_id, now_ms, expires_at):
-        return await _onconflict_try_acquire_lease(
-            tx, table, session_id=session_id, owner_id=owner_id,
-            now_ms=now_ms, expires_at=expires_at,
-        )
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
         return _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols)
@@ -283,26 +260,6 @@ class SqliteDialect:
         return row
 
 
-async def _onconflict_try_acquire_lease(
-    tx, table, *, session_id: str, owner_id: str, now_ms: int, expires_at: int
-) -> bool:
-    """Atomic take-or-steal-if-expired, shared by SQLite and Postgres.
-
-    Both support a ``WHERE`` on ``DO UPDATE``, which is what makes this a SINGLE statement: insert
-    when nobody holds the lease, overwrite only when the incumbent's ``expires_at`` has passed, and
-    do nothing at all while a live holder owns it. The row is then read back rather than trusting
-    rowcount, so "did I get it" is answered by the durable state either way.
-    """
-    await tx.execute(
-        f"INSERT INTO {table} (session_id, owner_id, acquired_at, expires_at, fence) "
-        "VALUES (?, ?, ?, ?, 1) ON CONFLICT (session_id) DO UPDATE SET "
-        "owner_id=excluded.owner_id, acquired_at=excluded.acquired_at, "
-        f"expires_at=excluded.expires_at, fence={table}.fence + 1 "
-        f"WHERE {table}.expires_at < ?",
-        (session_id, owner_id, now_ms, expires_at, now_ms),
-    )
-    row = await tx.fetchone(f"SELECT owner_id FROM {table} WHERE session_id=?", (session_id,))
-    return bool(row) and row["owner_id"] == owner_id
 
 
 def _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols) -> str:
@@ -480,11 +437,6 @@ class PostgresDialect:
             "ON CONFLICT DO NOTHING"
         )
 
-    async def try_acquire_lease(self, tx, table, *, session_id, owner_id, now_ms, expires_at):
-        return await _onconflict_try_acquire_lease(
-            tx, table, session_id=session_id, owner_id=owner_id,
-            now_ms=now_ms, expires_at=expires_at,
-        )
 
     def upsert(self, table, key_cols, val_cols, *, add_cols=(), insert_only_cols=()):
         return _onconflict_upsert(table, key_cols, val_cols, add_cols, insert_only_cols)
@@ -662,24 +614,6 @@ class MySQLDialect:
             f"VALUES ({', '.join('?' for _ in cols)})"
         )
 
-    async def try_acquire_lease(self, tx, table, *, session_id, owner_id, now_ms, expires_at):
-        # MySQL has no conditional ON DUPLICATE KEY UPDATE, so each assignment carries its own
-        # IF() guard on the INCUMBENT's expires_at. Order matters: MySQL evaluates the SET list
-        # left to right, so expires_at must be assigned LAST — updating it first would make the
-        # later guards test the value we just wrote and always take the steal branch.
-        await tx.execute(
-            f"INSERT INTO {table} (session_id, owner_id, acquired_at, expires_at, fence) "
-            "VALUES (?, ?, ?, ?, 1) AS new ON DUPLICATE KEY UPDATE "
-            f"fence = IF({table}.expires_at < ?, {table}.fence + 1, {table}.fence), "
-            f"owner_id = IF({table}.expires_at < ?, new.owner_id, {table}.owner_id), "
-            f"acquired_at = IF({table}.expires_at < ?, new.acquired_at, {table}.acquired_at), "
-            f"expires_at = IF({table}.expires_at < ?, new.expires_at, {table}.expires_at)",
-            (session_id, owner_id, now_ms, expires_at, now_ms, now_ms, now_ms, now_ms),
-        )
-        # Don't trust rowcount: MySQL reports 1 for an insert and 2 for an update, and 0 when the
-        # guards left every column unchanged. Read back who actually holds it.
-        row = await tx.fetchone(f"SELECT owner_id FROM {table} WHERE session_id=?", (session_id,))
-        return bool(row) and row["owner_id"] == owner_id
 
     #: Free-text / JSON columns (table → [(column, not_null)]) whose MySQL type was widened from
     #: TEXT (64 KiB) to LONGTEXT. Used by the v3→v4 migration to ALTER pre-existing MySQL stores.

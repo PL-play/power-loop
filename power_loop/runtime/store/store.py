@@ -407,12 +407,12 @@ class SessionStore:
         return _row_to_session(row) if row else None
 
     @contextlib.asynccontextmanager
-    async def send_read_scope(self, session_id, *, lease_owner_id=None):
+    async def send_read_scope(self, session_id, *, ownership=None):
         existing = send_reads.current(self, session_id)
-        if existing is not None and lease_owner_id is None:
+        if existing is not None and ownership is None:
             yield existing
             return
-        snapshot = send_reads.SessionHolding(self, session_id, lease_owner_id=lease_owner_id)
+        snapshot = send_reads.SessionHolding(self, session_id, ownership=ownership)
         if existing is not None and "session" in existing.rows:
             snapshot.rows["session"] = existing.rows["session"]
             snapshot.touched = existing.rows["session"].updated_at
@@ -491,6 +491,8 @@ class SessionStore:
                 and bool(await self.poll_background_updates(session_id)))
 
     async def signal_changes(self, tx, session_id, kind):
+        from ..session_ownership import require_current_ownership
+        require_current_ownership(self)
         self._holding(session_id).change_snapshot = None
         if kind == "runtime":
             snapshot = send_reads.current(self, session_id)
@@ -534,9 +536,7 @@ class SessionStore:
         reads = send_reads.lease_writer(self, session_id)
         if reads is None:
             return "", ()
-        lock = "" if self._db.dialect.name == "sqlite" else " FOR UPDATE"
-        return (f" AND EXISTS (SELECT 1 FROM {self.t.session_leases} WHERE session_id=? "
-                f"AND owner_id=? AND expires_at>?{lock})", (session_id, reads.lease_owner_id, _now_ms()))
+        return " AND next_seq=?", (reads.next_seq,)
 
     def _state_update(self, session_id, sets, values, *, condition='', condition_values=()):
         """Declare an ordinary mutation with its owner condition in the DML."""
@@ -697,7 +697,7 @@ class SessionStore:
                             signal_values = tuple(snapshot[column] for column in change_signals.COLUMNS)
                     if matched:
                         seq, state_written = expected, True
-                    elif owned is not None:
+                    elif guarded:
                         # An owned send cannot allocate past another writer or
                         # a superseding ancestor. It must reconcile its turn.
                         raise SessionLeaseLost(session_id)
@@ -1014,11 +1014,12 @@ class SessionStore:
         one transaction. ``fold_seqs`` marks the EXACT set (never a BETWEEN range, which
         could invert under a non-monotonic identity map); ``order_key`` is the note's
         logical position (``meta['ord']``). Returns ``(compact_seq, note_seq)``."""
-        self._holding(session_id).next_seq = None
+        holding = self._holding(session_id)
         send_reads.forget(self, session_id, "state")
         now = _now_ms()
         async with self._db.transaction() as tx:
             st = await self._db.dialect.lock_state(tx, self.t.session_state, session_id)
+            send_reads.lease_writer(self, session_id)
             note_seq = int(st["next_seq"])
             compact_seq = int(st["last_compact_seq"]) + 1
 
@@ -1065,14 +1066,15 @@ class SessionStore:
                     after_tokens, round_index, now,
                 ),
             )
-            await tx.execute(
-                f"UPDATE {self.t.session_state} SET next_seq=?, last_compact_seq=? "
-                "WHERE session_id=?",
-                (note_seq + 1, compact_seq, session_id),
-            )
+            statement, arguments, guarded, _ = self._state_update(session_id,
+                ['next_seq=?', 'last_compact_seq=?'], (note_seq + 1, compact_seq))
+            if await tx.execute(statement, arguments) != 1 and guarded:
+                raise SessionLeaseLost(session_id)
             await tx.execute(
                 f"UPDATE {self.t.sessions} SET updated_at=? WHERE session_id=?", (now, session_id)
             )
+        if holding.active:
+            holding.next_seq = note_seq + 1
         return compact_seq, note_seq
 
     async def deactivate_messages(self, session_id: str, seqs: list[int]) -> int:
@@ -1164,7 +1166,6 @@ class SessionStore:
         """Insert (or replace, by ``(session_id, send_index, kind)``) one projection row.
         Idempotent so a resume/re-finalize of the same send is a no-op-equivalent rewrite;
         ``created_at`` is preserved across re-finalize (insert-only)."""
-        self._holding(session_id).next_seq = None
         send_reads.forget(self, session_id, "state")
         async with self._db.transaction() as tx:
             # Standalone CRUD participates in the same revision fence. Low-level
@@ -1350,77 +1351,6 @@ class SessionStore:
     # processes share this database, it cannot see the others — so the lease row is the arbiter
     # they all consult. A holder renews while it works; if it dies, the lease simply expires and
     # the next process takes over.
-
-    async def acquire_session_lease(
-        self, session_id: str, *, owner_id: str, ttl_ms: int
-    ) -> bool:
-        """Try to take the lease on ``session_id``. Returns whether ``owner_id`` now holds it.
-
-        Steals only an EXPIRED lease; a live holder is never displaced. The take-or-steal decision
-        is a single atomic statement in the dialect (see ``Dialect.try_acquire_lease``).
-        """
-        now = _now_ms()
-        async with self._db.transaction() as tx:
-            return await self._db.dialect.try_acquire_lease(
-                tx, self.t.session_leases,
-                session_id=session_id, owner_id=owner_id,
-                now_ms=now, expires_at=now + max(1, ttl_ms),
-            )
-
-    async def renew_session_lease(
-        self, session_id: str, *, owner_id: str, ttl_ms: int
-    ) -> bool:
-        """Push out the expiry — but ONLY if ``owner_id`` still holds the lease.
-
-        Returns False when the lease was taken over (we stalled long enough to look dead). That is
-        the signal to STOP: another process is now driving this session, and continuing to write
-        would interleave with it. Callers must treat a false return as "abort the run", not as a
-        transient error to retry.
-        """
-        async with self._db.transaction() as tx:
-            changed = await tx.execute(
-                f"UPDATE {self.t.session_leases} SET expires_at=? "
-                "WHERE session_id=? AND owner_id=?",
-                (_now_ms() + max(1, ttl_ms), session_id, owner_id),
-            )
-            # The database port returns matched rows; MySQL enables FOUND_ROWS.
-            return changed == 1
-
-    async def release_session_lease(self, session_id: str, *, owner_id: str) -> None:
-        """Drop our claim so the next process can start immediately (idempotent).
-
-        Scoped by ``owner_id``: if we were already dispossessed, this must not delete the NEW
-        holder's lease.
-        """
-        async with self._db.transaction() as tx:
-            await tx.execute(
-                f"DELETE FROM {self.t.session_leases} WHERE session_id=? AND owner_id=?",
-                (session_id, owner_id),
-            )
-
-    async def session_lease_holder(self, session_id: str) -> dict | None:
-        """The live lease row (owner_id / expires_at / fence), or None if unheld or expired."""
-        row = await self._db.fetchone(
-            f"SELECT owner_id, acquired_at, expires_at, fence FROM {self.t.session_leases} "
-            "WHERE session_id=? AND expires_at >= ?",
-            (session_id, _now_ms()),
-        )
-        return dict(row) if row else None
-
-    # ── inbox (design/124 §6; schema v8) ────────────────────────────────────
-    #
-    # Everything that should reach a session's model but can't be written into its transcript
-    # right now (a run is in flight, or it belongs to the next send) waits here. Lifecycle:
-    #
-    #   pending ──claim──▶ claimed ──(same tx as the transcript row)──▶ delivered
-    #      ▲                  │
-    #      └──release/stale───┘                     pending ──void──▶ void
-    #
-    # ``delivered`` is written in the SAME transaction as the transcript row (append_message's
-    # ``inbox=``), so "in the transcript" and "marked delivered" can never disagree: a row still
-    # ``claimed`` long after its claim was taken provably never reached the transcript and is
-    # safe to hand out again. Delivered rows are KEPT — the unique (session_id, item_id) index is
-    # what makes a re-sent item a no-op, and it needs the old row to be there.
 
     async def inbox_put(
         self, session_id: str, items: Sequence[Mapping[str, Any]]
@@ -1619,7 +1549,6 @@ class SessionStore:
             f"DELETE FROM {self.t.project_messages} WHERE session_id=?", (session_id,)
         )
         await tx.execute(f"DELETE FROM {self.t.hook_events} WHERE session_id=?", (session_id,))
-        await tx.execute(f"DELETE FROM {self.t.session_leases} WHERE session_id=?", (session_id,))
         await tx.execute(
             f"DELETE FROM {self.t.follow_up_queue} WHERE session_id=?", (session_id,)
         )

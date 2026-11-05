@@ -53,7 +53,6 @@ from power_loop.agent.types import AgentLoopConfig, AgentLoopResult, LoopMessage
 from power_loop.contracts.errors import (
     CancellationRequested,
     InboxClaimChanged,
-    SessionBusy,
     SessionNotFoundError,
 )
 from power_loop.contracts.protocols import ChildRunGuard
@@ -300,6 +299,7 @@ class StatefulAgentLoop:
         session_cache_size: int = 256,
         task_runtime: Any = None,
         timer_backend: Any = None,
+        session_coordinator: Any = None,
     ) -> None:
         """Bind the loop to a store. Pass EITHER a pre-opened ``store=`` (e.g. shared across
         loops) OR a store config to lazily open one: ``dsn=`` (a DSN or sqlite path; ``db_path``
@@ -328,6 +328,8 @@ class StatefulAgentLoop:
             raise ValueError('timer_backend must implement create/list/cancel')
         self.timer_backend = timer_backend
         self.task_runtime = task_runtime
+        from power_loop.runtime.session_ownership import DEFAULT_SESSION_COORDINATOR
+        self.session_coordinator = session_coordinator or DEFAULT_SESSION_COORDINATOR
         self._dsn = dsn if dsn is not None else (db_path if db_path is not None else DEFAULT_DB_PATH)
         self._table_prefix = table_prefix if table_prefix is not None else DEFAULT_TABLE_PREFIX
         self._schema = schema
@@ -360,7 +362,7 @@ class StatefulAgentLoop:
         # aclose() drains only its own and teardown can release its claims.
         self._sync_sids: set[str] = set()
         self._closing = False
-        # Identity written into the lease row. Must be unique per PROCESS *and* per loop instance,
+        # Identity passed to the coordinator. Unique per process and loop instance,
         # and must NOT survive a restart: a crashed process's lease has to look foreign to its
         # replacement so the replacement can take it over once it expires.
         self._owner_id = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
@@ -777,18 +779,16 @@ class StatefulAgentLoop:
         """
         sid = session_id
         self._raise_if_closing()
-        store = await self._ensure_store()
-        async with self._session_guard(sid), store.send_read_scope(sid):
+        await self._ensure_store()
+        async with self._session_guard(sid), self._session_lease(sid):
             await self._ensure_session_or_raise(sid)
             await self._interrupt_pending(sid)
-            # Cross-process turn: the in-process lock above only covers THIS interpreter.
-            async with self._session_lease(sid):
-                send_index = await self._persist_user_input(sid, user_input, send_meta=metadata)
-                return await self._run_loop(
-                    sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                    max_rounds=max_rounds, response_format=response_format,
-                    with_history=history, _entry_send_index=send_index,
-                )
+            send_index = await self._persist_user_input(sid, user_input, send_meta=metadata)
+            return await self._run_loop(
+                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+                max_rounds=max_rounds, response_format=response_format,
+                with_history=history, _entry_send_index=send_index,
+            )
 
     async def deliver(
         self,
@@ -809,8 +809,7 @@ class StatefulAgentLoop:
         * a run is in flight on this session (this process holds its lock) → the items wait in
           the inbox; that run claims them at its next round boundary. Returns
           :class:`FollowUpQueued`.
-        * another process holds the session (``distributed_sessions``) → same, its run claims
-          them. Returns :class:`FollowUpQueued`.
+        * another owner holds the session → raises :class:`SessionBusy` before accepting input.
         * idle → a fresh send runs with the waiting items as its input (everything pending —
           including items a cancelled run left behind — oldest first). Returns its result.
         * ``enqueue_only=True`` → persist and return without starting an idle send;
@@ -824,37 +823,32 @@ class StatefulAgentLoop:
         batch = [items] if isinstance(items, InboxItem) else list(items)
         self._raise_if_closing()
         store = await self._ensure_store()
-        await self._ensure_session_or_raise(sid)
-        rows = [inbox_row(it) for it in batch]
-        accepted = await store.inbox_put(sid, rows)
-        entry = _session_sync(sid, owner=self)
-        self._sync_sids.add(sid)
-        entry.pending_hint += len(accepted)
-        accepted_set = set(accepted)
-        if any(r["mode"] == "steer" and r["item_id"] in accepted_set for r in rows):
-            entry.steer.set()
+        async with self._session_lease(sid):
+            await self._ensure_session_or_raise(sid)
+            rows = [inbox_row(it) for it in batch]
+            accepted = await store.inbox_put(sid, rows)
+            entry = _session_sync(sid, owner=self)
+            self._sync_sids.add(sid)
+            entry.pending_hint += len(accepted)
+            accepted_set = set(accepted)
+            if any(r["mode"] == "steer" and r["item_id"] in accepted_set for r in rows):
+                entry.steer.set()
 
-        async def _queued() -> FollowUpQueued:
-            counts = await store.inbox_counts(sid)
-            self._release_idle_sync(sid)
-            return FollowUpQueued(
-                session_id=sid, queue_depth=counts["pending"], accepted=len(accepted),
-                duplicates=len(rows) - len(accepted), accepted_ids=tuple(accepted),
-            )
+            async def _queued() -> FollowUpQueued:
+                counts = await store.inbox_counts(sid)
+                self._release_idle_sync(sid)
+                return FollowUpQueued(
+                    session_id=sid, queue_depth=counts["pending"], accepted=len(accepted),
+                    duplicates=len(rows) - len(accepted), accepted_ids=tuple(accepted),
+                )
 
-        if enqueue_only or not accepted or self._session_busy(sid):
-            return await _queued()
-        if self.config.distributed_sessions:
-            # Idle HERE, but another process may be driving this session: its run claims the
-            # items at its next round boundary — don't start a competing run.
-            holder = await store.session_lease_holder(sid)
-            if holder is not None and holder["owner_id"] != self._owner_id:
+            if enqueue_only or not accepted or self._session_busy(sid):
                 return await _queued()
-        result = await self._send_from_inbox(
-            sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-            max_rounds=max_rounds,
-        )
-        return result if result is not None else await _queued()
+            result = await self._send_from_inbox(
+                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+                max_rounds=max_rounds,
+            )
+            return result if result is not None else await _queued()
 
     async def follow_up(
         self,
@@ -943,22 +937,23 @@ class StatefulAgentLoop:
         sid = session_id
         self._raise_if_closing()
         store = await self._ensure_store()
-        await self._ensure_session_or_raise(sid)
-        # A host can commit input and its cursor proof atomically instead of
-        # calling deliver(). Read the durable pending state before returning
-        # to a busy owner, so committed steering still interrupts that owner.
-        pending = await store.inbox_counts(sid)
-        entry = _session_sync(sid, owner=self)
-        self._sync_sids.add(sid)
-        entry.pending_hint = max(entry.pending_hint, pending['pending'])
-        if pending['steer']:
-            entry.steer.set()
-        if self._session_busy(sid):
-            return None
-        return await self._send_from_inbox(
-            sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-            max_rounds=max_rounds,
-        )
+        async with self._session_lease(sid):
+            await self._ensure_session_or_raise(sid)
+            # A host can commit input and its cursor proof atomically instead of
+            # calling deliver(). Read the durable pending state before returning
+            # to a busy owner, so committed steering still interrupts that owner.
+            pending = await store.inbox_counts(sid)
+            entry = _session_sync(sid, owner=self)
+            self._sync_sids.add(sid)
+            entry.pending_hint = max(entry.pending_hint, pending['pending'])
+            if pending['steer']:
+                entry.steer.set()
+            if self._session_busy(sid):
+                return None
+            return await self._send_from_inbox(
+                sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+                max_rounds=max_rounds,
+            )
 
     async def _send_from_inbox(
         self,
@@ -977,34 +972,33 @@ class StatefulAgentLoop:
         go straight back to pending and are claimed by the pipeline's round-0 drain moments
         later — still before the first model call."""
         store = await self._ensure_store()
-        async with self._session_guard(sid), store.send_read_scope(sid):
+        async with self._session_guard(sid), self._session_lease(sid):
             await self._ensure_session_or_raise(sid)
             await self._interrupt_pending(sid)
-            async with self._session_lease(sid):
-                for _ in range(3):
-                    claimed = await self._claim_inbox(sid)
-                    if not claimed:
-                        return None
-                    token = claimed[0]["claim_token"]
-                    first = render_inbox_rows(claimed, wrap=False)[0]
-                    stale = False
-                    try:
-                        send_index = await self._persist_user_input(sid, first)
-                    except InboxClaimChanged:
-                        stale = True
-                        continue
-                    finally:
-                        released = await store.inbox_release(sid, token)
-                        _session_sync(sid).pending_hint += released
-                        if stale:
-                            # Another consumer may already have released/reclaimed the
-                            # batch, so our own release count alone can lose the wake hint.
-                            _session_sync(sid).pending_hint = (await store.inbox_counts(sid))["pending"]
-                    return await self._run_loop(
-                        sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
-                        max_rounds=max_rounds, _entry_send_index=send_index,
-                    )
-                return None
+            for _ in range(3):
+                claimed = await self._claim_inbox(sid)
+                if not claimed:
+                    return None
+                token = claimed[0]["claim_token"]
+                first = render_inbox_rows(claimed, wrap=False)[0]
+                stale = False
+                try:
+                    send_index = await self._persist_user_input(sid, first)
+                except InboxClaimChanged:
+                    stale = True
+                    continue
+                finally:
+                    released = await store.inbox_release(sid, token)
+                    _session_sync(sid).pending_hint += released
+                    if stale:
+                        # Another consumer may already have released/reclaimed the
+                        # batch, so our own release count alone can lose the wake hint.
+                        _session_sync(sid).pending_hint = (await store.inbox_counts(sid))["pending"]
+                return await self._run_loop(
+                    sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
+                    max_rounds=max_rounds, _entry_send_index=send_index,
+                )
+            return None
 
     def _run_sync(self, coro: Coroutine[Any, Any, Any]) -> Any:
         """Drive ``coro`` to completion on the loop's dedicated sync event loop.
@@ -1097,7 +1091,7 @@ class StatefulAgentLoop:
         """
         await self._require_host_continuation(session_id)
         store = await self._ensure_store()
-        async with self._session_guard(session_id):
+        async with self._session_guard(session_id), self._session_lease(session_id):
             await self._ensure_session_or_raise(session_id)
             waiting = await self._waiting_result_if_needed(session_id)
             if waiting is not None:
@@ -1131,7 +1125,7 @@ class StatefulAgentLoop:
         """
         await self._require_host_continuation(session_id)
         store = await self._ensure_store()
-        async with self._session_guard(session_id):
+        async with self._session_guard(session_id), self._session_lease(session_id):
             await self._ensure_session_or_raise(session_id)
             state = await store.get_state(session_id)
             pending = state.pending if state is not None else None
@@ -1185,6 +1179,13 @@ class StatefulAgentLoop:
         """Reuse the send-entry snapshot; only stale pending causes writes."""
         store = await self._ensure_store()
         state = await store.state_snapshot(sid)
+        cached = self._session_cache.get(sid)
+        cache_valid = (cached is not None and state is not None and
+                       cached.next_seq == state.next_seq and cached.last_compact_seq == state.last_compact_seq)
+        if cached is not None and not cache_valid:
+            self._cache_invalidate(sid)
+        from power_loop.runtime.session_ownership import recover_acquired_session
+        await recover_acquired_session(self, sid, cache_valid=cache_valid)
         if state is None or not state.pending:
             return 0
         return await self.abort_pending(sid, reason="执行中断，结果未知")
@@ -1512,59 +1513,9 @@ class StatefulAgentLoop:
 
     @contextlib.asynccontextmanager
     async def _session_lease(self, sid: str):
-        """Hold the cross-process lease for the body, renewing it in the background.
-
-        A no-op unless ``config.distributed_sessions`` is on. Raises :class:`SessionBusy` when
-        another process holds the session, so the caller can park its input rather than start a
-        competing run (``follow_up`` does exactly that).
-        """
-        if not self.config.distributed_sessions or self.store is None:
-            yield
-            return
-        ttl_ms = int(max(1.0, self.config.session_lease_ttl_s) * 1000)
-        if not await self.store.acquire_session_lease(sid, owner_id=self._owner_id, ttl_ms=ttl_ms):
-            holder = await self.store.session_lease_holder(sid)
-            raise SessionBusy(
-                f"session {sid} is held by {holder['owner_id'] if holder else 'another process'}"
-            )
-        # Renew from a background task rather than at round boundaries: a single round can outlast
-        # the TTL (one long tool call), and letting the lease lapse mid-round would invite another
-        # process to take the session while this one is still writing.
-        renew = asyncio.create_task(self._renew_lease_forever(sid, ttl_ms))
-        try:
-            async with self.store.send_read_scope(sid, lease_owner_id=self._owner_id):
-                yield
-        finally:
-            renew.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await renew
-            with contextlib.suppress(Exception):  # teardown must never mask the run's outcome
-                await self.store.release_session_lease(sid, owner_id=self._owner_id)
-
-    async def _renew_lease_forever(self, sid: str, ttl_ms: int) -> None:
-        """Push the expiry out every third of the TTL until cancelled.
-
-        Renewing at TTL/3 leaves room for transient failure. Losing ownership
-        fences subsequent turn writes; external work already in flight still
-        needs its original reconciliation and cannot be unwound here.
-        """
-        interval = max(0.5, (ttl_ms / 1000) / 3)
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                if not await self.store.renew_session_lease(
-                    sid, owner_id=self._owner_id, ttl_ms=ttl_ms
-                ):
-                    logger.error(
-                        "session %s lease lost; further turn writes are fenced and "
-                        "original external work may require reconciliation",
-                        sid,
-                    )
-                    return
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning("session %s lease renewal failed; will retry", sid, exc_info=True)
+        from power_loop.runtime.session_ownership import hold_session_ownership
+        async with hold_session_ownership(self, sid) as lease:
+            yield lease
 
     @staticmethod
     def _session_busy(sid: str) -> bool:

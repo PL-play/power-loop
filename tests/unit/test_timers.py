@@ -444,3 +444,25 @@ async def test_stop_aborts_inflight_timer_delivery_promptly(tmp_path) -> None:
         with contextlib.suppress(Exception):
             await runner.stop()
         await loop.aclose()
+
+
+@pytest.mark.asyncio
+async def test_foreign_owner_leaves_due_timer_pending_without_invoking_hook(tmp_path):
+    from power_loop import AgentHooks, MemorySessionOwnershipCoordinator
+
+    calls = []
+    hooks = AgentHooks()
+    hooks.register(HookPoint.TIMER_FIRE, lambda ctx: calls.append(ctx))
+    loop = _loop(tmp_path, hooks=hooks)
+    loop.session_coordinator = coordinator = MemorySessionOwnershipCoordinator()
+    sid = await loop.new_session()
+    await loop.schedule_timer(sid, due_at_ms=int(time.time()*1000)-1000, note='pending wake')
+    lease = await coordinator.acquire(f'{loop.store.store_id}/{sid}', owner_id='foreign',
+                                      ttl_s=30, on_lost=lambda: None)
+    try:
+        assert await TimerRunner(loop).scan_once() == 0
+        assert (await loop.store.get_timer(sid, 1)).status == 'armed'
+        assert not calls and not await loop.get_messages(sid)
+    finally:
+        await coordinator.release(lease)
+        await loop.aclose()

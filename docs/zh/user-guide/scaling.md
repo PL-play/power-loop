@@ -74,52 +74,36 @@ python -m bench --smoke    # 快速子集（也是 CI 烟囱）
 
 ## 多进程共享一个 store
 
-用服务端后端时，两个进程可能被派到同一个 session——重试、再平衡、蓝绿部署重叠期。进程内的锁看不见别的进程，
-所以要么你的 dispatcher 保证亲和性，要么开启：
+默认 `MemorySessionOwnershipCoordinator` 只协调同一进程内的 loop。多进程部署需要应用实现共享协调器，传给每个 loop：
 
 ```python
 loop = StatefulAgentLoop(
-    llm=llm, store=store,                      # PostgreSQL / MySQL——SQLite 本就是单机
-    config=AgentLoopConfig(
-        system_prompt="…",
-        distributed_sessions=True,
-        session_lease_ttl_s=90.0,
-    ),
+    llm=llm, store=store,
+    session_coordinator=shared_coordinator,
+    config=AgentLoopConfig(session_lease_ttl_s=90.0),
 )
 ```
 
-此后每次 `send()` 都会先为该 session 取一行**租约**，运行期间由后台任务续约，结束时释放。
-取不到租约的进程会抛 `SessionBusy`：
+接口 `SessionOwnershipCoordinator` 只有 `acquire`、`renew`、`release`；通过返回的 `SessionOwnership.lose()` 通知失权。
+应用实现应继承并通过 `power_loop.testing.SessionOwnershipContractTests`。
+SDK 不依赖 Redis，默认实现不需要数据库租约表。
 
-```python
-from power_loop import SessionBusy
-
-try:
-    result = await loop.send(text, session_id=sid)
-except SessionBusy:
-    ...  # 重新排期；绝不要自旋——持有者可能要跑几分钟
-```
-
-`follow_up()` 已经替你处理好了：当别的进程持有该 session 时，它把输入写进共享队列并返回 `FollowUpQueued`，
-由持有者在下一个 round 边界排水——**折叠语义跨进程保留**。
-
-需要 schema v7；`open_store` 会自动迁移（只新增表）。
+send、追加输入和恢复入口均先取得所有权。取不到时抛 `SessionBusy`，由宿主保留待办、路由或稍后重试。
+`follow_up()` 不向其他进程投递输入。持有期覆盖 send 及其子 Agent、workflow；最后一个任务退出后释放。
+续期失败会停止该会话本地任务。接手时校验缓存、修复 pending，旧未完成任务显示为中断。
 
 ### TTL 怎么定
 
 TTL 是**失败检测窗口**，不是单轮的预算。续约跑在后台任务上、每 TTL/3 一次，**与轮边界无关**——
 一轮跑十分钟也不会威胁到租约。真正威胁它的是 event loop 被**饿死**（某个同步工具堵住了循环、
-一段 CPU 密集计算），或者连续几次续约都失败，所以 TTL 要大于你预期的最长停顿。
+一段 CPU 密集计算），或者续约失败，所以 TTL 要大于你预期的最长停顿。
 
 同一个数字也决定了：持有者真的崩溃后，这个 session 要被锁住多久才能被别人接管。调大 →
 活着但卡顿的持有者更不容易被误判为死亡；调小 → 真崩溃后恢复更快。
 
 ### 租约给不了你什么
 
-租约**不是硬互斥保证**。持有者卡顿超过 TTL 就会被推定死亡、被别人接管，而它可能还在跑——这是分布式锁的
-经典风险。`fence` 列就是为解决它预留的（单调递增令牌，可以让被夺权者的写入被拒绝），但**目前尚未启用**，
-所以请把租约理解为大幅降低概率，而不是不可能性证明。`renew_session_lease()` 返回 `False` 就是
-「你已被夺权」的信号。
+协调器的期限检查和失权通知会取消本地任务；消息状态更新保留 `next_seq` 条件，拒绝已经落后于新持有者的写入。异常时允许结果丢失或未知，接手只修复消息格式并继续，不重放旧外部动作。
 
 另外注意：租约保护的是 **session**，不是你这一轮碰到的其它东西。如果你的工具往本地文件系统的
 workspace 写东西，两台机器上的两个进程看到的根本不是同一个目录，租约救不了你——共享存储或主机亲和
@@ -128,6 +112,6 @@ workspace 写东西，两台机器上的两个进程看到的根本不是同一�
 ## 诚实声明
 
 - **上面的实测上限是单 SQLite 写者且环境敏感的。** 磁盘 fsync 延迟与 CPU 主导；请在你的参考硬件上记录权威数字。
-- **多写者横向扩展是后端选择，不是魔法。** PostgreSQL/MySQL 让多个进程写同一个逻辑 store，但单个 session 仍同一时刻只能有一个写者——要么由你的 dispatcher 保证，要么开启 `distributed_sessions`。上面的数字是针对 SQLite 记录的。
+- **多写者横向扩展是后端选择，不是魔法。** PostgreSQL/MySQL 让多个进程写同一个逻辑 store，但单个 session 仍同一时刻只能有一个写者——要么由你的 dispatcher 保证，要么由应用提供共享会话协调器。上面的数字是针对 SQLite 记录的。
 - **压缩是长期会话的主要扩展杠杆**；不开则每次 send 成本随历史增长。
 - **上限是否"够用"由你判断**，对照你预期的并发会话负载——以及你把 DSN 指向哪个后端。
