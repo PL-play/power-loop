@@ -10,7 +10,7 @@ import json
 import os
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from decimal import Decimal
 
 import pytest
@@ -89,8 +89,9 @@ def _sites():
 
 
 class Profiled:
-    def __init__(self, db):
+    def __init__(self, db, meter=None):
         self.db, self.dialect = db, db.dialect
+        self.meter = meter
         self.records, self.transactions, self.tx_sites = [], 0, []
         self.tx_depth = 0
 
@@ -105,7 +106,8 @@ class Profiled:
         self.transactions += 1
         self.tx_sites.append(_sites())
         async with self.db.transaction() as tx:
-            yield _Tx(self, tx)
+            async with self.meter.transaction(tx) if self.meter else nullcontext():
+                yield _Tx(self, tx)
 
     @asynccontextmanager
     async def read_snapshot(self):
@@ -126,7 +128,8 @@ class Profiled:
 
     async def execute(self, sql, params=()):
         self.note(sql)
-        return await self.db.execute(sql, params)
+        async with self.meter.transaction(self.db) if self.meter else nullcontext():
+            return await self.db.execute(sql, params)
 
 
 class _Tx:
@@ -174,7 +177,7 @@ async def test_send_sql_profile(registry_store, models, budgeted, *, paid_tools=
     assert not over, f"SQL budget exceeded (actual, limit): {over}"
 
 
-@pytest.mark.parametrize('models', [2, 32])
+@pytest.mark.parametrize('models', [1, 2, 4, 8, 16, 32])
 async def test_paid_tool_send_sql_profile(registry_store, models):
     await test_send_sql_profile(registry_store, models, True, paid_tools=True)
 
@@ -191,8 +194,11 @@ async def test_send_sql_independent_of_history(registry_store, budgeted):
 
 
 async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
+    from tests.write_meter import WriteMeter
+
     original = store._db
-    store._db = profiled = Profiled(original)
+    meter = await WriteMeter.install(original, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
+    store._db = profiled = Profiled(original, meter)
     manager = JobManager(store)
     from power_loop.runtime.budget_contracts import BudgetConfig, BudgetPlan, LocalBudgetScope
     from power_loop.runtime.response_capture import ResponseCaptureReceipt
@@ -255,6 +261,8 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
         profiled.records.clear()
         profiled.tx_sites.clear()
         profiled.transactions = 0
+        if meter:
+            await meter.reset()
         started = time.monotonic()
         result = await loop.send("run", sid)
         elapsed_s = time.monotonic() - started
@@ -262,8 +270,20 @@ async def _measure(store, models, budgeted, history=0, *, paid_tools=False):
         assert result.status == "completed" and model.calls == models
         if paid_tools:
             assert sum(key.startswith('toolattempt_') for key in host.applied) == models - 1
+        if target := os.environ.get("P0_HISTORY_OUT"):
+            with open(target, "a") as f:
+                f.write(json.dumps({"db": original.dialect.name, "models": models, "budgeted": budgeted,
+                                    "history": history, "sql": _counts(records, tx_sites),
+                                    "total_sql": len(records), "transactions": transactions}) + "\n")
+        if meter and (target := os.environ.get("P0_WRITE_OUT")):
+            with open(target, "a") as f:
+                f.write(json.dumps({"db": original.dialect.name, "models": models, "budgeted": budgeted,
+                                    "paid_tools": paid_tools, "history": history,
+                                    "writes": await meter.report()}) + "\n")
         return records, transactions, tx_sites, elapsed_s
     finally:
         store._db = original
         await runtime.shutdown(timeout_s=1)
         await loop.aclose(drain_timeout_s=0.1)
+        if meter:
+            await meter.close()

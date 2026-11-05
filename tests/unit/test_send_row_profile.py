@@ -15,6 +15,7 @@ from power_loop.runtime.task_runtime import TaskRuntime
 from power_loop.tools.registry import ToolRegistry
 from tests.unit.test_job_registry_192 import registry_store  # noqa: F401
 from tests.unit.test_send_sql_profile import Profiled, _counts
+from tests.write_meter import WriteMeter
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 OUT = os.environ.get("ROWS_OUT")
@@ -95,7 +96,7 @@ async def _snapshot(db, prefix, *, largest=None):
     else:
         tables = [r["TABLE_NAME"] if "TABLE_NAME" in r else r["table_name"] for r in await db.fetchall(
             "SELECT table_name AS table_name FROM information_schema.tables WHERE table_schema=DATABASE() AND table_type='BASE TABLE'")]
-    tables = [t for t in tables if t.startswith(prefix)]
+    tables = [t for t in tables if t.startswith(prefix) and t != prefix + "p0_meter"]
     out = {}
     for t in tables:
         if d == "sqlite":
@@ -141,7 +142,8 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
     config = BudgetConfig("send-budget", (LocalBudgetScope("shared", max_calls=100000, max_tokens=10000000,
                                                            max_inflight=64),), host)
     original_db = store._db
-    store._db = profiled = Profiled(original_db)
+    meter = await WriteMeter.install(original_db, store.table_prefix) if os.environ.get("P0_WRITE_METER") else None
+    store._db = profiled = Profiled(original_db, meter)
     runtime = TaskRuntime(JobManager(store), tenant_id="eval", principal_id="host", executor_id=f"rows-{r}-{k}",
                           boot_id="boot", lease_ms=300000, boot_contract_hash="a" * 64,
                           budget_config=config if budgeted else None)
@@ -184,12 +186,15 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
         model.calls = 0
         profiled.records.clear()
         profiled.tx_sites.clear()
+        if meter:
+            await meter.reset()
         started = time.monotonic()
         result = await loop.send("run", sid)
         elapsed_s = time.monotonic() - started
         sql = _counts(profiled.records, profiled.tx_sites)
         sql["total"] = len(profiled.records)
         assert result.status == "completed" and model.calls == r
+        writes = await meter.report() if meter else None
         largest = {}
         after, ev_after = await _snapshot(store._db, p, largest=largest), await _events(store._db, events_table)
         delta = {t: (after[t][0] - before.get(t, (0, 0))[0], after[t][1] - before.get(t, (0, 0))[1])
@@ -207,7 +212,8 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
             with open(OUT, "a") as f:
                 f.write(json.dumps({"db": store._db.dialect.name, "R": r, "K": k, "T": (r - 1) * k,
                                     "budgeted": budgeted, "tables": delta, "job_events": ev,
-                                    "sql": sql, "elapsed_s": elapsed_s, "largest": largest}) + "\n")
+                                    "sql": sql, "transactions": len(profiled.tx_sites),
+                                    "writes": writes, "elapsed_s": elapsed_s, "largest": largest}) + "\n")
         assert not over, json.dumps({"over": over, "actual": delta}, sort_keys=True)
         assert delta.get('task_budget_attempts', (0, 0))[0] == 0
         assert largest.get('task_budget_attempts', 0) == 0
@@ -221,3 +227,5 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
         await runtime.shutdown(timeout_s=1)
         await loop.aclose(drain_timeout_s=0.1)
         store._db = original_db
+        if meter:
+            await meter.close()
