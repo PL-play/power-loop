@@ -1029,7 +1029,7 @@ async def test_follow_up_while_running_queues_for_next_round(store: SessionStore
     send_task = asyncio.create_task(loop.send("start task", sid))
 
     for _ in range(200):
-        if loop._lock_for(sid).locked():
+        if loop._session_busy(sid):
             break
         await asyncio.sleep(0.005)
     else:
@@ -1124,8 +1124,8 @@ async def test_close_session_clears_per_session_locks(store: SessionStore) -> No
 
     sid = await loop.new_session()
     await loop.send("hi", session_id=sid)
-    assert sid in _SESSION_SYNC  # populated on send
-    assert sid in loop._sync_sids
+    assert sid not in _SESSION_SYNC  # released as soon as send is idle
+    assert sid not in loop._sync_sids
 
     await loop.close_session(sid)
     assert sid not in _SESSION_SYNC
@@ -1141,7 +1141,6 @@ async def test_two_loop_objects_serialize_on_one_session(store: SessionStore) ->
     it concurrently — interleaved rounds on a shared workspace, and a second OWNER run because
     ``follow_up`` decides to fold by testing ``lock.locked()``.
     """
-    from power_loop.agent.stateful_loop import _SESSION_SYNC
 
     first = StatefulAgentLoop(
         llm=_Scripted(responses=[LLMResponse(raw_text="a")]), store=store,
@@ -1155,13 +1154,10 @@ async def test_two_loop_objects_serialize_on_one_session(store: SessionStore) ->
         config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
     )
 
-    assert first._lock_for(sid) is second._lock_for(sid), "one session ⇒ one lock"
-    assert len(_SESSION_SYNC[sid].refs) == 2, "both loops registered as users"
-
     # While one holds the session, the other must SEE it as busy — that is exactly the signal
     # follow_up uses to fold instead of starting a competing owner run.
-    async with first._lock_for(sid):
-        assert second._lock_for(sid).locked()
+    async with first._session_guard(sid):
+        assert second._session_busy(sid)
         queued = await second.follow_up("steer", sid)
         assert isinstance(queued, FollowUpQueued) and queued.queue_depth == 1
         # …and the loop that is actually running the session drains what the other enqueued,
@@ -1186,11 +1182,9 @@ async def test_session_sync_entry_released_when_last_loop_closes(store: SessionS
         llm=_Scripted(responses=[LLMResponse(raw_text="b")]), store=store,
         config=AgentLoopConfig(system_prompt="S", max_rounds=1, compactor=None),
     )
-    first._lock_for(sid)
-    second._lock_for(sid)
-
-    await first.aclose()
-    assert sid in _SESSION_SYNC, "still claimed by the second loop"
-
+    async with second._session_guard(sid):
+        await first.aclose()
+        assert sid in _SESSION_SYNC, "the second loop is still running"
+    assert sid not in _SESSION_SYNC, "idle entry released before closing the loop"
+    assert not second._sync_sids
     await second.aclose()
-    assert sid not in _SESSION_SYNC, "last claim released ⇒ entry dropped"

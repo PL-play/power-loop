@@ -25,6 +25,7 @@ import os
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from collections.abc import Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -179,9 +180,8 @@ class _SyncLoopRunner:
 class _SessionSync:
     """The concurrency primitives for ONE session_id, shared by every loop driving it.
 
-    ``refs`` holds the ``id()`` of each live loop that has touched the session, so the entry can be
-    dropped once the last one closes (without it, a host that cycles loop objects — e.g. rebuilding
-    on a config edit — would leak an entry per session forever).
+    ``users`` includes lock waiters. Once the last operation exits and the inbox
+    is drained, release the entry and every loop's reference to it.
     """
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -195,7 +195,8 @@ class _SessionSync:
     # Set while a ``steer``-mode item waits undelivered (design/124 §7 interrupt points and
     # waiting tools await it); cleared when the inbox is claimed.
     steer: asyncio.Event = field(default_factory=asyncio.Event)
-    refs: set[int] = field(default_factory=set)
+    refs: weakref.WeakValueDictionary = field(default_factory=weakref.WeakValueDictionary)
+    users: int = 0
     # 运行中追加的轮数（6.46，extend_rounds）：正在跑的这个 send 在下一轮开始时把它加到轮数上限上。
     round_bonus: int = 0
 
@@ -235,13 +236,11 @@ def take_round_bonus(session_id: str | None) -> int:
 _SESSION_SYNC_GUARD = threading.Lock()
 
 
-def _session_sync(sid: str, *, owner: int | None = None) -> _SessionSync:
+def _session_sync(sid: str, *, owner: StatefulAgentLoop | None = None) -> _SessionSync:
     """Fetch (or create) the shared primitives for ``sid``, registering ``owner`` as a user.
 
-    Lock-free on the hot path: ``_lock_for`` runs this on every send/follow_up/poll, and taking a
-    mutex there both costs time and perturbs the very interleavings this machinery exists to get
-    right. ``dict.get`` and ``set.add`` are atomic under the GIL, so the guard is needed only to
-    make CREATION single (double-checked below).
+    Registry lookup and reference updates do not await. Only creation needs
+    the thread guard; acquisition and idle cleanup happen in the session guard.
     """
     entry = _SESSION_SYNC.get(sid)
     if entry is None:
@@ -251,7 +250,7 @@ def _session_sync(sid: str, *, owner: int | None = None) -> _SessionSync:
                 entry = _SessionSync()
                 _SESSION_SYNC[sid] = entry
     if owner is not None:
-        entry.refs.add(owner)
+        entry.refs[id(owner)] = owner
     return entry
 
 
@@ -261,8 +260,8 @@ def _release_session_sync(sid: str, owner: int) -> None:
         entry = _SESSION_SYNC.get(sid)
         if entry is None:
             return
-        entry.refs.discard(owner)
-        if not entry.refs and not entry.lock.locked() and entry.pending_hint <= 0:
+        entry.refs.pop(owner, None)
+        if not entry.refs and not entry.users and not entry.lock.locked() and entry.pending_hint <= 0:
             del _SESSION_SYNC[sid]
 
 
@@ -779,7 +778,7 @@ class StatefulAgentLoop:
         sid = session_id
         self._raise_if_closing()
         store = await self._ensure_store()
-        async with self._lock_for(sid), store.send_read_scope(sid):
+        async with self._session_guard(sid), store.send_read_scope(sid):
             await self._ensure_session_or_raise(sid)
             await self._interrupt_pending(sid)
             # Cross-process turn: the in-process lock above only covers THIS interpreter.
@@ -828,7 +827,7 @@ class StatefulAgentLoop:
         await self._ensure_session_or_raise(sid)
         rows = [inbox_row(it) for it in batch]
         accepted = await store.inbox_put(sid, rows)
-        entry = _session_sync(sid, owner=id(self))
+        entry = _session_sync(sid, owner=self)
         self._sync_sids.add(sid)
         entry.pending_hint += len(accepted)
         accepted_set = set(accepted)
@@ -837,12 +836,13 @@ class StatefulAgentLoop:
 
         async def _queued() -> FollowUpQueued:
             counts = await store.inbox_counts(sid)
+            self._release_idle_sync(sid)
             return FollowUpQueued(
                 session_id=sid, queue_depth=counts["pending"], accepted=len(accepted),
                 duplicates=len(rows) - len(accepted), accepted_ids=tuple(accepted),
             )
 
-        if enqueue_only or not accepted or self._lock_for(sid).locked():
+        if enqueue_only or not accepted or self._session_busy(sid):
             return await _queued()
         if self.config.distributed_sessions:
             # Idle HERE, but another process may be driving this session: its run claims the
@@ -890,7 +890,7 @@ class StatefulAgentLoop:
     def _note_committed_inbox(self, session_id: str) -> None:
         """Idempotent wake hint after an external atomic inbox commit; no dispatch."""
         self._sync_sids.add(session_id)
-        entry = _session_sync(session_id, owner=id(self))
+        entry = _session_sync(session_id, owner=self)
         entry.pending_hint = max(1, entry.pending_hint)
 
     def pending_follow_up_count(self, session_id: str) -> int:
@@ -948,12 +948,12 @@ class StatefulAgentLoop:
         # calling deliver(). Read the durable pending state before returning
         # to a busy owner, so committed steering still interrupts that owner.
         pending = await store.inbox_counts(sid)
-        entry = _session_sync(sid, owner=id(self))
+        entry = _session_sync(sid, owner=self)
         self._sync_sids.add(sid)
         entry.pending_hint = max(entry.pending_hint, pending['pending'])
         if pending['steer']:
             entry.steer.set()
-        if self._lock_for(sid).locked():
+        if self._session_busy(sid):
             return None
         return await self._send_from_inbox(
             sid, stop_event=stop_event, tools=tools, system_prompt=system_prompt,
@@ -977,7 +977,7 @@ class StatefulAgentLoop:
         go straight back to pending and are claimed by the pipeline's round-0 drain moments
         later — still before the first model call."""
         store = await self._ensure_store()
-        async with self._lock_for(sid), store.send_read_scope(sid):
+        async with self._session_guard(sid), store.send_read_scope(sid):
             await self._ensure_session_or_raise(sid)
             await self._interrupt_pending(sid)
             async with self._session_lease(sid):
@@ -1097,7 +1097,7 @@ class StatefulAgentLoop:
         """
         await self._require_host_continuation(session_id)
         store = await self._ensure_store()
-        async with self._lock_for(session_id):
+        async with self._session_guard(session_id):
             await self._ensure_session_or_raise(session_id)
             waiting = await self._waiting_result_if_needed(session_id)
             if waiting is not None:
@@ -1131,7 +1131,7 @@ class StatefulAgentLoop:
         """
         await self._require_host_continuation(session_id)
         store = await self._ensure_store()
-        async with self._lock_for(session_id):
+        async with self._session_guard(session_id):
             await self._ensure_session_or_raise(session_id)
             state = await store.get_state(session_id)
             pending = state.pending if state is not None else None
@@ -1329,7 +1329,7 @@ class StatefulAgentLoop:
             return text
 
         jobs: list[dict[str, Any]] = []
-        if self._lock_for(session_id).locked():
+        if self._session_busy(session_id):
             jobs.append({"id": "send", "kind": "foreground", "title": "当前这一轮",
                          "status": "running", "started_at": None, "origin": ""})
         for t in await store.list_background_tasks(session_id):
@@ -1566,20 +1566,45 @@ class StatefulAgentLoop:
             except Exception:
                 logger.warning("session %s lease renewal failed; will retry", sid, exc_info=True)
 
-    def _lock_for(self, sid: str) -> asyncio.Lock:
+    @staticmethod
+    def _session_busy(sid: str) -> bool:
+        entry = _SESSION_SYNC.get(sid)
+        return entry is not None and entry.lock.locked()
+
+    @staticmethod
+    def _release_idle_sync(sid: str) -> None:
+        with _SESSION_SYNC_GUARD:
+            entry = _SESSION_SYNC.get(sid)
+            if (entry is None or entry.users or entry.lock.locked()
+                    or entry.queue_lock.locked() or entry.pending_hint > 0):
+                return
+            for loop in list(entry.refs.values()):
+                loop._sync_sids.discard(sid)
+            del _SESSION_SYNC[sid]
+
+    @contextlib.asynccontextmanager
+    async def _session_guard(self, sid: str):
+        entry = _session_sync(sid, owner=self)
         self._sync_sids.add(sid)
-        return _session_sync(sid, owner=id(self)).lock
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            self._release_idle_sync(sid)
 
     async def _claim_inbox(self, sid: str) -> list[dict[str, Any]]:
         """Claim everything waiting in ``sid``'s inbox (see ``SessionStore.inbox_claim``)."""
         store = await self._ensure_store()
-        entry = _session_sync(sid, owner=id(self))
+        entry = _session_sync(sid, owner=self)
         self._sync_sids.add(sid)
         async with entry.queue_lock:
             rows = await store.inbox_claim(sid)
         entry.pending_hint = max(0, entry.pending_hint - len(rows))
         if rows:
             entry.steer.clear()
+        self._release_idle_sync(sid)
         return rows
 
     async def _drain_follow_up_messages(self, sid: str) -> list[LoopMessage]:
@@ -2181,7 +2206,7 @@ class StatefulAgentLoop:
                     store=store,
                     drain_follow_ups=_drain_follow_ups,
                     drain_follow_ups_final=lambda: _drain_follow_ups(force=True),
-                    steer_event=_session_sync(sid, owner=id(self)).steer,
+                    steer_event=_session_sync(sid, owner=self).steer,
                 )
                 # Every row this run appends (assistant/tool/system, plus follow-up and
                 # trailing-notice rows drained mid-run) inherits the current send index, so

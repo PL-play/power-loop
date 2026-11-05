@@ -143,7 +143,7 @@ def reserve(loop, engine, source, ref, call_id, node_id, sid, message, *, expect
                 raise JobError("workflow_node_generation_changed")
             contract = await manager.store.get_runtime_state(sid, "workflow_execution_contract")
             child = await workflow_continuation_loop(loop, sid, expected_contract=contract)
-            if child._lock_for(sid).locked():
+            if child._session_busy(sid):
                 raise JobError("resume_session_busy")
             try:
                 operation, replayed = await manager.resume_workflow_node(source.actor, job["job_id"], caller=source.lease,

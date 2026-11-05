@@ -177,14 +177,11 @@ async def request_owned_stop(loop, parent_sid, run_id, *, reason="Stopped by req
 
 def remember_handle(runtime, handle):
     runtime.track_task(handle.task, cancel_token=handle.cancel_token, job_id=handle.job_id)
-    for key in list(runtime._workflow_handles):
-        if len(runtime._workflow_handles) < 254:
-            break
-        if runtime._workflow_handles[key].task.done():
-            runtime._workflow_handles.pop(key)
     for key in (handle.operation_id, handle.run_id):
-        if len(runtime._workflow_handles) < 256:
-            runtime._workflow_handles[key] = handle
+        runtime._workflow_handles.pop(key, None)
+        runtime._workflow_handles[key] = handle
+    while len(runtime._workflow_handles) > 256:
+        runtime._workflow_handles.pop(next(iter(runtime._workflow_handles)))
 
 
 async def stop_run(run_id: str, *, grace_s: float = 60.0, reason: str = "stopped") -> str:

@@ -46,6 +46,8 @@ class TaskExitCache:
             if self.slots[key].task is not task:
                 raise JobError('controller_exit_task_conflict')
             return
+        if len(self.slots) >= 1000:
+            raise JobError('controller_task_exit_capacity_reached')
         slot = _Slot(binding.actor, binding.lease, task)
         self.slots[key] = slot
         task.add_done_callback(lambda done: self._finished(key, slot, done))

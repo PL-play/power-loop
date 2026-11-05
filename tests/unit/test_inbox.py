@@ -285,7 +285,7 @@ async def test_terminal_window_item_is_flushed_once(store: SessionStore) -> None
     sid = await loop.new_session()
     await loop.send("first", sid)
     # accepted as if the lock was still held at the very end of that run
-    async with loop._lock_for(sid):
+    async with loop._session_guard(sid):
         q = await loop.follow_up("late card submission", sid, item_id="card")
     assert isinstance(q, FollowUpQueued)
     assert loop.pending_follow_up_count(sid) == 1

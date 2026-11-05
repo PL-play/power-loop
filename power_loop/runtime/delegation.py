@@ -457,7 +457,7 @@ async def nudge(loop, sid: str, message: str, *, on_complete=None, finalize=None
         if running is not None:
             await child_loop.deliver(InboxItem(message, mode="steer"), sid, enqueue_only=True)
             return {"session_id": sid, "run_id": running.run_id, "mode": "steer", "status": "accepted"}
-        if child_loop._lock_for(sid).locked():
+        if child_loop._session_busy(sid):
             raise ValueError("session is owned by another execution; nudge was not accepted")
         record = await store.get_runtime_state(parent, "subagent:child:" + sid)
         lifecycle = record.get("lifecycle", "linked")

@@ -61,7 +61,7 @@ async def resume_locked(loop, source, call_ref, call_id, sid, message, *, on_com
     # parent tools/persona for a missing or broken original child contract.
     contract = await store.get_runtime_state(sid, "workflow_execution_contract")
     child = await workflow_continuation_loop(loop, sid, expected_contract=contract)
-    if child._lock_for(sid).locked():
+    if child._session_busy(sid):
         raise JobError("resume_session_busy")
     args = dict(caller=source.lease, call_ref=call_ref, tool_call_id=call_id, session_id=sid, message=message,
         expected_generation=job.generation, executor_id=runtime.executor_id, boot_id=runtime.boot_id, contract=contract, lease_ms=runtime.lease_ms)

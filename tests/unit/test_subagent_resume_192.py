@@ -496,7 +496,7 @@ async def test_competing_dispatch_owner_only_returns_receipt_without_starting_an
 
 async def test_session_lock_prevents_uncoordinated_resume(ready, monkeypatch):
     c = ready
-    async with c.loop._lock_for(c.sid):
+    async with c.loop._session_guard(c.sid):
         await issue_nudge(c.fixture, monkeypatch)
     rows = await c.store.load_all_messages(c.parent)
     assert "resume_session_busy" in next(r.content for r in reversed(rows) if r.role == "tool")

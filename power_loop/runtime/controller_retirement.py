@@ -49,6 +49,8 @@ class RetirementCache:
                 or not binding.stop_renewal.is_set()):
             raise JobError('controller_exit_context_required')
         key = _hash(asdict(binding.lease))
+        if key not in self.pending and len(self.pending) >= 1000:
+            raise JobError('controller_retirement_capacity_reached')
         slot = self.pending.setdefault(key, _Exit(binding.actor, binding.lease))
         local['retirement'] = slot
         self.runtime._controller_task_exits.capture(binding, local)
