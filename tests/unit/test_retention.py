@@ -34,6 +34,92 @@ async def root(store, name, *, ended=True, at=OLD):
     return job_id, sid, registration.operation.operation_id[3:]
 
 
+@pytest.mark.parametrize('source', ['stopped', 'expired'])
+@pytest.mark.parametrize('limit', [1, 1000])
+async def test_executor_retention_progresses_past_references(registry_store, monkeypatch, source, limit):
+    store, connect = registry_store
+    db, p = store._db, store.table_prefix
+    job, _, _ = await root(store, 'active-reference', ended=False)
+    parent = await db.fetchone(f'SELECT * FROM {p}jobs WHERE job_id=?', (job,))
+    async with db.transaction() as tx:
+        for i in range(limit+3):
+            key = f'executor-{i}'
+            await insert(tx, p+'task_executors', executor_key=key, tenant_id='retention', principal_id='host',
+                         executor_id=key, boot_id='boot', contract_hash='a'*64, version=1,
+                         state='draining' if source == 'stopped' else 'accepting',
+                         lease_until_ms=NOW if source == 'stopped' else OLD+i, created_at=OLD, updated_at=OLD+i)
+            await insert(tx, p+'task_executor_events', event_id=key, executor_key=key, action='register',
+                         operation_key=key, request_hash='a'*64, payload_json='{}', created_at=OLD)
+            if i < limit:
+                await insert(tx, p+'jobs', **{**parent, 'job_id': f'child-{i}', 'parent_job_id': job,
+                                             'executor_key': key, 'kind': 'subagent'})
+        # More than one full batch of events for one deletable executor.
+        for i in range(1000 if limit == 1000 else 0):
+            await insert(tx, p+'task_executor_events', event_id=f'event-{i}', executor_key=f'executor-{limit}',
+                         action='heartbeat', operation_key=f'event-{i}', request_hash='a'*64,
+                         payload_json='{}', created_at=OLD)
+    peer = await connect()
+    async with db.transaction() as tx:
+        transaction_type = type(tx)
+    execute, deletions = transaction_type.execute, []
+
+    async def count_delete(tx, sql, params=()):
+        count = await execute(tx, sql, params)
+        if sql.startswith('DELETE FROM ' + p):
+            assert 0 <= count <= limit
+            deletions.append(count)
+        return count
+
+    monkeypatch.setattr(transaction_type, 'execute', count_delete)
+    first = await store.purge_expired(NOW, limit=limit)
+    assert first['task_executors'] == min(limit, 3)
+    # Separate connections compete for the same next candidate; only its
+    # deleting transaction may count it. Repeated calls must keep progressing.
+    reports = [first]
+    for _ in range(2):
+        reports.extend(await asyncio.gather(store.purge_expired(NOW, limit=1), peer.purge_expired(NOW, limit=1)))
+    assert sum(r.get('task_executors', 0) for r in reports) == 3
+    assert sum(r.get('task_executor_events', 0) for r in reports) == (1003 if limit == 1000 else 3)
+    assert sum(deletions) == (1006 if limit == 1000 else 6)
+    if limit == 1000:
+        assert max(deletions) == 1000
+    retained = {f'executor-{i}' for i in range(limit)}
+    for table in ('task_executors', 'task_executor_events'):
+        assert {r['executor_key'] for r in await db.fetchall(f'SELECT executor_key FROM {p}{table}')} == retained
+    assert not any((await store.purge_expired(NOW, limit=1)).values())
+
+
+@pytest.mark.parametrize('change', ['reference', 'updated_at', 'state', 'lease_until_ms'])
+async def test_executor_retention_rechecks_selected_candidates(registry_store, monkeypatch, change):
+    store, _ = registry_store
+    db, p = store._db, store.table_prefix
+    job, _, _ = await root(store, 'late-reference', ended=False)
+    await insert(db, p+'task_executors', executor_key='candidate', tenant_id='retention', principal_id='host',
+                 executor_id='candidate', boot_id='boot', contract_hash='a'*64, version=1,
+                 state='accepting' if change == 'lease_until_ms' else 'draining',
+                 lease_until_ms=OLD if change == 'lease_until_ms' else NOW, created_at=OLD, updated_at=OLD)
+    await insert(db, p+'task_executor_events', event_id='registered', executor_key='candidate', action='register',
+                 operation_key='registered', request_hash='a'*64, payload_json='{}', created_at=OLD)
+    fetchall, changed = db.fetchall, []
+
+    async def select_then_change(sql, params=()):
+        rows = await fetchall(sql, params)
+        if not changed and rows and sql.startswith(f'SELECT executor_key FROM {p}task_executors '):
+            changed.append(True)
+            if change == 'reference':
+                await db.execute(f"UPDATE {p}jobs SET executor_key='candidate' WHERE job_id=?", (job,))
+            else:
+                await db.execute(f"UPDATE {p}task_executors SET {change}=? WHERE executor_key='candidate'",
+                                 ('accepting' if change == 'state' else NOW,))
+        return rows
+
+    monkeypatch.setattr(db, 'fetchall', select_then_change)
+    report = await store.purge_expired(NOW, limit=1)
+    assert changed and report.get('task_executors', 0) == report.get('task_executor_events', 0) == 0
+    assert await db.fetchone(f"SELECT executor_key FROM {p}task_executors WHERE executor_key='candidate'")
+    assert await db.fetchone(f"SELECT event_id FROM {p}task_executor_events WHERE event_id='registered'")
+
+
 async def test_categories_expire_without_removing_recent_or_active_work(registry_store):
     store, connect = registry_store
     db, p = store._db, store.table_prefix

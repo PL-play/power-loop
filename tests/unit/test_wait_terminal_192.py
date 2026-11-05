@@ -6,11 +6,13 @@ import json
 
 import pytest
 
+from power_loop import AgentLoopConfig, StatefulAgentLoop
 from power_loop.runtime import model_attempts as attempts
 from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_terminal as terminal
-from power_loop.runtime.jobs import JobError, JobLease, JobManager, _json
-from power_loop.runtime.task_runtime import Execution
+from power_loop.runtime.jobs import JobActor, JobError, JobLease, JobManager, _json
+from power_loop.runtime.session_ownership import hold_session_ownership, recover_acquired_session
+from power_loop.runtime.task_runtime import Execution, TaskRuntime
 
 from .test_model_attempts_192 import attempt_case, completed, prepare
 from .test_wait_effects_192 import (
@@ -24,6 +26,7 @@ from .test_wait_effects_192 import (
 from .test_wait_effects_192 import (
     test_actual_workflow_node_consumes_original_system_input_before_review_can_start as exercise_node,
 )
+from .test_wait_handoff_192 import MainModel
 
 __all__ = ["attempt_case", "handoff", "registry_store", "runtime", "waiting", "managed_workflow"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
@@ -49,6 +52,28 @@ async def consume_owner(h):
     await h.loop.flush_follow_ups(c.main.session_id)
 
 
+@pytest.fixture
+async def owned_handoff(registry_store):
+    store, connect = registry_store
+    now = [1_000_000]
+    manager = JobManager(store, now_ms=lambda: now[0])
+    sid = await store.create_session()
+    actor = JobActor('tenant', 'host', sid)
+    task_runtime = TaskRuntime(manager, tenant_id=actor.tenant_id, principal_id=actor.principal_id,
+                               executor_id='executor', boot_id='boot')
+    loop = StatefulAgentLoop(llm=MainModel(), store=store, task_runtime=task_runtime,
+                             config=AgentLoopConfig(delegation_policy='single_level'))
+    # Active fixture jobs must be created after acquisition/recovery, within
+    # the same ownership period as the subsequent main-session decisions.
+    async with hold_session_ownership(loop, sid):
+        await recover_acquired_session(loop, sid, cache_valid=False)
+        root = await manager.register_job(actor, kind='send', session_id=sid, system_key='durable-root-key')
+        lease = await manager.claim_job(actor, root.job.job_id, executor_id='executor', boot_id='boot',
+                                        expected_version=1)
+        c = await waiting.__wrapped__((store, manager, actor, root, lease, connect, now))
+        yield await handoff.__wrapped__(c)
+
+
 async def test_managed_wait_cannot_claim_a_fictional_executor(handoff):
     h, c = handoff, handoff.c
     before = await c.manager.get_job(c.main, h.registration.job.job_id)
@@ -58,8 +83,8 @@ async def test_managed_wait_cannot_claim_a_fictional_executor(handoff):
     assert not await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE job_id=? AND event_type='execution_scope'", (before.job_id,))
 
 
-async def test_wait_termination_and_closure_are_recoverable_and_business_ack_does_not_change_proof(handoff):
-    h, c = handoff, handoff.c
+async def test_wait_termination_and_closure_are_recoverable_and_business_ack_does_not_change_proof(owned_handoff):
+    h, c = owned_handoff, owned_handoff.c
     await stop_owner(h)
     replies = await asyncio.gather(*(terminal.terminate(c.manager, c.main, h.registration.job.job_id) for _ in range(3)))
     assert all(r == replies[0] for r in replies)

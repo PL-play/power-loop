@@ -283,11 +283,14 @@ async def purge_expired(store, now, *, limit, retention_days):
             counts['session_runtime_state'] += deleted
             if not retained:
                 await delete_tree(store, tx, root['job_id'], limit, counts)
-    # Separate indexed ranges for stopped instances and expired leases.
+    # Filter references before LIMIT so retained instances cannot starve later
+    # candidates. Recheck under the existing row lock before deleting.
+    unreferenced = f'NOT EXISTS (SELECT 1 FROM {p}jobs j WHERE j.executor_key={p}task_executors.executor_key)'
     candidates = await store._db.fetchall(f'SELECT executor_key FROM {p}task_executors '
-        "WHERE state='draining' AND updated_at<? ORDER BY updated_at LIMIT ?", (cutoff['executors'], limit))
+        f"WHERE state='draining' AND updated_at<? AND {unreferenced} ORDER BY updated_at LIMIT ?",
+        (cutoff['executors'], limit))
     candidates += await store._db.fetchall(f'SELECT executor_key FROM {p}task_executors '
-        'WHERE lease_until_ms<? ORDER BY lease_until_ms LIMIT ?', (cutoff['executors'], limit))
+        f'WHERE lease_until_ms<? AND {unreferenced} ORDER BY lease_until_ms LIMIT ?', (cutoff['executors'], limit))
     for key in sorted({row['executor_key'] for row in candidates})[:limit]:
         async with store._db.transaction() as tx:
             suffix = '' if store._db.dialect.name == 'sqlite' else ' FOR UPDATE'
