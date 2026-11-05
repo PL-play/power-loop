@@ -73,3 +73,18 @@ async def test_executor_heartbeat_outlives_the_send_that_started_it(host):
         assert current['admission_open'] and current['lease_until_ms'] > first['lease_until_ms']
     finally:
         await loop.aclose(drain_timeout_s=.1)
+
+
+async def test_cached_foreground_history_does_not_hide_an_interrupted_child(managed):
+    store, manager, runtime, loop, model, sid, _ = managed
+    loop.session_coordinator = MemorySessionOwnershipCoordinator()
+    await loop.send('spawn', sid)
+    await asyncio.wait_for(model.entered.wait(), 3)
+    replacement = StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
+        session_coordinator=loop.session_coordinator, config=loop.config)
+    try:
+        # The foreground transcript is unchanged while its detached child runs.
+        await replacement.prewarm(sid)
+        await lose_and_resume(store, manager, runtime, replacement, sid)
+    finally:
+        await replacement.aclose(drain_timeout_s=.1)

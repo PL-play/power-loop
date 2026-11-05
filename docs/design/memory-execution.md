@@ -30,13 +30,11 @@ transaction. Unrelated root trees do not share a task-store control lock.
 `task_store` identity/protocol verification happens at startup, not each control
 transaction. Metadata transactions that do not publish job facts need no root.
 
-Root ownership conditions retain the original root ID, generation, executor and
-boot identity. Ordinary message/state writes also carry the frozen ancestor
-ownership vector. Taking over WF2 while leaf1/root1 still appear live revokes the
-old descendant's write permission. Root/ancestor checks participate in the same
-conditional write and lock ordering; a stale writer cannot pass a read and then
-append after takeover commits. A conditional miss gives an explicit ownership
-error; there is no fallback to an unfenced write.
+Root locks remain necessary for concurrent child completion and stop operations
+within one process. Session ownership excludes other containers; it does not
+serialize those local control operations. Ordinary message/state writes use
+the active ownership handle and `next_seq` condition, without ancestor joins.
+A miss raises an ownership error and never falls back to an unfenced append.
 
 Cross-tree operations publish one tree at a time. Discovery uses a coherent read
 snapshot; immutable source evidence and the original permission vector travel to
@@ -56,7 +54,9 @@ original closing evidence for reconciliation.
 Business writers use explicit ports such as `insert_job`, `write_job`,
 `append_event`, `update_event`, `set_event_recipient` and `handled`. The
 transaction records affected jobs, sessions and obligations. Before commit it
-refreshes pending entries and advances the relevant session versions. Neither
+refreshes pending entries. After commit, bounded process-local cache versions
+advance for the affected recipients, shared by managers of the same store.
+The database session row remains only a registration/cancellation lock. Neither
 INSERT parsing nor SQL-prefix matching determines those effects.
 
 `session_obligations` contains only outstanding work, keyed by
@@ -118,8 +118,8 @@ reduction and recovery together, outside the agreed completion scope.
 
 Three-engine process tests cover allocation-before-INSERT
 (`test_usage_append_atomic.py`), death during the actual tool-result INSERT
-(`test_tool_receipt_crash.py`), and old appenders after generation takeover.
-The WF2/leaf1/root1 cases also cover a writer waiting while takeover commits.
+(`test_tool_receipt_crash.py`), and old appenders after ownership takeover (`test_session_ownership_processes.py`,
+`test_owned_lease_writes.py`).
 Rollback and lost-acknowledgement tests keep exact original message/usage checks.
 
 ## Tool results and the receipt barrier
@@ -160,6 +160,8 @@ with RETURNING; MySQL uses its matched-row count and OK-packet value, without an
 extra confirmation SELECT. A child reuses the membership proven by root lookup.
 Cancellation rolls back renewal rather than extend the lease.
 
+Execution renewal runs at TTL/3, independently of the checkpoint interval
+(default 30-second lease: every 10 seconds instead of every 5 seconds).
 Finite leases require continuing renewals and executor heartbeats during long
 sends. SQL is not independent of elapsed time. Control lock timing adds no SQL
 and records acquisition wait and holding duration, including outcome.
@@ -220,10 +222,10 @@ Let T be tool rounds (model responses minus one), and L be elapsed whole seconds
 | --- | --- |
 | Ordinary SQLite/PostgreSQL | 15 + 4T + L |
 | Ordinary MySQL | 17 + 6T + L |
-| Billing, unpaid / paid | 0 / 13 |
-| Control, unpaid | 18 + floor(T/6) |
-| Control, paid | 28 + floor(T/6) + 4 floor(T/16) |
-| Control transactions, unpaid / paid | 2 / 3 + floor(T/16) |
+| Billing, unpaid / paid | 0 / 12 |
+| Control, unpaid | 14 |
+| Control, paid | 21 |
+| Control transactions, unpaid / paid | 2 / 3 |
 
 Activity touching contributes at most L ordinary statements. Long-lived renewal
 costs are additional and explicitly measured; these short-send bounds are never

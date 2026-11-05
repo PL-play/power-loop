@@ -204,26 +204,32 @@ def track_owned_task(task):
 
 
 async def recover_acquired_session(loop, session_id, *, cache_valid):
-    """A cold owner abandons unfinished execution, retaining unsettled billing.
+    """Abandon unfinished execution on acquisition, retaining unsettled billing.
 
-    A warm, unchanged message sequence validates the existing local cache. No
-    recovery query is needed for the normal same-owner send path.
+    An unchanged foreground transcript does not prove detached children ended.
+    Inspect only open roots, once per holding period. A completed child can
+    still leave a result to process, so those roots also invalidate quiet-cache hints.
     """
     period = _CURRENT.get()
     if period is None or period.session_id != session_id or period.checked:
         return
     period.checked = True
     runtime = loop.task_runtime
-    if runtime is None or cache_valid:
+    if runtime is None:
         return
     manager = runtime.manager
     from .session_controls import forget
-    forget(manager, session_id)
     roots = await manager.db.fetchall(
-        f"SELECT job_id FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? "
-        "AND session_id=? AND parent_job_id IS NULL AND supervision_status='open'",
+        f"SELECT root.job_id,EXISTS (SELECT 1 FROM {manager.jobs} j WHERE j.root_job_id=root.job_id "
+        "AND j.outcome IS NULL AND (j.status<>'model_closed' OR j.resource_state IN ('running','unknown'))) "
+        f"AS unfinished FROM {manager.jobs} root WHERE root.tenant_id=? AND root.principal_id=? "
+        "AND root.session_id=? AND root.parent_job_id IS NULL AND root.supervision_status='open'",
         (runtime.tenant_id, runtime.principal_id, session_id))
+    if not cache_valid or roots:
+        forget(manager, session_id)
     for root in roots:
+        if not root['unfinished']:
+            continue
         async with manager._write() as tx:
             await tx.write_job(root['job_id'],
                 f"UPDATE {manager.jobs} SET status='interrupted',outcome='interrupted',"

@@ -41,7 +41,7 @@ def _decode(actor, payload):
 async def _lock_session(manager, tx, actor):
     table = manager.prefix+'session_controls'
     suffix = '' if manager.db.dialect.name == 'sqlite' else ' FOR UPDATE'
-    sql = f'SELECT version FROM {table} WHERE session_id=?'+suffix
+    sql = f'SELECT session_id FROM {table} WHERE session_id=?'+suffix
     if await tx.fetchone(sql, (actor.session_id,)) is None:
         # A cold session or rebuilt derived table has no admission row yet.
         await tx.execute(manager.db.dialect.insert_ignore(table, ('session_id', 'version')), (actor.session_id, 0))
@@ -49,23 +49,10 @@ async def _lock_session(manager, tx, actor):
 
 
 async def _admission_state(manager, tx, actor, key):
-    controls, events = manager.prefix+'session_controls', manager.prefix+'task_context_events'
-    suffix = '' if manager.db.dialect.name == 'sqlite' else ' FOR UPDATE'
-    sql = (f'SELECT c.version AS current_version,'
-        f'(SELECT version FROM {controls} WHERE session_id=?) AS observed_version,'
-        f'(SELECT payload_json FROM {events} WHERE session_id=? AND state_key=?) AS payload_json '
-        f'FROM {controls} c WHERE c.session_id=?'+suffix)
-    params = (actor.session_id, actor.session_id, key, actor.session_id)
-    row = await tx.fetchone(sql, params)
-    if row is None:
-        await tx.execute(manager.db.dialect.insert_ignore(controls, ('session_id', 'version')), (actor.session_id, 0))
-        row = await tx.fetchone(sql, params)
-    # PostgreSQL can return a newly committed locked row while its original
-    # subquery still uses the snapshot from before the wait. Cancellation bumps
-    # this same version atomically,so only that race needs a fresh original read.
-    if row['current_version'] != row['observed_version']:
-        return await _state(manager, tx, actor, key)
-    return None if row['payload_json'] is None else _decode(actor, row['payload_json'])
+    # Same-process registration and cancellation still need serialization.
+    # Read the state after the lock so PostgreSQL sees the preceding commit.
+    await _lock_session(manager, tx, actor)
+    return await _state(manager, tx, actor, key)
 
 
 async def _save(manager, tx, actor, key, value):

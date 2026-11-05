@@ -236,3 +236,43 @@ async def test_finite_durable_leases_require_writes_as_send_time_advances(regist
         (Path(target) / f"elapsed-{registry_store[0]._db.dialect.name}.json").write_text(
             json.dumps({"0s": short, "3000s": long, "job_renewals": 30, "executor_renewals": 30,
                         "ttl_ms": 300000, "cadence_ms": 100000, "sql_per_job_renewal": 2}, indent=2)+"\n")
+
+
+async def test_checkpoint_interval_does_not_drive_execution_lease_writes(registry_store, monkeypatch):
+    import asyncio
+
+    from power_loop.runtime.execution_state import CheckpointPolicy
+
+    store, _ = registry_store
+    manager = JobManager(store)
+    runtime = TaskRuntime(manager, tenant_id='renewal-frequency', principal_id='host',
+        executor_id='executor', boot_id='boot', lease_ms=3000,
+        checkpoint_policy=CheckpointPolicy(interval_s=.05))
+    renewals = []
+    original = manager.renew_execution
+
+    async def counted(*args, **kwargs):
+        renewals.append(1)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(manager, 'renew_execution', counted)
+
+    class SlowModel(LLMService):
+        async def complete(self, request, **kwargs):
+            await asyncio.sleep(.15)
+            return LLMResponse(raw_text='done')
+
+        def stream(self, request):
+            raise AssertionError('nonstream fixture')
+
+        async def close(self):
+            return None
+
+    loop = StatefulAgentLoop(llm=SlowModel(), store=store, task_runtime=runtime,
+        config=AgentLoopConfig(compactor=None, delegation_policy='single_level'))
+    try:
+        sid = await loop.new_session()
+        assert (await loop.send('slow call', sid)).status == 'completed'
+        assert not renewals  # Frequent checkpoints must not turn into heartbeat writes.
+    finally:
+        await loop.aclose(drain_timeout_s=.1)

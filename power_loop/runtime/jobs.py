@@ -177,6 +177,8 @@ class JobManager:
         self._deferred_model_updates = ContextVar("execution_deferred_model_updates", default=None)
         self._finalization_preparation = ContextVar("execution_finalization_preparation", default=None)
         self._control_lock_timing = ContextVar("execution_control_lock_timing", default=None)
+        from .session_controls import bind_versions
+        self._control_versions = bind_versions(self)
 
     @asynccontextmanager
     async def _control_transaction(self):
@@ -562,17 +564,11 @@ class JobManager:
         await tx.control_statement("RELEASE SAVEPOINT power_loop_finalize")
         return closure
 
-    async def check_execution(self, actor: JobActor, lease: JobLease, *, capture=None) -> None:
+    async def check_execution(self, actor: JobActor, lease: JobLease) -> None:
         async with self._write() as tx:
             row = await self._fence(tx, actor, lease)
             from .workflow_controller import validate_dispatch
             await validate_dispatch(self, tx, row)
-            if capture is not None:
-                proofs = []
-                while row is not None:
-                    proofs.append(tuple(row[key] for key in ('job_id','generation','executor_id','boot_id')))
-                    row = await self._row(tx, row['parent_job_id']) if row['parent_job_id'] else None
-                capture['_message_write_proofs'] = tuple(proofs)
 
     async def renew_execution(self, actor: JobActor, lease: JobLease, *, lease_ms: int = 30000) -> None:
         if isinstance(lease_ms, bool) or not isinstance(lease_ms, int) or not 1 <= lease_ms <= 300000:

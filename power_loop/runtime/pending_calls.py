@@ -38,6 +38,10 @@ async def _object(manager, tx, table, column, where, parameters, limit):
 
 
 async def current(manager, tx, sid):
+    from .store.send_reads import trusted
+    holding = trusted(manager.store, sid)
+    if holding is not None and holding.pending_known:
+        return manager.store.known_pending(sid)[1]
     return await _object(manager, tx, manager.store.t.session_state, 'pending_json', 'session_id=?', (sid,), 32768)
 
 

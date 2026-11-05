@@ -512,7 +512,7 @@ class TaskRuntime:
             from .model_attempts import enable
             await enable(binding)  # One admission transaction owns all checks.
         else:
-            await self.manager.check_execution(binding.actor, binding.lease, capture=binding.resource_evidence)
+            await self.manager.check_execution(binding.actor, binding.lease)
         variable = context if context is not None else _OWNER if owner else _SEND
         token = variable.set(binding)
         owner_token = _enter_task_owner(self)
@@ -531,7 +531,7 @@ class TaskRuntime:
             try:
                 while True:
                     try:
-                        await asyncio.wait_for(binding.stop_renewal.wait(), min(self.lease_ms / 3000, self.checkpoint_policy.interval_s))
+                        await asyncio.wait_for(binding.stop_renewal.wait(), self.lease_ms / 3000)
                         return
                     except TimeoutError:
                         pass

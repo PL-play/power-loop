@@ -1,10 +1,12 @@
 """Explicit control write intents and transaction-local primary-key reads.
 
 Original events are authoritative. Writers declare event, job, executor and
-recipient changes; commit refreshes pending-only discovery and session versions.
+recipient changes; commit refreshes pending-only discovery and local cache versions.
 No SQL text is inspected to infer a write's meaning or invalidate cached rows.
 """
 from __future__ import annotations
+
+from weakref import WeakValueDictionary
 
 OBLIGATION_EVENTS = frozenset({
     "tool_call_abort", "source_abort_delivery", "pending_call_disposition",
@@ -12,6 +14,38 @@ OBLIGATION_EVENTS = frozenset({
     "controller_stopped", "wait_notification", "result", "supervision_reopened",
 })
 GLOBAL = "*"
+
+
+class _Versions:
+    """Bounded cache hints shared by managers of the same store in this process."""
+
+    def __init__(self):
+        self.sequence = 0
+        self.sessions = {}
+
+    def get(self, session_id):
+        if session_id not in self.sessions:
+            if len(self.sessions) >= 4096:
+                self.sessions.pop(next(iter(self.sessions)))
+            self.sessions[session_id] = self.sequence
+        return self.sessions[session_id]
+
+    def changed(self, sessions):
+        self.sequence += 1
+        for session_id in sessions:
+            self.get(session_id)
+            self.sessions[session_id] = self.sequence
+
+
+_VERSIONS = WeakValueDictionary()
+
+
+def bind_versions(manager):
+    key = manager.store.store_id
+    clock = _VERSIONS.get(key)
+    if clock is None:
+        clock = _VERSIONS[key] = _Versions()
+    return clock
 
 
 class ControlReadView:
@@ -348,17 +382,12 @@ async def bump(manager, tx, recorder):
                                  ",".join("?" for _ in part) + ")", tuple(part))
         for row in rows:
             sessions.update(value for value in (row["session_id"], row["created_by_session_id"]) if value)
-    table = manager.prefix + "session_controls"
-    for session_id in sorted(sessions):
-        if not await tx.execute(f"UPDATE {table} SET version=version+1 WHERE session_id=?", (session_id,)):
-            await tx.execute(manager.db.dialect.insert_ignore(table, ("session_id", "version")), (session_id, 1))
+    manager.after_outcome(lambda: manager._control_versions.changed(sessions), lambda: None)
 
 
 async def version(manager, reader, session_id):
-    rows = await reader.fetchall(f"SELECT session_id,version FROM {manager.prefix}session_controls "
-                                 "WHERE session_id IN (?,?)", (session_id, GLOBAL))
-    found = {row["session_id"]: int(row["version"]) for row in rows}
-    return found.get(session_id, 0), found.get(GLOBAL, 0)
+    clock = manager._control_versions
+    return clock.get(session_id), clock.get(GLOBAL)
 
 
 def is_clean(manager, session_id, seen):

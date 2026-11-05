@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from .jobs import JobActor, JobError, _hash, verify_stored
 from .result_revisions import result_id
@@ -373,9 +373,7 @@ async def rebuild_tx(manager, tx):
 @dataclass(frozen=True)
 class _RebuildJob:
     row: dict
-    entries: frozenset
     sessions: frozenset
-    versions: tuple
 
 
 async def _prepare_rebuild(manager, *, root_id=None):
@@ -406,23 +404,11 @@ async def _prepare_rebuild(manager, *, root_id=None):
         for entry in indexed:
             actual.setdefault(entry["job_id"], set()).add(tuple(entry[key] for key in COLUMNS))
         changed = [row for job_id, row in jobs.items() if expected[job_id] != actual.get(job_id, set())]
-        sessions = {session for row in changed for session in (row["session_id"], row["created_by_session_id"]) if session}
-        sessions.update(entry[0] for row in changed for entry in expected[row["job_id"]] | actual.get(row["job_id"], set()))
-        versions, ordered = {}, sorted(sessions)
-        for offset in range(0, len(ordered), 100):
-            part = ordered[offset:offset+100]
-            signals = await reader.fetchall(f"SELECT session_id,version FROM {manager.prefix}session_controls WHERE session_id IN ("+
-                ",".join("?" for _ in part)+")", tuple(part))
-            versions.update((row["session_id"], row["version"]) for row in signals)
         plans = {}
         for row in changed:
             entries = expected[row["job_id"]]
             recipients = frozenset(entry[0] for entry in entries | actual.get(row["job_id"], set()))
-            # Routes/notice appends also invalidate their original job's owner
-            # sessions. They need not advance the job's execution version.
-            protected = recipients | {value for value in (row["session_id"], row["created_by_session_id"]) if value}
-            plans.setdefault(row["root_job_id"], []).append(_RebuildJob(row, entries, recipients,
-                tuple((session, versions.get(session, 0)) for session in sorted(protected))))
+            plans.setdefault(row["root_job_id"], []).append(_RebuildJob(row, recipients))
         orphans = {job: frozenset(entry[0] for entry in entries) for job, entries in actual.items() if job not in jobs}
         return plans, orphans
 
@@ -431,16 +417,17 @@ async def _rebuild_tree(manager, root_id, plan):
     async with manager._write() as tx:
         for item in plan:
             row = item.row
-            guard = "".join(f" AND COALESCE((SELECT version FROM {manager.prefix}session_controls WHERE session_id=?),0)=?"
-                for _ in item.versions)
             changed = await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET version=version "
-                f"WHERE job_id=? AND root_job_id=? AND generation=? AND version=?{guard}",
-                (row["job_id"], root_id, row["generation"], row["version"],
-                 *(value for pair in item.versions for value in pair)))
+                "WHERE job_id=? AND root_job_id=? AND generation=? AND version=?",
+                (row["job_id"], root_id, row["generation"], row["version"]))
             if changed != 1:
                 raise _ProjectionConflict()
-            await _write_entries(manager, tx, row, item.entries)
-            tx.sessions.update(item.sessions)
+            # Routing may change without advancing the job version. Rebuild
+            # from current originals while this existing tree lock is held.
+            current = await manager._row(tx, row['job_id'])
+            entries = await _desired(manager, tx, current, verify=True)
+            await _write_entries(manager, tx, current, entries)
+            tx.sessions.update(item.sessions | {entry[0] for entry in entries})
     return frozenset(tx.sessions)
 
 
@@ -454,18 +441,11 @@ async def _remove_orphan_entries(manager, job_id, sessions):
 @verify_stored
 async def rebuild(manager):
     plans, orphans = await _prepare_rebuild(manager)
-    committed_bumps = {}
     for root_id in sorted(plans):
-        # Earlier tree repairs invalidate shared recipient sessions exactly once.
-        # Reuse those known commits; an external writer's extra change still
-        # fails the condition and requires a fresh original-derived plan.
-        plan = [replace(item, versions=tuple((session, version+committed_bumps.get(session, 0))
-            for session, version in item.versions)) for item in plans[root_id]]
+        plan = plans[root_id]
         while plan:
             try:
-                sessions = await _rebuild_tree(manager, root_id, plan)
-                for session in sessions:
-                    committed_bumps[session] = committed_bumps.get(session, 0)+1
+                await _rebuild_tree(manager, root_id, plan)
                 break
             except _ProjectionConflict:
                 # A concurrent writer changed a generation, job or route after
