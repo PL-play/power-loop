@@ -13,7 +13,7 @@ from power_loop.agent.sink import _encode_content, _meta_with_content_encoding
 from power_loop.contracts.events import AgentEventType
 from power_loop.core.events import AgentEventBus
 from power_loop.runtime.cancellation import CancellationToken
-from power_loop.runtime.jobs import JobManager
+from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .runtime_store import RuntimeInputStore, now_ms
@@ -153,9 +153,9 @@ class _InputStart:
         await tx.execute(port.db.dialect.upsert(store.t.session_runtime_state, ("session_id", "state_key"),
                          ("value_json", "updated_at")),
                          (ctx.session_id, "send_index", canonical(self.send_index), timestamp))
-        await tx.execute(f"UPDATE {port.q} SET status='delivered',delivered_seq=?,delivered_send_index=?,delivered_at=?,"
+        await tx.execute(f"UPDATE {port.q} SET status='delivered',delivered_seq=?,delivered_send_index=?,delivered_at=?,meta_json=?,"
                          "claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
-                         (seq, self.send_index, timestamp, ctx.session_id, ctx.input_ref.message_id))
+                         (seq, self.send_index, timestamp, canonical(self.record.meta), ctx.session_id, ctx.input_ref.message_id))
         ctx.job_ref = ref
         source = binding.resource_evidence.get("_control_source", {})
         ctx.parent_job_id = source.get("parent_job_id")
@@ -593,16 +593,27 @@ class RuntimeWorker:
                               else int(await r.store.get_runtime_state(sid, "send_index") or 0) + 1)
                 start = _InputStart(self, ctx, record, send_index)
                 await loop._interrupt_pending(sid)
-                await loop._run_loop(sid, stop_event=ctx.stop, tools=options["tools"],
-                    system_prompt=options["system_prompt"], max_rounds=options["max_rounds"],
-                    response_format=options["response_format"], with_history=options["history"],
-                    _initial_round_index=(record.meta["interaction"]["rounds"] if record.meta["operation"] == "answer" else 0),
-                    _entry_send_index=send_index, _runtime_start=start)
+                if env.command is not None:
+                    from power_loop.runtime.host_commands import run
+                    await run(loop, ctx, start, env.command, send_index)
+                else:
+                    await loop._run_loop(sid, stop_event=ctx.stop, tools=options["tools"],
+                        system_prompt=options["system_prompt"], max_rounds=options["max_rounds"],
+                        response_format=options["response_format"], with_history=options["history"],
+                        _initial_round_index=(record.meta["interaction"]["rounds"] if record.meta["operation"] == "answer" else 0),
+                        _entry_send_index=send_index, _runtime_start=start)
             finally:
                 ctx.closing = True
 
         except SessionBusy:
             busy = True
+
+        except JobError as exc:
+            if exc.code != 'root_context_cancelled' or ctx.job_ref is not None:
+                raise
+            async with self.inputs.db.transaction() as tx:
+                await self.inputs.db.dialect.lock_state(tx, self.inputs.state, sid)
+                await self.inputs.void_unbound(tx, record.ref, reason=exc.code, status='cancelled')
 
         except RuntimeRequestError as exc:
             if exc.code == "input_not_startable" and ctx.job_ref is None:
@@ -695,8 +706,8 @@ class RuntimeWorker:
             except Exception:
                 log.warning("output notification lost for %s", ctx.input_ref.message_id, exc_info=True)
 
-    async def drain_append(self, ctx):
-        if ctx.append_overflow and len(ctx.append_refs) < self.runtime.claim_limit:
+    async def drain_append(self, ctx, *, only=None):
+        if only is None and ctx.append_overflow and len(ctx.append_refs) < self.runtime.claim_limit:
             rows = await self.inputs.db.fetchall(f"SELECT id,item_id FROM {self.inputs.q} "
                 "WHERE session_id=? AND status='pending' AND id>? ORDER BY id LIMIT ?",
                 (ctx.session_id, ctx.append_cursor, self.runtime.claim_limit - len(ctx.append_refs)))
@@ -708,9 +719,9 @@ class RuntimeWorker:
         # Consume this checkpoint's hint even if its inputs were retracted.
         # Clear before yielding to claim, so newer control notifications survive.
         ctx.loop.steer_event(ctx.session_id).clear()
-        if not ctx.append_refs or ctx.job_ref is None:
+        if not (ctx.append_refs if only is None else only) or ctx.job_ref is None:
             return []
-        refs = list(ctx.append_refs)[:self.runtime.claim_limit]
+        refs = list(ctx.append_refs if only is None else only)[:self.runtime.claim_limit]
         for ref in refs:
             ctx.append_refs.pop(ref)
         ctx.claiming_refs = frozenset(refs)

@@ -149,11 +149,12 @@ async def _read(manager, tx, actor, source_job_id, *, namespace=None, required=T
         creation = json.loads(event["payload_json"])
         request = creation["request"]
         index = request["send_index"]
-        system_key = f"send:{index}"
-        if request.get("continuation_key") is not None:
-            system_key += f":continue:{request['continuation_key']}"
-        protocol = request["model_attempt_protocol"]
-        if (type(index) is not int or index < 1 or type(protocol) is not int or protocol != 1
+        from power_loop.agent.runtime_types import InputRef
+
+        input_ref = InputRef(**request["input_ref"])
+        system_key = "input:" + input_ref.message_id
+        if (type(index) is not int or index < 1
+                or (input_ref.store_id, input_ref.session_id) != (manager.store.store_id, root["session_id"])
                 or creation["job_id"] != root["job_id"] or creation["status"] != "queued"
                 or type(event["job_version"]) is not int or event["job_version"] != 1
                 or event["caller_session_id"] != root["session_id"]

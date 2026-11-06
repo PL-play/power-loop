@@ -241,7 +241,7 @@ def _child_config(spec: AgentSpec, parent_loop: Any) -> AgentLoopConfig:
         max_tokens=int(spec.max_tokens) if spec.max_tokens else int(
             getattr(parent_config, "max_tokens", 0) or 4000),
         temperature=float(spec.temperature),
-        model=spec.model,
+        model=spec.model or getattr(parent_config, "model", None),
         response_format=response_format,
         retry_policy=getattr(parent_config, "retry_policy", None),
         tool_context=context_policy,

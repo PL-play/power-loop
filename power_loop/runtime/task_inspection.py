@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from power_loop.agent.runtime_store import RuntimeInputStore
+from power_loop.agent.runtime_types import Command, RuntimeDescriptor, TargetRef, TrustedActor, canonical
+
 from .jobs import JobError, _hash, _json
 
 CONSTRAINTS = (
@@ -99,8 +102,11 @@ async def inspect_tasks(manager, actor, root_job_id, *, policy=None, limit=100, 
         main = await _main(manager, tx, root)
         if main['job_id'] != root_job_id or main['session_id'] != actor.session_id:
             raise JobError('inspection_requires_original_main')
-        rows = await tx.fetchall(f'SELECT * FROM {manager.jobs} WHERE root_job_id=? AND job_id>? ORDER BY job_id LIMIT ?',
+        rows = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE root_job_id=? AND supervision_status='open' "
+                                'AND job_id>? ORDER BY job_id LIMIT ?',
                                 (root_job_id, after_job_id, limit + 1))
+        inputs = RuntimeInputStore(manager.store)
+        original = None
         notifications = []
         now = manager.now()
         for row in rows[:limit]:
@@ -129,10 +135,14 @@ async def inspect_tasks(manager, actor, root_job_id, *, policy=None, limit=100, 
                      'observed_at_ms': now, 'execution_authority': False,
                      'resource_stop_confirmed': False, 'billing_settled': False}
             await _event(manager, tx, key, root, 'task_alert', value)
-            columns = ('session_id', 'item_id', 'kind', 'mode', 'status', 'content', 'created_at')
-            await manager.store.signal_changes(tx, actor.session_id, "inbox")
-            await tx.execute(manager.db.dialect.insert_ignore(manager.store.t.follow_up_queue, columns),
-                             (actor.session_id, key, 'task_alert', 'queue', 'pending', render(value), now))
+            if original is None:
+                original = await inputs.execution_input(tx, actor.session_id, root_job_id)
+            command = Command(key, TargetRef(manager.store.store_id, actor.session_id),
+                'append', {'body': render(value)}, 'append', options=original.meta['options'])
+            await inputs.accept_input(tx, command, TrustedActor(actor.tenant_id, actor.principal_id, None),
+                descriptor=RuntimeDescriptor(**original.meta['descriptor']))
+            await tx.execute(f"UPDATE {inputs.q} SET kind='task_alert' WHERE session_id=? AND item_id=?",
+                (actor.session_id, key))
             notifications.append(key)
         return {'notification_ids': notifications, 'scanned': min(limit, len(rows)),
                 'next_cursor': rows[limit-1]['job_id'] if len(rows) > limit else None}
@@ -170,7 +180,7 @@ async def read_alert(manager, actor, event_id, *, pending=True):
             raise JobError('task_alert_corrupt') from None
         inbox = await tx.fetchone(f'SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?',
                                  (actor.session_id, event_id))
-        if inbox is None or inbox['content'] != render(value) or inbox['kind'] != 'task_alert' or inbox['mode'] != 'queue':
+        if inbox is None or inbox['content'] != canonical(render(value)) or inbox['kind'] != 'task_alert' or inbox['mode'] != 'queue':
             raise JobError('task_alert_inbox_mismatch')
         if pending:
             affected = await manager._authorize(tx, actor, value['affected']['job_id'])

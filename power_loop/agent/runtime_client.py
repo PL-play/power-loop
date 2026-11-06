@@ -76,7 +76,7 @@ class RuntimeClient:
         return await answer(self, ref, interaction_id=interaction_id, wait_round=wait_round,
                             value=value, message_id=message_id, actor=actor)
 
-    async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None):
+    async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None, options=None):
         if ref.generation is None or ref.generation == 0:
             raise RuntimeRequestError("stale_generation")
         job = await self.inputs.resolve_job(self.inputs.db, ref, actor)
@@ -87,10 +87,24 @@ class RuntimeClient:
             "WHERE job_id=? AND action='create'", (ref.job_id,))
         start_ref = InputRef(**json.loads(creation["payload_json"])["request"]["input_ref"])
         start = await self.inputs.input(self.inputs.db, start_ref)
+        original = start.meta["options"]
+        narrowed = dict(original)
+        if options is not None:
+            if not isinstance(options, Mapping) or set(options) - {"tools", "max_rounds", "max_tokens", "max_tokens_per_run"}:
+                raise RuntimeRequestError("invalid_options", "resume only narrows tools and execution limits")
+            for key, value in options.items():
+                if key == "tools":
+                    if not isinstance(value, (list, tuple)) or any(not isinstance(name, str) for name in value):
+                        raise RuntimeRequestError("invalid_options", "resume tools")
+                    if original[key] is not None and set(value) - set(original[key]):
+                        raise RuntimeRequestError("forbidden", "resume tools exceed the original grant")
+                elif type(value) is not int or value < 1 or (original[key] is not None and value > original[key]):
+                    raise RuntimeRequestError("invalid_options", "resume cannot increase " + key)
+                narrowed[key] = value
         from .runtime_types import RuntimeDescriptor
         return await self._submit(Command(message_id, TargetRef(ref.store_id, job["session_id"], ref.job_id),
             "resume", {"body": body or "Continue the original task using saved results. Do not replay unknown external actions."},
-            "new_turn", options=start.meta["options"], expires_at_ms=deadline_ms,
+            "new_turn", options=narrowed, expires_at_ms=deadline_ms,
             expected_job_generation=ref.generation), actor=actor,
             descriptor=RuntimeDescriptor(**start.meta["descriptor"]))
 
@@ -353,14 +367,23 @@ class RuntimeClient:
             if subscription:
                 await subscription.aclose()
 
-    async def subscribe_output(self, ref, *, actor):
+    async def subscribe_output(self, ref, *, actor, before_send=False):
         self._require_open()
         if self._slots >= 1024:
             raise CapacityError()
         self._slots += 1
         subscription = None
         try:
-            await self.inputs.read(ref, actor)
+            if before_send:
+                # The trusted ingress may subscribe to its imminent request after
+                # authorizing the session. A guessed ID alone grants nothing.
+                if not isinstance(ref, InputRef) or actor.session_id is not None:
+                    raise RuntimeRequestError("forbidden")
+                await self.inputs.authorize(self.inputs.db, TargetRef(ref.store_id, ref.session_id), actor)
+                if await self.inputs.input(self.inputs.db, ref) is not None:
+                    await self.inputs.read(ref, actor)
+            else:
+                await self.inputs.read(ref, actor)
             self._require_open()
             subscription = await self.transport.subscribe(SubscriptionSpec(
                 self.namespace, ref.store_id, "output", "client", ref.session_id))

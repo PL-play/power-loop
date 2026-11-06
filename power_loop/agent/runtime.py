@@ -23,6 +23,9 @@ class ExecutionEnvironment:
     hooks: object = None
     resources: object = None
     task_runtime: object = None
+    # A trusted factory may resolve an explicit host command instead of an LLM
+    # turn. The registered name/arguments come from the frozen descriptor.
+    command: tuple[str, dict] | None = None
 
     async def aclose(self):
         if self.llm is not None:

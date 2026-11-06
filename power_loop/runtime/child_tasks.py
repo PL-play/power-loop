@@ -38,7 +38,19 @@ async def create(loop, spec, task):
     from .spec import _child_config
 
     await require_orchestration(loop, "subagent")
-    binding, actor = await tool_actor(loop)
+    host = getattr(loop, '_host_command', None)
+    system_key = None
+    if host is None:
+        binding, actor = await tool_actor(loop)
+    else:
+        from .task_runtime import _SEND
+        binding = _SEND.get()
+        actor = TrustedActor(binding.actor.tenant_id, binding.actor.principal_id, binding.actor.session_id)
+        if host['next_child'] >= 1000:
+            from power_loop.agent.runtime_types import CapacityError
+            raise CapacityError('host command child limit reached')
+        host['next_child'] += 1
+        system_key = f"host-child:{loop._runtime_worker_context.input_ref.message_id}:{host['next_child']}"
     parent_descriptor = loop._runtime_worker_context.descriptor
     names = list(loop.tool_registry.names()) if loop.tool_registry else []
     effective = get_effective_tools()
@@ -57,21 +69,23 @@ async def create(loop, spec, task):
         "child_spec": asdict(spec), "child_options": plain(options)})
     from power_loop.runtime.store.types import SubagentLifecycle
     return await admit(loop, binding, actor, kind="subagent", title=spec.name, descriptor=descriptor,
-                       options=options, body=task, role="subagent", lifecycle=SubagentLifecycle(spec.lifecycle))
+                       options=options, body=task, role="subagent", lifecycle=SubagentLifecycle(spec.lifecycle),
+                       system_key=system_key)
 
 
-async def admit(loop, binding, actor, *, kind, title, descriptor, options, body, role, lifecycle):
+async def admit(loop, binding, actor, *, kind, title, descriptor, options, body, role, lifecycle, system_key=None):
     worker = loop._runtime_worker
     port, manager = worker.inputs, loop.task_runtime.manager
     # Stable IDs make retries refer to the same original admission, even after
     # the first child has started. The job creation event owns deduplication.
-    key = manager._origin_key(binding.actor, "create", actor.call_ref, actor.tool_call_id, None)
+    key = manager._origin_key(binding.actor, "create", actor.call_ref, actor.tool_call_id, system_key)
     sid = "child_" + key[:32]
     input_ref = InputRef(port.store.store_id, sid, "start_" + key[:32])
     async with manager.joined_write() as tx:
         await port.lock_owned(tx, TargetRef(port.store.store_id, actor.session_id), loop._runtime_worker_context)
         await manager._fence(tx, binding.actor, binding.lease)
-        await manager._validate_call(tx, binding.actor, actor.call_ref, actor.tool_call_id)
+        if system_key is None:
+            await manager._validate_call(tx, binding.actor, actor.call_ref, actor.tool_call_id)
         existing = await tx.fetchone(f"SELECT job_id FROM {manager.events} WHERE operation_key=?", (key,))
         if existing is None:
             await port.store._create_session_tx(tx, sid, manager.now(),
@@ -84,10 +98,11 @@ async def admit(loop, binding, actor, *, kind, title, descriptor, options, body,
         registration = await manager.register_job(binding.actor, kind=kind, title=title,
             session_id=sid, parent=binding.lease, independent=loop._runtime_worker_context.descriptor.kind != "workflow_node",
             call_ref=actor.call_ref, tool_call_id=actor.tool_call_id,
-            request={"input_ref": plain(input_ref)})
+            system_key=system_key, request={"input_ref": plain(input_ref)})
         command = Command(input_ref.message_id, TargetRef(port.store.store_id, sid),
             "send", {"body": body}, "new_turn", options=plain(options))
-        receipt = await port.accept_input(tx, command, actor, descriptor=descriptor)
+        submitter = actor if system_key is None else TrustedActor(actor.tenant_id, actor.principal_id, None)
+        receipt = await port.accept_input(tx, command, submitter, descriptor=descriptor)
         if receipt.newly_accepted:
             await tx.execute(f"UPDATE {port.q} SET delivered_job_id=?,delivered_job_generation=0 "
                 "WHERE session_id=? AND item_id=?", (registration.job.job_id, sid, input_ref.message_id))
@@ -103,12 +118,17 @@ async def nudge(loop, sid, message):
     binding, actor = await tool_actor(loop)
     port = loop._runtime_worker.inputs
     await port.authorize(port.db, TargetRef(port.store.store_id, sid), actor)
-    row = await port.db.fetchone(f"SELECT job_id,generation FROM {port.jobs} "
+    row = await port.db.fetchone(f"SELECT job_id,generation,outcome FROM {port.jobs} "
         "WHERE session_id=? AND kind='subagent'", (sid,))
     if row is None:
         raise RuntimeRequestError("not_found")
     target = TargetRef(port.store.store_id, sid, row["job_id"])
     mid = "nudge_" + _hash([plain(actor.call_ref), actor.tool_call_id])[:32]
+    if row['outcome'] is not None:
+        receipt = await loop._runtime_worker.runtime.client.resume(
+            JobRef(port.store.store_id, row['job_id'], row['generation']),
+            message_id=mid, actor=actor, body=message)
+        return plain(receipt)
     manager = loop.task_runtime.manager
     async with manager.joined_write() as tx:
         await manager._fence(tx, binding.actor, binding.lease)

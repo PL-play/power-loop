@@ -206,7 +206,7 @@ class RuntimeInputStore:
         if job["cancel_requested_at"] is not None or job["outcome"] == "cancelled":
             raise RuntimeRequestError("target_cancelled")
         if (job["outcome"] != "interrupted" and job["resource_state"] != "unknown"
-                and not (job["kind"] in {"workflow", "workflow_node"} and job["outcome"] in {"succeeded", "failed"})):
+                and job["outcome"] not in {"succeeded", "failed"}):
             raise RuntimeRequestError("target_not_resumable")
 
     async def lock_owned(self, tx, target, ownership):
@@ -339,6 +339,14 @@ class RuntimeInputStore:
     async def get_result(self, ref, actor):
         return (await self.read(ref, actor))[1]
 
+    async def execution_input(self, reader, session_id, job_id):
+        """The first accepted input bound to this execution owns its frozen profile."""
+        row = await reader.fetchone(f"SELECT * FROM {self.q} WHERE session_id=? "
+            "AND delivered_job_id=? ORDER BY id LIMIT 1", (session_id, job_id))
+        if row is None:
+            raise RuntimeRequestError("definition_unavailable", "original execution input missing")
+        return self.record(row)
+
     async def result_input(self, record, reader=None):
         """Render the exact saved generation referenced by a parent notification."""
         reader = reader or self.db
@@ -348,14 +356,11 @@ class RuntimeInputStore:
         payload = json.loads(event["payload_json"])
         if payload["generation"] != reference["generation"]:
             raise RuntimeRequestError("stale_generation")
-        session = await reader.fetchone(f"SELECT metadata_json FROM {self.store.t.sessions} WHERE session_id=?",
-                                       (record.ref.session_id,))
-        descriptor = json.loads(session["metadata_json"])["runtime_descriptor"]
-        from .types import AgentLoopConfig
-        defaults = AgentLoopConfig()
-        options = {name: descriptor["config"].get(name, getattr(defaults, name, value))
-                   for name, value in plain(RequestOptions()).items()}
-        job = await reader.fetchone(f"SELECT kind FROM {self.jobs} WHERE job_id=?", (reference["job_id"],))
+        job = await reader.fetchone(f"SELECT kind,parent_job_id FROM {self.jobs} WHERE job_id=?", (reference["job_id"],))
+        profile = record.meta
+        if profile['descriptor'] is None:
+            original = await self.execution_input(reader, record.ref.session_id, job["parent_job_id"])
+            profile = original.meta
         if job["kind"] in {"background_tool", "background_command"}:
             from power_loop.runtime.background import encode_results, load_record, summarize_record
             original = await load_record(self.store, record.ref.session_id, reference["job_id"],
@@ -365,7 +370,7 @@ class RuntimeInputStore:
             label = "workflow_result" if job["kind"] == "workflow" else "subagent_result"
             body = "[" + label + "]\n" + canonical({**reference, **payload["result"]})
         return InputRecord(record.ref, {**record.row, "content": canonical(body)},
-                          {**record.meta, "descriptor": descriptor, "options": options})
+                          {**record.meta, "descriptor": profile["descriptor"], "options": profile["options"]})
 
     async def discard_cancelled_result(self, tx, record):
         """An explicitly cancelled originating scope must not wake a new send."""

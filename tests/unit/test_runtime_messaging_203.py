@@ -778,6 +778,9 @@ async def parent_child_port_fixture(store):
     parent = await manager.register_job(parent_actor, kind='send', session_id=parent_target.session_id, system_key='parent')
     lease = await manager.claim_job(parent_actor, parent.job.job_id,
                                    executor_id='parent', boot_id='boot', expected_version=1)
+    await accept(port, command(parent_target, 'parent-start', options={'max_rounds': 7}), actor)
+    await port.db.execute(f"UPDATE {port.q} SET status='delivered',delivered_job_id=?,delivered_job_generation=1 "
+                         "WHERE session_id=? AND item_id='parent-start'", (parent.job.job_id, parent_target.session_id))
     metadata = dict((await store.get_session(parent_target.session_id)).metadata, execution_role='subagent')
     child_sid = await store.create_session(parent_session_id=parent_target.session_id, metadata=metadata)
     child_target = TargetRef(store.store_id, child_sid)
@@ -851,6 +854,13 @@ async def test_result_port_rolls_back_and_duplicate_delivery_keeps_one_reference
     assert refs[0] == refs[1] and refs[0].session_id == parent.job.session_id
     assert (await store.inbox_counts(parent.job.session_id))['pending'] == 1
     assert (await port.get_result(receipt.input_ref, actor)).final_text == 'child original'
+    session = await store.get_session(parent.job.session_id)
+    changed = dict(session.metadata['runtime_descriptor'])
+    changed['definition_ref'] = 'test.agent@2'
+    await port_update_metadata(store, parent.job.session_id, dict(session.metadata, runtime_descriptor=changed))
+    rendered = await port.result_input(await port.input(port.db, refs[0]))
+    assert rendered.meta['descriptor']['definition_ref'] == 'test.agent@1'
+    assert rendered.meta['options']['max_rounds'] == 7
 
 
 async def test_factory_resolves_frozen_representation_and_rejects_missing_tools(registry_store):
@@ -895,3 +905,28 @@ async def test_factory_resolves_frozen_representation_and_rejects_missing_tools(
 async def port_update_metadata(store, sid, metadata):
     await store._db.execute(f'UPDATE {store.t.sessions} SET metadata_json=? WHERE session_id=?',
                             (json.dumps(metadata), sid))
+
+
+async def test_host_subscribes_to_its_input_before_send_and_cannot_cross_tenants(registry_store):
+    store, _ = registry_store
+    async with running(store, 'memory') as (runtime, model, target, actor):
+        ref = InputRef(store.store_id, target.session_id, 'http-stream')
+        for stranger in (TrustedActor('foreign', actor.principal_id, None),
+                         TrustedActor(actor.tenant_id, actor.principal_id, target.session_id)):
+            with pytest.raises(RuntimeRequestError, match='forbidden'):
+                await runtime.client.subscribe_output(ref, actor=stranger, before_send=True)
+        output = await runtime.client.subscribe_output(ref, actor=actor, before_send=True)
+        assert not model.requests
+        try:
+            receipt = await runtime.client.send(target, 'stream', message_id=ref.message_id, actor=actor)
+            assert receipt.input_ref == ref
+            assert (await anext(output)).kind == 'gap'
+            model.release.set()
+            async with asyncio.timeout(5):
+                async for item in output:
+                    if item.kind == 'completed':
+                        assert item.input_ref == ref and item.payload['final_text'] == 'result-1'
+            assert runtime.client._slots == 0
+        finally:
+            model.release.set()
+            await output.aclose()

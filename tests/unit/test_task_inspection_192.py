@@ -7,11 +7,42 @@ import pytest
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
 from power_loop.runtime.task_inspection import InspectionPolicy, inspect_tasks, read_alert
 
-from .test_job_registry_192 import child, registry_store, runtime
+from .test_job_registry_192 import registry_store
+from .test_job_registry_192 import runtime as registry_runtime
 
-__all__ = ['registry_store', 'runtime']
+__all__ = ['registry_store', 'registry_runtime']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 POLICY = InspectionPolicy(grace_ms=1000, runtime_ms=10000, result_ms=1000, escalation_ms=5000)
+
+
+@pytest.fixture
+async def runtime(registry_runtime):
+    from power_loop.agent.runtime_store import RuntimeInputStore
+    from power_loop.agent.runtime_types import Command, RuntimeDescriptor, TargetRef, TrustedActor, canonical, plain
+    store, manager, actor, root, *_ = registry_runtime
+    descriptor = RuntimeDescriptor(1, 'agent', 'inspection@1', None, 'tools@1', 'hooks@1', 'resources@1',
+                                   {'max_rounds': 3}, {'run_id': 101})
+    await manager.db.execute(f'UPDATE {store.t.sessions} SET metadata_json=? WHERE session_id=?',
+        (canonical({'tenant_id': actor.tenant_id, 'principal_id': actor.principal_id,
+                    'runtime_descriptor': plain(descriptor)}), actor.session_id))
+    port = RuntimeInputStore(store)
+    async with manager._write() as tx:
+        await port.accept_input(tx, Command('original', TargetRef(store.store_id, actor.session_id),
+            'send', {'body': 'original task'}, 'new_turn'), TrustedActor(actor.tenant_id, actor.principal_id, None))
+        await tx.execute(f"UPDATE {port.q} SET status='delivered',delivered_job_id=?,delivered_job_generation=1 "
+                         "WHERE session_id=? AND item_id='original'", (root.job.job_id, actor.session_id))
+    # A later definition edit must not change the original alert's profile or attribution.
+    await manager.db.execute(f'UPDATE {store.t.sessions} SET metadata_json=? WHERE session_id=?',
+        (canonical({'tenant_id': actor.tenant_id, 'principal_id': actor.principal_id,
+                    'runtime_descriptor': plain(RuntimeDescriptor(1, 'agent', 'inspection@2', None,
+                        'tools@2', 'hooks@2', 'resources@2', {'max_rounds': 9}, {'run_id': 202}))}), actor.session_id))
+    return registry_runtime
+
+
+async def child(runtime, *, key='child'):
+    store, manager, actor, _, lease, *_ = runtime
+    sid = await store.create_session(parent_session_id=actor.session_id, metadata={'execution_role': 'subagent'})
+    return await manager.register_job(actor, kind='subagent', parent=lease, session_id=sid, system_key=key)
 
 
 async def troubled(runtime, *, state='unknown'):
@@ -28,6 +59,7 @@ async def troubled(runtime, *, state='unknown'):
     elif state == 'result':
         await manager.record_execution_result(actor, proof, outcome='failed', result={'text': 'failed'}, resource_state='stopped')
     await manager.close_model_execution(actor, lease, evidence={'exit': 'completed'})
+    await manager.db.execute(f"UPDATE {manager.jobs} SET result_status='handled' WHERE job_id=?", (root.job.job_id,))
     now[0] += 2000
     return proof
 
@@ -59,7 +91,10 @@ async def test_original_problem_creates_one_main_alert_without_finishing_or_stop
     assert not await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='processing_decision'")
     inbox = await manager.db.fetchone(f'SELECT * FROM {store.t.follow_up_queue} WHERE item_id=?', (key,))
     assert inbox['session_id'] == actor.session_id and 'not a task result' in inbox['content']
-    public = json.loads(inbox['content'].split('Task alert data:\n', 1)[1])
+    public = json.loads(json.loads(inbox['content']).split('Task alert data:\n', 1)[1])
+    meta = json.loads(inbox['meta_json'])
+    assert meta['operation'] == 'append' and meta['descriptor']['definition_ref'] == 'inspection@1'
+    assert meta['descriptor']['host_context']['run_id'] == 101 and meta['options']['max_rounds'] == 3
     assert 'root' not in public and public['root_job_id'] == root.job.job_id
     assert 'executor_id' not in inbox['content'] and 'boot_id' not in inbox['content']
     assert (await inspect_tasks(manager, actor, root.job.job_id, policy=POLICY))['notification_ids'] == []
@@ -94,7 +129,8 @@ async def test_stale_changed_hidden_or_foreign_alert_is_not_fresh_wake_authority
     elif fault == 'superseded':
         await manager.db.execute(f'UPDATE {manager.jobs} SET generation=generation+1 WHERE job_id=?', (proof.job_id,))
     elif fault == 'claimed':
-        await manager.db.execute(f"UPDATE {store.t.follow_up_queue} SET status='claimed' WHERE item_id=?", (key,))
+        await manager.db.execute(f"UPDATE {store.t.follow_up_queue} SET status='claimed',claim_token='owner',"
+                                "claimed_at=?,claim_owner_epoch=1 WHERE item_id=?", (now[0], key))
     elif fault == 'content':
         await manager.db.execute(f"UPDATE {store.t.follow_up_queue} SET content='hidden' WHERE item_id=?", (key,))
     elif fault == 'authority_flag':

@@ -99,11 +99,19 @@ async def run_inline(spec, task, *, parent_loop):
 
     from .child_tasks import tool_actor
     receipt = await start(parent_loop, spec, task)
-    _, actor = await tool_actor(parent_loop)
+    if getattr(parent_loop, '_host_command', None) is None:
+        _, actor = await tool_actor(parent_loop)
+    else:
+        from power_loop.agent.runtime_types import TrustedActor
+        runtime = parent_loop.task_runtime
+        actor = TrustedActor(runtime.tenant_id, runtime.principal_id, None)
     worker = parent_loop._runtime_worker
     from power_loop.agent.runtime_store import now_ms
     result = await worker.runtime.client.wait(JobRef(**receipt["job_ref"]), actor=actor,
         deadline_ms=now_ms() + 1800000)
+    if getattr(parent_loop, '_host_command', None) is not None:
+        from .host_commands import consume_result
+        await consume_result(parent_loop, result)
     return {**plain(result), "session_id": receipt["session_id"], "run_id": receipt["run_id"]}
 
 
