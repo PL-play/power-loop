@@ -15,7 +15,10 @@ def execution_id(job_id, generation):
 
 
 async def delivery_id(manager, reader, job, generation=None):
+    import hashlib
     generation = job["generation"] if generation is None else generation
+    if job["kind"] == "subagent" or job["kind"] in {"background_tool", "background_command"} and job["session_id"]:
+        return hashlib.sha256(("result:" + result_id(job["job_id"], generation)).encode()).hexdigest()
     if generation <= 1:
         operation = await reader.fetchone(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND action='create'", (job["job_id"],))
         return "subagent:" + operation["event_id"][3:] if operation else None

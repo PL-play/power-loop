@@ -93,7 +93,7 @@ runtime = Runtime(
 
 客户端保存输入不需要目标租约。worker 先取权再构造执行环境；取不到时保留待处理输入。独立子执行持有自己的 session。失权只取消本会话执行并阻止新的 SDK 派发；hook 不能把失权或取消替换成工具成功、重试。SDK 不保证物理停止已在外部运行的进程。
 
-接手只中断本会话的未完成任务。原主 send 输入可读取原代次的 `interrupted` 结果，新 send 整理 pending 消息格式后继续；健康子会话不受影响。同 grant 下重建对象不改变 epoch 或 job generation。每 job 的周期续租和父执行凭据已移除，逻辑父子关系、累计预算及显式取消仍保留。子任务 resume、workflow 继续执行在后续阶段接通。
+接手只中断本会话的未完成任务。原主 send 输入可读取原代次的 `interrupted` 结果，新 send 整理 pending 消息格式后继续；健康子会话不受影响。同 grant 下重建对象不改变 epoch 或 job generation。每 job 的周期续租和父执行凭据已移除，逻辑父子关系、累计预算及显式取消仍保留。子任务 resume、后台任务和 answer 已按 P3 接通，见[异步编排](async-orchestration.md)；workflow 继续执行留 P4。
 
 `get_execution_context()` 返回不可修改的 SDK 身份、输入/任务引用、资源及取消信息。执行范围内可用 `with bind_host_context("app", {"trace_id": "trace-1"}):` 临时绑定白名单 JSON 字段，退出时自动 reset。独立子执行清除继承的租约、send、工具调用和取消上下文。重启后仍需保存的业务状态使用既有 `runtime_state` 接口。
 

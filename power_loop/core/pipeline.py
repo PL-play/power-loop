@@ -682,17 +682,19 @@ class AgentPipeline:
         reaches it; stopping just this call (e.g. once it was moved to the background) leaves
         the run alone."""
         tok = self.cancel_token.child()
+        detach = asyncio.Event()
         assistant_seq = getattr(self.sink, "persisted_assistant_seq", None)
 
         async def _run() -> tuple[str, bool]:
             if sem is None:
                 return await self.execute_tool(tool_name, tool_args, cancel_token=tok,
-                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq)
+                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq, background_detach=detach)
             async with sem:
                 return await self.execute_tool(tool_name, tool_args, cancel_token=tok,
-                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq)
+                                               tool_call_id=tool_call_id, assistant_seq=assistant_seq, background_detach=detach)
 
         fut = asyncio.ensure_future(_run())
+        fut.background_detach = detach
         self._tool_tokens[fut] = tok
         fut.add_done_callback(lambda f: self._tool_tokens.pop(f, None))
         return fut
@@ -732,11 +734,14 @@ class AgentPipeline:
         running call to the background task table. Returns the synthetic result for the model."""
         task_id = ""
         if mode == "background":
-            from power_loop.tools.default_tools import BG
-
-            task_id = await BG.adopt(tool_name, tool_args, work,
-                                     stop_token=self._tool_tokens.get(work))
-            output = self.STEER_BACKGROUND_TEXT.format(task_id=task_id)
+            # Admission finishes before returning a stable reference. Only the
+            # foreground wait ends; execution belongs to the independent job.
+            work.background_detach.set()
+            output, _ = await work
+            try:
+                task_id = json.loads(output).get("task_id", "")
+            except (ValueError, AttributeError):
+                pass
         else:
             work.cancel()
             with contextlib.suppress(BaseException):
@@ -908,7 +913,7 @@ class AgentPipeline:
         return AgentLoopResult(
             status=status,  # type: ignore[arg-type]
             final_text=final_text,
-            rounds=rounds,
+            rounds=max(0, rounds - getattr(self, "_initial_round_index", 0)),
             pending_tool_calls=pending_tool_calls or [],
             pending_interactions=pending_interactions or [],
             messages=self.history,
@@ -1697,6 +1702,7 @@ class AgentPipeline:
         self, tool_name: str, tool_args: dict[str, Any], *, count: bool = True,
         cancel_token: CancellationToken | None = None,
         tool_call_id: str | None = None, assistant_seq: int | None = None,
+        background_detach: asyncio.Event | None = None,
     ) -> tuple[str, bool]:
         """Execute a single tool and return ``(output_string, failed)``.
 
@@ -1730,13 +1736,17 @@ class AgentPipeline:
                     registered = await check_tool_dispatch(self.session_id, tool_name, self.tool_registry, tool_args)
                     from power_loop.runtime.tool_contracts import validate_registration
                     validate_registration(self.tool_registry, tool_name, registered)
+                    from power_loop.runtime.background_execution import automatic, invoke_and_wait
                     from power_loop.runtime.tool_attempts import begin_pipeline
-                    budget_attempt = await begin_pipeline(self, registered, tool_args)
+                    independent = automatic(registered)
+                    budget_attempt = None if independent else await begin_pipeline(self, registered, tool_args)
                     from power_loop.runtime.tool_call_plans import dispatch as record_tool_dispatch
                     receipt = await record_tool_dispatch(self, tool_name, tool_args, registered,
                                                          budget_attempt=budget_attempt)
                     from power_loop.runtime.native_returns import invoke
-                    result = await invoke(self, registered, tool_args, receipt, budget_attempt=budget_attempt)
+                    result = await invoke(self, registered, tool_args, receipt, budget_attempt=budget_attempt,
+                        dispatch=(lambda: invoke_and_wait(self, registered, tool_args,
+                            background_detach or asyncio.Event())) if independent else None)
             finally:
                 reset_current_cancel_token(_ctok)
         except (ToolNotFound, ToolValidationError) as exc:
@@ -1844,7 +1854,7 @@ class AgentPipeline:
         # empties so we retry a bounded number of times before giving up.
         self._empty_response_streak = 0
         self._truncated_streak = 0
-        round_idx = -1
+        round_idx = getattr(self, "_initial_round_index", 0) - 1
         while True:
             round_idx += 1
             from power_loop.agent.stateful_loop import take_round_bonus
@@ -1957,6 +1967,11 @@ class AgentPipeline:
 
             # ── pass_turn：上一轮调了 → 这一轮开始前硬停（design/188，不再调模型）──
             if self._pass_state and self._pass_state.get("passed"):
+                from power_loop.runtime.child_completion import continue_before_finish
+                final_text = self._make_result("completed", rounds=round_idx).final_text
+                if await continue_before_finish(self, final_text, round_idx - 1):
+                    self._pass_state["passed"] = False
+                    continue
                 if drained_count or await self._runtime_work_after_model():
                     # 停的这一刻有刚折进来的新输入：不撤销停，留痕交给宿主（另起一轮处理）
                     self._pass_state["new_input_after_pass"] = True
@@ -2375,6 +2390,9 @@ class AgentPipeline:
                     reason="completed", round_idx=round_idx, final_text=assistant_text,
                     next_round=round_idx + 1,
                 ):
+                    continue
+                from power_loop.runtime.child_completion import continue_before_finish
+                if await continue_before_finish(self, assistant_text, round_idx):
                     continue
                 await self._finalize("completed", final_text=assistant_text, rounds=round_idx + 1)
                 return self._make_result("completed", final_text=assistant_text, rounds=round_idx + 1)

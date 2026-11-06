@@ -1,48 +1,44 @@
-
-import asyncio
+"""Canonical output survives caller/client recreation and is delivered compactly."""
 import json
-from types import SimpleNamespace
 
 import pytest
 
-from power_loop import SessionStore
+from power_loop import AgentLoopConfig, RuntimeClient
+from power_loop.agent.runtime_store import now_ms
+from power_loop.agent.runtime_types import JobRef
 from power_loop.contracts.tools import ToolDefinition
-from power_loop.core import agent_context
-from power_loop.runtime.background import RESULT_PREFIX, record_key
+from power_loop.runtime.background import RESULT_PREFIX, load_record
 from power_loop.runtime.pricing import Free
-from power_loop.runtime.runtime_state import BackgroundRuntimeProjector
-from power_loop.tools import default_tools as dt
-from power_loop.tools.registry import ToolRegistry
+from power_loop.tools import create_default_tool_registry
+from tests.runtime_fixture import RunningAgent
+
+from .test_background_runtime_203 import BackgroundParent
+from .test_job_registry_192 import registry_store
+
+__all__ = ['registry_store']
+pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.asyncio
-async def test_full_result_identity_survives_manager_recreation(monkeypatch):
-    store = await SessionStore.open(':memory:')
-    sid = await store.create_session()
-    sid = sid.session_id if hasattr(sid, 'session_id') else sid
+async def test_full_result_identity_survives_client_recreation(registry_store, tmp_path):
+    store, _ = registry_store
     output = 'Error: ' + 'x' * 12000 + 'END'
-
-    registry = ToolRegistry()
-    registry.register(ToolDefinition('scene_pkg', 'test', async_capable=True, pricing=Free("test_fixture")), lambda **args: output)
-
-    monkeypatch.setattr(agent_context, 'get_current_loop', lambda: SimpleNamespace(tool_registry=registry))
-    monkeypatch.setattr(dt, '_current_store_and_session', lambda: (store, sid))
-    monkeypatch.setattr(dt, '_TOOL_TASK_ON_COMPLETE', None)
-    manager = dt.BackgroundManager()
+    registry = create_default_tool_registry(workspace_dir=str(tmp_path))
+    registry.register(ToolDefinition('slow', 'test', async_capable=True, pricing=Free('read')),
+                      lambda **args: output)
+    runner = await RunningAgent(store, BackgroundParent(), registry, AgentLoopConfig(compactor=None)).start()
+    recovered = RuntimeClient(store=store, transport=runner.runtime.transport)
     try:
-        receipt = await manager.run_tool('scene_pkg', {'action': 'sprite', 'frames': ['a.png']})
-        tid = receipt.split('task_id=')[1].split('（')[0]
-        await asyncio.gather(*list(manager._workers.values()))
-        record = await store.get_runtime_state(sid, record_key(tid))
-        assert record['result'] == output and record['status'] == 'failed'
-        assert record['args']['frames'] == ['a.png']
-        recovered = dt.BackgroundManager()
-        for text in (await recovered.check(tid), await recovered.wait([tid], 0.01)):
-            data = json.loads(text.split(RESULT_PREFIX)[1])['tasks'][0]
-            assert data['result'] == output and data['tool'] == 'scene_pkg'
-        messages = await BackgroundRuntimeProjector(mark_seen=False).project(
-            store=store, session_id=sid, round_index=0, context=None)
-        assert messages[0]['_persist'] and '_ack' not in messages[0]
-        assert len(messages[0]['content']) < 2000
+        await runner.send('start background')
+        rows = await store.load_all_messages(runner.target.session_id)
+        receipt = json.loads(next(m.content for m in rows if m.tool_call_id=='background'))
+        result = await recovered.wait(JobRef(**receipt['job_ref']), actor=runner.actor, deadline_ms=now_ms()+10000)
+        assert result.status=='failed' and result.final_text==output
+        record = await load_record(store,runner.target.session_id,receipt['job_id'])
+        assert record['tool']=='slow' and record['result']==output
+        await runner.drain()
+        rows = await store.load_all_messages(runner.target.session_id)
+        notifications = [m for m in rows if RESULT_PREFIX in (m.content or '')]
+        assert len(notifications)==1 and len(notifications[0].content)<2000
     finally:
-        await store.close()
+        await recovered.aclose()
+        await runner.aclose()

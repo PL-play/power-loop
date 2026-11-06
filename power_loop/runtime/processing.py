@@ -135,9 +135,11 @@ async def _discover_request(manager, actor, caller, *, round_index, send_index, 
                 continue
             item_id = "nudge:" + event["event_id"]
         else:
-            if event["event_id"] != result_id(job["job_id"], job["generation"]):
+            generation = json.loads(event["payload_json"])["generation"]
+            if event["event_id"] != result_id(job["job_id"], generation):
                 continue
-            item_id = await delivery_id(manager, tx, job) if job["kind"] == "subagent" else event["event_id"]
+            item_id = (await delivery_id(manager, tx, job, generation) if job["kind"] == "subagent"
+                or job["kind"] in {"background_tool", "background_command"} and job["session_id"] else event["event_id"])
         if event['event_type'] == 'result' and job['kind'] in ('subagent', 'workflow_node', 'workflow'):
             from .controller_recovery import observation as controller_observation
             from .controller_recovery import read as controller_stop
@@ -154,7 +156,7 @@ async def _discover_request(manager, actor, caller, *, round_index, send_index, 
                 observed.append({'event_id': event['event_id'], 'job_id': event['job_id'],
                     'revision': int(event['job_version']), 'result_hash': _hash(json.loads(event['payload_json'])), **actual})
             continue
-        if event['event_type'] == 'result' and job['kind'] == 'background_tool':
+        if event['event_type'] == 'result' and job['kind'] == 'background_tool' and job['session_id'] is None:
             from .managed_delivery import observation
 
             actual = await observation(manager, tx, actor, job, event, visible)
@@ -197,7 +199,7 @@ async def _already_handled(manager, reader, event):
         elif row["kind"] == "send":
             from .abort_outcomes import handled_references
             await handled_references(manager, reader, row, event)
-        elif row["kind"] == "background_tool":
+        elif row["kind"] == "background_tool" and row["session_id"] is None:
             from .managed_delivery import handled_references, read
             await handled_references(manager, reader, row, event, await read(manager, reader, row, event))
         elif event.get("_processing_kind") == "controller":
@@ -228,7 +230,7 @@ async def _decision_target(manager, tx, actor, send, event, response_seq):
             raise JobError("processing_input_mismatch")
     controller_review = not is_input and 'controller_result_delivery' in event
     if ((not is_input and ((not controller_review and target["kind"] not in ("background_tool","send") and target["created_by_session_id"] != actor.session_id) or
-            current is not None and current["event_id"] != result_id(target["job_id"], target["generation"]))) or
+            current is not None and current["event_id"] != result_id(target["job_id"], json.loads(current["payload_json"])["generation"]))) or
             current is None or current["job_id"] != target["job_id"] or
             int(current["job_version"]) != event["revision"] or _hash(json.loads(current["payload_json"])) != event["result_hash"]):
         raise JobError("processing_revision_changed")
@@ -245,7 +247,7 @@ async def _decision_target(manager, tx, actor, send, event, response_seq):
         from .original_owner_review import require_handler
         await require_handler(manager,tx,target,send)
         await verify_observation(manager, tx, actor, target, current, event)
-    if not is_input and target['kind'] == 'background_tool':
+    if not is_input and target['kind'] == 'background_tool' and target['session_id'] is None:
         from .managed_delivery import verify_observation
 
         if send['execution_role'] != 'main':
@@ -253,6 +255,8 @@ async def _decision_target(manager, tx, actor, send, event, response_seq):
         await verify_observation(manager, tx, actor, target, current, event)
     if response_seq <= event["delivered_seq"]:
         raise JobError("processing_response_mismatch")
+    if not is_input:
+        target = {**target, "generation": json.loads(current["payload_json"])["generation"]}
     return target, current
 
 
@@ -422,6 +426,15 @@ async def require_inputs_handled(manager, tx, job):
 
 async def require_event_handled(manager, tx, result, *, session_id, owner_job_id, allow_suppressed=False):
     from .jobs import JobError, _hash
+    if owner_job_id is None and result["event_type"] == "result":
+        # Independent execution does not inherit the parent's runtime owner.
+        # Its result is nevertheless consumed in that original parent scope.
+        parent = await tx.fetchone(f"SELECT p.control_owner_job_id FROM {manager.jobs} child "
+            f"JOIN {manager.jobs} p ON p.job_id=child.parent_job_id WHERE child.job_id=? "
+            "AND child.kind IN ('subagent','background_tool','background_command') "
+            "AND child.session_id IS NOT NULL AND child.control_owner_job_id IS NULL", (result["job_id"],))
+        if parent:
+            owner_job_id = parent["control_owner_job_id"]
     if result.get("action") == "nudge":
         from .input_dispositions import read_tx
         disposed = await read_tx(manager, tx, result)

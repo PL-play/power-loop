@@ -92,6 +92,21 @@ async def _references(manager, tx, event_ids, known=None):
     return [_event_reference(found[key]) for key in event_ids]
 
 
+async def _unstarted_references(manager, tx, row):
+    if row["kind"] == "background_tool" and row["session_id"] is None:
+        from .managed_effects import unstarted_references
+        return await unstarted_references(manager, tx, row)
+    result = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (result_id(row["job_id"], 0),))
+    if result is None or not json.loads(result["payload_json"]).get("unstarted"):
+        raise JobError("finalization_result_unsettled")
+    refs = [await _reference(manager, tx, result["event_id"])]
+    if result["delivery_status"] != "suppressed":
+        from .processing import require_event_handled
+        await require_event_handled(manager, tx, result, session_id=row["created_by_session_id"], owner_job_id=row["control_owner_job_id"])
+        refs.extend(await _processing_references(manager, tx, result))
+    return refs
+
+
 async def _closed_event(manager, tx, event, state=None, depth=0):
     state = {"visiting": set(), "done": {}} if state is None else state
     event_id = event["event_id"]
@@ -122,13 +137,12 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
             raise JobError("finalization_evidence_changed")
     else:
         row = await manager._row(tx, event["job_id"])
-        if (row is None or row["kind"] != "background_tool" or data["scope"].get("generation") != 0
+        if (row is None or row["kind"] not in ("background_tool", "background_command", "subagent") or data["scope"].get("generation") != 0
                 or type(data["scope"].get("generation")) is not int
                 or _hash(data["scope"]) != _hash(_lease(row)) or data["proof"].get("kind") != row["kind"]
                 or data["proof"].get("outcome") != row["outcome"]):
             raise JobError("finalization_evidence_corrupt")
-        from .managed_effects import unstarted_references
-        if _hash(data["proof"].get("references")) != _hash(await unstarted_references(manager, tx, row)):
+        if _hash(data["proof"].get("references")) != _hash(await _unstarted_references(manager, tx, row)):
             raise JobError("finalization_evidence_changed")
     from .jobs import KINDS
     proof = data["proof"]
@@ -174,7 +188,8 @@ async def _closed_event(manager, tx, event, state=None, depth=0):
             raise JobError("finalization_evidence_missing")
         # The delivery and actual handling transcript remain part of retained
         # proof, including when this closed child is read through its parent.
-        await require_closed(manager, tx, current, result)
+        if current["session_id"] is None:
+            await require_closed(manager, tx, current, result)
     if data["version"] == 1 and proof["kind"] == "send":
         from .pending_calls import negative_review_references, require_disposition
         source = await manager._row(tx, event["job_id"])
@@ -297,9 +312,8 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
             from .wait_terminal import references
             refs = await references(manager, tx, row)
             version_code = 2
-        elif row["kind"] == "background_tool":
-            from .managed_effects import unstarted_references
-            refs = await unstarted_references(manager, tx, row)
+        elif row["kind"] in ("background_tool", "background_command", "subagent"):
+            refs = await _unstarted_references(manager, tx, row)
             version_code = 3
         else:
             raise JobError("finalization_adapter_required")
@@ -335,7 +349,7 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
             raise JobError("finalization_model_exit_unconfirmed")
         from .model_exit import require_stopped
         evidence = model["payload"].get("evidence", {})
-        if evidence.get("exit") != "completed" and evidence.get("exit") not in ("failed", "cancelled", "interrupted", "hit_round_limit", "timed_out", "budget_exceeded", "degraded"):
+        if evidence.get("exit") != "completed" and evidence.get("exit") not in ("failed", "cancelled", "interrupted", "hit_round_limit", "timed_out", "budget_exceeded", "degraded", "waiting_for_input"):
             raise JobError("finalization_model_exit_unconfirmed")
         await require_stopped(manager, tx, row, model["payload"])
         from .model_budgets import require_quiescent as require_budget_quiescent
@@ -366,10 +380,11 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
             refs.extend(await handled_references(manager, tx, row, _closures=validated))
         elif row["kind"] == "workflow_node":
             refs.append(await require_node_consumed(manager, tx, row))
-        elif row["kind"] in ("workflow", "subagent"):
+        elif row["kind"] in ("workflow", "subagent") or row["kind"] in ("background_tool", "background_command") and row["session_id"]:
             from .processing import require_handled
-            await require_handled(manager, tx, row)
-            refs.extend(await _processing_references(manager, tx, result))
+            if result["delivery_status"] != "suppressed":
+                await require_handled(manager, tx, row)
+                refs.extend(await _processing_references(manager, tx, result))
             if row["kind"] == "workflow":
                 from .workflow_profile import read as profile
                 from .workflow_results import _id, delivery_event_id, require_closed
@@ -404,9 +419,9 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
         if child is None or (child["tenant_id"], child["principal_id"]) != (row["tenant_id"], row["principal_id"]):
             raise JobError("invalid_finalization_tree")
         if child_generation == 0:
-            if child["kind"] not in ("timer", "background_tool") or _hash(lease) != _hash(_lease(child)) or (job_id, 0) in owned:
+            if child["kind"] not in ("timer", "background_tool", "background_command", "subagent") or _hash(lease) != _hash(_lease(child)) or (job_id, 0) in owned:
                 raise JobError("invalid_finalization_tree")
-            if child["kind"] == "background_tool":
+            if child["kind"] == "background_tool" and child["session_id"] is None:
                 from .managed_effects import descriptor
                 if await descriptor(manager, tx, child) is None:
                     raise JobError("invalid_finalization_tree")

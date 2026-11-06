@@ -337,35 +337,17 @@ async def signal_local(runtime, actor, operation):
 
 
 async def stop_from_current_call(loop, session_id, job_id, *, reason="Stopped by request", expected_generation=None):
-    """Shared model-control adapter for jobs/workflow, not another model tool.
+    """Stop the original logical task through the shared control channel."""
+    from power_loop.agent.runtime_types import JobRef, plain
 
-    Capture actual invocation identity, reconcile uncertain committed acceptance,
-    and signal only after the persistent stop intent has committed.
-    """
-    from .invocation import current_invocation
-    from .task_runtime import _SEND
-
-    runtime = getattr(loop, "task_runtime", None)
-    source = _SEND.get()
-    if runtime is None or source is None or source.runtime is not runtime or source.actor.session_id != session_id:
-        raise JobError("persisted_tool_call_required")
-    manager, actor = runtime.manager, runtime.actor(session_id)
-    seq, tool_call_id = current_invocation(session_id)
-    if seq is None or not tool_call_id:
-        raise JobError("persisted_tool_call_required")
-    arguments = dict(caller=source.lease, call_ref=await manager.store.message_ref(session_id, seq),
-        tool_call_id=tool_call_id, reason=reason, expected_generation=expected_generation)
-    try:
-        operation, replayed = await request_stop(manager, actor, job_id, **arguments)
-    except JobError:
-        raise
-    except Exception:
-        operation = await _recover_stop(manager, actor, _intent(job_id, **arguments))
-        replayed = True
-    signals, signal_error = 0, None
-    try:
-        signals = await signal_local(runtime, actor, operation)
-    except Exception:
-        signal_error = "local_signal_requires_reconciliation"
-    return {"version": 1, "backend": "task_registry", "operation_id": operation.operation_id, "replayed": replayed,
-        **operation.result["response"], "local_signals": signals, "signal_error": signal_error}
+    from .child_tasks import tool_actor
+    binding, actor = await tool_actor(loop)
+    port = loop._runtime_worker.inputs
+    async with binding.runtime.manager._read() as reader:
+        await binding.runtime.manager._fence(reader, binding.actor, binding.lease)
+    row = await port.resolve_job(port.db, JobRef(port.store.store_id, job_id), actor)
+    generation = row["generation"] if expected_generation is None else expected_generation
+    receipt = await loop._runtime_worker.runtime.client.cancel(
+        JobRef(port.store.store_id, job_id, generation), actor=actor, scope="subtree", reason=reason)
+    return {"version": 1, "backend": "task_registry", "job_id": job_id,
+            "generation": generation, "status": "accepted", "receipt": plain(receipt)}

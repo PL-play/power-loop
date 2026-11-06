@@ -12,7 +12,7 @@ import logging
 import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 from .invocation import current_invocation
@@ -610,10 +610,10 @@ class TaskRuntime:
                     owner = None
             else:
                 owner = None
-        if owner is None and await session_role(self.manager.store, sid) != "main":
+        if owner is None and not input_start.child_job_id and await session_role(self.manager.store, sid) != "main":
             raise JobError("task_owner_required")
         from power_loop.agent.runtime_types import plain
-        request = {"input_ref": plain(input_start.context.input_ref)}
+        request = {"input_ref": plain(input_start.context.input_ref), "send_index": send_index}
         system_key = "input:" + input_start.context.input_ref.message_id
         original_round_limit = None
         if owner is not None:
@@ -656,6 +656,8 @@ class TaskRuntime:
                 async with prepare_policy(self, source=policy_source), self.manager.joined_write():
                     tx = self.manager._joined_write.get()
                     await input_start.prepare(tx)
+                    if input_start.child_job_id:
+                        owner = await input_start.claim_owner(self, tx)
                     if self.budget_config is None:
                         from .executor_registry import ExecutorIdentity, admit_unbudgeted
                         await admit_unbudgeted(self.manager, tx,
@@ -679,6 +681,8 @@ class TaskRuntime:
                     binding = await self.claim(actor, registration)
                     await input_start.bind(tx, binding)
                     binding.resource_evidence["_control_registered_payload"] = registration.operation.result
+                    if input_start.record.meta["operation"] == "resume":
+                        binding.resource_evidence["explicit_resume"] = True
                     await enable(binding,review_sources=review_sources)
                 break
             except ReviewSourcesChanged:
@@ -729,11 +733,17 @@ class TaskRuntime:
                 evidence["last_assistant_ref"] = last.to_dict()
             async with self.manager.joined_write() as tx:
                 await input_start.prepare_finish(tx)
-                _, finalized = await self.manager.close_and_finalize(
-                    actor, binding.lease, evidence=evidence,
-                    resource_state=binding.resource_evidence.get("resource_state", "stopped"),
-                )
-                await input_start.finish(tx, binding, evidence)
+                if evidence.get("exit") == "waiting_for_input":
+                    from .interactions import save_wait
+                    await save_wait(input_start, tx, binding, evidence)
+                    finalized = True
+                else:
+                    _, finalized = await self.manager.close_and_finalize(
+                        actor, binding.lease, evidence=evidence,
+                        resource_state=binding.resource_evidence.get("resource_state", "stopped"),
+                    )
+                    await input_start.finish(tx, binding, evidence)
+            await input_start.notify_finished()
             from .finalization import after_send
 
             try:
@@ -749,38 +759,6 @@ class TaskRuntime:
             if failure is not None:
                 from .original_owner_review import remember
                 remember(binding,owner,failure,original_round_limit)
-
-    async def admit_subagent(self, sid: str, spec, task: str) -> JobRegistration:
-        # Disabled until its unified task path is implemented; retained internals are not a fallback.
-        from power_loop.agent.runtime_types import RuntimeRequestError
-        raise RuntimeRequestError("feature_unavailable", "subagent is not enabled")
-        execution = _SEND.get()
-        if execution is None or execution.runtime is not self or execution.actor.session_id != sid:
-            raise JobError("task_send_required")
-        if spec.lifecycle != "linked":
-            raise JobError("task_adapter_unavailable:ephemeral_subagent")
-        assistant_seq, call_id = current_invocation(sid)
-        if assistant_seq is None or not call_id:
-            raise JobError("persisted_tool_call_required")
-        role = await self.manager.get_job(execution.actor, execution.lease.job_id)
-        return await self.manager.register_job(
-            execution.actor,
-            kind="subagent",
-            title=spec.name,
-            parent=execution.lease,
-            independent=role.execution_role == "main",
-            call_ref=await self.manager.store.message_ref(sid, assistant_seq),
-            tool_call_id=call_id,
-            request={"spec": asdict(spec), "input": task, "completion_window_protocol": 1, "owner_abort_review_protocol": 1},
-        )
-
-    async def bind_subagent(self, parent: str, registration: JobRegistration, sid: str) -> Execution:
-        bound = await self.manager.bind_session(self.actor(parent), registration.job.job_id, sid)
-        # The child's SID now authorizes its own model sends and execution evidence.
-        return await self.claim(self.actor(sid), JobRegistration(bound, registration.operation, False))
-
-    async def record_subagent(self, binding: Execution, result: dict) -> dict:
-        return await self.record_scope(binding, result)
 
     async def record_scope(self, binding: Execution, result: dict) -> dict:
         try:

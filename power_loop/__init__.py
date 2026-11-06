@@ -238,7 +238,6 @@ from power_loop.runtime.representation import (
 )
 from power_loop.runtime.retry import LLMRetryPolicy, is_permanent_llm_error, with_retry
 from power_loop.runtime.runtime_state import (
-    BackgroundRuntimeProjector,
     RuntimeMessage,
     RuntimeProjector,
     TodoRuntimeProjector,
@@ -444,7 +443,6 @@ __all__ = [
 	"RuntimeProjector",
 	"ToolRuntimeContext",
 	"TodoRuntimeProjector",
-	"BackgroundRuntimeProjector",
 	"default_runtime_projectors",
 	"get_tool_runtime_context",
 	"Representation",

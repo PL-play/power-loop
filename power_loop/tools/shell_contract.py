@@ -14,6 +14,12 @@ class ShellTool(RuntimeTool):
         return ToolRuntimeContract("sdk.shell")
 
     def __call__(self, **arguments):
+        from power_loop.core.agent_context import get_current_loop
+        loop = get_current_loop()
+        ctx = getattr(loop, "_runtime_worker_context", None)
+        if ctx is not None and ctx.descriptor.kind in {"background_tool", "background_command"}:
+            from .background_shell import execute
+            return execute(**arguments)
         # Keep the built-in shell's synchronous registry API.
         return self.handler(**arguments)
 

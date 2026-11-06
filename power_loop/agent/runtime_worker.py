@@ -5,6 +5,7 @@ import asyncio
 import contextvars
 import json
 import logging
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 
 from power_loop.agent.follow_up import render_inbox_rows
@@ -60,12 +61,14 @@ class _SessionExecution:
     closing: bool = False
     task: object = None
     shutdown_interrupted: bool = False
+    idle_users: int = 0
     output: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=256))
 
     actor: object = None
     parent_job_id: str | None = None
     root_job_id: str | None = None
     resources: object = None
+    descriptor: object = None
 
     def snapshot(self):
         from power_loop.core.execution_context import ExecutionContext
@@ -78,6 +81,30 @@ class _InputStart:
     def __init__(self, worker, context, record, send_index):
         self.worker, self.context, self.record, self.send_index = worker, context, record, send_index
         self.structured_output, self.output_error = None, None
+        self.owner = None
+        self.parent_result = None
+
+    @property
+    def child_job_id(self):
+        return (self.record.row["target_job_id"] if self.record.meta["operation"] in {"resume", "answer"}
+                else self.record.row["delivered_job_id"])
+
+    async def claim_owner(self, runtime, tx):
+        if not self.child_job_id:
+            return None
+        from power_loop.runtime.jobs import JobRegistration, _record
+        row = await runtime.manager._row(tx, self.child_job_id)
+        if self.record.meta["operation"] == "answer":
+            from power_loop.runtime.interactions import claim_answer
+            self.owner = await claim_answer(self, runtime, tx, row)
+            return self.owner
+        if self.record.meta["operation"] == "resume":
+            from power_loop.runtime.subagent_resume import resume_claim
+            self.owner = await resume_claim(runtime, tx, self.record, row)
+            return self.owner
+        self.owner = await runtime.claim(runtime.actor(self.context.session_id),
+            JobRegistration(_record(row), None, False))
+        return self.owner
 
     async def prepare(self, tx):
         port, ctx = self.worker.inputs, self.context
@@ -85,14 +112,29 @@ class _InputStart:
         if not records:
             raise RuntimeRequestError("input_not_startable")
         self.record = records[0]
+        if self.record.meta["operation"] == "result_ready":
+            if await port.discard_cancelled_result(tx, self.record):
+                raise RuntimeRequestError("origin_cancelled")
+            self.record = await port.result_input(self.record, tx)
 
     async def bind(self, tx, binding):
         port, ctx, store = self.worker.inputs, self.context, self.worker.runtime.store
-        ref = JobRef(ctx.store_id, binding.lease.job_id, binding.lease.generation)
+        self.model_ref = JobRef(ctx.store_id, binding.lease.job_id, binding.lease.generation)
+        lease = self.owner.lease if self.owner else binding.lease
+        ref = JobRef(ctx.store_id, lease.job_id, lease.generation)
         await port.bind_input_job(tx, ctx.input_ref, ref, ctx, claim_token=self.record.row["claim_token"])
         state = await port.db.dialect.lock_state(tx, port.state, ctx.session_id)
         ctx.lease.require_owned()
         seq = state["next_seq"]
+        if self.record.meta["operation"] == "answer":
+            waiting = self.record.meta["interaction"]
+            self.next_seq = seq
+            await tx.execute(f"UPDATE {port.q} SET status='delivered',delivered_seq=?,delivered_send_index=?,delivered_at=?,"
+                "claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
+                (waiting["answer_seq"], self.send_index, now_ms(), ctx.session_id, ctx.input_ref.message_id))
+            ctx.job_ref = ref
+            binding.resource_evidence["_runtime_send_index"] = self.send_index
+            return
         self.next_seq = seq + 1
         body = json.loads(self.record.row["content"])
         role, name = "user", None
@@ -133,6 +175,9 @@ class _InputStart:
 
     def completed(self, result):
         response_format = self.context.options.response_format
+        if result.status == "completed" and "child_spec" in self.context.descriptor.config and not result.final_text.strip():
+            result.status = "failed"
+            self.output_error = "subagent_output_missing"
         if result.status != "completed" or not response_format or response_format.get("type") not in {"json_object", "json_schema"}:
             return
         from power_loop.runtime.structured import StructuredOutputError, parse_structured
@@ -163,7 +208,43 @@ class _InputStart:
             status = "interrupted"
         value = Result(ctx.job_ref, ctx.input_ref, status, result.get("final_text", ""),
                        result.get("usage", evidence.get("usage", {})), self.structured_output, error)
-        await self.worker.inputs._commit_result(tx, ctx.job_ref, value, ctx, self.result_route)
+        if self.owner:
+            from power_loop.runtime.execution_membership import seal
+            manager = binding.runtime.manager
+            # Keep the physical model send's own result, without enqueueing an
+            # internal result back into the same child session.
+            await self.worker.inputs._commit_result(tx, self.model_ref,
+                replace(value, job_ref=self.model_ref, input_ref=None), ctx,
+                {"parent_session_id": None})
+            row = await manager._row(tx, ctx.job_ref.job_id)
+            manager._check_proof(row, self.owner.lease)
+            waiting = self.record.meta.get("interaction")
+            if waiting:
+                usage = dict(waiting["usage"])
+                for key, count in value.usage.items():
+                    usage[key] = usage.get(key, 0) + count
+                value = replace(value, usage=usage)
+            if row["kind"] == "send":
+                await manager.close_model_execution(self.owner.actor, self.owner.lease, evidence=evidence)
+                self.parent_result = await self.worker.inputs._commit_result(tx, ctx.job_ref, value, ctx, self.result_route)
+                return
+            outcome = {"completed": "succeeded", "cancelled": "cancelled",
+                       "interrupted": "interrupted"}.get(status, "failed")
+            if row["cancel_requested_at"] is not None:
+                outcome, value = "cancelled", replace(value, status="cancelled")
+            await seal(manager, tx, row)
+            await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status='settling',outcome=?,"
+                "resource_state='stopped',intake='closed',version=version+1,updated_at=? "
+                "WHERE job_id=? AND generation=? AND version=?",
+                (outcome, manager.now(), row["job_id"], row["generation"], row["version"]), obligations=True)
+        self.parent_result = await self.worker.inputs._commit_result(
+            tx, ctx.job_ref, value, ctx, self.result_route)
+
+    async def notify_finished(self):
+        if self.parent_result:
+            ref = self.parent_result
+            await self.worker.runtime.client._notify(TargetRef(ref.store_id, ref.session_id),
+                ref.message_id, ref, ["work", "activation"])
 
 
 class RuntimeWorker:
@@ -175,9 +256,12 @@ class RuntimeWorker:
         self._pending = {}
         self._active = {}
         self._tasks = set()
+        self._waiting = set()
+        self._capacity = asyncio.Semaphore(runtime.capacity)
         self._wake = asyncio.Event()
         self._started, self._closing, self._closed = False, False, False
         self._recovery_cursor = None
+        self._job_recovery_cursor = ""
         self._overflow = False
         self.shutdown_result = ShutdownResult(True)
 
@@ -225,6 +309,13 @@ class RuntimeWorker:
             self._overflow = False
         for ref in page.items:
             self._activate(ref.session_id)
+        jobs = await self.inputs.db.fetchall(f"SELECT job_id,session_id FROM {self.inputs.jobs} "
+            "WHERE kind IN ('subagent','background_tool','background_command') AND session_id IS NOT NULL "
+            "AND status='running' AND outcome IS NULL AND job_id>? ORDER BY job_id LIMIT ?",
+            (self._job_recovery_cursor, self.runtime.claim_limit))
+        self._job_recovery_cursor = jobs[-1]["job_id"] if len(jobs) == self.runtime.claim_limit else ""
+        for job in jobs:
+            self._activate(job["session_id"])
 
     async def _recover_periodically(self):
         while True:
@@ -315,7 +406,8 @@ class RuntimeWorker:
             self._wake.clear()
             if (self._recovery_cursor is not None or self._overflow) and len(self._pending) < 924:
                 await self.recover()
-            while self._pending and len(self._tasks) < self.runtime.capacity and not self._closing:
+            while (self._pending and len(self._tasks) < 1024
+                   and len(self._tasks) - len(self._waiting) < self.runtime.capacity and not self._closing):
                 sid = next(iter(self._pending))
                 self._pending.pop(sid)
                 self._active[sid] = None
@@ -335,12 +427,35 @@ class RuntimeWorker:
         from .stateful_loop import _ExecutionLoop, _session_sync
         entry = _session_sync(sid)
         entry.users += 1
+        acquired = False
+        task = asyncio.current_task()
         try:
+            await self._capacity.acquire()
+            acquired = True
             async with entry.lock:
                 await self._run_session_owned(sid)
         finally:
+            if acquired and task not in self._waiting:
+                self._capacity.release()
+            self._waiting.discard(task)
             entry.users -= 1
             _ExecutionLoop._release_idle_sync(sid)
+
+    @asynccontextmanager
+    async def idle(self, ctx):
+        """Keep the session owner while yielding its execution slot to children."""
+        ctx.idle_users += 1
+        if ctx.idle_users == 1:
+            self._waiting.add(ctx.task)
+            self._capacity.release()
+            self._wake.set()
+        try:
+            yield
+        finally:
+            ctx.idle_users -= 1
+            if ctx.idle_users == 0 and not ctx.stop.is_cancelled() and not ctx.shutdown_interrupted:
+                await self._capacity.acquire()
+                self._waiting.discard(ctx.task)
 
     async def _run_session_owned(self, sid):
         from contextlib import AsyncExitStack, ExitStack
@@ -358,15 +473,29 @@ class RuntimeWorker:
         r, env, ctx, deadline_task, output_task = self.runtime, None, None, None, None
         try:
             row = await self.inputs.db.fetchone(f"SELECT * FROM {self.inputs.q} WHERE session_id=? AND status='pending' ORDER BY id LIMIT 1", (sid,))
-            if row is None:
-                return
-            record = self.inputs.record(row)
+            recovery_only = row is None
+            if recovery_only:
+                creation = await self.inputs.db.fetchone(f"SELECT e.payload_json FROM {self.inputs.jobs} j "
+                    f"JOIN {self.inputs.events} e ON e.job_id=j.job_id AND e.action='create' WHERE j.session_id=? "
+                    "AND j.kind IN ('subagent','background_tool','background_command') AND j.status='running' AND j.outcome IS NULL",
+                    (sid,))
+                if creation is None:
+                    return
+                saved_ref = InputRef(**json.loads(creation["payload_json"])["request"]["input_ref"])
+                record = await self.inputs.input(self.inputs.db, saved_ref)
+                row = record.row
+            else:
+                record = self.inputs.record(row)
+            if record.meta["operation"] == "result_ready":
+                record = await self.inputs.result_input(record)
+                if record is None:
+                    return
             ctx = _SessionExecution(r.store.store_id, sid, r.node_id, r.boot_id, record.ref)
             ctx.options = RequestOptions(**record.meta["options"])
             scopes.enter_context(_bind_execution_context(ctx.snapshot, r.host_context_fields))
             ctx.task = asyncio.current_task()
             self._active[sid] = ctx
-            if row["target_job_id"]:
+            if row["target_job_id"] and record.meta["operation"] not in {"resume", "answer"}:
                 job = await self.inputs.db.fetchone(f"SELECT generation,status FROM {self.inputs.jobs} WHERE job_id=?", (row["target_job_id"],))
                 reason = ("target_terminal" if job is None or job["status"] != "running" else
                           "stale_generation" if job["generation"] != row["expected_job_generation"] else None)
@@ -374,10 +503,6 @@ class RuntimeWorker:
                     async with self.inputs.db.transaction() as tx:
                         await self.inputs.void_unbound(tx, record.ref, reason=reason)
                     return
-            if row["expires_at"] is not None and row["expires_at"] <= now_ms():
-                async with self.inputs.db.transaction() as tx:
-                    await self.inputs.void_unbound(tx, record.ref, reason="expired")
-                return
             metadata = await self.inputs.db.fetchone(f"SELECT metadata_json FROM {r.store.t.sessions} WHERE session_id=?", (sid,))
             identity = json.loads(metadata["metadata_json"])
             from .runtime_types import TrustedActor
@@ -389,8 +514,17 @@ class RuntimeWorker:
                 _cache_invalidate=lambda session: ctx.loop._cache_invalidate(session) if ctx.loop else None)
             ctx.lease = await leases.enter_async_context(hold_session_ownership(holder, sid))
             ctx.epoch = ctx.lease.epoch
+            if row["expires_at"] is not None and row["expires_at"] <= now_ms():
+                await self.inputs.fail_start(record.ref, "expired", ctx)
+                return
+            if recovery_only:
+                from power_loop.runtime.session_ownership import recover_acquired_session
+                recovered = SimpleNamespace(store=r.store, task_runtime=SimpleNamespace(manager=JobManager(r.store),
+                    tenant_id=identity["tenant_id"], principal_id=identity["principal_id"]))
+                await recover_acquired_session(recovered, sid, cache_valid=False)
+                return
             await notify(r.hooks, HookPoint.EXECUTION_ACQUIRED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
-            descriptor = RuntimeDescriptor(**record.meta["descriptor"])
+            descriptor = ctx.descriptor = RuntimeDescriptor(**record.meta["descriptor"])
             try:
                 env = await r.factory.build(descriptor, ctx.snapshot())
                 ctx.resources = env.resources
@@ -401,11 +535,19 @@ class RuntimeWorker:
             except (SessionLeaseLost, SessionBusy, CancellationRequested):
                 raise
             except Exception as exc:
-                async with self.inputs.db.transaction() as tx:
-                    await self.inputs.void_unbound(tx, record.ref, reason="definition_unavailable: " + str(exc))
+                parent_ref = await self.inputs.fail_start(record.ref, "definition_unavailable: " + str(exc), ctx)
+                if parent_ref:
+                    await r.client._notify(TargetRef(parent_ref.store_id, parent_ref.session_id),
+                                           parent_ref.message_id, parent_ref, ["work", "activation"])
                 return
             options = record.meta["options"]
-            config = replace(env.config, delegation_policy="single_level", session_lease_ttl_s=r.session_lease_ttl_s)
+            if "child_spec" in descriptor.config:
+                from power_loop.runtime.spec import AgentSpec, _child_config
+                child_config = _child_config(AgentSpec.from_dict(plain(descriptor.config["child_spec"])),
+                                             SimpleNamespace(config=env.config))
+            else:
+                child_config = env.config
+            config = replace(child_config, delegation_policy="single_level", session_lease_ttl_s=r.session_lease_ttl_s)
             for field_name in ("model", "temperature", "max_tokens", "max_rounds", "max_tokens_per_run", "system_prompt", "response_format"):
                 if options[field_name] is not None:
                     setattr(config, field_name, options[field_name])
@@ -413,6 +555,16 @@ class RuntimeWorker:
                 deadline_task = asyncio.create_task(self._expire(ctx, record.row["expires_at"], identity))
             task_runtime = env.task_runtime or TaskRuntime(JobManager(r.store), tenant_id=identity["tenant_id"],
                 principal_id=identity["principal_id"], executor_id=r.node_id, boot_id=r.boot_id)
+            model = env.llm
+            if "child_spec" in descriptor.config:
+                from power_loop.runtime.spec import _model_service
+                model = _model_service(SimpleNamespace(llm=model, task_runtime=task_runtime),
+                                       AgentSpec.from_dict(plain(descriptor.config["child_spec"])))
+            if descriptor.kind in {"background_tool", "background_command"}:
+                from power_loop.runtime.background_execution import run
+                async with self.idle(ctx):
+                    await run(self, ctx, record, env, task_runtime)
+                return
             bus = AgentEventBus()
             def on_delta(event):
                 if ctx.output.full():
@@ -423,25 +575,41 @@ class RuntimeWorker:
             bus.subscribe(AgentEventType.STREAM_DELTA, on_delta)
             bus.subscribe(AgentEventType.STREAM_THINK_DELTA, on_delta)
             output_task = asyncio.create_task(self._pump_output(ctx))
-            loop = _ExecutionLoop(llm=env.llm, store=r.store, config=config, tool_registry=env.tool_registry,
+            loop = _ExecutionLoop(llm=model, store=r.store, config=config, tool_registry=env.tool_registry,
                                      hooks=env.hooks, event_bus=bus, task_runtime=task_runtime, session_coordinator=r.coordinator)
             loop._runtime_worker_context = ctx
             loop._runtime_worker = self
             loop._owner_id = r.node_id + "/" + r.boot_id
             ctx.loop = loop
             try:
-                send_index = int(await r.store.get_runtime_state(sid, "send_index") or 0) + 1
+                send_index = (record.meta["interaction"]["send_index"] if record.meta["operation"] == "answer"
+                              else int(await r.store.get_runtime_state(sid, "send_index") or 0) + 1)
                 start = _InputStart(self, ctx, record, send_index)
                 await loop._interrupt_pending(sid)
                 await loop._run_loop(sid, stop_event=ctx.stop, tools=options["tools"],
                     system_prompt=options["system_prompt"], max_rounds=options["max_rounds"],
                     response_format=options["response_format"], with_history=options["history"],
+                    _initial_round_index=(record.meta["interaction"]["rounds"] if record.meta["operation"] == "answer" else 0),
                     _entry_send_index=send_index, _runtime_start=start)
             finally:
                 ctx.closing = True
 
         except SessionBusy:
             busy = True
+
+        except RuntimeRequestError as exc:
+            if exc.code != "origin_cancelled":
+                raise
+            async with loop.task_runtime.manager.joined_write() as tx:
+                await self.inputs.db.dialect.lock_state(tx, self.inputs.state, sid)
+                await self.inputs.discard_cancelled_result(tx, record)
+            from power_loop.runtime.finalization import try_finalize
+            manager = loop.task_runtime.manager
+            job = await manager._row(manager.db, record.meta["result_ref"]["job_id"])
+            actor = loop.task_runtime.actor(sid)
+            await try_finalize(manager, actor, job["job_id"], job["generation"])
+            root = await manager._row(manager.db, job["root_job_id"])
+            await try_finalize(manager, actor, root["job_id"], root["generation"])
 
         finally:
             try:
@@ -532,12 +700,14 @@ class RuntimeWorker:
             # consumed here. Claim/void/delivery still use the original transaction.
             ctx.control_read.hint_consumed = True
         try:
-            async with self.inputs.db.transaction() as tx:
+            async with ctx.loop.task_runtime.manager.joined_write() as tx:
                 # Filter the finite notification batch; new_turn must remain pending.
                 eligible = []
                 for ref in refs:
                     record = await self.inputs.input(tx, ref)
-                    if record and record.meta["operation"] in {"append", "nudge", "steer"}:
+                    if record and record.meta["operation"] == "result_ready":
+                        eligible.append(ref)
+                    elif record and record.meta["operation"] in {"append", "nudge", "steer"}:
                         row = record.row
                         reason = ("expired" if row["expires_at"] is not None and row["expires_at"] <= now_ms() else
                                   "stale_generation" if row["target_job_id"] and
@@ -549,6 +719,14 @@ class RuntimeWorker:
                             eligible.append(ref)
                 records = await self.inputs.claim_inputs(tx, TargetRef(ctx.store_id, ctx.session_id), ctx,
                                                         self.runtime.claim_limit, eligible)
+                rendered = []
+                for record in records:
+                    if record.meta["operation"] == "result_ready":
+                        if await self.inputs.discard_cancelled_result(tx, record):
+                            continue
+                        record = await self.inputs.result_input(record, tx)
+                    rendered.append(record)
+                records = rendered
         finally:
             ctx.claiming_refs = frozenset()
         rows = []
@@ -577,9 +755,13 @@ class RuntimeWorker:
                 client = RuntimeClient(store=self.runtime.store, transport=self.runtime.transport,
                                        namespace=self.runtime.namespace)
                 for ctx in tuple(self._active.values()):
-                    if ctx:
+                    if ctx and ctx.job_ref and ctx.lease and not ctx.lease.lost:
                         session = await self.inputs.db.fetchone(
-                            f"SELECT metadata_json FROM {self.runtime.store.t.sessions} WHERE session_id=?", (ctx.session_id,))
+                            f"SELECT metadata_json FROM {self.runtime.store.t.sessions} WHERE session_id=? "
+                            f"AND EXISTS (SELECT 1 FROM {self.inputs.jobs} WHERE job_id=? AND status='running')",
+                            (ctx.session_id, ctx.job_ref.job_id))
+                        if session is None:
+                            continue
                         identity = json.loads(session["metadata_json"])
                         await client.cancel(ctx.input_ref, actor=TrustedActor(identity["tenant_id"], identity["principal_id"], None),
                                             reason="worker shutdown")

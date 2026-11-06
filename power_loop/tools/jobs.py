@@ -18,12 +18,12 @@ JOBS_DEFINITION = ToolDefinition(pricing=Free("local"),
         "Select event_id for operations/results to read one saved event in character chunks, "
         "or output_file to export saved events as new workspace JSONL. Reads never acknowledge or execute them. "
         "stop requests durable cancellation for one job_id and its supervised subtree; acceptance is not physical stop. "
-        "Use separate stop calls for separate roots. Never stop unrelated work. Legacy stores expose limited live best-effort information only."),
+        "Use separate stop calls for separate roots. Never stop unrelated work."),
     input_schema={"type": "object", "properties": {
         "action": {"type": "string", "enum": ["list", "get", "stop"]},
         "job_id": {"type": "string", "description": "get/stop: a task ID or an authorized unambiguous alias."},
         "ids": {"type": "array", "items": {"type": "string"}, "maxItems": 20,
-            "description": "Legacy stop compatibility. Native stop uses one job_id; a single-element ids array is accepted as an alias."},
+            "description": "Stop one job_id; a single-element ids array is accepted as an alias."},
         "root_job_id": {"type": "string"},
         "scope": {"type": "string", "enum": ["self", "descendants"]},
         "status": {"oneOf": [{"type": "string", "enum": ["active", "terminal", "all"]}, {"type": "array", "items": {"type": "string"}}]},
@@ -143,63 +143,6 @@ async def _native(loop, sid, action, options):
         reason=options.get("reason", "Stopped by request"), expected_generation=options.get("expected_generation"))
 
 
-def resolve_legacy_job_id(value, known):
-    if value in known:
-        return value
-    hits = [k for k in known if k.partition(":")[2] == value]
-    return hits[0] if len(hits) == 1 else value
-
-
-async def _legacy(loop, sid, action, options):
-    options = dict(options)
-    if action == "get" and options.get("view") == "summary":
-        options.pop("view")
-    if options.get("status") == "active":
-        options.pop("status")
-    if set(options) - {"job_id", "ids", "limit", "max_chars"}:
-        raise JobError("task_registry_required")
-    limit, budget = options.get("limit", 20), options.get("max_chars", 8000)
-    if type(limit) is not int or not 1 <= limit <= 100 or type(budget) is not int or not 1024 <= budget <= 32000:
-        raise JobError("invalid_jobs_limit")
-    rows = [r for r in await loop.list_jobs(sid) if r["kind"] != "foreground"]
-    known = {r["id"] for r in rows}
-    base = {"version": 1, "backend": "legacy", "history_available": False, "hierarchy_available": False,
-        "control_guarantee": "legacy_best_effort"}
-    if action == "list":
-        if options.get("job_id") is not None or options.get("ids") is not None:
-            raise JobError("invalid_jobs_parameters")
-        result = {**base, "nodes": [], "matched_count": 0, "truncated": False, "next_cursor": None}
-        for row in rows[:limit]:
-            trial = {**result, "nodes": [*result["nodes"], row], "matched_count": len(result["nodes"]) + 1}
-            if len(_json(trial)) + 30 > budget:
-                break
-            result = trial
-        result["truncated"] = len(result["nodes"]) < len(rows)
-        return result
-    if action == "get":
-        if options.get("ids") is not None:
-            raise JobError("invalid_jobs_parameters")
-        if not isinstance(options.get("job_id"), str) or not options["job_id"]:
-            raise JobError("job_id_required")
-        jid = resolve_legacy_job_id(options["job_id"], known)
-        row = next((r for r in rows if r["id"] == jid), None)
-        if row is None:
-            raise JobError("legacy_history_unavailable")
-        result = {**base, "node": row}
-        if len(_json(result)) > budget:
-            raise JobError("query_result_too_small")
-        return result
-    wanted = _ids(options.get("job_id"), options.get("ids"))
-    results = []
-    for wanted_id in wanted:
-        jid = resolve_legacy_job_id(wanted_id, known)
-        if jid not in known:
-            results.append({"id": jid, "result": "unknown"})
-        else:
-            results.append(await loop.stop_job(sid, jid))
-    return {**base, "results": results}
-
-
 async def run_jobs(action="", **kwargs):
     """Uniform JSON handler. Library code owns authorization/control semantics."""
     loop, sid = get_current_loop(), get_session_id()
@@ -209,7 +152,7 @@ async def run_jobs(action="", **kwargs):
         return _json(_error("invalid_jobs_action"))
     options = {k: v for k, v in kwargs.items() if v is not None}
     try:
-        result = await (_native(loop, sid, action, options) if getattr(loop, "task_runtime", None) is not None else _legacy(loop, sid, action, options))
+        result = await _native(loop, sid, action, options)
         return _json(result)
     except JobError as exc:
         return _json(_error(exc.code))

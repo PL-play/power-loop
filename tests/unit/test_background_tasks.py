@@ -23,15 +23,8 @@ def test_tool_description_forbids_polling():
     assert "fallback" in desc.lower(), "check 必须被降格成兜底，不能读成取结果的正常路径"
 
 
-def test_launch_receipts_send_the_model_away_not_to_check():
-    """两条启动回执（tool 与 shell）都要说清：结果会自动送到，别去问。"""
-    import inspect
-
-    from power_loop.tools import default_tools
-
-    src = inspect.getsource(default_tools.BackgroundManager)
-    assert "完成时结果会自动送到你面前，不用去取" in src
-    assert "只会空烧回合" in src
-    assert "do NOT poll with check" in src
-    # 兜底出口仍要留着：卡住时得有办法查。
-    assert 'action=\\"check\\"' in src or "action=check" in src
+def test_query_and_cancel_schema_use_original_task_id():
+    definition = next(d for d in DEFAULT_TOOL_DEFINITIONS if d.name == 'background_run')
+    properties = definition.input_schema['properties']
+    assert {'check', 'list', 'wait', 'cancel'} <= set(properties['action']['enum'])
+    assert 'task_id' in properties and 'tasks keep running' in properties['timeout_s']['description']

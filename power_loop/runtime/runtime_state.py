@@ -97,88 +97,11 @@ class TodoRuntimeProjector(RuntimeProjector):
         ]
 
 
-@dataclass(frozen=True)
-class BackgroundRuntimeProjector(RuntimeProjector):
-    mark_seen: bool = True
-
-    async def project(
-        self,
-        *,
-        store: Any,
-        session_id: str,
-        round_index: int,
-        context: Any,
-    ) -> list[RuntimeMessage]:
-        updates = await store.poll_background_updates(session_id)
-        if not updates:
-            return []
-        from power_loop.runtime.background import ACTIVE_STATUSES, encode_results, load_record, summarize_record
-        durable = []
-        legacy = []
-        for task in updates:
-            record = await load_record(store, session_id, task.task_id)
-            if record is not None and task.status not in ACTIVE_STATUSES:
-                if "result" not in record:
-                    record = {**record, "result": "（完整结果未保存，以下为台账预览）\n" + (task.output_tail or "")}
-                durable.append(summarize_record({**record, "status": task.status}))
-            else:
-                legacy.append(task)
-        messages = []
-        for record in durable:
-            # Stable per-task messages remain deduplicable if another task finishes
-            # between a failed model request and its retry.
-            message = {"role": "user", "name": "background_tool_results",
-                       "content": encode_results([record]), "_persist": True,
-                       "meta": {"context_timeline": True}}
-            if self.mark_seen:
-                message["_ack"] = ("background_seen", [record["task_id"]])
-            messages.append(message)
-        if not legacy:
-            return messages
-        chunks: list[str] = ["<background_updates>"]
-        for task in legacy:
-            output = (task.output_tail or "(running)").strip()
-            chunks.append(
-                "\n".join(
-                    [
-                        f'<task id="{task.task_id}" status="{task.status}">',
-                        f"command: {task.command}",
-                        "output:",
-                        output,
-                        "</task>",
-                    ]
-                )
-            )
-        chunks.append("</background_updates>")
-        msg: RuntimeMessage = {
-            "role": "user",
-            "name": "runtime_background_updates",
-            "content": "\n\n".join(chunks),
-        }
-        if self.mark_seen:
-            # Deferred: "seen" means the MODEL saw it, i.e. the LLM call carrying this message
-            # succeeded. The pipeline strips this private marker before the request and calls
-            # :meth:`acknowledge` only after a successful call — a failed / degraded / aborted
-            # call must not swallow the updates (design/124 Z7).
-            msg["_ack"] = ("background_seen", [task.task_id for task in legacy])
-        return [*messages, msg]
-
-    async def acknowledge(self, *, store: Any, session_id: str, ack: Any) -> None:
-        """Mark the projected tasks seen — called by the pipeline once the model saw them."""
-        kind, ids = ack
-        if kind == "background_seen" and ids:
-            await store.mark_background_seen(session_id, list(ids))
-
-    async def requires_round(self, *, store, session_id):
-        return await store.background_changed_during_model(session_id)
-
-
 def default_runtime_projectors() -> tuple[RuntimeProjector, ...]:
-    return (TodoRuntimeProjector(), BackgroundRuntimeProjector())
+    return (TodoRuntimeProjector(),)
 
 
 __all__ = [
-    "BackgroundRuntimeProjector",
     "RuntimeMessage",
     "RuntimeProjector",
     "ToolRuntimeContext",

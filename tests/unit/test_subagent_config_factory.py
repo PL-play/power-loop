@@ -1,156 +1,83 @@
-"""S3 (3.14): ``AgentLoopConfig.subagent_config_factory`` — host seam rewriting
-the default child config built by ``run_agent_spec``."""
-
-from __future__ import annotations
-
-from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field, replace
-from typing import Any
+"""Child config isolation through the public runtime and persisted admission."""
+from dataclasses import replace
 
 import pytest
 
-from power_loop import AgentLoopConfig, AgentSpec, SessionStore, StatefulAgentLoop
-from power_loop._vendor.llm_client.interface import (
-    LLMRequest,
-    LLMResponse,
-    LLMService,
-    LLMStreamChunk,
-)
+from power_loop import AgentLoopConfig, AgentSpec, LLMResponse, LLMService, SessionStore, StatefulAgentLoop
+from power_loop.contracts.tools import ToolDefinition
+from power_loop.core.agent_context import get_current_loop
 from power_loop.runtime.pricing import Free
 from power_loop.runtime.spec import run_agent_spec
-
-
-@dataclass
-class _Capturing(LLMService):
-    """Records each request's generation params so the child config is observable."""
-
-    responses: list[LLMResponse] = field(default_factory=list)
-    seen: list[LLMRequest] = field(default_factory=list)
-    _idx: int = 0
-
-    async def complete(
-        self,
-        request: LLMRequest,
-        *,
-        on_chunk_delta_text: Callable[[str], Any] | None = None,
-        on_chunk_think: Callable[[str], Any] | None = None,
-        on_stream_end: Callable[[LLMResponse], Any] | None = None,
-    ) -> LLMResponse:
-        self.seen.append(request)
-        if self._idx >= len(self.responses):
-            return LLMResponse(raw_text="done")
-        r = self.responses[self._idx]
-        self._idx += 1
-        return r
-
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-        async def _empty() -> AsyncIterator[LLMStreamChunk]:
-            if False:
-                yield LLMStreamChunk()
-
-        return _empty()
-
-    async def close(self) -> None:
-        return None
+from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
+from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
 
 @pytest.fixture
-async def store() -> AsyncIterator[SessionStore]:
-    s = await SessionStore.open(":memory:")
-    yield s
-    await s.close()
+async def store():
+    value = await SessionStore.open(':memory:', schema='tasks')
+    yield value
+    await value.close()
+
+
+class _Capturing(LLMService):
+    def __init__(self):
+        self.seen=[]
+    async def complete(self, request, **kwargs):
+        self.seen.append(request)
+        if len(self.seen)==1:
+            return LLMResponse(raw_text='',tool_calls=[{'id':'delegate','type':'function',
+                'function':{'name':'delegate','arguments':'{}'}}])
+        return LLMResponse(raw_text='child out' if request.system_prompt.startswith('p') else 'parent done')
+    async def close(self):
+        pass
 
 
 @pytest.mark.asyncio
-async def test_factory_rewrites_child_config(store: SessionStore) -> None:
-    calls: list[tuple[str, AgentLoopConfig]] = []
-
-    def factory(spec: AgentSpec, default: AgentLoopConfig) -> AgentLoopConfig:
-        calls.append((spec.name, default))
-        return replace(default, temperature=0.9, max_tokens=1234)
-
-    llm = _Capturing(responses=[LLMResponse(raw_text="child out")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store,
-        config=AgentLoopConfig(max_rounds=3, subagent_config_factory=factory),
-    )
-    res = await run_agent_spec(
-        AgentSpec(name="kid", system_prompt="p", max_tokens=500),
-        "task", parent_loop=loop,
-    )
-    assert res["status"] == "completed"
-    # Factory saw the spec-derived default and its output was used as-is.
-    assert calls[0][0] == "kid"
-    assert calls[0][1].max_tokens == 500
-    assert llm.seen[0].temperature == 0.9
-    assert llm.seen[0].max_tokens == 1234
-
-
-@pytest.mark.asyncio
-async def test_no_factory_default_unchanged(store: SessionStore) -> None:
-    llm = _Capturing(responses=[LLMResponse(raw_text="child out")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store, config=AgentLoopConfig(max_rounds=3),
-    )
-    await run_agent_spec(
-        AgentSpec(name="kid", system_prompt="p", max_tokens=500, temperature=0.2),
-        "task", parent_loop=loop,
-    )
-    assert llm.seen[0].max_tokens == 500
-    assert llm.seen[0].temperature == 0.2
-
-
-@pytest.mark.asyncio
-async def test_factory_bad_return_type_raises_before_session(store: SessionStore) -> None:
-    def factory(spec: AgentSpec, default: AgentLoopConfig) -> Any:
-        return {"not": "a config"}
-
-    llm = _Capturing()
-    loop = StatefulAgentLoop(
-        llm=llm, store=store,
-        config=AgentLoopConfig(max_rounds=3, subagent_config_factory=factory),
-    )
-    with pytest.raises(TypeError, match="subagent_config_factory must return"):
-        await run_agent_spec(
-            AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop,
-        )
-    # Raised BEFORE the child session was created — nothing leaked.
-    assert llm.seen == []
-
-
-@pytest.mark.asyncio
-async def test_factory_exception_propagates_without_leaking(store: SessionStore) -> None:
-    def factory(spec: AgentSpec, default: AgentLoopConfig) -> AgentLoopConfig:
-        raise RuntimeError("host factory bug")
-
-    llm = _Capturing()
-    loop = StatefulAgentLoop(
-        llm=llm, store=store,
-        config=AgentLoopConfig(max_rounds=3, subagent_config_factory=factory),
-    )
-    with pytest.raises(RuntimeError, match="host factory bug"):
-        await run_agent_spec(
-            AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop,
-        )
-    assert llm.seen == []
-
-
-@pytest.mark.asyncio
-async def test_a_system_prompt_the_factory_adds_reaches_the_model(store: SessionStore) -> None:
-    """The child session used to be created with spec.system_prompt; a send resolves the prompt
-    as per-call > session > config, so whatever a host factory appended never reached the model
-    (DeepTalk's structured-output note was silently dropped — design/126 §0)."""
-
-    def factory(spec: AgentSpec, default: AgentLoopConfig) -> AgentLoopConfig:
-        return replace(default, system_prompt=(default.system_prompt or "") + "\n\nHOST NOTE")
-
-    llm = _Capturing(responses=[LLMResponse(raw_text="child out")])
-    loop = StatefulAgentLoop(
-        llm=llm, store=store,
-        config=AgentLoopConfig(max_rounds=3, subagent_config_factory=factory),
-    )
-    await run_agent_spec(AgentSpec(name="kid", system_prompt="p"), "task", parent_loop=loop)
-    assert llm.seen[0].system_prompt.startswith("p") and "HOST NOTE" in llm.seen[0].system_prompt
+@pytest.mark.parametrize('mode', ['rewrite','default','bad_type','exception','system_prompt'])
+async def test_child_factory_is_applied_before_admission_and_on_worker(store,mode):
+    seen=[]
+    def factory(spec,default):
+        seen.append((spec.name,default))
+        if mode=='bad_type':
+            return {'not':'config'}
+        if mode=='exception':
+            raise RuntimeError('host factory bug')
+        if mode=='system_prompt':
+            return replace(default,system_prompt=default.system_prompt+' HOST NOTE')
+        return replace(default,temperature=.9,max_tokens=1234)
+    model, registry=_Capturing(),ToolRegistry()
+    config=AgentLoopConfig(compactor=None,max_rounds=3,
+        subagent_config_factory=None if mode=='default' else factory)
+    async def delegate():
+        return await run_agent_spec(AgentSpec(name='kid',system_prompt='p',max_tokens=500,temperature=.2),
+                                    'task',parent_loop=get_current_loop())
+    registry.register(ToolDefinition(name='delegate',description='delegate',pricing=Free('composite')),
+        FunctionRuntimeTool(delegate,ToolRuntimeContract('sdk.subagent',background_allowed=False,allowed_roles=('main',)),
+                            policy=lambda arguments: ToolDispatchPolicy(native_admitted=True)))
+    runner=await RunningAgent(store,model,registry,config).start()
+    try:
+        result=await runner.send('delegate')
+        assert result.status=='completed'
+        children=await store._db.fetchall(f"SELECT session_id FROM {store.table_prefix}jobs WHERE kind='subagent'")
+        requests=[r for r in model.seen if r.system_prompt.startswith('p')]
+        if mode in {'bad_type','exception'}:
+            assert not children and not requests
+            rows=await store.load_all_messages(runner.target.session_id)
+            text=next(r.content for r in rows if r.tool_call_id=='delegate')
+            assert ('subagent_config_factory must return' if mode=='bad_type' else 'host factory bug') in text
+        else:
+            assert len(children)==1 and len(requests)==1
+            request=requests[0]
+            assert request.max_tokens==(1234 if mode=='rewrite' else 500)
+            assert request.temperature==(.9 if mode=='rewrite' else .2)
+            if mode=='system_prompt':
+                assert 'HOST NOTE' in request.system_prompt
+            if seen:
+                assert seen[0][0]=='kid' and seen[0][1].max_tokens==500
+        assert config.max_rounds==3 and config.temperature==0
+    finally:
+        await runner.aclose()
 
 
 @pytest.mark.asyncio

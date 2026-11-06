@@ -50,6 +50,10 @@ async def record_billing_receipt(receipt: BillingReceipt) -> None:
     slot = _CURRENT.get()
     if slot is None:
         raise JobError('tool_billing_checkpoint_unavailable')
+    from .background_execution import BackgroundReceipt
+    if isinstance(slot, BackgroundReceipt):
+        slot.record(receipt)
+        return
     cache = slot.binding.runtime._native_returns
     cache.require(slot)
     if _SEND.get() is not slot.binding or asyncio.current_task() is not slot.task or slot.finished:

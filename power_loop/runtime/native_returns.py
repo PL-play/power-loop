@@ -113,7 +113,7 @@ async def persist(runtime, slot):
     return await persist_return(runtime, slot)
 
 
-async def invoke(pipeline, registered, arguments, slot, *, budget_attempt=None):
+async def invoke(pipeline, registered, arguments, slot, *, budget_attempt=None, dispatch=None):
     """Called by the pipeline after original dispatch, before formatting/hooks."""
     cache = slot.binding.runtime._native_returns if slot is not None else None
     settlement_started = False
@@ -124,7 +124,8 @@ async def invoke(pipeline, registered, arguments, slot, *, budget_attempt=None):
         if slot is not None:
             slot.budget_attempt = budget_attempt
         with receipt_context(slot):
-            result = await pipeline.tool_registry.invoke_async(registered.definition.name, arguments)
+            result = (await dispatch() if dispatch is not None else
+                      await pipeline.tool_registry.invoke_async(registered.definition.name, arguments))
         if slot is not None:
             from .nested_tools import join_children
             await join_children(slot)

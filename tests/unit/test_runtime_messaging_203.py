@@ -4,7 +4,6 @@ import hashlib
 import json
 import time
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -899,9 +898,7 @@ async def port_update_metadata(store, sid, metadata):
 
 
 async def test_deferred_features_fail_before_creating_work(registry_store, tmp_path):
-    from power_loop import StatefulAgentLoop, run_agent_spec
-    from power_loop.runtime.human_input import request_user_input
-    from power_loop.tools.default_tools import run_background
+    from power_loop import StatefulAgentLoop
     from power_loop.workflow.api import Workflow
     from power_loop.workflow.engine import WorkflowEngine
     from power_loop.workflow.resume import resume_detached, resume_run
@@ -911,21 +908,13 @@ async def test_deferred_features_fail_before_creating_work(registry_store, tmp_p
     store, _ = registry_store
     async with running(store, "memory") as (runtime, model, target, actor):
         facade = StatefulAgentLoop(runtime=runtime)
-        job = JobRef(target.store_id, "not-created", 1)
         descriptor = RuntimeDescriptor(1, "workflow_driver", "deferred@1", None,
             "builtin.empty@1", "builtin.none@1", "builtin.none@1", {}, {})
         state_before = await store._db.fetchone(f"SELECT inbox_version FROM {store.t.session_state} WHERE session_id=?", (target.session_id,))
         calls = [
-            lambda: facade.submit_input(job, interaction_id="question", wait_round=1, value="answer", message_id="answer", actor=actor),
-            lambda: facade.resume(job, message_id="resume", actor=actor),
-            lambda: runtime.client.submit(Command("answer", target, "answer", {"interaction_id": "q", "wait_round": 1, "value": "yes"}, "control"), actor=actor),
-            lambda: runtime.client.submit(Command("resume", target, "resume", {"body": "continue"}, "new_turn"), actor=actor),
             lambda: runtime.open_session(descriptor, actor=actor),
             lambda: runtime.client.send(target, "no", message_id="driver", actor=actor, descriptor=descriptor),
-            lambda: runtime.client.send(target, "no", message_id="background", actor=actor, descriptor=replace(descriptor, kind="background_tool")),
-            lambda: run_agent_spec({}, "no", parent_loop=facade),
             lambda: run_spec_isolated({}, "no", bootstrap=None, db_path=str(tmp_path / "deferred_test.db")),
-            lambda: run_background("run", command="must not execute"),
             lambda: Workflow.run(object()),
             lambda: Workflow.start(object()),
             lambda: WorkflowEngine.run(object(), None),
@@ -937,8 +926,6 @@ async def test_deferred_features_fail_before_creating_work(registry_store, tmp_p
             for call in calls:
                 with pytest.raises(RuntimeRequestError, match="feature_unavailable"):
                     await call()
-            with pytest.raises(RuntimeRequestError, match="feature_unavailable"):
-                request_user_input(prompt="not enabled")
             assert not (tmp_path / "deferred_test.db").exists()
             assert not model.requests
             assert await store._db.fetchone(f"SELECT inbox_version FROM {store.t.session_state} WHERE session_id=?", (target.session_id,)) == state_before

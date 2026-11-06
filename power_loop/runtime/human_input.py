@@ -38,9 +38,6 @@ def request_user_input(
     metadata: dict[str, Any] | None = None,
 ) -> str:
     """Special tool handler: pause the loop and ask the caller for input."""
-    # Disabled until its unified task path is implemented; retained internals are not a fallback.
-    from power_loop.agent.runtime_types import RuntimeRequestError
-    raise RuntimeRequestError("feature_unavailable", "user input is not enabled")
     clean_prompt = (prompt or "").strip()
     if not clean_prompt:
         raise ValueError("prompt is required")

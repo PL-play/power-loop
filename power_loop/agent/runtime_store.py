@@ -120,17 +120,22 @@ class RuntimeInputStore:
     async def accept_input(self, tx, command, actor, *, descriptor=None):
         """A: conditionally gate intake, freeze once, insert/dedupe the original row."""
         defaults = await self.authorize(tx, command.target, actor)
+        waiting_gate = (f" AND NOT EXISTS (SELECT 1 FROM {self.jobs} j WHERE j.session_id=? AND j.status='waiting')"
+                        if command.operation == "send" else "")
         changed = await tx.execute(
-            f"UPDATE {self.state} SET inbox_version=inbox_version+1 WHERE session_id=? AND lifecycle='open'",
-            (command.target.session_id,))
+            f"UPDATE {self.state} SET inbox_version=inbox_version+1 WHERE session_id=? AND lifecycle='open'" + waiting_gate,
+            (command.target.session_id,) * (2 if waiting_gate else 1))
         if not changed:
+            state = await tx.fetchone(f"SELECT lifecycle FROM {self.state} WHERE session_id=?", (command.target.session_id,))
+            if state and state["lifecycle"] == "open":
+                raise RuntimeRequestError("waiting_input", "answer the pending interaction before starting a new turn")
             raise RuntimeRequestError("session_closed")
         ref = InputRef(command.target.store_id, command.target.session_id, command.message_id)
         old = await self.input(tx, ref)
         frozen_descriptor = (plain(descriptor) if descriptor is not None else
                              old.meta["descriptor"] if old else defaults["runtime_descriptor"])
         definition = RuntimeDescriptor(**frozen_descriptor)
-        if definition.kind != "agent":
+        if definition.kind not in {"agent", "background_tool", "background_command"}:
             raise RuntimeRequestError("feature_unavailable", definition.kind + " is not enabled")
         from power_loop.agent.types import AgentLoopConfig
         config_defaults = AgentLoopConfig()
@@ -161,10 +166,15 @@ class RuntimeInputStore:
         if command.expires_at_ms is not None and command.expires_at_ms <= now_ms():
             raise RuntimeRequestError("deadline_expired")
         if command.target.job_id:
-            job = await tx.fetchone(f"SELECT generation,status FROM {self.jobs} WHERE job_id=?", (command.target.job_id,))
+            job = await tx.fetchone(f"SELECT * FROM {self.jobs} WHERE job_id=?", (command.target.job_id,))
             if command.expected_job_generation != job["generation"]:
                 raise RuntimeRequestError("stale_generation")
-            if job["status"] != "running":
+            if command.operation == "resume":
+                self.require_resumable(job)
+            elif command.operation == "answer":
+                if job["status"] != "waiting" or job["cancel_requested_at"] is not None:
+                    raise RuntimeRequestError("interaction_expired")
+            elif job["status"] != "running":
                 raise RuntimeRequestError("target_not_running" if job["generation"] == 0 else "target_terminal")
         meta = dict(protocol_version=42, operation=command.operation, execution_mode=command.execution_mode,
                     request_id=command.message_id, request_hash=digest, descriptor=plain(definition),
@@ -184,6 +194,15 @@ class RuntimeInputStore:
             return self.receipt(existing)
         row = dict(zip(columns, values, strict=True), delivered_job_id=None, delivered_job_generation=None)
         return self.receipt(InputRecord(ref, row, meta), new=True)
+
+    @staticmethod
+    def require_resumable(job):
+        if job["kind"] != "subagent" or job["generation"] == 0:
+            raise RuntimeRequestError("target_not_resumable")
+        if job["cancel_requested_at"] is not None or job["outcome"] == "cancelled":
+            raise RuntimeRequestError("target_cancelled")
+        if job["outcome"] != "interrupted" and job["resource_state"] != "unknown":
+            raise RuntimeRequestError("target_not_resumable")
 
     async def lock_owned(self, tx, target, ownership):
         changed = await tx.execute(
@@ -308,12 +327,81 @@ class RuntimeInputStore:
                                result.status == "cancelled", payload["resource_state"]), result, fixed)
             if selected < job["generation"] or job["supervision_status"] == "closed":
                 raise RuntimeRequestError("not_found", "result no longer available")
-            state = "accepted" if selected == 0 else "running"
+            state = "accepted" if selected == 0 else "waiting_input" if job["status"] == "waiting" else "running"
             return (Status(input_ref, actual, state, None, False, job["cancel_requested_at"] is not None,
                            "not_started" if selected == 0 else job["resource_state"]), None, fixed)
 
     async def get_result(self, ref, actor):
         return (await self.read(ref, actor))[1]
+
+    async def result_input(self, record, reader=None):
+        """Render the exact saved generation referenced by a parent notification."""
+        reader = reader or self.db
+        reference = record.meta["result_ref"]
+        event = await reader.fetchone(f"SELECT payload_json FROM {self.events} WHERE event_id=? AND job_id=?",
+            (reference["result_id"], reference["job_id"]))
+        payload = json.loads(event["payload_json"])
+        if payload["generation"] != reference["generation"]:
+            raise RuntimeRequestError("stale_generation")
+        session = await reader.fetchone(f"SELECT metadata_json FROM {self.store.t.sessions} WHERE session_id=?",
+                                       (record.ref.session_id,))
+        descriptor = json.loads(session["metadata_json"])["runtime_descriptor"]
+        from .types import AgentLoopConfig
+        defaults = AgentLoopConfig()
+        options = {name: descriptor["config"].get(name, getattr(defaults, name, value))
+                   for name, value in plain(RequestOptions()).items()}
+        job = await reader.fetchone(f"SELECT kind FROM {self.jobs} WHERE job_id=?", (reference["job_id"],))
+        if job["kind"] in {"background_tool", "background_command"}:
+            from power_loop.runtime.background import encode_results, load_record, summarize_record
+            original = await load_record(self.store, record.ref.session_id, reference["job_id"],
+                                         reader=reader, generation=reference["generation"])
+            body = encode_results([summarize_record(original)])
+        else:
+            body = "[subagent_result]\n" + canonical({**reference, **payload["result"]})
+        return InputRecord(record.ref, {**record.row, "content": canonical(body)},
+                          {**record.meta, "descriptor": descriptor, "options": options})
+
+    async def discard_cancelled_result(self, tx, record):
+        """An explicitly cancelled originating scope must not wake a new send."""
+        job = await tx.fetchone(f"SELECT parent_job_id FROM {self.jobs} WHERE job_id=?",
+                               (record.meta["result_ref"]["job_id"],))
+        parent = job["parent_job_id"]
+        while parent:
+            row = await tx.fetchone(f"SELECT parent_job_id,cancel_requested_at FROM {self.jobs} WHERE job_id=?", (parent,))
+            if row["cancel_requested_at"] is not None:
+                await self.void_unbound(tx, record.ref, reason="origin_cancelled", status="cancelled")
+                ref = record.meta["result_ref"]
+                await tx.update_event(ref["job_id"], f"UPDATE {self.events} SET delivery_status='suppressed' WHERE event_id=?",
+                    (ref["result_id"],))
+                await tx.write_job(ref["job_id"], f"UPDATE {self.jobs} SET result_status='suppressed',version=version+1 "
+                    "WHERE job_id=? AND generation=?", (ref["job_id"], ref["generation"]), obligations=True)
+                return True
+            parent = row["parent_job_id"]
+        return False
+
+    async def fail_start(self, ref, reason, ownership):
+        manager = JobManager(self.store)
+        async with manager.joined_write() as tx:
+            record = await self.input(tx, ref)
+            if record.row["delivered_job_id"] is None:
+                await self.void_unbound(tx, ref, reason=reason)
+                return None
+            job_ref = JobRef(ref.store_id, record.row["delivered_job_id"], 0)
+            route = await self._lock_result_sessions(tx, job_ref)
+            await self.lock_owned(tx, TargetRef(ref.store_id, ref.session_id), ownership)
+            row = await manager._row(tx, job_ref.job_id)
+            if row["generation"] != 0 or row["outcome"] is not None:
+                return None
+            changed = await tx.write_job(row["job_id"], f"UPDATE {self.jobs} SET status='failed',outcome='failed',"
+                "resource_state='stopped',intake='closed',supervision_status='open',version=version+1 "
+                "WHERE job_id=? AND generation=0 AND version=? AND outcome IS NULL", (row["job_id"], row["version"]),
+                obligations=True)
+            if not changed:
+                raise RuntimeRequestError("stale_generation")
+            await tx.execute(f"UPDATE {self.q} SET status='void',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
+                "WHERE session_id=? AND delivered_job_id=? AND delivered_job_generation=0 AND status IN ('pending','claimed')",
+                (ref.session_id, row["job_id"]))
+            return await self._commit_result(tx, job_ref, Result(job_ref, ref, "failed", error=reason), ownership, route)
 
     async def commit_result_and_parent_ref(self, tx, job_ref, result, ownership):
         """F: one original result; a queued failure never invents an execution."""
@@ -338,7 +426,7 @@ class RuntimeInputStore:
         job = await tx.job_row(job_ref.job_id)
         if job["generation"] != job_ref.generation:
             raise RuntimeRequestError("stale_generation")
-        if job_ref.generation > 0:
+        if job_ref.generation > 0 and ownership is not None:
             await self.lock_owned(tx, TargetRef(job_ref.store_id, job["session_id"]), ownership)
         value = plain(result)
         result_key = result_id(job_ref.job_id, job_ref.generation)

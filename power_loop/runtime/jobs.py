@@ -667,10 +667,6 @@ class JobManager:
         return await accept(self, actor, target, caller=caller, call_ref=call_ref,
                             tool_call_id=tool_call_id, session_id=session_id, message=message, node=node)
 
-    async def resume_subagent(self, actor, job_id, **kwargs):
-        from .subagent_resume import admit
-        return await admit(self, actor, job_id, **kwargs)
-
     async def resume_workflow_node(self, actor, job_id, **kwargs):
         from .node_resume import admit
         return await admit(self, actor, job_id, **kwargs)
@@ -684,8 +680,8 @@ class JobManager:
         return await preview(self, actor, job_id, **kwargs)
 
     async def claim_resume_dispatch(self, actor, operation_id, **kwargs):
-        from .subagent_resume import claim_dispatch
-        return await claim_dispatch(self, actor, operation_id, **kwargs)
+        from .resume_dispatch import claim
+        return await claim(self, actor, operation_id, **kwargs)
 
     async def get_result_revision(self, actor, job_id, generation):
         from .result_revisions import get
@@ -1001,7 +997,7 @@ class JobManager:
             "intake": "open", "resource_state": "not_started", "supervision_status": "open",
             "result_status": "none", "outcome": None, "result_json": None, "created_at": now, "updated_at": now})
         payload = {"job_id": job_id, "status": "queued"}
-        if (kind in ("send", "subagent", "workflow", "workflow_node", "timer") or effect is not None) and request is not None:
+        if request is not None:
             # Recovery must not reread a potentially edited YAML/file or
             # reconstruct a full execution contract from a request hash.
             payload["request"] = request_data

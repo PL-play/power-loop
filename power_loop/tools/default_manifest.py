@@ -391,13 +391,12 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         usage_hint='action=tool submits an eligible registered target asynchronously; action=check inspects status/output by task_id or lists all tasks.',
         name="background_run",
         description=(
-            "Manage private background tasks with one action: run, tool, check, list or wait. action=run "
+            "Manage independent background tasks with one action: run, tool, check, list, wait or cancel. action=run "
             "starts a shell command in a private non-interactive background worker and returns its "
             "task_id immediately. action=tool runs one async-capable TOOL in the background "
             "(tool=<name>, args={…}) and returns a task_id at once — use it for long, "
             "side-effect-free calls (image generation, web fetches) whose result you do not "
-            "need immediately. Up to 8 submitted tools execute per session; excess calls are accepted "
-            "as queued and start automatically in submission order when a slot opens. No check is needed "
+            "need immediately. Runtime capacity limits execution; accepted tasks wait for an available slot. No check is needed "
             "to release a slot. **Results are delivered to you automatically on completion "
             "(in the background updates block or a wake message) — do not poll for them.** "
             "While a task runs, do other work, or pass_turn if there is nothing else to do. "
@@ -416,13 +415,13 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
                     # list = check 不带 task_id 的显式别名（6.17.0）。原来「列出全部」这件事
                     # 藏在「check 不带参数」这个隐式约定里，模型要先知道才用得上——同一件事
                     # 该只有一个名字（design/96 §6.4）。
-                    "enum": ["run", "tool", "check", "list", "wait"],
+                    "enum": ["run", "tool", "check", "list", "wait", "cancel"],
                     "description": "Operation to perform.",
                 },
                 "command": {"type": "string", "description": "Required for action=run: shell command to execute."},
                 "tool": {"type": "string", "description": "Required for action=tool: name of an async-capable tool (marked in its description)."},
                 "args": {"type": "object", "description": "action=tool: the tool's arguments, exactly as you would pass them when calling it directly."},
-                "task_id": {"type": "string", "description": "For action=check: task to inspect; omit to list all tasks."},
+                "task_id": {"type": "string", "description": "For action=check/cancel: original task ID."},
                 "task_ids": {"type": "array", "items": {"type": "string"}, "description": "For action=wait: tasks to wait for; omit to wait for all your running tasks."},
                 "timeout_s": {"type": "number", "description": "For action=wait: give up waiting after this many seconds (default 600, max 3600); tasks keep running."},
             },
@@ -435,7 +434,7 @@ DEFAULT_TOOL_DEFINITIONS: list[ToolDefinition] = [
         description=(
             "Ask the caller or product UI for external input, then pause the agent loop. "
             "The loop returns status='waiting_for_input' with pending_interactions; resume by calling "
-            "StatefulAgentLoop.submit_input(session_id, interaction_id, value). Use this for confirmations, choices, "
+            "RuntimeClient.answer(job_ref, interaction_id, wait_round, value). Use this for confirmations, choices, "
             "or text that must come from outside the LLM process."
         ),
         input_schema={

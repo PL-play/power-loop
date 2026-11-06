@@ -6,7 +6,6 @@ import logging
 from dataclasses import asdict
 
 from . import control_requests as requests
-from .invocation import current_invocation
 from .jobs import JobError, JobLease, _hash, _operation, verify_stored
 from .message_ref import MessageRef
 
@@ -275,92 +274,6 @@ def receipt(operation, replayed):
             key: operation.result[key] for key in ("generation", "result_event_id") if key in operation.result}
 
 
-async def steer(loop, session_id, message, *, on_complete=None, finalize=None, admission=None):
-    """Only the original local executor may receive a newly admitted nudge."""
-    from . import delegation
-    from .task_runtime import _SEND
-
-    runtime = loop.task_runtime
-    execution = _SEND.get()
-    parent = execution.actor.session_id if execution is not None else None
-    if execution is None or execution.runtime is not runtime:
-        raise JobError("task_send_required")
-    assistant_seq, call_id = current_invocation(parent)
-    if assistant_seq is None or not call_id:
-        raise JobError("persisted_tool_call_required")
-    store = runtime.manager.store
-    call_ref = await store.message_ref(parent, assistant_seq)
-
-    async def old_operation():
-        operation = await runtime.manager.operation_for_call(execution.actor, call_ref, call_id)
-        if operation is not None and operation.action != "nudge":
-            raise JobError("operation_conflict")
-        return operation
-
-    async def replay(operation):
-        request = operation.result["request"]
-        if request["session_id"] != session_id or request["message"] != message or operation.call_ref != call_ref.to_dict():
-            raise JobError("operation_conflict")
-        if operation.result["mode"] == "steer":
-            recovered = await recover_call(runtime.manager, execution.actor, call_ref, call_id,
-                session_id=session_id, message=message)
-            if recovered is None:
-                raise JobError("nudge_request_original_missing")
-            operation = recovered
-        elif operation.result["mode"] == "continue":
-            from .subagent_admission import recover_call as recover_resume
-            recovered = await recover_resume(runtime.manager, execution.actor, call_ref, call_id,
-                session_id=session_id, message=message)
-            if recovered is None:
-                raise JobError("resume_request_original_missing")
-            operation = recovered
-        await notify(operation)
-        return receipt(operation, True)
-
-    async def notify(operation):
-        try:
-            row = await runtime.manager.db.fetchone(f"SELECT status FROM {store.t.follow_up_queue} "
-                "WHERE session_id=? AND item_id=?", (session_id, "nudge:" + operation.operation_id))
-            if row is not None and row["status"] == "pending":
-                loop.steer_event(session_id).set()
-        except Exception:
-            log.exception("nudge accepted; local signal failed: %s", operation.operation_id)
-
-    async with delegation._gate(store, session_id):
-        old = await old_operation()
-        if old is not None:
-            return await replay(old)
-        running = delegation._RUNNING.get((id(store), session_id))
-        if (running is None or running.task_binding is None or running.task_binding.runtime is not runtime or
-                running.task is None or running.task.done()):
-            recovered = await recover_call(runtime.manager, execution.actor, call_ref, call_id,
-                session_id=session_id, message=message)
-            if recovered is not None:
-                await notify(recovered)
-                return receipt(recovered, True)
-            from .subagent_admission import recover_call as recover_resume
-            recovered = await recover_resume(runtime.manager, execution.actor, call_ref, call_id,
-                session_id=session_id, message=message)
-            if recovered is not None:
-                await notify(recovered)
-                return receipt(recovered, True)
-            from .subagent_resume import resume_locked
-            return await resume_locked(loop, execution, call_ref, call_id, session_id, message,
-                                       on_complete=on_complete, finalize=finalize, admission=admission)
-        if running.parent != parent:
-            raise JobError("nudge_target_mismatch")
-        args = {"caller": execution.lease, "call_ref": call_ref, "tool_call_id": call_id,
-                "session_id": session_id, "message": message}
-        try:
-            operation, repeated = await runtime.manager.accept_nudge(execution.actor, running.task_binding.lease, **args)
-        except Exception:
-            recovered = await recover_call(runtime.manager, execution.actor, call_ref, call_id,
-                session_id=session_id, message=message)
-            if recovered is None:
-                raise
-            await notify(recovered)
-            return receipt(recovered, True)
-        # The event is an optimization; the original executor also drains the
-        # durable inbox at boundaries and before committing its canonical result.
-        await notify(operation)
-        return receipt(operation, repeated)
+async def steer(loop, session_id, message):
+    from .child_tasks import nudge
+    return await nudge(loop, session_id, message)

@@ -212,7 +212,7 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
         source = dict(await manager._fence(tx, binding.actor, binding.lease))
         from .workflow_controller import validate_dispatch
         await validate_dispatch(manager, tx, source)
-        if source["kind"] != "send" or source["session_id"] != binding.actor.session_id:
+        if source["kind"] not in {"send", "background_tool", "background_command"} or source["session_id"] != binding.actor.session_id:
             raise JobError("model_attempt_owner_mismatch")
         from . import session_controls
         seen = await session_controls.version(manager,tx,binding.actor.session_id)
@@ -223,7 +223,8 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
         else:
             review_pending = review_sources.pending
         await ensure_policy(binding, transaction=tx, job=source)
-        await _no_unknown_sends(manager, tx, source)
+        if not binding.resource_evidence.get("explicit_resume"):
+            await _no_unknown_sends(manager, tx, source)
         wait_deadline, wait_owners = await dispatch_policy(manager, tx, source)
         import json
 
@@ -238,7 +239,7 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
             if len(creations) != 1 or creations[0]["payload_json"] is None:
                 raise JobError("execution_creation_missing")
             creation_request = json.loads(creations[0]["payload_json"])["request"]
-        plan_required = "input_ref" in creation_request
+        plan_required = source["kind"] == "send" and "input_ref" in creation_request
         # A job registered in this same transaction cannot have children yet.
         managed_check = not fresh and await tx.fetchone(
             f"SELECT job_id FROM {manager.jobs} WHERE parent_job_id=? AND kind='background_tool' LIMIT 1",

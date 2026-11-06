@@ -71,16 +71,32 @@ class RuntimeClient:
         return await self._job_input(ref, "steer", body, message_id=message_id, actor=actor, deadline_ms=deadline_ms)
 
     async def answer(self, ref, *, interaction_id, wait_round, value, message_id, actor):
-        """Reserved for the task interaction path delivered in P3."""
-        raise RuntimeRequestError("feature_unavailable", "answer is not enabled")
+        self._require_open()
+        from power_loop.runtime.interactions import answer
+        return await answer(self, ref, interaction_id=interaction_id, wait_round=wait_round,
+                            value=value, message_id=message_id, actor=actor)
 
     async def resume(self, ref, *, message_id, actor, body=None, deadline_ms=None):
-        """Reserved for explicit task continuation delivered in P3."""
-        raise RuntimeRequestError("feature_unavailable", "resume is not enabled")
+        if ref.generation is None or ref.generation == 0:
+            raise RuntimeRequestError("stale_generation")
+        job = await self.inputs.resolve_job(self.inputs.db, ref, actor)
+        if job["kind"] != "subagent":
+            raise RuntimeRequestError("invalid_options", "resume requires a child task")
+        import json
+        creation = await self.inputs.db.fetchone(f"SELECT payload_json FROM {self.inputs.events} "
+            "WHERE job_id=? AND action='create'", (ref.job_id,))
+        start_ref = InputRef(**json.loads(creation["payload_json"])["request"]["input_ref"])
+        start = await self.inputs.input(self.inputs.db, start_ref)
+        from .runtime_types import RuntimeDescriptor
+        return await self._submit(Command(message_id, TargetRef(ref.store_id, job["session_id"], ref.job_id),
+            "resume", {"body": body or "Continue the original task using saved results. Do not replay unknown external actions."},
+            "new_turn", options=start.meta["options"], expires_at_ms=deadline_ms,
+            expected_job_generation=ref.generation), actor=actor,
+            descriptor=RuntimeDescriptor(**start.meta["descriptor"]))
 
     async def submit(self, command, *, actor):
         if command.operation in {"answer", "resume"}:
-            raise RuntimeRequestError("feature_unavailable", command.operation + " is not enabled")
+            raise RuntimeRequestError("invalid_options", command.operation + " requires its dedicated control port")
         if command.operation == "cancel":
             if (set(command.payload) - {"input_ref", "reason"} or "reason" not in command.payload
                     or not isinstance(command.payload["reason"], str) or command.options
@@ -104,7 +120,7 @@ class RuntimeClient:
 
     async def _submit(self, command, *, actor, descriptor=None):
         self._require_open()
-        if command.operation not in {"send", "append", "nudge", "steer"}:
+        if command.operation not in {"send", "append", "nudge", "steer", "resume"}:
             raise RuntimeRequestError("invalid_options", "operation requires its dedicated control port")
         if set(command.payload) != {"body"} or command.descriptor_ref is not None:
             raise RuntimeRequestError("invalid_options")
@@ -113,7 +129,7 @@ class RuntimeClient:
             raise RuntimeRequestError("invalid_options", "body must be text or a message")
         if command.scope != "self":
             raise RuntimeRequestError("invalid_options", "ordinary inputs have self scope")
-        if command.operation != "send" and command.options:
+        if command.operation not in {"send", "resume"} and command.options:
             raise RuntimeRequestError("invalid_options", "append does not accept execution overrides")
         try:
             async with self.inputs.db.transaction() as tx:
@@ -164,6 +180,7 @@ class RuntimeClient:
             else:
                 row = await self.inputs.resolve_job(self.inputs.db, ref, actor)
                 target = TargetRef(ref.store_id, row["session_id"], ref.job_id)
+        parent_ref = None
         async with manager.joined_write() as tx:
             await self.inputs.authorize(tx, target, actor)
             result_route = None
@@ -174,7 +191,7 @@ class RuntimeClient:
                 if original.row["delivered_job_id"] is not None:
                     job_ref = JobRef(ref.store_id, original.row["delivered_job_id"],
                                      original.row["delivered_job_generation"])
-            if job_ref is not None and job_ref.generation == 0:
+            if job_ref is not None:
                 result_route = await self.inputs._lock_result_sessions(tx, job_ref)
             else:
                 await self.inputs.db.dialect.lock_state(tx, self.inputs.state, target.session_id)
@@ -199,17 +216,38 @@ class RuntimeClient:
                 if job_ref.generation == 0:
                     await tx.write_job(job_ref.job_id,
                         f"UPDATE {manager.jobs} SET status='cancelled',outcome='cancelled',resource_state='stopped',"
-                        "supervision_status='closed',result_status='available',version=version+1 WHERE job_id=? AND generation=0",
-                        (job_ref.job_id,))
+                        "supervision_status=?,result_status='available',version=version+1 WHERE job_id=? AND generation=0",
+                        ("open" if row["kind"] in {"subagent", "background_tool", "background_command"} and result_route["parent_session_id"] else "closed", job_ref.job_id))
                     await tx.execute(f"UPDATE {self.inputs.q} SET status='void',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
                         "WHERE session_id=? AND delivered_job_id=? AND delivered_job_generation=0 AND status IN ('pending','claimed')",
                         (target.session_id, job_ref.job_id))
-                    await self.inputs._commit_result(tx, job_ref,
+                    parent_ref = await self.inputs._commit_result(tx, job_ref,
                         Result(job_ref, input_ref, "cancelled", error=reason), None, result_route)
+            if row["status"] == "waiting" and row["outcome"] is None:
+                import json
+                state = await tx.fetchone(f"SELECT pending_json,next_seq FROM {self.inputs.state} WHERE session_id=?", (target.session_id,))
+                pending = json.loads(state["pending_json"] or "{}")
+                seq = state["next_seq"]
+                for call in pending.get("tool_calls", []):
+                    await tx.execute(f"INSERT INTO {self.store.t.messages} "
+                        "(session_id,seq,role,tool_call_id,name,content,state,round_index,send_index,created_at) "
+                        "VALUES (?,?,'tool',?,?,?,'active',?,?,?)", (target.session_id, seq, call["id"],
+                        call["function"]["name"], "<cancelled>", pending["round_index"],
+                        pending["runtime_wait"]["send_index"], now_ms()))
+                    seq += 1
+                await tx.execute(f"UPDATE {self.inputs.state} SET pending_json=NULL,next_seq=?,runtime_version=runtime_version+1 WHERE session_id=?",
+                                 (seq, target.session_id))
+                await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status='cancelled',outcome='cancelled',"
+                    "intake='closed',resource_state='stopped',version=version+1 WHERE job_id=? AND generation=? AND outcome IS NULL",
+                    (row["job_id"], job_ref.generation), obligations=True)
+                parent_ref = await self.inputs._commit_result(tx, job_ref, Result(job_ref, input_ref, "cancelled", error=reason), None, result_route)
             receipt = Receipt(input_ref, target, input_ref.message_id if input_ref else
                 f"cancel:{job_ref.job_id}:{job_ref.generation}", False, job_ref, "applied", "not_needed", reason)
         success = await self._notify(TargetRef(target.store_id, target.session_id, job_ref.job_id),
             receipt.message_id, input_ref, ["control"], {"generation": job_ref.generation})
+        if parent_ref:
+            success = await self._notify(TargetRef(parent_ref.store_id, parent_ref.session_id),
+                parent_ref.message_id, parent_ref, ["work", "activation"]) and success
         if scope == "subtree":
             cursor = ""
             while True:
@@ -261,6 +299,15 @@ class RuntimeClient:
         return JobPage(items, rows[-1]["job_id"] if len(rows) == limit else None)
 
     async def wait(self, ref, *, actor, deadline_ms):
+        from power_loop.core.agent_context import get_current_loop
+        loop = get_current_loop()
+        worker = getattr(loop, "_runtime_worker", None)
+        if worker is not None and worker.runtime.client is self:
+            async with worker.idle(loop._runtime_worker_context):
+                return await self._wait(ref, actor=actor, deadline_ms=deadline_ms)
+        return await self._wait(ref, actor=actor, deadline_ms=deadline_ms)
+
+    async def _wait(self, ref, *, actor, deadline_ms):
         self._require_open()
         if self._slots >= 1024:
             raise CapacityError()
@@ -282,7 +329,7 @@ class RuntimeClient:
                 if result:
                     return replace(result, input_ref=original if isinstance(original, InputRef) else None)
                 ref = selected
-                remaining = (deadline_ms - now_ms()) / 1000
+                remaining = 30.0 if deadline_ms is None else (deadline_ms - now_ms()) / 1000
                 if remaining <= 0:
                     raise WaitTimeout(str(original))
                 if subscription is None:
@@ -292,8 +339,9 @@ class RuntimeClient:
                         delivery = await asyncio.wait_for(anext(subscription), min(30.0, remaining))
                         await delivery.ack()
                     except TimeoutError:
-                        if now_ms() >= deadline_ms:
-                            raise WaitTimeout(str(original)) from None
+                        # A lost notification is not a lost durable result.
+                        # Recheck once before the deadline decision above.
+                        continue
         finally:
             self._slots -= 1
             self._waiters.discard(task)

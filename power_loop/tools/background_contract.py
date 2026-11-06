@@ -22,22 +22,12 @@ class BackgroundTool(RuntimeTool):
             background_allowed=False, result_container=True,
         )
 
+    def dispatch_policy(self, arguments, *, runtime=None):
+        from power_loop.runtime.tool_contracts import ToolDispatchPolicy
+        return ToolDispatchPolicy(native_admitted=True, control_only=arguments.get("action") in {"list", "check", "wait", "cancel"})
+
     async def __call__(self, **arguments):
         return await self.handler(**arguments)
-
-    def context_spec(self, spec):
-        fn = spec['function']
-        params = fn.setdefault('parameters', {})
-        props = params.setdefault('properties', {})
-        action = props.get('action', {})
-        if 'enum' in action:
-            action['enum'] = [x for x in action['enum'] if x != 'run']
-        props.pop('command', None)
-        fn['description'] = fn.get('description', '') + (
-            '\nStart registered tools with action=tool. '
-            'For shell commands use a registered shell tool and its required arguments. '
-            'Do not use action=run.')
-        return spec
 
     def background_hint(self, definition, *, scheduler_name):
         return (

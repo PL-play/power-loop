@@ -386,25 +386,35 @@ class SessionStore:
         sid = session_id or _new_session_id()
         now = _now_ms()
         async with self._db.transaction() as tx:
-            await tx.execute(
-                f"INSERT INTO {self.t.sessions} ("
-                "session_id, created_at, updated_at, system_prompt, model, config_json, "
-                "status, kind, parent_session_id, spawn_tool_call_id, spawn_depth, "
-                "lifecycle, metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    sid, now, now, system_prompt, model, _dumps(config or {}),
-                    SessionStatus.ACTIVE.value, kind.value, parent_session_id,
-                    spawn_tool_call_id, spawn_depth, lifecycle.value, _dumps(metadata or {}),
-                ),
-            )
-            await tx.execute(
-                f"INSERT INTO {self.t.session_state} (session_id) VALUES (?)", (sid,)
-            )
-            if self.store_id is not None:
-                # The first context-bearing send uses this existing row as its
-                # short admission gate;its version remains derived from writes.
-                await tx.execute(f'INSERT INTO {self.table_prefix}session_controls (session_id,version) VALUES (?,?)', (sid, 0))
+            await self._create_session_tx(tx, sid, now, system_prompt=system_prompt, model=model,
+                config=config, kind=kind, parent_session_id=parent_session_id,
+                spawn_tool_call_id=spawn_tool_call_id, spawn_depth=spawn_depth,
+                lifecycle=lifecycle, metadata=metadata)
         return sid
+
+    async def _create_session_tx(self, tx, sid, now, *, system_prompt=None, model=None,
+                                 config=None, kind=SessionKind.SUBAGENT, parent_session_id=None,
+                                 spawn_tool_call_id=None, spawn_depth=1,
+                                 lifecycle=SubagentLifecycle.LINKED, metadata=None):
+        """Allocate an independently executable session in its admission transaction."""
+        await tx.execute(
+            f"INSERT INTO {self.t.sessions} ("
+            "session_id, created_at, updated_at, system_prompt, model, config_json, "
+            "status, kind, parent_session_id, spawn_tool_call_id, spawn_depth, "
+            "lifecycle, metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                sid, now, now, system_prompt, model, _dumps(config or {}),
+                SessionStatus.ACTIVE.value, kind.value, parent_session_id,
+                spawn_tool_call_id, spawn_depth, lifecycle.value, _dumps(metadata or {}),
+            ),
+        )
+        await tx.execute(
+            f"INSERT INTO {self.t.session_state} (session_id) VALUES (?)", (sid,)
+        )
+        if self.store_id is not None:
+            # The first context-bearing send uses this existing row as its
+            # short admission gate;its version remains derived from writes.
+            await tx.execute(f'INSERT INTO {self.table_prefix}session_controls (session_id,version) VALUES (?,?)', (sid, 0))
 
     async def get_session(self, session_id: str) -> SessionRow | None:
         holding = self._holding(session_id)

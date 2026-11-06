@@ -571,17 +571,6 @@ class _ExecutionLoop:
         ``asyncio.run``. Called from inside a running loop it only schedules + warns.
         """
         runner = self._sync_runner
-        # Let in-flight background tasks finish + persist their terminal status before the
-        # store/loop is torn down (a finishing task's write-back targets the runner loop,
-        # which is still alive here); then recover any already-deferred ones.
-        if self.store is not None and runner is not None:
-            from power_loop.tools.default_tools import BG
-
-            try:
-                BG.join_pending(timeout=5.0)
-                runner.run(BG.flush_orphaned(self.store))
-            except Exception:  # pragma: no cover - drain must never block teardown
-                logger.warning("close: background-task drain failed; continuing", exc_info=True)
         store = self.store if self._owns_store else None
         if store is not None:
             if runner is not None:
@@ -655,17 +644,6 @@ class _ExecutionLoop:
             await self.event_bus.drain(timeout=drain_timeout_s)
         except Exception:  # pragma: no cover - drain must never block teardown
             logger.warning("aclose: event-bus drain raised; continuing", exc_info=True)
-        # (4) let in-flight background tasks finish so their terminal status write-back
-        # lands on the still-open store/loop, then recover any that were already deferred —
-        # otherwise closing the store here would strand them at 'running' forever.
-        if self.store is not None:
-            from power_loop.tools.default_tools import BG
-
-            try:
-                await asyncio.to_thread(BG.join_pending, drain_timeout_s)
-                await BG.flush_orphaned(self.store)
-            except Exception:  # pragma: no cover - drain must never block teardown
-                logger.warning("aclose: background-task drain failed; continuing", exc_info=True)
         # (5) checkpoint + close the owned store (only if it was ever opened).
         if self._owns_store and self.store is not None:
             try:
@@ -824,6 +802,8 @@ class _ExecutionLoop:
         await recover_acquired_session(self, sid, cache_valid=cache_valid)
         if state is None or not state.pending:
             return 0
+        if state.pending.get("pending_interactions"):
+            return 0
         return await self.abort_pending(sid, reason="执行中断，结果未知")
 
     async def abort_pending(self, session_id: str, *, reason: str = "aborted") -> int:
@@ -937,110 +917,17 @@ class _ExecutionLoop:
     # ── work in flight: list + stop by id (design/124 §8.1 / §8.4) ────────────────────────
 
     async def list_jobs(self, session_id: str) -> list[dict[str, Any]]:
-        """Everything this session has going: the foreground run (if one holds the session in
-        this process), running background tasks, running detached workflows, armed timers.
+        from power_loop.runtime import task_query
+        from power_loop.runtime.child_tasks import tool_actor
+        _, actor = await tool_actor(self)
+        result = await task_query.list_jobs(self.task_runtime.manager,
+            self.task_runtime.actor(actor.session_id), status="active", limit=100)
+        return result["nodes"]
 
-        Each: ``id`` (stable, what :meth:`stop_job` takes — ``send`` / ``bg:<task_id>`` /
-        ``wf:<run_id>`` / ``timer:<id>``), ``kind``, ``title``, ``status``, ``started_at`` (ms), and
-        ``origin`` — the start of the user input of the send during which it was started, so a
-        vague "stop" can be matched to the request it concerns."""
-        from power_loop.runtime.background import ACTIVE_STATUSES
-        from power_loop.workflow.introspect import list_workflows
-        from power_loop.workflow.runner import is_run_live
+    async def stop_job(self, session_id: str, job_id: str) -> dict:
+        from power_loop.runtime.task_control import stop_from_current_call
+        return await stop_from_current_call(self, session_id, job_id)
 
-        store = await self._ensure_store()
-        await self._ensure_session_or_raise(session_id)
-        sends: list[tuple[int, str]] = []
-        with contextlib.suppress(Exception):
-            for r in await store.load_active_messages(session_id):
-                if r.role == "user" and not r.name and r.content:
-                    sends.append((int(r.created_at or 0), " ".join(str(r.content).split())[:80]))
-
-        def _origin(ts: int) -> str:
-            text = ""
-            for created, head in sends:
-                if created <= ts:
-                    text = head
-                else:
-                    break
-            return text
-
-        jobs: list[dict[str, Any]] = []
-        if self._session_busy(session_id):
-            jobs.append({"id": "send", "kind": "foreground", "title": "当前这一轮",
-                         "status": "running", "started_at": None, "origin": ""})
-        for t in await store.list_background_tasks(session_id):
-            if t.status not in ACTIVE_STATUSES:
-                continue
-            jobs.append({"id": f"bg:{t.task_id}", "kind": "background",
-                         "title": str(t.command or "")[:80], "status": t.status,
-                         "started_at": t.created_at, "origin": _origin(int(t.created_at or 0))})
-        with contextlib.suppress(Exception):
-            for w in await list_workflows(self, session_id):
-                if str(w.get("status") or "") not in ("running", "pending"):
-                    continue
-                rid = str(w.get("run_id") or "")
-                ts = int(w.get("created_at_ms") or 0)
-                jobs.append({"id": f"wf:{rid}", "kind": "workflow",
-                             "title": str(w.get("workflow") or "")[:80],
-                             "status": "running" if is_run_live(rid) else "orphaned",
-                             "started_at": ts, "origin": _origin(ts)})
-        from power_loop.runtime.delegation import running_jobs
-        jobs.extend(running_jobs(store, session_id))
-        for tm in await self.list_timers(session_id, statuses=("armed",)):
-            jobs.append({"id": f"timer:{tm.timer_id}", "kind": "timer",
-                         "title": str(tm.note or "")[:80], "status": "armed",
-                         "started_at": tm.created_at, "due_at": tm.due_at,
-                         "origin": _origin(int(tm.created_at or 0))})
-        return jobs
-
-    async def stop_job(self, session_id: str, job_id: str) -> dict[str, str]:
-        """Stop one job of :meth:`list_jobs` by id — mechanically, within the configured
-        :class:`~power_loop.runtime.stop_policy.StopPolicy` limit; a stopped job does not wake
-        the agent when it settles. ``result``: ``stopped`` (wound down in time) / ``forced`` (cut
-        off at the limit) / ``finished`` (had already ended) / ``unknown`` / ``not_here`` (the
-        foreground run is stopped by its caller's token, not from inside it)."""
-        from power_loop.runtime.background import ACTIVE_STATUSES
-        from power_loop.tools.default_tools import BG
-        from power_loop.workflow.runner import stop_run
-
-        store = await self._ensure_store()
-        await self._ensure_session_or_raise(session_id)
-        pol = self.config.stop_policy
-        kind, _, ref = str(job_id).partition(":")
-        result = "unknown"
-        if job_id == "send":
-            result = "not_here"
-        elif kind == "bg" and ref:
-            row = await store.get_background_task(session_id, ref)
-            if row is None:
-                result = "unknown"
-            elif row.status not in ACTIVE_STATUSES:
-                result = "finished"
-            else:
-                result = await BG.cancel_task(ref, grace_s=pol.background_task_s,
-                                              shell_term_s=pol.shell_term_s)
-                if result == "unknown":
-                    # Losing the original controller is not proof of exit.
-                    # Retain the obligation for control/reconciliation instead
-                    # of fabricating a stopped result after a restart.
-                    await store.upsert_background_task(
-                        session_id, task_id=ref, command=row.command, status="stop_unconfirmed",
-                        return_code=None, output_tail=(row.output_tail or "") + "\n(stop unconfirmed)")
-        elif kind == "wf" and ref:
-            from power_loop.workflow import journal
-            from power_loop.workflow.runner import get_run_handle
-            handle = get_run_handle(ref)
-            if (await journal.read(store, session_id, ref) is not None and handle is not None and
-                    getattr(handle, "_origin_store", None) is store and
-                    getattr(handle, "_origin_parent_sid", None) == session_id):
-                result = await stop_run(ref, grace_s=pol.workflow_s, reason="stopped")
-        elif kind == "sub" and ref:
-            from power_loop.runtime.delegation import stop
-            result = await stop(store, session_id, ref, pol.workflow_s)
-        elif kind == "timer" and ref.isdigit():
-            result = "stopped" if await self.cancel_timer(session_id, int(ref)) else "finished"
-        return {"id": job_id, "result": result}
 
     # ── inspection ────────────────────────────────────────────────────────
 
@@ -1444,6 +1331,7 @@ class _ExecutionLoop:
         max_rounds: int | None = None,
         response_format: dict[str, Any] | None = None,
         with_history: bool = True,
+        _initial_round_index: int = 0,
     ) -> StatefulResult:
         store = await self._ensure_store()
         # 3.0: projection-style representation drives the derived-layer path; verbatim → None
@@ -1789,6 +1677,7 @@ class _ExecutionLoop:
                 # the whole send shares one index. _persist_user_input bumped it for a fresh
                 # send; resume()/submit_input() leave it, correctly attaching to the prior send.
                 pipeline.send_index = current_send_index
+                pipeline._initial_round_index = _initial_round_index
                 # Same index onto the sink: per-round usage rows are keyed by send (store v6).
                 # Stamped HERE (the convergence point of send/resume/submit_input) so every
                 # entry path gets it without duplicating the lookup.

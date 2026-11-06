@@ -409,9 +409,15 @@ async def admit_unbudgeted(manager, tx, identity, *, required):
 
 
 async def check_execution(manager, tx, row):
-    identity = identity_for(row)
+    from .session_ownership import current_ownership
+    from .task_runtime import _TASK_OWNERS
+    original = identity_for(row)
+    ownership = current_ownership(manager.store, row["session_id"])
+    runtime = next((runtime for _, runtime in reversed(_TASK_OWNERS.get()) if runtime.manager is manager), None)
+    identity = (ExecutorIdentity(row["tenant_id"], row["principal_id"], runtime.executor_id, runtime.boot_id)
+                if ownership is not None and runtime is not None else original)
     registered = await require_accepting(manager, tx, identity, required=row["executor_key"] is not None)
-    if registered is not None and row["executor_key"] != registered["executor_key"]:
+    if identity == original and registered is not None and row["executor_key"] != registered["executor_key"]:
         raise JobError("executor_binding_missing")
     if row["executor_key"] is not None and not manager._trust_own_writes.get():
         from .execution_membership import scope
@@ -474,7 +480,7 @@ async def _drain_scope(manager, identity, operation, request):
     if original is not None:
         return original
     jobs = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? AND supervision_status<>'closed' "
-        "AND executor_id=? AND boot_id=? "
+        "AND executor_id=? AND boot_id=? AND status<>'waiting' "
         "AND (intake='open' OR resource_state IN ('not_started','running','unknown')) ORDER BY job_id LIMIT ?",
         (*asdict(identity).values(), _LIMIT+1))
     if len(jobs) > _LIMIT:
@@ -524,7 +530,8 @@ async def _drain_tree(manager, identity, operation, reason, targets, creators):
                     manager._control_notifications.get().add(job_id)
                 continue
             changed = any(job[k] != target[k] for k in ("generation", "executor_id", "boot_id"))
-            closed = not changed and job["resource_state"] == "stopped" and job["intake"] == "closed"
+            closed = not changed and job["resource_state"] == "stopped" and (
+                job["intake"] == "closed" or job["status"] == "waiting")
             if not changed and not closed and job["cancel_requested_at"] is None:
                 status = job["status"] if job["supervision_status"] == "closed" or job["status"] == "model_closed" else (
                     "cancelled" if job["resource_state"] == "not_started" else "cancelling")

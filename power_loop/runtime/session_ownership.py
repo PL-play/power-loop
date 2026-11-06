@@ -231,7 +231,7 @@ async def recover_acquired_session(loop, session_id, *, cache_valid):
     from .session_controls import forget
     rows = await manager.db.fetchall(
         f"SELECT job_id,generation,kind,parent_job_id FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? "
-        "AND session_id=? AND outcome IS NULL AND status IN ('running','waiting','settling')",
+        "AND session_id=? AND outcome IS NULL AND status IN ('running','settling')",
         (runtime.tenant_id, runtime.principal_id, session_id))
     if not cache_valid or rows:
         forget(manager, session_id)
@@ -243,16 +243,16 @@ async def recover_acquired_session(loop, session_id, *, cache_valid):
 
         port = RuntimeInputStore(loop.store)
         ref = JobRef(loop.store.store_id, row['job_id'], row['generation'])
-        main_send = row['kind'] == 'send' and row['parent_job_id'] is None
+        public_job = row['kind'] != 'send' or row['parent_job_id'] is None
         async with manager._write() as tx:
-            if main_send:
+            if public_job:
                 route = await port._lock_result_sessions(tx, ref)
             changed = await tx.write_job(row['job_id'],
                 f"UPDATE {manager.jobs} SET status='interrupted',outcome='interrupted',"
                 "intake='closed',resource_state='unknown',version=version+1,updated_at=? "
                 "WHERE job_id=? AND generation=? AND outcome IS NULL AND status IN ('running','waiting','settling')",
                 (manager.now(), row['job_id'], row['generation']))
-            if changed and main_send:
+            if changed and public_job:
                 await port._commit_result(tx, ref, Result(ref, None, 'interrupted', error='execution owner lost'),
                     SimpleNamespace(epoch=period.lease.epoch, lease=period.lease), route)
 

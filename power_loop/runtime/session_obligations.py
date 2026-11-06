@@ -133,10 +133,15 @@ async def _desired(manager, tx, row, *, verify=False, clean=None, processed_inpu
         for event in dispositions:
             for session in routes:
                 add(session, "disposition", event)
-    if current is not None and row["kind"] in ("subagent", "workflow"):
-        if not await _processing_handled(manager, tx, row, current,
-                row["created_by_session_id"], row["control_owner_job_id"], clean):
-            add(row["created_by_session_id"], "result", current)
+    if (row["kind"] in ("subagent", "workflow")
+            or row["kind"] in ("background_tool", "background_command") and row["session_id"]):
+        for result in (event for event in events if event["event_type"] == "result"):
+            if result["delivery_status"] in ("handled", "suppressed"):
+                continue
+            result_clean = clean if result is current else None
+            if not await _processing_handled(manager, tx, row, result,
+                    row["created_by_session_id"], row["control_owner_job_id"], result_clean):
+                add(row["created_by_session_id"], "result", result)
     for event in events:
         kind = event["event_type"]
         recipient = event["caller_session_id"]
@@ -244,8 +249,7 @@ async def refresh_closed_decisions(manager, decisions, *, verify=False):
         for event in pending:
             payload = json.loads(event["payload_json"])
             target = await manager._row(reader, payload["event"]["job_id"])
-            if target["generation"] != payload["target"]["generation"]:
-                continue
+            current_target = target
             handler = event.get("_handler_snapshot") or await manager._row(reader, event["job_id"])
             actor = JobActor(target["tenant_id"], target["principal_id"], event["caller_session_id"])
             from .message_ref import integer_id
@@ -258,7 +262,7 @@ async def refresh_closed_decisions(manager, decisions, *, verify=False):
                     raise JobError("processing_target_changed")
                 await require_event_handled(manager, reader, source, session_id=actor.session_id,
                     owner_job_id=handler["control_owner_job_id"], allow_suppressed=target["generation"] == 0)
-            roots.setdefault(target["root_job_id"], []).append((event, payload, target, source))
+            roots.setdefault(target["root_job_id"], []).append((event, payload, current_target, source))
         pending = []
         for root_id in sorted(roots):
             projections = await _prepare_closed_tree(manager, reader, roots[root_id])
@@ -280,7 +284,7 @@ async def _prepare_closed_tree(manager, reader, entries):
             if payload["event"].get("event_type", "result") == "operation"}
         observed_result = any(source["event_id"] == result_id(row["job_id"], row["generation"])
             for _, _, source in sources)
-        negative = row["kind"] == "background_tool" and row["generation"] == 0
+        negative = row["kind"] == "background_tool" and row["session_id"] is None and row["generation"] == 0
         result_changed = observed_result and not negative and row["result_status"] != "handled"
         events = [source for _, _, source in sources if source["delivery_status"] != "handled" and not negative]
         changed = bool(events) or result_changed

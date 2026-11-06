@@ -111,7 +111,8 @@ class SqliteDatabase:
                 # silent no-op (mode stays NONE) and incremental_vacuum reclaims nothing. So it
                 # has to run BEFORE journal_mode=WAL. (DBs created by an older build where the
                 # order was reversed need a one-time full VACUUM to switch the mode.)
-                conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                if conn.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
+                    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
