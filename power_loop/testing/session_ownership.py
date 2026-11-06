@@ -20,7 +20,7 @@ not introduce a pytest dependency into the SDK.
 
     async def test_exclusive_acquisition(self):
         first, second = await self.coordinator(), await self.coordinator()
-        key = uuid.uuid4().hex
+        key = (uuid.uuid4().hex, uuid.uuid4().hex)
         leases = await asyncio.gather(*(
             client.acquire(key, owner_id=str(i), ttl_s=5, on_lost=lambda: None)
             for i, client in enumerate((first, second))))
@@ -33,7 +33,7 @@ not introduce a pytest dependency into the SDK.
 
     async def test_renew_and_release_then_reacquire(self):
         client = await self.coordinator()
-        key, lost = uuid.uuid4().hex, []
+        key, lost = (uuid.uuid4().hex, uuid.uuid4().hex), []
         lease = await client.acquire(key, owner_id='same-owner', ttl_s=5,
                                      on_lost=lambda: lost.append(True))
         try:
@@ -59,7 +59,7 @@ not introduce a pytest dependency into the SDK.
 
     async def test_expiry_takeover_notifies_old_holder_and_rejects_renewal(self):
         first, second = await self.coordinator(), await self.coordinator()
-        key, lost = uuid.uuid4().hex, []
+        key, lost = (uuid.uuid4().hex, uuid.uuid4().hex), []
         old = await first.acquire(key, owner_id='old', ttl_s=.05,
                                   on_lost=lambda: lost.append(True))
         await asyncio.sleep(.08)
@@ -79,7 +79,7 @@ not introduce a pytest dependency into the SDK.
     async def test_expired_local_handle_rejects_writes_without_waiting_for_renewal(self):
         client = await self.coordinator()
         lost = []
-        lease = await client.acquire(uuid.uuid4().hex, owner_id='old', ttl_s=.05,
+        lease = await client.acquire((uuid.uuid4().hex, uuid.uuid4().hex), owner_id='old', ttl_s=.05,
                                      on_lost=lambda: lost.append(True))
         try:
             await asyncio.sleep(.08)

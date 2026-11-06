@@ -38,11 +38,8 @@ def _reason(row, now, policy):
     if row['resource_state'] == 'unknown' and now - row['updated_at'] >= policy.grace_ms:
         return 'resource_unknown'
     # A declared wait or a queued task is not a runaway model execution.
-    if row['status'] in ('running', 'settling', 'cancelling') and row['lease_until_ms'] is not None:
-        if now - row['lease_until_ms'] >= policy.grace_ms:
-            return 'lease_expired'
-        if row['status'] == 'running' and now - row['created_at'] >= policy.runtime_ms:
-            return 'long_running'
+    if row['status'] == 'running' and now - row['created_at'] >= policy.runtime_ms:
+        return 'long_running'
     if row['result_status'] not in ('none', 'handled', 'suppressed') and now - row['updated_at'] >= policy.result_ms:
         return 'result_unhandled'
     return None
@@ -52,8 +49,6 @@ def _facts(row, reason):
     keys = ('job_id', 'generation', 'kind', 'status', 'resource_state', 'supervision_status',
             'result_status', 'cancel_requested_at')
     value = {k: row[k] for k in keys}
-    if reason == 'lease_expired':
-        value['lease_until_ms'] = row['lease_until_ms']
     return value
 
 

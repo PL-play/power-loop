@@ -272,8 +272,8 @@ async def collect_node(runtime, loop, raw, stop_event, *, timeout_s=1800, max_ro
                     raise JobError("task_cancel_signal_unavailable")
         unresolved = await runtime.manager.db.fetchone(
             f"SELECT job_id FROM {runtime.manager.jobs} WHERE control_owner_job_id=? "
-            "AND control_owner_generation=? AND resource_state='unknown' LIMIT 1",
-            (scope.lease.job_id, scope.lease.generation),
+            "AND resource_state='unknown' LIMIT 1",
+            (scope.lease.job_id,),
         )
         if unresolved:
             status = ("cancelled" if raw.get("status") == "cancelled" or stop_event.is_cancelled()

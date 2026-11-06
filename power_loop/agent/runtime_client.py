@@ -31,10 +31,11 @@ log = logging.getLogger(__name__)
 
 
 class RuntimeClient:
-    def __init__(self, *, store, transport, namespace="power-loop"):
+    def __init__(self, *, store, transport, namespace="power-loop", hooks=None, hook_timeout_s=1.0):
         if not namespace:
             raise ValueError("namespace must be nonempty")
         self.store, self.transport, self.namespace = store, transport, namespace
+        self.hooks, self.hook_timeout_s = hooks, hook_timeout_s
         self.inputs = RuntimeInputStore(store)
         self._waiters, self._outputs = set(), set()
         self._closed = False
@@ -122,6 +123,10 @@ class RuntimeClient:
         except Exception as exc:
             raise StoreError(InputRef(command.target.store_id, command.target.session_id,
                                       command.message_id)) from exc
+        if receipt.newly_accepted:
+            from power_loop.contracts.hooks import HookPoint
+            from power_loop.core.execution_notifications import notify
+            await notify(self.hooks, HookPoint.MESSAGE_ACCEPTED, {"receipt": receipt}, timeout_s=self.hook_timeout_s)
         if receipt.state not in {"accepted"}:
             return receipt
         channels = ["work", "activation"]

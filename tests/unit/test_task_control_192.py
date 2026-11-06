@@ -192,11 +192,11 @@ async def test_local_cancel_deduplicates_nested_task_and_never_recancels_cleanup
     runtime = TaskRuntime(c.manager, tenant_id=c.actor.tenant_id, principal_id=c.actor.principal_id, executor_id="worker", boot_id="boot", lease_ms=300)
     child_sid = await c.store.create_session(parent_session_id=c.actor.session_id, metadata={"execution_role": "subagent"})
     bound = await c.manager.bind_session(c.actor, c.child.job.job_id, child_sid)
-    lease = await c.manager.claim_job(c.actor, c.child.job.job_id, executor_id="worker", boot_id="boot", expected_version=bound.version, lease_ms=300)
+    lease = await c.manager.claim_job(c.actor, c.child.job.job_id, executor_id="worker", boot_id="boot", expected_version=bound.version)
     binding = Execution(runtime, c.actor, lease)
     subactor = runtime.actor(child_sid)
     send = await c.manager.register_job(subactor, kind="send", session_id=child_sid, parent=lease, system_key="actual-child-send", request={"send_index": 1})
-    send_lease = await c.manager.claim_job(subactor, send.job.job_id, executor_id="worker", boot_id="boot", expected_version=1, lease_ms=300)
+    send_lease = await c.manager.claim_job(subactor, send.job.job_id, executor_id="worker", boot_id="boot", expected_version=1)
     nested = Execution(runtime, subactor, send_lease)
     entered, stopping, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
     cancelled = []
@@ -243,7 +243,7 @@ async def test_missing_local_handle_never_clears_persistent_control(control):
 async def test_old_stop_cannot_cancel_new_generation_or_interrupt_known_exit_settlement(control, mode):
     c = control
     runtime = TaskRuntime(c.manager, tenant_id="control", principal_id="host", executor_id="worker", boot_id="boot", lease_ms=300000)
-    lease = await c.manager.claim_job(c.actor, c.child.job.job_id, executor_id="worker", boot_id="boot", expected_version=1, lease_ms=300000)
+    lease = await c.manager.claim_job(c.actor, c.child.job.job_id, executor_id="worker", boot_id="boot", expected_version=1)
     binding = Execution(runtime, c.actor, lease)
     entered, finish = asyncio.Event(), asyncio.Event()
     async def worker():
@@ -282,11 +282,11 @@ async def test_old_stop_cannot_cancel_new_generation_or_interrupt_known_exit_set
 async def test_local_cancel_skips_other_authorized_principals_session_tasks(control):
     c = control
     runtime = TaskRuntime(c.manager, tenant_id="control", principal_id="host", executor_id="worker", boot_id="boot", lease_ms=300000)
-    own = await c.manager.claim_job(c.actor, c.child.job.job_id, executor_id="worker", boot_id="boot", expected_version=1, lease_ms=300000)
+    own = await c.manager.claim_job(c.actor, c.child.job.job_id, executor_id="worker", boot_id="boot", expected_version=1)
     other_sid = await c.store.create_session()
     other_actor = replace(c.actor, session_id=other_sid)
     other = await c.manager.register_job(other_actor, kind="send", session_id=other_sid, system_key="other-root", request={"send_index": 1})
-    foreign = await c.manager.claim_job(other_actor, other.job.job_id, executor_id="worker", boot_id="boot", expected_version=1, lease_ms=300000)
+    foreign = await c.manager.claim_job(other_actor, other.job.job_id, executor_id="worker", boot_id="boot", expected_version=1)
     finish, entered_own, entered_other, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event(), []
     async def work(binding, event, label):
         async with runtime.execution(binding):

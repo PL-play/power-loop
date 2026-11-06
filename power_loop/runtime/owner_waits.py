@@ -201,8 +201,8 @@ async def _pending(manager, tx, actor, owner, sid=None):
     from .wait_notifications import decision_id
 
     rows = await tx.fetchall(f"SELECT j.*,e.payload_json AS creation_json FROM {manager.jobs} j LEFT JOIN {manager.events} e ON e.job_id=j.job_id "
-        "AND e.event_type='operation' AND e.action='create' WHERE j.control_owner_job_id=? AND j.control_owner_generation=? AND j.kind='timer'",
-        (owner["job_id"], owner["generation"]))
+        "AND e.event_type='operation' AND e.action='create' WHERE j.control_owner_job_id=? AND j.kind='timer'",
+        (owner["job_id"],))
     pending = []
     for row in rows:
         creation = waits._object(row["creation_json"])
@@ -247,8 +247,8 @@ async def require_time(manager, tx, owner):
         return
     actor = JobActor(owner["tenant_id"], owner["principal_id"], owner["created_by_session_id"])
     timers = await tx.fetchall(f"SELECT j.job_id,e.payload_json FROM {manager.jobs} j LEFT JOIN {manager.events} e ON e.job_id=j.job_id "
-        "AND e.event_type='operation' AND e.action='create' WHERE j.control_owner_job_id=? AND j.control_owner_generation=? AND j.kind='timer'",
-        (owner["job_id"], owner["generation"]))
+        "AND e.event_type='operation' AND e.action='create' WHERE j.control_owner_job_id=? AND j.kind='timer'",
+        (owner["job_id"],))
     deadline = None
     for timer in timers:
         creation = waits._object(timer["payload_json"])
@@ -279,7 +279,7 @@ async def dispatch_policy(manager, tx, row):
             raise JobError("invalid_control_owner")
         seen.add(row["job_id"])
         if row["kind"] in ("subagent", "workflow_node"):
-            owners.append((row["job_id"], row["generation"]))
+            owners.append(row["job_id"])
         bound = await require_time(manager, tx, row)
         if bound is not None:
             deadline = bound if deadline is None else min(deadline, bound)
@@ -291,7 +291,7 @@ async def dispatch_policy(manager, tx, row):
 
 def note_registered_policy(manager, owner, deadline):
     """Publish committed owner bounds; unknown writes invalidate admission hints."""
-    scope = (owner["job_id"], owner["generation"])
+    scope = owner["job_id"]
 
     def publish(committed):
         for binding in manager._execution_controls.values():
@@ -360,7 +360,7 @@ async def _quiescent(manager, tx, owner):
                     raise JobError("owner_wait_resources_unsettled")
                 following.append((historical_row(child, original["scope"]), scope["lease"]))
                 ids.append(edge["event_id"])
-            owned = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE control_owner_job_id=? AND control_owner_generation=?", key)
+            owned = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE control_owner_job_id=?", (key[0],))
             for child in owned:
                 if child["kind"] == "timer" and child["generation"] == 0:
                     from .wait_terminal import admission

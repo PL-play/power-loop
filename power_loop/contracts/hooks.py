@@ -24,6 +24,11 @@ class HookPoint(str, Enum):
     MESSAGE_APPEND = "message.append"
     MEMORY_RECALLED = "memory.recalled"
     TIMER_FIRE = "timer.fire"
+    EXECUTION_ACQUIRED = "execution_acquired"
+    EXECUTION_LOST = "execution_lost"
+    EXECUTION_RELEASED = "execution_released"
+    MESSAGE_ACCEPTED = "message_accepted"
+    EXECUTION_FINISHED = "execution_finished"
 
 
 class HookDirective(str, Enum):

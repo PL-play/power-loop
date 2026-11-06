@@ -52,12 +52,10 @@ def _lease(raw):
     return raw
 
 
-def _snapshot(row):
+def _snapshot(row, owner=None):
     return {"version": 1,
         "lease": asdict(JobLease(row["job_id"], row["executor_id"], row["boot_id"], row["generation"])),
-        "owner": ({"job_id": row["control_owner_job_id"], "generation": row["control_owner_generation"],
-                   "executor_id": row["control_owner_executor_id"], "boot_id": row["control_owner_boot_id"]}
-                  if row["control_owner_job_id"] is not None else None),
+        "owner": owner,
         **{k: row[k] for k in ("tenant_id", "principal_id", "kind", "execution_role", "parent_job_id", "created_by_session_id", "session_id")}}
 
 
@@ -139,7 +137,9 @@ async def require_current(manager, tx, row):
     # Resuming cannot make incomplete/corrupt historical descendants disappear.
     await usage(manager, tx, row, row["generation"])
     data = saved["scope"]
-    current = _snapshot(row)
+    current = _snapshot(row, data["owner"])
+    if (data["owner"]["job_id"] if data["owner"] else None) != row["control_owner_job_id"]:
+        raise JobError("execution_membership_mismatch")
     # A workflow driver is bound after claim; the execution lease/ownership is
     # immutable independently of that deferred physical-session binding.
     normalized = {k: v for k, v in data.items() if k != "executor_binding"}
@@ -162,7 +162,10 @@ async def _insert(manager, tx, event_id, job_id, kind, version, payload):
 
 async def start(manager, tx, row):
     """Atomic with claim/admission; no execution capability is granted here."""
-    data = _snapshot(row)
+    owner_row = await manager._row(tx, row["control_owner_job_id"]) if row["control_owner_job_id"] else None
+    owner = (asdict(JobLease(owner_row["job_id"], owner_row["executor_id"], owner_row["boot_id"], owner_row["generation"]))
+             if owner_row else None)
+    data = _snapshot(row, owner)
     if row["executor_key"] is not None:
         from .executor_registry import registration_binding
         data["version"] = 2

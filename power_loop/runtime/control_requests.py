@@ -131,12 +131,11 @@ async def accept(manager, actor, request, target, *, action, authorize):
                 from .control_runtime import flush_binding
                 await flush_binding(binding, transaction=tx)
             version, now = source["version"]+1, manager.now()
-            lease_condition = " AND lease_until_ms>?" if action != "stop" else ""
             params = (now, caller.job_id, source["root_job_id"], caller.generation, caller.executor_id,
-                caller.boot_id, source["version"])+((now,) if lease_condition else ())
+                caller.boot_id, source["version"])
             changed = await tx.write_job(caller.job_id, f"UPDATE {manager.jobs} SET version=version+1,updated_at=? "
                 "WHERE job_id=? AND root_job_id=? AND generation=? AND executor_id=? AND boot_id=? AND version=? "
-                "AND intake='open' AND status IN ('running','waiting','settling')"+lease_condition, params)
+                "AND intake='open' AND status IN ('running','waiting','settling')", params)
             if changed != 1:
                 raise JobError(action+"_caller_changed")
             data = {"version": 1, "phase": "accepted", "action": action, "actor": asdict(actor),
@@ -210,7 +209,7 @@ async def complete(manager, actor, accepted, outcome):
 
 
 _OBSERVED = ("job_id", "root_job_id", "generation", "executor_id", "boot_id", "status", "intake",
-    "resource_state", "cancel_requested_at", "lease_until_ms")
+    "resource_state", "cancel_requested_at")
 
 
 async def reject(manager, tx, actor, event, data, row, code):

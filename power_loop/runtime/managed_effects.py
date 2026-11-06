@@ -487,7 +487,7 @@ async def _original(manager, tx, row, creation, binding):
     ref = _ref(json.loads(creation["call_ref_json"]))
     actor = JobActor(row["tenant_id"], row["principal_id"], ref.session_id)
     source = await manager._authorize(tx, actor, row["parent_job_id"])
-    proof = JobLease(row["parent_job_id"], row["parent_executor_id"], row["parent_boot_id"], row["parent_generation"])
+    proof = JobLease(source["job_id"], source["executor_id"], source["boot_id"], source["generation"])
     if (
         row["created_by_session_id"] != ref.session_id
         or creation["caller_session_id"] != ref.session_id
@@ -854,7 +854,6 @@ async def _never_claimed(manager, tx, row):
         row["generation"] != 0
         or row["executor_id"] is not None
         or row["boot_id"] is not None
-        or row["lease_until_ms"] is not None
     ):
         raise JobError("managed_effect_unstarted_conflict")
     history = await tx.fetchone(

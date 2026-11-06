@@ -388,8 +388,6 @@ async def require_accepting(manager, tx, identity, *, required=False, exclusive=
     if row is not None:
         if row["state"] != "accepting":
             raise JobError("executor_not_accepting")
-        if row["lease_until_ms"] <= manager.now():
-            raise JobError("executor_lease_expired")
     return row
 
 
@@ -476,9 +474,9 @@ async def _drain_scope(manager, identity, operation, request):
     if original is not None:
         return original
     jobs = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? AND supervision_status<>'closed' "
-        "AND ((executor_id=? AND boot_id=?) OR (resource_state='not_started' AND parent_executor_id=? AND parent_boot_id=?)) "
+        "AND executor_id=? AND boot_id=? "
         "AND (intake='open' OR resource_state IN ('not_started','running','unknown')) ORDER BY job_id LIMIT ?",
-        (*asdict(identity).values(), identity.executor_id, identity.boot_id, _LIMIT+1))
+        (*asdict(identity).values(), _LIMIT+1))
     if len(jobs) > _LIMIT:
         return None
     snapshot = [{k: job[k] for k in ("job_id", "generation", "kind", "executor_id", "boot_id", "resource_state")}

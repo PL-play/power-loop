@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import logging
 import math
 
 from . import executor_registry as registry
@@ -161,9 +162,7 @@ class ExecutorLifecycle:
         except asyncio.CancelledError:
             raise
         except Exception:
-            self.failure = "executor_supervision_lost"
-            # Do not await ourselves while shutting down the heartbeat.
-            self._begin_shutdown(5.0, 0.25, "executor heartbeat unavailable")
+            logging.getLogger(__name__).exception("executor health heartbeat failed; session ownership remains authoritative")
 
     def track_task(self, task, *, cancel_token=None, job_id=None):
         """Retain adapter tasks, including admission queues and exit delivery."""

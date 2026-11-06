@@ -138,13 +138,12 @@ async def _no_unknown_sends(manager, tx, row):
         return
     blocked = await tx.fetchone(
         f"SELECT job_id FROM {manager.jobs} WHERE kind='send' AND resource_state='unknown' AND job_id<>? "
-        "AND tenant_id=? AND principal_id=? AND control_owner_job_id=? AND control_owner_generation=? LIMIT 1",
+        "AND tenant_id=? AND principal_id=? AND control_owner_job_id=? LIMIT 1",
         (
             row["job_id"],
             row["tenant_id"],
             row["principal_id"],
             row["control_owner_job_id"],
-            row["control_owner_generation"],
         ),
     )
     if blocked:

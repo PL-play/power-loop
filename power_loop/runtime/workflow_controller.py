@@ -114,9 +114,7 @@ async def for_node(manager, reader, row):
             workflow is None or workflow["kind"] != "workflow" or row["control_owner_job_id"] != workflow["job_id"]):
         raise JobError("workflow_controller_mismatch")
     data = await current(manager, reader, workflow)
-    owner = {"job_id": row["control_owner_job_id"], "generation": row["control_owner_generation"],
-        "executor_id": row["control_owner_executor_id"], "boot_id": row["control_owner_boot_id"]}
-    if (_hash(owner) != _hash(data["workflow"]) or
+    if (row["control_owner_job_id"] != data["workflow"]["job_id"] or
             (row["created_by_session_id"] != data["session_id"] and workflow["generation"] == 1) or
             (row["tenant_id"], row["principal_id"]) != (workflow["tenant_id"], workflow["principal_id"])):
         raise JobError("workflow_controller_mismatch")
@@ -132,7 +130,7 @@ async def for_node(manager, reader, row):
         from .execution_membership import scope
         anchor = await scope(manager, reader, row["job_id"], row["generation"])
         fields = ("kind", "execution_role", "tenant_id", "principal_id", "created_by_session_id", "parent_job_id")
-        if (_hash(anchor["owner"]) != _hash(owner) or _hash(anchor["lease"]) != _hash(proof(row)) or
+        if (anchor["owner"]["job_id"] != row["control_owner_job_id"] or _hash(anchor["lease"]) != _hash(proof(row)) or
                 any(anchor[k] != row[k] for k in fields)):
             raise JobError("workflow_controller_mismatch")
     return data

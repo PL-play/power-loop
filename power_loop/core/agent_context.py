@@ -132,3 +132,6 @@ def reset_ctx(token: Token) -> None:
 def reset_session_id(token: Token) -> None:
     _current_session_id.reset(token)
 
+
+# Public execution identity is immutable; host values have their own allowlist.
+from .execution_context import bind_host_context, get_execution_context  # noqa: E402,F401

@@ -261,6 +261,7 @@ class JobManager:
         try:
             try:
                 async with self._control_transaction() as tx:
+                    require_current_ownership(self.store)
                     from .session_controls import ControlTransaction, bump
                     recorder = ControlTransaction(tx, self)
                     intent_token = self._control_intents.set(recorder)
@@ -340,28 +341,19 @@ class JobManager:
         raise JobError("job_depth_exceeded")
 
     async def _supervision_barriers(self, tx, row):
-        """Historical ancestors retain stop/unknown barriers, not model leases."""
-        current, seen, independent_creator = row, set(), False
+        """Ancestors retain explicit cancellation; unknown blocks only itself."""
+        current, seen = row, set()
         for _ in range(64):
             if current is None or current["job_id"] in seen:
                 raise JobError("invalid_job_lineage")
             seen.add(current["job_id"])
             if current["cancel_requested_at"] is not None:
                 raise JobError("cancel_requested")
-            if current["resource_state"] == "unknown" and not independent_creator:
+            if current["job_id"] == row["job_id"] and current["resource_state"] == "unknown":
                 raise JobError("unresolved_prior_attempt")
             if not current["parent_job_id"]:
                 return
-            child = current
             current = await self._row(tx, current["parent_job_id"])
-            # Previously admitted independent work has its own execution
-            # authority. An uncertain creator's *model* request is a separate
-            # action, not authority to replay it or to cancel that child. A
-            # persistent subtree stop still applies at every ancestor above.
-            independent_creator = bool(current is not None and current["kind"] == "send" and
-                current["execution_role"] == "main" and current["status"] == "model_closed" and
-                child["kind"] in ("workflow", "subagent") and child["control_owner_job_id"] is None and
-                not child["blocks_completion"] and child["completion_scope_job_id"] == child["job_id"])
         raise JobError("job_depth_exceeded")
 
     async def _control_owners(self, tx, row):
@@ -376,22 +368,14 @@ class JobManager:
             owner = await self._row(tx, owner_id)
             if owner is None:
                 raise JobError("invalid_control_owner")
-            if (current["control_owner_generation"], current["control_owner_executor_id"],
-                    current["control_owner_boot_id"]) != (owner["generation"], owner["executor_id"], owner["boot_id"]):
-                raise JobError("stale_parent_execution")
-            self._execution_open(owner)
-            from .completion_windows import require_time
-            await require_time(self, tx, owner)
-            from .executor_registry import check_execution
-            await check_execution(self, tx, owner)
+            if owner["cancel_requested_at"] is not None:
+                raise JobError("cancel_requested")
             current = owner
         raise JobError("job_depth_exceeded")
 
     def _execution_open(self, row):
         if row["intake"] != "open":
             raise JobError("job_intake_closed")
-        if row["lease_until_ms"] is None or row["lease_until_ms"] <= self.now():
-            raise JobError("execution_lease_expired")
         if row["status"] not in ("running", "waiting", "settling"):
             raise JobError("execution_not_running")
 
@@ -467,7 +451,7 @@ class JobManager:
                 deferred[lease.job_id] = (resource_state, now, row["version"], lease.generation)
             else:
                 await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
-                    "resource_state=?,lease_until_ms=NULL,version=version+1,updated_at=? WHERE job_id=?", (resource_state, now, lease.job_id))
+                    "resource_state=?,version=version+1,updated_at=? WHERE job_id=?", (resource_state, now, lease.job_id))
             closed = json.loads(_json({"generation": lease.generation, "evidence": evidence_data,
                                        "resource_state": resource_state}))
             await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), ("model_closed_" + lease.job_id, lease.job_id, "model_closed", row["version"]+1,
@@ -477,7 +461,7 @@ class JobManager:
             await seal(self, tx, row, model={"event_id": "model_closed_" + lease.job_id,
                                              "hash": _hash(closed), "payload": closed})
             closed_row = {**row, "status": "model_closed", "intake": "closed", "resource_state": resource_state,
-                          "lease_until_ms": None, "version": row["version"] + 1, "updated_at": now}
+                          "version": row["version"] + 1, "updated_at": now}
             tx.remember_row(self.jobs, "job_id", lease.job_id, closed_row)
             result = _record(closed_row)
             if control is not None:
@@ -522,7 +506,7 @@ class JobManager:
                     # the model exit still commits in this same transaction.
                     state, now, version, generation = deferred[lease.job_id]
                     changed = await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
-                        "resource_state=?,lease_until_ms=NULL,version=version+1,updated_at=? "
+                        "resource_state=?,version=version+1,updated_at=? "
                         "WHERE job_id=? AND version=? AND generation=?", (state, now, lease.job_id, version, generation))
                     if changed != 1:
                         raise JobError("stale_execution")
@@ -570,22 +554,6 @@ class JobManager:
             from .workflow_controller import validate_dispatch
             await validate_dispatch(self, tx, row)
 
-    async def renew_execution(self, actor: JobActor, lease: JobLease, *, lease_ms: int = 30000) -> None:
-        if isinstance(lease_ms, bool) or not isinstance(lease_ms, int) or not 1 <= lease_ms <= 300000:
-            raise JobError("invalid_lease_duration")
-        async with self._write() as tx:
-            from .task_runtime import _OWNER, _SEND
-            owned = any(binding is not None and binding.runtime.manager is self and binding.lease == lease
-                        and not binding.stop_renewal.is_set() for binding in (_SEND.get(), _OWNER.get()))
-            if not owned:
-                await self._fence(tx, actor, lease)  # Cold control verifies originals at entry.
-            from .execution_renewal import renew
-            cancelled = await renew(self, tx, actor, lease, lease_ms)
-            if cancelled:
-                raise JobError("cancel_requested")
-            if cancelled is None:
-                await self._fence(tx, actor, lease)  # Fault-only precise classification.
-                raise JobError("execution_renewal_conflict")
 
     async def bind_session(self, actor: JobActor, job_id: str, session_id: str) -> JobRecord:
         """Bind an admitted subagent to its actual child before any model call."""
@@ -1005,14 +973,11 @@ class JobManager:
         await tx.insert_job(job_id, root, f"INSERT INTO {self.jobs} (job_id,parent_job_id,root_job_id,tenant_id,principal_id,"
             "session_id,created_by_session_id,kind,title,completion_scope_job_id,blocks_completion,"
             "status,version,generation,intake,resource_state,supervision_status,result_status,created_at,updated_at,"
-            "parent_generation,parent_executor_id,parent_boot_id,execution_role,control_owner_job_id,"
-            "control_owner_generation,control_owner_executor_id,control_owner_boot_id) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, parent.job_id if parent else None,
+            "execution_role,control_owner_job_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, parent.job_id if parent else None,
             root, actor.tenant_id, actor.principal_id, session_id, actor.session_id, kind, title,
             scope, 0 if independent or parent is None else 1, "queued", 1, 0, "open", "not_started", "open", "none", now, now,
-            parent.generation if parent else None, parent.executor_id if parent else None, parent.boot_id if parent else None,
-            role, owner["job_id"] if owner else None, owner["generation"] if owner else None,
-            owner["executor_id"] if owner else None, owner["boot_id"] if owner else None))
+            role, owner["job_id"] if owner else None))
         if parent is None:
             # The root upsert serializes concurrent first registrations of the
             # same origin. Read the immutable creation only after that lock.
@@ -1027,18 +992,12 @@ class JobManager:
                 return JobRegistration(_record(current), _operation(old), True)
         tx.remember_row(self.jobs, "job_id", job_id, {
             "job_id": job_id, "parent_job_id": parent.job_id if parent else None, "root_job_id": root,
-            "parent_generation": parent.generation if parent else None,
-            "parent_executor_id": parent.executor_id if parent else None,
-            "parent_boot_id": parent.boot_id if parent else None,
             "control_owner_job_id": owner["job_id"] if owner else None,
-            "control_owner_generation": owner["generation"] if owner else None,
-            "control_owner_executor_id": owner["executor_id"] if owner else None,
-            "control_owner_boot_id": owner["boot_id"] if owner else None,
             "tenant_id": actor.tenant_id, "principal_id": actor.principal_id, "session_id": session_id,
             "created_by_session_id": actor.session_id, "kind": kind, "execution_role": role, "title": title,
             "completion_scope_job_id": scope, "blocks_completion": 0 if independent or parent is None else 1,
             "status": "queued", "version": 1, "generation": 0, "executor_id": None, "boot_id": None,
-            "executor_key": None, "lease_until_ms": None, "cancel_requested_at": None, "cancel_reason": None,
+            "executor_key": None, "cancel_requested_at": None, "cancel_reason": None,
             "intake": "open", "resource_state": "not_started", "supervision_status": "open",
             "result_status": "none", "outcome": None, "result_json": None, "created_at": now, "updated_at": now})
         payload = {"job_id": job_id, "status": "queued"}
@@ -1064,11 +1023,9 @@ class JobManager:
 
 
     async def claim_job(self, actor: JobActor, job_id: str, *, executor_id: str, boot_id: str,
-                        expected_version: int, lease_ms: int = 30000) -> JobLease:
+                        expected_version: int) -> JobLease:
         if not all(isinstance(v, str) and 0 < len(v) <= 64 for v in (executor_id, boot_id)):
             raise JobError("invalid_executor")
-        if isinstance(lease_ms, bool) or not isinstance(lease_ms, int) or not 1 <= lease_ms <= 300000:
-            raise JobError("invalid_lease_duration")
         async with self._write() as tx:
             row = await self._authorize(tx, actor, job_id)
             await self._supervision_barriers(tx, row)
@@ -1085,9 +1042,8 @@ class JobManager:
             from .tool_call_abort import require_claim
             await require_claim(self, tx, row)
             from .executor_registry import ExecutorIdentity, require_accepting
-            inherited = await self._row(tx, row["control_owner_job_id"] or row["parent_job_id"]) if row["parent_job_id"] else None
             executor = await require_accepting(self, tx, ExecutorIdentity(actor.tenant_id, actor.principal_id, executor_id, boot_id),
-                required=row["executor_key"] is not None or inherited is not None and inherited["executor_key"] is not None)
+                required=row["executor_key"] is not None)
             if row["kind"] == "workflow_node":
                 workflow = await self._row(tx, row["parent_job_id"])
                 from .workflow_controller import for_node, has_binding
@@ -1102,9 +1058,13 @@ class JobManager:
             claimed = {"status": "running", "version": row["version"] + 1, "generation": generation,
                        "executor_id": executor_id, "boot_id": boot_id,
                        "executor_key": executor["executor_key"] if executor else None,
-                       "lease_until_ms": now + lease_ms, "resource_state": "running", "updated_at": now}
-            await tx.write_job(job_id, f"UPDATE {self.jobs} SET status='running',version=version+1,generation=?,"
-                "executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,resource_state='running',updated_at=? WHERE job_id=?", (generation, executor_id, boot_id, claimed["executor_key"], claimed["lease_until_ms"], now, job_id))
+                       "resource_state": "running", "updated_at": now}
+            changed = await tx.write_job(job_id, f"UPDATE {self.jobs} SET status='running',version=version+1,generation=?,"
+                "executor_id=?,boot_id=?,executor_key=?,resource_state='running',updated_at=? "
+                "WHERE job_id=? AND generation=0 AND version=? AND status='queued' AND outcome IS NULL",
+                (generation, executor_id, boot_id, claimed["executor_key"], now, job_id, expected_version))
+            if changed != 1:
+                raise JobError("job_claim_conflict")
             tx.remember_row(self.jobs, "job_id", job_id, {**row, **claimed})
             from .execution_membership import note_first_claim, start
             if generation == 1:
@@ -1251,7 +1211,7 @@ class JobManager:
             from .result_payloads import canonical
             payload = canonical(payload, effective, saved)
             await tx.write_job(job_id, f"UPDATE {self.jobs} SET status='settling',outcome=?,result_json=?,resource_state='stopped',"
-                "intake='closed',lease_until_ms=NULL,result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?", (effective, _json(saved), self.now(), job_id), obligations=True)
+                "intake='closed',result_status='pending_delivery',version=version+1,updated_at=? WHERE job_id=?", (effective, _json(saved), self.now(), job_id), obligations=True)
             await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (event_id, job_id, "result", row["version"]+1, _json(payload), "pending_delivery", self.now()))
             return saved
 
@@ -1340,7 +1300,7 @@ class JobManager:
         from .result_payloads import canonical
         payload = canonical(payload, effective_outcome, effective_result)
         await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET status=?,outcome=?,result_json=?,"
-            "result_status='pending_delivery',resource_state=?,intake='closed',lease_until_ms=NULL,"
+            "result_status='pending_delivery',resource_state=?,intake='closed',"
             "version=version+1,updated_at=? WHERE job_id=?", ("model_closed" if exited_model else "settling", effective_outcome, _json(effective_result), resource_state, self.now(), lease.job_id), obligations=True)
         await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'payload_json', 'delivery_status', 'created_at'), (event_id, lease.job_id, "result", int(row["version"]) + 1, _json(payload), "pending_delivery", self.now()))
         from .execution_membership import seal

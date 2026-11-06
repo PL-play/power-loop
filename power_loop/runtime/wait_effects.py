@@ -272,8 +272,8 @@ async def _prepare_owner_sources(manager, actor, owner_lease, *, check_result=Fa
 
 
 async def _owner_effects(manager, tx, actor, owner):
-    rows = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE control_owner_job_id=? AND control_owner_generation=? AND kind='timer'",
-        (owner["job_id"], owner["generation"]))
+    rows = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE control_owner_job_id=? AND kind='timer'",
+        (owner["job_id"],))
     for row in rows:
         creation = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND action='create' AND event_type='operation'", (row["job_id"],))
         initial = waits._object(creation["payload_json"]) if creation else {}

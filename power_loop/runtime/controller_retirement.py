@@ -130,4 +130,4 @@ async def _persist(runtime, binding):
         # already fence closed intake and unknown resources; no new permission
         # rule or inferred physical-exit proof is needed.
         await tx.write_job(row['job_id'], f"UPDATE {manager.jobs} SET intake='closed',status='settling',"
-                         "resource_state='unknown',lease_until_ms=NULL,version=version+1,updated_at=? WHERE job_id=?", (manager.now(), row['job_id']))
+                         "resource_state='unknown',version=version+1,updated_at=? WHERE job_id=?", (manager.now(), row['job_id']))

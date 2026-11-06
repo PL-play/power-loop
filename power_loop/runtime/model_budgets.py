@@ -735,11 +735,11 @@ async def _prepare_unfrozen_release(runtime, actor, job_id, attempt_id):
                                 (job_id, generation))
         summary = json.loads(head['summary_json'])
         if not summary['closed']:
-            # A live lease is never interpreted as a crashed owner. Fence the
-            # old job and checkpoint in this transaction before any API release.
+            # Session recovery must have interrupted this job first. Fence its
+            # version and checkpoint before releasing the unused reservation.
             changed = await tx.write_job(job_id, f"UPDATE {manager.jobs} SET intake='closed',version=version+1 "
-                "WHERE job_id=? AND generation=? AND version=? AND lease_until_ms<=?",
-                (job_id, generation, job['version'], manager.now()))
+                "WHERE job_id=? AND generation=? AND version=? AND status='interrupted'",
+                (job_id, generation, job['version']))
             if changed != 1:
                 raise JobError('execution_reconciliation_requires_quiescence')
             identity = ExecutionIdentity(manager.store.store_id, job_id, generation,

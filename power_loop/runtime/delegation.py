@@ -409,9 +409,6 @@ async def start(loop, spec: AgentSpec, task: str, *, on_complete=None, finalize=
     _retain(run.task)
     if runtime is not None:
         runtime.track_task(run.task, cancel_token=run.token, job_id=registration.job.job_id)
-    else:
-        from .session_ownership import track_owned_task
-        track_owned_task(run.task)
     sid = await asyncio.shield(ready)
     receipt = {"session_id": sid, "run_id": run.run_id, "mode": "create", "status": "queued"}
     if registration is not None:
@@ -511,8 +508,6 @@ async def nudge(loop, sid: str, message: str, *, on_complete=None, finalize=None
 
         run.task = asyncio.create_task(execute(), name="subagent-" + run.run_id)
         _retain(run.task)
-        from .session_ownership import track_owned_task
-        track_owned_task(run.task)
         return {"session_id": sid, "run_id": run.run_id, "mode": "continue", "status": "queued"}
 
 

@@ -22,7 +22,7 @@ class RunningAgent:
         self.executions = {}
         factory = RegistryRuntimeFactory()
         async def build(descriptor, context):
-            self.executions[context.input_ref] = context.task
+            self.executions[context.input_ref] = asyncio.current_task()
             return ExecutionEnvironment(model, registry, self.config, hooks=hooks, task_runtime=task_runtime)
         factory.register('fixture.agent@1', build)
         self.runtime = Runtime(store=store, factory=factory, node_id='fixture', boot_id='boot',

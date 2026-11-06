@@ -137,6 +137,8 @@ class ControlTransaction(ControlReadView):
         suffix = '' if self.dialect.name == 'sqlite' else ' FOR UPDATE'
         root = await self._tx.fetchone(f'SELECT root.* FROM {self._jobs} root '
             f'WHERE root.job_id=(SELECT root_job_id FROM {self._jobs} WHERE job_id=?)'+suffix, (job_id,))
+        from .session_ownership import require_current_ownership
+        require_current_ownership(self._manager.store)
         if root is None:
             return False
         self.root_job_id = root['job_id']
@@ -204,15 +206,6 @@ class ControlTransaction(ControlReadView):
         elif await self.job_row(job_id) is not None:
             return
         raise JobError('task_tree_scope_mismatch')
-
-    async def renew_job(self, job_id, sql, params):
-        """A lease update has the same root scope as other job writes."""
-        await self.require_job(job_id)
-        from .session_ownership import require_current_ownership
-        require_current_ownership(self._manager.store)
-        self.touch_job(job_id)
-        self.writes += 1
-        return await self._tx.execute_flag(sql, params)
 
     async def write_executor(self, executor_key, sql, params=()):
         self._memo.pop((f"SELECT * FROM {self._executors} WHERE executor_key=?", (executor_key,)), None)

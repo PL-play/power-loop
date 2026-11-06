@@ -190,10 +190,8 @@ async def _read(manager, tx, actor, job_id):
             or job["parent_job_id"] != binding["source"]["job_id"] or not job["blocks_completion"]
             or job["root_job_id"] != binding["root_job_id"] or job["completion_scope_job_id"] != owner["job_id"]
             or binding["completion_scope_job_id"] != owner["job_id"]
-            or (job["control_owner_job_id"], job["control_owner_generation"], job["control_owner_executor_id"], job["control_owner_boot_id"])
-                != (owner["job_id"], owner["generation"], owner["executor_id"], owner["boot_id"])
-            or (job["parent_generation"], job["parent_executor_id"], job["parent_boot_id"])
-                != (binding["source"]["generation"], binding["source"]["executor_id"], binding["source"]["boot_id"])):
+            or job["control_owner_job_id"] != owner["job_id"]
+            or job["parent_job_id"] != binding["source"]["job_id"]):
         raise JobError("wait_evidence_corrupt")
     fingerprint = _hash(["timer", job["title"], job["session_id"], job["parent_job_id"], False,
                          data["request"], call])
@@ -246,8 +244,8 @@ async def has_required_wait(manager, tx, actor, owner):
     """Managed waits cannot be bypassed by the legacy optional success check."""
     timers = await tx.fetchall(f"SELECT j.job_id,e.payload_json FROM {manager.jobs} j LEFT JOIN {manager.events} e ON e.job_id=j.job_id "
         "AND e.event_type='operation' AND e.action='create' "
-        "WHERE j.control_owner_job_id=? AND j.control_owner_generation=? AND j.kind='timer'",
-        (owner["job_id"], owner["generation"]))
+        "WHERE j.control_owner_job_id=? AND j.kind='timer'",
+        (owner["job_id"],))
     for timer in timers:
         data = _object(timer["payload_json"])
         if data.get("job_id") != timer["job_id"]:

@@ -289,8 +289,8 @@ async def require_ready(manager,tx,owner):
         return
     declared = await enabled(manager,tx,owner)
     from .pending_calls import ERROR, SNAPSHOT, _closed, negative_review_references, require_disposition
-    rows = await tx.fetchall(f"SELECT j.* FROM {manager.jobs} j WHERE j.kind='send' AND j.control_owner_job_id=? AND j.control_owner_generation=?",
-                             (owner['job_id'],owner['generation']))
+    rows = await tx.fetchall(f"SELECT j.* FROM {manager.jobs} j WHERE j.kind='send' AND j.control_owner_job_id=?",
+                             (owner['job_id'],))
     if declared is None:
         for source in rows:
             creation = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND action='create'",(source['job_id'],))

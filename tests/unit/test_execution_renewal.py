@@ -1,278 +1,143 @@
-"""Conditional heartbeat fencing and the unavoidable cost of finite leases."""
-from __future__ import annotations
-
-import json
-import os
+"""Session renewal is the only execution clock; hooks cannot defeat its loss."""
+import asyncio
 from contextlib import asynccontextmanager
-from dataclasses import replace
-from pathlib import Path
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, StatefulAgentLoop
-from power_loop.runtime.control_runtime import current
-from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.task_runtime import _SEND, Execution, TaskRuntime
+from power_loop import (
+    AgentHooks,
+    AgentLoopConfig,
+    ExecutionEnvironment,
+    HookDirective,
+    HookPoint,
+    LLMResponse,
+    LLMService,
+    RegistryRuntimeFactory,
+    Runtime,
+    SessionLeaseLost,
+    ToolDefinition,
+)
+from power_loop.runtime.pricing import Free
+from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
+from power_loop.tools.registry import ToolRegistry
+from tests.runtime_fixture import RunningAgent
 
-from .test_job_registry_192 import registry_store, runtime
-from .test_nudge_runtime_192 import issue_nudge
-from .test_send_sql_profile import Profiled, _counts
-from .test_subagent_resume_192 import ready
-from .test_task_runtime_192 import finish, managed
+from .test_job_registry_192 import registry_store
+from .test_runtime_messaging_203 import fixture
 
-__all__ = ["registry_store", "runtime", "ready", "managed"]
+__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-def owner(case):
-    _store, manager, actor, _root, lease, _connect, _now = case
-    task_runtime = TaskRuntime(manager, tenant_id=actor.tenant_id, principal_id=actor.principal_id,
-                              executor_id=lease.executor_id, boot_id=lease.boot_id)
-    return task_runtime, Execution(task_runtime, actor, lease)
-
-
-async def test_owned_renewal_has_one_update_and_one_root_lock_even_at_the_same_time(runtime):
-    task_runtime, binding = owner(runtime)
-    manager = task_runtime.manager
-    async with task_runtime.execution(binding, initialize_model=False):
-        original = manager.db
-        manager.db = measured = Profiled(original)
+class WaitingModel(LLMService):
+    def __init__(self):
+        self.entered, self.cancelled, self.release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        self.calls = 0
+    async def complete(self, request, **kwargs):
+        self.calls += 1
+        self.entered.set()
         try:
-            for _ in range(3):
-                measured.records.clear()
-                await manager.renew_execution(binding.actor, binding.lease)
-                assert len(measured.records) == 2
-                assert measured.records[0]["sql"].startswith("SELECT root.*")
-                assert measured.records[1]["sql"].startswith("WITH RECURSIVE lineage")
-        finally:
-            manager.db = original
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        return LLMResponse(raw_text='done')
+    def stream(self, request):
+        raise AssertionError('nonstream test')
+    async def close(self):
+        pass
 
 
-@pytest.mark.parametrize("fault", ["expired", "cancelled", "actor", "tenant"])
-async def test_owned_renewal_cannot_erase_a_durable_barrier(runtime, fault):
-    task_runtime, binding = owner(runtime)
-    store, manager, actor, root, lease, connect, clock = runtime
-    async with task_runtime.execution(binding, initialize_model=False):
-        if fault == "expired":
-            clock[0] += 30001
-        elif fault == "cancelled":
-            await JobManager(await connect(), now_ms=manager.now).request_cancel(actor, root.job.job_id, system_key="stop", reason="stop")
-        other = replace(actor, session_id=await store.create_session()) if fault == "actor" else (
-            replace(actor, tenant_id="foreign") if fault == "tenant" else actor)
-        before = await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (lease.job_id,))
-        with pytest.raises(JobError, match={"expired": "expired", "cancelled": "cancel_requested", "actor": "access_denied", "tenant": "access_denied"}[fault]):
-            await manager.renew_execution(other, lease)
-        assert await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (lease.job_id,)) == before
-
-
-async def test_ancestor_stop_is_returned_by_the_same_child_update(runtime):
-    task_runtime, _binding = owner(runtime)
-    _store, manager, actor, root, parent, connect, _clock = runtime
-    registered = await manager.register_job(actor, kind="subagent", parent=parent, system_key="owned-child")
-    lease = await manager.claim_job(actor, registered.job.job_id, executor_id=parent.executor_id, boot_id=parent.boot_id, expected_version=1)
-    binding = Execution(task_runtime, actor, lease)
-    async with task_runtime.execution(binding, initialize_model=False):
-        await JobManager(await connect(), now_ms=manager.now).request_cancel(actor, root.job.job_id, system_key="stop-tree", reason="stop")
-        original = manager.db
-        manager.db = measured = Profiled(original)
-        try:
-            with pytest.raises(JobError, match="cancel_requested"):
-                await manager.renew_execution(actor, lease)
-            assert len(measured.records) == 2
-        finally:
-            manager.db = original
-
-
-async def test_owned_renewal_does_not_extend_the_original_completion_window(runtime, monkeypatch):
-    from power_loop.runtime import completion_windows
-    monkeypatch.setattr(completion_windows, "DEFAULT_TIMEOUT_MS", 1000)
-    task_runtime, _binding = owner(runtime)
-    _store, manager, actor, _root, parent, _connect, clock = runtime
-    registered = await manager.register_job(actor, kind="subagent", parent=parent, independent=True,
-        system_key="finite-owner", request={completion_windows.PROTOCOL: 1})
-    lease = await manager.claim_job(actor, registered.job.job_id, executor_id=parent.executor_id,
-                                   boot_id=parent.boot_id, expected_version=1, lease_ms=300000)
-    binding = Execution(task_runtime, actor, lease)
-    async with task_runtime.execution(binding):
-        clock[0] += 1001
-        before = await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (lease.job_id,))
-        with pytest.raises(JobError, match="owner_completion_deadline_exceeded"):
-            await manager.renew_execution(actor, lease)
-        assert await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (lease.job_id,)) == before
-
-
-async def test_owned_job_renewal_requires_its_still_live_original_executor(registry_store):
-    store, _connect = registry_store
-    clock = [1_000_000]
-    manager = JobManager(store, now_ms=lambda: clock[0])
-    task_runtime = TaskRuntime(manager, tenant_id="executor-renewal", principal_id="host",
-        executor_id="original", boot_id="boot", lease_ms=300000, boot_contract_hash="a"*64)
-    await task_runtime.start()
-    actor = task_runtime.actor(await store.create_session())
-    registered = await manager.register_job(actor, kind="send", session_id=actor.session_id, system_key="original")
-    binding = await task_runtime.claim(actor, registered)
+@asynccontextmanager
+async def running(store, coordinator, *, hooks=None):
+    model, factory = WaitingModel(), RegistryRuntimeFactory()
+    async def build(descriptor, context):
+        assert context.owner_epoch > 0 and context.owner_token
+        return ExecutionEnvironment(model, ToolRegistry(), AgentLoopConfig(compactor=None))
+    factory.register('test.agent@1', build)
+    runtime = Runtime(store=store, factory=factory, node_id='test', coordinator=coordinator,
+        session_lease_ttl_s=.3, recovery_interval_s=None, hooks=hooks, hook_timeout_s=.03)
+    _, target, actor = await fixture(store)
+    await runtime.worker.start()
     try:
-        async with task_runtime.execution(binding):
-            clock[0] += 299000
-            await manager.renew_execution(actor, binding.lease, lease_ms=300000)
-            clock[0] += 1001  # Job lease is live; the original executor lease has expired.
-            before = await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (binding.lease.job_id,))
-            with pytest.raises(JobError, match="executor_lease_expired"):
-                await manager.renew_execution(actor, binding.lease)
-            assert await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (binding.lease.job_id,)) == before
+        await runtime.client.send(target, 'start', message_id='input', actor=actor)
+        await asyncio.wait_for(model.entered.wait(), 5)
+        yield runtime, model, target, actor
     finally:
-        await manager.close_model_execution(actor, binding.lease, evidence={"exit": "completed"})
-        await task_runtime.shutdown(timeout_s=1)
+        model.release.set()
+        await runtime.worker.shutdown(timeout_s=2, cancel_running=True)
+        await runtime.client.aclose()
+        await runtime.transport.aclose()
 
 
-@pytest.mark.parametrize("committed", [False, True])
-async def test_renewal_commit_failure_and_unknown_ack_retry_the_same_lease(runtime, monkeypatch, committed):
-    task_runtime, binding = owner(runtime)
-    _store, manager, actor, _root, lease, _connect, clock = runtime
-    async with task_runtime.execution(binding, initialize_model=False):
-        original = manager.db.transaction
-
-        @asynccontextmanager
-        async def failed():
-            async with original() as tx:
-                yield tx
-                if not committed:
-                    raise OSError("renewal commit failed")
-            raise OSError("renewal acknowledgement lost")
-
-        before = await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (lease.job_id,))
-        with monkeypatch.context() as patch:
-            patch.setattr(manager.db, "transaction", failed)
-            with pytest.raises(OSError, match="renewal"):
-                await manager.renew_execution(actor, lease, lease_ms=60000)
-        after = await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (lease.job_id,))
-        assert after["lease_until_ms"] == (clock[0]+60000 if committed else before["lease_until_ms"])
-        await manager.renew_execution(actor, lease, lease_ms=60000)
-        final = await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE job_id=?", (lease.job_id,))
-        assert final == {**before, "lease_until_ms": clock[0]+60000, "updated_at": clock[0]}
-
-
-async def test_old_executor_cannot_renew_after_actual_generation_takeover(ready, monkeypatch):
-    c = ready
-    await issue_nudge(c.fixture, monkeypatch)
-    try:
-        assert (await c.manager.get_job(c.runtime.actor(c.parent), c.old.job_id)).generation == 2
-        before = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.old.job_id,))
-        stale = Execution(c.runtime, c.runtime.actor(c.sid), c.old_lease)
-        token = _SEND.set(stale)
-        try:
-            with pytest.raises(JobError, match="stale_execution"):
-                await c.manager.renew_execution(stale.actor, stale.lease)
-        finally:
-            _SEND.reset(token)
-        assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.jobs} WHERE job_id=?", (c.old.job_id,)) == before
-    finally:
-        c.model.release.set()
-        await finish(c.fixture)
-
-
-async def test_finite_durable_leases_require_writes_as_send_time_advances(registry_store, record_property):
-    async def measure(ticks):
-        store = await registry_store[1](suffix=f"e{ticks}_")
-        original = store._db
-        store._db = measured = Profiled(original)
-        clock = [1_000_000]
-        manager = JobManager(store, now_ms=lambda: clock[0])
-        task_runtime = TaskRuntime(manager, tenant_id="elapsed", principal_id="host", executor_id="executor", boot_id="boot",
-                                   lease_ms=300000, boot_contract_hash="a"*64)
-
-        class Model(LLMService):
-            ticks = 0
-            calls = 0
-
-            async def complete(self, request, **kwargs):
-                self.calls += 1
-                binding = _SEND.get()
-                for _ in range(self.ticks):
-                    from power_loop.runtime import executor_registry
-                    clock[0] += 100000  # The configured five-minute leases renew at TTL/3.
-                    lifecycle = task_runtime._lifecycle
-                    receipt = await executor_registry.heartbeat(manager, lifecycle.identity,
-                        expected_version=lifecycle._version, lease_ms=300000)
-                    lifecycle._version = receipt["executor"]["version"]
-                    start = len(measured.records)
-                    await manager.renew_execution(binding.actor, binding.lease, lease_ms=300000)
-                    assert len(measured.records)-start == 2
-                    current(binding).renew(clock[0]+300000)
-                return LLMResponse(raw_text="original response")
-
-            def stream(self, request):
-                raise AssertionError("complete only")
-
-            async def close(self):
-                pass
-
-        model = Model()
-        loop = StatefulAgentLoop(llm=model, store=store, task_runtime=task_runtime,
-            config=AgentLoopConfig(compactor=None, max_rounds=2, delegation_policy="single_level"))
-        sid = await loop.new_session()
-        try:
-            assert (await loop.send("warm", sid)).status == "completed"
-            measured.records.clear()
-            measured.tx_sites.clear()
-            model.ticks = ticks
-            assert (await loop.send("original long send", sid)).status == "completed"
-            assert model.calls == 2
-            renewals = [record for record in measured.records if record["sql"].startswith("WITH RECURSIVE lineage")]
-            assert len(renewals) == ticks
-            return _counts(measured.records, measured.tx_sites)
-        finally:
-            await task_runtime.shutdown(timeout_s=1)
-            await loop.aclose(drain_timeout_s=.1)
-            store._db = original
-
-    short, long = await measure(0), await measure(30)
-    assert long["control"] >= short["control"]+60
-    assert long["control_tx"] >= short["control_tx"]+30
-    record_property("finite_lease_elapsed_sql", json.dumps({"0s": short, "3000s": long}))
-    target = os.environ.get("POWER_LOOP_SQL_PROFILE")
-    if target:
-        Path(target).mkdir(parents=True, exist_ok=True)
-        (Path(target) / f"elapsed-{registry_store[0]._db.dialect.name}.json").write_text(
-            json.dumps({"0s": short, "3000s": long, "job_renewals": 30, "executor_renewals": 30,
-                        "ttl_ms": 300000, "cadence_ms": 100000, "sql_per_job_renewal": 2}, indent=2)+"\n")
-
-
-async def test_checkpoint_interval_does_not_drive_execution_lease_writes(registry_store, monkeypatch):
-    import asyncio
-
-    from power_loop.runtime.execution_state import CheckpointPolicy
-
+async def test_only_session_renews_without_writing_job_heartbeats(registry_store):
     store, _ = registry_store
-    manager = JobManager(store)
-    runtime = TaskRuntime(manager, tenant_id='renewal-frequency', principal_id='host',
-        executor_id='executor', boot_id='boot', lease_ms=3000,
-        checkpoint_policy=CheckpointPolicy(interval_s=.05))
-    renewals = []
-    original = manager.renew_execution
+    class Counting(MemorySessionOwnershipCoordinator):
+        renewals = 0
+        async def renew(self, lease, **kwargs):
+            self.renewals += 1
+            return await super().renew(lease, **kwargs)
+    coordinator = Counting()
+    async with running(store, coordinator) as (runtime, model, target, actor):
+        before = await store._db.fetchall(f'SELECT * FROM {store.table_prefix}jobs')
+        await asyncio.sleep(.45)
+        after = await store._db.fetchall(f'SELECT * FROM {store.table_prefix}jobs')
+        assert after == before and coordinator.renewals >= 2
+        assert not model.cancelled.is_set() and model.calls == 1
 
-    async def counted(*args, **kwargs):
-        renewals.append(1)
-        return await original(*args, **kwargs)
 
-    monkeypatch.setattr(manager, 'renew_execution', counted)
+@pytest.mark.parametrize('failure', ['false', 'exception', 'timeout'])
+async def test_renewal_failure_cancels_before_broken_lost_hook(registry_store, failure, caplog):
+    store, _ = registry_store
+    class Broken(MemorySessionOwnershipCoordinator):
+        broken = False
+        async def renew(self, lease, **kwargs):
+            if not self.broken:
+                return await super().renew(lease, **kwargs)
+            if failure == 'exception':
+                raise OSError('shared coordinator unavailable')
+            if failure == 'timeout':
+                await asyncio.Event().wait()
+            return False
+    hooks, noticed = AgentHooks(), asyncio.Event()
+    async def lost(context):
+        noticed.set()
+        await asyncio.Event().wait()
+    hooks.register(HookPoint.EXECUTION_LOST, lost)
+    async with running(store, Broken(), hooks=hooks) as (runtime, model, target, actor):
+        runtime.coordinator.broken = True
+        await asyncio.wait_for(model.cancelled.wait(), 2)
+        await asyncio.wait_for(noticed.wait(), 2)
+        await asyncio.sleep(.06)
+        assert model.calls == 1
+        assert 'execution notification failed' in caplog.text
+        assert not runtime.coordinator._leases
 
-    class SlowModel(LLMService):
+
+@pytest.mark.parametrize('directive', [HookDirective.SKIP, HookDirective.SHORT_CIRCUIT])
+async def test_tool_error_hook_never_replaces_or_retries_lease_loss(registry_store, directive):
+    store, _ = registry_store
+    calls, invoked = [], []
+    class Model(WaitingModel):
         async def complete(self, request, **kwargs):
-            await asyncio.sleep(.15)
-            return LLMResponse(raw_text='done')
-
-        def stream(self, request):
-            raise AssertionError('nonstream fixture')
-
-        async def close(self):
-            return None
-
-    loop = StatefulAgentLoop(llm=SlowModel(), store=store, task_runtime=runtime,
-        config=AgentLoopConfig(compactor=None, delegation_policy='single_level'))
+            self.calls += 1
+            return LLMResponse(raw_text='', tool_calls=[{'id': 'lost', 'type': 'function',
+                'function': {'name': 'lose', 'arguments': '{}'}}])
+    async def lose():
+        calls.append('tool')
+        raise SessionLeaseLost('test')
+    def replace_error(ctx):
+        invoked.append(ctx.error)
+        ctx.output = 'success'
+        return directive
+    hooks, registry, model = AgentHooks(), ToolRegistry(), Model()
+    hooks.register(HookPoint.TOOL_ERROR, replace_error)
+    registry.register(ToolDefinition('lose', 'lose permission', input_schema={'type': 'object', 'properties': {}},
+                                     pricing=Free('test')), lose)
+    agent = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None), hooks=hooks).start()
     try:
-        sid = await loop.new_session()
-        assert (await loop.send('slow call', sid)).status == 'completed'
-        assert not renewals  # Frequent checkpoints must not turn into heartbeat writes.
+        with pytest.raises(SessionLeaseLost):
+            await agent.send('go')
+        assert calls == ['tool'] and not invoked and model.calls == 1
     finally:
-        await loop.aclose(drain_timeout_s=.1)
+        await agent.aclose()

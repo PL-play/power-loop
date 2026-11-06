@@ -66,16 +66,7 @@ def _owners(job, lineage):
         if key is None:
             return result
         owner = lineage.get(key)
-        if (
-            key in seen
-            or owner is None
-            or (
-                current["control_owner_generation"],
-                current["control_owner_executor_id"],
-                current["control_owner_boot_id"],
-            )
-            != (owner["generation"], owner["executor_id"], owner["boot_id"])
-        ):
+        if key in seen or owner is None:
             raise JobError("budget_scope_lineage_changed")
         seen.add(key)
         result.append(owner)

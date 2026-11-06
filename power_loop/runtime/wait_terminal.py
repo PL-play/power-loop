@@ -22,7 +22,7 @@ def terminal_id(manager, job_id, creation_id):
 async def admission(manager, tx, actor, job_id):
     job, creation, saved = await waits._read(manager, tx, actor, job_id)
     if (type(job["generation"]) is not int or job["generation"] != 0
-            or any(job[k] is not None for k in ("executor_id", "boot_id", "executor_key", "lease_until_ms"))):
+            or any(job[k] is not None for k in ("executor_id", "boot_id", "executor_key"))):
         raise JobError("wait_unstarted_evidence_required")
     events = await tx.fetchall(f"SELECT event_type,action FROM {manager.events} WHERE job_id=?", (job_id,))
     if any(e["event_type"] not in _EVENTS or e["event_type"] == "operation" and e["action"] not in ("create", "wait_decision", "stop") for e in events):
@@ -89,7 +89,7 @@ async def negative_owner_exit(manager, tx, actor, original, kind):
                 claimed.add((child["job_id"], child["generation"]))
                 ids.append(edge["event_id"])
                 following.append((child, scope["lease"]))
-            owned = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE control_owner_job_id=? AND control_owner_generation=?", key)
+            owned = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE control_owner_job_id=?", (key[0],))
             for child in owned:
                 if child["generation"] == 0 and child["kind"] == "timer":
                     # Another logical wait has no executing resource either.

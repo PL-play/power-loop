@@ -89,14 +89,21 @@ returns those counters; a live round reads detailed state only after a change.
 Final completion performs a fresh signal check. Public getters and stored
 verification read durable state rather than reuse a live turn's snapshot.
 
-Session ownership is provided by `SessionOwnershipCoordinator`; the default
-implementation is in-memory. Shared implementations belong to the application
-and must pass the importable `power_loop.testing.SessionOwnershipContractTests`.
-All entry points acquire ownership before accepting input. Loss cancels local
-send/child/workflow tasks. A fresh owner validates the message cache against
-`next_seq`, repairs pending tools, and abandons interrupted task execution.
-The write condition uses the send's observed `next_seq`. The former database
-lease table is retained only until the separate D3 migration.
+Session ownership uses `(store_id, session_id)` and an application-provided
+`SessionOwnershipCoordinator`, with memory as the single-process default.
+Shared adapters pass `power_loop.testing.SessionOwnershipContractTests`.
+Inputs are accepted without owning the target; the unified worker acquires
+before executing. Each independent session has its own grant and context.
+Only the session grant is renewed; jobs retain generation/version attribution,
+logical parentage, explicit cancellation and cumulative budgets.
+
+Expected owner epoch is read before acquire and installed conditionally.
+Existing message writes combine owner epoch/token with next_seq protection;
+result publication uses its existing state/job transaction. Locks are followed
+by local deadline checks. Loss stops new dispatch; takeover interrupts only the
+acquired session's unfinished execution and repairs pending message format.
+The original main send receives an interrupted result at its original generation.
+See [the scaling guide](../en/user-guide/scaling.md) for context and hook APIs.
 
 ## Message usage and crash boundaries
 

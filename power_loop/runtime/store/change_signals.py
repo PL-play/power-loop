@@ -11,7 +11,14 @@ async def bump(store, tx, session_id, kind):
     # Acquire the session row before mutating its queue/runtime rows. The append
     # path takes these locks in the same order when it marks input delivered.
     column = kind + "_version"
-    await tx.execute(f"UPDATE {store.t.session_state} SET {column}={column}+1 WHERE session_id=?", (session_id,))
+    from power_loop.contracts.errors import SessionLeaseLost
+
+    from . import send_reads
+    sql, args, guarded = store._state_update(session_id, [f"{column}={column}+1"], ())
+    changed = await tx.execute(sql, args)
+    send_reads.lease_writer(store, session_id)
+    if guarded and changed != 1:
+        raise SessionLeaseLost(session_id)
 
 
 async def migration_steps(tx, db, prefix):

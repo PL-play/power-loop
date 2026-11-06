@@ -202,7 +202,7 @@ async def _publish(manager, actor, accepted, prepared):
         if operation is None:
             raise PlanChanged()
         fields = dict(generation=target.generation, executor_id=target.executor_id, boot_id=target.boot_id,
-            executor_key=executor["executor_key"] if executor else None, lease_until_ms=now+command["lease_ms"], session_id=None,
+            executor_key=executor["executor_key"] if executor else None, session_id=None,
             status="running", supervision_status="open", intake="open", resource_state="running", result_status="none",
             outcome=None, result_json=None, version=version, updated_at=now)
         if await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET "+','.join(field+'=?' for field in fields)

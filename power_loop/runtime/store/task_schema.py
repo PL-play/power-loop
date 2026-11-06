@@ -39,7 +39,7 @@ _QUERY_INDEXES = {
     'idx_budget_dispatch': ('task_budget_attempts', ('pending', 'phase', 'attempt_id')),
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
-    'idx_jobs_control_owner': ('jobs', ('control_owner_job_id', 'control_owner_generation', 'job_id')),
+    'idx_jobs_control_owner': ('jobs', ('control_owner_job_id', 'job_id')),
     'idx_jobs_main_page': ('jobs', ('kind', 'execution_role', 'parent_job_id', 'generation', 'job_id')),
     'idx_events_job_type': ('job_events', ('job_id', 'event_type', 'event_id')),
     'idx_events_caller_type': ('job_events', ('caller_session_id', 'event_type', 'job_id', 'event_id')),
@@ -81,15 +81,13 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             id INTEGER PRIMARY KEY, store_id {small} NOT NULL, protocol_version INTEGER NOT NULL){opts}""",
         f"""CREATE TABLE IF NOT EXISTS {prefix}jobs (
             job_id {small} PRIMARY KEY, parent_job_id {small}, root_job_id {small} NOT NULL,
-            parent_generation {integer}, parent_executor_id {small}, parent_boot_id {small},
-            control_owner_job_id {small}, control_owner_generation {integer},
-            control_owner_executor_id {small}, control_owner_boot_id {small},
+            control_owner_job_id {small},
             tenant_id {sid} NOT NULL, principal_id {sid} NOT NULL,
             session_id {sid}, created_by_session_id {sid} NOT NULL,
             kind {small} NOT NULL, execution_role {small} NOT NULL, title {body} NOT NULL,
             completion_scope_job_id {small} NOT NULL, blocks_completion INTEGER NOT NULL,
             status {small} NOT NULL, version {integer} NOT NULL, generation {integer} NOT NULL,
-            executor_id {small}, boot_id {small}, executor_key {small}, lease_until_ms {integer},
+            executor_id {small}, boot_id {small}, executor_key {small},
             cancel_requested_at {integer}, cancel_reason {body},
             intake {small} NOT NULL, resource_state {small} NOT NULL,
             supervision_status {small} NOT NULL, result_status {small} NOT NULL,
@@ -147,7 +145,6 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
         f"CREATE INDEX {prefix}idx_jobs_root ON {prefix}jobs(root_job_id, created_at, job_id)",
         f"CREATE INDEX {prefix}idx_jobs_owner ON {prefix}jobs(created_by_session_id, status)",
         f"CREATE INDEX {prefix}idx_jobs_scope ON {prefix}jobs(completion_scope_job_id, status)",
-        f"CREATE INDEX {prefix}idx_jobs_lease ON {prefix}jobs(executor_id, lease_until_ms)",
         f"CREATE INDEX {prefix}idx_jobs_executor ON {prefix}jobs(executor_key)",
         f"CREATE INDEX {prefix}idx_job_events_job ON {prefix}job_events(job_id, created_at, event_id)",
         f"CREATE INDEX {prefix}idx_job_events_delivery ON {prefix}job_events(delivery_status, created_at)",
@@ -212,9 +209,6 @@ async def _verify_task_schema_tx(tx, db, prefix):
     for column in (
         "execution_role",
         "control_owner_job_id",
-        "control_owner_generation",
-        "control_owner_executor_id",
-        "control_owner_boot_id",
     ):
         if not await _column_exists(tx, db.dialect.name, prefix + "jobs", column):
             raise StoreSchemaError("task control owner schema incomplete")

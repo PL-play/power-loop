@@ -194,8 +194,10 @@ async def test_cancelled_unstarted_attempt_refunds_exact_original_root_and_not_i
     c = tree_case
     await new_send(c)
     original = c.host.reserve
+    captured = {}
 
     async def stop_after_grant(plan):
+        captured['attempt_id'] = plan.request['attempt_id']
         grant = await original(plan)
         await c.manager.request_cancel(c.actor, c.binding.lease.job_id, system_key="stop-original", reason="test")
         return grant
@@ -203,10 +205,8 @@ async def test_cancelled_unstarted_attempt_refunds_exact_original_root_and_not_i
     c.host.reserve = stop_after_grant
     with pytest.raises(JobError, match="cancel_requested"):
         await start(c)
-    [event] = await c.manager.db.fetchall(
-        f"SELECT payload_json FROM {c.manager.events} WHERE event_type='model_attempt_prepared'"
-    )
-    prepared = json.loads(event["payload_json"])
+    from power_loop.runtime.control_runtime import current
+    prepared = current(c.binding).get('attempt', captured['attempt_id'])['prepared']
     old = attempts.Attempt(c.binding, prepared["attempt_id"], prepared)
     old_actor, old_root = c.actor, c.binding.lease.job_id
     c.host.reserve = original
@@ -283,7 +283,7 @@ async def test_frozen_scope_set_rejects_missing_or_changed_original_bindings(tre
 
 
 @pytest.mark.parametrize("fault", ["cycle", "outside_tree", "generation", "executor", "boot"])
-async def test_owner_lineage_requires_original_ancestor_execution_identity(fault):
+async def test_owner_lineage_keeps_logical_edges_when_parent_execution_changes(fault):
     owner = {
         "job_id": "node",
         "generation": 1,
@@ -295,9 +295,6 @@ async def test_owner_lineage_requires_original_ancestor_execution_identity(fault
         "job_id": "send",
         "kind": "send",
         "control_owner_job_id": "node",
-        "control_owner_generation": 1,
-        "control_owner_executor_id": "executor",
-        "control_owner_boot_id": "boot",
     }
     assert budget_scopes._owners(send, {"node": owner}) == [owner]
     if fault == "cycle":
@@ -308,8 +305,11 @@ async def test_owner_lineage_requires_original_ancestor_execution_identity(fault
         owner[{"generation": "generation", "executor": "executor_id", "boot": "boot_id"}[fault]] = (
             2 if fault == "generation" else "new"
         )
-    with pytest.raises(JobError, match="budget_scope_lineage_changed"):
-        budget_scopes._owners(send, {"node": owner})
+    if fault in ("cycle", "outside_tree"):
+        with pytest.raises(JobError, match="budget_scope_lineage_changed"):
+            budget_scopes._owners(send, {"node": owner})
+    else:
+        assert budget_scopes._owners(send, {"node": owner}) == [owner]
 
 
 class TreeModel(LLMService):

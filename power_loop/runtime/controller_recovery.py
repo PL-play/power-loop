@@ -74,7 +74,7 @@ async def _facts(manager, tx, actor, row, *, _closures=None, _source=None):
     children = {(edge['payload']['member']['job_id'], edge['payload']['member']['generation'])
                 for edge in frozen['members']}
     direct = await tx.fetchall(f'SELECT job_id,generation FROM {manager.jobs} WHERE parent_job_id=? '
-        'AND parent_generation=? ORDER BY job_id LIMIT 1001', (row['job_id'], row['generation']))
+        'ORDER BY job_id LIMIT 1001', (row['job_id'],))
     children.update((child['job_id'], child['generation']) for child in direct)
     if len(children) > 1000:
         raise JobError('controller_recovery_scope_too_large')
@@ -146,8 +146,8 @@ async def _interrupted_result(manager, tx, row):
         if type(name) is not str or not name:
             raise JobError('controller_recovery_creation_invalid')
         children = await tx.fetchall(f"SELECT result_json FROM {manager.jobs} WHERE parent_job_id=? "
-            "AND parent_generation=? AND kind='workflow_node' ORDER BY updated_at,job_id LIMIT 1001",
-            (row['job_id'], row['generation']))
+            "AND kind='workflow_node' ORDER BY updated_at,job_id LIMIT 1001",
+            (row['job_id'],))
         if len(children) > 1000:
             raise JobError('controller_recovery_scope_too_large')
         results, allowed = {}, {field.name for field in fields(AgentResult)}

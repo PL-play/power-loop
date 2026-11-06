@@ -57,10 +57,6 @@ async def _source(manager, tx, actor, caller, call_ref, tool_call_id):
         parent = await manager._row(tx, owner["control_owner_job_id"])
         if parent is None or (parent["tenant_id"], parent["principal_id"]) != (actor.tenant_id, actor.principal_id):
             raise JobError("invalid_control_owner")
-        manager._check_proof(parent, JobLease(parent["job_id"], owner["control_owner_executor_id"],
-            owner["control_owner_boot_id"], owner["control_owner_generation"]))
-        if parent["intake"] != "open":
-            raise JobError("stop_caller_closed")
         owner = parent
     else:
         raise JobError("job_depth_exceeded")

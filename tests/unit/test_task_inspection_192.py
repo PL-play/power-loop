@@ -18,13 +18,13 @@ async def troubled(runtime, *, state='unknown'):
     store, manager, actor, root, lease, connect, now = runtime
     reg = await child(runtime)
     proof = await manager.claim_job(actor, reg.job.job_id, executor_id='child', boot_id='child-boot',
-                                    expected_version=1, lease_ms=300000)
+                                    expected_version=1)
     if state == 'unknown':
         await manager.db.execute(f"UPDATE {manager.jobs} SET resource_state='unknown' WHERE job_id=?", (proof.job_id,))
     elif state == 'cancel':
         await manager.request_cancel(actor, proof.job_id, system_key='cancel-once', reason='stop original')
-    elif state == 'lease':
-        await manager.db.execute(f'UPDATE {manager.jobs} SET lease_until_ms=? WHERE job_id=?', (now[0], proof.job_id))
+    elif state == 'runtime':
+        now[0] += POLICY.runtime_ms
     elif state == 'result':
         await manager.record_execution_result(actor, proof, outcome='failed', result={'text': 'failed'}, resource_state='stopped')
     await manager.close_model_execution(actor, lease, evidence={'exit': 'completed'})
@@ -33,7 +33,17 @@ async def troubled(runtime, *, state='unknown'):
 
 
 @pytest.mark.parametrize('state,reason', [('unknown', 'resource_unknown'), ('cancel', 'stop_unconfirmed'),
-                                         ('lease', 'lease_expired'), ('result', 'result_unhandled')])
+                                         ('runtime', 'long_running'), ('result', 'result_unhandled')])
+async def test_current_job_alert_reason_without_job_lease(runtime, state, reason):
+    from power_loop.runtime.task_inspection import _reason
+    _, manager, _, _, _, _, now = runtime
+    proof = await troubled(runtime, state=state)
+    row = await manager.db.fetchone(f'SELECT * FROM {manager.jobs} WHERE job_id=?', (proof.job_id,))
+    assert _reason(row, now[0], POLICY) == reason
+
+
+@pytest.mark.parametrize('state,reason', [('unknown', 'resource_unknown'), ('cancel', 'stop_unconfirmed'),
+                                         ('runtime', 'long_running'), ('result', 'result_unhandled')])
 async def test_original_problem_creates_one_main_alert_without_finishing_or_stopping_work(runtime, state, reason):
     store, manager, actor, root, lease, connect, now = runtime
     proof = await troubled(runtime, state=state)
@@ -106,9 +116,8 @@ async def test_stale_changed_hidden_or_foreign_alert_is_not_fresh_wake_authority
 async def test_explicit_wait_does_not_become_runaway_and_pages_do_not_drop_descendants(runtime):
     store, manager, actor, root, lease, connect, now = runtime
     reg = await child(runtime, key='waiting-child')
-    await manager.db.execute(f"UPDATE {manager.jobs} SET status='waiting',lease_until_ms=NULL WHERE job_id=?", (reg.job.job_id,))
+    await manager.db.execute(f"UPDATE {manager.jobs} SET status='waiting' WHERE job_id=?", (reg.job.job_id,))
     now[0] += 100000
-    await manager.db.execute(f'UPDATE {manager.jobs} SET lease_until_ms=? WHERE job_id=?', (now[0]+300000, root.job.job_id))
     after, found, visited = '', [], set()
     while True:
         page = await inspect_tasks(manager, actor, root.job.job_id, policy=POLICY, limit=1, after_job_id=after)

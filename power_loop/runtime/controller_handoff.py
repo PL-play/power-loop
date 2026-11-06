@@ -222,8 +222,8 @@ async def handoff_retired_reviews(runtime, actor, owner_job_id, *, limit=100):
             raise JobError('controller_handoff_requires_original_main')
         rows = await tx.fetchall(f"SELECT DISTINCT j.job_id FROM {manager.jobs} j "
             f"JOIN {manager.events} e ON e.job_id=j.job_id WHERE j.kind='send' "
-            "AND j.control_owner_job_id=? AND j.control_owner_generation=? AND j.result_status NOT IN ('none','handled') "
-            "AND e.event_type='tool_call_abort' ORDER BY j.job_id LIMIT ?", (owner_job_id, owner['generation'], limit+1))
+            "AND j.control_owner_job_id=? AND j.result_status NOT IN ('none','handled') "
+            "AND e.event_type='tool_call_abort' ORDER BY j.job_id LIMIT ?", (owner_job_id, limit+1))
     if len(rows) > limit:
         raise JobError('controller_handoff_scope_too_large')
     results = []

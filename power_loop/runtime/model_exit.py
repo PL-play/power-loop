@@ -25,7 +25,4 @@ def historical_row(row, scope):
     lease = _lease(scope["lease"])
     owner = scope["owner"]
     return {**row, **lease, "kind": scope["kind"], "session_id": scope["session_id"], "intake": "closed",
-        "control_owner_job_id": owner["job_id"] if owner else None,
-        "control_owner_generation": owner["generation"] if owner else None,
-        "control_owner_executor_id": owner["executor_id"] if owner else None,
-        "control_owner_boot_id": owner["boot_id"] if owner else None}
+        "control_owner_job_id": owner["job_id"] if owner else None}

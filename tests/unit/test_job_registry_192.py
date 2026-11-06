@@ -134,16 +134,11 @@ async def test_session_binding_is_direct_child_role_checked_immutable_and_surviv
     assert sub_send.job.execution_role == "subagent"
 
 
-@pytest.mark.parametrize("barrier", ["expired", "cancelled"])
-async def test_renewal_cannot_erase_barriers_but_actual_model_exit_evidence_is_saved(runtime, barrier):
-    _, m, actor, root, proof, _, now = runtime
-    await m.renew_execution(actor, proof, lease_ms=1000)
-    if barrier == "expired":
-        now[0] += 1001
-    else:
-        await m.request_cancel(actor, root.job.job_id, system_key="stop", reason="stop")
-    with pytest.raises(JobError, match="expired|cancel"):
-        await m.renew_execution(actor, proof)
+async def test_cancellation_blocks_dispatch_but_model_exit_evidence_is_saved(runtime):
+    _, m, actor, root, proof, _, _ = runtime
+    await m.request_cancel(actor, root.job.job_id, system_key="stop", reason="stop")
+    with pytest.raises(JobError, match="cancel"):
+        await m.check_execution(actor, proof)
     closed = await m.close_model_execution(actor, proof, evidence={"usage": {"total_tokens": 17}})
     assert closed.status == "model_closed" and closed.resource_state == "stopped"
     assert (await m.close_model_execution(actor, proof)).version == closed.version
@@ -153,12 +148,12 @@ async def test_renewal_cannot_erase_barriers_but_actual_model_exit_evidence_is_s
         await m.check_execution(actor, proof)
 
 
-@pytest.mark.parametrize("barrier", ["expired", "cancelled", "ancestor_cancelled"])
-async def test_result_evidence_keeps_usage_after_stop_or_expiry_without_claiming_final_success(runtime, barrier):
+@pytest.mark.parametrize("barrier", ["elapsed-time", "cancelled", "ancestor_cancelled"])
+async def test_result_evidence_keeps_usage_after_stop_without_claiming_final_success(runtime, barrier):
     _, m, actor, root, caller, _, now = runtime
     reg = await child(runtime, independent=True)
     proof = await m.claim_job(actor, reg.job.job_id, executor_id="worker", boot_id="boot", expected_version=1)
-    if barrier == "expired":
+    if barrier == "elapsed-time":
         now[0] += 30001
     else:
         await m.request_cancel(actor, root.job.job_id if barrier == "ancestor_cancelled" else reg.job.job_id,
@@ -168,8 +163,8 @@ async def test_result_evidence_keeps_usage_after_stop_or_expiry_without_claiming
     assert await m.record_execution_result(actor, proof, outcome="succeeded", result=payload, resource_state="stopped") == event
     result = await m.get_job(actor, reg.job.job_id)
     assert result.status == "settling" and result.supervision_status == "open" and result.result["usage"]["total_tokens"] == 17
-    assert result.outcome == ("succeeded" if barrier == "expired" else "cancelled")
-    if barrier != "expired":
+    assert result.outcome == ("succeeded" if barrier == "elapsed-time" else "cancelled")
+    if barrier != "elapsed-time":
         assert result.result["execution_status"] == "completed" and result.result["status"] == "cancelled"
     with pytest.raises(JobError, match="cancel|closed|not_running"):
         await m.register_job(actor, kind="background_tool", parent=proof, system_key="after-result-must-not-run")
@@ -218,8 +213,8 @@ async def test_node_subagent_depends_on_node_scope_instead_of_creator_model_send
     assert reg.job.completion_scope_job_id == node.job.job_id and reg.job.blocks_completion
     await m.close_model_execution(actor, sp)
     await m.close_model_execution(actor, caller)
-    await store._db.execute(f"UPDATE {m.jobs} SET lease_until_ms=?,generation=generation+1 WHERE job_id=?",
-                            (now[0]-1, send.job.job_id))
+    await store._db.execute(f"UPDATE {m.jobs} SET generation=generation+1 WHERE job_id=?",
+                            (send.job.job_id,))
     recovered = JobManager(await connect(), now_ms=m.now)
     ap = await recovered.claim_job(actor, reg.job.job_id, executor_id="audit", boot_id="boot", expected_version=1)
     bg = await recovered.register_job(actor, kind="background_tool", parent=ap, system_key="ordinary-tool")
@@ -227,20 +222,23 @@ async def test_node_subagent_depends_on_node_scope_instead_of_creator_model_send
     assert wp.job_id != np.job_id
 
 
-@pytest.mark.parametrize("case", ["expired", "new-generation", "cancelled"])
-async def test_actual_node_control_owner_still_fences_subagent(runtime, case):
+@pytest.mark.parametrize("case", ["unknown", "new-generation", "cancelled"])
+async def test_node_identity_change_preserves_child_permission_and_explicit_cancel_stops_it(runtime, case):
     store, m, actor, _, _, _, now = runtime
     _, _, node, np, _, sp = await node_tree(runtime)
     reg, ap = await claimed(m, actor, "subagent", sp, "audit")
     await m.close_model_execution(actor, sp)
-    if case == "expired":
-        await store._db.execute(f"UPDATE {m.jobs} SET lease_until_ms=? WHERE job_id=?", (now[0]-1, np.job_id))
+    if case == "unknown":
+        await store._db.execute(f"UPDATE {m.jobs} SET resource_state='unknown' WHERE job_id=?", (np.job_id,))
     elif case == "new-generation":
         await store._db.execute(f"UPDATE {m.jobs} SET generation=generation+1 WHERE job_id=?", (np.job_id,))
     else:
         await m.request_cancel(actor, node.job.job_id, system_key="cancel-owner", reason="stop")
-    with pytest.raises(JobError, match="expired|stale|cancel"):
-        await m.register_job(actor, kind="background_tool", parent=ap, system_key="must-not-run")
+    if case == "cancelled":
+        with pytest.raises(JobError, match="cancel"):
+            await m.check_execution(actor, ap)
+    else:
+        await m.check_execution(actor, ap)
     assert (await m.get_job(actor, reg.job.job_id)).control_owner_job_id == node.job.job_id
 
 
@@ -439,21 +437,23 @@ async def test_queued_cancel_is_persistent_and_cannot_later_start(runtime):
         await recovered.claim_job(actor, reg.job.job_id, executor_id="late", boot_id="boot", expected_version=2)
 
 
-@pytest.mark.parametrize("case", ["own-generation", "parent-generation", "own-expiry", "parent-expiry"])
-async def test_stale_execution_cannot_create_new_descendant(runtime, case):
-    store, m, actor, root, root_proof, _, now = runtime
+@pytest.mark.parametrize("case", ["own-generation", "parent-generation", "own-closed", "parent-closed"])
+async def test_child_permission_depends_on_own_identity_and_state(runtime, case):
+    store, m, actor, root, _, _, _ = runtime
     reg = await child(runtime)
     proof = await m.claim_job(actor, reg.job.job_id, executor_id="child", boot_id="boot", expected_version=1)
     if case == "own-generation":
         proof = replace(proof, generation=proof.generation - 1)
     elif case == "parent-generation":
         await store._db.execute(f"UPDATE {m.jobs} SET generation=generation+1 WHERE job_id=?", (root.job.job_id,))
-    elif case == "own-expiry":
-        await store._db.execute(f"UPDATE {m.jobs} SET lease_until_ms=? WHERE job_id=?", (now[0] - 1, proof.job_id))
     else:
-        await store._db.execute(f"UPDATE {m.jobs} SET lease_until_ms=? WHERE job_id=?", (now[0] - 1, root_proof.job_id))
-    with pytest.raises(JobError, match="stale|expired"):
-        await m.register_job(actor, kind="background_tool", parent=proof, system_key="must-not-start")
+        target = proof.job_id if case == "own-closed" else root.job.job_id
+        await store._db.execute(f"UPDATE {m.jobs} SET intake='closed' WHERE job_id=?", (target,))
+    if case.startswith('own-'):
+        with pytest.raises(JobError, match="stale|closed"):
+            await m.check_execution(actor, proof)
+    else:
+        await m.check_execution(actor, proof)
 
 
 async def test_registration_and_operation_rollback_together(runtime, monkeypatch):

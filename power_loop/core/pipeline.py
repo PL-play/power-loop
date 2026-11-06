@@ -2570,8 +2570,9 @@ class AgentPipeline:
                     )
                 except Exception as exc:
                     # ── Hook: TOOL_ERROR ──
+                    from power_loop.contracts.errors import SessionBusy, SessionLeaseLost
                     from power_loop.runtime.native_returns import NativeReturnPending
-                    if isinstance(exc, NativeReturnPending):
+                    if isinstance(exc, (NativeReturnPending, SessionLeaseLost, SessionBusy, CancellationRequested)):
                         raise
                     err_ctx = ToolErrorCtx(
                         round_index=round_idx,
@@ -2592,6 +2593,8 @@ class AgentPipeline:
                                 tool_name, tool_args, count=False, tool_call_id=call_id
                             )
                         except Exception as retry_exc:
+                            if isinstance(retry_exc, (SessionLeaseLost, SessionBusy, CancellationRequested)):
+                                raise
                             output = f"Error (retry failed): {retry_exc}"
                             failed = True
                     else:

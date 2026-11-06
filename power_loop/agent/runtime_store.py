@@ -191,7 +191,8 @@ class RuntimeInputStore:
             (target.session_id, ownership.epoch, ownership.lease.token))
         ownership.lease.require_owned()
         if not changed:
-            raise RuntimeRequestError("ownership_lost")
+            from power_loop.contracts.errors import SessionLeaseLost
+            raise SessionLeaseLost(target.session_id)
 
     async def claim_inputs(self, tx, target, ownership, limit=100, input_refs=None):
         if not 1 <= limit <= 100 or input_refs is not None and len(input_refs) > 100:

@@ -8,6 +8,14 @@
 
 ## 10.0.0 — 2026-10-30
 
+- **Unreleased design 203 P2:** session ownership keys are `(store_id, session_id)`;
+  epoch installation precedes execution and original tokens fence release/writes.
+  Per-job renewal and parent execution credentials are removed, including the
+  `JobManager.claim_job(lease_ms=...)` parameter. Node registry health remains separate.
+- `ExecutionContext` is now immutable; `get_execution_context` and allowlisted
+  `bind_host_context` expose scoped identity and business values. Runtime adds
+  bounded lifecycle notifications. Takeover interrupts only its acquired session
+  and preserves the original main-send result identity. Independent G2 is pending.
 - **Breaking LLM contract:** supplier money is now `LLMResponse.provider_cost` (`ProviderCost`, exact decimal string and optional currency), separate from `LLMTokenUsage`. The former float `LLMTokenUsage.cost` field is removed. Completed events use a decimal string and an explicit currency.
 - Stable `TokenUsageExtractor` and `CostExtractor` interfaces; default implementations share the existing token normalizer and recognize common OpenAI, Anthropic and Gemini shapes. Configurable nested field mappings and trusted host code extensions use the same standardized outputs.
 - Missing fields are normal misses. Invalid values become structured extraction evidence; hosts can choose raise (default) or continue separately for usage and cost. The loop enforces failure policy after durable capture, outside transport retries, preserving the original paid response.

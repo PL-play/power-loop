@@ -137,9 +137,9 @@ async def _apply(manager, actor, accepted):
         now, version = manager.now(), row['version']+1
         changed = await tx.write_job(target.job_id, f'UPDATE {manager.jobs} SET version=version+1,updated_at=? '
             'WHERE job_id=? AND root_job_id=? AND generation=? AND executor_id=? AND boot_id=? AND version=? '
-            "AND intake='open' AND cancel_requested_at IS NULL AND lease_until_ms>?",
+            "AND intake='open' AND cancel_requested_at IS NULL",
             (now, target.job_id, row['root_job_id'], target.generation, target.executor_id,
-             target.boot_id, row['version'], now))
+             target.boot_id, row['version']))
         if changed != 1:
             raise _TargetChanged()
         fingerprint = _outcome_hash(request, requests.reference(accepted.event))

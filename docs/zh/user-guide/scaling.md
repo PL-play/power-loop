@@ -74,23 +74,30 @@ python -m bench --smoke    # 快速子集（也是 CI 烟囱）
 
 ## 多进程共享一个 store
 
-默认 `MemorySessionOwnershipCoordinator` 只协调同一进程内的 loop。多进程部署需要应用实现共享协调器，传给每个 loop：
+默认 `MemorySessionOwnershipCoordinator` 用于单进程。共享部署在统一 Runtime 上配置共享协调器和传输：
 
 ```python
-loop = StatefulAgentLoop(
-    llm=llm, store=store,
-    session_coordinator=shared_coordinator,
-    config=AgentLoopConfig(session_lease_ttl_s=90.0),
+runtime = Runtime(
+    store=store, factory=factory, node_id="worker-1",
+    coordinator=shared_coordinator, transport=shared_transport,
+    shared_execution=True, session_lease_ttl_s=90.0,
+    host_context_fields={"app": {"trace_id"}},
 )
 ```
 
-接口 `SessionOwnershipCoordinator` 只有 `acquire`、`renew`、`release`；通过返回的 `SessionOwnership.lose()` 通知失权。
-应用实现应继承并通过 `power_loop.testing.SessionOwnershipContractTests`。
-SDK 不依赖 Redis，默认实现不需要数据库租约表。
+`node_id` 保持稳定，默认 `boot_id` 在每次解释器启动时生成。共享模式拒绝进程内适配器，故障后不会回退内存执行。SDK 不依赖 Redis。
 
-send、追加输入和恢复入口均先取得所有权。取不到时抛 `SessionBusy`，由宿主保留待办、路由或稍后重试。
-`follow_up()` 不向其他进程投递输入。持有期覆盖 send 及其子 Agent、workflow；最后一个任务退出后释放。
-续期失败会停止该会话本地任务。接手时校验缓存、修复 pending，旧未完成任务显示为中断。
+所有权键为 `(store_id, session_id)`。`SessionOwnershipCoordinator` 提供 `acquire`、`renew`、`release`，续期和释放核对原 token。SDK **先读取**固定的 expected epoch，再 acquire，最后条件安装；冲突则释放本次 grant，重新取权。句柄的本地期限从共享请求发出前开始计算，迟到响应不能延长许可。
+
+宿主适配器须通过 `power_loop.testing.SessionOwnershipContractTests`。`power_loop.testing.db_session_ownership.DatabaseSessionOwnershipCoordinator` 是用于同机真实多进程测试的 SQLite 实现；正式跨机器适配由宿主提供。
+
+客户端保存输入不需要目标租约。worker 先取权再构造执行环境；取不到时保留待处理输入。独立子执行持有自己的 session。失权只取消本会话执行并阻止新的 SDK 派发；hook 不能把失权或取消替换成工具成功、重试。SDK 不保证物理停止已在外部运行的进程。
+
+接手只中断本会话的未完成任务。原主 send 输入可读取原代次的 `interrupted` 结果，新 send 整理 pending 消息格式后继续；健康子会话不受影响。同 grant 下重建对象不改变 epoch 或 job generation。每 job 的周期续租和父执行凭据已移除，逻辑父子关系、累计预算及显式取消仍保留。子任务 resume、workflow 继续执行在后续阶段接通。
+
+`get_execution_context()` 返回不可修改的 SDK 身份、输入/任务引用、资源及取消信息。执行范围内可用 `with bind_host_context("app", {"trace_id": "trace-1"}):` 临时绑定白名单 JSON 字段，退出时自动 reset。独立子执行清除继承的租约、send、工具调用和取消上下文。重启后仍需保存的业务状态使用既有 `runtime_state` 接口。
+
+Runtime 提供 `execution_acquired`、`execution_lost`、`execution_released`、`message_accepted`、`execution_finished` 通知。默认超时一秒，失败有日志，不会无限阻止必须执行的取消。
 
 ### TTL 怎么定
 

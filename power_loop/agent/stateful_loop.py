@@ -2160,7 +2160,8 @@ class StatefulAgentLoop:
         from .runtime_client import RuntimeClient
         self.runtime = runtime
         self.store = runtime.store
-        self.client = RuntimeClient(store=runtime.store, transport=runtime.transport, namespace=runtime.namespace)
+        self.client = RuntimeClient(store=runtime.store, transport=runtime.transport, namespace=runtime.namespace,
+                                    hooks=runtime.hooks, hook_timeout_s=runtime.hook_timeout_s)
 
     async def new_session(self, descriptor, *, actor):
         return await self.runtime.open_session(descriptor, actor=actor)

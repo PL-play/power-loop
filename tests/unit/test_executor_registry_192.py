@@ -39,7 +39,7 @@ async def root(c, *, identity=None, key="root", request=None):
     identity = identity or c.identity
     reg = await c.manager.register_job(c.actor, kind="send", session_id=c.actor.session_id, system_key=key, request=request)
     lease = await c.manager.claim_job(c.actor, reg.job.job_id, executor_id=identity.executor_id,
-        boot_id=identity.boot_id, expected_version=reg.job.version, lease_ms=300000)
+        boot_id=identity.boot_id, expected_version=reg.job.version)
     return reg, lease
 
 
@@ -150,19 +150,18 @@ async def test_replayed_old_activation_or_heartbeat_cannot_revive_drain(boot):
         await registry.heartbeat(c.manager, c.identity, expected_version=2)
 
 
-async def test_expired_boot_cannot_renew_or_dispatch_while_job_lease_is_still_live(boot):
+async def test_health_expiry_cannot_renew_but_does_not_revoke_session_execution(boot):
     c = boot
     await start(c)
     _, lease = await root(c)
     c.now[0] += 1001
-    with pytest.raises(JobError, match="executor_lease_expired"):
+    with pytest.raises(JobError, match="executor_heartbeat_conflict"):
         await registry.heartbeat(c.manager, c.identity, expected_version=2)
-    with pytest.raises(JobError, match="executor_lease_expired"):
-        await c.manager.check_execution(c.actor, lease)
+    await c.manager.check_execution(c.actor, lease)
     assert not (await registry.get(c.manager, c.identity))["admission_open"]
 
 
-async def test_expired_registered_boot_cannot_commit_success_but_negative_evidence_is_saved(boot):
+async def test_health_expiry_does_not_turn_known_success_into_failure(boot):
     c = boot
     await start(c)
     _, parent = await root(c)
@@ -170,12 +169,9 @@ async def test_expired_registered_boot_cannot_commit_success_but_negative_eviden
     lease = await c.manager.claim_job(c.actor, child.job.job_id, executor_id="executor", boot_id="boot-one", expected_version=1)
     c.now[0] += 1001
     raw = {"status": "completed", "final_text": "known late output", "usage": {"total_tokens": 17}}
-    with pytest.raises(JobError, match="executor_lease_expired"):
-        await c.manager.record_execution_result(c.actor, lease, outcome="succeeded", result=raw, resource_state="stopped")
-    assert not await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='result'", (child.job.job_id,))
-    await c.manager.record_execution_result(c.actor, lease, outcome="failed", result={**raw, "status": "failed", "execution_status": "completed"}, resource_state="stopped")
+    await c.manager.record_execution_result(c.actor, lease, outcome="succeeded", result=raw, resource_state="stopped")
     saved = await c.manager.get_job(c.actor, child.job.job_id)
-    assert saved.outcome == "failed" and saved.result["final_text"] == "known late output"
+    assert saved.outcome == "succeeded" and saved.result["final_text"] == "known late output"
     assert saved.result["usage"]["total_tokens"] == 17 and saved.supervision_status == "open"
 
 
@@ -319,13 +315,13 @@ async def test_deleted_control_row_cannot_allow_a_new_root_to_downgrade(boot):
     assert (await c.manager.get_job(c.actor, pending.job.job_id)).generation == 0
 
 
-async def test_registered_parent_cannot_dispatch_an_unregistered_child_executor(boot):
+async def test_registered_parent_does_not_require_child_to_share_its_registry(boot):
     c = boot
     await start(c)
     _, lease = await root(c)
     pending = await c.manager.register_job(c.actor, kind="subagent", parent=lease, system_key="child", independent=True)
-    with pytest.raises(JobError, match="executor_registration_required"):
-        await c.manager.claim_job(c.actor, pending.job.job_id, executor_id="unregistered", boot_id="new-boot", expected_version=1)
+    child = await c.manager.claim_job(c.actor, pending.job.job_id, executor_id="unregistered", boot_id="new-boot", expected_version=1)
+    await c.manager.check_execution(c.actor, child)
 
 
 async def test_mutable_stopped_cache_cannot_hide_old_unconfirmed_model_request(boot):

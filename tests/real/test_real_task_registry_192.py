@@ -65,7 +65,7 @@ async def test_real_model_admission_receipt_result_and_reopen_use_durable_regist
     actor = JobActor("isolated-real-test", "host", sid)
     root = await manager.register_job(actor, kind="send", session_id=sid, system_key="persistent-real-root")
     proof = await manager.claim_job(actor, root.job.job_id, executor_id="test-host", boot_id="test-boot",
-                                    expected_version=1, lease_ms=300000)
+                                    expected_version=1)
     admissions = []
 
     async def start_add(a, b):

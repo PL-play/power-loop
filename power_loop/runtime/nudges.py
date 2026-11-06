@@ -178,9 +178,9 @@ async def _apply_nudge_request(manager, actor, event, data):
         now = manager.now()
         if await tx.write_job(target.job_id, f"UPDATE {manager.jobs} SET version=version+1,updated_at=? "
                 "WHERE job_id=? AND root_job_id=? AND version=? AND generation=? AND executor_id=? AND boot_id=? "
-                "AND intake='open' AND cancel_requested_at IS NULL AND lease_until_ms>?",
+                "AND intake='open' AND cancel_requested_at IS NULL",
                 (now, target.job_id, data["target"]["root_job_id"], job["version"], target.generation,
-                 target.executor_id, target.boot_id, now)) != 1:
+                 target.executor_id, target.boot_id)) != 1:
             raise JobError("nudge_write_mismatch")
         operation = await manager._insert_operation(tx, job_id=target.job_id, version=job["version"]+1,
             actor=actor, action="nudge", key=key, fingerprint=_hash([command, ref.to_dict()]),

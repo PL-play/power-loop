@@ -74,23 +74,30 @@ Route a given session to a fixed process (e.g. hash the session id). Do **not** 
 
 ## Running several processes over one store
 
-The default `MemorySessionOwnershipCoordinator` coordinates loops within one process. Multi-process hosts implement a shared coordinator and pass it to every loop:
+The default `MemorySessionOwnershipCoordinator` serves one process. Shared deployments configure the unified Runtime with shared ownership and transport adapters:
 
 ```python
-loop = StatefulAgentLoop(
-    llm=llm, store=store,
-    session_coordinator=shared_coordinator,
-    config=AgentLoopConfig(session_lease_ttl_s=90.0),
+runtime = Runtime(
+    store=store, factory=factory, node_id="worker-1",
+    coordinator=shared_coordinator, transport=shared_transport,
+    shared_execution=True, session_lease_ttl_s=90.0,
+    host_context_fields={"app": {"trace_id"}},
 )
 ```
 
-`SessionOwnershipCoordinator` defines `acquire`, `renew`, and `release`; notify ownership loss through the returned `SessionOwnership.lose()`.
-Application implementations must pass `power_loop.testing.SessionOwnershipContractTests`.
-The SDK has no Redis dependency and the default coordinator requires no database lease table.
+Keep `node_id` stable; the default `boot_id` is generated once per interpreter startup. Shared mode rejects process-only adapters and never falls back to memory after failure. The SDK has no Redis dependency.
 
-Send, follow-up, and resume acquire ownership before accepting work. A competing owner receives `SessionBusy`; the host keeps the wake-up pending and routes or retries it.
-`follow_up()` does not deliver to another process. Ownership lasts through the send and its child Agent/workflow tasks, releasing when the last task exits.
-Renewal failure stops local session work. Takeover validates caches, repairs pending messages, and marks unfinished execution interrupted.
+Ownership uses `(store_id, session_id)`. `SessionOwnershipCoordinator` exposes `acquire`, `renew`, and `release`; original tokens fence renewal and release. The SDK reads the expected store epoch **before** acquire, installs the grant conditionally, and releases/reacquires on conflict. A handle's monotonic deadline starts before the shared request, so a delayed response cannot extend permission.
+
+Host adapters must pass `power_loop.testing.SessionOwnershipContractTests`. `power_loop.testing.db_session_ownership.DatabaseSessionOwnershipCoordinator` is a SQLite adapter for real same-host process tests, not the production cross-machine adapter.
+
+Clients persist inputs without owning the target session. Workers acquire before constructing the execution environment; a busy worker leaves the input pending. Each independent child owns its own session. Loss cancels only this session's execution and prevents new SDK dispatch. Hooks cannot replace ownership loss or cancellation with tool success/retry. Already running external processes are outside that cancellation guarantee.
+
+On takeover, only unfinished jobs in the acquired session are interrupted. The original main-send input retains an `interrupted` result at its original generation, and a new send repairs pending message format. Healthy child sessions are untouched. Rebuilding under an existing grant preserves its epoch and job generation. Per-job lease renewal and parent execution credentials have been removed; logical lineage, cumulative budgets and explicit cancellation still apply. Child resume and workflow continuation are subsequent implementation stages.
+
+`get_execution_context()` returns an immutable snapshot of SDK identity, request/job references, resources and cancellation. Inside an execution, `with bind_host_context("app", {"trace_id": "trace-1"}):` temporarily binds allowlisted JSON values; exit resets them. Independent execution clears inherited ownership, send, tool invocation and cancellation context. Persist restart-surviving business state with the existing `runtime_state` API.
+
+Runtime hooks provide `execution_acquired`, `execution_lost`, `execution_released`, `message_accepted`, and `execution_finished`. Notifications default to a one-second timeout, log failures, and cannot delay required cancellation indefinitely.
 
 ### Sizing the TTL
 

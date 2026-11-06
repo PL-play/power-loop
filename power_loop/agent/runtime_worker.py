@@ -40,7 +40,7 @@ class _ControlInputRead:
 
 
 @dataclass
-class ExecutionContext:
+class _SessionExecution:
     store_id: str
     session_id: str
     node_id: str
@@ -62,6 +62,17 @@ class ExecutionContext:
     shutdown_interrupted: bool = False
     output: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=256))
 
+    actor: object = None
+    parent_job_id: str | None = None
+    root_job_id: str | None = None
+    resources: object = None
+
+    def snapshot(self):
+        from power_loop.core.execution_context import ExecutionContext
+        return ExecutionContext(self.store_id, self.session_id, self.node_id, self.boot_id,
+            self.input_ref, self.job_ref, self.parent_job_id, self.root_job_id,
+            self.epoch, self.lease.token if self.lease else None, self.actor, self.options, self.resources, self.stop)
+
 
 class _InputStart:
     def __init__(self, worker, context, record, send_index):
@@ -80,6 +91,7 @@ class _InputStart:
         ref = JobRef(ctx.store_id, binding.lease.job_id, binding.lease.generation)
         await port.bind_input_job(tx, ctx.input_ref, ref, ctx, claim_token=self.record.row["claim_token"])
         state = await port.db.dialect.lock_state(tx, port.state, ctx.session_id)
+        ctx.lease.require_owned()
         seq = state["next_seq"]
         self.next_seq = seq + 1
         body = json.loads(self.record.row["content"])
@@ -103,6 +115,9 @@ class _InputStart:
                          "claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
                          (seq, self.send_index, timestamp, ctx.session_id, ctx.input_ref.message_id))
         ctx.job_ref = ref
+        source = binding.resource_evidence.get("_control_source", {})
+        ctx.parent_job_id = source.get("parent_job_id")
+        ctx.root_job_id = source.get("root_job_id", ref.job_id)
         binding.resource_evidence["_runtime_send_index"] = self.send_index
 
     def committed(self):
@@ -114,6 +129,7 @@ class _InputStart:
 
     async def prepare_finish(self, tx):
         self.result_route = await self.worker.inputs._lock_result_sessions(tx, self.context.job_ref)
+        self.context.lease.require_owned()
 
     def completed(self, result):
         response_format = self.context.options.response_format
@@ -327,15 +343,27 @@ class RuntimeWorker:
             _ExecutionLoop._release_idle_sync(sid)
 
     async def _run_session_owned(self, sid):
+        from contextlib import AsyncExitStack, ExitStack
+        from types import SimpleNamespace
+
         from power_loop.agent.stateful_loop import _ExecutionLoop
+        from power_loop.contracts.errors import CancellationRequested, SessionBusy, SessionLeaseLost
+        from power_loop.contracts.hooks import HookPoint
+        from power_loop.core.execution_context import _bind_execution_context
+        from power_loop.core.execution_notifications import notify
+        from power_loop.runtime.session_ownership import hold_session_ownership
+        scopes = ExitStack()
+        leases = AsyncExitStack()
+        busy = False
         r, env, ctx, deadline_task, output_task = self.runtime, None, None, None, None
         try:
             row = await self.inputs.db.fetchone(f"SELECT * FROM {self.inputs.q} WHERE session_id=? AND status='pending' ORDER BY id LIMIT 1", (sid,))
             if row is None:
                 return
             record = self.inputs.record(row)
-            ctx = ExecutionContext(r.store.store_id, sid, r.node_id, r.boot_id, record.ref)
+            ctx = _SessionExecution(r.store.store_id, sid, r.node_id, r.boot_id, record.ref)
             ctx.options = RequestOptions(**record.meta["options"])
+            scopes.enter_context(_bind_execution_context(ctx.snapshot, r.host_context_fields))
             ctx.task = asyncio.current_task()
             self._active[sid] = ctx
             if row["target_job_id"]:
@@ -350,13 +378,28 @@ class RuntimeWorker:
                 async with self.inputs.db.transaction() as tx:
                     await self.inputs.void_unbound(tx, record.ref, reason="expired")
                 return
+            metadata = await self.inputs.db.fetchone(f"SELECT metadata_json FROM {r.store.t.sessions} WHERE session_id=?", (sid,))
+            identity = json.loads(metadata["metadata_json"])
+            from .runtime_types import TrustedActor
+            ctx.actor = TrustedActor(identity["tenant_id"], identity["principal_id"], sid)
+            holder = SimpleNamespace(store=r.store, session_coordinator=r.coordinator,
+                config=SimpleNamespace(session_lease_ttl_s=r.session_lease_ttl_s),
+                _owner_id=r.node_id + "/" + r.boot_id,
+                task_runtime=SimpleNamespace(executor_id=r.node_id, boot_id=r.boot_id),
+                _cache_invalidate=lambda session: ctx.loop._cache_invalidate(session) if ctx.loop else None)
+            ctx.lease = await leases.enter_async_context(hold_session_ownership(holder, sid))
+            ctx.epoch = ctx.lease.epoch
+            await notify(r.hooks, HookPoint.EXECUTION_ACQUIRED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
             descriptor = RuntimeDescriptor(**record.meta["descriptor"])
             try:
-                env = await r.factory.build(descriptor, ctx)
+                env = await r.factory.build(descriptor, ctx.snapshot())
+                ctx.resources = env.resources
                 available = set(env.tool_registry.names() if env.tool_registry else ()) | {"pass_turn"}
                 missing = set(ctx.options.tools or ()) - available
                 if missing:
                     raise RuntimeRequestError("definition_unavailable", "missing tools: " + ", ".join(sorted(missing)))
+            except (SessionLeaseLost, SessionBusy, CancellationRequested):
+                raise
             except Exception as exc:
                 async with self.inputs.db.transaction() as tx:
                     await self.inputs.void_unbound(tx, record.ref, reason="definition_unavailable: " + str(exc))
@@ -366,8 +409,6 @@ class RuntimeWorker:
             for field_name in ("model", "temperature", "max_tokens", "max_rounds", "max_tokens_per_run", "system_prompt", "response_format"):
                 if options[field_name] is not None:
                     setattr(config, field_name, options[field_name])
-            metadata = await self.inputs.db.fetchone(f"SELECT metadata_json FROM {r.store.t.sessions} WHERE session_id=?", (sid,))
-            identity = json.loads(metadata["metadata_json"])
             if record.row["expires_at"] is not None:
                 deadline_task = asyncio.create_task(self._expire(ctx, record.row["expires_at"], identity))
             task_runtime = env.task_runtime or TaskRuntime(JobManager(r.store), tenant_id=identity["tenant_id"],
@@ -388,53 +429,60 @@ class RuntimeWorker:
             loop._runtime_worker = self
             loop._owner_id = r.node_id + "/" + r.boot_id
             ctx.loop = loop
-            async with loop._session_lease(sid) as lease:
-                ctx.lease = lease
-                async with self.inputs.db.transaction() as tx:
-                    await tx.execute(f"UPDATE {self.inputs.state} SET owner_epoch=owner_epoch+1,owner_token=?,owner_node_id=?,owner_boot_id=? "
-                                     "WHERE session_id=? AND lifecycle='open'", (lease.token, r.node_id, r.boot_id, sid))
-                    state = await self.inputs.db.dialect.lock_state(tx, self.inputs.state, sid)
-                    ctx.epoch = state["owner_epoch"]
-                try:
-                    send_index = int(await r.store.get_runtime_state(sid, "send_index") or 0) + 1
-                    start = _InputStart(self, ctx, record, send_index)
-                    await loop._interrupt_pending(sid)
-                    await loop._run_loop(sid, stop_event=ctx.stop, tools=options["tools"],
-                        system_prompt=options["system_prompt"], max_rounds=options["max_rounds"],
-                        response_format=options["response_format"], with_history=options["history"],
-                        _entry_send_index=send_index, _runtime_start=start)
-                finally:
-                    ctx.closing = True
-                    await self.inputs.db.execute(f"UPDATE {self.inputs.state} SET owner_token=NULL,owner_node_id=NULL,owner_boot_id=NULL,owner_lease_until_ms=NULL "
-                                                "WHERE session_id=? AND owner_epoch=? AND owner_token=?", (sid, ctx.epoch, lease.token))
-        finally:
-            if deadline_task:
-                deadline_task.cancel()
-                await asyncio.gather(deadline_task, return_exceptions=True)
-            if output_task:
-                if ctx.shutdown_interrupted:
-                    output_task.cancel()
-                    await asyncio.gather(output_task, return_exceptions=True)
-                else:
-                    await ctx.output.put(None)
-                    await output_task
-            if ctx:
+            try:
+                send_index = int(await r.store.get_runtime_state(sid, "send_index") or 0) + 1
+                start = _InputStart(self, ctx, record, send_index)
+                await loop._interrupt_pending(sid)
+                await loop._run_loop(sid, stop_event=ctx.stop, tools=options["tools"],
+                    system_prompt=options["system_prompt"], max_rounds=options["max_rounds"],
+                    response_format=options["response_format"], with_history=options["history"],
+                    _entry_send_index=send_index, _runtime_start=start)
+            finally:
                 ctx.closing = True
-                if ctx.loop:
-                    from .stateful_loop import _release_session_sync
-                    for owned_sid in ctx.loop._sync_sids:
-                        _release_session_sync(owned_sid, id(ctx.loop))
-                    ctx.loop._sync_sids.clear()
-                    ctx.loop._session_cache.clear()
-                    ctx.append_refs.clear()
-            self._active.pop(sid, None)
+
+        except SessionBusy:
+            busy = True
+
+        finally:
+            try:
+                if deadline_task:
+                    deadline_task.cancel()
+                    await asyncio.gather(deadline_task, return_exceptions=True)
+                if output_task:
+                    if ctx.shutdown_interrupted:
+                        output_task.cancel()
+                        await asyncio.gather(output_task, return_exceptions=True)
+                    else:
+                        await ctx.output.put(None)
+                        await output_task
+                if ctx:
+                    ctx.closing = True
+                    if ctx.loop:
+                        from .stateful_loop import _release_session_sync
+                        for owned_sid in ctx.loop._sync_sids:
+                            _release_session_sync(owned_sid, id(ctx.loop))
+                        ctx.loop._sync_sids.clear()
+                        ctx.loop._session_cache.clear()
+                        ctx.append_refs.clear()
+                if ctx and ctx.lease:
+                    if ctx.lease.lost:
+                        await notify(r.hooks, HookPoint.EXECUTION_LOST, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
+                    await notify(r.hooks, HookPoint.EXECUTION_FINISHED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
+            finally:
+                try:
+                    await leases.aclose()
+                    if ctx and ctx.lease:
+                        await notify(r.hooks, HookPoint.EXECUTION_RELEASED, {"execution": ctx.snapshot()}, timeout_s=r.hook_timeout_s)
+                finally:
+                    scopes.close()
+                    self._active.pop(sid, None)
             if env:
                 await env.aclose()
             # This check is AFTER the lease has been released. New submit always
             # sends activation as well, covering the other side of the handoff.
-            if await self.inputs.has_pending(sid):
+            if not busy and not (ctx and ctx.lease and ctx.lease.lost) and await self.inputs.has_pending(sid):
                 await r.transport.publish(TransportPacket(42, r.namespace, "idle", TargetRef(r.store.store_id, sid), "activation"))
-            if ctx:
+            if ctx and not busy:
                 await r.transport.publish(TransportPacket(42, r.namespace, ctx.input_ref.message_id,
                     TargetRef(ctx.store_id, sid), "output", ctx.input_ref, {"kind": "completed"}))
 

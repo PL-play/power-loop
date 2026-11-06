@@ -73,7 +73,7 @@ from power_loop.agent.runtime_types import (
     TrustedActor,
     WaitTimeout,
 )
-from power_loop.agent.runtime_worker import ExecutionContext, RuntimeWorker
+from power_loop.agent.runtime_worker import RuntimeWorker
 from power_loop.agent.sink import MessageSink, NullSink, SQLiteSink
 from power_loop.agent.stateful_loop import StatefulAgentLoop, StatefulResult
 from power_loop.agent.system_prompt import (
@@ -178,6 +178,7 @@ from power_loop.contracts.protocols import (
 from power_loop.contracts.tools import ToolDefinition, ToolResult, validate_tool_args
 from power_loop.core.agent_context import get_effective_tools
 from power_loop.core.events import AgentEventBus
+from power_loop.core.execution_context import ExecutionContext, bind_host_context, get_execution_context
 from power_loop.core.hooks import AgentHooks
 from power_loop.core.pass_turn import PASS_TURN_TOOL, pass_progress, request_pass
 from power_loop.core.phase import PhaseContext, PhaseResult, phase
@@ -624,7 +625,7 @@ __all__ = [
 
 __all__ += [
     "Runtime", "RuntimeFactory", "RegistryRuntimeFactory", "ExecutionEnvironment",
-    "RuntimeClient", "RuntimeWorker", "ExecutionContext", "OutputSubscription",
+    "RuntimeClient", "RuntimeWorker", "ExecutionContext", "bind_host_context", "get_execution_context", "OutputSubscription",
     "TargetRef", "InputRef", "JobRef", "Command", "RequestOptions", "RuntimeDescriptor", "TrustedActor",
     "Receipt", "Status", "Result", "ShutdownResult", "JobPage", "RuntimeRequestError", "CapacityError", "WaitTimeout", "StoreError",
     "MessageTransport", "MemoryMessageTransport", "DatabasePollingTransport",

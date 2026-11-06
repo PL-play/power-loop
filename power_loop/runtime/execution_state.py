@@ -139,14 +139,13 @@ class ExecutionState:
     failed checkpoint retains its exact immutable batch for an idempotent retry.
     """
 
-    def __init__(self, identity: ExecutionIdentity, journal, *, lease_until_ms: int,
+    def __init__(self, identity: ExecutionIdentity, journal, *, ownership=None,
                  policy: CheckpointPolicy | None = None, now_ms=None):
         self.identity = identity
         self.journal = journal
         self.policy = policy or CheckpointPolicy()
         self.now_ms = now_ms or (lambda: time.time_ns() // 1_000_000)
-        self.lease_until_ms = lease_until_ms
-        self.deadline = time.monotonic() + max(0, (lease_until_ms - self.now_ms()) / 1000)
+        self.ownership = ownership
         self.cancel_requested = False
         self.closed = False
         self.needs_reconciliation = False
@@ -184,20 +183,14 @@ class ExecutionState:
             raise JobError("execution_control_closed")
         if self.cancel_requested:
             raise JobError("cancel_requested")
-        if self.now_ms() >= self.lease_until_ms or time.monotonic() >= self.deadline:
-            raise JobError("execution_lease_expired")
+        if self.ownership is not None:
+            self.ownership.require_owned()
         if self.needs_reconciliation or self.unknown:
             raise JobError("unresolved_prior_attempt")
         if len(self.pending_obligations) >= self.max_pending_obligations:
             raise JobError("budget_reconciliation_required")
         if self.checkpoint_failed:
             raise JobError("execution_checkpoint_pending")
-
-    def renew(self, lease_until_ms: int):
-        if type(lease_until_ms) is not int or lease_until_ms <= self.now_ms():
-            raise JobError("execution_lease_expired")
-        self.lease_until_ms = lease_until_ms
-        self.deadline = time.monotonic() + (lease_until_ms - self.now_ms()) / 1000
 
     def record(self, kind: str, key: str, value: dict):
         if type(kind) is not str or not kind or type(key) is not str or not key or type(value) is not dict:

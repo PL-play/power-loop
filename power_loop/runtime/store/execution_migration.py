@@ -95,7 +95,7 @@ async def import_accounting(tx, db, prefix):
             async def projector(tx, identity, records):
                 await project_events(manager, tx, identity, records)
             journal = ExecutionJournal(store, projector=projector)
-            state = ExecutionState(identity, journal, lease_until_ms=0)
+            state = ExecutionState(identity, journal)
             state.closed = True
             records = []
             for original, scopes, booked in attempts:
@@ -123,7 +123,7 @@ async def import_accounting(tx, db, prefix):
             await journal.append(identity, 1, identity.digest, records, summary, transaction=tx)
         # Old owners were stopped by the maintenance operator. A remaining
         # running row proves neither completion nor safe replay after restart.
-        await tx.execute(f"UPDATE {prefix}jobs SET intake='closed',resource_state='unknown',lease_until_ms=NULL,version=version+1 "
+        await tx.execute(f"UPDATE {prefix}jobs SET intake='closed',resource_state='unknown',version=version+1 "
                          "WHERE resource_state='running'")
     except (JobError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise StoreSchemaError("execution migration requires reconciliation: " + str(exc)) from exc

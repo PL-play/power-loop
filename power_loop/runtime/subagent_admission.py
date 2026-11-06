@@ -158,11 +158,11 @@ async def _publish(manager, actor, accepted, prepared):
             key=key, fingerprint=_hash([command, request["call_ref"]]), call_ref=ref, tool_call_id=request["tool_call_id"], payload=payload, tree=tree)
         if operation is None:
             raise PlanChanged()
-        if await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,lease_until_ms=?,"
+        if await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,"
                 "status='running',supervision_status='open',intake='open',resource_state='running',result_status='none',outcome=NULL,result_json=NULL,"
                 "version=version+1,updated_at=? WHERE job_id=? AND root_job_id=? AND generation=? AND version=?",
                 (target.generation, target.executor_id, target.boot_id, executor["executor_key"] if executor else None,
-                 now+command["lease_ms"], now, row["job_id"], row["root_job_id"], row["generation"], row["version"]), obligations=True) != 1:
+                 now, row["job_id"], row["root_job_id"], row["generation"], row["version"]), obligations=True) != 1:
             raise PlanChanged()
         payload["run_id"] = operation.operation_id[3:]
         await tx.update_event(row["job_id"], f"UPDATE {manager.events} SET payload_json=?,delivery_status='pending_delivery' WHERE event_id=?",

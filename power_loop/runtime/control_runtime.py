@@ -243,10 +243,9 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
         managed_check = not fresh and await tx.fetchone(
             f"SELECT job_id FROM {manager.jobs} WHERE parent_job_id=? AND kind='background_tool' LIMIT 1",
             (source["job_id"],)) is not None
-        ancestors, ancestor_proofs, ancestor = [], {}, source
+        ancestors, ancestor = [], source
         while ancestor is not None:
             ancestors.append(ancestor["job_id"])
-            ancestor_proofs[ancestor['job_id']] = tuple(ancestor[k] for k in ('generation', 'executor_id', 'boot_id'))
             if len(ancestors) > 64:
                 raise JobError("invalid_job_lineage")
             ancestor = await manager._row(tx, ancestor["parent_job_id"]) if ancestor["parent_job_id"] else None
@@ -267,7 +266,8 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
         if journal is None:
             journal = ExecutionJournal(manager.store, projector=projector, writer=owned_writer)
             binding.resource_evidence["_control_journal_opening"] = journal
-        state = ExecutionState(identity, journal, lease_until_ms=source["lease_until_ms"],
+        from .session_ownership import current_ownership
+        state = ExecutionState(identity, journal, ownership=current_ownership(),
                                policy=runtime.checkpoint_policy, now_ms=lambda: manager.now())
         policy = binding.resource_evidence.get("_control_budget_policy")
         if policy is not None:
@@ -293,21 +293,18 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
             rows = [await manager._row(reader, identity.job_id)]
         else:
             rows = await reader.fetchall(
-                f"SELECT job_id,generation,executor_id,boot_id,cancel_requested_at,intake,resource_state,lease_until_ms "
+                f"SELECT job_id,generation,executor_id,boot_id,cancel_requested_at,intake,resource_state "
                 f"FROM {manager.jobs} WHERE job_id IN (" + ",".join("?" for _ in ancestors) + ")", tuple(ancestors))
         found = {row["job_id"]: row for row in rows}
         if len(found) != len(ancestors):
             state.needs_reconciliation = True
             raise JobError("invalid_job_lineage")
         actual = found[identity.job_id]
-        if any(tuple(row[k] for k in ('generation', 'executor_id', 'boot_id')) != ancestor_proofs[row['job_id']]
-                for row in rows):
+        if tuple(actual[k] for k in ('generation', 'executor_id', 'boot_id')) != (identity.generation, identity.executor_id, identity.boot_id):
             state.needs_reconciliation = True
             state.cancel_requested = True
         if any(row["cancel_requested_at"] is not None for row in rows) or actual["intake"] != "open":
             state.cancel_requested = True
-        if actual["lease_until_ms"] is not None:
-            state.lease_until_ms = min(state.lease_until_ms, actual["lease_until_ms"])
         if actual["resource_state"] == "unknown":
             state.needs_reconciliation = True
         if state.cancel_requested:

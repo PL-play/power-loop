@@ -395,8 +395,8 @@ async def _prepare(manager, tx, actor, row, generation, state, depth=0):
     # independent workflows that outlive their creator's model send.
     from .execution_membership import childless
     rows = [] if childless(manager, row["job_id"]) else await tx.fetchall(
-        f"SELECT * FROM {manager.jobs} WHERE parent_job_id=? OR (control_owner_job_id=? AND control_owner_generation=?)",
-        (row["job_id"], row["job_id"], generation))
+        f"SELECT * FROM {manager.jobs} WHERE parent_job_id=? OR (control_owner_job_id=?)",
+        (row["job_id"], row["job_id"]))
     for child in rows:
         children[(child["job_id"], child["generation"])] = _lease(child)
     for (job_id, child_generation), lease in sorted(children.items()):
@@ -453,7 +453,7 @@ async def _publish(manager, tx, plans, *, tree=None):
         if close is not None:
             resource, _now, previous_version, generation = close
             changed = await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status=?,intake='closed',resource_state=?,"
-                "lease_until_ms=NULL,supervision_status='closed',version=?,updated_at=? "
+                "supervision_status='closed',version=?,updated_at=? "
                 "WHERE job_id=? AND version=? AND generation=? AND supervision_status='open'", (status, resource, version, manager.now(), row["job_id"], previous_version, generation))
         else:
             changed = await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status=?,supervision_status='closed',version=?,updated_at=? WHERE job_id=? AND root_job_id=? AND version=? AND generation=? AND supervision_status='open'", (status, version, manager.now(), row["job_id"], row["root_job_id"], row["version"], row["generation"]))

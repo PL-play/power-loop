@@ -20,11 +20,11 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
 def loop_for(store, model, executor, directory):
-    from ._shared_session_coordinator import SharedSessionCoordinator
+    from power_loop.testing.db_session_ownership import DatabaseSessionOwnershipCoordinator
     runtime = TaskRuntime(JobManager(store), tenant_id='shared-session', principal_id='host',
                           executor_id=executor, boot_id=executor)
     return StatefulAgentLoop(llm=model, store=store, task_runtime=runtime,
-        session_coordinator=SharedSessionCoordinator(str(Path(directory)/"ownership.json")),
+        session_coordinator=DatabaseSessionOwnershipCoordinator(str(Path(directory)/"ownership.db")),
         config=AgentLoopConfig(compactor=None, delegation_policy='single_level'))
 
 

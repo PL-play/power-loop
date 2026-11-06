@@ -31,7 +31,7 @@ async def main():
     source = await manager.register_job(actor, kind='send', session_id=actor.session_id,
         system_key='node-continuation-source', request={'send_index':3})
     caller = await manager.claim_job(actor, source.job.job_id, executor_id=context['executor_id'],
-        boot_id=context['boot_id'], expected_version=source.job.version, lease_ms=300000)
+        boot_id=context['boot_id'], expected_version=source.job.version)
     seq = await store.append_message(actor.session_id, role='assistant', send_index=3, round_index=0,
         tool_calls=[{'id':'resume-node-worker', 'type':'function', 'function':{'name':'nudge_node', 'arguments':'{}'}}])
     ref = await store.message_ref(actor.session_id, seq)

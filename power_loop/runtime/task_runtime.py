@@ -450,10 +450,8 @@ class TaskRuntime:
         return tuple(task for task in self._budget_handles.values() if not task.done())
 
     def track_task(self, task, *, cancel_token=None, job_id=None):
-        from .session_ownership import track_owned_task
         if not isinstance(task, asyncio.Task):
             raise JobError("executor_task_handle_required")
-        track_owned_task(task)
         # Keep original mechanical writes reachable even for a legacy runtime
         # without the optional automatic boot lifecycle.
         self._adapter_tasks.add(task)
@@ -489,13 +487,12 @@ class TaskRuntime:
             executor_id=self.executor_id,
             boot_id=self.boot_id,
             expected_version=registration.job.version,
-            lease_ms=self.lease_ms,
         )
         return Execution(self, actor, lease)
 
     @asynccontextmanager
     async def execution(self, binding: Execution, *, owner: bool = False, context=None, cancel_token=None, initialize_model=False):
-        """Renew only while this attempt runs; a failed renewal stops dispatch."""
+        """Bind one job attempt; only its session coordinator renews execution."""
         _check_task_owner(self)
         if (not isinstance(binding, Execution) or binding.runtime is not self
                 or (binding.actor.tenant_id, binding.actor.principal_id) != (self.tenant_id, self.principal_id)
@@ -519,76 +516,9 @@ class TaskRuntime:
         task = asyncio.current_task()
         local = {"binding": binding, "task": task, "signalled": False, "cancel_token": cancel_token}
         local_key = id(local)
-        lost = []
-
-        def supervision_lost(exc):
-            lost.append(exc)
-            # The body may catch cancellation and persist its result before
-            # this context manager exits. Preserve the real cause immediately.
-            binding.resource_evidence["supervision_error"] = getattr(exc, "code", type(exc).__name__)
-
-        async def renew():
-            try:
-                while True:
-                    try:
-                        await asyncio.wait_for(binding.stop_renewal.wait(), self.lease_ms / 3000)
-                        return
-                    except TimeoutError:
-                        pass
-                    await self.manager.renew_execution(binding.actor, binding.lease, lease_ms=self.lease_ms)
-                    if binding.resource_evidence.get("_control_state") is not None:
-                        from .control_runtime import current
-                        control = current(binding)
-                        control.renew(self.manager.now() + self.lease_ms)
-                        binding.resource_evidence["_processing_dirty"] = True
-                        from .abort_outcomes import pending_reviews
-                        binding.resource_evidence["_control_review_pending"] = bool(await pending_reviews(self.manager, self.manager.db, binding.actor))
-                        await control.checkpoint(force=True)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                if not binding.stop_renewal.is_set():
-                    # A durable stop or another nested scope already cancelled
-                    # this task. Let its actual-exit/usage cleanup finish.
-                    if local["signalled"] or task.cancelling():
-                        return
-                    if cancel_token is not None:
-                        # A logical node can share the parent task. Stop its
-                        # own operation, never the task hosting the parent.
-                        if not isinstance(exc, JobError) or exc.code != "cancel_requested":
-                            supervision_lost(exc)
-                        from .executor_lifecycle import signal_token
-
-                        local["signalled"] = signal_token(cancel_token, "task supervision lost")
-                        if not local["signalled"]:
-                            # A malformed/read-only host token cannot leave an
-                            # unconfirmed executor running indefinitely. It is
-                            # a supervision failure, not tolerated node cancel.
-                            supervision_lost(JobError("task_cancel_signal_unavailable"))
-                            local["signalled"] = bool(task.cancel("task supervision lost"))
-                    else:
-                        if not isinstance(exc, JobError) or exc.code != "cancel_requested":
-                            supervision_lost(exc)
-                        task.cancel("task supervision lost")
-
-        heartbeat = None
         try:
-            coroutine = renew()
-            try:
-                heartbeat = asyncio.create_task(coroutine, name="job-lease-" + binding.lease.job_id)
-            except BaseException:
-                coroutine.close()
-                raise
             self._local_executions[local_key] = local
             yield binding
-        except asyncio.CancelledError:
-            if lost:
-                raise JobError("task_supervision_lost") from lost[0]
-            raise
-        else:
-            if lost:
-                # A lease/backend failure is not a user-tolerated node cancel.
-                raise JobError("task_supervision_lost") from lost[0]
         finally:
             try:
                 from .session_ownership import current_ownership, ownership_lost
@@ -617,13 +547,8 @@ class TaskRuntime:
                         self._controller_retirements.discard(slot)
             finally:
                 self._local_executions.pop(local_key, None)
-                try:
-                    if heartbeat is not None:
-                        heartbeat.cancel()
-                        await asyncio.gather(heartbeat, return_exceptions=True)
-                finally:
-                    variable.reset(token)
-                    _TASK_OWNERS.reset(owner_token)
+                variable.reset(token)
+                _TASK_OWNERS.reset(owner_token)
 
     @asynccontextmanager
     async def model_send(self, loop, sid: str, send_index: int, *, input_start, cancel_token=None, round_limit=None):

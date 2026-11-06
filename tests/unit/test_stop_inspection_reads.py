@@ -51,11 +51,11 @@ async def test_receipt_recall_and_missing_local_handle_never_open_a_control_writ
 async def test_paused_local_discovery_spans_two_roots_without_blocking_another_root_stop(control, monkeypatch):
     c = control
     runtime = TaskRuntime(c.manager, tenant_id="control", principal_id="host", executor_id="worker", boot_id="boot", lease_ms=300000)
-    own = await c.manager.claim_job(c.actor, c.child.job.job_id, executor_id="worker", boot_id="boot", expected_version=1, lease_ms=300000)
+    own = await c.manager.claim_job(c.actor, c.child.job.job_id, executor_id="worker", boot_id="boot", expected_version=1)
     other = await c.manager.register_job(c.actor, kind="send", session_id=c.actor.session_id,
         system_key="unrelated-local-root", request={"send_index": 2})
     other_lease = await c.manager.claim_job(c.actor, other.job.job_id,
-        executor_id="worker", boot_id="boot", expected_version=1, lease_ms=300000)
+        executor_id="worker", boot_id="boot", expected_version=1)
     third = await c.manager.register_job(c.actor, kind="send", session_id=c.actor.session_id,
         system_key="stop-during-local-discovery", request={"send_index": 3})
     finish, own_entered, other_entered, stopped = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()

@@ -516,6 +516,7 @@ class SessionStore:
         async with self._db.transaction() as tx:
             sql, arguments, guarded = self._state_update(session_id, ['round_index=?'], (round_index,))
             changed = await tx.execute(sql, arguments)
+            send_reads.lease_writer(self, session_id)
             if guarded and changed != 1:
                 raise SessionLeaseLost(session_id)
         if prior is not None:
@@ -531,6 +532,7 @@ class SessionStore:
                 # legacy oracle so get_state(...).pending round-trips to None, not {}.
                 (_dumps(pending) if pending else None,))
             changed = await tx.execute(sql, arguments)
+            send_reads.lease_writer(self, session_id)
             if guarded and changed != 1:
                 raise SessionLeaseLost(session_id)
         if not holding.active:
@@ -539,13 +541,45 @@ class SessionStore:
         if prior is not None:
             send_reads.remember_state(self, session_id, replace(prior, pending=_loads(_dumps(pending)) if pending else None))
 
+    async def session_owner_epoch(self, session_id):
+        row = await self._db.fetchone(
+            f"SELECT owner_epoch,lifecycle FROM {self.t.session_state} WHERE session_id=?", (session_id,))
+        if row is None:
+            raise ValueError(f"unknown session: {session_id}")
+        if row['lifecycle'] != 'open':
+            from power_loop.agent.runtime_types import RuntimeRequestError
+            raise RuntimeRequestError('session_closed')
+        return row["owner_epoch"]
+
+    async def install_session_owner(self, session_id, lease, expected_epoch):
+        lease.require_owned()
+        async with self._db.transaction() as tx:
+            lease.require_owned()
+            changed = await tx.execute(
+                f"UPDATE {self.t.session_state} SET owner_epoch=owner_epoch+1,owner_token=?,"
+                "owner_node_id=?,owner_boot_id=? WHERE session_id=? AND owner_epoch=? AND lifecycle='open'",
+                (lease.token, lease.node_id, lease.boot_id, session_id, expected_epoch))
+            lease.require_owned()
+        if changed:
+            lease.epoch = expected_epoch + 1
+        return bool(changed)
+
+    async def release_session_owner(self, session_id, lease):
+        await self._db.execute(
+            f"UPDATE {self.t.session_state} SET owner_token=NULL,owner_node_id=NULL,"
+            "owner_boot_id=NULL,owner_lease_until_ms=NULL WHERE session_id=? AND owner_epoch=? AND owner_token=?",
+            (session_id, lease.epoch, lease.token))
+
     # ── messages ──────────────────────────────────────────────────────────────
     def _lease_write_guard(self, session_id):
         # Recheck after awaiting transaction entry: its turn may have ended.
         reads = send_reads.lease_writer(self, session_id)
-        if reads is None:
+        from ..session_ownership import current_ownership
+        lease = reads.ownership if reads is not None else current_ownership(self, session_id)
+        if lease is None:
             return "", ()
-        return " AND next_seq=?", (reads.next_seq,)
+        lease.require_owned()
+        return " AND owner_epoch=? AND owner_token=?", (lease.epoch, lease.token)
 
     def _state_update(self, session_id, sets, values, *, condition='', condition_values=()):
         """Declare an ordinary mutation with its owner condition in the DML."""
@@ -718,6 +752,7 @@ class SessionStore:
                     seq = int(st["next_seq"]) - 1
                     signal_values = tuple(st[column] for column in change_signals.COLUMNS)
                     state_written = None  # Allocation and plain state changes only.
+                send_reads.lease_writer(self, session_id)
                 if inbox is not None:
                     token, raw_ids = inbox.get("claim_token"), inbox.get("ids")
                     if not isinstance(token, str) or not token or not isinstance(raw_ids, (list, tuple)) or not raw_ids:

@@ -444,9 +444,7 @@ async def require_event_handled(manager, tx, result, *, session_id, owner_job_id
         raise JobError("required_result_unhandled")
     if result.get("action") == "nudge":
         target = json.loads(result["payload_json"])["request"]["target"]
-        proof = {"job_id": handler["control_owner_job_id"], "generation": handler["control_owner_generation"],
-            "executor_id": handler["control_owner_executor_id"], "boot_id": handler["control_owner_boot_id"]}
-        if _hash(proof) != _hash(target):
+        if handler["control_owner_job_id"] != target["job_id"]:
             raise JobError("required_result_unhandled")
     closed = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=? AND event_type='model_closed'",
                               ("model_closed_" + payload["handler_job_id"],))
