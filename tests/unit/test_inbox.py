@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
@@ -177,20 +178,45 @@ async def test_steer_text_is_persisted_once_and_bound_to_original_job(store, mak
     assert (await store.inbox_counts(agent.target.session_id))['pending'] == 0
 
 
-@pytest.mark.parametrize("notification", ["first_only", "duplicate_delivered", "delayed_void"])
+@pytest.mark.parametrize("notification", [
+    "first_only", "duplicate_delivered", "delayed_void", "received_void", "received_void_new_steer",
+])
 async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, notification):
     from power_loop import TransportPacket
 
-    model = _Gate([_tool_call("c1"), _tool_call("c2"), LLMResponse(raw_text="done")])
+    concurrent = notification == "received_void_new_steer"
+    void = notification in {"delayed_void", "received_void", "received_void_new_steer"}
+    calls = [_tool_call("c1"), _tool_call("c2")]
+    model = _Gate([*calls, *([_tool_call("c3")] if concurrent else []), LLMResponse(raw_text="done")])
     first, second = model.gate(0), model.gate(1)
     executed = []
     agent = await RunningAgent(store, model, _registry(executed)).start()
     worker = agent.runtime.worker
     received, release, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    draining, resume_drain = asyncio.Event(), asyncio.Event()
+    in_drain = armed = False
     original = worker._control
+    original_drain, transaction = worker.drain_append, worker.inputs.db.transaction
+
+    async def drain(ctx):
+        nonlocal in_drain
+        in_drain = True
+        try:
+            return await original_drain(ctx)
+        finally:
+            in_drain = False
+
+    @asynccontextmanager
+    async def pause_transaction():
+        # Yield after drain snapshots its refs, before acquiring any DB lock.
+        if armed and in_drain and not draining.is_set():
+            draining.set()
+            await resume_drain.wait()
+        async with transaction() as tx:
+            yield tx
 
     async def control(ctx, packet):
-        if packet.input_ref and packet.input_ref.message_id == "steer":
+        if packet.input_ref and packet.input_ref.message_id in {"steer", "keep"}:
             received.set()
             if notification == "delayed_void":
                 await release.wait()
@@ -200,6 +226,9 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
             await original(ctx, packet)
 
     monkeypatch.setattr(worker, "_control", control)
+    if concurrent:
+        monkeypatch.setattr(worker, "drain_append", drain)
+        monkeypatch.setattr(worker.inputs.db, "transaction", pause_transaction)
     run = asyncio.create_task(agent.send("start"))
     try:
         async with asyncio.timeout(10):
@@ -212,9 +241,20 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
                 release.set()
             await processed.wait()
             assert ctx.loop.steer_event(ctx.session_id).is_set() == (notification != "delayed_void")
+            if notification.startswith("received_void"):
+                cancelled = await agent.runtime.client.cancel(receipt.input_ref, actor=agent.actor)
+                assert cancelled.reason == "cancelled" and cancelled.job_ref is None
+            armed = concurrent
             first.set()
+            if concurrent:
+                await draining.wait()
+                processed.clear()
+                await agent.runtime.client.steer(ctx.job_ref, "kept direction", message_id="keep", actor=agent.actor)
+                await processed.wait()
+                assert ctx.loop.steer_event(ctx.session_id).is_set()
+                resume_drain.set()
             await _wait_calls(model, 2)
-            assert not ctx.loop.steer_event(ctx.session_id).is_set()
+            second_steer = ctx.loop.steer_event(ctx.session_id).is_set()
             if notification == "duplicate_delivered":
                 processed.clear()
                 await agent.runtime.transport.publish(TransportPacket(42, agent.runtime.namespace,
@@ -224,12 +264,21 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
             result = await run
         assert result.status == "completed"
         assert executed == (["x", "x"] if notification == "delayed_void" else ["x"])
+        assert second_steer == concurrent
         rows = await store.load_all_messages(agent.target.session_id)
-        assert sum("new direction" in (r.content or "") for r in rows) == (notification != "delayed_void")
-        assert [r.content for r in rows if r.role == "tool" and r.tool_call_id == "c2"] == ["x"]
+        assert sum("new direction" in (r.content or "") for r in rows) == (not void)
+        if void:
+            assert "new direction" not in str(model.calls)
+        if concurrent:
+            assert sum("kept direction" in (r.content or "") for r in rows) == 1
+            assert "kept direction" in str(model.calls[2])
+            assert [r.content for r in rows if r.role == "tool" and r.tool_call_id == "c2"][0].startswith("[skipped:")
+        last_call = "c3" if concurrent else "c2"
+        assert [r.content for r in rows if r.role == "tool" and r.tool_call_id == last_call] == ["x"]
     finally:
         first.set()
         second.set()
         release.set()
+        resume_drain.set()
         await agent.aclose()
         await asyncio.gather(run, return_exceptions=True)

@@ -453,6 +453,9 @@ class RuntimeWorker:
                 ctx.append_cursor = row["id"]
             if not rows:
                 ctx.append_overflow, ctx.append_cursor = False, 0
+        # Consume this checkpoint's hint even if its inputs were retracted.
+        # Clear before yielding to claim, so newer control notifications survive.
+        ctx.loop.steer_event(ctx.session_id).clear()
         if not ctx.append_refs or ctx.job_ref is None:
             return []
         refs = list(ctx.append_refs)[:self.runtime.claim_limit]
@@ -480,8 +483,6 @@ class RuntimeWorker:
             body = json.loads(record.row["content"])
             content, structured = (body, False) if isinstance(body, str) else _encode_content(body.get("content"))
             rows.append(dict(record.row, content=content, meta={"structured": structured}))
-        if records:
-            ctx.loop.steer_event(ctx.session_id).clear()
         messages = render_inbox_rows(rows, wrap=True) if rows else []
         for message in messages:
             message["_inbox"]["job_ref"] = plain(ctx.job_ref)
