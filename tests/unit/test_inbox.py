@@ -180,11 +180,13 @@ async def test_steer_text_is_persisted_once_and_bound_to_original_job(store, mak
 
 @pytest.mark.parametrize("notification", [
     "first_only", "duplicate_delivered", "delayed_void", "received_void", "received_void_new_steer",
+    "claim_first_only", "duplicate_claim", "duplicate_claim_new_steer",
 ])
 async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, notification):
     from power_loop import TransportPacket
 
-    concurrent = notification == "received_void_new_steer"
+    concurrent = notification in {"received_void_new_steer", "duplicate_claim_new_steer"}
+    claim_gate = concurrent or notification in {"claim_first_only", "duplicate_claim"}
     void = notification in {"delayed_void", "received_void", "received_void_new_steer"}
     calls = [_tool_call("c1"), _tool_call("c2")]
     model = _Gate([*calls, *([_tool_call("c3")] if concurrent else []), LLMResponse(raw_text="done")])
@@ -226,7 +228,7 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
             await original(ctx, packet)
 
     monkeypatch.setattr(worker, "_control", control)
-    if concurrent:
+    if claim_gate:
         monkeypatch.setattr(worker, "drain_append", drain)
         monkeypatch.setattr(worker.inputs.db, "transaction", pause_transaction)
     run = asyncio.create_task(agent.send("start"))
@@ -244,17 +246,27 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
             if notification.startswith("received_void"):
                 cancelled = await agent.runtime.client.cancel(receipt.input_ref, actor=agent.actor)
                 assert cancelled.reason == "cancelled" and cancelled.job_ref is None
-            armed = concurrent
+            armed = claim_gate
             first.set()
-            if concurrent:
+            if claim_gate:
                 await draining.wait()
-                processed.clear()
-                await agent.runtime.client.steer(ctx.job_ref, "kept direction", message_id="keep", actor=agent.actor)
-                await processed.wait()
-                assert ctx.loop.steer_event(ctx.session_id).is_set()
+                if concurrent:
+                    processed.clear()
+                    keep = await agent.runtime.client.steer(ctx.job_ref, "kept direction", message_id="keep", actor=agent.actor)
+                    await processed.wait()
+                    assert ctx.loop.steer_event(ctx.session_id).is_set()
+                if notification.startswith("duplicate_claim"):
+                    processed.clear()
+                    await agent.runtime.transport.publish(TransportPacket(42, agent.runtime.namespace,
+                        "duplicate", receipt.target, "control", receipt.input_ref))
+                    await processed.wait()
                 resume_drain.set()
             await _wait_calls(model, 2)
             second_steer = ctx.loop.steer_event(ctx.session_id).is_set()
+            original_state = await worker.inputs.input(worker.inputs.db, receipt.input_ref)
+            assert original_state.row["status"] == ("void" if void else "delivered")
+            if concurrent:
+                assert (await worker.inputs.input(worker.inputs.db, keep.input_ref)).row["status"] == "pending"
             if notification == "duplicate_delivered":
                 processed.clear()
                 await agent.runtime.transport.publish(TransportPacket(42, agent.runtime.namespace,
@@ -263,15 +275,20 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
             second.set()
             result = await run
         assert result.status == "completed"
+        assert result.job_ref == ctx.job_ref
+        assert not ctx.claiming_refs
         assert executed == (["x", "x"] if notification == "delayed_void" else ["x"])
         assert second_steer == concurrent
         rows = await store.load_all_messages(agent.target.session_id)
         assert sum("new direction" in (r.content or "") for r in rows) == (not void)
+        assert sum("new direction" in str(m) for m in model.calls[1]) == (not void)
         if void:
             assert "new direction" not in str(model.calls)
         if concurrent:
             assert sum("kept direction" in (r.content or "") for r in rows) == 1
             assert "kept direction" in str(model.calls[2])
+            assert sum("kept direction" in str(m) for m in model.calls[2]) == 1
+            assert (await worker.inputs.input(worker.inputs.db, keep.input_ref)).row["status"] == "delivered"
             assert [r.content for r in rows if r.role == "tool" and r.tool_call_id == "c2"][0].startswith("[skipped:")
         last_call = "c3" if concurrent else "c2"
         assert [r.content for r in rows if r.role == "tool" and r.tool_call_id == last_call] == ["x"]

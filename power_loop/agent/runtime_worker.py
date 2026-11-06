@@ -46,6 +46,7 @@ class ExecutionContext:
     lease: object = None
     stop: CancellationToken = field(default_factory=CancellationToken)
     append_refs: dict = field(default_factory=dict)
+    claiming_refs: frozenset[InputRef] = field(default_factory=frozenset)
     append_overflow: bool = False
     append_cursor: int = 0
     loop: object = None
@@ -259,6 +260,10 @@ class RuntimeWorker:
                     and record.meta["operation"] == "steer" and ctx.job_ref is not None
                     and record.row["target_job_id"] == ctx.job_ref.job_id
                     and record.row["expected_job_generation"] == ctx.job_ref.generation):
+                # This input's hint is already being consumed at the checkpoint.
+                # The claim/void result, not another notification, decides its fate.
+                if packet.input_ref in ctx.claiming_refs:
+                    return
                 if len(ctx.append_refs) < 100:
                     ctx.append_refs[packet.input_ref] = None
                 else:
@@ -461,23 +466,27 @@ class RuntimeWorker:
         refs = list(ctx.append_refs)[:self.runtime.claim_limit]
         for ref in refs:
             ctx.append_refs.pop(ref)
-        async with self.inputs.db.transaction() as tx:
-            # Filter the finite notification batch; new_turn must remain pending.
-            eligible = []
-            for ref in refs:
-                record = await self.inputs.input(tx, ref)
-                if record and record.meta["operation"] in {"append", "nudge", "steer"}:
-                    row = record.row
-                    reason = ("expired" if row["expires_at"] is not None and row["expires_at"] <= now_ms() else
-                              "stale_generation" if row["target_job_id"] and
-                              (row["target_job_id"], row["expected_job_generation"]) !=
-                              (ctx.job_ref.job_id, ctx.job_ref.generation) else None)
-                    if reason:
-                        await self.inputs.void_unbound(tx, ref, reason=reason)
-                    else:
-                        eligible.append(ref)
-            records = await self.inputs.claim_inputs(tx, TargetRef(ctx.store_id, ctx.session_id), ctx,
-                                                    self.runtime.claim_limit, eligible)
+        ctx.claiming_refs = frozenset(refs)
+        try:
+            async with self.inputs.db.transaction() as tx:
+                # Filter the finite notification batch; new_turn must remain pending.
+                eligible = []
+                for ref in refs:
+                    record = await self.inputs.input(tx, ref)
+                    if record and record.meta["operation"] in {"append", "nudge", "steer"}:
+                        row = record.row
+                        reason = ("expired" if row["expires_at"] is not None and row["expires_at"] <= now_ms() else
+                                  "stale_generation" if row["target_job_id"] and
+                                  (row["target_job_id"], row["expected_job_generation"]) !=
+                                  (ctx.job_ref.job_id, ctx.job_ref.generation) else None)
+                        if reason:
+                            await self.inputs.void_unbound(tx, ref, reason=reason)
+                        else:
+                            eligible.append(ref)
+                records = await self.inputs.claim_inputs(tx, TargetRef(ctx.store_id, ctx.session_id), ctx,
+                                                        self.runtime.claim_limit, eligible)
+        finally:
+            ctx.claiming_refs = frozenset()
         rows = []
         for record in records:
             body = json.loads(record.row["content"])
