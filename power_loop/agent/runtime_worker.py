@@ -255,7 +255,8 @@ class RuntimeWorker:
         # Never enters the normal execution semaphore or the loop's send lock.
         if packet.input_ref is not None:
             record = await self.inputs.input(self.inputs.db, packet.input_ref)
-            if (record and record.meta["operation"] == "steer" and ctx.job_ref is not None
+            if (record and record.row["status"] == "pending"
+                    and record.meta["operation"] == "steer" and ctx.job_ref is not None
                     and record.row["target_job_id"] == ctx.job_ref.job_id
                     and record.row["expected_job_generation"] == ctx.job_ref.generation):
                 if len(ctx.append_refs) < 100:

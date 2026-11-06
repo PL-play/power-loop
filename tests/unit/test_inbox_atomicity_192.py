@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import json
 from contextlib import asynccontextmanager
 
 import pytest
@@ -207,3 +209,99 @@ async def test_runtime_start_and_cancel_serialize_on_original_input(registry_sto
                 cancel.cancel()
                 await asyncio.gather(cancel, return_exceptions=True)
             await client.aclose()
+
+
+@pytest.mark.parametrize("winner,keep,image", [
+    ("cancel", False, False), ("cancel", True, False),
+    ("cancel", False, True), ("cancel", True, True),
+    ("delivery", False, False), ("delivery", True, False),
+])
+async def test_runtime_append_retraction_keeps_original_send(registry_store, monkeypatch, winner, keep, image):
+    from power_loop import RequestOptions, RuntimeClient
+    from power_loop.core.pipeline import AgentPipeline
+    from tests.runtime_fixture import RunningAgent
+
+    from .test_inbox import LLMResponse, _Gate, _registry, _tool_call, _wait_calls
+    from .test_runtime_messaging_203 import deadline
+
+    store, connect = registry_store
+    other = await connect()
+    model = _Gate([_tool_call("c1"), LLMResponse(raw_text="accepted")])
+    first = model.gate(0)
+    agent = await RunningAgent(store, model, _registry()).start()
+    client = RuntimeClient(store=other, transport=agent.runtime.transport)
+    held, release = asyncio.Event(), asyncio.Event()
+    append = store.append_message
+    observed, rolled_back = [], []
+    pipeline_append = AgentPipeline._append_message
+
+    async def observe_memory(pipeline, *args, **kwargs):
+        before = (list(pipeline.history), pipeline._tok_len, pipeline._tok_total,
+                  dict(pipeline._image_rounds), list(pipeline.sink._history_seqs), list(pipeline.sink._history_ord))
+        accepted = await pipeline_append(pipeline, *args, **kwargs)
+        if not accepted:
+            assert (pipeline.history, pipeline._tok_len, pipeline._tok_total,
+                    pipeline._image_rounds, pipeline.sink._history_seqs, pipeline.sink._history_ord) == before
+            rolled_back.append(True)
+        return accepted
+
+    async def pause_append(sid, **kwargs):
+        if kwargs.get("inbox") and not observed:
+            observed.append(kwargs["inbox"])
+            if winner == "delivery":
+                seq = await append(sid, **kwargs)
+            held.set()
+            await release.wait()
+            if winner == "delivery":
+                return seq
+        return await append(sid, **kwargs)
+
+    monkeypatch.setattr(store, "append_message", pause_append)
+    monkeypatch.setattr(AgentPipeline, "_append_message", observe_memory)
+    run = asyncio.create_task(agent.send("start", options=RequestOptions(system_prompt="original config")))
+    try:
+        async with asyncio.timeout(15):
+            await _wait_calls(model, 1)
+            body = {"role": "user", "content": [{"type": "attachment", "name": "DROP.png", "url": "https://invalid.test/DROP.png"}]} if image else "DROP"
+            drop = await client.append(agent.target, body, message_id="drop", actor=agent.actor)
+            survivor = await client.append(agent.target, "KEEP", message_id="keep", actor=agent.actor) if keep else None
+            ctx = agent.runtime.worker._active[agent.target.session_id]
+            while len(ctx.append_refs) < 1 + int(keep):
+                await asyncio.sleep(.005)
+            original_job = ctx.job_ref
+            first.set()
+            await held.wait()
+            assert set(observed[0]["item_ids"]) == ({"drop", "keep"} if keep else {"drop"})
+            cancelled = await asyncio.create_task(client.cancel(drop.input_ref, actor=agent.actor), context=contextvars.Context())
+            assert cancelled.job_ref == (None if winner == "cancel" else original_job)
+            queued = await client.send(agent.target, "NEXT", message_id="next", actor=agent.actor) if winner == "delivery" else None
+            release.set()
+            result = await run
+            assert result.status == "completed", result.error
+            if winner == "delivery":
+                assert cancelled.reason == "already_applied"
+            assert result.job_ref == original_job
+            if winner == "cancel":
+                assert rolled_back == [True]
+                assert len(model.calls) == 2
+                assert "original config" in model.system_prompts[-1]
+                assert "DROP" not in json.dumps(model.calls)
+                assert "DROP" not in json.dumps([r.content for r in await store.load_all_messages(ctx.session_id)])
+            if survivor:
+                surviving_result = await client.wait(survivor.input_ref, actor=agent.actor, deadline_ms=deadline())
+                assert surviving_result.job_ref == original_job
+                rows = await store.load_all_messages(ctx.session_id)
+                assert sum("KEEP" in (r.content or "") for r in rows) == 1
+                if winner == "cancel":
+                    assert "KEEP" in json.dumps(model.calls[-1])
+            if queued:
+                next_result = await client.wait(queued.input_ref, actor=agent.actor, deadline_ms=deadline())
+                assert next_result.status == "completed" and next_result.job_ref != original_job
+            await agent.drain()
+            assert (await store.inbox_counts(ctx.session_id)) == {"pending": 0, "steer": 0}
+    finally:
+        first.set()
+        release.set()
+        await client.aclose()
+        await agent.aclose()
+        await asyncio.gather(run, return_exceptions=True)

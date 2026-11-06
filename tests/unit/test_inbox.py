@@ -34,6 +34,7 @@ class _Gate(LLMService):
         self.responses = list(responses)
         self.calls: list[list[dict[str, Any]]] = []
         self.gates: dict[int, asyncio.Event] = {}
+        self.system_prompts = []
 
     def gate(self, n: int) -> asyncio.Event:
         self.gates[n] = asyncio.Event()
@@ -42,6 +43,7 @@ class _Gate(LLMService):
     async def complete(self, request: LLMRequest, **kwargs: Any) -> LLMResponse:
         n = len(self.calls)
         self.calls.append([dict(m) for m in request.messages])
+        self.system_prompts.append(request.system_prompt)
         if n in self.gates:
             await self.gates[n].wait()
         return self.responses.pop(0) if self.responses else LLMResponse(raw_text="done")
@@ -57,13 +59,18 @@ def _tool_call(call_id: str) -> LLMResponse:
     }])
 
 
-def _registry() -> ToolRegistry:
+def _registry(executed=None) -> ToolRegistry:
     reg = ToolRegistry()
+    def echo(**kw):
+        value = str(kw.get("text") or "")
+        if executed is not None:
+            executed.append(value)
+        return value
     reg.register(
         ToolDefinition(name="echo", description="Echo",
                        input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
                        required_params=("text",), pricing=Free("test_fixture")),
-        lambda **kw: str(kw.get("text") or ""),
+        echo,
     )
     return reg
 
@@ -168,3 +175,61 @@ async def test_steer_text_is_persisted_once_and_bound_to_original_job(store, mak
     rows = await store.load_active_messages(agent.target.session_id)
     assert sum('new direction' in (r.content or '') for r in rows) == 1
     assert (await store.inbox_counts(agent.target.session_id))['pending'] == 0
+
+
+@pytest.mark.parametrize("notification", ["first_only", "duplicate_delivered", "delayed_void"])
+async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, notification):
+    from power_loop import TransportPacket
+
+    model = _Gate([_tool_call("c1"), _tool_call("c2"), LLMResponse(raw_text="done")])
+    first, second = model.gate(0), model.gate(1)
+    executed = []
+    agent = await RunningAgent(store, model, _registry(executed)).start()
+    worker = agent.runtime.worker
+    received, release, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = worker._control
+
+    async def control(ctx, packet):
+        if packet.input_ref and packet.input_ref.message_id == "steer":
+            received.set()
+            if notification == "delayed_void":
+                await release.wait()
+            await original(ctx, packet)
+            processed.set()
+        else:
+            await original(ctx, packet)
+
+    monkeypatch.setattr(worker, "_control", control)
+    run = asyncio.create_task(agent.send("start"))
+    try:
+        async with asyncio.timeout(10):
+            await _wait_calls(model, 1)
+            ctx = worker._active[agent.target.session_id]
+            receipt = await agent.runtime.client.steer(ctx.job_ref, "new direction", message_id="steer", actor=agent.actor)
+            await received.wait()
+            if notification == "delayed_void":
+                assert (await agent.runtime.client.cancel(receipt.input_ref, actor=agent.actor)).job_ref is None
+                release.set()
+            await processed.wait()
+            assert ctx.loop.steer_event(ctx.session_id).is_set() == (notification != "delayed_void")
+            first.set()
+            await _wait_calls(model, 2)
+            assert not ctx.loop.steer_event(ctx.session_id).is_set()
+            if notification == "duplicate_delivered":
+                processed.clear()
+                await agent.runtime.transport.publish(TransportPacket(42, agent.runtime.namespace,
+                    "duplicate", receipt.target, "control", receipt.input_ref))
+                await processed.wait()
+            second.set()
+            result = await run
+        assert result.status == "completed"
+        assert executed == (["x", "x"] if notification == "delayed_void" else ["x"])
+        rows = await store.load_all_messages(agent.target.session_id)
+        assert sum("new direction" in (r.content or "") for r in rows) == (notification != "delayed_void")
+        assert [r.content for r in rows if r.role == "tool" and r.tool_call_id == "c2"] == ["x"]
+    finally:
+        first.set()
+        second.set()
+        release.set()
+        await agent.aclose()
+        await asyncio.gather(run, return_exceptions=True)

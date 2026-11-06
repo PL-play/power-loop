@@ -735,10 +735,10 @@ class _ExecutionLoop:
 
 
     def _note_committed_inbox(self, session_id: str) -> None:
-        """Idempotent wake hint after an external atomic inbox commit; no dispatch."""
-        self._sync_sids.add(session_id)
-        entry = _session_sync(session_id, owner=self)
-        entry.pending_hint = max(1, entry.pending_hint)
+        """Re-read pending inputs after a rolled-back batch releases its claims."""
+        ctx = self._runtime_worker_context
+        ctx.append_overflow = True
+        ctx.append_cursor = 0
 
     def pending_follow_up_count(self, session_id: str) -> int:
         """In-process HINT of undelivered inbox items for ``session_id`` (items this process

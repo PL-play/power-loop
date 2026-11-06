@@ -665,7 +665,7 @@ class SessionStore:
                            "tool_call_ids": [str(call.get("id") or "") for call in tool_calls
                                              if isinstance(call, Mapping) and call.get("id")],
                            "tool_calls": tool_calls})
-        committed, lease_lost = False, False
+        committed, lease_lost, claim_changed = False, False, False
         prior = send_reads.take_state(self, session_id)
         signal_columns = ','.join(change_signals.COLUMNS)
         signal_values = None
@@ -810,12 +810,18 @@ class SessionStore:
                         ),
                     )
             committed = True
+        except InboxClaimChanged:
+            # The transaction rolled back its allocation. Retain the known seq:
+            # NULL would make this live owner's next conditional write miss.
+            claim_changed = True
+            raise
         except SessionLeaseLost:
             lease_lost = True
             raise
         finally:
             if not committed and not lease_lost and holding.active:
-                holding.next_seq = None
+                if not claim_changed:
+                    holding.next_seq = None
                 holding.change_snapshot = None
                 if deferred_round is not None:
                     holding.deferred_round = holding.deferred_round if holding.deferred_round is not None else deferred_round
