@@ -34,6 +34,12 @@ log = logging.getLogger(__name__)
 
 
 @dataclass
+class _ControlInputRead:
+    input_ref: InputRef
+    hint_consumed: bool
+
+
+@dataclass
 class ExecutionContext:
     store_id: str
     session_id: str
@@ -47,6 +53,7 @@ class ExecutionContext:
     stop: CancellationToken = field(default_factory=CancellationToken)
     append_refs: dict = field(default_factory=dict)
     claiming_refs: frozenset[InputRef] = field(default_factory=frozenset)
+    control_read: _ControlInputRead | None = None
     append_overflow: bool = False
     append_cursor: int = 0
     loop: object = None
@@ -255,14 +262,19 @@ class RuntimeWorker:
     async def _control(self, ctx, packet):
         # Never enters the normal execution semaphore or the loop's send lock.
         if packet.input_ref is not None:
-            record = await self.inputs.input(self.inputs.db, packet.input_ref)
+            # The serial control listener has one in-flight read. Keep its
+            # consumption fact across awaits, even after the claim batch ends.
+            read = _ControlInputRead(packet.input_ref, packet.input_ref in ctx.claiming_refs)
+            ctx.control_read = read
+            try:
+                record = await self.inputs.input(self.inputs.db, packet.input_ref)
+            finally:
+                ctx.control_read = None
             if (record and record.row["status"] == "pending"
                     and record.meta["operation"] == "steer" and ctx.job_ref is not None
                     and record.row["target_job_id"] == ctx.job_ref.job_id
                     and record.row["expected_job_generation"] == ctx.job_ref.generation):
-                # This input's hint is already being consumed at the checkpoint.
-                # The claim/void result, not another notification, decides its fate.
-                if packet.input_ref in ctx.claiming_refs:
+                if read.hint_consumed:
                     return
                 if len(ctx.append_refs) < 100:
                     ctx.append_refs[packet.input_ref] = None
@@ -467,6 +479,10 @@ class RuntimeWorker:
         for ref in refs:
             ctx.append_refs.pop(ref)
         ctx.claiming_refs = frozenset(refs)
+        if ctx.control_read and ctx.control_read.input_ref in ctx.claiming_refs:
+            # A pending snapshot already being read must not re-issue the hint
+            # consumed here. Claim/void/delivery still use the original transaction.
+            ctx.control_read.hint_consumed = True
         try:
             async with self.inputs.db.transaction() as tx:
                 # Filter the finite notification batch; new_turn must remain pending.

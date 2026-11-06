@@ -27,6 +27,10 @@ from power_loop.runtime.pricing import Free
 from power_loop.tools.registry import ToolRegistry
 from tests.runtime_fixture import RunningAgent
 
+from .test_job_registry_192 import registry_store
+
+__all__ = ["registry_store"]
+
 
 class _Gate(LLMService):
     """Scripted LLM; call #n blocks until ``gates[n]`` is set (if one is registered)."""
@@ -183,10 +187,26 @@ async def test_steer_text_is_persisted_once_and_bound_to_original_job(store, mak
     "claim_first_only", "duplicate_claim", "duplicate_claim_new_steer",
 ])
 async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, notification):
+    await _check_steer_notifications(store, monkeypatch, notification)
+
+
+@pytest.mark.parametrize("registry_store", ["postgres"], indirect=True)
+@pytest.mark.parametrize("notification", [
+    "claim_first_only", "duplicate_read", "duplicate_read_before_claim",
+    "new_read", "duplicate_read_new_steer",
+])
+async def test_steer_control_read_crosses_claim_completion(registry_store, monkeypatch, notification):
+    store, _ = registry_store
+    await _check_steer_notifications(store, monkeypatch, notification, postgres=True)
+
+
+async def _check_steer_notifications(store, monkeypatch, notification, *, postgres=False):
     from power_loop import TransportPacket
 
-    concurrent = notification in {"received_void_new_steer", "duplicate_claim_new_steer"}
-    claim_gate = concurrent or notification in {"claim_first_only", "duplicate_claim"}
+    read_window = "read" in notification
+    concurrent = notification in {"received_void_new_steer", "duplicate_claim_new_steer",
+                                   "new_read", "duplicate_read_new_steer"}
+    claim_gate = concurrent or read_window or notification in {"claim_first_only", "duplicate_claim"}
     void = notification in {"delayed_void", "received_void", "received_void_new_steer"}
     calls = [_tool_call("c1"), _tool_call("c2")]
     model = _Gate([*calls, *([_tool_call("c3")] if concurrent else []), LLMResponse(raw_text="done")])
@@ -196,6 +216,9 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
     worker = agent.runtime.worker
     received, release, processed = asyncio.Event(), asyncio.Event(), asyncio.Event()
     draining, resume_drain = asyncio.Event(), asyncio.Event()
+    read_waiting, resume_read = asyncio.Event(), asyncio.Event()
+    reading_task = None
+    delay_read = False
     in_drain = armed = False
     original = worker._control
     original_drain, transaction = worker.drain_append, worker.inputs.db.transaction
@@ -218,14 +241,36 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
             yield tx
 
     async def control(ctx, packet):
+        nonlocal reading_task
         if packet.input_ref and packet.input_ref.message_id in {"steer", "keep"}:
             received.set()
             if notification == "delayed_void":
                 await release.wait()
+            if delay_read:
+                reading_task = asyncio.current_task()
             await original(ctx, packet)
             processed.set()
         else:
             await original(ctx, packet)
+
+    if postgres:
+        pool = store._db._pool
+        pool_release = type(pool).release
+
+        async def pause_release(self, connection, *, timeout=None):
+            # The real SELECT has completed; only delay this control task's
+            # existing connection-release await, leaving other connections free.
+            if self is pool and asyncio.current_task() is reading_task and not read_waiting.is_set():
+                read_waiting.set()
+                await resume_read.wait()
+            return await pool_release(self, connection, timeout=timeout)
+
+        monkeypatch.setattr(type(pool), "release", pause_release)
+
+    async def repeat_control(receipt):
+        processed.clear()
+        await agent.runtime.transport.publish(TransportPacket(42, agent.runtime.namespace,
+            "duplicate", receipt.target, "control", receipt.input_ref))
 
     monkeypatch.setattr(worker, "_control", control)
     if claim_gate:
@@ -247,26 +292,44 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
                 cancelled = await agent.runtime.client.cancel(receipt.input_ref, actor=agent.actor)
                 assert cancelled.reason == "cancelled" and cancelled.job_ref is None
             armed = claim_gate
+            if notification == "duplicate_read_before_claim":
+                delay_read = True
+                await repeat_control(receipt)
+                await read_waiting.wait()
             first.set()
             if claim_gate:
                 await draining.wait()
                 if concurrent:
                     processed.clear()
+                    delay_read = notification == "new_read"
                     keep = await agent.runtime.client.steer(ctx.job_ref, "kept direction", message_id="keep", actor=agent.actor)
-                    await processed.wait()
-                    assert ctx.loop.steer_event(ctx.session_id).is_set()
-                if notification.startswith("duplicate_claim"):
-                    processed.clear()
-                    await agent.runtime.transport.publish(TransportPacket(42, agent.runtime.namespace,
-                        "duplicate", receipt.target, "control", receipt.input_ref))
-                    await processed.wait()
+                    if delay_read:
+                        await read_waiting.wait()
+                    else:
+                        await processed.wait()
+                        assert ctx.loop.steer_event(ctx.session_id).is_set()
+                if notification.startswith("duplicate") and notification != "duplicate_read_before_claim":
+                    delay_read = read_window
+                    await repeat_control(receipt)
+                    if read_window:
+                        await read_waiting.wait()
+                    else:
+                        await processed.wait()
                 resume_drain.set()
             await _wait_calls(model, 2)
-            second_steer = ctx.loop.steer_event(ctx.session_id).is_set()
             original_state = await worker.inputs.input(worker.inputs.db, receipt.input_ref)
             assert original_state.row["status"] == ("void" if void else "delivered")
+            if not void:
+                assert (original_state.row["delivered_job_id"], original_state.row["delivered_job_generation"]) == (
+                    ctx.job_ref.job_id, ctx.job_ref.generation)
             if concurrent:
                 assert (await worker.inputs.input(worker.inputs.db, keep.input_ref)).row["status"] == "pending"
+            if read_window:
+                assert not ctx.claiming_refs
+                assert ctx.loop.steer_event(ctx.session_id).is_set() == (notification == "duplicate_read_new_steer")
+                resume_read.set()
+                await processed.wait()
+            second_steer = ctx.loop.steer_event(ctx.session_id).is_set()
             if notification == "duplicate_delivered":
                 processed.clear()
                 await agent.runtime.transport.publish(TransportPacket(42, agent.runtime.namespace,
@@ -277,6 +340,7 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
         assert result.status == "completed"
         assert result.job_ref == ctx.job_ref
         assert not ctx.claiming_refs
+        assert ctx.control_read is None
         assert executed == (["x", "x"] if notification == "delayed_void" else ["x"])
         assert second_steer == concurrent
         rows = await store.load_all_messages(agent.target.session_id)
@@ -288,7 +352,10 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
             assert sum("kept direction" in (r.content or "") for r in rows) == 1
             assert "kept direction" in str(model.calls[2])
             assert sum("kept direction" in str(m) for m in model.calls[2]) == 1
-            assert (await worker.inputs.input(worker.inputs.db, keep.input_ref)).row["status"] == "delivered"
+            kept = await worker.inputs.input(worker.inputs.db, keep.input_ref)
+            assert kept.row["status"] == "delivered"
+            assert (kept.row["delivered_job_id"], kept.row["delivered_job_generation"]) == (
+                result.job_ref.job_id, result.job_ref.generation)
             assert [r.content for r in rows if r.role == "tool" and r.tool_call_id == "c2"][0].startswith("[skipped:")
         last_call = "c3" if concurrent else "c2"
         assert [r.content for r in rows if r.role == "tool" and r.tool_call_id == last_call] == ["x"]
@@ -297,5 +364,6 @@ async def test_steer_notifications_do_not_skip_later_tools(store, monkeypatch, n
         second.set()
         release.set()
         resume_drain.set()
+        resume_read.set()
         await agent.aclose()
         await asyncio.gather(run, return_exceptions=True)
