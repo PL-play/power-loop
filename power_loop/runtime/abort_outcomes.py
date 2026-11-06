@@ -74,12 +74,12 @@ async def _original(manager, tx, source):
 
 
 async def requested(manager, tx, source):
+    from .execution_membership import proof
     from .tool_call_abort import identity
-    from .workflow_controller import proof
 
     closed, _snapshot, _pending, ref, checkpoint = await _original(manager, tx, source)
     abort = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (identity(manager, source, ref),))
-    model = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', ('model_closed_'+source['job_id'],))
+    model = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (result_id(source["job_id"], source["generation"]),))
     outcome = closed['evidence'].get('exit')
     if outcome not in ('cancelled', 'interrupted', 'timed_out', 'budget_exceeded'):
         outcome = 'failed'
@@ -214,7 +214,7 @@ async def expected_disposition(manager, tx, source, closed, *, optional=False):
         proof = await unstarted_references(manager, tx, row)
         children.append({'tool_call_id': call_id, 'job_id': row['job_id'], 'generation': 0,
                          'negative_evidence_hash': _hash(proof)})
-    return {'version': 2, 'snapshot': snapshot, 'model_exit': await _reference(manager, tx, 'model_closed_'+source['job_id']),
+    return {'version': 2, 'snapshot': snapshot, 'model_exit': await _reference(manager, tx, result_id(source["job_id"], source["generation"])),
             'calls': [{'tool_call_id': e['call_id'], 'resolution': 'not_dispatched'} for e in checkpoint['entries']],
             'children': children, 'source_result': content_reference(result),
             'notice_id': delivery[0]['event_id'], 'notice_hash': _hash(delivery[1]), 'disposition': MODE,
@@ -246,11 +246,11 @@ async def reconcile(loop,actor,source_job_id):
 @_verify_stored
 async def _reconcile(loop, actor, source_job_id, *, permit):
     """One original main batch: atomic negative result, notice and disposition."""
+    from .execution_membership import proof
     from .managed_completion import _host_only
     from .managed_effects import terminate_unstarted_tx
     from .pending_calls import current, identity, model, require_disposition
     from .tool_call_plans import _event
-    from .workflow_controller import proof
     if permit is None:
         _host_only()
     runtime = getattr(loop, 'task_runtime', None)

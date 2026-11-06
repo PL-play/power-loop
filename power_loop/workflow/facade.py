@@ -4,6 +4,7 @@ The low-level SDK can still await a Workflow. Model submissions always return
 an admission receipt. No platform import, model-selected executor, or duplicate
 live-handle registry belongs here.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -23,9 +24,8 @@ from power_loop.core.agent_context import get_current_loop, get_effective_tools,
 from power_loop.runtime.execution_roles import require_orchestration
 from power_loop.runtime.pricing import Free
 
-from .api import create_workflow
 from .engine import in_workflow
-from .result import WorkflowRunHandle
+from .runner import WorkflowRunHandle
 from .spec import WorkflowSpec, WorkflowSpecError
 
 log = logging.getLogger(__name__)
@@ -46,37 +46,30 @@ class WorkflowToolPorts:
     """Host-selected capabilities; never populated from model arguments.
 
     load_spec(file, args) may return a spec/dict or an awaitable. Policy and
-    resource factories are synchronous and run in the invoking context. View
+    tool-grant factories are synchronous and run in the invoking context. View
     observers may be async, are bounded, and cannot invalidate admission.
-    Completion is the actual engine callback, not a presentation observer.
+    Completion is read from the durable workflow result.
     """
 
     load_spec: Callable[..., Any] | None = None
     spec_transform: Callable[[WorkflowSpec], WorkflowSpec] | None = None
-    executor_factory: Callable[..., Any] | None = None
-    budget_factory: Callable[..., Any] | None = None
-    file_io_factory: Callable[..., Any] | None = None
     allowed_tools_factory: Callable[..., Any] | None = None
-    on_complete: Callable[..., Any] | None = None
     on_compiled: Callable[..., Any] | None = None
     on_accepted: Callable[..., Any] | None = None
     allow_inline_spec: bool = True
     observer_timeout_s: float = 2.0
-    resource_adapter: tuple[str, str] | None = None
 
     def __post_init__(self):
         if type(self.allow_inline_spec) is not bool:
             raise TypeError("allow_inline_spec must be a bool")
         value = self.observer_timeout_s
-        if (isinstance(value, bool) or not isinstance(value, (int, float)) or
-                not math.isfinite(value) or not 0 < value <= 30):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 < value <= 30
+        ):
             raise WorkflowToolInputError("invalid_workflow_observer_timeout")
-        if self.resource_adapter is not None:
-            if (type(self.resource_adapter) is not tuple or len(self.resource_adapter) != 2 or
-                    any(type(value) is not str or not value.strip() for value in self.resource_adapter)):
-                raise WorkflowToolInputError("invalid_workflow_resource_adapter")
-            if any(value is not None for value in (self.executor_factory, self.budget_factory, self.file_io_factory, self.on_complete)):
-                raise WorkflowToolInputError("workflow_resource_ports_conflict")
 
 
 @dataclass(frozen=True)
@@ -119,7 +112,7 @@ def _load_workspace_spec(ref, args):
 async def prepare_workflow(arguments: Mapping[str, Any], ports: WorkflowToolPorts) -> PreparedWorkflow:
     """Freeze inputs, compile and apply the same policy for create/validate."""
     options = copy.deepcopy(dict(arguments))
-    if set(options) - {"spec", "file", "args", "input", "detached", "wait", "sync"}:
+    if set(options) - {"spec", "file", "args", "input"}:
         raise WorkflowToolInputError("invalid_workflow_parameters")
     # Capture before a host loader can await, and never let a host whitelist
     # accidentally widen the actual calling send's effective capabilities.
@@ -204,36 +197,43 @@ async def submit_workflow(arguments: Mapping[str, Any], ports: WorkflowToolPorts
     # A control-only pipeline lane must never authorize source loading, resource
     # factories or presentation hooks for a new execution.
     from power_loop.runtime.task_runtime import check_dispatch
+
     await check_dispatch(sid)
     prepared = await prepare_workflow(options, ports)
     warning = await _observe(ports.on_compiled, ports, copy.deepcopy(prepared.spec.to_dict()))
-    resource_binding = None
-    if ports.resource_adapter is not None:
-        from power_loop.runtime.jobs import JobError
-        from power_loop.runtime.workflow_resources import WorkflowResourceScope, execution_contract
-        runtime = getattr(loop, "task_runtime", None)
-        resources = getattr(runtime, "workflow_resources", None)
-        if resources is None:
-            raise JobError("workflow_resource_registry_required")
-        bound = await resources.prepare(*ports.resource_adapter,
-            scope=WorkflowResourceScope(runtime.tenant_id, runtime.principal_id, sid),
-            contract_sha256=execution_contract(prepared.spec, prepared.allowed_tools))
-        resource_binding = bound.binding
-    wf = create_workflow(prepared.spec, parent_loop=loop, parent_session_id=sid,
-        executor=ports.executor_factory(loop, sid) if ports.executor_factory else None,
-        budget=ports.budget_factory(loop, sid) if ports.budget_factory else None,
-        file_io=ports.file_io_factory(loop, sid) if ports.file_io_factory else None,
-        allowed_tools=prepared.allowed_tools, resource_binding=resource_binding)
-    handle = await wf.start(detached=True, on_complete=ports.on_complete)
-    if not isinstance(handle, WorkflowRunHandle):
-        raise TypeError("asynchronous workflow admission must return a WorkflowRunHandle")
-    native = getattr(loop, "task_runtime", None) is not None
-    receipt = {"version": 1, "backend": "task_registry" if native else "legacy",
-        "status": "accepted", "run_id": handle.run_id, "workflow": prepared.spec.name,
-        "job_id": handle.job_id, "operation_id": handle.operation_id,
-        "completion_delivery": "owner_inbox" if native else ("host_callback" if ports.on_complete else "durable_timer_requires_runner"),
-        "view_warnings": [warning] if warning else []}
-    accepted = WorkflowAdmission(WorkflowSpec.from_json(copy.deepcopy(prepared.spec.to_dict())), handle, copy.deepcopy(receipt))
+    from power_loop.agent.runtime_types import RequestOptions, TargetRef, plain
+    from power_loop.runtime.child_tasks import tool_actor
+
+    from .runner import submit
+
+    binding, actor = await tool_actor(loop)
+    client = loop._runtime_worker.runtime.client
+    handle = await submit(
+        client,
+        TargetRef(loop.store.store_id, sid),
+        prepared.spec,
+        message_id="workflow:" + actor.tool_call_id,
+        actor=actor,
+        descriptor=loop._runtime_worker_context.descriptor,
+        parent=binding.lease,
+        options=RequestOptions(tools=sorted(prepared.allowed_tools) if prepared.allowed_tools is not None else None),
+    )
+    receipt = {
+        "version": 1,
+        "status": "accepted",
+        "run_id": handle.run_id,
+        "workflow": prepared.spec.name,
+        "job_id": handle.job_id,
+        "job_ref": plain(handle.job_ref),
+        "input_ref": plain(handle.input_ref),
+        "operation_id": handle.operation_id,
+        "completion_delivery": "owner_inbox",
+        "view_warnings": [warning] if warning else [],
+    }
+
+    accepted = WorkflowAdmission(
+        WorkflowSpec.from_json(copy.deepcopy(prepared.spec.to_dict())), handle, copy.deepcopy(receipt)
+    )
     warning = await _observe(ports.on_accepted, ports, accepted)
     if warning:
         receipt["view_warnings"].append(warning)
@@ -243,73 +243,66 @@ async def submit_workflow(arguments: Mapping[str, Any], ports: WorkflowToolPorts
 def workflow_tool_definition(*, allow_inline_spec=True, description_suffix=""):
     properties = {
         "action": {"type": "string", "enum": list(_ACTIONS)},
-        "file": {"type": "string", "description": "Workspace YAML file; host may also grant skill: references."},
-        "args": {"type": "object"}, "input": {"type": "string"},
-        "run_id": {"type": "string"}, "detail": {"type": "boolean"},
+        "file": {"type": "string"},
+        "args": {"type": "object"},
+        "input": {"type": "string"},
+        "run_id": {"type": "string"},
+        "node": {"type": "string"},
+        "node_job_id": {"type": "string"},
+        "message": {"type": "string"},
+        "reason": {"type": "string"},
+        "expected_generation": {"type": "integer", "minimum": 0},
         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-        "max_chars": {"type": "integer", "minimum": 1024, "maximum": 32000},
         "cursor": {"type": "string"},
-        "reason": {"type": "string", "maxLength": 1000},
-        "node": {"type": "string", "description": "One unambiguous existing node ID for logs/cancel/nudge/steer. Only cancel may omit all node selectors for the whole workflow."},
-        "node_job_id": {"type": "string", "description": "Exact native workflow-node job when an ID has multiple routes. Mutually exclusive with node."},
-        "expected_generation": {"type": "integer", "minimum": 0, "description": "Native cancellation only; legacy generations are unavailable."},
-        "sid": {"type": "string", "description": "Exact session from leaves. Native nudge/steer require run_id and a node/node_job_id or this saved sid; optional sid further constrains the node."},
-        "message": {"type": "string", "minLength": 1, "maxLength": 64000, "description": "nudge/steer: correction for the original node. Native control preserves its saved tools and rounds; do not pass rounds or force."},
-        "source": {"type": "string", "enum": ["messages", "projection"], "description": "Native logs: saved original messages or projections."},
-        "ids": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"oneOf": [{"type": "integer"}, {"type": "string"}]}, "description": "Native logs: inclusive seq range for messages, ID range for projection."},
-        "seq": {"oneOf": [{"type": "integer"}, {"type": "string"}], "description": "Native logs: one original seq coordinate."},
-        "id": {"oneOf": [{"type": "integer"}, {"type": "string"}], "description": "Native logs: one projection ID."},
-        "message_id": {"oneOf": [{"type": "integer"}, {"type": "string"}], "description": "Native logs: one global raw-message ID. Decimal strings preserve precision."},
-        "message_ids": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"oneOf": [{"type": "integer"}, {"type": "string"}]}},
-        "send_index": {"oneOf": [{"type": "integer"}, {"type": "string"}], "description": "Native logs: optional narrower send filter; cannot widen a send job's authority."},
-        "char_offset": {"type": "integer", "minimum": 0, "description": "Native logs: next_char_offset for one record."},
-        "output_file": {"type": "string", "description": "Native logs: export originals as JSONL to a new workspace file. Omit cursor/char_offset."},
-        "tail": {"type": "integer", "minimum": 1, "maximum": 200, "description": "Legacy logs preview only: latest assistant rounds, default 40. Native logs use limit/coordinates."},
-        "verbose": {"type": "boolean", "description": "Legacy logs preview only: longer argument/result excerpts."},
+        "max_chars": {"type": "integer", "minimum": 1024, "maximum": 32000},
+        "detail": {"type": "boolean"},
     }
     if allow_inline_spec:
-        properties["spec"] = {"type": "object", "description": "WorkflowSpec JSON. Select exactly one spec or file."}
-    return ToolDefinition(pricing=Free("composite"), name="workflow", description=(
-        "Create and inspect deterministic agent workflows. create always admits asynchronous work; "
-        "the returned accepted receipt is not its result. Use validate for compilation/policy checks without execution. "
-        "list/status read saved tasks; status without run_id lists owned workflows. They do not start agents. Results require actual completion and owner consumption. "
-        "cancel requests stopping the original workflow or a selected node; acceptance is not physical stop. "
-        "Native nudge/steer send a correction to the original node through its owning engine; an accepted receipt is not processing/completion. "
-        "They preserve the original contract and never start a substitute session. Old stores require a host control adapter. "
-        "leaves lists owned node/session bindings; legacy responses identify their compatibility scope. "
-        "logs reads retained node history without running agents: native uses run_id plus node/node_job_id; "
-        "legacy accepts an owned sid or run_id plus node. Use limit/cursor/max_chars or exact coordinates, "
-        "or legacy-only tail/verbose for a round preview. "
-        "Main agents may orchestrate; nested workflows are forbidden. " + description_suffix),
+        properties["spec"] = {"type": "object"}
+    return ToolDefinition(
+        name="workflow",
+        pricing=Free("composite"),
+        description=(
+            "Create asynchronous workflows; inspect saved tasks, leaves and messages; cancel or steer an exact node. "
+            "Accepted is a receipt, not completion. Results arrive in the owner inbox. " + description_suffix
+        ),
         input_schema={"type": "object", "properties": properties, "additionalProperties": False},
-        required_params=(), interrupt="background")
+    )
 
 
 def _dump(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(value, ensure_ascii=False, default=str)
 
 
-async def run_workflow_tool(arguments: Mapping[str, Any], *, ports: WorkflowToolPorts | None = None) -> str:
-    """Library action router. Host ports are supplied by registration only."""
+async def _owned_native_workflow(loop, sid, run_id):
+    if not isinstance(run_id, str) or not re.fullmatch(r"[a-f0-9]{8,64}", run_id):
+        raise WorkflowToolInputError("workflow_run_id_required")
+    manager = loop.task_runtime.manager
+    event = await manager.db.fetchone(
+        f"SELECT job_id FROM {manager.events} WHERE event_id=? AND action='create'", ("op_" + run_id,)
+    )
+    if event is None:
+        raise WorkflowToolInputError("workflow_run_not_found")
+    job = await manager.get_job(loop.task_runtime.actor(sid), event["job_id"], include_result=False)
+    if job.kind != "workflow":
+        raise WorkflowToolInputError("workflow_run_not_found")
+    return job
+
+
+async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
+    from power_loop.agent.runtime_types import JobRef, RuntimeRequestError, plain
+    from power_loop.runtime import task_history, task_query
+    from power_loop.runtime.child_tasks import tool_actor
+    from power_loop.runtime.jobs import JobError
+
     ports = ports or WorkflowToolPorts()
-    options = copy.deepcopy(dict(arguments))
+    options = dict(arguments or kwargs)
     action = options.pop("action", "help")
-    if action not in _ACTIONS:
-        return _dump({"version": 1, "error": {"code": "invalid_workflow_action"}})
-    allowed = {"create": {"spec", "file", "args", "input", "wait", "sync", "detached"},
-        "validate": {"spec", "file", "args", "input"}, "help": set(),
-        "status": {"run_id", "detail", "max_chars"}, "list": {"limit", "max_chars", "cursor"},
-        "cancel": {"run_id", "reason", "expected_generation", "node", "node_job_id"},
-        "nudge": {"run_id", "node", "node_job_id", "sid", "message"},
-        "steer": {"run_id", "node", "node_job_id", "sid", "message"},
-        "leaves": {"run_id", "limit", "max_chars", "cursor"},
-        "logs": {"run_id", "node", "node_job_id", "sid", "source", "ids", "seq", "id", "message_id", "message_ids",
-            "send_index", "limit", "cursor", "char_offset", "max_chars", "output_file", "tail", "verbose"}}[action]
-    if set(options) - allowed:
-        return _dump({"version": 1, "error": {"code": "invalid_workflow_parameters"}})
     try:
+        if action not in _ACTIONS:
+            raise WorkflowToolInputError("invalid_workflow_action")
         if action == "help":
-            return _dump({"version": 1, "actions": list(_ACTIONS), "execution": "asynchronous", "source": "file_or_spec" if ports.allow_inline_spec else "file"})
+            return _dump({"actions": list(_ACTIONS), "execution": "asynchronous"})
         loop, sid = get_current_loop(), get_session_id()
         if loop is None or not sid:
             raise WorkflowToolInputError("active_session_required")
@@ -317,191 +310,68 @@ async def run_workflow_tool(arguments: Mapping[str, Any], *, ports: WorkflowTool
         if action == "create":
             return _dump((await submit_workflow(options, ports)).receipt)
         if action == "validate":
-            from power_loop.runtime.task_runtime import check_dispatch
-
             from .tool import _spec_summary
-            await check_dispatch(sid)
+
             prepared = await prepare_workflow(options, ports)
-            return _dump({"version": 1, "status": "valid", "summary": _spec_summary(prepared.spec)})
-        if action == "cancel":
-            return _dump(await _cancel(loop, sid, options))
-        if action in ("nudge", "steer"):
-            return _dump(await _nudge(loop, sid, options))
-        if action in ("leaves", "logs"):
-            return _dump(await _history(loop, sid, action, options))
-        return _dump(await _inspect(loop, sid, action, options))
-    except WorkflowSpecError as exc:
-        return _dump({"version": 1, "error": {"code": "invalid_workflow_spec", "problems": list(exc.problems)}})
-    except ValueError as exc:
-        # Known contract codes only. Filesystem/decode/backend details are not
-        # model-visible; arbitrary host exceptions must not leak credentials.
-        from power_loop.runtime.jobs import JobError
-        roles = {"execution_role_unavailable", "execution_role_conflict", "execution_role_forbids_workflow", "invalid_delegation_policy"}
-        code = (getattr(exc, "code", str(exc)) if isinstance(exc, (WorkflowToolInputError, JobError)) or str(exc) in roles
-            else "workflow_control_requires_reconciliation" if action in ("nudge", "steer") else "workflow_input_rejected")
-        result = {"version": 1, "error": {"code": code}}
-        if code in ("stop_control_unconfirmed", "stop_requires_reconciliation", "workflow_control_requires_reconciliation"):
-            result["control_state"] = "unknown"
-        return _dump(result)
-    except Exception:
-        result = {"version": 1, "error": {"code": "workflow_admission_requires_reconciliation" if action == "create" else
-            "stop_requires_reconciliation" if action == "cancel" else
-            "workflow_control_requires_reconciliation" if action in ("nudge", "steer") else "workflow_backend_unavailable"}}
-        if action in ("cancel", "nudge", "steer"):
-            result["control_state"] = "unknown"
-        return _dump(result)
+            return _dump({"status": "valid", "summary": _spec_summary(prepared.spec)})
+        manager, actor = loop.task_runtime.manager, loop.task_runtime.actor(sid)
+        if action == "list" or action == "status" and not options.get("run_id"):
+            value = await task_query.list_jobs(
+                manager,
+                actor,
+                kinds=["workflow"],
+                status="all",
+                limit=options.get("limit", 20),
+                cursor=options.get("cursor"),
+                max_chars=options.get("max_chars", 8000),
+            )
+        else:
+            job = await _owned_native_workflow(loop, sid, options.get("run_id"))
+            if action == "status":
+                value = await task_query.get_job(manager, actor, job.job_id, max_chars=options.get("max_chars", 8000))
+            elif action == "leaves":
+                rows = await manager.db.fetchall(
+                    f"SELECT job_id,session_id,generation,title,status,outcome FROM {manager.jobs} "
+                    "WHERE parent_job_id=? AND kind='workflow_node' ORDER BY job_id LIMIT 101",
+                    (job.job_id,),
+                )
+                value = {"nodes": rows[:100], "truncated": len(rows) > 100}
+            else:
+                from .control import select_native_target
+
+                selected = await select_native_target(loop.task_runtime, sid, job, options)
+                node = await manager.get_job(actor, selected, include_result=False)
+                if action == "logs":
+                    value = await task_history.read_history(manager, actor, selected, limit=options.get("limit", 20))
+                else:
+                    _, trusted = await tool_actor(loop)
+                    client = loop._runtime_worker.runtime.client
+                    ref = JobRef(loop.store.store_id, selected, options.get("expected_generation", node.generation))
+                    if action == "cancel":
+                        value = plain(
+                            await client.cancel(
+                                ref, actor=trusted, scope="subtree", reason=options.get("reason", "cancelled")
+                            )
+                        )
+                    else:
+                        value = plain(
+                            await getattr(client, action)(
+                                ref, options["message"], actor=trusted, message_id=action + ":" + trusted.tool_call_id
+                            )
+                        )
+        return _dump(value)
+    except (WorkflowToolInputError, WorkflowSpecError, JobError, RuntimeRequestError) as exc:
+        return _dump({"error": {"code": getattr(exc, "code", str(exc))}})
 
 
-async def _owned_native_workflow(loop, sid, run_id):
-    if not isinstance(run_id, str) or not re.fullmatch(r"[a-f0-9]{8,64}", run_id):
-        raise WorkflowToolInputError("workflow_run_id_required")
-    manager, actor = loop.task_runtime.manager, loop.task_runtime.actor(sid)
-    operation = await manager.get_operation(actor, "op_"+run_id)
-    job = await manager.get_job(actor, operation.job_id, include_result=False)
-    if job.kind != "workflow" or job.created_by_session_id != sid or operation.action != "create":
-        raise WorkflowToolInputError("workflow_run_not_owned")
-    return job
-
-
-async def _nudge(loop, sid, options):
-    if getattr(loop, "task_runtime", None) is None:
-        raise WorkflowToolInputError("legacy_workflow_control_requires_host")
-    from power_loop.runtime.task_runtime import check_dispatch
-
-    from .control import nudge
-    await check_dispatch(sid)
-    workflow = await _owned_native_workflow(loop, sid, options.get("run_id"))
-    return await nudge(loop, sid, workflow, options)
-
-
-async def _cancel(loop, sid, options):
-    from power_loop.runtime.task_control import stop_from_current_call
-
-    run_id = options.get("run_id")
-    if getattr(loop, "task_runtime", None) is not None:
-        job = await _owned_native_workflow(loop, sid, run_id)
-        target = await _native_cancel_target(loop.task_runtime, sid, job, options)
-        return {"run_id": run_id, **await stop_from_current_call(loop, sid, target,
-            reason=options.get("reason", "Stopped by request"), expected_generation=options.get("expected_generation"))}
-    from .runner import request_owned_node_stop, request_owned_stop
-    if "node" in options and "node_job_id" in options:
-        raise WorkflowToolInputError("ambiguous_workflow_node_selector")
-    if "node_job_id" in options:
-        raise WorkflowToolInputError("legacy_node_job_unavailable")
-    if "node" in options:
-        return await request_owned_node_stop(loop, sid, run_id, options["node"],
-            reason=options.get("reason", "Stopped by request"), expected_generation=options.get("expected_generation"))
-    return await request_owned_stop(loop, sid, run_id, reason=options.get("reason", "Stopped by request"),
-        expected_generation=options.get("expected_generation"))
-
-
-async def _native_cancel_target(runtime, sid, workflow, options):
-    from .control import select_native_target
-    return await select_native_target(runtime, sid, workflow, options)
-
-
-async def _history(loop, sid, action, options):
-    from power_loop.runtime import task_history, task_query, task_sessions
-
-    runtime = getattr(loop, "task_runtime", None)
-    if runtime is None:
-        from power_loop.runtime.jobs import JobError
-
-        from .legacy_history import leaves, logs
-        try:
-            return await (leaves(loop, sid, options) if action == "leaves" else logs(loop, sid, options))
-        except JobError:
-            raise
-        except Exception as exc:
-            raise WorkflowToolInputError("legacy_workflow_history_backend_unavailable") from exc
-    workflow = await _owned_native_workflow(loop, sid, options.get("run_id"))
-    budget = options.get("max_chars", 8000)
-    if type(budget) is not int or not 1024 <= budget <= 32000:
-        raise WorkflowToolInputError("invalid_query_max_chars")
-    if action == "logs":
-        if "tail" in options or "verbose" in options:
-            raise WorkflowToolInputError("native_workflow_logs_use_limit_and_coordinates")
-        if "node" not in options and "node_job_id" not in options:
-            raise WorkflowToolInputError("workflow_history_node_required")
-        node = await _native_cancel_target(runtime, sid, workflow, options)
-        return await task_history.read_history(runtime.manager, runtime.actor(sid), node,
-            session_id=options.get("sid"), **{k: v for k, v in options.items() if k not in ("run_id", "node", "node_job_id", "sid")})
-    listing = await task_query.list_jobs(runtime.manager, runtime.actor(sid), root_job_id=workflow.job_id,
-        kinds=["workflow_node"], status="all", limit=options.get("limit", 20), cursor=options.get("cursor"), max_chars=max(1024, budget-512))
-    nodes = []
-    for row in listing["nodes"]:
-        if row["context_only"]:
-            continue
-        binding = await task_sessions.list_sessions(runtime.manager, runtime.actor(sid), row["job_id"])
-        nodes.append({key: row[key] for key in ("job_id", "parent_job_id", "title", "generation", "status", "outcome", "resource_state")} |
-            {"bindings": binding["bindings"], "reason": binding["reason"]})
-    result = {"version": 1, "backend": "task_registry", "run_id": options["run_id"], "workflow_job_id": workflow.job_id,
-        "nodes": nodes, "next_cursor": listing["next_cursor"], "truncated": listing["truncated"],
-        "snapshot_at": listing["snapshot_at"], "execution_authority": False}
-    if len(_dump(result)) > budget:
-        raise WorkflowToolInputError("workflow_history_budget_too_small_reduce_limit")
-    return result
-
-
-async def _inspect(loop, sid, action, options):
-    from .introspect import get_workflow, list_workflows
-
-    budget = options.get("max_chars", 8000)
-    if type(budget) is not int or not 1024 <= budget <= 32000:
-        raise WorkflowToolInputError("invalid_query_max_chars")
-    if "detail" in options and type(options["detail"]) is not bool:
-        raise WorkflowToolInputError("invalid_workflow_detail")
-    if action == "status" and options.get("run_id") in (None, ""):
-        action = "list"
-        options = {key: value for key, value in options.items() if key not in ("run_id", "detail")}
-    runtime = getattr(loop, "task_runtime", None)
-    if runtime is not None:
-        from power_loop.runtime import task_query
-        actor, manager = runtime.actor(sid), runtime.manager
-        if action == "list":
-            result = {"backend": "task_registry", **await task_query.list_jobs(manager, actor, kinds=["workflow"], status="all",
-                limit=options.get("limit", 20), cursor=options.get("cursor"), max_chars=max(1024, budget-64))}
-            if len(_dump(result)) > budget:
-                raise WorkflowToolInputError("query_result_too_small")
-            return result
-        job = await _owned_native_workflow(loop, sid, options.get("run_id"))
-        result = {"backend": "task_registry", **await task_query.get_job(manager, actor, job.job_id, max_chars=max(1024, budget-64))}
-        if len(_dump(result)) > budget:
-            raise WorkflowToolInputError("query_result_too_small")
-        return result
-    base = {"version": 1, "backend": "legacy", "state_authority": "compatibility_journal", "physical_state_confirmed": False}
-    if action == "list":
-        if options.get("cursor") is not None:
-            raise WorkflowToolInputError("legacy_workflow_cursor_unavailable")
-        limit = options.get("limit", 20)
-        if type(limit) is not int or not 1 <= limit <= 100:
-            raise WorkflowToolInputError("invalid_query_limit")
-        rows = await list_workflows(loop, sid)
-        result = {**base, "runs": rows[:limit], "truncated": len(rows) > limit}
-    else:
-        run_id = options.get("run_id")
-        if not isinstance(run_id, str) or not re.fullmatch(r"[a-f0-9]{8,64}", run_id):
-            raise WorkflowToolInputError("workflow_run_id_required")
-        detail = options.get("detail", False)
-        if type(detail) is not bool:
-            raise WorkflowToolInputError("invalid_workflow_detail")
-        row = await get_workflow(loop, sid, run_id, detail=detail)
-        if row is None:
-            raise WorkflowToolInputError("workflow_run_not_found")
-        result = {**base, "run": row}
-    if len(_dump(result)) > budget:
-        raise WorkflowToolInputError("query_result_too_small")
-    return result
-
-
-_CONTROL_ACTIONS = ('help', 'status', 'list', 'cancel', 'leaves', 'logs')
+_CONTROL_ACTIONS = ("help", "status", "list", "cancel", "leaves", "logs")
 
 
 def _review_spec(spec):
-    action = spec['function']['parameters'].get('properties', {}).get('action')
+    action = spec["function"]["parameters"].get("properties", {}).get("action")
     if type(action) is not dict:
         return None
-    action['enum'] = [name for name in action.get('enum', _CONTROL_ACTIONS) if name in _CONTROL_ACTIONS]
+    action["enum"] = [name for name in action.get("enum", _CONTROL_ACTIONS) if name in _CONTROL_ACTIONS]
     return spec
 
 
@@ -509,10 +379,15 @@ def workflow_runtime_tool(handler, *, key="sdk.workflow"):
     """Declare this router's implemented native actions for a trusted host wrapper."""
     from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolDispatchPolicy, ToolRuntimeContract
 
-    return FunctionRuntimeTool(handler, ToolRuntimeContract(key, background_allowed=False, allowed_roles=("main",)),
+    return FunctionRuntimeTool(
+        handler,
+        ToolRuntimeContract(key, background_allowed=False, allowed_roles=("main",)),
         policy=lambda arguments: ToolDispatchPolicy(
             native_admitted=arguments.get("action", "help") in _ACTIONS,
-            control_only=arguments.get("action", "help") in _CONTROL_ACTIONS), reviewer=_review_spec)
+            control_only=arguments.get("action", "help") in _CONTROL_ACTIONS,
+        ),
+        reviewer=_review_spec,
+    )
 
 
 def register_workflow_tool(registry, *, ports=None, overwrite=False, description_suffix=""):
@@ -523,5 +398,8 @@ def register_workflow_tool(registry, *, ports=None, overwrite=False, description
     async def handler(**arguments):
         return await run_workflow_tool(arguments, ports=selected)
 
-    registry.register(workflow_tool_definition(allow_inline_spec=selected.allow_inline_spec,
-        description_suffix=description_suffix), workflow_runtime_tool(handler), overwrite=overwrite)
+    registry.register(
+        workflow_tool_definition(allow_inline_spec=selected.allow_inline_spec, description_suffix=description_suffix),
+        workflow_runtime_tool(handler),
+        overwrite=overwrite,
+    )

@@ -1,8 +1,6 @@
 """Host-invoked retention, with indexed candidates and bounded delete statements."""
 from __future__ import annotations
 
-import json
-
 from . import message_usage
 
 DAY_MS = 86400000
@@ -114,16 +112,6 @@ async def lock_root(store, tx, root_id):
 
 async def drop_runtime_key(store, tx, row):
     sid, key = row['session_id'], row['state_key']
-    if key.startswith('workflow:run:'):
-        # The existing workflow index uses the session-state lock for mutations.
-        await store._db.dialect.lock_state(tx, store.t.session_state, sid)
-        index = await tx.fetchone(f'SELECT value_json FROM {store.t.session_runtime_state} '
-                                  "WHERE session_id=? AND state_key='workflow:index'", (sid,))
-        if index is not None:
-            from power_loop.workflow.journal import run_key
-            remaining = [run for run in json.loads(index['value_json']) if run_key(run) != key]
-            await tx.execute(f'UPDATE {store.t.session_runtime_state} SET value_json=? '
-                "WHERE session_id=? AND state_key='workflow:index'", (json.dumps(remaining), sid))
     return await tx.execute(f'DELETE FROM {store.t.session_runtime_state} '
         'WHERE session_id=? AND state_key=? AND updated_at=?', (sid, key, row['updated_at']))
 
@@ -133,7 +121,10 @@ async def runtime_root(store, tx, row):
     if key.startswith('subagent:child:'):
         return await tx.fetchone(f'SELECT root_job_id FROM {p}jobs WHERE session_id=? '
             "AND kind IN ('subagent','workflow_node') ORDER BY updated_at DESC LIMIT 1", (key[15:],))
-    for prefix in ('subagent:run:', 'workflow:run:', 'workflow:history:'):
+    if key.startswith('workflow:node:'):
+        return await tx.fetchone(f'SELECT j.root_job_id FROM {p}job_events e '
+            f'JOIN {p}jobs j ON j.job_id=e.job_id WHERE e.operation_key=?', (key[len('workflow:node:'):],))
+    for prefix in ('subagent:run:', 'workflow:run:'):
         if key.startswith(prefix):
             return await tx.fetchone(f'SELECT j.root_job_id FROM {p}job_events e '
                 f'JOIN {p}jobs j ON j.job_id=e.job_id WHERE e.event_id=?', ('op_'+key[len(prefix):],))
@@ -144,7 +135,7 @@ async def purge_runtime(store, cutoff, limit):
     table, count = store.t.session_runtime_state, 0
     rows = await store._db.fetchall(f'SELECT * FROM {table} WHERE updated_at<? '
         "AND (state_key LIKE 'subagent:run:%' OR state_key LIKE 'subagent:child:%' "
-        "OR state_key LIKE 'workflow:run:%' OR state_key LIKE 'workflow:history:%') "
+        "OR state_key LIKE 'workflow:run:%' OR state_key LIKE 'workflow:node:%') "
         'ORDER BY updated_at LIMIT ?', (cutoff, limit))
     for row in rows:
         owner = await runtime_root(store, store._db, row)
@@ -175,14 +166,18 @@ async def tree_runtime(store, tx, root_id, cutoff, limit, *, force=False):
                 keys.append((job['created_by_session_id'], 'subagent:child:'+job['session_id']))
             event_cursor = ''
             while True:
-                events = await tx.fetchall(f'SELECT event_id,caller_session_id FROM {p}job_events '
+                events = await tx.fetchall(f'SELECT event_id,operation_key,caller_session_id FROM {p}job_events '
                     "WHERE job_id=? AND event_type='operation' AND event_id>? ORDER BY event_id LIMIT ?",
                     (job['job_id'], event_cursor, limit))
                 for event in events:
                     sid = event['caller_session_id'] or job['created_by_session_id']
                     run_id = event['event_id'][3:]
-                    for namespace in ('subagent:run:', 'workflow:run:', 'workflow:history:'):
-                        keys.append((sid, namespace+run_id))
+                    if job['kind']=='workflow':
+                        keys.append((job['session_id'],'workflow:run:'+run_id))
+                    elif job['kind']=='workflow_node' and event['operation_key']:
+                        keys.append((job['created_by_session_id'],'workflow:node:'+event['operation_key']))
+                    else:
+                        keys.append((sid,'subagent:run:'+run_id))
                 for sid, key in keys:
                     row = await tx.fetchone(f'SELECT * FROM {store.t.session_runtime_state} '
                                             'WHERE session_id=? AND state_key=?', (sid, key))

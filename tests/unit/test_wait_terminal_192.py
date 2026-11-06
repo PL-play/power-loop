@@ -18,17 +18,13 @@ from .test_model_attempts_192 import attempt_case, completed, prepare
 from .test_wait_effects_192 import (
     decide,
     handoff,
-    managed_workflow,
     registry_store,
     runtime,
     waiting,
 )
-from .test_wait_effects_192 import (
-    test_actual_workflow_node_consumes_original_system_input_before_review_can_start as exercise_node,
-)
 from .test_wait_handoff_192 import MainModel
 
-__all__ = ["attempt_case", "handoff", "registry_store", "runtime", "waiting", "managed_workflow"]
+__all__ = ["attempt_case", "handoff", "registry_store", "runtime", "waiting"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -112,26 +108,8 @@ async def test_original_tree_finalization_can_terminate_wait_in_its_own_atomic_t
     assert len(await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='wait_terminated'")) == 1
 
 
-async def test_successful_workflow_tree_closes_its_unexecuted_wait_without_any_extra_model(managed_workflow, monkeypatch):
-    managed_workflow[6]["on_complete"] = None
-    await exercise_node(managed_workflow, monkeypatch)
-    _, manager, task_runtime, loop, model, parent, state, _ = managed_workflow
-    before = model.counts.copy()
-    await loop.flush_follow_ups(parent)
-    assert model.counts["BUILD"] == before["BUILD"] and model.counts["REVIEW"] == before["REVIEW"]
-    rows = await manager.db.fetchall(f"SELECT kind,generation,supervision_status FROM {manager.jobs}")
-    assert all(r["supervision_status"] == "closed" for r in rows), rows
-    assert (await manager.get_job(task_runtime.actor(parent), state["handles"][0].job_id)).supervision_status == "closed"
 
 
-async def test_wait_closure_does_not_turn_a_callback_return_into_a_business_delivery_receipt(managed_workflow, monkeypatch):
-    await exercise_node(managed_workflow, monkeypatch)
-    _, manager, task_runtime, loop, _, parent, state, _ = managed_workflow
-    await loop.flush_follow_ups(parent)
-    [timer] = await manager.db.fetchall(f"SELECT supervision_status FROM {manager.jobs} WHERE kind='timer'")
-    assert timer["supervision_status"] == "closed"
-    with pytest.raises(JobError, match="finalization_notification_receipt_required"):
-        await manager.finalize_supervision(task_runtime.actor(parent), state["handles"][0].job_id, generation=1)
 
 
 @pytest.mark.parametrize("fault", ["running", "unknown", "legacy_exit", "cache", "missing_result", "missing_seal"])

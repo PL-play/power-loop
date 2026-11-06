@@ -27,12 +27,12 @@ def entry(binding, seq, call_id):
 
 async def prepare(pipeline, attempt):
     from . import tool_call_plans as plans
+    from .execution_membership import proof
     from .managed_effects import _document
     from .message_ref import MessageRef
     from .task_runtime import _SEND
     from .tool_call_abort import _freeze
     from .tool_contracts import policy, resolve, validate_registration
-    from .workflow_controller import proof
     binding = _SEND.get()
     if binding is None or binding.actor.session_id != pipeline.session_id:
         return

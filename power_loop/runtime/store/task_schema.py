@@ -83,7 +83,7 @@ def task_tables_ddl(name: str, prefix: str) -> list[str]:
             job_id {small} PRIMARY KEY, parent_job_id {small}, root_job_id {small} NOT NULL,
             control_owner_job_id {small},
             tenant_id {sid} NOT NULL, principal_id {sid} NOT NULL,
-            session_id {sid}, created_by_session_id {sid} NOT NULL,
+            session_id {sid} NOT NULL, created_by_session_id {sid} NOT NULL,
             kind {small} NOT NULL, execution_role {small} NOT NULL, title {body} NOT NULL,
             completion_scope_job_id {small} NOT NULL, blocks_completion INTEGER NOT NULL,
             status {small} NOT NULL, version {integer} NOT NULL, generation {integer} NOT NULL,

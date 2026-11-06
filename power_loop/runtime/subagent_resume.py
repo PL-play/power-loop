@@ -30,5 +30,7 @@ async def resume_claim(runtime, tx, record, row):
         obligations=True)
     if changed != 1:
         raise RuntimeRequestError("stale_generation")
+    from .finalization import reopen_ancestors
+    await reopen_ancestors(manager, tx, row)
     await start(manager, tx, await manager._row(tx, row["job_id"]))
     return Execution(runtime, runtime.actor(row["session_id"]), lease)

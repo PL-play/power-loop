@@ -9,9 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop import LLMResponse, create_default_tool_registry
 from power_loop.core.agent_context import (
-    get_session_id,
     reset_current_loop,
     reset_session_id,
     set_current_loop,
@@ -21,16 +19,10 @@ from power_loop.runtime import task_history
 from power_loop.runtime.env import RuntimeEnv, runtime_env_context
 from power_loop.runtime.jobs import JobActor, JobError, JobManager
 from power_loop.tools.default_tools import run_recall_send
-from power_loop.workflow.facade import register_workflow_tool
 
 from .test_job_registry_192 import registry_store
-from .test_task_sessions_192 import history
-from .test_workflow_control_192 import invoke
-from .test_workflow_restore_plan_192 import finished
-from .test_workflow_restore_runtime_192 import native_restore
-from .test_workflow_task_runtime_192 import managed_workflow
 
-__all__ = ["registry_store", "history", "managed_workflow", "native_restore"]
+__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -209,18 +201,6 @@ async def test_export_refuses_overwrite_scope_escape_limits_and_cleans_partial_f
         assert not target.exists()
 
 
-async def test_retained_node_history_is_readable_after_driver_cleanup_without_execution(history):
-    _, manager, runtime, _, model, sid, state, connect = history
-    before = model.counts.copy()
-    reopened = JobManager(await connect())
-    workflow = await task_history.read_history(reopened, runtime.actor(sid), state["handles"][0].job_id)
-    assert workflow["status"] == "unavailable" and workflow["reason"] == "logical_task"
-    nodes = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='workflow_node'")
-    for node in nodes:
-        result = await task_history.read_history(reopened, runtime.actor(sid), node["job_id"])
-        assert result["status"] == "ok" and result["bindings"][0]["generation"] == 1
-        assert result["records"] and not result["execution_authority"]
-    assert model.counts == before
 
 
 async def test_model_entry_sanitizes_unknown_backend_valueerror_and_legacy_rejects_task_mode(audit, monkeypatch):
@@ -243,125 +223,16 @@ async def test_model_entry_sanitizes_unknown_backend_valueerror_and_legacy_rejec
         reset_current_loop(lt)
 
 
-async def test_workflow_leaves_pages_owned_nodes_and_logs_use_same_authority(history):
-    _, manager, runtime, loop, model, sid, state, _ = history
-    original_counts = model.counts.copy()
-    run_id = state["handles"][0].run_id
-    first = await invoke(loop, sid, {"action": "leaves", "run_id": run_id, "limit": 1})
-    assert len(first["nodes"]) == 1 and first["next_cursor"] and not first["execution_authority"]
-    second = await invoke(loop, sid, {"action": "leaves", "run_id": run_id, "limit": 1, "cursor": first["next_cursor"]})
-    assert len(second["nodes"]) == 1 and second["nodes"][0]["job_id"] != first["nodes"][0]["job_id"]
-    selected = first["nodes"][0]
-    result = await invoke(loop, sid, {"action": "logs", "run_id": run_id, "node_job_id": selected["job_id"]})
-    assert result["status"] == "ok" and result["job_id"] == selected["job_id"]
-    assert result["session_id"] == selected["bindings"][0]["session_id"]
-    forbidden = await invoke(loop, sid, {"action": "logs", "run_id": run_id, "node_job_id": selected["job_id"],
-        "sid": second["nodes"][0]["bindings"][0]["session_id"]})
-    assert forbidden["error"]["code"] == "task_session_access_denied"
-    assert model.counts == original_counts
 
 
-@pytest.mark.parametrize("mode", ["recall", "leaves", "logs", "spoof"])
-async def test_expired_send_can_only_use_actual_library_history_handlers(managed_workflow, monkeypatch, mode):
-    store, manager, runtime, loop, model, sid, state, _ = managed_workflow
-    runtime.lease_ms = 300000
-    await loop.send("Launch", sid)
-    await asyncio.wait_for(model.entered["BUILD"].wait(), 3)
-    [node] = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='workflow_node'")
-    register_workflow_tool(loop.tool_registry)
-    tool = create_default_tool_registry(include=["recall_send"]).get("recall_send")
-    calls = []
-    async def unsafe(**kwargs):
-        calls.append("business")
-        return "unsafe"
-    loop.tool_registry.register(tool.definition, unsafe if mode == "spoof" else tool.handler)
-    name = "recall_send" if mode in ("recall", "spoof") else "workflow"
-    args = {"job_id": node["job_id"]} if name == "recall_send" else {"action": mode, "run_id": state["handles"][0].run_id}
-    if mode == "logs":
-        args["node_job_id"] = node["job_id"]
-    original, clock, issued = model.complete, manager.now, False
-    async def expire(request, **kwargs):
-        nonlocal issued
-        if get_session_id() == sid and not issued:
-            issued = True
-            manager.now = lambda: clock()+600000
-            return LLMResponse(raw_text="", tool_calls=[{"id": "history-read", "type": "function",
-                "function": {"name": name, "arguments": json.dumps(args)}}])
-        return await original(request, **kwargs)
-    monkeypatch.setattr(model, "complete", expire)
-    try:
-        try:
-            await loop.send("Inspect only", sid)
-        except JobError as exc:
-            assert "expired" in exc.code or "supervision" in exc.code
-    finally:
-        manager.now = clock
-    assert issued and not calls
-    if mode != "spoof":
-        rows = [m for m in await store.load_all_messages(sid) if m.role == "tool" and m.name == name]
-        assert rows
-        result = json.loads(rows[-1].content)
-        assert result.get("status") == "ok" if mode != "leaves" else len(result["nodes"]) == 1
 
 
-async def test_retries_require_an_exact_physical_session(managed_workflow, monkeypatch):
-    _, manager, runtime, _, model, sid, state, _ = managed_workflow
-    state["spec"]["root"]["steps"][0]["retry"] = {"max_attempts": 2, "on": ["hit_round_limit"]}
-    model.hold = set()
-    original = model.complete
-    async def first_empty(request, **kwargs):
-        value = await original(request, **kwargs)
-        if "ROLE-BUILD" in (request.system_prompt or "") and model.counts["BUILD"] <= 3:
-            value.raw_text = ""
-        return value
-    monkeypatch.setattr(model, "complete", first_empty)
-    await finished(managed_workflow)
-    [node] = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='workflow_node' AND title='BUILD'")
-    with pytest.raises(JobError, match="session_required"):
-        await task_history.read_history(manager, runtime.actor(sid), node["job_id"])
-    events = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND event_type='node_session'", (node["job_id"],))
-    assert len(events) == 2
-    for event in events:
-        physical = json.loads(event["payload_json"])["session_id"]
-        result = await task_history.read_history(manager, runtime.actor(sid), node["job_id"], session_id=physical)
-        assert result["status"] == "ok" and len(result["bindings"]) == 1
 
 
-async def test_same_original_session_reports_both_generations_without_granting_single_generation_history(native_restore):
-    c = native_restore
-    [node] = [n for n in c.node_jobs if n["title"] == "BUILD"]
-    first = await task_history.read_history(c.manager, c.actor, node["job_id"], limit=1)
-    handle = await c.restore()
-    await asyncio.wait_for(handle.task, 5)
-    with pytest.raises(JobError, match="binding_changed"):
-        await task_history.read_history(c.manager, c.actor, node["job_id"], cursor=first["next_cursor"])
-    result = await task_history.read_history(c.manager, c.actor, node["job_id"])
-    assert {b["generation"] for b in result["bindings"]} == {1, 2}
-    assert all(b["history_scope"] == "physical_session" and not b["execution_authority"] for b in result["bindings"])
 
 
-async def test_creation_call_and_receipt_ids_are_recallable_without_granting_callers_whole_session(history):
-    _, manager, runtime, _, _, sid, state, _ = history
-    handle = state["handles"][0]
-    operation = await manager.get_operation(runtime.actor(sid), handle.operation_id)
-    ids = [operation.call_ref["id"], operation.receipt_ref["id"]]
-    result = await task_history.read_history(manager, runtime.actor(sid), handle.job_id, message_ids=ids)
-    assert result["status"] == "ok" and {r["id"] for r in result["records"]} == set(ids)
-    assert result["bindings"][0]["history_scope"] == "exact_origin_messages"
-    exact = await task_history.read_history(manager, runtime.actor(sid), handle.job_id, message_id=ids[1])
-    assert json.loads(exact["text"])["message_ref"] == operation.receipt_ref
-    unrelated = next(m for m in await manager.store.load_all_messages(sid) if str(m.id) not in ids)
-    denied = await task_history.read_history(manager, runtime.actor(sid), handle.job_id, message_ids=ids+[str(unrelated.id)])
-    assert denied["status"] == "unavailable" and denied["reason"] == "logical_task"
 
 
-async def test_child_cannot_read_ancestor_call_body_via_own_task_origin_reference(history):
-    _, manager, runtime, _, _, sid, _, _ = history
-    [child] = await manager.db.fetchall(f"SELECT job_id,session_id FROM {manager.jobs} WHERE kind='subagent'")
-    [event] = await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND action='create'", (child["job_id"],))
-    op = await manager.get_operation(runtime.actor(sid), event["event_id"])
-    with pytest.raises(JobError, match="access_denied"):
-        await task_history.read_history(manager, runtime.actor(child["session_id"]), child["job_id"], message_id=op.call_ref["id"])
 
 
 @pytest.mark.parametrize("field", ["query", "binding", "upper", "after", "snapshot_at", "extra"])
@@ -443,29 +314,6 @@ async def test_export_link_race_keeps_the_other_writers_file_and_cleans_temp(aud
     assert target.read_text() == "OTHER-WRITER" and not list(c.workspace.glob(".recall-*"))
 
 
-@pytest.mark.parametrize("fault", ["sid", "send", "raw_identity", "missing_raw", "missing_creation"])
-async def test_origin_references_require_matching_caller_send_and_actual_original_row(history, fault):
-    _, manager, runtime, _, _, sid, state, _ = history
-    handle = state["handles"][0]
-    operation = await manager.get_operation(runtime.actor(sid), handle.operation_id)
-    options = {"message_id": operation.receipt_ref["id"]}
-    if fault == "sid":
-        options["session_id"] = "sess_wrong"
-    elif fault == "send":
-        ref = {**operation.receipt_ref, "send_index": "999"}
-        await manager.db.execute(f"UPDATE {manager.events} SET receipt_ref_json=? WHERE event_id=?", (json.dumps(ref), handle.operation_id))
-    elif fault == "raw_identity":
-        await manager.db.execute(f"UPDATE {manager.store.t.messages} SET tool_call_id='wrong' WHERE session_id=? AND id=?", (sid, int(operation.receipt_ref["id"])))
-    elif fault == "missing_raw":
-        await manager.db.execute(f"DELETE FROM {manager.store.t.messages} WHERE session_id=? AND id=?", (sid, int(operation.receipt_ref["id"])))
-    else:
-        await manager.db.execute(f"DELETE FROM {manager.events} WHERE event_id=?", (handle.operation_id,))
-    if fault in ("missing_raw", "missing_creation"):
-        result = await task_history.read_history(manager, runtime.actor(sid), handle.job_id, **options)
-        assert result["status"] == "unavailable" and result["reason"] in ("records_not_found", "logical_task")
-    else:
-        with pytest.raises(JobError, match="origin_"):
-            await task_history.read_history(manager, runtime.actor(sid), handle.job_id, **options)
 
 
 @pytest.mark.parametrize("options", [{"session_id": ""}, {"source": "bogus"}, {"ids": []},

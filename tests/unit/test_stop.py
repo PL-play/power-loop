@@ -13,7 +13,6 @@ time, and never starts new work or wakes the agent afterwards.
 from __future__ import annotations
 
 import asyncio
-import tempfile
 import time
 from typing import Any
 
@@ -43,7 +42,6 @@ from power_loop.runtime.pricing import Free
 from power_loop.tools.default_tools import BG, BackgroundManager, register_tool_task_callback
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow
-from power_loop.workflow.runner import get_run_handle, stop_run
 
 USAGE = LLMTokenUsage(prompt_tokens=10, completion_tokens=2, total_tokens=12)
 
@@ -311,31 +309,6 @@ async def test_an_awaited_workflow_stops_with_its_caller(store) -> None:
     assert res.status == "cancelled" and out["status"] == "cancelled"
 
 
-@pytest.mark.asyncio
-async def test_a_detached_workflow_outlives_a_foreground_stop_and_stops_by_id() -> None:
-    llm = _LLM()
-    loop = StatefulAgentLoop(llm=llm, db_path=tempfile.mktemp(suffix=".db"),
-                             config=AgentLoopConfig(system_prompt="S", max_rounds=3,
-                                                    compactor=None, retry_policy=None))
-    psid = await loop.new_session()
-    woke: list[Any] = []
-
-    async def on_complete(completion: Any) -> None:
-        woke.append(completion)
-
-    wf = create_workflow(HANG_WF, parent_loop=loop, parent_session_id=psid)
-    handle = await wf.start(detached=True, on_complete=on_complete)
-    await asyncio.wait_for(llm.hanging.wait(), 5)
-    assert get_run_handle(handle.run_id) is handle
-    jobs = await loop.list_jobs(psid)
-    assert any(j["id"] == f"wf:{handle.run_id}" and j["status"] == "running" for j in jobs)
-    res = await loop.stop_job(psid, f"wf:{handle.run_id}")
-    assert res["result"] in ("stopped", "forced")
-    await asyncio.sleep(0.05)
-    assert woke == [], "a workflow the user stopped must not wake the agent"
-    assert get_run_handle(handle.run_id) is None
-    assert await stop_run(handle.run_id) == "unknown"
-    await loop.aclose()
 
 
 # ── background tasks by id ────────────────────────────────────────────────────────────────

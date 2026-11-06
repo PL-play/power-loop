@@ -110,12 +110,11 @@ async def prepare_binding(manager, tx, actor, source, request, *, caller, sessio
         route = {"kind": "subagent", "session_id": session_id}
     else:
         from .node_inputs import descriptor, is_closed
-        from .workflow_controller import for_node
 
         if await is_closed(manager, tx, owner, session_id):
             raise JobError("wait_owner_closed")
         route = {"kind": "workflow_node", "node": await descriptor(manager, tx, owner, session_id),
-                 "workflow": (await for_node(manager, tx, owner))["workflow"]}
+                 "workflow": {"job_id": owner["parent_job_id"]}}
     root = await manager._row(tx, source["root_job_id"])
     main = await tx.fetchone(f"SELECT parent_session_id,metadata_json FROM {manager.store.t.sessions} WHERE session_id=?",
                             (root["session_id"],)) if root else None
@@ -208,7 +207,7 @@ async def _read(manager, tx, actor, job_id):
         raise JobError("wait_deadline_exceeds_owner_window")
     root = await manager._row(tx, binding["root_job_id"])
     route = binding["route"]
-    if (source_scope["lease"] != binding["source"] or source_scope["owner"] != owner
+    if (source_scope["lease"] != binding["source"] or source_scope["owner"] != {"job_id": owner["job_id"], "generation": owner["generation"]}
             or source_scope["kind"] != "send" or source_scope["session_id"] != binding["session_id"]
             or owner_scope["lease"] != owner or owner_scope["kind"] not in ("workflow_node", "subagent")
             or not isinstance(route, dict) or route.get("kind") != owner_scope["kind"]
@@ -220,11 +219,9 @@ async def _read(manager, tx, actor, job_id):
                 or owner_scope["session_id"] != binding["session_id"]):
             raise JobError("wait_evidence_corrupt")
     else:
-        if (set(route) != {"kind", "node", "workflow"} or _hash(_lease(route["workflow"])) != _hash(owner_scope["owner"])):
-            raise JobError("wait_evidence_corrupt")
-        descriptor = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=? AND job_id=? AND event_type='node_session'",
-            (manager._node_session_event_id(owner["job_id"], binding["session_id"], owner["generation"]), owner["job_id"]))
-        if descriptor is None or _hash(_object(descriptor["payload_json"])) != _hash(route["node"]):
+        from .node_inputs import descriptor
+        if (route["workflow"]["job_id"] != owner["parent_job_id"] or
+                _hash(await descriptor(manager, tx, owner, binding["session_id"])) != _hash(route["node"])):
             raise JobError("wait_evidence_corrupt")
     if receipt is not None and (receipt["tool_call_id"] != binding["tool_call_id"]
                                 or receipt["send_index"] != call["send_index"]):

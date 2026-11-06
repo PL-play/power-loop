@@ -68,8 +68,6 @@ async def _target(manager, tx, actor, request, source_role):
         if (job["kind"] != "workflow_node" or source_role != "main" or workflow is None
                 or workflow["kind"] != "workflow" or workflow["created_by_session_id"] != actor.session_id):
             raise JobError("nudge_target_mismatch")
-        from .workflow_controller import for_node
-        await for_node(manager, tx, job)
         if _hash(command["node"]) != _hash(await descriptor(manager, tx, job, sid)):
             raise JobError("node_input_binding_mismatch")
         if await is_closed(manager, tx, job, sid):

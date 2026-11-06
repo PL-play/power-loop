@@ -9,6 +9,7 @@ import json
 import logging
 
 from .jobs import JobError, _hash, _json
+from .result_revisions import result_id
 
 _LOG = logging.getLogger(__name__)
 CONSTRAINTS = (
@@ -32,7 +33,6 @@ def render(public):
 
 
 async def result_event(manager, tx, row):
-    from .result_revisions import result_id
 
     key = result_id(row['job_id'], row['generation'])
     length = 'length(CAST(payload_json AS BLOB))' if manager.db.dialect.name == 'sqlite' else 'octet_length(payload_json)'
@@ -255,7 +255,7 @@ async def observation(manager, tx, actor, row, result, visible=None):
             return None
     from .pending_calls import require_disposition
     source = await manager._row(tx, row['parent_job_id'])
-    closed = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', ('model_closed_' + source['job_id'],))
+    closed = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', (result_id(source["job_id"], source["generation"]),))
     extra = {}
     if closed is not None:
         from .pending_calls import SNAPSHOT, _closed, identity
@@ -366,7 +366,7 @@ async def negative_review_view(manager, tx, row):
         batch_review = await review_view(manager, tx, source, child=row)
         if batch_review is not None:
             return batch_review
-        closed = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', ('model_closed_' + source['job_id'],))
+        closed = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', (result_id(source["job_id"], source["generation"]),))
         required_review = False
         if closed is not None:
             evidence = (await _closed(manager, tx, source))['evidence']

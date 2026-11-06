@@ -13,9 +13,8 @@ from power_loop.runtime.processing import require_handled
 from power_loop.runtime.task_runtime import _SEND, prepare_model_processing
 
 from .test_job_registry_192 import registry_store, runtime
-from .test_workflow_task_runtime_192 import managed_workflow, records, settle
 
-__all__ = ["registry_store", "runtime", "managed_workflow"]
+__all__ = ['registry_store', 'runtime']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -349,46 +348,6 @@ async def test_actual_request_assembly_does_not_credit_hidden_or_rewritten_rows(
         assert "processing_snapshot_id" not in binding.resource_evidence
 
 
-@pytest.mark.parametrize("fault", ["snapshot", "decision", "response_write"])
-@pytest.mark.parametrize("retry", [False, True])
-async def test_actual_workflow_never_advances_when_processing_persistence_fails(managed_workflow, monkeypatch, fault, retry):
-    store, manager, _, loop, model, sid, state, _ = managed_workflow
-    from .test_workflow_task_runtime_192 import leaf
-    model.hold = {"AUDIT"}
-    model.spawn_from_build = True
-    state["spec"]["root"]["steps"][0] = leaf("BUILD", tools=["spawn_agent"])
-    if retry:
-        state["spec"]["root"]["steps"][0]["retry"] = {"max_attempts": 3, "on": ["failed"], "backoff_s": 0}
-    await loop.send("run with audit", sid)
-    await asyncio.wait_for(model.entered["AUDIT"].wait(), 3)
-    if fault in ("snapshot", "decision"):
-        target = "prepare_processing" if fault == "snapshot" else "commit_processing_decision"
-        original = getattr(manager, target)
-
-        async def fail(actor, *args, **kwargs):
-            if actor.session_id != sid:
-                raise RuntimeError("processing persistence unavailable")
-            return await original(actor, *args, **kwargs)
-
-        monkeypatch.setattr(manager, target, fail)
-    else:
-        original = store.append_message
-
-        async def fail(session_id, **kwargs):
-            if session_id != sid and kwargs.get("role") == "assistant" and model.counts["BUILD"] >= 2:
-                raise RuntimeError("assistant response write unavailable")
-            return await original(session_id, **kwargs)
-
-        monkeypatch.setattr(store, "append_message", fail)
-    await settle(managed_workflow)
-    assert model.counts["REVIEW"] == 0
-    wf = await manager.get_job(manager_actor := loop.task_runtime.actor(sid), state["handles"][0].job_id)
-    assert wf.outcome == "failed"
-    [audit] = [r for r in await records(managed_workflow) if r.kind == "subagent"]
-    assert audit.result_status != "handled"
-    assert (await manager.get_job(manager_actor, audit.job_id)).result is not None
-    bindings = await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='node_session'")
-    assert len(bindings) == 1  # Never re-run business work to repair a failed ACK.
 
 
 async def test_scope_guard_requires_decision_and_matching_successful_model_exit(processing_case):
@@ -443,43 +402,6 @@ async def test_scope_guard_cannot_use_incomplete_or_other_execution_proof(proces
             await c.manager.db.execute(f"UPDATE {table} SET {field}=? WHERE {key}=?", (original, value))
 
 
-@pytest.mark.parametrize("fault", ["lost_ack", "lost_ack_recall_failure"])
-async def test_workflow_recalls_committed_decision_without_repeating_model_or_tools(managed_workflow, monkeypatch, fault):
-    _, manager, _, loop, model, sid, state, _ = managed_workflow
-    from .test_workflow_task_runtime_192 import leaf
-    model.hold = {"AUDIT"}
-    model.spawn_from_build = True
-    state["spec"]["root"]["steps"][0] = leaf("BUILD", tools=["spawn_agent"])
-    await loop.send("run with audit", sid)
-    await asyncio.wait_for(model.entered["AUDIT"].wait(), 3)
-    commit, recall = manager.commit_processing_decision, manager.recall_processing_decision
-    calls = []
-
-    async def lose_ack(actor, *args, **kwargs):
-        value = await commit(actor, *args, **kwargs)
-        if actor.session_id != sid:
-            calls.append(value)
-            raise RuntimeError("decision committed but ack lost")
-        return value
-
-    async def fail_recall(actor, *args, **kwargs):
-        if actor.session_id != sid:
-            raise RuntimeError("durable decision lookup unavailable")
-        return await recall(actor, *args, **kwargs)
-
-    monkeypatch.setattr(manager, "commit_processing_decision", lose_ack)
-    if fault == "lost_ack_recall_failure":
-        monkeypatch.setattr(manager, "recall_processing_decision", fail_recall)
-    await settle(managed_workflow)
-    [audit] = [r for r in await records(managed_workflow) if r.kind == "subagent"]
-    assert audit.result_status == ("handled" if fault == "lost_ack" else "pending_delivery") and len(calls) == 1
-    if fault == "lost_ack_recall_failure":
-        with pytest.raises(JobError, match="required_result_unhandled"):
-            await require_handled(manager, manager.db, await manager._row(manager.db, audit.job_id))
-    assert model.counts["AUDIT"] == 1 and model.counts["BUILD"] == 3
-    wf = await manager.get_job(loop.task_runtime.actor(sid), state["handles"][0].job_id)
-    assert wf.outcome == ("succeeded" if fault == "lost_ack" else "failed")
-    assert model.counts["REVIEW"] == (1 if fault == "lost_ack" else 0)
 
 
 async def test_snapshot_is_frozen_before_entering_transaction(processing_case, monkeypatch):

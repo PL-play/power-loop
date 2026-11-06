@@ -79,11 +79,15 @@ class RuntimeInputStore:
                 if ancestor is None:
                     raise RuntimeRequestError("forbidden")
                 parent = ancestor["parent_session_id"]
-            if actor.call_ref is None or actor.tool_call_id is None:
-                raise RuntimeRequestError("forbidden", "persisted tool call required")
-            manager = JobManager(self.store)
-            await manager._validate_call(reader, JobActor(actor.tenant_id, actor.principal_id, actor.session_id),
-                                         actor.call_ref, actor.tool_call_id)
+            from power_loop.workflow.runner import DriverActor, authorize_driver
+            if isinstance(actor, DriverActor):
+                await authorize_driver(self, reader, actor)
+            else:
+                if actor.call_ref is None or actor.tool_call_id is None:
+                    raise RuntimeRequestError("forbidden", "persisted tool call required")
+                manager = JobManager(self.store)
+                await manager._validate_call(reader, JobActor(actor.tenant_id, actor.principal_id, actor.session_id),
+                                             actor.call_ref, actor.tool_call_id)
         if target.job_id is not None:
             job = await reader.fetchone(f"SELECT session_id,tenant_id,principal_id FROM {self.jobs} WHERE job_id=?",
                                         (target.job_id,))
@@ -135,7 +139,7 @@ class RuntimeInputStore:
         frozen_descriptor = (plain(descriptor) if descriptor is not None else
                              old.meta["descriptor"] if old else defaults["runtime_descriptor"])
         definition = RuntimeDescriptor(**frozen_descriptor)
-        if definition.kind not in {"agent", "background_tool", "background_command"}:
+        if definition.kind not in {"agent", "background_tool", "background_command", "workflow_driver", "workflow_node"}:
             raise RuntimeRequestError("feature_unavailable", definition.kind + " is not enabled")
         from power_loop.agent.types import AgentLoopConfig
         config_defaults = AgentLoopConfig()
@@ -197,11 +201,12 @@ class RuntimeInputStore:
 
     @staticmethod
     def require_resumable(job):
-        if job["kind"] != "subagent" or job["generation"] == 0:
+        if job["kind"] not in {"subagent", "workflow_node", "workflow"} or job["generation"] == 0:
             raise RuntimeRequestError("target_not_resumable")
         if job["cancel_requested_at"] is not None or job["outcome"] == "cancelled":
             raise RuntimeRequestError("target_cancelled")
-        if job["outcome"] != "interrupted" and job["resource_state"] != "unknown":
+        if (job["outcome"] != "interrupted" and job["resource_state"] != "unknown"
+                and not (job["kind"] in {"workflow", "workflow_node"} and job["outcome"] in {"succeeded", "failed"})):
             raise RuntimeRequestError("target_not_resumable")
 
     async def lock_owned(self, tx, target, ownership):
@@ -357,7 +362,8 @@ class RuntimeInputStore:
                                          reader=reader, generation=reference["generation"])
             body = encode_results([summarize_record(original)])
         else:
-            body = "[subagent_result]\n" + canonical({**reference, **payload["result"]})
+            label = "workflow_result" if job["kind"] == "workflow" else "subagent_result"
+            body = "[" + label + "]\n" + canonical({**reference, **payload["result"]})
         return InputRecord(record.ref, {**record.row, "content": canonical(body)},
                           {**record.meta, "descriptor": descriptor, "options": options})
 
@@ -421,7 +427,7 @@ class RuntimeInputStore:
             raise RuntimeRequestError("not_found")
         return rows[0]
 
-    async def _commit_result(self, tx, job_ref, result, ownership, route):
+    async def _commit_result(self, tx, job_ref, result, ownership, route, *, evidence=None):
         from power_loop.runtime.result_revisions import result_id
         job = await tx.job_row(job_ref.job_id)
         if job["generation"] != job_ref.generation:
@@ -434,6 +440,8 @@ class RuntimeInputStore:
                        outcome=job["outcome"],
                        resource_state=job["resource_state"] if job_ref.generation else "stopped",
                        result=value)
+        if evidence is not None:
+            payload["evidence"] = evidence
         if job_ref.generation == 0:
             payload["unstarted"] = True
         inserted = await tx.append_event(("event_id", "job_id", "event_type", "job_version", "payload_json", "delivery_status", "created_at"),

@@ -9,41 +9,18 @@ siblings when a branch fails under halt.
 from __future__ import annotations
 
 import asyncio
-import tempfile
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 import pytest
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
-from power_loop._vendor.llm_client.interface import LLMRequest, LLMResponse, LLMService, LLMStreamChunk
 from power_loop.workflow import WorkflowSpec
 from power_loop.workflow.engine import WorkflowEngine
 
 pytestmark = pytest.mark.unit
 
 
-@dataclass
-class _FakeLLM(LLMService):
-    async def complete(self, request: LLMRequest, *, on_chunk_delta_text=None,
-                       on_chunk_think=None, on_stream_end=None) -> LLMResponse:
-        return LLMResponse(raw_text="ok", content_text="ok")
-
-    def stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]:
-        async def _e() -> AsyncIterator[LLMStreamChunk]:
-            if False:
-                yield LLMStreamChunk()
-        return _e()
-
-    async def close(self) -> None:
-        return None
 
 
-def _loop() -> StatefulAgentLoop:
-    return StatefulAgentLoop(
-        llm=_FakeLLM(), db_path=tempfile.mktemp(suffix=".db"),
-        config=AgentLoopConfig(system_prompt="o", max_rounds=3, compactor=None),
-    )
 
 
 @dataclass
@@ -58,10 +35,10 @@ class _Tracker:
     def __post_init__(self):
         self.started, self.finished, self.cancelled = [], [], []
 
-    async def run_agent(self, spec, user_input, *, parent_loop, driver_sid, stop_event=None):
+    async def run_agent(self, request, *, allow_start=True):
         # Key off the rendered input so a foreach (whose leaves share one spec name)
         # is distinguishable per item; fall back to the spec name for parallel.
-        key = (user_input or "").strip() or spec.name
+        key = request.body.strip() or request.node_path
         self.started.append(key)
         try:
             if key == "boom":
@@ -87,7 +64,7 @@ async def test_parallel_halt_cancels_inflight_siblings() -> None:
             {"type": "agent", "id": "boom", "input": "boom", "spec": {"name": "boom", "system_prompt": "p"}},
             {"type": "agent", "id": "slow2", "input": "slow2", "spec": {"name": "slow2", "system_prompt": "p"}},
         ]}})
-    eng = WorkflowEngine(_loop(), executor=ex)
+    eng = WorkflowEngine(ex, run_id="test", driver_sid="driver")
 
     with pytest.raises(RuntimeError, match="branch failed"):
         await eng.run(spec)
@@ -107,7 +84,7 @@ async def test_foreach_parallel_halt_cancels_inflight_siblings() -> None:
             "body": {"type": "agent", "id": "leaf", "input": "{{name}}",
                      "spec": {"name": "leaf", "system_prompt": "p"}},
         }})
-    eng = WorkflowEngine(_loop(), executor=ex)
+    eng = WorkflowEngine(ex, run_id="test", driver_sid="driver")
 
     with pytest.raises(RuntimeError, match="branch failed"):
         await eng.run(spec)
@@ -127,7 +104,7 @@ async def test_parallel_continue_still_collects_all_errors() -> None:
             {"type": "agent", "id": "boom", "input": "boom", "spec": {"name": "boom", "system_prompt": "p"}},
         ]}})
     # 'ok1' must finish (not cancelled) under continue; shorten its sleep via name
-    eng = WorkflowEngine(_loop(), executor=ex)
+    eng = WorkflowEngine(ex, run_id="test", driver_sid="driver")
     res = await eng.run(spec)  # does not raise under continue
     assert res.status in {"completed", "failed"}
     assert any("branch error" in e or "failed" in e for e in res.errors)
@@ -206,21 +183,6 @@ def test_output_schema_shape_validated() -> None:
     ).name == "w"
 
 
-def test_resume_guard_refuses_live_run() -> None:
-    # workflow-durability-3: resuming a run whose engine is still LIVE in-process would start a
-    # second concurrent engine. A crashed run (not live) is resumable — recovery isn't blocked.
-    from power_loop.workflow.engine import WorkflowRunError
-    from power_loop.workflow.resume import _guard_resumable
-    from power_loop.workflow.runner import _LIVE_RUN_IDS
-
-    _guard_resumable("not-live", force=False)  # not running here → resumable (crash recovery)
-    _LIVE_RUN_IDS.add("live-1")
-    try:
-        with pytest.raises(WorkflowRunError, match="still executing in this process"):
-            _guard_resumable("live-1", force=False)
-        _guard_resumable("live-1", force=True)  # explicit force overrides
-    finally:
-        _LIVE_RUN_IDS.discard("live-1")
 
 
 def test_valid_reference_to_completed_node_accepted() -> None:
@@ -262,7 +224,7 @@ def test_foreach_items_from_runtime_capped() -> None:
     from power_loop.workflow.result import AgentResult
     from power_loop.workflow.spec import MAX_FOREACH_ITEMS
 
-    eng = WorkflowEngine(_loop(), executor=_Tracker())
+    eng = WorkflowEngine(_Tracker(), run_id="test", driver_sid="driver")
     eng._results["src"] = AgentResult(
         node_id="src", status="completed", text="",
         payload={"xs": list(range(MAX_FOREACH_ITEMS + 1))},
@@ -286,7 +248,7 @@ async def test_total_leaf_ceiling_enforced(monkeypatch) -> None:
     class _Counter:
         runs: int = 0
 
-        async def run_agent(self, spec, user_input, *, parent_loop, driver_sid, stop_event=None):
+        async def run_agent(self, request, *, allow_start=True):
             self.runs += 1
             return {"status": "completed", "final_text": "ok", "session_id": None, "usage": {}}
 
@@ -296,7 +258,7 @@ async def test_total_leaf_ceiling_enforced(monkeypatch) -> None:
         "items": ["a", "b", "c", "d"], "as": "x",
         "body": {"type": "agent", "id": "leaf", "input": "{{x}}", "spec": {"name": "l", "system_prompt": "p"}},
     }})
-    res = await engmod.WorkflowEngine(_loop(), executor=ex).run(spec)
+    res = await engmod.WorkflowEngine(ex, run_id="test", driver_sid="driver").run(spec)
     assert ex.runs == 2                       # only 2 leaves actually executed
     assert res.status in {"completed", "failed"}
     assert any("leaf ceiling" in e for e in res.errors)

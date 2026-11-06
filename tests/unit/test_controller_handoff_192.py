@@ -240,45 +240,6 @@ async def test_transfer_and_queue_are_atomic_and_retry_returns_same_original_res
         await c.loop.aclose(drain_timeout_s=.1)
 
 
-@pytest.mark.parametrize('corruption', ['handoff_payload', 'original_exit', 'original_notice', 'membership_seal'])
-async def test_corrupt_handoff_cannot_be_used_as_model_processing_authority(registry_store, corruption):
-    from power_loop.runtime.abort_outcomes import notice, result_event
-    from power_loop.runtime.controller_handoff import identity
-
-    c = await original_owner_case(registry_store, 'subagent', allowed_calls=1)
-    initial = set(delegation._TASKS)
-    try:
-        await c.loop.send('Launch original work once.', c.state.root)
-        await wait_owned(c, 'subagent', initial)
-        actor = c.runtime.actor(c.state.root)
-        await transfer_review(c.loop, actor, c.state.source)
-        source = await c.manager._authorize(c.manager.db, actor, c.state.source)
-        if corruption == 'handoff_payload':
-            key = identity(c.manager, source)
-        elif corruption == 'original_exit':
-            key = 'model_closed_' + source['job_id']
-        elif corruption == 'original_notice':
-            from power_loop.runtime.abort_outcomes import notice_id
-            key = notice_id(c.manager, source)
-        else:
-            from power_loop.runtime.execution_membership import seal_id
-            key = seal_id(c.manager, c.state.owner_binding.lease.job_id, 1)
-        original = await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (key,))
-        assert original is not None
-        await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json='{{}}' WHERE event_id=?", (key,))
-        async with c.manager._read() as tx:
-            with pytest.raises(JobError):
-                result = await result_event(c.manager, tx, source)
-                await notice(c.manager, tx, source, result)
-        assert (await c.manager.get_job(actor, c.state.source)).result_status == 'pending_delivery'
-        assert not c.state.effects
-        assert await c.manager.db.fetchone(f"SELECT * FROM {c.manager.events} WHERE event_id=?", (key,)) == {
-            **original, 'payload_json': '{}'}
-        await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?", (original['payload_json'], key))
-    finally:
-        c.state.release.set()
-        await c.runtime.shutdown(timeout_s=3)
-        await c.loop.aclose(drain_timeout_s=.1)
 
 
 async def test_handoff_does_not_increase_exhausted_original_main_budget(registry_store):

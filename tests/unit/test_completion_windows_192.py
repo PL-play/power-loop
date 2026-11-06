@@ -10,16 +10,14 @@ import pytest
 
 from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop
 from power_loop.runtime import completion_windows as windows
-from power_loop.runtime import node_inputs
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime.completion import CompletionWindow
-from power_loop.runtime.jobs import JobActor, JobError, JobLease, JobManager, _hash, _json
+from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
 from power_loop.runtime.task_runtime import _OWNER, Execution, TaskRuntime
 
 from .test_job_registry_192 import registry_store, runtime
-from .test_workflow_task_runtime_192 import managed_workflow
 
-__all__ = ["registry_store", "runtime", "managed_workflow"]
+__all__ = ['registry_store', 'runtime']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -249,86 +247,3 @@ async def test_later_processing_error_preserves_already_paid_round_usage(registr
     assert (await manager.execution_usage(task_runtime.actor(sid), job["job_id"]))["total_tokens"] == 10
     [closed] = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND event_type='model_closed'", (job["job_id"],))
     assert json.loads(closed["payload_json"])["evidence"]["usage"]["total_tokens"] == 10
-
-
-@pytest.mark.parametrize("fault", ["none", "missing_window", "corrupt_window", "missing_lease", "bool_lease", "other_generation", "unknown_resource", "expired_lease", "write_failure"])
-async def test_expired_original_node_closes_input_only_with_exact_retained_authority(managed_workflow, monkeypatch, fault):
-    store, manager, task_runtime, loop, model, parent, state, _ = managed_workflow
-    # Isolate the mechanical port from the separately tested live heartbeat
-    # while this fixture temporarily advances its shared runtime clock.
-    task_runtime.lease_ms = 300000
-    await loop.send("Run original workflow", parent)
-    await asyncio.wait_for(model.entered["BUILD"].wait(), 3)
-    [node] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='workflow_node'")
-    [bound] = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE job_id=? AND event_type='node_session'", (node["job_id"],))
-    sid = json.loads(bound["payload_json"])["session_id"]
-    actor = JobActor(node["tenant_id"], node["principal_id"], node["created_by_session_id"])
-    binding = Execution(task_runtime, actor, JobLease(node["job_id"], node["executor_id"], node["boot_id"], node["generation"]))
-    original = await windows.read(manager, actor, node["job_id"])
-    window_row = await manager.db.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (windows.event_id(manager, node["job_id"]),))
-    clock = manager.now
-    try:
-        manager.now = lambda: original["deadline_at_ms"]
-        await manager.db.execute(f"UPDATE {manager.jobs} SET lease_until_ms=? WHERE resource_state='running'", (manager.now() + 30000,))
-        if fault in ("missing_window", "corrupt_window"):
-            key = windows.event_id(manager, node["job_id"])
-            if fault == "missing_window":
-                await manager.db.execute(f"DELETE FROM {manager.events} WHERE event_id=?", (key,))
-            else:
-                await manager.db.execute(f"UPDATE {manager.events} SET payload_json='{{}}' WHERE event_id=?", (key,))
-        elif fault == "missing_lease":
-            binding = replace(binding, lease=None)
-        elif fault in ("bool_lease", "other_generation"):
-            binding = replace(binding, lease=replace(binding.lease, generation=True if fault == "bool_lease" else 2))
-        elif fault == "unknown_resource":
-            await manager.db.execute(f"UPDATE {manager.jobs} SET resource_state='unknown' WHERE job_id=?", (node["job_id"],))
-        elif fault == "expired_lease":
-            await manager.db.execute(f"UPDATE {manager.jobs} SET lease_until_ms=? WHERE job_id=?", (manager.now(), node["job_id"]))
-        before = await manager._row(manager.db, node["job_id"])
-        if fault == "write_failure":
-            async with manager._write() as tx:
-                transaction_type = type(tx)
-            execute = transaction_type._execute
-            async def fail(tx, sql, params=()):
-                result = await execute(tx, sql, params)
-                if sql.startswith("INSERT INTO " + manager.events) and params[2] == "node_input_closed":
-                    raise RuntimeError("original input close write failed")
-                return result
-            with monkeypatch.context() as patch:
-                patch.setattr(transaction_type, "_execute", fail)
-                with pytest.raises(RuntimeError, match="input close write failed"):
-                    await node_inputs.close(task_runtime, binding, sid)
-            assert not await node_inputs.is_closed(manager, manager.db, before, sid)
-            assert (await manager._row(manager.db, node["job_id"]))["version"] == before["version"]
-        elif fault != "none":
-            with pytest.raises(JobError):
-                await node_inputs.close(task_runtime, binding, sid)
-            if fault in ("missing_window", "corrupt_window"):
-                with pytest.raises(JobError, match="completion_window_evidence_(missing|corrupt)"):
-                    await manager.bind_node_session(actor, binding.lease, sid)
-            assert not await node_inputs.is_closed(manager, manager.db, before, sid)
-        else:
-            await node_inputs.close(task_runtime, binding, sid)
-            await node_inputs.close(task_runtime, binding, sid)
-            current = await manager._row(manager.db, node["job_id"])
-            assert await node_inputs.is_closed(manager, manager.db, current, sid)
-            [count] = await manager.db.fetchall(f"SELECT COUNT(*) AS count FROM {manager.events} WHERE job_id=? AND event_type='node_input_closed'", (node["job_id"],))
-            assert count["count"] == 1
-            assert current["resource_state"] == "running" and current["outcome"] is None
-        assert model.counts["BUILD"] == 1 and model.counts["REVIEW"] == 0
-    finally:
-        # Restore only fault-injected test state so the original fixture's live
-        # controller can exit; these repairs do not count as runtime recovery.
-        manager.now = clock
-        if fault in ("missing_window", "corrupt_window"):
-            key = windows.event_id(manager, node["job_id"])
-            if fault == "missing_window":
-                await manager.db.execute(f"INSERT INTO {manager.events} (event_id,job_id,event_type,job_version,request_hash,payload_json,delivery_status,created_at) VALUES (?,?,?,?,?,?,?,?)",
-                    (key, node["job_id"], "completion_window", window_row["job_version"], _hash(original), _json(original), "not_applicable", original["admitted_at_ms"]))
-            else:
-                await manager.db.execute(f"UPDATE {manager.events} SET payload_json=? WHERE event_id=?", (_json(original), key))
-        if fault == "unknown_resource":
-            await manager.db.execute(f"UPDATE {manager.jobs} SET resource_state='running' WHERE job_id=?", (node["job_id"],))
-        if fault == "expired_lease":
-            await manager.db.execute(f"UPDATE {manager.jobs} SET lease_until_ms=? WHERE job_id=?", (manager.now() + 30000, node["job_id"]))
-        model.release["BUILD"].set()

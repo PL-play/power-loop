@@ -9,6 +9,7 @@ import json
 from dataclasses import asdict
 
 from .jobs import JobError, _hash, _json
+from .result_revisions import result_id
 from .task_history import _snapshot
 
 KEY = "stateful_result_v1"
@@ -83,13 +84,13 @@ async def read(manager, actor, job_id, *, expected_host_context=None, max_bytes=
         # it. Length on PostgreSQL/SQLite must count UTF-8 bytes, not characters.
         length = "length(CAST(payload_json AS BLOB))" if manager.db.dialect.name == "sqlite" else "octet_length(payload_json)"
         size = await tx.fetchone(f"SELECT {length} AS n FROM {manager.events} WHERE event_id=?",
-            ("model_closed_" + job_id,))
+            (result_id(job_id, row["generation"]),))
         if size is None:
             raise JobError("send_receipt_exit_unavailable")
         if size["n"] > max_bytes:
             raise JobError("send_receipt_too_large")
         event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?",
-            ("model_closed_" + job_id,))
+            (result_id(job_id, row["generation"]),))
         try:
             payload = json.loads(event["payload_json"])
             evidence = payload["evidence"]
@@ -103,7 +104,7 @@ async def read(manager, actor, job_id, *, expected_host_context=None, max_bytes=
                     or value["usage"] != evidence["usage"]
                     or value["rounds"] != evidence["rounds"]
                     or value["new_input_after_pass"] != evidence["new_input_after_pass"]
-                    or event["job_id"] != job_id or event["event_type"] != "model_closed"
+                    or event["job_id"] != job_id or event["event_type"] != "result"
                     or event["delivery_status"] != "not_applicable"
                     or type(payload["generation"]) is not int or payload["generation"] != row["generation"]):
                 raise ValueError()

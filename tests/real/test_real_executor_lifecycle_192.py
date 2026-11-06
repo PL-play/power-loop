@@ -11,9 +11,6 @@ from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_real_async_boundaries_192 import BoundedProvider
-from .test_real_workflow_native_restore_192 import (
-    test_real_native_restoration_recomputes_original_nodes_and_main_consumes_new_result as verify_restoration,
-)
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
@@ -87,24 +84,3 @@ async def test_real_automatic_shutdown_signals_inflight_default_send_without_ext
         provider.report(record_property)
         await provider.close()
         await store.close()
-
-
-@pytest.mark.parametrize("resource_mode", ["native", "bound"])
-async def test_real_original_workflow_restoration_uses_automatic_boot_lifecycle(tmp_path, record_property, monkeypatch, resource_mode):
-    original_init, close_store = TaskRuntime.__init__, SessionStore.close
-    runtimes = []
-    async def managed_close(store):
-        for runtime in runtimes:
-            if runtime.manager.store is store:
-                stopped = await runtime.shutdown(timeout_s=5)
-                assert stopped["durable_drain_confirmed"] and not stopped["pending_handles"]
-        await close_store(store)
-    def configured(runtime, *args, **kwargs):
-        kwargs["boot_contract_hash"] = "a"*64
-        original_init(runtime, *args, **kwargs)
-        runtimes.append(runtime)
-    monkeypatch.setattr(TaskRuntime, "__init__", configured)
-    monkeypatch.setattr(SessionStore, "close", managed_close)
-    await verify_restoration(tmp_path, record_property, monkeypatch, "node_ack", resource_mode)
-    assert len(runtimes) == 1
-    assert runtimes[0]._lifecycle.closed

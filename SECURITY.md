@@ -29,8 +29,8 @@ is matters more than any single setting:
 - **For untrusted or model-authored commands, inject real isolation:**
   - tool-level — supply a sandboxed `ShellBackend` (gVisor/Docker/firejail) via the
     runtime-env seam; or
-  - process-level — run workflow leaves through the `SubprocessExecutor` + a
-    `WorkerLauncher` that wraps each child in your sandbox.
+  - process-level — deploy Runtime workers in host-managed sandboxes with explicit
+    resource profiles and shared ownership/transport adapters.
   See the [Sandboxing](docs/en/user-guide/sandboxing.md) guide.
 - **Keep secrets in your orchestrator.** Sandboxed children get no MinIO/API credentials;
   the contrib logging/JSONL sinks redact common secret keys by default, but you own what

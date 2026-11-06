@@ -11,9 +11,6 @@ from power_loop.runtime.jobs import JobError, JobManager
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_real_async_boundaries_192 import BoundedProvider
-from .test_real_workflow_native_restore_192 import (
-    test_real_native_restoration_recomputes_original_nodes_and_main_consumes_new_result as verify_restoration,
-)
 
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
@@ -101,25 +98,3 @@ async def test_real_inflight_request_keeps_unknown_after_durable_drain_and_local
             await provider.close()
         finally:
             await store.close()
-
-
-@pytest.mark.parametrize("resource_mode", ["native", "bound"])
-async def test_real_registered_original_workflow_restoration_keeps_boot_binding(tmp_path, record_property, monkeypatch, resource_mode):
-    claim = TaskRuntime.claim
-    seen = set()
-    async def registered(runtime, *args, **kwargs):
-        key = runtime.manager.store.store_id, runtime.executor_id, runtime.boot_id
-        if key not in seen:
-            await register_runtime(runtime)
-            seen.add(key)
-        return await claim(runtime, *args, **kwargs)
-    monkeypatch.setattr(TaskRuntime, "claim", registered)
-    await verify_restoration(tmp_path, record_property, monkeypatch, "node_ack", resource_mode)
-    store = await SessionStore.open(str(tmp_path / "native-restore.db"), schema="tasks")
-    try:
-        jobs = await store._db.fetchall(f"SELECT executor_key FROM {store.table_prefix}jobs WHERE generation>0")
-        assert jobs and all(j["executor_key"] is not None for j in jobs)
-        events = await store._db.fetchall(f"SELECT event_id FROM {store.table_prefix}task_executor_events WHERE action='register'")
-        assert len(events) == 1
-    finally:
-        await store.close()

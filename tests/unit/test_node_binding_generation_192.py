@@ -13,9 +13,8 @@ from power_loop.runtime.jobs import JobActor, JobError, JobManager, _hash
 
 from .test_job_registry_192 import registry_store
 from .test_job_registry_192 import runtime as registry_runtime
-from .test_workflow_task_runtime_192 import managed_workflow, settle
 
-__all__ = ["registry_store", "registry_runtime", "managed_workflow"]
+__all__ = ['registry_store', 'registry_runtime']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -300,20 +299,3 @@ async def test_old_input_descriptor_cannot_be_processed_as_new_generation(physic
         await node_inputs.input_target(c.manager, c.manager.db, actor, send, old)
     current = {**old, "payload_json": json.dumps({"request": {"node": {**c.data, "generation": 2}}})}
     assert (await node_inputs.input_target(c.manager, c.manager.db, actor, send, current))["generation"] == 2
-
-
-async def test_corrupt_binding_blocks_actual_workflow_send_before_provider_and_downstream(managed_workflow, monkeypatch):
-    _, manager, runtime, loop, model, parent, state, _ = managed_workflow
-    model.hold.clear()
-    bind = manager.bind_node_session
-    async def corrupted(actor, lease, sid):
-        await bind(actor, lease, sid)
-        await manager.db.execute(f"UPDATE {manager.events} SET payload_json='[]' WHERE event_id=?",
-            (manager._node_session_event_id(lease.job_id, sid, lease.generation),))
-    monkeypatch.setattr(manager, "bind_node_session", corrupted)
-    await loop.send("start workflow", parent)
-    await settle(managed_workflow)
-    assert model.counts["BUILD"] == model.counts["REVIEW"] == 0
-    job = await manager.get_job(runtime.actor(parent), state["handles"][0].job_id)
-    assert job.outcome == "failed" and "binding" in str(job.result)
-    assert not await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='send' AND created_by_session_id<>?", (parent,))

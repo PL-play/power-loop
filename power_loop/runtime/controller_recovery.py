@@ -40,11 +40,11 @@ def render(public):
 async def _exit_facts(manager, tx, actor, row):
     from .controller_retirement import read_retirement
     from .controller_task_exit import read as task_exit
+    from .execution_membership import proof
     from .managed_delivery import _main
-    from .workflow_controller import proof
 
     main = await _main(manager, tx, row)
-    if actor.session_id != main['session_id'] or row['kind'] not in ('subagent', 'workflow_node', 'workflow'):
+    if actor.session_id != main['session_id'] or row['kind'] != 'subagent':
         raise JobError('controller_recovery_requires_original_main')
     if row['intake'] != 'closed' or row['outcome'] not in (*NEGATIVE, None):
         raise JobError('controller_recovery_negative_exit_required')
@@ -62,14 +62,14 @@ async def _exit_facts(manager, tx, actor, row):
 
 async def _facts(manager, tx, actor, row, *, _closures=None, _source=None):
     from .controller_task_exit import identity as exit_id
+    from .execution_membership import proof
     from .execution_membership import read as membership
     from .finalization import closed
-    from .workflow_controller import proof
 
     _closures = {'visiting': set(), 'done': {}} if _closures is None else _closures
     main, lease, retirement = _source if _source is not None else await _exit_facts(manager, tx, actor, row)
     frozen = await membership(manager, tx, row, row['generation'])
-    if not frozen['sealed'] or _hash(frozen['scope']['lease']) != _hash(proof(row)):
+    if _hash(frozen['scope']['lease']) != _hash(proof(row)):
         raise JobError('controller_recovery_members_unsealed')
     children = {(edge['payload']['member']['job_id'], edge['payload']['member']['generation'])
                 for edge in frozen['members']}
@@ -125,41 +125,9 @@ class _NegativeProof(ResultPublicationProof):
 
 
 async def _interrupted_result(manager, tx, row):
-    from .completion_windows import _creation
     from .execution_membership import usage
-    creation, _ = await _creation(manager, tx, row)
-    request = json.loads(creation['payload_json'])['request']
     error = 'Original controller exited before publishing a final result; original history is retained.'
     recorded_usage = await usage(manager, tx, row, row['generation'])
-    if row['kind'] == 'workflow_node':
-        from power_loop.workflow.result import AgentResult
-        node_id = request.get('node', {}).get('id')
-        if type(node_id) is not str or not node_id:
-            raise JobError('controller_recovery_creation_invalid')
-        return AgentResult(node_id=node_id, status='interrupted', text='', usage=recorded_usage,
-                           session_id=row['session_id'], error=error).to_dict()
-    if row['kind'] == 'workflow':
-        from dataclasses import fields
-
-        from power_loop.workflow.result import AgentResult, WorkflowResult
-        name = request.get('spec', {}).get('name')
-        if type(name) is not str or not name:
-            raise JobError('controller_recovery_creation_invalid')
-        children = await tx.fetchall(f"SELECT result_json FROM {manager.jobs} WHERE parent_job_id=? "
-            "AND kind='workflow_node' ORDER BY updated_at,job_id LIMIT 1001",
-            (row['job_id'],))
-        if len(children) > 1000:
-            raise JobError('controller_recovery_scope_too_large')
-        results, allowed = {}, {field.name for field in fields(AgentResult)}
-        for child in children:
-            saved = json.loads(child['result_json'] or 'null')
-            try:
-                node = AgentResult(**{key: value for key, value in saved.items() if key in allowed})
-            except (AttributeError, TypeError, ValueError) as exc:
-                raise JobError('controller_recovery_original_result_unavailable') from exc
-            results[node.node_id] = node
-        return WorkflowResult(name=name, status='interrupted', results=results,
-                              usage=recorded_usage, errors=[error]).to_dict()
     from .result_revisions import delivery_id
     delivery = await delivery_id(manager, tx, row)
     if delivery is None or row['session_id'] is None:
@@ -171,14 +139,9 @@ async def _interrupted_result(manager, tx, row):
     except ValueError:
         projection, projection_status = None, 'disabled'
     return {'status': 'interrupted', 'text': '', 'error': error, 'usage': recorded_usage,
-        'session_id': row['session_id'], 'run_id': delivery.split(':', 1)[1],
+        'session_id': row['session_id'], 'run_id': delivery,
         'messages': bounds, 'projection': projection, 'history_status': 'available' if bounds else 'empty',
         'projection_status': projection_status}
-
-
-@dataclass(frozen=True)
-class _Seal:
-    job_id: str
 
 
 @dataclass(frozen=True)
@@ -198,13 +161,9 @@ class _Recovery:
 
 
 async def _prepare_recovery(manager, actor, job_id):
-    from .execution_membership import read as membership
-
     async with manager._read() as reader:
         row = await manager._authorize(reader, actor, job_id)
         source = await _exit_facts(manager, reader, actor, row)
-        if not (await membership(manager, reader, row, row['generation']))['sealed']:
-            return _Seal(job_id)
         validated = {'visiting': set(), 'done': {}}
         main, refs = await _facts(manager, reader, actor, row, _closures=validated, _source=source)
         old = await read(manager, reader, row, _closures=validated)
@@ -234,18 +193,9 @@ async def _prepare_recovery(manager, actor, job_id):
             row, main, refs, old, result, value, delivery, complete)
 
 
-async def _seal_recovery(manager, actor, job_id):
-    from .execution_membership import seal
-
-    async with manager._write() as tx:
-        row = await manager._authorize(tx, actor, job_id)
-        await _exit_facts(manager, tx, actor, row)
-        await seal(manager, tx, row)
-
-
 async def _publish_recovery(manager, actor, prepared):
+    from .execution_membership import proof
     from .tool_call_plans import _event_document
-    from .workflow_controller import proof
 
     async with manager._write() as tx:
         base, now = prepared.row, manager.now()
@@ -294,7 +244,7 @@ async def _publish_recovery(manager, actor, prepared):
 
 @_verify_stored
 async def reconcile(runtime, actor, job_id):
-    """Host-only original-result recovery. No model or business callback runs."""
+    """Host maintenance for exited subagents; workflow recovery is worker-owned."""
     from .managed_completion import _host_only
     from .task_runtime import TaskRuntime
 
@@ -305,9 +255,6 @@ async def reconcile(runtime, actor, job_id):
     manager = runtime.manager
     while True:
         prepared = await _prepare_recovery(manager, actor, job_id)
-        if isinstance(prepared, _Seal):
-            await _seal_recovery(manager, actor, prepared.job_id)
-            continue
         if prepared.complete:
             old = prepared.stopped
             break
@@ -431,21 +378,11 @@ async def handled_references(manager, tx, row, *, _closures=None):
 
 async def _original_handling(manager, tx, row, result, *, _closures=None):
     """Retain an actual prior engine/main decision; never manufacture a second ACK."""
-    from .finalization import _processing_references, _reference, require_node_consumed
-    from .jobs import JobActor
+    from .finalization import _processing_references
     from .processing import require_event_handled
-    if row['kind'] == 'workflow_node':
-        return [await require_node_consumed(manager, tx, row)]
     await require_event_handled(manager, tx, result, session_id=row['created_by_session_id'],
                                owner_job_id=row['control_owner_job_id'])
-    refs = await _processing_references(manager, tx, result)
-    if row['kind'] == 'workflow':
-        from .workflow_results import _id, delivery_event_id, require_closed
-        actor = JobActor(row['tenant_id'], row['principal_id'], row['created_by_session_id'])
-        await require_closed(manager, tx, actor, row['job_id'], row['generation'], _controller_closures=_closures)
-        for key in (delivery_event_id(row['job_id'], row['generation']), _id('projected', row['job_id'], row['generation'])):
-            refs.append(await _reference(manager, tx, key))
-    return refs
+    return await _processing_references(manager, tx, result)
 
 
 @_verify_stored
@@ -468,7 +405,7 @@ async def recover_tree(runtime, actor, root_job_id, *, after_job_id='', limit=32
             raise JobError('controller_recovery_requires_original_main')
         rows = await tx.fetchall(f'SELECT DISTINCT j.job_id FROM {manager.jobs} j '
             f'JOIN {manager.events} e ON e.job_id=j.job_id WHERE j.root_job_id=? '
-            "AND j.intake='closed' AND j.resource_state='unknown' AND j.kind IN ('subagent','workflow_node','workflow') "
+            "AND j.intake='closed' AND j.resource_state='unknown' AND j.kind='subagent' "
             "AND e.event_type='controller_task_exit' AND j.job_id>? ORDER BY j.job_id LIMIT ?",
             (root_job_id, after_job_id, limit+1))
     receipts = []

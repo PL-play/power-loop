@@ -334,7 +334,7 @@ async def _quiescent(manager, tx, owner):
                 raise JobError("owner_wait_membership_corrupt")
             ids = []
             if parent is not None:
-                if _hash(scope["owner"]) != _hash(parent) or not member["sealed"]:
+                if scope["owner"]["job_id"] != parent["job_id"] or not member["sealed"]:
                     raise JobError("owner_wait_resources_unsettled")
                 if scope["kind"] == "send":
                     if member["model"] is None:

@@ -143,7 +143,6 @@ def _context(variable, value, reset):
 
 
 async def run(worker, ctx, record, env, runtime):
-    from .execution_membership import seal
     from .jobs import JobRegistration, _record
     from .model_attempts import enable
     from .tool_billing import receipt_context
@@ -235,7 +234,6 @@ async def run(worker, ctx, record, env, runtime):
                     row = await manager._row(tx, ctx.job_ref.job_id)
                     if row["cancel_requested_at"] is not None:
                         status = "cancelled"
-                    await seal(manager, tx, row)
                     await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status='settling',outcome=?,"
                         "resource_state=?,intake='closed',version=version+1 WHERE job_id=? AND generation=? AND version=?",
                         ("succeeded" if status == "completed" else status,

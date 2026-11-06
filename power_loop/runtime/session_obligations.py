@@ -33,15 +33,11 @@ def note(recorder, event):
         recorder.obligation_jobs.add(event["job_id"])
         if kind == "result":
             recorder.obligation_processed.add(event["job_id"])
-    elif kind == "model_closed":
+    if kind == "result":
         data = json.loads(event["payload_json"])
         evidence = data.get("evidence", {})
         response = evidence.get("last_assistant_ref") if evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass") else None
         recorder.obligation_decisions.update((key, response) for key in evidence.get("processing_decisions", ()))
-    elif kind == "supervision_closed":
-        data = json.loads(event["payload_json"])
-        if any(ref["event_type"] in EVENTS for ref in data["proof"]["references"]):
-            recorder.obligation_jobs.add(event["job_id"])
 
 
 async def _handled(manager, tx, row, result, notice, *, aborted=False, clean=None):
@@ -134,7 +130,7 @@ async def _desired(manager, tx, row, *, verify=False, clean=None, processed_inpu
             for session in routes:
                 add(session, "disposition", event)
     if (row["kind"] in ("subagent", "workflow")
-            or row["kind"] in ("background_tool", "background_command") and row["session_id"]):
+            or row["kind"] in ("background_tool", "background_command") and row["session_id"] != row["created_by_session_id"]):
         for result in (event for event in events if event["event_type"] == "result"):
             if result["delivery_status"] in ("handled", "suppressed"):
                 continue
@@ -284,7 +280,7 @@ async def _prepare_closed_tree(manager, reader, entries):
             if payload["event"].get("event_type", "result") == "operation"}
         observed_result = any(source["event_id"] == result_id(row["job_id"], row["generation"])
             for _, _, source in sources)
-        negative = row["kind"] == "background_tool" and row["session_id"] is None and row["generation"] == 0
+        negative = row["kind"] == "background_tool" and row["session_id"] == row["created_by_session_id"] and row["generation"] == 0
         result_changed = observed_result and not negative and row["result_status"] != "handled"
         events = [source for _, _, source in sources if source["delivery_status"] != "handled" and not negative]
         changed = bool(events) or result_changed
@@ -329,7 +325,7 @@ async def reconcile_closed(manager, actor, job_id):
     reader = ControlReadView(manager.db, manager)
     row = await manager._authorize(reader, actor, job_id)
     event = await reader.fetchone(f"SELECT payload_json FROM {manager.events} "
-        "WHERE event_id=? AND job_id=? AND event_type='model_closed'", ("model_closed_"+job_id, job_id))
+        "WHERE event_id=? AND job_id=? AND event_type='result'", (result_id(job_id, row["generation"]), job_id))
     if event is None:
         return False
     data = json.loads(event["payload_json"])

@@ -85,9 +85,9 @@ async def inspect_tasks(manager, actor, root_job_id, *, policy=None, limit=100, 
     Hosts schedule ticks without a model. They separately decide whether an API
     wake is allowed; this function only writes durable original-main inbox data.
     """
+    from .execution_membership import proof
     from .managed_delivery import _main
     from .tool_call_plans import _event
-    from .workflow_controller import proof
 
     policy = InspectionPolicy() if policy is None else policy
     if type(policy) is not InspectionPolicy or type(limit) is not int or not 1 <= limit <= 100:
@@ -140,9 +140,9 @@ async def inspect_tasks(manager, actor, root_job_id, *, policy=None, limit=100, 
 
 async def read_alert(manager, actor, event_id, *, pending=True):
     """Revalidate original identity and current responsibility before a host wake."""
+    from .execution_membership import proof
     from .managed_delivery import _main
     from .pending_calls import _object
-    from .workflow_controller import proof
 
     if type(event_id) is not str or not event_id.startswith('task_alert_') or len(event_id) != 59:
         raise JobError('invalid_task_alert')

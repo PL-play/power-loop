@@ -15,9 +15,8 @@ from power_loop.tools.jobs import run_jobs
 
 from .test_job_registry_192 import registry_store, runtime
 from .test_nudge_runtime_192 import nudge_case
-from .test_workflow_restore_runtime_192 import managed_workflow, native_restore
 
-__all__ = ["registry_store", "runtime", "nudge_case", "managed_workflow", "native_restore"]
+__all__ = ['registry_store', 'runtime', 'nudge_case']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -386,23 +385,3 @@ async def test_small_list_budget_preserves_every_operation_across_pages(events_c
     assert len(seen) == 2 and set(seen) == {c.create, c.stop}
     with pytest.raises(JobError, match="budget_too_small"):
         await get(c, view="operations", max_chars=1024)
-
-
-async def test_actual_restored_workflow_keeps_both_canonical_result_versions(native_restore):
-    import asyncio
-
-    c = native_restore
-    handle = await c.restore()
-    await asyncio.wait_for(handle.task, 10)
-    first = await c.manager.get_result_revision(c.actor, handle.job_id, 1)
-    second = await c.manager.get_result_revision(c.actor, handle.job_id, 2)
-    counts = c.model.counts.copy()
-    listing = await task_events.read_events(c.manager, c.actor, handle.job_id, view="results")
-    assert {event["generation"] for event in listing["events"]} == {"1", "2"}
-    for revision in (first, second):
-        response = await task_events.read_events(c.manager, c.actor, handle.job_id, view="results", event_id=revision["event_id"], max_chars=32000)
-        assert not response["truncated"]
-        saved = json.loads(response["text"])
-        assert saved["generation"] == str(revision["generation"]) and saved["result"] == revision["payload"]["result"]
-    assert c.model.counts == counts and await c.manager.get_result_revision(c.actor, handle.job_id, 1) == first
-    assert await c.manager.get_result_revision(c.actor, handle.job_id, 2) == second

@@ -1,6 +1,6 @@
 """Compare final SQL/row measurements with fixed B.
 
-Run: python -m tests.compare_design203_costs OUTPUT_DIRECTORY
+Run: python -m tests.compare_design203_costs OUTPUT_DIRECTORY SDK_START_HEAD
 """
 
 import hashlib
@@ -90,7 +90,7 @@ for d in read_lines("history.jsonl"):
     )
 assert (len(sql), len(rows), len(writes), len(history)) == (54, 24, 66, 12)
 result = {
-    "sdk_start": "7dc39e1beb54434dc7263a16e7f74fcb516c1e20",
+    "sdk_start": sys.argv[2],
     "fixed_B": b["sdk_base"],
     "baseline_sha256": hashlib.sha256(base.read_bytes()).hexdigest(),
     "scope": "Full request including acceptance, execution, result query, owner/resource release and parent handling. No performance gates.",
@@ -98,7 +98,7 @@ result = {
     "rows": rows,
     "sql_writes": writes,
     "history": history,
-    "p3_flows": read_lines("flows.jsonl"),
+    "flows": read_lines("flows.jsonl"),
 }
 (out / "cost-comparison.json").write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
 print(
@@ -108,7 +108,7 @@ print(
             "rows": len(rows),
             "writes": len(writes),
             "history": len(history),
-            "flows": len(result["p3_flows"]),
+            "flows": len(result["flows"]),
         }
     )
 )
@@ -131,7 +131,7 @@ for x in rows:
                 )
             },
         )
-for x in result["p3_flows"]:
+for x in result["flows"]:
     print(
         {k: x[k] for k in ("db", "flow", "sql", "elapsed_s")},
         {

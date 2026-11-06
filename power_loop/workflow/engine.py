@@ -1,29 +1,4 @@
-"""Deterministic in-process engine that interprets a :class:`WorkflowSpec`.
-
-The engine walks the spec's control-flow tree and runs each ``agent`` leaf as a
-sub-agent via :func:`power_loop.runtime.spec.run_agent_spec`. It is deterministic
-— the only LLM calls are the leaves; ``sequence`` / ``parallel`` / ``foreach`` /
-``branch`` are ordinary code.
-
-Execution model (this tier): **in-process, single writer.** All sub-agents are
-children of one *driver session* on the parent loop's shared ``SessionStore``,
-run with ``asyncio`` concurrency (one ``asyncio.Lock`` per session in the loop
-makes that safe). This respects the store's one-process-per-file write
-constraint.
-
-Executor seam
--------------
-Leaf execution goes through the :class:`Executor` protocol so a future
-out-of-process backend (``python -m power_loop.runner --spec …``) can be slotted
-in without touching the interpreter. The default :class:`InProcessExecutor` calls
-``run_agent_spec`` directly. A subprocess executor must additionally solve the
-single-writer constraint (a single owning writer funnel) — deliberately deferred.
-
-Sharp edge handled here: ``run_agent_spec`` resolves the *parent* session from a
-``contextvar`` (``get_session_id``). The engine sets that contextvar to the
-driver session id **inside each leaf coroutine**, so concurrent fan-out tasks
-(which each get their own copied context) never clobber one another.
-"""
+"""Graph interpretation over independently owned durable node jobs."""
 
 from __future__ import annotations
 
@@ -32,14 +7,12 @@ import json
 import logging
 import re
 from collections import ChainMap
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
-from power_loop.core.agent_context import reset_session_id, set_session_id
-from power_loop.runtime.cancellation import CancellationLike, CancellationToken
-from power_loop.runtime.spec import _ON_CHILD_SESSION, AgentSpec, run_agent_spec
+from power_loop.runtime.cancellation import CancellationToken
 from power_loop.runtime.structured import StructuredOutputError, parse_structured
 
 from .result import AgentResult, SharedBudget, WorkflowResult
@@ -91,7 +64,8 @@ class _ScopedResults(dict):
         scope = _ITER_SCOPE.get()
         return (scope is not None and key in scope) or super().__contains__(key)
 
-__all__ = ["Executor", "InProcessExecutor", "WorkflowEngine", "WorkflowRunError", "in_workflow"]
+
+__all__ = ["Executor", "NodeRequest", "WorkflowEngine", "WorkflowRunError", "in_workflow"]
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +73,8 @@ logger = logging.getLogger(__name__)
 #: backstop independent of the optional budget: caps nested fanout (foreach-in-foreach) and any
 #: programmatically-built spec that bypasses the static validation caps. Fail-closed when exceeded.
 MAX_TOTAL_LEAVES = 10_000
+ITERATION_ENV_KEY = "\x00iteration"
+
 
 #: ``{{var}}``（foreach 变量等）和 ``{{node.key}}``（上游节点结构化输出里的一个键，6.45：之前不认带点的名字，
 #: YAML 的 ``${{ needs.x.outputs.k }}`` 编成 ``{{x.k}}`` 后原样送给了模型）。节点 id 可以带短横线。
@@ -106,7 +82,7 @@ def _agent_ids(node: WorkflowNode) -> list[str]:
     out: list[str] = []
     if isinstance(node, AgentNode):
         return [node.id]
-    for child in (getattr(node, "steps", None) or getattr(node, "branches", None) or ()):
+    for child in getattr(node, "steps", None) or getattr(node, "branches", None) or ():
         out += _agent_ids(child)
     if isinstance(node, BranchNode):
         for c in node.cases.values():
@@ -120,17 +96,21 @@ def _agent_ids(node: WorkflowNode) -> list[str]:
 
 def _loop_prompt(lc: dict[str, Any], user_input: str) -> str:
     """循环第 2 轮起给 continue_nodes 的话：上一轮为什么没过、意见是什么、在已有成果上改。"""
-    return (f"第 {lc['iteration']}/{lc['max']} 轮：上一轮没通过（{lc.get('why') or ''}）。\n"
-            f"上一轮的意见：\n{lc.get('feedback') or ''}\n\n"
-            "按你的节点职责处理反馈：开发节点局部修复，审核节点独立复验、不能代改。上一轮会话和文件都还在，不从头重做；按原来的要求交卷。\n\n"
-            "先用 todo 列出本轮审核意见对应的修复或复验任务；上一轮已完成待办只代表历史成果。"
-            "完成待办后还需提交本轮最终结果；若审核缺少具体问题，先读取审核报告核实。\n\n"
-            f"（这一轮的任务输入照旧附在下面）\n{user_input}")
+    return (
+        f"第 {lc['iteration']}/{lc['max']} 轮：上一轮没通过（{lc.get('why') or ''}）。\n"
+        f"上一轮的意见：\n{lc.get('feedback') or ''}\n\n"
+        "按你的节点职责处理反馈：开发节点局部修复，审核节点独立复验、不能代改。上一轮会话和文件都还在，不从头重做；按原来的要求交卷。\n\n"
+        "先用 todo 列出本轮审核意见对应的修复或复验任务；上一轮已完成待办只代表历史成果。"
+        "完成待办后还需提交本轮最终结果；若审核缺少具体问题，先读取审核报告核实。\n\n"
+        f"（这一轮的任务输入照旧附在下面）\n{user_input}"
+    )
 
 
 #: 重启后在原会话接着跑时给叶子的话（6.46）
-_RESUME_PROMPT = ("进程重启打断了你，你的会话、文件和半成品都还在。先看一眼自己做到哪了（todo、产出文件），"
-                  "接着把原来的任务做完，然后照原来的要求给出最终回复。")
+_RESUME_PROMPT = (
+    "进程重启打断了你，你的会话、文件和半成品都还在。先看一眼自己做到哪了（todo、产出文件），"
+    "接着把原来的任务做完，然后照原来的要求给出最终回复。"
+)
 
 _VAR_RE = re.compile(r"\{\{\s*([a-zA-Z_][\w-]*(?:\.[a-zA-Z_]\w*)?)\s*\}\}")
 
@@ -150,24 +130,6 @@ class WorkflowRunError(RuntimeError):
     """Raised when a node references missing data, or a ``halt`` branch fails."""
 
 
-class Executor(Protocol):
-    """How a single ``agent`` leaf is executed.
-
-    Implementations return the ``run_agent_spec`` result dict augmented with a
-    ``usage`` key (``{"prompt_tokens", "completion_tokens", "total_tokens"}``).
-    """
-
-    async def run_agent(
-        self,
-        spec: AgentSpec,
-        user_input: str,
-        *,
-        parent_loop: Any,
-        driver_sid: str,
-        stop_event: CancellationLike = None,
-    ) -> dict[str, Any]: ...
-
-
 def _continuation_prompt(remaining: list[str], i: int, n: int) -> str:
     todo_block = ("\n剩余待办：\n" + "\n".join(f"- {t}" for t in remaining)) if remaining else ""
     return (
@@ -177,402 +139,73 @@ def _continuation_prompt(remaining: list[str], i: int, n: int) -> str:
     )
 
 
-class InProcessExecutor:
-    """Default executor: run the sub-agent in this process via ``run_agent_spec``."""
+@dataclass(frozen=True)
+class NodeRequest:
+    """Serializable leaf command; identity survives driver replacement."""
 
-    async def run_agent(
-        self,
-        spec: AgentSpec,
-        user_input: str,
-        *,
-        parent_loop: Any,
-        driver_sid: str,
-        stop_event: CancellationLike = None,
-    ) -> dict[str, Any]:
-        # Make this leaf a child of the driver session. Set inside the coroutine
-        # so concurrent fan-out tasks (each with their own context copy) don't
-        # clobber each other's parent id.
-        token = set_session_id(driver_sid)
-        try:
-            raw = await run_agent_spec(
-                spec, user_input, parent_loop=parent_loop, stop_event=stop_event,
-                execution_role="workflow_node",
-            )
-        finally:
-            reset_session_id(token)
-        # run_agent_spec now surfaces usage; fall back to persisted session stats.
-        if not raw.get("usage"):
-            raw["usage"] = await _usage_for(parent_loop, raw.get("session_id"))
-        return raw
-
-    async def continue_agent(
-        self,
-        session_id: str,
-        user_input: str,
-        *,
-        parent_loop: Any,
-        extra_rounds: int,
-        stop_event: CancellationLike = None,
-    ) -> dict[str, Any]:
-        """耗尽续跑的默认实现：对**同一叶子会话** ``follow_up`` 一段续命输入。
-
-        走 parent_loop 的 child-run guards（host 注册过的 per-wake 钩子挂起，与
-        run_agent_spec 同一套保障），预算 ``extra_rounds`` 由调用方（引擎的
-        ContinuationPolicy）钳制。"""
-        import contextlib as _ctxlib
-
-        from power_loop.runtime.spec import _USAGE_SINK, _add_usage, workflow_continuation_loop
-
-        leaf_loop = await workflow_continuation_loop(parent_loop, session_id)
-        sink: dict[str, int] = {}   # 续跑这几轮里派的子 agent 的用量也算进来（design/170 §5）
-        sink_tok = _USAGE_SINK.set(sink)
-        try:
-            with _ctxlib.ExitStack() as guards:
-                for _name, guard in getattr(parent_loop, "_child_run_guards", ()) or ():
-                    guards.enter_context(guard())
-                from power_loop.runtime.node_resume import _PREPARED
-                from power_loop.runtime.original_owner_review import invoke
-                prepared = _PREPARED.get()
-                if prepared is not None and prepared.sid == session_id and prepared.pending:
-                    prepared.pending = False
-                    res = await invoke(prepared.child,session_id,prepared.child.flush_follow_ups,session_id, stop_event=stop_event,
-                        max_rounds=min(extra_rounds, prepared.child.config.max_rounds))
-                    if res is None or (res.status == "completed" and not (res.final_text or "").strip() and not getattr(prepared, "restored", False)):
-                        raise WorkflowRunError("node resume produced no final answer")
-                else:
-                    res = await invoke(leaf_loop,session_id,leaf_loop.follow_up,
-                        user_input, session_id=session_id,
-                        stop_event=stop_event, max_rounds=extra_rounds,
-                    )
-        finally:
-            _USAGE_SINK.reset(sink_tok)
-        status = str(getattr(res, "status", "failed") or "failed")
-        usage = await _usage_delta(parent_loop, session_id, getattr(res, "usage", None))
-        _add_usage(usage, sink)
-        return {
-            "status": status,
-            "final_text": str(getattr(res, "final_text", "") or ""),
-            "rounds": int(getattr(res, "rounds", 0) or 0),
-            "new_input_after_pass": bool(getattr(res, "new_input_after_pass", False)),
-            "usage": usage,
-            "session_id": session_id,
-        }
+    run_id: str
+    node_path: str
+    iteration_path: list
+    attempt: int
+    spec: dict
+    body: str
+    continuation: int = 0
+    session_id: str | None = None
 
 
-async def _usage_delta(parent_loop: Any, session_id: str, res_usage: Any) -> dict[str, int]:
-    """续跑轮的增量用量：优先取本次 send 结果自带的 usage；缺失再退回全会话统计（可能偏大）。"""
-    if isinstance(res_usage, dict) and res_usage:
-        return {k: int(v or 0) for k, v in res_usage.items() if isinstance(v, (int, float))}
-    return await _usage_for(parent_loop, session_id)
+class Executor(Protocol):
+    async def run_agent(self, request: NodeRequest, *, allow_start: bool = True) -> dict[str, Any]: ...
+    async def todo_remaining(self, session_id: str) -> list[str]: ...
 
 
-async def _usage_for(parent_loop: Any, session_id: str | None) -> dict[str, int]:
-    """Best-effort token usage for a finished child session.
-
-    ``run_agent_spec`` drops ``result.usage`` today, so we read it back from the
-    persisted session stats (works because workflow leaves use ``linked``
-    lifecycle, keeping the session). Returns ``{}`` if unavailable.
-    """
-    if not session_id:
-        return {}
-    try:
-        stats = await parent_loop.get_session_stats(session_id)
-    except Exception:
-        return {}
-    if stats is None:
-        return {}
-    return {
-        "prompt_tokens": int(getattr(stats, "prompt_tokens", 0) or 0),
-        "completion_tokens": int(getattr(stats, "completion_tokens", 0) or 0),
-        "total_tokens": int(getattr(stats, "total_tokens", 0) or 0),
-    }
-
-
-#: 叶子输入里的文件引用占位符：``@@FILEREF:outputs/static.md[-50:]@@``。
-#: 引擎只认**语法**（在哪、指哪个文件、切片表达式原样是什么）；读文件与渲染文案由 host 的
-#: :class:`WorkflowFileIO` 实现——那部分带语言和产品口径，不该焊进库里。
 FILEREF_RE = re.compile(r"@@FILEREF:([^\[\]@]+)(\[[^\]]*\])?@@")
-
-#: foreach 把当前迭代序号放进 body 的 env（保留键），供 FileIO 端口分配 per-iteration 产出文件。
-ITERATION_ENV_KEY = "__iteration__"
 
 
 class WorkflowFileIO(Protocol):
-    """叶子产出文件与文件引用的宿主端口（design/64 §2）。引擎自己不碰文件系统。"""
-
-    def output_path(self, node_id: str, *, iteration: int | None = None) -> str:
-        """该节点产出文件的路径（相对 run 工作区）。foreach 的每次迭代给不同的 ``iteration``——
-        body 节点共享一个 node_id，不区分就会互相覆盖。"""
-
-    def render_ref(self, path: str, slice_expr: str) -> str:
-        """把一处文件引用渲染成要注入叶子输入的文本（路径 + 片段 + **截断留痕**）。"""
-
-    def before_attempt(self, node_id: str, path: str, attempt: int) -> None:
-        """第 2 次及以后的 attempt 开始前调用：host 可以把上一次的产出归档，
-        免得重跑的内容追加到旧证据后面分不清哪次。"""
+    def output_path(self, node_id: str, *, iteration: int | None = None) -> str: ...
+    def render_ref(self, path: str, slice_expr: str) -> str: ...
 
 
 class WorkflowEngine:
-    """Interpret a :class:`WorkflowSpec` to completion (in-process)."""
+    """Interpret the frozen graph; the executor owns durable node admission."""
 
     def __init__(
-        self,
-        parent_loop: Any,
-        *,
-        executor: Executor | None = None,
-        budget: SharedBudget | None = None,
-        on_step: Callable[[AgentResult], Awaitable[None]] | None = None,
-        on_node_start=None,
-        stop_event: CancellationLike = None,
-        replay: dict[str, AgentResult] | None = None,
-        run_id: str | None = None,
-        close_driver: bool = True,
-        allowed_tools: frozenset[str] | None = None,
-        file_io: WorkflowFileIO | None = None,
-        on_node_session: Callable[[str, str], Awaitable[None]] | None = None,
-        resume_sessions: dict[str, str] | None = None,
-        history_owner_sid: str | None = None,
-    ) -> None:
-        self._loop = parent_loop
-        self._history_owner_sid = history_owner_sid
-        self._executor = executor or InProcessExecutor()
-        self._budget = budget
-        # Capability clamp: every leaf's tools are intersected with this set at
-        # the SPEC level (before the executor runs it), so it holds for any
-        # executor — including out-of-process leaves, where the parent's ambient
-        # contextvar filter can't reach. None = unrestricted.
-        self._allowed_tools = allowed_tools
-        # M-workflow-engine-2: close the driver session (+ its linked leaf subtree) when run()
-        # finishes so each run doesn't leak a driver row + one linked leaf row per node. Nothing
-        # reads those sessions after the result is built (outputs/usage are already in `results`).
-        # Set False to retain leaf sessions for post-hoc inspection.
-        self._close_driver = close_driver
-        # Optional per-step observer fired when each agent node settles
-        # (completed / failed / budget_exceeded). Used by the detached runner to
-        # journal live progress. Must not raise; errors are swallowed.
-        self._on_step = on_step
-        # Optional observer fired when a REAL leaf execution begins (not for replays
-        # or guard short-circuits). The detached runner journals it as the run's live
-        # heartbeat — without it a single-leaf run reads as "running, steps: []" for
-        # its whole duration and looks hung. Must not raise; errors are swallowed.
-        self._on_node_start = on_node_start
-        # Cooperative cancellation: forwarded into every in-flight leaf so they
-        # stop at their next checkpoint, and checked before spawning new leaves
-        # so a cancelled run stops fanning out.
-        # 6.46：引擎自己也持有一个令牌（run 超时用它停整个 run），和外面传进来的「谁取消都算」。
-        self._own_cancel = CancellationToken()
-        self._cancel: CancellationToken = CancellationToken.any_of(
-            CancellationToken.from_any(stop_event), self._own_cancel)
-        self._timed_out = False
-        # 单节点取消（6.46）：每个节点一个子令牌——取消它只停这个节点，run 和别的节点照跑。
-        self._node_tokens: dict[str, list[CancellationToken]] = {}
-        self._node_cancelled: set[str] = set()
-        self._admission_tokens: dict[str, list[CancellationToken]] = {}
-        # 叶子会话建好时的观察者（runner 把「节点 → 会话」记进 journal）；resume 时有会话的节点在原会话接着跑。
-        self._on_node_session = on_node_session
-        self._resume_sessions: dict[str, str] = dict(resume_sessions or {})
-        # Resume support: results of already-completed nodes, keyed by node id,
-        # rehydrated from a run's journal. A node whose id is here is replayed
-        # (its cached result is returned) instead of re-executed. Foreach-body
-        # ids must NOT appear here (they share one id across iterations) — only
-        # individually-addressable nodes and foreach *aggregate* ids belong.
-        self._replay: dict[str, AgentResult] = dict(replay or {})
-        # Stable id for this run; threaded into each leaf's metadata as an
-        # idempotency key so side-effecting tools can dedupe across a resume.
-        self._run_id = run_id
-        self._results: dict[str, AgentResult] = _ScopedResults()
-        self._iter_broken: list[str] = []
-        self._errors: list[str] = []
-        self._last: AgentResult | None = None
-        self._budget_hit = False
-        self._cancelled = False
-        # H3: hard backstop on total real leaf executions per run, independent of the optional
-        # budget. Guards nested fanout (foreach-in-foreach) and specs built programmatically
-        # (bypassing the parse-time caps). Counted in _exec_agent; fail-closed past the ceiling.
+        self, executor: Executor, *, run_id: str, driver_sid: str, allowed_tools=None, stop_event=None, file_io=None
+    ):
+        self._executor, self._run_id, self._driver_sid = executor, run_id, driver_sid
+        self._allowed_tools, self._file_io = allowed_tools, file_io
+        self._cancel = stop_event or CancellationToken()
+        self._results = _ScopedResults()
+        self._errors, self._iter_broken, self._tolerated = [], [], set()
+        self._last = None
+        self._budget = None
+        self._budget_hit = self._cancelled = self._leaf_cap_hit = False
         self._leaves_run = 0
-        self._leaf_cap_hit = False
-        # 叶子产出文件与文件引用的宿主端口（design/64 §2）。引擎不碰文件系统：它只决定
-        # 「哪个节点有产出文件」「输入里的引用占位符在哪」，读写与文案渲染都由 host 实现。
-        # None = 不启用（老行为）。
-        self._file_io = file_io
-        # 明知会失败仍放行的节点（continue_on_error）——run 终态判定要跳过它们。
-        self._tolerated: set[str] = set()
-        # Token usage accumulated exactly once per real leaf execution (and once
-        # per replayed result on resume). Robust against the foreach-body id
-        # collision, which would double/under-count if summed from _results.
-        self._usage_acc: dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        # >0 while executing inside a foreach body: suppresses per-iteration step
-        # journaling (those leaves share one id and aren't individually
-        # replayable). The foreach's aggregate is journaled instead.
-        self._emit_suppressed = 0
-        self._frames: dict[int, dict[str, Any]] = {}
-        self._repairs: dict[int, asyncio.Task[Any]] = {}
-        self._continuation_barriers: set[int] = set()
-        self._accept_continuations = True
-        self._resume_instructions: dict[str, tuple[str, int]] = {}
-        self._replay_no_charge: set[str] = set()
-        self._steering: dict[str, list[asyncio.Task[Any]]] = {}
-        self._task_execution = None
-        self._task_nodes: dict[str, Any] = {}
+        self._usage_acc = {}
 
     async def run(self, spec: WorkflowSpec) -> WorkflowResult:
-        # Disabled until its unified task path is implemented; retained internals are not a fallback.
-        from power_loop.agent.runtime_types import RuntimeRequestError
-        raise RuntimeRequestError("feature_unavailable", "workflow is not enabled")
-        runtime = getattr(self._loop, "task_runtime", None)
-        if runtime is not None:
-            from power_loop.runtime.jobs import JobError
-            from power_loop.runtime.workflow_tasks import current_workflow
-            if (self._task_execution is None or current_workflow(runtime) is not self._task_execution or
-                    self._run_id != self._task_execution.resource_evidence.get("workflow_run_id")):
-                raise JobError("task_workflow_admission_required")
-            if (self._replay or self._resume_sessions) and not getattr(self, "_restore_operation_id", None):
-                raise JobError("task_adapter_unavailable:workflow_resume")
-            if getattr(self, "_restore_operation_id", None):
-                from power_loop.runtime.workflow_restore_execution import validate_engine
-                await validate_engine(runtime, self._task_execution, self, spec)
         self._spec = spec
-        if self._budget is None and spec.budget is not None:
-            self._budget = SharedBudget(
-                spec.budget.max_tokens, stop_at_remaining_pct=spec.budget.stop_at_remaining_pct
-            )
-        # On resume, pre-charge the (fresh) budget with tokens already spent by
-        # replayed steps so the shared ceiling accounts for the whole run.
-        if self._budget is not None and self._replay and not getattr(self, "_restore_operation_id", None):
-            for r in self._replay.values():
-                self._budget.commit(r.usage)
-        driver_meta = {"kind": "wf_driver", "workflow": spec.name}
-        if runtime is None and self._run_id and self._history_owner_sid:
-            driver_meta.update(workflow_run_id=self._run_id, legacy_workflow_owner_sid=self._history_owner_sid)
-        if runtime is not None:
-            driver_meta.update(task_owner_job_id=self._task_execution.lease.job_id,
-                               workflow_run_id=self._run_id, execution_role="workflow",
-                               task_workflow_generation=self._task_execution.lease.generation)
-        if runtime is not None and getattr(self, "_restore_operation_id", None):
-            from power_loop.runtime.workflow_restore_execution import create_driver
-            try:
-                driver_sid = await create_driver(runtime, self._task_execution, self._restore_operation_id)
-            except Exception:
-                from power_loop.runtime.workflow_controller import physical
-                from power_loop.runtime.workflow_restore_execution import driver_proof
-                async with runtime.manager._write() as tx:
-                    row = await runtime.manager._fence(tx, self._task_execution.actor, self._task_execution.lease)
-                    op, request, _ = await driver_proof(runtime.manager, tx, row)
-                    if op["event_id"] != self._restore_operation_id:
-                        raise JobError("workflow_restore_driver_mismatch") from None
-                    driver_sid = request["driver_sid"]
-                    await physical(runtime.manager, tx, row, driver_sid, self._run_id)
-        else:
-            driver_sid = await self._loop.new_session(metadata=driver_meta)
-        # Driver rows are deliberately ephemeral. Freeze execution ancestry in
-        # each leaf so late receipts and restarts don't depend on those rows.
-        from power_loop.core.agent_context import get_session_id
-        caller_sid = get_session_id()
-        caller = await self._loop.store.get_session(caller_sid) if caller_sid else None
-        from power_loop.runtime.lineage import workflow_ancestry
-        self._workflow_ancestry = workflow_ancestry(caller)
-        if not self._workflow_ancestry:
-            # A detached resume has no ambient caller. Retained leaf sessions
-            # remain authoritative for the original ancestry of this run.
-            candidates = list(self._resume_sessions.values()) + [r.session_id for r in self._replay.values() if r.session_id]
-            for sid in candidates:
-                prior = await self._loop.store.get_session(sid)
-                if prior and prior.metadata.get("workflow_run_id") == self._run_id:
-                    self._workflow_ancestry = list(prior.metadata.get("workflow_ancestry") or [])
-                    break
-
+        if spec.budget:
+            self._budget = SharedBudget(spec.budget.max_tokens, stop_at_remaining_pct=spec.budget.stop_at_remaining_pct)
+            self._budget.commit(self._usage_acc)
+        token = _IN_WORKFLOW.set(True)
+        status = "completed"
         try:
-            if runtime is None and self._run_id and self._history_owner_sid:
-                from .legacy_history import register_driver
-                await register_driver(self._loop.store, self._history_owner_sid, self._run_id, driver_sid, spec)
-            if runtime is not None:
-                try:
-                    await runtime.manager.bind_workflow_driver(self._task_execution.actor, self._task_execution.lease, driver_sid)
-                except Exception:
-                    if not getattr(self, "_restore_operation_id", None):
-                        raise
-                    control = await runtime.manager.get_workflow_controller(self._task_execution.actor,
-                        self._task_execution.lease.job_id, self._task_execution.lease.generation)
-                    if control["session_id"] != driver_sid:
-                        raise JobError("workflow_restore_driver_mismatch") from None
-                    await runtime.manager.check_execution(self._task_execution.actor, self._task_execution.lease)
-            env: dict[str, Any] = {"input": spec.input}
-            status = "completed"
-            guard = _IN_WORKFLOW.set(True)
-            watchdog: asyncio.Task[None] | None = None
-            if spec.timeout_s:
-                async def _watchdog(limit: float = float(spec.timeout_s)) -> None:
-                    await asyncio.sleep(limit)
-                    self._timed_out = True
-                    self._own_cancel.cancel(f"run timeout ({int(limit)}s)")
-                watchdog = asyncio.create_task(_watchdog(), name="workflow-timeout")
-            try:
-                await self._exec(spec.root, env, driver_sid)
-            except WorkflowRunError as exc:
-                status = "failed"
-                self._errors.append(str(exc))
-            finally:
-                self._accept_continuations = False
-                # Repairs are owned work. On errors/cancellation, stop and join
-                # them before the driver can disappear or the run can settle.
-                try:
-                    repairs = list(self._repairs.values())
-                    for task in repairs:
-                        # An already-cancelled repair still owns its original
-                        # result write. A second cancel can interrupt that exit.
-                        if not task.done() and not task.cancelling():
-                            task.cancel()
-                    if repairs:
-                        await asyncio.gather(*repairs, return_exceptions=True)
-                finally:
-                    _IN_WORKFLOW.reset(guard)
-                    if watchdog is not None:
-                        watchdog.cancel()
-            if self._timed_out:
-                status = "failed"
-                self._errors.append(f"run 超时（{int(spec.timeout_s or 0)} 秒）：没跑完的节点已停，没开始的不再启动")
-            elif self._cancelled or self._cancel.is_cancelled():
-                status = "cancelled"
-            elif self._budget_hit:
-                status = "budget_exceeded"
-            elif status == "completed" and not self._leaf_cap_hit:
-                # 以前只要没抛异常就报 completed——哪怕 judge 节点整个失败了。
-                # 现在:任一叶子 failed 即 run failed,除非它显式 continue_on_error(或被兜底救回,
-                # 那种情况结果已被顶替成 completed)。这是 continue_on_error 得以有意义的前提。
-                # (叶子上限触顶时跳过:那时下面那条「ceiling」才是准确的根因诊断。)
-                # 6.7.0：hit_round_limit 也算 broken——被截断的叶子曾让 run 谎报 completed
-                # （只认 "failed" 的老判定漏掉它；continuation 救回来的已经是 completed 了）。
-                broken = [
-                    nid for nid, r in self._results.items()
-                    if r.status not in ("completed", "skipped") and nid not in self._tolerated
-                ]
-                # foreach 各路里没成功的（全局表里只留了最后写的那一路，见 _iter_broken）
-                broken += [b for b in self._iter_broken if b.rsplit(".", 1)[-1] not in self._tolerated]
-                if broken:
-                    status = "failed"
-                    self._errors.append(
-                        "failed node(s): " + ", ".join(sorted(set(broken)))
-                        + "（如果这些失败是可接受的，给对应节点加 continue_on_error: true）"
-                    )
-            if self._leaf_cap_hit and status == "completed":
-                # The leaf ceiling fail-closes individual leaves (status=failed); surface it at the
-                # run level so a truncated fanout isn't reported as a clean "completed". (H3)
-                status = "failed"
-                self._errors.append(
-                    f"workflow leaf ceiling ({MAX_TOTAL_LEAVES}) exceeded; fanout truncated")
-            return self._build_result(spec, status)
+            await self._exec(spec.root, {"input": spec.input}, self._driver_sid)
+        except WorkflowRunError as exc:
+            self._errors.append(str(exc))
+            status = "failed"
         finally:
-            # Close ONLY the synthetic driver session; the LINKED leaf sessions survive
-            # (re-parented to NULL by cascade=False) as the run's audit trail — their
-            # transcripts are the only tool-by-tool record of what each role actually did.
-            # (Formerly M-workflow-engine-2 cascaded the whole subtree away, which erased
-            # every leaf transcript the moment a run finished.) Best-effort — a cleanup
-            # failure must not fail an otherwise-successful run.
-            if self._close_driver:
-                try:
-                    await self._loop.close_session(driver_sid, cascade=False)
-                except Exception:  # noqa: BLE001
-                    logger.debug("workflow driver session cleanup failed", exc_info=True)
+            _IN_WORKFLOW.reset(token)
+        if self._cancel.is_cancelled() or self._cancelled:
+            status = "cancelled"
+        elif self._budget_hit:
+            status = "budget_exceeded"
+        elif self._iter_broken or any(
+            r.status not in ("completed", "skipped") and nid not in self._tolerated for nid, r in self._results.items()
+        ):
+            status = "failed"
+        return self._build_result(spec, status)
 
     def _build_result(self, spec: WorkflowSpec, status: str) -> WorkflowResult:
         return WorkflowResult(
@@ -599,146 +232,8 @@ class WorkflowEngine:
             return list(node.cases.values()) + ([node.default] if node.default else [])
         return []
 
-    async def steer_node(self, node_id: str, sid: str, message: str, *, expected_job=None):
-        """Accept steering only while this engine owns execution, never launch an idle send."""
-        import uuid
-
-        from power_loop.runtime.task_runtime import reject_unregistered_adapter
-        if getattr(self._loop, "task_runtime", None) is not None:
-            from power_loop.runtime.node_inputs import steer
-            return await steer(self._loop, self, self._run_id, node_id, sid, message, expected_job=expected_job)
-        if expected_job is not None:
-            raise WorkflowRunError("native node expectation requires a task runtime")
-        reject_unregistered_adapter("workflow_nudge", self._loop)
-        pending = self._steering.get(node_id)
-        if pending is None:
-            raise WorkflowRunError("node is settling; retry nudge after its journal step settles")
-        task = asyncio.create_task(self._loop.follow_up(
-            message, session_id=sid, mode="steer", enqueue_only=True,
-            item_id=f"workflow-steer-{uuid.uuid4().hex}"))
-        pending.append(task)  # registered before any await; the leaf joins delivery before settling
-        return await asyncio.shield(task)
-
-    def start_node_continuation(self, node_id: str, message: str, rounds: int) -> asyncio.Task:
-        """Recover a settled branch while siblings run, using the original leaf session.
-
-        Active dependent scopes are rejected before executing anything. Foreach IDs are
-        ambiguous and require iteration-aware orchestration instead of guessing a session.
-        """
-        from power_loop.runtime.task_runtime import reject_unregistered_adapter
-        reject_unregistered_adapter("workflow_nudge", self._loop)
-        if not self._accept_continuations or self._cancel.is_cancelled():
-            raise WorkflowRunError("run is settling; resume the persisted workflow")
-
-        def path_to(node):
-            if isinstance(node, AgentNode) and node.id == node_id:
-                return [node]
-            for child in self._children(node):
-                path = path_to(child)
-                if path:
-                    return [node, *path]
-            return None
-
-        from .continuation import plan_continuation, replay_results, subtree_ids, walk, within
-        plan = plan_continuation(self._spec, node_id)
-        path = path_to(self._spec.root)
-        if not path or any(isinstance(n, ForeachNode) for n in path):
-            raise WorkflowRunError("node is missing or requires an explicit foreach iteration")
-        leaf = path[-1]
-        frame = self._frames.get(id(leaf))
-        if not frame or frame["active"]:
-            raise WorkflowRunError("node is active or has not settled; deliver a steering message to its sid")
-        scope = leaf
-        for parent in reversed(path[:-1]):
-            pf = self._frames.get(id(parent))
-            if not pf or pf["active"]:
-                if not isinstance(parent, ParallelNode):
-                    raise WorkflowRunError("dependent scope is still active; wait for its current step to settle")
-                break
-            scope = parent
-        key = id(scope)
-        if any(id(n) in self._continuation_barriers for n in path):
-            raise WorkflowRunError("dependent scope is settling; continuation intake is closed")
-        scope_path = plan.target_path[:next(i for i, n in enumerate(path) if n is scope)]
-        scope_ids = subtree_ids(scope)
-        if any(p < plan.target_path and not within(plan.target_path, p) for p in plan.affected_paths):
-            raise WorkflowRunError("continuation affects earlier work; dependency order requires full replanning")
-        # Full-spec analysis catches references outside the chosen repair scope.
-        # A live repair cannot rewrite another settled branch or race a consumer.
-        for occurrence, candidate in walk(self._spec.root):
-            frame = self._frames.get(id(candidate))
-            if (occurrence in plan.affected_paths and frame and frame["active"] and
-                    not within(scope_path, occurrence)):
-                raise WorkflowRunError("dependent scope is still active; wait for its current step to settle")
-        if (plan.invalidated - scope_ids) & self._results.keys():
-            raise WorkflowRunError("continuation affects results outside this branch; resume the persisted workflow")
-        if key in self._repairs and self._repairs[key].done():
-            self._repairs[key].result()  # Do not silently discard failed repairs.
-            self._repairs.pop(key)
-        if key in self._repairs:
-            raise WorkflowRunError("this branch already has a continuation in progress")
-        prior = self._results.get(node_id)
-        if prior is None or not prior.session_id:
-            raise WorkflowRunError("node has no resumable session")
-        sf = self._frames[key]
-        # Freeze the invalidation/replay decision before returning acceptance.
-        # The task must not recompute it from a later mutable result table.
-        repaired_spec = replace(self._spec, root=scope)
-        invalidated = plan.invalidated & scope_ids
-        replay = replay_results(repaired_spec, plan, dict(self._results))
-
-        async def repair():
-            for replay_id in scope_ids:
-                self._replay.pop(replay_id, None)
-            self._replay.update(replay)
-            self._replay_no_charge.update(replay)
-            for invalid_id in sorted(invalidated):
-                self._tolerated.discard(invalid_id)
-                self._replay.pop(invalid_id, None)
-                old = self._results.pop(invalid_id, None)
-                await self._emit_step(AgentResult(
-                    node_id=invalid_id, status="pending", text="",
-                    session_id=old.session_id if old else None,
-                    error="invalidated by node continuation"))
-            self._resume_sessions[node_id] = prior.session_id
-            self._resume_instructions[node_id] = (message, rounds)
-            guard = _IN_WORKFLOW.set(True)
-            try:
-                return await self._exec(scope, sf["env"], sf["driver"])
-            finally:
-                _IN_WORKFLOW.reset(guard)
-
-        coroutine = repair()
-        try:
-            task = asyncio.create_task(coroutine, name=f"workflow-continue-{node_id}")
-        except BaseException:
-            coroutine.close()
-            raise
-        self._repairs[key] = task
-        return task
-
-    async def continue_node(self, node_id: str, message: str, rounds: int) -> AgentResult | None:
-        """Host/test await API; model tools use start_node_continuation."""
-        task = self.start_node_continuation(node_id, message, rounds)
-        try:
-            return await asyncio.shield(task)
-        finally:
-            # Keep the task registered until completed, even if the caller disconnects.
-            if task.done():
-                for key, registered in list(self._repairs.items()):
-                    if registered is task:
-                        self._repairs.pop(key, None)
-
     async def _exec(self, node: WorkflowNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
-        if ITERATION_ENV_KEY in env:
-            return await self._exec_dispatch(node, env, driver_sid)
-        frame = {"active": True, "env": dict(env), "driver": driver_sid, "result": None}
-        self._frames[id(node)] = frame
-        try:
-            frame["result"] = await self._exec_dispatch(node, env, driver_sid)
-            return frame["result"]
-        finally:
-            frame["active"] = False
+        return await self._exec_dispatch(node, env, driver_sid)
 
     async def _exec_dispatch(self, node: WorkflowNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         if isinstance(node, AgentNode):
@@ -757,18 +252,6 @@ class WorkflowEngine:
 
     async def _exec_loop(self, node: LoopNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
         """反复跑循环体直到 ``until`` 成立（6.46，design/170 第三批）。循环信息随 env 往下传（几个循环可以并行跑）。"""
-        replayed = self._replay.pop(node.id, None)
-        if replayed is not None:
-            # 整体重放：把最后一轮各节点的结果还原，循环之后对它们的引用照样能用
-            for nid, r in ((replayed.payload or {}).get("last") or {}).items():
-                self._results[nid] = AgentResult(node_id=nid, status=str(r.get("status") or "completed"),
-                                                 text=str(r.get("text") or ""), payload=r.get("payload"),
-                                                 session_id=r.get("session_id"))
-            self._results[node.id] = replayed
-            if node.id not in self._replay_no_charge:
-                self._add_usage(replayed.usage)
-            self._replay_no_charge.discard(node.id)
-            return replayed
         body_ids = _agent_ids(node.body)
         feedback_node = str(node.until.get("ref") or "").split(".", 1)[0]
         prev: dict[str, str] = {}
@@ -776,14 +259,29 @@ class WorkflowEngine:
         for iteration in range(1, node.max_iterations + 1):
             if self._cancel.is_cancelled():
                 break
-            lc = {"loop_id": node.id, "iteration": iteration, "max": node.max_iterations,
-                  "continue": set(node.continue_nodes), "prev": dict(prev), "why": why,
-                  "feedback": self._loop_feedback(feedback_node) if iteration > 1 else ""}
-            from power_loop.runtime.workflow_tasks import ROUTE_KEY
-            body_env = {**env, _LOOP_KEY: lc, "loop_iteration": iteration,
-                        ROUTE_KEY: [*env.get(ROUTE_KEY, []), {"loop": node.id, "iteration": iteration}]}
+            lc = {
+                "loop_id": node.id,
+                "iteration": iteration,
+                "max": node.max_iterations,
+                "continue": set(node.continue_nodes),
+                "prev": dict(prev),
+                "why": why,
+                "feedback": self._loop_feedback(feedback_node) if iteration > 1 else "",
+            }
+            from .journal import ROUTE_KEY
+
+            body_env = {
+                **env,
+                _LOOP_KEY: lc,
+                "loop_iteration": iteration,
+                ROUTE_KEY: [*env.get(ROUTE_KEY, []), {"loop": node.id, "iteration": iteration}],
+            }
             body_result = await self._exec(node.body, body_env, driver_sid)
-            if body_result is not None and body_result.status not in ("completed", "skipped") and body_result.node_id not in self._tolerated:
+            if (
+                body_result is not None
+                and body_result.status not in ("completed", "skipped")
+                and body_result.node_id not in self._tolerated
+            ):
                 why = f"上游 {body_result.node_id} 未完成：{body_result.status}；审核与下一轮已阻断"
                 break
             for nid in node.continue_nodes:
@@ -794,17 +292,30 @@ class WorkflowEngine:
             if converged:
                 break
             logger.info("workflow loop %s: iteration %d/%d not done (%s)", node.id, iteration, node.max_iterations, why)
-        last = {nid: {"status": r.status, "text": (r.text or "")[:4000], "payload": r.payload, "session_id": r.session_id}
-                for nid in body_ids if (r := self._results.get(nid)) is not None}
+        last = {
+            nid: {"status": r.status, "text": (r.text or "")[:4000], "payload": r.payload, "session_id": r.session_id}
+            for nid in body_ids
+            if (r := self._results.get(nid)) is not None
+        }
         payload = {"converged": converged, "iterations": iteration, "why": why, "last": last}
-        broken = any(r.status not in ("completed", "skipped") and nid not in self._tolerated
-                     for nid in body_ids if (r := self._results.get(nid)) is not None)
+        broken = any(
+            r.status not in ("completed", "skipped") and nid not in self._tolerated
+            for nid in body_ids
+            if (r := self._results.get(nid)) is not None
+        )
         ok = converged or (node.on_exhausted == "continue" and not broken and not self._cancel.is_cancelled())
-        err = None if converged else (f"跑了 {iteration} 轮仍不满足 until：{why}" if not self._cancel.is_cancelled()
-                                      else "循环被取消")
-        res = AgentResult(node_id=node.id, status="completed" if ok else ("cancelled" if self._cancel.is_cancelled() else "failed"),
-                          text=f"循环 {node.id}：{'满足' if converged else '没满足'}（{iteration} 轮）：{why}",
-                          payload=payload, error=err)
+        err = (
+            None
+            if converged
+            else (f"跑了 {iteration} 轮仍不满足 until：{why}" if not self._cancel.is_cancelled() else "循环被取消")
+        )
+        res = AgentResult(
+            node_id=node.id,
+            status="completed" if ok else ("cancelled" if self._cancel.is_cancelled() else "failed"),
+            text=f"循环 {node.id}：{'满足' if converged else '没满足'}（{iteration} 轮）：{why}",
+            payload=payload,
+            error=err,
+        )
         self._results[node.id] = res
         await self._emit_step(res)
         return res
@@ -818,536 +329,147 @@ class WorkflowEngine:
             return json.dumps(r.payload, ensure_ascii=False)[:4000]
         return (r.text or r.error or "")[:4000]
 
-    async def _exec_agent(self, node: AgentNode, env: dict[str, Any], driver_sid: str) -> AgentResult:
-        runtime = getattr(self._loop, "task_runtime", None)
-        if runtime is None:
-            return await self._exec_agent_admitted(node, env, driver_sid)
-        if getattr(self, "_restore_operation_id", None) and node.id in self._replay:
-            return await self._exec_agent_body(node, env, driver_sid)
-        from power_loop.runtime.jobs import JobError
-        from power_loop.runtime.workflow_tasks import node_execution
-        node_stop = self._cancel.child()
-        async with node_execution(runtime, self, node, env, driver_sid, cancel_token=node_stop) as binding:
-            token = _DEFER_STEP.set(node.id)
-            retained_input_failure = False
-            try:
-                try:
-                    result = await self._exec_agent_admitted(node, env, driver_sid, node_stop=node_stop)
-                except JobError as exc:
-                    snapshot = getattr(exc, "execution_result", None)
-                    if (exc.code == "required_input_unhandled" and isinstance(snapshot, dict)
-                            and snapshot.get("status") in ("failed", "cancelled", "timed_out", "budget_exceeded", "hit_round_limit", "degraded")):
-                        # The original model phase has ended. Accepted input prevents a
-                        # replacement business attempt, not consumption of this actual
-                        # negative result by the owning workflow. Physical uncertainty
-                        # remains on the original execution ledger.
-                        result = AgentResult(node_id=node.id, session_id=snapshot.get("session_id"),
-                            status=snapshot["status"], text=snapshot.get("final_text") or "",
-                            payload=snapshot.get("payload"), usage=dict(snapshot.get("usage") or {}),
-                            error=snapshot.get("error") or exc.code)
-                        retained_input_failure = True
-                    elif exc.code == "cancel_requested":
-                        # A durable node stop can win before its local signal or
-                        # heartbeat reaches the provider-admission checkpoint.
-                        # Only this exact node's stop may be tolerated; an ancestor
-                        # stop or another lost lease must still stop the workflow.
-                        current = await runtime.manager._authorize(runtime.manager.db, binding.actor, binding.lease.job_id)
-                        runtime.manager._check_proof(current, binding.lease)
-                        if current["cancel_requested_at"] is None:
-                            raise
-                        node_stop.cancel("durable node cancellation requested")
-                        sessions = [sid for sid, active in self._task_nodes.items() if active is binding]
-                        result = AgentResult(node_id=node.id, session_id=sessions[-1] if sessions else None,
-                            status="cancelled", text="", error="node cancelled before dispatch")
-                        self._tolerated.add(node.id)
-                        self._last = result
-                    else:
-                        raise
-                saved = await runtime.record_scope(binding, result.to_dict())
-                if retained_input_failure:
-                    accounted = binding.resource_evidence.get("workflow_usage_accounted", {})
-                    usage = saved.get("usage", {})
-                    delta = {key: int(usage.get(key, 0)) - int(accounted.get(key, 0)) for key in usage.keys() | accounted.keys()}
-                    if any(value < 0 for value in delta.values()):
-                        raise WorkflowRunError("workflow usage regressed during negative input settlement")
-                    self._add_usage(delta)
-                    if self._budget is not None:
-                        self._budget.commit(delta)
-            finally:
-                _DEFER_STEP.reset(token)
-            result.status = saved["status"]
-            result.usage = saved.get("usage", result.usage)
-            self._results[node.id] = result
-            if result.status not in ("completed", "skipped"):
-                self._last = result
-            if result.status == "cancelled" and self._cancel.is_cancelled():
-                self._cancelled = True
-            from power_loop.runtime.finalization import consume_node, try_finalize
-            await consume_node(runtime, self._task_execution, binding, result.to_dict())
-            await try_finalize(runtime.manager, self._task_execution.actor, binding.lease.job_id, binding.lease.generation)
-            await self._emit_step(result)
-            return result
+    async def _exec_agent(self, node, env, driver_sid):
+        from dataclasses import asdict
 
-    async def _exec_agent_admitted(self, node: AgentNode, env: dict[str, Any], driver_sid: str, *, node_stop=None) -> AgentResult:
-        from time import monotonic
-
-        from power_loop.runtime.completion import WINDOW, CompletionWindow
-        from power_loop.workflow.admission import AdmissionCancelled, admit
-        managed = getattr(self._loop, "task_runtime", None) is not None
-        owns_completion = managed
-        ceiling = None
-        if managed:
-            hint = self._resume_instructions.get(node.id)
-            ceiling = int(hint[1]) if hint else int(node.spec.max_rounds or 30)
-            if node.continuation is not None:
-                ceiling += node.continuation.max_continuations * node.continuation.extra_rounds
-        completion_token = WINDOW.set(CompletionWindow(round_ceiling=ceiling, multi_session=True)) if owns_completion else None
-        if owns_completion:
-            from power_loop.runtime.completion_windows import bind_window
-            try:
-                await bind_window(self._loop, WINDOW.get(), driver_sid)
-            except BaseException:
-                WINDOW.reset(completion_token)
-                raise
-        started = monotonic()
-        token = node_stop if node_stop is not None else self._cancel.child()
-        waiting = self._admission_tokens.setdefault(node.id, [])
-        waiting.append(token)
-        try:
-            async with admit(token) as lease:
-                waiting.remove(token)
-                result = await self._exec_agent_body(node, env, driver_sid, node_stop=token)
-        except AdmissionCancelled:
-            result = AgentResult(node_id=node.id, status="cancelled", text="", error="cancelled while queued")
-            self._results[node.id] = result
-            if not self._cancel.is_cancelled():
-                self._tolerated.add(node.id)
-            await self._emit_step(result)
-            return result
-        finally:
-            if completion_token is not None:
-                WINDOW.reset(completion_token)
-            if token in waiting:
-                waiting.remove(token)
-        if result.session_id and hasattr(self._loop, "ensure_store"):
-            try:
-                store = await self._loop.ensure_store()
-                old = await store.get_runtime_state(result.session_id, "workflow_admission", {})
-                await store.set_runtime_state(result.session_id, "workflow_admission", {
-                    "attempts": int(old.get("attempts", 0)) + 1,
-                    "queue_s": float(old.get("queue_s", 0)) + lease.queue_s,
-                    "idle_s": float(old.get("idle_s", 0)) + lease.idle_s,
-                    "metrics": {key: old.get("metrics", {}).get(key, 0) + lease.metrics.get(key, 0)
-                                for key in old.get("metrics", {}).keys() | lease.metrics.keys()},
-                    "elapsed_s": float(old.get("elapsed_s", 0)) + monotonic() - started,
-                })
-            except Exception:
-                logger.warning("workflow admission metric persistence failed", exc_info=True)
-        return result
-
-    async def _exec_agent_body(self, node: AgentNode, env: dict[str, Any], driver_sid: str, *, node_stop=None) -> AgentResult:
-        # Resume: a completed node is replayed from the journal, not re-run. Pop
-        # so a body id that somehow leaked in can only ever replay once.
-        replayed = self._replay.pop(node.id, None)
-        if replayed is not None:
-            self._results[node.id] = replayed
-            self._last = replayed
-            if node.id not in self._replay_no_charge:
-                self._add_usage(replayed.usage)
-            self._replay_no_charge.discard(node.id)
-            return replayed
+        from .admission import admit
+        from .journal import ROUTE_KEY
 
         if self._cancel.is_cancelled():
             self._cancelled = True
-            res = AgentResult(node_id=node.id, status="cancelled", text="",
-                              error="workflow cancelled before this step started")
-            self._results[node.id] = res
-            await self._emit_step(res)
-            return res
-
-        if node.when is not None:
-            ok, why = self._eval_when(node.when)
-            if not ok:
-                res = AgentResult(node_id=node.id, status="skipped", text="", error=f"条件不成立，跳过：{why}")
-                self._results[node.id] = res
-                await self._emit_step(res)
-                return res
-
-        if self._budget is not None and not self._budget.can_spawn():
-            self._budget_hit = True
-            res = AgentResult(node_id=node.id, status="budget_exceeded", text="",
-                              error="shared token budget exhausted")
-            self._results[node.id] = res
-            await self._emit_step(res)
-            return res
-
+            return AgentResult(node.id, "cancelled", "")
+        if node.when and not self._eval_when(node.when)[0]:
+            result = AgentResult(node.id, "skipped", "")
+            self._results[node.id] = result
+            return result
         if self._leaves_run >= MAX_TOTAL_LEAVES:
-            self._leaf_cap_hit = True
-            res = AgentResult(node_id=node.id, status="failed", text="",
-                              error=f"workflow leaf ceiling ({MAX_TOTAL_LEAVES}) exceeded")
-            self._results[node.id] = res
-            await self._emit_step(res)
-            return res
+            raise WorkflowRunError("workflow leaf ceiling exceeded")
         self._leaves_run += 1
-
-        user_input = _render(node.input, env, self._resolve_ref_soft)
-        if node.inputs_from:
-            extras = []
-            for ref in node.inputs_from:
-                up = self._results.get(ref)
-                if up is None:
-                    continue
-                if up.status == "skipped":
-                    extras.append(f"[上游节点 '{ref}' 条件不成立，跳过了：{up.error or ''}]")
-                elif up.status != "completed":
-                    # 🔴 上游失败时**绝不能**给空字符串:下游模型会把「没说话」读成「没意见」,
-                    # 进而在缺证据的情况下下结论。给一个显式的失败说明。
-                    extras.append(
-                        f"[上游节点 '{ref}' 未产出结果：{up.error or up.status}。"
-                        f"本次没有它的证据——不要把「没有发现」当成「没有问题」。]"
-                    )
-                else:
-                    extras.append(up.text)
-            if extras:
-                user_input = user_input + "\n\n--- context ---\n" + "\n\n".join(extras)
-
-        # 文件产出与文件引用（design/64 §2）：产出路径进 metadata 供 host/叶子使用；
-        # 输入里的 @@FILEREF:…@@ 就地换成「路径 + 片段 + 截断留痕」。
-        output_file: str | None = None
-        if self._file_io is not None:
-            try:
-                output_file = node.output_file or self._file_io.output_path(
-                    node.id, iteration=env.get(ITERATION_ENV_KEY)
-                )
-            except Exception:  # noqa: BLE001 — 产出文件是增益,不该让整个叶子起不来
-                logger.debug("file_io.output_path failed for %s", node.id, exc_info=True)
-            user_input = FILEREF_RE.sub(
-                lambda m: self._render_fileref(m.group(1), m.group(2) or ""), user_input
+        body = _render(node.input, env, self._resolve_ref_soft)
+        extras = []
+        for name in node.inputs_from or []:
+            result = self._results.get(name)
+            extras.append(
+                result.text
+                if result and result.status == "completed"
+                else f"[Upstream {name} did not complete: {result.error or result.status if result else 'missing'}]"
             )
-
-        # keep trace + readable usage (linked); enforce structured output at the
-        # provider via the node's output_schema so real models return JSON, not prose.
-        # Thread a stable idempotency key (run_id:node_id) into the leaf's
-        # metadata so side-effecting tools can dedupe if the step re-runs on resume.
-        leaf_tools = node.spec.tools
+        if extras:
+            body += "\n\n--- context ---\n" + "\n\n".join(extras)
+        output_file = node.output_file
+        if self._file_io:
+            output_file = output_file or self._file_io.output_path(node.id, iteration=env.get(ITERATION_ENV_KEY))
+            body = FILEREF_RE.sub(lambda match: self._file_io.render_ref(match.group(1), match.group(2) or ""), body)
+        elif FILEREF_RE.search(body):
+            raise WorkflowRunError("workflow file references require the configured resource profile")
+        tools = node.spec.tools
         if self._allowed_tools is not None:
-            # inherit (None) → the clamp set becomes the explicit whitelist;
-            # explicit list → intersect. Unknown names are dropped by the
-            # registry subset downstream, so an over-broad clamp is harmless.
-            leaf_tools = (
-                sorted(self._allowed_tools)
-                if leaf_tools is None
-                else [t for t in leaf_tools if t in self._allowed_tools]
-            )
+            tools = sorted(self._allowed_tools) if tools is None else [t for t in tools if t in self._allowed_tools]
         spec = replace(
             node.spec,
-            tools=leaf_tools,
+            system_prompt=_render(node.spec.system_prompt, env, self._resolve_ref_soft),
+            tools=tools,
             lifecycle="linked",
             output_schema=node.output_schema,
-            metadata={
-                **node.spec.metadata,
-                **self._step_idempotency(node.id),
-                "workflow_ancestry": self._workflow_ancestry,
-                **({"legacy_workflow_owner_sid": self._history_owner_sid}
-                   if self._history_owner_sid and getattr(self._loop, "task_runtime", None) is None else {}),
-                **({"output_file": output_file} if output_file else {}),
-                # foreach 迭代号（6.8.1）：body 各迭代共享一个 node_id，观测端（活动面板）
-                # 没有它就把 N 路并发画成同一个节点反复亮灭——看起来像串行循环。
-                **({"workflow_iteration": env[ITERATION_ENV_KEY]}
-                   if ITERATION_ENV_KEY in env else {}),
-            },
+            metadata={**node.spec.metadata, **({"output_file": output_file} if output_file else {})},
         )
-        runtime = getattr(self._loop, "task_runtime", None)
-        if runtime is not None:
-            from power_loop.runtime.workflow_tasks import node_metadata
-            spec = replace(spec, metadata={**spec.metadata, **node_metadata(runtime)})
-        if self._on_node_start is not None:
-            try:
-                await self._on_node_start(node.id)
-            except Exception:  # noqa: BLE001 — observability must not fail the run
-                pass
-
-        self._steering[node.id] = []
-        node_tok = (node_stop if node_stop is not None else self._cancel).child()
-        self._node_tokens.setdefault(node.id, []).append(node_tok)
-        # 重启后接着跑（6.46）：这个节点上次有叶子会话、没做完 → 先在原会话补轮；失败保留会话，不隐式重放。
-        resumed_raw: dict[str, Any] | None = None
-        rs = self._resume_sessions.pop(node.id, None) if not self._emit_suppressed else None
-        if rs:
-            try:
-                prompt, rounds = self._resume_instructions.pop(
-                    node.id, (_RESUME_PROMPT, max(int(node.spec.max_rounds or 30), 10)))
-                if runtime is not None and getattr(self, "_restore_operation_id", None):
-                    from power_loop.runtime.node_resume import _PREPARED
-                    from power_loop.runtime.workflow_restore_execution import accept_input, confirm_input
-                    prepared = _PREPARED.get()
-                    prompt = "Continue this node for the new workflow execution using its original contract.\n"+user_input+"\n\n"+prompt
-                    try:
-                        await accept_input(runtime, prepared.binding, rs, prompt)
-                    except Exception:
-                        await confirm_input(runtime, prepared.binding, rs, prompt)
-                    prepared.pending = True
-                resumed_raw = await self._continue_leaf(
-                    rs, prompt, extra_rounds=rounds, stop=node_tok)
-                resumed_raw.setdefault("session_id", rs)
-                logger.info("workflow leaf %s resumed in its original session %s", node.id, rs)
-            except Exception as exc:  # noqa: BLE001 — 保留原会话，防止重复副作用
-                logger.warning("workflow leaf %s: resume in session %s failed (%s); preserving original session", node.id, rs, exc)
-                resumed_raw = {"status": "failed", "session_id": rs,
-                               "error": f"continuation failed without replay: {exc}"}
-
+        route = env.get(ROUTE_KEY, [])
         lc = env.get(_LOOP_KEY)
-        if (resumed_raw is None and lc and lc["iteration"] > 1 and node.id in lc["continue"]
-                and lc["prev"].get(node.id)):
-            prev_sid = lc["prev"][node.id]
-            try:
-                await self._prepare_rework(prev_sid, node.id, lc)
-                resumed_raw = await self._continue_leaf(
-                    prev_sid, _loop_prompt(lc, user_input), extra_rounds=max(int(node.spec.max_rounds or 30), 10), stop=node_tok)
-                resumed_raw.setdefault("session_id", prev_sid)
-            except Exception as exc:  # noqa: BLE001 — 续跑失败不能变成首次执行
-                logger.warning("workflow loop %s: continuing %s in %s failed (%s); preserving original session",
-                               lc["loop_id"], node.id, prev_sid, exc)
-                resumed_raw = {"status": "failed", "session_id": prev_sid,
-                               "error": f"continuation failed without replay: {exc}"}
+        previous = lc["prev"].get(node.id) if lc and node.id in lc["continue"] else None
+        if previous:
+            body = _loop_prompt(lc, body)
+        attempts = node.retry.max_attempts if node.retry else 1
+        raw = {}
+        node_usage = {}
 
-        # ── 重试循环（design/64 §1）──────────────────────────────────────────────
-        # 每次 attempt 都起**新的叶子会话**（失败会话的上下文可能已被半截的工具调用污染）。
-        # idempotency_key 跨 attempt 不变（变了工具就没法去重），attempt 号单独进 metadata。
-        policy = node.retry
-        max_attempts = policy.max_attempts if policy is not None else 1
-        triggers = set(policy.on) if policy is not None else set()
-        raw: dict[str, Any] = {}
-        for attempt in range(1, max_attempts + 1):
-            if attempt > 1:
-                # 重跑会把产出**追加**到已有文件里,证据混在一起分不清哪次——交给 host 处理
-                # (DeepTalk:改名成 .attempt<N>.md 留证据但不混淆)。
-                if self._file_io is not None and output_file:
-                    try:
-                        self._file_io.before_attempt(node.id, output_file, attempt)
-                    except Exception:  # noqa: BLE001 — 归档失败不该毁掉这次重试
-                        logger.debug("file_io.before_attempt failed", exc_info=True)
-                if policy is not None and policy.backoff_s > 0:
-                    # 第 N 次重试等 backoff_s * factor**(N-1)；factor=1 就是固定间隔。
-                    delay = policy.backoff_s * (policy.backoff_factor ** (attempt - 2))
-                    await asyncio.sleep(min(delay, MAX_BACKOFF_S))
-            if attempt == 1 and resumed_raw is not None:
-                raw = resumed_raw
-            else:
-                admission = None
-                if runtime is None and self._history_owner_sid and self._run_id:
-                    from power_loop.runtime.spec import _CHILD_ADMISSION
-                    from power_loop.runtime.workflow_tasks import ROUTE_KEY
+        def record_usage(raw):
+            value = raw.get("usage") or {}
+            current = raw.get("accounting_usage", value)
+            self._add_usage(current)
+            if self._budget:
+                self._budget.commit(current)
+            if raw["status"] == "budget_exceeded":
+                self._budget_hit = True
+            for name, count in value.items():
+                node_usage[name] = node_usage.get(name, 0) + count
 
-                    from .legacy_history import register_session
-                    previous_admission = _CHILD_ADMISSION.get()
-                    async def admitted(sid, *, _attempt=attempt, _previous=previous_admission):
-                        if _previous is not None:
-                            await _previous(sid)
-                        await register_session(self._loop.store, self._history_owner_sid, self._run_id, driver_sid,
-                            node, sid, env.get(ROUTE_KEY, []), _attempt)
-                    admission = _CHILD_ADMISSION.set(admitted)
-                cb_tok = (_ON_CHILD_SESSION.set(self._session_cb(node.id))
-                          if self._on_node_session is not None and not self._emit_suppressed else None)
-                try:
-                    raw = await self._executor.run_agent(
-                        replace(spec, metadata={**spec.metadata, "attempt": attempt}),
-                        user_input, parent_loop=self._loop, driver_sid=driver_sid,
-                        stop_event=node_tok,
-                    )
-                finally:
-                    if admission is not None:
-                        _CHILD_ADMISSION.reset(admission)
-                    if cb_tok is not None:
-                        _ON_CHILD_SESSION.reset(cb_tok)
-            if runtime is not None:
-                from power_loop.runtime.workflow_tasks import collect_node
-                raw = await collect_node(runtime, self._loop, raw, node_tok)
-            else:
-                from power_loop.runtime.completion import WINDOW, collect_required
-                if WINDOW.get() is not None:
-                    raw = await collect_required(self._loop, raw, node_tok)
-            if resumed_raw is not None or attempt >= max_attempts or not self._should_retry(raw, triggers):
-                break
-            # 取消/预算耗尽时不再重试:那不是「这次没跑好」,是整个 run 该停了。
-            if node_tok.is_cancelled() or (
-                self._budget is not None and not self._budget.can_spawn()
-            ):
-                break
-            if runtime is not None:
-                from power_loop.runtime.node_inputs import finish_attempt
-                await finish_attempt(runtime, self, raw)
-                raw = await collect_node(runtime, self._loop, raw, node_tok)
-                if not self._should_retry(raw, triggers):
-                    break
-            logger.info(
-                "workflow leaf %s attempt %d/%d failed (%s); retrying",
-                node.id, attempt, max_attempts, raw.get("status"),
-            )
-        # ── 耗尽续跑（6.7.0，ContinuationPolicy）：hit_round_limit + 门条件成立 → 原会话补轮。
-        # 与 retry 正交：retry 起新会话防污染，这里恰恰要**同一会话**接着成果做——引擎在
-        # 耗尽时已逼叶子写下「做了什么+还剩什么」，续命提示再喂它自己的剩余 todo。
-        # Each continuation's usage is part of raw's cumulative usage. Charge
-        # that cumulative evidence once, including before checking another
-        # continuation's budget. Final canonical usage may add required child
-        # work, but cannot charge already-accounted requests again.
-        accounted_usage: dict[str, int] = {}
-
-        def account_usage(usage):
-            totals = {key: int(value or 0) for key, value in (usage or {}).items()}
-            delta = {key: value - accounted_usage.get(key, 0) for key, value in totals.items()}
-            if any(value < 0 for value in delta.values()):
-                raise WorkflowRunError("workflow usage regressed during continuation settlement")
-            self._add_usage(delta)
-            if self._budget is not None:
-                self._budget.commit(delta)
-            accounted_usage.update(totals)
-            if runtime is not None:
-                from power_loop.runtime.task_runtime import _OWNER
-                binding = _OWNER.get()
-                if binding is not None and binding.runtime is runtime:
-                    binding.resource_evidence["workflow_usage_accounted"] = dict(accounted_usage)
-
-        account_usage(raw.get("usage"))
-        cont = node.continuation
-        if cont is not None:
-            for c_i in range(1, cont.max_continuations + 1):
-                if raw.get("completion_unresolved"):
-                    break
-                if str(raw.get("status")) not in ("hit_round_limit", "context_checkpoint") or not raw.get("session_id"):
-                    break
-                if node_tok.is_cancelled() or (
-                    self._budget is not None and not self._budget.can_spawn()
+        async with admit(self._cancel):
+            for attempt in range(1, attempts + 1):
+                request = NodeRequest(self._run_id, node.id, route, attempt, asdict(spec), body, session_id=previous)
+                raw = await self._executor.run_agent(request, allow_start=not self._budget or self._budget.can_spawn())
+                record_usage(raw)
+                # Unknown actions are never automatically retried.
+                if (
+                    raw.get("status") in {"unknown", "interrupted", "cancelled", "budget_exceeded"}
+                    or not node.retry
+                    or not self._should_retry(raw, set(node.retry.on))
+                    or attempt == attempts
                 ):
                     break
-                remaining = await self._todo_remaining(str(raw["session_id"]))
-                if cont.gate == "todo_remaining" and not remaining:
-                    break  # 没有账本（或全勾完）：不知道从哪接，续跑只会瞎跑
-                prompt = _continuation_prompt(remaining, c_i, cont.max_continuations)
-                logger.info("workflow leaf %s hit_round_limit; continuation %d/%d (+%d rounds)",
-                            node.id, c_i, cont.max_continuations, cont.extra_rounds)
-                try:
-                    more = await self._continue_leaf(
-                        str(raw["session_id"]), prompt, extra_rounds=cont.extra_rounds, stop=node_tok)
-                except Exception as exc:  # noqa: BLE001 — 续跑失败不毁掉已有成果
-                    logger.warning("workflow leaf %s continuation failed: %s", node.id, exc)
+                if node.retry.backoff_s:
+                    await asyncio.sleep(
+                        min(MAX_BACKOFF_S, node.retry.backoff_s * node.retry.backoff_factor ** (attempt - 1))
+                    )
+            cont = node.continuation
+            for index in range(1, cont.max_continuations + 1 if cont else 1):
+                if raw.get("status") not in {"hit_round_limit", "context_checkpoint"}:
                     break
-                merged_usage = dict(raw.get("usage") or {})
-                for k, v in (more.get("usage") or {}).items():
-                    merged_usage[k] = int(merged_usage.get(k, 0) or 0) + int(v or 0)
-                raw = {
-                    **raw,
-                    "status": more.get("status"),
-                    "final_text": more.get("final_text") or raw.get("final_text"),
-                    "rounds": int(raw.get("rounds") or 0) + int(more.get("rounds") or 0),
-                    "usage": merged_usage,
-                }
-                account_usage(merged_usage)
-
-        if str(raw.get("status")) == "cancelled":
-            if node_tok.is_cancelled() and not self._cancel.is_cancelled():
-                # 只取消了这一个节点（cancel_node）：run 照跑，这个节点按「放行的失败」记
-                self._node_cancelled.add(node.id)
-                raw = {**raw, "error": raw.get("error") or f"节点被单独取消：{node_tok.reason}"}
-            else:
-                self._cancelled = True
-        # Close intake, then join every accepted delivery. Any input arriving after the
-        # final round drain is flushed before schema validation, journaling or review.
-        accepted_steering = self._steering.pop(node.id, [])
-        if accepted_steering:
-            await asyncio.gather(*accepted_steering)
-            sid = raw.get("session_id")
-            pending = await self._loop.inbox_pending(sid) if sid else {}
-            if pending.get("pending", 0):
-                more = await self._continue_leaf(
-                    str(sid), "继续处理收件箱中的补充要求，完成后按原任务格式交付。",
-                    extra_rounds=max(int(node.spec.max_rounds or 30), 10), stop=node_tok)
-                combined_usage = dict(raw.get("usage") or {})
+                if self._cancel.is_cancelled():
+                    break
+                remaining = await self._executor.todo_remaining(raw["session_id"])
+                if cont.gate == "todo_remaining" and not remaining:
+                    break
+                more = await self._executor.run_agent(
+                    replace(
+                        request,
+                        continuation=index,
+                        session_id=raw["session_id"],
+                        spec=asdict(replace(spec, max_rounds=cont.extra_rounds)),
+                        body=_continuation_prompt(remaining, index, cont.max_continuations),
+                    ),
+                    allow_start=not self._budget or self._budget.can_spawn(),
+                )
+                record_usage(more)
+                usage = dict(raw.get("usage") or {})
                 for key, value in (more.get("usage") or {}).items():
-                    combined_usage[key] = combined_usage.get(key, 0) + value
-                raw = {**more, "session_id": sid, "usage": combined_usage}
-
-        if runtime is not None:
-            from power_loop.runtime.workflow_tasks import collect_node
-            raw = await collect_node(runtime, self._loop, raw, node_tok)
-            from power_loop.runtime.node_inputs import finish_attempt
-            await finish_attempt(runtime, self, raw)
-            raw = await collect_node(runtime, self._loop, raw, node_tok)
-            if (type(self._executor) is InProcessExecutor or getattr(self._executor, "completion_owner", None) == "power_loop") and not (node.output_file or spec.metadata.get("output_file")):
-                from power_loop.runtime.workflow_tasks import ensure_node_answer
-                raw = await ensure_node_answer(runtime, self._loop, raw, node_tok)
-            from power_loop.runtime.task_runtime import _OWNER
-            scope = _OWNER.get()
-            raw["usage"] = await runtime.manager.execution_usage(scope.actor, scope.lease.job_id,
-                generation=scope.lease.generation)
-
-        payload: dict[str, Any] | None = None
-        err: str | None = None
-        if node.output_schema is not None and raw.get("status") == "completed":
+                    usage[key] = usage.get(key, 0) + value
+                raw = {**more, "usage": usage}
+        payload, error = raw.get("structured_output"), raw.get("error")
+        if node.output_schema and raw["status"] == "completed" and payload is None:
             try:
-                payload = parse_structured(
-                    raw.get("final_text") or "", schema=node.output_schema.get("schema")
-                )
+                payload = parse_structured(raw.get("final_text", ""), schema=node.output_schema.get("schema"))
             except StructuredOutputError as exc:
-                err = f"output_schema parse failed for '{node.id}': {exc}"
-                self._errors.append(err)
-
-        res = AgentResult(
-            node_id=node.id,
-            status="failed" if err else str(raw.get("status")),
-            text=raw.get("final_text") or "",
+                error, raw = str(exc), {**raw, "status": "failed"}
+        result = AgentResult(
+            node.id,
+            raw["status"],
+            raw.get("final_text", ""),
             payload=payload,
-            usage=dict(raw.get("usage") or {}),
+            usage=node_usage,
             session_id=raw.get("session_id"),
-            # output_schema parse error takes precedence; otherwise surface any
-            # error the executor reported (e.g. a subprocess timeout / crash).
-            error=err or raw.get("error"),
-            db_path=raw.get("db_path"),
+            error=error,
         )
-        self._results[node.id] = res
-        self._last = res
-        account_usage(res.usage)
-
-        # ── 兜底节点：所有 attempt 用尽仍失败时跑，成功则**顶替**本节点的结果供下游引用 ──
-        if res.status not in ("completed", "cancelled") and node.fallback is not None and not self._cancelled and not raw.get("completion_unresolved"):
-            logger.info("workflow leaf %s failed; running fallback", node.id)
-            fb = await self._exec(node.fallback, env, driver_sid)
-            if fb is not None and fb.status == "completed":
-                # 下游引用的是主节点 id,所以结果要挂在主节点上;兜底自己的记录也留着(它有自己的 id)。
-                res = replace(
-                    fb, node_id=node.id,
-                    error=f"primary failed ({res.error or res.status}); recovered by fallback "
-                          f"'{node.fallback.id}'",
-                )
-                self._results[node.id] = res
-                self._last = res
-                await self._emit_step(res)
-                return res
-
-        # continue_on_error:失败但明确放行——记下来,run 终态判定跳过它。被单独取消的节点同样放行。
-        if (res.status == "failed" and node.continue_on_error) or node.id in self._node_cancelled:
+        self._results[node.id] = self._last = result
+        if (
+            result.status not in {"completed", "cancelled", "interrupted", "unknown", "budget_exceeded"}
+            and node.fallback
+        ):
+            fallback = await self._exec(node.fallback, env, driver_sid)
+            if fallback and fallback.ok:
+                result = replace(fallback, node_id=node.id)
+                self._results[node.id] = self._last = result
+        if node.continue_on_error and not result.ok:
             self._tolerated.add(node.id)
-        await self._emit_step(res)
-        return res
+        return result
 
-    def _session_cb(self, node_id: str) -> Callable[[str], Awaitable[None]]:
-        async def _cb(sid: str) -> None:
-            if self._on_node_session is not None:
-                try:
-                    await self._on_node_session(node_id, sid)
-                except Exception:  # noqa: BLE001 — 观测失败不毁叶子
-                    logger.debug("on_node_session failed for %s", node_id, exc_info=True)
-        return _cb
+    async def _emit_step(self, result):
+        # Leaf results are persisted by the executor. Aggregate results are
+        # deterministic projections, rebuilt from those exact node references.
+        pass
 
-    def cancel_node(self, node_id: str, reason: str = "cancelled by host") -> int:
-        """只取消一个节点（6.46）：它在跑就在下一个检查点停下，run 和别的节点照跑；被取消的节点按「放行的失败」记。
-        返回取消了几个在跑的叶子（foreach 的迭代共用一个 id，会一起停）。"""
-        n = 0
-        for tok in [*(self._node_tokens.get(node_id) or []), *(self._admission_tokens.get(node_id) or [])]:
-            if not tok.is_cancelled():
-                tok.cancel(reason)
-                n += 1
-        return n
+    def _add_usage(self, usage):
+        for key, value in (usage or {}).items():
+            self._usage_acc[key] = self._usage_acc.get(key, 0) + value
 
     def _eval_when(self, when: dict[str, Any]) -> tuple[bool, str]:
         """``when`` 成立吗？引用取不到（上游失败 / 跳过 / 没交结构化结果）按不成立。返回 (成立, 说明)。"""
@@ -1376,77 +498,10 @@ class WorkflowEngine:
         else:  # in
             ok = any(v == norm(x) or str(value) == str(x) for x in (target or []))
         shown = json.dumps(value, ensure_ascii=False)[:80] if not isinstance(value, str) else value[:80]
-        return ok, f"{ref} = {shown}（要求 {op}{'' if op in ('truthy', 'falsy') else ' ' + json.dumps(target, ensure_ascii=False)[:60]}）"
-
-    def _render_fileref(self, path: str, slice_expr: str) -> str:
-        if self._file_io is None:
-            return ""
-        try:
-            return self._file_io.render_ref(path, slice_expr)
-        except Exception:  # noqa: BLE001 — 引用渲染失败要说出来,不能悄悄注入空串
-            logger.debug("file_io.render_ref failed for %s", path, exc_info=True)
-            return f"[无法读取上游产物 {path}]"
-
-    async def _todo_remaining(self, session_id: str) -> list[str]:
-        """叶子自己的未完成 todo 文本（runtime_state key='todo'）。读不到=空（门自然关）。"""
-        try:
-            store = await self._loop.ensure_store()
-            state = await store.get_runtime_state(session_id, "todo")
-            items = state.get("items") if isinstance(state, dict) else None
-            if not isinstance(items, list):
-                return []
-            return [str(i.get("text") or "") for i in items
-                    if isinstance(i, dict) and i.get("status") != "completed"][:12]
-        except Exception:  # noqa: BLE001
-            return []
-
-    async def _prepare_rework(self, session_id: str, node_id: str, lc: dict[str, Any]) -> None:
-        """Archive the previous todo only for a new review iteration, never for a budget continuation."""
-        from power_loop.runtime.todos import render_todos, todo_counts, validate_todos
-
-        if not hasattr(self._loop, "ensure_store"):
-            return
-        store = await self._loop.ensure_store()
-        key = f"workflow_rework:{lc['loop_id']}:{node_id}:{lc['iteration']}"
-        if await store.get_runtime_state(session_id, key, default=None):
-            return
-        old = await store.get_runtime_state(session_id, "todo", default={})
-        await store.set_runtime_state(session_id, key + ":previous_todo", old)
-        items = validate_todos([{"text": f"第 {lc['iteration']} 轮：核实审核意见，列出修复与复验任务", "status": "in_progress"}])
-        await store.set_runtime_state(session_id, "todo", {
-            "items": items, "rendered": render_todos(items), "counts": todo_counts(items),
-        })
-        state = {"iteration": lc["iteration"], "node_id": node_id, "loop_id": lc["loop_id"],
-                 "reason": lc.get("why"), "previous_todo_ref": key + ":previous_todo"}
-        await store.set_runtime_state(session_id, "workflow_rework", state)
-        await store.set_runtime_state(session_id, key, state)
-
-    async def _continue_leaf(self, session_id: str, prompt: str, *, extra_rounds: int,
-                             stop: CancellationToken | None = None) -> dict[str, Any]:
-        """原会话补轮。走 executor 的 ``continue_agent``（host 可换实现，如加自己的 guards）；
-        没有该方法的旧 executor 退回 InProcessExecutor 的默认路径。"""
-        fn = getattr(self._executor, "continue_agent", None)
-        if fn is None:
-            fn = InProcessExecutor().continue_agent
-        from power_loop.contracts.event_payloads import SubagentCompletedPayload, SubagentTaskStartPayload
-        from power_loop.contracts.events import AgentEventType
-        from power_loop.core.agent_context import get_session_id
-        from power_loop.runtime.spec import _publish_subagent_event
-
-        parent_sid = get_session_id()
-        _publish_subagent_event(self._loop, parent_sid, AgentEventType.SUBAGENT_TASK_START,
-                               SubagentTaskStartPayload(task=prompt, preset="core", sub_session_id=session_id, depth=1))
-        result = None
-        try:
-            result = await fn(session_id, prompt, parent_loop=self._loop,
-                              extra_rounds=extra_rounds, stop_event=stop or self._cancel)
-            return result
-        finally:
-            _publish_subagent_event(self._loop, parent_sid, AgentEventType.SUBAGENT_COMPLETED,
-                                   SubagentCompletedPayload(sub_session_id=session_id,
-                                       status=(result or {}).get("status", "failed"),
-                                       rounds=int((result or {}).get("rounds") or 0),
-                                       final_text=str((result or {}).get("final_text") or "")))
+        return (
+            ok,
+            f"{ref} = {shown}（要求 {op}{'' if op in ('truthy', 'falsy') else ' ' + json.dumps(target, ensure_ascii=False)[:60]}）",
+        )
 
     @staticmethod
     def _should_retry(raw: dict[str, Any], triggers: set[str]) -> bool:
@@ -1459,37 +514,10 @@ class WorkflowEngine:
         if status in ("hit_round_limit", "context_checkpoint"):
             return "hit_round_limit" in triggers
         if status == "cancelled":
-            return False          # 取消不是「没跑好」
+            return False  # 取消不是「没跑好」
         if status != "completed":
             return "failed" in triggers
         return "empty" in triggers and not str(raw.get("final_text") or "").strip()
-
-    def _add_usage(self, usage: dict[str, int] | None) -> None:
-        for k in self._usage_acc:
-            self._usage_acc[k] += int((usage or {}).get(k, 0) or 0)
-
-    def _step_idempotency(self, node_id: str) -> dict[str, Any]:
-        """Stable per-step keys injected into a leaf's metadata. Empty for an
-        ad-hoc (non-journaled) run with no run_id."""
-        if not self._run_id:
-            return {}
-        return {
-            "workflow_run_id": self._run_id,
-            "workflow_node_id": node_id,
-            "idempotency_key": f"{self._run_id}:{node_id}",
-        }
-
-    async def _emit_step(self, res: AgentResult) -> None:
-        if _DEFER_STEP.get() == res.node_id:
-            return
-        # Inside a foreach body, per-iteration leaves are not journaled (they
-        # share one id and aren't individually replayable); the aggregate is.
-        if self._on_step is None or self._emit_suppressed > 0:
-            return
-        try:
-            await self._on_step(res)
-        except Exception:  # noqa: BLE001 — observer must never break the run
-            pass
 
     async def _exec_sequence(self, node: SequenceNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
         last: AgentResult | None = None
@@ -1501,9 +529,7 @@ class WorkflowEngine:
                 break
         return last
 
-    async def _gather_branches(
-        self, coros: list[Any], *, on_error: str
-    ) -> list[Any]:
+    async def _gather_branches(self, coros: list[Any], *, on_error: str) -> list[Any]:
         """Run branch coroutines concurrently with halt-aware cancellation (H1.2/C2).
 
         ``on_error="continue"``: collect every result/exception (return_exceptions).
@@ -1521,7 +547,19 @@ class WorkflowEngine:
         a containing ``halt``/``sequence`` re-raises, and the top level becomes
         ``"failed"`` (or surfaces the raw exception) — never a spurious ``"cancelled"``.
         """
-        tasks = [asyncio.ensure_future(c) for c in coros]
+
+        async def branch(coro):
+            result = await coro
+            if (
+                on_error == "halt"
+                and result is not None
+                and result.status not in {"completed", "skipped"}
+                and result.node_id not in self._tolerated
+            ):
+                raise WorkflowRunError(f"branch {result.node_id}: {result.status}")
+            return result
+
+        tasks = [asyncio.create_task(branch(c)) for c in coros]
         if not tasks:
             return []
         if on_error == "continue":
@@ -1534,8 +572,7 @@ class WorkflowEngine:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
         first_exc: BaseException | None = next(
-            (t.exception() for t in tasks
-             if t.done() and not t.cancelled() and t.exception() is not None),
+            (t.exception() for t in tasks if t.done() and not t.cancelled() and t.exception() is not None),
             None,
         )
         if first_exc is not None:
@@ -1555,6 +592,7 @@ class WorkflowEngine:
         async def one(branch: WorkflowNode) -> AgentResult | None:
             if node.concurrency_scope == "leaf":
                 from power_loop.workflow.admission import GATES, REQUEST_GATES
+
                 token = GATES.set((*GATES.get(), sem))
                 requests = REQUEST_GATES.set((*REQUEST_GATES.get(), request_sem))
                 try:
@@ -1565,43 +603,26 @@ class WorkflowEngine:
             async with sem:
                 return await self._exec(branch, dict(env), driver_sid)
 
-        gathered = await self._gather_branches(
-            [one(b) for b in node.branches], on_error=node.on_error
-        )
-        # A closed branch may have been repaired while siblings were executing.
-        # Join accepted repairs before releasing dependent sequence/assembly steps.
-        barrier_ids = {id(branch) for branch in node.branches}
-        self._continuation_barriers.update(barrier_ids)
-        try:
-            for branch in node.branches:
-                task = self._repairs.get(id(branch))
-                if task is not None:
-                    await asyncio.shield(task)
-        finally:
-            self._continuation_barriers.difference_update(barrier_ids)
-        gathered = [self._frames.get(id(b), {}).get("result", r)
-                    if not isinstance(r, BaseException) and ITERATION_ENV_KEY not in env else r
-                    for b, r in zip(node.branches, gathered, strict=True)]
+        gathered = await self._gather_branches([one(b) for b in node.branches], on_error=node.on_error)
         for r in gathered:
             if isinstance(r, BaseException):
                 self._errors.append(f"parallel branch error: {r}")
-        broken = next((r for r in gathered if isinstance(r, AgentResult)
-                       and r.status not in ("completed", "skipped") and r.node_id not in self._tolerated), None)
+            elif node.on_error == "continue" and r is not None and r.status not in {"completed", "skipped"}:
+                self._tolerated.add(r.node_id)
+                self._errors.append(f"parallel branch {r.node_id}: {r.status}")
+        broken = next(
+            (
+                r
+                for r in gathered
+                if isinstance(r, AgentResult)
+                and r.status not in ("completed", "skipped")
+                and r.node_id not in self._tolerated
+            ),
+            None,
+        )
         return broken or next((r for r in reversed(gathered) if isinstance(r, AgentResult)), None)
 
     async def _exec_foreach(self, node: ForeachNode, env: dict[str, Any], driver_sid: str) -> AgentResult | None:
-        # Resume: a foreach is replayed atomically via its journaled aggregate.
-        # (Its body leaves share one id across iterations, so they can't be
-        # replayed individually — a half-done foreach re-runs in full.)
-        if node.id:
-            replayed = self._replay.pop(node.id, None)
-            if replayed is not None:
-                self._results[node.id] = replayed
-                if node.id not in self._replay_no_charge:
-                    self._add_usage(replayed.usage)  # aggregate carries summed leaf usage
-                self._replay_no_charge.discard(node.id)
-                return replayed
-
         items = self._resolve_items(node)
         sem = asyncio.Semaphore(node.max_concurrency)
 
@@ -1609,7 +630,8 @@ class WorkflowEngine:
             # ITERATION_ENV_KEY：body 的所有迭代共享同一个 node_id，宿主的 FileIO 端口靠它
             # 给每次迭代分不同的产出文件——不区分的话 N 个并发迭代会追加进同一个文件，互相搅乱。
             child_env = {**env, node.as_var: item, ITERATION_ENV_KEY: index}
-            from power_loop.runtime.workflow_tasks import ROUTE_KEY
+            from .journal import ROUTE_KEY
+
             child_env[ROUTE_KEY] = [*env.get(ROUTE_KEY, []), {"foreach": node.id, "index": index}]
             outer = _ITER_SCOPE.get()
             scope: ChainMap[str, AgentResult] = ChainMap() if outer is None else outer.new_child()
@@ -1624,27 +646,24 @@ class WorkflowEngine:
                 # 这一路里没成功的节点（6.46.1）：全局结果表里体内 id 只留最后写的那一路，run 终态要看每一路
                 for nid, r in scope.maps[0].items():
                     if r.status not in ("completed", "skipped") and nid not in self._tolerated:
-                        self._iter_broken.append(f"{node.id or 'foreach'}[{index}].{nid}")
+                        failure = f"{node.id or 'foreach'}[{index}].{nid}"
+                        if node.on_error == "continue":
+                            self._tolerated.add(nid)
+                            self._errors.append(failure)
+                        else:
+                            self._iter_broken.append(failure)
 
-        # Per-iteration leaves are not journaled individually (see _emit_step);
-        # the aggregate below is the resume unit. Reset even if a body raises.
-        self._emit_suppressed += 1
-        try:
-            if node.parallel:
-                gathered = await self._gather_branches(
-                    [one(it, i) for i, it in enumerate(items)], on_error=node.on_error
-                )
-            else:
-                gathered = []
-                for i, it in enumerate(items):
-                    try:
-                        gathered.append(await one(it, i))
-                    except Exception as exc:  # noqa: BLE001
-                        if node.on_error == "halt":
-                            raise
-                        gathered.append(exc)
-        finally:
-            self._emit_suppressed -= 1
+        if node.parallel:
+            gathered = await self._gather_branches([one(it, i) for i, it in enumerate(items)], on_error=node.on_error)
+        else:
+            gathered = []
+            for i, it in enumerate(items):
+                try:
+                    gathered.append(await one(it, i))
+                except Exception as exc:  # noqa: BLE001
+                    if node.on_error == "halt":
+                        raise
+                    gathered.append(exc)
 
         leaves = [r for r in gathered if isinstance(r, AgentResult)]
         for r in gathered:
@@ -1671,9 +690,7 @@ class WorkflowEngine:
         value = self._resolve_ref(node.on)
         chosen = node.cases.get(str(value), node.default)
         if chosen is None:
-            raise WorkflowRunError(
-                f"branch on '{node.on}' got value {value!r} with no matching case and no default"
-            )
+            raise WorkflowRunError(f"branch on '{node.on}' got value {value!r} with no matching case and no default")
         return await self._exec(chosen, env, driver_sid)
 
     # ── data references ────────────────────────────────────────────────────
@@ -1692,8 +709,7 @@ class WorkflowEngine:
         # upstream node can't fan out into millions of leaves/LLM calls.
         if len(value) > MAX_FOREACH_ITEMS:
             raise WorkflowRunError(
-                f"foreach items_from '{node.items_from}' resolved to {len(value)} items "
-                f"(max {MAX_FOREACH_ITEMS})"
+                f"foreach items_from '{node.items_from}' resolved to {len(value)} items (max {MAX_FOREACH_ITEMS})"
             )
         return value
 
@@ -1711,8 +727,7 @@ class WorkflowEngine:
             )
         if key not in res.payload:
             raise WorkflowRunError(
-                f"reference '{ref}': key '{key}' not in node '{node_id}' payload "
-                f"(keys: {sorted(res.payload)})"
+                f"reference '{ref}': key '{key}' not in node '{node_id}' payload (keys: {sorted(res.payload)})"
             )
         return res.payload[key]
 

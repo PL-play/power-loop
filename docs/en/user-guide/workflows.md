@@ -1,171 +1,138 @@
-# Dynamic Workflows
+# Workflows
 
-[中文](../../zh/user-guide/workflows.md) | [User Guide](../index.md)
+A workflow is a frozen `WorkflowSpec` interpreted by a durable driver job. The
+driver and every leaf execution have independent sessions in one shared store.
+The same client/worker protocol runs locally or across host-managed processes.
+The parent Python object does not own the workflow's lifetime.
 
-`power_loop.workflow` is an **optional** submodule for *code-driven* deterministic multi-agent orchestration: a declarative `WorkflowSpec` JSON whose leaves are ordinary sub-agents, interpreted by a deterministic engine. This complements — it does not replace — the *model-driven* ad-hoc delegation of `spawn_agent` ([Sub-agents](subagents.md)).
+## Submit and wait
 
-Use a workflow when you (the developer) know the control flow up front (a pipeline, a fan-out, a branch). Use ad-hoc delegation when the *model* should decide whom to call.
-
-## The spec
-
-A `WorkflowSpec` is a tree of nodes. Five node types:
-
-| Node | Does |
-|---|---|
-| `agent` | run one sub-agent (a leaf); keyed by `id` |
-| `sequence` | run `steps` in order |
-| `parallel` | run `branches` concurrently (barrier fan-in) |
-| `foreach` | map a `body` over a runtime list (`items` or `items_from`), optionally concurrent |
-| `branch` | pick a `case` from a prior agent's output |
+Create a `Runtime`, register a versioned environment builder in
+`RegistryRuntimeFactory`, start its worker and open a root session with a
+`RuntimeDescriptor`. [Example 27](../../../examples/27_dynamic_workflow.py)
+contains executable setup. With that runtime and target:
 
 ```python
-SPEC = {
-    "name": "research_and_summarize",
-    "input": "the Japanese tea ceremony",
-    "budget": {"max_tokens": 200_000, "stop_at_remaining_pct": 5},
-    "root": {
-        "type": "sequence",
-        "steps": [
-            {"type": "agent", "id": "plan",
-             "spec": {"name": "planner",
-                      "system_prompt": 'Reply ONLY JSON: {"subtopics": ["...","...","..."]}'},
-             "input": "Topic: {{input}}",
-             "output_schema": {"name": "Plan", "schema": {
-                 "type": "object", "required": ["subtopics"],
-                 "properties": {"subtopics": {"type": "array", "items": {"type": "string"}}}}}},
-            {"type": "foreach", "id": "research",
-             "items_from": "plan.subtopics", "as": "subtopic",
-             "parallel": True, "max_concurrency": 3,
-             "body": {"type": "agent", "id": "researcher",
-                      "spec": {"name": "researcher",
-                               "system_prompt": "Write 2-3 factual sentences."},
-                      "input": "Subtopic: {{subtopic}}"}},
-            {"type": "agent", "id": "synthesize",
-             "spec": {"name": "writer", "system_prompt": "Synthesize into one paragraph."},
-             "inputs_from": ["research"]},
-        ],
-    },
-}
-```
-
-Data flow between nodes:
-
-- `{{input}}` / `{{var}}` — template substitution in a node's `input`.
-- `output_schema` — make a leaf emit structured JSON (validated); downstream nodes read it. `{name, schema, strict?}`; `strict` defaults to true — set false for schemas that don't follow strict-mode rules.
-- `items_from: "plan.subtopics"` — a `foreach` reads a key out of a prior agent's parsed payload; `inputs_from: ["research"]` feeds prior results in as text.
-
-## Running it
-
-```python
-from power_loop import StatefulAgentLoop, AgentLoopConfig
 from power_loop.workflow import create_workflow
 
-loop = StatefulAgentLoop(llm=make_llm(), db_path=":memory:",
-                         config=AgentLoopConfig(system_prompt="orchestrator"))
+spec = {
+    "name": "review",
+    "budget": {"max_tokens": 50000},
+    "timeout_s": 300,
+    "root": {"type": "sequence", "steps": [
+        {"type": "agent", "id": "draft", "input": "Write a short proposal.",
+         "spec": {"name": "draft", "system_prompt": "Write clearly.", "tools": []}},
+        {"type": "agent", "id": "review", "inputs_from": ["draft"],
+         "spec": {"name": "review", "system_prompt": "Check the proposal.", "tools": []}},
+    ]},
+}
+handle = await runtime.client.workflow(target, spec, message_id="review-1", actor=actor)
+result = await handle.wait(deadline_ms=None)
+print(result.status, result.usage)
 
-wf = create_workflow(SPEC, parent_loop=loop)   # validates on creation
-result = await wf.run()                         # deterministic, in-process
-
-print(result.status)                            # completed | failed | budget_exceeded | cancelled
-print(result.results["plan"].payload)           # parsed structured output
-print(result.results["synthesize"].text)        # final sub-agent text
-print(result.usage["total_tokens"])
+# Equivalent convenience wrapper; the same request ID reuses the original admission.
+workflow = create_workflow(spec, client=runtime.client, target=target,
+                          actor=actor, message_id="review-1")
+result = await workflow.run()
 ```
 
-`create_workflow` validates the spec immediately; an invalid spec raises `WorkflowSpecError` listing **every** problem at once (so an LLM that authored it can repair in one shot). `result.results[node_id]` is an `AgentResult` (`status`, `text`, `payload`, `usage`, `session_id`, `db_path`).
+The handle contains `run_id`, `job_ref` and `input_ref`, never a local task or
+completion callback. A repeated request ID with changed content is rejected.
+`client.wait(handle.input_ref, actor=actor, deadline_ms=...)` also works after
+rebuilding the client. Its result is the common Runtime `Result`, whose
+`structured_output` contains the workflow projection. A wait deadline stops the
+wait; explicit cancellation controls execution.
 
-See [example 27](../../../examples/27_dynamic_workflow.py).
+## Graph behavior
 
-### Let the model author workflows
+- `sequence` runs steps in order. `inputs_from` appends upstream results;
+  `{{input}}`, `{{variable}}` and `{{node.key}}` render leaf input and system prompt.
+- `parallel` runs branches with `max_concurrency`; `foreach` iterates literal
+  `items` or `items_from`, with distinct nested iteration identities. Reference a
+  foreach aggregate outside its body, not an individual body leaf.
+- `branch` chooses a case from an earlier result. `when` conditionally skips a leaf.
+  Structured fields require `output_schema` on their producing leaf.
+- `loop` repeats its body until the declared condition or `max_iterations`.
+  `continue_nodes` retains those node sessions across iterations. It starts a new
+  node execution in that session and does not recreate a prior Python stack.
+- `retry` creates another attempt for declared known failures. `fallback` and
+  `continue_on_error` retain their explicit graph meanings. Container
+  `on_error="halt"` stops its outstanding siblings; `"continue"` collects failures
+  and lets other branches finish. Inspect both `status` and `ok`/`errors`.
+- `continuation` can extend round-limit/context-checkpoint results in the same
+  node job/session. The default gate reads remaining todos; `gate="always"` uses
+  the declared continuation count. Interrupted or unknown external work is not
+  automatically retried.
 
-Register the meta-tools so the main agent can emit a spec and run it itself:
+IDs are globally unique in a definition. References must point to earlier nodes
+on the same dependency path, not parallel siblings. JSON and YAML compile to the
+same spec. Invalid definitions report their problems before admission.
+
+## Recovery, control and explicit continuation
+
+The original start input and an already selected positive JobRef keep their original
+generation result, including an interrupted old driver. Inspect the workflow job
+to select the new generation for waiting or cancellation after takeover.
+
+A node is keyed by run, node path, iteration path and attempt. Admission saves its
+job, session, start input and journal reference in one transaction. Results and
+parent inbox notifications also commit together. Only the driver updates its own
+node journal entries while consuming those notices.
+
+A new worker acquires the driver's session and advances the original workflow job
+generation conditionally. It reads the frozen graph, reuses completed results and
+waits for healthy original leaves. Leaf results and fees retain their original
+owners. Missing information may produce `interrupted`/`unknown`; no unknown external
+action is replayed to manufacture a result.
 
 ```python
-from power_loop.workflow import register_workflow_tools
-register_workflow_tools(registry)   # adds create_workflow + workflow_status
+await handle.cancel("user stopped the workflow")  # closes new subtree dispatch
+# For one running node, use its exact JobRef:
+await runtime.client.cancel(node_ref, actor=actor, scope="self")
+await runtime.client.nudge(node_ref, "additional guidance", message_id="note-1", actor=actor)
+
+# After the workflow has a terminal result, use its current generation.
+continued = await handle.resume(generation=current_generation, node_id="draft",
+    message="Revise the proposal", message_id="revision-1")
+result = await continued.wait()
 ```
 
-(Don't grant these to a workflow's own leaves — nested runs are refused in this tier.)
+Explicit continuation resumes the selected node job in a new generation and
+recomputes its dependent tail using new attempts. Unchanged branches reuse their
+results. A node appearing in several foreach/loop iterations is ambiguous for
+this graph-level API and is rejected; inspect its concrete jobs and send a new,
+explicitly scoped task. Running leaves use nudge/steer or answer; graph-level
+resume requires a terminal workflow. A cancelled generation is not restarted.
 
-## Executors
+Token usage and the workflow deadline remain cumulative across automatic and
+explicit continuations. Existing results can still be read after budget
+exhaustion. Limits on calls and money use the Runtime's configured `BudgetConfig`
+and original logical ancestry; the graph token budget is a soft dispatch limit,
+so already running parallel calls may finish after it is reached. Unsettled fees
+remain visible and prevent supervision closure.
 
-The engine runs leaves through an `Executor`. Two ship in the box.
+## Workers, model tools and resources
 
-### In-process (default)
+For shared execution, configure a shared store, `SessionOwnershipCoordinator`
+and `MessageTransport`, and set `shared_execution=True`. The default memory
+adapters are single-process. All workers must resolve the frozen versioned
+profiles. Hosts decide worker routing and process/container isolation; the SDK
+has no per-leaf process launcher or private leaf database.
 
-`InProcessExecutor` runs each leaf in the parent process via `run_agent_spec`. Fast, simple, shares the parent's store. This is what `wf.run()` uses by default.
+`register_workflow_tool(registry)` exposes create/validate/status/list/leaves/logs,
+node nudge/steer and cancellation. `register_workflow_tools` exposes the same
+admission path under create/validate/status tool names. Model creation returns a
+receipt immediately, and the result reaches the original parent inbox.
+`WorkflowToolPorts` supports spec loading, policy transforms, tool-grant limits
+and bounded presentation observers. Observers do not decide completion.
 
-### Out-of-process (`SubprocessExecutor`)
+Host resource profiles may provide `resources.workflow_file_io` with
+`output_path(node_id, iteration=...)` and `render_ref(path, slice_expr)` for
+`output_file` and `@@FILEREF:path@@` inputs. Workers need access to the same intended
+resources; Python objects are not serialized in node requests. File adapter
+errors fail explicitly. Required child tasks and user answers remain attached to
+the leaf's own session/job.
 
-On POSIX, a small SDK supervisor owns each worker's process group. Cancelling a
-leaf closes its private control pipe; caller process death closes it as well.
-The supervisor performs bounded TERM/KILL cleanup of its own live group, including
-same-group descendants after the direct worker exits. The caller never sends
-signals using a cached numeric PGID. Worker result frames and databases retain
-their existing format; the supervisor's final signal exit is expected.
-
-This does not contain commands that create another session or remote resources,
-and cannot prove those resources stopped if the supervisor itself is killed.
-Such launchers need an explicit lifecycle adapter. The legacy separate-database
-executor remains unavailable under native managed-task admission.
-
-
-Run **each leaf in its own OS process against its own SQLite file**, so the one-writer-per-file rule holds trivially and a crashed/killed/timed-out leaf can't corrupt the orchestrator or its siblings.
-
-```python
-from power_loop.workflow import SubprocessExecutor, WorkerBootstrap, WorkflowSpec
-from power_loop.workflow.engine import WorkflowEngine
-
-executor = SubprocessExecutor(
-    bootstrap=WorkerBootstrap(llm_from_env=True),  # child rebuilds the provider from env
-    runs_dir="/tmp/wf_runs",
-    timeout_s=120,
-    delete_on_success=False,   # keep each leaf db for inspection (GC via reap_runs)
-)
-result = await WorkflowEngine(loop, executor=executor, run_id="run1").run(
-    WorkflowSpec.from_json(SPEC)
-)
-```
-
-The worker rebuilds its dependencies from **config alone** (`WorkerBootstrap`) — nothing live crosses the process boundary. Cancel = SIGTERM→SIGKILL; timeout/crash → `failed` (re-runnable on resume). Each leaf's db is left on disk for post-hoc inspection; GC with `reap_runs(runs_dir, older_than_s=…)` or `cleanup_run(runs_dir, run_id)`. To confine each leaf in a sandbox, inject a [`WorkerLauncher`](sandboxing.md#workerlauncher--sandbox-a-workflow-leaf-process). See [example 30](../../../examples/30_subprocess_isolation.py).
-
-## Detached execution + completion wake
-
-Run a workflow in the background and let it wake the parent agent when done (the parent `pass_turn`s out and is re-woken via a durable timer):
-
-```python
-from power_loop import TimerRunner
-from power_loop.workflow import create_workflow, register_wake_guard, get_workflow, list_workflows
-
-register_wake_guard(loop)                # dedupe the at-least-once wake timer
-await TimerRunner(loop).start()          # REQUIRED: delivers the wake (see Timers)
-
-wf = create_workflow(SPEC, parent_loop=loop, parent_session_id=parent_sid)
-handle = await wf.start(detached=True)   # returns immediately
-# inspect any time:
-get_workflow(loop, parent_sid, handle.run_id, detail=True)   # status + per-step usage
-list_workflows(loop, parent_sid)
-```
-
-The host must run a `TimerRunner` **and** call `register_wake_guard(loop)`, or the parent never wakes. Progress is published as `SYSTEM_LOG` events with `source="workflow"`.
-
-## Resume across a process restart
-
-A detached run journals its spec and each step's output. If the process dies mid-run, point a fresh loop (same `db_path`) at the run id and resume — completed steps are **replayed** (their sub-agent is not called again), only the unfinished tail re-runs:
-
-```python
-from power_loop.workflow import resume_run, resume_detached
-
-result = await resume_run(loop, parent_sid, run_id)        # sync
-# or, to resume in the background and wake the parent:
-handle = await resume_detached(loop, parent_sid, run_id)
-```
-
-Re-supply `executor=` / `budget=` if the original used non-default ones — only *data* is journaled; runtime objects come from the live process. Each leaf gets a stable `metadata["idempotency_key"] = f"{run_id}:{node_id}"` so side-effecting tools can dedupe a re-run. `foreach` is atomic: it replays via its journaled aggregate or re-runs the whole fan-out.
-
-## See also
-
-- [Sub-agents](subagents.md) — the model-driven alternative
-- [Sandboxing](sandboxing.md) — confining out-of-process leaves
-- [Timers](timers.md) — the wake mechanism behind detached runs
-- [Blackboard](blackboard.md) — coordinating peer agents
+The unreleased design 203 branch uses schema 15/protocol 42 and fresh stores.
+Old parent-loop workflow APIs, local resume handles, completion callbacks,
+`eager_wake`, detached/wait/sync flags and subprocess executors are removed.

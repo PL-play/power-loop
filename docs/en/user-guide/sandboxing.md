@@ -7,7 +7,6 @@ By default power-loop runs model-authored shell **in-process, on the host**, wit
 | Seam | Wraps | Scope | Example |
 |---|---|---|---|
 | `ShellBackend` | the persistent **shell** behind the `bash` tool | one shell per workspace | [28](../../../examples/28_docker_shell_backend.py) |
-| `WorkerLauncher` | a whole **workflow leaf process** | one process per sub-agent | [30](../../../examples/30_subprocess_isolation.py) |
 
 Both follow the same pattern as every other power-loop seam: a tiny `Protocol`, a safe default, and per-run injection. Neither changes any tool or engine code.
 
@@ -71,42 +70,13 @@ with runtime_env_context(env):
 
 See [example 28](../../../examples/28_docker_shell_backend.py) for a complete, runnable version (it proves isolation: the shell reports the container's OS and reads a bind-mounted host file). DeepTalk uses this exact seam with a per-conversation gVisor (`runsc`) container.
 
-## WorkerLauncher — sandbox a workflow leaf process
+## Runtime worker isolation
 
-When workflow leaves run out-of-process (see [Workflows → SubprocessExecutor](workflows.md#out-of-process-subprocessexecutor)), `WorkerLauncher` decides *how each worker process is launched* — the process-level analog of `ShellBackend`. The default `DirectWorkerLauncher` runs the worker bare; inject your own to wrap it in `runsc` / `docker run` / `firejail` / `nsjail`:
-
-```python
-from power_loop.runtime.spec import AgentSpec
-from power_loop.workflow import DirectWorkerLauncher, SubprocessExecutor, WorkerBootstrap
-
-class DockerWorkerLauncher:
-    def build(self, *, base_argv, base_env, spec: AgentSpec, db_path, workspace_dir):
-        # Decide isolation PER LEAF from spec.tools, then wrap the command.
-        argv = ["docker", "run", "--rm", "-i", "--network", "none",
-                "-v", f"{db_path}:{db_path}", "python:3.12-slim", *base_argv]
-        return argv, base_env
-
-executor = SubprocessExecutor(
-    bootstrap=WorkerBootstrap(llm_from_env=True),
-    launcher=DockerWorkerLauncher(),
-)
-```
-
-Because `build` receives the leaf's `AgentSpec`, you can choose isolation **per leaf** (e.g. only sandbox leaves that have the `bash` tool). This is the only way to give a sub-agent *stronger* isolation than its parent: the child runs confined while the orchestrator stays unconfined.
-
-Key responsibilities and guarantees:
-
-- **Paths are the launcher's job.** The worker uses `db_path` (and the bootstrap's `workspace_dir`) verbatim, so a sandbox must make those paths resolve to the same location inside it (e.g. an identity bind-mount).
-- **Fail-closed.** A launch/sandbox error becomes a `failed` leaf, never a hang — the resume tier can re-run it.
-- The reserved *shared scope → orchestrator* seam (for a future cross-process blackboard) is not implemented in this tier; isolated leaves don't share live state.
-
-See [example 30](../../../examples/30_subprocess_isolation.py) for a runnable version that records the per-leaf launches and inspects each leaf's private DB afterward.
-
-## Which seam do I need?
-
-- Running a coding agent that executes `bash`? → **`ShellBackend`** (sandbox the shell).
-- Fanning out a workflow whose leaves run untrusted code in parallel? → **`SubprocessExecutor` + `WorkerLauncher`** (sandbox each process).
-- Both? Compose them — a sandboxed worker can itself install a `ShellBackend` for its own bash.
+Workflow drivers and leaves run through the common Runtime worker. Deploy workers
+in host-managed containers or sandboxes and resolve tools/resources using the frozen
+RuntimeDescriptor. Shared execution requires a shared coordinator and transport;
+the default memory adapters are for one process. The SDK no longer launches leaf
+processes or creates private per-leaf databases. See [Workflows](workflows.md).
 
 ## See also
 

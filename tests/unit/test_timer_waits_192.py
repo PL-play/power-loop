@@ -9,19 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from power_loop import LLMResponse, LLMTokenUsage, ToolDefinition
-from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import timer_waits as waits
-from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobError, JobManager
-from power_loop.runtime.pricing import Free
 from power_loop.runtime.task_query import list_jobs
-from power_loop.runtime.task_runtime import _SEND
 
 from .test_job_registry_192 import registry_store, runtime
-from .test_workflow_task_runtime_192 import managed_workflow
 
-__all__ = ["registry_store", "runtime", "managed_workflow"]
+__all__ = ['registry_store', 'runtime']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -332,97 +326,3 @@ async def test_due_event_write_failure_rolls_back_version_and_delivery_responsib
         await waits.prepare_due(c.manager, c.main, registered.job.job_id)
     assert (await c.manager.get_job(c.main, registered.job.job_id)).version == 1
     assert await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='wait_due'") == []
-
-
-async def _exercise_node_wait(managed_workflow, monkeypatch):
-    store, manager, runtime, loop, model, parent, state, _ = managed_workflow
-    state["spec"]["root"]["steps"][0]["spec"]["tools"] = ["arm_wait"]
-    ready, release = asyncio.Event(), asyncio.Event()
-    registrations = []
-    original = model.complete
-
-    async def arm():
-        binding = _SEND.get()
-        sid = get_session_id()
-        seq, call_id = current_invocation(sid)
-        now = manager.now()
-        registration = await waits.register_wait(manager, runtime.actor(sid), caller=binding.lease,
-            call_ref=await store.message_ref(sid, seq), tool_call_id=call_id,
-            request=waits.WaitRequest(now + 250, "Node decision", "Continue original BUILD"),
-            policy=waits.WaitPolicy(now + 10000))
-        registrations.append(registration)
-        return "accepted, pending owner decision"
-
-    async def complete(request, **kwargs):
-        result = await original(request, **kwargs)
-        if "ROLE-BUILD" in (request.system_prompt or ""):
-            if model.counts["BUILD"] == 1:
-                return LLMResponse(raw_text="", tool_calls=[{"id": "node-wait-call", "type": "function",
-                    "function": {"name": "arm_wait", "arguments": "{}"}}],
-                    token_usage=LLMTokenUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10))
-            ready.set()
-            await release.wait()
-        return result
-
-    monkeypatch.setattr(model, "complete", complete)
-    loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Request a decision",
-                                input_schema={"type": "object"}, pricing=Free("test_fixture")), arm)
-    try:
-        await loop.send("start workflow", parent)
-        model.release["BUILD"].set()
-        await asyncio.wait_for(ready.wait(), 5)
-        if not registrations:
-            bindings = await manager.db.fetchall(f"SELECT payload_json FROM {manager.events} WHERE event_type='node_session'")
-            raw_messages = []
-            for binding in bindings:
-                raw_messages.extend([m.content for m in await store.load_all_messages(json.loads(binding["payload_json"])["session_id"]) if m.role == "tool"])
-            pytest.fail("Wait admission was not accepted: " + repr(raw_messages))
-        [registration] = registrations
-        saved = await waits.read_wait(manager, runtime.actor(parent), registration.job.job_id)
-        await asyncio.sleep(max(0, (saved["request"]["request"]["due_at_ms"] - manager.now()) / 1000) + .01)
-        due = await waits.prepare_due(manager, runtime.actor(parent), registration.job.job_id)
-        route = due["payload"]["wait"]["binding"]["route"]
-        assert route["kind"] == "workflow_node" and route["node"]["node_id"] == "BUILD"
-        assert route["node"]["session_id"] == registration.job.session_id
-        assert route["workflow"]["job_id"] == state["handles"][0].job_id
-        assert due["payload"]["wait"]["receipt_ref"]["tool_call_id"] == "node-wait-call"
-        assert model.counts["REVIEW"] == 0 and not state["notifications"]
-    finally:
-        for registration in registrations:
-            await manager.request_cancel(runtime.actor(parent), registration.job.job_id,
-                                          system_key="cleanup-node-wait", reason="test cleanup")
-            await manager.record_unstarted_result(runtime.actor(registration.job.created_by_session_id),
-                registration.job.job_id, outcome="cancelled", result={"reason": "test cleanup"})
-        release.set()
-
-
-async def test_actual_workflow_node_wait_keeps_its_driver_route_and_blocks_review(managed_workflow, monkeypatch):
-    await _exercise_node_wait(managed_workflow, monkeypatch)
-
-
-@pytest.mark.parametrize("field", ["attempt", "workflow_generation"])
-async def test_boolean_alias_does_not_match_the_frozen_integer_node_route(managed_workflow, monkeypatch, field):
-    original = waits.prepare_due
-
-    async def corrupt(manager, actor, job_id):
-        [row] = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND action='create'", (job_id,))
-        data = json.loads(row["payload_json"])
-        binding = data["wait_binding"]
-        if field == "attempt":
-            assert binding["route"]["node"]["attempt"] == 1
-            binding["route"]["node"]["attempt"] = True
-        else:
-            assert binding["route"]["workflow"]["generation"] == 1
-            binding["route"]["workflow"]["generation"] = True
-        from power_loop.runtime.jobs import _hash
-        binding["evidence_hash"] = _hash({k: v for k, v in binding.items() if k != "evidence_hash"})
-        await manager.db.execute(f"UPDATE {manager.events} SET payload_json=? WHERE event_id=?", (json.dumps(data), row["event_id"]))
-        try:
-            with pytest.raises(JobError):
-                await original(manager, actor, job_id)
-        finally:
-            await manager.db.execute(f"UPDATE {manager.events} SET payload_json=? WHERE event_id=?", (row["payload_json"], row["event_id"]))
-        return await original(manager, actor, job_id)
-
-    monkeypatch.setattr(waits, "prepare_due", corrupt)
-    await _exercise_node_wait(managed_workflow, monkeypatch)

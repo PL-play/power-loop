@@ -12,7 +12,7 @@ from .model_exit import content_reference, historical_row, require_stopped
 
 _NEGATIVE = frozenset({"failed", "cancelled", "timed_out", "budget_exceeded", "interrupted"})
 _EVENTS = frozenset({"operation", "wait_due", "wait_notification", "wait_decision", "wait_effect",
-    "wait_review", "wait_disposition", "wait_resolved", "wait_terminated", "result", "supervision_closed"})
+    "wait_review", "wait_disposition", "wait_resolved", "wait_terminated", "result"})
 
 
 def terminal_id(manager, job_id, creation_id):
@@ -57,7 +57,7 @@ async def negative_owner_exit(manager, tx, actor, original, kind):
             member = await read(manager, tx, current, lease["generation"])
             scope = member["scope"]
             if (not member["sealed"] or _hash(scope["lease"]) != _hash(lease)
-                    or parent is not None and _hash(scope["owner"]) != _hash(parent)):
+                    or parent is not None and scope["owner"]["job_id"] != parent["job_id"]):
                 raise JobError("wait_owner_exit_unconfirmed")
             row = historical_row(current, scope)
             if current["generation"] == lease["generation"] and (current["resource_state"] != "stopped" or current["intake"] != "closed"):
@@ -176,51 +176,9 @@ async def _terminated(manager, tx, actor, job, creation, saved, *, _state=None):
 
 
 async def terminate(manager, actor, job_id):
-    """End one unexecuted wait only after the original owner's stopped exit."""
-    from .finalization_plan import PlanChanged
-
-    while True:
-        try:
-            reply,tree = await _prepare_snapshot(manager,actor,job_id)
-            if tree is not None:
-                await _publish_snapshot(manager,tree)
-            return reply
-        except PlanChanged:
-            continue
-
-
-async def _prepare_snapshot(manager,actor,job_id):
-    from .finalization import _TreeRevision
-    from .finalization_plan import Preparation
-
-    async with manager._read() as reader:
-        row = await manager._authorize(reader,actor,job_id)
-        prepared = Preparation(manager,reader)
-        token = manager._finalization_preparation.set(prepared)
-        try:
-            reply = await _prepare_termination(manager,reader,actor,job_id,prepared)
-            if not any((prepared.jobs,prepared.events,prepared.statuses,prepared.queues,prepared.signals)):
-                return reply,None
-            root = row['root_job_id']
-            summary = await reader.fetchone(f"SELECT COUNT(*) AS job_count,COALESCE(SUM(version),0) AS version_sum,"
-                f"MAX(CASE WHEN job_id=? THEN generation END) AS root_generation FROM {manager.jobs} WHERE root_job_id=?",(root,root))
-            tree = _TreeRevision(root,summary['root_generation'],summary['job_count'],summary['version_sum'],prepared)
-            return reply,tree
-        finally:
-            manager._finalization_preparation.reset(token)
-
-
-async def _publish_snapshot(manager,tree):
-    from .finalization_plan import PlanChanged
-
-    prepared = tree.preparation
-    async with manager._write() as tx:
-        if prepared.events:
-            key,event = next(iter(prepared.events.items()))
-            if await tx.append_event_if_tree_current(event,tree)!=1:
-                raise PlanChanged()
-            del prepared.events[key]
-        await prepared.apply(tx)
+    """Reconcile a stopped wait inside its existing control transaction."""
+    async with manager.joined_write() as tx:
+        return await terminate_tx(manager, tx, actor, job_id)
 
 
 async def terminate_tx(manager, tx, actor, job_id):

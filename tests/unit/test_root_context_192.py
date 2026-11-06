@@ -14,9 +14,8 @@ from power_loop.runtime.task_runtime import _SEND, TaskRuntime
 
 from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import finish, managed
-from .test_workflow_task_runtime_192 import managed_workflow, settle
 
-__all__ = ["registry_store", "managed", "managed_workflow"]
+__all__ = ['registry_store', 'managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 NAMESPACE = "deeptalk.agent-run.v1"
 
@@ -181,23 +180,6 @@ async def test_source_child_reads_original_root_without_duplicating_its_context(
     assert rows and all("host_context" not in json.loads(r["payload_json"])["request"] for r in rows)
 
 
-async def test_workflow_nodes_keep_original_main_provenance(managed_workflow):
-    _, manager, runtime, loop, _, sid, _, _ = managed_workflow
-    runtime.lease_ms = 30000
-    with runtime.root_context(sid, namespace=NAMESPACE, payload={"origin_run_id": 101}):
-        await loop.send("run original workflow", sid)
-    await settle(managed_workflow)
-    nodes = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='workflow_node'")
-    assert len(nodes) == 2
-    roots = set()
-    for node in nodes:
-        original = await root_context.read(manager, runtime.actor(sid), node["job_id"])
-        assert original["payload"] == {"origin_run_id": 101} and original["execution_authority"] is False
-        roots.add(original["root_job_id"])
-    assert len(roots) == 1
-    rows = await manager.db.fetchall(f"SELECT e.payload_json FROM {manager.events} e JOIN {manager.jobs} j ON j.job_id=e.job_id "
-        "WHERE j.kind='send' AND j.parent_job_id IS NOT NULL AND e.action='create'")
-    assert len(rows) == 2 and all("host_context" not in json.loads(r["payload_json"])["request"] for r in rows)
 
 
 async def test_same_registration_cannot_replace_the_original_context(root_case):

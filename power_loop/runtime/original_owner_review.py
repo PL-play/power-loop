@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, replace
 
 from .jobs import JobError, _hash
 from .model_exit import content_reference
+from .result_revisions import result_id
 
 PROTOCOL = 'owner_abort_review_protocol'
 
@@ -34,8 +35,8 @@ async def admit(manager,tx,owner):
         if old is not None:
             raise JobError('original_owner_review_contract_invalid')
         return
+    from .execution_membership import proof
     from .tool_call_plans import _event
-    from .workflow_controller import proof
     data = {'version':1,'origin':proof(owner),'creation':content_reference(creation)}
     await _event(manager,tx,admission_id(manager,owner),owner,'owner_review_admission',data)
     await enabled(manager,tx,owner)
@@ -108,7 +109,6 @@ async def read(manager, tx, source):
     if owner['kind'] == 'workflow_node':
         from .node_inputs import descriptor
         await descriptor(manager,tx,owner,source['session_id'],historical=True)
-        refs.append(manager._node_session_event_id(owner['job_id'],source['session_id'],lease['generation']))
     elif frozen['session_id'] != source['session_id'] or not meta.get('standalone_subagent'):
         raise JobError('original_owner_review_session_invalid')
     refs.extend([member_id(manager,source['job_id'],source['generation']),creation['event_id'],admission_id(manager,owner)])
@@ -299,7 +299,7 @@ async def require_ready(manager,tx,owner):
                 raise JobError('original_owner_review_admission_required')
         return  # Explicit historical owners keep their original protocol.
     for source in rows:
-        event = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?',('model_closed_'+source['job_id'],))
+        event = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?',(result_id(source["job_id"], source["generation"]),))
         if event is None:
             continue
         closed = await _closed(manager,tx,source)

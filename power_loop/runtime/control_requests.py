@@ -54,18 +54,6 @@ def _domain(action):
     if action == "nudge":
         from . import nudges
         return nudges
-    if action == "dispatch":
-        from . import resume_dispatch
-        return resume_dispatch
-    if action == "resume":
-        from . import subagent_admission
-        return subagent_admission
-    if action == "resume_node":
-        from . import node_admission
-        return node_admission
-    if action == "restore":
-        from . import workflow_admission
-        return workflow_admission
     if action == 'decide':
         from . import wait_decision_admission
         return wait_decision_admission

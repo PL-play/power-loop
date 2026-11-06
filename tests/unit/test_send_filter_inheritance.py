@@ -34,8 +34,6 @@ from power_loop.runtime.spec import run_agent_spec
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow
 from power_loop.workflow.engine import WorkflowEngine
-from power_loop.workflow.journal import new_journal
-from power_loop.workflow.resume import _journaled_clamp
 from power_loop.workflow.spec import WorkflowSpec
 
 
@@ -316,14 +314,3 @@ async def test_workflow_engine_intersects_explicit_leaf_tools(store: SessionStor
     result = await engine.run(WorkflowSpec.from_json(_leaf_spec(tools=["a", "b"])))
     assert result.status == "completed"
     assert llm.seen_tools == [["b"]]
-
-
-def test_journal_persists_and_rehydrates_clamp() -> None:
-    j = new_journal("r1", "wf", allowed_tools=["a", "b"])
-    assert j["allowed_tools"] == ["a", "b"]
-    assert _journaled_clamp(j) == frozenset({"a", "b"})
-    # null and pre-3.14 (absent key) → unrestricted.
-    assert _journaled_clamp(new_journal("r2", "wf")) is None
-    legacy = new_journal("r3", "wf")
-    legacy.pop("allowed_tools")
-    assert _journaled_clamp(legacy) is None

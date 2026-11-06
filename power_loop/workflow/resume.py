@@ -1,367 +1,72 @@
-"""Orchestration-level resume across a process restart (full tier).
+"""Explicit graph continuation, starting new executions from saved results."""
 
-A detached run journals its spec (``WorkflowSpec.to_dict()``) and, per node as it
-settles, the node's status + output (``text`` / ``payload``). If the process dies
-mid-run, :func:`resume_run` / :func:`resume_detached` rebuild the engine from that
-journal and re-run **only the unfinished tail**:
+from dataclasses import replace
 
-* completed nodes are *replayed* (their cached result is returned, the sub-agent is
-  not called again) so downstream ``inputs_from`` / ``items_from`` / ``branch.on``
-  references still resolve;
-* everything else re-runs.
-
-Granularity & idempotency
--------------------------
-Replay is keyed by node id. A ``foreach`` is atomic: it is replayed only via its
-journaled *aggregate* (its body leaves share one id across iterations, so they
-cannot be replayed individually) — a foreach that died mid-fan-out re-runs in
-full. Re-running a node re-executes its sub-agent from scratch, which re-runs any
-side-effecting tools; the engine threads a stable ``idempotency_key``
-(``run_id:node_id``) into each leaf's metadata so a tool *can* dedupe, but the
-library does not force it.
-
-Caveats
--------
-* Only data is journaled, so runtime objects (``executor`` / ``budget``) must be
-  re-supplied on resume. Pass a *fresh* budget: it is pre-charged with the tokens
-  replayed steps already spent, so a partially-spent budget would double-count.
-* Runs created before resume support landed have no persisted spec and cannot be
-  resumed — :func:`rehydrate` raises a clear :class:`WorkflowRunError`.
-"""
-
-from __future__ import annotations
-
-from typing import TYPE_CHECKING, Any
-
-from power_loop.runtime.cancellation import CancellationToken
-
-from . import journal
-from .engine import WorkflowEngine, WorkflowRunError
-from .result import AgentResult, WorkflowResult
-from .runner import (
-    _LIVE_RUN_IDS,
-    OnComplete,
-    is_run_live,
-    make_on_node_session,
-    make_on_node_start,
-    make_on_step,
-    spawn_background,
-)
-from .spec import (
-    AgentNode,
-    BranchNode,
-    ForeachNode,
-    LoopNode,
-    ParallelNode,
-    SequenceNode,
-    WorkflowNode,
-    WorkflowSpec,
+from power_loop.agent.runtime_types import (
+    Command,
+    InputRef,
+    RequestOptions,
+    RuntimeDescriptor,
+    RuntimeRequestError,
+    TargetRef,
+    plain,
 )
 
-if TYPE_CHECKING:
-    from power_loop.runtime.store.store import SessionStore
-
-    from .result import WorkflowRunHandle
-
-__all__ = ["replayable_node_ids", "rehydrate", "resume_run", "resume_detached"]
-
-# Module-level GC guard for detached resume tasks (first-run uses Workflow._tasks).
-_RESUME_TASKS: set[Any] = set()
+from .runner import WorkflowRunHandle
 
 
-def replayable_node_ids(spec: WorkflowSpec) -> set[str]:
-    """Ids whose journaled result may be replayed individually on resume.
+async def resume_run(client, ref, *, node_id, message, message_id, actor):
+    """Continue one settled node and recompute its dependent tail.
 
-    Excludes everything inside a ``foreach`` body (those ids collide across
-    iterations); includes ordinary agent ids and a foreach's own aggregate id,
-    as long as they are not themselves nested in another foreach body.
+    Live leaves use client.nudge/steer; this entry never resumes a Python stack.
     """
-    out: set[str] = set()
-    _collect(spec.root, in_foreach_body=False, out=out)
-    return out
+    port = client.inputs
+    job = await port.resolve_job(port.db, ref, actor)
+    if job["kind"] != "workflow" or ref.generation != job["generation"]:
+        raise RuntimeRequestError("stale_generation")
+    if job["outcome"] is None:
+        raise RuntimeRequestError("target_not_resumable", "Use nudge or steer for a running leaf.")
+    import json
 
-
-def _collect(node: WorkflowNode, *, in_foreach_body: bool, out: set[str]) -> None:
-    if isinstance(node, AgentNode):
-        if not in_foreach_body:
-            out.add(node.id)
-        return
-    if isinstance(node, SequenceNode):
-        for s in node.steps:
-            _collect(s, in_foreach_body=in_foreach_body, out=out)
-        return
-    if isinstance(node, ParallelNode):
-        for b in node.branches:
-            _collect(b, in_foreach_body=in_foreach_body, out=out)
-        return
-    if isinstance(node, ForeachNode):
-        if node.id and not in_foreach_body:
-            out.add(node.id)  # the aggregate is atomically replayable
-        _collect(node.body, in_foreach_body=True, out=out)  # body ids are not
-        return
-    if isinstance(node, LoopNode):
-        # 循环整体重放（聚合里带着最后一轮的结果）；循环体里的节点不单独重放——没跑完的循环 resume 时从头再跑（6.46）
-        if not in_foreach_body:
-            out.add(node.id)
-        _collect(node.body, in_foreach_body=True, out=out)
-        return
-    if isinstance(node, BranchNode):
-        for c in node.cases.values():
-            _collect(c, in_foreach_body=in_foreach_body, out=out)
-        if node.default is not None:
-            _collect(node.default, in_foreach_body=in_foreach_body, out=out)
-        return
-
-
-async def rehydrate(
-    store: SessionStore, parent_sid: str, run_id: str
-) -> tuple[WorkflowSpec, dict[str, AgentResult], dict[str, Any]]:
-    """Load a run's journal and rebuild (spec, replay-cache, journal blob).
-
-    Raises :class:`WorkflowRunError` if the run is unknown or predates spec
-    persistence (and so cannot be resumed).
-    """
-    j = await journal.read(store, parent_sid, run_id)
-    if j is None:
-        raise WorkflowRunError(f"cannot resume: no journal for run {run_id!r} under {parent_sid!r}")
-    spec_dict = j.get("spec")
-    if not spec_dict:
-        raise WorkflowRunError(
-            f"cannot resume run {run_id!r}: no spec persisted (run predates resume support)"
-        )
-    spec = WorkflowSpec.from_json(spec_dict)
-    replayable = replayable_node_ids(spec)
-    replay: dict[str, AgentResult] = {}
-    for step in j.get("steps", []):
-        if step.get("status") != "completed":
-            continue
-        nid = step.get("node_id")
-        if nid not in replayable:
-            continue
-        replay[nid] = AgentResult(
-            node_id=nid,
-            status="completed",
-            text=step.get("text") or "",
-            payload=step.get("payload"),
-            usage=step.get("usage") or {},
-            session_id=step.get("session_id"),
-            error=step.get("error"),
-            db_path=step.get("db_path"),
-        )
-    return spec, replay, j
-
-
-def _session_resumable_ids(node: WorkflowNode, *, in_foreach: bool, out: set[str]) -> None:
-    """能在原会话接着跑的节点：foreach 体以外的 agent（循环体里的也算——循环重跑时第一轮接着原会话）。"""
-    if isinstance(node, AgentNode):
-        if not in_foreach:
-            out.add(node.id)
-        return
-    for child in (getattr(node, "steps", None) or getattr(node, "branches", None) or ()):
-        _session_resumable_ids(child, in_foreach=in_foreach, out=out)
-    if isinstance(node, BranchNode):
-        for c in node.cases.values():
-            _session_resumable_ids(c, in_foreach=in_foreach, out=out)
-        if node.default is not None:
-            _session_resumable_ids(node.default, in_foreach=in_foreach, out=out)
-    if isinstance(node, (ForeachNode, LoopNode)):
-        _session_resumable_ids(node.body, in_foreach=in_foreach or isinstance(node, ForeachNode), out=out)
-
-
-def resume_sessions(spec: WorkflowSpec, replay: dict[str, AgentResult], j: dict[str, Any]) -> dict[str, str]:
-    """没做完、但记下了叶子会话的节点（6.46）：resume 时在原会话接着跑，不从头开。foreach 迭代不在内（共用 id）。"""
-    ok: set[str] = set()
-    _session_resumable_ids(spec.root, in_foreach=False, out=ok)
-    return {nid: str(sid) for nid, sid in (j.get("live_sessions") or {}).items()
-            if nid in ok and nid not in replay and sid}
-
-
-def _journaled_clamp(j: dict[str, Any]) -> frozenset[str] | None:
-    """The run's journaled capability clamp (see ``journal.new_journal``).
-
-    Reapplied on resume so a clamped run cannot silently widen its leaf tools
-    across a restart. Absent key (pre-3.14 journal) or null → unrestricted.
-    """
-    tools = j.get("allowed_tools")
-    return frozenset(tools) if tools is not None else None
-
-
-def _guard_resumable(run_id: str, force: bool) -> None:
-    """Refuse to resume a run whose engine is still executing IN THIS PROCESS unless ``force``
-    (workflow-durability-3): a second engine for the same run would race the journal. Liveness is
-    tracked by the in-process registry (set while a detached/sync run's task is alive), so a CRASHED
-    run — the normal resume case — is not blocked (its task already discarded the id). Cross-process
-    liveness can't be detected from here; ``force=True`` overrides if you've confirmed it's dead."""
-    if not force and is_run_live(run_id):
-        raise WorkflowRunError(
-            f"run {run_id} is still executing in this process — resuming would start a second "
-            f"concurrent engine and race the journal. Wait for it to finish (or cancel it), or pass "
-            f"force=True if you've confirmed it is no longer running."
-        )
-
-
-async def _mark_resuming(store: SessionStore, parent_sid: str, run_id: str, j: dict[str, Any]) -> None:
-    """Flip a finished/failed journal back to running and bump the attempt count."""
-    await journal.update(
-        store, parent_sid, run_id,
-        allow_terminal=True,  # an intentional terminal→running restart, not a late clobber
-        status="running",
-        attempts=int(j.get("attempts", 1)) + 1,
-        finished_at_ms=None,
-        error=None,
-        woke=False,  # allow the completion wake to fire again for this attempt
+    creation = await port.db.fetchone(
+        f"SELECT event_id,payload_json FROM {port.events} WHERE job_id=? AND action='create'", (job["job_id"],)
     )
+    first = await port.input(port.db, InputRef(**json.loads(creation["payload_json"])["request"]["input_ref"]))
+    descriptor = RuntimeDescriptor(**first.meta["descriptor"])
+    from .continuation import plan_continuation
+    from .spec import WorkflowSpec
 
+    spec = WorkflowSpec.from_json(plain(descriptor.config["workflow"]["spec"]))
+    plan_continuation(spec, node_id)
+    if spec.budget:
+        from .result import SharedBudget
 
-async def resume_run(
-    loop: Any,
-    parent_sid: str,
-    run_id: str,
-    *,
-    executor: Any | None = None,
-    budget: Any | None = None,
-    force: bool = False,
-    file_io: Any | None = None,
-) -> WorkflowResult:
-    """Resume a run synchronously (in-process), returning the final result.
+        budget = SharedBudget(spec.budget.max_tokens, stop_at_remaining_pct=spec.budget.stop_at_remaining_pct)
+        budget.commit(json.loads(job["result_json"])["usage"])
+        if not budget.can_spawn():
+            raise RuntimeRequestError("budget_exceeded", "The cumulative workflow budget is exhausted.")
+    if spec.timeout_s:
+        from power_loop.agent.runtime_store import now_ms
 
-    Pass the ``StatefulAgentLoop`` whose store holds the journal. Completed steps
-    are replayed; the unfinished tail re-runs. The journal is updated live and
-    finalized at the end.
+        from . import journal
 
-    Runtime objects are not journaled (only data is), so re-supply a non-default
-    ``executor`` / ``budget`` if the original run used one. A ``budget`` is
-    pre-charged with the tokens already spent by replayed steps.
-    """
-    # Disabled until its unified task path is implemented; retained internals are not a fallback.
-    from power_loop.agent.runtime_types import RuntimeRequestError
-    raise RuntimeRequestError("feature_unavailable", "workflow resume is not enabled")
-    from power_loop.runtime.task_runtime import reject_unregistered_adapter
-    reject_unregistered_adapter("workflow_resume", loop)
-    store = await loop._ensure_store()
-    spec, replay, j = await rehydrate(store, parent_sid, run_id)
-    _guard_resumable(run_id, force)
-    await _mark_resuming(store, parent_sid, run_id, j)
-    engine = WorkflowEngine(
-        loop, executor=executor, budget=budget,
-        on_step=make_on_step(store, parent_sid, run_id),
-        on_node_start=make_on_node_start(store, parent_sid, run_id),
-        on_node_session=make_on_node_session(store, parent_sid, run_id),
-        resume_sessions=resume_sessions(spec, replay, j),
-        replay=replay, run_id=run_id,
-        history_owner_sid=parent_sid,
-        allowed_tools=_journaled_clamp(j),
-        file_io=file_io,
+        saved = await journal.get(port.store, port.db, job["session_id"], journal.run_key(creation["event_id"][3:]))
+        if now_ms() - saved["created_at_ms"] >= spec.timeout_s * 1000:
+            raise RuntimeRequestError("workflow_timeout")
+    descriptor = replace(
+        descriptor, config={**plain(descriptor.config), "workflow_resume": {"node_id": node_id, "message": message}}
     )
-    # Mark live so a concurrent resume of the same run is refused; discard in finally.
-    _LIVE_RUN_IDS.add(run_id)
-    try:
-        result = await engine.run(spec)
-    except Exception as exc:  # noqa: BLE001 — mirror detached: journal then re-raise
-        await journal.fail(store, parent_sid, run_id, exc)
-        raise
-    finally:
-        _LIVE_RUN_IDS.discard(run_id)
-    await journal.finalize(store, parent_sid, run_id, result)
-    return result
-
-
-def continuation_replay(spec: WorkflowSpec, node_id: str, results: dict[str, AgentResult],
-                        *, invalidated: set[str] | None = None) -> dict[str, AgentResult]:
-    """Invalidate the target, its downstream sequence, and enclosing aggregates.
-
-    Parallel siblings retain their completed results. Foreach body IDs cannot identify
-    an iteration and are rejected. Old reviews downstream of changed work never replay.
-    """
-    from .continuation import plan_continuation, replay_results
-
-    plan = plan_continuation(spec, node_id)
-    if invalidated is not None:
-        invalidated.update(plan.invalidated)
-    return replay_results(spec, plan, results)
-
-
-async def resume_detached(
-    loop: Any,
-    parent_sid: str,
-    run_id: str,
-    *,
-    executor: Any | None = None,
-    budget: Any | None = None,
-    eager_wake: bool = False,
-    force: bool = False,
-    on_complete: OnComplete | None = None,
-    file_io: Any | None = None,
-    continuation: tuple[str, str, int] | None = None,
-) -> WorkflowRunHandle:
-    """Resume a run on a background task; wake the parent on completion.
-
-    Mirror of :func:`run_detached` for the resume path. Re-supply ``executor`` /
-    ``budget`` if the original run used non-default ones.
-
-    Default wake needs a running ``TimerRunner`` + ``register_wake_guard``. Pass
-    ``on_complete`` to take over the wake in-process (timer-free); it supersedes
-    ``eager_wake`` and skips the durable timer (see :func:`run_detached`).
-    """
-    # Disabled until its unified task path is implemented; retained internals are not a fallback.
-    from power_loop.agent.runtime_types import RuntimeRequestError
-    raise RuntimeRequestError("feature_unavailable", "workflow resume is not enabled")
-    from power_loop.runtime.execution_roles import require_orchestration
-    from power_loop.runtime.task_runtime import reject_unregistered_adapter
-    if getattr(loop, "task_runtime", None) is not None:
-        await require_orchestration(loop, "workflow", sid=parent_sid)
-        from power_loop.runtime.workflow_restore_runner import start
-        return await start(loop, parent_sid, run_id, continuation=continuation, executor=executor, budget=budget,
-            force=force, file_io=file_io, eager_wake=eager_wake, on_complete=on_complete)
-    reject_unregistered_adapter("workflow_resume", loop)
-    await require_orchestration(loop, "workflow", sid=parent_sid)
-    store = await loop._ensure_store()
-    if await store.get_session(parent_sid) is None:
-        raise WorkflowRunError("parent session not found; cannot resume detached run")
-    spec, replay, j = await rehydrate(store, parent_sid, run_id)
-    invalidated: set[str] = set()
-    if continuation is not None:
-        nid, message, rounds = continuation
-        all_results = {str(st["node_id"]): AgentResult(
-            node_id=str(st["node_id"]), status=str(st.get("status") or "failed"),
-            text=st.get("text") or "", payload=st.get("payload"), usage=st.get("usage") or {},
-            session_id=st.get("session_id"),
-        ) for st in j.get("steps", [])}
-        replay = continuation_replay(spec, nid, all_results, invalidated=invalidated)
-        if not (j.get("live_sessions") or {}).get(nid):
-            raise WorkflowRunError("continuation node has no recorded session")
-    _guard_resumable(run_id, force)
-    _LIVE_RUN_IDS.add(run_id)  # reserve before the first journal-write await
-    try:
-        await _mark_resuming(store, parent_sid, run_id, j)
-        for invalid_id in invalidated:
-            await journal.record_step(store, parent_sid, run_id, node_id=invalid_id,
-                                      status="pending", error="invalidated by node continuation",
-                                      session_id=(j.get("live_sessions") or {}).get(invalid_id))
-        cancel_token = CancellationToken()
-
-        def _build_engine() -> WorkflowEngine:
-            engine = WorkflowEngine(
-                loop, executor=executor, budget=budget,
-                on_step=make_on_step(store, parent_sid, run_id),
-                on_node_start=make_on_node_start(store, parent_sid, run_id),
-                on_node_session=make_on_node_session(store, parent_sid, run_id),
-                resume_sessions=resume_sessions(spec, replay, j),
-                replay=replay, run_id=run_id, stop_event=cancel_token,
-                history_owner_sid=parent_sid,
-                allowed_tools=_journaled_clamp(j),
-                file_io=file_io,
-            )
-            if continuation is not None:
-                engine._resume_instructions[continuation[0]] = (continuation[1], continuation[2])
-            return engine
-
-        return spawn_background(
-            loop, parent_sid, run_id, store=store,
-            build_engine=_build_engine, run_spec=spec,
-            cancel_token=cancel_token, eager_wake=eager_wake, task_set=_RESUME_TASKS,
-            on_complete=on_complete,
-        )
-    except BaseException:
-        _LIVE_RUN_IDS.discard(run_id)
-        raise
+    receipt = await client._submit(
+        Command(
+            message_id,
+            TargetRef(ref.store_id, job["session_id"], job["job_id"]),
+            "resume",
+            {"body": message},
+            "new_turn",
+            expected_job_generation=ref.generation,
+            options=plain(RequestOptions()),
+        ),
+        actor=actor,
+        descriptor=descriptor,
+    )
+    return WorkflowRunHandle(client, actor, creation["event_id"][3:], ref, receipt.input_ref)

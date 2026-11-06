@@ -316,7 +316,7 @@ def registration(request, *, kind, parent, call_ref, tool_call_id, session_id, i
         or parent is None
         or call_ref is None
         or not tool_call_id
-        or session_id is not None
+        or session_id != call_ref.session_id
         or independent
         or type(value) is not dict
         or set(value) != keys
@@ -582,7 +582,7 @@ async def descriptor(manager, tx, row):
             or payload["job_id"] != row["job_id"]
             or payload["status"] != "queued"
             or event["request_hash"]
-            != _hash([row["kind"], row["title"], None, row["parent_job_id"], False, request, call])
+            != _hash([row["kind"], row["title"], row["session_id"], row["parent_job_id"], False, request, call])
             or type(binding["version"]) is not int
             or binding["version"] != 1
         ):
@@ -665,7 +665,7 @@ async def _invoke_original(handler, execution, arguments, slot):
         registration = await adopt(manager, tx, source, ref, call_id, request)
     if registration is None:
         registration = await manager.register_job(
-            actor, kind="background_tool", title=handler.definition.name,
+            actor, kind="background_tool", title=handler.definition.name, session_id=actor.session_id,
             parent=execution.lease, call_ref=ref, tool_call_id=call_id, request=request,
         )
     if registration.replayed:
@@ -994,11 +994,9 @@ async def terminate_unstarted_tx(manager, tx, actor, job):
                 "result_hash": _hash(payload),
             },
         )
-    from .finalization import _prepare, _publish
+    from .finalization import _finish
 
-    state = {"done": {}, "visiting": set(), "plans": []}
-    reference = await _prepare(manager, tx, actor, row, 0, state)
-    await _publish(manager, tx, state["plans"])
+    reference = await _finish(manager, tx, row, set())
     return {
         "job_id": job,
         "generation": 0,

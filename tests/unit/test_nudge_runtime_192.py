@@ -16,9 +16,8 @@ from power_loop.runtime.jobs import JobActor, JobError, JobManager
 
 from .test_job_registry_192 import registry_store, runtime
 from .test_task_runtime_192 import finish, jobs, managed, receipt
-from .test_workflow_task_runtime_192 import leaf, managed_workflow, settle
 
-__all__ = ["registry_store", "runtime", "managed", "managed_workflow"]
+__all__ = ['registry_store', 'runtime', 'managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -617,61 +616,6 @@ async def test_missing_original_invocation_does_not_admit_steering(managed, monk
     await finish(managed)
 
 
-@pytest.mark.parametrize("max_rounds", [3, 4])
-async def test_workflow_node_can_nudge_its_own_subagent_without_changing_owner_or_role(managed_workflow, monkeypatch, max_rounds):
-    store, manager, runtime, loop, model, parent, state, _ = managed_workflow
-    runtime.lease_ms = 30000  # the tested limit is model rounds, not execution expiry
-    model.hold = {"AUDIT"}
-    model.spawn_from_build = True
-    state["spec"]["root"]["steps"][0] = leaf("BUILD", tools=["spawn_agent"])
-    state["spec"]["root"]["steps"][0]["spec"]["max_rounds"] = max_rounds
-    node_exited = asyncio.Event()
-    original_close = manager.close_model_execution
-    async def close_model(actor, *args, **kwargs):
-        result = await original_close(actor, *args, **kwargs)
-        # Close now joins the finalization transaction; the observer must use
-        # that transaction instead of waiting for a second SQLite connection.
-        reader = manager._joined_write.get() or store._db
-        session = await reader.fetchone(f"SELECT metadata_json FROM {store.t.sessions} WHERE session_id=?",
-                                       (actor.session_id,))
-        if session and json.loads(session["metadata_json"] or "{}").get("workflow_node_id") == "BUILD":
-            node_exited.set()
-        return result
-    monkeypatch.setattr(manager, "close_model_execution", close_model)
-    original = model.complete
-
-    async def complete(request, **kwargs):
-        if "ROLE-BUILD" in (request.system_prompt or "") and model.counts["BUILD"] == 1:
-            source = get_session_id()
-            [target] = [sid for (key, sid), running in delegation._RUNNING.items()
-                        if key == id(store) and running.parent == source]
-            model.counts["BUILD"] += 1
-            return LLMResponse(raw_text="", tool_calls=[{"id": "node-nudge", "type": "function", "function": {
-                "name": "spawn_agent", "arguments": json.dumps({"action": "nudge", "sub_session": target, "message": "NUDGED-42"})}}],
-                token_usage=LLMTokenUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10))
-        return await original(request, **kwargs)
-
-    monkeypatch.setattr(model, "complete", complete)
-    assert (await loop.send("run with node-owned audit", parent)).status == "completed"
-    await asyncio.wait_for(model.entered["AUDIT"].wait(), 5)
-    assert model.counts["REVIEW"] == 0
-    await asyncio.wait_for(node_exited.wait(), 3)
-    await settle(managed_workflow)
-    wf = await manager.get_job(runtime.actor(parent), state["handles"][0].job_id)
-    if max_rounds == 3:
-        assert wf.outcome == "failed" and model.counts["REVIEW"] == 0, wf.result
-        assert model.counts["BUILD"] == 3
-        assert wf.result["results"]["BUILD"]["error"] == "completion settlement round budget exhausted"
-        assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='node_session'")) == 1
-        return
-    assert wf.outcome == "succeeded" and model.counts["REVIEW"] == 1, wf.result
-    [event] = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE action='nudge'")
-    [child] = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='subagent'")
-    assert child["execution_role"] == "subagent" and child["control_owner_job_id"] is not None
-    assert event["job_id"] == child["job_id"] and event["delivery_status"] == "handled"
-    call_ref = json.loads(event["call_ref_json"])
-    assert call_ref["session_id"] == child["created_by_session_id"] != parent
-    assert json.loads(event["receipt_ref_json"])["tool_call_id"] == "node-nudge"
 
 
 async def test_actual_same_call_changed_message_conflicts_without_enqueuing_it(managed, monkeypatch):

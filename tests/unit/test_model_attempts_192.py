@@ -16,9 +16,8 @@ from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import managed
-from .test_workflow_task_runtime_192 import managed_workflow
 
-__all__ = ["registry_store", "managed", "managed_workflow"]
+__all__ = ['registry_store', 'managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 

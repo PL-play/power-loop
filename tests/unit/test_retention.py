@@ -9,10 +9,8 @@ from power_loop.runtime.store.retention import DAY_MS
 
 from .test_job_registry_192 import registry_store
 from .test_send_sql_profile import _measure
-from .test_workflow_restore_plan_192 import finished, preview
-from .test_workflow_task_runtime_192 import managed_workflow
 
-__all__ = ['registry_store', 'managed_workflow']
+__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 NOW = 200 * DAY_MS
 OLD = 1
@@ -246,14 +244,3 @@ async def test_purged_task_trees_do_not_reset_budget_policy_or_balances(registry
     await store.close_session(sid)
     assert not await store._db.fetchall(f'SELECT job_id FROM {p}jobs')
     assert await store._db.fetchone(f'SELECT policy_key FROM {p}task_budget_policies')
-
-
-async def test_expired_delivered_notice_does_not_break_workflow_resume(managed_workflow):
-    store, manager, _, _, _, _, _, connect = managed_workflow
-    await finished(managed_workflow)
-    expected = await preview(managed_workflow)
-    await store.purge_expired(manager.now()+8*DAY_MS)
-    assert await preview(managed_workflow, manager=JobManager(await connect())) == expected
-    await store.purge_expired(manager.now()+31*DAY_MS)
-    assert not await store._db.fetchall(f'SELECT job_id FROM {manager.jobs}')
-    assert not await store._db.fetchall(f'SELECT id FROM {store.t.follow_up_queue}')

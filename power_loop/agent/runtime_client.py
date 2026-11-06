@@ -80,7 +80,7 @@ class RuntimeClient:
         if ref.generation is None or ref.generation == 0:
             raise RuntimeRequestError("stale_generation")
         job = await self.inputs.resolve_job(self.inputs.db, ref, actor)
-        if job["kind"] != "subagent":
+        if job["kind"] not in {"subagent", "workflow_node"}:
             raise RuntimeRequestError("invalid_options", "resume requires a child task")
         import json
         creation = await self.inputs.db.fetchone(f"SELECT payload_json FROM {self.inputs.events} "
@@ -93,6 +93,11 @@ class RuntimeClient:
             "new_turn", options=start.meta["options"], expires_at_ms=deadline_ms,
             expected_job_generation=ref.generation), actor=actor,
             descriptor=RuntimeDescriptor(**start.meta["descriptor"]))
+
+    async def workflow(self, target, spec, *, message_id, actor, descriptor=None, options=None):
+        from power_loop.workflow.runner import submit
+        return await submit(self, target, spec, message_id=message_id, actor=actor,
+                            descriptor=descriptor, options=options)
 
     async def submit(self, command, *, actor):
         if command.operation in {"answer", "resume"}:

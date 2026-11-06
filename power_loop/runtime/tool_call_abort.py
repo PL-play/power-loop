@@ -21,7 +21,7 @@ class _Attempt:
 
 
 def _freeze(pipeline, execution, source, ref, entries):
-    from .workflow_controller import proof
+    from .execution_membership import proof
     return _Attempt(pipeline, execution, _json(proof(source)), ref, _json(normalize(entries)))
 
 
@@ -75,9 +75,9 @@ async def _facts(manager, tx, source, ref, entries):
 
 
 async def read(manager, tx, source, ref, *, required=False):
+    from .execution_membership import proof
     from .managed_effects import _ref
     from .tool_call_plans import _read
-    from .workflow_controller import proof
 
     key = identity(manager, source, ref)
     value = await _read(manager, tx, key, source, 'tool_call_abort', optional=not required)
@@ -102,10 +102,10 @@ async def read(manager, tx, source, ref, *, required=False):
 
 async def _record(attempt):
     """Only called while unwinding the actual pre-admission SDK stack."""
+    from .execution_membership import proof
     from .task_runtime import _SEND
     from .tool_call_plans import _event
     from .tool_call_plans import identity as plan_identity
-    from .workflow_controller import proof
 
     execution = _SEND.get()
     if (type(attempt) is not _Attempt or execution is not attempt.execution

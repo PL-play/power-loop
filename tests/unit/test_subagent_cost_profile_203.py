@@ -1,4 +1,4 @@
-"""Full P3 flows, including acceptance, parent handling, and owner release."""
+"""Full child, workflow and interaction flows, including acceptance, parent handling, and owner release."""
 import asyncio
 import json
 import os
@@ -27,12 +27,28 @@ __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize('flow', ['subagent', 'background', 'answer'])
-async def test_p3_complete_flow_cost(registry_store, tmp_path, flow):
+@pytest.mark.parametrize('flow', ['subagent', 'background', 'answer', 'workflow'])
+async def test_complete_flow_cost(registry_store, tmp_path, flow):
     store, _ = registry_store
     registry = create_default_tool_registry(workspace_dir=str(tmp_path))
     gate = asyncio.Event()
-    if flow == 'subagent':
+    if flow == 'workflow':
+        from power_loop import LLMResponse
+        from power_loop.workflow import register_workflow_tool
+
+        from ._workflow_fixture_203 import Model, leaf
+        register_workflow_tool(registry)
+        class WorkflowParent(Model):
+            async def complete(self, request, **kwargs):
+                if request.system_prompt.startswith(('A', 'B')):
+                    return LLMResponse(raw_text='leaf done')
+                if not any(m.get('role') == 'tool' for m in request.messages):
+                    return LLMResponse(raw_text='', tool_calls=[{'id':'workflow', 'type':'function', 'function':{
+                        'name':'workflow', 'arguments':json.dumps({'action':'create','spec':{
+                            'name':'cost','root':{'type':'sequence','steps':[leaf('A'),leaf('B')]}}})}}])
+                return LLMResponse(raw_text='parent done')
+        model = WorkflowParent()
+    elif flow == 'subagent':
         model = ParentAndChild()
         model.child_gate = gate
         register_spawn_agent(registry)
@@ -70,7 +86,7 @@ async def test_p3_complete_flow_cost(registry_store, tmp_path, flow):
         else:
             await runner.send('start')
             rows = await store.load_all_messages(runner.target.session_id)
-            receipt = json.loads(next(m.content for m in rows if m.tool_call_id == ('spawn' if flow == 'subagent' else 'background')))
+            receipt = json.loads(next(m.content for m in rows if m.tool_call_id == ('spawn' if flow == 'subagent' else flow)))
             gate.set()
             result = await runner.runtime.client.wait(JobRef(**receipt['job_ref']), actor=runner.actor, deadline_ms=now_ms()+10000)
         assert result.status == 'completed'
@@ -86,7 +102,7 @@ async def test_p3_complete_flow_cost(registry_store, tmp_path, flow):
         if output := os.environ.get('P3_FLOW_OUT'):
             with Path(output).open('a') as file:
                 file.write(json.dumps({'db':original.dialect.name,'flow':flow,'sql':sql,'tables':delta,
-                    'writes':writes,'elapsed_s':elapsed,'B':None,'comparison':'new P3 flow; no equivalent fixed-B case'})+'\n')
+                    'writes':writes,'elapsed_s':elapsed,'B':None,'comparison':'no equivalent fixed-B flow case; ordinary-send B comparison is reported separately'})+'\n')
     finally:
         gate.set()
         await runner.aclose()

@@ -247,7 +247,6 @@ class TaskRuntime:
         executor_id: str,
         boot_id: str,
         lease_ms: int = 30000,
-        workflow_resources=None,
         boot_contract_hash: str | None = None,
         budget_config=None,
         require_host_send_steps: bool = False,
@@ -261,11 +260,6 @@ class TaskRuntime:
         if type(require_host_send_steps) is not bool:
             raise JobError("invalid_host_send_step_requirement")
         self.require_host_send_steps = self._original_host_step_requirement = require_host_send_steps
-        if workflow_resources is not None:
-            from .workflow_resources import WorkflowResourceRegistry
-
-            if type(workflow_resources) is not WorkflowResourceRegistry:
-                raise JobError("workflow_resource_registry_invalid")
         if budget_config is not None:
             from .budget_contracts import BudgetConfig
 
@@ -282,8 +276,6 @@ class TaskRuntime:
         self.manager = manager
         self.tenant_id, self.principal_id = tenant_id, principal_id
         self.executor_id, self.boot_id, self.lease_ms = executor_id, boot_id, lease_ms
-        self.workflow_resources = workflow_resources
-        self._workflow_handles: dict = {}
         self._local_executions: dict = {}
         self._model_executions: dict = {}
         from .managed_completion import CompletionCache
@@ -581,35 +573,7 @@ class TaskRuntime:
         owner = _OWNER.get()
         registering_actor = actor
         if owner is not None and (owner.runtime is not self or owner.actor.session_id != sid):
-            if owner.runtime is self:
-                job = await self.manager.get_job(owner.actor, owner.lease.job_id)
-                session = await self.manager.store.session_snapshot(sid)
-                restored = False
-                if (
-                    job.kind == "workflow_node"
-                    and session is not None
-                    and session.parent_session_id != owner.actor.session_id
-                ):
-                    from .workflow_restore_execution import controls_node
-
-                    async with self.manager._write() as tx:
-                        restored = await controls_node(
-                            self.manager, tx, await self.manager._row(tx, job.job_id), owner.actor, sid
-                        )
-                if (
-                    job.kind == "workflow_node"
-                    and session is not None
-                    and (session.parent_session_id == owner.actor.session_id or restored)
-                    and session.metadata.get("task_owner_job_id") == job.job_id
-                ):
-                    # A logical node controls all its physical retry sessions.
-                    # Registration checks the durable node_session admission,
-                    # while model calls retain the actual child actor/SID.
-                    registering_actor = owner.actor
-                else:
-                    owner = None
-            else:
-                owner = None
+            owner = None
         if owner is None and not input_start.child_job_id and await session_role(self.manager.store, sid) != "main":
             raise JobError("task_owner_required")
         from power_loop.agent.runtime_types import plain
@@ -738,11 +702,20 @@ class TaskRuntime:
                     await save_wait(input_start, tx, binding, evidence)
                     finalized = True
                 else:
-                    _, finalized = await self.manager.close_and_finalize(
+                    public = input_start.public_result(evidence)
+                    from dataclasses import replace
+
+                    from power_loop.agent.runtime_types import plain
+                    evidence["_public_result"] = plain(replace(public, job_ref=input_start.model_ref,
+                        input_ref=None if input_start.owner else public.input_ref))
+                    await self.manager.close_model_execution(
                         actor, binding.lease, evidence=evidence,
-                        resource_state=binding.resource_evidence.get("resource_state", "stopped"),
-                    )
+                        resource_state=binding.resource_evidence.get("resource_state", "stopped"))
+                    evidence.pop("_public_result", None)
                     await input_start.finish(tx, binding, evidence)
+                    from .finalization import try_finalize
+                    await try_finalize(self.manager, actor, binding.lease.job_id, binding.lease.generation)
+                    finalized = not owner and not evidence.get("processing_decisions")
             await input_start.notify_finished()
             from .finalization import after_send
 

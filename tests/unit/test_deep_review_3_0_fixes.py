@@ -7,21 +7,15 @@ Each test FAILS against the pre-fix code and passes after:
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from power_loop._vendor.llm_client.interface import LLMResponse
 from power_loop.agent.stateful_loop import StatefulAgentLoop
 from power_loop.agent.types import AgentLoopConfig
-from power_loop.contracts.hook_contexts import TimerFireCtx
-from power_loop.contracts.hooks import HookDirective
 from power_loop.runtime.history_projector import DefaultDeterministicProjector, IdentityProjector
 from power_loop.runtime.representation import ProjectedRepresentation
 from power_loop.runtime.store.store import SessionStore
 from power_loop.runtime.store.types import ProjectMessageRow
-from power_loop.workflow import journal
-from power_loop.workflow.runner import _wake_note, make_wake_guard
 from tests.unit.test_history_projection_loop import _projector_loop
 from tests.unit.test_stateful_loop import _echo_registry, _Scripted
 
@@ -83,36 +77,8 @@ def test_b9_projected_render_tags_sends_with_index() -> None:
 # ── B2: wake-guard atomic claim ───────────────────────────────────────────────
 
 
-async def test_wake_guard_claim_does_not_clobber_concurrent_journal_write() -> None:
-    async with await SessionStore.open(":memory:") as store:
-        parent = await store.create_session(system_prompt="p")
-        run_id = "run-W"
-        await journal.seed(store, parent, run_id, "wf", spec={})
-        guard = make_wake_guard(store)
-        ctx = TimerFireCtx(session_id=parent, note=_wake_note(run_id, "completed"))
-        # The wake-guard's claim and a journal step land concurrently on the SAME run key.
-        await asyncio.gather(
-            guard(ctx),
-            journal.record_step(store, parent, run_id, node_id="leaf", status="completed", text="o"),
-        )
-        rec = await journal.read(store, parent, run_id)
-        assert rec.get("woke") is True  # wake claimed
-        assert [s["node_id"] for s in rec["steps"]] == ["leaf"]  # step NOT clobbered by the guard
 
 
-async def test_wake_guard_double_fire_delivers_once() -> None:
-    async with await SessionStore.open(":memory:") as store:
-        parent = await store.create_session(system_prompt="p")
-        run_id = "run-D"
-        await journal.seed(store, parent, run_id, "wf", spec={})
-        guard = make_wake_guard(store)
-        c1 = TimerFireCtx(session_id=parent, note=_wake_note(run_id, "completed"))
-        c2 = TimerFireCtx(session_id=parent, note=_wake_note(run_id, "completed"))
-        await asyncio.gather(guard(c1), guard(c2))
-        # exactly one CONTINUE (first delivery), the other SKIP — never two wakes.
-        skips = [c for c in (c1, c2) if c.directive == HookDirective.SKIP]
-        assert len(skips) == 1
-        assert (await journal.read(store, parent, run_id)).get("woke") is True
 
 
 # ── B3 + B5: resume() self-heals a crash-left ids-only pending ─────────────────

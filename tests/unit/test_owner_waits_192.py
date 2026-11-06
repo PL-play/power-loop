@@ -21,12 +21,10 @@ from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 from power_loop.tools.wait_handoff import register_wait_handoff_tool
 from power_loop.workflow.admission import GATES, admit, idle
-from power_loop.workflow.engine import WorkflowEngine
 
 from .test_job_registry_192 import registry_store
-from .test_workflow_task_runtime_192 import leaf, managed_workflow
 
-__all__ = ["registry_store", "managed_workflow"]
+__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -269,127 +267,8 @@ async def test_original_subagent_releases_its_pool_and_reacquires_before_resume(
         release.set()
 
 
-async def test_waiting_workflow_leaf_releases_capacity_for_sibling_and_reacquires_before_its_original_input(managed_workflow, monkeypatch):
-    store, manager, task_runtime, loop, model, parent, state, _ = managed_workflow
-    task_runtime.lease_ms = 30000
-    state["on_complete"] = None
-    model.hold = {"AUDIT"}
-    state["spec"]["root"] = {"type": "sequence", "steps": [
-        {"type": "parallel", "max_concurrency": 1, "concurrency_scope": "leaf", "branches": [leaf("BUILD", tools=["arm_wait"]), leaf("AUDIT")]}, leaf("REVIEW")]}
-    register_wait_handoff_tool(loop.tool_registry)
-    saved, choice = [], {"event_id": None, "issued": False}
-    waiting_committed = asyncio.Event()
-    audit_admissions = []
-    original_enter = owner_waits._enter
-    original_admitted = WorkflowEngine._exec_agent_admitted
-
-    async def entered(*args, **kwargs):
-        result = await original_enter(*args, **kwargs)
-        if result is not None:
-            waiting_committed.set()
-        return result
-
-    async def admit_after_original_wait(engine, node, *args, **kwargs):
-        # Parallel branches have no start-order guarantee. Stage AUDIT before
-        # admission, so this case specifically measures release/reacquisition
-        # by a waiting BUILD rather than racing to obtain the initial slot.
-        # The actual admission, semaphore and owning executor are unchanged.
-        if node.id == "AUDIT":
-            audit_admissions.append(node.id)
-            await asyncio.wait_for(waiting_committed.wait(), 5)
-        return await original_admitted(engine, node, *args, **kwargs)
-
-    monkeypatch.setattr(owner_waits, "_enter", entered)
-    monkeypatch.setattr(WorkflowEngine, "_exec_agent_admitted", admit_after_original_wait)
-
-    async def arm():
-        source, sid = _SEND.get(), get_session_id()
-        seq, call_id = current_invocation(sid)
-        now = manager.now()
-        registration = await waits.register_wait(manager, task_runtime.actor(sid), caller=source.lease,
-            call_ref=await store.message_ref(sid, seq), tool_call_id=call_id,
-            request=waits.WaitRequest(now + 2000, "Review original BUILD", "Continue original BUILD"),
-            policy=waits.WaitPolicy(now + 120000))
-        saved.append(registration)
-        return "Original node wait admitted."
-
-    loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Admit original node wait", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), arm)
-    original_complete = model.complete
-
-    async def provider(request, **kwargs):
-        response = await original_complete(request, **kwargs)
-        sid = get_session_id()
-        if sid != parent and "ROLE-BUILD" in (request.system_prompt or "") and model.counts["BUILD"] == 1:
-            response.raw_text = ""
-            response.tool_calls = [{"id": "node-wait", "type": "function", "function": {"name": "arm_wait", "arguments": "{}"}}]
-        elif sid == parent and choice["event_id"] and not choice["issued"]:
-            choice["issued"] = True
-            response.raw_text = ""
-            response.tool_calls = [{"id": "original-node-decision", "type": "function", "function": {"name": "wait_handoff", "arguments": json.dumps({
-                "action": "decide", "event_id": choice["event_id"], "decision": "continue"})}}]
-        return response
-
-    monkeypatch.setattr(model, "complete", provider)
-    try:
-        await loop.send("Run original workflow", parent)
-        await asyncio.wait_for(model.entered["AUDIT"].wait(), 5)
-        assert audit_admissions == ["AUDIT"] and waiting_committed.is_set()
-        if not saved:
-            diagnostic = []
-            workflow_job = await manager.get_job(task_runtime.actor(parent), state["handles"][0].job_id)
-            for child in await store.list_children(workflow_job.session_id):
-                diagnostic.extend({"role": m.role, "content": str(m.content)[:500]} for m in await store.load_all_messages(child.session_id))
-            pytest.fail(f"Original node wait was not admitted; counts={model.counts}; messages={diagnostic}")
-        [registration] = saved
-        owner = await manager.get_job(task_runtime.actor(parent), registration.job.control_owner_job_id)
-        assert owner.status == "waiting" and owner.outcome is None
-        assert model.counts["BUILD"] == 2 and model.counts["REVIEW"] == 0
-        assert not state["handles"][0].task.done()
-        due = await prepare_due(manager, task_runtime.actor(parent), registration)
-        choice["event_id"] = due["event_id"]
-        await notices.enqueue_notification(loop, task_runtime.actor(parent), due["event_id"])
-        await loop.flush_follow_ups(parent)
-        await effects.apply(manager, task_runtime.actor(parent), due["event_id"])
-        for _ in range(300):
-            if await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE event_type='owner_wait_resumed'"):
-                break
-            await asyncio.sleep(.01)
-        assert model.counts["BUILD"] == 2 and model.counts["REVIEW"] == 0
-        model.release["AUDIT"].set()
-        await asyncio.wait_for(state["handles"][0].task, 8)
-        assert model.counts["BUILD"] == 3 and model.counts["AUDIT"] == model.counts["REVIEW"] == 1
-        assert (await manager.get_job(task_runtime.actor(parent), owner.job_id)).outcome == "succeeded"
-        assert (await manager.get_job(task_runtime.actor(parent), registration.job.job_id)).outcome == "succeeded"
-        await loop.flush_follow_ups(parent)
-        rows = await manager.db.fetchall(f"SELECT kind,supervision_status FROM {manager.jobs}")
-        assert all(r["supervision_status"] == "closed" for r in rows), rows
-    finally:
-        model.release["AUDIT"].set()
 
 
-async def test_original_workflow_node_empty_pass_gets_its_answer_without_a_standalone_pool(managed_workflow, monkeypatch):
-    store, manager, runtime, loop, model, parent, state, _ = managed_workflow
-    state["on_complete"] = None
-    runtime.lease_ms = 30000
-    model.hold = set()
-    original = model.complete
-
-    async def provider(request, **kwargs):
-        result = await original(request, **kwargs)
-        if "ROLE-BUILD" in (request.system_prompt or "") and model.counts["BUILD"] == 1:
-            result.raw_text = ""
-            result.tool_calls = [{"id": "original-empty-node", "type": "function", "function": {
-                "name": "pass_turn", "arguments": '{"reason":"original empty pass"}'}}]
-        return result
-
-    monkeypatch.setattr(model, "complete", provider)
-    await loop.send("Run original workflow", parent)
-    await asyncio.wait_for(state["handles"][0].task, 8)
-    job = await manager.get_job(runtime.actor(parent), state["handles"][0].job_id)
-    assert job.outcome == "succeeded", job.result
-    assert model.counts["BUILD"] == 2 and model.counts["REVIEW"] == 1
-    assert not await store.get_runtime_state(parent, "subagent:usage:total")
-    await loop.flush_follow_ups(parent)
 
 
 @pytest.mark.parametrize("ending", ["cancelled", "timed_out"])

@@ -1,168 +1,110 @@
-# 动态工作流
+# 工作流
 
-[English](../../en/user-guide/workflows.md) | [用户手册](../index.md)
+workflow 提交时固定图定义，创建独立的调度器 session/job/start 待办；每次叶子执行也有
+自己的 session 和 job。同一套 Runtime client/worker 协议支持单进程与宿主部署的多个
+进程。原父 Agent 的 Python 对象结束，不会结束健康叶子。
 
-`power_loop.workflow` 是一个**可选**子模块，用于*代码驱动*的确定性多 Agent 编排：一份声明式的 `WorkflowSpec` JSON，其叶子节点是普通的子 Agent，由一个确定性引擎解释执行。它是对 `spawn_agent`（[子代理](subagents.md)）那种*模型驱动*的即兴委托的补充，而非替代。
+## 提交和读取结果
 
-当你（开发者）预先就知道控制流（一条流水线、一次扇出、一个分支）时，使用工作流。当应该由*模型*决定调用谁时，使用即兴委托。
-
-## spec
-
-一个 `WorkflowSpec` 是一棵节点树。共有五种节点类型：
-
-| 节点 | 作用 |
-|---|---|
-| `agent` | 运行一个子 Agent（一个叶子）；以 `id` 为键 |
-| `sequence` | 按顺序运行 `steps` |
-| `parallel` | 并发运行 `branches`（屏障式扇入） |
-| `foreach` | 在一个运行时列表（`items` 或 `items_from`）上对 `body` 做映射，可选并发 |
-| `branch` | 根据前序 agent 的输出选取一个 `case` |
+先创建 Runtime、在 RegistryRuntimeFactory 登记带版本的环境构造器、启动 worker，
+再用 RuntimeDescriptor 创建根 session。完整示例见
+[27_dynamic_workflow.py](../../../examples/27_dynamic_workflow.py)。
 
 ```python
-SPEC = {
-    "name": "research_and_summarize",
-    "input": "the Japanese tea ceremony",
-    "budget": {"max_tokens": 200_000, "stop_at_remaining_pct": 5},
-    "root": {
-        "type": "sequence",
-        "steps": [
-            {"type": "agent", "id": "plan",
-             "spec": {"name": "planner",
-                      "system_prompt": 'Reply ONLY JSON: {"subtopics": ["...","...","..."]}'},
-             "input": "Topic: {{input}}",
-             "output_schema": {"name": "Plan", "schema": {
-                 "type": "object", "required": ["subtopics"],
-                 "properties": {"subtopics": {"type": "array", "items": {"type": "string"}}}}}},
-            {"type": "foreach", "id": "research",
-             "items_from": "plan.subtopics", "as": "subtopic",
-             "parallel": True, "max_concurrency": 3,
-             "body": {"type": "agent", "id": "researcher",
-                      "spec": {"name": "researcher",
-                               "system_prompt": "Write 2-3 factual sentences."},
-                      "input": "Subtopic: {{subtopic}}"}},
-            {"type": "agent", "id": "synthesize",
-             "spec": {"name": "writer", "system_prompt": "Synthesize into one paragraph."},
-             "inputs_from": ["research"]},
-        ],
-    },
-}
-```
-
-节点之间的数据流：
-
-- `{{input}}` / `{{var}}` —— 在节点的 `input` 中做模板替换。
-- `output_schema` —— 让叶子产出结构化 JSON（经校验）；下游节点读取它。形如 `{name, schema, strict?}`，`strict` 默认 true，schema 不符合 strict 规范时写 false。
-- `items_from: "plan.subtopics"` —— `foreach` 从前序 agent 已解析的 payload 中读取一个键；`inputs_from: ["research"]` 则把前序结果作为文本喂入。
-
-## 运行它
-
-```python
-from power_loop import StatefulAgentLoop, AgentLoopConfig
 from power_loop.workflow import create_workflow
 
-loop = StatefulAgentLoop(llm=make_llm(), db_path=":memory:",
-                         config=AgentLoopConfig(system_prompt="orchestrator"))
+spec = {
+    "name": "review", "budget": {"max_tokens": 50000}, "timeout_s": 300,
+    "root": {"type": "sequence", "steps": [
+        {"type": "agent", "id": "draft", "input": "写一份简短提案。",
+         "spec": {"name": "draft", "system_prompt": "写清楚方案。", "tools": []}},
+        {"type": "agent", "id": "review", "inputs_from": ["draft"],
+         "spec": {"name": "review", "system_prompt": "检查提案。", "tools": []}},
+    ]},
+}
+handle = await runtime.client.workflow(target, spec, message_id="review-1", actor=actor)
+result = await handle.wait()
+print(result.status, result.usage)
 
-wf = create_workflow(SPEC, parent_loop=loop)   # validates on creation
-result = await wf.run()                         # deterministic, in-process
-
-print(result.status)                            # completed | failed | budget_exceeded | cancelled
-print(result.results["plan"].payload)           # parsed structured output
-print(result.results["synthesize"].text)        # final sub-agent text
-print(result.usage["total_tokens"])
+# 便利入口调用同一条受理路径；相同 ID、相同内容返回原受理。
+result = await create_workflow(spec, client=runtime.client, target=target,
+                              actor=actor, message_id="review-1").run()
 ```
 
-`create_workflow` 会立即校验 spec；非法 spec 会抛出 `WorkflowSpecError`，**一次性**列出所有问题（这样编写该 spec 的 LLM 可以一次修复到位）。`result.results[node_id]` 是一个 `AgentResult`（`status`、`text`、`payload`、`usage`、`session_id`、`db_path`）。
+handle 只有持久的 run_id、job_ref、input_ref，不持有本地执行任务。客户端重建后可用
+`client.wait(input_ref, actor=actor, deadline_ms=...)` 读取原结果；返回的统一 Result
+在 structured_output 中携带工作流结果。等待超时只结束等待，取消执行需要明确调用 cancel。
+相同请求 ID 携带不同内容会报冲突。
 
-参见 [example 27](../../../examples/27_dynamic_workflow.py)。
+## 图的行为
 
-### 让模型来编写工作流
+- sequence 顺序执行。inputs_from 追加上游结果；`{{input}}`、`{{变量}}`、
+  `{{node.key}}` 可用于叶子输入和系统提示词。
+- parallel 按 max_concurrency 并行；foreach 遍历 items/items_from，嵌套迭代各有
+  独立身份。在循环体外引用 foreach 的汇总 ID，不引用某次循环体叶子。
+- branch 读取先前结果选分支；when 可跳过叶子。结构化字段的生产节点必须声明 output_schema。
+- loop 按 until/max_iterations 迭代；continue_nodes 在原节点会话中启动下一次执行，
+  保留上下文，不恢复旧 Python 调用栈。
+- retry 为已知失败创建新 attempt；fallback、continue_on_error 按声明执行。
+  容器 on_error="halt" 会停止同一容器尚未结束的分支；"continue" 收集失败后继续其它
+  分支。需要同时查看 status、ok 和 errors。
+- continuation 可为轮数用尽或上下文检查点结果追加执行，复用原节点 job/session。
+  默认门检查未完成 todo，gate="always" 使用声明的继续次数。unknown/interrupted
+  外部动作不会自动重试。
 
-注册这些元工具，使主 Agent 能够自行产出一份 spec 并运行它：
+节点 ID 在定义内全局唯一，依赖只能指向同一路径上已完成的节点，不能引用并行兄弟。
+JSON 与 YAML 编译为同一个 WorkflowSpec；无效定义在受理前集中返回问题。
+
+## 调度器重建、停止和显式继续
+
+原 start input 和已经选定的正代次 JobRef 始终读取原代次结果，包括旧调度器的中断结果。
+接手后需要先检查 workflow job 的当前代次，再等待或取消该新代次。
+
+run/path/iteration/attempt 形成稳定节点键。节点 job、session、start 待办和 journal
+引用同事务保存；节点结果与父 inbox 通知同事务保存。叶子不覆盖整份父 journal，调度器
+消费结果时更新自己的节点记录。
+
+新 worker 取得调度器自身 session 执行权后，按原 job/version 条件推进 generation。
+它读取固定图，复用已完成结果、等待健康原叶子。节点结果和费用保持原归属。信息不足时
+允许报告 interrupted/unknown，不自动重做未知外部动作来补结果。
 
 ```python
-from power_loop.workflow import register_workflow_tools
-register_workflow_tools(registry)   # adds create_workflow + workflow_status
+await handle.cancel("用户停止工作流")  # 先关闭整树新派发
+await runtime.client.cancel(node_ref, actor=actor, scope="self")  # 指定节点和代次
+await runtime.client.nudge(node_ref, "补充要求", message_id="note-1", actor=actor)
+
+# 工作流已有终态结果时，明确给出当前 generation。
+continued = await handle.resume(generation=current_generation, node_id="draft",
+    message="修改提案", message_id="revision-1")
+result = await continued.wait()
 ```
 
-（不要把它们授予某个工作流自己的叶子节点 —— 本层级拒绝嵌套运行。）
+显式继续在所选节点原 job 中开启新代次，其依赖尾部用新 attempt 重算；未变化分支复用
+原结果。节点在 foreach/loop 中存在多个迭代时，图级 resume 拒绝歧义；先检查具体 job，
+再提交范围明确的新任务。运行中节点使用 nudge/steer 或 answer；图级 resume 要求工作流
+已经终结。已取消代次不会重新启动。
 
-## 执行器
+自动与显式继续都保留累计 token 用量和原工作流截止时间。额度用尽仍可读取已有结果。
+调用次数与费用上限使用 Runtime 的 BudgetConfig 和原逻辑归属。图 token 上限是派发前
+软限制，已运行的并行调用可以在到达上限后完成。未结费用继续可见，并阻止监督范围关闭。
 
-引擎通过一个 `Executor` 来运行叶子节点。开箱即用提供两种。
+## worker、模型工具和资源
 
-### 进程内（默认）
+跨进程部署须配置共享 store、SessionOwnershipCoordinator、MessageTransport，并设置
+shared_execution=True；默认内存适配器仅供单进程使用。所有 worker 必须能解析冻结的
+版本化环境定义。宿主负责 worker 路由和进程/容器隔离，SDK 不再逐叶子拉起进程或创建
+独立数据库。
 
-`InProcessExecutor` 通过 `run_agent_spec` 在父进程内运行每个叶子。快、简单，且共享父进程的 store。这正是 `wf.run()` 默认使用的执行器。
+register_workflow_tool 提供 create/validate/status/list/leaves/logs、节点 nudge/steer
+和 cancel；register_workflow_tools 将同一受理路径注册为 create/validate/status 三个
+工具名。模型创建立即返回收据，结果进入原父 inbox。WorkflowToolPorts 保留定义加载、
+策略转换、工具授权收窄和有时限的展示观察函数；观察函数不决定任务完成。
 
-## Out-of-process (`SubprocessExecutor`)（进程外）
+宿主资源定义可提供 resources.workflow_file_io，实现 output_path(node_id, iteration=...)
+和 render_ref(path, slice_expr)，支持 output_file 与 `@@FILEREF:path@@`。各 worker
+必须能访问指定资源，不把 Python 资源对象序列化进请求。文件适配器失败会明确报错。
+必要子任务和等待用户回答归属叶子自身 session/job。
 
-POSIX 下，每个 worker 由 SDK 内部的监督进程持有原进程组。取消叶子时关闭专用
-控制管道；调用方进程崩溃也会关闭管道。监督进程对自己仍持有的组执行有界 TERM/KILL，
-清理原 worker 及同组孙进程。调用方不再按缓存 PGID 发信号，避免数字复用后误杀。
-worker 的结果帧和数据库格式不变，监督进程最后由信号退出属于预期。
-
-这不隔离主动创建新 session 的命令或远端资源，也不能在监督进程本身被强杀后证明
-这些资源已经停止。这类 launcher 仍需要显式生命周期适配器；旧的独立数据库
-executor 仍不允许进入 native 受管任务模式。
-
-
-**让每个叶子运行在自己的操作系统进程里，对应自己的 SQLite 文件**，这样「每文件单写者」规则得以轻松成立，且一个崩溃 / 被杀 / 超时的叶子无法破坏编排器或它的兄弟节点。
-
-```python
-from power_loop.workflow import SubprocessExecutor, WorkerBootstrap, WorkflowSpec
-from power_loop.workflow.engine import WorkflowEngine
-
-executor = SubprocessExecutor(
-    bootstrap=WorkerBootstrap(llm_from_env=True),  # child rebuilds the provider from env
-    runs_dir="/tmp/wf_runs",
-    timeout_s=120,
-    delete_on_success=False,   # keep each leaf db for inspection (GC via reap_runs)
-)
-result = await WorkflowEngine(loop, executor=executor, run_id="run1").run(
-    WorkflowSpec.from_json(SPEC)
-)
-```
-
-worker 仅凭**配置**（`WorkerBootstrap`）重建其依赖 —— 没有任何活动对象跨越进程边界。取消 = SIGTERM→SIGKILL；超时 / 崩溃 → `failed`（在 resume 时可重跑）。每个叶子的 db 会保留在磁盘上以便事后检查；用 `reap_runs(runs_dir, older_than_s=…)` 或 `cleanup_run(runs_dir, run_id)` 做 GC。要把每个叶子限制在沙箱里，可注入一个 [`WorkerLauncher`](sandboxing.md#workerlauncher--sandbox-a-workflow-leaf-process)。参见 [example 30](../../../examples/30_subprocess_isolation.py)。
-
-## 分离执行 + 完成唤醒
-
-在后台运行一个工作流，并让它在完成时唤醒父 Agent（父 Agent 通过 `pass_turn` 让出，再经由一个持久化定时器被重新唤醒）：
-
-```python
-from power_loop import TimerRunner
-from power_loop.workflow import create_workflow, register_wake_guard, get_workflow, list_workflows
-
-register_wake_guard(loop)                # dedupe the at-least-once wake timer
-await TimerRunner(loop).start()          # REQUIRED: delivers the wake (see Timers)
-
-wf = create_workflow(SPEC, parent_loop=loop, parent_session_id=parent_sid)
-handle = await wf.start(detached=True)   # returns immediately
-# inspect any time:
-get_workflow(loop, parent_sid, handle.run_id, detail=True)   # status + per-step usage
-list_workflows(loop, parent_sid)
-```
-
-宿主必须运行一个 `TimerRunner`，**并且**调用 `register_wake_guard(loop)`，否则父 Agent 永远不会被唤醒。进度会以 `source="workflow"` 的 `SYSTEM_LOG` 事件形式发布。
-
-## 跨进程重启恢复
-
-分离运行会把它的 spec 以及每一步的输出记入日志（journal）。如果进程在运行中途挂掉，把一个新的 loop（使用相同的 `db_path`）指向该 run id 并恢复 —— 已完成的步骤会被**重放**（不会再次调用其子 Agent），只有尚未完成的尾部才会重跑：
-
-```python
-from power_loop.workflow import resume_run, resume_detached
-
-result = await resume_run(loop, parent_sid, run_id)        # sync
-# or, to resume in the background and wake the parent:
-handle = await resume_detached(loop, parent_sid, run_id)
-```
-
-如果原始运行使用了非默认的执行器或预算，则需重新提供 `executor=` / `budget=` —— 只有*数据*被记入日志；运行时对象来自活动进程。每个叶子会得到一个稳定的 `metadata["idempotency_key"] = f"{run_id}:{node_id}"`，因此带副作用的工具可以对重跑做去重。`foreach` 是原子的：它要么通过其记入日志的聚合结果进行重放，要么重跑整次扇出。
-
-## 另见
-
-- [子代理](subagents.md) —— 模型驱动的替代方案
-- [沙箱](sandboxing.md) —— 隔离进程外叶子
-- [定时器](timers.md) —— 分离运行背后的唤醒机制
-- [黑板](blackboard.md) —— 协调对等 Agent
+本次未发布设计 203 分支使用 schema 15/protocol 42 和新建数据库。旧 parent_loop
+workflow 入口、本地恢复句柄、完成回调、eager_wake、detached/wait/sync 参数和 subprocess
+executor 已删除，不提供旧数据迁移或兼容运行路径。

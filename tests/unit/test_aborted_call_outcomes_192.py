@@ -308,9 +308,9 @@ async def test_original_main_outcome_path_cannot_promote_a_child_role(registry_s
 
 @pytest.mark.parametrize('attempt', ['false_proof', 'success', 'unknown_resource'])
 async def test_closed_model_publication_requires_an_actual_negative_stopped_proof(registry_store, attempt):
+    from power_loop.runtime.execution_membership import proof
     from power_loop.runtime.jobs import JobLease
     from power_loop.runtime.result_proof import ResultPublicationProof
-    from power_loop.runtime.workflow_controller import proof
     c, source = await pending_batch(registry_store)
     class HostProof(ResultPublicationProof):
         async def validate(self, manager, transaction, execution_row, requested_result):

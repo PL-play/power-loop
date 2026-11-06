@@ -51,7 +51,7 @@ def test_description_states_key_authoring_rules() -> None:
         "{{input}}",
         "globally",          # id uniqueness
         "parallel sibling",  # reachability rule
-        "detached",
+        "inbox",
         "ALL problems at once",
         "EXAMPLE",
     ):

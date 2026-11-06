@@ -1,5 +1,4 @@
-"""S5 (3.14): ``TimerRunner(delivery=...)`` host delivery seam +
-``claim_wake`` / ``parse_workflow_wake`` public helpers."""
+"""TimerRunner host delivery seam, independent of workflow dispatch."""
 
 from __future__ import annotations
 
@@ -24,9 +23,6 @@ from power_loop._vendor.llm_client.interface import (
     LLMService,
     LLMStreamChunk,
 )
-from power_loop.workflow import claim_wake, parse_workflow_wake
-from power_loop.workflow.journal import JOURNAL_PREFIX, seed
-from power_loop.workflow.runner import _wake_note
 
 pytestmark = pytest.mark.asyncio
 
@@ -168,34 +164,4 @@ async def test_default_delivery_unchanged(tmp_path) -> None:
     await _arm_due_timer(loop, sid, note="classic")
     assert await TimerRunner(loop).scan_once() == 1
     assert llm.calls == 1  # built-in follow_up path ran the session
-    await loop.aclose()
-
-
-# ── claim_wake / parse_workflow_wake ─────────────────────────────────────
-
-
-async def test_parse_workflow_wake() -> None:
-    assert parse_workflow_wake(_wake_note("abc123", "completed")) == "abc123"
-    assert parse_workflow_wake(f"{JOURNAL_PREFIX}xyz failed — boom") == "xyz"
-    assert parse_workflow_wake("an ordinary reminder") is None
-    assert parse_workflow_wake(None) is None
-    assert parse_workflow_wake(JOURNAL_PREFIX) is None  # prefix but no run id
-
-
-async def test_claim_wake_first_true_then_false(tmp_path) -> None:
-    loop, _llm = _loop(tmp_path)
-    sid = await loop.new_session()
-    store = await loop.ensure_store()
-    await seed(store, sid, "run1", "wf")
-    assert await claim_wake(store, sid, "run1") is True
-    assert await claim_wake(store, sid, "run1") is False  # second delivery deduped
-    await loop.aclose()
-
-
-async def test_claim_wake_no_journal_is_true(tmp_path) -> None:
-    """Nothing to dedupe against → deliver (don't strand the parent)."""
-    loop, _llm = _loop(tmp_path)
-    sid = await loop.new_session()
-    store = await loop.ensure_store()
-    assert await claim_wake(store, sid, "ghost-run") is True
     await loop.aclose()

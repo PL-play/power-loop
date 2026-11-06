@@ -2,7 +2,7 @@
 
 The low-level SDK still supports direct awaited execution. Model create calls
 always return admission; durable completion delivery depends on the runtime or
-host callback/timer runner.
+shared inbox and worker.
 """
 
 from __future__ import annotations
@@ -98,10 +98,8 @@ def _build_create_workflow_description() -> str:
         "(reference the foreach's own aggregate id instead).\n"
         "\n"
         "ASYNCHRONOUS: returns an accepted receipt and run id immediately. "
-        "You may pass_turn; read actual results with workflow_status. Runtime owner-inbox "
-        "delivery or a host completion callback/timer runner handles completion; a wake "
-        "is not guaranteed without that host infrastructure. The old detached=true input "
-        "is accepted for compatibility; detached=false, wait and sync are rejected.\n"
+        "You may pass_turn; read actual results with workflow_status. The workflow result "
+        "and original parent inbox notification commit together; workers consume that inbox.\n"
         "\n"
         "EXAMPLE: {\"name\":\"research\",\"input\":\"topic X\",\"root\":{\"type\":"
         "\"sequence\",\"steps\":[{\"type\":\"agent\",\"id\":\"plan\",\"spec\":"
@@ -117,7 +115,7 @@ def _build_create_workflow_description() -> str:
         "\"inputs_from\":[\"res\"]}]}}\n"
         "\n"
         "Validation reports ALL problems at once — fix everything in one revision "
-        "rather than retrying one error at a time. For a large or detached "
+        "rather than retrying one error at a time. For a large "
         "workflow, dry-run the spec with validate_workflow first; a spec it "
         "accepts is guaranteed to be accepted here."
     )
@@ -162,7 +160,7 @@ VALIDATE_WORKFLOW_DEFINITION = ToolDefinition(pricing=Free("local"),
         "(plus the platform's policy checks, when the host installed any), "
         "reporting ALL problems at once so you can fix everything in one "
         "revision. On success returns a structure summary (nodes, leaves, "
-        "referenced outputs). Use it to cheaply verify a large or detached "
+        "referenced outputs). Use it to cheaply verify a large "
         "workflow before create_workflow commits real sub-agent runs; for "
         "small specs you may call create_workflow directly — it validates too."
     ),
@@ -186,7 +184,7 @@ WORKFLOW_STATUS_DEFINITION = ToolDefinition(pricing=Free("local"),
         "Inspect workflows you started. With no args, lists all runs (run_id, "
         "name, status). With 'run_id', returns that run's status and per-step "
         "results; add 'detail' for per-step token usage. After being woken by a "
-        "detached run's completion, call this first to read its results before "
+        "workflow completion, call this first to read its results before "
         "continuing."
     ),
     input_schema={
@@ -201,13 +199,10 @@ WORKFLOW_STATUS_DEFINITION = ToolDefinition(pricing=Free("local"),
 
 def _make_create_workflow_handler(
     *,
-    executor_factory: Callable[[Any, str | None], Any] | None = None,
-    budget_factory: Callable[[Any, str | None], Any] | None = None,
     spec_transform: Callable[[WorkflowSpec], WorkflowSpec] | None = None,
     ports: WorkflowToolPorts | None = None,
 ) -> Callable[..., Any]:
-    selected = ports or WorkflowToolPorts(executor_factory=executor_factory,
-        budget_factory=budget_factory, spec_transform=spec_transform)
+    selected = ports or WorkflowToolPorts(spec_transform=spec_transform)
 
     async def _handle(**kwargs: Any) -> str:
         # The alias fixes its action; a raw model argument cannot change it.
@@ -296,49 +291,18 @@ def register_workflow_tools(
     registry: Any,
     *,
     overwrite: bool = False,
-    executor_factory: Callable[[Any, str | None], Any] | None = None,
-    budget_factory: Callable[[Any, str | None], Any] | None = None,
     spec_transform: Callable[[WorkflowSpec], WorkflowSpec] | None = None,
     description_suffix: str | None = None,
     ports: WorkflowToolPorts | None = None,
 ) -> None:
-    """Register the ``create_workflow`` + ``workflow_status`` tools on ``registry``.
-
-    For detached runs to wake the agent, the host must also run a ``TimerRunner``
-    and call :func:`power_loop.workflow.register_wake_guard(loop)` once.
-
-    Do NOT grant these tools to sub-agents spawned inside a workflow — nested
-    runs are refused in this tier.
-
-    Model submission is asynchronous. Optional ports supply the shared host
-    capabilities; do not combine ports with the older individual factory arguments.
-    HOST injection points (PROVISIONAL). Each is evaluated PER TOOL INVOCATION with
-    ``(loop, parent_session_id)`` from the invoking run's context:
-
-    * ``executor_factory`` → the run's :class:`~power_loop.workflow.engine.Executor`
-      (e.g. a capability-clamping wrapper, or a ``SubprocessExecutor``).
-      ``None``/returning ``None`` → the default ``InProcessExecutor``.
-    * ``budget_factory`` → a per-run ``SharedBudget`` (e.g. from host config).
-      Returning ``None`` → no host budget (the spec's own ``budget`` still applies).
-    * ``spec_transform`` → rewrite the validated :class:`WorkflowSpec` before it
-      runs (policy clamps, forced limits). May raise
-      :class:`~power_loop.workflow.spec.WorkflowSpecError` to reject — the
-      aggregated problems go back to the model like a validation failure.
-    * ``description_suffix`` → appended to ``create_workflow``'s model-facing
-      description. The default description documents power-loop's own facts
-      (grammar, AgentSpec fields, data flow); a host whose ``spec_transform``
-      enforces policy limits, or whose wake delivery has its own protocol,
-      states those HOST facts here so the model writes within them first try.
-    """
-    if ports is not None and any((executor_factory, budget_factory, spec_transform)):
+    """Register asynchronous creation and read-only validation/status tools."""
+    if ports is not None and spec_transform is not None:
         raise ValueError("workflow_ports_and_individual_seams_are_mutually_exclusive")
     handler = (
         _make_create_workflow_handler(
-            executor_factory=executor_factory,
-            budget_factory=budget_factory,
             spec_transform=spec_transform, ports=ports,
         )
-        if (executor_factory or budget_factory or spec_transform or ports is not None)
+        if (spec_transform or ports is not None)
         else _handle_create_workflow
     )
     create_def = CREATE_WORKFLOW_DEFINITION

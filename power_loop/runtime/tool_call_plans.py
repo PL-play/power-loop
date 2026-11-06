@@ -8,8 +8,6 @@ from dataclasses import asdict, dataclass
 from .jobs import JobError, _hash, _json
 from .jobs import verify_stored as _verify_stored
 
-FIELD = 'tool_call_plan_protocol'
-
 
 @dataclass(frozen=True)
 class _BatchBindings:
@@ -26,7 +24,7 @@ def start_id(plan, call_id):
     return "tcs_" + _hash([plan, call_id])[:48]
 
 def _retained(pipeline, manager, source, ref, plan):
-    from .workflow_controller import proof
+    from .execution_membership import proof
     original = getattr(pipeline, '_native_tool_batch_bindings', None)
     if (type(original) is not _BatchBindings or original.plan_id != identity(manager, source, ref)
             or original.plan_hash != _hash(plan) or original.source_scope != _json(proof(source))
@@ -42,17 +40,10 @@ def identity(manager, source, ref):
 
 
 async def required(manager, tx, source):
-    from .pending_calls import _object
-    creates = await tx.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='operation' AND action='create' LIMIT 2", (source['job_id'],))
-    if len(creates) != 1:
-        raise JobError('tool_call_plan_source_missing')
-    data = await _object(manager, tx, manager.events, 'payload_json', 'event_id=?', (creates[0]['event_id'],), 262144)
-    flag = data.get('request', {}).get(FIELD)
-    if flag is None:
-        return False
-    if type(flag) is not int or flag != 1:
-        raise JobError('tool_call_plan_protocol_invalid')
-    return True
+    # Only synchronous managed effects persist a call plan. Ordinary tools use
+    # the execution journal, and no creation-time protocol flag is needed.
+    return await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE job_id=? "
+        "AND event_type='tool_call_plan' LIMIT 1", (source['job_id'],)) is not None
 
 
 def registration_value(registered):
@@ -97,10 +88,10 @@ async def _read(manager, tx, key, source, kind, *, optional=False):
 
 
 async def read(manager, tx, source, ref, *, optional=False):
+    from .execution_membership import proof
     from .jobs import JobActor
     from .managed_completion import _scope
     from .managed_effects import _verify_call
-    from .workflow_controller import proof
 
     key = identity(manager, source, ref)
     value = await _read(manager, tx, key, source, 'tool_call_plan', optional=optional)
@@ -166,8 +157,6 @@ async def _prepare_children(pipeline, attempt):
     async with manager._write() as tx:
         source = await manager._authorize(tx, actor, binding.lease.job_id)
         manager._check_proof(source, binding.lease)
-        if not await required(manager, tx, source):
-            return
         from .pending_calls import current
         pending = await current(manager, tx, actor.session_id)
         if pending is None or pending.get('assistant_seq') != seq:
@@ -228,7 +217,7 @@ async def _prepare_children(pipeline, attempt):
             return
         for entry in entries:
             if entry['recovery'] is not None:
-                prepared = manager._registration_spec(actor, kind='background_tool', title=entry['tool_name'],
+                prepared = manager._registration_spec(actor, kind='background_tool', title=entry['tool_name'], session_id=actor.session_id,
                     parent=binding.lease, call_ref=ref, tool_call_id=entry['call_id'], request=entry['recovery']['request'])
                 created = await manager._register_job_tx(tx, actor, **prepared)
                 if created.replayed:
@@ -239,7 +228,7 @@ async def _prepare_children(pipeline, attempt):
                 validate_registration(pipeline.tool_registry, entry['tool_name'], original)
             elif pipeline.tool_registry is not None and pipeline.tool_registry.get(entry['tool_name']) is not None:
                 raise JobError('tool_call_plan_binding_changed')
-        from .workflow_controller import proof
+        from .execution_membership import proof
         key = identity(manager, source, ref)
         value = {'version': 1, 'scope': proof(source), 'call_ref': ref.to_dict(), 'entries': entries}
         await _event(manager, tx, key, source, 'tool_call_plan', value)
@@ -296,8 +285,6 @@ async def queued_for_call(manager, tx, row, source, invocation):
 
 
 async def adopt(manager, tx, source, ref, call_id, request):
-    if not await required(manager, tx, source):
-        return None
     plan = await read(manager, tx, source, ref)
     matches = [e for e in plan['entries'] if e['call_id'] == call_id]
     if len(matches) != 1 or matches[0]['recovery'] != {'kind': 'managed_effect', 'request': request}:

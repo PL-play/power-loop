@@ -212,9 +212,7 @@ async def validate_input(manager, tx, actor, event, *, _retired_input=False):
     if event["call_ref_json"] is not None and "handoff" not in request:
         return
     if "handoff" not in request:
-        from .workflow_restore_execution import validate_system_input
-        await validate_system_input(manager, tx, actor, event)
-        return
+        raise JobError("wait_effect_input_evidence_missing")
     binding = request.get("handoff")
     if not isinstance(binding, dict) or not isinstance(binding.get("event_id"), str):
         raise JobError("wait_effect_input_evidence_missing")

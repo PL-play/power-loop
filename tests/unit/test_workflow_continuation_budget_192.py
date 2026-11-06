@@ -1,195 +1,120 @@
-"""Cumulative continuation evidence must charge actual usage exactly once."""
-
-from __future__ import annotations
+"""Design 203 workflow behavior through the public runtime."""
 
 import pytest
 
-from power_loop import LLMResponse, LLMTokenUsage, SessionStore, StatefulAgentLoop, ToolDefinition
-from power_loop.core.agent_context import get_session_id
-from power_loop.runtime.pricing import Free
-from power_loop.runtime.workflow_resources import (
-    WorkflowResourceAdapter,
-    WorkflowResourceBinding,
-    WorkflowResourceRegistry,
-    WorkflowResources,
-    execution_contract,
-)
-from power_loop.workflow import InProcessExecutor, SharedBudget, WorkflowSpec, create_workflow
-from power_loop.workflow.engine import WorkflowEngine
+from power_loop import AgentLoopConfig, LLMResponse
+from power_loop.agent.runtime_store import now_ms
+from tests.runtime_fixture import RunningAgent
 
+from ._workflow_fixture_203 import Model, leaf
 from .test_job_registry_192 import registry_store
-from .test_workflow import _FakeLLM
-from .test_workflow_task_runtime_192 import managed_workflow, settle
 
-__all__ = ["registry_store", "managed_workflow"]
-
+__all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("ceiling,expected_calls,expected_spend", [(1000, 2, 17), (5, 0, 5), (10, 1, 12)])
-async def test_continuations_charge_once_and_observe_spend_before_next_request(ceiling, expected_calls, expected_spend):
-    store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(llm=_FakeLLM(), store=store)
-    pool = SharedBudget(ceiling)
-    calls = []
-    sid = await store.create_session(system_prompt="work")
+@pytest.mark.parametrize("budget,expected_calls", [(100, 3), (2, 2)])
+async def test_automatic_continuation_keeps_session_and_cumulative_usage(
+    registry_store, tmp_path, budget, expected_calls
+):
+    from power_loop import LLMTokenUsage
+    from power_loop.contracts.tools import ToolDefinition
+    from power_loop.runtime.pricing import Free
+    from power_loop.tools import create_default_tool_registry
 
-    class Executor:
-        async def run_agent(self, *args, **kwargs):
-            return {
-                "status": "hit_round_limit",
-                "final_text": "partial",
-                "session_id": sid,
-                "rounds": 1,
-                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
-            }
+    store, _ = registry_store
+    registry = create_default_tool_registry(workspace_dir=str(tmp_path))
 
-        async def continue_agent(self, *args, **kwargs):
-            calls.append(args)
-            done = len(calls) == 2
-            usage = (
-                {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
-                if done
-                else {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}
-            )
-            return {
-                "status": "completed" if done else "hit_round_limit",
-                "final_text": "done" if done else "partial",
-                "session_id": sid,
-                "rounds": 1,
-                "usage": usage,
-            }
+    async def step():
+        return "saved"
 
-    spec = WorkflowSpec.from_json(
-        {
-            "name": "continued",
-            "root": {
-                "type": "agent",
-                "id": "a",
-                "spec": {"name": "a", "system_prompt": "work"},
-                "continuation": {"max_continuations": 2, "extra_rounds": 1, "gate": "always"},
-            },
-        }
+    registry.register(
+        ToolDefinition(name="step", description="step", input_schema={"type": "object"}, pricing=Free("local")), step
     )
+
+    class Continuing(Model):
+        calls = 0
+
+        async def complete(self, request, **kwargs):
+            self.calls += 1
+            usage = LLMTokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+            if self.calls < 3:
+                return LLMResponse(
+                    raw_text="",
+                    token_usage=usage,
+                    tool_calls=[
+                        {
+                            "id": f"step-{self.calls}",
+                            "type": "function",
+                            "function": {"name": "step", "arguments": "{}"},
+                        }
+                    ],
+                )
+            return LLMResponse(raw_text="finished", token_usage=usage)
+
+    model = Continuing()
+    runner = await RunningAgent(store, model, registry, config=AgentLoopConfig(compactor=None)).start()
+    node = leaf("A")
+    node["spec"].update(max_rounds=1, tools=["step"])
+    node["continuation"] = {"max_continuations": 2, "extra_rounds": 1, "gate": "always"}
     try:
-        result = await WorkflowEngine(loop, executor=Executor(), budget=pool).run(spec)
-        assert len(calls) == expected_calls
-        assert pool.spent == expected_spend
-        assert result.usage["total_tokens"] == expected_spend
-        assert result.results["a"].usage["total_tokens"] == expected_spend
+        handle = await runner.runtime.client.workflow(
+            runner.target,
+            {"name": "auto", "budget": {"max_tokens": budget}, "root": node},
+            message_id="auto",
+            actor=runner.actor,
+        )
+        result = await handle.wait(deadline_ms=now_ms() + 15000)
+        assert model.calls == expected_calls, (model.calls, result)
+        assert result.usage["calls"] == expected_calls
+        assert result.usage["total_tokens"] == expected_calls * 2
+        assert result.status == ("completed" if expected_calls == 3 else "budget_exceeded"), result
+        nodes = await store._db.fetchall(
+            f"SELECT session_id,generation FROM {store.table_prefix}jobs WHERE kind='workflow_node'"
+        )
+        assert len(nodes) == 1 and nodes[0]["generation"] == (2 if expected_calls == 3 else 1)
     finally:
-        await store.close()
+        await runner.aclose()
 
 
-async def test_preexisting_shared_spend_and_failed_continuation_are_preserved():
-    store = await SessionStore.open(":memory:")
-    loop = StatefulAgentLoop(llm=_FakeLLM(), store=store)
-    pool = SharedBudget(1000)
-    pool.commit({"total_tokens": 13})
-    sid = await store.create_session(system_prompt="work")
+async def test_explicit_continuations_keep_total_usage_and_exhaust_budget(registry_store):
+    from power_loop import LLMTokenUsage
+    from power_loop.agent.runtime_types import RuntimeRequestError
 
-    class Executor:
-        async def run_agent(self, *args, **kwargs):
-            return {
-                "status": "hit_round_limit",
-                "final_text": "partial",
-                "session_id": sid,
-                "usage": {"total_tokens": 5},
-            }
+    store, _ = registry_store
 
-        async def continue_agent(self, *args, **kwargs):
-            return {"status": "failed", "final_text": "failure", "session_id": sid, "usage": {"total_tokens": 7}}
+    class Metered(Model):
+        async def complete(self, request, **kwargs):
+            return LLMResponse(raw_text="done", token_usage=LLMTokenUsage(prompt_tokens=1, total_tokens=1))
 
-    spec = WorkflowSpec.from_json(
-        {
-            "name": "continued",
-            "root": {
-                "type": "agent",
-                "id": "a",
-                "spec": {"name": "a", "system_prompt": "work"},
-                "continuation": {"max_continuations": 2, "extra_rounds": 1, "gate": "always"},
-            },
-        }
-    )
+    runner = await RunningAgent(store, Metered(), config=AgentLoopConfig(compactor=None)).start()
     try:
-        result = await WorkflowEngine(loop, executor=Executor(), budget=pool).run(spec)
-        assert result.results["a"].status == "failed"
-        assert pool.spent == 25 and result.usage["total_tokens"] == 12
-        assert result.results["a"].usage["total_tokens"] == 12
-    finally:
-        await store.close()
-
-
-async def test_native_automatic_continuation_keeps_pool_equal_to_canonical_usage(managed_workflow, monkeypatch):
-    _, manager, runtime, loop, model, sid, state, _ = managed_workflow
-    node = state["spec"]["root"]["steps"][0]
-    node["spec"].update(max_rounds=1, tools=["touch"])
-    node["continuation"] = {"max_continuations": 1, "extra_rounds": 2, "gate": "always"}
-    original = model.complete
-    first = True
-
-    async def complete(request, **kwargs):
-        nonlocal first
-        if first and get_session_id() != sid and "ROLE-BUILD" in (request.system_prompt or ""):
-            first = False
-            model.counts["BUILD"] += 1
-            return LLMResponse(
-                raw_text="",
-                tool_calls=[{"id": "touch-call", "type": "function", "function": {"name": "touch", "arguments": "{}"}}],
-                token_usage=LLMTokenUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10),
+        handle = await runner.runtime.client.workflow(
+            runner.target,
+            {
+                "name": "cumulative",
+                "budget": {"max_tokens": 5, "stop_at_remaining_pct": 0},
+                "root": {"type": "parallel", "branches": [leaf("A"), leaf("B")]},
+            },
+            message_id="cumulative",
+            actor=runner.actor,
+        )
+        result = await handle.wait(deadline_ms=now_ms() + 15000)
+        assert result.usage["calls"] == result.usage["total_tokens"] == 2
+        for generation in range(1, 4):
+            await runner.drain()
+            handle = await handle.resume(
+                generation=generation, node_id="A", message="improve", message_id=f"more-{generation}"
             )
-        return await original(request, **kwargs)
-
-    monkeypatch.setattr(model, "complete", complete)
-
-    async def touch():
-        return "done"
-
-    loop.tool_registry.register(
-        ToolDefinition(name="touch", description="One local read", input_schema={"type": "object"}, pricing=Free("test_fixture")), touch
-    )
-    spec = WorkflowSpec.from_json(state["spec"])
-    binding = WorkflowResourceBinding(
-        "native-continuation",
-        "1.0.0",
-        "original-resource",
-        1,
-        runtime.tenant_id,
-        runtime.principal_id,
-        sid,
-        "a" * 64,
-        execution_contract(spec, ["touch"]),
-        budget_scope_id="original-pool",
-    )
-    pool = SharedBudget(10000)
-    pool.commit({"total_tokens": 7})
-    resource = WorkflowResources(binding, InProcessExecutor(), budget=pool)
-
-    async def prepare(*args):
-        return resource
-
-    async def resolve(*args):
-        return resource
-
-    async def authorize(*args):
-        return True
-
-    registry = WorkflowResourceRegistry()
-    registry.register("native-continuation", "1.0.0", WorkflowResourceAdapter(prepare, resolve, authorize))
-    runtime.workflow_resources = registry
-
-    async def launch():
-        handle = await create_workflow(
-            spec, parent_loop=loop, parent_session_id=sid, allowed_tools=["touch"], resource_binding=binding
-        ).start(detached=True)
-        state["handles"].append(handle)
-        return handle.run_id
-
-    loop.tool_registry.register(loop.tool_registry.get("launch").definition, launch, overwrite=True)
-    await loop.send("launch", sid)
-    await settle(managed_workflow)
-    job = await manager.get_job(runtime.actor(sid), state["handles"][0].job_id)
-    assert job.result["status"] == "completed", job.result
-    assert model.counts["BUILD"] == 3
-    assert job.result["usage"]["total_tokens"] == 40
-    assert pool.spent == 47, (pool.spent, job.result["usage"], dict(model.counts))
+            result = await handle.wait(deadline_ms=now_ms() + 15000)
+            assert result.status == "completed", result
+            assert set(result.results) == {"A", "B"}
+            assert result.usage["calls"] == result.usage["total_tokens"] == generation + 2
+        with pytest.raises(RuntimeRequestError, match="budget_exceeded"):
+            await handle.resume(generation=4, node_id="A", message="over budget", message_id="over")
+        nodes = await store._db.fetchall(
+            f"SELECT title,generation FROM {store.table_prefix}jobs WHERE kind='workflow_node'"
+        )
+        assert {r["title"]: r["generation"] for r in nodes} == {"A": 4, "B": 1}
+    finally:
+        await runner.aclose()

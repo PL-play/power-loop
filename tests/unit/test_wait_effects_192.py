@@ -7,22 +7,16 @@ from dataclasses import replace
 
 import pytest
 
-from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop, ToolDefinition
-from power_loop.core.agent_context import get_session_id
+from power_loop import AgentLoopConfig, LLMResponse, LLMService, LLMTokenUsage, StatefulAgentLoop
 from power_loop.runtime import timer_waits as waits
 from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_notifications as notices
-from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
-from power_loop.runtime.pricing import Free
-from power_loop.runtime.task_runtime import _SEND, Execution, TaskRuntime
-from power_loop.tools.wait_handoff import register_wait_handoff_tool
+from power_loop.runtime.task_runtime import Execution, TaskRuntime
 
 from .test_wait_handoff_192 import handoff, registry_store, runtime, waiting
-from .test_workflow_restore_runtime_192 import native_restore
-from .test_workflow_task_runtime_192 import managed_workflow
 
-__all__ = ["handoff", "registry_store", "runtime", "waiting", "managed_workflow", "native_restore"]
+__all__ = ['handoff', 'registry_store', 'runtime', 'waiting']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -307,75 +301,6 @@ async def test_cancel_storage_failure_keeps_original_owner_and_wait_open(handoff
     assert not await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='stop' OR event_type='wait_effect'")
 
 
-async def test_actual_workflow_node_consumes_original_system_input_before_review_can_start(managed_workflow, monkeypatch):
-    store, manager, task_runtime, loop, model, parent, state, _ = managed_workflow
-    state["spec"]["root"]["steps"][0]["spec"]["tools"] = ["arm_wait"]
-    register_wait_handoff_tool(loop.tool_registry)
-    ready, release = asyncio.Event(), asyncio.Event()
-    registered, pending = [], {}
-    original = model.complete
-
-    async def arm():
-        source, sid = _SEND.get(), get_session_id()
-        seq, call_id = current_invocation(sid)
-        now = manager.now()
-        registration = await waits.register_wait(manager, task_runtime.actor(sid), caller=source.lease,
-            call_ref=await store.message_ref(sid, seq), tool_call_id=call_id,
-            request=waits.WaitRequest(now + 250, "Review this BUILD node.", "Continue original BUILD: PROOF-42."),
-            policy=waits.WaitPolicy(now + 10000))
-        registered.append(registration)
-        return "Original node wait accepted."
-
-    async def complete(request, **kwargs):
-        if get_session_id() == parent and pending and not pending.get("decided"):
-            pending["decided"] = True
-            return LLMResponse(raw_text="", tool_calls=[{"id": "decide-original-node", "type": "function", "function": {
-                "name": "wait_handoff", "arguments": json.dumps({"action": "decide", "event_id": pending["event_id"], "decision": "continue"})}}],
-                token_usage=LLMTokenUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10))
-        result = await original(request, **kwargs)
-        if "ROLE-BUILD" in (request.system_prompt or ""):
-            if model.counts["BUILD"] == 1:
-                return LLMResponse(raw_text="", tool_calls=[{"id": "node-arm", "type": "function", "function": {
-                    "name": "arm_wait", "arguments": "{}"}}],
-                    token_usage=LLMTokenUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10))
-            ready.set()
-            await release.wait()
-        return result
-
-    monkeypatch.setattr(model, "complete", complete)
-    loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Register a node wait", input_schema={"type": "object"}, pricing=Free("test_fixture")), arm)
-    try:
-        await loop.send("Start workflow", parent)
-        model.release["BUILD"].set()
-        await asyncio.wait_for(ready.wait(), 5)
-        [registration] = registered
-        saved = await waits.read_wait(manager, task_runtime.actor(parent), registration.job.job_id)
-        await asyncio.sleep(max(0, (saved["request"]["request"]["due_at_ms"] - manager.now()) / 1000) + .01)
-        due = await waits.prepare_due(manager, task_runtime.actor(parent), registration.job.job_id)
-        pending["event_id"] = due["event_id"]
-        await notices.enqueue_notification(loop, task_runtime.actor(parent), due["event_id"])
-        summary = await decisions_summary(manager, task_runtime.actor(parent), due["event_id"])
-        route = summary["notification"]["original_owner"]
-        assert route["kind"] == "workflow_node" and route["node"]["node_id"] == "BUILD"
-        assert route["workflow_job_id"] == state["handles"][0].job_id and model.counts["REVIEW"] == 0
-        await loop.flush_follow_ups(parent)
-        effect = await effects.apply(manager, task_runtime.actor(parent), due["event_id"])
-        assert effect["status"] == "input_enqueued" and model.counts["REVIEW"] == 0
-        release.set()
-        await asyncio.wait_for(state["handles"][0].task, 8)
-        assert (await manager.get_job(task_runtime.actor(parent), state["handles"][0].job_id)).outcome == "succeeded"
-        assert model.counts["REVIEW"] == 1
-        assert (await manager.get_job(task_runtime.actor(parent), registration.job.control_owner_job_id)).outcome == "succeeded"
-        assert (await manager.get_job(task_runtime.actor(parent), registration.job.job_id)).outcome == "succeeded"
-        assert (await effects.apply(manager, task_runtime.actor(parent), due["event_id"]))["effect_status"] == "handled"
-    finally:
-        for registration in registered:
-            timer = await manager.get_job(task_runtime.actor(parent), registration.job.job_id)
-            if timer.outcome is None:
-                await manager.request_cancel(task_runtime.actor(parent), registration.job.job_id, system_key="node-effects-cleanup", reason="cleanup")
-                await manager.record_unstarted_result(task_runtime.actor(registration.job.created_by_session_id), registration.job.job_id,
-                    outcome="cancelled", result={"reason": "test cleanup"})
-        release.set()
 
 
 async def decisions_summary(manager, actor, event_id):
@@ -423,33 +348,3 @@ async def test_cancelled_wait_cannot_be_rewritten_as_success_after_child_consume
                 result={"final_text": result.final_text}, resource_state="stopped")
     timer = await c.manager.get_job(c.main, h.registration.job.job_id)
     assert timer.cancel_requested_at is not None and timer.outcome is None
-
-
-@pytest.mark.parametrize("fault", ["key", "caller", "target", "restore_operation", "workflow", "node"])
-async def test_native_restore_system_input_keeps_its_own_verified_historical_authority(native_restore, fault):
-    c = native_restore
-    handle = await c.restore()
-    await asyncio.wait_for(handle.task, 8)
-    assert (await c.manager.get_job(c.actor, handle.job_id)).outcome == "succeeded"
-    events = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='nudge' AND call_ref_json IS NULL")
-    [event] = [e for e in events if json.loads(e["payload_json"])["request"]["node"]["node_id"] == "BUILD"]
-    async with c.manager._write() as tx:
-        await effects.validate_input(c.manager, tx, c.actor, event)
-    payload = json.loads(event["payload_json"])
-    if fault == "key":
-        event["operation_key"] = "forged"
-    elif fault == "caller":
-        event["caller_session_id"] = c.parent
-    elif fault == "target":
-        payload["request"]["target"]["generation"] = True
-    elif fault == "restore_operation":
-        payload["request"]["restore_operation_id"] = "fake"
-    elif fault == "workflow":
-        payload["request"]["workflow"]["generation"] = True
-    else:
-        payload["request"]["node"]["node_id"] = "wrong-node"
-    event["payload_json"] = _json(payload)
-    event["request_hash"] = _hash(payload["request"])
-    async with c.manager._write() as tx:
-        with pytest.raises(JobError):
-            await effects.validate_input(c.manager, tx, c.actor, event)

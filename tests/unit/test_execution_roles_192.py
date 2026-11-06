@@ -9,13 +9,11 @@ import pytest
 from power_loop import AgentLoopConfig, AgentSpec, SessionStore, StatefulAgentLoop, ToolDefinition
 from power_loop.core.agent_context import reset_session_id, set_session_id
 from power_loop.runtime import delegation
-from power_loop.runtime.execution_roles import session_role
 from power_loop.runtime.pricing import Free
-from power_loop.runtime.spec import run_agent_spec, workflow_continuation_loop
+from power_loop.runtime.spec import run_agent_spec
 from power_loop.runtime.tool_contracts import FunctionRuntimeTool, ToolRuntimeContract
 from power_loop.tools.registry import ToolRegistry
 from power_loop.workflow import create_workflow
-from power_loop.workflow.engine import InProcessExecutor
 
 from .test_async_task_faults_192 import ControlledModel
 
@@ -57,21 +55,6 @@ def spec(**kwargs):
     return AgentSpec(name="audit", system_prompt="ROLE-A", lifecycle="linked", max_rounds=2, **kwargs)
 
 
-async def test_child_role_overrides_authored_metadata_and_filters_inherited_tools(runtime):
-    store, loop, _, _ = runtime
-    child = await run_agent_spec(spec(metadata={"execution_role": "main"}), "audit", parent_loop=loop)
-    sid = child["session_id"]
-    assert await session_role(store, sid) == "subagent"
-    contract = await store.get_runtime_state(sid, "workflow_execution_contract")
-    assert contract["tools"] == ["local_read"] and contract["delegation_policy"] == "single_level"
-    assert loop.tool_registry.has("spawn_agent")  # Parent registry was not mutated.
-    assert loop.tool_registry.has("schedule_wakeup")
-    assert loop.tool_registry.has("wait_handoff")
-    # Even a subsequently weaker parent/config cannot widen the saved child policy.
-    loop.config = replace(loop.config, delegation_policy="legacy")
-    restored = await workflow_continuation_loop(loop, sid)
-    assert restored.config.delegation_policy == "single_level"
-    assert restored.tool_registry.names() == ["local_read"]
 
 
 @pytest.mark.parametrize("operation", ["spawn", "nudge", "workflow", "fake-node"])
@@ -99,26 +82,6 @@ async def test_direct_dispatch_cannot_bypass_child_role(runtime, operation):
         reset_session_id(token)
 
 
-async def test_workflow_node_can_delegate_and_role_survives_driver_cleanup(runtime):
-    store, loop, _, _ = runtime
-    driver = await store.create_session(metadata={"kind": "wf_driver"})
-    result = await InProcessExecutor().run_agent(spec(), "node", parent_loop=loop, driver_sid=driver)
-    node_sid = result["session_id"]
-    assert await session_role(store, node_sid) == "workflow_node"
-    await store.close_session(driver, cascade=False)
-    assert (await store.get_session(node_sid)).parent_session_id is None
-    assert await session_role(store, node_sid) == "workflow_node"
-    node = await workflow_continuation_loop(loop, node_sid)
-    assert node.tool_registry.has("spawn_agent") and not node.tool_registry.has("workflow")
-    assert not node.tool_registry.has("schedule_wakeup")
-    token = set_session_id(node_sid)
-    try:
-        receipt = await delegation.start(node, spec(), "audit")
-        own = [t for t in delegation._TASKS if t.get_name() == "subagent-" + receipt["run_id"]]
-        await asyncio.wait_for(asyncio.gather(*own), 3)
-        assert await session_role(store, receipt["session_id"]) == "subagent"
-    finally:
-        reset_session_id(token)
 
 
 @pytest.mark.parametrize("metadata", [{}, {"execution_role": "main"}])
@@ -141,15 +104,6 @@ async def test_host_config_factory_cannot_widen_child_delegation_policy(runtime)
     assert contract["tools"] == ["local_read"] and contract["delegation_policy"] == "single_level"
 
 
-async def test_corrupt_saved_policy_fails_closed_during_restore(runtime):
-    store, loop, _, _ = runtime
-    child = await run_agent_spec(spec(), "audit", parent_loop=loop)
-    sid = child["session_id"]
-    contract = await store.get_runtime_state(sid, "workflow_execution_contract")
-    contract["delegation_policy"] = "typo"
-    await store.set_runtime_state(sid, "workflow_execution_contract", contract)
-    with pytest.raises(ValueError, match="invalid_saved"):
-        await workflow_continuation_loop(loop, sid)
 
 
 async def test_mutated_invalid_host_policy_cannot_silently_disable_dispatch_guard(runtime):

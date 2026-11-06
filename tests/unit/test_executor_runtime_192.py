@@ -11,24 +11,13 @@ from power_loop.runtime.jobs import JobError
 from power_loop.runtime.task_runtime import TaskRuntime
 
 from .test_job_registry_192 import registry_store
-from .test_node_resume_192 import ready_node
-from .test_node_resume_192 import test_finished_leaf_resumes_same_job_sid_before_downstream as verify_node
 from .test_subagent_resume_192 import ready
 from .test_subagent_resume_192 import (
     test_original_job_and_session_resume_once_with_distinct_results_and_usage as verify_agent,
 )
 from .test_task_runtime_192 import finish, managed
-from .test_workflow_bound_restore_192 import bound_restore
-from .test_workflow_bound_restore_192 import (
-    test_original_pool_and_node_identities_survive_two_restorations_without_replay_charge as verify_bound,
-)
-from .test_workflow_restore_runtime_192 import native_restore
-from .test_workflow_restore_runtime_192 import (
-    test_original_workflow_and_nodes_recompute_and_main_consumes_only_new_revision as verify_workflow,
-)
-from .test_workflow_task_runtime_192 import managed_workflow
 
-__all__ = ["registry_store", "ready_node", "ready", "managed", "managed_workflow", "native_restore", "bound_restore"]
+__all__ = ['registry_store', 'ready', 'managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -72,22 +61,10 @@ async def test_registered_agent_original_resume_keeps_identity_and_canonical_usa
     await assert_registered_scopes(ready.manager, ready.runtime.actor(ready.parent))
 
 
-@pytest.mark.parametrize("fault", ["none", "admission_ack", "dispatch_ack"])
-async def test_registered_live_node_resume_keeps_owner_and_scope_history(
-    ready_node, managed_workflow, monkeypatch, fault
-):
-    await verify_node(ready_node, managed_workflow, monkeypatch, fault)
-    await assert_registered_scopes(ready_node.manager, ready_node.runtime.actor(ready_node.parent))
 
 
-async def test_registered_whole_workflow_restores_original_scopes(native_restore):
-    await verify_workflow(native_restore)
-    await assert_registered_scopes(native_restore.manager, native_restore.runtime.actor(native_restore.parent))
 
 
-async def test_registered_bound_workflow_retains_original_pool_through_two_restorations(bound_restore):
-    await verify_bound(bound_restore)
-    await assert_registered_scopes(bound_restore.manager, bound_restore.runtime.actor(bound_restore.parent))
 
 
 async def test_registered_runtime_drain_stops_original_child_and_rejects_new_paid_send(managed):
@@ -109,87 +86,6 @@ async def test_registered_runtime_drain_stops_original_child_and_rejects_new_pai
     assert child.supervision_status == "open"
 
 
-@pytest.mark.parametrize("during_failure_write", [False, True, "before_commit"])
-async def test_boot_expiry_before_node_commit_cannot_advance_review_or_lose_completed_output(
-    managed_workflow, monkeypatch, during_failure_write
-):
-    _, manager, runtime, loop, model, sid, state, _ = managed_workflow
-    model.hold = set()
-    record = runtime.record_scope
-    usage = manager.execution_usage
-    first_read = []
-
-    async def pause_first_read(actor, job_id, **kwargs):
-        local = next((v for v in runtime._local_executions.values() if v["binding"].lease.job_id == job_id), None)
-        if (
-            during_failure_write == "before_commit"
-            and not first_read
-            and local
-            and local["binding"].stop_renewal.is_set()
-        ):
-            row = await manager._row(manager.db, job_id)
-            if row["kind"] == "workflow_node":
-                first_read.append(job_id)
-                await asyncio.sleep(1.1)
-        return await usage(actor, job_id, **kwargs)
-
-    monkeypatch.setattr(manager, "execution_usage", pause_first_read)
-
-    async def expire_at_commit(binding, result):
-        if result.get("node_id") == "BUILD" and result.get("status") == "completed":
-            identity = registry.ExecutorIdentity(
-                runtime.tenant_id, runtime.principal_id, runtime.executor_id, runtime.boot_id
-            )
-            boot = await registry.get(manager, identity)
-            monkeypatch.setattr(manager, "now", lambda: boot["lease_until_ms"] + 1)
-        return await record(binding, result)
-
-    monkeypatch.setattr(runtime, "record_scope", expire_at_commit)
-    record_result = manager.record_execution_result
-    failed_writes = []
-
-    async def slow_failure_write(actor, lease, **kwargs):
-        if (
-            during_failure_write is True
-            and kwargs["outcome"] == "failed"
-            and kwargs["result"].get("node_id") == "BUILD"
-        ):
-            failed_writes.append(lease.job_id)
-            # Allow the original workflow heartbeat to observe the expired
-            # clock while the node's original negative result write is in flight.
-            await asyncio.sleep(1)
-        return await record_result(actor, lease, **kwargs)
-
-    monkeypatch.setattr(manager, "record_execution_result", slow_failure_write)
-    await loop.send("run", sid)
-    await asyncio.wait_for(state["handles"][0].task, 8)
-    assert model.counts["BUILD"] == 1 and model.counts["REVIEW"] == 0
-    [row] = await manager.db.fetchall(f"SELECT job_id FROM {manager.jobs} WHERE kind='workflow_node'")
-    build = await manager.get_job(runtime.actor(sid), row["job_id"])
-    assert build.outcome == "failed" and build.result["text"] == "PROOF-42"
-    assert build.result["usage"]["total_tokens"] == 10
-    workflow = await manager.get_job(runtime.actor(sid), state["handles"][0].job_id)
-    assert workflow.outcome == "failed" and workflow.result["usage"]["total_tokens"] == 10
-    assert workflow.result["results"]["BUILD"]["text"] == "PROOF-42"
-    assert workflow.result["results"]["BUILD"]["usage"]["total_tokens"] == 10
-    assert not any("KeyError" in error for error in workflow.result["errors"])
-    if during_failure_write is True:
-        assert failed_writes == [build.job_id]
-        assert workflow.result["supervision_error"] in ("execution_lease_expired", "executor_lease_expired")
-        assert workflow.result["execution_status"] == "cancelled"
-    if during_failure_write == "before_commit":
-        assert first_read == [build.job_id]
-        assert build.result["supervision_error"] == workflow.result["supervision_error"]
-        assert build.result["supervision_error"] in ("execution_lease_expired", "executor_lease_expired")
-    # Returning the workflow result does not imply its separate exit-checkpoint
-    # writer has finished. Await actual retained tasks before dropping PG tables.
-    async with asyncio.timeout(5):
-        while runtime._adapter_tasks:
-            await asyncio.gather(*tuple(runtime._adapter_tasks))
-        checkpoint = await runtime.flush_control_checkpoints()
-    assert checkpoint == {"controller_retirement_pending": 0, "controller_task_exit_pending": 0,
-                          "execution_checkpoint_pending": 0}
-    assert not runtime._adapter_tasks
 
 
 @pytest.mark.parametrize("cause", ["executor_lease_expired", "lease_expired", "cancel_requested"])

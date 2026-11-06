@@ -8,17 +8,14 @@ from dataclasses import asdict
 import pytest
 
 from power_loop.runtime import execution_membership, root_context, task_sessions
-from power_loop.runtime.jobs import JobError, JobManager
+from power_loop.runtime.jobs import JobManager
 
 from .test_job_registry_192 import call, registry_store
 from .test_job_registry_192 import runtime as registry_runtime
 from .test_root_context_192 import root_case
 from .test_send_sql_profile import Profiled
-from .test_workflow_controller_192 import unbound
-from .test_workflow_restore_plan_192 import finished, preview
-from .test_workflow_task_runtime_192 import managed_workflow
 
-__all__ = ["registry_store", "registry_runtime", "root_case", "unbound", "managed_workflow"]
+__all__ = ['registry_store', 'registry_runtime', 'root_case']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -57,69 +54,12 @@ async def test_membership_usage_and_call_lookup_have_no_control_writer(registry_
     assert await originals(manager) == before
 
 
-async def test_workflow_profile_has_no_control_writer(registry_runtime, monkeypatch):
-    from power_loop.runtime import workflow_profile
-
-    from .test_workflow_profile_192 import spec
-
-    _, manager, actor, _, parent, _, _ = registry_runtime
-    request = workflow_profile.creation_request(spec(), None)
-    child = await manager.register_job(actor, kind="workflow", parent=parent, independent=True,
-        system_key="read-profile", request=request)
-    before = await originals(manager)
-    with monkeypatch.context() as patch:
-        patch.setattr(manager, "_write", forbidden_writer)
-        profile = await manager.get_workflow_profile(actor, child.job.job_id)
-        assert profile == request["execution_profile"]
-    assert await originals(manager) == before
 
 
-async def test_frozen_workflow_controller_has_no_control_writer(unbound, monkeypatch):
-    c = unbound
-    await c.manager.bind_workflow_driver(c.actor, c.proof, c.sid)
-    before = await originals(c.manager)
-    with monkeypatch.context() as patch:
-        patch.setattr(c.manager, "_write", forbidden_writer)
-        data = await c.manager.get_workflow_controller(c.actor, c.proof.job_id, 1)
-        assert data["workflow"] == asdict(c.proof) and data["session_id"] == c.sid
-    assert await originals(c.manager) == before
 
 
-async def test_full_restore_preview_uses_a_read_port_and_does_not_dispatch(managed_workflow, monkeypatch):
-    _, manager, _, _, model, _, _, _ = managed_workflow
-    handle = await finished(managed_workflow)
-    before, calls = await originals(manager), model.counts.copy()
-    with monkeypatch.context() as patch:
-        patch.setattr(manager, "_write", forbidden_writer)
-        plan = await preview(managed_workflow)
-        assert plan["workflow"]["job_id"] == handle.job_id
-        assert plan["dependency"]["invalidated"] == ["BUILD", "REVIEW"] and plan["replay"] == []
-    assert await originals(manager) == before and model.counts == calls
 
 
-async def test_rejected_delivery_verification_cannot_create_an_original_even_if_its_caller_commits(managed_workflow):
-    from power_loop.runtime import workflow_results
-
-    _, manager, runtime, _, model, sid, _, _ = managed_workflow
-    handle = await finished(managed_workflow)
-    removed = await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? "
-        "AND event_type IN ('workflow_delivery','workflow_projected')", (handle.job_id,))
-    assert len(removed) == 2
-    await manager.db.execute(f"DELETE FROM {manager.events} WHERE job_id=? "
-        "AND event_type IN ('workflow_delivery','workflow_projected')", (handle.job_id,))
-    before, calls = await originals(manager), model.counts.copy()
-    try:
-        # Catch the rejection inside a real caller transaction, so an accidental
-        # preparation write could commit rather than being hidden by rollback.
-        async with manager.joined_write() as tx:
-            with pytest.raises(JobError, match="workflow_projection_unsettled"):
-                await workflow_results.require_closed(manager, tx, runtime.actor(sid), handle.job_id, 1)
-        assert await originals(manager) == before and model.counts == calls
-    finally:
-        for event in removed:
-            columns = tuple(event)
-            await manager.db.execute(f"INSERT INTO {manager.events} ({','.join(columns)}) "
-                f"VALUES ({','.join('?' for _ in columns)})", tuple(event[key] for key in columns))
 
 
 async def test_root_provenance_and_owned_transcript_bindings_have_no_control_writer(root_case, monkeypatch):

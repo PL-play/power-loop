@@ -2,23 +2,16 @@
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 
-from power_loop import ToolDefinition
 from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import delegation, model_attempts
-from power_loop.runtime import timer_waits as waits
-from power_loop.runtime.invocation import current_invocation
-from power_loop.runtime.pricing import Free
-from power_loop.runtime.task_runtime import _SEND
 
 from .test_job_registry_192 import registry_store
 from .test_owner_waits_192 import original
-from .test_workflow_task_runtime_192 import leaf, managed_workflow
 
-__all__ = ["registry_store", "original", "managed_workflow"]
+__all__ = ['registry_store', 'original']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -130,63 +123,6 @@ async def test_deadline_then_shutdown_retains_the_same_uncooperative_request(ori
         await original.runtime.shutdown(timeout_s=2)
 
 
-async def test_native_node_short_policy_does_not_run_downstream_or_retry_business(managed_workflow, monkeypatch):
-    store, manager, runtime, loop, model, parent, state, _ = managed_workflow
-    model.hold = set()
-    runtime.lease_ms = 30000
-    state["on_complete"] = None
-    state["spec"] = {"name": "short-original-node", "root": {"type": "sequence",
-        "steps": [leaf("BUILD", tools=["arm_wait"]), leaf("REVIEW")]}}
-    registrations = []
-    started, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    complete = model.complete
-
-    async def arm():
-        source, sid = _SEND.get(), get_session_id()
-        seq, call_id = current_invocation(sid)
-        now = manager.now()
-        registrations.append(await waits.register_wait(manager, runtime.actor(sid), caller=source.lease,
-            call_ref=await store.message_ref(sid, seq), tool_call_id=call_id,
-            request=waits.WaitRequest(now + 250, "Review original node", "Continue original node"),
-            policy=waits.WaitPolicy(now + 1200)))
-        return "Original policy armed."
-
-    loop.tool_registry.register(ToolDefinition(name="arm_wait", description="Arm original node policy",
-        input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), arm)
-
-    async def in_progress(request, **kwargs):
-        response = await complete(request, **kwargs)
-        if "ROLE-BUILD" in (request.system_prompt or ""):
-            if model.counts["BUILD"] == 1:
-                response.raw_text = ""
-                response.tool_calls = [{"id": "node-policy", "type": "function", "function": {
-                    "name": "arm_wait", "arguments": json.dumps({})}}]
-            else:
-                started.set()
-                try:
-                    await release.wait()
-                except asyncio.CancelledError:
-                    cancelled.set()
-                    raise
-        return response
-
-    monkeypatch.setattr(model, "complete", in_progress)
-    try:
-        await loop.send("Run original workflow", parent)
-        await asyncio.wait_for(started.wait(), 3)
-        await asyncio.wait_for(cancelled.wait(), 2.5)
-        [handle] = state["handles"]
-        await asyncio.wait_for(asyncio.shield(handle.task), 5)
-        [registration] = registrations
-        owner = await manager.get_job(runtime.actor(parent), registration.job.control_owner_job_id)
-        assert owner.outcome == "timed_out" and owner.resource_state == "unknown", owner
-        assert owner.supervision_status == "open" and owner.cancel_requested_at is None
-        assert model.counts["BUILD"] == 2 and model.counts["REVIEW"] == 0
-        workflow = await manager.get_job(runtime.actor(parent), handle.job_id)
-        assert workflow.outcome == "failed" and workflow.resource_state == "unknown"
-        assert workflow.result["results"]["BUILD"]["status"] == "timed_out"
-    finally:
-        release.set()
 
 
 async def test_lost_original_dispatch_ack_keeps_one_request_and_original_deadline(original, monkeypatch):

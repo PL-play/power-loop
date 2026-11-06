@@ -8,6 +8,20 @@
 
 ## 10.0.0 — 2026-10-30
 
+- **Unreleased design 203 P4:** workflow driver and leaves execute in independent
+  sessions through Runtime. Replacement drivers reuse persisted dispatches and
+  original results; unknown external actions are not automatically replayed.
+- **Breaking workflow API:** use `client.workflow(target, spec, message_id=..., actor=...)`
+  or `create_workflow(..., client=..., target=..., actor=..., message_id=...)`.
+  Handles contain durable references; explicit resume takes a generation and node.
+  Remove parent-loop execution, local completion callbacks/registries, eager wake,
+  detached/wait/sync input flags, executor/budget factories, SubprocessExecutor,
+  WorkerBootstrap/WorkerLauncher, and private-leaf `AgentResult.db_path`.
+- Ordinary sends retain one canonical result; completion checks actual children,
+  result handling and unsettled fees. No model/supervision closure events are written.
+  Schema 15/protocol 42 now require a session for every job. No migration path.
+  Source remains 10.0.0 until the P7 version/export handoff; independent G4 is pending.
+
 - **Unreleased design 203 P3-R1:** rejected answer/resume claims terminate their
   unbound input so later sends can proceed without changing the original result.
   Running background tools and commands retain their Runtime capacity slot;

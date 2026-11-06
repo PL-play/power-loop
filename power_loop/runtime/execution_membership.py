@@ -5,6 +5,7 @@ import json
 from dataclasses import asdict
 
 from .jobs import KINDS, JobError, JobLease, _hash, _json
+from .result_revisions import result_id
 
 
 def _generation(value):
@@ -25,8 +26,8 @@ def member_id(manager, job_id, generation):
     return _id(manager, "member", job_id, generation)
 
 
-def seal_id(manager, job_id, generation):
-    return _id(manager, "members_sealed", job_id, generation)
+def proof(row):
+    return asdict(JobLease(row["job_id"], row["executor_id"], row["boot_id"], row["generation"]))
 
 
 def _object(raw):
@@ -87,24 +88,13 @@ def _remember(manager, name, key, value):
         cache.popitem(last=False)
 
 
-async def _completed_scope(manager, reader, job_id, generation):
-    rows = await reader.fetchall(f"SELECT payload_json FROM {manager.events} "
-        "WHERE job_id=? AND event_type='supervision_closed' ORDER BY job_version DESC", (job_id,))
-    for row in rows:
-        data = _object(row['payload_json'])
-        if data['scope']['generation'] == generation:
-            return data['execution_scope']
-    return None
-
-
 async def scope(manager, reader, job_id, generation):
     # Scope events are immutable; one written or validated here is not reread.
     known = _trusted(manager, "_membership_scopes", (job_id, generation))
     if known is not None:
         return json.loads(known)
     row = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (scope_id(manager, job_id, generation),))
-    data = (await _completed_scope(manager, reader, job_id, generation) if row is None
-            else _event(row, job_id, "execution_scope"))
+    data = _event(row, job_id, "execution_scope") if row else None
     if data is None:
         raise JobError("execution_membership_missing")
     proof = _lease(data.get("lease"))
@@ -119,7 +109,7 @@ async def scope(manager, reader, job_id, generation):
             any(data.get(k) is not None and (not isinstance(data[k], str) or not 0 < len(data[k]) <= 64) for k in ("parent_job_id", "session_id"))):
         raise JobError("execution_membership_corrupt")
     if data["owner"] is not None:
-        _lease(data["owner"])
+        _generation(data["owner"]["generation"])
     if data["version"] == 2 and row is not None:
         from .executor_registry import validate_binding
         await validate_binding(manager, reader, data)
@@ -131,20 +121,8 @@ async def scope(manager, reader, job_id, generation):
 
 
 async def require_current(manager, tx, row):
-    saved = await read(manager, tx, row, row["generation"])
-    if not saved["sealed"]:
-        raise JobError("execution_membership_unsealed")
-    # Resuming cannot make incomplete/corrupt historical descendants disappear.
-    await usage(manager, tx, row, row["generation"])
-    data = saved["scope"]
-    current = _snapshot(row, data["owner"])
-    if (data["owner"]["job_id"] if data["owner"] else None) != row["control_owner_job_id"]:
-        raise JobError("execution_membership_mismatch")
-    # A workflow driver is bound after claim; the execution lease/ownership is
-    # immutable independently of that deferred physical-session binding.
-    normalized = {k: v for k, v in data.items() if k != "executor_binding"}
-    normalized["version"] = 1
-    if _hash({k: v for k, v in normalized.items() if k != "session_id"}) != _hash({k: v for k, v in current.items() if k != "session_id"}):
+    data = await scope(manager, tx, row["job_id"], row["generation"])
+    if data["lease"]["generation"] != row["generation"] or data["session_id"] != row["session_id"]:
         raise JobError("execution_membership_mismatch")
     return data
 
@@ -163,25 +141,16 @@ async def _insert(manager, tx, event_id, job_id, kind, version, payload):
 async def start(manager, tx, row):
     """Atomic with claim/admission; no execution capability is granted here."""
     owner_row = await manager._row(tx, row["control_owner_job_id"]) if row["control_owner_job_id"] else None
-    owner = (asdict(JobLease(owner_row["job_id"], owner_row["executor_id"], owner_row["boot_id"], owner_row["generation"]))
-             if owner_row else None)
+    owner = ({"job_id": owner_row["job_id"], "generation": owner_row["generation"]} if owner_row else None)
     data = _snapshot(row, owner)
     if row["executor_key"] is not None:
         from .executor_registry import registration_binding
         data["version"] = 2
         data["executor_binding"] = await registration_binding(manager, tx, row)
     _lease(data["lease"])
-    if data["owner"] is not None:
-        owner = _lease(data["owner"])
-        parent = await scope(manager, tx, owner["job_id"], owner["generation"])
-        if (_hash(parent["lease"]) != _hash(owner) or
-                (parent["tenant_id"], parent["principal_id"]) != (data["tenant_id"], data["principal_id"])):
-            raise JobError("execution_membership_mismatch")
-        if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (seal_id(manager, owner["job_id"], owner["generation"]),)):
-            raise JobError("execution_membership_closed")
-        owner_row = await manager._row(tx, owner["job_id"])
-        await _insert(manager, tx, member_id(manager, row["job_id"], row["generation"]), owner["job_id"], "execution_member", owner_row["version"],
-            {"version": 1, "owner": owner, "member": data["lease"]})
+    if owner is not None:
+        await _insert(manager, tx, member_id(manager, row["job_id"], row["generation"]), owner["job_id"],
+            "execution_member", owner_row["version"], {"version": 1, "owner": owner, "member": data["lease"]})
     await _insert(manager, tx, scope_id(manager, row["job_id"], row["generation"]), row["job_id"], "execution_scope", row["version"], data)
     _remember_after_commit(manager, tx, "_membership_scopes", (row["job_id"], row["generation"]), _json(data))
 
@@ -247,78 +216,36 @@ async def members(manager, reader, data):
     result = []
     for row in rows:
         payload = _event(row, proof["job_id"], "execution_member")
-        owner, member = _lease(payload.get("owner")), _lease(payload.get("member"))
+        owner, member = payload["owner"], _lease(payload["member"])
         if owner["job_id"] != proof["job_id"] or row["event_id"] != member_id(manager, member["job_id"], member["generation"]):
             raise JobError("execution_membership_corrupt")
         if owner["generation"] != proof["generation"]:
             continue
-        if _hash(owner) != _hash(proof) or _hash(payload) != _hash({"version": 1, "owner": owner, "member": member}):
-            raise JobError("execution_membership_corrupt")
+
         result.append({"event_id": row["event_id"], "payload": payload})
     return result
 
 
 async def closed_model(manager, reader, data):
     proof = data["lease"]
-    row = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", ("model_closed_"+proof["job_id"],))
+    row = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (result_id(proof["job_id"], proof["generation"]),))
     if row is None:
         return None
-    payload = _event(row, proof["job_id"], "model_closed")
+    payload = _object(row["payload_json"])
     if (data["kind"] != "send" or type(payload.get("generation")) is not int or payload["generation"] != proof["generation"] or
             not isinstance(payload.get("evidence"), dict) or not isinstance(payload["evidence"].get("usage", {}), dict)):
         raise JobError("execution_membership_corrupt")
     return {"event_id": row["event_id"], "hash": _hash(payload), "payload": payload}
 
 
-async def seal(manager, tx, row, *, model=None):
-    """Freeze admitted direct members, not final supervision or provider costs.
-
-    ``model`` is the model_closed fact written by the caller in this transaction.
-    """
-    if row["supervision_status"] == "closed":
-        return
-    key = (row["job_id"], row["generation"])
-    if _trusted(manager, "_membership_scopes", key) is None:
-        anchor = await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (scope_id(manager, *key),))
-        if anchor is None:
-            return  # Preserve exit evidence for uninstrumented legacy executions.
-    data = await scope(manager, tx, *key)
-    edges = [] if childless(manager, row["job_id"]) else await members(manager, tx, data)
-    if model is None:
-        model = await closed_model(manager, tx, data)
-    sealed = {"version": 1, "lease": data["lease"], "members_hash": _hash(edges),
-              "model": {k: model[k] for k in ("event_id", "hash")} if model else None}
-    await _insert(manager, tx, seal_id(manager, *key), row["job_id"], "execution_membership_seal", row["version"]+1, sealed)
-    _remember_after_commit(manager, tx, "_membership_reads", key, _json(
-        {"scope": data, "members": edges, "sealed": True, "model": model}))
-
-
 async def read(manager, reader, row, generation):
-    known = _trusted(manager, "_membership_reads", (row["job_id"], generation))
-    if known is not None:
-        saved = json.loads(known)
-        if (saved["scope"]["tenant_id"], saved["scope"]["principal_id"]) != (row["tenant_id"], row["principal_id"]):
-            raise JobError("execution_membership_mismatch")
-        return saved
     data = await scope(manager, reader, row["job_id"], generation)
     if (data["tenant_id"], data["principal_id"]) != (row["tenant_id"], row["principal_id"]):
         raise JobError("execution_membership_mismatch")
-    edges, model = await members(manager, reader, data), await closed_model(manager, reader, data)
-    sealed = await reader.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (seal_id(manager, row["job_id"], generation),))
-    if sealed:
-        expected = {"version": 1, "lease": data["lease"], "members_hash": _hash(edges),
-            "model": {k: model[k] for k in ("event_id", "hash")} if model else None}
-        if _hash(_event(sealed, row["job_id"], "execution_membership_seal")) != _hash(expected):
-            raise JobError("execution_membership_corrupt")
-    elif await _completed_scope(manager, reader, row["job_id"], generation) is not None:
-        return {"scope": data, "members": edges, "sealed": True, "model": model}
-    elif model is not None:
-        raise JobError("execution_membership_missing")
-    else:
-        from .result_revisions import result_id
-        if await reader.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (result_id(row["job_id"], generation),)):
-            raise JobError("execution_membership_missing")
-    return {"scope": data, "members": edges, "sealed": sealed is not None, "model": model}
+    model = await closed_model(manager, reader, data) if data["kind"] == "send" else None
+    result = model or await reader.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?",
+                                           (result_id(row["job_id"], generation),))
+    return {"scope": data, "members": await members(manager, reader, data), "sealed": result is not None, "model": model}
 
 
 async def get(manager, actor, job_id, generation):
@@ -338,7 +265,7 @@ async def usage(manager, tx, row, generation):
         for item, owner in pending:
             data = item["scope"]
             key = (data["lease"]["job_id"], data["lease"]["generation"])
-            if key in seen or (owner is not None and _hash(data["owner"]) != _hash(owner)):
+            if key in seen or (owner is not None and data["owner"]["job_id"] != owner["job_id"]):
                 raise JobError("invalid_execution_membership")
             seen.add(key)
             if item["model"] is not None:

@@ -26,9 +26,8 @@ from power_loop.runtime.store.factory import open_store
 from power_loop.runtime.task_runtime import TaskRuntime
 from tests.real._llm import make_llm
 from tests.unit.test_job_registry_192 import registry_store
-from tests.unit.test_workflow_task_runtime_192 import managed_workflow
 
-__all__ = ["registry_store", "managed_workflow"]
+__all__ = ['registry_store']
 
 pytestmark = pytest.mark.asyncio
 
@@ -134,8 +133,3 @@ class _Counted:
 async def test_real_summary_model_folds_subagent_repair_send(registry_store, monkeypatch):
     positions = _real_positions(monkeypatch)
     await positions.test_subagent_schema_repair_send_folds_under_the_child_session(registry_store)
-
-
-async def test_real_summary_model_folds_workflow_node_second_send(managed_workflow, monkeypatch):
-    positions = _real_positions(monkeypatch)
-    await positions.test_workflow_node_second_send_folds_under_the_node_session(managed_workflow)

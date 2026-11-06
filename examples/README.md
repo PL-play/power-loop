@@ -40,7 +40,6 @@ A representative subset is validated by `tests/real/test_examples.py` against a 
 | 27 | [`27_dynamic_workflow.py`](27_dynamic_workflow.py) | Declarative multi-agent workflow | `power_loop.workflow`, `WorkflowSpec`, `create_workflow`, `register_workflow_tools` |
 | 28 | [`28_docker_shell_backend.py`](28_docker_shell_backend.py) | **Sandbox**: model-authored bash inside Docker | `ShellBackend`, `RuntimeEnv(shell_backend=…)`, `runtime_env_context` |
 | 29 | [`29_shared_blackboard.py`](29_shared_blackboard.py) | **Coordination**: two agents share a scoped board | `SqliteBlackboard`, `register_blackboard_tools`, `RuntimeEnv(blackboard=…)` |
-| 30 | [`30_subprocess_isolation.py`](30_subprocess_isolation.py) | **Isolation**: each workflow leaf in its own process + DB | `SubprocessExecutor`, `WorkerBootstrap`, `WorkerLauncher` |
 | 31 | [`31_memory_with_compaction.py`](31_memory_with_compaction.py) | Cross-session memory recall alongside the default compactor | `MemoryProvider`, `DefaultCompactor` |
 | 32 | [`32_recall_compacted.py`](32_recall_compacted.py) | Pull back exact turns that compaction folded out | `recall_compacted` tool |
 | 33 | [`33_coordinating_compactor.py`](33_coordinating_compactor.py) | Custom compactor that remembers must-keep detail before folding | `CompactionContext`, `Compactor` |

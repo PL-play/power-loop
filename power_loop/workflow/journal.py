@@ -1,343 +1,79 @@
-"""Durable journal for workflow runs (D2).
-
-Persists a run's status + per-step records into the existing
-``session_runtime_state`` table via ``SessionStore.set/get_runtime_state`` —
-**no new core tables**. Everything is keyed on the *parent* agent session (the
-session that created the workflow): that session outlives the workflow's driver
-session and is the one the completion wake targets, so introspection reads from
-one place.
-
-Layout (per parent session):
-
-* ``workflow:run:<run_token>`` → one journal blob per run (status, steps, result).
-* ``workflow:index``         → ``list[run_id]`` so runs can be enumerated
-  (``SessionStore`` has no list-by-prefix / query-by-metadata).
-
-Caveats baked in here:
-
-* ``get_runtime_state`` cannot tell "absent" from a stored JSON ``null`` — so we
-  never store a meaningful ``null`` (status is always a string, lists default to
-  ``[]``).
-* Every blob mutation (status/steps/index) is a read-modify-write. Bare
-  ``get_runtime_state`` + ``set_runtime_state`` is NOT safe here: the async store yields
-  the event loop between the read and the write, so concurrent parallel-branch steps (one
-  run) or concurrent ``seed`` calls (the shared index) would lose updates. We therefore
-  funnel every mutation through the store's atomic ``mutate_runtime_state`` (row-locked
-  read-modify-write), which serializes them correctly even across coroutines/processes.
-"""
+"""Frozen run definition and small node references in the existing runtime store."""
 
 from __future__ import annotations
 
-import re
-import time
-from typing import TYPE_CHECKING, Any
+import json
 
-from power_loop.runtime.store.store import MUTATE_SKIP
-
-if TYPE_CHECKING:
-    from power_loop.runtime.store.store import SessionStore
-
-    from .result import WorkflowResult
-
-__all__ = [
-    "JOURNAL_PREFIX",
-    "INDEX_KEY",
-    "run_key",
-    "new_journal",
-    "seed",
-    "read",
-    "update",
-    "record_step",
-    "finalize",
-    "fail",
-    "list_run_ids",
-]
+from power_loop.agent.runtime_types import canonical
 
 JOURNAL_PREFIX = "workflow:run:"
-INDEX_KEY = "workflow:index"
-
-# A run in any of these states is FINISHED: its status/result/steps are frozen. budget_exceeded is
-# a settled outcome too (M-workflow-durability-2): without it the journal stayed writable, so an
-# orphaned sub-agent settling late could still mutate a budget-exhausted run. Resume is unaffected —
-# it flips a terminal run back to "running" via allow_terminal=True.
-_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled", "budget_exceeded"})
+ROUTE_KEY = "\x00workflow_route"
 
 
-def _is_terminal(status: Any) -> bool:
-    return status in _TERMINAL_STATUSES
+def run_key(run_id):
+    return JOURNAL_PREFIX + run_id
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
+def node_key(identity):
+    return "workflow:node:" + identity
 
 
-def _run_token(run_id: str) -> str:
-    """One bounded storage identity for journal and owned history keys."""
-    if re.fullmatch(r"[0-9a-f]{8,64}", run_id):
-        return run_id
-    from power_loop.runtime.jobs import _hash
-    return "sdk_" + _hash(run_id)
+async def put(store, tx, sid, key, value):
+    from power_loop.agent.runtime_store import now_ms
+
+    await tx.execute(
+        store._db.dialect.upsert(
+            store.t.session_runtime_state, ("session_id", "state_key"), ("value_json", "updated_at")
+        ),
+        (sid, key, canonical(value), now_ms()),
+    )
 
 
-def run_key(run_id: str) -> str:
-    return f"{JOURNAL_PREFIX}{_run_token(run_id)}"
+async def get(store, reader, sid, key):
+    row = await reader.fetchone(
+        f"SELECT value_json FROM {store.t.session_runtime_state} WHERE session_id=? AND state_key=?", (sid, key)
+    )
+    return json.loads(row["value_json"]) if row else None
 
 
-def new_journal(
-    run_id: str,
-    workflow: str,
-    driver_sid: str | None = None,
-    spec: dict[str, Any] | None = None,
-    allowed_tools: list[str] | None = None,
-) -> dict[str, Any]:
-    now = _now_ms()
+async def read(store, parent_sid, run_id):
+    from power_loop.runtime.jobs import JobActor, JobManager
+
+    manager = JobManager(store)
+    row = await manager.db.fetchone(
+        f"SELECT j.* FROM {manager.jobs} j JOIN {manager.events} e "
+        "ON e.job_id=j.job_id WHERE e.event_id=? AND e.action='create' AND j.kind='workflow'",
+        ("op_" + run_id,),
+    )
+    if row is None:
+        return None
+    await manager._authorize(manager.db, JobActor(row["tenant_id"], row["principal_id"], parent_sid), row["job_id"])
+    value = await get(store, manager.db, row["session_id"], run_key(run_id))
+    nodes = await manager.db.fetchall(
+        f"SELECT value_json FROM {store.t.session_runtime_state} WHERE session_id=? "
+        "AND state_key LIKE 'workflow:node:%' ORDER BY state_key LIMIT 10001",
+        (row["session_id"],),
+    )
+    if len(nodes) > 10000:
+        from power_loop.agent.runtime_types import CapacityError
+
+        raise CapacityError("workflow node query limit exceeded")
     return {
-        "run_id": run_id,
-        "workflow": workflow,
-        "driver_sid": driver_sid,
-        # The serialized WorkflowSpec (WorkflowSpec.to_dict()) so the run can be
-        # resumed after a process restart without the caller re-supplying it.
-        "spec": spec,
-        # The run's capability clamp (sorted list; null = unrestricted), persisted
-        # so a resume applies the SAME leaf-tool intersection — without it a
-        # resume would silently widen a clamped run's permissions. Absent in
-        # pre-3.14 journals → treated as null (old behavior).
-        "allowed_tools": allowed_tools,
-        "status": "running",
-        "created_at_ms": now,
-        "updated_at_ms": now,
-        "finished_at_ms": None,
-        "woke": False,
-        # Bumped each time the run is (re)started; lets introspection tell a
-        # resumed run from a first run.
-        "attempts": 1,
-        "steps": [],
-        "result": None,
-        "error": None,
+        **value,
+        "nodes": [json.loads(node["value_json"]) for node in nodes],
+        "task_generation": row["generation"],
+        "status": row["status"],
+        "result": json.loads(row["result_json"] or "null"),
     }
 
 
-async def seed(
-    store: SessionStore,
-    parent_sid: str,
-    run_id: str,
-    workflow: str,
-    spec: dict[str, Any] | None = None,
-    allowed_tools: list[str] | None = None,
-) -> dict[str, Any]:
-    """Create the run journal and add it to the parent's run index."""
-    j = new_journal(run_id, workflow, spec=spec, allowed_tools=allowed_tools)
-    await store.set_runtime_state(parent_sid, run_key(run_id), j)
-    await _append_index(store, parent_sid, run_id)
-    return j
+async def list_run_ids(store, parent_sid):
+    from power_loop.runtime.jobs import JobManager
 
-
-async def _append_index(store: SessionStore, parent_sid: str, run_id: str) -> None:
-    def _add(idx: Any) -> list[str]:
-        idx = list(idx or [])
-        if run_id not in idx:
-            idx.append(run_id)
-        return idx
-
-    # Atomic RMW: concurrent seed() calls for different runs all mutate this one shared
-    # index blob; a plain get+set would drop run_ids (lost-update). See module docstring.
-    await store.mutate_runtime_state(parent_sid, INDEX_KEY, _add, default=[])
-
-
-async def read(store: SessionStore, parent_sid: str, run_id: str) -> dict[str, Any] | None:
-    return await store.get_runtime_state(parent_sid, run_key(run_id), default=None)
-
-
-async def update(
-    store: SessionStore,
-    parent_sid: str,
-    run_id: str,
-    *,
-    allow_terminal: bool = False,
-    **fields: Any,
-) -> dict[str, Any] | None:
-    """Read-modify-write a run journal (single-writer; bumps ``updated_at_ms``).
-
-    Once a run is terminal (completed/failed/cancelled) the journal is **frozen**: a
-    late write — e.g. an orphaned sub-agent settling after the run already finalized
-    (H1.2), or a duplicate finalize — must not revert status/result. Callers that
-    legitimately mutate a finished run pass ``allow_terminal=True``: the completion
-    wake's ``woke`` flag, and resume flipping a finished run back to ``running``.
-    """
-    def _apply(j: Any) -> Any:
-        if j is None:
-            return MUTATE_SKIP  # gone
-        if _is_terminal(j.get("status")) and not allow_terminal:
-            return MUTATE_SKIP  # frozen — ignore the late write, first finalize wins
-        j.update(fields)
-        j["updated_at_ms"] = _now_ms()
-        return j
-
-    # Atomic RMW; on skip mutate_runtime_state returns the unchanged current blob
-    # (None when absent, the frozen journal when terminal) — matching the old contract.
-    return await store.mutate_runtime_state(parent_sid, run_key(run_id), _apply, default=None)
-
-
-async def node_start(
-    store: SessionStore, parent_sid: str, run_id: str, *, node_id: str
-) -> None:
-    """Mark a leaf as LIVE in the journal (``live[node_id] = started_at_ms``).
-
-    A single-leaf detached run used to be a black box: ``steps`` only fills as nodes
-    SETTLE, so a 40-minute walkthrough showed ``running, steps: []`` the whole time and
-    every observer concluded it was hung. ``live`` + elapsed is the heartbeat."""
-    def _apply(jn: Any) -> Any:
-        if jn is None or _is_terminal(jn.get("status")):
-            return MUTATE_SKIP
-        live = dict(jn.get("live") or {})
-        if node_id not in live:
-            attempts = dict(jn.get("node_attempts") or {})
-            attempts[node_id] = int(attempts.get(node_id) or 0) + 1
-            jn["node_attempts"] = attempts
-        live[node_id] = _now_ms()
-        jn["live"] = live
-        jn["updated_at_ms"] = _now_ms()
-        return jn
-
-    await store.mutate_runtime_state(parent_sid, run_key(run_id), _apply, default=None)
-
-
-async def node_session(
-    store: SessionStore, parent_sid: str, run_id: str, *, node_id: str, session_id: str
-) -> None:
-    """记下节点的叶子会话（``live_sessions[node_id] = session_id``，6.46）。进程重启后 resume 对没做完、
-    有会话的节点在原会话接着跑，不再从头开新会话（叶子的上下文和半成品都在）。"""
-    def _apply(jn: Any) -> Any:
-        if jn is None or _is_terminal(jn.get("status")):
-            return MUTATE_SKIP
-        ls = dict(jn.get("live_sessions") or {})
-        ls[node_id] = session_id
-        jn["live_sessions"] = ls
-        jn["updated_at_ms"] = _now_ms()
-        return jn
-
-    await store.mutate_runtime_state(parent_sid, run_key(run_id), _apply, default=None)
-
-
-async def record_step(
-    store: SessionStore,
-    parent_sid: str,
-    run_id: str,
-    *,
-    node_id: str,
-    status: str,
-    session_id: str | None = None,
-    usage: dict[str, int] | None = None,
-    error: str | None = None,
-    text: str | None = None,
-    payload: dict[str, Any] | None = None,
-    db_path: str | None = None,
-) -> None:
-    """Append (or replace) a per-step record as the engine progresses.
-
-    ``text`` / ``payload`` capture the step's *output* so a completed step can be
-    replayed (not re-run) on resume and feed downstream ``inputs_from`` /
-    ``items_from`` / ``branch.on`` references. ``db_path`` records an
-    out-of-process leaf's private db so it can be inspected after the fact.
-    """
-    step = {
-        "node_id": node_id,
-        "status": status,
-        "session_id": session_id,
-        "usage": usage or {},
-        "error": error,
-        "text": text or "",
-        "payload": payload,
-        "db_path": db_path,
-    }
-
-    def _merge(j: Any) -> Any:
-        # Gone, or already finalized: a step settling this late (an orphaned sibling
-        # under on_error='halt', H1.2) must not clobber the terminal status/result.
-        if j is None or _is_terminal(j.get("status")):
-            return MUTATE_SKIP
-        # Replace-or-append this node's record (idempotent on replay), merging onto the
-        # freshest blob so a concurrent finalize's status/result is preserved.
-        steps = [s for s in j.get("steps", []) if s.get("node_id") != node_id]
-        steps.append(step)
-        j["steps"] = steps
-        # The node settled — drop its live heartbeat (see node_start).
-        live = dict(j.get("live") or {})
-        if live.pop(node_id, None) is not None:
-            j["live"] = live
-        j["updated_at_ms"] = _now_ms()
-        return j
-
-    # Atomic, row-locked RMW: parallel branches of one run record concurrently, so a
-    # plain get+set would let siblings clobber each other (lost-update). See docstring.
-    await store.mutate_runtime_state(parent_sid, run_key(run_id), _merge, default=None)
-
-
-async def amend_step(
-    store: SessionStore,
-    parent_sid: str,
-    run_id: str,
-    *,
-    node_id: str,
-    status: str,
-    text: str = "",
-    usage: dict[str, int] | None = None,
-    note: str | None = None,
-) -> bool:
-    """宿主显式修正一个**已终局** run 里某节点的记录（6.7.0，for host nudge）。
-
-    与 ``record_step`` 相反：那条路对终局 run 冻结（晚到的写入不许搅局），这条路只在
-    终局后开放——宿主对某叶子原会话补了轮（nudge）之后，把新结果写回 journal，
-    否则日后 resume 会拿旧的 hit_round_limit/failed 记录把该叶子**从头重跑**，
-    清掉续跑成果。run 级 status 不动（历史事实），节点记录附 ``amended`` 标记留审计。
-    返回是否写入（run 不存在或仍在跑 → False）。
-    """
-    wrote = False
-
-    def _merge(j: Any) -> Any:
-        nonlocal wrote
-        if j is None or not _is_terminal(j.get("status")):
-            return MUTATE_SKIP
-        steps = [s for s in j.get("steps", []) if s.get("node_id") != node_id]
-        steps.append({
-            "node_id": node_id, "status": status, "session_id": next(
-                (s.get("session_id") for s in j.get("steps", []) if s.get("node_id") == node_id),
-                None),
-            "usage": usage or {}, "error": None, "text": text or "",
-            "payload": None, "db_path": None,
-            "amended": {"at_ms": _now_ms(), "note": note or "host nudge"},
-        })
-        j["steps"] = steps
-        j["updated_at_ms"] = _now_ms()
-        wrote = True
-        return j
-
-    await store.mutate_runtime_state(parent_sid, run_key(run_id), _merge, default=None)
-    return wrote
-
-
-async def finalize(store: SessionStore, parent_sid: str, run_id: str, result: WorkflowResult) -> None:
-    await update(
-        store,
-        parent_sid,
-        run_id,
-        status=result.status,
-        result=result.to_dict(),
-        finished_at_ms=_now_ms(),
-        error=(result.errors[0] if result.errors else None),
+    manager = JobManager(store)
+    rows = await manager.db.fetchall(
+        f"SELECT e.event_id FROM {manager.jobs} j JOIN {manager.events} e ON e.job_id=j.job_id "
+        "WHERE j.created_by_session_id=? AND j.kind='workflow' AND e.action='create' ORDER BY j.created_at DESC LIMIT 100",
+        (parent_sid,),
     )
-
-
-async def fail(store: SessionStore, parent_sid: str, run_id: str, exc: BaseException) -> None:
-    await update(
-        store,
-        parent_sid,
-        run_id,
-        status="failed",
-        finished_at_ms=_now_ms(),
-        error=f"{type(exc).__name__}: {exc}",
-    )
-
-
-async def list_run_ids(store: SessionStore, parent_sid: str) -> list[str]:
-    return list(await store.get_runtime_state(parent_sid, INDEX_KEY, default=[]) or [])
+    return [row["event_id"][3:] for row in rows]

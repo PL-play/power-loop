@@ -17,7 +17,7 @@ async def continue_before_finish(pipeline, text, round_index):
     pending = await port.db.fetchall(f"SELECT j.job_id,j.generation,e.call_ref_json,e.tool_call_id FROM {manager.jobs} j "
         f"JOIN {manager.jobs} p ON p.job_id=j.parent_job_id "
         f"JOIN {manager.events} e ON e.job_id=j.job_id AND e.action='create' WHERE p.session_id=? "
-        "AND j.kind IN ('background_tool','background_command') AND j.outcome IS NULL LIMIT 1001", (ctx.session_id,))
+        "AND j.kind IN ('background_tool','background_command','subagent') AND j.outcome IS NULL LIMIT 1001", (ctx.session_id,))
     if len(pending) > 1000:
         from power_loop.agent.runtime_types import CapacityError
         raise CapacityError()

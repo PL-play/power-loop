@@ -7,14 +7,12 @@ the task manager's responsibility. No platform imports live here.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import math
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from .background import ACTIVE_STATUSES as ACTIVE
 from .cancellation import CancellationToken
-from .original_owner_review import invoke
 
 FINALIZE_PROMPT = (
     "Your workflow task ended without a final answer. Using only the work and evidence already "
@@ -108,143 +106,3 @@ def _merge(raw, more):
     raw.update(status=more.status, final_text=more.final_text,
         rounds=int(raw.get("rounds") or 0) + int(more.rounds or 0), usage=usage,
         new_input_after_pass=bool(getattr(more, "new_input_after_pass", False)))
-
-
-async def collect_required(loop, raw, stop_event=None, *, window=None, resolve_loop=None, drain_on_error=False):
-    """Collect to a fixed point using one shared time/round window.
-
-    A caller-owned window survives repeated collection within the same node.
-    A continuation resolver is a trusted host port, never a model argument.
-    """
-    from power_loop.workflow.admission import idle
-
-    from . import delegation
-    from .spec import workflow_continuation_loop
-    raw = dict(raw)
-    sid = raw.get("session_id")
-    if not sid:
-        return raw
-    window = window or WINDOW.get() or CompletionWindow()
-    from .completion_windows import bind_window
-    await bind_window(loop, window, sid)
-    token = CancellationToken.from_any(stop_event)
-    if token.is_cancelled():
-        return {**raw, "status": "cancelled", "error": "cancelled during completion settlement"}
-    if not hasattr(loop, "ensure_store"):
-        return raw
-    if window._collecting:
-        return {**raw, "status": "failed", "completion_unresolved": True, "error": "completion collection already running"}
-    window._collecting = True
-    try:
-        async with asyncio.timeout(max(0, window.deadline - asyncio.get_running_loop().time())):
-            window.require_time()
-            store = await loop.ensure_store()
-            while True:
-                if drain_on_error or raw.get("status") == "completed":
-                    await delegation.await_children(store, sid, stop_event,
-                        max(0, window.deadline - asyncio.get_running_loop().time()))
-                if token.is_cancelled():
-                    return {**raw, "status": "cancelled", "error": "cancelled during completion settlement"}
-                if raw.get("status") != "completed":
-                    return raw
-                prompts = []
-                running = await running_background(store, sid) if hasattr(store, "list_background_tasks") else []
-                if running:
-                    async with idle():
-                        rows = await wait_background(store, sid, [r.task_id for r in running],
-                            max(0, window.deadline - asyncio.get_running_loop().time()), stop_event)
-                    if token.is_cancelled():
-                        return {**raw, "status": "cancelled", "error": "cancelled while waiting for background tasks"}
-                    if any(str(row.status) in ACTIVE for row in rows):
-                        raise TimeoutError("background tasks still pending")
-                    lines = [f"- {r.task_id} [{r.status}] {str(r.command or '')[:120]}\n  {str(r.output_tail or '')[-1500:]}" for r in rows]
-                    prompts.append("Your background tasks have settled. Read and use these results to finish the original task:\n" + "\n".join(lines))
-                if not prompts and hasattr(store, "list_unseen_background_updates"):
-                    unseen = await store.list_unseen_background_updates(sid)
-                    if any(str(row.status) not in ACTIVE for row in unseen):
-                        prompts.append("Final background results are available. Process them and finish the original task.")
-                if raw.get("new_input_after_pass"):
-                    prompts.append("Process the new input already in this session and finish the original task. Do not repeat completed actions.")
-                if not prompts:
-                    from .owner_waits import wait_ready
-                    resumed = await wait_ready(loop, raw, stop_event, deadline=window.deadline)
-                    if resumed == "cancelled":
-                        return {**raw, "status": "cancelled", "error": "cancelled during original task wait"}
-                    if resumed == "history":
-                        prompts.append("Process the accepted original input already in this session and finish the original task without repeating completed actions.")
-                pending = (await loop.inbox_pending(sid)).get("pending", 0) if hasattr(loop, "inbox_pending") else 0
-                if not prompts and not pending:
-                    return raw
-                allowance = window.allowance(raw)
-                if allowance <= 0:
-                    return {**raw, "status": "hit_round_limit", "completion_unresolved": True, "error": "completion settlement round budget exhausted"}
-                window.require_time()
-                child = await (resolve_loop or workflow_continuation_loop)(loop, sid)
-                window.require_time()
-                with contextlib.ExitStack() as guards:
-                    for _, guard in getattr(loop, "_child_run_guards", ()) or ():
-                        guards.enter_context(guard())
-                    async with delegation.readmit_session(loop, sid):
-                        options = dict(stop_event=stop_event,max_rounds=allowance,
-                            _completion_window=window,_caller_consumes=True)
-                        more = (await invoke(child,sid,child.follow_up,"\n\n".join(prompts),session_id=sid,**options) if prompts else
-                            await invoke(child,sid,child.flush_follow_ups,sid,**options))
-                if more is None or not hasattr(more, "status"):
-                    return {**raw, "status": "failed", "completion_unresolved": True, "error": "completion settlement returned no result"}
-                _merge(raw, more)
-                within_limit = window.consume(more, allowance)
-                if not within_limit and raw["status"] == "completed":
-                    return {**raw, "status": "failed", "completion_unresolved": True, "error": "completion round allowance exceeded"}
-                if raw["status"] != "completed":
-                    raw["completion_unresolved"] = True
-    except TimeoutError as exc:
-        from .owner_waits import WaitDeadline
-        if isinstance(exc, WaitDeadline):
-            return {**raw, "status": "timed_out", "completion_unresolved": True, "error": str(exc)}
-        return {**raw, "status": "failed", "completion_unresolved": True, "error": "completion settlement timed out"}
-    except Exception as exc:
-        expired = getattr(exc, "code", None) == "owner_wait_deadline_exceeded"
-        return {**raw, "status": "cancelled" if token.is_cancelled() else "timed_out" if expired else "failed",
-            "completion_unresolved": True, "error": "completion check failed: " + str(exc)}
-    finally:
-        window._collecting = False
-
-
-async def finish_text(loop, raw, stop_event=None, *, window=None, resolve_loop=None):
-    """Direct host-adapter completion; managed engines own this work themselves."""
-    from .spec import workflow_continuation_loop
-    window = window or CompletionWindow()
-    raw = await collect_required(loop, raw, stop_event, window=window, resolve_loop=resolve_loop)
-    if raw.get("status") != "completed" or (raw.get("final_text") or "").strip():
-        return raw
-    sid = raw.get("session_id")
-    if not sid:
-        return {**raw, "status": "failed", "completion_unresolved": True, "error": "workflow leaf completed without a final result or recoverable session"}
-    token = CancellationToken.from_any(stop_event)
-    if token.is_cancelled():
-        return {**raw, "status": "cancelled"}
-    allowance = min(2, window.allowance(raw))
-    if allowance <= 0 or window.answer_attempted:
-        return {**raw, "status": "failed", "completion_unresolved": True, "error": "workflow leaf finalization round budget exhausted"}
-    window.answer_attempted = True
-    try:
-        async with asyncio.timeout(max(0, window.deadline - asyncio.get_running_loop().time())):
-            window.require_time()
-            child = await (resolve_loop or workflow_continuation_loop)(loop, sid)
-            window.require_time()
-            with contextlib.ExitStack() as guards:
-                for _, guard in getattr(loop, "_child_run_guards", ()) or ():
-                    guards.enter_context(guard())
-                extra = await invoke(child,sid,child.send,FINALIZE_PROMPT, session_id=sid, stop_event=stop_event,
-                    tools=[], max_rounds=allowance,_completion_window=window,_caller_consumes=True)
-            _merge(raw, extra)
-            within_limit = window.consume(extra, allowance)
-            if not within_limit and raw["status"] == "completed":
-                return {**raw, "status": "failed", "completion_unresolved": True, "error": "completion round allowance exceeded"}
-    except Exception as exc:
-        return {**raw, "status": "cancelled" if token.is_cancelled() else "failed",
-            "completion_unresolved": True, "error": "workflow leaf finalization failed: " + type(exc).__name__ + ": " + str(exc)}
-    if raw["status"] == "completed" and (raw.get("final_text") or "").strip():
-        return raw
-    error = "workflow leaf finalization returned no final result" if raw["status"] == "completed" else "workflow leaf finalization ended with status " + str(raw["status"])
-    return {**raw, "status": "failed", "completion_unresolved": True, "error": error}

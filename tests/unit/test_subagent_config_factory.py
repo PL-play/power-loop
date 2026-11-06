@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import pytest
 
-from power_loop import AgentLoopConfig, AgentSpec, LLMResponse, LLMService, SessionStore, StatefulAgentLoop
+from power_loop import AgentLoopConfig, AgentSpec, LLMResponse, LLMService, SessionStore
 from power_loop.contracts.tools import ToolDefinition
 from power_loop.core.agent_context import get_current_loop
 from power_loop.runtime.pricing import Free
@@ -78,33 +78,3 @@ async def test_child_factory_is_applied_before_admission_and_on_worker(store,mod
         assert config.max_rounds==3 and config.temperature==0
     finally:
         await runner.aclose()
-
-
-@pytest.mark.asyncio
-async def test_workflow_continuation_restores_leaf_contract_after_recreation(store):
-    from power_loop.runtime.spec import workflow_continuation_loop
-    from power_loop.workflow.engine import InProcessExecutor
-
-    def factory(spec, default):
-        return replace(default, microcompact_hot_tail=8, temperature=0.7)
-
-    llm = _Capturing()
-    config = AgentLoopConfig(max_rounds=3, subagent_config_factory=factory)
-    from power_loop.contracts.tools import ToolDefinition
-    from power_loop.tools.registry import ToolRegistry
-    registry = ToolRegistry()
-    registry.register(ToolDefinition(name="parent_only", description="parent tool", input_schema={"type": "object", "properties": {}}, pricing=Free("test_fixture")), lambda: "ok")
-    parent = StatefulAgentLoop(llm=llm, store=store, config=config, tool_registry=registry)
-    spec = AgentSpec(name="leaf", system_prompt="leaf prompt", tools=[], model="leaf-model",
-                     max_tokens=1234, lifecycle="linked")
-    raw = await run_agent_spec(spec, "first", parent_loop=parent)
-    recreated = StatefulAgentLoop(llm=llm, store=store, config=config, tool_registry=registry)
-    leaf = await workflow_continuation_loop(recreated, raw["session_id"])
-    assert leaf.tool_registry.names() == []
-    assert leaf.config.model == "leaf-model"
-    assert leaf.config.microcompact_hot_tail == 8
-    out = await InProcessExecutor().continue_agent(raw["session_id"], "repair", parent_loop=recreated, extra_rounds=3)
-    assert out["session_id"] == raw["session_id"]
-    assert out["status"] == "completed"
-    assert llm.seen[-1].max_tokens == 1234
-    assert llm.seen[-1].temperature == 0.7

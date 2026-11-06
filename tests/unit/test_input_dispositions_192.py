@@ -9,33 +9,22 @@ from dataclasses import replace
 
 import pytest
 
-from power_loop import LLMResponse, LLMTokenUsage, ToolDefinition
-from power_loop.core.agent_context import get_session_id
 from power_loop.runtime import input_dispositions as inputs
 from power_loop.runtime import model_attempts as attempts
-from power_loop.runtime import timer_waits as waits
 from power_loop.runtime import wait_effects as effects
 from power_loop.runtime import wait_terminal as terminal
-from power_loop.runtime.invocation import current_invocation
 from power_loop.runtime.jobs import JobError, JobManager, _hash, _json
-from power_loop.runtime.pricing import Free
-from power_loop.runtime.task_runtime import _SEND, Execution, TaskRuntime
-from power_loop.workflow.admission import GATES
+from power_loop.runtime.task_runtime import Execution, TaskRuntime
 
 from .test_job_registry_192 import registry_store, runtime
-from .test_node_nudge_runtime_192 import client
-from .test_node_nudge_runtime_192 import (
-    test_failed_original_with_unhandled_input_does_not_retry_business as exercise_failed_node,
-)
 from .test_nudge_runtime_192 import nudge_case
 from .test_timer_waits_192 import waiting
 from .test_wait_dispositions_192 import exited
 from .test_wait_effects_192 import child_loop, decide
 from .test_wait_handoff_192 import handoff
 from .test_wait_terminal_192 import consume_owner
-from .test_workflow_task_runtime_192 import leaf, managed_workflow
 
-__all__ = ["registry_store", "runtime", "waiting", "handoff", "nudge_case", "managed_workflow"]
+__all__ = ['registry_store', 'runtime', 'waiting', 'handoff', 'nudge_case']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -391,212 +380,10 @@ async def test_ordinary_nudge_retains_call_receipt_and_never_claims_model_consum
         await require_event_handled(c.manager, tx, updated, session_id=c.sid, owner_job_id=c.target.job_id)
 
 
-async def test_native_provider_failure_with_unknown_resources_keeps_input_unsettled(managed_workflow, monkeypatch):
-    managed_workflow[6]["on_complete"] = None
-    await exercise_failed_node(managed_workflow, monkeypatch)
-    _, manager, runtime, loop, model, parent, _, _ = managed_workflow
-    before = model.counts.copy()
-    await loop.flush_follow_ups(parent)
-    node = await manager.db.fetchone(f"SELECT * FROM {manager.jobs} WHERE kind='workflow_node'")
-    assert node["resource_state"] == "unknown"
-    with pytest.raises(JobError, match="finalization_execution_unsettled"):
-        await manager.finalize_supervision(runtime.actor(parent), node["job_id"], generation=node["generation"])
-    assert not await manager.db.fetchall(f"SELECT * FROM {manager.events} WHERE event_type='input_disposition'")
-    assert model.counts["BUILD"] == before["BUILD"] and model.counts["REVIEW"] == 0
 
 
-async def test_actual_waiting_node_retires_original_nudge_after_cancelled_readmission(managed_workflow, monkeypatch):
-    c = await client(managed_workflow, monkeypatch)
-    c.state["on_complete"] = None
-    c.state["spec"]["budget"] = {"max_tokens": 1000}
-    c.state["spec"]["root"]["steps"][0]["spec"]["tools"] = ["arm_wait"]
-    c.model.hold.clear()
-    readmission_queued = asyncio.Event()
-
-    class Capacity(asyncio.Semaphore):
-        async def acquire(self):
-            if self.locked():
-                readmission_queued.set()
-            return await super().acquire()
-
-    gate, registered = Capacity(1), []
-    token = GATES.set((gate,))
-    held = False
-    original = c.model.complete
-
-    async def arm():
-        sid, source = get_session_id(), _SEND.get()
-        seq, call_id = current_invocation(sid)
-        now = c.manager.now()
-        reg = await waits.register_wait(
-            c.manager,
-            c.runtime.actor(sid),
-            caller=source.lease,
-            call_ref=await c.store.message_ref(sid, seq),
-            tool_call_id=call_id,
-            request=waits.WaitRequest(now + 1000, "Original node review", "Continue original node"),
-            policy=waits.WaitPolicy(now + 60000),
-        )
-        registered.append(reg)
-        return "Original wait accepted."
-
-    async def complete(request, **kwargs):
-        result = await original(request, **kwargs)
-        if "ROLE-BUILD" in (request.system_prompt or "") and c.model.counts["BUILD"] == 1:
-            return LLMResponse(
-                raw_text="",
-                tool_calls=[
-                    {"id": "arm-node", "type": "function", "function": {"name": "arm_wait", "arguments": "{}"}}
-                ],
-            )
-        return result
-
-    monkeypatch.setattr(c.model, "complete", complete)
-    c.loop.tool_registry.register(
-        ToolDefinition(
-            name="arm_wait", description="Admit original node wait", input_schema={"type": "object", "properties": {}}
-        , pricing=Free("test_fixture")),
-        arm,
-    )
-    try:
-        await c.loop.send("Start the original workflow", c.parent)
-        for _ in range(500):
-            if registered:
-                [reg] = registered
-                owner = await c.manager.get_job(c.runtime.actor(c.parent), reg.job.control_owner_job_id)
-                if owner.status == "waiting" and not gate.locked():
-                    break
-            await asyncio.sleep(0.01)
-        else:
-            pytest.fail("Original BUILD did not exit its model and release the native leaf slot")
-        assert c.model.counts["BUILD"] == 2
-        # Reserve real native capacity only after the model has naturally exited.
-        await gate.acquire()
-        held = True
-        [node_binding] = await c.manager.db.fetchall(
-            f"SELECT * FROM {c.manager.events} WHERE event_type='node_session'"
-        )
-        data = json.loads(node_binding["payload_json"])
-        c.sid, c.job_id = data["session_id"], node_binding["job_id"]
-        c.run_id = c.state["handles"][0].run_id
-        from power_loop.workflow import runner
-
-        c.engine = runner._ENGINES[c.run_id]
-        await c.issue()
-        assert len(c.replies) == 1
-        for _ in range(500):
-            if await c.manager.db.fetchone(
-                f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='owner_wait_resumed'",
-                (c.job_id,),
-            ):
-                break
-            await asyncio.sleep(0.01)
-        else:
-            pytest.fail("Original node did not reach native readmission")
-        await asyncio.wait_for(readmission_queued.wait(), 5)
-        await c.manager.request_cancel(
-            c.runtime.actor(c.parent),
-            c.job_id,
-            system_key="stop-original-node-readmission",
-            reason="Cancel queued original continuation",
-        )
-        await asyncio.wait_for(c.state["handles"][0].task, 8)
-        owner = await c.manager.get_job(c.runtime.actor(c.parent), c.job_id)
-        assert owner.outcome == "cancelled" and owner.resource_state == "stopped"
-        assert owner.result["text"] == "PROOF-42"
-        assert c.engine._last is not None and c.engine._last.node_id == "BUILD"
-        assert c.engine._usage_acc["total_tokens"] == c.engine._budget.spent == owner.result["usage"]["total_tokens"]
-        assert c.model.counts["BUILD"] == 2 and c.model.counts["REVIEW"] == 0
-        gate.release()
-        held = False
-        await c.loop.flush_follow_ups(c.parent)
-        await c.manager.finalize_supervision(c.runtime.actor(c.parent), c.job_id, generation=1)
-        [proof] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='input_disposition'")
-        assert json.loads(proof["payload_json"])["owner"]["job_id"] == c.job_id
-        assert all(
-            r["supervision_status"] == "closed"
-            for r in await c.manager.db.fetchall(f"SELECT supervision_status FROM {c.manager.jobs}")
-        )
-    finally:
-        if held:
-            gate.release()
-        GATES.reset(token)
 
 
-async def test_negative_input_before_usage_accounting_retains_actual_tokens_once(managed_workflow, monkeypatch):
-    from power_loop.workflow import runner
-
-    c = await client(managed_workflow, monkeypatch)
-    c.state["on_complete"] = None
-    c.state["spec"]["budget"] = {"max_tokens": 1000}
-    c.state["spec"]["root"] = leaf("BUILD", tools=["checkpoint"], retry={"max_attempts": 2, "on": ["failed"]})
-    checkpoint, release = asyncio.Event(), asyncio.Event()
-    original, calls = c.model.complete, []
-
-    async def hold_checkpoint():
-        checkpoint.set()
-        await release.wait()
-        return "Original checkpoint reached."
-
-    async def complete(request, **kwargs):
-        if "ROLE-BUILD" in (request.system_prompt or ""):
-            calls.append(request)
-            if len(calls) == 1:
-                return LLMResponse(
-                    raw_text="",
-                    tool_calls=[
-                        {"id": "checkpoint", "type": "function", "function": {"name": "checkpoint", "arguments": "{}"}}
-                    ],
-                    token_usage=LLMTokenUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10),
-                )
-            raise RuntimeError("Original next request failed with unknown provider outcome")
-        return await original(request, **kwargs)
-
-    c.loop.tool_registry.register(
-        ToolDefinition(
-            name="checkpoint", description="Original task checkpoint", input_schema={"type": "object", "properties": {}}
-        , pricing=Free("test_fixture")),
-        hold_checkpoint,
-    )
-    monkeypatch.setattr(c.model, "complete", complete)
-    try:
-        await c.loop.send("Run the original node", c.parent)
-        await asyncio.wait_for(checkpoint.wait(), 5)
-        [binding] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='node_session'")
-        c.sid, c.run_id = json.loads(binding["payload_json"])["session_id"], c.state["handles"][0].run_id
-        engine = runner._ENGINES[c.run_id]
-        await c.issue()
-        assert len(c.replies) == 1
-        release.set()
-        await asyncio.wait_for(c.state["handles"][0].task, 8)
-        assert len(calls) == 2
-        node = await c.manager.get_job(c.runtime.actor(c.parent), binding["job_id"])
-        assert node.outcome == "failed" and node.resource_state == "unknown"
-        phases = [
-            json.loads(r["payload_json"])
-            for r in await c.manager.db.fetchall(
-                f"SELECT e.payload_json FROM {c.manager.events} e JOIN {c.manager.jobs} j ON j.job_id=e.job_id "
-                "WHERE e.event_type='model_attempt_finished' AND j.session_id=?",
-                (c.sid,),
-            )
-        ]
-        assert len(phases) == 2
-        [returned] = [p for p in phases if p["status"] == "returned"]
-        [unknown] = [p for p in phases if p["status"] == "unknown"]
-        assert returned["usage"]["total_tokens"] == 10 and returned["estimated"] is False
-        assert unknown["estimated"] is True and unknown["provider_cost"] is None
-        expected = 10 + unknown["usage"]["total_tokens"]
-        assert (
-            node.result["usage"]["total_tokens"]
-            == engine._usage_acc["total_tokens"]
-            == engine._budget.spent
-            == expected
-        )
-        [ack] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='node_result_consumed'")
-        assert ack["job_id"] == node.job_id
-        assert not await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='input_disposition'")
-    finally:
-        release.set()
 
 
 async def test_closed_owner_revalidates_ordinary_input_raw_call_even_without_a_wait_binding(handoff):

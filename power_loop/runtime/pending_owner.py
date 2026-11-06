@@ -47,7 +47,7 @@ async def _expected(manager, tx, source):
     events = [retirement]
     for key in (exit_id(manager, lease),):
         events.append(await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (key,)))
-    from .workflow_controller import proof
+    from .execution_membership import proof
     return {'version': 1, 'source': proof(source), 'review_owner': binding,
         'main_session_id': main['session_id'], 'evidence': [content_reference(event) for event in events],
         'execution_authority': False, 'resource_stop_confirmed': False,
@@ -68,11 +68,10 @@ async def read(manager, tx, source, *, optional=False):
 
 
 async def transfer(manager, tx, actor, source):
-    from .execution_membership import seal
+    from .execution_membership import proof
     from .managed_delivery import _main
     from .original_owner_review import read as original_owner
     from .tool_call_plans import _event
-    from .workflow_controller import proof
 
     main = await _main(manager, tx, source)
     if actor.session_id != main['session_id']:
@@ -88,7 +87,6 @@ async def transfer(manager, tx, actor, source):
         raise JobError('pending_owner_controller_not_retired')
     # A stopped original Task and closed intake fence all future admissions.
     # Sealing membership does not claim sibling resources are already stopped.
-    await seal(manager, tx, owner)
     data = await _expected(manager, tx, source)
     await _event(manager, tx, identity(manager, source), source, 'pending_owner_transfer', data)
     await tx.set_event_recipient(identity(manager, source), actor.session_id)

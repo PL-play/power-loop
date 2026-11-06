@@ -1,19 +1,16 @@
 """Typed results and the shared token budget for workflow runs.
 
-The base library returns sub-agent results as a loose ``dict`` and drops token
-usage on the ``run_agent_spec`` path; deterministic control flow needs typed
-results it can branch on, so the workflow layer wraps every step in
-:class:`AgentResult` and aggregates a run into :class:`WorkflowResult`.
+Canonical runtime results are projected into graph-node results and aggregate
+usage. Driver and node transcripts remain in the shared store.
 """
 
 from __future__ import annotations
 
-import asyncio
 import threading
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["AgentResult", "WorkflowResult", "SharedBudget", "WorkflowRunHandle"]
+__all__ = ["AgentResult", "WorkflowResult", "SharedBudget"]
 
 
 @dataclass
@@ -32,10 +29,6 @@ class AgentResult:
     usage: dict[str, int] = field(default_factory=dict)
     session_id: str | None = None
     error: str | None = None
-    #: For an out-of-process leaf, the path to its private SQLite db (so the
-    #: supervisor can open it read-only and inspect the full trace). None for
-    #: in-process leaves (they share the orchestrator's store).
-    db_path: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -50,7 +43,6 @@ class AgentResult:
             "usage": self.usage,
             "session_id": self.session_id,
             "error": self.error,
-            "db_path": self.db_path,
         }
 
 
@@ -150,63 +142,8 @@ class SharedBudget:
 
     def as_dict(self) -> dict[str, int]:
         with self._lock:
-            return {"max_tokens": self.max_tokens, "spent": self._spent,
-                    "remaining": max(0, self.max_tokens - self._spent)}
-
-
-@dataclass
-class WorkflowCompletion:
-    """Handed to a host ``on_complete`` callback when a detached run settles.
-
-    When a host supplies ``on_complete`` to :func:`run_detached` /
-    :func:`resume_detached`, it OWNS the parent wake: the built-in durable-timer
-    wake (and the ``eager_wake`` fast-path) are skipped entirely, and this record
-    is passed to the callback instead. The callback typically re-resolves the
-    parent's current loop and calls ``loop.follow_up(note, parent_session_id)``
-    — an in-process, timer-free wake that lives and dies with the process.
-
-    ``note`` is the same pointer string the timer wake would have carried
-    (``run_id`` + status); the full result lives in the durable journal, keyed by
-    ``run_id`` — the callback reads it there rather than receiving it inline.
-    """
-
-    parent_session_id: str
-    run_id: str
-    status: str  # "completed" | "failed" | "cancelled"
-    note: str
-    # Native immutable result identity. Legacy callbacks have no task revision.
-    # These are lookup coordinates, never execution/continuation authority.
-    task_generation: int | None = None
-    result_event_id: str | None = None
-
-
-@dataclass
-class WorkflowRunHandle:
-    """Handle for a detached workflow run.
-
-    ``run_id`` is the journal key suffix (``workflow:run:<run_id>``) used by
-    :func:`power_loop.workflow.get_workflow` to read status/detail; ``task`` is
-    the background ``asyncio.Task`` driving the run (retained by the
-    :class:`Workflow` so it is not garbage-collected mid-flight).
-
-    NOTE: the completion **wake** of the parent agent is delivered by a durable
-    timer — it fires only while a ``TimerRunner`` (or an external poller of
-    ``store.due_timers()``) is running on the host. Without one, the run still
-    completes and the journal updates, but the parent is not auto-woken.
-
-    :meth:`cancel` requests cooperative cancellation: in-flight sub-agents stop
-    at their next checkpoint and the run settles with ``status="cancelled"``
-    (the journal is finalized and the parent woken as usual). It does **not**
-    hard-abort the ``asyncio.Task``, so the run tears down cleanly.
-    """
-
-    run_id: str
-    task: asyncio.Task[None]
-    cancel_token: Any | None = None  # CancellationToken; flipped by cancel()
-    job_id: str | None = None  # opt-in task-runtime admission
-    operation_id: str | None = None
-
-    def cancel(self, reason: str = "cancelled") -> None:
-        """Request cooperative cancellation of this detached run."""
-        if self.cancel_token is not None:
-            self.cancel_token.cancel(reason)
+            return {
+                "max_tokens": self.max_tokens,
+                "spent": self._spent,
+                "remaining": max(0, self.max_tokens - self._spent),
+            }

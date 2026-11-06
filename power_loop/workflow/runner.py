@@ -1,812 +1,688 @@
-"""Detached execution + completion-callback wake (D3).
-
-``run_detached`` runs a workflow as a background ``asyncio.Task`` and returns a
-:class:`WorkflowRunHandle` immediately, so the parent agent can ``pass_turn`` out.
-When the run finishes (success or failure) it:
-
-1. finalizes the durable journal (:mod:`power_loop.workflow.journal`);
-2. publishes a ``SYSTEM_LOG`` progress event (no new ``AgentEventType``); and
-3. **wakes the parent agent** by scheduling a durable timer
-   (``loop.schedule_timer(parent_sid, delay_s=0, note=...)``) — delivered by the
-   host's ``TimerRunner`` as a normal ``follow_up`` into the parent session.
-
-The timer is the durable, "one path into the conversation" wake. A non-durable
-``eager_wake`` fast-path is available; the :func:`make_wake_guard` TIMER_FIRE
-hook dedupes the at-least-once timer so the parent wakes exactly once.
-
-**Host wake seam (``on_complete``).** A host may pass ``on_complete`` to
-:func:`run_detached` / :func:`resume_detached`, taking over the parent wake
-entirely: the durable timer and the ``eager_wake`` fast-path are BOTH skipped,
-and a :class:`WorkflowCompletion` is handed to the callback instead. This is the
-in-process, timer-free wake — the host typically re-resolves the parent's current
-loop and calls ``loop.follow_up``. It lives and dies with the process (no durable
-backstop): a raising callback is logged and swallowed (the run is journal-final,
-so a lost wake means the caller must re-request), and it never falls back to a
-timer. ``on_complete`` supersedes ``eager_wake``.
-
-Everything here uses an EXPLICITLY captured ``loop`` / ``parent_sid`` — never the
-contextvars (which are unreliable inside a detached task).
-"""
+"""Workflow admission and driver execution through the common message runtime."""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import logging
-import re
-import secrets
-from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any
+import hashlib
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
-from power_loop.contracts.event_payloads import SystemLogPayload
-from power_loop.contracts.events import AgentEvent, AgentEventType
-from power_loop.contracts.hooks import HookDirective, HookPoint
-from power_loop.runtime.store.store import MUTATE_SKIP
+from power_loop.agent.runtime_store import now_ms
+from power_loop.agent.runtime_types import (
+    Command,
+    InputRef,
+    JobRef,
+    RequestOptions,
+    Result,
+    RuntimeDescriptor,
+    RuntimeRequestError,
+    TargetRef,
+    TrustedActor,
+    canonical,
+    plain,
+)
+from power_loop.runtime.jobs import JobActor, JobLease, JobManager, JobRegistration, _hash, _record
+from power_loop.runtime.store.types import SubagentLifecycle
 
 from . import journal
-from .engine import WorkflowEngine, WorkflowRunError
-from .result import AgentResult, WorkflowCompletion, WorkflowRunHandle
-
-if TYPE_CHECKING:
-    from power_loop.contracts.hook_contexts import TimerFireCtx
-
-    from .api import Workflow
-
-logger = logging.getLogger(__name__)
-
-#: Host completion-wake seam (see module docstring). Receives a
-#: :class:`WorkflowCompletion`; when supplied it replaces the durable-timer wake.
-OnComplete = Callable[["WorkflowCompletion"], Awaitable[None]]
-
-__all__ = [
-    "run_detached", "make_wake_guard", "register_wake_guard", "make_on_step", "spawn_background",
-    "claim_wake", "parse_workflow_wake", "get_run_handle", "stop_run", "cancel_node",
-]
-
-#: run_ids whose engine is currently executing IN THIS PROCESS (set by spawn_background +
-#: resume_run). Lets the resume entry points refuse to start a second concurrent engine for a
-#: still-live run (workflow-durability-3) without blocking resume-after-crash (a crashed run's
-#: task already discarded its id).
-_LIVE_RUN_IDS: set[str] = set()
-
-
-def is_run_live(run_id: str) -> bool:
-    """True iff ``run_id``'s engine is currently executing in this process (workflow-durability-3)."""
-    return run_id in _LIVE_RUN_IDS
-
-
-#: design/124 §8.4: run_id → handle of every DETACHED run executing in this process, so a stop can
-#: reach a run by id (it used to be reachable only through whatever handle its starter kept).
-_HANDLES: dict[str, WorkflowRunHandle] = {}
-#: runs stopped by :func:`stop_run` — they settle ``cancelled`` and must NOT wake the parent agent
-#: (the user said stop; a "your workflow finished" wake-up would contradict them).
-_STOPPED_RUNS: set[str] = set()
-#: runs whose engine finished and whose journal is final, but whose background task is still
-#: delivering the completion (``on_complete`` / wake). From here on the run is NOT live: the woken
-#: parent may nudge / resume its leaves and a stop is a no-op (6.46.3 — the parent's whole wake
-#: turn ran inside that task, so ``nudge`` was refused and ``cancel`` deadlocked on itself).
-_SETTLED_RUNS: set[str] = set()
-_LOCAL_STOP_TASKS: set[asyncio.Task] = set()
-
-
-def get_run_handle(run_id: str) -> WorkflowRunHandle | None:
-    return _HANDLES.get(run_id)
-
-
-async def _owned_legacy_control(loop, parent_sid, run_id, reason, expected_generation):
-    """Prove the exact process-local handle before any legacy control."""
-    from power_loop.runtime.jobs import JobError
-
-    if not isinstance(run_id, str) or not re.fullmatch(r"[a-f0-9]{8,64}", run_id):
-        raise JobError("workflow_run_id_required")
-    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
-        raise JobError("invalid_cancel_reason")
-    if expected_generation is not None:
-        raise JobError("legacy_generation_unavailable")
-    store = await loop._ensure_store()
-    if await journal.read(store, parent_sid, run_id) is None:
-        raise JobError("workflow_run_not_found")
-    base = {"version": 1, "backend": "legacy", "run_id": run_id,
-        "control_guarantee": "legacy_best_effort", "durable_intent": False,
-        "resource_stop_confirmed": False}
-    handle = _HANDLES.get(run_id)
-    if handle is None:
-        return base, None
-    if (getattr(handle, "_origin_store", None) is not store or
-            getattr(handle, "_origin_parent_sid", None) != parent_sid):
-        raise JobError("workflow_control_owner_mismatch")
-    if getattr(handle, "_task_runtime", None) is not None:
-        raise JobError("native_workflow_requires_durable_control")
-    return base, handle
-
-
-async def request_owned_node_stop(loop, parent_sid, run_id, node, *, reason="Stopped by request", expected_generation=None):
-    """Signal the engine retained by the proven handle, never a global ID lookup."""
-    from power_loop.runtime.jobs import JobError
-
-    if not isinstance(node, str) or not node.strip() or len(node) > 1000:
-        raise JobError("invalid_workflow_node")
-    base, handle = await _owned_legacy_control(loop, parent_sid, run_id, reason, expected_generation)
-    base = {**base, "node": node, "resource_state": "unknown", "local_signals": 0}
-    if handle is None:
-        return {**base, "status": "control_unavailable", "control_pending": True}
-    if handle.task.done() or run_id in _SETTLED_RUNS:
-        return {**base, "status": "already_finished", "control_pending": False}
-    engine = getattr(handle, "_origin_engine", None)
-    count = engine.cancel_node(node, reason) if engine is not None else 0
-    return {**base, "status": "accepted" if count else "control_unavailable", "control_pending": True,
-        "local_signals": count}
-
-
-async def request_owned_stop(loop, parent_sid, run_id, *, reason="Stopped by request", expected_generation=None):
-    """Legacy asynchronous control with exact process-local ownership.
-
-    No durable intent, remote liveness or physical-stop guarantee is invented.
-    Native model control must use the task registry instead.
-    """
-    base, handle = await _owned_legacy_control(loop, parent_sid, run_id, reason, expected_generation)
-    if handle is None:
-        return {**base, "status": "control_unavailable", "control_pending": True, "resource_state": "unknown"}
-    if handle.task.done() or run_id in _SETTLED_RUNS:
-        return {**base, "status": "already_finished", "control_pending": False, "resource_state": "unknown"}
-    previous = getattr(handle, "_local_stop_task", None)
-    if previous is None:
-        # Suppress callbacks before yielding to a background control coroutine.
-        _STOPPED_RUNS.add(run_id)
-        handle.cancel(reason)
-        grace = float(loop.config.stop_policy.workflow_s)
-
-        async def stop_original():
-            if _HANDLES.get(run_id) is not handle:
-                return "superseded"
-            return await stop_run(run_id, grace_s=grace, reason=reason)
-
-        control = asyncio.create_task(stop_original(), name="workflow-stop-"+run_id)
-        handle._local_stop_task = control
-        _LOCAL_STOP_TASKS.add(control)
-
-        def finished(task):
-            _LOCAL_STOP_TASKS.discard(task)
-            if not task.cancelled() and task.exception() is not None:
-                logger.error("legacy workflow stop requires reconciliation: %s", run_id)
-
-        control.add_done_callback(finished)
-    return {**base, "status": "accepted", "control_pending": True, "resource_state": "unknown",
-        "replayed_local_request": previous is not None}
-
-
-def remember_handle(runtime, handle):
-    runtime.track_task(handle.task, cancel_token=handle.cancel_token, job_id=handle.job_id)
-    for key in (handle.operation_id, handle.run_id):
-        runtime._workflow_handles.pop(key, None)
-        runtime._workflow_handles[key] = handle
-    while len(runtime._workflow_handles) > 256:
-        runtime._workflow_handles.pop(next(iter(runtime._workflow_handles)))
-
-
-async def stop_run(run_id: str, *, grace_s: float = 60.0, reason: str = "stopped") -> str:
-    """Stop a detached run by id: flip its token (leaves stop at their next checkpoint, no new
-    steps start), wait up to ``grace_s`` for it to settle, then cancel its task. It will not wake
-    the parent. Returns ``stopped`` / ``forced`` / ``finished`` / ``unknown``."""
-    handle = _HANDLES.get(run_id)
-    if handle is None:
-        return "unknown"
-    task = handle.task
-    if task is None or task.done() or run_id in _SETTLED_RUNS:
-        return "finished"
-    if task is asyncio.current_task():
-        return "finished"      # called from inside the run's own completion delivery — never wait on ourselves
-    runtime = getattr(handle, "_task_runtime", None)
-    registration = getattr(handle, "_task_registration", None)
-    if runtime is not None and registration is not None:
-        await runtime.manager.request_cancel(runtime.actor(registration.job.created_by_session_id),
-            registration.job.job_id, system_key="stop-run:" + run_id, reason=reason)
-    _STOPPED_RUNS.add(run_id)
-    handle.cancel(reason)
-    done, _ = await asyncio.wait({task}, timeout=grace_s)
-    if task in done:
-        return "stopped"
-    task.cancel()
-    await asyncio.wait({task}, timeout=5)
-    return "forced"
-
-
-def make_on_step(store: Any, parent_sid: str, run_id: str):
-    """Build the per-step journaling callback the engine fires as nodes settle.
-
-    Captures the step's output (``text`` / ``payload``) too, so a completed step
-    can be replayed (not re-run) when the run is resumed. Async: the engine awaits
-    it as each node settles, and the journal write hits the async store.
-    """
-
-    async def _on_step(res: AgentResult) -> None:
-        await journal.record_step(
-            store, parent_sid, run_id,
-            node_id=res.node_id, status=res.status,
-            session_id=res.session_id, usage=res.usage, error=res.error,
-            text=res.text, payload=res.payload, db_path=res.db_path,
-        )
-
-    return _on_step
-
-
-def make_on_node_session(store: Any, parent_sid: str, run_id: str):
-    """叶子会话建好时把「节点 → 会话」记进 journal（6.46），resume 时接着原会话跑。"""
-
-    async def _on_node_session(node_id: str, session_id: str) -> None:
-        await journal.node_session(store, parent_sid, run_id, node_id=node_id, session_id=session_id)
-
-    return _on_node_session
-
-
-#: run_id → 正在本进程跑的引擎（6.46）：单节点取消要找到它。
-_ENGINES: dict[str, Any] = {}
-
-
-async def steer_node(run_id: str, node_id: str, sid: str, message: str, *, expected_job=None):
-    engine = _ENGINES.get(run_id)
-    if engine is None:
-        from power_loop.core.agent_context import get_current_loop
-        loop = get_current_loop()
-        if loop is not None and getattr(loop, "task_runtime", None) is not None:
-            from power_loop.runtime.node_inputs import steer
-            return await steer(loop, None, run_id, node_id, sid, message, expected_job=expected_job)
-        raise RuntimeError("run is settling; retry nudge to resume the persisted workflow")
-    if expected_job is None:
-        return await engine.steer_node(node_id, sid, message)
-    return await engine.steer_node(node_id, sid, message, expected_job=expected_job)
-
-
-async def continue_node(run_id: str, node_id: str, message: str, rounds: int = 8):
-    """Continue one settled branch in its live engine; active leaves use follow_up."""
-    engine = _ENGINES.get(run_id)
-    if engine is None:
-        raise RuntimeError("run has no live engine; resume its persisted journal first")
-    return await engine.continue_node(node_id, message, rounds)
-
-
-def queue_node_continuation(run_id: str, node_id: str, message: str, rounds: int = 8) -> None:
-    """Register the repair in its owning engine before returning acceptance.
-
-    No await boundary may separate registering this dependency from accepting it.
-    Persistent operation admission/restart recovery belongs to the new registry
-    adapter; this is the existing journal/engine path, not a durable job queue.
-    """
-    engine = _ENGINES.get(run_id)
-    if engine is None:
-        raise RuntimeError("run has no live engine; resume its persisted journal first")
-    engine.start_node_continuation(node_id, message, rounds)
-
-
-def cancel_node(run_id: str, node_id: str, reason: str = "cancelled by host") -> int | None:
-    """只取消某个 run 里的一个节点（6.46）。返回停了几个在跑的叶子；None = 这个 run 不在本进程跑。"""
-    eng = _ENGINES.get(run_id)
-    if eng is None:
-        return None
-    return int(eng.cancel_node(node_id, reason))
-
-
-def make_on_node_start(store: Any, parent_sid: str, run_id: str):
-    """Build the leaf-start callback: journals the node into ``live`` (the run's heartbeat)."""
-
-    async def _on_node_start(node_id: str) -> None:
-        await journal.node_start(store, parent_sid, run_id, node_id=node_id)
-
-    return _on_node_start
-
-
-def _wake_note(run_id: str, status: str, extra: str = "") -> str:
-    base = f"{journal.JOURNAL_PREFIX}{run_id} {status}"
-    return f"{base} — {extra}" if extra else base
-
-
-def parse_workflow_wake(note: str | None) -> str | None:
-    """Extract the run id from a workflow completion-wake timer note.
-
-    Returns ``None`` for any non-workflow note, so a host
-    :data:`~power_loop.runtime.timers.TimerDelivery` can branch: workflow wakes
-    get enriched (e.g. with ``workflow_status`` detail) or routed differently
-    from ordinary timers. PROVISIONAL (3.14).
-    """
-    if not note or not note.startswith(journal.JOURNAL_PREFIX):
-        return None
-    rest = note[len(journal.JOURNAL_PREFIX):].strip()
-    return rest.split()[0] if rest else None
-
-
-async def claim_wake(store: Any, parent_sid: str, run_id: str) -> bool:
-    """Atomically claim the completion wake for ``run_id`` — True = this caller
-    delivers, False = the wake was already delivered once.
-
-    Only needed by hosts that bypass ``TimerRunner`` entirely (polling
-    ``store.due_timers()`` themselves): with a running ``TimerRunner`` +
-    :func:`register_wake_guard`, dedupe already happens in the TIMER_FIRE hook
-    — BEFORE any custom delivery — so a host delivery seam gets it for free.
-
-    A missing journal (or a deleted parent session) claims as True: there is
-    nothing to dedupe against, and dropping the wake would strand the parent.
-    PROVISIONAL (3.14).
-    """
-    outcome = await _claim_wake_state(store, parent_sid, run_id)
-    return outcome != "already"
-
-
-async def _claim_wake_state(store: Any, parent_sid: str, run_id: str) -> str:
-    """Shared atomic claim: ``"claimed"`` | ``"already"`` | ``"no_journal"``.
-
-    The claim is an atomic RMW via ``mutate_runtime_state`` (row-locked): a bare
-    get→set would race concurrent journal writes on the same run key and let two
-    concurrent fires both observe ``woke=False`` → double-wake.
-    """
-    seen = {"woke": False}
-
-    def _claim(cur: Any) -> Any:
-        if cur is None:
-            return MUTATE_SKIP  # no journal → nothing to dedupe
-        if cur.get("woke"):
-            seen["woke"] = True
-            return MUTATE_SKIP  # already delivered once
-        return {**cur, "woke": True}  # first delivery — set woke, preserve every other key
-
-    try:
-        await store.mutate_runtime_state(parent_sid, journal.run_key(run_id), _claim, default=None)
-    except ValueError:
-        # Session/state row gone (a stale timer firing on a deleted session):
-        # treat as no-journal, matching the old get_runtime_state(default=None)
-        # tolerance; nothing to dedupe.
-        return "no_journal"
-    return "already" if seen["woke"] else "claimed"
-
-
-def _publish(loop: Any, parent_sid: str, run_id: str, event: str, status: str, *, level: str = "info") -> None:
-    try:
-        loop.event_bus.publish(
-            AgentEvent(
-                type=AgentEventType.SYSTEM_LOG,
-                data=SystemLogPayload(
-                    message=json.dumps({"workflow": run_id, "event": event, "status": status}),
-                    level=level,
-                ),
-                session_id=parent_sid,
-                source="workflow",
+from .engine import WorkflowEngine
+from .spec import WorkflowSpec
+
+
+@dataclass(frozen=True)
+class DriverActor(TrustedActor):
+    job_ref: JobRef | None = None
+
+
+async def authorize_driver(port, reader, actor):
+    from power_loop.runtime.session_ownership import current_ownership
+
+    ownership = current_ownership()
+    if ownership is None or ownership.key != (port.store.store_id, actor.session_id):
+        raise RuntimeRequestError("forbidden", "driver ownership required")
+    ownership.require_owned()
+    row = await reader.fetchone(
+        f"SELECT kind,session_id,generation FROM {port.jobs} WHERE job_id=?", (actor.job_ref.job_id,)
+    )
+    if row is None or (row["kind"], row["session_id"], row["generation"]) != (
+        "workflow",
+        actor.session_id,
+        actor.job_ref.generation,
+    ):
+        raise RuntimeRequestError("forbidden", "driver generation changed")
+
+
+async def submit(client, target, spec, *, message_id, actor, descriptor=None, options=None, parent=None):
+    """Freeze a graph and atomically create its independent driver and start input."""
+    client._require_open()
+    spec = WorkflowSpec.from_json(spec.to_dict() if isinstance(spec, WorkflowSpec) else spec)
+    port, manager = client.inputs, JobManager(client.store)
+    defaults = await port.authorize(port.db, target, actor)
+    origin = JobActor(actor.tenant_id, actor.principal_id, target.session_id)
+    key = manager._origin_key(
+        origin, "create", actor.call_ref, actor.tool_call_id, None if actor.call_ref else "workflow:" + message_id
+    )
+    sid = "driver_" + key[:32]
+    start = InputRef(target.store_id, sid, "start_" + key[:32])
+    descriptor = descriptor or RuntimeDescriptor(**defaults["runtime_descriptor"])
+    options = options or RequestOptions()
+    descriptor = replace(
+        descriptor,
+        kind="workflow_driver",
+        config={
+            **plain(descriptor.config),
+            "workflow": {"spec": spec.to_dict(), "allowed_tools": plain(options.tools)},
+        },
+    )
+    async with manager.joined_write() as tx:
+        await port.db.dialect.lock_state(tx, port.state, target.session_id)
+        if parent:
+            await manager._fence(tx, origin, parent)
+        old = await tx.fetchone(f"SELECT job_id FROM {manager.events} WHERE operation_key=?", (key,))
+        if old is None:
+            await port.store._create_session_tx(
+                tx,
+                sid,
+                now_ms(),
+                parent_session_id=target.session_id,
+                lifecycle=SubagentLifecycle.LINKED,
+                metadata={
+                    "tenant_id": actor.tenant_id,
+                    "principal_id": actor.principal_id,
+                    "execution_role": "workflow",
+                    "runtime_descriptor": plain(descriptor),
+                },
             )
+        registration = await manager.register_job(
+            origin,
+            kind="workflow",
+            title=spec.name,
+            session_id=sid,
+            parent=parent,
+            independent=True,
+            call_ref=actor.call_ref,
+            tool_call_id=actor.tool_call_id,
+            system_key=None if actor.call_ref else "workflow:" + message_id,
+            request={"input_ref": plain(start)},
         )
-    except Exception:  # noqa: BLE001 — observability must never break a run
-        pass
-
-
-async def _wake(loop: Any, parent_sid: str, note: str) -> None:
-    try:
-        await loop.schedule_timer(parent_sid, delay_s=0, note=note)
-    except Exception:  # noqa: BLE001 — parent may have been closed; journal is the source of truth
-        pass
-
-
-async def _run_on_complete(
-    on_complete: OnComplete, parent_sid: str, run_id: str, status: str, note: str,
-    *, task_generation: int | None = None, result_event_id: str | None = None,
-) -> bool:
-    """Invoke the host completion callback in place of the durable-timer wake.
-
-    The host owns delivery (die-with-process, no timer fallback). A raising
-    callback is logged and swallowed: the run is already journal-final, so a lost
-    wake means the caller must re-request — it must NOT crash the detached task
-    (which would leave the run marked live-but-dead) or fall back to a timer.
-    """
-    try:
-        await on_complete(
-            WorkflowCompletion(
-                parent_session_id=parent_sid, run_id=run_id, status=status, note=note,
-                task_generation=task_generation, result_event_id=result_event_id,
-            )
-        )
-        return True
-    except Exception:  # noqa: BLE001 — a lost wake is recoverable by re-request; a crash is not
-        logger.warning(
-            "workflow %s on_complete callback failed (wake lost; caller must re-request)",
-            run_id, exc_info=True,
-        )
-        return False
-
-
-async def run_detached(
-    workflow: Workflow,
-    *,
-    eager_wake: bool = False,
-    on_complete: OnComplete | None = None,
-) -> WorkflowRunHandle:
-    """Start ``workflow`` as a background task; return a handle immediately.
-
-    Requires ``workflow`` to carry a ``parent_session_id`` (the session that
-    will be woken on completion).
-
-    Default wake (``on_complete=None``): a durable timer — the parent must be
-    live and a ``TimerRunner`` must be running on the host for it to be delivered.
-    ``eager_wake`` adds a non-durable instant wake that calls ``loop.follow_up``
-    DIRECTLY — it does not go through the TimerRunner, so a host that installed
-    a custom ``TimerDelivery`` should leave it False (the eager path would
-    bypass the host's pipeline; the durable timer still honors it).
-
-    Host wake seam (``on_complete``): supply a callback to take over the wake
-    (in-process, timer-free). It receives a :class:`WorkflowCompletion`; the
-    durable timer and ``eager_wake`` are both skipped. See the module docstring.
-    """
-    # Disabled until its unified task path is implemented; retained internals are not a fallback.
-    from power_loop.agent.runtime_types import RuntimeRequestError
-    raise RuntimeRequestError("feature_unavailable", "workflow is not enabled")
-    parent_sid = workflow._parent_sid
-    if not parent_sid:
-        raise WorkflowRunError("detached run requires a parent_session_id on the workflow")
-    loop = workflow._loop
-    runtime = getattr(loop, "task_runtime", None)
-    submitted_executor, submitted_budget, submitted_file_io = workflow._executor, workflow._budget, workflow._file_io
-    submitted_cancel = workflow._cancel
-    submitted_spec, submitted_tools = workflow.spec, workflow._allowed_tools
-    submitted_request = None
-    resource_binding = getattr(workflow, "_resource_binding", None)
-    resource_registry = None
-    if resource_binding is not None:
-        from power_loop.runtime.jobs import JobError
-        from power_loop.runtime.workflow_resources import (
-            WorkflowResourceScope,
-            execution_contract,
-            require_managed_creation,
-        )
-
-        from .spec import WorkflowSpec
-        if runtime is None:
-            raise JobError("workflow_resource_registry_required")
-        if on_complete is not None or resource_binding.notification_mode != "durable_inbox":
-            raise JobError("workflow_resource_notification_adapter_required")
-        # Freeze before the first resolver await, including SDK-owned mutable IR.
-        submitted_spec = WorkflowSpec.from_json(json.dumps(submitted_spec.to_dict(), ensure_ascii=False))
-        submitted_tools = frozenset(submitted_tools) if submitted_tools is not None else None
-        resource_registry = runtime.workflow_resources
-        resource_scope = WorkflowResourceScope(runtime.tenant_id, runtime.principal_id, parent_sid)
-        resource_contract = execution_contract(submitted_spec, submitted_tools)
-        resource_binding.require(resource_scope, resource_contract)
-        from power_loop.runtime.invocation import current_invocation
-        seq, call_id = current_invocation(parent_sid)
-        original = None
-        if seq is not None and call_id:
-            source = await runtime.manager.store.message_ref(parent_sid, seq)
-            operation = await runtime.manager.operation_for_call(runtime.actor(parent_sid), source, call_id)
-            if operation is not None:
-                saved = await runtime.manager.get_workflow_profile(runtime.actor(parent_sid), operation.job_id)
-                original = operation.result.get("request")
-                if (operation.action != "create" or saved.get("version") != 2 or
-                        saved["resource_binding"] != resource_binding.to_dict() or
-                        original["spec"] != submitted_spec.to_dict() or
-                        original["allowed_tools"] != (sorted(submitted_tools) if submitted_tools is not None else None) or
-                        original["completion_callback"] is not False):
-                    raise JobError("operation_conflict")
-        if original is not None:
-            # Exact durable call replay uses original admission evidence, even
-            # if the adapter was revoked or the shared pool has since spent.
-            submitted_request = original
-        else:
-            if resource_registry is None:
-                raise JobError("workflow_resource_registry_required")
-            resources = await resource_registry.resolve(resource_binding, scope=resource_scope, contract_sha256=resource_contract)
-            require_managed_creation(resources)
-            if runtime.workflow_resources is not resource_registry:
-                raise JobError("workflow_resource_adapter_changed")
-            submitted_executor, submitted_budget, submitted_file_io = resources.executor, resources.budget, resources.file_io
-            if submitted_budget is not None:
-                resource_registry.retain_soft_pool(resource_binding, submitted_budget)
-    if runtime is not None:
-        from power_loop.runtime.workflow_profile import creation_request
-        if submitted_request is None:
-            submitted_request = creation_request(submitted_spec, submitted_tools, executor=submitted_executor,
-                budget=submitted_budget, file_io=submitted_file_io, completion_callback=on_complete is not None,
-                resource_binding=resource_binding)
-    store = await loop._ensure_store()
-    if await store.get_session(parent_sid) is None:
-        raise WorkflowRunError("parent session not found; cannot start detached run")
-
-    registration = None
-    if runtime is not None:
-        from power_loop.runtime.jobs import JobError
-        from power_loop.runtime.workflow_tasks import admit_workflow, validate_new_workflow
-
-        from .spec import WorkflowSpec
-        submitted_spec = WorkflowSpec.from_json(submitted_request["spec"])
-        validate_new_workflow(submitted_spec, eager_wake=eager_wake)
-        registration = await admit_workflow(runtime, parent_sid, submitted_request)
-        frozen_request = registration.operation.result["request"]
-        submitted_spec = WorkflowSpec.from_json(json.dumps(frozen_request["spec"], ensure_ascii=False))
-        submitted_tools = frozenset(frozen_request["allowed_tools"]) if frozen_request["allowed_tools"] is not None else None
-        run_id = registration.operation.operation_id[3:]
-        if registration.replayed:
-            handle = runtime._workflow_handles.get(registration.operation.operation_id) or runtime._workflow_handles.get(run_id) or get_run_handle(run_id)
-            if handle is None or handle.operation_id != registration.operation.operation_id:
-                raise JobError("workflow_admission_requires_reconciliation")
-            return handle
-    else:
-        run_id = secrets.token_hex(8)
-    try:
-        await journal.seed(
-            store, parent_sid, run_id, submitted_spec.name, spec=submitted_spec.to_dict(),
-            allowed_tools=(
-                sorted(submitted_tools) if submitted_tools is not None else None
+        receipt = await port.accept_input(
+            tx,
+            Command(
+                start.message_id,
+                TargetRef(start.store_id, sid),
+                "send",
+                {"body": spec.input},
+                "new_turn",
+                options=plain(options),
             ),
+            actor,
+            descriptor=descriptor,
         )
-    except BaseException:
-        if registration is not None:
-            await runtime.manager.request_cancel(runtime.actor(parent_sid), registration.job.job_id,
-                system_key="journal-admission:" + run_id, reason="workflow journal admission failed")
-        raise
+        run_id = registration.operation.operation_id[3:]
+        if receipt.newly_accepted:
+            await tx.execute(
+                f"UPDATE {port.q} SET delivered_job_id=?,delivered_job_generation=0 WHERE session_id=? AND item_id=?",
+                (registration.job.job_id, sid, start.message_id),
+            )
+            await journal.put(
+                port.store,
+                tx,
+                sid,
+                journal.run_key(run_id),
+                {
+                    "run_id": run_id,
+                    "job_id": registration.job.job_id,
+                    "driver_sid": sid,
+                    "definition_ref": plain(start),
+                    "created_at_ms": now_ms(),
+                },
+            )
+    await client._notify(TargetRef(start.store_id, sid), start.message_id, start, ["work", "activation"])
+    return WorkflowRunHandle(client, actor, run_id, JobRef(start.store_id, registration.job.job_id, 0), start)
 
-    def _engine(executor, budget, file_io) -> WorkflowEngine:
-        return WorkflowEngine(
-            loop, executor=executor, budget=budget,
-            on_step=make_on_step(store, parent_sid, run_id),
-            on_node_start=make_on_node_start(store, parent_sid, run_id),
-            on_node_session=make_on_node_session(store, parent_sid, run_id),
-            stop_event=submitted_cancel, run_id=run_id,
-            history_owner_sid=parent_sid,
-            allowed_tools=submitted_tools,
-            file_io=file_io,
+
+class WorkflowRunHandle:
+    """A durable reference, with no local task or callback ownership."""
+
+    def __init__(self, client, actor, run_id, job_ref, input_ref):
+        self.client, self.actor, self.run_id = client, actor, run_id
+        self.job_ref, self.input_ref = job_ref, input_ref
+        self.job_id, self.operation_id = job_ref.job_id, "op_" + run_id
+
+    async def wait(self, *, deadline_ms=None):
+        result = await self.client.wait(self.input_ref, actor=self.actor, deadline_ms=deadline_ms)
+        from .result import AgentResult, WorkflowResult
+
+        data = plain(result.structured_output)
+        if data is None:
+            return WorkflowResult(self.run_id, result.status, errors=[result.error] if result.error else [])
+        data["results"] = {key: AgentResult(**value) for key, value in data["results"].items()}
+        data["final"] = AgentResult(**data["final"]) if data["final"] else None
+        return WorkflowResult(**data)
+
+    async def resume(self, *, generation, node_id, message, message_id):
+        from .resume import resume_run
+
+        return await resume_run(
+            self.client,
+            replace(self.job_ref, generation=generation),
+            node_id=node_id,
+            message=message,
+            message_id=message_id,
+            actor=self.actor,
         )
 
-    async def _bound_engine():
-        from power_loop.runtime.workflow_profile import capture
-        from power_loop.runtime.workflow_tasks import current_workflow
-        if runtime.workflow_resources is not resource_registry:
-            raise JobError("workflow_resource_adapter_changed")
-        execution = current_workflow(runtime)
-        if execution is None:
-            raise JobError("task_workflow_admission_required")
-        saved = await runtime.manager.get_workflow_profile(runtime.actor(parent_sid), registration.job.job_id)
-        if saved != submitted_request["execution_profile"]:
-            raise JobError("workflow_profile_creation_mismatch")
-        resolved = await resource_registry.resolve(resource_binding, scope=resource_scope, contract_sha256=resource_contract)
-        require_managed_creation(resolved)
-        if resolved.budget is not None:
-            resource_registry.require_soft_pool(resource_binding, resolved.budget)
-        actual = capture(submitted_spec, executor=resolved.executor, budget=resolved.budget,
-            file_io=resolved.file_io, resource_binding=resolved.binding, allowed_tools=submitted_tools)
-        # Shared pool spend may grow across admission; capacity/config may not.
-        if saved["budget"]["kind"] == "runtime_soft" and actual["budget"]["kind"] == "runtime_soft":
-            if actual["budget"]["spent_at_admission"] < saved["budget"]["spent_at_admission"]:
-                raise JobError("workflow_resource_budget_rewound")
-            actual["budget"]["spent_at_admission"] = saved["budget"]["spent_at_admission"]
-        if actual != saved or runtime.workflow_resources is not resource_registry:
-            raise JobError("workflow_resource_binding_mismatch")
-        await runtime.manager.check_execution(execution.actor, execution.lease)
-        return _engine(resolved.executor, resolved.budget, resolved.file_io)
-
-    def _build_engine():
-        return _bound_engine() if resource_binding is not None else _engine(submitted_executor, submitted_budget, submitted_file_io)
-
-    handle = spawn_background(
-        loop, parent_sid, run_id, store=store,
-        build_engine=_build_engine, run_spec=submitted_spec,
-        cancel_token=submitted_cancel, eager_wake=eager_wake, task_set=workflow._tasks,
-        on_complete=on_complete,
-        task_registration=registration,
-    )
-    if registration is not None:
-        handle.job_id, handle.operation_id = registration.job.job_id, registration.operation.operation_id
-        handle._task_runtime, handle._task_registration = runtime, registration
-        # A bounded in-process replay accelerator; durable admission remains the
-        # authority. Missing handles after restart never authorize re-dispatch.
-        remember_handle(runtime, handle)
-    return handle
+    async def cancel(self, reason="cancelled"):
+        return await self.client.cancel(self.input_ref, actor=self.actor, scope="subtree", reason=reason)
 
 
-def spawn_background(
-    loop: Any,
-    parent_sid: str,
-    run_id: str,
-    *,
-    store: Any,
-    build_engine: Any,
-    run_spec: Any,
-    cancel_token: Any,
-    eager_wake: bool,
-    task_set: set[Any],
-    on_complete: OnComplete | None = None,
-    task_registration=None,
-) -> WorkflowRunHandle:
-    """Drive a workflow engine on a background task; journal + wake on finish.
+class DurableExecutor:
+    def __init__(self, worker, ctx, runtime, binding, run_id, env):
+        self.worker, self.ctx, self.runtime, self.binding = worker, ctx, runtime, binding
+        self.port, self.manager = worker.inputs, runtime.manager
+        self.run_id, self.env = run_id, env
+        self.plan = {}
+        self.actor = DriverActor(ctx.actor.tenant_id, ctx.actor.principal_id, ctx.session_id, job_ref=ctx.job_ref)
 
-    Shared by first-run (``run_detached``) and ``resume_detached``. The engine is
-    built lazily inside the task so its construction happens on the run's own
-    task. Returns a handle immediately.
+    async def run_agent(self, request, *, allow_start=True):
+        """G: stable dispatch plus node record; consume results under driver ownership."""
+        from power_loop.runtime.execution_roles import role_tools
+        from power_loop.runtime.spec import AgentSpec, _child_config
 
-    ``store`` is the caller's already-resolved store (this fn is sync and cannot
-    ``await loop._ensure_store()`` itself; reading ``loop.store`` here would capture
-    ``None`` if a future caller hadn't pre-opened it).
-
-    ``on_complete`` (host wake seam): when supplied, it OWNS the parent wake — the
-    durable timer and ``eager_wake`` are both skipped and a
-    :class:`WorkflowCompletion` is handed to it instead (in-process, timer-free).
-    """
-    # Disabled until its unified task path is implemented; retained internals are not a fallback.
-    from power_loop.agent.runtime_types import RuntimeRequestError
-    raise RuntimeRequestError("feature_unavailable", "workflow is not enabled")
-
-    runtime = getattr(loop, "task_runtime", None)
-    if runtime is not None and task_registration is None:
-        from power_loop.runtime.jobs import JobError
-        raise JobError("task_workflow_admission_required")
-
-    async def _bg() -> None:
-        if task_registration is not None:
-            from power_loop.runtime.workflow_tasks import execute_background
-            try:
-                await execute_background(loop, parent_sid, run_id, task_registration, build_engine, run_spec, on_complete)
-            finally:
-                if _HANDLES.get(run_id) is handle:
-                    _LIVE_RUN_IDS.discard(run_id)
-                    _SETTLED_RUNS.add(run_id)
-            return
-        status = "failed"
+        spec = AgentSpec.from_dict(request.spec)
+        config = _child_config(spec, SimpleNamespace(config=self.env.config))
+        available = self.env.tool_registry.names() if self.env.tool_registry else []
+        tools = role_tools(
+            spec.tools if spec.tools is not None else available, "workflow_node", registry=self.env.tool_registry
+        )
+        options = RequestOptions(
+            tools=tools,
+            **{
+                name: getattr(config, name)
+                for name in (
+                    "model",
+                    "temperature",
+                    "max_tokens",
+                    "max_rounds",
+                    "max_tokens_per_run",
+                    "system_prompt",
+                    "response_format",
+                )
+            },
+        )
+        descriptor = replace(
+            self.ctx.descriptor,
+            kind="workflow_node",
+            config={
+                **{key: value for key, value in plain(self.ctx.descriptor.config).items() if key != "workflow"},
+                "child_spec": request.spec,
+                "child_options": plain(options),
+                "workflow_node": {
+                    "workflow_run_id": self.run_id,
+                    "node_id": request.node_path,
+                    "route": request.iteration_path,
+                    "attempt": request.attempt,
+                },
+            },
+        )
+        # This exact system key is the G0 contract. Only the creation event is unique.
+        system_key = (
+            "wf:"
+            + hashlib.sha256(
+                canonical([self.run_id, request.node_path, request.iteration_path, request.attempt]).encode()
+            ).hexdigest()
+        )
+        origin = self.runtime.actor(self.ctx.session_id)
+        offset = self.plan.get("attempt_offsets", {}).get(request.node_path, 0)
+        if offset:
+            request = replace(request, attempt=request.attempt + offset)
+            system_key = (
+                "wf:"
+                + hashlib.sha256(
+                    canonical([self.run_id, request.node_path, request.iteration_path, request.attempt]).encode()
+                ).hexdigest()
+            )
+        key = self.manager._origin_key(origin, "create", None, None, system_key)
+        sid = request.session_id or "node_" + key[:32]
+        start = InputRef(self.ctx.store_id, sid, "start_" + key[:32])
+        entry_key = journal.node_key(key)
+        async with self.manager.joined_write() as tx:
+            await self.port.lock_owned(tx, TargetRef(self.ctx.store_id, self.ctx.session_id), self.ctx)
+            await self.manager._fence(tx, origin, self.binding.lease)
+            saved = await journal.get(self.port.store, tx, self.ctx.session_id, entry_key)
+            if saved is None:
+                if not allow_start:
+                    return {"status": "budget_exceeded", "usage": {}}
+                if request.session_id is None:
+                    await self.port.store._create_session_tx(
+                        tx,
+                        sid,
+                        now_ms(),
+                        parent_session_id=self.ctx.session_id,
+                        lifecycle=SubagentLifecycle.LINKED,
+                        metadata={
+                            **plain(spec.metadata),
+                            "tenant_id": self.actor.tenant_id,
+                            "principal_id": self.actor.principal_id,
+                            "execution_role": "workflow_node",
+                            "workflow_run_id": self.run_id,
+                            "runtime_descriptor": plain(descriptor),
+                        },
+                    )
+                registration = await self.manager.register_job(
+                    origin,
+                    kind="workflow_node",
+                    title=request.node_path,
+                    session_id=sid,
+                    parent=self.binding.lease,
+                    system_key=system_key,
+                    request={"input_ref": plain(start)},
+                )
+                receipt = await self.port.accept_input(
+                    tx,
+                    Command(
+                        start.message_id,
+                        TargetRef(start.store_id, sid),
+                        "send",
+                        {"body": request.body},
+                        "new_turn",
+                        options=plain(options),
+                    ),
+                    self.actor,
+                    descriptor=descriptor,
+                )
+                await tx.execute(
+                    f"UPDATE {self.port.q} SET delivered_job_id=?,delivered_job_generation=0 WHERE session_id=? AND item_id=?",
+                    (registration.job.job_id, sid, start.message_id),
+                )
+                saved = {
+                    "path": request.node_path,
+                    "iteration": request.iteration_path,
+                    "attempt": request.attempt,
+                    "session_id": sid,
+                    "job_id": registration.job.job_id,
+                    "input_ref": plain(receipt.input_ref),
+                    "request_hash": _hash(plain(request)),
+                    "continuations": {},
+                    "result_ref": None,
+                }
+                await journal.put(self.port.store, tx, self.ctx.session_id, entry_key, saved)
+            elif request.continuation == 0 and saved["request_hash"] != _hash(plain(request)):
+                raise RuntimeRequestError("request_conflict", "workflow dispatch input changed")
+            wait_ref = InputRef(**self.plan.get("overrides", {}).get(key, saved["input_ref"]))
+            if request.continuation:
+                continuation_key = str(request.continuation)
+                existing = saved["continuations"].get(continuation_key)
+                if existing is None:
+                    if not allow_start:
+                        return {"status": "budget_exceeded", "session_id": saved["session_id"], "usage": {}}
+                    row = await self.manager._row(tx, saved["job_id"])
+                    wait_ref = InputRef(
+                        self.ctx.store_id, saved["session_id"], "continue_" + _hash([key, request.continuation])[:32]
+                    )
+                    receipt = await self.port.accept_input(
+                        tx,
+                        Command(
+                            wait_ref.message_id,
+                            TargetRef(wait_ref.store_id, wait_ref.session_id, row["job_id"]),
+                            "resume",
+                            {"body": request.body},
+                            "new_turn",
+                            expected_job_generation=row["generation"],
+                            options=plain(options),
+                        ),
+                        self.actor,
+                        descriptor=descriptor,
+                    )
+                    saved["continuations"][continuation_key] = plain(receipt.input_ref)
+                    await journal.put(self.port.store, tx, self.ctx.session_id, entry_key, saved)
+                else:
+                    wait_ref = InputRef(**existing)
+        await self.worker.runtime.client._notify(
+            TargetRef(wait_ref.store_id, wait_ref.session_id), wait_ref.message_id, wait_ref, ["work", "activation"]
+        )
         try:
-            engine = build_engine()
-            handle._origin_engine = engine
-            _ENGINES[run_id] = engine
-            try:
-                result = await engine.run(run_spec)
-            finally:
-                if getattr(handle, "_origin_engine", None) is engine:
-                    del handle._origin_engine
-                if _ENGINES.get(run_id) is engine:
-                    _ENGINES.pop(run_id, None)
-            await journal.finalize(store, parent_sid, run_id, result)
-            status = result.status
-            note = _wake_note(run_id, status)
-            _publish(loop, parent_sid, run_id, "completed", status,
-                     level=("error" if status == "failed" else "info"))
+            result = await self.worker.runtime.client.wait(wait_ref, actor=self.actor, deadline_ms=None)
         except asyncio.CancelledError:
-            # A forced legacy task exit is real business interruption, even
-            # when a provider could not return a final AgentResult. Preserve
-            # existing steps/usage and never claim its remote resources stopped.
-            try:
-                await journal.update(store, parent_sid, run_id, status="cancelled",
-                    error="workflow_execution_cancelled", finished_at_ms=journal._now_ms())
-            except Exception:
-                logger.exception("legacy cancellation journal requires reconciliation: %s", run_id)
+            # A graph halt stops its outstanding leaves. Losing the driver
+            # process leaves healthy nodes alone for the replacement driver.
+            if not self.ctx.shutdown_interrupted and not self.ctx.lease.lost:
+                await self.worker.runtime.client.cancel(
+                    wait_ref, actor=self.actor, scope="subtree", reason="workflow branch stopped"
+                )
             raise
-        except Exception as exc:  # noqa: BLE001 — capture everything; the task must not die silently
-            await journal.fail(store, parent_sid, run_id, exc)
-            status = "failed"
-            note = _wake_note(run_id, "failed", repr(exc))
-            _publish(loop, parent_sid, run_id, "failed", "failed", level="error")
-        # The journal is final: the run is over even though this task still delivers the wake below.
-        _LIVE_RUN_IDS.discard(run_id)
-        _SETTLED_RUNS.add(run_id)
-        if run_id in _STOPPED_RUNS:
-            return  # stopped by request — journaled as cancelled, no wake (design/124 §8.4)
-        if on_complete is not None:
-            # Host owns delivery (timer-free, die-with-process). Supersedes eager_wake.
-            await _run_on_complete(on_complete, parent_sid, run_id, status, note)
+        from power_loop.runtime.result_revisions import result_id
+
+        reference = {
+            "result_id": result_id(result.job_ref.job_id, result.job_ref.generation),
+            "job_id": result.job_ref.job_id,
+            "generation": result.job_ref.generation,
+        }
+        async with self.manager.joined_write() as tx:
+            await self.port.lock_owned(tx, TargetRef(self.ctx.store_id, self.ctx.session_id), self.ctx)
+            await self.manager._fence(tx, origin, self.binding.lease)
+            saved = await journal.get(self.port.store, tx, self.ctx.session_id, entry_key)
+            saved["result_ref"] = reference
+            await journal.put(self.port.store, tx, self.ctx.session_id, entry_key, saved)
+            item = hashlib.sha256(("result:" + reference["result_id"]).encode()).hexdigest()
+            await tx.execute(
+                f"UPDATE {self.port.q} SET status='delivered',delivered_at=?,claim_token=NULL,claimed_at=NULL,"
+                "claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
+                (now_ms(), self.ctx.session_id, item),
+            )
+            await tx.update_event(
+                reference["job_id"],
+                f"UPDATE {self.port.events} SET delivery_status='handled' WHERE event_id=?",
+                (reference["result_id"],),
+            )
+            await tx.write_job(
+                reference["job_id"],
+                f"UPDATE {self.port.jobs} SET result_status='handled',version=version+1 "
+                "WHERE job_id=? AND generation=?",
+                (reference["job_id"], reference["generation"]),
+                obligations=True,
+            )
+        from power_loop.runtime.finalization import try_finalize
+
+        await try_finalize(self.manager, origin, result.job_ref.job_id, result.job_ref.generation)
+        raw = plain(result)
+        # Public results classify incomplete model turns as interrupted. The
+        # graph retains the explicit round-limit reason for its declared policy.
+        if result.status == "interrupted" and result.error in {"hit_round_limit", "context_checkpoint"}:
+            raw["status"] = result.error
+        return {
+            **raw,
+            "session_id": saved["session_id"],
+            "accounting_usage": (
+                {}
+                if result.job_ref.generation <= self.plan.get("already_counted", {}).get(result.job_ref.job_id, 0)
+                else raw["usage"]
+            ),
+        }
+
+    async def todo_remaining(self, sid):
+        state = await self.port.store.get_runtime_state(sid, "todo") or {}
+        return [item["text"] for item in state.get("items", []) if item["status"] != "completed"]
+
+
+async def run(worker, ctx, record, env, runtime, *, recovery=False):
+    """Reconstruct a driver from the frozen definition and existing dispatches."""
+    from power_loop.runtime.task_runtime import Execution
+
+    port, manager = worker.inputs, runtime.manager
+    await runtime.ensure_started()
+    job_id = record.row["delivered_job_id"] or record.row["target_job_id"]
+    async with manager.joined_write() as tx:
+        await port.lock_owned(tx, TargetRef(ctx.store_id, ctx.session_id), ctx)
+        row = await manager._row(tx, job_id)
+        if row["outcome"] is not None and (record.meta["operation"] != "resume" or recovery):
+            await consume_late_results(worker, ctx, row, tx)
+            from power_loop.runtime.finalization import try_finalize
+
+            await try_finalize(manager, runtime.actor(ctx.session_id), job_id, row["generation"])
+            return
+        explicit = record.meta["operation"] == "resume" and not recovery
+        if explicit:
+            claimed = await port.claim_inputs(tx, TargetRef(ctx.store_id, ctx.session_id), ctx, 1, [record.ref])
+            if not claimed:
+                return
+            from power_loop.runtime.subagent_resume import resume_claim
+
+            binding = await resume_claim(runtime, tx, record, row)
+            ctx.job_ref = JobRef(ctx.store_id, job_id, binding.lease.generation)
+            await port.bind_input_job(tx, record.ref, ctx.job_ref, ctx, claim_token=claimed[0].row["claim_token"])
+            await tx.execute(
+                f"UPDATE {port.q} SET status='delivered',delivered_at=?,claim_token=NULL,claimed_at=NULL,"
+                "claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
+                (now_ms(), ctx.session_id, record.ref.message_id),
+            )
+        elif row["generation"] == 0:
+            claimed = await port.claim_inputs(tx, TargetRef(ctx.store_id, ctx.session_id), ctx, 1, [record.ref])
+            if not claimed:
+                return
+            binding = await runtime.claim(runtime.actor(ctx.session_id), JobRegistration(_record(row), None, False))
+            ctx.job_ref = JobRef(ctx.store_id, job_id, binding.lease.generation)
+            await port.bind_input_job(tx, record.ref, ctx.job_ref, ctx, claim_token=claimed[0].row["claim_token"])
+            await tx.execute(
+                f"UPDATE {port.q} SET status='delivered',delivered_at=?,claim_token=NULL,claimed_at=NULL,"
+                "claim_owner_epoch=NULL WHERE session_id=? AND item_id=?",
+                (now_ms(), ctx.session_id, record.ref.message_id),
+            )
         else:
-            await _wake(loop, parent_sid, note)
-            if eager_wake:
-                await _eager_wake(loop, store, parent_sid, run_id, note, task_set)
+            # Only the new driver owner enters a new generation. No leaf is
+            # re-claimed or stopped, and its original result/cost owner remains.
+            old_ref = JobRef(ctx.store_id, job_id, row["generation"])
+            await port._commit_result(
+                tx,
+                old_ref,
+                Result(old_ref, record.ref, "interrupted", error="workflow driver replaced"),
+                ctx,
+                {"parent_session_id": None},
+            )
+            row = await manager._row(tx, job_id)
+            lease = JobLease(job_id, runtime.executor_id, runtime.boot_id, row["generation"] + 1)
+            from power_loop.runtime.executor_registry import ExecutorIdentity, require_accepting
 
-    task = asyncio.create_task(_bg(), name=f"workflow-{run_id}")
-    task_set.add(task)
-    task.add_done_callback(task_set.discard)
-    # In-process liveness (workflow-durability-3): mark live now, discard when the task settles —
-    # a crashed run is therefore NOT marked live, so resume-after-crash still works.
-    _LIVE_RUN_IDS.add(run_id)
-    _SETTLED_RUNS.discard(run_id)      # a resumed run starts unsettled again
-    task.add_done_callback(lambda _t: _LIVE_RUN_IDS.discard(run_id) if _HANDLES.get(run_id) is handle else None)
-    handle = WorkflowRunHandle(run_id=run_id, task=task, cancel_token=cancel_token)
-    handle._origin_store, handle._origin_parent_sid = store, parent_sid
-    _HANDLES[run_id] = handle
+            executor = await require_accepting(
+                manager,
+                tx,
+                ExecutorIdentity(row["tenant_id"], row["principal_id"], runtime.executor_id, runtime.boot_id),
+                required=row["executor_key"] is not None,
+            )
+            changed = await tx.write_job(
+                job_id,
+                f"UPDATE {manager.jobs} SET generation=?,executor_id=?,boot_id=?,executor_key=?,version=version+1,"
+                "result_json=NULL,result_status='none',updated_at=? WHERE job_id=? AND generation=? AND version=? AND outcome IS NULL",
+                (
+                    lease.generation,
+                    lease.executor_id,
+                    lease.boot_id,
+                    executor["executor_key"] if executor else None,
+                    now_ms(),
+                    job_id,
+                    row["generation"],
+                    row["version"],
+                ),
+            )
+            if not changed:
+                raise RuntimeRequestError("stale_generation")
+            binding = Execution(runtime, runtime.actor(ctx.session_id), lease)
+            from power_loop.runtime.execution_membership import start
 
-    def _forget(_t: Any) -> None:
-        if _HANDLES.get(run_id) is handle:
-            _HANDLES.pop(run_id, None)
-            _STOPPED_RUNS.discard(run_id)
-            _SETTLED_RUNS.discard(run_id)
-
-    task.add_done_callback(_forget)
-    return handle
-
-
-async def _eager_wake(
-    loop: Any, store: Any, parent_sid: str, run_id: str, note: str, task_set: set[Any]
-) -> None:
-    """Non-durable fast-path layered on the durable timer (already armed above).
-
-    The eager delivery bypasses ``TIMER_FIRE``, so :func:`make_wake_guard` can't
-    dedupe it — we CLAIM the wake (journal ``woke=True``) so the later durable timer
-    is skipped and the parent wakes exactly once.
-
-    The follow_up is a real, fallible coroutine, so we must NOT fire-and-forget it:
-    a bare ``create_task`` is only weakly referenced by CPython and can be GC'd
-    mid-flight, and the coroutine can raise *after* we claimed the wake — and since
-    the durable timer is then suppressed, the parent would be lost forever. So we
-    RETAIN the task in ``task_set`` and, if it fails/cancels, re-open the claim and
-    re-arm a durable timer (see :func:`_recover_eager_wake`).
-    """
-    j = await journal.read(store, parent_sid, run_id)
-    if j is None or j.get("woke"):
-        return
-    await journal.update(store, parent_sid, run_id, allow_terminal=True, woke=True)
-    eager = asyncio.create_task(
-        loop.follow_up(note, parent_sid), name=f"workflow-eagerwake-{run_id}"
-    )
-    task_set.add(eager)
-    eager.add_done_callback(task_set.discard)
-    eager.add_done_callback(
-        lambda t: _recover_eager_wake(loop, store, parent_sid, run_id, note, t, task_set)
-    )
-
-
-def _recover_eager_wake(
-    loop: Any, store: Any, parent_sid: str, run_id: str, note: str, task: Any, task_set: set[Any]
-) -> None:
-    """Done-callback for the eager follow_up.
-
-    On success, leave ``woke=True`` (the durable timer stays suppressed). On failure
-    or cancellation the parent was never woken yet the durable timer is suppressed —
-    so schedule an async recovery that re-opens the claim and re-arms a fresh durable
-    timer. The wake-guard dedupes if the original timer is also still pending, so the
-    parent still wakes exactly once. A done-callback must never raise (and cannot
-    await), so the real work runs on a retained recovery task.
-    """
-    if not task.cancelled() and task.exception() is None:
-        return  # eager delivery succeeded
-    try:
-        recovery = asyncio.create_task(
-            _recover_eager_wake_async(loop, store, parent_sid, run_id, note),
-            name=f"workflow-eagerwake-recover-{run_id}",
+            await start(manager, tx, await manager._row(tx, job_id))
+            ctx.job_ref = JobRef(ctx.store_id, job_id, lease.generation)
+        ctx.parent_job_id, ctx.root_job_id = row["parent_job_id"], row["root_job_id"]
+        creation = await tx.fetchone(
+            f"SELECT event_id FROM {manager.events} WHERE job_id=? AND action='create'", (job_id,)
         )
-        task_set.add(recovery)
-        recovery.add_done_callback(task_set.discard)
-    except Exception:  # noqa: BLE001 — recovery scheduling must not raise inside a callback
-        return
+        run_id = creation["event_id"][3:]
+        saved = await journal.get(port.store, tx, ctx.session_id, journal.run_key(run_id))
+        if explicit:
+            saved = await prepare_continuation(worker, ctx, runtime, binding, run_id, saved, tx)
+            await journal.put(port.store, tx, ctx.session_id, journal.run_key(run_id), saved)
+    executor = DurableExecutor(worker, ctx, runtime, binding, run_id, env)
+    executor.plan = saved.get("continuation", {})
+    spec = WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"]))
+    engine = WorkflowEngine(
+        executor,
+        run_id=run_id,
+        driver_sid=ctx.session_id,
+        allowed_tools=ctx.descriptor.config["workflow"]["allowed_tools"],
+        stop_event=ctx.stop,
+        file_io=getattr(env.resources, "workflow_file_io", None),
+    )
+    engine._usage_acc = dict(executor.plan.get("prior_usage", {}))
+    # The scheduler holds ownership but no model slot while awaiting leaves.
+    async with runtime.execution(binding, cancel_token=ctx.stop), worker.idle(ctx):
+        graph = asyncio.create_task(engine.run(spec))
+        stopped = asyncio.create_task(ctx.stop.wait())
+        timed_out = False
+        try:
+            remaining = max(0, spec.timeout_s - (now_ms() - saved["created_at_ms"]) / 1000) if spec.timeout_s else None
+            done, _ = await asyncio.wait((graph, stopped), timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            if graph in done:
+                result = graph.result()
+            else:
+                timed_out = stopped not in done
+                if timed_out:
+                    await worker.runtime.client.cancel(
+                        ctx.job_ref, actor=executor.actor, scope="subtree", reason="workflow timeout"
+                    )
+                graph.cancel()
+                await asyncio.gather(graph, return_exceptions=True)
+                result = engine._build_result(spec, "failed" if timed_out else "cancelled")
+                if timed_out:
+                    result.errors.append("workflow timeout")
+        finally:
+            stopped.cancel()
+            graph.cancel()
+            await asyncio.gather(stopped, graph, return_exceptions=True)
+        async with manager.joined_write() as tx:
+            route = await port._lock_result_sessions(tx, ctx.job_ref)
+            await port.lock_owned(tx, TargetRef(ctx.store_id, ctx.session_id), ctx)
+            row = await manager._authorize(tx, binding.actor, job_id)
+            manager._check_proof(row, binding.lease)
+            status = "failed" if timed_out else "cancelled" if row["cancel_requested_at"] is not None else result.status
+            await tx.write_job(
+                job_id,
+                f"UPDATE {manager.jobs} SET status='settling',outcome=?,resource_state='stopped',intake='closed',"
+                "version=version+1 WHERE job_id=? AND generation=? AND version=?",
+                (
+                    "succeeded" if status == "completed" else "failed" if status == "budget_exceeded" else status,
+                    job_id,
+                    ctx.job_ref.generation,
+                    row["version"],
+                ),
+                obligations=True,
+            )
+            parent = await port._commit_result(
+                tx,
+                ctx.job_ref,
+                Result(
+                    ctx.job_ref,
+                    record.ref,
+                    status,
+                    result.final.text if result.final else "",
+                    result.usage,
+                    result.to_dict(),
+                ),
+                ctx,
+                route,
+            )
+    from power_loop.runtime.finalization import try_finalize
+
+    await try_finalize(manager, binding.actor, job_id, ctx.job_ref.generation)
+    if parent:
+        await worker.runtime.client._notify(
+            TargetRef(parent.store_id, parent.session_id), parent.message_id, parent, ["work", "activation"]
+        )
 
 
-async def _recover_eager_wake_async(
-    loop: Any, store: Any, parent_sid: str, run_id: str, note: str
-) -> None:
-    """Re-open a failed eager-wake claim and re-arm the durable timer (off the
-    done-callback so it can await the async store)."""
-    try:
-        j = await journal.read(store, parent_sid, run_id)
-        if j is None or not j.get("woke"):
-            return  # already re-opened, or the run is gone
-        await journal.update(store, parent_sid, run_id, allow_terminal=True, woke=False)
-    except Exception:  # noqa: BLE001 — recovery must not raise
-        return
-    await _wake(loop, parent_sid, note)
+async def prepare_continuation(worker, ctx, runtime, binding, run_id, saved, tx):
+    """The explicit new input selects one node and a new dependent tail."""
+    from .continuation import plan_continuation
+
+    port, manager = worker.inputs, runtime.manager
+    options = plain(ctx.descriptor.config["workflow_resume"])
+    plan = plan_continuation(
+        WorkflowSpec.from_json(plain(ctx.descriptor.config["workflow"]["spec"])), options["node_id"]
+    )
+    rows = await tx.fetchall(
+        f"SELECT state_key,value_json FROM {port.store.t.session_runtime_state} "
+        "WHERE session_id=? AND state_key LIKE 'workflow:node:%' LIMIT 10001",
+        (ctx.session_id,),
+    )
+    import json
+
+    nodes = [(r["state_key"].removeprefix("workflow:node:"), json.loads(r["value_json"])) for r in rows]
+    selected = [(key, n) for key, n in nodes if n["path"] == options["node_id"]]
+    if not selected or len({canonical(n["iteration"]) for _, n in selected}) != 1:
+        raise RuntimeRequestError("workflow_node_ambiguous_choose_job")
+    key, node = max(selected, key=lambda pair: pair[1]["attempt"])
+    child = await manager._row(tx, node["job_id"])
+    original = await port.input(tx, InputRef(**node["input_ref"]))
+    actor = DriverActor(ctx.actor.tenant_id, ctx.actor.principal_id, ctx.session_id, job_ref=ctx.job_ref)
+    start = InputRef(ctx.store_id, node["session_id"], "resume_" + _hash([ctx.input_ref.message_id, key])[:32])
+    receipt = await port.accept_input(
+        tx,
+        Command(
+            start.message_id,
+            TargetRef(ctx.store_id, node["session_id"], node["job_id"]),
+            "resume",
+            {"body": options["message"]},
+            "new_turn",
+            expected_job_generation=child["generation"],
+            options=original.meta["options"],
+        ),
+        actor,
+        descriptor=RuntimeDescriptor(**original.meta["descriptor"]),
+    )
+    previous = saved.get("continuation", {})
+    offsets = dict(previous.get("attempt_offsets", {}))
+    for _, n in nodes:
+        if n["path"] in plan.invalidated and n["path"] != options["node_id"]:
+            offsets[n["path"]] = max(offsets.get(n["path"], 0), n["attempt"])
+    overrides = dict(previous.get("overrides", {}))
+    overrides[key] = plain(receipt.input_ref)
+    import json
+
+    from power_loop.runtime.result_revisions import result_id
+
+    old_result = await tx.fetchone(
+        f"SELECT payload_json FROM {manager.events} WHERE event_id=?",
+        (result_id(ctx.job_ref.job_id, ctx.job_ref.generation - 1),),
+    )
+    usage = json.loads(old_result["payload_json"])["result"]["usage"]
+    counted = {}
+    for _, n in nodes:
+        job = await manager._row(tx, n["job_id"])
+        counted[job["job_id"]] = job["generation"]
+    return {
+        **saved,
+        "definition_ref": plain(ctx.input_ref),
+        "continuation": {
+            "attempt_offsets": offsets,
+            "overrides": overrides,
+            "prior_usage": usage,
+            "already_counted": counted,
+        },
+    }
 
 
-def make_wake_guard(store: Any):
-    """A ``HookPoint.TIMER_FIRE`` guard that delivers each workflow wake exactly
-    once (timers are at-least-once). Ignores non-workflow timers. Async because the
-    store is async; ``run_typed_async`` awaits it.
-
-    Runs BEFORE the runner's delivery step, so the dedupe also covers a host
-    ``TimerDelivery`` — a custom delivery does not need to re-claim.
-    """
-
-    async def guard(ctx: TimerFireCtx) -> None:
-        run_id = parse_workflow_wake(ctx.note)
-        if run_id is None:
-            return  # not a workflow timer → CONTINUE
-        if await _claim_wake_state(store, ctx.session_id, run_id) == "already":
-            ctx.directive = HookDirective.SKIP
-
-    return guard
-
-
-def register_wake_guard(loop: Any) -> None:
-    """Install the workflow wake-dedupe guard on ``loop``'s hooks (call once).
-
-    Resolves the loop's (lazily-opened) async store at fire time, so it is safe
-    to register before the first session is created.
-    """
-
-    async def guard(ctx: TimerFireCtx) -> None:
-        store = await loop._ensure_store()
-        await make_wake_guard(store)(ctx)
-
-    loop.hooks.register(HookPoint.TIMER_FIRE, guard)
+async def consume_late_results(worker, ctx, workflow, tx):
+    """A finished graph records late node results without starting another graph."""
+    port = worker.inputs
+    records = await tx.fetchall(
+        f"SELECT * FROM {port.q} WHERE session_id=? AND status='pending' ORDER BY id LIMIT 100", (ctx.session_id,)
+    )
+    for row in records:
+        record = port.record(row)
+        if record.meta["operation"] != "result_ready":
+            await port.void_unbound(tx, record.ref, reason="workflow_finished")
+            continue
+        ref = record.meta["result_ref"]
+        source = await tx.fetchone(
+            f"SELECT j.parent_job_id,e.operation_key FROM {port.jobs} j JOIN {port.events} e "
+            "ON e.job_id=j.job_id AND e.action='create' WHERE j.job_id=?",
+            (ref["job_id"],),
+        )
+        if source["parent_job_id"] != workflow["job_id"]:
+            raise RuntimeRequestError("forbidden")
+        key = journal.node_key(source["operation_key"])
+        node = await journal.get(port.store, tx, ctx.session_id, key)
+        if node is not None:
+            node["result_ref"] = ref
+            await journal.put(port.store, tx, ctx.session_id, key, node)
+        await tx.execute(
+            f"UPDATE {port.q} SET status='delivered',delivered_at=? WHERE session_id=? AND item_id=?",
+            (now_ms(), ctx.session_id, record.ref.message_id),
+        )
+        await tx.update_event(
+            ref["job_id"], f"UPDATE {port.events} SET delivery_status='handled' WHERE event_id=?", (ref["result_id"],)
+        )
+        await tx.write_job(
+            ref["job_id"],
+            f"UPDATE {port.jobs} SET result_status='handled',version=version+1 WHERE job_id=? AND generation=?",
+            (ref["job_id"], ref["generation"]),
+            obligations=True,
+        )

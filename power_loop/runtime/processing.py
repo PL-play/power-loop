@@ -138,8 +138,7 @@ async def _discover_request(manager, actor, caller, *, round_index, send_index, 
             generation = json.loads(event["payload_json"])["generation"]
             if event["event_id"] != result_id(job["job_id"], generation):
                 continue
-            item_id = (await delivery_id(manager, tx, job, generation) if job["kind"] == "subagent"
-                or job["kind"] in {"background_tool", "background_command"} and job["session_id"] else event["event_id"])
+            item_id = await delivery_id(manager, tx, job, generation)
         if event['event_type'] == 'result' and job['kind'] in ('subagent', 'workflow_node', 'workflow'):
             from .controller_recovery import observation as controller_observation
             from .controller_recovery import read as controller_stop
@@ -156,7 +155,7 @@ async def _discover_request(manager, actor, caller, *, round_index, send_index, 
                 observed.append({'event_id': event['event_id'], 'job_id': event['job_id'],
                     'revision': int(event['job_version']), 'result_hash': _hash(json.loads(event['payload_json'])), **actual})
             continue
-        if event['event_type'] == 'result' and job['kind'] == 'background_tool' and job['session_id'] is None:
+        if event['event_type'] == 'result' and job['kind'] == 'background_tool' and job['session_id'] == job['created_by_session_id']:
             from .managed_delivery import observation
 
             actual = await observation(manager, tx, actor, job, event, visible)
@@ -199,7 +198,7 @@ async def _already_handled(manager, reader, event):
         elif row["kind"] == "send":
             from .abort_outcomes import handled_references
             await handled_references(manager, reader, row, event)
-        elif row["kind"] == "background_tool" and row["session_id"] is None:
+        elif row["kind"] == "background_tool" and row["session_id"] == row["created_by_session_id"]:
             from .managed_delivery import handled_references, read
             await handled_references(manager, reader, row, event, await read(manager, reader, row, event))
         elif event.get("_processing_kind") == "controller":
@@ -247,7 +246,7 @@ async def _decision_target(manager, tx, actor, send, event, response_seq):
         from .original_owner_review import require_handler
         await require_handler(manager,tx,target,send)
         await verify_observation(manager, tx, actor, target, current, event)
-    if not is_input and target['kind'] == 'background_tool' and target['session_id'] is None:
+    if not is_input and target['kind'] == 'background_tool' and target['session_id'] == target['created_by_session_id']:
         from .managed_delivery import verify_observation
 
         if send['execution_role'] != 'main':
@@ -404,10 +403,6 @@ async def require_inputs_handled(manager, tx, job):
     events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type='operation' AND action='nudge'", (job["job_id"],))
     for event in events:
         try:
-            if job["kind"] == "workflow" and json.loads(event["payload_json"]).get("mode") == "workflow_continue":
-                from .workflow_restore_execution import require_settled
-                await require_settled(manager, tx, job, event)
-                continue
             sid = job["session_id"]
             if job["kind"] == "workflow_node":
                 from .node_inputs import descriptor
@@ -459,8 +454,8 @@ async def require_event_handled(manager, tx, result, *, session_id, owner_job_id
         target = json.loads(result["payload_json"])["request"]["target"]
         if handler["control_owner_job_id"] != target["job_id"]:
             raise JobError("required_result_unhandled")
-    closed = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=? AND event_type='model_closed'",
-                              ("model_closed_" + payload["handler_job_id"],))
+    closed = await tx.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=? AND event_type='result'",
+                              (result_id(payload["handler_job_id"], 1),))
     evidence = json.loads(closed["payload_json"]).get("evidence", {}) if closed else {}
     if (closed is None or json.loads(closed["payload_json"]).get("generation") != payload["generation"] or
             evidence.get("exit") != "completed" or evidence.get("new_input_after_pass") or

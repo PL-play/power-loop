@@ -175,25 +175,20 @@ spec = {
          "inputs_from": ["research"]},
     ]},
 }
-result = await create_workflow(spec, parent_loop=loop).run()
+result = await create_workflow(spec, client=runtime.client, target=target,
+                               actor=actor, message_id="research-1").run()
 ```
 
-Validated on creation (every problem reported at once — ideal for an LLM to repair). Run it **detached** and the parent agent is woken on completion via a durable timer. Crash halfway through the fan-out? `resume_run(loop, parent_sid, run_id)` replays the planner + finished researchers from the journal and re-runs only what's left. Register it as a tool and the agent builds and submits workflows itself.
+Validated before admission, then executed by workers against a frozen definition.
+The driver and each leaf have independent sessions. A replacement driver reuses
+completed results and waits for healthy original leaves. Unknown external work is
+reported as interrupted; explicit continuation creates a new execution and keeps
+cumulative budgets. See [Workflows](docs/en/user-guide/workflows.md) and
+[example 27](examples/27_dynamic_workflow.py) for runtime setup.
 
-### Run untrusted sub-agents in real sandboxes — without sandboxing the parent
-
-The default executor runs leaves in-process. The **subprocess executor** runs each leaf in its own OS process against its own SQLite file (the one-writer-per-file rule holds trivially), and a `WorkerLauncher` wraps that process — per leaf, by inspecting its granted tools — in gVisor / Docker / firejail.
-
-```python
-from power_loop.workflow import SubprocessExecutor, WorkerBootstrap, create_workflow
-
-ex = SubprocessExecutor(
-    bootstrap=WorkerBootstrap(llm_from_env=True, tool_preset="core"),
-    launcher=my_gvisor_launcher,   # wraps the worker command per leaf; fail-closed
-    timeout_s=120,
-)
-await create_workflow(spec, parent_loop=loop, executor=ex).run()
-```
+Hosts run shared workers using a shared session coordinator, message transport and
+store. Process isolation is a host deployment choice; tools can use a sandboxed
+`ShellBackend`. The SDK does not launch one private database per leaf.
 
 ### Durable, operable storage — the part most "agent libraries" skip
 
@@ -287,7 +282,7 @@ See the [API reference](docs/en/api/index.md).
 
 ## Honest scope
 
-power-loop **orchestrates; it does not, by itself, isolate.** The built-in `bash`/file tools run in-process and inherit the host environment — convenient for trusted, local use, **not a security boundary**. For untrusted/model-authored commands, inject a sandbox via the `ShellBackend` seam (tool-level) or run leaves through `SubprocessExecutor` + `WorkerLauncher` (process-level). Keep secrets in your orchestrator. See [SECURITY.md](SECURITY.md).
+power-loop **orchestrates; it does not, by itself, isolate.** The built-in `bash`/file tools run in-process and inherit the host environment — convenient for trusted, local use, **not a security boundary**. For untrusted/model-authored commands, inject a sandbox via the `ShellBackend` seam (tool-level) or deploy workers inside host-managed isolated processes. Keep secrets in your orchestrator. See [SECURITY.md](SECURITY.md).
 
 **Single-writer-per-session.** Per-session ordering is an in-process `asyncio.Lock`; it gives no cross-process mutual exclusion. With **SQLite**, run one writer process per file (shard sessions across files). With **PostgreSQL/MySQL**, sequence allocation is multi-writer-safe (`SELECT … FOR UPDATE`), but the *pending-state machine* still assumes one writer drives a given session at a time (the dispatcher/queue layer above is yours). Concurrent first-boot of a fresh server schema should provision out-of-band (`SchemaPolicy.VERIFY`). See the [scaling guide](docs/en/user-guide/scaling.md).
 

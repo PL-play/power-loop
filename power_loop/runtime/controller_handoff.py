@@ -5,6 +5,7 @@ import json
 
 from .jobs import JobError, _hash
 from .model_exit import content_reference
+from .result_revisions import result_id
 
 
 def identity(manager, source):
@@ -44,7 +45,7 @@ async def read(manager, tx, source, result, *, optional=True):
     from .pending_calls import identity as disposition_id
     owner = await manager._row(tx, binding['owner']['job_id'])
     retirement = (await read_retirement(manager, tx, owner, binding['owner']))[0]['event_id']
-    required_ids = {retirement, disposition_id(manager, source), 'model_closed_' + source['job_id']}
+    required_ids = {retirement, disposition_id(manager, source), result_id(source["job_id"], source["generation"])}
     if (set(data) != required or type(data['version']) is not int or data['version'] != 1
             or data['source_job_id'] != source['job_id'] or data['main_session_id'] != main['session_id']
             or data['review_owner'] != binding or data['result'] != content_reference(result)
@@ -72,11 +73,10 @@ async def read(manager, tx, source, result, *, optional=True):
 
 async def _quiescent(manager, tx, actor, owner, source, binding):
     """Retirement fences new work; every existing descendant needs exit evidence."""
+    from .execution_membership import proof
     from .execution_membership import read as membership
-    from .execution_membership import seal
     from .model_exit import require_stopped
     from .pending_calls import _closed
-    from .workflow_controller import proof
 
     if proof(owner) != binding['owner'] or owner['intake'] != 'closed':
         raise JobError('controller_handoff_owner_not_retired')
@@ -107,9 +107,8 @@ async def _quiescent(manager, tx, actor, owner, source, binding):
                 if row['kind'] == 'send':
                     closed = await _closed(manager, tx, row)
                     await require_stopped(manager, tx, row, closed)
-                    event_id = 'model_closed_' + row['job_id']
+                    event_id = result_id(row["job_id"], row["generation"])
                 else:
-                    from .result_revisions import result_id
                     event_id = result_id(row['job_id'], row['generation'])
                     result = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (event_id,))
                     if result is None or json.loads(result['payload_json']).get('resource_state') not in ('stopped', 'not_started'):
@@ -123,7 +122,6 @@ async def _quiescent(manager, tx, actor, owner, source, binding):
         raise JobError('controller_handoff_source_missing')
     # No additional execution can join this retired scope. Seal only its actual
     # existing members; this creates no result, processing ACK or new generation.
-    await seal(manager, tx, owner)
     frozen = await membership(manager, tx, owner, owner['generation'])
     if not frozen['sealed']:
         raise JobError('controller_handoff_members_unsealed')

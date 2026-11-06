@@ -1,40 +1,22 @@
-"""27 · 动态工作流 / Dynamic workflow: declarative JSON DSL + deterministic engine
+"""Declarative workflow through the common runtime. Run with POWER_LOOP_* model settings.
 
-What you learn / 你将学到
---------------------------
-- 用一份**声明式 WorkflowSpec JSON** 描述确定性控制流（sequence / foreach），
-  叶子是普通子代理（每个一个 AgentSpec）
-  / describe deterministic control flow (sequence / foreach) with a declarative
-  ``WorkflowSpec`` JSON whose leaves are ordinary sub-agents (one ``AgentSpec`` each)
-- ``create_workflow(spec, parent_loop=loop)`` 创建即校验（错误一次性聚合报出），
-  ``await wf.run()`` 在进程内确定性执行
-  / ``create_workflow`` validates on creation (all problems aggregated),
-  ``await wf.run()`` interprets it deterministically in-process
-- 用 ``output_schema`` 让上游 agent 产出结构化数据，下游用 ``items_from:"plan.subtopics"``
-  引用它做 ``foreach`` 扇出
-  / an upstream agent's ``output_schema`` lets a downstream ``foreach`` fan out over
-  ``items_from: "plan.subtopics"``
-- 这是 **code-driven** 确定性编排，区别于 ``spawn_agent`` 的
-  **model-driven** 即兴委派
-  / this is *code-driven* deterministic orchestration, vs the *model-driven*
-  ad-hoc delegation of ``spawn_agent``
-
-也可把 ``create_workflow`` 注册成 LLM 工具（``register_workflow_tools``），让主
-agent 自己产出 WorkflowSpec JSON 提交执行——见文件末尾注释。
-
-Run / 运行
-----------
-    python examples/27_dynamic_workflow.py        # needs POWER_LOOP_* env
+The driver and leaves use independent sessions. This example uses the default
+single-process adapters; shared workers use host-supplied shared adapters.
 """
-
-from __future__ import annotations
-
 import asyncio
+from uuid import uuid4
 
 from _helpers import make_llm
 
-from power_loop import AgentLoopConfig, StatefulAgentLoop
-from power_loop.workflow import create_workflow
+from power_loop import (
+    AgentLoopConfig,
+    ExecutionEnvironment,
+    RegistryRuntimeFactory,
+    Runtime,
+    RuntimeDescriptor,
+    SessionStore,
+    TrustedActor,
+)
 
 SPEC = {
     "name": "research_and_summarize",
@@ -96,82 +78,24 @@ SPEC = {
     },
 }
 
-
-async def main() -> str:
-    loop = StatefulAgentLoop(
-        llm=make_llm(),
-        db_path=":memory:",
-        config=AgentLoopConfig(system_prompt="orchestrator", max_rounds=4),
-    )
-
-    # Validated on creation; an invalid spec raises WorkflowSpecError listing
-    # every problem at once (good for an LLM to read and repair).
-    wf = create_workflow(SPEC, parent_loop=loop)
-    result = await wf.run()
-
-    print(f"status     : {result.status}")
-    if result.errors:
-        print(f"errors     : {result.errors}")
-    plan = result.results.get("plan")
-    print(f"subtopics  : {plan.payload if plan else None}")
-    print(f"tokens     : {result.usage.get('total_tokens')}")
-    syn = result.results.get("synthesize")
-    if syn:
-        print("\n--- final synthesis ---")
-        print(syn.text)
-    print("\n--- run summary ---")
-    print(result.summary())
-    return syn.text if syn else ""
-
-
-# ── Letting the main agent author workflows itself (LLM-facing) ──────────────
-#
-#   from power_loop import create_default_tool_registry
-#   from power_loop.workflow import register_workflow_tools
-#
-#   registry = create_default_tool_registry(preset="core")
-#   register_workflow_tools(registry)        # adds create_workflow + workflow_status
-#   loop = StatefulAgentLoop(llm=make_llm(), db_path=":memory:", tool_registry=registry)
-#   # Now the model can emit a WorkflowSpec JSON and call create_workflow itself.
-#   # (Don't grant this tool to a workflow's own leaf agents — nested runs are
-#   #  refused in this tier.)
-
-
-# ── Detached execution + completion wake (middle tier) ───────────────────────
-#
-#   from power_loop import TimerRunner
-#   from power_loop.workflow import create_workflow, register_wake_guard, get_workflow
-#
-#   register_wake_guard(loop)                 # SYNC: dedupe at-least-once wake timers
-#   await TimerRunner(loop).start()           # REQUIRED: delivers the wake
-#   parent_sid = await loop.new_session()
-#   wf = create_workflow(SPEC, parent_loop=loop, parent_session_id=parent_sid)
-#   handle = await wf.start(detached=True)    # returns immediately; runs in background
-#   # ... the parent agent can pass_turn now; it is woken with the result when done.
-#   # Inspect any time (introspection helpers are async):
-#   #   await get_workflow(loop, parent_sid, handle.run_id, detail=True)  -> status + steps + usage
-#   #   await list_workflows(loop, parent_sid)                            -> all runs
-
-
-# ── Resume across a process restart (full tier) ──────────────────────────────
-#
-# A detached run journals its spec + each step's output. If the process dies
-# mid-run, point a fresh loop (same DB path) at the run id and resume: completed
-# steps are replayed (their sub-agent is NOT called again), only the unfinished
-# tail re-runs.
-#
-#   from power_loop.workflow import resume_run, resume_detached, get_workflow
-#
-#   # ... new process, same db_path; parent_sid + run_id known (persisted by you)
-#   info = await get_workflow(loop, parent_sid, run_id)  # status == "failed"/"running"?
-#   result = await resume_run(loop, parent_sid, run_id)  # replays + finishes tail
-#   #   or, to resume in the background and wake the parent on completion:
-#   #   handle = await resume_detached(loop, parent_sid, run_id)
-#   #
-#   # Re-supply executor=/budget= if the original run used non-default ones — only
-#   # data is journaled, runtime objects come from the live process. Each leaf gets
-#   # a stable metadata["idempotency_key"] = f"{run_id}:{node_id}" so side-effecting
-#   # tools can dedupe a re-run.
+async def main():
+    factory = RegistryRuntimeFactory()
+    async def build(descriptor, context):
+        return ExecutionEnvironment(make_llm(), None, AgentLoopConfig(compactor=None))
+    factory.register("example.workflow@1", build)
+    store = await SessionStore.open(":memory:")
+    runtime = Runtime(store=store, factory=factory, node_id="example", capacity=4)
+    actor = TrustedActor("example", "host", None)
+    descriptor = RuntimeDescriptor(1, "agent", "example.workflow@1", None,
+        "example.tools@1", "example.hooks@1", "example.resources@1", {}, {})
+    try:
+        await runtime.worker.start()
+        target = await runtime.open_session(descriptor, actor=actor)
+        handle = await runtime.client.workflow(target, SPEC, message_id=uuid4().hex, actor=actor)
+        print("Accepted", handle.job_ref)
+        print((await handle.wait()).summary())
+    finally:
+        await runtime.aclose()
 
 
 if __name__ == "__main__":

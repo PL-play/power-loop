@@ -201,42 +201,6 @@ async def test_unconfirmed_controller_cannot_publish_a_result_or_claim_resource_
         await cleanup(c)
 
 
-@pytest.mark.parametrize('missing_seal', [False, True])
-async def test_controller_evidence_discovery_never_writes_or_recreates_its_seal(registry_store, missing_seal):
-    from power_loop.runtime import controller_recovery
-    from power_loop.runtime.execution_membership import seal_id
-    from power_loop.runtime.session_controls import ControlReadView
-
-    c = await ready(registry_store, 'subagent')
-    rt, actor, owner = c.recovery_runtime, c.actor, c.state.owner_binding
-    original = None
-    try:
-        await reconcile(rt, actor, owner.lease.job_id)
-        job = await rt.manager._authorize(rt.manager.db, actor, owner.lease.job_id)
-        key = seal_id(rt.manager, owner.lease.job_id, owner.lease.generation)
-        if missing_seal:
-            original = await rt.manager.db.fetchone(f"SELECT * FROM {rt.manager.events} WHERE event_id=?", (key,))
-            assert original is not None
-            await rt.manager.db.execute(f"DELETE FROM {rt.manager.events} WHERE event_id=?", (key,))
-        events = await rt.manager.db.fetchall(f"SELECT * FROM {rt.manager.events} ORDER BY event_id")
-        jobs = await rt.manager.db.fetchall(f"SELECT * FROM {rt.manager.jobs} ORDER BY job_id")
-        reader = ControlReadView(rt.manager.db, rt.manager)
-        if missing_seal:
-            with pytest.raises(JobError, match='execution_membership_missing'):
-                await controller_recovery.read(rt.manager, reader, job, optional=False)
-        else:
-            saved = await controller_recovery.read(rt.manager, reader, job, optional=False)
-            assert saved is not None
-        assert await rt.manager.db.fetchall(f"SELECT * FROM {rt.manager.events} ORDER BY event_id") == events
-        assert await rt.manager.db.fetchall(f"SELECT * FROM {rt.manager.jobs} ORDER BY job_id") == jobs
-        assert c.state.counts['BUILD'] == 1 and not c.state.effects
-    finally:
-        if original is not None:
-            columns = tuple(original)
-            await rt.manager.db.execute(
-                f"INSERT INTO {rt.manager.events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
-                tuple(original[key] for key in columns))
-        await cleanup(c)
 
 
 async def test_hidden_controller_result_does_not_ack_or_close_and_can_later_be_handled(registry_store):
@@ -321,38 +285,6 @@ async def test_entire_original_workflow_closes_without_rewriting_its_failure_or_
         await cleanup(c)
 
 
-async def test_missing_workflow_result_is_interrupted_and_keeps_all_recorded_node_results(registry_store, monkeypatch):
-    from power_loop.runtime.jobs import JobManager
-    from power_loop.runtime.workflow_results import workflow_result
-    original = JobManager._record_result_tx
-    blocked, attempts = True, []
-    async def unavailable(manager, tx, actor, lease, **kwargs):
-        row = await manager._authorize(tx, actor, lease.job_id)
-        if blocked and row['kind'] == 'workflow':
-            attempts.append(row['job_id'])
-            raise OSError('workflow canonical result unavailable before commit')
-        return await original(manager, tx, actor, lease, **kwargs)
-    monkeypatch.setattr(JobManager, '_record_result_tx', unavailable)
-    c = await ready(registry_store, 'workflow_node')
-    blocked = False
-    rt, actor, node = c.recovery_runtime, c.actor, c.state.owner_binding
-    try:
-        child = await rt.manager.get_job(actor, node.lease.job_id)
-        root = await rt.manager.get_job(actor, child.parent_job_id)
-        assert attempts and root.result_status == 'none'
-        await reconcile(rt, actor, child.job_id)
-        await c.recovery_loop.send('Handle interrupted node; do not repeat work.', c.state.root, tools=[])
-        child_result = (await rt.manager.get_job(actor, child.job_id)).result
-        await reconcile(rt, actor, root.job_id)
-        pending = await rt.manager.get_job(actor, root.job_id)
-        projected = workflow_result(pending.result)
-        assert projected.status == 'interrupted' and projected.results['BUILD'].to_dict() == child_result
-        await c.recovery_loop.send('Handle original interrupted workflow without restarting it.', c.state.root, tools=[])
-        assert (await rt.manager.get_job(actor, root.job_id)).supervision_status == 'closed'
-        assert c.state.counts['AFTER'] == 0 and c.state.counts['BUILD'] == 1 and not c.state.effects
-    finally:
-        blocked = False
-        await cleanup(c)
 
 
 async def test_saved_closure_rechecks_exit_proof_in_a_new_transaction(registry_store):

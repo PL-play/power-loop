@@ -7,7 +7,6 @@ from power_loop.runtime.spec import AgentSpec
 from power_loop.workflow.continuation import plan_continuation, replay_results
 from power_loop.workflow.engine import WorkflowRunError
 from power_loop.workflow.result import AgentResult
-from power_loop.workflow.resume import continuation_replay
 from power_loop.workflow.spec import (
     AgentNode,
     BranchNode,
@@ -52,7 +51,8 @@ def test_closure_covers_sequence_tail_and_ancestors_without_invalidating_paralle
     old = {name: result(name) for name in ["prefix", "dev", "review", "independent", "assemble"]}
     original = dict(old)
     invalidated = set()
-    replay = continuation_replay(design, "dev", old, invalidated=invalidated)
+    invalidated.update(plan.invalidated)
+    replay = replay_results(design, plan, old)
     assert invalidated == plan.invalidated and set(replay) == {"prefix", "independent"}
     assert old == original and old["dev"].text == "original"
     assert plan == plan_continuation(design, "dev")

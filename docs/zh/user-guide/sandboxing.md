@@ -7,7 +7,6 @@
 | 接缝 | 包裹对象 | 作用范围 | 示例 |
 |---|---|---|---|
 | `ShellBackend` | `bash` 工具背后那个持久化的 **shell** | 每个 workspace 一个 shell | [28](../../../examples/28_docker_shell_backend.py) |
-| `WorkerLauncher` | 整个 **workflow 叶子进程** | 每个 sub-agent 一个进程 | [30](../../../examples/30_subprocess_isolation.py) |
 
 两者都遵循与 power-loop 其他接缝相同的模式：一个极小的 `Protocol`、一个安全的默认实现，以及按运行注入。它们都不改动任何工具或引擎代码。
 
@@ -70,42 +69,11 @@ with runtime_env_context(env):
 
 完整可运行的版本见 [示例 28](../../../examples/28_docker_shell_backend.py)（它证明了隔离的有效性：shell 会报告容器的操作系统，并读取一个 bind-mount 进来的宿主文件）。DeepTalk 正是用这个接缝，配合一个按会话隔离的 gVisor（`runsc`）容器。
 
-## WorkerLauncher — sandbox a workflow leaf process
+## Runtime worker 隔离
 
-当 workflow 叶子在进程外运行时（见 [Workflows → SubprocessExecutor](workflows.md#out-of-process-subprocessexecutor)），`WorkerLauncher` 决定 *每个 worker 进程如何启动*——它是 `ShellBackend` 在进程层面的对应物。默认的 `DirectWorkerLauncher` 裸跑 worker；注入你自己的实现，即可用 `runsc` / `docker run` / `firejail` / `nsjail` 把它包起来：
-
-```python
-from power_loop.runtime.spec import AgentSpec
-from power_loop.workflow import DirectWorkerLauncher, SubprocessExecutor, WorkerBootstrap
-
-class DockerWorkerLauncher:
-    def build(self, *, base_argv, base_env, spec: AgentSpec, db_path, workspace_dir):
-        # Decide isolation PER LEAF from spec.tools, then wrap the command.
-        argv = ["docker", "run", "--rm", "-i", "--network", "none",
-                "-v", f"{db_path}:{db_path}", "python:3.12-slim", *base_argv]
-        return argv, base_env
-
-executor = SubprocessExecutor(
-    bootstrap=WorkerBootstrap(llm_from_env=True),
-    launcher=DockerWorkerLauncher(),
-)
-```
-
-由于 `build` 拿到了该叶子的 `AgentSpec`，你可以**按叶子**选择隔离方式（例如只对带 `bash` 工具的叶子做沙箱）。这是唯一一种能让 sub-agent 获得比其父更*强*隔离的途径：子进程在受限环境中运行，而编排器本身保持不受限。
-
-关键职责与保证：
-
-- **路径是 launcher 的职责。** worker 会原样使用 `db_path`（以及 bootstrap 的 `workspace_dir`），所以沙箱必须让这些路径在其内部解析到相同的位置（例如用 identity bind-mount）。
-- **失败即关闭（Fail-closed）。** 启动 / 沙箱错误会变成一个 `failed` 叶子，绝不会挂起——恢复层（resume tier）可以重新运行它。
-- 预留的 *shared scope → orchestrator* 接缝（为将来的跨进程黑板预留）在本层尚未实现；被隔离的叶子之间不共享实时状态。
-
-可运行的版本见 [示例 30](../../../examples/30_subprocess_isolation.py)，它会记录每个叶子的启动过程，并在之后检视每个叶子各自私有的 DB。
-
-## 我该用哪个接缝？
-
-- 运行一个会执行 `bash` 的编码 agent？→ **`ShellBackend`**（对 shell 做沙箱）。
-- 把一个 workflow 扇出，其叶子并行运行不可信代码？→ **`SubprocessExecutor` + `WorkerLauncher`**（对每个进程做沙箱）。
-- 两者都要？组合它们——一个被沙箱化的 worker 本身也可以为自己的 bash 安装一个 `ShellBackend`。
+workflow 调度器和叶子统一由 Runtime worker 执行。宿主部署隔离进程或容器，按冻结的
+RuntimeDescriptor 提供工具和资源。跨进程执行必须配置共享协调器和消息传输；默认内存
+适配器只用于单进程。SDK 不再逐叶子拉起进程或创建独立数据库。见 [工作流](workflows.md)。
 
 ## 另见
 

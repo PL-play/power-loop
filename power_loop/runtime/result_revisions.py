@@ -17,16 +17,7 @@ def execution_id(job_id, generation):
 async def delivery_id(manager, reader, job, generation=None):
     import hashlib
     generation = job["generation"] if generation is None else generation
-    if job["kind"] == "subagent" or job["kind"] in {"background_tool", "background_command"} and job["session_id"]:
-        return hashlib.sha256(("result:" + result_id(job["job_id"], generation)).encode()).hexdigest()
-    if generation <= 1:
-        operation = await reader.fetchone(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND action='create'", (job["job_id"],))
-        return "subagent:" + operation["event_id"][3:] if operation else None
-    execution = await reader.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=? AND event_type='execution'",
-        (execution_id(job["job_id"], generation),))
-    if execution is None:
-        raise JobError("execution_revision_missing")
-    return "subagent:" + json.loads(execution["payload_json"])["run_id"]
+    return hashlib.sha256(("result:" + result_id(job["job_id"], generation)).encode()).hexdigest()
 
 
 async def get(manager, actor, job_id, generation):

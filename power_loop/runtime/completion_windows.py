@@ -71,7 +71,7 @@ async def read_row(manager, tx, row):
 
 async def admit(manager, tx, row):
     """Part of the first original owner claim transaction; no standalone grant."""
-    from .workflow_controller import proof
+    from .execution_membership import proof
 
     _, protocol = await _creation(manager, tx, row)
     if protocol is None:

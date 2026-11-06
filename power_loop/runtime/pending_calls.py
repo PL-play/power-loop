@@ -10,6 +10,7 @@ import json
 
 from .jobs import JobActor, JobError, _hash, _json
 from .jobs import verify_stored as _verify_stored
+from .result_revisions import result_id
 
 SNAPSHOT = 'pending_call_snapshot'
 ERROR = 'pending_call_snapshot_error'
@@ -46,9 +47,9 @@ async def current(manager, tx, sid):
 
 
 async def _verify(manager, tx, source, snapshot):
+    from .execution_membership import proof
     from .managed_completion import _scope
     from .managed_effects import _ref, _verify_call
-    from .workflow_controller import proof
 
     await _scope(manager, tx, source)
     try:
@@ -109,8 +110,8 @@ async def capture(manager, tx, source):
     pending = await current(manager, tx, source['session_id'])
     if pending is None:
         return None
+    from .execution_membership import proof
     from .message_ref import MessageRef
-    from .workflow_controller import proof
 
     seq = pending.get('assistant_seq')
     if type(seq) is not int or seq <= 0:
@@ -141,11 +142,11 @@ async def _closed(manager, tx, source):
     if source is None:
         raise JobError('pending_call_model_exit_required')
     value = await _object(manager, tx, manager.events, 'payload_json', 'event_id=?',
-                          ('model_closed_' + source['job_id'],), 4 * 1024 * 1024)
-    event = await tx.fetchone(f'SELECT job_id,event_type,delivery_status FROM {manager.events} WHERE event_id=?', ('model_closed_' + source['job_id'],))
-    if (value is None or event['job_id'] != source['job_id'] or event['event_type'] != 'model_closed'
+                          (result_id(source["job_id"], source["generation"]),), 4 * 1024 * 1024)
+    event = await tx.fetchone(f'SELECT job_id,event_type,delivery_status FROM {manager.events} WHERE event_id=?', (result_id(source["job_id"], source["generation"]),))
+    if (value is None or event['job_id'] != source['job_id'] or event['event_type'] != 'result'
             or event['delivery_status'] != 'not_applicable'
-            or set(value) != {'generation', 'resource_state', 'evidence'}
+            or 'evidence' not in value
             or type(value['generation']) is not int or type(value['evidence']) is not dict):
         raise JobError('pending_call_model_exit_required')
     return value
@@ -196,7 +197,7 @@ async def _expected(manager, tx, source, closed):
         refs.append({'job_id': row['job_id'], 'generation': row['generation'], 'tool_call_id': call['id'],
             'evidence_hash': _hash(original), 'notice_id': notice[0]['event_id'], 'notice_hash': _hash(notice[1])})
     expected = {'version': 1, 'snapshot': snapshot,
-        'model_exit': await _reference(manager, tx, 'model_closed_' + source['job_id']),
+        'model_exit': await _reference(manager, tx, result_id(source["job_id"], source["generation"])),
         'calls': refs, 'disposition': 'retired_for_result_review', 'execution_authority': False,
         'acknowledgement_created': False, 'billing_settled': False}
     if source['execution_role'] != 'main':
@@ -328,9 +329,9 @@ async def recover_runtime(runtime, actor, source_job_id):
             return {'job_id': source_job_id, 'state': 'not_applicable', 'execution_authority': False}
         if source['execution_role'] != 'main':
             from .controller_task_exit import read as task_exit
+            from .execution_membership import proof
             from .jobs import JobLease
             from .original_owner_review import read as original_owner
-            from .workflow_controller import proof
             binding = await original_owner(manager, tx, source)
             owner = await manager._authorize(tx, actor, binding['owner']['job_id'])
             if owner['intake'] != 'closed' or _hash(proof(owner)) != _hash(binding['owner']):

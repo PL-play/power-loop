@@ -210,8 +210,6 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
         from .budget_admissions import enter
         await enter(runtime, tx)
         source = dict(await manager._fence(tx, binding.actor, binding.lease))
-        from .workflow_controller import validate_dispatch
-        await validate_dispatch(manager, tx, source)
         if source["kind"] not in {"send", "background_tool", "background_command"} or source["session_id"] != binding.actor.session_id:
             raise JobError("model_attempt_owner_mismatch")
         from . import session_controls

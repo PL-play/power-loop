@@ -18,9 +18,8 @@ from power_loop.tools.registry import ToolRegistry
 from power_loop.tools.spawn_agent import register_spawn_agent
 
 from .test_job_registry_192 import registry_store
-from .test_workflow_task_runtime_192 import managed_workflow, records, settle
 
-__all__ = ["registry_store", "managed_workflow"]
+__all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -51,32 +50,6 @@ async def fold_attempts(manager):
     return [p for p in (json.loads(r["payload_json"]) for r in rows) if p.get("purpose") == "fold"]
 
 
-async def test_workflow_node_second_send_folds_under_the_node_session(managed_workflow):
-    store, manager, _, loop, model, sid, state, _ = managed_workflow
-    from power_loop.workflow.engine import InProcessExecutor
-    model.hold = set()
-    summarizer = Summarizer()
-    loop.config = folding(loop.config, summarizer)
-
-    class LateInputExecutor(InProcessExecutor):
-        async def run_agent(self, spec, user_input, **kwargs):
-            raw = await super().run_agent(spec, user_input, **kwargs)
-            if spec.name == "BUILD":
-                await store.append_message(raw["session_id"], role="user", content="late-input-proof")
-                raw["new_input_after_pass"] = True
-            return raw
-
-    state["executor"] = LateInputExecutor()
-    await loop.send("run", sid)
-    await settle(managed_workflow)
-    node = next(r for r in await records(managed_workflow) if r.kind == "workflow_node" and r.title == "BUILD")
-    sends = [r for r in await records(managed_workflow) if r.kind == "send" and r.parent_job_id == node.job_id]
-    assert len(sends) == 2 and len({r.session_id for r in sends}) == 1
-    node_sid = sends[0].session_id
-    attempts = await fold_attempts(manager)
-    assert len(attempts) == summarizer.calls
-    assert node_sid in {a["session_id"] for a in attempts}
-    assert (await store.latest_project_compact(node_sid)) is not None
 
 
 class SpawnModel(LLMService):

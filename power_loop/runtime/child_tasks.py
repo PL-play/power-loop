@@ -82,7 +82,7 @@ async def admit(loop, binding, actor, *, kind, title, descriptor, options, body,
                     "execution_role": role, "standalone_subagent": kind == "subagent",
                     "runtime_descriptor": plain(descriptor)})
         registration = await manager.register_job(binding.actor, kind=kind, title=title,
-            session_id=sid, parent=binding.lease, independent=True,
+            session_id=sid, parent=binding.lease, independent=loop._runtime_worker_context.descriptor.kind != "workflow_node",
             call_ref=actor.call_ref, tool_call_id=actor.tool_call_id,
             request={"input_ref": plain(input_ref)})
         command = Command(input_ref.message_id, TargetRef(port.store.store_id, sid),

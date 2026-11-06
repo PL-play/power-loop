@@ -99,7 +99,7 @@ async def _scope(manager, tx, row):
     from .execution_membership import _snapshot, scope
 
     actual = await scope(manager, tx, row['job_id'], row['generation'])
-    expected = _snapshot(row)
+    expected = _snapshot(row, actual["owner"])
     normalized = {k: v for k, v in actual.items() if k != 'executor_binding'}
     normalized['version'] = 1
     if _hash(normalized) != _hash(expected):

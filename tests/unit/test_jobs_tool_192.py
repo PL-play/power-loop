@@ -26,9 +26,8 @@ from power_loop.tools.registry import ToolRegistry
 
 from .test_job_registry_192 import registry_store
 from .test_task_runtime_192 import managed, receipt
-from .test_workflow_task_runtime_192 import leaf, managed_workflow
 
-__all__ = ["registry_store", "managed", "managed_workflow"]
+__all__ = ['registry_store', 'managed']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
@@ -232,57 +231,6 @@ async def test_jobs_outside_session_is_a_structured_error():
     assert json.loads(await run_jobs(action="list"))["error"]["code"] == "active_session_required"
 
 
-async def test_workflow_node_can_stop_its_own_required_child_without_ancestor_read_permission(
-    managed_workflow, monkeypatch
-):
-    store, manager, runtime, loop, model, parent, state, _ = managed_workflow
-    register_jobs_tools(loop.tool_registry)
-    state["spec"]["root"]["steps"][0] = leaf("BUILD", tools=["spawn_agent", "jobs"])
-    model.spawn_from_build = True
-    model.release["BUILD"].set()
-    model.hold.add("AUDIT")
-    original = model.complete
-    stop_sid, issued = None, False
-
-    async def complete(request, **kwargs):
-        nonlocal stop_sid, issued
-        if "ROLE-BUILD" in (request.system_prompt or "") and model.counts["BUILD"] == 1 and not issued:
-            sid = get_session_id()
-            [child] = await manager.db.fetchall(
-                f"SELECT job_id FROM {manager.jobs} WHERE kind='subagent' AND created_by_session_id=?", (sid,)
-            )
-            issued, stop_sid = True, sid
-            return LLMResponse(
-                raw_text="",
-                tool_calls=[
-                    {
-                        "id": "node-stop-child",
-                        "type": "function",
-                        "function": {
-                            "name": "jobs",
-                            "arguments": json.dumps({"action": "stop", "job_id": child["job_id"]}),
-                        },
-                    }
-                ],
-                token_usage=LLMTokenUsage(prompt_tokens=7, completion_tokens=3, total_tokens=10),
-            )
-        return await original(request, **kwargs)
-
-    monkeypatch.setattr(model, "complete", complete)
-    await loop.send("start workflow", parent)
-    [handle] = state["handles"]
-    await asyncio.wait_for(handle.task, 8)
-    assert issued and stop_sid != parent
-    [row] = await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='stop'")
-    op = await manager.get_operation(runtime.actor(parent), row["event_id"])
-    assert op.call_ref["session_id"] == stop_sid and op.call_ref["id"] != op.receipt_ref["id"]
-    assert op.result["response"]["cancel_requested"] and op.result["response"]["resource_stop_confirmed"] is False
-    assert (await manager.get_job(runtime.actor(parent), op.job_id)).outcome == "cancelled"
-    [source] = await manager.db.fetchall(
-        f"SELECT execution_role FROM {manager.jobs} WHERE job_id=?", (op.result["request"]["caller"]["job_id"],)
-    )
-    assert source["execution_role"] == "workflow_node"
-    assert not runtime._local_executions
 
 
 async def test_cancel_after_result_commit_suppresses_external_callback_without_erasing_owner_result(
