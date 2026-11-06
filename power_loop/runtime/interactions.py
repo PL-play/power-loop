@@ -108,6 +108,8 @@ async def claim_answer(start, runtime, tx, row):
     manager = runtime.manager
     if row["generation"] != start.record.row["expected_job_generation"]:
         raise RuntimeRequestError("stale_generation")
+    if row["cancel_requested_at"] is not None:
+        raise RuntimeRequestError("target_cancelled")
     if row["status"] != "waiting":
         raise RuntimeRequestError("interaction_expired")
     await manager._supervision_barriers(tx, row)

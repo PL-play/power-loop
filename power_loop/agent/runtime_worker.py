@@ -562,8 +562,7 @@ class RuntimeWorker:
                                        AgentSpec.from_dict(plain(descriptor.config["child_spec"])))
             if descriptor.kind in {"background_tool", "background_command"}:
                 from power_loop.runtime.background_execution import run
-                async with self.idle(ctx):
-                    await run(self, ctx, record, env, task_runtime)
+                await run(self, ctx, record, env, task_runtime)
                 return
             bus = AgentEventBus()
             def on_delta(event):
@@ -598,6 +597,16 @@ class RuntimeWorker:
             busy = True
 
         except RuntimeRequestError as exc:
+            if ctx.job_ref is None and record.meta["operation"] in {"answer", "resume"} and exc.code in {
+                "target_cancelled", "interaction_expired", "target_not_resumable", "stale_generation",
+            }:
+                # The claim transaction rejected this continuation. Terminalize
+                # only its unbound input; the original job/result stays intact.
+                async with self.inputs.db.transaction() as tx:
+                    await self.inputs.db.dialect.lock_state(tx, self.inputs.state, sid)
+                    await self.inputs.void_unbound(tx, record.ref, reason=exc.code,
+                        status="cancelled" if exc.code == "target_cancelled" else "failed")
+                return
             if exc.code != "origin_cancelled":
                 raise
             async with loop.task_runtime.manager.joined_write() as tx:

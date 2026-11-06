@@ -92,7 +92,8 @@ async def test_child_start_reference_and_parent_result(registry_store, inline):
         await runner.aclose()
 
 
-async def test_explicit_resume_preserves_first_result_and_voids_only_new_input(registry_store):
+@pytest.mark.parametrize("cancel_resume", [False, True])
+async def test_explicit_resume_preserves_first_result_and_voids_only_new_input(registry_store, cancel_resume):
     from power_loop import RuntimeClient
     from power_loop.agent.runtime_transport import MemoryMessageTransport
     from power_loop.agent.runtime_types import InputRef
@@ -119,16 +120,27 @@ async def test_explicit_resume_preserves_first_result_and_voids_only_new_input(r
         cancelled = await client.wait(withdrawn.input_ref, actor=first.actor, deadline_ms=now_ms() + 1000)
         assert cancelled.job_ref is None and cancelled.status == "cancelled"
         resume = await client.resume(one, actor=first.actor, message_id="resume")
+        if cancel_resume:
+            await client.cancel(one, actor=first.actor)
+        else:
+            superseded = await client.resume(one, actor=first.actor, message_id="superseded")
         model.child_gate = None
         second = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None)).start()
         resumed = await client.wait(resume.input_ref, actor=first.actor, deadline_ms=now_ms() + 10000)
-        assert resumed.job_ref == JobRef(one.store_id, one.job_id, 2)
-        assert resumed.status == "completed"
+        if cancel_resume:
+            assert resumed.job_ref is None and resumed.status == "cancelled"
+        else:
+            assert resumed.job_ref == JobRef(one.store_id, one.job_id, 2)
+            assert resumed.status == "completed"
+            stale = await client.wait(superseded.input_ref, actor=first.actor, deadline_ms=now_ms()+1000)
+            assert stale.job_ref is None and stale.status == "failed"
         assert await client.wait(ref, actor=first.actor, deadline_ms=now_ms() + 1000) == original
         assert (await client.wait(start, actor=first.actor, deadline_ms=now_ms() + 1000)).job_ref == one
         await second.drain()
+        assert not await client.inputs.has_pending(start.session_id)
         events = await store._db.fetchall(f"SELECT payload_json,delivery_status FROM {store.table_prefix}job_events WHERE job_id=? AND event_type='result'", (one.job_id,))
-        assert {json.loads(event['payload_json'])['generation']: event['delivery_status'] for event in events} == {1:'handled', 2:'handled'}
+        assert {json.loads(event['payload_json'])['generation']: event['delivery_status'] for event in events} == (
+            {1:'handled'} if cancel_resume else {1:'handled', 2:'handled'})
     finally:
         if client:
             await client.aclose()

@@ -142,3 +142,55 @@ async def test_invalid_answer_preserves_original_question(registry_store, tmp_pa
         assert len(model.calls)==1
     finally:
         await runner.aclose()
+
+
+@pytest.mark.parametrize("answer_first", [False, True])
+async def test_cancel_waiting_answer_does_not_block_next_send(registry_store, tmp_path, answer_first):
+    from power_loop import RuntimeClient
+    from power_loop.agent.runtime_transport import MemoryMessageTransport
+
+    store, _ = registry_store
+    model = AskingModel()
+    registry = create_default_tool_registry(workspace_dir=str(tmp_path))
+    first = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None)).start()
+    client = RuntimeClient(store=store, transport=MemoryMessageTransport())
+    second = None
+    try:
+        receipt = await first.runtime.client.send(first.target, "ask", message_id="ask", actor=first.actor)
+        for _ in range(300):
+            state = await store.get_state(first.target.session_id)
+            if state.pending and state.pending.get("runtime_wait"):
+                break
+            await asyncio.sleep(.01)
+        waiting = state.pending
+        original = (await client.inspect(receipt.input_ref, actor=first.actor)).job_ref
+        await first.runtime.worker.shutdown(timeout_s=2)
+        kwargs = dict(interaction_id=waiting["pending_interactions"][0]["interaction_id"],
+                      wait_round=waiting["round_index"], value="blue", message_id="answer", actor=first.actor)
+        if answer_first:
+            answered = await client.answer(original, **kwargs)
+        await client.cancel(original, actor=first.actor)
+        if not answer_first:
+            with pytest.raises(RuntimeRequestError, match="target_cancelled"):
+                await client.answer(original, **kwargs)
+        cancelled = await client.wait(receipt.input_ref, actor=first.actor, deadline_ms=now_ms()+1000)
+        assert cancelled.status == "cancelled"
+        following = await client.send(first.target, "next", message_id="next", actor=first.actor)
+        second = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None)).start()
+        result = await client.wait(following.input_ref, actor=first.actor, deadline_ms=now_ms()+5000)
+        assert result.status == "completed" and result.job_ref != original
+        assert await client.wait(receipt.input_ref, actor=first.actor, deadline_ms=now_ms()+1000) == cancelled
+        if answer_first:
+            rejected = await client.wait(answered.input_ref, actor=first.actor, deadline_ms=now_ms()+1000)
+            assert rejected.status == "cancelled" and rejected.job_ref is None
+            assert (await client.answer(original, **kwargs)).input_ref == answered.input_ref
+        rows = await store.load_all_messages(first.target.session_id)
+        assert [r.content for r in rows if r.tool_call_id == "question"] == ["blue" if answer_first else "<cancelled>"]
+        assert len(model.calls) == 2
+        await second.drain()
+        assert not await client.inputs.has_pending(first.target.session_id)
+    finally:
+        if second:
+            await second.aclose()
+        await client.aclose()
+        await first.aclose()

@@ -36,7 +36,7 @@ class BackgroundParent(LLMService):
 
 
 @pytest.mark.parametrize("automatic", [False, True])
-async def test_background_job_survives_parent_and_delivers_once(registry_store, tmp_path, automatic):
+async def test_background_job_survives_parent_and_delivers_once(registry_store, tmp_path, automatic, monkeypatch):
     store, _ = registry_store
     gate, began = asyncio.Event(), asyncio.Event()
     count = 0
@@ -48,6 +48,13 @@ async def test_background_job_survives_parent_and_delivers_once(registry_store, 
         return "background result"
     model = BackgroundParent()
     if automatic:
+        from power_loop.core.pipeline import AgentPipeline
+        steered = asyncio.Event()
+        settle = AgentPipeline._settle_steered_tool
+        async def observe_steer(pipeline, *args, **kwargs):
+            steered.set()
+            return await settle(pipeline, *args, **kwargs)
+        monkeypatch.setattr(AgentPipeline, "_settle_steered_tool", observe_steer)
         complete = model.complete
         async def direct(request, **kwargs):
             first = not model.sent
@@ -66,6 +73,11 @@ async def test_background_job_survives_parent_and_delivers_once(registry_store, 
             await asyncio.wait_for(began.wait(), 5)
             status = await runner.runtime.client.inspect(original.input_ref, actor=runner.actor)
             await runner.runtime.client.steer(status.job_ref, "respond now", message_id="steer", actor=runner.actor)
+            await asyncio.wait_for(steered.wait(), 5)
+            # Steering detaches the call, but the parent must wait for the sole
+            # execution slot before its next model call. The child owns it now.
+            assert len(model.requests) == 1
+            gate.set()
             parent = await runner.runtime.client.wait(original.input_ref, actor=runner.actor, deadline_ms=now_ms()+10000)
             await runner.finish(original.input_ref)
         else:
@@ -76,7 +88,8 @@ async def test_background_job_survives_parent_and_delivers_once(registry_store, 
         assert receipt["job_ref"]["generation"] == 0
         await asyncio.wait_for(began.wait(), 5)
         ref = JobRef(**receipt["job_ref"])
-        assert not (await runner.runtime.client.inspect(ref, actor=runner.actor)).result_available
+        if not automatic:
+            assert not (await runner.runtime.client.inspect(ref, actor=runner.actor)).result_available
         gate.set()
         result = await runner.runtime.client.wait(ref, actor=runner.actor, deadline_ms=now_ms() + 10000)
         assert result.status == "completed" and result.final_text == "background result"
@@ -90,7 +103,9 @@ async def test_background_job_survives_parent_and_delivers_once(registry_store, 
         row = await runner.runtime.worker.inputs.db.fetchone(
             f"SELECT result_status,supervision_status FROM {runner.runtime.worker.inputs.jobs} WHERE job_id=?", (ref.job_id,))
         assert row == {"result_status": "handled", "supervision_status": "closed"}
-        assert len(model.requests) == 3  # Parent tool call, parent return, result handling; no background model.
+        # An automatic call's result can join the parent before its second model
+        # call; an explicit call finishes after the parent has already returned.
+        assert len(model.requests) in ({2, 3} if automatic else {3})
     finally:
         gate.set()
         await runner.aclose()
@@ -121,3 +136,71 @@ async def test_cancel_background_handler_that_does_not_poll_stop_token(registry_
     finally:
         release.set()
         await runner.aclose()
+
+
+@pytest.mark.parametrize("command", [False, True])
+async def test_background_execution_obeys_capacity_one(tmp_path, command):
+    import shlex
+    import sys
+
+    from power_loop import SessionStore
+
+    store = await SessionStore.open(":memory:", schema="tasks")
+    gate, began = asyncio.Event(), asyncio.Event()
+    started = active = peak = 0
+    async def slow():
+        nonlocal started, active, peak
+        started += 1
+        active += 1
+        peak = max(peak, active)
+        began.set()
+        try:
+            await gate.wait()
+            return "done"
+        finally:
+            active -= 1
+    model = BackgroundParent()
+    complete = model.complete
+    async def three(request, **kwargs):
+        first = not model.sent
+        response = await complete(request, **kwargs)
+        if first:
+            response.tool_calls = []
+            for i in range(3):
+                args = {"action": "tool", "tool": "slow", "args": {}}
+                if command:
+                    script = (f"from pathlib import Path; import time; p=Path({str(tmp_path)!r}); "
+                              f"(p/'started-{i}').touch()\n"
+                              "while not (p/'release').exists(): time.sleep(.01)\n")
+                    args = {"action": "run", "command": shlex.join([sys.executable, "-c", script])}
+                response.tool_calls.append({"id": f"b{i}", "type": "function",
+                    "function": {"name": "background_run", "arguments": json.dumps(args)}})
+        return response
+    model.complete = three
+    registry = create_default_tool_registry(workspace_dir=str(tmp_path))
+    registry.register(ToolDefinition("slow", "wait", async_capable=True, pricing=Free("local")), slow)
+    runner = await RunningAgent(store, model, registry, AgentLoopConfig(compactor=None)).start()
+    try:
+        assert (await runner.send("three backgrounds")).status == "completed"
+        if command:
+            for _ in range(500):
+                if list(tmp_path.glob("started-*")):
+                    break
+                await asyncio.sleep(.01)
+        else:
+            await asyncio.wait_for(began.wait(), 5)
+        await asyncio.sleep(.1)
+        assert (len(list(tmp_path.glob("started-*"))) if command else started) == 1
+        gate.set()
+        (tmp_path / "release").touch()
+        await asyncio.wait_for(runner.drain(), 10)
+        assert (len(list(tmp_path.glob("started-*"))) if command else started) == 3
+        if not command:
+            assert peak == 1 and active == 0
+        assert runner.runtime.worker._capacity._value == 1
+        assert not runner.runtime.worker._waiting
+    finally:
+        gate.set()
+        (tmp_path / "release").touch()
+        await runner.aclose()
+        await store.close()

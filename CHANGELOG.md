@@ -8,6 +8,10 @@
 
 ## 10.0.0 — 2026-10-30
 
+- **Unreleased design 203 P3-R1:** rejected answer/resume claims terminate their
+  unbound input so later sends can proceed without changing the original result.
+  Running background tools and commands retain their Runtime capacity slot;
+  waiting parents release theirs. Independent G3 re-review is pending.
 - **Unreleased design 203 P3:** child Agent and background executions now use
   independent sessions, frozen descriptors and stable job/input references.
   Results and parent notifications commit together; later parent sends can
