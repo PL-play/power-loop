@@ -64,21 +64,27 @@ async def submit(client, target, spec, *, message_id, actor, descriptor=None, op
     )
     sid = "driver_" + key[:32]
     start = InputRef(target.store_id, sid, "start_" + key[:32])
-    descriptor = descriptor or RuntimeDescriptor(**defaults["runtime_descriptor"])
     options = options or RequestOptions()
-    descriptor = replace(
-        descriptor,
-        kind="workflow_driver",
-        config={
-            **plain(descriptor.config),
-            "workflow": {"spec": spec.to_dict(), "allowed_tools": plain(options.tools)},
-        },
-    )
     async with manager.joined_write() as tx:
         await port.db.dialect.lock_state(tx, port.state, target.session_id)
         if parent:
             await manager._fence(tx, origin, parent)
         old = await tx.fetchone(f"SELECT job_id FROM {manager.events} WHERE operation_key=?", (key,))
+        accepted = await port.input(tx, start) if old else None
+        descriptor = descriptor or RuntimeDescriptor(
+            **(accepted.meta["descriptor"] if accepted else defaults["runtime_descriptor"])
+        )
+        allowed_tools = options.tools
+        if allowed_tools is None and accepted:
+            allowed_tools = accepted.meta["descriptor"]["config"]["workflow"]["allowed_tools"]
+        descriptor = replace(
+            descriptor,
+            kind="workflow_driver",
+            config={
+                **plain(descriptor.config),
+                "workflow": {"spec": spec.to_dict(), "allowed_tools": plain(allowed_tools)},
+            },
+        )
         if old is None:
             await port.store._create_session_tx(
                 tx,
@@ -362,8 +368,11 @@ class DurableExecutor:
             await self.port.lock_owned(tx, TargetRef(self.ctx.store_id, self.ctx.session_id), self.ctx)
             await self.manager._fence(tx, origin, self.binding.lease)
             saved = await journal.get(self.port.store, tx, self.ctx.session_id, entry_key)
-            saved["result_ref"] = reference
-            await journal.put(self.port.store, tx, self.ctx.session_id, entry_key, saved)
+            # Re-reading earlier generations rebuilds usage, not the latest
+            # node projection. Keep the already consumed continuation result.
+            if saved["result_ref"] is None or saved["result_ref"]["generation"] < reference["generation"]:
+                saved["result_ref"] = reference
+                await journal.put(self.port.store, tx, self.ctx.session_id, entry_key, saved)
             item = hashlib.sha256(("result:" + reference["result_id"]).encode()).hexdigest()
             await tx.execute(
                 f"UPDATE {self.port.q} SET status='delivered',delivered_at=?,claim_token=NULL,claimed_at=NULL,"
@@ -393,6 +402,7 @@ class DurableExecutor:
         return {
             **raw,
             "session_id": saved["session_id"],
+            "has_next_continuation": str(request.continuation + 1) in saved["continuations"],
             "accounting_usage": (
                 {}
                 if result.job_ref.generation <= self.plan.get("already_counted", {}).get(result.job_ref.job_id, 0)

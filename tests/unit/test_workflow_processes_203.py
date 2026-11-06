@@ -10,7 +10,8 @@ import pytest
 
 from power_loop import DatabasePollingTransport, RuntimeClient
 from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
-from power_loop.agent.runtime_types import JobRef, RuntimeDescriptor, TargetRef, TrustedActor
+from power_loop.agent.runtime_types import JobRef, RuntimeDescriptor, RuntimeRequestError, TargetRef, TrustedActor
+from power_loop.workflow import journal
 
 from ._workflow_fixture_203 import leaf
 from .test_job_registry_192 import registry_store
@@ -19,7 +20,7 @@ __all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("scenario", ["live", "dispatch_gap", "parallel", "unknown_leaf"])
+@pytest.mark.parametrize("scenario", ["live", "dispatch_gap", "parallel", "unknown_leaf", "auto_completed", "auto_pending"])
 async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_store, tmp_path, scenario):
     store, _ = registry_store
     descriptor = RuntimeDescriptor(1, "agent", "p4.agent@1", None, "p4.tools@1", "p4.hooks@1", "p4.resources@1", {}, {})
@@ -41,6 +42,7 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
         else os.environ["POWER_LOOP_TASK_PG_DSN" if backend == "postgres" else "POWER_LOOP_TASK_MYSQL_DSN"]
     )
     processes = []
+    automatic = scenario.startswith("auto_")
 
     async def launch(role):
         path = tmp_path / (role + ".log")
@@ -54,6 +56,7 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
                 str(tmp_path / "coordinator.db"),
                 role,
                 str(tmp_path),
+                scenario,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=err,
@@ -90,7 +93,12 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
             root = {"type": "sequence", "steps": [a, b]}
         if scenario == "unknown_leaf":
             a["retry"] = {"max_attempts": 2, "on": ["failed"]}
-        handle = await client.workflow(target, {"name": "rebuild", "root": root}, message_id="run", actor=actor)
+        spec = {"name": "rebuild", "root": root}
+        if automatic:
+            a["spec"].update(max_rounds=1, tools=["progress"])
+            a["continuation"] = {"max_continuations": 2, "extra_rounds": 3, "gate": "todo_remaining"}
+            spec["budget"] = {"max_tokens": 12, "stop_at_remaining_pct": 0}
+        handle = await client.workflow(target, spec, message_id="run", actor=actor)
         c = await launch("C")
         if scenario == "dispatch_gap":
             for _ in range(250):
@@ -104,8 +112,11 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
             a = None
         else:
             a = await launch("A")
-            first = await event(a, "running")
-            assert first["calls"] == first["used"] == 1
+            if automatic:
+                await event(a, "completed" if scenario == "auto_completed" else "continuing")
+            else:
+                first = await event(a, "running")
+                assert first["calls"] == first["used"] == 1
         if scenario == "unknown_leaf":
             a.kill()
             await a.wait()
@@ -118,9 +129,18 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
             assert len(nodes) == 1 and nodes[0]["outcome"] == "interrupted"
             assert (tmp_path / "A-actions").read_text().splitlines() == ["external action"]
             return
-        if scenario == "parallel":
+        if scenario in {"parallel", "auto_completed"}:
             b = await launch("B")
             await event(b, "running")
+        if automatic:
+            original = await store._db.fetchall(
+                f"SELECT title,job_id,session_id,generation FROM {store.table_prefix}jobs WHERE kind='workflow_node'"
+            )
+            a_row = next(n for n in original if n["title"] == "A")
+            assert a_row["generation"] == 2
+            assert all(item["status"] == "completed" for item in (
+                await store.get_runtime_state(a_row["session_id"], "todo")
+            )["items"])
         c.kill()
         await c.wait()
         c2 = await launch("C2")
@@ -137,9 +157,10 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
         if a is None:
             a = await launch("A")
             await event(a, "running")
-        await command(a, "release")
-        await event(a, "completed")
-        if scenario != "parallel":
+        if scenario != "auto_completed":
+            await command(a, "release")
+            await event(a, "completed")
+        if scenario not in {"parallel", "auto_completed"}:
             b = await launch("B")
             await event(b, "running")
         await command(b, "release")
@@ -150,12 +171,31 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
             f"SELECT * FROM {store.table_prefix}jobs WHERE kind='workflow_node' ORDER BY title"
         )
         assert len(nodes) == 2
-        assert all(n["generation"] == 1 and n["outcome"] == "succeeded" for n in nodes)
+        assert all(n["generation"] == (2 if automatic and n["title"] == "A" else 1)
+                   and n["outcome"] == "succeeded" for n in nodes)
         for process in (a, b):
             await command(process, "budget")
             budget = await event(process, "budget")
-            assert budget["reserved"] == budget["settled"] == 2
-        assert result.usage["calls"] == 4
+            assert budget["reserved"] == budget["settled"] == (4 if automatic and process is a else 2)
+        assert result.usage["calls"] == (6 if automatic else 4)
+        if automatic:
+            assert result.usage["total_tokens"] == 12
+            assert result.structured_output["results"]["A"]["text"] == "A done"
+            assert result.structured_output["results"]["A"]["usage"]["calls"] == 4
+            for before in original:
+                after = next(n for n in nodes if n["title"] == before["title"])
+                assert all(after[k] == before[k] for k in ("job_id", "session_id", "generation"))
+            for generation in (1, 2):
+                old_a = await client.wait(JobRef(store.store_id, a_row["job_id"], generation),
+                                          actor=actor, deadline_ms=now_ms() + 3000)
+                assert old_a.usage["calls"] == 2 and old_a.usage["total_tokens"] == 4
+            saved = await journal.read(store, target.session_id, handle.run_id)
+            assert next(n for n in saved["nodes"] if n["path"] == "A")["result_ref"]["generation"] == 2
+            # The round-limit response is a model call but executes no tool.
+            assert (tmp_path / "A-progress").read_text().splitlines() == ["progress"] * 2
+            assert (tmp_path / "B-actions").read_text().splitlines() == ["external action"]
+            with pytest.raises(RuntimeRequestError, match="budget_exceeded"):
+                await handle.resume(generation=2, node_id="A", message="over budget", message_id="over")
     finally:
         for process in processes:
             if process.returncode is None:

@@ -32,9 +32,10 @@ def report(**data):
 
 
 async def main():
-    dsn, prefix, coord, role, workspace = sys.argv[1:]
+    dsn, prefix, coord, role, workspace, scenario = sys.argv[1:]
     store = await open_store(dsn, table_prefix=prefix, schema="tasks")
     gate = asyncio.Event()
+    auto_calls = 0
 
     class Coordinator(DatabaseSessionOwnershipCoordinator):
         async def acquire(self, key, **kwargs):
@@ -75,9 +76,39 @@ async def main():
         hold,
     )
 
+    async def progress():
+        from pathlib import Path
+
+        from power_loop.core.agent_context import get_session_id
+
+        with (Path(workspace) / "A-progress").open("a") as marker:
+            marker.write("progress\n")
+        await store.set_runtime_state(get_session_id(), "todo", {
+            "items": [{"text": "finish A", "status": "pending" if auto_calls < 3 else "completed"}]
+        })
+        if auto_calls == 3 and scenario == "auto_pending":
+            report(event="continuing")
+            await gate.wait()
+        return "saved"
+
+    registry.register(
+        ToolDefinition(name="progress", description="advance todo", input_schema={"type": "object"},
+                       pricing=Free("local")), progress,
+    )
+
     class Model(LLMService):
         async def complete(self, request, **kwargs):
+            nonlocal auto_calls
             usage = LLMTokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+            if scenario.startswith("auto_") and role == "A":
+                auto_calls += 1
+                if auto_calls <= 3:
+                    return LLMResponse(raw_text="", token_usage=usage, tool_calls=[{
+                        "id": f"progress-{auto_calls}", "type": "function",
+                        "function": {"name": "progress", "arguments": "{}"},
+                    }])
+                report(event="completed", text="A done")
+                return LLMResponse(raw_text="A done", token_usage=usage)
             if not any(m.get("role") == "tool" for m in request.messages):
                 return LLMResponse(
                     raw_text="",
@@ -102,7 +133,8 @@ async def main():
         "p4-shared",
         (
             LocalBudgetScope("root", max_calls=20, binding="root"),
-            LocalBudgetScope("leaf", max_calls=2, binding="owner", owner_kinds=("workflow_node",)),
+            LocalBudgetScope("leaf", max_calls=4 if scenario.startswith("auto_") else 2,
+                             binding="owner", owner_kinds=("workflow_node",)),
         ),
         provider,
         max_pending=64,

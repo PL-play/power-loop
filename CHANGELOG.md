@@ -8,6 +8,12 @@
 
 ## 10.0.0 — 2026-10-30
 
+- **Unreleased design 203 P4-R1:** replacement workflow drivers reuse accepted
+  automatic continuations before checking the todo gate, retain the latest node
+  result reference, and rebuild usage from each original generation. Duplicate
+  workflow requests use frozen defaults; explicit changes still conflict.
+  Independent G4 re-review is pending; no version change or release.
+
 - **Unreleased design 203 P4:** workflow driver and leaves execute in independent
   sessions through Runtime. Replacement drivers reuse persisted dispatches and
   original results; unknown external actions are not automatically replayed.

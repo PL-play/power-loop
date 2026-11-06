@@ -13,9 +13,12 @@ __all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("budget,expected_calls", [(100, 3), (2, 2)])
+@pytest.mark.parametrize("budget,gate,expected_calls,expected_status", [
+    (100, "always", 3, "completed"), (2, "always", 2, "budget_exceeded"),
+    (100, "todo_remaining", 2, "failed"),
+])
 async def test_automatic_continuation_keeps_session_and_cumulative_usage(
-    registry_store, tmp_path, budget, expected_calls
+    registry_store, tmp_path, budget, gate, expected_calls, expected_status
 ):
     from power_loop import LLMTokenUsage
     from power_loop.contracts.tools import ToolDefinition
@@ -56,7 +59,7 @@ async def test_automatic_continuation_keeps_session_and_cumulative_usage(
     runner = await RunningAgent(store, model, registry, config=AgentLoopConfig(compactor=None)).start()
     node = leaf("A")
     node["spec"].update(max_rounds=1, tools=["step"])
-    node["continuation"] = {"max_continuations": 2, "extra_rounds": 1, "gate": "always"}
+    node["continuation"] = {"max_continuations": 2, "extra_rounds": 1, "gate": gate}
     try:
         handle = await runner.runtime.client.workflow(
             runner.target,
@@ -68,7 +71,7 @@ async def test_automatic_continuation_keeps_session_and_cumulative_usage(
         assert model.calls == expected_calls, (model.calls, result)
         assert result.usage["calls"] == expected_calls
         assert result.usage["total_tokens"] == expected_calls * 2
-        assert result.status == ("completed" if expected_calls == 3 else "budget_exceeded"), result
+        assert result.status == expected_status, result
         nodes = await store._db.fetchall(
             f"SELECT session_id,generation FROM {store.table_prefix}jobs WHERE kind='workflow_node'"
         )

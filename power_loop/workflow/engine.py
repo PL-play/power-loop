@@ -416,9 +416,13 @@ class WorkflowEngine:
                     break
                 if self._cancel.is_cancelled():
                     break
-                remaining = await self._executor.todo_remaining(raw["session_id"])
-                if cont.gate == "todo_remaining" and not remaining:
-                    break
+                # A gate admits new work; it cannot invalidate an input that
+                # was already accepted (and may have completed its todo).
+                remaining = []
+                if not raw.get("has_next_continuation"):
+                    remaining = await self._executor.todo_remaining(raw["session_id"])
+                    if cont.gate == "todo_remaining" and not remaining:
+                        break
                 more = await self._executor.run_agent(
                     replace(
                         request,
