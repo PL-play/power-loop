@@ -8,6 +8,11 @@
 
 ## 10.0.0 — 2026-10-30
 
+- **Unreleased design 203 P4-R2:** explicit workflow resume starts its own
+  automatic continuation sequence and input keys. Rebuilt drivers reuse that
+  execution's saved references; original results and cumulative usage remain.
+  Independent G4 review is pending; no version change or release.
+
 - **Unreleased design 203 P4-R1:** replacement workflow drivers reuse accepted
   automatic continuations before checking the todo gate, retain the latest node
   result reference, and rebuild usage from each original generation. Duplicate

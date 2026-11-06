@@ -13,12 +13,12 @@ __all__ = ["registry_store"]
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("budget,gate,expected_calls,expected_status", [
-    (100, "always", 3, "completed"), (2, "always", 2, "budget_exceeded"),
-    (100, "todo_remaining", 2, "failed"),
+@pytest.mark.parametrize("budget,gate,expected_calls,expected_status,limit,finish_after", [
+    (100, "always", 3, "completed", 2, 3), (2, "always", 2, "budget_exceeded", 2, 3),
+    (100, "todo_remaining", 2, "failed", 2, 3), (100, "always", 4, "failed", 1, 5),
 ])
 async def test_automatic_continuation_keeps_session_and_cumulative_usage(
-    registry_store, tmp_path, budget, gate, expected_calls, expected_status
+    registry_store, tmp_path, budget, gate, expected_calls, expected_status, limit, finish_after
 ):
     from power_loop import LLMTokenUsage
     from power_loop.contracts.tools import ToolDefinition
@@ -41,7 +41,7 @@ async def test_automatic_continuation_keeps_session_and_cumulative_usage(
         async def complete(self, request, **kwargs):
             self.calls += 1
             usage = LLMTokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2)
-            if self.calls < 3:
+            if self.calls < finish_after:
                 return LLMResponse(
                     raw_text="",
                     token_usage=usage,
@@ -59,7 +59,7 @@ async def test_automatic_continuation_keeps_session_and_cumulative_usage(
     runner = await RunningAgent(store, model, registry, config=AgentLoopConfig(compactor=None)).start()
     node = leaf("A")
     node["spec"].update(max_rounds=1, tools=["step"])
-    node["continuation"] = {"max_continuations": 2, "extra_rounds": 1, "gate": gate}
+    node["continuation"] = {"max_continuations": limit, "extra_rounds": 1, "gate": gate}
     try:
         handle = await runner.runtime.client.workflow(
             runner.target,
@@ -75,7 +75,7 @@ async def test_automatic_continuation_keeps_session_and_cumulative_usage(
         nodes = await store._db.fetchall(
             f"SELECT session_id,generation FROM {store.table_prefix}jobs WHERE kind='workflow_node'"
         )
-        assert len(nodes) == 1 and nodes[0]["generation"] == (2 if expected_calls == 3 else 1)
+        assert len(nodes) == 1 and nodes[0]["generation"] == (2 if expected_calls > 2 else 1)
     finally:
         await runner.aclose()
 

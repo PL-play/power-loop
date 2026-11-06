@@ -324,7 +324,9 @@ class DurableExecutor:
                         return {"status": "budget_exceeded", "session_id": saved["session_id"], "usage": {}}
                     row = await self.manager._row(tx, saved["job_id"])
                     wait_ref = InputRef(
-                        self.ctx.store_id, saved["session_id"], "continue_" + _hash([key, request.continuation])[:32]
+                        self.ctx.store_id,
+                        saved["session_id"],
+                        "continue_" + _hash([key, plain(wait_ref), request.continuation])[:32],
                     )
                     receipt = await self.port.accept_input(
                         tx,
@@ -627,6 +629,10 @@ async def prepare_continuation(worker, ctx, runtime, binding, run_id, saved, tx)
         actor,
         descriptor=RuntimeDescriptor(**original.meta["descriptor"]),
     )
+    # This explicit input starts a new continuation sequence. Driver recovery
+    # skips this preparation and retains that sequence's accepted references.
+    node["continuations"] = {}
+    await journal.put(port.store, tx, ctx.session_id, journal.node_key(key), node)
     previous = saved.get("continuation", {})
     offsets = dict(previous.get("attempt_offsets", {}))
     for _, n in nodes:
