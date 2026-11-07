@@ -415,7 +415,8 @@ async def test_first_result_and_input_do_not_follow_resume_generation(registry_s
     await client.aclose()
 
 
-async def test_current_schema_reopens_and_refuses_old_versions_without_conversion(registry_store):
+@pytest.mark.parametrize("offset", [-1, 1])
+async def test_current_schema_reopens_and_refuses_old_versions_without_conversion(registry_store, offset):
     from power_loop.runtime.store.schema import StoreSchemaError
     from power_loop.runtime.store.task_schema import TASK_PROTOCOL_VERSION, TASK_SCHEMA_VERSION
     store, connect = registry_store
@@ -425,7 +426,7 @@ async def test_current_schema_reopens_and_refuses_old_versions_without_conversio
     await store.append_message(sid, role="user", content="unchanged")
     for table, column, original in (("schema_migrations", "version", TASK_SCHEMA_VERSION),
                                     ("task_store", "protocol_version", TASK_PROTOCOL_VERSION)):
-        await store._db.execute(f"UPDATE {store.table_prefix}{table} SET {column}=? WHERE id=1", (original - 1,))
+        await store._db.execute(f"UPDATE {store.table_prefix}{table} SET {column}=? WHERE id=1", (original + offset,))
         try:
             with pytest.raises(StoreSchemaError):
                 await connect()

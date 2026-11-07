@@ -14,16 +14,13 @@ inspect the source modules linked below.
 | Provisional | Re-exported from `power_loop`, but may change in a future minor. |
 | Internal | Submodule imports such as `power_loop.core.*`; no compatibility guarantee. |
 
-## Core
+## Current runtime (11.0.0)
 
-| Symbol | Covers | More |
-|---|---|---|
-| `StatefulAgentLoop` | `new_session`, `send`, `send_sync`, `follow_up`, `follow_up_sync`, `resume`, `submit_input`, `abort_pending`, `close_session`, `get_messages`, `get_pending` | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/agent/stateful_loop.py) |
-| `StatefulResult` | `session_id`, `status`, `final_text`, `rounds`, `pending_tool_calls`, `pending_interactions` | [source](../../../power_loop/agent/stateful_loop.py) |
-| `FollowUpQueued` | `session_id`, `queue_depth` — returned when `follow_up()` enqueues steering input for the next round | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/agent/follow_up.py) |
-| `AgentLoopConfig` | loop limits, temperature, compaction, retry, memory | [Configuration](../user-guide/configuration.md), [source](../../../power_loop/agent/types.py) |
-| `SessionStore` | Pluggable async store (SQLite / Postgres / MySQL): sessions, messages, compactions, usage, pending state, projection (`pl_project_messages`), hook-injection audit (`pl_hook_events` via `list_hook_events`) | [Sessions](../user-guide/sessions.md), [source](../../../power_loop/runtime/store/store.py) |
-| `HookEventRow` | One audit row of an ephemeral `LLM_BEFORE` hook injection (`pl_hook_events`); see `AgentLoopConfig.record_hook_events` / `SessionStore.list_hook_events` | [Hook-events audit](../user-guide/hook-events-audit.md), [source](../../../power_loop/runtime/store/types.py) |
+See the [current runtime contract](../../runtime-11.md) and the executable
+`examples/design203_single_process.py`. `StatefulAgentLoop(runtime=...)` delegates
+to `RuntimeClient`; the old direct constructor, sync methods and process worker
+bootstrap are retired. Acceptance receipts and persisted results are distinct.
+
 
 ## Tools and Sub-Agents
 

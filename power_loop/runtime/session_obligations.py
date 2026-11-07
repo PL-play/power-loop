@@ -187,20 +187,6 @@ async def event_rows(manager, tx, actor, kind, *, job_id=None, limit=1001):
         (actor.session_id, kind, actor.tenant_id, actor.principal_id, *((job_id,) if job_id is not None else ())))
 
 
-async def rebuild_tx(manager, tx):
-    """Offline schema migration only, with all writers fenced by its caller."""
-    old = await tx.fetchall(f"SELECT DISTINCT session_id FROM {manager.prefix}session_obligations")
-    sessions = {row["session_id"] for row in old}
-    await tx.execute(f"DELETE FROM {manager.prefix}session_obligations")
-    cursor = ""
-    while True:
-        rows = await tx.fetchall(f"SELECT * FROM {manager.jobs} WHERE job_id>? ORDER BY job_id LIMIT 100", (cursor,))
-        if not rows:
-            return sessions
-        for row in rows:
-            entries = await _replace(manager, tx, row, verify=True)
-            sessions.update(entry[0] for entry in entries)
-        cursor = rows[-1]["job_id"]
 
 
 class _RebuildConflict(Exception):

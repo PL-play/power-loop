@@ -15,7 +15,7 @@ Stability tiers
 无版本承诺，可随时变更或删除。
 """
 
-__version__ = "10.0.0"
+__version__ = "11.0.0"
 
 # Public LLM contract (SDK-free) re-exported so callers (e.g. writing llm.* hooks or
 # a custom LLMService) don't reach into the internal vendored transport package (H3.4).
@@ -38,7 +38,7 @@ from power_loop._vendor.llm_client.interface import (
 from power_loop._vendor.llm_client.multimodal import create_attachment_ref
 from power_loop.agent.follow_up import FollowUpQueued, InboxItem
 
-# Design 203: ID-addressed message runtime (the SDK major is finalized at P7).
+# Design 203: the single ID-addressed execution API (11.0).
 from power_loop.agent.runtime import (
     ExecutionEnvironment,
     RegistryRuntimeFactory,
@@ -326,6 +326,14 @@ _logging.getLogger("power_loop").addHandler(_logging.NullHandler())
 # docstring and __all__ agree, and a SemVer guard fails if a symbol is dropped/renamed
 # without a major bump). Add freely; never remove/rename within a major version.
 STABLE_API = (
+    "Runtime", "RuntimeFactory", "RegistryRuntimeFactory", "ExecutionEnvironment",
+    "RuntimeClient", "RuntimeWorker", "ExecutionContext", "OutputSubscription",
+    "TargetRef", "InputRef", "JobRef", "Command", "RequestOptions", "RuntimeDescriptor",
+    "TrustedActor", "Receipt", "Status", "Result", "ShutdownResult", "JobPage",
+    "RuntimeRequestError", "CapacityError", "WaitTimeout", "StoreError",
+    "MessageTransport", "MemoryMessageTransport", "DatabasePollingTransport",
+    "PublishReceipt", "SubscriptionSpec", "TransportCapabilities", "TransportPacket",
+    "SessionOwnership", "SessionOwnershipCoordinator", "MemorySessionOwnershipCoordinator",
     "StatefulAgentLoop",
     "StatefulResult",
     "FollowUpQueued",

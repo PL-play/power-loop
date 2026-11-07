@@ -1,4 +1,4 @@
-"""Design 203 P1 single-process runtime example.
+"""Power Loop 11 single-process runtime example (no Redis or broker).
 
 Run from a fresh directory: python design203_single_process.py
 """

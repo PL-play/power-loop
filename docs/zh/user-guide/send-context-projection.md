@@ -197,18 +197,9 @@ from power_loop import Representation, ProjectedSend, ProjectedRow  # 写自己�
 - **原子且并发安全** —— 每个已结束 send 的投影行在一把短锁内提交；（LLM）折叠在锁外运行，并以乐观的先验游标检查提交，所以两个共享 store 的 loop 不会重复写一次折叠。
 - **token**：真正的削减来自 `ProjectedRepresentation` 的按字段截断 + `compact` 折叠；存的是结构化 JSON，装配时渲染成紧凑文本。**前缀缓存**：投影前缀是 append-only 增长（每 send 一组行），比逐字的就地压缩（每次折叠重写一段）对厂商的隐式前缀缓存更友好。
 
-## 已有会话的一次性转换
+## 当前存储
 
-运行时不转换旧会话，也不按旧模式降级。某个 send 的投影缺失或版本不符时，读取该 send 的原始消息；现有的逐 send 投影修复可以重建这份派生记录。会话最初使用的表示仍保留在元数据中供查看。
-
-保留的逐字历史要转成投影时，先把数据库升级到当前任务结构，停止写者并备份，再从 SDK 目录查看单个会话的转换计划：
-
-```bash
-.venv/bin/python -m scripts.migrate_projection_history --dsn "$POWER_LOOP_MAINTENANCE_DSN" --session-id SESSION_ID
-```
-
-追加 `--apply --writers-stopped` 才实际执行；多个会话逐个处理。CLI 使用内置 `ProjectedRepresentation`；应用有自定义表示时，把配置好的对象传给脚本的 `convert(..., projector=...)` 函数。
-脚本补齐缺失或过时的逐 send 投影，把已有的就地压缩摘要保留为 compact 种子，移除退役的迁移标记；不调用模型、不执行工具、不改原始消息或费用。投影与元数据在同一事务提交，已转换会话重跑不重复写入。
+11.0.0 使用新 SDK 库，不导入或转换历史 SDK 会话。当前数据的投影缺失或版本不符时读取原始消息，正常投影修复保留。
 
 
 ## 鲁棒性：自愈错乱的历史

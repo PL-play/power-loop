@@ -44,18 +44,6 @@ def view_ddl(backend, prefix):
     return [f'{create} {prefix}usage_rounds AS '+view_query(backend, prefix)]
 
 
-async def migrate(tx, db, prefix):
-    """Offline,with writers stopped;rename originals and create their read view.
-
-    The physical table is unchanged. On MySQL a crash after the atomic rename
-    can be resumed without copying or recreating any original observation.
-    """
-    from .schema import _table_exists_tx
-
-    if not await _table_exists_tx(tx, db.dialect.name, prefix+'usage_observations'):
-        await tx.execute(f'ALTER TABLE {prefix}usage_rounds RENAME TO {prefix}usage_observations')
-    for statement in view_ddl(db.dialect.name, prefix):
-        await tx.execute(statement)
 
 
 def remove_sql(backend):

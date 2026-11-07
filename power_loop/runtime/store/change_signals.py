@@ -21,19 +21,6 @@ async def bump(store, tx, session_id, kind):
         raise SessionLeaseLost(session_id)
 
 
-async def migration_steps(tx, db, prefix):
-    from .schema import _column_exists
-    integer = "INTEGER" if db.dialect.name == "sqlite" else "BIGINT"
-    missing = [column for column in COLUMNS
-               if not await _column_exists(tx, db.dialect.name, prefix + "session_state", column)]
-    steps = [f"ALTER TABLE {prefix}session_state ADD COLUMN {column} {integer} NOT NULL DEFAULT 0"
-             for column in missing]
-    # Maintenance imports existing obligations once. Live readers then use the
-    # counters, with no old-format recognition or history scans.
-    for column, table in zip(COLUMNS, ("follow_up_queue", "background_tasks", "session_runtime_state"), strict=True):
-        steps.append(f"UPDATE {prefix}session_state SET {column}=1 WHERE {column}=0 AND EXISTS "
-                     f"(SELECT 1 FROM {prefix}{table} c WHERE c.session_id={prefix}session_state.session_id)")
-    return steps
 
 
 class ChangeReader:

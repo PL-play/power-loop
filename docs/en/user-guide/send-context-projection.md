@@ -200,27 +200,9 @@ A custom representation satisfies the `Representation` Protocol by declaring `ki
 - **Atomic & concurrency-safe** — each finished send's projection rows commit under a short lock; the (LLM) fold runs outside the lock and commits with an optimistic prior-cursor check, so two loops sharing a store can't double-write a fold.
 - **Tokens**: real reduction comes from `ProjectedRepresentation`'s per-field truncation and the `compact` fold; stored content is structured JSON, rendered to compact text at assembly time. **Prompt caching**: the projected prefix grows append-only (one row group per send), friendlier to a provider's implicit prefix cache than verbatim in-place compaction (which rewrites a span on each fold).
 
-## Existing sessions and offline conversion
+## Current stores
 
-Runtime sends do not convert old sessions or downgrade their history mode. A missing
-or version-mismatched projection reads that send's original messages; the existing
-per-send projection repair can rebuild that derived row. The session's original
-representation remains inspectable in metadata.
-
-To convert retained verbatim history, first upgrade the database to the current task
-schema, stop writers and take a backup. From the SDK checkout, inspect one session:
-
-```bash
-.venv/bin/python -m scripts.migrate_projection_history --dsn "$POWER_LOOP_MAINTENANCE_DSN" --session-id SESSION_ID
-```
-
-Add `--apply --writers-stopped` for the explicit conversion. Each session is handled
-independently. The CLI uses `ProjectedRepresentation`; for a custom representation,
-pass its configured object to the script's `convert(..., projector=...)` function.
-The script projects missing/stale sends, preserves an existing in-place summary as a
-compact seed, and removes the retired migration marker. It does not call a model,
-execute tools, modify original messages, or change fees. Projection writes and
-metadata commit together; rerunning an already-converted session is a no-op.
+Version 11 uses a fresh SDK store. Historical SDK sessions are not imported or converted. Missing or stale projections of current data read the original messages; normal projection repair is retained.
 
 
 ## Robustness: self-healing a malformed history

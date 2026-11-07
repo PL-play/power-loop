@@ -1,5 +1,21 @@
 # Changelog
 
+## 11.0.0 — Design 203 (source delivery; not published)
+
+- Breaking: all execution uses `RuntimeClient` → durable input → `RuntimeWorker`.
+  `StatefulAgentLoop(runtime=...)` is a convenience facade over those ports.
+  Callers supply authenticated actors, stable targets and request IDs; old direct
+  `StatefulAgentLoop(llm=..., dsn=...)` construction is removed.
+- Main agents, children, background work and workflow drivers/nodes use independent
+  session ownership. Shared deployments require explicit shared coordination and transport.
+- Current task schema **15**, protocol **42**, descriptor schema **1**. Open a fresh
+  database or table prefix and use its new store ID; other versions are rejected.
+  Historical SDK tasks, bindings and fees are not imported or converted.
+- Preserve normal permissions, billing, context, tools and cleanup. On infrastructure
+  failure, results may be interrupted/unknown; unknown external actions are not replayed.
+- The runtime, transport, identity and ownership contracts join `STABLE_API`.
+
+
 本项目采用 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 风格，
 并遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
