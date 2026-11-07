@@ -9,7 +9,7 @@ import pytest
 
 from power_loop import DatabasePollingTransport, RuntimeClient
 from power_loop.agent.runtime_store import RuntimeInputStore, now_ms
-from power_loop.agent.runtime_types import JobRef, TrustedActor
+from power_loop.agent.runtime_types import JobRef, TargetRef, TrustedActor
 
 from .test_job_registry_192 import registry_store
 
@@ -222,6 +222,11 @@ async def test_background_query_cancel_and_lost_shell_never_replays(registry_sto
         assert lost.status=='interrupted'
         assert (await client.inspect(JobRef(**two['job_ref']),actor=actor)).resource_state=='unknown'
         await asyncio.sleep(.2)
+        assert (tmp_path/'marker-two').read_text()=='started\n'
+        following = await client.send(TargetRef(store.store_id, sid), 'after unknown background',
+                                      message_id='after-unknown-background', actor=actor)
+        continued = await client.wait(following.input_ref, actor=actor, deadline_ms=now_ms()+15000)
+        assert continued.status == 'completed', continued
         assert (tmp_path/'marker-two').read_text()=='started\n'
         for process in (c,replacement):
             process.stdin.write(b'quit\n')

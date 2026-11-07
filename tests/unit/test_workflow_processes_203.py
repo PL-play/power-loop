@@ -128,6 +128,19 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
             nodes = await store._db.fetchall(f"SELECT * FROM {store.table_prefix}jobs WHERE kind='workflow_node'")
             assert len(nodes) == 1 and nodes[0]["outcome"] == "interrupted"
             assert (tmp_path / "A-actions").read_text().splitlines() == ["external action"]
+            next_leaf = leaf("B")
+            next_leaf["spec"].update(tools=["hold"], max_rounds=3)
+            following = await client.workflow(target, {"name": "after unknown", "root": next_leaf},
+                                              message_id="after-unknown", actor=actor)
+            b = await launch("B")
+            await event(b, "running")
+            await command(b, "release")
+            await event(b, "completed")
+            continued = await client.wait(JobRef(store.store_id, following.job_id, 0),
+                                          actor=actor, deadline_ms=now_ms() + 20000)
+            assert continued.status == "completed", continued
+            assert continued.usage["calls"] == 2
+            assert (tmp_path / "A-actions").read_text().splitlines() == ["external action"]
             return
         if scenario in {"parallel", "auto_completed"}:
             b = await launch("B")
@@ -198,11 +211,14 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
                 await handle.resume(generation=2, node_id="A", message="over budget", message_id="over")
         # A fresh invocation after replacement uses new work, without changing
         # any of the original identities, result or billing assertions above.
-        following = await client.workflow(target, {"name": "next", "root": leaf("B")},
+        next_leaf = leaf("B")
+        next_leaf["spec"].update(tools=["hold"], max_rounds=3)
+        following = await client.workflow(target, {"name": "next", "root": next_leaf},
                                           message_id="next", actor=actor)
         next_result = await client.wait(JobRef(store.store_id, following.job_id, 0),
                                        actor=actor, deadline_ms=now_ms() + 20000)
         assert next_result.status == "completed", next_result
+        assert next_result.usage["calls"] == 2
     finally:
         for process in processes:
             if process.returncode is None:
