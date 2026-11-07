@@ -249,7 +249,14 @@ async def test_queued_cancel_and_control_while_model_hangs(registry_store, mode)
         first = await runtime.client.send(target, "first", message_id="first", actor=actor)
         await asyncio.wait_for(model.started.wait(), 3)
         second = await runtime.client.send(target, "second", message_id="second", actor=actor)
+        output = await runtime.client.subscribe_output(second.input_ref, actor=actor)
+        assert (await anext(output)).kind == 'gap'
+        waiting = asyncio.create_task(anext(output))
+        await asyncio.sleep(0)
         await runtime.client.cancel(second.input_ref, actor=actor)
+        completed = await asyncio.wait_for(waiting, 3)
+        assert completed.kind == 'completed' and completed.payload['status'] == 'cancelled'
+        await output.aclose()
         void = await runtime.client.wait(second.input_ref, actor=actor, deadline_ms=deadline())
         assert void.status == "cancelled" and void.job_ref is None
         assert (await runtime.client.inspect(first.input_ref, actor=actor)).state == "running"

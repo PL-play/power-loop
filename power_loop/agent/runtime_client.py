@@ -219,49 +219,54 @@ class RuntimeClient:
                 if record is None:
                     raise RuntimeRequestError("not_found")
                 if record.row["delivered_job_id"] is None:
-                    return await self.inputs.void_unbound(tx, input_ref, reason=reason, status="cancelled")
-                job_ref = JobRef(ref.store_id, record.row["delivered_job_id"], record.row["delivered_job_generation"])
+                    receipt = await self.inputs.void_unbound(tx, input_ref, reason=reason, status="cancelled")
+                else:
+                    job_ref = JobRef(ref.store_id, record.row["delivered_job_id"], record.row["delivered_job_generation"])
                 if record.meta["operation"] in {"append", "nudge", "steer"} and record.row["status"] == "delivered":
                     return self.inputs.receipt(record, reason="already_applied")
-            row = await manager._row(tx, job_ref.job_id)
-            if job_ref.generation is None or row["generation"] != job_ref.generation:
-                raise RuntimeRequestError("stale_generation")
-            reason = row["cancel_reason"] or reason
-            if row["cancel_requested_at"] is None and row["supervision_status"] != "closed":
-                await tx.write_job(job_ref.job_id,
-                    f"UPDATE {manager.jobs} SET cancel_requested_at=?,cancel_reason=?,intake='closed',version=version+1 "
-                    "WHERE job_id=? AND generation=? AND version=?",
-                    (now_ms(), reason, job_ref.job_id, job_ref.generation, row["version"]))
-                if job_ref.generation == 0:
+            if job_ref is not None:
+                row = await manager._row(tx, job_ref.job_id)
+                if job_ref.generation is None or row["generation"] != job_ref.generation:
+                    raise RuntimeRequestError("stale_generation")
+                reason = row["cancel_reason"] or reason
+                if row["cancel_requested_at"] is None and row["supervision_status"] != "closed":
                     await tx.write_job(job_ref.job_id,
-                        f"UPDATE {manager.jobs} SET status='cancelled',outcome='cancelled',resource_state='stopped',"
-                        "supervision_status=?,result_status='available',version=version+1 WHERE job_id=? AND generation=0",
-                        ("open" if row["kind"] in {"subagent", "background_tool", "background_command"} and result_route["parent_session_id"] else "closed", job_ref.job_id))
-                    await tx.execute(f"UPDATE {self.inputs.q} SET status='void',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
-                        "WHERE session_id=? AND delivered_job_id=? AND delivered_job_generation=0 AND status IN ('pending','claimed')",
-                        (target.session_id, job_ref.job_id))
-                    parent_ref = await self.inputs._commit_result(tx, job_ref,
-                        Result(job_ref, input_ref, "cancelled", error=reason), None, result_route)
-            if row["status"] == "waiting" and row["outcome"] is None:
-                import json
-                state = await tx.fetchone(f"SELECT pending_json,next_seq FROM {self.inputs.state} WHERE session_id=?", (target.session_id,))
-                pending = json.loads(state["pending_json"] or "{}")
-                seq = state["next_seq"]
-                for call in pending.get("tool_calls", []):
-                    await tx.execute(f"INSERT INTO {self.store.t.messages} "
-                        "(session_id,seq,role,tool_call_id,name,content,state,round_index,send_index,created_at) "
-                        "VALUES (?,?,'tool',?,?,?,'active',?,?,?)", (target.session_id, seq, call["id"],
-                        call["function"]["name"], "<cancelled>", pending["round_index"],
-                        pending["runtime_wait"]["send_index"], now_ms()))
-                    seq += 1
-                await tx.execute(f"UPDATE {self.inputs.state} SET pending_json=NULL,next_seq=?,runtime_version=runtime_version+1 WHERE session_id=?",
-                                 (seq, target.session_id))
-                await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status='cancelled',outcome='cancelled',"
-                    "intake='closed',resource_state='stopped',version=version+1 WHERE job_id=? AND generation=? AND outcome IS NULL",
-                    (row["job_id"], job_ref.generation), obligations=True)
-                parent_ref = await self.inputs._commit_result(tx, job_ref, Result(job_ref, input_ref, "cancelled", error=reason), None, result_route)
-            receipt = Receipt(input_ref, target, input_ref.message_id if input_ref else
-                f"cancel:{job_ref.job_id}:{job_ref.generation}", False, job_ref, "applied", "not_needed", reason)
+                        f"UPDATE {manager.jobs} SET cancel_requested_at=?,cancel_reason=?,intake='closed',version=version+1 "
+                        "WHERE job_id=? AND generation=? AND version=?",
+                        (now_ms(), reason, job_ref.job_id, job_ref.generation, row["version"]))
+                    if job_ref.generation == 0:
+                        await tx.write_job(job_ref.job_id,
+                            f"UPDATE {manager.jobs} SET status='cancelled',outcome='cancelled',resource_state='stopped',"
+                            "supervision_status=?,result_status='available',version=version+1 WHERE job_id=? AND generation=0",
+                            ("open" if row["kind"] in {"subagent", "background_tool", "background_command"} and result_route["parent_session_id"] else "closed", job_ref.job_id))
+                        await tx.execute(f"UPDATE {self.inputs.q} SET status='void',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL "
+                            "WHERE session_id=? AND delivered_job_id=? AND delivered_job_generation=0 AND status IN ('pending','claimed')",
+                            (target.session_id, job_ref.job_id))
+                        parent_ref = await self.inputs._commit_result(tx, job_ref,
+                            Result(job_ref, input_ref, "cancelled", error=reason), None, result_route)
+                if row["status"] == "waiting" and row["outcome"] is None:
+                    import json
+                    state = await tx.fetchone(f"SELECT pending_json,next_seq FROM {self.inputs.state} WHERE session_id=?", (target.session_id,))
+                    pending = json.loads(state["pending_json"] or "{}")
+                    seq = state["next_seq"]
+                    for call in pending.get("tool_calls", []):
+                        await tx.execute(f"INSERT INTO {self.store.t.messages} "
+                            "(session_id,seq,role,tool_call_id,name,content,state,round_index,send_index,created_at) "
+                            "VALUES (?,?,'tool',?,?,?,'active',?,?,?)", (target.session_id, seq, call["id"],
+                            call["function"]["name"], "<cancelled>", pending["round_index"],
+                            pending["runtime_wait"]["send_index"], now_ms()))
+                        seq += 1
+                    await tx.execute(f"UPDATE {self.inputs.state} SET pending_json=NULL,next_seq=?,runtime_version=runtime_version+1 WHERE session_id=?",
+                                     (seq, target.session_id))
+                    await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET status='cancelled',outcome='cancelled',"
+                        "intake='closed',resource_state='stopped',version=version+1 WHERE job_id=? AND generation=? AND outcome IS NULL",
+                        (row["job_id"], job_ref.generation), obligations=True)
+                    parent_ref = await self.inputs._commit_result(tx, job_ref, Result(job_ref, input_ref, "cancelled", error=reason), None, result_route)
+                receipt = Receipt(input_ref, target, input_ref.message_id if input_ref else
+                    f"cancel:{job_ref.job_id}:{job_ref.generation}", False, job_ref, "applied", "not_needed", reason)
+        if job_ref is None:
+            success = await self._notify(target, receipt.message_id, input_ref, ['output'], {'kind': 'completed'})
+            return replace(receipt, notification='published' if success else 'failed')
         success = await self._notify(TargetRef(target.store_id, target.session_id, job_ref.job_id),
             receipt.message_id, input_ref, ["control"], {"generation": job_ref.generation})
         if parent_ref:
