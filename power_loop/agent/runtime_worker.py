@@ -723,7 +723,8 @@ class RuntimeWorker:
             return []
         refs = list(ctx.append_refs if only is None else only)[:self.runtime.claim_limit]
         for ref in refs:
-            ctx.append_refs.pop(ref)
+            # Explicit durable references need not have reached the notification cache.
+            ctx.append_refs.pop(ref, None)
         ctx.claiming_refs = frozenset(refs)
         if ctx.control_read and ctx.control_read.input_ref in ctx.claiming_refs:
             # A pending snapshot already being read must not re-issue the hint

@@ -1,4 +1,5 @@
 """HTTP-style commands are inputs, never forged model tool calls."""
+import asyncio
 import json
 
 import pytest
@@ -17,9 +18,20 @@ __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-async def test_worker_command_and_inline_child_without_assistant_call(registry_store):
+@pytest.mark.parametrize('late_work', [False, True])
+async def test_worker_command_and_inline_child_without_assistant_call(registry_store, monkeypatch, late_work):
     store, _ = registry_store
     executed, model_calls = [], []
+    release_work = asyncio.Event()
+    if late_work:
+        from power_loop.agent.runtime_transport import _Subscription
+        original = _Subscription.__anext__
+        async def delayed(subscription):
+            delivery = await original(subscription)
+            if delivery.packet.channel == 'work':
+                await release_work.wait()
+            return delivery
+        monkeypatch.setattr(_Subscription, '__anext__', delayed)
 
     class Model(LLMService):
         async def complete(self, request, **kwargs):
@@ -47,6 +59,17 @@ async def test_worker_command_and_inline_child_without_assistant_call(registry_s
         assert (await client.wait(ref, actor=actor, deadline_ms=now_ms()+1000)).final_text == '42'
         from power_loop.runtime.host_commands import consume_result
         await consume_result(loop, fixed)
+        ctx = loop._runtime_worker_context
+        consumed = list(loop._host_command['consumed'])
+        assert len(consumed) == 2  # Original child plus its explicit repair generation.
+        release_work.set()
+        if late_work:
+            async with asyncio.timeout(5):
+                while not ctx.append_refs:
+                    await asyncio.sleep(0.001)
+        assert await loop._runtime_worker.drain_append(ctx) == []
+        await consume_result(loop, fixed)  # Duplicate durable reminder must not consume twice.
+        assert loop._host_command['consumed'] == consumed
         return {'answer': fixed.final_text}
 
     class Factory:
