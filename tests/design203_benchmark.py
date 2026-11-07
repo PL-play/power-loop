@@ -44,8 +44,6 @@ from power_loop.tools.spawn_agent import register_spawn_agent
 from power_loop.workflow import create_workflow
 from tests.unit.test_model_budgets_192 import Host
 from tests.unit.test_nested_tool_billing_196 import Paid
-from tests.unit.test_task_runtime_192 import AdapterModel
-from tests.unit.test_workflow_task_runtime_192 import WorkflowModel, leaf
 
 SCENARIOS = ('send', 'paid', 'append', 'cancel', 'child', 'workflow', 'stateless', 'same_session')
 
@@ -162,6 +160,11 @@ async def simple(store, lane, scenario):
 
 @asynccontextmanager
 async def composite(store, scenario):
+    # These fixtures belong only to the historical P0 runner. The current
+    # runtime benchmark imports Model/batch/rss without using that old API.
+    from tests.unit.test_task_runtime_192 import AdapterModel
+    from tests.unit.test_workflow_task_runtime_192 import WorkflowModel, leaf
+
     manager, registry = JobManager(store), ToolRegistry()
     runtime = TaskRuntime(manager, tenant_id='composite', principal_id='host',
         executor_id='bench-'+os.urandom(4).hex(), boot_id=os.urandom(8).hex(), lease_ms=300000)
