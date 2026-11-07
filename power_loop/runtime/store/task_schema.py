@@ -23,6 +23,7 @@ TASK_PROTOCOL_VERSION = 42
 _QUERY_INDEXES = {
     'idx_retention_messages': ('messages', ('created_at',)),
     'idx_retention_usage': ('usage_observations', ('created_at',)),
+    'idx_retention_descriptors': ('sessions', ('kind', 'updated_at', 'session_id')),
     'idx_retention_runtime': ('session_runtime_state', ('updated_at',)),
     'idx_retention_timers': ('timers', ('status', 'updated_at')),
     'idx_retention_hooks': ('hook_events', ('created_at',)),
@@ -38,6 +39,8 @@ _QUERY_INDEXES = {
     'idx_budget_unsettled': ('task_budget_attempts', ('pending', 'attempt_id')),
     'idx_budget_dispatch': ('task_budget_attempts', ('pending', 'phase', 'attempt_id')),
     'idx_jobs_root_page': ('jobs', ('root_job_id', 'job_id')),
+    'idx_jobs_session_open': ('jobs', ('session_id', 'supervision_status', 'job_id')),
+    'idx_jobs_session_resource': ('jobs', ('session_id', 'resource_state', 'job_id')),
     'idx_jobs_session_kind': ('jobs', ('session_id', 'kind', 'job_id')),
     'idx_jobs_control_owner': ('jobs', ('control_owner_job_id', 'job_id')),
     'idx_jobs_main_page': ('jobs', ('kind', 'execution_role', 'parent_job_id', 'generation', 'job_id')),

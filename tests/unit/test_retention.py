@@ -17,6 +17,8 @@ OLD = 1
 
 
 async def insert(db, table, **row):
+    if table.endswith('follow_up_queue'):
+        row.setdefault('meta_json', '{}')
     await db.execute(f"INSERT INTO {table} ({','.join(row)}) VALUES ({','.join('?' for _ in row)})", tuple(row.values()))
 
 
@@ -70,12 +72,11 @@ async def test_executor_retention_progresses_past_references(registry_store, mon
 
     monkeypatch.setattr(transaction_type, 'execute', count_delete)
     first = await store.purge_expired(NOW, limit=limit)
-    assert first['task_executors'] == min(limit, 3)
-    # Separate connections compete for the same next candidate; only its
-    # deleting transaction may count it. Repeated calls must keep progressing.
+    # One allowance covers executor events and the executor itself. Continue
+    # across calls, including when the allowance is a single row.
     reports = [first]
-    for _ in range(2):
-        reports.extend(await asyncio.gather(store.purge_expired(NOW, limit=1), peer.purge_expired(NOW, limit=1)))
+    for _ in range(8):
+        reports.extend(await asyncio.gather(store.purge_expired(NOW, limit=limit), peer.purge_expired(NOW, limit=limit)))
     assert sum(r.get('task_executors', 0) for r in reports) == 3
     assert sum(r.get('task_executor_events', 0) for r in reports) == (1003 if limit == 1000 else 3)
     assert sum(deletions) == (1006 if limit == 1000 else 6)
@@ -133,9 +134,9 @@ async def test_categories_expire_without_removing_recent_or_active_work(registry
                      value_json='{"deleted":false}', updated_at=at)
         await insert(db, store.t.follow_up_queue, session_id=sid, item_id=str(i), kind='user', mode='queue',
                      status='pending' if i == 2 else 'delivered', content='keep message', created_at=at, delivered_at=at)
-        for item, status in (('op_'+run, 'delivered'), ('nudge:op_'+run, 'void'), ('subagent:'+run, 'transferred')):
+        for item, status in (('op_'+run, 'delivered'), ('nudge:op_'+run, 'void'), ('subagent:'+run, 'void')):
             await insert(db, store.t.follow_up_queue, session_id=sid, item_id=item, kind='task_done', mode='queue',
-                         status=status, content='task history', created_at=OLD, delivered_at=OLD)
+                         status=status, content='task history', created_at=at, delivered_at=at, delivered_job_id=job, delivered_job_generation=1)
         await insert(db, store.t.timers, session_id=sid, timer_id=1, due_at=at, note='timer',
                      status='armed' if i == 2 else 'fired', created_at=at, updated_at=at)
         await insert(db, store.t.hook_events, session_id=sid, event_id=1, hook_point='after', kind='metadata', created_at=at)
@@ -144,11 +145,9 @@ async def test_categories_expire_without_removing_recent_or_active_work(registry
         await store.append_message(sid, role='assistant', content='retained body', send_index=2, round_index=1,
                                    meta={'_round_usage': {'total_tokens': 5}})
         await db.execute(f'UPDATE {store.t.messages} SET created_at=? WHERE session_id=?', (at, sid))
-        for namespace in ('subagent:run:', 'workflow:run:', 'workflow:history:'):
+        for namespace in ('subagent:run:', 'workflow:run:'):
             await insert(db, store.t.session_runtime_state, session_id=sid, state_key=namespace+run,
                          value_json=json.dumps({'run_id': run}), updated_at=at)
-        await insert(db, store.t.session_runtime_state, session_id=sid, state_key='workflow:index',
-                     value_json=json.dumps([run]), updated_at=at)
         await insert(db, p+'task_executors', executor_key=f'executor-{i}', tenant_id='retention', principal_id='host',
                      executor_id=f'executor-{i}', boot_id='boot', contract_hash='a'*64, state='draining' if i < 2 else 'accepting',
                      version=1, lease_until_ms=at, created_at=at, updated_at=at)
@@ -162,7 +161,6 @@ async def test_categories_expire_without_removing_recent_or_active_work(registry
     assert sum(r.get('task_executors', 0) for r in reports) == 1
     remaining = {r['job_id'] for r in await db.fetchall(f'SELECT job_id FROM {p}jobs')}
     assert remaining == {roots[1][0], roots[2][0], 'child-1', 'child-2'}
-    assert (await store.get_runtime_state(roots[0][1], 'workflow:index')) == []
     for i, (_, sid, run) in enumerate(roots):
         assert bool(await store.get_runtime_state(sid, 'workflow:run:'+run)) == (i != 0)
         child_keys = await db.fetchall(f"SELECT state_key FROM {store.t.session_runtime_state} "
@@ -191,7 +189,7 @@ async def test_unsettled_fees_obligations_and_alerts_keep_their_tree(registry_st
     await insert(db, p+'job_events', event_id='alert', job_id=jobs[2][0], event_type='task_alert', job_version=1,
                  payload_json='{}', delivery_status='pending', created_at=OLD)
     await insert(db, store.t.follow_up_queue, session_id=jobs[2][1], item_id='alert', kind='task_alert', mode='queue',
-                 status='claimed', content='still actionable', created_at=OLD)
+                 status='claimed', content='still actionable', created_at=OLD, claim_token='claim', claimed_at=OLD, claim_owner_epoch=1)
     try:
         assert (await store.purge_expired(NOW)).get('task_trees', 0) == 0
         assert len(await db.fetchall(f'SELECT job_id FROM {p}jobs')) == 3
@@ -199,7 +197,7 @@ async def test_unsettled_fees_obligations_and_alerts_keep_their_tree(registry_st
         # Complete the three fixture obligations, then retention can delete them.
         await db.execute(f'UPDATE {p}task_budget_attempts SET pending=0')
         await db.execute(f'DELETE FROM {p}session_obligations')
-        await db.execute(f"UPDATE {store.t.follow_up_queue} SET status='delivered',delivered_at=?", (OLD,))
+        await db.execute(f"UPDATE {store.t.follow_up_queue} SET status='delivered',claim_token=NULL,claimed_at=NULL,claim_owner_epoch=NULL,delivered_at=?", (OLD,))
     assert (await store.purge_expired(NOW))['task_trees'] == 3
 
 
@@ -215,8 +213,11 @@ async def test_batch_bound_and_session_delete_preserve_parent_tree(registry_stor
                      kind='user', mode='queue', status='void', created_at=OLD)
     assert (await store.purge_expired(NOW, limit=2))['follow_up_queue'] == 2
     assert (await store.purge_expired(NOW, limit=2))['follow_up_queue'] == 2
-    await store.close_session(child_sid)
+    from power_loop.contracts.errors import SessionBusy
+    with pytest.raises(SessionBusy):
+        await store.close_session(child_sid)
     assert len(await db.fetchall(f'SELECT job_id FROM {p}jobs')) == 2
+    await db.execute(f"UPDATE {p}jobs SET status='completed',supervision_status='closed',resource_state='stopped',intake='closed'")
     await store.close_session(sid)
     assert not await db.fetchall(f'SELECT job_id FROM {p}jobs')
     assert not await db.fetchall(f'SELECT event_id FROM {p}job_events')

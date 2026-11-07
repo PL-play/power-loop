@@ -397,6 +397,12 @@ class SessionStore:
                                  spawn_tool_call_id=None, spawn_depth=1,
                                  lifecycle=SubagentLifecycle.LINKED, metadata=None):
         """Allocate an independently executable session in its admission transaction."""
+        if parent_session_id is not None:
+            changed = await tx.execute(f"UPDATE {self.t.session_state} SET inbox_version=inbox_version+1 "
+                "WHERE session_id=? AND lifecycle='open'", (parent_session_id,))
+            if not changed:
+                from power_loop.agent.runtime_types import RuntimeRequestError
+                raise RuntimeRequestError('session_closed')
         await tx.execute(
             f"INSERT INTO {self.t.sessions} ("
             "session_id, created_at, updated_at, system_prompt, model, config_json, "
@@ -1502,69 +1508,20 @@ class SessionStore:
         """
         return len(await self.close_session_tree(session_id, cascade=cascade))
 
-    async def close_session_tree(self, session_id: str, *, cascade: bool = True) -> list[str]:
-        """Like :meth:`close_session`, but return the id of EVERY session deleted (the named
-        session plus any cascaded ``LINKED`` descendants), so a caller can drop per-session
-        in-memory bookkeeping (caches/locks/queues) for each. Re-parented ``DETACHED``
-        descendants are NOT deleted and are NOT included."""
-        async with self._db.transaction() as tx:
-            deleted: list[str] = []
-            await self._delete_session_tree(tx, session_id, cascade=cascade, deleted=deleted)
-            return deleted
+    async def close_if_idle(self, session_id: str, *, cascade: bool = True, limit: int = 1000, resource_guard=None) -> str:
+        """Close admission globally; busy leaves previously open sessions open."""
+        from .closing import close_if_idle
+        return await close_if_idle(self, [session_id], cascade=cascade, limit=limit, resource_guard=resource_guard)
 
-    async def _delete_session_tree(
-        self, tx: Any, session_id: str, *, cascade: bool, deleted: list[str]
-    ) -> None:
-        if cascade:
-            children = await tx.fetchall(
-                f"SELECT session_id, lifecycle FROM {self.t.sessions} WHERE parent_session_id=?",
-                (session_id,),
-            )
-            for child in children:
-                if child["lifecycle"] == SubagentLifecycle.DETACHED.value:
-                    await tx.execute(
-                        f"UPDATE {self.t.sessions} SET parent_session_id=NULL WHERE session_id=?",
-                        (child["session_id"],),
-                    )
-                else:
-                    await self._delete_session_tree(
-                        tx, child["session_id"], cascade=True, deleted=deleted
-                    )
-        else:
-            # Keep the whole subtree, but never leave dangling parent refs: every direct
-            # child (any lifecycle) is re-parented to NULL, same as DETACHED under cascade.
-            await tx.execute(
-                f"UPDATE {self.t.sessions} SET parent_session_id=NULL WHERE parent_session_id=?",
-                (session_id,),
-            )
-        from .retention import delete_session_tasks
-        await delete_session_tasks(self, tx, session_id)
-        await tx.execute(f"DELETE FROM {self.t.messages} WHERE session_id=?", (session_id,))
-        self._forget_appended(session_id)
-        await tx.execute(f"DELETE FROM {self.t.compactions} WHERE session_id=?", (session_id,))
-        await tx.execute(f"DELETE FROM {self.t.usage_observations} WHERE session_id=?", (session_id,))
-        await tx.execute(f"DELETE FROM {self.t.session_stats} WHERE session_id=?", (session_id,))
-        await tx.execute(f"DELETE FROM {self.t.timers} WHERE session_id=?", (session_id,))
-        await tx.execute(
-            f"DELETE FROM {self.t.session_runtime_state} WHERE session_id=?", (session_id,)
-        )
-        await tx.execute(
-            f"DELETE FROM {self.t.background_tasks} WHERE session_id=?", (session_id,)
-        )
-        await tx.execute(f"DELETE FROM {self.t.notes} WHERE session_id=?", (session_id,))
-        await tx.execute(
-            f"DELETE FROM {self.t.project_messages} WHERE session_id=?", (session_id,)
-        )
-        await tx.execute(f"DELETE FROM {self.t.hook_events} WHERE session_id=?", (session_id,))
-        await tx.execute(
-            f"DELETE FROM {self.t.follow_up_queue} WHERE session_id=?", (session_id,)
-        )
-        await tx.execute(f"DELETE FROM {self.t.session_state} WHERE session_id=?", (session_id,))
-        affected = await tx.execute(
-            f"DELETE FROM {self.t.sessions} WHERE session_id=?", (session_id,)
-        )
-        if affected:  # the session row existed → count it as removed
-            deleted.append(session_id)
+    async def close_sessions_if_idle(self, session_ids: Sequence[str], *, limit: int = 1000, resource_guard=None) -> str:
+        """Close a host's memory/seat group without partially closing a busy group."""
+        from .closing import close_if_idle
+        return await close_if_idle(self, session_ids, limit=limit, resource_guard=resource_guard)
+
+    async def close_session_tree(self, session_id: str, *, cascade: bool = True, limit: int = 1000, resource_guard=None) -> list[str]:
+        """Delete at most limit rows; an unfinished tree keeps its session roots."""
+        from .closing import delete_sessions
+        return await delete_sessions(self, session_id, cascade=cascade, limit=limit, resource_guard=resource_guard)
 
     async def update_session_prompt(self, session_id: str, system_prompt: str | None) -> None:
         send_reads.forget(self, session_id, "session")
