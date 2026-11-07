@@ -26,6 +26,8 @@ class Execution:
     lease: JobLease
     stop_renewal: asyncio.Event = field(default_factory=asyncio.Event, compare=False, repr=False)
     resource_evidence: dict = field(default_factory=dict, compare=False, repr=False)
+    consumed_inputs: dict = field(default_factory=dict, compare=False, repr=False)
+    observed_inputs: set = field(default_factory=set, compare=False, repr=False)
 
 
 _SEND: ContextVar[Execution | None] = ContextVar("power_loop_task_send", default=None)
@@ -109,8 +111,6 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
     if implementation is not None:
         if source(execution)["execution_role"] not in implementation.runtime_contract.allowed_roles:
             raise JobError("execution_role_forbids_tool")
-    if not declared.control_only and execution.resource_evidence.get("_control_review_pending"):
-        raise JobError("outcome_review_requires_control_only")
     if declared.control_only:
         from .task_control import _source
 
@@ -138,44 +138,22 @@ async def check_tool_dispatch(session_id, tool_name, registry, tool_args=None):
     return registered
 
 
-async def prepare_model_processing(pipeline, messages, round_index, *, provider_call=True):
+async def observe_model_inputs(pipeline, messages, round_index, *, provider_call=True):
     execution = _SEND.get()
-    if execution is None or execution.actor.session_id != pipeline.session_id:
+    if execution is None or execution.actor.session_id != pipeline.session_id or not provider_call:
         return
-    if not provider_call:
-        return
-    previous = execution.resource_evidence.get("processing_snapshot_id")
-    if previous is None and not execution.resource_evidence.get("_processing_dirty", True):
-        return
-    # Projection/rewritten rows do not get credited just because a result is
-    # somewhere in the raw transcript. Match identities and actual raw content.
-    from . import session_controls
-    manager = execution.runtime.manager
-    seen = await session_controls.version(manager, manager.db, execution.actor.session_id)
-    source = execution.resource_evidence.get("_control_source") or {}
-    owned = source.get("control_owner_job_id") is not None  # Owner nudges are not session obligations.
-    if not owned and session_controls.is_clean(manager, execution.actor.session_id, seen):
-        execution.resource_evidence["processing_snapshot_id"] = None
-        execution.resource_evidence["_processing_dirty"] = False
-        execution.resource_evidence["_control_review_pending"] = False
-        return
-    included = {id(message) for message in messages}
-    seqs = getattr(pipeline.sink, "_history_seqs", [])
-    actual = [
-        {"seq": seq, "role": message.get("role"), "content": message.get("content")}
-        for message, seq in zip(pipeline.history, seqs, strict=False)
-        if seq is not None and id(message) in included and isinstance(message.get("content"), str)
-    ]
-    report = {}
-    execution.resource_evidence["processing_snapshot_id"] = await manager.prepare_processing(
-        execution.actor, execution.lease, round_index=round_index, send_index=pipeline.send_index, messages=actual,
-        report=report)
-    execution.resource_evidence["_processing_dirty"] = False
-    from .abort_outcomes import pending_reviews
-    pending = bool(await pending_reviews(manager, manager.db, execution.actor))
-    execution.resource_evidence["_control_review_pending"] = pending
-    if not pending and report.get("quiet") and not owned:
-        session_controls.mark_clean(manager, execution.actor.session_id, seen)
+    # Hooks may copy message dictionaries without changing what the provider
+    # receives. Credit the original input only when its actual text is sent.
+    included = {(message.get("role"), message["content"]) for message in messages
+        if isinstance(message.get("content"), str)}
+    sources = getattr(pipeline.sink, "_input_messages", {})
+    actual = [sources[seq] for message, seq in zip(pipeline.history,
+        getattr(pipeline.sink, "_history_seqs", []), strict=False)
+        if seq in sources and (sources[seq]["role"], sources[seq]["content"]) in included
+        and message.get("role") == sources[seq]["role"] and message.get("content") == sources[seq]["content"]]
+    if actual:
+        from .result_consumption import observe
+        await observe(execution, actual, round_index=round_index, send_index=pipeline.send_index)
 
 
 def mark_unconfirmed_resource() -> None:
@@ -611,8 +589,6 @@ class TaskRuntime:
         await flush_observed_controls(SimpleNamespace(runtime=self))
         from .budget_policy_sources import PolicySourceChanged
         from .budget_policy_sources import prepared as prepare_policy
-        from .control_runtime import ReviewSourcesChanged, needs_review_sources, prepare_review_sources
-        review_sources = await prepare_review_sources(self.manager,actor) if needs_review_sources(self.manager,actor) else None
         # Registration, claim and control admission commit together or not at all.
         policy_source = None
         while True:
@@ -647,10 +623,8 @@ class TaskRuntime:
                     binding.resource_evidence["_control_registered_payload"] = registration.operation.result
                     if input_start.record.meta["operation"] == "resume":
                         binding.resource_evidence["explicit_resume"] = True
-                    await enable(binding,review_sources=review_sources)
+                    await enable(binding)
                 break
-            except ReviewSourcesChanged:
-                review_sources = await prepare_review_sources(self.manager,actor)
             except PolicySourceChanged as changed:
                 policy_source = changed.source
         input_start.committed()
@@ -659,24 +633,6 @@ class TaskRuntime:
         try:
             async with self.execution(binding, cancel_token=cancel_token, initialize_model=True):
                 yield evidence
-                snapshot = binding.resource_evidence.get("processing_snapshot_id")
-                if snapshot and evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass"):
-                    last = await self.manager.store.last_assistant_ref(sid, send_index)
-                    if last is None:
-                        raise JobError("processing_response_missing")
-                    decision_args = {
-                        "snapshot_id": snapshot,
-                        "response_ref": last,
-                        "reason": "Original session completed its registered processing send with no unresolved tools.",
-                    }
-                    try:
-                        decisions = await self.manager.commit_processing_decision(actor, binding.lease, **decision_args)
-                    except Exception:
-                        decisions = await self.manager.recall_processing_decision(actor, binding.lease, **decision_args)
-                        if decisions is None:
-                            raise
-                        evidence["processing_decision_ack_reconciled"] = True
-                    evidence["processing_decisions"] = decisions
         except BaseException as exc:
             failure = exc
             evidence["exit"] = "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
@@ -695,6 +651,10 @@ class TaskRuntime:
             last = await self.manager.store.last_assistant_ref(sid, send_index)
             if last is not None:
                 evidence["last_assistant_ref"] = last.to_dict()
+            consumed = ()
+            if evidence.get("exit") == "completed" and not evidence.get("new_input_after_pass"):
+                from .result_consumption import finish
+                consumed = await finish(binding)
             async with self.manager.joined_write() as tx:
                 await input_start.prepare_finish(tx)
                 if evidence.get("exit") == "waiting_for_input":
@@ -715,13 +675,13 @@ class TaskRuntime:
                     await input_start.finish(tx, binding, evidence)
                     from .finalization import try_finalize
                     await try_finalize(self.manager, actor, binding.lease.job_id, binding.lease.generation)
-                    finalized = not owner and not evidence.get("processing_decisions")
+                    finalized = not owner and not consumed
             await input_start.notify_finished()
             from .finalization import after_send
 
             try:
                 if not finalized:
-                    await after_send(self.manager, actor, binding.lease)
+                    await after_send(self.manager, actor, binding.lease, consumed=consumed)
             except Exception:
                 # The model exit is already durable. A failed mechanical
                 # close leaves supervision open for reconciliation; it must

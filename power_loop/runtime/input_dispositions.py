@@ -133,18 +133,15 @@ async def _prepare(manager, tx, actor, event, prepared):
     if old is not None:
         return old
     if event["delivery_status"] == "handled":
-        from .processing import require_event_handled
+        from .result_consumption import require_event_handled
         request = waits._object(event["payload_json"])["request"]
         await require_event_handled(manager, tx, event, session_id=request["session_id"], owner_job_id=owner["job_id"])
-        return None  # A normal consumption proof remains normal consumption.
+        return None  # Already consumed by a normal execution.
     if event["delivery_status"] != "pending_delivery" or owner["supervision_status"] != "open":
         raise JobError("input_disposition_after_close")
     _, request, _, _, _ = await _original(manager, tx, event)
     if owner["generation"] != request["target"]["generation"]:
         raise JobError("input_disposition_historical_read_only")
-    decision = "decision_" + _hash([event["event_id"], event["job_version"], _hash(waits._object(event["payload_json"]))])[:48]
-    if await tx.fetchone(f"SELECT event_id FROM {manager.events} WHERE event_id=?", (decision,)):
-        raise JobError("input_disposition_processing_conflict")
     queue = await tx.fetchone(f"SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?",
         (request["session_id"], "nudge:" + event["event_id"]))
     if queue is not None and queue["status"] in ("pending", "claimed"):

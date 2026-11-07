@@ -141,7 +141,9 @@ class _InputStart:
         content, structured = (body, False) if isinstance(body, str) else _encode_content(body.get("content"))
         if not isinstance(body, str):
             role, name = body.get("role", "user"), body.get("name")
-        meta = _meta_with_content_encoding({}, structured=structured)
+        input_meta = ({"inbox": {"item_ids": [ctx.input_ref.message_id], "kinds": [self.record.row["kind"]]}}
+            if self.record.row["kind"] != "user" else {})
+        meta = _meta_with_content_encoding(input_meta, structured=structured)
         if self.record.meta["options"].get("metadata"):
             meta = dict(meta or {}, send=self.record.meta["options"]["metadata"])
         timestamp = now_ms()
@@ -473,11 +475,14 @@ class RuntimeWorker:
         busy = False
         r, env, ctx, deadline_task, output_task = self.runtime, None, None, None, None
         try:
-            row = await self.inputs.db.fetchone(f"SELECT * FROM {self.inputs.q} WHERE session_id=? AND status='pending' ORDER BY id LIMIT 1", (sid,))
+            row = await self.inputs.db.fetchone(f"SELECT q.*,s.metadata_json AS session_metadata FROM {self.inputs.q} q "
+                f"JOIN {r.store.t.sessions} s ON s.session_id=q.session_id "
+                "WHERE q.session_id=? AND q.status='pending' ORDER BY q.id LIMIT 1", (sid,))
             recovery_only = row is None
             if recovery_only:
-                row = await self.inputs.db.fetchone(f"SELECT q.* FROM {self.inputs.jobs} j "
-                    f"JOIN {self.inputs.q} q ON q.delivered_job_id=j.job_id WHERE j.session_id=? "
+                row = await self.inputs.db.fetchone(f"SELECT q.*,s.metadata_json AS session_metadata FROM {self.inputs.jobs} j "
+                    f"JOIN {self.inputs.q} q ON q.delivered_job_id=j.job_id "
+                    f"JOIN {r.store.t.sessions} s ON s.session_id=j.session_id WHERE j.session_id=? "
                     "AND j.kind IN ('subagent','background_tool','background_command','workflow','workflow_node') "
                     "AND j.status='running' AND j.outcome IS NULL ORDER BY q.id DESC LIMIT 1", (sid,))
                 if row is None:
@@ -485,6 +490,7 @@ class RuntimeWorker:
                 record = self.inputs.record(row)
             else:
                 record = self.inputs.record(row)
+            identity = json.loads(row["session_metadata"])
             if record.meta["operation"] == "result_ready":
                 record = await self.inputs.result_input(record)
             driver = record.meta["descriptor"]["kind"] == "workflow_driver"
@@ -507,8 +513,6 @@ class RuntimeWorker:
                     async with self.inputs.db.transaction() as tx:
                         await self.inputs.void_unbound(tx, record.ref, reason=reason)
                     return
-            metadata = await self.inputs.db.fetchone(f"SELECT metadata_json FROM {r.store.t.sessions} WHERE session_id=?", (sid,))
-            identity = json.loads(metadata["metadata_json"])
             from .runtime_types import TrustedActor
             ctx.actor = TrustedActor(identity["tenant_id"], identity["principal_id"], sid)
             holder = SimpleNamespace(store=r.store, session_coordinator=r.coordinator,
@@ -583,7 +587,8 @@ class RuntimeWorker:
             bus.subscribe(AgentEventType.STREAM_THINK_DELTA, on_delta)
             output_task = asyncio.create_task(self._pump_output(ctx))
             loop = _ExecutionLoop(llm=model, store=r.store, config=config, tool_registry=env.tool_registry,
-                                     hooks=env.hooks, event_bus=bus, task_runtime=task_runtime, session_coordinator=r.coordinator)
+                                     hooks=env.hooks, event_bus=bus, task_runtime=task_runtime, session_coordinator=r.coordinator,
+                                     session_cache_size=0)  # This worker builds a fresh loop for each input.
             loop._runtime_worker_context = ctx
             loop._runtime_worker = self
             loop._owner_id = r.node_id + "/" + r.boot_id

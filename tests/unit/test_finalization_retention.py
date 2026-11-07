@@ -15,8 +15,6 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 async def transient_rows(manager):
     rows = {name: await manager.db.fetchall(f'SELECT * FROM {manager.prefix}{name} ORDER BY job_id')
             for name in ('execution_checkpoints', 'execution_allocations', 'task_budget_attempts')}
-    rows['events'] = await manager.db.fetchall(f"SELECT * FROM {manager.events} "
-        "WHERE event_type IN ('execution_scope','execution_membership_seal') ORDER BY event_id")
     return rows
 
 
@@ -29,11 +27,10 @@ async def test_paid_send_deletes_temporary_rows_but_retains_cold_usage_and_closu
     assert len(jobs) == 2 and all(row['supervision_status'] == 'closed' for row in jobs)
     for row in jobs:
         actor = JobActor(row['tenant_id'], row['principal_id'], row['session_id'])
-        membership = await cold.get_execution_membership(actor, row['job_id'], 1)
-        assert membership['sealed']
         usage = await cold.execution_usage(actor, row['job_id'], generation=1)
-        assert usage == membership['model']['payload']['evidence']['usage']
-        assert (await cold.finalize_supervision(actor, row['job_id'], generation=1))['event_type'] == 'supervision_closed'
+        assert usage['total_tokens'] > 0
+        assert (await cold.finalize_supervision(actor, row['job_id'], generation=1))['event_type'] == 'result'
+
 
 
 async def test_unacknowledged_fee_prevents_finalization_and_is_retained(budget_case):
@@ -56,15 +53,15 @@ async def test_failed_finalization_rolls_back_deletions_with_the_closure(budget_
     await observed(c, attempt)
     await c.manager.close_model_execution(c.actor, c.binding.lease, evidence={'exit': 'completed'})
     before = await transient_rows(c.manager)
-    assert all(before.values())
-    publish = finalization._publish
+    assert before["execution_checkpoints"] and before["task_budget_attempts"]
+    publish = finalization._finish
 
     async def fail_after_delete(*args, **kwargs):
         await publish(*args, **kwargs)
         raise OSError('commit failed after cleanup')
 
     with monkeypatch.context() as patch:
-        patch.setattr(finalization, '_publish', fail_after_delete)
+        patch.setattr(finalization, '_finish', fail_after_delete)
         with pytest.raises(OSError, match='commit failed'):
             await c.manager.finalize_supervision(c.actor, c.binding.lease.job_id, generation=1)
     assert await transient_rows(c.manager) == before

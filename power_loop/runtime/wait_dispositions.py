@@ -41,18 +41,17 @@ async def _expected(manager, tx, actor, job, creation, saved, state, intent):
     from .wait_terminal import _terminated
 
     main, decision, data, operation, effect = intent
-    input_proof, input_processing = None, None
+    input_proof, input_consumed = None, False
     if effect is not None and data["request"]["decision"] == "continue":
         from .input_dispositions import read_tx
         effect_data = waits._object(effect["payload_json"])
         original_input = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (effect_data["operation_id"],))
         input_proof = await read_tx(manager, tx, original_input)
         if input_proof is None:
-            from .finalization import _processing_references
-            from .processing import require_event_handled
+            from .result_consumption import require_event_handled
             await require_event_handled(manager, tx, original_input,
                 session_id=saved["binding"]["session_id"], owner_job_id=saved["binding"]["owner"]["job_id"])
-            input_processing = await _processing_references(manager, tx, original_input)
+            input_consumed = True
     elif effect is not None and (data["request"]["decision"] != "defer"
             or waits._object(effect["payload_json"])["operation_id"] is not None):
         raise JobError("wait_disposition_effect_already_applied")
@@ -89,11 +88,11 @@ async def _expected(manager, tx, actor, job, creation, saved, state, intent):
         "effect": content_reference(effect) if effect else None,
         "prior_delivery_status": "delivered" if effect else "pending_delivery", "termination": content_reference(ended),
         "terminated_at_ms": ended["created_at"]}
-    if input_proof is not None or input_processing is not None:
+    if input_proof is not None or input_consumed:
         payload.update(version=2,
             disposition="owner_terminated_before_input_processed" if input_proof else "owner_terminated_after_input_processed",
             input_disposition=content_reference(input_proof) if input_proof else None,
-            input_processing=input_processing, input_operation_id=original_input["event_id"])
+            input_consumed=input_consumed, input_operation_id=original_input["event_id"])
     return payload
 
 
@@ -184,7 +183,7 @@ def reply(row):
             "event_id": payload["due"]["event_id"], "wait_job_id": row["job_id"], "decision": payload["decision_kind"],
             "operation_id": payload["input_operation_id"],
             "input_disposition_id": payload["input_disposition"]["event_id"] if payload["input_disposition"] else None,
-            "input_was_processed": payload["input_processing"] is not None,
+            "input_was_processed": payload["input_consumed"],
             "input_was_enqueued": True, "new_execution_dispatched": False,
             "original_owner": {"job_id": payload["owner"]["job_id"], "generation": str(payload["owner"]["generation"])},
             "disposition_status": "handled", "execution_authority": False, "billing_settled": False}
@@ -212,5 +211,4 @@ def event_ids(row):
     return [row["event_id"], *[payload[k]["event_id"] for k in
         ("creation", "due", "decision", "operation", "observation", "termination")],
         *([payload["effect"]["event_id"]] if payload["effect"] else []),
-        *([payload["input_disposition"]["event_id"]] if payload["version"] == 2 and payload["input_disposition"] else []),
-        *([ref["event_id"] for ref in payload["input_processing"]] if payload["version"] == 2 and payload["input_processing"] else [])]
+        *([payload["input_disposition"]["event_id"]] if payload["version"] == 2 and payload["input_disposition"] else [])]

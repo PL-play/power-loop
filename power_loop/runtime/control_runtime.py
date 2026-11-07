@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 
 from .execution_journal import ExecutionJournal
 from .execution_state import ExecutionIdentity, ExecutionState
@@ -169,32 +168,7 @@ async def require_closed(manager, tx, job_id, generation):
         raise JobError("execution_reconciliation_requires_quiescence")
 
 
-class ReviewSourcesChanged(JobError):
-    def __init__(self):
-        super().__init__('pending_review_sources_changed')
-
-
-@dataclass(frozen=True)
-class ReviewSources:
-    version: tuple
-    pending: bool
-
-
-def needs_review_sources(manager, actor):
-    return not (manager._trust_own_writes.get() and actor.session_id in manager.__dict__.get('_clean_sessions',{}))
-
-
-async def prepare_review_sources(manager, actor):
-    from . import session_controls
-    from .abort_outcomes import pending_reviews
-
-    async with manager._read() as reader:
-        seen = await session_controls.version(manager,reader,actor.session_id)
-        pending = bool(await pending_reviews(manager,reader,actor))
-        return ReviewSources(seen,pending)
-
-
-async def open_control(binding, *, review_sources=None, policy_source=None):
+async def open_control(binding, *, policy_source=None):
     runtime, manager = binding.runtime, binding.runtime.manager
     if binding.resource_evidence.get("_control_state") is not None:
         return current(binding)
@@ -212,14 +186,6 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
         source = dict(await manager._fence(tx, binding.actor, binding.lease))
         if source["kind"] not in {"send", "background_tool", "background_command"} or source["session_id"] != binding.actor.session_id:
             raise JobError("model_attempt_owner_mismatch")
-        from . import session_controls
-        seen = await session_controls.version(manager,tx,binding.actor.session_id)
-        if session_controls.is_clean(manager,binding.actor.session_id,seen):
-            review_pending = False
-        elif review_sources is None or review_sources.version!=seen:
-            raise ReviewSourcesChanged()
-        else:
-            review_pending = review_sources.pending
         await ensure_policy(binding, transaction=tx, job=source)
         if not binding.resource_evidence.get("explicit_resume"):
             await _no_unknown_sends(manager, tx, source)
@@ -278,7 +244,6 @@ async def open_control(binding, *, review_sources=None, policy_source=None):
     binding.resource_evidence["_control_ancestors"] = tuple(ancestors)
     binding.resource_evidence["_control_create_request"] = creation_request
     binding.resource_evidence["_control_tool_plan_required"] = plan_required
-    binding.resource_evidence["_control_review_pending"] = review_pending
     binding.resource_evidence["_control_wait_deadline"] = wait_deadline
     binding.resource_evidence["_control_wait_owners"] = wait_owners
     binding.resource_evidence["_control_state"] = state

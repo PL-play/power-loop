@@ -107,10 +107,6 @@ class RuntimeTool(ABC):
         from .tool_truncation import truncate_pair
         return truncate_pair(raw_arguments, source.result, policy, source.recall)
 
-    def review_spec(self, spec):
-        """Optional pure control-review schema; None advertises no tool in review."""
-        return None
-
     def pending_call_spec(self, arguments, *, runtime=None, definition=None):
         """Pure recovery description; None is unsupported, never not-dispatched."""
         return None
@@ -134,13 +130,12 @@ class FunctionRuntimeTool(RuntimeTool):
     contract: ToolRuntimeContract
     policy: object = None
     formatter: object = None
-    reviewer: object = None
 
     def __post_init__(self):
         if (
             not callable(self.handler)
             or type(self.contract) is not ToolRuntimeContract
-            or any(value is not None and not callable(value) for value in (self.policy, self.formatter, self.reviewer))
+            or any(value is not None and not callable(value) for value in (self.policy, self.formatter))
         ):
             raise ToolContractError("invalid_runtime_tool_implementation")
 
@@ -153,9 +148,6 @@ class FunctionRuntimeTool(RuntimeTool):
 
     def format_result(self, result, max_chars):
         return self.formatter(result, max_chars) if self.formatter is not None else None
-
-    def review_spec(self, spec):
-        return self.reviewer(spec) if self.reviewer is not None else None
 
     async def __call__(self, **arguments):
         value = self.handler(**arguments)
@@ -298,15 +290,4 @@ def truncate_context(registered, source, policy, *, raw_arguments):
     if value is not None and (type(value) is not tuple or len(value) != 2
                               or any(type(part) is not str for part in value)):
         raise ToolContractError("invalid_tool_context_truncation")
-    return value
-
-
-def review_spec(registered, spec):
-    implementation = resolve(registered)
-    value = implementation.review_spec(json.loads(_json(spec))) if implementation is not None else None
-    if value is not None and (type(value) is not dict or value.get('type') != 'function'
-            or type(value.get('function')) is not dict or value['function'].get('name') != registered.definition.name
-            or type(value['function'].get('parameters')) is not dict):
-        raise ToolContractError('invalid_tool_review_spec')
-    resolve(registered)
     return value

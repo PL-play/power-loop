@@ -81,10 +81,6 @@ async def run(loop, ctx, start, command, send_index):
                         output = await loop.tool_registry.invoke_async(name, arguments)
                     await join_children(slot)
                     text = output if isinstance(output, str) else canonical(output)
-                    consumed = loop._host_command['consumed']
-                    if consumed:
-                        binding.resource_evidence['processing_snapshot_id'] = await binding.runtime.manager.prepare_processing(
-                            binding.actor, binding.lease, round_index=0, send_index=send_index, messages=consumed)
                     await store.append_message(sid, role='assistant', content=text,
                         send_index=send_index, round_index=0, meta={'host_command_result': name})
                     result = StatefulResult(sid, 'completed', text,
@@ -125,4 +121,8 @@ async def consume_result(loop, result):
         seq = await loop.store.append_message(ctx.session_id, role=message['role'],
             content=message['content'], name=message.get('name'), inbox=message['_inbox'],
             send_index=state['send_index'], round_index=0)
-        state['consumed'].append({'seq': seq, 'role': message['role'], 'content': message['content']})
+        consumed = {'seq': seq, 'role': message['role'], 'content': message['content'],
+            'item_ids': message['_inbox']['item_ids']}
+        state['consumed'].append(consumed)
+        from .result_consumption import observe
+        await observe(_SEND.get(), [consumed], round_index=0, send_index=state['send_index'])

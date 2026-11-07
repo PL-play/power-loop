@@ -96,8 +96,6 @@ async def prepare(pipeline, attempt):
     pipeline._native_abort_attempt = attempt["value"]
     if not all(controls):
         control.require_admission()
-        if binding.resource_evidence.get("_control_review_pending"):
-            raise JobError("outcome_review_requires_control_only")
     if any(e["recovery"] is not None for e in entries):
         # Independent effects need their own durable jobs. Their registration is
         # an explicit control-plane event, not one job for each ordinary call.
@@ -135,8 +133,6 @@ async def dispatch(pipeline, name, arguments, registered, *, budget_attempt=None
     declared = policy(registered, arguments, runtime=binding.runtime)
     if not declared.control_only:
         control.require_admission()
-        if binding.resource_evidence.get("_control_review_pending"):
-            raise JobError("outcome_review_requires_control_only")
     if (owned["registrations"][call_id] is not registered or selected["tool_name"] != name
             or selected["arguments_hash"] != _hash(arguments)
             or selected["registration"] != registration_value(registered)):

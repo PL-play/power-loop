@@ -189,52 +189,6 @@ async def test_untrusted_or_missing_delivery_evidence_cannot_be_queued_again(pen
         await c.manager.db.execute(f'UPDATE {c.manager.jobs} SET result_json=? WHERE job_id=?', (target['result_json'], row['job_id']))
 
 
-@pytest.mark.parametrize('part', ['delivered_message', 'decision', 'snapshot', 'model_closed', 'response'])
-async def test_closed_resolution_revalidates_actual_handling_evidence(pending_review, part):
-    import json
-
-    from power_loop.runtime.jobs import _json
-
-    c, row, loop, model = pending_review
-    await loop.send('Read and handle the original result without repeating work.', c.sid)
-    await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
-    from power_loop.runtime.result_revisions import result_id
-    candidates = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='processing_decision'")
-    [decision] = [event for event in candidates if json.loads(event['payload_json'])['event']['event_id'] == result_id(row['job_id'], 1)]
-    value = json.loads(decision['payload_json'])
-    assert decision['job_id'] == value['handler_job_id'] and decision['job_id'] != row['job_id']
-    table, key_name = c.manager.events, 'event_id'
-    if part == 'delivered_message':
-        table, key_name = c.store.t.messages, 'id'
-        original = await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE session_id=? AND seq=?', (c.sid, value['event']['delivered_seq']))
-        await c.manager.db.execute(f'DELETE FROM {c.store.t.messages} WHERE session_id=? AND seq=?', (c.sid, value['event']['delivered_seq']))
-    elif part == 'decision':
-        value['event']['managed_delivery']['payload_hash'] = 'f' * 64
-        await c.manager.db.execute(f'UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?', (_json(value), decision['event_id']))
-    elif part == 'snapshot':
-        original = await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE event_id=?', (value['snapshot_id'],))
-        await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', (value['snapshot_id'],))
-    elif part == 'response':
-        table, key_name = c.store.t.messages, 'id'
-        original = await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE id=?', (int(value['response_ref']['id']),))
-        await c.manager.db.execute(f'DELETE FROM {c.store.t.messages} WHERE id=?', (int(value['response_ref']['id']),))
-    else:
-        original = await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE event_id=?', ('model_closed_' + value['handler_job_id'],))
-        await c.manager.db.execute(f'DELETE FROM {c.manager.events} WHERE event_id=?', ('model_closed_' + value['handler_job_id'],))
-    with pytest.raises(JobError):
-        await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
-    assert c.state.dispatched == c.model.calls == model.calls == 1
-    if part == 'decision':
-        assert await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE event_id=?', (decision['event_id'],)) == {
-            **decision, 'payload_json': _json(value)}
-        await c.manager.db.execute(f'UPDATE {table} SET payload_json=? WHERE event_id=?', (decision['payload_json'], decision['event_id']))
-    else:
-        assert original is not None
-        assert await c.manager.db.fetchone(f'SELECT * FROM {table} WHERE {key_name}=?', (original[key_name],)) is None
-        columns = tuple(original)
-        await c.manager.db.execute(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", tuple(original.values()))
-    await c.manager.finalize_supervision(c.actor, row['job_id'], generation=1)
-    assert c.state.dispatched == c.model.calls == model.calls == 1
 
 
 async def test_duplicate_queue_after_handling_does_not_create_another_notification_or_model(pending_review):
@@ -320,32 +274,3 @@ async def test_local_hint_failure_does_not_lose_or_repeat_a_durable_outcome(pend
     await loop.send('Handle the durable original result.', c.sid)
     assert model.calls == c.state.dispatched == 1
     assert (await c.manager.get_job(c.actor, row['job_id'])).result_status == 'handled'
-
-
-async def test_processing_commit_ack_loss_recalls_same_decision_and_does_not_repeat_effect(pending_review):
-    import json
-
-    from power_loop.runtime.result_revisions import result_id
-
-    c, row, loop, model = pending_review
-    commit = c.manager.commit_processing_decision
-    fired = []
-
-    async def lose_ack(*args, **kwargs):
-        result = await commit(*args, **kwargs)
-        if not fired:
-            fired.append(True)
-            raise OSError('test_processing_commit_ack_lost')
-        return result
-
-    c.manager.commit_processing_decision = lose_ack
-    result = await loop.send('Handle the known result once.', c.sid)
-    assert result.status == 'completed'
-    assert fired == [True]
-    assert (await c.manager.get_job(c.actor, row['job_id'])).supervision_status == 'closed'
-    candidates = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE event_type='processing_decision'")
-    [decision] = [event for event in candidates if json.loads(event['payload_json'])['event']['event_id'] == result_id(row['job_id'], 1)]
-    value = json.loads(decision['payload_json'])
-    assert decision['job_id'] == value['handler_job_id'] and decision['job_id'] != row['job_id']
-    assert len(await c.manager.db.fetchall(f"SELECT event_id FROM {c.manager.events} WHERE job_id=? AND event_type='processing_decision'", (value['handler_job_id'],))) == 1
-    assert model.calls == c.state.dispatched == c.model.calls == 1 and c.host.reserve_calls == 2

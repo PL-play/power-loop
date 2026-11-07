@@ -177,8 +177,6 @@ class JobManager:
         self._deferred_model_updates = ContextVar("execution_deferred_model_updates", default=None)
         self._finalization_preparation = ContextVar("execution_finalization_preparation", default=None)
         self._control_lock_timing = ContextVar("execution_control_lock_timing", default=None)
-        from .session_controls import bind_versions
-        self._control_versions = bind_versions(self)
 
     @asynccontextmanager
     async def _control_transaction(self):
@@ -262,7 +260,7 @@ class JobManager:
             try:
                 async with self._control_transaction() as tx:
                     require_current_ownership(self.store)
-                    from .session_controls import ControlTransaction, bump
+                    from .session_controls import ControlTransaction
                     recorder = ControlTransaction(tx, self)
                     intent_token = self._control_intents.set(recorder)
                     try:
@@ -270,9 +268,7 @@ class JobManager:
                     finally:
                         self._control_intents.reset(intent_token)
                     from .session_obligations import refresh
-                    await refresh(self, tx, recorder)
-                    if recorder.jobs or recorder.sessions:
-                        await bump(self, tx, recorder)
+                    await refresh(self, recorder, recorder)
             except BaseException:
                 if outer_undo is None:
                     for hook in reversed(undo):
@@ -301,9 +297,6 @@ class JobManager:
             self._control_overlay.reset(overlay_token)
             self._control_notifications.reset(token)
             self._control_retirements.reset(retirement_token)
-        if recorder.obligation_decisions:
-            from .session_obligations import refresh_closed_decisions
-            await refresh_closed_decisions(self, recorder.obligation_decisions)
 
     def after_outcome(self, commit, rollback):
         """Defer in-memory effects of a control write until its transaction ends."""
@@ -437,9 +430,13 @@ class JobManager:
             if row["resource_state"] not in ("running", "unknown"):
                 raise JobError("execution_not_running")
             now = self.now()
-            await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
+            changed = await tx.write_job(lease.job_id, f"UPDATE {self.jobs} SET status='model_closed',intake='closed',"
                 "resource_state=?,version=version+1,updated_at=? WHERE job_id=? AND generation=? AND version=?",
                 (resource_state, now, lease.job_id, lease.generation, row["version"]))
+            if changed != 1:
+                raise JobError("stale_execution")
+            tx.remember_row(self.jobs, "job_id", lease.job_id, {**row, "status": "model_closed", "intake": "closed",
+                "resource_state": resource_state, "version": row["version"] + 1, "updated_at": now})
             from power_loop.agent.runtime_store import RuntimeInputStore
             from power_loop.agent.runtime_types import JobRef, Result
 
@@ -704,9 +701,6 @@ class JobManager:
         parent_row = await self._fence(tx, actor, parent) if parent else None
         if parent_row and parent_row["session_id"] != actor.session_id:
             raise JobError("caller_is_not_executing_parent")
-        if parent_row is not None and parent_row['kind'] == 'send' and kind != 'send':
-            from .review_tools import require_batch
-            await require_batch(self, tx, actor, control_only=False)
         role = parent_row["execution_role"] if parent_row else "main"
         if (kind == "workflow" and role != "main") or (kind == "subagent" and role not in ("main", "workflow_node")):
             raise JobError("role_forbids_delegation")
@@ -924,28 +918,10 @@ class JobManager:
                                          resource_state=resource_state, evidence_only=True,
                                          require_children_stopped=require_children_stopped)
 
-    async def prepare_processing(self, actor: JobActor, caller: JobLease, *, round_index: int,
-                                 send_index: int, messages: list[dict], report: dict | None = None) -> str | None:
-        from .processing import prepare
-        return await prepare(self, actor, caller, round_index=round_index, send_index=send_index, messages=messages,
-                             report=report)
-
-    async def commit_processing_decision(self, actor: JobActor, caller: JobLease, *, snapshot_id: str,
-                                          response_ref: MessageRef, decision: str = "consumed", reason: str) -> list[str]:
-        from .processing import commit
-        return await commit(self, actor, caller, snapshot_id=snapshot_id, response_ref=response_ref,
-                            decision=decision, reason=reason)
-
-    async def recall_processing_decision(self, actor: JobActor, caller: JobLease, *, snapshot_id: str,
-                                          response_ref: MessageRef, decision: str = "consumed", reason: str) -> list[str] | None:
-        from .processing import recall
-        return await recall(self, actor, caller, snapshot_id=snapshot_id, response_ref=response_ref,
-                            decision=decision, reason=reason)
-
     async def _require_scope_ready(self, tx, row):
         from .managed_effects import require_owned_resolved
         await require_owned_resolved(self, tx, row)
-        from .processing import require_inputs_handled
+        from .result_consumption import require_inputs_handled
         await require_inputs_handled(self, tx, row)
         children = await tx.fetchall(f"SELECT * FROM {self.jobs} WHERE control_owner_job_id=?", (row["job_id"],))
         for child in children:
@@ -954,7 +930,7 @@ class JobManager:
                 raise JobError("required_execution_unsettled")
             if row["kind"] != "workflow_node" or child["kind"] != "subagent" or child["status"] == "cancelled":
                 continue
-            from .processing import require_handled
+            from .result_consumption import require_handled
             await require_handled(self, tx, child)
 
     async def record_unstarted_result(self, actor: JobActor, job_id: str, *, outcome: str, result: Mapping[str, Any]) -> dict:

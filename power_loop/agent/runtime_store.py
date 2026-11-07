@@ -62,13 +62,21 @@ class RuntimeInputStore:
         session = await reader.fetchone(
             f"SELECT metadata_json,parent_session_id FROM {self.store.t.sessions} WHERE session_id=?",
             (target.session_id,))
+        metadata = await self._authorize_session(reader, target.session_id, actor, session)
+        if target.job_id is not None:
+            job = await reader.fetchone(f"SELECT session_id,tenant_id,principal_id FROM {self.jobs} WHERE job_id=?",
+                                        (target.job_id,))
+            self._authorize_loaded_job(job, target.session_id, actor)
+        return metadata
+
+    async def _authorize_session(self, reader, session_id, actor, session):
         if session is None:
             raise RuntimeRequestError("not_found")
         metadata = json.loads(session["metadata_json"])
         if (metadata.get("tenant_id"), metadata.get("principal_id")) != (actor.tenant_id, actor.principal_id):
             raise RuntimeRequestError("forbidden")
         if actor.session_id is not None:
-            sid = target.session_id
+            sid = session_id
             parent = session["parent_session_id"]
             while sid != actor.session_id:
                 if parent is None:
@@ -88,16 +96,16 @@ class RuntimeInputStore:
                 manager = JobManager(self.store)
                 await manager._validate_call(reader, JobActor(actor.tenant_id, actor.principal_id, actor.session_id),
                                              actor.call_ref, actor.tool_call_id)
-        if target.job_id is not None:
-            job = await reader.fetchone(f"SELECT session_id,tenant_id,principal_id FROM {self.jobs} WHERE job_id=?",
-                                        (target.job_id,))
-            if job is None:
-                raise RuntimeRequestError("not_found")
-            if (job["session_id"], job["tenant_id"], job["principal_id"]) != (
-                target.session_id, actor.tenant_id, actor.principal_id
-            ):
-                raise RuntimeRequestError("forbidden")
         return metadata
+
+    @staticmethod
+    def _authorize_loaded_job(job, session_id, actor):
+        if job is None:
+            raise RuntimeRequestError("not_found")
+        if (job["session_id"], job["tenant_id"], job["principal_id"]) != (
+            session_id, actor.tenant_id, actor.principal_id
+        ):
+            raise RuntimeRequestError("forbidden")
 
     async def input(self, reader, ref):
         self.check_store(ref)
@@ -248,14 +256,15 @@ class RuntimeInputStore:
 
     async def bind_input_job(self, tx, input_ref, job_ref, ownership, *, claim_token):
         """C: called inside the same transaction that creates/claims the job."""
-        await self.lock_owned(tx, TargetRef(input_ref.store_id, input_ref.session_id), ownership)
+        ownership.lease.require_owned()
         changed = await tx.execute(
             f"UPDATE {self.q} SET delivered_job_id=?,delivered_job_generation=? "
             "WHERE session_id=? AND item_id=? AND status='claimed' AND claim_owner_epoch=? AND claim_token=? "
             "AND (expires_at IS NULL OR expires_at>?) "
-            "AND (delivered_job_id IS NULL OR (delivered_job_id=? AND delivered_job_generation=0))",
+            "AND (delivered_job_id IS NULL OR (delivered_job_id=? AND delivered_job_generation=0)) "
+            f"AND EXISTS (SELECT 1 FROM {self.state} WHERE session_id=? AND owner_epoch=? AND owner_token=?)",
             (job_ref.job_id, job_ref.generation, input_ref.session_id, input_ref.message_id,
-             ownership.epoch, claim_token, now_ms(), job_ref.job_id))
+             ownership.epoch, claim_token, now_ms(), job_ref.job_id, input_ref.session_id, ownership.epoch, ownership.lease.token))
         if not changed:
             raise RuntimeRequestError("input_not_startable")
 
@@ -286,23 +295,32 @@ class RuntimeInputStore:
 
     async def resolve_job(self, reader, ref, actor):
         self.check_store(ref)
-        row = await reader.fetchone(f"SELECT * FROM {self.jobs} WHERE job_id=?", (ref.job_id,))
+        row = await reader.fetchone(f"SELECT j.*,s.metadata_json AS auth_metadata,s.parent_session_id AS auth_parent "
+            f"FROM {self.jobs} j JOIN {self.store.t.sessions} s ON s.session_id=j.session_id WHERE j.job_id=?", (ref.job_id,))
         if row is None:
             raise RuntimeRequestError("not_found")
-        await self.authorize(reader, TargetRef(ref.store_id, row["session_id"], ref.job_id), actor)
+        session = {"metadata_json": row.pop("auth_metadata"), "parent_session_id": row.pop("auth_parent")}
+        await self._authorize_session(reader, row["session_id"], actor, session)
+        self._authorize_loaded_job(row, row["session_id"], actor)
         return row
 
     async def read(self, ref, actor):
         """Resolve once, then read the selected immutable result, including 0/1."""
+        from power_loop.runtime.result_revisions import result_id
         input_ref, job_ref = None, ref
         async with self.db.read_snapshot() as reader:
             if isinstance(ref, InputRef):
                 input_ref = ref
-                await self.authorize(reader, TargetRef(ref.store_id, ref.session_id), actor)
-                record = await self.input(reader, ref)
-                if record is None:
+                self.check_store(ref)
+                row = await reader.fetchone(f"SELECT q.*,s.metadata_json AS auth_metadata,s.parent_session_id AS auth_parent "
+                    f"FROM {self.store.t.sessions} s LEFT JOIN {self.q} q ON q.session_id=s.session_id AND q.item_id=? "
+                    "WHERE s.session_id=?", (ref.message_id, ref.session_id))
+                session = None if row is None else {"metadata_json": row.pop("auth_metadata"),
+                    "parent_session_id": row.pop("auth_parent")}
+                await self._authorize_session(reader, ref.session_id, actor, session)
+                if row["item_id"] is None:
                     raise RuntimeRequestError("not_found")
-                row = record.row
+                record = self.record(row)
                 if row["delivered_job_id"] is None:
                     reason = record.meta.get("reason")
                     terminal = row["status"] == "void"
@@ -311,18 +329,25 @@ class RuntimeInputStore:
                     return (Status(ref, None, state, detail, terminal, state == "cancelled", "not_started"),
                             Result(None, ref, state, error=detail) if terminal else None, ref)
                 job_ref = JobRef(ref.store_id, row["delivered_job_id"], row["delivered_job_generation"])
-            job = await self.resolve_job(reader, job_ref, actor)
+                job = await reader.fetchone(f"SELECT j.*,e.payload_json AS original_result FROM {self.jobs} j "
+                    f"LEFT JOIN {self.events} e ON e.event_id=? AND e.event_type='result' WHERE j.job_id=?",
+                    (result_id(job_ref.job_id, job_ref.generation), job_ref.job_id))
+                self._authorize_loaded_job(job, ref.session_id, actor)
+                raw_result = job.pop("original_result")
+            else:
+                job = await self.resolve_job(reader, job_ref, actor)
             choice = job["generation"] if job_ref.generation is None else job_ref.generation
             if choice > job["generation"]:
                 raise RuntimeRequestError("stale_generation")
             selected = 1 if choice == 0 and job["generation"] > 0 else choice
             fixed = JobRef(ref.store_id, job["job_id"], choice)
             actual = JobRef(ref.store_id, job["job_id"], selected)
-            from power_loop.runtime.result_revisions import result_id
-            event = await reader.fetchone(f"SELECT payload_json FROM {self.events} WHERE event_id=? AND event_type='result'",
-                                          (result_id(job["job_id"], selected),))
-            if event:
-                payload = json.loads(event["payload_json"])
+            if input_ref is None:
+                event = await reader.fetchone(f"SELECT payload_json FROM {self.events} WHERE event_id=? AND event_type='result'",
+                    (result_id(job["job_id"], selected),))
+                raw_result = event["payload_json"] if event else None
+            if raw_result is not None:
+                payload = json.loads(raw_result)
                 if payload["generation"] != selected:
                     raise RuntimeRequestError("not_found")
                 value = payload["result"]
@@ -459,6 +484,8 @@ class RuntimeInputStore:
                 (canonical(value), job_ref.job_id, job_ref.generation, job["version"]))
             if not changed:
                 raise RuntimeRequestError("stale_generation")
+            tx.remember_row(self.jobs, "job_id", job_ref.job_id,
+                {**job, "result_json": canonical(value), "result_status": "available", "version": job["version"] + 1})
         parent_sid = route["parent_session_id"]
         if parent_sid is None:
             return None

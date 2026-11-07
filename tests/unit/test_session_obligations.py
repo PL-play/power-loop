@@ -328,16 +328,10 @@ async def test_process_death_keeps_originals_and_a_rebuildable_pending_index(reg
 
 async def test_completed_control_history_does_not_enter_discovery(runtime):
     store, manager, actor, _, parent, connect, _now = runtime
-    handler_count = 0
+    from types import SimpleNamespace
 
-    async def handler():
-        nonlocal handler_count
-        handler_count += 1
-        registered = await manager.register_job(actor, kind="send", session_id=actor.session_id,
-            system_key=f"handler-{handler_count}", request={"send_index": handler_count})
-        return await manager.claim_job(actor, registered.job.job_id, executor_id="handler", boot_id="boot", expected_version=1)
-
-    probe = await handler()
+    from power_loop.runtime.result_consumption import finish, observe
+    from power_loop.runtime.task_runtime import Execution
 
     async def discover():
         cold = JobManager(await connect(), now_ms=manager.now)
@@ -345,36 +339,25 @@ async def test_completed_control_history_does_not_enter_discovery(runtime):
         cold.db = measured = Profiled(original)
         try:
             assert await pending_reviews(cold, cold.db, actor) == []
-            report = {}
-            assert await cold.prepare_processing(actor, probe, round_index=0, send_index=1, messages=[], report=report) is None
-            assert report == {"quiet": True}
             return [(record["sql"].replace(cold.prefix, "PREFIX_"), record["rows"]) for record in measured.records]
         finally:
             cold.db = original
 
     short = await discover()
-    for batch in range(16):
-        lease = await handler()
-        items = []
-        async with manager.joined_write():
-            for index in range(64):
-                registered = await manager.register_job(actor, kind="subagent", parent=parent, independent=True,
-                    system_key=f"original-{batch}-{index}")
-                child = await manager.claim_job(actor, registered.job.job_id, executor_id="child", boot_id="boot", expected_version=1)
-                await manager.record_execution_result(actor, child, outcome="succeeded", result={"value": index}, resource_state="stopped")
-                items.append({"item_id": "subagent:"+registered.operation.operation_id[3:], "kind": "task_done", "content": str(index)})
-        await store.inbox_put(actor.session_id, items)
+    for index in range(20):
+        sid = await store.create_session(parent_session_id=actor.session_id)
+        registered = await manager.register_job(actor, kind="subagent", session_id=sid, parent=parent, independent=True,
+            system_key=f"original-{index}")
+        child = await manager.claim_job(actor, registered.job.job_id, executor_id="child", boot_id="boot", expected_version=1)
+        key = await manager.record_execution_result(actor, child, outcome="succeeded", result={"value": index}, resource_state="stopped")
+        await store.inbox_put(actor.session_id, [{"item_id": key, "kind": "task_done", "content": str(index)}])
         claimed = await store.inbox_claim(actor.session_id)
-        assert len(claimed) == 64
-        seq = await store.append_message(actor.session_id, role="user", content="Actual batch of original results", send_index=handler_count,
+        seq = await store.append_message(actor.session_id, role="user", content=str(index), send_index=index,
             inbox={"claim_token": claimed[0]["claim_token"], "ids": [item["id"] for item in claimed]})
-        snapshot = await manager.prepare_processing(actor, lease, round_index=0, send_index=handler_count,
-            messages=[{"seq": seq, "role": "user", "content": "Actual batch of original results"}])
-        response = await store.append_message(actor.session_id, role="assistant", content="Processed originals", send_index=handler_count, round_index=0)
-        ref = await store.message_ref(actor.session_id, response)
-        decisions = await manager.commit_processing_decision(actor, lease, snapshot_id=snapshot, response_ref=ref, reason="Actual processing of original result batch")
-        assert len(decisions) == 64
-        await manager.close_model_execution(actor, lease, evidence={"exit": "completed", "last_assistant_ref": ref.to_dict(), "processing_decisions": decisions})
-    assert (await manager.db.fetchone(f"SELECT COUNT(*) AS n FROM {manager.events} WHERE event_type='processing_decision'"))["n"] == 1024
+        binding = Execution(SimpleNamespace(manager=manager), actor, parent)
+        binding.resource_evidence["_control_source"] = await manager._row(manager.db, parent.job_id)
+        await observe(binding, [{"seq": seq, "role": "user", "content": str(index), "item_ids": [key]}],
+            round_index=0, send_index=index)
+        await finish(binding)
     assert await rows(manager) == []
     assert await discover() == short

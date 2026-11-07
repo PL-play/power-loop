@@ -22,7 +22,7 @@ from .test_real_async_boundaries_192 import BoundedProvider
 pytestmark = [pytest.mark.real_llm, pytest.mark.asyncio]
 
 
-@pytest.mark.parametrize("ending", ["natural", "pass_turn", "decision_write_failure", "empty_child_pass", "node_answer_write_failure"])
+@pytest.mark.parametrize("ending", ["natural", "pass_turn", "consumption_write_failure", "empty_child_pass", "node_answer_write_failure"])
 async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_path, record_property, ending, monkeypatch):
     store = await SessionStore.open(str(tmp_path / "real-workflow-runtime.db"), schema="tasks")
     manager = JobManager(store)
@@ -37,15 +37,14 @@ async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_
             system_prompt="Follow the requested tool sequence. A queued receipt is not a result. Never duplicate a workflow. "
                           "When its task_done summary arrives, report the final answer in final assistant text; do not call pass_turn instead of replying."))
     sid = await loop.new_session()
-    if ending == "decision_write_failure":
-        original_commit = manager.commit_processing_decision
-
-        async def fail_decision(actor, *args, **kwargs):
-            if actor.session_id != sid:
-                raise RuntimeError("test: processing decision write unavailable")
-            return await original_commit(actor, *args, **kwargs)
-
-        monkeypatch.setattr(manager, "commit_processing_decision", fail_decision)
+    if ending == "consumption_write_failure":
+        from power_loop.runtime import result_consumption
+        original_finish = result_consumption.finish
+        async def fail_consumption(binding):
+            if binding.actor.session_id != sid and binding.consumed_inputs:
+                raise RuntimeError("test: result consumption write unavailable")
+            return await original_finish(binding)
+        monkeypatch.setattr(result_consumption, "finish", fail_consumption)
     provider.root_sid, provider.hold_children = sid, True
     spec = {"name": "registered-nested-calculation", "root": {"type": "sequence", "steps": [
         {"type": "agent", "id": "calculate", "input": "Calculate 19+23 by delegating exactly once, then report the returned answer.",
@@ -58,7 +57,7 @@ async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_
          "spec": {"name": "review", "tools": [], "max_rounds": 2,
                   "system_prompt": "Read the supplied calculation result. Reply with its correct number only in final assistant text. Do not call pass_turn."}},
     ]}}
-    if ending == "decision_write_failure":
+    if ending == "consumption_write_failure":
         # A lost processing decision is not permission to restart business
         # work, even when the original leaf explicitly permits failed retries.
         spec["root"]["steps"][0]["retry"] = {"max_attempts": 3, "on": ["failed"], "backoff_s": 0}
@@ -163,7 +162,7 @@ async def test_real_registered_workflow_consumes_nested_child_before_review(tmp_
             assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE job_id=? AND event_type='workflow_projected'", (handle.job_id,))) == 1
             wf = await manager.get_job(actor, handle.job_id)
             assert await manager.get_workflow_profile(actor, handle.job_id) == original_profile
-            if ending in ("decision_write_failure", "node_answer_write_failure"):
+            if ending in ("consumption_write_failure", "node_answer_write_failure"):
                 assert wf.result["status"] == "failed" and wf.outcome == "failed", wf.result
                 nodes = await manager.db.fetchall(f"SELECT * FROM {manager.jobs} WHERE kind='workflow_node'")
                 assert len(nodes) == 1 and nodes[0]["outcome"] == "failed"

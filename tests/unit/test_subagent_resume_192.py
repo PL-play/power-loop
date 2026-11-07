@@ -351,19 +351,6 @@ async def test_active_nudge_uses_resumed_execution_run_and_generation(ready, mon
     assert len(events) == 2 and all(e["delivery_status"] == "handled" for e in events)
 
 
-async def test_old_committed_processing_decision_cannot_acknowledge_new_result(ready, monkeypatch):
-    c = ready
-    [decision] = await c.manager.db.fetchall(f"SELECT payload_json FROM {c.manager.events} WHERE event_type='processing_decision'")
-    payload = json.loads(decision["payload_json"])
-    handler = await c.manager._row(c.manager.db, payload["handler_job_id"])
-    from power_loop.runtime.jobs import JobLease
-    lease = JobLease(handler["job_id"], handler["executor_id"], handler["boot_id"], handler["generation"])
-    await issue_nudge(c.fixture, monkeypatch)
-    await finish(c.fixture)
-    assert (await latest(c)).result_status == "pending_delivery"
-    ids = await c.manager.commit_processing_decision(c.runtime.actor(c.parent), lease, snapshot_id=payload["snapshot_id"],
-        response_ref=await c.store.message_ref(c.parent, int(payload["response_ref"]["seq"])), decision=payload["decision"], reason=payload["reason"])
-    assert ids and (await latest(c)).result_status == "pending_delivery"
 
 
 @pytest.mark.parametrize("stop_phase", ["queue", "model"])

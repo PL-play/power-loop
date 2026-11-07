@@ -203,75 +203,6 @@ async def enqueue_runtime(runtime, actor, job):
     return response
 
 
-async def candidates(manager, tx, actor):
-    """Only explicitly queued original-main deliveries join ordinary processing."""
-    from .session_obligations import event_rows
-    rows = await event_rows(manager, tx, actor, "managed")
-    if len(rows) > 1000:
-        raise JobError('managed_delivery_scope_too_large')
-    events = []
-    for notice in rows:
-        row = await manager._authorize(tx, actor, notice['job_id'])
-        result = await result_event(manager, tx, row)
-        await read(manager, tx, row, result)
-        if row['generation'] == 0:
-            decision_id = 'decision_' + _hash([result['event_id'], int(result['job_version']), _hash(json.loads(result['payload_json']))])[:48]
-            if await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', (decision_id,)) is not None:
-                continue
-        if row['result_status'] != 'handled' and result['delivery_status'] != 'handled':
-            events.append(result)
-    return events
-
-
-async def observation(manager, tx, actor, row, result, visible=None):
-    notice = await read(manager, tx, row, result)
-    if notice[1]['main_session_id'] != actor.session_id:
-        raise JobError('managed_delivery_requires_original_main')
-    inbox = await _inbox(manager, tx, row, notice)
-    if inbox['status'] != 'delivered':
-        return None
-    length = (lambda column: f'length(CAST({column} AS BLOB))') if manager.db.dialect.name == 'sqlite' else (lambda column: f'octet_length({column})')
-    size = await tx.fetchone(f'SELECT {length("content")} AS n,{length("meta_json")} AS m FROM {manager.store.t.messages} WHERE session_id=? AND seq=?',
-                             (actor.session_id, inbox['delivered_seq']))
-    if size is None or size['n'] is None or size['n'] > 4 * 1024 * 1024 or size['m'] is not None and size['m'] > 65536:
-        raise JobError('managed_delivery_message_missing')
-    message = await tx.fetchone(f'SELECT id,seq,role,content,meta_json,send_index,round_index FROM {manager.store.t.messages} WHERE session_id=? AND seq=?',
-                                (actor.session_id, inbox['delivered_seq']))
-    if message is None:
-        raise JobError('managed_delivery_message_missing')
-    from .managed_effects import _document
-    try:
-        meta = _document(json.loads(message['meta_json'] or '{}'), 65536)
-    except (ValueError, TypeError):
-        raise JobError('managed_delivery_message_mismatch') from None
-    if (message['role'] != 'user' or message['send_index'] != inbox['delivered_send_index']
-            or type(meta.get('inbox')) is not dict or type(meta['inbox'].get('item_ids')) is not list
-            or meta['inbox']['item_ids'].count(notice[0]['event_id']) != 1
-            or type(message['content']) is not str or render(notice[1]['public']) not in message['content']):
-        raise JobError('managed_delivery_message_mismatch')
-    if visible is not None:
-        candidate = visible.get(int(message['seq']))
-        if candidate is None or candidate.get('role') != message['role'] or candidate.get('content') != message['content']:
-            return None
-    from .pending_calls import require_disposition
-    source = await manager._row(tx, row['parent_job_id'])
-    closed = await tx.fetchone(f'SELECT event_id FROM {manager.events} WHERE event_id=?', (result_id(source["job_id"], source["generation"]),))
-    extra = {}
-    if closed is not None:
-        from .pending_calls import SNAPSHOT, _closed, identity
-        source_exit = await _closed(manager, tx, source)
-        if SNAPSHOT in source_exit['evidence'] and await tx.fetchone(
-                f'SELECT event_id FROM {manager.events} WHERE event_id=?', (identity(manager, source),)) is None:
-            # The actual main may inspect/stop unresolved work before the whole
-            # original batch can be disposed. Seeing this notice is not its ACK.
-            return None
-        reference = await require_disposition(manager, tx, source)
-        if reference is not None:
-            extra['pending_disposition'] = reference
-    return {'delivered_seq': int(message['seq']), 'managed_delivery': {
-        'event_id': notice[0]['event_id'], 'payload_hash': _hash(notice[1]), 'message_hash': _hash(message['content']), **extra}}
-
-
 async def pending_reviews(manager, tx, actor):
     """Known original notices remain control-only until actual clean handling."""
     from .model_exit import content_reference
@@ -306,45 +237,11 @@ async def pending_reviews(manager, tx, actor):
     return pending
 
 
-async def verify_observation(manager, tx, actor, row, result, event):
-    observed = await observation(manager, tx, actor, row, result)
-    if observed is None or any(event.get(k) != v for k, v in observed.items()):
-        raise JobError('managed_delivery_processing_mismatch')
-
-
-async def handled_references(manager, tx, row, result, notice, *, verifier=None, session_id=None, owner_job_id=None, handler_role='main'):
-    from .finalization import _processing_references, _reference
-    from .jobs import JobActor, JobLease
-    from .processing import _fingerprint, require_event_handled
-
-    actor = JobActor(row['tenant_id'], row['principal_id'], session_id or notice[1]['main_session_id'])
-    await require_event_handled(manager, tx, result, session_id=actor.session_id, owner_job_id=owner_job_id, allow_suppressed=row['generation'] == 0)
-    refs = await _processing_references(manager, tx, result)
-    decision = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (refs[0]['event_id'],))
-    data = json.loads(decision['payload_json'])
-    await (verifier or verify_observation)(manager, tx, actor, row, result, data['event'])
-    handler = await manager._row(tx, data['handler_job_id'])
-    source = {'job_id': handler['job_id'], 'generation': data['generation'],
-        'executor_id': handler['executor_id'], 'boot_id': handler['boot_id']}
-    from .execution_membership import _lease
-    _lease(source)
-    if handler['execution_role'] != handler_role:
-        raise JobError('managed_delivery_processing_mismatch')
-    snapshot = await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (data['snapshot_id'],))
-    if snapshot is None or snapshot['event_type'] != 'processing_request' or snapshot['delivery_status'] != 'handled':
-        raise JobError('managed_delivery_processing_mismatch')
-    request = json.loads(snapshot['payload_json'])
-    if (snapshot['job_id'] != handler['job_id'] or request.get('handler_job_id') != handler['job_id']
-            or request.get('generation') != data['generation'] or request.get('session_id') != actor.session_id
-            or data['event'] not in request.get('events', [])):
-        raise JobError('managed_delivery_processing_mismatch')
-    from .managed_effects import _ref
-    ref = _ref(data['response_ref'])
-    await manager._validate_ref(tx, actor, ref, role='assistant', metadata_only=True)
-    if decision['request_hash'] != _fingerprint(JobLease(**source), data['snapshot_id'], ref, data['decision'], data['reason']):
-        raise JobError('managed_delivery_processing_mismatch')
-    refs.extend([await _reference(manager, tx, notice[0]['event_id']), await _reference(manager, tx, snapshot['event_id'])])
-    return refs
+async def handled_references(manager, tx, row, result, notice):
+    from .finalization import _event_reference
+    if result["delivery_status"] != "handled":
+        raise JobError("required_result_unhandled")
+    return [_event_reference(result), _event_reference(notice[0])]
 
 
 async def negative_review_view(manager, tx, row):
@@ -355,8 +252,7 @@ async def negative_review_view(manager, tx, row):
     found = await descriptor(manager, tx, row)
     if found is None:
         return None
-    view = {'state': 'unknown', 'notice_event_id': identity(manager, row),
-            'decision_event_id': None, 'response_ref': None}
+    view = {'state': 'unknown', 'notice_event_id': identity(manager, row)}
     try:
         result = await result_event(manager, tx, row)
         await unstarted_references(manager, tx, row)
@@ -377,18 +273,15 @@ async def negative_review_view(manager, tx, row):
                 required_review = (found[0]['tool_call_id'] in pending['tool_call_ids']
                     and _hash(json.loads(found[0]['call_ref_json'])) == _hash(evidence[SNAPSHOT]['assistant_ref']))
         notice = await read(manager, tx, row, result, required=False)
-        decision_id = 'decision_' + _hash([result['event_id'], int(result['job_version']), _hash(json.loads(result['payload_json']))])[:48]
-        decision = await tx.fetchone(f'SELECT event_id,payload_json FROM {manager.events} WHERE event_id=?', (decision_id,))
         if not required_review:
             if notice is not None:
                 raise JobError('managed_delivery_unexpected_negative_review')
             return {**view, 'state': 'not_required', 'notice_event_id': None}
-        if notice is None and decision is not None:
+        if notice is None and result['delivery_status'] == 'handled':
             raise JobError('managed_delivery_evidence_missing')
-        if decision is None:
+        if result['delivery_status'] != 'handled':
             return {**view, 'state': 'pending'}
         await handled_references(manager, tx, row, result, notice)
-        return {**view, 'state': 'handled', 'decision_event_id': decision_id,
-                'response_ref': json.loads(decision['payload_json'])['response_ref']}
+        return {**view, 'state': 'handled'}
     except JobError as exc:
         return {**view, 'error': str(exc.code)[:128]}

@@ -236,14 +236,15 @@ def observation_id(manager, caller, round_index, notice_id):
     return "wait_seen_" + _hash([manager.store.store_id, caller.job_id, caller.generation, round_index, notice_id])[:48]
 
 
-async def prepare_request_observations(manager, tx, actor, caller, *, source, round_index, send_index, messages):
+async def prepare_request_observations(manager, tx, actor, caller, *, source, round_index, send_index, messages, notices=None):
     """Discover delivered notices without holding the caller's writer lock."""
     if source["execution_role"] != "main":
         return 0, []
     visible = {m["seq"]: m for m in messages}
     from .session_obligations import event_rows
-    notices = [event for event in await event_rows(manager, tx, actor, "wait")
-               if event["delivery_status"] == "delivered"]
+    if notices is None:
+        notices = await event_rows(manager, tx, actor, "wait")
+    notices = [event for event in notices if event["delivery_status"] == "delivered"]
     if len(notices) > _SCOPE_LIMIT:
         raise JobError("wait_notification_scope_too_large")
     observations = []

@@ -543,11 +543,6 @@ class AgentPipeline:
         # delivered in the same transaction as this transcript row.
         message = dict(msg)
         inbox = message.pop("_inbox", None)
-        if inbox is not None:
-            from power_loop.runtime.task_runtime import _SEND
-            execution = _SEND.get()
-            if execution is not None and execution.actor.session_id == self.session_id:
-                execution.resource_evidence["_processing_dirty"] = True
         ctx = MessageAppendCtx(
             round_index=round_index or 0,
             message=message,
@@ -1367,8 +1362,6 @@ class AgentPipeline:
                            StreamDeltaPayload(text=text, is_think=True),
                            round_index=round_index, stream_id="main")
 
-        from power_loop.runtime.review_tools import restrict_request
-        system_prompt, tools = await restrict_request(self, system_prompt, tools)
         from power_loop.runtime.history_sanitize import sanitize_request_messages
         from power_loop.runtime.retry import request_repair_kind
         model_name = (self.config.model
@@ -2073,8 +2066,8 @@ class AgentPipeline:
                     await self._finalize('capacity_blocked', rounds=round_idx)
                     return self._make_result('degraded', final_text=self._capacity_blocked, rounds=round_idx)
 
-            from power_loop.runtime.task_runtime import prepare_model_processing
-            await prepare_model_processing(self, llm_before.messages, round_idx,
+            from power_loop.runtime.task_runtime import observe_model_inputs
+            await observe_model_inputs(self, llm_before.messages, round_idx,
                 provider_call=llm_before.directive not in (HookDirective.SHORT_CIRCUIT, HookDirective.BREAK))
 
             if llm_before.directive == HookDirective.SHORT_CIRCUIT:

@@ -367,12 +367,6 @@ async def run_workflow_tool(arguments=None, *, ports=None, **kwargs):
 _CONTROL_ACTIONS = ("help", "status", "list", "cancel", "leaves", "logs")
 
 
-def _review_spec(spec):
-    action = spec["function"]["parameters"].get("properties", {}).get("action")
-    if type(action) is not dict:
-        return None
-    action["enum"] = [name for name in action.get("enum", _CONTROL_ACTIONS) if name in _CONTROL_ACTIONS]
-    return spec
 
 
 def workflow_runtime_tool(handler, *, key="sdk.workflow"):
@@ -386,7 +380,6 @@ def workflow_runtime_tool(handler, *, key="sdk.workflow"):
             native_admitted=arguments.get("action", "help") in _ACTIONS,
             control_only=arguments.get("action", "help") in _CONTROL_ACTIONS,
         ),
-        reviewer=_review_spec,
     )
 
 

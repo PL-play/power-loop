@@ -1619,6 +1619,8 @@ class _ExecutionLoop:
             except Exception:
                 logger.exception("session %s: durable history repair (deactivate) failed", sid)
         sink.init_history_seqs(hist_seqs, hist_ords)
+        for row in active_rows if with_history else own:
+            sink.remember_input(row.seq, row.role, row.content, row.meta)
         # System prompt precedence: per-call > session > config. (session_row loaded above.)
         effective_sp = system_prompt
         if effective_sp is None and session_row is not None and session_row.system_prompt:

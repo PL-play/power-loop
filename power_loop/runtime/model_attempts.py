@@ -103,24 +103,16 @@ def response_observation(usage, response):
     }
 
 
-async def enable(binding, *, review_sources=None):
+async def enable(binding):
     from .budget_policy_sources import PolicySourceChanged
-    from .control_runtime import ReviewSourcesChanged, needs_review_sources, open_control, prepare_review_sources
+    from .control_runtime import open_control
 
-    manager = binding.runtime.manager
-    joined = manager._joined_write.get() is not None
-    if (binding.resource_evidence.get('_control_state') is None and not joined and review_sources is None
-            and needs_review_sources(manager,binding.actor)):
-        review_sources = await prepare_review_sources(manager,binding.actor)
+    joined = binding.runtime.manager._joined_write.get() is not None
     policy_source = None
     while True:
         try:
-            await open_control(binding,review_sources=review_sources,policy_source=policy_source)
+            await open_control(binding, policy_source=policy_source)
             break
-        except ReviewSourcesChanged:
-            if joined:
-                raise
-            review_sources = await prepare_review_sources(manager,binding.actor)
         except PolicySourceChanged as changed:
             if joined:
                 raise

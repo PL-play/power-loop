@@ -228,13 +228,10 @@ async def recover_acquired_session(loop, session_id, *, cache_valid):
     if runtime is None:
         return
     manager = runtime.manager
-    from .session_controls import forget
     rows = await manager.db.fetchall(
         f"SELECT job_id,generation,kind,parent_job_id FROM {manager.jobs} WHERE tenant_id=? AND principal_id=? "
         "AND session_id=? AND outcome IS NULL AND status IN ('running','settling')",
         (runtime.tenant_id, runtime.principal_id, session_id))
-    if not cache_valid or rows:
-        forget(manager, session_id)
     for row in rows:
         from types import SimpleNamespace
 

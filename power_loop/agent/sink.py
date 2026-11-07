@@ -139,6 +139,13 @@ class SQLiteSink:
         # identity map AND lets the note reload at the right position (C1 fix).
         self._history_seqs: list[int | None] = []
         self._history_ord: list[int | None] = []
+        self._input_messages: dict[int, dict] = {}
+
+    def remember_input(self, seq, role, content, meta):
+        inbox = (meta or {}).get("inbox", {})
+        if inbox.get("item_ids") and any(kind != "user" for kind in inbox.get("kinds", [])):
+            self._input_messages[seq] = {"seq": seq, "role": role, "content": content,
+                "item_ids": inbox["item_ids"]}
 
     def init_history_seqs(
         self, seqs: list[int], ords: list[int] | None = None
@@ -282,6 +289,7 @@ class SQLiteSink:
             raise
         self._history_seqs.append(seq)
         self._history_ord.append(seq)
+        self.remember_input(seq, role, message.get("content"), meta)
         if usage:
             self._usage_written.add(round_index)
 

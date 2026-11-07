@@ -202,8 +202,6 @@ async def _prepare_children(pipeline, attempt):
         from .tool_call_abort import read as read_abort
         attempt['value'] = _freeze(pipeline, binding, source, ref, entries)
         pipeline._native_abort_attempt = attempt['value']
-        from .review_tools import require_batch
-        await require_batch(manager, tx, actor, control_only=all(control_calls))
         if await read_abort(manager, tx, source, ref) is not None:
             raise JobError('tool_call_batch_aborted')
         existing = await read(manager, tx, source, ref, optional=True)

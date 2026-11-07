@@ -237,7 +237,7 @@ async def _publish_recovery(manager, actor, prepared):
             row = {**row, 'outcome': payload['outcome'], 'resource_state': 'stopped',
                 'version': row['version']+(prepared.result is None)}
         if old[1]['handling_route'] == 'original':
-            tx.handled(job_id)
+            tx.touch_job(job_id, obligations=True)
         await enqueue(manager, tx, row, old, result=result, delivery=prepared.delivery)
     return old
 
@@ -312,51 +312,6 @@ async def enqueue(manager, tx, row, saved, *, result, delivery):
         (data['main_session_id'], notice_id(manager, row), 'controller_result', 'queue', 'pending', render(public), manager.now()))
 
 
-async def candidates(manager, tx, actor):
-    from .session_obligations import sources
-    rows = await sources(manager, tx, actor, "controller")
-    if len(rows) > 1000:
-        raise JobError('controller_recovery_scope_too_large')
-    result = []
-    for row in rows:
-        await manager._authorize(tx, actor, row['job_id'])
-        await notice(manager, tx, row)
-        result.append(await tx.fetchone(f'SELECT * FROM {manager.events} WHERE event_id=?', (result_id(row['job_id'], row['generation']),)))
-    return result
-
-
-async def observation(manager, tx, actor, row, visible=None, *, _closures=None):
-    delivery = await notice(manager, tx, row, _closures=_closures)
-    if delivery is None or delivery[1]['main_session_id'] != actor.session_id:
-        raise JobError('controller_recovery_requires_original_main')
-    queue = await tx.fetchone(f'SELECT * FROM {manager.store.t.follow_up_queue} WHERE session_id=? AND item_id=?',
-                              (actor.session_id, delivery[0]['event_id']))
-    if (queue is None or queue['kind'] != 'controller_result' or queue['mode'] != 'queue'
-            or queue['status'] not in ('pending', 'claimed', 'delivered') or queue['content'] != render(delivery[1]['public'])):
-        raise JobError('controller_recovery_inbox_changed')
-    if queue['status'] != 'delivered':
-        return None
-    message = await tx.fetchone(f'SELECT * FROM {manager.store.t.messages} WHERE session_id=? AND seq=?',
-                                (actor.session_id, queue['delivered_seq']))
-    meta = json.loads(message['meta_json'] or '{}') if message else {}
-    if (message is None or message['role'] != 'user' or message['send_index'] != queue['delivered_send_index']
-            or meta.get('inbox', {}).get('item_ids', []).count(delivery[0]['event_id']) != 1
-            or render(delivery[1]['public']) not in message['content']):
-        raise JobError('controller_recovery_message_changed')
-    if visible is not None:
-        actual = visible.get(int(message['seq']))
-        if actual is None or actual.get('role') != message['role'] or actual.get('content') != message['content']:
-            return None
-    return {'delivered_seq': int(message['seq']), 'controller_result_delivery': {
-        'event_id': delivery[0]['event_id'], 'payload_hash': _hash(delivery[1]), 'message_hash': _hash(message['content'])}}
-
-
-async def verify_observation(manager, tx, actor, row, result, event, *, _closures=None):
-    observed = await observation(manager, tx, actor, row, _closures=_closures)
-    if observed is None or any(_hash(event.get(k)) != _hash(v) for k, v in observed.items()):
-        raise JobError('controller_recovery_processing_changed')
-
-
 async def handled_references(manager, tx, row, *, _closures=None):
     from .finalization import _reference
     from .managed_delivery import handled_references as common
@@ -369,20 +324,17 @@ async def handled_references(manager, tx, row, *, _closures=None):
     delivery = await notice(manager, tx, row, _closures=_closures)
     if delivery is None:
         raise JobError('controller_recovery_delivery_missing')
-    async def verify(manager, tx, actor, row, result, event):
-        await verify_observation(manager, tx, actor, row, result, event, _closures=_closures)
-    refs = await common(manager, tx, row, result, delivery, verifier=verify)
+    refs = await common(manager, tx, row, result, delivery)
     refs.append(await _reference(manager, tx, identity(manager, row)))
     return refs
 
 
 async def _original_handling(manager, tx, row, result, *, _closures=None):
-    """Retain an actual prior engine/main decision; never manufacture a second ACK."""
-    from .finalization import _processing_references
-    from .processing import require_event_handled
+    from .finalization import _event_reference
+    from .result_consumption import require_event_handled
     await require_event_handled(manager, tx, result, session_id=row['created_by_session_id'],
                                owner_job_id=row['control_owner_job_id'])
-    return await _processing_references(manager, tx, result)
+    return [_event_reference(result)]
 
 
 @_verify_stored

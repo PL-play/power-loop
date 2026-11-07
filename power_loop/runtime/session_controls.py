@@ -6,48 +6,11 @@ No SQL text is inspected to infer a write's meaning or invalidate cached rows.
 """
 from __future__ import annotations
 
-from weakref import WeakValueDictionary
-
 OBLIGATION_EVENTS = frozenset({
     "tool_call_abort", "source_abort_delivery", "pending_call_disposition",
     "controller_review_handoff", "pending_owner_transfer", "managed_effect_delivery",
     "controller_stopped", "wait_notification", "result", "supervision_reopened",
 })
-GLOBAL = "*"
-
-
-class _Versions:
-    """Bounded cache hints shared by managers of the same store in this process."""
-
-    def __init__(self):
-        self.sequence = 0
-        self.sessions = {}
-
-    def get(self, session_id):
-        if session_id not in self.sessions:
-            if len(self.sessions) >= 4096:
-                self.sessions.pop(next(iter(self.sessions)))
-            self.sessions[session_id] = self.sequence
-        return self.sessions[session_id]
-
-    def changed(self, sessions):
-        self.sequence += 1
-        for session_id in sessions:
-            self.get(session_id)
-            self.sessions[session_id] = self.sequence
-
-
-_VERSIONS = WeakValueDictionary()
-
-
-def bind_versions(manager):
-    key = manager.store.store_id
-    clock = _VERSIONS.get(key)
-    if clock is None:
-        clock = _VERSIONS[key] = _Versions()
-    return clock
-
-
 class ControlReadView:
     """A bounded discovery's primary-key view, with no mutation port or lock.
 
@@ -104,11 +67,9 @@ class ControlTransaction(ControlReadView):
         self.writes = 0
         self.obligation_jobs: set[str] = set()
         self.obligation_routes: set[str] = set()
-        self.obligation_decisions: dict[str, dict | None] = {}
-        self.obligation_processed: set[str] = set()
-        self.obligation_handled: set[str] = set()
         self.obligation_open: set[tuple] = set()
         self.obligation_close: set[tuple] = set()
+        self._result_events: dict[str, dict] = {}
         self._executor_admissions: dict[str, bool] = {}
         self._executor_group_locks: dict[str, tuple[bool, bool]] = {}
         self._budget_policy_admissions: dict[str, dict | None] = {}
@@ -124,11 +85,6 @@ class ControlTransaction(ControlReadView):
             self.obligation_jobs.add(job_id)
         if notify:
             self.jobs.add(job_id)
-
-    def handled(self, job_id):
-        """Declare an original result's already-proved handling for this write."""
-        self.touch_job(job_id, obligations=True)
-        self.obligation_handled.add(job_id)
 
     async def _lock_root(self, job_id):
         """The lookup proves the target's root without fetching its full row."""
@@ -252,7 +208,16 @@ class ControlTransaction(ControlReadView):
         self.note_event(event)
         sql = (self._dialect.insert_ignore(self._events, columns) if ignore else
                f"INSERT INTO {self._events} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})")
-        return await self._execute(sql, values)
+        inserted = await self._execute(sql, values)
+        if inserted and event["event_type"] == "result":
+            self._result_events[event["event_id"]] = {"request_hash": None, **event}
+        return inserted
+
+    async def result_event(self, event_id):
+        """Reuse a result inserted in this transaction, including its original generation."""
+        if event_id in self._result_events:
+            return dict(self._result_events[event_id])
+        return await self.fetchone(f"SELECT * FROM {self._events} WHERE event_id=? AND event_type='result'", (event_id,))
 
     async def append_context_event(self, columns, values):
         """Append a host task-context original, before any root need exist."""
@@ -311,6 +276,7 @@ class ControlTransaction(ControlReadView):
     async def update_event(self, job_id, sql, params=(), *, obligations=True, notify=False):
         """Declare an original event's state change without re-reading it."""
         await self.require_job(job_id)
+        self._result_events = {key: value for key, value in self._result_events.items() if value["job_id"] != job_id}
         self.touched_jobs.add(job_id)
         if obligations:
             self.obligation_jobs.add(job_id)
@@ -365,34 +331,3 @@ class ControlTransaction(ControlReadView):
         self.writes += 1
         self.forget_reads()
         return await self._tx.execute_flag(sql, params)
-
-async def bump(manager, tx, recorder):
-    sessions = set(recorder.sessions)
-    jobs = sorted(recorder.jobs)
-    for offset in range(0, len(jobs), 100):
-        part = jobs[offset:offset + 100]
-        rows = await tx.fetchall(f"SELECT session_id,created_by_session_id FROM {manager.jobs} WHERE job_id IN (" +
-                                 ",".join("?" for _ in part) + ")", tuple(part))
-        for row in rows:
-            sessions.update(value for value in (row["session_id"], row["created_by_session_id"]) if value)
-    manager.after_outcome(lambda: manager._control_versions.changed(sessions), lambda: None)
-
-
-async def version(manager, reader, session_id):
-    clock = manager._control_versions
-    return clock.get(session_id), clock.get(GLOBAL)
-
-
-def is_clean(manager, session_id, seen):
-    return manager._trust_own_writes.get() and manager.__dict__.get("_clean_sessions", {}).get(session_id) == seen
-
-
-def mark_clean(manager, session_id, seen):
-    cache = manager.__dict__.setdefault("_clean_sessions", {})
-    if len(cache) >= 4096 and session_id not in cache:
-        cache.pop(next(iter(cache)))
-    cache[session_id] = seen
-
-
-def forget(manager, session_id):
-    manager.__dict__.get("_clean_sessions", {}).pop(session_id, None)

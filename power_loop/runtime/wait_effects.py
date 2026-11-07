@@ -299,16 +299,14 @@ async def settle_owner_tx(manager, tx, actor, owner):
             continue
         op_id = waits._object(effect["payload_json"])["operation_id"]
         op = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (op_id,))
-        from .processing import require_event_handled
+        from .result_consumption import require_event_handled
         await validate_input(manager, tx, actor, op)
         await require_event_handled(manager, tx, op, session_id=saved["binding"]["session_id"], owner_job_id=owner["job_id"])
-        from .finalization import _processing_references
-        proofs = await _processing_references(manager, tx, op)
         if (job["generation"] != 0 or job["resource_state"] != "not_started" or job["outcome"] is not None
                 or job["intake"] != "open" or job["cancel_requested_at"] is not None):
             raise JobError("wait_state_changed")
         payload = {"version": 1, "effect_id": effect["event_id"], "effect_hash": effect["request_hash"], "input_id": op_id,
-            "input_hash": _hash(waits._object(op["payload_json"])), "proofs": proofs}
+            "input_hash": _hash(waits._object(op["payload_json"]))}
         key = "wait_resolved_" + _hash([manager.store.store_id, effect["event_id"]])[:48]
         await tx.append_event(('event_id', 'job_id', 'event_type', 'job_version', 'request_hash', 'payload_json', 'delivery_status', 'created_at'), (key, job["job_id"], "wait_resolved", job["version"]+1, _hash(payload), _json(payload), "not_applicable", manager.now()))
         result = {"status": "succeeded", "wait_resolved_event_id": key}
@@ -328,16 +326,14 @@ async def _resolved(manager, tx, job, effect):
     data = waits._object(row["payload_json"])
     payload = waits._object(effect["payload_json"])
     op = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (payload["operation_id"],))
-    from .finalization import _processing_references, _reference
-    proofs = await _processing_references(manager, tx, op) if op is not None else None
     expected = {"version": 1, "effect_id": effect["event_id"], "effect_hash": effect["request_hash"],
-        "input_id": op["event_id"] if op else None, "input_hash": _hash(waits._object(op["payload_json"])) if op else None, "proofs": proofs}
+        "input_id": op["event_id"] if op else None, "input_hash": _hash(waits._object(op["payload_json"])) if op else None}
     result = {"status": "succeeded", "wait_resolved_event_id": key}
     canonical = {"outcome": "succeeded", "result": result, "resource_state": "stopped", "unstarted": True,
         "logical_wait": True, "resolution_hash": _hash(expected)}
     result_event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", ("result_" + job["job_id"],))
     if (row["event_type"] != "wait_resolved" or row["job_id"] != job["job_id"] or row["request_hash"] != _hash(data)
-            or _hash(data) != _hash(expected) or proofs is None
+            or _hash(data) != _hash(expected) or op is None
             or row["delivery_status"] != "not_applicable" or data.get("effect_id") != effect["event_id"]
             or data.get("effect_hash") != effect["request_hash"] or job["generation"] != 0
             or job["outcome"] != "succeeded" or job["resource_state"] != "stopped" or job["intake"] != "closed"
@@ -346,10 +342,7 @@ async def _resolved(manager, tx, job, effect):
             or result_event["delivery_status"] != "handled" or result_event["request_hash"] != _hash(canonical)
             or _hash(waits._object(result_event["payload_json"])) != _hash(canonical)):
         raise JobError("wait_resolution_evidence_corrupt")
-    from .processing import require_event_handled
+    from .result_consumption import require_event_handled
     request = waits._object(op["payload_json"])["request"]
     await require_event_handled(manager, tx, op, session_id=request["session_id"], owner_job_id=payload["owner"]["job_id"])
-    for proof in data.get("proofs", []):
-        if _hash(await _reference(manager, tx, proof["event_id"])) != _hash(proof):
-            raise JobError("wait_resolution_evidence_corrupt")
     return row

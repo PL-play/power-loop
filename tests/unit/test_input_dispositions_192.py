@@ -374,7 +374,7 @@ async def test_ordinary_nudge_retains_call_receipt_and_never_claims_model_consum
     updated = await c.manager.db.fetchone(
         f"SELECT * FROM {c.manager.events} WHERE event_id=?", (accepted.operation_id,)
     )
-    from power_loop.runtime.processing import require_event_handled
+    from power_loop.runtime.result_consumption import require_event_handled
 
     async with c.manager._write() as tx:
         await require_event_handled(c.manager, tx, updated, session_id=c.sid, owner_job_id=c.target.job_id)

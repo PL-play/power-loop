@@ -24,15 +24,15 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 @pytest.fixture
 async def nudge_case(runtime):
     store, manager, actor, _, supervisor, connect, now = runtime
-    reg = await manager.register_job(actor, kind="subagent", parent=supervisor, independent=True, system_key="nudge-target")
+    sid = await store.create_session(parent_session_id=actor.session_id,
+        metadata={"execution_role": "subagent", "standalone_subagent": True})
+    reg = await manager.register_job(actor, kind="subagent", session_id=sid,
+        parent=supervisor, independent=True, system_key="nudge-target")
     source = await manager.register_job(actor, kind="send", session_id=actor.session_id,
         system_key="nudge-caller", request={"send_index": 1})
     caller = await manager.claim_job(actor, source.job.job_id, executor_id="parent", boot_id="boot", expected_version=1)
-    sid = await store.create_session(parent_session_id=actor.session_id,
-        metadata={"execution_role": "subagent", "standalone_subagent": True})
-    bound = await manager.bind_session(actor, reg.job.job_id, sid)
     child_actor = replace(actor, session_id=sid)
-    target = await manager.claim_job(child_actor, bound.job_id, executor_id="child", boot_id="boot", expected_version=bound.version)
+    target = await manager.claim_job(child_actor, reg.job.job_id, executor_id="child", boot_id="boot", expected_version=reg.job.version)
     seq = await store.append_message(actor.session_id, role="assistant", send_index=1, round_index=0,
         tool_calls=[{"id": "nudge-call", "type": "function", "function": {"name": "spawn_agent", "arguments": "{}"}}])
     origin = await store.message_ref(actor.session_id, seq)
@@ -45,22 +45,26 @@ async def nudge_case(runtime):
         params.update(changes)
         return await manager.accept_nudge(actor, target, **params)
 
+    from power_loop.runtime.result_consumption import finish as finish_consumption
+    from power_loop.runtime.result_consumption import observe
+    from power_loop.runtime.task_runtime import Execution
+    binding = Execution(SimpleNamespace(manager=manager), child_actor, receiver)
+    binding.resource_evidence["_control_source"] = await manager._row(manager.db, receiver.job_id)
+
     async def consume(operation, *, complete=True):
         rows = await store.inbox_claim(sid)
         seq = await store.append_message(sid, role="user", content="NUDGED-42", send_index=1,
             inbox={"claim_token": rows[0]["claim_token"], "ids": [r["id"] for r in rows]})
-        snapshot = await manager.prepare_processing(child_actor, receiver, round_index=0, send_index=1,
-            messages=[{"seq": seq, "role": "user", "content": "NUDGED-42"}])
-        seq = await store.append_message(sid, role="assistant", content="NUDGED-42", send_index=1, round_index=0)
-        response = await store.message_ref(sid, seq)
-        ids = await manager.commit_processing_decision(child_actor, receiver, snapshot_id=snapshot, response_ref=response, reason="processed input")
+        await observe(binding, [{"seq": seq, "role": "user", "content": "NUDGED-42",
+            "item_ids": [r["item_id"] for r in rows]}], round_index=0, send_index=1)
+        await store.append_message(sid, role="assistant", content="NUDGED-42", send_index=1, round_index=0)
         if complete:
-            await manager.close_model_execution(child_actor, receiver, evidence={"exit": "completed",
-                "last_assistant_ref": response.to_dict(), "processing_decisions": ids})
-        return ids
+            await finish_consumption(binding)
+            await manager.close_model_execution(child_actor, receiver, evidence={"exit": "completed"})
+        return tuple(binding.consumed_inputs)
 
     return SimpleNamespace(store=store, manager=manager, actor=actor, caller=caller, supervisor=supervisor, target=target, sid=sid,
-        child_actor=child_actor, receiver=receiver, origin=origin, accept=accept, consume=consume, connect=connect, now=now)
+        child_actor=child_actor, receiver=receiver, origin=origin, accept=accept, consume=consume, binding=binding, connect=connect, now=now)
 
 
 async def test_atomic_nudge_receipt_call_and_inbox_survive_reopen_and_original_caller_close(nudge_case):
@@ -182,10 +186,9 @@ async def test_pending_or_history_only_input_blocks_success_until_original_recei
     assert (await c.manager.get_job(c.child_actor, c.target.job_id)).result_status == "none"
     with pytest.raises(JobError, match="required_input_unhandled"):
         await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={}, resource_state="stopped", require_children_stopped=True)
-    [decision] = await c.manager.db.fetchall(f"SELECT event_id,payload_json FROM {c.manager.events} WHERE event_type='processing_decision'")
-    payload = json.loads(decision["payload_json"])
-    await c.manager.close_model_execution(c.child_actor, c.receiver, evidence={"exit": "completed",
-        "last_assistant_ref": payload["response_ref"], "processing_decisions": [decision["event_id"]]})
+    from power_loop.runtime.result_consumption import finish as finish_consumption
+    await finish_consumption(c.binding)
+    await c.manager.close_model_execution(c.child_actor, c.receiver, evidence={"exit": "completed"})
     await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={"answer": "NUDGED-42"},
                                             resource_state="stopped", require_children_stopped=True)
     saved = await c.manager.get_job(c.child_actor, c.target.job_id)
@@ -453,42 +456,41 @@ async def test_same_invocation_replay_after_target_finishes_is_read_only(managed
     assert len(await manager.db.fetchall(f"SELECT event_id FROM {manager.events} WHERE action='nudge'")) == 1
 
 
-@pytest.mark.parametrize("visibility", ["missing", "rewritten", "wrong_session"])
+@pytest.mark.parametrize("visibility", ["missing", "rewritten", "short_circuit"])
 async def test_receiver_cannot_ack_an_input_not_carried_by_its_request(nudge_case, visibility):
+    from power_loop.runtime.task_runtime import _SEND, observe_model_inputs
     c = nudge_case
     await c.accept()
     rows = await c.store.inbox_claim(c.sid)
     seq = await c.store.append_message(c.sid, role="user", content="NUDGED-42", send_index=1,
         inbox={"claim_token": rows[0]["claim_token"], "ids": [r["id"] for r in rows]})
-    original = await c.manager.db.fetchone(f"SELECT event_id,payload_json FROM {c.manager.events} WHERE action='nudge'")
-    if visibility == "wrong_session":
-        await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE action='nudge'",
-            (json.dumps({"request": {"session_id": "wrong"}}),))
+    raw = {"seq": seq, "role": "user", "content": "NUDGED-42", "item_ids": [r["item_id"] for r in rows]}
+    message = {"role": "user", "content": "different" if visibility == "rewritten" else "NUDGED-42"}
+    pipeline = SimpleNamespace(session_id=c.sid, send_index=1, history=[message],
+        sink=SimpleNamespace(_history_seqs=[seq], _input_messages={seq: raw}))
+    token = _SEND.set(c.binding)
     try:
-        messages = [] if visibility == "missing" else [{"seq": seq, "role": "user",
-            "content": "different" if visibility == "rewritten" else "NUDGED-42"}]
-        assert await c.manager.prepare_processing(c.child_actor, c.receiver, round_index=0, send_index=1, messages=messages) is None
-        with pytest.raises(JobError, match="required_input_unhandled"):
-            await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={}, resource_state="stopped", require_children_stopped=True)
-        if visibility == "wrong_session":
-            assert (await c.manager.db.fetchone(f"SELECT payload_json FROM {c.manager.events} WHERE event_id=?",
-                (original['event_id'],)))['payload_json'] == json.dumps({"request": {"session_id": "wrong"}})
+        await observe_model_inputs(pipeline, [] if visibility == "missing" else [message], 0,
+            provider_call=visibility != "short_circuit")
     finally:
-        if visibility == "wrong_session":
-            await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?",
-                                      (original['payload_json'], original['event_id']))
+        _SEND.reset(token)
+    assert not c.binding.consumed_inputs
+    with pytest.raises(JobError, match="required_input_unhandled"):
+        await c.manager.record_execution_result(c.child_actor, c.target, outcome="succeeded", result={},
+            resource_state="stopped", require_children_stopped=True)
+
 
 
 async def test_originating_parent_cannot_handle_the_receivers_input(nudge_case):
+    from power_loop.runtime.result_consumption import require_event_handled
     c = nudge_case
     operation, _ = await c.accept()
     await c.consume(operation)
-    [request] = await c.manager.db.fetchall(f"SELECT event_id,payload_json FROM {c.manager.events} WHERE event_type='processing_request'")
-    [decision] = await c.manager.db.fetchall(f"SELECT payload_json FROM {c.manager.events} WHERE event_type='processing_decision'")
-    response = json.loads(decision["payload_json"])["response_ref"]
-    ref = await c.store.message_ref(c.sid, int(response["seq"]))
-    with pytest.raises(JobError, match="processing_snapshot_mismatch"):
-        await c.manager.commit_processing_decision(c.actor, c.caller, snapshot_id=request["event_id"], response_ref=ref, reason="parent ack")
+    [event] = await c.manager.db.fetchall(f"SELECT * FROM {c.manager.events} WHERE action='nudge'")
+    with pytest.raises(JobError, match="required_input_unhandled"):
+        await require_event_handled(c.manager, c.manager.db, event,
+            session_id=c.actor.session_id, owner_job_id=c.caller.job_id)
+
 
 
 async def test_nudge_requires_current_model_send_and_persisted_invocation(managed):
@@ -562,19 +564,6 @@ async def test_nudge_rejects_wrong_execution_roles_kinds_and_conflicting_action(
         with pytest.raises(JobError, match="operation_conflict"):
             await c.accept()
     assert (await c.store.inbox_counts(c.sid))["pending"] == 0
-
-
-@pytest.mark.parametrize("proof_field", ["job_id", "generation", "executor_id", "boot_id"])
-async def test_input_from_another_generation_cannot_be_acknowledged(nudge_case, proof_field):
-    c = nudge_case
-    op, _ = await c.accept()
-    payload = op.result
-    payload["request"]["target"][proof_field] = 999 if proof_field == "generation" else "forged"
-    await c.manager.db.execute(f"UPDATE {c.manager.events} SET payload_json=? WHERE event_id=?", (json.dumps(payload), op.operation_id))
-    with pytest.raises(JobError, match="processing_input_mismatch"):
-        await c.consume(op)
-    event = await c.manager.db.fetchone(f"SELECT delivery_status FROM {c.manager.events} WHERE event_id=?", (op.operation_id,))
-    assert event["delivery_status"] == "pending_delivery"
 
 
 async def test_inbox_identity_collision_rolls_back_operation_and_keeps_original_item(nudge_case, monkeypatch):

@@ -119,7 +119,7 @@ async def _validate_entry(manager, tx, actor, owner, event, data):
 
 async def references(manager, tx, actor, owner, *, success):
     """Retain each original waiting phase in success and supervision proofs."""
-    from .processing import require_event_handled
+    from .result_consumption import require_event_handled
 
     events = await tx.fetchall(f"SELECT * FROM {manager.events} WHERE job_id=? AND event_type IN "
         "('owner_waiting','owner_wait_resumed','owner_wait_expired')", (owner["job_id"],))
@@ -235,7 +235,7 @@ async def _pending(manager, tx, actor, owner, sid=None):
             if effect is not None and data["request"]["decision"] == "continue":
                 op = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=?", (waits._object(effect["payload_json"])["operation_id"],))
                 if op is not None and op["delivery_status"] == "handled":
-                    from .processing import require_event_handled
+                    from .result_consumption import require_event_handled
                     await require_event_handled(manager, tx, op, session_id=saved["binding"]["session_id"], owner_job_id=owner["job_id"])
                     continue
         pending.append((job, event, saved))

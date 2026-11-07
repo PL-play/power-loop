@@ -79,22 +79,6 @@ async def _references(manager, tx, event_ids, known=None):
     return [_event_reference(found[key]) for key in event_ids]
 
 
-async def _processing_references(manager, tx, event):
-    if event.get("action") == "nudge":
-        from .input_dispositions import event_ids, read_tx
-        disposed = await read_tx(manager, tx, event)
-        if disposed is not None:
-            return [await _reference(manager, tx, key) for key in event_ids(disposed)]
-    decision_id = "decision_" + _hash([event["event_id"], event["job_version"], _hash(_object(event["payload_json"]))])[:48]
-    decision = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='processing_decision'", (decision_id,))
-    if decision is None:
-        raise JobError("finalization_evidence_missing")
-    data = _object(decision["payload_json"])
-    return [await _reference(manager, tx, decision_id),
-        await _reference(manager, tx, result_id(data["handler_job_id"], 1))]
-
-
-
 async def closed(manager, tx, row, generation=None, *, _state=None):
     generation = row["generation"] if generation is None else generation
     event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='result'",
@@ -110,8 +94,7 @@ async def _finish(manager, tx, row, seen):
     seen.add(row["job_id"])
     if row["resource_state"] != "stopped" or row["intake"] != "closed":
         raise JobError("finalization_execution_unsettled")
-    event = await tx.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='result'",
-                             (result_id(row["job_id"], row["generation"]),))
+    event = await tx.result_event(result_id(row["job_id"], row["generation"]))
     if event is None:
         raise JobError("finalization_result_unsettled")
     if row["supervision_status"] == "closed":
@@ -126,6 +109,8 @@ async def _finish(manager, tx, row, seen):
     item_id = hashlib.sha256(("result:" + event["event_id"]).encode()).hexdigest()
     parent = await manager._row(tx, row["parent_job_id"]) if row["parent_job_id"] else None
     if parent:
+        if row["kind"] in {"subagent", "workflow", "workflow_node", "background_tool", "background_command"} and event["delivery_status"] not in {"handled", "suppressed"}:
+            raise JobError("finalization_result_unhandled")
         pending = await tx.fetchone(f"SELECT item_id FROM {manager.store.t.follow_up_queue} "
             "WHERE session_id=? AND item_id=? AND status IN ('pending','claimed')", (parent["session_id"], item_id))
         if pending:
@@ -138,11 +123,14 @@ async def _finish(manager, tx, row, seen):
         raise JobError("job_count_exceeded")
     for child in children:
         await _finish(manager, tx, child, seen)
+    now = manager.now()
     changed = await tx.write_job(row["job_id"], f"UPDATE {manager.jobs} SET supervision_status='closed',"
         "version=version+1,updated_at=? WHERE job_id=? AND generation=? AND version=? AND supervision_status='open'",
-        (manager.now(), row["job_id"], row["generation"], row["version"]), obligations=True)
+        (now, row["job_id"], row["generation"], row["version"]), obligations=True)
     if changed != 1:
         raise JobError("finalization_execution_changed")
+    tx.remember_row(manager.jobs, "job_id", row["job_id"],
+        {**row, "supervision_status": "closed", "version": row["version"] + 1, "updated_at": now})
     for table in ("execution_checkpoints", "execution_allocations", "task_budget_attempts"):
         await tx.execute(f"DELETE FROM {manager.prefix}{table} WHERE job_id=?", (row["job_id"],))
     return _event_reference(event)
@@ -162,20 +150,10 @@ async def try_finalize(manager, actor, job_id, generation):
     except JobError as exc:
         return {"status": "pending", "reason": exc.code}
 
-async def after_send(manager, actor, lease):
-    """Read the original successful consumer exits, then close eligible scopes."""
+async def after_send(manager, actor, lease, *, consumed=()):
+    """Close eligible original targets from this execution's used references."""
     results = []
-    exit = await manager.db.fetchone(f"SELECT payload_json FROM {manager.events} WHERE event_id=? AND event_type='result'", (result_id(lease.job_id, lease.generation),))
-    evidence = json.loads(exit["payload_json"]).get("evidence", {}) if exit else {}
-    decision_ids = evidence.get("processing_decisions", [])
-    if not isinstance(decision_ids, list) or len(decision_ids) > 10000:
-        raise JobError("finalization_consumer_evidence_corrupt")
-    targets, rows = {lease.job_id}, {}
-    for decision_id in decision_ids:
-        event = await manager.db.fetchone(f"SELECT * FROM {manager.events} WHERE event_id=? AND event_type='processing_decision'", (decision_id,))
-        if event is None or event["caller_session_id"] != actor.session_id or json.loads(event["payload_json"]).get("handler_job_id") != lease.job_id:
-            raise JobError("finalization_consumer_evidence_corrupt")
-        targets.add(json.loads(event["payload_json"])["event"]["job_id"])
+    targets, rows = {lease.job_id, *consumed}, {}
     # Older creator sends may now have all their independent work settled.
     for job_id in list(targets):
         try:

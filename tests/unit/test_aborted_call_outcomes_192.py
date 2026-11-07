@@ -131,7 +131,7 @@ async def test_actual_review_rejects_new_effects_even_with_a_control_schema(regi
         raise AssertionError('new resource cannot be admitted')
     definition = ToolDefinition('inspect_original', '', input_schema={'type': 'object'}, pricing=Free("test_fixture"))
     loop.tool_registry.register(definition, FunctionRuntimeTool(control, ToolRuntimeContract('example.original-control'),
-        policy=lambda args: ToolDispatchPolicy(True, True), reviewer=lambda spec: spec))
+        policy=lambda args: ToolDispatchPolicy(True, True)))
     original = c.registry.get('post_once')
     loop.tool_registry.register(original.definition, original.handler)
     async def complete(request, **kwargs):
