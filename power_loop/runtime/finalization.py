@@ -153,24 +153,32 @@ async def try_finalize(manager, actor, job_id, generation):
 async def after_send(manager, actor, lease, *, consumed=()):
     """Close eligible original targets from this execution's used references."""
     results = []
-    targets, rows = {lease.job_id, *consumed}, {}
-    # Older creator sends may now have all their independent work settled.
-    for job_id in list(targets):
-        try:
-            row = rows[job_id] = await manager._authorize(manager.db, actor, job_id)
-        except JobError as exc:
-            # Physical node sessions may consume their own input while the
-            # logical node is authorized only to its owning engine. Do not
-            # enlarge that session's authority or fail its completed send.
-            results.append({"status": "pending", "reason": exc.code})
+    originals = {lease.job_id, *consumed}
+    targets, visited = sorted(originals), set()
+    while targets:
+        job_id = targets.pop(0)
+        if job_id in visited:
             continue
-        if row["parent_job_id"]:
-            targets.add(row["parent_job_id"])
-    for job_id in sorted(targets):
+        visited.add(job_id)
         try:
-            row = rows.get(job_id) or await manager._authorize(manager.db, actor, job_id)
-            results.append(await try_finalize(manager, actor, job_id, row["generation"]))
+            # Authorization, parent discovery and finalization share this root's
+            # existing write transaction. Never carry a job row into a later one.
+            async with manager.joined_write() as tx:
+                row = await manager._authorize(tx, actor, job_id)
+                if job_id in originals and row["parent_job_id"]:
+                    targets.append(row["parent_job_id"])
+                generation = row["generation"]
+                try:
+                    closure = await _finish(manager, tx, row, set())
+                except (TypeError, ValueError, KeyError, AttributeError) as exc:
+                    if isinstance(exc, JobError):
+                        raise
+                    raise JobError("finalization_evidence_corrupt") from exc
+            manager._publish_closure(actor, job_id, generation, closure)
+            results.append({"status": "closed", "closure": closure})
         except JobError as exc:
+            # Independent leaves can finish while the original creator still
+            # has pending work. Each failed target rolls back its own transaction.
             results.append({"status": "pending", "reason": exc.code})
     return results
 

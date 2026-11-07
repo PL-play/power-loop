@@ -293,10 +293,14 @@ class RuntimeInputStore:
     async def has_pending(self, sid):
         return await self.db.fetchone(f"SELECT id FROM {self.q} WHERE session_id=? AND status='pending' LIMIT 1", (sid,)) is not None
 
-    async def resolve_job(self, reader, ref, actor):
+    async def resolve_job(self, reader, ref, actor, *, result_event_id=None):
         self.check_store(ref)
-        row = await reader.fetchone(f"SELECT j.*,s.metadata_json AS auth_metadata,s.parent_session_id AS auth_parent "
-            f"FROM {self.jobs} j JOIN {self.store.t.sessions} s ON s.session_id=j.session_id WHERE j.job_id=?", (ref.job_id,))
+        result_column = ",e.payload_json AS original_result" if result_event_id else ""
+        result_join = (f" LEFT JOIN {self.events} e ON e.event_id=? AND e.event_type='result'"
+                       if result_event_id else "")
+        row = await reader.fetchone(f"SELECT j.*,s.metadata_json AS auth_metadata,s.parent_session_id AS auth_parent{result_column} "
+            f"FROM {self.jobs} j JOIN {self.store.t.sessions} s ON s.session_id=j.session_id{result_join} WHERE j.job_id=?",
+            (result_event_id, ref.job_id) if result_event_id else (ref.job_id,))
         if row is None:
             raise RuntimeRequestError("not_found")
         session = {"metadata_json": row.pop("auth_metadata"), "parent_session_id": row.pop("auth_parent")}
@@ -335,14 +339,19 @@ class RuntimeInputStore:
                 self._authorize_loaded_job(job, ref.session_id, actor)
                 raw_result = job.pop("original_result")
             else:
-                job = await self.resolve_job(reader, job_ref, actor)
+                # An explicit generation already identifies the immutable event.
+                # None still needs the current job generation from this snapshot.
+                event_id = result_id(ref.job_id, ref.generation) if ref.generation is not None else None
+                job = await self.resolve_job(reader, job_ref, actor, result_event_id=event_id)
+                if event_id:
+                    raw_result = job.pop("original_result")
             choice = job["generation"] if job_ref.generation is None else job_ref.generation
             if choice > job["generation"]:
                 raise RuntimeRequestError("stale_generation")
             selected = 1 if choice == 0 and job["generation"] > 0 else choice
             fixed = JobRef(ref.store_id, job["job_id"], choice)
             actual = JobRef(ref.store_id, job["job_id"], selected)
-            if input_ref is None:
+            if input_ref is None and job_ref.generation is None:
                 event = await reader.fetchone(f"SELECT payload_json FROM {self.events} WHERE event_id=? AND event_type='result'",
                     (result_id(job["job_id"], selected),))
                 raw_result = event["payload_json"] if event else None
@@ -376,12 +385,13 @@ class RuntimeInputStore:
         """Render the exact saved generation referenced by a parent notification."""
         reader = reader or self.db
         reference = record.meta["result_ref"]
-        event = await reader.fetchone(f"SELECT payload_json FROM {self.events} WHERE event_id=? AND job_id=?",
+        event = await reader.fetchone(f"SELECT e.payload_json,j.kind,j.parent_job_id FROM {self.events} e "
+            f"JOIN {self.jobs} j ON j.job_id=e.job_id WHERE e.event_id=? AND e.job_id=?",
             (reference["result_id"], reference["job_id"]))
         payload = json.loads(event["payload_json"])
         if payload["generation"] != reference["generation"]:
             raise RuntimeRequestError("stale_generation")
-        job = await reader.fetchone(f"SELECT kind,parent_job_id FROM {self.jobs} WHERE job_id=?", (reference["job_id"],))
+        job = event
         profile = record.meta
         if profile['descriptor'] is None:
             original = await self.execution_input(reader, record.ref.session_id, job["parent_job_id"])

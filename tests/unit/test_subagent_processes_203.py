@@ -17,7 +17,7 @@ __all__ = ['registry_store']
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
 
-async def test_parent_a_child_b_parent_c_with_original_budget(registry_store, tmp_path):
+async def test_parent_a_child_b_parent_c_with_original_budget(registry_store, tmp_path, parent_lost=False):
     store, _ = registry_store
     descriptor = dict(schema_version=1,kind='agent',definition_ref='p3.agent@1', model_profile_ref=None,
         tool_profile_ref='p3.tools@1', hook_profile_ref='p3.hooks@1',resource_profile_ref='p3.resources@1',config={},host_context={})
@@ -49,10 +49,11 @@ async def test_parent_a_child_b_parent_c_with_original_budget(registry_store, tm
     client = RuntimeClient(store=store,transport=transport)
     actor = TrustedActor('tenant','principal',None)
     try:
-        a = await launch('A')
+        a = await launch('A-parent_lost' if parent_lost else 'A')
         created = await event(a,'parent_finished')
-        await asyncio.wait_for(a.wait(),10)
-        assert a.returncode==0, a._stderr_path.read_bytes().decode()[-20000:]
+        if not parent_lost:
+            await asyncio.wait_for(a.wait(),10)
+            assert a.returncode==0, a._stderr_path.read_bytes().decode()[-20000:]
         assert len(created['children'])==2
         one,two = created['children']
         b = await launch('B')
@@ -60,6 +61,10 @@ async def test_parent_a_child_b_parent_c_with_original_budget(registry_store, tm
         for _ in range(2):
             running = await event(b,'child_running')
             assert running['allocation_calls'] == running['used_calls'] == 1
+        if parent_lost:
+            assert a.returncode is None
+            a.kill()
+            await a.wait()
         c = await launch('C')
         await event(c,'ready')
         await command(c,dict(id='discover',tool='jobs',args=dict(action='list',kinds=['subagent'])))

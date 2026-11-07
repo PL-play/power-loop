@@ -136,6 +136,8 @@ async def main():
             except ValueError:
                 raise AssertionError(outputs) from None
             report(event='parent_finished',job_id=result.job_ref.job_id,children=children)
+            if scenario == 'parent_lost':
+                await asyncio.to_thread(sys.stdin.readline)
         else:
             report(event='ready')
             while True:

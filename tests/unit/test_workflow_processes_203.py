@@ -196,6 +196,13 @@ async def test_new_driver_reuses_live_leaf_and_completed_dependency(registry_sto
             assert (tmp_path / "B-actions").read_text().splitlines() == ["external action"]
             with pytest.raises(RuntimeRequestError, match="budget_exceeded"):
                 await handle.resume(generation=2, node_id="A", message="over budget", message_id="over")
+        # A fresh invocation after replacement uses new work, without changing
+        # any of the original identities, result or billing assertions above.
+        following = await client.workflow(target, {"name": "next", "root": leaf("B")},
+                                          message_id="next", actor=actor)
+        next_result = await client.wait(JobRef(store.store_id, following.job_id, 0),
+                                       actor=actor, deadline_ms=now_ms() + 20000)
+        assert next_result.status == "completed", next_result
     finally:
         for process in processes:
             if process.returncode is None:
