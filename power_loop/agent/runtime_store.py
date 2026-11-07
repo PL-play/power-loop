@@ -375,8 +375,13 @@ class RuntimeInputStore:
 
     async def execution_input(self, reader, session_id, job_id):
         """The first accepted input bound to this execution owns its frozen profile."""
-        row = await reader.fetchone(f"SELECT * FROM {self.q} WHERE session_id=? "
-            "AND delivered_job_id=? ORDER BY id LIMIT 1", (session_id, job_id))
+        # A workflow leaf's model send is an inner job. Its accepted input is
+        # bound to the owning leaf, while a delegated child names that send as
+        # its parent. Resolve that existing relation in the same read.
+        row = await reader.fetchone(f"SELECT q.* FROM {self.jobs} j JOIN {self.q} q "
+            "ON q.delivered_job_id=CASE WHEN j.kind='send' AND j.parent_job_id IS NOT NULL "
+            "THEN j.parent_job_id ELSE j.job_id END "
+            "WHERE q.session_id=? AND j.job_id=? ORDER BY q.id LIMIT 1", (session_id, job_id))
         if row is None:
             raise RuntimeRequestError("definition_unavailable", "original execution input missing")
         return self.record(row)
