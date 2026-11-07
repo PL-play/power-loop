@@ -126,6 +126,7 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
         elapsed_s = time.monotonic() - started
         sql = _counts(profiled.records, profiled.tx_sites)
         sql["total"] = len(profiled.records)
+        records, tx_sites = list(profiled.records), list(profiled.tx_sites)
         assert result.status == "completed" and model.calls == r
         writes = await meter.report() if meter else None
         largest = {}
@@ -138,7 +139,7 @@ async def test_rows(registry_store, r, k, budgeted):  # noqa: F811
             with open(OUT, "a") as f:
                 f.write(json.dumps({"db": store._db.dialect.name, "R": r, "K": k, "T": (r - 1) * k,
                                     "budgeted": budgeted, "tables": delta, "job_events": ev,
-                                    "sql": sql, "transactions": len(profiled.tx_sites),
+                                    "sql": sql, "transactions": len(tx_sites), "records": records, "tx_sites": tx_sites,
                                     "writes": writes, "elapsed_s": elapsed_s, "largest": largest}) + "\n")
         assert delta.get('task_budget_attempts', (0, 0))[0] == 0
         assert largest.get('task_budget_attempts', 0) == 0

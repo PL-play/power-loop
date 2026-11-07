@@ -937,3 +937,74 @@ async def test_host_subscribes_to_its_input_before_send_and_cannot_cross_tenants
         finally:
             model.release.set()
             await output.aclose()
+
+class QueuedStreamModel(LLMService):
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.commands = asyncio.Queue()
+
+    async def complete(self, request, **callbacks):
+        self.started.set()
+        while True:
+            count, done = await self.commands.get()
+            if count == 0:
+                break
+            for _ in range(count):
+                callbacks['on_chunk_delta_text']('x')
+                await asyncio.sleep(0.03)
+            done.set()
+        return LLMResponse(raw_text='42')
+
+    async def close(self):
+        pass
+
+async def test_queued_subscription_ignores_other_request_before_read(registry_store):
+    import os
+
+    from tests.runtime_fixture import RunningAgent
+    from tests.unit.test_send_sql_profile import Profiled
+    store, _ = registry_store
+    raw = store._db
+    store._db = p = Profiled(raw)
+    model = QueuedStreamModel()
+    runner = await RunningAgent(store, model, config=AgentLoopConfig(max_rounds=1, compactor=None)).start()
+    out = None
+    pending = None
+    try:
+        c = runner.runtime.client
+        first = await c.send(runner.target, 'first', message_id='first', actor=runner.actor)
+        await asyncio.wait_for(model.started.wait(), 10)
+        second = InputRef(store.store_id, runner.target.session_id, 'second')
+        out = await c.subscribe_output(second, actor=runner.actor, before_send=True)
+        await c.send(runner.target, 'second', message_id='second', actor=runner.actor)
+        assert (await anext(out)).kind == 'gap'
+        pending = asyncio.create_task(anext(out))
+        await asyncio.sleep(0.05)
+        for n in [5, 20]:
+            p.records.clear()
+            p.transactions = 0
+            p.tx_sites.clear()
+            done = asyncio.Event()
+            await model.commands.put((n, done))
+            await asyncio.wait_for(done.wait(), 10)
+            await asyncio.sleep(0.1)
+            reads = [r for r in p.records if 'agent.runtime_client:__anext__' in r['chain']]
+            tx = [x for x in p.tx_sites if 'agent.runtime_client:__anext__' in x]
+            assert len(reads) == len(tx) == 0
+            if path := os.environ.get('P5BR1_STREAM_OUT'):
+                with open(path, 'a') as f:
+                    f.write(json.dumps({'db': store._db.dialect.name, 'deltas': n, 'sql': len(reads), 'transactions': len(tx)}) + '\n')
+        await c.cancel(second, actor=runner.actor)
+        assert (await asyncio.wait_for(pending, 5)).kind == 'completed'
+        await model.commands.put((0, None))
+        await c.wait(first.input_ref, actor=runner.actor, deadline_ms=None)
+        await runner.drain()
+    finally:
+        if pending and (not pending.done()):
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        if out:
+            await out.aclose()
+        await runner.aclose()
+        store._db = raw

@@ -20,9 +20,12 @@ class RunningAgent:
     def __init__(self, store, model, registry=None, config=None, *, task_runtime=None, hooks=None):
         self.config = config or AgentLoopConfig(compactor=None)
         self.executions = {}
+        self.execution_started = asyncio.Condition()
         factory = RegistryRuntimeFactory()
         async def build(descriptor, context):
             self.executions[context.input_ref] = asyncio.current_task()
+            async with self.execution_started:
+                self.execution_started.notify_all()
             return ExecutionEnvironment(model, registry, self.config, hooks=hooks, task_runtime=task_runtime)
         factory.register('fixture.agent@1', build)
         self.runtime = Runtime(store=store, factory=factory, node_id='fixture', boot_id='boot',
@@ -57,7 +60,11 @@ class RunningAgent:
         if task:
             await asyncio.gather(task)
 
-    async def drain(self):
+    async def drain(self, *, after_input=None):
+        if after_input is not None:
+            async with asyncio.timeout(15), self.execution_started:
+                await self.execution_started.wait_for(lambda: after_input in self.executions)
+            await self.finish(after_input)
         while self.runtime.worker._tasks:
             await asyncio.gather(*tuple(self.runtime.worker._tasks))
 

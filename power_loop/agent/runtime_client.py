@@ -437,6 +437,9 @@ class OutputSubscription:
                     await self.aclose()
                     raise
                 await delivery.ack()
+                if (isinstance(self.ref, InputRef) and delivery.packet.input_ref is not None
+                        and delivery.packet.input_ref != self.ref):
+                    continue
                 payload = delivery.packet.payload or {}
                 if payload.get("kind") == "delta":
                     if self.job_ref is None:
