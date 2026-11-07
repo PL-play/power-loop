@@ -102,7 +102,8 @@ async def test_complete_flow_cost(registry_store, tmp_path, flow):
         if output := os.environ.get('P3_FLOW_OUT'):
             with Path(output).open('a') as file:
                 file.write(json.dumps({'db':original.dialect.name,'flow':flow,'sql':sql,'tables':delta,
-                    'writes':writes,'elapsed_s':elapsed,'B':None,'comparison':'no equivalent fixed-B flow case; ordinary-send B comparison is reported separately'})+'\n')
+                    'writes':writes,'elapsed_s':elapsed,'records':profiled.records,'tx_sites':profiled.tx_sites,
+                    'B':None,'comparison':'no equivalent fixed-B flow case; ordinary-send B comparison is reported separately'})+'\n')
     finally:
         gate.set()
         await runner.aclose()
