@@ -68,9 +68,11 @@ async def test_unknown_acceptance_is_not_replayed_and_next_timer_can_fire(regist
             raise ConnectionError('acceptance reply lost')
         monkeypatch.setattr(runtime.client, 'append', lose_reply)
         timer = await runtime.timer_backend.create(source, delay_s=-1, note='unknown original')
-        with pytest.raises(ConnectionError, match='reply lost'):
-            await runtime.timer_driver.scan_once()
-        assert (await store.get_timer(target.session_id, timer.timer_id)).status == 'fired'
+        assert await runtime.timer_driver.scan_once() == 0
+        assert (await store.get_timer(target.session_id, timer.timer_id)).status == 'unknown'
+        assert 'acceptance reply lost' in runtime.status()['timer']['last_error']
+        ref = InputRef(store.store_id, target.session_id, calls[0])
+        assert (await runtime.client.wait(ref, actor=actor, deadline_ms=now_ms()+10000)).status == 'completed'
         assert await runtime.timer_driver.scan_once() == 0
         assert len(calls) == 1
         monkeypatch.setattr(runtime.client, 'append', original)
