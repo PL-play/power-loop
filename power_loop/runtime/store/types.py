@@ -64,7 +64,7 @@ class MessageState(str, Enum):
 @dataclass
 class TimerRow:
     """A durable per-session wake-up. One-shot (interval_s is None):
-    armed -> firing -> fired | cancelled. Recurring (interval_s set):
+    armed -> firing -> fired | cancelled | unknown. Recurring (interval_s set):
     armed -> firing -> armed again at fire-time + interval (fixed-delay,
     missed periods while down collapse into one) until cancelled.
     The row is the source of truth; in-process scheduling is just an

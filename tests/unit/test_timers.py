@@ -11,8 +11,11 @@ from typing import Any
 import pytest
 
 from power_loop import (
+    AgentHooks,
     AgentLoopConfig,
     ExecutionEnvironment,
+    HookPoint,
+    InputRef,
     RegistryRuntimeFactory,
     Runtime,
     RuntimeRequestError,
@@ -70,14 +73,14 @@ def _tool_resp(call_id: str, name: str, args: str) -> LLMResponse:
 
 
 @asynccontextmanager
-async def timers(store, model=None):
+async def timers(store, model=None, *, hooks=None):
     from .test_runtime_messaging_203 import fixture
     _, target, actor = await fixture(store)
     factory = RegistryRuntimeFactory()
     async def build(descriptor, context):
         return ExecutionEnvironment(model or _Scripted(), None, AgentLoopConfig(compactor=None))
     factory.register('test.agent@1', build)
-    runtime = Runtime(store=store, factory=factory, node_id='timer-test')
+    runtime = Runtime(store=store, factory=factory, node_id='timer-test', hooks=hooks)
     await runtime.worker.start()
     # Explicit scans make time/races deterministic; lifecycle itself is tested below.
     await runtime.timer_driver.stop()
@@ -151,6 +154,46 @@ async def test_periodic_fixed_delay_and_unknown_occurrence_not_replayed(registry
         assert (await store.get_timer(target.session_id,one.timer_id)).status == 'cancelled'
         rows = await store._db.fetchall(f'SELECT item_id FROM {store.t.follow_up_queue} WHERE session_id=?',(target.session_id,))
         assert len(rows) == 1
+
+
+async def test_default_timer_hook_failure_is_visible_and_scan_continues(registry_store):
+    store, _ = registry_store
+    hooks = AgentHooks()
+
+    def fail_before_append(ctx):
+        if ctx.note == 'bad':
+            raise RuntimeError('test timer hook failure')
+
+    class RecordingModel(_Scripted):
+        async def complete(self, request, **kwargs):
+            requests.append(str(request.messages))
+            return await super().complete(request, **kwargs)
+
+    requests = []
+    hooks.register(HookPoint.TIMER_FIRE, fail_before_append)
+    async with timers(store, RecordingModel(), hooks=hooks) as (runtime, target, actor, source):
+        backend = runtime.timer_backend
+        bad = await backend.create(source, due_at_ms=1, note='bad')
+        assert await runtime.timer_driver.scan_once() == 0
+        [row] = await backend.list(source, statuses=('unknown',))
+        assert row.timer_id == bad.timer_id and row.last_fired_at is None
+        assert not await store._db.fetchall(f'SELECT item_id FROM {store.t.follow_up_queue}')
+        error = runtime.status()['timer']['last_error']
+        assert f'/{bad.timer_id} unknown: RuntimeError: test timer hook failure' in error
+        assert await runtime.timer_driver.scan_once() == 0
+        assert runtime.status()['timer']['last_error'] == error
+
+        recurring = await backend.create(source, due_at_ms=1, note='bad', interval_s=60)
+        good = await backend.create(source, due_at_ms=2, note='GOOD_TIMER_NOTE')
+        assert await runtime.timer_driver.scan_once() == 1
+        [rearmed] = await backend.list(source)
+        assert (rearmed.timer_id, rearmed.fire_count) == (recurring.timer_id, 1)
+        assert rearmed.due_at > int(time.time()*1000)
+        ref = InputRef(store.store_id, target.session_id, f'timer-{good.timer_id}-{good.created_at}-0')
+        result = await runtime.client.wait(ref, actor=actor, deadline_ms=int(time.time()*1000)+10000)
+        assert result.status == 'completed'
+        assert len(requests) == 1 and 'GOOD_TIMER_NOTE' in requests[0]
+        assert await store.prune_timers(target.session_id, statuses=('unknown',)) == 1
 
 
 async def test_busy_append_and_driver_stop_do_not_wait_for_or_cancel_model(registry_store):

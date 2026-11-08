@@ -48,6 +48,11 @@ class TimerBackend(Protocol):
 
 @dataclass(frozen=True)
 class TimerDriverStatus:
+    """Driver readiness and the last observed error.
+
+    The default driver retains its last error across scans until restarted.
+    """
+
     mode: str
     ready: bool
     last_scan_ms: int | None = None

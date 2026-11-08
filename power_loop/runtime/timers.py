@@ -76,14 +76,16 @@ class TimerRunner:
                 async with asyncio.timeout(self.acceptance_timeout_s):
                     await self._deliver(timer)
                 count += 1
-            except BaseException as exc:
+            except (Exception, asyncio.CancelledError) as exc:
                 # Never automatically replay an unknown accepted input. End this
                 # occurrence, allowing a recurring timer's next occurrence.
-                await self.store.finish_firing_timer(timer.session_id, timer.timer_id)
-                self._status = replace(self._status, last_error=str(exc)[:500], ready=False)
+                error = f'timer {timer.session_id}/{timer.timer_id} unknown: {type(exc).__name__}: {exc}'
+                self._status = replace(self._status, last_error=error[:500])
+                await self.store.finish_firing_timer(timer.session_id, timer.timer_id, unknown=True)
                 self._emit(timer, 'unknown')
-                raise
-        self._status = replace(self._status, ready=True, last_scan_ms=int(time.time()*1000), last_error=None)
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+        self._status = replace(self._status, ready=True, last_scan_ms=int(time.time()*1000))
         return count
 
     async def _deliver(self, timer):

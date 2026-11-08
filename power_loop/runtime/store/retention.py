@@ -31,7 +31,7 @@ async def prune_timers(store, session_id, *, statuses, cutoff, limit):
     limit = batch_limit(limit)
     if not statuses:
         return 0
-    if not set(statuses) <= {'fired', 'cancelled'}:
+    if not set(statuses) <= {'fired', 'cancelled', 'unknown'}:
         raise ValueError('only terminal timers can be pruned')
     where, params = 'status IN ('+','.join('?' for _ in statuses)+')', list(statuses)
     if session_id is not None:

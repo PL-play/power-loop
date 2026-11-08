@@ -1627,21 +1627,21 @@ class SessionStore:
             )
         return affected > 0
 
-    async def finish_firing_timer(self, session_id: str, timer_id: int) -> bool:
-        """Complete a delivery: one-shot firing -> fired (due_at unchanged); recurring
+    async def finish_firing_timer(self, session_id: str, timer_id: int, *, unknown: bool = False) -> bool:
+        """End an occurrence: one-shot firing -> fired or unknown; recurring
         firing -> armed at now + interval (fixed-delay — missed periods collapse). Bumps
-        fire_count / last_fired_at either way. CAS on status='firing': returns False if
+        fire_count for both, and last_fired_at for a normal result. CAS on status='firing': returns False if
         the caller no longer holds the firing claim."""
         now = _now_ms()
         async with self._db.transaction() as tx:
             affected = await tx.execute(
                 f"UPDATE {self.t.timers} SET "
-                "status = CASE WHEN interval_s IS NULL THEN 'fired' ELSE 'armed' END, "
+                "status = CASE WHEN interval_s IS NULL THEN ? ELSE 'armed' END, "
                 "due_at = CASE WHEN interval_s IS NULL THEN due_at "
                 "              ELSE ? + interval_s * 1000 END, "
-                "fire_count = fire_count + 1, last_fired_at = ?, updated_at = ? "
+                "fire_count = fire_count + 1, last_fired_at = COALESCE(?, last_fired_at), updated_at = ? "
                 "WHERE session_id=? AND timer_id=? AND status='firing'",
-                (now, now, now, session_id, int(timer_id)),
+                ("unknown" if unknown else "fired", now, None if unknown else now, now, session_id, int(timer_id)),
             )
         return affected > 0
 
@@ -1665,7 +1665,7 @@ class SessionStore:
         self,
         session_id: str | None,
         *,
-        statuses: tuple[str, ...] = ("fired", "cancelled"),
+        statuses: tuple[str, ...] = ("fired", "cancelled", "unknown"),
         older_than_ms: int | None = None,
         now: int | None = None,
         limit: int = 1000,

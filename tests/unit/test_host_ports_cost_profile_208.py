@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from power_loop import RuntimeClient, StoreBlackboard, StoreTimerBackend, TimerContext, TimerRunner
+from power_loop import (
+    AgentHooks,
+    HookPoint,
+    RuntimeClient,
+    StoreBlackboard,
+    StoreTimerBackend,
+    TimerContext,
+    TimerRunner,
+)
 from power_loop.agent.runtime_transport import MemoryMessageTransport
 from power_loop.runtime.session_ownership import MemorySessionOwnershipCoordinator
 from power_loop.runtime.store.process_guard import ProcessStoreGuard
@@ -57,7 +65,8 @@ class PortsProfile(Profiled):
 
 
 @pytest.mark.parametrize('operation', ['timer_create', 'timer_cancel', 'timer_scan_initial',
-    'timer_scan_empty', 'timer_fire_acceptance', 'board_first', 'board_update', 'board_delete', 'startup_lock'])
+    'timer_scan_empty', 'timer_fire_acceptance', 'timer_fire_unknown',
+    'board_first', 'board_update', 'board_delete', 'startup_lock'])
 async def test_host_port_cost(registry_store, operation):
     store, _ = registry_store
     _, target, actor = await fixture(store)
@@ -71,14 +80,19 @@ async def test_host_port_cost(registry_store, operation):
     if operation in {'board_update', 'board_delete'}:
         await board.post('cost-board', text='first')
     timer = None
-    if operation in {'timer_cancel', 'timer_fire_acceptance'}:
-        timer = await backend.create(source, delay_s=-1 if operation == 'timer_fire_acceptance' else 3600, note='cost timer')
+    if operation in {'timer_cancel', 'timer_fire_acceptance', 'timer_fire_unknown'}:
+        timer = await backend.create(source, delay_s=3600 if operation == 'timer_cancel' else -1, note='cost timer')
     meter = await WriteMeter.install(original, store.table_prefix)
     profile = PortsProfile(original, meter)
     store._db = profile
     # Recreate client store ports after attaching the profiler.
     client = RuntimeClient(store=store, transport=transport)
-    driver = TimerRunner(store=store, client=client)
+    hooks = AgentHooks()
+    if operation == 'timer_fire_unknown':
+        def fail_before_append(ctx):
+            raise RuntimeError('timer cost hook failure')
+        hooks.register(HookPoint.TIMER_FIRE, fail_before_append)
+    driver = TimerRunner(store=store, client=client, hooks=hooks)
     if operation != 'timer_scan_initial':
         driver._last_recovery = time.monotonic()
     guard = ProcessStoreGuard(store, MemorySessionOwnershipCoordinator(), transport)
@@ -94,6 +108,9 @@ async def test_host_port_cost(registry_store, operation):
             assert await driver.scan_once() == 0
         elif operation == 'timer_fire_acceptance':
             assert await driver.scan_once() == 1
+        elif operation == 'timer_fire_unknown':
+            assert await driver.scan_once() == 0
+            assert 'timer cost hook failure' in driver.status().last_error
         elif operation == 'board_first':
             await board.post('cost-board', text='first')
         elif operation == 'board_update':
