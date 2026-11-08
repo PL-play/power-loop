@@ -55,6 +55,16 @@ class RevisionHost(Host):
 @pytest.fixture
 async def late_case(registry_store, request):
     store, connect = registry_store
+    import os
+    output = os.environ.get('P7_R1_REVISION_COSTS')
+    original, profile, meter = store._db, None, None
+    if output:
+        from tests.write_meter import WriteMeter
+
+        from .test_send_sql_profile import Profiled
+        meter = await WriteMeter.install(original, store.table_prefix)
+        profile = Profiled(original, meter)
+        store._db = profile
     host = RevisionHost()
     scopes = (LocalBudgetScope("shared", max_calls=4, max_tokens=1000),)
     if getattr(request, "param", False):
@@ -66,10 +76,34 @@ async def late_case(registry_store, request):
         executor_id="executor", boot_id="boot", boot_contract_hash="a" * 64, budget_config=config)
     c = SimpleNamespace(store=store, connect=connect, manager=runtime.manager, host=host, config=config, runtime=runtime)
     await new_send(c)
+    if output:
+        from .test_send_row_profile import _snapshot
+        before = await _snapshot(original, store.table_prefix)
+        await meter.reset()
+        profile.records.clear()
+        profile.tx_sites.clear()
+        profile.transactions = 0
+        started = __import__('time').monotonic()
     try:
         yield c
     finally:
         await runtime.shutdown(timeout_s=1)
+        if output:
+            import json
+            from pathlib import Path
+
+            from .test_send_sql_profile import _counts
+            records, sites = list(profile.records), list(profile.tx_sites)
+            writes = await meter.report()
+            after = await _snapshot(original, store.table_prefix)
+            row = dict(case=request.node.nodeid, db=original.dialect.name,
+                records=records,tx_sites=sites,sql={**_counts(records,sites),'total':len(records)},
+                transactions=len(sites),writes=writes,
+                net_tables={k:[after[k][i]-before[k][i] for i in (0,1)] for k in after if after[k]!=before[k]},
+                elapsed_s=__import__('time').monotonic()-started)
+            with Path(output).open('a') as file:
+                file.write(json.dumps(row)+'\n')
+            store._db = original
 
 
 def evidence(tokens=12, *, key="late-1", quality="actual", correction_of=None):

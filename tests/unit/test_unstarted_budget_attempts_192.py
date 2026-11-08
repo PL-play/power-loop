@@ -254,3 +254,30 @@ async def test_original_dispatch_and_host_release_cannot_both_win(budget_case):
     counters = json.loads(scope["counters_json"])
     assert counters["held_calls"] == counters["held_tokens"] == counters["inflight"] == 0
     assert counters["used_calls"] == len(actual)
+
+
+@pytest.mark.parametrize('refusal', ['host_rejects', 'cancel_after_reserve'])
+async def test_normal_admission_refusal_releases_original_hold_and_next_call_can_run(budget_case, refusal):
+    c = budget_case
+    reserve = c.host.reserve
+
+    async def refused(plan):
+        if refusal == 'host_rejects':
+            raise JobError('host_quota_exhausted')
+        grant = await reserve(plan)
+        await c.manager.request_cancel(c.actor, c.binding.lease.job_id,
+            system_key='stop-before-supplier', reason='cancel before dispatch')
+        return grant
+
+    c.host.reserve = refused
+    with pytest.raises(JobError):
+        await start(c)
+    assert len(c.host.released) == 1 and not c.host.applied
+    await flush_binding(c.binding, close=True)
+    [row] = await c.manager.db.fetchall(f'SELECT counters_json FROM {c.manager.prefix}task_budget_scopes')
+    counts = json.loads(row['counters_json'])
+    assert counts['held_calls'] == counts['held_tokens'] == counts['used_calls'] == 0
+    c.host.reserve = reserve
+    await new_send(c)
+    await observed(c, await start(c))
+    assert len(c.host.applied) == 1

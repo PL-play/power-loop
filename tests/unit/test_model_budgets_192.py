@@ -94,6 +94,18 @@ class Host:
 @pytest.fixture
 async def budget_case(registry_store, request):
     store, connect = registry_store
+    import os
+
+    output = os.environ.get("P7_R1_BUDGET_COSTS")
+    original, profile, meter = store._db, None, None
+    if output:
+        from tests.write_meter import WriteMeter
+
+        from .test_send_sql_profile import Profiled
+
+        meter = await WriteMeter.install(original, store.table_prefix)
+        profile = Profiled(original, meter)
+        store._db = profile
     manager, host = JobManager(store), Host()
     config = BudgetConfig(
         "host-budget-v1",
@@ -114,10 +126,42 @@ async def budget_case(registry_store, request):
     )
     c = SimpleNamespace(store=store, connect=connect, manager=manager, host=host, config=config, runtime=runtime)
     await new_send(c)
+    if output:
+        from .test_send_row_profile import _snapshot
+
+        before = await _snapshot(original, store.table_prefix)
+        await meter.reset()
+        profile.records.clear()
+        profile.tx_sites.clear()
+        profile.transactions = 0
+        started = __import__("time").monotonic()
     try:
         yield c
     finally:
         await runtime.shutdown(timeout_s=1)
+        if output:
+            from pathlib import Path
+
+            from .test_send_sql_profile import _counts
+
+            records = list(profile.records)
+            sites = list(profile.tx_sites)
+            writes = await meter.report()
+            after = await _snapshot(original, store.table_prefix)
+            row = dict(
+                case=request.node.nodeid,
+                db=original.dialect.name,
+                records=records,
+                tx_sites=sites,
+                sql={**_counts(records, sites), "total": len(records)},
+                transactions=len(sites),
+                writes=writes,
+                net_tables={k: [after[k][i] - before[k][i] for i in (0, 1)] for k in after if after[k] != before[k]},
+                elapsed_s=__import__("time").monotonic() - started,
+            )
+            with Path(output).open("a") as file:
+                file.write(json.dumps(row) + "\n")
+            store._db = original
 
 
 async def new_send(c, *, runtime=None):
@@ -175,6 +219,7 @@ async def test_admission_and_model_dispatch_commit_one_original_grant(budget_cas
     [actual] = (await current(c.binding).journal.inspect(current(c.binding).identity))["summary"]["allocations"]
     assert actual["used_calls"] == 1 and actual["used_tokens"] == 10
     from power_loop.runtime.control_runtime import flush_binding
+
     await flush_binding(c.binding, close=True)
     assert await counters(c) == {"used_calls": 1, "held_calls": 0, "used_tokens": 10, "held_tokens": 0, "inflight": 0}
 
@@ -210,6 +255,7 @@ async def test_usage_ack_loss_keeps_frozen_outbox_and_replays_without_duplicate_
 
 async def test_scope_counters_survive_new_sends_and_new_runtime_objects(budget_case):
     from power_loop.runtime.control_runtime import flush_binding
+
     c = budget_case
     await observed(c, await start(c))
     await flush_binding(c.binding, close=True)
@@ -272,8 +318,11 @@ async def test_cancel_after_host_grant_never_authorizes_provider_and_can_release
     c.host.reserve = cancel_after_grant
     with pytest.raises(JobError, match="cancel_requested"):
         await start(c)
-    [prepared] = [value["prepared"] for (kind, _), value in current(c.binding)._records.items()
-                  if kind == "attempt" and value["kind"] == "model"]
+    [prepared] = [
+        value["prepared"]
+        for (kind, _), value in current(c.binding)._records.items()
+        if kind == "attempt" and value["kind"] == "model"
+    ]
     a = attempts.Attempt(c.binding, prepared["attempt_id"], prepared)
     assert all(value["phase"] != "dispatched" for value in current(c.binding).active.values())
     proof = await budgets.close_unstarted(a)
@@ -323,6 +372,7 @@ async def test_actual_component_totals_match_host_settlement_without_counting_to
     current = await counters(c)
     assert current == dict(used_calls=0, held_calls=1, used_tokens=0, held_tokens=100, inflight=1)
     from power_loop.runtime.control_runtime import flush_binding
+
     await flush_binding(c.binding, close=True)
     closed = await counters(c)
     assert closed["used_tokens"] == (0 if total is None else total)
@@ -346,8 +396,6 @@ async def test_actual_component_over_bound_closes_policy_and_preserves_the_whole
     assert c.host.reserve_calls == 1
 
 
-
-
 @pytest.mark.parametrize("invalid", [2, -1])
 async def test_invalid_policy_enabled_projection_cannot_enable_paid_work(budget_case, invalid):
     c = budget_case
@@ -355,8 +403,6 @@ async def test_invalid_policy_enabled_projection_cannot_enable_paid_work(budget_
     with pytest.raises(JobError, match="budget_policy_evidence_corrupt"):
         await start(c)
     assert c.host.reserve_calls == 0 and all(v == 0 for v in (await counters(c)).values())
-
-
 
 
 @pytest.mark.parametrize("budget_case", [{"max_pending": 10}], indirect=True)
@@ -386,6 +432,7 @@ async def test_two_independent_requests_can_reserve_concurrently_without_oversub
             await observed(case, attempt)
         assert (await counters(c))["held_calls"] == 2 and (await counters(c))["inflight"] == 2
         from power_loop.runtime.control_runtime import flush_binding
+
         await asyncio.gather(*(flush_binding(case.binding, close=True) for case in (first, second)))
         assert (await counters(c))["used_calls"] == 2 and (await counters(c))["used_tokens"] == 20
     finally:
@@ -402,11 +449,15 @@ async def test_unconfirmed_reservation_closes_dispatch_then_uses_host_tombstone_
     c.host.reserve = unavailable
     with pytest.raises(JobError, match="budget_host_reservation_unconfirmed"):
         await start(c)
-    [prepared] = [value["prepared"] for (kind, _), value in current(c.binding)._records.items()
-                  if kind == "attempt" and value["kind"] == "model"]
+    [prepared] = [
+        value["prepared"]
+        for (kind, _), value in current(c.binding)._records.items()
+        if kind == "attempt" and value["kind"] == "model"
+    ]
     original = attempts.Attempt(c.binding, prepared["attempt_id"], prepared)
     proof = await budgets.close_unstarted(original)
     from power_loop.runtime.control_runtime import flush_binding
+
     await flush_binding(c.binding, close=True)
     assert proof and (await counters(c))["held_tokens"] == 0
     assert (await budgets.get_budget(c.manager, c.actor, original.attempt_id))["phase"] == "released"
@@ -429,12 +480,17 @@ async def test_timed_out_api_task_is_retained_and_late_grant_only_allows_mechani
     [task] = c.runtime._budget_handles.values()
     assert not task.done() and not task.cancelling()
     release.set()
-    await task
-    [prepared] = [value["prepared"] for (kind, _), value in current(c.binding)._records.items()
-                  if kind == "attempt" and value["kind"] == "model"]
+    with pytest.raises(JobError, match="budget_dispatch_closed"):
+        await task
+    [prepared] = [
+        value["prepared"]
+        for (kind, _), value in current(c.binding)._records.items()
+        if kind == "attempt" and value["kind"] == "model"
+    ]
     original = attempts.Attempt(c.binding, prepared["attempt_id"], prepared)
     await budgets.close_unstarted(original)
     from power_loop.runtime.control_runtime import flush_binding
+
     await flush_binding(c.binding, close=True)
     assert (await budgets.get_budget(c.manager, c.actor, original.attempt_id))["phase"] == "released"
     assert all(value == 0 for value in (await counters(c)).values())
@@ -470,6 +526,7 @@ async def test_wrong_usage_ack_cannot_clear_a_frozen_outbox_or_apply_local_token
     await budgets.deliver(a)
     assert not (await budgets.get_budget(c.manager, c.actor, a.attempt_id))["pending"]
     from power_loop.runtime.control_runtime import flush_binding
+
     await flush_binding(c.binding, close=True)
     assert (await counters(c))["used_tokens"] == 10 and (await counters(c))["used_calls"] == 1
 
@@ -504,6 +561,7 @@ async def test_duplicate_parallel_close_returns_one_original_release_and_never_r
     replies = await asyncio.gather(*(budgets.close_unstarted(a) for _ in range(8)))
     assert all(r == replies[0] for r in replies) and len(c.host.released) == 1
     from power_loop.runtime.control_runtime import flush_binding
+
     await flush_binding(c.binding, close=True)
     assert all(v == 0 for v in (await counters(c)).values())
     assert (await budgets.get_budget(c.manager, c.actor, a.attempt_id))["phase"] == "released"
@@ -523,7 +581,13 @@ async def test_unadapted_or_name_spoofed_tool_is_rejected_before_its_side_effect
 
     registry = ToolRegistry()
     registry.register(
-        ToolDefinition(name=name, description="unadapted external effect", input_schema={"type": "object"}, pricing=Free("test_fixture")), unadapted
+        ToolDefinition(
+            name=name,
+            description="unadapted external effect",
+            input_schema={"type": "object"},
+            pricing=Free("test_fixture"),
+        ),
+        unadapted,
     )
     token = _SEND.set(c.binding)
     try:
@@ -563,6 +627,8 @@ async def test_budget_schema_rejects_a_missing_required_control_column(budget_ca
     if table == "task_budget_attempts" and column == "pending":
         suffix = f" ON {c.manager.prefix}{table}" if c.manager.db.dialect.name == "mysql" else ""
         await c.manager.db.execute(f"DROP INDEX {c.manager.prefix}idx_budget_pending{suffix}")
+        await c.manager.db.execute(f"DROP INDEX {c.manager.prefix}idx_budget_unsettled{suffix}")
+        await c.manager.db.execute(f"DROP INDEX {c.manager.prefix}idx_budget_dispatch{suffix}")
     await c.manager.db.execute(f"ALTER TABLE {c.manager.prefix}{table} DROP COLUMN {column}")
     with pytest.raises(StoreSchemaError, match="task budget schema incomplete"):
         await verify_task_schema(c.manager.db, c.manager.prefix)

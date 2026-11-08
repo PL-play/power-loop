@@ -293,13 +293,13 @@ async def start_call(pipeline, request, *, round_index, retry_index, model, purp
     except Exception:
         # Same key recall only; prepare never sends a provider request.
         attempt = await prepare(binding, **args)
-    from .model_budgets import close_unreserved, reserve
+    from .model_budgets import close_unstarted, reserve
 
     try:
         await reserve(attempt, request, service=getattr(pipeline, "llm", None))
     except Exception:
         try:
-            await close_unreserved(attempt)
+            await close_unstarted(attempt)
         except Exception:
             # Preserve the original admission error. Failed proof leaves the
             # attempt unresolved; it never authorizes a retry or zero charge.
@@ -311,6 +311,13 @@ async def start_call(pipeline, request, *, round_index, retry_index, model, purp
     try:
         deadline = await dispatch(attempt)
     except JobError:
+        # This stack has not called the supplier. Release its original grant
+        # before losing that knowledge at execution shutdown.
+        try:
+            await close_unstarted(attempt)
+        except Exception:
+            binding.resource_evidence["budget_pending"] = True
+            log.exception("Undispatched attempt release remains pending: %s", attempt.attempt_id)
         raise
     except Exception:
         try:

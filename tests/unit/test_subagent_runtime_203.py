@@ -140,7 +140,7 @@ async def test_explicit_resume_preserves_first_result_and_voids_only_new_input(r
         assert not await client.inputs.has_pending(start.session_id)
         events = await store._db.fetchall(f"SELECT payload_json,delivery_status FROM {store.table_prefix}job_events WHERE job_id=? AND event_type='result'", (one.job_id,))
         assert {json.loads(event['payload_json'])['generation']: event['delivery_status'] for event in events} == (
-            {1:'handled'} if cancel_resume else {1:'handled', 2:'handled'})
+            {1:'suppressed'} if cancel_resume else {1:'handled', 2:'handled'})
     finally:
         if client:
             await client.aclose()
@@ -175,7 +175,8 @@ async def test_real_queued_child_finishes_at_generation_zero(registry_store, mod
             build = runner.runtime.factory.build
             async def missing(descriptor, context):
                 if context.session_id != runner.target.session_id:
-                    raise ValueError("missing frozen child definition")
+                    from power_loop import RuntimeRequestError
+                    raise RuntimeRequestError("definition_unavailable", "missing frozen child definition")
                 return await build(descriptor, context)
             monkeypatch.setattr(runner.runtime.factory, "build", missing)
         enabled = True
@@ -186,8 +187,15 @@ async def test_real_queued_child_finishes_at_generation_zero(registry_store, mod
         assert (await runner.runtime.client.wait(input_ref, actor=runner.actor, deadline_ms=now_ms()+1000)).job_ref==result.job_ref
         assert not model.child_started.is_set()
         await runner.drain()
-        current = await store._db.fetchone(f"SELECT result_status,supervision_status FROM {store.table_prefix}jobs WHERE job_id=?", (ref.job_id,))
-        assert current == {'result_status':'handled','supervision_status':'closed'}
+        expected = {'result_status': 'handled' if mode == 'missing_definition' else 'suppressed',
+                    'supervision_status': 'closed'}
+        async with asyncio.timeout(10):
+            while True:
+                current = await store._db.fetchone(f"SELECT result_status,supervision_status FROM {store.table_prefix}jobs WHERE job_id=?", (ref.job_id,))
+                if current == expected:
+                    break
+                await asyncio.sleep(0.01)
+        assert (await runner.runtime.client.wait(ref, actor=runner.actor, deadline_ms=now_ms()+1000)) == result
     finally:
         await runner.aclose()
 
@@ -209,6 +217,13 @@ async def test_claimed_child_rejects_zero_cancel_but_start_input_cancels_one(reg
         await runner.runtime.client.cancel(InputRef(**receipt["input_ref"]), actor=runner.actor)
         result = await runner.runtime.client.wait(JobRef(**receipt["job_ref"]), actor=runner.actor, deadline_ms=now_ms()+10000)
         assert result.status == "cancelled" and result.job_ref.generation == 1
+        calls = len(model.requests)
+        await runner.drain()
+        assert len(model.requests) == calls, "a cancelled original result must not start another parent model"
+        row = await store._db.fetchone(f"SELECT result_status FROM {store.table_prefix}jobs WHERE job_id=?",
+                                      (result.job_ref.job_id,))
+        assert row['result_status'] == 'suppressed'
+        assert (await runner.runtime.client.wait(result.job_ref, actor=runner.actor, deadline_ms=now_ms()+1000)).status == 'cancelled'
     finally:
         model.child_gate.set()
         await runner.aclose()

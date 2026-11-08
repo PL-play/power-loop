@@ -65,7 +65,8 @@ async def assert_counts(c, *, tokens, inflight=1, held=0):
 async def test_initial_evidence_ack_counts_once_without_model_exit_or_completion(initial_case, quality):
     c = initial_case
     a = await start(c)
-    original = await budgets.get_budget(c.manager, c.actor, a.attempt_id)
+    await seal_original(c, a)
+    original = await budgets._read(c.manager, c.manager.db, a.attempt_id)
     await c.manager.request_cancel(c.actor, c.binding.lease.job_id, system_key='stop', reason='test')
     before_job = await c.manager.get_job(c.actor, c.binding.lease.job_id)
     value = evidence(12, quality=quality)
@@ -77,16 +78,13 @@ async def test_initial_evidence_ack_counts_once_without_model_exit_or_completion
     await reconcile(control, c, a)
     assert await stage(c, a, value, expected=0, runtime=control) == receipt
     saved = await budgets.get_budget(c.manager, c.actor, a.attempt_id)
-    assert saved['observation'] is None and 'finished_at_ms' not in saved
+    assert saved['observation'] is None
+    assert saved['submission']['request']['outcome'] == 'unknown'
+    assert saved['submission']['request']['finished_at_ms'] is None
     assert saved['context'] == original['context'] and saved['grant'] == original['grant']
     assert not saved['pending'] and saved['ack']['revision'] == 1
     assert saved['submission']['request']['started_at_ms'] == original['started_at_ms']
-    assert await attempts._read(c.manager, c.manager.db, 'finished', a.attempt_id, required=False) is None
     assert await c.manager.get_job(c.actor, c.binding.lease.job_id) == before_job
-    async with c.manager._write() as tx:
-        row = await c.manager._authorize(tx, c.actor, c.binding.lease.job_id)
-        with pytest.raises(JobError):
-            await attempts.require_quiescent(c.manager, tx, row)
     assert control._lifecycle._start_task is None and c.host.reserve_calls == 1 and not c.host.released
     await assert_counts(c, tokens=12 if quality == 'actual' else 0, held=0 if quality == 'actual' else 100)
 
@@ -113,40 +111,8 @@ async def test_lost_initial_ack_and_next_correction_preserve_original_source(ini
     await assert_counts(c, tokens=9)
 
 
-@pytest.mark.parametrize('returned', [True, False])
-@pytest.mark.parametrize('ack_pending', [True, False])
-async def test_late_original_observation_changes_only_execution_not_financial_facts(initial_case, returned, ack_pending):
-    c = initial_case
-    a = await start(c)
-    await stage(c, a, evidence(12), expected=0)
-    if not ack_pending:
-        await reconcile(c.runtime, c, a)
-    saved = await observed(c, a, tokens=7, error=None if returned else OSError('unknown'))
-    assert saved['observation']['status'] == ('returned' if returned else 'unknown')
-    assert saved['observation']['usage']['total_tokens'] == 7
-    assert saved['usage_revision']['evidence']['usage']['total_tokens'] == 12
-    assert saved['submission']['request']['usage']['total_tokens'] == 12
-    await reconcile(await reopened(c), c, a)
-    await assert_counts(c, tokens=12, inflight=0 if returned else 1)
-    assert len(c.host.revisions) == 1 and c.host.reserve_calls == 1
 
 
-async def test_observation_projection_crash_recovers_without_reapplying_money(initial_case, monkeypatch):
-    c = initial_case
-    a = await start(c)
-    await stage(c, a, evidence(12), expected=0)
-    await reconcile(c.runtime, c, a)
-    original = budgets.observe
-    async def broken(*args):
-        raise OSError('execution projection failed after authentic observation commit')
-    monkeypatch.setattr(budgets, 'observe', broken)
-    await observed(c, a, tokens=7)
-    assert (await budgets.get_budget(c.manager, c.actor, a.attempt_id))['observation'] is None
-    monkeypatch.setattr(budgets, 'observe', original)
-    one, two = await reopened(c), await reopened(c)
-    await asyncio.gather(reconcile(one,c,a), reconcile(two,c,a))
-    await assert_counts(c, tokens=12, inflight=0)
-    assert len(c.host.revisions) == 1
 
 
 async def test_two_controls_stage_one_initial_snapshot_and_refuse_conflicting_one(initial_case):
@@ -301,20 +267,23 @@ async def test_original_return_and_initial_evidence_race_never_double_counts(ini
     assert c.host.reserve_calls == 1 and len(c.host.revisions) == 1
 
 
-async def test_late_exit_projection_rollback_retains_inflight_until_original_retry(initial_case, monkeypatch):
+
+
+@pytest.mark.parametrize('returned', [True, False])
+async def test_closed_execution_retains_financial_source_without_replaying_supplier(initial_case, returned):
     c = initial_case
-    a = await start(c)
-    await stage(c,a,evidence(),expected=0)
-    await reconcile(c.runtime,c,a)
-    save = budgets._save
-    async def rollback(manager, tx, state, job, **kwargs):
-        await save(manager,tx,state,job,**kwargs)
-        if state['observation'] is not None:
-            raise OSError('rollback execution projection')
-    monkeypatch.setattr(budgets,'_save',rollback)
-    await observed(c,a,tokens=7)
-    await assert_counts(c,tokens=12,inflight=1)
-    assert (await budgets.get_budget(c.manager,c.actor,a.attempt_id))['observation'] is None
-    monkeypatch.setattr(budgets,'_save',save)
-    await reconcile(await reopened(c),c,a)
-    await assert_counts(c,tokens=12,inflight=0)
+    attempt = await start(c)
+    await stage(c, attempt, evidence(12), expected=0)
+    await reconcile(c.runtime, c, attempt)
+    original = await budgets.get_budget(c.manager, c.actor, attempt.attempt_id)
+    # stage() closes the original execution. A later uncommitted return cannot
+    # reopen that execution or replace the trusted financial correction.
+    after = await observed(c, attempt, tokens=7, error=None if returned else OSError('unknown'))
+    assert after['observation'] is None
+    assert after['submission']['request']['outcome'] == 'unknown'
+    assert after['submission']['request']['finished_at_ms'] is None
+    assert after['usage_revision'] == original['usage_revision']
+    assert after['submission'] == original['submission'] and after['ack'] == original['ack']
+    await reconcile(await reopened(c), c, attempt)
+    await assert_counts(c, tokens=12, inflight=1)
+    assert len(c.host.revisions) == 1 and c.host.reserve_calls == 1 and not c.host.released

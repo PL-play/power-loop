@@ -726,7 +726,9 @@ async def _prepare_unfrozen_release(runtime, actor, job_id, attempt_id):
         policy = await _policy(runtime, tx)
         job = await manager._authorize(tx, actor, job_id)
         state = await _release_source(runtime, tx, job, attempt_id, policy)
-        if state['submission'] is not None or state['phase'] == 'released':
+        # A staged usage revision already accounts for the original call. Its
+        # submission is prepared next; it is never an unused reservation.
+        if state['submission'] is not None or state['phase'] in ('released', 'settling'):
             return False
         generation = state['context']['generation']
         if job['generation'] != generation:

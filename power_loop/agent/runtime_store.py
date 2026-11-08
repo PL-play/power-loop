@@ -419,11 +419,9 @@ class RuntimeInputStore:
 
     async def discard_cancelled_result(self, tx, record):
         """An explicitly cancelled originating scope must not wake a new send."""
-        job = await tx.fetchone(f"SELECT parent_job_id FROM {self.jobs} WHERE job_id=?",
+        row = await tx.fetchone(f"SELECT parent_job_id,cancel_requested_at FROM {self.jobs} WHERE job_id=?",
                                (record.meta["result_ref"]["job_id"],))
-        parent = job["parent_job_id"]
-        while parent:
-            row = await tx.fetchone(f"SELECT parent_job_id,cancel_requested_at FROM {self.jobs} WHERE job_id=?", (parent,))
+        while row:
             if row["cancel_requested_at"] is not None:
                 await self.void_unbound(tx, record.ref, reason="origin_cancelled", status="cancelled")
                 ref = record.meta["result_ref"]
@@ -433,6 +431,8 @@ class RuntimeInputStore:
                     "WHERE job_id=? AND generation=?", (ref["job_id"], ref["generation"]), obligations=True)
                 return True
             parent = row["parent_job_id"]
+            row = (await tx.fetchone(f"SELECT parent_job_id,cancel_requested_at FROM {self.jobs} WHERE job_id=?",
+                                    (parent,))) if parent else None
         return False
 
     async def fail_start(self, ref, reason, ownership, *, error_code=None):
